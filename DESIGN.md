@@ -4,9 +4,9 @@ Knot is a functional relational programming language. Relations are the primary 
 
 ## Core Principles
 
-1. **Relations are the data structure** — not lists, not arrays. A `Rel` is a typed set of values.
+1. **Relations are the data structure** — not lists, not arrays. `[T]` is a typed set of `T` values.
 2. **Effects are inferred** — the compiler tracks reads and writes. No annotations needed.
-3. **ADTs are native to relations** — a `Rel Shape` holds circles and rects in one relation. The tag is an implementation detail.
+3. **ADTs are native to relations** — a `[Shape]` holds circles and rects in one relation. The tag is an implementation detail.
 4. **No keys** — relations are sets. Identity is structural. The runtime handles indexing.
 5. **State is visible** — source relations (mutable, persisted) are prefixed with `*`, derived relations (read-only) with `&`. Every reference site shows whether you're touching state. No ORM, no SQL.
 
@@ -30,8 +30,8 @@ There are five kinds of top-level declarations:
 
 ```knot
 -- Source: stored in DB, mutable via `set`
-*people : Rel Person
-*orders : Rel {customer: Text, amount: Int}
+*people : [Person]
+*orders : [{customer: Text, amount: Int}]
 
 -- View: defined by a query over source relations, settable (writes propagate back)
 *openTodos = do
@@ -54,7 +54,7 @@ The prefix determines mutability, the presence of a body determines whether it's
 
 | Declaration | Category | How the compiler knows |
 |---|---|---|
-| `*foo : Rel T` | Source (persisted) | `*` prefix, no body |
+| `*foo : [T]` | Source (persisted) | `*` prefix, no body |
 | `*foo = expr` | View (read/write) | `*` prefix, has body |
 | `&foo = expr` | Derived (read-only) | `&` prefix, has body |
 | `foo = expr` (pure) | Constant | No prefix, no effects inferred |
@@ -62,22 +62,22 @@ The prefix determines mutability, the presence of a body determines whether it's
 
 ### ADTs as Relation Schemas
 
-Every ADT defines a relation schema. Each constructor is a record variant. A `Rel T` holds values of any variant of `T` in the same relation.
+Every ADT defines a relation schema. Each constructor is a record variant. A `[T]` holds values of any variant of `T` in the same relation.
 
 ```knot
 data Shape
   = Circle {radius: Float}
   | Rect {width: Float, height: Float}
 
-*shapes : Rel Shape  -- source (no body)
+*shapes : [Shape]  -- source (no body)
 ```
 
 Single-variant types are equivalent to bare records:
 
 ```knot
 -- These are the same:
-*people : Rel {name: Text, age: Int}
-*people : Rel Person
+*people : [{name: Text, age: Int}]
+*people : [Person]
 ```
 
 Constructors are the interface for building values, inserting, and querying. The tag/discriminator is an internal storage detail that never appears in the language.
@@ -101,19 +101,19 @@ data Status
   = Open {}
   | InProgress {assignee: Text}
   | Resolved {resolution: Text}
-  | Blocked {reason: Text, dependencies: Rel {title: Text}}
+  | Blocked {reason: Text, dependencies: [{title: Text}]}
 
-*tickets : Rel {title: Text, priority: Priority, status: Status}
+*tickets : [{title: Text, priority: Priority, status: Status}]
 ```
 
 ### Nested Relations
 
-A field can hold a `Rel` — a set nested inside a row. This departs from SQL's first normal form restriction.
+A field can hold a `[]` — a set nested inside a row. This departs from SQL's first normal form restriction.
 
 ```knot
 type Person = {name: Text, age: Int}
 
-*teams : Rel {name: Text, members: Rel Person}
+*teams : [{name: Text, members: [Person]}]
 ```
 
 #### Querying into Nested Relations
@@ -166,7 +166,7 @@ Convert between flat and nested representations:
 ```knot
 -- Flat relation
 type FlatMembership = {team: Text, member: Text, age: Int}
-*memberships : Rel FlatMembership
+*memberships : [FlatMembership]
 
 -- Nest: group a flat relation into nested structure
 &nested = do
@@ -188,9 +188,9 @@ type FlatMembership = {team: Text, member: Text, age: Int}
 Nesting is arbitrarily deep:
 
 ```knot
-type Course = {name: Text, students: Rel {name: Text, grades: Rel {subject: Text, score: Int}}}
+type Course = {name: Text, students: [{name: Text, grades: [{subject: Text, score: Int}]}]}
 
-*departments : Rel {name: Text, courses: Rel Course}
+*departments : [{name: Text, courses: [Course]}]
 
 -- Find all failing grades across all departments
 &failing = do
@@ -206,7 +206,7 @@ type Course = {name: Text, students: Rel {name: Text, grades: Rel {subject: Text
 
 ### Trait Hierarchy
 
-`do` syntax is not hardcoded to `Rel`. It desugars to trait methods, so any type implementing `Monad` gets `do`/`yield`/`<-` for free. This requires higher-kinded types in the type system.
+`do` syntax is not hardcoded to `[]`. It desugars to trait methods, so any type implementing `Monad` gets `do`/`yield`/`<-` for free. This requires higher-kinded types in the type system.
 
 ```knot
 trait Functor (f : Type -> Type) where
@@ -236,7 +236,7 @@ trait Foldable (t : Type -> Type) where
 - `where cond` desugars to `if cond then yield {} else empty` (requires `Alternative`)
 
 ```knot
--- do with Rel (relation comprehension)
+-- do with [] (relation comprehension)
 &richEmployees = do
   e <- *employees
   d <- *departments
@@ -255,34 +255,34 @@ parseConfig text = do
   yield name
 ```
 
-### `Rel` Trait Implementations
+### `[]` Trait Implementations
 
-`Rel` implements the full hierarchy:
+`[]` implements the full hierarchy:
 
 ```knot
-impl Functor Rel where
+impl Functor [] where
   map f rel = do x <- rel; yield (f x)
 
-impl Applicative Rel where
+impl Applicative [] where
   yield x = [x]
   ap fs xs = do f <- fs; x <- xs; yield (f x)
 
-impl Monad Rel where
+impl Monad [] where
   bind = ...  -- built-in
 
-impl Alternative Rel where
+impl Alternative [] where
   empty = []
   alt = union
 
-impl Foldable Rel where
+impl Foldable [] where
   fold = ...  -- built-in
 ```
 
-### The Only `Rel`-Specific Primitive
+### The Only `[]`-Specific Primitive
 
 | Primitive | Type | Description |
 |-----------|------|-------------|
-| `set` | `Rel a -> Rel a -> {}` | Set a persistent relation to a new value |
+| `set` | `[a] -> [a] -> {}` | Set a persistent relation to a new value |
 
 Everything else comes from traits:
 
@@ -418,8 +418,8 @@ Derived combinators like `filter` compose with `|>`:
 `match` filters to one variant and exposes its fields:
 
 ```knot
-&circles = *shapes |> match Circle    -- : Rel {radius: Float}
-&rects   = *shapes |> match Rect      -- : Rel {width: Float, height: Float}
+&circles = *shapes |> match Circle    -- : [{radius: Float}]
+&rects   = *shapes |> match Rect      -- : [{width: Float, height: Float}]
 
 &bigCircles = &circles |> filter (\c -> c.radius > 10)
 ```
@@ -520,7 +520,7 @@ The compiler infers effect signatures internally:
 
 ```
 formatName : Text -> Text                                   -- pure
-&seniors   : {reads *people} Rel {name: Text, age: Int}     -- DB read
+&seniors   : {reads *people} [{name: Text, age: Int}]     -- DB read
 birthday   : {reads *people, writes *people} Text -> {}     -- DB write
 greet      : {console} Text -> {}                           -- IO
 notify     : {network} Url -> Text -> {}                    -- IO
@@ -617,9 +617,9 @@ Return types can be declared per-endpoint:
 
 ```knot
 route Api where
-  GET                              /todos/{user: Text} -> Rel {title: Text, priority: Priority}  = GetTodos
+  GET                              /todos/{user: Text} -> [{title: Text, priority: Priority}]  = GetTodos
   POST {title: Text, owner: Text}  /todos              -> {ok: Bool}                              = AddTodo
-  GET                              /workload           -> Rel {owner: Text, count: Int}           = GetWorkload
+  GET                              /workload           -> [{owner: Text, count: Int}]           = GetWorkload
 ```
 
 The compiler checks that each `serve` branch returns the declared type.
@@ -729,8 +729,8 @@ No surrogate IDs, no key declarations. Data identifies itself.
 For referential integrity and uniqueness, express value relationships:
 
 ```knot
-*orders : Rel {customer: Text, amount: Int}
-*users : Rel {email: Text, name: Text}
+*orders : [{customer: Text, amount: Int}]
+*users : [{email: Text, name: Text}]
 
 -- Referential integrity: every order's customer must appear in people's names
 *orders.customer <= *people.name
@@ -777,7 +777,7 @@ For `*openTodos` above:
 The constant column is hidden from the type — its value is fixed by definition:
 
 ```knot
-*openTodos : Rel {title: Text, owner: Text, priority: Priority}
+*openTodos : [{title: Text, owner: Text, priority: Priority}]
 ```
 
 Writing through a view auto-fills constants and propagates source columns:
@@ -803,7 +803,7 @@ Multiple constants create narrow slices:
   t <- *todos
   yield {title: t.title, owner: t.owner, status: Open {}, priority: Critical {}}
 
--- Type: Rel {title: Text, owner: Text}
+-- Type: [{title: Text, owner: Text}]
 -- Reads: only critical open todos
 -- Writes: auto-fills status=Open, priority=Critical
 ```
@@ -813,9 +813,9 @@ Multiple constants create narrow slices:
 Datalog-style transitive closure:
 
 ```knot
-*manages : Rel {manager: Text, report: Text}
+*manages : [{manager: Text, report: Text}]
 
-&reportsTo : Rel {ancestor: Text, descendant: Text} =
+&reportsTo : [{ancestor: Text, descendant: Text}] =
   union
     (do m <- *manages
         yield {m.manager, m.report})
@@ -844,9 +844,9 @@ data Status
   | InProgress {assignee: Text}
   | Resolved {resolution: Text}
 
-*people : Rel {name: Text, age: Int, email: Text}
+*people : [{name: Text, age: Int, email: Text}]
 
-*todos : Rel {title: Text, owner: Text, priority: Priority, status: Status}
+*todos : [{title: Text, owner: Text, priority: Priority, status: Status}]
 
 migrate *people
   from {name: Text, age: Int}
@@ -907,7 +907,7 @@ The runtime stores the compiled schema version in the database. On startup it co
 Optional history tracking:
 
 ```knot
-*employees : Rel {name: Text, salary: Int}
+*employees : [{name: Text, salary: Int}]
   with history
 
 salaryLastYear name =
@@ -936,7 +936,7 @@ Functions can be generic over any ADT that has a particular variant:
 countOpen rel =
   rel |> filter (\r -> case r.status of Open {} -> True {}; _ -> False {}) |> count
 
--- Inferred: Rel {status: <Open {} | r> | s} -> Int
+-- Inferred: [{status: <Open {} | r> | s}] -> Int
 -- Works on tickets, issues, orders — anything with an Open status variant
 ```
 
@@ -965,16 +965,16 @@ printAll rel = do
   r <- rel
   yield (display r)
 
--- Inferred: Display a => Rel a -> Rel Text
+-- Inferred: Display a => [a] -> [Text]
 
 -- Explicit bound (optional)
-printAll : Display a => Rel a -> Rel Text
+printAll : Display a => [a] -> [Text]
 ```
 
 #### Multiple Bounds
 
 ```knot
-sortAndShow : Ord a => Display a => Rel a -> [Text]
+sortAndShow : Ord a => Display a => [a] -> [Text]
 ```
 
 #### Associated Types
@@ -986,10 +986,10 @@ trait Collection c where
   type Item c
   empty : c
   add : Item c -> c -> c
-  toRel : c -> Rel (Item c)
+  toRel : c -> [Item c]
 
-impl Collection (Rel a) where
-  type Item (Rel a) = a
+impl Collection [a] where
+  type Item [a] = a
   empty = []
   add x rel = union rel (yield x)
   toRel = id
@@ -1034,7 +1034,7 @@ report rel = do
   yield {summary: display r}
 
 -- Works on any relation with a numeric column named `amount`
-totalAmount : Num n => Rel {amount: n | r} -> n
+totalAmount : Num n => [{amount: n | r}] -> n
 totalAmount rel = fold (\acc r -> acc + r.amount) 0 rel
 ```
 
@@ -1069,15 +1069,15 @@ data Status
   | InProgress {assignee: Text}
   | Resolved {resolution: Text}
 
-*todos : Rel {title: Text, owner: Text, priority: Priority, status: Status}
+*todos : [{title: Text, owner: Text, priority: Priority, status: Status}]
 
 route Api where
-  GET                                /todos/{user: Text}           -> Rel {title: Text, priority: Priority}  = GetTodos
+  GET                                /todos/{user: Text}           -> [{title: Text, priority: Priority}]  = GetTodos
   POST {title: Text, owner: Text, priority: Priority}
                                      /todos                        -> {ok: Bool}                             = AddTodo
   PUT  {owner: Text, person: Text}   /todos/{title: Text}/assign   -> {ok: Bool}                             = AssignTodo
   PUT  {owner: Text, msg: Text}      /todos/{title: Text}/resolve  -> {ok: Bool}                             = ResolveTodo
-  GET                                /workload                     -> Rel {owner: Text, count: Int}          = GetWorkload
+  GET                                /workload                     -> [{owner: Text, count: Int}]          = GetWorkload
 
 formatTitle title = toUpper (take 1 title) ++ drop 1 title
 

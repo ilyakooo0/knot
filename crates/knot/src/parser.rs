@@ -234,6 +234,7 @@ impl Parser {
             | TokenKind::Let
             | TokenKind::In
             | TokenKind::Not
+            | TokenKind::Full
             | TokenKind::Atomic
             | TokenKind::Deriving
             | TokenKind::With => {
@@ -1127,7 +1128,17 @@ impl Parser {
             TokenKind::If => self.parse_if(),
             TokenKind::Case => self.parse_case(),
             TokenKind::Do => self.parse_do_expr(),
-            TokenKind::Set => self.parse_set(),
+            TokenKind::Set => self.parse_set(false),
+            TokenKind::Full => {
+                if self.peek_ahead(1) == &TokenKind::Set {
+                    self.advance(); // consume `full`
+                    self.parse_set(true)
+                } else {
+                    // `full` used as a regular identifier
+                    let tok = self.advance();
+                    Some(Spanned::new(ExprKind::Var("full".into()), tok.span))
+                }
+            }
             TokenKind::Yield => {
                 let start = self.span();
                 self.advance();
@@ -1353,6 +1364,10 @@ impl Parser {
             TokenKind::Upper(name) => {
                 let tok = self.advance();
                 Some(Spanned::new(ExprKind::Constructor(name), tok.span))
+            }
+            TokenKind::Full => {
+                let tok = self.advance();
+                Some(Spanned::new(ExprKind::Var("full".into()), tok.span))
             }
             TokenKind::Star => {
                 // *name — source reference
@@ -1721,9 +1736,9 @@ impl Parser {
         ))
     }
 
-    fn parse_set(&mut self) -> Option<Expr> {
+    fn parse_set(&mut self, full: bool) -> Option<Expr> {
         let start = self.span();
-        self.push_context("set expression");
+        self.push_context(if full { "full set expression" } else { "set expression" });
         self.advance(); // consume `set`
 
         let target = self.parse_expr_bp(0)?;
@@ -1735,13 +1750,18 @@ impl Parser {
 
         let end_sp = value.span;
         self.pop_context();
-        Some(Spanned::new(
+        let kind = if full {
+            ExprKind::FullSet {
+                target: Box::new(target),
+                value: Box::new(value),
+            }
+        } else {
             ExprKind::Set {
                 target: Box::new(target),
                 value: Box::new(value),
-            },
-            Span::new(start.start, end_sp.end),
-        ))
+            }
+        };
+        Some(Spanned::new(kind, Span::new(start.start, end_sp.end)))
     }
 
     fn parse_let_in_expr(&mut self) -> Option<Expr> {

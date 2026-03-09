@@ -707,12 +707,34 @@ impl Codegen {
                             )
                             .label(value.span, "this expression reads `*".to_string() + name + "` but no optimized update pattern was recognized")
                             .note("supported patterns: `set *rel = union *rel <expr>` (append)")
-                            .note("if you don't need the old data, remove the reference to `*".to_string() + name + "`"),
+                            .note("use `full set` if you intend a complete table replacement"),
                         );
                     }
                     self.call_rt(builder, "knot_value_unit", &[])
                 } else {
                     panic!("codegen: set target must be a source reference")
+                }
+            }
+
+            ast::ExprKind::FullSet { target, value } => {
+                if let ast::ExprKind::SourceRef(name) = &target.node {
+                    let schema = self
+                        .source_schemas
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_default();
+                    let val = self.compile_expr(builder, value, env, db);
+                    let (name_ptr, name_len) = self.string_ptr(builder, name);
+                    let (schema_ptr, schema_len) =
+                        self.string_ptr(builder, &schema);
+                    self.call_rt_void(
+                        builder,
+                        "knot_source_write",
+                        &[db, name_ptr, name_len, schema_ptr, schema_len, val],
+                    );
+                    self.call_rt(builder, "knot_value_unit", &[])
+                } else {
+                    panic!("codegen: full set target must be a source reference")
                 }
             }
 
@@ -1080,7 +1102,7 @@ impl Codegen {
                                 &[result, val],
                             );
                         }
-                        ast::ExprKind::Set { target: _, value: _ } => {
+                        ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => {
                             // Compile set inside do block
                             let _ = self.compile_expr(builder, expr, env, db);
                         }
@@ -1358,7 +1380,8 @@ impl Codegen {
                 ast::StmtKind::Expr(e) => Self::references_source(e, source_name),
             }),
             ast::ExprKind::Yield(inner) => Self::references_source(inner, source_name),
-            ast::ExprKind::Set { target, value } => {
+            ast::ExprKind::Set { target, value }
+            | ast::ExprKind::FullSet { target, value } => {
                 Self::references_source(target, source_name)
                     || Self::references_source(value, source_name)
             }
@@ -1568,7 +1591,8 @@ fn collect_free_vars(expr: &ast::Expr, bound: &[String], free: &mut Vec<String>)
         ast::ExprKind::Yield(inner) => {
             collect_free_vars(inner, bound, free);
         }
-        ast::ExprKind::Set { target, value } => {
+        ast::ExprKind::Set { target, value }
+        | ast::ExprKind::FullSet { target, value } => {
             collect_free_vars(target, bound, free);
             collect_free_vars(value, bound, free);
         }

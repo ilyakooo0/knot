@@ -213,8 +213,11 @@ pub enum ExprKind {
     /// `yield expr` — `Applicative.yield`.
     Yield(Box<Expr>),
 
-    /// `set *rel = expr` — replace a source relation.
+    /// `set *rel = expr` — update a source relation (must match an optimized pattern).
     Set { target: Box<Expr>, value: Box<Expr> },
+
+    /// `full set *rel = expr` — full table replacement (DELETE + INSERT).
+    FullSet { target: Box<Expr>, value: Box<Expr> },
 
     /// `atomic expr` — transactional boundary.
     Atomic(Box<Expr>),

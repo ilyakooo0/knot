@@ -94,6 +94,12 @@ fn brief_value(v: *mut Value) -> String {
     }
 }
 
+/// Escape a SQL identifier by wrapping it in double quotes and doubling
+/// any internal `"` characters, per the SQL standard.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 // ── Value constructors ────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
@@ -664,15 +670,16 @@ pub extern "C" fn knot_source_init(
     let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
     let cols = parse_schema(schema);
 
+    let table = quote_ident(&format!("_knot_{}", name));
     let col_defs: Vec<String> = cols
         .iter()
-        .map(|c| format!("\"{}\" {}", c.name, sql_type(c.ty)))
+        .map(|c| format!("{} {}", quote_ident(&c.name), sql_type(c.ty)))
         .collect();
-    let col_names: Vec<String> = cols.iter().map(|c| format!("\"{}\"", c.name)).collect();
+    let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
 
     let sql = format!(
-        "CREATE TABLE IF NOT EXISTS \"_knot_{}\" ({});",
-        name,
+        "CREATE TABLE IF NOT EXISTS {} ({});",
+        table,
         col_defs.join(", ")
     );
     db_ref.conn.execute_batch(&sql).unwrap_or_else(|e| {
@@ -682,9 +689,9 @@ pub extern "C" fn knot_source_init(
     // Create unique index for set semantics (ignore if already exists)
     if !cols.is_empty() {
         let idx_sql = format!(
-            "CREATE UNIQUE INDEX IF NOT EXISTS \"_knot_{}_unique\" ON \"_knot_{}\" ({});",
-            name,
-            name,
+            "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({});",
+            quote_ident(&format!("_knot_{}_unique", name)),
+            table,
             col_names.join(", ")
         );
         let _ = db_ref.conn.execute_batch(&idx_sql);
@@ -705,15 +712,15 @@ pub extern "C" fn knot_source_read(
     let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
     let cols = parse_schema(schema);
 
-    let col_names: Vec<String> = cols.iter().map(|c| format!("\"{}\"", c.name)).collect();
+    let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
     let sql = format!(
-        "SELECT {} FROM \"_knot_{}\"",
+        "SELECT {} FROM {}",
         if col_names.is_empty() {
             "1".to_string()
         } else {
             col_names.join(", ")
         },
-        name
+        quote_ident(&format!("_knot_{}", name))
     );
 
     let mut stmt = db_ref
@@ -778,18 +785,19 @@ pub extern "C" fn knot_source_write(
         .execute_batch("BEGIN;")
         .expect("knot runtime: failed to begin transaction");
 
-    let delete_sql = format!("DELETE FROM \"_knot_{}\";", name);
+    let table = quote_ident(&format!("_knot_{}", name));
+    let delete_sql = format!("DELETE FROM {};", table);
     db_ref
         .conn
         .execute_batch(&delete_sql)
         .expect("knot runtime: failed to delete rows");
 
     if !cols.is_empty() && !rows.is_empty() {
-        let col_names: Vec<String> = cols.iter().map(|c| format!("\"{}\"", c.name)).collect();
+        let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
         let placeholders: Vec<String> = cols.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
         let insert_sql = format!(
-            "INSERT OR IGNORE INTO \"_knot_{}\" ({}) VALUES ({});",
-            name,
+            "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
+            table,
             col_names.join(", "),
             placeholders.join(", ")
         );
@@ -868,15 +876,15 @@ pub extern "C" fn knot_source_append(
         .execute_batch("BEGIN;")
         .expect("knot runtime: failed to begin transaction");
 
-    let col_names: Vec<String> = cols.iter().map(|c| format!("\"{}\"", c.name)).collect();
+    let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
     let placeholders: Vec<String> = cols
         .iter()
         .enumerate()
         .map(|(i, _)| format!("?{}", i + 1))
         .collect();
     let insert_sql = format!(
-        "INSERT OR IGNORE INTO \"_knot_{}\" ({}) VALUES ({});",
-        name,
+        "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
+        quote_ident(&format!("_knot_{}", name)),
         col_names.join(", "),
         placeholders.join(", ")
     );
@@ -948,8 +956,8 @@ pub extern "C" fn knot_source_diff_write(
         ),
     };
 
-    let table = format!("_knot_{}", name);
-    let temp = format!("_knot_{}_new", name);
+    let table = quote_ident(&format!("_knot_{}", name));
+    let temp = quote_ident(&format!("_knot_{}_new", name));
 
     db_ref
         .conn
@@ -959,10 +967,10 @@ pub extern "C" fn knot_source_diff_write(
     // 1. Create temp table with same schema
     let col_defs: Vec<String> = cols
         .iter()
-        .map(|c| format!("\"{}\" {}", c.name, sql_type(c.ty)))
+        .map(|c| format!("{} {}", quote_ident(&c.name), sql_type(c.ty)))
         .collect();
     let create_temp = format!(
-        "CREATE TEMP TABLE \"{}\" ({});",
+        "CREATE TEMP TABLE {} ({});",
         temp,
         col_defs.join(", ")
     );
@@ -973,14 +981,14 @@ pub extern "C" fn knot_source_diff_write(
 
     // 2. Insert all new rows into temp
     if !cols.is_empty() && !rows.is_empty() {
-        let col_names: Vec<String> = cols.iter().map(|c| format!("\"{}\"", c.name)).collect();
+        let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
         let placeholders: Vec<String> = cols
             .iter()
             .enumerate()
             .map(|(i, _)| format!("?{}", i + 1))
             .collect();
         let insert_sql = format!(
-            "INSERT INTO \"{}\" ({}) VALUES ({});",
+            "INSERT INTO {} ({}) VALUES ({});",
             temp,
             col_names.join(", "),
             placeholders.join(", ")
@@ -1026,20 +1034,20 @@ pub extern "C" fn knot_source_diff_write(
 
     // 3. DELETE rows from main that are not in temp
     if !cols.is_empty() {
-        let col_names: Vec<String> = cols.iter().map(|c| format!("\"{}\"", c.name)).collect();
+        let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
         let match_conds: Vec<String> = cols
             .iter()
             .map(|c| {
                 format!(
-                    "\"{t}\".\"{c}\" = \"{m}\".\"{c}\"",
+                    "{t}.{c} = {m}.{c}",
                     t = temp,
                     m = table,
-                    c = c.name
+                    c = quote_ident(&c.name)
                 )
             })
             .collect();
         let delete_sql = format!(
-            "DELETE FROM \"{}\" WHERE NOT EXISTS (SELECT 1 FROM \"{}\" WHERE {});",
+            "DELETE FROM {} WHERE NOT EXISTS (SELECT 1 FROM {} WHERE {});",
             table,
             temp,
             match_conds.join(" AND ")
@@ -1051,7 +1059,7 @@ pub extern "C" fn knot_source_diff_write(
 
         // 4. INSERT rows from temp that are not in main
         let insert_new_sql = format!(
-            "INSERT OR IGNORE INTO \"{}\" ({}) SELECT {} FROM \"{}\";",
+            "INSERT OR IGNORE INTO {} ({}) SELECT {} FROM {};",
             table,
             col_names.join(", "),
             col_names.join(", "),
@@ -1064,7 +1072,7 @@ pub extern "C" fn knot_source_diff_write(
     }
 
     // 5. Drop temp table
-    let drop_temp = format!("DROP TABLE \"{}\";", temp);
+    let drop_temp = format!("DROP TABLE {};", temp);
     db_ref
         .conn
         .execute_batch(&drop_temp)
@@ -1101,8 +1109,9 @@ pub extern "C" fn knot_source_delete_where(
     };
 
     let sql = format!(
-        "DELETE FROM \"_knot_{}\" WHERE NOT ({});",
-        name, where_clause
+        "DELETE FROM {} WHERE NOT ({});",
+        quote_ident(&format!("_knot_{}", name)),
+        where_clause
     );
 
     let sql_params: Vec<rusqlite::types::Value> =
@@ -1144,8 +1153,10 @@ pub extern "C" fn knot_source_update_where(
     };
 
     let sql = format!(
-        "UPDATE \"_knot_{}\" SET {} WHERE {};",
-        name, set_clause, where_clause
+        "UPDATE {} SET {} WHERE {};",
+        quote_ident(&format!("_knot_{}", name)),
+        set_clause,
+        where_clause
     );
 
     let sql_params: Vec<rusqlite::types::Value> =

@@ -731,7 +731,7 @@ impl Codegen {
                                     }
                                     _ => return None,
                                 };
-                                parts.push(format!("\"{}\" = ?", field_name));
+                                parts.push(format!("{} = ?", quote_sql_ident(field_name)));
                                 params.push(param);
                             }
                             Some(SqlFragment {
@@ -1676,7 +1676,7 @@ impl Codegen {
         };
 
         Some(SqlFragment {
-            sql: format!("\"{}\" {} ?", col_name, op),
+            sql: format!("{} {} ?", quote_sql_ident(&col_name), op),
             params: vec![param],
         })
     }
@@ -1860,6 +1860,11 @@ impl Codegen {
 }
 
 // ── SQL compilation types ─────────────────────────────────────────
+
+/// Escape a SQL identifier by wrapping in double quotes, doubling internal `"`.
+fn quote_sql_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
 
 struct SqlFragment {
     sql: String,

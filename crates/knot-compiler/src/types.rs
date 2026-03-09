@@ -27,6 +27,8 @@ pub struct TypeEnv {
     pub constructors: HashMap<String, Vec<(String, ResolvedType)>>,
     /// source_name -> schema descriptor string ("col:type,col:type,...")
     pub source_schemas: HashMap<String, String>,
+    /// relation_name -> (old_schema, new_schema) from `migrate` declarations
+    pub migrate_schemas: HashMap<String, (String, String)>,
 }
 
 impl TypeEnv {
@@ -34,6 +36,7 @@ impl TypeEnv {
         let mut aliases = HashMap::new();
         let mut constructors = HashMap::new();
         let mut source_schemas = HashMap::new();
+        let mut migrate_schemas = HashMap::new();
 
         // First pass: collect type aliases and data types
         for decl in &module.decls {
@@ -75,11 +78,26 @@ impl TypeEnv {
             }
         }
 
-        // Second pass: compute source schemas
+        // Second pass: compute source schemas and migration schemas
         for decl in &module.decls {
-            if let DeclKind::Source { name, ty, .. } = &decl.node {
-                let schema = schema_for_source(ty, &aliases);
-                source_schemas.insert(name.clone(), schema);
+            match &decl.node {
+                DeclKind::Source { name, ty, .. } => {
+                    let schema = schema_for_source(ty, &aliases);
+                    source_schemas.insert(name.clone(), schema);
+                }
+                DeclKind::Migrate {
+                    relation,
+                    from_ty,
+                    to_ty,
+                    ..
+                } => {
+                    let old_resolved = resolve_type(from_ty, &aliases);
+                    let new_resolved = resolve_type(to_ty, &aliases);
+                    let old_schema = schema_descriptor(&old_resolved);
+                    let new_schema = schema_descriptor(&new_resolved);
+                    migrate_schemas.insert(relation.clone(), (old_schema, new_schema));
+                }
+                _ => {}
             }
         }
 
@@ -87,6 +105,7 @@ impl TypeEnv {
             aliases,
             constructors,
             source_schemas,
+            migrate_schemas,
         }
     }
 }

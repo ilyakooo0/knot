@@ -646,6 +646,187 @@ pub extern "C" fn knot_db_exec(db: *mut c_void, sql_ptr: *const u8, sql_len: usi
         .unwrap_or_else(|e| panic!("knot runtime: SQL error: {}\n  SQL: {}", e, sql));
 }
 
+// ── Schema tracking ──────────────────────────────────────────────
+
+/// Create the schema metadata table that tracks each source's column layout.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_schema_init(db: *mut c_void) {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let sql =
+        "CREATE TABLE IF NOT EXISTS _knot_schema (name TEXT PRIMARY KEY, schema TEXT NOT NULL);";
+    debug_sql(sql);
+    db_ref
+        .conn
+        .execute_batch(sql)
+        .expect("knot runtime: failed to create schema tracking table");
+}
+
+/// Apply a migration to a source relation.
+///
+/// Checks the stored schema in `_knot_schema`:
+/// - If stored == new_schema: already migrated, skip.
+/// - If stored == old_schema: read old rows, transform each via `migrate_fn`,
+///   drop & recreate the table, insert transformed rows, update stored schema.
+/// - If no stored schema: new table, skip.
+/// - Otherwise: error (unexpected schema).
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_source_migrate(
+    db: *mut c_void,
+    name_ptr: *const u8,
+    name_len: usize,
+    old_schema_ptr: *const u8,
+    old_schema_len: usize,
+    new_schema_ptr: *const u8,
+    new_schema_len: usize,
+    migrate_fn: *mut Value,
+) {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let name = unsafe { str_from_raw(name_ptr, name_len) };
+    let old_schema = unsafe { str_from_raw(old_schema_ptr, old_schema_len) };
+    let new_schema = unsafe { str_from_raw(new_schema_ptr, new_schema_len) };
+
+    // Check stored schema
+    let stored: Option<String> = db_ref
+        .conn
+        .query_row(
+            "SELECT schema FROM _knot_schema WHERE name = ?1;",
+            rusqlite::params![name],
+            |row| row.get(0),
+        )
+        .ok();
+
+    match &stored {
+        Some(s) if s == new_schema => return,
+        Some(s) if s == old_schema => {}
+        Some(s) => panic!(
+            "knot runtime: source '{}' has schema '{}', expected '{}' (pre-migration) or '{}' (post-migration).\n\
+             Check your migrate block.",
+            name, s, old_schema, new_schema
+        ),
+        None => return,
+    }
+
+    eprintln!("Migrating source '{}'...", name);
+
+    // 1. Read all rows using old schema
+    let old_data = knot_source_read(db, name_ptr, name_len, old_schema_ptr, old_schema_len);
+    let old_rows = match unsafe { as_ref(old_data) } {
+        Value::Relation(rows) => rows.clone(),
+        _ => panic!("knot runtime: expected relation during migration"),
+    };
+
+    // 2. Transform each row through the migration function
+    let mut new_rows: Vec<*mut Value> = Vec::with_capacity(old_rows.len());
+    for row in &old_rows {
+        let new_row = knot_value_call(db, migrate_fn, *row);
+        new_rows.push(new_row);
+    }
+
+    // 3. Drop old table + index and recreate with new schema (in a transaction)
+    let table = quote_ident(&format!("_knot_{}", name));
+    let new_cols = parse_schema(new_schema);
+    let col_defs: Vec<String> = new_cols
+        .iter()
+        .map(|c| format!("{} {}", quote_ident(&c.name), sql_type(c.ty)))
+        .collect();
+    let col_names: Vec<String> = new_cols.iter().map(|c| quote_ident(&c.name)).collect();
+
+    db_ref
+        .conn
+        .execute_batch("BEGIN IMMEDIATE;")
+        .expect("knot runtime: failed to begin migration transaction");
+
+    let drop_sql = format!("DROP TABLE IF EXISTS {};", table);
+    debug_sql(&drop_sql);
+    db_ref
+        .conn
+        .execute_batch(&drop_sql)
+        .expect("knot runtime: failed to drop table during migration");
+
+    let create_sql = format!("CREATE TABLE {} ({});", table, col_defs.join(", "));
+    debug_sql(&create_sql);
+    db_ref
+        .conn
+        .execute_batch(&create_sql)
+        .expect("knot runtime: failed to create table during migration");
+
+    if !new_cols.is_empty() {
+        let idx_sql = format!(
+            "CREATE UNIQUE INDEX {} ON {} ({});",
+            quote_ident(&format!("_knot_{}_unique", name)),
+            table,
+            col_names.join(", ")
+        );
+        debug_sql(&idx_sql);
+        let _ = db_ref.conn.execute_batch(&idx_sql);
+    }
+
+    // 4. Insert transformed rows
+    if !new_cols.is_empty() && !new_rows.is_empty() {
+        let placeholders: Vec<String> = new_cols
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect();
+        let insert_sql = format!(
+            "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
+            table,
+            col_names.join(", "),
+            placeholders.join(", ")
+        );
+        debug_sql(&insert_sql);
+
+        let mut stmt = db_ref
+            .conn
+            .prepare(&insert_sql)
+            .expect("knot runtime: failed to prepare insert during migration");
+
+        for row_ptr in &new_rows {
+            let row_ref = unsafe { as_ref(*row_ptr) };
+            let fields = match row_ref {
+                Value::Record(f) => f,
+                _ => panic!("knot runtime: migration function must return a record"),
+            };
+            let params: Vec<rusqlite::types::Value> = new_cols
+                .iter()
+                .map(|c| {
+                    let val = fields
+                        .iter()
+                        .find(|f| f.name == c.name)
+                        .map(|f| f.value)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "knot runtime: migration result missing field '{}'",
+                                c.name
+                            )
+                        });
+                    value_to_sql_param(val)
+                })
+                .collect();
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+            stmt.execute(param_refs.as_slice())
+                .expect("knot runtime: failed to insert row during migration");
+        }
+    }
+
+    // 5. Update stored schema
+    db_ref
+        .conn
+        .execute(
+            "INSERT OR REPLACE INTO _knot_schema (name, schema) VALUES (?1, ?2);",
+            rusqlite::params![name, new_schema],
+        )
+        .expect("knot runtime: failed to update schema after migration");
+
+    db_ref
+        .conn
+        .execute_batch("COMMIT;")
+        .expect("knot runtime: failed to commit migration");
+
+    eprintln!("Migrated source '{}': {} rows", name, old_rows.len());
+}
+
 // ── Source operations ─────────────────────────────────────────────
 
 /// Schema descriptor format: "col1:type1,col2:type2,..."
@@ -734,6 +915,37 @@ pub extern "C" fn knot_source_init(
         debug_sql(&idx_sql);
         let _ = db_ref.conn.execute_batch(&idx_sql);
     }
+
+    // Check stored schema against compiled schema
+    let stored: Option<String> = db_ref
+        .conn
+        .query_row(
+            "SELECT schema FROM _knot_schema WHERE name = ?1;",
+            rusqlite::params![name],
+            |row| row.get(0),
+        )
+        .ok();
+
+    if let Some(ref stored_schema) = stored {
+        if stored_schema != schema {
+            panic!(
+                "knot runtime: schema mismatch for source '*{}'.\n\
+                 Stored:   {}\n\
+                 Compiled: {}\n\
+                 Add a `migrate *{} from {{...}} to {{...}} using (\\old -> ...)` block to your source.",
+                name, stored_schema, schema, name
+            );
+        }
+    }
+
+    // Record current schema
+    db_ref
+        .conn
+        .execute(
+            "INSERT OR REPLACE INTO _knot_schema (name, schema) VALUES (?1, ?2);",
+            rusqlite::params![name, schema],
+        )
+        .expect("knot runtime: failed to record schema");
 }
 
 /// Read all rows from a source relation.

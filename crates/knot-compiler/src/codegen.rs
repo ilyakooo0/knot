@@ -50,6 +50,9 @@ pub struct Codegen {
     // Database path baked into the compiled binary
     db_path: String,
 
+    // Migration schemas: relation_name -> (old_schema, new_schema)
+    migrate_schemas: HashMap<String, (String, String)>,
+
     // Collected diagnostics
     diagnostics: Vec<knot::diagnostic::Diagnostic>,
 }
@@ -111,6 +114,7 @@ pub fn compile(
         .unwrap_or("knot");
     cg.db_path = format!("{}.db", stem);
     cg.source_schemas = type_env.source_schemas.clone();
+    cg.migrate_schemas = type_env.migrate_schemas.clone();
     for (name, fields) in &type_env.constructors {
         let field_strs: Vec<(String, String)> = fields
             .iter()
@@ -122,6 +126,13 @@ pub fn compile(
     cg.collect_declarations(module);
     cg.define_functions(module, type_env);
     cg.generate_main(module);
+    // Drain lambdas created by generate_main (e.g., migration functions)
+    while !cg.pending_lambdas.is_empty() {
+        let lambdas: Vec<PendingLambda> = std::mem::take(&mut cg.pending_lambdas);
+        for lambda in lambdas {
+            cg.define_lambda_function(&lambda);
+        }
+    }
     if !cg.diagnostics.is_empty() {
         return Err(cg.diagnostics);
     }
@@ -163,6 +174,7 @@ impl Codegen {
             lambda_counter: 0,
             pending_lambdas: Vec::new(),
             db_path: String::new(),
+            migrate_schemas: HashMap::new(),
             diagnostics: Vec::new(),
         }
     }
@@ -237,6 +249,10 @@ impl Codegen {
         self.declare_rt("knot_source_diff_write", &[p, p, p, p, p, p], &[]);
         self.declare_rt("knot_source_delete_where", &[p, p, p, p, p, p], &[]);
         self.declare_rt("knot_source_update_where", &[p, p, p, p, p, p, p, p], &[]);
+
+        // Schema tracking
+        self.declare_rt("knot_schema_init", &[p], &[]);
+        self.declare_rt("knot_source_migrate", &[p, p, p, p, p, p, p, p], &[]);
 
         // Debug
         self.declare_rt("knot_debug_init", &[], &[]);
@@ -436,6 +452,40 @@ impl Codegen {
             let db_open_call =
                 builder.ins().call(db_open_ref, &[db_path_ptr, db_path_len]);
             let db = builder.inst_results(db_open_call)[0];
+
+            // Initialize schema tracking
+            cg.call_rt_void(builder, "knot_schema_init", &[db]);
+
+            // Apply pending migrations (before source init)
+            let migrate_schemas = cg.migrate_schemas.clone();
+            for decl in &decls {
+                if let ast::DeclKind::Migrate {
+                    relation,
+                    using_fn,
+                    ..
+                } = &decl.node
+                {
+                    if let Some((old_schema, new_schema)) = migrate_schemas.get(relation) {
+                        let (name_ptr, name_len) = cg.string_ptr(builder, relation);
+                        let (old_ptr, old_len) = cg.string_ptr(builder, old_schema);
+                        let (new_ptr, new_len) = cg.string_ptr(builder, new_schema);
+
+                        // Compile the using expression (typically a lambda)
+                        let mut env = Env::new();
+                        let migrate_fn_val =
+                            cg.compile_expr(builder, using_fn, &mut env, db);
+
+                        cg.call_rt_void(
+                            builder,
+                            "knot_source_migrate",
+                            &[
+                                db, name_ptr, name_len, old_ptr, old_len, new_ptr,
+                                new_len, migrate_fn_val,
+                            ],
+                        );
+                    }
+                }
+            }
 
             // Initialize source tables
             for decl in &decls {

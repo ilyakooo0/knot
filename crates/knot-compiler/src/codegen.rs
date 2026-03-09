@@ -47,6 +47,9 @@ pub struct Codegen {
     // Pending lambda definitions: (func_id, params, body, free_vars)
     pending_lambdas: Vec<PendingLambda>,
 
+    // Database path baked into the compiled binary
+    db_path: String,
+
     // Collected diagnostics
     diagnostics: Vec<knot::diagnostic::Diagnostic>,
 }
@@ -98,8 +101,15 @@ struct LoopInfo {
 pub fn compile(
     module: &ast::Module,
     type_env: &TypeEnv,
+    source_file: &str,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     let mut cg = Codegen::new();
+    // Derive database path from source filename: "foo.knot" → "foo.db"
+    let stem = std::path::Path::new(source_file)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("knot");
+    cg.db_path = format!("{}.db", stem);
     cg.source_schemas = type_env.source_schemas.clone();
     for (name, fields) in &type_env.constructors {
         let field_strs: Vec<(String, String)> = fields
@@ -152,6 +162,7 @@ impl Codegen {
             constructors: HashMap::new(),
             lambda_counter: 0,
             pending_lambdas: Vec::new(),
+            db_path: String::new(),
             diagnostics: Vec::new(),
         }
     }
@@ -409,7 +420,8 @@ impl Codegen {
 
         self.build_function(main_id, sig, |cg, builder, _entry| {
             // Open database
-            let (db_path_ptr, db_path_len) = cg.string_ptr(builder, "knot.db");
+            let db_path = cg.db_path.clone();
+            let (db_path_ptr, db_path_len) = cg.string_ptr(builder, &db_path);
             let db_open_ref = cg.import_rt(builder, "knot_db_open");
             let db_open_call =
                 builder.ins().call(db_open_ref, &[db_path_ptr, db_path_len]);

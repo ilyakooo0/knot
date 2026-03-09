@@ -79,7 +79,7 @@ fn cmd_build(source_file: &str) {
     let type_env = types::TypeEnv::from_module(&module);
 
     // Code generation
-    let obj_bytes = match codegen::compile(&module, &type_env) {
+    let obj_bytes = match codegen::compile(&module, &type_env, source_file) {
         Ok(bytes) => bytes,
         Err(diags) => {
             for diag in &diags {

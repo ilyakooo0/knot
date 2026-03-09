@@ -51,6 +51,49 @@ unsafe fn str_from_raw(ptr: *const u8, len: usize) -> &'static str {
     unsafe { std::str::from_utf8_unchecked(slice::from_raw_parts(ptr, len)) }
 }
 
+fn type_name(v: *mut Value) -> &'static str {
+    if v.is_null() {
+        return "null";
+    }
+    match unsafe { as_ref(v) } {
+        Value::Int(_) => "Int",
+        Value::Float(_) => "Float",
+        Value::Text(_) => "Text",
+        Value::Bool(_) => "Bool",
+        Value::Unit => "Unit",
+        Value::Record(_) => "Record",
+        Value::Relation(_) => "Relation",
+        Value::Constructor(_, _) => "Constructor",
+        Value::Function(_, _) => "Function",
+    }
+}
+
+fn brief_value(v: *mut Value) -> String {
+    if v.is_null() {
+        return "null".to_string();
+    }
+    match unsafe { as_ref(v) } {
+        Value::Int(n) => format!("Int({})", n),
+        Value::Float(n) => format!("Float({})", n),
+        Value::Text(s) => {
+            if s.len() > 30 {
+                format!("Text(\"{}...\")", &s[..27])
+            } else {
+                format!("Text(\"{}\")", s)
+            }
+        }
+        Value::Bool(b) => format!("Bool({})", b),
+        Value::Unit => "Unit".to_string(),
+        Value::Record(fields) => {
+            let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+            format!("Record({{{}}})", names.join(", "))
+        }
+        Value::Relation(rows) => format!("Relation({} rows)", rows.len()),
+        Value::Constructor(tag, _) => format!("Constructor({})", tag),
+        Value::Function(_, _) => "Function".to_string(),
+    }
+}
+
 // ── Value constructors ────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
@@ -100,7 +143,7 @@ pub extern "C" fn knot_value_constructor(
 pub extern "C" fn knot_value_get_int(v: *mut Value) -> i64 {
     match unsafe { as_ref(v) } {
         Value::Int(n) => *n,
-        _ => panic!("knot runtime: expected Int"),
+        _ => panic!("knot runtime: expected Int, got {}", brief_value(v)),
     }
 }
 
@@ -108,7 +151,7 @@ pub extern "C" fn knot_value_get_int(v: *mut Value) -> i64 {
 pub extern "C" fn knot_value_get_float(v: *mut Value) -> f64 {
     match unsafe { as_ref(v) } {
         Value::Float(n) => *n,
-        _ => panic!("knot runtime: expected Float"),
+        _ => panic!("knot runtime: expected Float, got {}", brief_value(v)),
     }
 }
 
@@ -116,7 +159,7 @@ pub extern "C" fn knot_value_get_float(v: *mut Value) -> f64 {
 pub extern "C" fn knot_value_get_bool(v: *mut Value) -> i32 {
     match unsafe { as_ref(v) } {
         Value::Bool(b) => *b as i32,
-        _ => panic!("knot runtime: expected Bool"),
+        _ => panic!("knot runtime: expected Bool, got {}", brief_value(v)),
     }
 }
 
@@ -160,7 +203,7 @@ pub extern "C" fn knot_record_set_field(
                 fields.push(RecordField { name, value });
             }
         }
-        _ => panic!("knot runtime: expected Record in set_field"),
+        _ => panic!("knot runtime: expected Record in set_field, got {}", type_name(record)),
     }
 }
 
@@ -178,13 +221,21 @@ pub extern "C" fn knot_record_field(
                     return field.value;
                 }
             }
-            panic!("knot runtime: field '{}' not found", name)
+            let available: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+            panic!(
+                "knot runtime: field '{}' not found in record\n  available fields: {}",
+                name,
+                if available.is_empty() { "(none)".to_string() } else { available.join(", ") }
+            )
         }
         Value::Constructor(_, payload) => {
             // Delegate to the payload (which should be a record)
             knot_record_field(*payload, key_ptr, key_len)
         }
-        _ => panic!("knot runtime: expected Record in field access"),
+        _ => panic!(
+            "knot runtime: expected Record in field access, got {}",
+            brief_value(record)
+        ),
     }
 }
 
@@ -205,7 +256,7 @@ pub extern "C" fn knot_relation_push(rel: *mut Value, row: *mut Value) {
     let r = unsafe { &mut *rel };
     match r {
         Value::Relation(rows) => rows.push(row),
-        _ => panic!("knot runtime: expected Relation in push"),
+        _ => panic!("knot runtime: expected Relation in push, got {}", type_name(rel)),
     }
 }
 
@@ -213,7 +264,7 @@ pub extern "C" fn knot_relation_push(rel: *mut Value, row: *mut Value) {
 pub extern "C" fn knot_relation_len(rel: *mut Value) -> usize {
     match unsafe { as_ref(rel) } {
         Value::Relation(rows) => rows.len(),
-        _ => panic!("knot runtime: expected Relation in len"),
+        _ => panic!("knot runtime: expected Relation in len, got {}", type_name(rel)),
     }
 }
 
@@ -221,7 +272,7 @@ pub extern "C" fn knot_relation_len(rel: *mut Value) -> usize {
 pub extern "C" fn knot_relation_get(rel: *mut Value, index: usize) -> *mut Value {
     match unsafe { as_ref(rel) } {
         Value::Relation(rows) => rows[index],
-        _ => panic!("knot runtime: expected Relation in get"),
+        _ => panic!("knot runtime: expected Relation in get, got {}", type_name(rel)),
     }
 }
 
@@ -229,11 +280,11 @@ pub extern "C" fn knot_relation_get(rel: *mut Value, index: usize) -> *mut Value
 pub extern "C" fn knot_relation_union(a: *mut Value, b: *mut Value) -> *mut Value {
     let rows_a = match unsafe { as_ref(a) } {
         Value::Relation(rows) => rows.clone(),
-        _ => panic!("knot runtime: expected Relation in union"),
+        _ => panic!("knot runtime: expected Relation in union, got {}", type_name(a)),
     };
     let rows_b = match unsafe { as_ref(b) } {
         Value::Relation(rows) => rows.clone(),
-        _ => panic!("knot runtime: expected Relation in union"),
+        _ => panic!("knot runtime: expected Relation in union, got {}", type_name(b)),
     };
     let mut result = rows_a;
     for row in rows_b {
@@ -291,7 +342,7 @@ pub extern "C" fn knot_value_add(a: *mut Value, b: *mut Value) -> *mut Value {
         (Value::Float(x), Value::Float(y)) => alloc(Value::Float(x + y)),
         (Value::Int(x), Value::Float(y)) => alloc(Value::Float(*x as f64 + y)),
         (Value::Float(x), Value::Int(y)) => alloc(Value::Float(x + *y as f64)),
-        _ => panic!("knot runtime: cannot add non-numeric values"),
+        _ => panic!("knot runtime: cannot add {} + {}", type_name(a), type_name(b)),
     }
 }
 
@@ -302,7 +353,7 @@ pub extern "C" fn knot_value_sub(a: *mut Value, b: *mut Value) -> *mut Value {
         (Value::Float(x), Value::Float(y)) => alloc(Value::Float(x - y)),
         (Value::Int(x), Value::Float(y)) => alloc(Value::Float(*x as f64 - y)),
         (Value::Float(x), Value::Int(y)) => alloc(Value::Float(x - *y as f64)),
-        _ => panic!("knot runtime: cannot subtract non-numeric values"),
+        _ => panic!("knot runtime: cannot subtract {} - {}", type_name(a), type_name(b)),
     }
 }
 
@@ -313,7 +364,7 @@ pub extern "C" fn knot_value_mul(a: *mut Value, b: *mut Value) -> *mut Value {
         (Value::Float(x), Value::Float(y)) => alloc(Value::Float(x * y)),
         (Value::Int(x), Value::Float(y)) => alloc(Value::Float(*x as f64 * y)),
         (Value::Float(x), Value::Int(y)) => alloc(Value::Float(x * *y as f64)),
-        _ => panic!("knot runtime: cannot multiply non-numeric values"),
+        _ => panic!("knot runtime: cannot multiply {} * {}", type_name(a), type_name(b)),
     }
 }
 
@@ -329,7 +380,7 @@ pub extern "C" fn knot_value_div(a: *mut Value, b: *mut Value) -> *mut Value {
         (Value::Float(x), Value::Float(y)) => alloc(Value::Float(x / y)),
         (Value::Int(x), Value::Float(y)) => alloc(Value::Float(*x as f64 / y)),
         (Value::Float(x), Value::Int(y)) => alloc(Value::Float(x / *y as f64)),
-        _ => panic!("knot runtime: cannot divide non-numeric values"),
+        _ => panic!("knot runtime: cannot divide {} / {}", type_name(a), type_name(b)),
     }
 }
 
@@ -351,7 +402,7 @@ pub extern "C" fn knot_value_lt(a: *mut Value, b: *mut Value) -> *mut Value {
         (Value::Int(x), Value::Float(y)) => (*x as f64) < *y,
         (Value::Float(x), Value::Int(y)) => *x < (*y as f64),
         (Value::Text(x), Value::Text(y)) => x < y,
-        _ => panic!("knot runtime: cannot compare values with <"),
+        _ => panic!("knot runtime: cannot compare {} < {}", type_name(a), type_name(b)),
     };
     alloc(Value::Bool(result))
 }
@@ -364,7 +415,7 @@ pub extern "C" fn knot_value_gt(a: *mut Value, b: *mut Value) -> *mut Value {
         (Value::Int(x), Value::Float(y)) => (*x as f64) > *y,
         (Value::Float(x), Value::Int(y)) => *x > (*y as f64),
         (Value::Text(x), Value::Text(y)) => x > y,
-        _ => panic!("knot runtime: cannot compare values with >"),
+        _ => panic!("knot runtime: cannot compare {} > {}", type_name(a), type_name(b)),
     };
     alloc(Value::Bool(result))
 }
@@ -377,7 +428,7 @@ pub extern "C" fn knot_value_le(a: *mut Value, b: *mut Value) -> *mut Value {
         (Value::Int(x), Value::Float(y)) => (*x as f64) <= *y,
         (Value::Float(x), Value::Int(y)) => *x <= (*y as f64),
         (Value::Text(x), Value::Text(y)) => x <= y,
-        _ => panic!("knot runtime: cannot compare values with <="),
+        _ => panic!("knot runtime: cannot compare {} <= {}", type_name(a), type_name(b)),
     };
     alloc(Value::Bool(result))
 }
@@ -390,7 +441,7 @@ pub extern "C" fn knot_value_ge(a: *mut Value, b: *mut Value) -> *mut Value {
         (Value::Int(x), Value::Float(y)) => (*x as f64) >= *y,
         (Value::Float(x), Value::Int(y)) => *x >= (*y as f64),
         (Value::Text(x), Value::Text(y)) => x >= y,
-        _ => panic!("knot runtime: cannot compare values with >="),
+        _ => panic!("knot runtime: cannot compare {} >= {}", type_name(a), type_name(b)),
     };
     alloc(Value::Bool(result))
 }
@@ -399,7 +450,7 @@ pub extern "C" fn knot_value_ge(a: *mut Value, b: *mut Value) -> *mut Value {
 pub extern "C" fn knot_value_and(a: *mut Value, b: *mut Value) -> *mut Value {
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Bool(x), Value::Bool(y)) => alloc(Value::Bool(*x && *y)),
-        _ => panic!("knot runtime: && requires Bool operands"),
+        _ => panic!("knot runtime: && requires Bool operands, got {} && {}", type_name(a), type_name(b)),
     }
 }
 
@@ -407,7 +458,7 @@ pub extern "C" fn knot_value_and(a: *mut Value, b: *mut Value) -> *mut Value {
 pub extern "C" fn knot_value_or(a: *mut Value, b: *mut Value) -> *mut Value {
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Bool(x), Value::Bool(y)) => alloc(Value::Bool(*x || *y)),
-        _ => panic!("knot runtime: || requires Bool operands"),
+        _ => panic!("knot runtime: || requires Bool operands, got {} || {}", type_name(a), type_name(b)),
     }
 }
 
@@ -423,7 +474,7 @@ pub extern "C" fn knot_value_concat(a: *mut Value, b: *mut Value) -> *mut Value 
             // ++ on relations is union
             knot_relation_union(a, b)
         }
-        _ => panic!("knot runtime: ++ requires Text or Relation operands"),
+        _ => panic!("knot runtime: ++ requires Text or Relation operands, got {} ++ {}", type_name(a), type_name(b)),
     }
 }
 
@@ -434,7 +485,7 @@ pub extern "C" fn knot_value_negate(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Int(n) => alloc(Value::Int(-n)),
         Value::Float(n) => alloc(Value::Float(-n)),
-        _ => panic!("knot runtime: cannot negate non-numeric value"),
+        _ => panic!("knot runtime: cannot negate {}", type_name(v)),
     }
 }
 
@@ -442,7 +493,7 @@ pub extern "C" fn knot_value_negate(v: *mut Value) -> *mut Value {
 pub extern "C" fn knot_value_not(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Bool(b) => alloc(Value::Bool(!b)),
-        _ => panic!("knot runtime: 'not' requires Bool operand"),
+        _ => panic!("knot runtime: 'not' requires Bool, got {}", type_name(v)),
     }
 }
 
@@ -461,7 +512,7 @@ pub extern "C" fn knot_value_call(
                 unsafe { std::mem::transmute(*fn_ptr) };
             f(db, *env, arg)
         }
-        _ => panic!("knot runtime: cannot call non-function value"),
+        _ => panic!("knot runtime: cannot call {}, expected Function", brief_value(func)),
     }
 }
 
@@ -718,7 +769,7 @@ pub extern "C" fn knot_source_write(
 
     let rows = match unsafe { as_ref(relation) } {
         Value::Relation(rows) => rows,
-        _ => panic!("knot runtime: source_write expects a Relation"),
+        _ => panic!("knot runtime: source_write expects a Relation, got {}", type_name(relation)),
     };
 
     // Delete all existing rows and insert new ones in a transaction
@@ -773,7 +824,7 @@ pub extern "C" fn knot_source_write(
                         panic!("knot runtime: insert error: {}", e)
                     });
                 }
-                _ => panic!("knot runtime: relation rows must be records"),
+                _ => panic!("knot runtime: relation rows must be Records, got {}", type_name(*row_ptr)),
             }
         }
     }
@@ -790,7 +841,7 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
         (Value::Float(n), _) => rusqlite::types::Value::Real(*n),
         (Value::Text(s), _) => rusqlite::types::Value::Text(s.clone()),
         (Value::Bool(b), _) => rusqlite::types::Value::Integer(*b as i64),
-        _ => panic!("knot runtime: cannot convert value to SQL"),
+        _ => panic!("knot runtime: cannot convert {} to SQL", brief_value(v)),
     }
 }
 
@@ -840,7 +891,7 @@ pub extern "C" fn knot_record_update(base: *mut Value) -> *mut Value {
                 .collect();
             alloc(Value::Record(new_fields))
         }
-        _ => panic!("knot runtime: record update requires a Record base"),
+        _ => panic!("knot runtime: record update requires a Record base, got {}", type_name(base)),
     }
 }
 
@@ -877,6 +928,6 @@ pub extern "C" fn knot_constructor_matches(
 pub extern "C" fn knot_constructor_payload(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Constructor(_, payload) => *payload,
-        _ => panic!("knot runtime: expected Constructor"),
+        _ => panic!("knot runtime: expected Constructor, got {}", type_name(v)),
     }
 }

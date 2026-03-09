@@ -265,7 +265,7 @@ impl Codegen {
         self.declare_rt("knot_value_text", &[p, p], &[p]);
         self.declare_rt("knot_value_bool", &[types::I32], &[p]);
         self.declare_rt("knot_value_unit", &[], &[p]);
-        self.declare_rt("knot_value_function", &[p, p], &[p]);
+        self.declare_rt("knot_value_function", &[p, p, p, p], &[p]);
         self.declare_rt("knot_value_constructor", &[p, p, p], &[p]);
 
         // Value accessors
@@ -1154,9 +1154,8 @@ impl Codegen {
                         self.module.declare_func_in_func(func_id, builder.func);
                     let fn_addr = builder.ins().func_addr(self.ptr_type, func_ref);
                     let null = builder.ins().iconst(self.ptr_type, 0);
-                    let mk_fn = self.import_rt(builder, "knot_value_function");
-                    let call = builder.ins().call(mk_fn, &[fn_addr, null]);
-                    builder.inst_results(call)[0]
+                    let (src_ptr, src_len) = self.string_ptr(builder, name);
+                    self.call_rt(builder, "knot_value_function", &[fn_addr, null, src_ptr, src_len])
                 } else {
                     panic!("codegen: undefined variable '{}'", name)
                 }
@@ -2264,7 +2263,13 @@ impl Codegen {
             env_record
         };
 
-        self.call_rt(builder, "knot_value_function", &[fn_addr, env_val])
+        // Generate source representation for this lambda
+        let source_text = {
+            let ps: Vec<String> = params.iter().map(pretty_pat).collect();
+            format!("\\{} -> {}", ps.join(" "), pretty_expr(body))
+        };
+        let (src_ptr, src_len) = self.string_ptr(builder, &source_text);
+        self.call_rt(builder, "knot_value_function", &[fn_addr, env_val, src_ptr, src_len])
     }
 
     // ── Literal compilation ───────────────────────────────────────
@@ -3107,6 +3112,184 @@ fn is_builtin_name(name: &str) -> bool {
             | "map"
             | "fold"
     )
+}
+
+// ── AST pretty-printer (for function source display) ─────────────
+
+fn pretty_expr(expr: &ast::Expr) -> String {
+    match &expr.node {
+        ast::ExprKind::Lit(lit) => pretty_lit(lit),
+        ast::ExprKind::Var(name) => name.clone(),
+        ast::ExprKind::Constructor(name) => name.clone(),
+        ast::ExprKind::SourceRef(name) => format!("*{}", name),
+        ast::ExprKind::DerivedRef(name) => format!("&{}", name),
+        ast::ExprKind::Record(fields) => {
+            let fs: Vec<String> = fields
+                .iter()
+                .map(|f| format!("{}: {}", f.name, pretty_expr(&f.value)))
+                .collect();
+            format!("{{{}}}", fs.join(", "))
+        }
+        ast::ExprKind::RecordUpdate { base, fields } => {
+            let fs: Vec<String> = fields
+                .iter()
+                .map(|f| format!("{}: {}", f.name, pretty_expr(&f.value)))
+                .collect();
+            format!("{{{} | {}}}", pretty_expr(base), fs.join(", "))
+        }
+        ast::ExprKind::FieldAccess { expr, field } => {
+            format!("{}.{}", pretty_expr(expr), field)
+        }
+        ast::ExprKind::List(elems) => {
+            let es: Vec<String> = elems.iter().map(pretty_expr).collect();
+            format!("[{}]", es.join(", "))
+        }
+        ast::ExprKind::Lambda { params, body } => {
+            let ps: Vec<String> = params.iter().map(pretty_pat).collect();
+            format!("\\{} -> {}", ps.join(" "), pretty_expr(body))
+        }
+        ast::ExprKind::App { func, arg } => {
+            let f = pretty_expr(func);
+            let a = pretty_expr(arg);
+            let needs_parens = matches!(
+                arg.node,
+                ast::ExprKind::App { .. }
+                    | ast::ExprKind::BinOp { .. }
+                    | ast::ExprKind::Lambda { .. }
+            );
+            if needs_parens {
+                format!("{} ({})", f, a)
+            } else {
+                format!("{} {}", f, a)
+            }
+        }
+        ast::ExprKind::BinOp { op, lhs, rhs } => {
+            format!(
+                "{} {} {}",
+                pretty_expr(lhs),
+                pretty_binop(op),
+                pretty_expr(rhs)
+            )
+        }
+        ast::ExprKind::UnaryOp { op, operand } => match op {
+            ast::UnaryOp::Neg => format!("-{}", pretty_expr(operand)),
+            ast::UnaryOp::Not => format!("not {}", pretty_expr(operand)),
+        },
+        ast::ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => format!(
+            "if {} then {} else {}",
+            pretty_expr(cond),
+            pretty_expr(then_branch),
+            pretty_expr(else_branch)
+        ),
+        ast::ExprKind::Case { scrutinee, arms } => {
+            let arm_strs: Vec<String> = arms
+                .iter()
+                .map(|a| format!("{} -> {}", pretty_pat(&a.pat), pretty_expr(&a.body)))
+                .collect();
+            format!(
+                "case {} of {{ {} }}",
+                pretty_expr(scrutinee),
+                arm_strs.join("; ")
+            )
+        }
+        ast::ExprKind::Do(stmts) => {
+            let ss: Vec<String> = stmts.iter().map(pretty_stmt).collect();
+            format!("do {{ {} }}", ss.join("; "))
+        }
+        ast::ExprKind::Yield(e) => format!("yield {}", pretty_expr(e)),
+        ast::ExprKind::Set { target, value } => {
+            format!("set {} = {}", pretty_expr(target), pretty_expr(value))
+        }
+        ast::ExprKind::FullSet { target, value } => {
+            format!(
+                "full set {} = {}",
+                pretty_expr(target),
+                pretty_expr(value)
+            )
+        }
+        ast::ExprKind::Atomic(e) => format!("atomic ({})", pretty_expr(e)),
+        ast::ExprKind::At { relation, time } => {
+            format!("{} @({})", pretty_expr(relation), pretty_expr(time))
+        }
+    }
+}
+
+fn pretty_pat(pat: &ast::Pat) -> String {
+    match &pat.node {
+        ast::PatKind::Var(name) => name.clone(),
+        ast::PatKind::Wildcard => "_".to_string(),
+        ast::PatKind::Constructor { name, payload } => {
+            format!("{} {}", name, pretty_pat(payload))
+        }
+        ast::PatKind::Record(fields) => {
+            let fs: Vec<String> = fields
+                .iter()
+                .map(|f| {
+                    if let Some(p) = &f.pattern {
+                        format!("{}: {}", f.name, pretty_pat(p))
+                    } else {
+                        f.name.clone()
+                    }
+                })
+                .collect();
+            format!("{{{}}}", fs.join(", "))
+        }
+        ast::PatKind::Lit(lit) => pretty_lit(lit),
+        ast::PatKind::List(pats) => {
+            let ps: Vec<String> = pats.iter().map(pretty_pat).collect();
+            format!("[{}]", ps.join(", "))
+        }
+    }
+}
+
+fn pretty_lit(lit: &ast::Literal) -> String {
+    match lit {
+        ast::Literal::Int(n) => n.to_string(),
+        ast::Literal::Float(n) => {
+            if *n == (*n as i64) as f64 {
+                format!("{:.1}", n)
+            } else {
+                n.to_string()
+            }
+        }
+        ast::Literal::Text(s) => format!("\"{}\"", s),
+    }
+}
+
+fn pretty_binop(op: &ast::BinOp) -> &'static str {
+    match op {
+        ast::BinOp::Add => "+",
+        ast::BinOp::Sub => "-",
+        ast::BinOp::Mul => "*",
+        ast::BinOp::Div => "/",
+        ast::BinOp::Eq => "==",
+        ast::BinOp::Neq => "!=",
+        ast::BinOp::Lt => "<",
+        ast::BinOp::Gt => ">",
+        ast::BinOp::Le => "<=",
+        ast::BinOp::Ge => ">=",
+        ast::BinOp::And => "&&",
+        ast::BinOp::Or => "||",
+        ast::BinOp::Concat => "++",
+        ast::BinOp::Pipe => "|>",
+    }
+}
+
+fn pretty_stmt(stmt: &ast::Stmt) -> String {
+    match &stmt.node {
+        ast::StmtKind::Bind { pat, expr } => {
+            format!("{} <- {}", pretty_pat(pat), pretty_expr(expr))
+        }
+        ast::StmtKind::Let { pat, expr } => {
+            format!("let {} = {}", pretty_pat(pat), pretty_expr(expr))
+        }
+        ast::StmtKind::Where { cond } => format!("where {}", pretty_expr(cond)),
+        ast::StmtKind::Expr(e) => pretty_expr(e),
+    }
 }
 
 // ── Trait support helpers ─────────────────────────────────────────

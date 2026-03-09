@@ -58,8 +58,8 @@ pub enum Value {
     Record(Vec<RecordField>),
     Relation(Vec<*mut Value>),
     Constructor(String, *mut Value),
-    /// (fn_ptr, env) — fn_ptr has signature: extern "C" fn(db, env, arg) -> *mut Value
-    Function(*const u8, *mut Value),
+    /// (fn_ptr, env, source) — fn_ptr has signature: extern "C" fn(db, env, arg) -> *mut Value
+    Function(*const u8, *mut Value, String),
 }
 
 pub struct RecordField {
@@ -114,7 +114,7 @@ fn type_name(v: *mut Value) -> &'static str {
         Value::Record(_) => "Record",
         Value::Relation(_) => "Relation",
         Value::Constructor(_, _) => "Constructor",
-        Value::Function(_, _) => "Function",
+        Value::Function(_, _, _) => "Function",
     }
 }
 
@@ -140,7 +140,7 @@ fn brief_value(v: *mut Value) -> String {
         }
         Value::Relation(rows) => format!("Relation({} rows)", rows.len()),
         Value::Constructor(tag, _) => format!("Constructor({})", tag),
-        Value::Function(_, _) => "Function".to_string(),
+        Value::Function(_, _, src) => format!("Function({})", src),
     }
 }
 
@@ -179,8 +179,14 @@ pub extern "C" fn knot_value_unit() -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_function(fn_ptr: *const u8, env: *mut Value) -> *mut Value {
-    alloc(Value::Function(fn_ptr, env))
+pub extern "C" fn knot_value_function(
+    fn_ptr: *const u8,
+    env: *mut Value,
+    src_ptr: *const u8,
+    src_len: usize,
+) -> *mut Value {
+    let source = unsafe { str_from_raw(src_ptr, src_len) }.to_string();
+    alloc(Value::Function(fn_ptr, env, source))
 }
 
 #[unsafe(no_mangle)]
@@ -230,7 +236,7 @@ pub extern "C" fn knot_value_get_tag(v: *mut Value) -> i32 {
         Value::Record(_) => 5,
         Value::Relation(_) => 6,
         Value::Constructor(_, _) => 7,
-        Value::Function(_, _) => 8,
+        Value::Function(_, _, _) => 8,
     }
 }
 
@@ -563,7 +569,7 @@ pub extern "C" fn knot_value_call(
     arg: *mut Value,
 ) -> *mut Value {
     match unsafe { as_ref(func) } {
-        Value::Function(fn_ptr, env) => {
+        Value::Function(fn_ptr, env, _) => {
             let f: extern "C" fn(*mut c_void, *mut Value, *mut Value) -> *mut Value =
                 unsafe { std::mem::transmute(*fn_ptr) };
             f(db, *env, arg)
@@ -615,7 +621,7 @@ fn format_value(v: *mut Value) -> String {
                 format!("{} {}", tag, p)
             }
         }
-        Value::Function(_, _) => "<function>".to_string(),
+        Value::Function(_, _, src) => src.clone(),
     }
 }
 
@@ -671,7 +677,7 @@ pub extern "C" fn knot_value_show(v: *mut Value) -> *mut Value {
                     format!("{} {}", tag, p)
                 }
             }
-            Value::Function(_, _) => "<function>".to_string(),
+            Value::Function(_, _, src) => src.clone(),
         }
     }
     alloc(Value::Text(show_inner(v)))

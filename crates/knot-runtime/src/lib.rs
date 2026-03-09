@@ -7,6 +7,41 @@
 use rusqlite::Connection;
 use std::ffi::c_void;
 use std::slice;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// ── Debug mode ───────────────────────────────────────────────────
+
+static DEBUG: AtomicBool = AtomicBool::new(false);
+
+fn debug_enabled() -> bool {
+    DEBUG.load(Ordering::Relaxed)
+}
+
+fn debug_sql(sql: &str) {
+    if debug_enabled() {
+        eprintln!("[SQL] {}", sql);
+    }
+}
+
+fn debug_sql_params(sql: &str, params: &[rusqlite::types::Value]) {
+    if debug_enabled() {
+        if params.is_empty() {
+            eprintln!("[SQL] {}", sql);
+        } else {
+            eprintln!("[SQL] {} -- params: {:?}", sql, params);
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_debug_init() {
+    for arg in std::env::args() {
+        if arg == "--debug" {
+            DEBUG.store(true, Ordering::Relaxed);
+            return;
+        }
+    }
+}
 
 // ── Value representation ──────────────────────────────────────────
 
@@ -605,6 +640,7 @@ pub extern "C" fn knot_db_close(db: *mut c_void) {
 pub extern "C" fn knot_db_exec(db: *mut c_void, sql_ptr: *const u8, sql_len: usize) {
     let db = unsafe { &*(db as *mut KnotDb) };
     let sql = unsafe { str_from_raw(sql_ptr, sql_len) };
+    debug_sql(sql);
     db.conn
         .execute_batch(sql)
         .unwrap_or_else(|e| panic!("knot runtime: SQL error: {}\n  SQL: {}", e, sql));
@@ -682,6 +718,7 @@ pub extern "C" fn knot_source_init(
         table,
         col_defs.join(", ")
     );
+    debug_sql(&sql);
     db_ref.conn.execute_batch(&sql).unwrap_or_else(|e| {
         panic!("knot runtime: failed to create table '{}': {}", name, e)
     });
@@ -694,6 +731,7 @@ pub extern "C" fn knot_source_init(
             table,
             col_names.join(", ")
         );
+        debug_sql(&idx_sql);
         let _ = db_ref.conn.execute_batch(&idx_sql);
     }
 }
@@ -723,6 +761,7 @@ pub extern "C" fn knot_source_read(
         quote_ident(&format!("_knot_{}", name))
     );
 
+    debug_sql(&sql);
     let mut stmt = db_ref
         .conn
         .prepare(&sql)
@@ -787,6 +826,7 @@ pub extern "C" fn knot_source_write(
 
     let table = quote_ident(&format!("_knot_{}", name));
     let delete_sql = format!("DELETE FROM {};", table);
+    debug_sql(&delete_sql);
     db_ref
         .conn
         .execute_batch(&delete_sql)
@@ -801,6 +841,7 @@ pub extern "C" fn knot_source_write(
             col_names.join(", "),
             placeholders.join(", ")
         );
+        debug_sql(&insert_sql);
 
         let mut stmt = db_ref
             .conn
@@ -888,6 +929,7 @@ pub extern "C" fn knot_source_append(
         col_names.join(", "),
         placeholders.join(", ")
     );
+    debug_sql(&insert_sql);
 
     let mut stmt = db_ref
         .conn
@@ -974,6 +1016,7 @@ pub extern "C" fn knot_source_diff_write(
         temp,
         col_defs.join(", ")
     );
+    debug_sql(&create_temp);
     db_ref
         .conn
         .execute_batch(&create_temp)
@@ -993,6 +1036,7 @@ pub extern "C" fn knot_source_diff_write(
             col_names.join(", "),
             placeholders.join(", ")
         );
+        debug_sql(&insert_sql);
 
         let mut stmt = db_ref
             .conn
@@ -1052,6 +1096,7 @@ pub extern "C" fn knot_source_diff_write(
             temp,
             match_conds.join(" AND ")
         );
+        debug_sql(&delete_sql);
         db_ref
             .conn
             .execute_batch(&delete_sql)
@@ -1065,6 +1110,7 @@ pub extern "C" fn knot_source_diff_write(
             col_names.join(", "),
             temp
         );
+        debug_sql(&insert_new_sql);
         db_ref
             .conn
             .execute_batch(&insert_new_sql)
@@ -1073,6 +1119,7 @@ pub extern "C" fn knot_source_diff_write(
 
     // 5. Drop temp table
     let drop_temp = format!("DROP TABLE {};", temp);
+    debug_sql(&drop_temp);
     db_ref
         .conn
         .execute_batch(&drop_temp)
@@ -1116,6 +1163,7 @@ pub extern "C" fn knot_source_delete_where(
 
     let sql_params: Vec<rusqlite::types::Value> =
         param_values.iter().map(|v| value_to_sql_param(*v)).collect();
+    debug_sql_params(&sql, &sql_params);
     let param_refs: Vec<&dyn rusqlite::types::ToSql> =
         sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
 
@@ -1153,7 +1201,7 @@ pub extern "C" fn knot_source_update_where(
     };
 
     let sql = format!(
-        "UPDATE {} SET {} WHERE {};",
+        "UPDATE OR REPLACE {} SET {} WHERE {};",
         quote_ident(&format!("_knot_{}", name)),
         set_clause,
         where_clause
@@ -1161,6 +1209,7 @@ pub extern "C" fn knot_source_update_where(
 
     let sql_params: Vec<rusqlite::types::Value> =
         param_values.iter().map(|v| value_to_sql_param(*v)).collect();
+    debug_sql_params(&sql, &sql_params);
     let param_refs: Vec<&dyn rusqlite::types::ToSql> =
         sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
 

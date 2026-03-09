@@ -238,6 +238,9 @@ impl Codegen {
         self.declare_rt("knot_source_delete_where", &[p, p, p, p, p, p], &[]);
         self.declare_rt("knot_source_update_where", &[p, p, p, p, p, p, p, p], &[]);
 
+        // Debug
+        self.declare_rt("knot_debug_init", &[], &[]);
+
         // Transactions
         self.declare_rt("knot_atomic_begin", &[p], &[]);
         self.declare_rt("knot_atomic_commit", &[p], &[]);
@@ -422,6 +425,10 @@ impl Codegen {
         let user_main = self.user_fns.get("main").copied();
 
         self.build_function(main_id, sig, |cg, builder, _entry| {
+            // Check --debug flag
+            let debug_init_ref = cg.import_rt(builder, "knot_debug_init");
+            builder.ins().call(debug_init_ref, &[]);
+
             // Open database
             let db_path = cg.db_path.clone();
             let (db_path_ptr, db_path_len) = cg.string_ptr(builder, &db_path);

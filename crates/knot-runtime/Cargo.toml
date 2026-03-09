@@ -1,0 +1,10 @@
+[package]
+name = "knot-runtime"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rusqlite = { workspace = true }

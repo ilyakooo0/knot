@@ -1,0 +1,26 @@
+type Todo = {title: Text, owner: Text, done: Int}
+
+*todos : [Todo]
+
+add title owner =
+  set *todos = union *todos [{title: title, owner: owner, done: 0}]
+
+complete title =
+  set *todos = do
+    t <- *todos
+    yield (if t.title == title
+      then {t | done: 1}
+      else t)
+
+pending owner = do
+  t <- *todos
+  where t.done == 0
+  where t.owner == owner
+  yield t.title
+
+main = do
+  add "Write parser" "Alice"
+  add "Write codegen" "Alice"
+  add "Write runtime" "Bob"
+  complete "Write parser"
+  yield (pending "Alice")

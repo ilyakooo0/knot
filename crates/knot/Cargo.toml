@@ -1,0 +1,4 @@
+[package]
+name = "knot"
+version.workspace = true
+edition.workspace = true

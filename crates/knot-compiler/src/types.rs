@@ -7,6 +7,7 @@ use knot::ast::*;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum ResolvedType {
     Int,
     Float,
@@ -20,6 +21,7 @@ pub enum ResolvedType {
 }
 
 pub struct TypeEnv {
+    #[allow(dead_code)]
     pub aliases: HashMap<String, ResolvedType>,
     /// constructor_name -> Vec<(field_name, field_type)>
     pub constructors: HashMap<String, Vec<(String, ResolvedType)>>,

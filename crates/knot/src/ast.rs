@@ -421,6 +421,7 @@ pub enum TraitItem {
     Method {
         name: Name,
         ty: TypeScheme,
+        default_params: Vec<Pat>,
         default_body: Option<Expr>,
     },
     /// `type Item c` — associated type declaration.

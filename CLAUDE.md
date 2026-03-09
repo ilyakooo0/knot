@@ -81,12 +81,16 @@ Key codegen patterns:
 - Lambdas compile as separate functions; free variables captured in a record-valued closure environment
 - Runtime functions are pre-declared as imports; `call_rt`/`call_rt_void` helpers emit calls
 - `knot_relation_len` returns raw `usize`, not a boxed `Value` — use directly as loop bound
+- Trait impl methods compile as mangled functions (`TraitName_TypeName_methodName`); a dispatcher function checks `knot_value_get_tag` at runtime and calls the matching impl; missing impls panic with a clear error message
+- Default trait methods: if an impl omits a method with a default body, the default is auto-compiled for that type
+- `deriving (TraitName)` on data types auto-generates impls using the trait's default method bodies
+- `show` calls `knot_value_show` (converts any value to Text representation)
 
 ## Supported Language Features
 
-Currently compiled: source declarations, type aliases, data declarations, functions, literals, records, field access, record updates, relation literals, binary/unary operations, if/else, do blocks (bind/where/yield/let), set expressions, lambdas, closures, function application, case expressions, constructors, atomic transactions, migrations (schema tracking + `migrate` blocks), schema lockfile (`<name>.schema.lock`), views (`*view = do { ... yield {...} }` with bidirectional read/write, constant column filtering, auto-fill on write), built-ins (println, print, show, union, count).
+Currently compiled: source declarations, type aliases, data declarations, functions, literals, records, field access, record updates, relation literals, binary/unary operations, if/else, do blocks (bind/where/yield/let), set expressions, lambdas, closures, function application, case expressions, constructors, atomic transactions, migrations (schema tracking + `migrate` blocks), schema lockfile (`<name>.schema.lock`), views (`*view = do { ... yield {...} }` with bidirectional read/write, constant column filtering, auto-fill on write), traits and impls (single-dispatch on runtime type tags for primitives and ADTs, default methods, deriving from defaults), built-ins (println, print, show, union, count).
 
-Not yet implemented: traits, impls, derived relations, routes, temporal queries, pattern matching in do-bind (constructor patterns filter but don't branch), partial application.
+Not yet implemented: supertraits (parsed but not enforced), associated types (parsed but not compiled), derived relations, routes, temporal queries, pattern matching in do-bind (constructor patterns filter but don't branch), partial application.
 
 ## Version Control
 

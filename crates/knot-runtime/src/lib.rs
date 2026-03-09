@@ -86,6 +86,21 @@ unsafe fn str_from_raw(ptr: *const u8, len: usize) -> &'static str {
     unsafe { std::str::from_utf8_unchecked(slice::from_raw_parts(ptr, len)) }
 }
 
+/// Runtime error for missing trait implementations.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_trait_no_impl(
+    method_ptr: *const u8,
+    method_len: usize,
+    value: *mut Value,
+) -> *mut Value {
+    let method = unsafe { str_from_raw(method_ptr, method_len) };
+    panic!(
+        "knot runtime: no implementation of '{}' for type {}",
+        method,
+        brief_value(value)
+    );
+}
+
 fn type_name(v: *mut Value) -> &'static str {
     if v.is_null() {
         return "null";
@@ -614,6 +629,52 @@ pub extern "C" fn knot_print(v: *mut Value) -> *mut Value {
 pub extern "C" fn knot_println(v: *mut Value) -> *mut Value {
     println!("{}", format_value(v));
     alloc(Value::Unit)
+}
+
+/// Convert a value to its text representation (returned as a Value::Text).
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_value_show(v: *mut Value) -> *mut Value {
+    fn show_inner(v: *mut Value) -> String {
+        if v.is_null() {
+            return "null".to_string();
+        }
+        match unsafe { as_ref(v) } {
+            Value::Int(n) => n.to_string(),
+            Value::Float(n) => {
+                if *n == (*n as i64) as f64 {
+                    format!("{:.1}", n)
+                } else {
+                    n.to_string()
+                }
+            }
+            Value::Text(s) => s.clone(),
+            Value::Bool(b) => {
+                if *b { "True".to_string() } else { "False".to_string() }
+            }
+            Value::Unit => "{}".to_string(),
+            Value::Record(fields) => {
+                let inner: Vec<String> = fields
+                    .iter()
+                    .map(|f| format!("{}: {}", f.name, show_inner(f.value)))
+                    .collect();
+                format!("{{{}}}", inner.join(", "))
+            }
+            Value::Relation(rows) => {
+                let inner: Vec<String> = rows.iter().map(|r| show_inner(*r)).collect();
+                format!("[{}]", inner.join(", "))
+            }
+            Value::Constructor(tag, payload) => {
+                let p = show_inner(*payload);
+                if p == "{}" {
+                    format!("{} {{}}", tag)
+                } else {
+                    format!("{} {}", tag, p)
+                }
+            }
+            Value::Function(_, _) => "<function>".to_string(),
+        }
+    }
+    alloc(Value::Text(show_inner(v)))
 }
 
 // ── Database operations ───────────────────────────────────────────

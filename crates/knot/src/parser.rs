@@ -713,6 +713,7 @@ impl Parser {
                 return Some(TraitItem::Method {
                     name,
                     ty: ts,
+                    default_params: Vec::new(),
                     default_body: None,
                 });
             }
@@ -736,6 +737,7 @@ impl Parser {
                         constraints: vec![],
                         ty: Spanned::new(TypeKind::Named("_".into()), self.span()),
                     },
+                    default_params: params,
                     default_body: Some(body),
                 });
             }

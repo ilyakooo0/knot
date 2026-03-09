@@ -58,6 +58,21 @@ pub struct Codegen {
 
     // Collected diagnostics
     diagnostics: Vec<knot::diagnostic::Diagnostic>,
+
+    // Trait support: method_name -> dispatch info
+    trait_methods: HashMap<String, TraitMethodInfo>,
+
+    // Trait definitions: trait_name -> TraitDef (for default method lookup)
+    trait_defs: HashMap<String, TraitDef>,
+
+    // Data type -> constructor names (for ADT trait dispatch)
+    data_constructors: HashMap<String, Vec<String>>,
+
+    // Trait method dispatcher function IDs (method_name -> func_id)
+    trait_dispatcher_fns: HashMap<String, FuncId>,
+
+    // Derived method bodies to define (from `deriving` clauses)
+    derived_methods: Vec<DerivedMethodDef>,
 }
 
 /// Provenance info for a view declaration, extracted at compile time.
@@ -79,6 +94,35 @@ struct PendingLambda {
     params: Vec<String>,
     body: ast::Expr,
     free_vars: Vec<String>,
+}
+
+/// Information about a trait method for runtime dispatch.
+struct TraitMethodInfo {
+    param_count: usize,
+    impls: Vec<ImplEntry>,
+}
+
+struct ImplEntry {
+    type_name: String,
+    func_id: FuncId,
+}
+
+/// Default method definition from a trait declaration.
+#[derive(Clone)]
+struct DefaultMethod {
+    params: Vec<ast::Pat>,
+    body: ast::Expr,
+}
+
+/// Info about a trait declaration (methods with optional defaults).
+struct TraitDef {
+    defaults: HashMap<String, DefaultMethod>,
+}
+
+/// Tracks pending derived method definitions (mangled_name -> default method).
+struct DerivedMethodDef {
+    mangled: String,
+    default: DefaultMethod,
 }
 
 // ── Variable environment ──────────────────────────────────────────
@@ -202,6 +246,11 @@ impl Codegen {
             migrate_schemas: HashMap::new(),
             views: HashMap::new(),
             diagnostics: Vec::new(),
+            trait_methods: HashMap::new(),
+            trait_defs: HashMap::new(),
+            data_constructors: HashMap::new(),
+            trait_dispatcher_fns: HashMap::new(),
+            derived_methods: Vec::new(),
         }
     }
 
@@ -260,9 +309,10 @@ impl Codegen {
         // Function calls
         self.declare_rt("knot_value_call", &[p, p, p], &[p]);
 
-        // Printing
+        // Printing / show
         self.declare_rt("knot_print", &[p], &[p]);
         self.declare_rt("knot_println", &[p], &[p]);
+        self.declare_rt("knot_value_show", &[p], &[p]);
 
         // Database
         self.declare_rt("knot_db_open", &[p, p], &[p]);
@@ -295,6 +345,12 @@ impl Codegen {
         // Constructor matching
         self.declare_rt("knot_constructor_matches", &[p, p, p], &[types::I32]);
         self.declare_rt("knot_constructor_payload", &[p], &[p]);
+
+        // Trait dispatch error
+        self.declare_rt("knot_trait_no_impl", &[p, p, p], &[p]);
+
+        // Type tag inspection (for trait dispatch)
+        self.declare_rt("knot_value_get_tag", &[p], &[types::I32]);
     }
 
     fn declare_rt(&mut self, name: &str, params: &[types::Type], returns: &[types::Type]) {
@@ -332,8 +388,256 @@ impl Codegen {
                         .unwrap();
                     self.user_fns.insert(name.clone(), (func_id, n_params));
                 }
+                ast::DeclKind::Data {
+                    name,
+                    constructors: ctors,
+                    ..
+                } => {
+                    let ctor_names: Vec<String> =
+                        ctors.iter().map(|c| c.name.clone()).collect();
+                    self.data_constructors.insert(name.clone(), ctor_names);
+                }
+                ast::DeclKind::Trait {
+                    name: trait_name,
+                    items,
+                    ..
+                } => {
+                    let mut defaults = HashMap::new();
+                    for item in items {
+                        if let ast::TraitItem::Method {
+                            name: method_name,
+                            ty,
+                            default_params,
+                            default_body,
+                        } = item
+                        {
+                            let param_count = if default_body.is_some() {
+                                default_params.len()
+                            } else {
+                                count_fn_params(&ty.ty)
+                            };
+                            self.trait_methods
+                                .entry(method_name.clone())
+                                .or_insert(TraitMethodInfo {
+                                    param_count,
+                                    impls: Vec::new(),
+                                });
+                            if let Some(body) = default_body {
+                                defaults.insert(
+                                    method_name.clone(),
+                                    DefaultMethod {
+                                        params: default_params.clone(),
+                                        body: body.clone(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    self.trait_defs.insert(
+                        trait_name.clone(),
+                        TraitDef { defaults },
+                    );
+                }
+                ast::DeclKind::Impl {
+                    trait_name,
+                    args,
+                    items,
+                    ..
+                } => {
+                    if let Some(type_name) = impl_type_name(args) {
+                        // Collect names of methods explicitly provided in this impl
+                        let provided_methods: Vec<String> = items
+                            .iter()
+                            .filter_map(|item| {
+                                if let ast::ImplItem::Method { name, .. } = item {
+                                    Some(name.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        for item in items {
+                            if let ast::ImplItem::Method {
+                                name: method_name,
+                                params,
+                                ..
+                            } = item
+                            {
+                                let n_params = params.len();
+                                let mangled = format!(
+                                    "{}_{}_{}", trait_name, type_name, method_name
+                                );
+                                let mut sig = self.module.make_signature();
+                                sig.params.push(AbiParam::new(self.ptr_type));
+                                for _ in 0..n_params {
+                                    sig.params.push(AbiParam::new(self.ptr_type));
+                                }
+                                sig.returns.push(AbiParam::new(self.ptr_type));
+                                let func_name = format!("knot_user_{}", mangled);
+                                let func_id = self
+                                    .module
+                                    .declare_function(
+                                        &func_name,
+                                        Linkage::Local,
+                                        &sig,
+                                    )
+                                    .unwrap();
+                                self.user_fns
+                                    .insert(mangled.clone(), (func_id, n_params));
+
+                                self.trait_methods
+                                    .entry(method_name.clone())
+                                    .or_insert(TraitMethodInfo {
+                                        param_count: n_params,
+                                        impls: Vec::new(),
+                                    })
+                                    .impls
+                                    .push(ImplEntry {
+                                        type_name: type_name.clone(),
+                                        func_id,
+                                    });
+                            }
+                        }
+
+                        // Auto-declare functions for default methods not provided
+                        if let Some(trait_def) = self.trait_defs.get(trait_name) {
+                            let defaults_to_add: Vec<(String, DefaultMethod)> = trait_def
+                                .defaults
+                                .iter()
+                                .filter(|(method_name, _)| {
+                                    !provided_methods.contains(method_name)
+                                })
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect();
+                            for (method_name, default) in defaults_to_add {
+                                let n_params = default.params.len();
+                                let mangled = format!(
+                                    "{}_{}_{}", trait_name, type_name, method_name
+                                );
+                                let mut sig = self.module.make_signature();
+                                sig.params.push(AbiParam::new(self.ptr_type));
+                                for _ in 0..n_params {
+                                    sig.params.push(AbiParam::new(self.ptr_type));
+                                }
+                                sig.returns.push(AbiParam::new(self.ptr_type));
+                                let func_name = format!("knot_user_{}", mangled);
+                                let func_id = self
+                                    .module
+                                    .declare_function(
+                                        &func_name,
+                                        Linkage::Local,
+                                        &sig,
+                                    )
+                                    .unwrap();
+                                self.user_fns
+                                    .insert(mangled.clone(), (func_id, n_params));
+
+                                self.trait_methods
+                                    .entry(method_name.clone())
+                                    .or_insert(TraitMethodInfo {
+                                        param_count: n_params,
+                                        impls: Vec::new(),
+                                    })
+                                    .impls
+                                    .push(ImplEntry {
+                                        type_name: type_name.clone(),
+                                        func_id,
+                                    });
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
+        }
+
+        // Process deriving clauses: auto-generate impl methods from trait defaults
+        for decl in &module.decls {
+            if let ast::DeclKind::Data {
+                name: type_name,
+                deriving,
+                ..
+            } = &decl.node
+            {
+                for trait_name in deriving {
+                    if let Some(trait_def) = self.trait_defs.get(trait_name) {
+                        let defaults_to_derive: Vec<(String, DefaultMethod)> = trait_def
+                            .defaults
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        for (method_name, default) in defaults_to_derive {
+                            let mangled = format!(
+                                "{}_{}_{}", trait_name, type_name, method_name
+                            );
+                            // Skip if already declared (explicit impl takes priority)
+                            if self.user_fns.contains_key(&mangled) {
+                                continue;
+                            }
+                            let n_params = default.params.len();
+                            let mut sig = self.module.make_signature();
+                            sig.params.push(AbiParam::new(self.ptr_type));
+                            for _ in 0..n_params {
+                                sig.params.push(AbiParam::new(self.ptr_type));
+                            }
+                            sig.returns.push(AbiParam::new(self.ptr_type));
+                            let func_name = format!("knot_user_{}", mangled);
+                            let func_id = self
+                                .module
+                                .declare_function(&func_name, Linkage::Local, &sig)
+                                .unwrap();
+                            self.user_fns
+                                .insert(mangled.clone(), (func_id, n_params));
+
+                            self.trait_methods
+                                .entry(method_name.clone())
+                                .or_insert(TraitMethodInfo {
+                                    param_count: n_params,
+                                    impls: Vec::new(),
+                                })
+                                .impls
+                                .push(ImplEntry {
+                                    type_name: type_name.clone(),
+                                    func_id,
+                                });
+
+                            self.derived_methods.push(DerivedMethodDef {
+                                mangled,
+                                default: default.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Create dispatcher functions for trait methods
+        // (skip methods that collide with user-defined functions)
+        let dispatchers: Vec<(String, usize)> = self
+            .trait_methods
+            .iter()
+            .filter(|(name, info)| {
+                !info.impls.is_empty() && !self.user_fns.contains_key(name.as_str())
+            })
+            .map(|(name, info)| (name.clone(), info.param_count))
+            .collect();
+        for (method_name, param_count) in dispatchers {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(self.ptr_type)); // db
+            for _ in 0..param_count {
+                sig.params.push(AbiParam::new(self.ptr_type));
+            }
+            sig.returns.push(AbiParam::new(self.ptr_type));
+            let func_name = format!("knot_user_{}", method_name);
+            let func_id = self
+                .module
+                .declare_function(&func_name, Linkage::Local, &sig)
+                .unwrap();
+            self.user_fns
+                .insert(method_name.clone(), (func_id, param_count));
+            self.trait_dispatcher_fns
+                .insert(method_name, func_id);
         }
     }
 
@@ -341,15 +645,76 @@ impl Codegen {
 
     fn define_functions(&mut self, module: &ast::Module, _type_env: &TypeEnv) {
         for decl in &module.decls {
-            if let ast::DeclKind::Fun {
-                name,
-                params,
-                body,
-                ..
-            } = &decl.node
-            {
-                self.define_user_function(name, params, body);
+            match &decl.node {
+                ast::DeclKind::Fun {
+                    name,
+                    params,
+                    body,
+                    ..
+                } => {
+                    self.define_user_function(name, params, body);
+                }
+                ast::DeclKind::Impl {
+                    trait_name,
+                    args,
+                    items,
+                    ..
+                } => {
+                    if let Some(type_name) = impl_type_name(args) {
+                        let provided_methods: Vec<String> = items
+                            .iter()
+                            .filter_map(|item| {
+                                if let ast::ImplItem::Method { name, .. } = item {
+                                    Some(name.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        for item in items {
+                            if let ast::ImplItem::Method { name, params, body } =
+                                item
+                            {
+                                let mangled = format!(
+                                    "{}_{}_{}", trait_name, type_name, name
+                                );
+                                self.define_user_function(&mangled, params, body);
+                            }
+                        }
+
+                        // Define default method bodies for methods not in this impl
+                        if let Some(trait_def) = self.trait_defs.get(trait_name) {
+                            let defaults_to_define: Vec<(String, DefaultMethod)> =
+                                trait_def
+                                    .defaults
+                                    .iter()
+                                    .filter(|(method_name, _)| {
+                                        !provided_methods.contains(method_name)
+                                    })
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect();
+                            for (method_name, default) in defaults_to_define {
+                                let mangled = format!(
+                                    "{}_{}_{}", trait_name, type_name, method_name
+                                );
+                                self.define_user_function(
+                                    &mangled,
+                                    &default.params,
+                                    &default.body,
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
+        }
+
+        // Define derived method bodies
+        let derived = std::mem::take(&mut self.derived_methods);
+        for dm in &derived {
+            self.define_user_function(&dm.mangled, &dm.default.params, &dm.default.body);
         }
 
         // Compile any pending lambdas (may generate more lambdas)
@@ -359,6 +724,206 @@ impl Codegen {
             for lambda in lambdas {
                 self.define_lambda_function(&lambda);
             }
+        }
+
+        // Define trait dispatcher function bodies
+        self.define_trait_dispatchers();
+
+        // Compile any pending lambdas from dispatchers
+        while !self.pending_lambdas.is_empty() {
+            let lambdas: Vec<PendingLambda> =
+                std::mem::take(&mut self.pending_lambdas);
+            for lambda in lambdas {
+                self.define_lambda_function(&lambda);
+            }
+        }
+    }
+
+    // ── Trait dispatcher code generation ─────────────────────────
+
+    /// Generate runtime dispatch function bodies for trait methods.
+    /// Each dispatcher checks the runtime type tag of the first argument
+    /// and calls the appropriate impl method.
+    fn define_trait_dispatchers(&mut self) {
+        let dispatcher_info: Vec<(String, FuncId, usize, Vec<(String, FuncId)>)> = self
+            .trait_dispatcher_fns
+            .iter()
+            .filter_map(|(method_name, &dispatcher_id)| {
+                let info = self.trait_methods.get(method_name)?;
+                let impls: Vec<(String, FuncId)> = info
+                    .impls
+                    .iter()
+                    .map(|e| (e.type_name.clone(), e.func_id))
+                    .collect();
+                Some((method_name.clone(), dispatcher_id, info.param_count, impls))
+            })
+            .collect();
+
+        let data_ctors = self.data_constructors.clone();
+
+        for (method_name, dispatcher_id, param_count, impls) in dispatcher_info {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(self.ptr_type)); // db
+            for _ in 0..param_count {
+                sig.params.push(AbiParam::new(self.ptr_type));
+            }
+            sig.returns.push(AbiParam::new(self.ptr_type));
+
+            let data_ctors_ref = data_ctors.clone();
+
+            self.build_function(dispatcher_id, sig, |cg, builder, entry| {
+                let db = builder.block_params(entry)[0];
+                let mut all_params: Vec<Value> = Vec::new();
+                for i in 0..param_count {
+                    all_params.push(builder.block_params(entry)[i + 1]);
+                }
+                let dispatch_arg = all_params[0];
+
+                let merge_block = builder.create_block();
+                merge_block_param(builder, merge_block, cg.ptr_type);
+
+                // Get value tag for dispatch
+                let tag = cg.call_rt_typed(
+                    builder,
+                    "knot_value_get_tag",
+                    &[dispatch_arg],
+                    types::I32,
+                );
+
+                // Separate primitive and ADT impls
+                let mut primitive_impls: Vec<(i64, FuncId)> = Vec::new();
+                let mut adt_impls: Vec<(Vec<String>, FuncId)> = Vec::new();
+                for (type_name, impl_func_id) in &impls {
+                    if let Some(runtime_tag) = type_name_to_tag(type_name) {
+                        primitive_impls.push((runtime_tag, *impl_func_id));
+                    } else if let Some(ctors) = data_ctors_ref.get(type_name) {
+                        adt_impls.push((ctors.clone(), *impl_func_id));
+                    }
+                }
+
+                // Generate primitive type checks
+                for (runtime_tag, impl_func_id) in &primitive_impls {
+                    let impl_block = builder.create_block();
+                    let next_block = builder.create_block();
+
+                    let tag_const =
+                        builder.ins().iconst(types::I32, *runtime_tag);
+                    let is_match =
+                        builder.ins().icmp(IntCC::Equal, tag, tag_const);
+                    builder.ins().brif(
+                        is_match,
+                        impl_block,
+                        &[],
+                        next_block,
+                        &[],
+                    );
+
+                    builder.switch_to_block(impl_block);
+                    builder.seal_block(impl_block);
+                    let impl_ref = cg
+                        .module
+                        .declare_func_in_func(*impl_func_id, builder.func);
+                    let mut call_args = vec![db];
+                    call_args.extend(&all_params);
+                    let call = builder.ins().call(impl_ref, &call_args);
+                    let result = builder.inst_results(call)[0];
+                    builder.ins().jump(merge_block, &[result]);
+
+                    builder.switch_to_block(next_block);
+                    builder.seal_block(next_block);
+                }
+
+                // Generate ADT type checks (Constructor tag + constructor name)
+                for (ctors, impl_func_id) in &adt_impls {
+                    if ctors.is_empty() {
+                        continue;
+                    }
+
+                    let impl_block = builder.create_block();
+                    let ctor_check_block = builder.create_block();
+                    let next_adt_block = builder.create_block();
+
+                    // Check if value is a Constructor (tag == 7)
+                    let tag_7 = builder.ins().iconst(types::I32, 7);
+                    let is_ctor =
+                        builder.ins().icmp(IntCC::Equal, tag, tag_7);
+                    builder.ins().brif(
+                        is_ctor,
+                        ctor_check_block,
+                        &[],
+                        next_adt_block,
+                        &[],
+                    );
+
+                    // Check each constructor name
+                    builder.switch_to_block(ctor_check_block);
+                    builder.seal_block(ctor_check_block);
+                    for (j, ctor_name) in ctors.iter().enumerate() {
+                        let (tag_ptr, tag_len) =
+                            cg.string_ptr(builder, ctor_name);
+                        let matches = cg.call_rt_typed(
+                            builder,
+                            "knot_constructor_matches",
+                            &[dispatch_arg, tag_ptr, tag_len],
+                            types::I32,
+                        );
+                        let is_match = builder
+                            .ins()
+                            .icmp_imm(IntCC::NotEqual, matches, 0);
+
+                        if j < ctors.len() - 1 {
+                            let next_ctor = builder.create_block();
+                            builder.ins().brif(
+                                is_match,
+                                impl_block,
+                                &[],
+                                next_ctor,
+                                &[],
+                            );
+                            builder.switch_to_block(next_ctor);
+                            builder.seal_block(next_ctor);
+                        } else {
+                            builder.ins().brif(
+                                is_match,
+                                impl_block,
+                                &[],
+                                next_adt_block,
+                                &[],
+                            );
+                        }
+                    }
+
+                    // Impl block: call the impl function
+                    builder.switch_to_block(impl_block);
+                    builder.seal_block(impl_block);
+                    let impl_ref = cg
+                        .module
+                        .declare_func_in_func(*impl_func_id, builder.func);
+                    let mut call_args = vec![db];
+                    call_args.extend(&all_params);
+                    let call = builder.ins().call(impl_ref, &call_args);
+                    let result = builder.inst_results(call)[0];
+                    builder.ins().jump(merge_block, &[result]);
+
+                    builder.switch_to_block(next_adt_block);
+                    builder.seal_block(next_adt_block);
+                }
+
+                // Fallback: runtime error (no matching impl found)
+                let (name_ptr, name_len) =
+                    cg.string_ptr(builder, &method_name);
+                let err = cg.call_rt(
+                    builder,
+                    "knot_trait_no_impl",
+                    &[name_ptr, name_len, dispatch_arg],
+                );
+                builder.ins().jump(merge_block, &[err]);
+
+                builder.switch_to_block(merge_block);
+                builder.seal_block(merge_block);
+                let result = builder.block_params(merge_block)[0];
+                builder.ins().return_(&[result]);
+            });
         }
     }
 
@@ -1288,9 +1853,8 @@ impl Codegen {
                 }
             }
             ast::ExprKind::Var(name) if name == "show" => {
-                // show is identity for now (values are already printable)
                 if compiled_args.len() == 1 {
-                    compiled_args[0]
+                    self.call_rt(builder, "knot_value_show", &[compiled_args[0]])
                 } else {
                     self.call_rt(builder, "knot_value_unit", &[])
                 }
@@ -1366,7 +1930,16 @@ impl Codegen {
         for (i, arm) in arms.iter().enumerate() {
             let is_last = i == arms.len() - 1;
             let arm_block = builder.create_block();
-            let next_block = if is_last {
+
+            // For unconditional patterns on the last arm, use merge_block
+            // as next_block. For conditional patterns, always create a
+            // separate block (merge_block has a parameter that brif can't
+            // provide).
+            let is_unconditional = matches!(
+                &arm.pat.node,
+                ast::PatKind::Wildcard | ast::PatKind::Var(_)
+            );
+            let next_block = if is_last && is_unconditional {
                 merge_block
             } else {
                 builder.create_block()
@@ -1425,7 +1998,13 @@ impl Codegen {
                 self.compile_expr(builder, &arm.body, &mut arm_env, db);
             builder.ins().jump(merge_block, &[arm_val]);
 
-            if !is_last {
+            if is_last && !is_unconditional {
+                // Last arm was conditional — fallback block for non-exhaustive match
+                builder.switch_to_block(next_block);
+                builder.seal_block(next_block);
+                let unit = self.call_rt(builder, "knot_value_unit", &[]);
+                builder.ins().jump(merge_block, &[unit]);
+            } else if !is_last {
                 builder.switch_to_block(next_block);
                 builder.seal_block(next_block);
             }
@@ -2528,4 +3107,41 @@ fn is_builtin_name(name: &str) -> bool {
             | "map"
             | "fold"
     )
+}
+
+// ── Trait support helpers ─────────────────────────────────────────
+
+/// Count the number of function parameters from a type annotation.
+/// `a -> b -> c` has 2 parameters.
+fn count_fn_params(ty: &ast::Type) -> usize {
+    match &ty.node {
+        ast::TypeKind::Function { result, .. } => 1 + count_fn_params(result),
+        _ => 0,
+    }
+}
+
+/// Extract the type name from an impl's type arguments.
+/// `impl Display Int` → Some("Int"), `impl Functor []` → Some("Relation").
+fn impl_type_name(args: &[ast::Type]) -> Option<String> {
+    if args.is_empty() {
+        return None;
+    }
+    match &args[0].node {
+        ast::TypeKind::Named(name) => Some(name.clone()),
+        ast::TypeKind::Relation(_) => Some("Relation".to_string()),
+        _ => None,
+    }
+}
+
+/// Map a type name to its runtime Value tag (as used by knot_value_get_tag).
+fn type_name_to_tag(name: &str) -> Option<i64> {
+    match name {
+        "Int" => Some(0),
+        "Float" => Some(1),
+        "Text" => Some(2),
+        "Bool" => Some(3),
+        "Unit" => Some(4),
+        "Relation" => Some(6),
+        _ => None,
+    }
 }

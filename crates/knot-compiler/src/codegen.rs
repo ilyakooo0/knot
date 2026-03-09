@@ -46,6 +46,9 @@ pub struct Codegen {
 
     // Pending lambda definitions: (func_id, params, body, free_vars)
     pending_lambdas: Vec<PendingLambda>,
+
+    // Collected diagnostics
+    diagnostics: Vec<knot::diagnostic::Diagnostic>,
 }
 
 struct PendingLambda {
@@ -92,7 +95,10 @@ struct LoopInfo {
 
 // ── Public API ────────────────────────────────────────────────────
 
-pub fn compile(module: &ast::Module, type_env: &TypeEnv) -> Vec<u8> {
+pub fn compile(
+    module: &ast::Module,
+    type_env: &TypeEnv,
+) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     let mut cg = Codegen::new();
     cg.source_schemas = type_env.source_schemas.clone();
     for (name, fields) in &type_env.constructors {
@@ -106,7 +112,10 @@ pub fn compile(module: &ast::Module, type_env: &TypeEnv) -> Vec<u8> {
     cg.collect_declarations(module);
     cg.define_functions(module, type_env);
     cg.generate_main(module);
-    cg.finish()
+    if !cg.diagnostics.is_empty() {
+        return Err(cg.diagnostics);
+    }
+    Ok(cg.finish())
 }
 
 // ── Constructor ───────────────────────────────────────────────────
@@ -143,6 +152,7 @@ impl Codegen {
             constructors: HashMap::new(),
             lambda_counter: 0,
             pending_lambdas: Vec::new(),
+            diagnostics: Vec::new(),
         }
     }
 
@@ -665,8 +675,8 @@ impl Codegen {
                         .cloned()
                         .unwrap_or_default();
 
-                    // Optimize: detect `set *rel = union *rel <expr>` → append only
                     if let Some(new_rows_expr) = self.match_union_append(name, value) {
+                        // Append: only insert new rows
                         let new_rows = self.compile_expr(builder, new_rows_expr, env, db);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
                         let (schema_ptr, schema_len) =
@@ -676,7 +686,9 @@ impl Codegen {
                             "knot_source_append",
                             &[db, name_ptr, name_len, schema_ptr, schema_len, new_rows],
                         );
-                    } else {
+                    } else if !Self::references_source(value, name) {
+                        // Full replace: value doesn't read the source, so
+                        // DELETE + INSERT is the only correct strategy.
                         let val = self.compile_expr(builder, value, env, db);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
                         let (schema_ptr, schema_len) =
@@ -685,6 +697,17 @@ impl Codegen {
                             builder,
                             "knot_source_write",
                             &[db, name_ptr, name_len, schema_ptr, schema_len, val],
+                        );
+                    } else {
+                        // Value reads from *rel but doesn't match any
+                        // optimized pattern — reject at compile time.
+                        self.diagnostics.push(
+                            knot::diagnostic::Diagnostic::error(
+                                format!("cannot determine efficient update strategy for `set *{}`", name),
+                            )
+                            .label(value.span, "this expression reads `*".to_string() + name + "` but no optimized update pattern was recognized")
+                            .note("supported patterns: `set *rel = union *rel <expr>` (append)")
+                            .note("if you don't need the old data, remove the reference to `*".to_string() + name + "`"),
                         );
                     }
                     self.call_rt(builder, "knot_value_unit", &[])
@@ -1287,6 +1310,65 @@ impl Codegen {
     }
 
     // ── Set-expression analysis ──────────────────────────────────
+
+    /// Check whether an expression references `*<source_name>` anywhere.
+    fn references_source(expr: &ast::Expr, source_name: &str) -> bool {
+        match &expr.node {
+            ast::ExprKind::SourceRef(name) => name == source_name,
+            ast::ExprKind::Lit(_)
+            | ast::ExprKind::Var(_)
+            | ast::ExprKind::Constructor(_)
+            | ast::ExprKind::DerivedRef(_) => false,
+            ast::ExprKind::Record(fields) => {
+                fields.iter().any(|f| Self::references_source(&f.value, source_name))
+            }
+            ast::ExprKind::RecordUpdate { base, fields } => {
+                Self::references_source(base, source_name)
+                    || fields.iter().any(|f| Self::references_source(&f.value, source_name))
+            }
+            ast::ExprKind::FieldAccess { expr, .. } => Self::references_source(expr, source_name),
+            ast::ExprKind::List(elems) => {
+                elems.iter().any(|e| Self::references_source(e, source_name))
+            }
+            ast::ExprKind::Lambda { body, .. } => Self::references_source(body, source_name),
+            ast::ExprKind::App { func, arg } => {
+                Self::references_source(func, source_name)
+                    || Self::references_source(arg, source_name)
+            }
+            ast::ExprKind::BinOp { lhs, rhs, .. } => {
+                Self::references_source(lhs, source_name)
+                    || Self::references_source(rhs, source_name)
+            }
+            ast::ExprKind::UnaryOp { operand, .. } => {
+                Self::references_source(operand, source_name)
+            }
+            ast::ExprKind::If { cond, then_branch, else_branch } => {
+                Self::references_source(cond, source_name)
+                    || Self::references_source(then_branch, source_name)
+                    || Self::references_source(else_branch, source_name)
+            }
+            ast::ExprKind::Case { scrutinee, arms } => {
+                Self::references_source(scrutinee, source_name)
+                    || arms.iter().any(|a| Self::references_source(&a.body, source_name))
+            }
+            ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
+                ast::StmtKind::Bind { expr, .. } => Self::references_source(expr, source_name),
+                ast::StmtKind::Let { expr, .. } => Self::references_source(expr, source_name),
+                ast::StmtKind::Where { cond } => Self::references_source(cond, source_name),
+                ast::StmtKind::Expr(e) => Self::references_source(e, source_name),
+            }),
+            ast::ExprKind::Yield(inner) => Self::references_source(inner, source_name),
+            ast::ExprKind::Set { target, value } => {
+                Self::references_source(target, source_name)
+                    || Self::references_source(value, source_name)
+            }
+            ast::ExprKind::Atomic(inner) => Self::references_source(inner, source_name),
+            ast::ExprKind::At { relation, time } => {
+                Self::references_source(relation, source_name)
+                    || Self::references_source(time, source_name)
+            }
+        }
+    }
 
     /// Detect `set *rel = union *rel <expr>` (or `union <expr> *rel`) and
     /// return the "new rows" expression so we can emit an append instead of

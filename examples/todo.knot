@@ -6,7 +6,7 @@ add title owner =
   set *todos = union *todos [{title: title, owner: owner, done: 0}]
 
 complete title =
-  full set *todos = do
+  set *todos = do
     t <- *todos
     yield (if t.title == title
       then {t | done: 1}

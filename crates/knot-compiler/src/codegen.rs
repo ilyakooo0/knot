@@ -234,6 +234,9 @@ impl Codegen {
         self.declare_rt("knot_source_read", &[p, p, p, p, p], &[p]);
         self.declare_rt("knot_source_write", &[p, p, p, p, p, p], &[]);
         self.declare_rt("knot_source_append", &[p, p, p, p, p, p], &[]);
+        self.declare_rt("knot_source_diff_write", &[p, p, p, p, p, p], &[]);
+        self.declare_rt("knot_source_delete_where", &[p, p, p, p, p, p], &[]);
+        self.declare_rt("knot_source_update_where", &[p, p, p, p, p, p, p, p], &[]);
 
         // Transactions
         self.declare_rt("knot_atomic_begin", &[p], &[]);
@@ -688,7 +691,7 @@ impl Codegen {
                         .unwrap_or_default();
 
                     if let Some(new_rows_expr) = self.match_union_append(name, value) {
-                        // Append: only insert new rows
+                        // 1. Append: union *rel <new> → INSERT only
                         let new_rows = self.compile_expr(builder, new_rows_expr, env, db);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
                         let (schema_ptr, schema_len) =
@@ -699,8 +702,139 @@ impl Codegen {
                             &[db, name_ptr, name_len, schema_ptr, schema_len, new_rows],
                         );
                     } else if !Self::references_source(value, name) {
-                        // Full replace: value doesn't read the source, so
-                        // DELETE + INSERT is the only correct strategy.
+                        // 2. Full replace: value doesn't read the source
+                        let val = self.compile_expr(builder, value, env, db);
+                        let (name_ptr, name_len) = self.string_ptr(builder, name);
+                        let (schema_ptr, schema_len) =
+                            self.string_ptr(builder, &schema);
+                        self.call_rt_void(
+                            builder,
+                            "knot_source_write",
+                            &[db, name_ptr, name_len, schema_ptr, schema_len, val],
+                        );
+                    } else if let Some((bind_var, cond, update_fields)) =
+                        Self::match_conditional_update(name, value)
+                    {
+                        // 3. Conditional update: do { t <- *rel; yield (if cond then {t | ...} else t) }
+                        //    Try SQL UPDATE WHERE
+                        let where_frag = Self::try_compile_sql_expr(&bind_var, cond);
+                        let set_frag = where_frag.as_ref().and_then(|_| {
+                            let mut parts = Vec::new();
+                            let mut params = Vec::new();
+                            for (field_name, field_val) in &update_fields {
+                                let param = match &field_val.node {
+                                    ast::ExprKind::Lit(lit) => {
+                                        SqlParamSource::Literal(lit.clone())
+                                    }
+                                    ast::ExprKind::Var(name) => {
+                                        SqlParamSource::Var(name.clone())
+                                    }
+                                    _ => return None,
+                                };
+                                parts.push(format!("\"{}\" = ?", field_name));
+                                params.push(param);
+                            }
+                            Some(SqlFragment {
+                                sql: parts.join(", "),
+                                params,
+                            })
+                        });
+
+                        if let (Some(wf), Some(sf)) = (where_frag, set_frag) {
+                            // SQL compilation succeeded → UPDATE WHERE
+                            let mut all_params = sf.params;
+                            all_params.extend(wf.params);
+                            let params_rel =
+                                self.compile_sql_params(builder, &all_params, env);
+                            let (name_ptr, name_len) = self.string_ptr(builder, name);
+                            let set_sql = sf.sql;
+                            let where_sql = wf.sql;
+                            let (set_ptr, set_len) =
+                                self.string_ptr(builder, &set_sql);
+                            let (where_ptr, where_len) =
+                                self.string_ptr(builder, &where_sql);
+                            self.call_rt_void(
+                                builder,
+                                "knot_source_update_where",
+                                &[
+                                    db, name_ptr, name_len, set_ptr, set_len,
+                                    where_ptr, where_len, params_rel,
+                                ],
+                            );
+                        } else {
+                            // SQL compilation failed → map with no filter → full write
+                            let val = self.compile_expr(builder, value, env, db);
+                            let (name_ptr, name_len) = self.string_ptr(builder, name);
+                            let (schema_ptr, schema_len) =
+                                self.string_ptr(builder, &schema);
+                            self.call_rt_void(
+                                builder,
+                                "knot_source_write",
+                                &[db, name_ptr, name_len, schema_ptr, schema_len, val],
+                            );
+                        }
+                    } else if let Some((bind_var, conditions)) =
+                        Self::match_filter_only(name, value)
+                    {
+                        // 4. Filter only: do { t <- *rel; where cond; yield t }
+                        //    Try SQL DELETE WHERE
+                        let combined_sql: Option<SqlFragment> = {
+                            let mut frags = Vec::new();
+                            let mut all_ok = true;
+                            for cond in &conditions {
+                                if let Some(f) =
+                                    Self::try_compile_sql_expr(&bind_var, cond)
+                                {
+                                    frags.push(f);
+                                } else {
+                                    all_ok = false;
+                                    break;
+                                }
+                            }
+                            if all_ok && !frags.is_empty() {
+                                let sql = frags
+                                    .iter()
+                                    .map(|f| format!("({})", f.sql))
+                                    .collect::<Vec<_>>()
+                                    .join(" AND ");
+                                let params: Vec<SqlParamSource> = frags
+                                    .into_iter()
+                                    .flat_map(|f| f.params)
+                                    .collect();
+                                Some(SqlFragment { sql, params })
+                            } else {
+                                None
+                            }
+                        };
+
+                        if let Some(frag) = combined_sql {
+                            // SQL compilation succeeded → DELETE WHERE NOT (cond)
+                            let params_rel =
+                                self.compile_sql_params(builder, &frag.params, env);
+                            let (name_ptr, name_len) = self.string_ptr(builder, name);
+                            let where_sql = frag.sql;
+                            let (where_ptr, where_len) =
+                                self.string_ptr(builder, &where_sql);
+                            self.call_rt_void(
+                                builder,
+                                "knot_source_delete_where",
+                                &[db, name_ptr, name_len, where_ptr, where_len, params_rel],
+                            );
+                        } else {
+                            // SQL compilation failed → fall back to diff-write
+                            let val = self.compile_expr(builder, value, env, db);
+                            let (name_ptr, name_len) = self.string_ptr(builder, name);
+                            let (schema_ptr, schema_len) =
+                                self.string_ptr(builder, &schema);
+                            self.call_rt_void(
+                                builder,
+                                "knot_source_diff_write",
+                                &[db, name_ptr, name_len, schema_ptr, schema_len, val],
+                            );
+                        }
+                    } else if Self::match_map_no_filter(name, value) {
+                        // 5. Map without filter: every row transformed, no filtering
+                        //    Full write is safe and avoids diff overhead.
                         let val = self.compile_expr(builder, value, env, db);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
                         let (schema_ptr, schema_len) =
@@ -711,15 +845,15 @@ impl Codegen {
                             &[db, name_ptr, name_len, schema_ptr, schema_len, val],
                         );
                     } else {
-                        // Value reads from *rel but doesn't match any
-                        // optimized pattern — reject at compile time.
-                        self.diagnostics.push(
-                            knot::diagnostic::Diagnostic::error(
-                                format!("cannot determine efficient update strategy for `set *{}`", name),
-                            )
-                            .label(value.span, "this expression reads `*".to_string() + name + "` but no optimized update pattern was recognized")
-                            .note("supported patterns: `set *rel = union *rel <expr>` (append)")
-                            .note("use `full set` if you intend a complete table replacement"),
+                        // 6. Fallback: diff-based write
+                        let val = self.compile_expr(builder, value, env, db);
+                        let (name_ptr, name_len) = self.string_ptr(builder, name);
+                        let (schema_ptr, schema_len) =
+                            self.string_ptr(builder, &schema);
+                        self.call_rt_void(
+                            builder,
+                            "knot_source_diff_write",
+                            &[db, name_ptr, name_len, schema_ptr, schema_len, val],
                         );
                     }
                     self.call_rt(builder, "knot_value_unit", &[])
@@ -1440,6 +1574,302 @@ impl Codegen {
         }
         None
     }
+
+    // ── SQL expression compilation ──────────────────────────────────
+
+    /// Try to compile a Knot condition to a SQL WHERE fragment.
+    /// `bind_var` is the loop variable (e.g., "t" in `t <- *rel`).
+    /// Field accesses on bind_var become column references;
+    /// literals and free variables become bind parameters (?).
+    fn try_compile_sql_expr(
+        bind_var: &str,
+        expr: &ast::Expr,
+    ) -> Option<SqlFragment> {
+        match &expr.node {
+            ast::ExprKind::BinOp { op, lhs, rhs } => match op {
+                ast::BinOp::And => {
+                    let l = Self::try_compile_sql_expr(bind_var, lhs)?;
+                    let r = Self::try_compile_sql_expr(bind_var, rhs)?;
+                    let mut params = l.params;
+                    params.extend(r.params);
+                    Some(SqlFragment {
+                        sql: format!("({}) AND ({})", l.sql, r.sql),
+                        params,
+                    })
+                }
+                ast::BinOp::Or => {
+                    let l = Self::try_compile_sql_expr(bind_var, lhs)?;
+                    let r = Self::try_compile_sql_expr(bind_var, rhs)?;
+                    let mut params = l.params;
+                    params.extend(r.params);
+                    Some(SqlFragment {
+                        sql: format!("({}) OR ({})", l.sql, r.sql),
+                        params,
+                    })
+                }
+                ast::BinOp::Eq | ast::BinOp::Neq | ast::BinOp::Lt
+                | ast::BinOp::Gt | ast::BinOp::Le | ast::BinOp::Ge => {
+                    let sql_op = match op {
+                        ast::BinOp::Eq => "=",
+                        ast::BinOp::Neq => "!=",
+                        ast::BinOp::Lt => "<",
+                        ast::BinOp::Gt => ">",
+                        ast::BinOp::Le => "<=",
+                        ast::BinOp::Ge => ">=",
+                        _ => unreachable!(),
+                    };
+                    // Try field op value, then value op field (reversed)
+                    Self::try_compile_sql_comparison(bind_var, lhs, rhs, sql_op)
+                        .or_else(|| {
+                            let rev = match sql_op {
+                                "=" | "!=" => sql_op,
+                                "<" => ">",
+                                ">" => "<",
+                                "<=" => ">=",
+                                ">=" => "<=",
+                                _ => return None,
+                            };
+                            Self::try_compile_sql_comparison(bind_var, rhs, lhs, rev)
+                        })
+                }
+                _ => None,
+            },
+            ast::ExprKind::UnaryOp {
+                op: ast::UnaryOp::Not,
+                operand,
+            } => {
+                let inner = Self::try_compile_sql_expr(bind_var, operand)?;
+                Some(SqlFragment {
+                    sql: format!("NOT ({})", inner.sql),
+                    params: inner.params,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Try to compile `field_expr op value_expr` to SQL.
+    fn try_compile_sql_comparison(
+        bind_var: &str,
+        field_side: &ast::Expr,
+        value_side: &ast::Expr,
+        op: &str,
+    ) -> Option<SqlFragment> {
+        let col_name = if let ast::ExprKind::FieldAccess { expr, field } = &field_side.node {
+            if let ast::ExprKind::Var(name) = &expr.node {
+                if name == bind_var {
+                    field.clone()
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        };
+
+        let param = match &value_side.node {
+            ast::ExprKind::Lit(lit) => SqlParamSource::Literal(lit.clone()),
+            ast::ExprKind::Var(name) => SqlParamSource::Var(name.clone()),
+            _ => return None,
+        };
+
+        Some(SqlFragment {
+            sql: format!("\"{}\" {} ?", col_name, op),
+            params: vec![param],
+        })
+    }
+
+    // ── Additional set-expression pattern matchers ───────────────────
+
+    /// Detect `do { t <- *rel; yield expr }` with no `where` clauses.
+    /// A simple map: every input row produces one output row, so full write
+    /// is safe and avoids diff overhead.
+    fn match_map_no_filter(source_name: &str, value: &ast::Expr) -> bool {
+        if let ast::ExprKind::Do(stmts) = &value.node {
+            if stmts.len() == 2 {
+                if let ast::StmtKind::Bind { expr, .. } = &stmts[0].node {
+                    if let ast::ExprKind::SourceRef(name) = &expr.node {
+                        if name == source_name {
+                            if let ast::StmtKind::Expr(e) = &stmts[1].node {
+                                return matches!(&e.node, ast::ExprKind::Yield(_));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Detect `do { t <- *rel; where cond1; ...; yield t }`.
+    /// Returns (bind_var_name, conditions) for SQL DELETE WHERE compilation.
+    fn match_filter_only<'a>(
+        source_name: &str,
+        value: &'a ast::Expr,
+    ) -> Option<(String, Vec<&'a ast::Expr>)> {
+        let stmts = if let ast::ExprKind::Do(stmts) = &value.node {
+            stmts
+        } else {
+            return None;
+        };
+        if stmts.len() < 3 {
+            return None;
+        }
+
+        // First: t <- *rel
+        let bind_var = if let ast::StmtKind::Bind { pat, expr } = &stmts[0].node {
+            if let ast::ExprKind::SourceRef(name) = &expr.node {
+                if name == source_name {
+                    if let ast::PatKind::Var(v) = &pat.node {
+                        v.clone()
+                    } else {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        };
+
+        // Last: yield t
+        if let ast::StmtKind::Expr(e) = &stmts.last()?.node {
+            if let ast::ExprKind::Yield(inner) = &e.node {
+                if let ast::ExprKind::Var(v) = &inner.node {
+                    if v != &bind_var {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        }
+
+        // Middle: all must be where clauses
+        let mut conditions = Vec::new();
+        for stmt in &stmts[1..stmts.len() - 1] {
+            if let ast::StmtKind::Where { cond } = &stmt.node {
+                conditions.push(cond);
+            } else {
+                return None;
+            }
+        }
+        if conditions.is_empty() {
+            return None;
+        }
+
+        Some((bind_var, conditions))
+    }
+
+    /// Detect `do { t <- *rel; yield (if cond then {t | fields} else t) }`.
+    /// Returns (bind_var, condition, update_fields) for SQL UPDATE WHERE.
+    fn match_conditional_update<'a>(
+        source_name: &str,
+        value: &'a ast::Expr,
+    ) -> Option<(String, &'a ast::Expr, Vec<(&'a str, &'a ast::Expr)>)> {
+        let stmts = if let ast::ExprKind::Do(stmts) = &value.node {
+            stmts
+        } else {
+            return None;
+        };
+        if stmts.len() != 2 {
+            return None;
+        }
+
+        // First: t <- *rel
+        let bind_var = if let ast::StmtKind::Bind { pat, expr } = &stmts[0].node {
+            if let ast::ExprKind::SourceRef(name) = &expr.node {
+                if name == source_name {
+                    if let ast::PatKind::Var(v) = &pat.node {
+                        v.clone()
+                    } else {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        };
+
+        // Second: yield (if cond then {t | ...} else t)
+        if let ast::StmtKind::Expr(e) = &stmts[1].node {
+            if let ast::ExprKind::Yield(yield_inner) = &e.node {
+                if let ast::ExprKind::If {
+                    cond,
+                    then_branch,
+                    else_branch,
+                } = &yield_inner.node
+                {
+                    // else must be just the bind var
+                    if let ast::ExprKind::Var(v) = &else_branch.node {
+                        if v != &bind_var {
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    }
+                    // then must be {t | field: val, ...}
+                    if let ast::ExprKind::RecordUpdate { base, fields } = &then_branch.node {
+                        if let ast::ExprKind::Var(v) = &base.node {
+                            if v != &bind_var {
+                                return None;
+                            }
+                        } else {
+                            return None;
+                        }
+                        let update_fields: Vec<(&str, &ast::Expr)> =
+                            fields.iter().map(|f| (f.name.as_str(), &f.value)).collect();
+                        return Some((bind_var, cond, update_fields));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Compile SQL bind parameters into a runtime Relation value.
+    fn compile_sql_params(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        params: &[SqlParamSource],
+        env: &mut Env,
+    ) -> Value {
+        let rel = self.call_rt(builder, "knot_relation_empty", &[]);
+        for param in params {
+            let val = match param {
+                SqlParamSource::Literal(lit) => self.compile_lit(builder, lit),
+                SqlParamSource::Var(name) => env.get(name),
+            };
+            self.call_rt_void(builder, "knot_relation_push", &[rel, val]);
+        }
+        rel
+    }
+}
+
+// ── SQL compilation types ─────────────────────────────────────────
+
+struct SqlFragment {
+    sql: String,
+    params: Vec<SqlParamSource>,
+}
+
+#[derive(Clone)]
+enum SqlParamSource {
+    Literal(ast::Literal),
+    Var(String),
 }
 
 // ── Free functions ────────────────────────────────────────────────

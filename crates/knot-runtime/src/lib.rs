@@ -924,6 +924,254 @@ pub extern "C" fn knot_source_append(
         .expect("knot runtime: failed to commit transaction");
 }
 
+/// Diff-based write: compute minimal INSERT/DELETE against the existing table.
+/// Used when the value expression reads from the same source relation.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_source_diff_write(
+    db: *mut c_void,
+    name_ptr: *const u8,
+    name_len: usize,
+    schema_ptr: *const u8,
+    schema_len: usize,
+    relation: *mut Value,
+) {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let name = unsafe { str_from_raw(name_ptr, name_len) };
+    let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
+    let cols = parse_schema(schema);
+
+    let rows = match unsafe { as_ref(relation) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: source_diff_write expects a Relation, got {}",
+            type_name(relation)
+        ),
+    };
+
+    let table = format!("_knot_{}", name);
+    let temp = format!("_knot_{}_new", name);
+
+    db_ref
+        .conn
+        .execute_batch("BEGIN;")
+        .expect("knot runtime: failed to begin transaction");
+
+    // 1. Create temp table with same schema
+    let col_defs: Vec<String> = cols
+        .iter()
+        .map(|c| format!("\"{}\" {}", c.name, sql_type(c.ty)))
+        .collect();
+    let create_temp = format!(
+        "CREATE TEMP TABLE \"{}\" ({});",
+        temp,
+        col_defs.join(", ")
+    );
+    db_ref
+        .conn
+        .execute_batch(&create_temp)
+        .expect("knot runtime: failed to create temp table");
+
+    // 2. Insert all new rows into temp
+    if !cols.is_empty() && !rows.is_empty() {
+        let col_names: Vec<String> = cols.iter().map(|c| format!("\"{}\"", c.name)).collect();
+        let placeholders: Vec<String> = cols
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect();
+        let insert_sql = format!(
+            "INSERT INTO \"{}\" ({}) VALUES ({});",
+            temp,
+            col_names.join(", "),
+            placeholders.join(", ")
+        );
+
+        let mut stmt = db_ref
+            .conn
+            .prepare(&insert_sql)
+            .expect("knot runtime: failed to prepare temp insert");
+
+        for row_ptr in rows {
+            let row = unsafe { as_ref(*row_ptr) };
+            match row {
+                Value::Record(fields) => {
+                    let params: Vec<rusqlite::types::Value> = cols
+                        .iter()
+                        .map(|col| {
+                            let field = fields
+                                .iter()
+                                .find(|f| f.name == col.name)
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "knot runtime: missing field '{}' in record",
+                                        col.name
+                                    )
+                                });
+                            value_to_sqlite(field.value, col.ty)
+                        })
+                        .collect();
+                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                        params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+                    stmt.execute(param_refs.as_slice()).unwrap_or_else(|e| {
+                        panic!("knot runtime: temp insert error: {}", e)
+                    });
+                }
+                _ => panic!(
+                    "knot runtime: relation rows must be Records, got {}",
+                    type_name(*row_ptr)
+                ),
+            }
+        }
+    }
+
+    // 3. DELETE rows from main that are not in temp
+    if !cols.is_empty() {
+        let col_names: Vec<String> = cols.iter().map(|c| format!("\"{}\"", c.name)).collect();
+        let match_conds: Vec<String> = cols
+            .iter()
+            .map(|c| {
+                format!(
+                    "\"{t}\".\"{c}\" = \"{m}\".\"{c}\"",
+                    t = temp,
+                    m = table,
+                    c = c.name
+                )
+            })
+            .collect();
+        let delete_sql = format!(
+            "DELETE FROM \"{}\" WHERE NOT EXISTS (SELECT 1 FROM \"{}\" WHERE {});",
+            table,
+            temp,
+            match_conds.join(" AND ")
+        );
+        db_ref
+            .conn
+            .execute_batch(&delete_sql)
+            .expect("knot runtime: failed to delete removed rows");
+
+        // 4. INSERT rows from temp that are not in main
+        let insert_new_sql = format!(
+            "INSERT OR IGNORE INTO \"{}\" ({}) SELECT {} FROM \"{}\";",
+            table,
+            col_names.join(", "),
+            col_names.join(", "),
+            temp
+        );
+        db_ref
+            .conn
+            .execute_batch(&insert_new_sql)
+            .expect("knot runtime: failed to insert new rows");
+    }
+
+    // 5. Drop temp table
+    let drop_temp = format!("DROP TABLE \"{}\";", temp);
+    db_ref
+        .conn
+        .execute_batch(&drop_temp)
+        .expect("knot runtime: failed to drop temp table");
+
+    db_ref
+        .conn
+        .execute_batch("COMMIT;")
+        .expect("knot runtime: failed to commit transaction");
+}
+
+/// DELETE rows that don't match a WHERE condition.
+/// Used for `set *rel = do { t <- *rel; where cond; yield t }`.
+/// The where_clause is the *keep* condition; rows NOT matching are deleted.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_source_delete_where(
+    db: *mut c_void,
+    name_ptr: *const u8,
+    name_len: usize,
+    where_ptr: *const u8,
+    where_len: usize,
+    params: *mut Value,
+) {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let name = unsafe { str_from_raw(name_ptr, name_len) };
+    let where_clause = unsafe { str_from_raw(where_ptr, where_len) };
+
+    let param_values = match unsafe { as_ref(params) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: delete_where params must be a Relation, got {}",
+            type_name(params)
+        ),
+    };
+
+    let sql = format!(
+        "DELETE FROM \"_knot_{}\" WHERE NOT ({});",
+        name, where_clause
+    );
+
+    let sql_params: Vec<rusqlite::types::Value> =
+        param_values.iter().map(|v| value_to_sql_param(*v)).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+
+    db_ref
+        .conn
+        .execute(&sql, param_refs.as_slice())
+        .unwrap_or_else(|e| panic!("knot runtime: delete_where error: {}\n  SQL: {}", e, sql));
+}
+
+/// UPDATE rows matching a WHERE condition with new field values.
+/// Used for `set *rel = do { t <- *rel; yield (if cond then {t | ...} else t) }`.
+/// Params relation contains SET values first, then WHERE values.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_source_update_where(
+    db: *mut c_void,
+    name_ptr: *const u8,
+    name_len: usize,
+    set_clause_ptr: *const u8,
+    set_clause_len: usize,
+    where_ptr: *const u8,
+    where_len: usize,
+    params: *mut Value,
+) {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let name = unsafe { str_from_raw(name_ptr, name_len) };
+    let set_clause = unsafe { str_from_raw(set_clause_ptr, set_clause_len) };
+    let where_clause = unsafe { str_from_raw(where_ptr, where_len) };
+
+    let param_values = match unsafe { as_ref(params) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: update_where params must be a Relation, got {}",
+            type_name(params)
+        ),
+    };
+
+    let sql = format!(
+        "UPDATE \"_knot_{}\" SET {} WHERE {};",
+        name, set_clause, where_clause
+    );
+
+    let sql_params: Vec<rusqlite::types::Value> =
+        param_values.iter().map(|v| value_to_sql_param(*v)).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+
+    db_ref
+        .conn
+        .execute(&sql, param_refs.as_slice())
+        .unwrap_or_else(|e| panic!("knot runtime: update_where error: {}\n  SQL: {}", e, sql));
+}
+
+fn value_to_sql_param(v: *mut Value) -> rusqlite::types::Value {
+    match unsafe { as_ref(v) } {
+        Value::Int(n) => rusqlite::types::Value::Integer(*n),
+        Value::Float(n) => rusqlite::types::Value::Real(*n),
+        Value::Text(s) => rusqlite::types::Value::Text(s.clone()),
+        Value::Bool(b) => rusqlite::types::Value::Integer(*b as i64),
+        _ => panic!(
+            "knot runtime: cannot use {} as SQL parameter",
+            brief_value(v)
+        ),
+    }
+}
+
 fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
     match (unsafe { as_ref(v) }, ty) {
         (Value::Int(n), _) => rusqlite::types::Value::Integer(*n),

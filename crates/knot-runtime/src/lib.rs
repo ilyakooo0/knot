@@ -1437,6 +1437,7 @@ fn value_to_sql_param(v: *mut Value) -> rusqlite::types::Value {
         Value::Float(n) => rusqlite::types::Value::Real(*n),
         Value::Text(s) => rusqlite::types::Value::Text(s.clone()),
         Value::Bool(b) => rusqlite::types::Value::Integer(*b as i64),
+        Value::Constructor(tag, _) => rusqlite::types::Value::Text(tag.clone()),
         _ => panic!(
             "knot runtime: cannot use {} as SQL parameter",
             brief_value(v)
@@ -1450,6 +1451,7 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
         (Value::Float(n), _) => rusqlite::types::Value::Real(*n),
         (Value::Text(s), _) => rusqlite::types::Value::Text(s.clone()),
         (Value::Bool(b), _) => rusqlite::types::Value::Integer(*b as i64),
+        (Value::Constructor(tag, _), _) => rusqlite::types::Value::Text(tag.clone()),
         _ => panic!("knot runtime: cannot convert {} to SQL", brief_value(v)),
     }
 }
@@ -1502,6 +1504,274 @@ pub extern "C" fn knot_record_update(base: *mut Value) -> *mut Value {
         }
         _ => panic!("knot runtime: record update requires a Record base, got {}", type_name(base)),
     }
+}
+
+// ── View operations ──────────────────────────────────────────────
+
+/// Read through a view: SELECT only view columns WHERE constant columns match.
+/// `view_schema` contains only the columns visible in the view (source columns).
+/// `filter_where` is the WHERE clause for constant column filtering.
+/// `filter_params` is a flat relation of values for the WHERE placeholders.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_view_read(
+    db: *mut c_void,
+    name_ptr: *const u8,
+    name_len: usize,
+    schema_ptr: *const u8,
+    schema_len: usize,
+    filter_ptr: *const u8,
+    filter_len: usize,
+    filter_params: *mut Value,
+) -> *mut Value {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let name = unsafe { str_from_raw(name_ptr, name_len) };
+    let view_schema = unsafe { str_from_raw(schema_ptr, schema_len) };
+    let filter_where = unsafe { str_from_raw(filter_ptr, filter_len) };
+    let cols = parse_schema(view_schema);
+
+    let filter_values = match unsafe { as_ref(filter_params) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: view_read filter_params must be Relation, got {}",
+            type_name(filter_params)
+        ),
+    };
+
+    let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
+    let sql = if filter_where.is_empty() {
+        format!(
+            "SELECT {} FROM {}",
+            if col_names.is_empty() {
+                "1".to_string()
+            } else {
+                col_names.join(", ")
+            },
+            quote_ident(&format!("_knot_{}", name))
+        )
+    } else {
+        format!(
+            "SELECT {} FROM {} WHERE {}",
+            if col_names.is_empty() {
+                "1".to_string()
+            } else {
+                col_names.join(", ")
+            },
+            quote_ident(&format!("_knot_{}", name)),
+            filter_where
+        )
+    };
+
+    let sql_params: Vec<rusqlite::types::Value> = filter_values
+        .iter()
+        .map(|v| value_to_sql_param(*v))
+        .collect();
+    debug_sql_params(&sql, &sql_params);
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = sql_params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
+
+    let mut stmt = db_ref
+        .conn
+        .prepare(&sql)
+        .unwrap_or_else(|e| panic!("knot runtime: view_read query error: {}", e));
+
+    let mut rows: Vec<*mut Value> = Vec::new();
+    let mut result_rows = stmt
+        .query(param_refs.as_slice())
+        .unwrap_or_else(|e| panic!("knot runtime: view_read exec error: {}", e));
+
+    while let Some(row) = result_rows
+        .next()
+        .unwrap_or_else(|e| panic!("knot runtime: view_read fetch error: {}", e))
+    {
+        let record = knot_record_empty(cols.len());
+        for (i, col) in cols.iter().enumerate() {
+            let val = match col.ty {
+                ColType::Int => knot_value_int(row.get::<_, i64>(i).unwrap()),
+                ColType::Float => knot_value_float(row.get::<_, f64>(i).unwrap()),
+                ColType::Text => {
+                    let s: String = row.get(i).unwrap();
+                    alloc(Value::Text(s))
+                }
+                ColType::Bool => knot_value_bool(row.get::<_, i32>(i).unwrap()),
+            };
+            let name_bytes = col.name.as_bytes();
+            knot_record_set_field(record, name_bytes.as_ptr(), name_bytes.len(), val);
+        }
+        rows.push(record);
+    }
+
+    alloc(Value::Relation(rows))
+}
+
+/// Add fields from `extra_fields` record to each row in `relation`.
+/// Returns a new relation with augmented rows.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_add_fields(
+    relation: *mut Value,
+    extra_fields: *mut Value,
+) -> *mut Value {
+    let rows = match unsafe { as_ref(relation) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: relation_add_fields expects Relation, got {}",
+            type_name(relation)
+        ),
+    };
+    let extra = match unsafe { as_ref(extra_fields) } {
+        Value::Record(fields) => fields,
+        _ => panic!(
+            "knot runtime: relation_add_fields extra must be Record, got {}",
+            type_name(extra_fields)
+        ),
+    };
+
+    let new_rows: Vec<*mut Value> = rows
+        .iter()
+        .map(|row_ptr| {
+            let updated = knot_record_update(*row_ptr);
+            for field in extra {
+                let name_bytes = field.name.as_bytes();
+                knot_record_set_field(
+                    updated,
+                    name_bytes.as_ptr(),
+                    name_bytes.len(),
+                    field.value,
+                );
+            }
+            updated
+        })
+        .collect();
+
+    alloc(Value::Relation(new_rows))
+}
+
+/// Write through a view: delete rows matching filter, insert new rows.
+/// `filter_params` is a flat relation of values for the WHERE clause placeholders.
+/// `new_relation` has ALL columns (including constants that were added back).
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_view_write(
+    db: *mut c_void,
+    name_ptr: *const u8,
+    name_len: usize,
+    schema_ptr: *const u8,
+    schema_len: usize,
+    filter_ptr: *const u8,
+    filter_len: usize,
+    filter_params: *mut Value,
+    new_relation: *mut Value,
+) {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let name = unsafe { str_from_raw(name_ptr, name_len) };
+    let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
+    let filter_where = unsafe { str_from_raw(filter_ptr, filter_len) };
+    let cols = parse_schema(schema);
+
+    let filter_values = match unsafe { as_ref(filter_params) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: view_write filter_params must be Relation, got {}",
+            type_name(filter_params)
+        ),
+    };
+
+    let rows = match unsafe { as_ref(new_relation) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: view_write new_relation must be Relation, got {}",
+            type_name(new_relation)
+        ),
+    };
+
+    let table = quote_ident(&format!("_knot_{}", name));
+
+    db_ref
+        .conn
+        .execute_batch("BEGIN;")
+        .expect("knot runtime: view_write begin failed");
+
+    // 1. Delete rows matching the view's constant filter
+    let delete_sql = format!("DELETE FROM {} WHERE {};", table, filter_where);
+    let sql_params: Vec<rusqlite::types::Value> = filter_values
+        .iter()
+        .map(|v| value_to_sql_param(*v))
+        .collect();
+    debug_sql_params(&delete_sql, &sql_params);
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = sql_params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
+    db_ref
+        .conn
+        .execute(&delete_sql, param_refs.as_slice())
+        .unwrap_or_else(|e| {
+            panic!(
+                "knot runtime: view_write delete error: {}\n  SQL: {}",
+                e, delete_sql
+            )
+        });
+
+    // 2. Insert new rows
+    if !cols.is_empty() && !rows.is_empty() {
+        let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
+        let placeholders: Vec<String> = cols
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect();
+        let insert_sql = format!(
+            "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
+            table,
+            col_names.join(", "),
+            placeholders.join(", ")
+        );
+        debug_sql(&insert_sql);
+
+        let mut stmt = db_ref
+            .conn
+            .prepare(&insert_sql)
+            .expect("knot runtime: view_write prepare insert failed");
+
+        for row_ptr in rows {
+            let row = unsafe { as_ref(*row_ptr) };
+            match row {
+                Value::Record(fields) => {
+                    let params: Vec<rusqlite::types::Value> = cols
+                        .iter()
+                        .map(|col| {
+                            let field = fields
+                                .iter()
+                                .find(|f| f.name == col.name)
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "knot runtime: missing field '{}' in record",
+                                        col.name
+                                    )
+                                });
+                            value_to_sqlite(field.value, col.ty)
+                        })
+                        .collect();
+                    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+                        .iter()
+                        .map(|p| p as &dyn rusqlite::types::ToSql)
+                        .collect();
+                    stmt.execute(param_refs.as_slice()).unwrap_or_else(|e| {
+                        panic!("knot runtime: view_write insert error: {}", e)
+                    });
+                }
+                _ => panic!(
+                    "knot runtime: rows must be Records, got {}",
+                    type_name(*row_ptr)
+                ),
+            }
+        }
+    }
+
+    db_ref
+        .conn
+        .execute_batch("COMMIT;")
+        .expect("knot runtime: view_write commit failed");
 }
 
 // ── Pipe (|>) support ─────────────────────────────────────────────

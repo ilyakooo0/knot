@@ -1,0 +1,45 @@
+-- Views example: bidirectional queries over source relations
+
+data Priority = Low {} | High {} | Critical {}
+data Status = Open {} | Done {}
+
+type Todo = {title: Text, owner: Text, priority: Priority, status: Status}
+
+*todos : [Todo]
+
+-- View: only open todos (filters by status = Open)
+*openTodos = do
+  t <- *todos
+  yield {title: t.title, owner: t.owner, priority: t.priority, status: Open {}}
+
+main = do
+  -- Insert through the view (auto-fills status: Open)
+  set *openTodos = union *openTodos [{title: "Write docs", owner: "Alice", priority: High {}}]
+  set *openTodos = union *openTodos [{title: "Fix bug", owner: "Bob", priority: Critical {}}]
+  set *openTodos = union *openTodos [{title: "Add tests", owner: "Alice", priority: Low {}}]
+
+  -- Also add a done todo directly to the source
+  set *todos = union *todos [{title: "Setup CI", owner: "Bob", priority: High {}, status: Done {}}]
+
+  -- Read through the view: should only show open todos
+  println "Open todos:"
+  println (show *openTodos)
+
+  -- Read all todos: should include the done one too
+  println "All todos:"
+  println (show *todos)
+
+  -- Delete through the view: remove Alice's open todos
+  set *openTodos = do
+    t <- *openTodos
+    where t.owner != "Alice"
+    yield t
+
+  println "Open todos after removing Alice's:"
+  println (show *openTodos)
+
+  -- All todos should still have the done one
+  println "All todos after view delete:"
+  println (show *todos)
+
+  yield {}

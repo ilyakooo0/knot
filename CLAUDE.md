@@ -84,9 +84,9 @@ Key codegen patterns:
 
 ## Supported Language Features
 
-Currently compiled: source declarations, type aliases, data declarations, functions, literals, records, field access, record updates, relation literals, binary/unary operations, if/else, do blocks (bind/where/yield/let), set expressions, lambdas, closures, function application, case expressions, constructors, atomic transactions, migrations (schema tracking + `migrate` blocks), schema lockfile (`<name>.schema.lock`), built-ins (println, print, show, union, count).
+Currently compiled: source declarations, type aliases, data declarations, functions, literals, records, field access, record updates, relation literals, binary/unary operations, if/else, do blocks (bind/where/yield/let), set expressions, lambdas, closures, function application, case expressions, constructors, atomic transactions, migrations (schema tracking + `migrate` blocks), schema lockfile (`<name>.schema.lock`), views (`*view = do { ... yield {...} }` with bidirectional read/write, constant column filtering, auto-fill on write), built-ins (println, print, show, union, count).
 
-Not yet implemented: traits, impls, views, derived relations, routes, temporal queries, pattern matching in do-bind (constructor patterns filter but don't branch), partial application.
+Not yet implemented: traits, impls, derived relations, routes, temporal queries, pattern matching in do-bind (constructor patterns filter but don't branch), partial application.
 
 ## Version Control
 

@@ -53,8 +53,25 @@ pub struct Codegen {
     // Migration schemas: relation_name -> (old_schema, new_schema)
     migrate_schemas: HashMap<String, (String, String)>,
 
+    // View declarations: view_name -> provenance info
+    views: HashMap<String, ViewInfo>,
+
     // Collected diagnostics
     diagnostics: Vec<knot::diagnostic::Diagnostic>,
+}
+
+/// Provenance info for a view declaration, extracted at compile time.
+#[derive(Clone)]
+#[allow(dead_code)]
+struct ViewInfo {
+    /// The underlying source relation name.
+    source_name: String,
+    /// Source columns: (yield_field_name, source_field_name).
+    source_columns: Vec<(String, String)>,
+    /// Constant columns: (field_name, constant_expr).
+    constant_columns: Vec<(String, ast::Expr)>,
+    /// The full view body expression (for read compilation).
+    body: ast::Expr,
 }
 
 struct PendingLambda {
@@ -123,6 +140,14 @@ pub fn compile(
         cg.constructors.insert(name.clone(), field_strs);
     }
     cg.declare_runtime_fns();
+    // Collect view declarations and analyze provenance
+    for decl in &module.decls {
+        if let ast::DeclKind::View { name, body, .. } = &decl.node {
+            if let Some(info) = analyze_view(body) {
+                cg.views.insert(name.clone(), info);
+            }
+        }
+    }
     cg.collect_declarations(module);
     cg.define_functions(module, type_env);
     cg.generate_main(module);
@@ -175,6 +200,7 @@ impl Codegen {
             pending_lambdas: Vec::new(),
             db_path: String::new(),
             migrate_schemas: HashMap::new(),
+            views: HashMap::new(),
             diagnostics: Vec::new(),
         }
     }
@@ -260,6 +286,11 @@ impl Codegen {
         // Transactions
         self.declare_rt("knot_atomic_begin", &[p], &[]);
         self.declare_rt("knot_atomic_commit", &[p], &[]);
+
+        // View operations
+        self.declare_rt("knot_view_read", &[p, p, p, p, p, p, p, p], &[p]);
+        self.declare_rt("knot_relation_add_fields", &[p, p], &[p]);
+        self.declare_rt("knot_view_write", &[p, p, p, p, p, p, p, p, p], &[]);
 
         // Constructor matching
         self.declare_rt("knot_constructor_matches", &[p, p, p], &[types::I32]);
@@ -576,18 +607,74 @@ impl Codegen {
             }
 
             ast::ExprKind::SourceRef(name) => {
-                let schema = self
-                    .source_schemas
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_default();
-                let (name_ptr, name_len) = self.string_ptr(builder, name);
-                let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
-                self.call_rt(
-                    builder,
-                    "knot_source_read",
-                    &[db, name_ptr, name_len, schema_ptr, schema_len],
-                )
+                // Check if this is a view reference
+                let view_info = self.views.get(name).cloned();
+                if let Some(view) = view_info {
+                    if view.constant_columns.is_empty() {
+                        // Simple alias: read the underlying source directly
+                        let schema = self
+                            .source_schemas
+                            .get(&view.source_name)
+                            .cloned()
+                            .unwrap_or_default();
+                        let (name_ptr, name_len) =
+                            self.string_ptr(builder, &view.source_name);
+                        let (schema_ptr, schema_len) =
+                            self.string_ptr(builder, &schema);
+                        self.call_rt(
+                            builder,
+                            "knot_source_read",
+                            &[db, name_ptr, name_len, schema_ptr, schema_len],
+                        )
+                    } else {
+                        // Filtered view: SELECT source columns WHERE constants match
+                        let view_schema = self.compute_view_schema(&view);
+                        let (filter_where, constant_cols) =
+                            self.compute_view_filter(&view);
+
+                        let filter_params = self.compile_view_filter_params(
+                            builder,
+                            &constant_cols,
+                            env,
+                            db,
+                        );
+
+                        let (name_ptr, name_len) =
+                            self.string_ptr(builder, &view.source_name);
+                        let (schema_ptr, schema_len) =
+                            self.string_ptr(builder, &view_schema);
+                        let (filter_ptr, filter_len) =
+                            self.string_ptr(builder, &filter_where);
+
+                        self.call_rt(
+                            builder,
+                            "knot_view_read",
+                            &[
+                                db,
+                                name_ptr,
+                                name_len,
+                                schema_ptr,
+                                schema_len,
+                                filter_ptr,
+                                filter_len,
+                                filter_params,
+                            ],
+                        )
+                    }
+                } else {
+                    let schema = self
+                        .source_schemas
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_default();
+                    let (name_ptr, name_len) = self.string_ptr(builder, name);
+                    let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
+                    self.call_rt(
+                        builder,
+                        "knot_source_read",
+                        &[db, name_ptr, name_len, schema_ptr, schema_len],
+                    )
+                }
             }
 
             ast::ExprKind::DerivedRef(name) => {
@@ -739,8 +826,14 @@ impl Codegen {
             }
 
             ast::ExprKind::Set { target, value } => {
-                // target should be a SourceRef
+                // target should be a SourceRef (source or view)
                 if let ast::ExprKind::SourceRef(name) = &target.node {
+                    // Check if target is a view
+                    let view_info = self.views.get(name).cloned();
+                    if let Some(view) = view_info {
+                        return self.compile_view_set(builder, &view, name, value, env, db);
+                    }
+
                     let schema = self
                         .source_schemas
                         .get(name)
@@ -921,6 +1014,12 @@ impl Codegen {
 
             ast::ExprKind::FullSet { target, value } => {
                 if let ast::ExprKind::SourceRef(name) = &target.node {
+                    // Check if target is a view
+                    let view_info = self.views.get(name).cloned();
+                    if let Some(view) = view_info {
+                        return self.compile_view_set(builder, &view, name, value, env, db);
+                    }
+
                     let schema = self
                         .source_schemas
                         .get(name)
@@ -958,6 +1057,171 @@ impl Codegen {
                 self.call_rt(builder, "knot_value_unit", &[])
             }
         }
+    }
+
+    // ── View compilation ─────────────────────────────────────────
+
+    /// Compute the view schema: subset of source schema for source columns only.
+    fn compute_view_schema(&self, view: &ViewInfo) -> String {
+        let source_schema = self
+            .source_schemas
+            .get(&view.source_name)
+            .cloned()
+            .unwrap_or_default();
+        let view_col_names: Vec<&str> = view
+            .source_columns
+            .iter()
+            .map(|(_, src_col)| src_col.as_str())
+            .collect();
+        source_schema
+            .split(',')
+            .filter(|part| {
+                let name = part.split(':').next().unwrap_or("");
+                view_col_names.contains(&name)
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Compute the WHERE clause and constant column expressions for a view.
+    fn compute_view_filter(&self, view: &ViewInfo) -> (String, Vec<(String, ast::Expr)>) {
+        let filter_parts: Vec<String> = view
+            .constant_columns
+            .iter()
+            .enumerate()
+            .map(|(i, (name, _))| format!("{} = ?{}", quote_sql_ident(name), i + 1))
+            .collect();
+        let filter_where = filter_parts.join(" AND ");
+        (filter_where, view.constant_columns.clone())
+    }
+
+    fn compile_view_set(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        view: &ViewInfo,
+        view_name: &str,
+        value: &ast::Expr,
+        env: &mut Env,
+        db: Value,
+    ) -> Value {
+        let source_name = view.source_name.clone();
+        let source_schema = self
+            .source_schemas
+            .get(&source_name)
+            .cloned()
+            .unwrap_or_default();
+
+        // Check for append optimization: set *view = union *view newRows
+        if let Some(new_rows_expr) = self.match_union_append(view_name, value) {
+            let new_rows_expr = new_rows_expr.clone();
+            let new_rows = self.compile_expr(builder, &new_rows_expr, env, db);
+            let augmented =
+                self.compile_view_augment(builder, new_rows, &view.constant_columns, env, db);
+            let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
+            let (schema_ptr, schema_len) = self.string_ptr(builder, &source_schema);
+            self.call_rt_void(
+                builder,
+                "knot_source_append",
+                &[db, name_ptr, name_len, schema_ptr, schema_len, augmented],
+            );
+        } else if view.constant_columns.is_empty() {
+            // No constant columns — simple alias, use diff-write on underlying source
+            let val = self.compile_expr(builder, value, env, db);
+            let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
+            let (schema_ptr, schema_len) = self.string_ptr(builder, &source_schema);
+            self.call_rt_void(
+                builder,
+                "knot_source_diff_write",
+                &[db, name_ptr, name_len, schema_ptr, schema_len, val],
+            );
+        } else {
+            // General case: delete matching rows, insert new rows with constants
+            let new_val = self.compile_expr(builder, value, env, db);
+            let augmented =
+                self.compile_view_augment(builder, new_val, &view.constant_columns, env, db);
+
+            // Build filter WHERE clause
+            let filter_parts: Vec<String> = view
+                .constant_columns
+                .iter()
+                .enumerate()
+                .map(|(i, (name, _))| format!("{} = ?{}", quote_sql_ident(name), i + 1))
+                .collect();
+            let filter_where = filter_parts.join(" AND ");
+
+            // Build filter params
+            let constant_cols = view.constant_columns.clone();
+            let filter_params =
+                self.compile_view_filter_params(builder, &constant_cols, env, db);
+
+            let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
+            let (schema_ptr, schema_len) = self.string_ptr(builder, &source_schema);
+            let (filter_ptr, filter_len) = self.string_ptr(builder, &filter_where);
+
+            self.call_rt_void(
+                builder,
+                "knot_view_write",
+                &[
+                    db,
+                    name_ptr,
+                    name_len,
+                    schema_ptr,
+                    schema_len,
+                    filter_ptr,
+                    filter_len,
+                    filter_params,
+                    augmented,
+                ],
+            );
+        }
+
+        self.call_rt(builder, "knot_value_unit", &[])
+    }
+
+    /// Augment each row in a relation with constant column values.
+    fn compile_view_augment(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        relation: Value,
+        constant_columns: &[(String, ast::Expr)],
+        env: &mut Env,
+        db: Value,
+    ) -> Value {
+        if constant_columns.is_empty() {
+            return relation;
+        }
+
+        // Build extra fields record
+        let n = constant_columns.len();
+        let n_val = builder.ins().iconst(self.ptr_type, n as i64);
+        let extra = self.call_rt(builder, "knot_record_empty", &[n_val]);
+        for (name, expr) in constant_columns {
+            let val = self.compile_expr(builder, expr, env, db);
+            let (key_ptr, key_len) = self.string_ptr(builder, name);
+            self.call_rt_void(
+                builder,
+                "knot_record_set_field",
+                &[extra, key_ptr, key_len, val],
+            );
+        }
+
+        self.call_rt(builder, "knot_relation_add_fields", &[relation, extra])
+    }
+
+    /// Build a flat relation of SQL parameter values from constant column expressions.
+    fn compile_view_filter_params(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        constant_columns: &[(String, ast::Expr)],
+        env: &mut Env,
+        db: Value,
+    ) -> Value {
+        let rel = self.call_rt(builder, "knot_relation_empty", &[]);
+        for (_, expr) in constant_columns {
+            let val = self.compile_expr(builder, expr, env, db);
+            self.call_rt_void(builder, "knot_relation_push", &[rel, val]);
+        }
+        rel
     }
 
     // ── Application compilation ───────────────────────────────────
@@ -1913,6 +2177,122 @@ impl Codegen {
             self.call_rt_void(builder, "knot_relation_push", &[rel, val]);
         }
         rel
+    }
+}
+
+// ── View analysis ─────────────────────────────────────────────────
+
+/// Analyze a view body expression to extract column provenance.
+/// Returns `None` if the view body cannot be analyzed (unsupported pattern).
+fn analyze_view(body: &ast::Expr) -> Option<ViewInfo> {
+    // Case 1: simple alias — *view = *source
+    if let ast::ExprKind::SourceRef(source_name) = &body.node {
+        return Some(ViewInfo {
+            source_name: source_name.clone(),
+            source_columns: vec![],
+            constant_columns: vec![],
+            body: body.clone(),
+        });
+    }
+
+    // Case 2: do-block with bind + yield
+    if let ast::ExprKind::Do(stmts) = &body.node {
+        // Find the bind statement: t <- *source
+        let bind_info = stmts.iter().find_map(|s| {
+            if let ast::StmtKind::Bind { pat, expr } = &s.node {
+                if let ast::ExprKind::SourceRef(source_name) = &expr.node {
+                    if let ast::PatKind::Var(var_name) = &pat.node {
+                        return Some((var_name.clone(), source_name.clone()));
+                    }
+                }
+            }
+            None
+        })?;
+
+        let (bind_var, source_name) = bind_info;
+
+        // Find the yield expression with a record
+        let yield_record = stmts.iter().rev().find_map(|s| {
+            if let ast::StmtKind::Expr(expr) = &s.node {
+                if let ast::ExprKind::Yield(inner) = &expr.node {
+                    if let ast::ExprKind::Record(fields) = &inner.node {
+                        return Some(fields.clone());
+                    }
+                }
+            }
+            None
+        })?;
+
+        let mut source_columns = Vec::new();
+        let mut constant_columns = Vec::new();
+
+        for field in &yield_record {
+            // Check if it's a field access on the bind var: t.field
+            if let ast::ExprKind::FieldAccess {
+                expr,
+                field: accessed_field,
+            } = &field.value.node
+            {
+                if let ast::ExprKind::Var(var_name) = &expr.node {
+                    if var_name == &bind_var {
+                        source_columns.push((field.name.clone(), accessed_field.clone()));
+                        continue;
+                    }
+                }
+            }
+            // Check it doesn't reference the bind var (constant column)
+            if !expr_references_var(&field.value, &bind_var) {
+                constant_columns.push((field.name.clone(), field.value.clone()));
+            }
+            // If it references bind_var but isn't a simple field access,
+            // it's a computed column — view reads work, writes are not supported.
+        }
+
+        return Some(ViewInfo {
+            source_name,
+            source_columns,
+            constant_columns,
+            body: body.clone(),
+        });
+    }
+
+    None
+}
+
+/// Check if an expression references a specific variable name.
+fn expr_references_var(expr: &ast::Expr, var_name: &str) -> bool {
+    match &expr.node {
+        ast::ExprKind::Var(name) => name == var_name,
+        ast::ExprKind::Lit(_)
+        | ast::ExprKind::Constructor(_)
+        | ast::ExprKind::SourceRef(_)
+        | ast::ExprKind::DerivedRef(_) => false,
+        ast::ExprKind::Record(fields) => fields
+            .iter()
+            .any(|f| expr_references_var(&f.value, var_name)),
+        ast::ExprKind::App { func, arg } => {
+            expr_references_var(func, var_name) || expr_references_var(arg, var_name)
+        }
+        ast::ExprKind::FieldAccess { expr, .. } => expr_references_var(expr, var_name),
+        ast::ExprKind::BinOp { lhs, rhs, .. } => {
+            expr_references_var(lhs, var_name) || expr_references_var(rhs, var_name)
+        }
+        ast::ExprKind::UnaryOp { operand, .. } => expr_references_var(operand, var_name),
+        ast::ExprKind::Lambda { body, params, .. } => {
+            // If the lambda rebinds the var, don't look inside
+            let rebinds = params
+                .iter()
+                .any(|p| matches!(&p.node, ast::PatKind::Var(n) if n == var_name));
+            !rebinds && expr_references_var(body, var_name)
+        }
+        ast::ExprKind::RecordUpdate { base, fields } => {
+            expr_references_var(base, var_name)
+                || fields
+                    .iter()
+                    .any(|f| expr_references_var(&f.value, var_name))
+        }
+        // Conservatively return true for complex expressions
+        _ => true,
     }
 }
 

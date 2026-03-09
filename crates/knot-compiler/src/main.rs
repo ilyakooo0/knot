@@ -4,6 +4,7 @@
 
 mod codegen;
 mod linker;
+mod lockfile;
 mod types;
 
 use std::path::PathBuf;
@@ -78,6 +79,20 @@ fn cmd_build(source_file: &str) {
     // Resolve types
     let type_env = types::TypeEnv::from_module(&module);
 
+    // Check schema lockfile
+    let lock_diags = lockfile::check(&source_path, &module, &type_env);
+    if !lock_diags.is_empty() {
+        for diag in &lock_diags {
+            eprintln!("{}", diag.render(&source, &filename));
+        }
+        if lock_diags
+            .iter()
+            .any(|d| d.severity == knot::diagnostic::Severity::Error)
+        {
+            process::exit(1);
+        }
+    }
+
     // Code generation
     let obj_bytes = match codegen::compile(&module, &type_env, source_file) {
         Ok(bytes) => bytes,
@@ -109,6 +124,11 @@ fn cmd_build(source_file: &str) {
 
     // Clean up
     let _ = std::fs::remove_file(&obj_path);
+
+    // Update schema lockfile
+    if let Err(e) = lockfile::update(&source_path, &source, &module) {
+        eprintln!("Warning: {}", e);
+    }
 
     eprintln!("Compiled: {}", output_path.display());
 }

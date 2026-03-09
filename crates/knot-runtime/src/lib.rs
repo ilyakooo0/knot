@@ -835,6 +835,95 @@ pub extern "C" fn knot_source_write(
         .expect("knot runtime: failed to commit transaction");
 }
 
+/// Append rows to a source relation (INSERT only, no DELETE).
+/// Used when the compiler detects `set *rel = union *rel <new_rows>`.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_source_append(
+    db: *mut c_void,
+    name_ptr: *const u8,
+    name_len: usize,
+    schema_ptr: *const u8,
+    schema_len: usize,
+    relation: *mut Value,
+) {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let name = unsafe { str_from_raw(name_ptr, name_len) };
+    let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
+    let cols = parse_schema(schema);
+
+    let rows = match unsafe { as_ref(relation) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: source_append expects a Relation, got {}",
+            type_name(relation)
+        ),
+    };
+
+    if cols.is_empty() || rows.is_empty() {
+        return;
+    }
+
+    db_ref
+        .conn
+        .execute_batch("BEGIN;")
+        .expect("knot runtime: failed to begin transaction");
+
+    let col_names: Vec<String> = cols.iter().map(|c| format!("\"{}\"", c.name)).collect();
+    let placeholders: Vec<String> = cols
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect();
+    let insert_sql = format!(
+        "INSERT OR IGNORE INTO \"_knot_{}\" ({}) VALUES ({});",
+        name,
+        col_names.join(", "),
+        placeholders.join(", ")
+    );
+
+    let mut stmt = db_ref
+        .conn
+        .prepare(&insert_sql)
+        .expect("knot runtime: failed to prepare insert");
+
+    for row_ptr in rows {
+        let row = unsafe { as_ref(*row_ptr) };
+        match row {
+            Value::Record(fields) => {
+                let params: Vec<rusqlite::types::Value> = cols
+                    .iter()
+                    .map(|col| {
+                        let field = fields
+                            .iter()
+                            .find(|f| f.name == col.name)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "knot runtime: missing field '{}' in record",
+                                    col.name
+                                )
+                            });
+                        value_to_sqlite(field.value, col.ty)
+                    })
+                    .collect();
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+                stmt.execute(param_refs.as_slice()).unwrap_or_else(|e| {
+                    panic!("knot runtime: insert error: {}", e)
+                });
+            }
+            _ => panic!(
+                "knot runtime: relation rows must be Records, got {}",
+                type_name(*row_ptr)
+            ),
+        }
+    }
+
+    db_ref
+        .conn
+        .execute_batch("COMMIT;")
+        .expect("knot runtime: failed to commit transaction");
+}
+
 fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
     match (unsafe { as_ref(v) }, ty) {
         (Value::Int(n), _) => rusqlite::types::Value::Integer(*n),

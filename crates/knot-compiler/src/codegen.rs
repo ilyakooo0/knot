@@ -212,6 +212,7 @@ impl Codegen {
         self.declare_rt("knot_source_init", &[p, p, p, p, p], &[]);
         self.declare_rt("knot_source_read", &[p, p, p, p, p], &[p]);
         self.declare_rt("knot_source_write", &[p, p, p, p, p, p], &[]);
+        self.declare_rt("knot_source_append", &[p, p, p, p, p, p], &[]);
 
         // Transactions
         self.declare_rt("knot_atomic_begin", &[p], &[]);
@@ -663,15 +664,29 @@ impl Codegen {
                         .get(name)
                         .cloned()
                         .unwrap_or_default();
-                    let val = self.compile_expr(builder, value, env, db);
-                    let (name_ptr, name_len) = self.string_ptr(builder, name);
-                    let (schema_ptr, schema_len) =
-                        self.string_ptr(builder, &schema);
-                    self.call_rt_void(
-                        builder,
-                        "knot_source_write",
-                        &[db, name_ptr, name_len, schema_ptr, schema_len, val],
-                    );
+
+                    // Optimize: detect `set *rel = union *rel <expr>` → append only
+                    if let Some(new_rows_expr) = self.match_union_append(name, value) {
+                        let new_rows = self.compile_expr(builder, new_rows_expr, env, db);
+                        let (name_ptr, name_len) = self.string_ptr(builder, name);
+                        let (schema_ptr, schema_len) =
+                            self.string_ptr(builder, &schema);
+                        self.call_rt_void(
+                            builder,
+                            "knot_source_append",
+                            &[db, name_ptr, name_len, schema_ptr, schema_len, new_rows],
+                        );
+                    } else {
+                        let val = self.compile_expr(builder, value, env, db);
+                        let (name_ptr, name_len) = self.string_ptr(builder, name);
+                        let (schema_ptr, schema_len) =
+                            self.string_ptr(builder, &schema);
+                        self.call_rt_void(
+                            builder,
+                            "knot_source_write",
+                            &[db, name_ptr, name_len, schema_ptr, schema_len, val],
+                        );
+                    }
                     self.call_rt(builder, "knot_value_unit", &[])
                 } else {
                     panic!("codegen: set target must be a source reference")
@@ -1269,6 +1284,44 @@ impl Codegen {
         let ptr = builder.ins().global_value(self.ptr_type, gv);
         let len = builder.ins().iconst(self.ptr_type, s.len() as i64);
         (ptr, len)
+    }
+
+    // ── Set-expression analysis ──────────────────────────────────
+
+    /// Detect `set *rel = union *rel <expr>` (or `union <expr> *rel`) and
+    /// return the "new rows" expression so we can emit an append instead of
+    /// a full table replacement.
+    fn match_union_append<'a>(
+        &self,
+        source_name: &str,
+        value: &'a ast::Expr,
+    ) -> Option<&'a ast::Expr> {
+        // Match: App(App(Var("union"), arg1), arg2)
+        if let ast::ExprKind::App { func, arg: arg2 } = &value.node {
+            if let ast::ExprKind::App {
+                func: inner_func,
+                arg: arg1,
+            } = &func.node
+            {
+                if let ast::ExprKind::Var(fn_name) = &inner_func.node {
+                    if fn_name == "union" {
+                        // union *rel <new_rows>
+                        if let ast::ExprKind::SourceRef(name) = &arg1.node {
+                            if name == source_name {
+                                return Some(arg2);
+                            }
+                        }
+                        // union <new_rows> *rel
+                        if let ast::ExprKind::SourceRef(name) = &arg2.node {
+                            if name == source_name {
+                                return Some(arg1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 }
 

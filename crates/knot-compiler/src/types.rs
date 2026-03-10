@@ -4,7 +4,7 @@
 //! runtime uses to create SQLite tables and read/write rows.
 
 use knot::ast::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -40,6 +40,8 @@ pub struct TypeEnv {
     /// Associated type definitions: assoc_type_name -> definitions from impls
     #[allow(dead_code)]
     pub associated_types: HashMap<String, Vec<AssocTypeDef>>,
+    /// Sources with `with history` enabled
+    pub history_sources: HashSet<String>,
 }
 
 impl TypeEnv {
@@ -49,6 +51,7 @@ impl TypeEnv {
         let mut source_schemas = HashMap::new();
         let mut migrate_schemas = HashMap::new();
         let mut associated_types: HashMap<String, Vec<AssocTypeDef>> = HashMap::new();
+        let mut history_sources = HashSet::new();
 
         // First pass: collect type aliases and data types
         for decl in &module.decls {
@@ -130,10 +133,13 @@ impl TypeEnv {
         // Second pass: compute source schemas and migration schemas
         for decl in &module.decls {
             match &decl.node {
-                DeclKind::Source { name, ty, .. } => {
+                DeclKind::Source { name, ty, history } => {
                     let schema =
                         schema_for_source(ty, &aliases, &associated_types);
                     source_schemas.insert(name.clone(), schema);
+                    if *history {
+                        history_sources.insert(name.clone());
+                    }
                 }
                 DeclKind::Migrate {
                     relation,
@@ -160,6 +166,7 @@ impl TypeEnv {
             source_schemas,
             migrate_schemas,
             associated_types,
+            history_sources,
         }
     }
 }

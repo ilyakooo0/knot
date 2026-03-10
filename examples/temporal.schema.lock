@@ -1,0 +1,5 @@
+-- schema.lock (auto-generated, do not edit)
+-- Commit to source control.
+
+*employees : [{name: Text, salary: Int}]
+  with history

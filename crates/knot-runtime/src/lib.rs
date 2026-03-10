@@ -1523,6 +1523,201 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
     }
 }
 
+// ── Temporal queries (history tracking) ───────────────────────────
+
+/// Return current time as milliseconds since Unix epoch.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_now() -> *mut Value {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    knot_value_int(ms)
+}
+
+/// Initialize a history table for a source with `with history`.
+/// Creates `_knot_{name}_history` with the same columns plus `_knot_valid_from`
+/// and `_knot_valid_to` timestamp columns.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_history_init(
+    db: *mut c_void,
+    name_ptr: *const u8,
+    name_len: usize,
+    schema_ptr: *const u8,
+    schema_len: usize,
+) {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let name = unsafe { str_from_raw(name_ptr, name_len) };
+    let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
+    let cols = parse_schema(schema);
+
+    let history_table = quote_ident(&format!("_knot_{}_history", name));
+    let mut col_defs: Vec<String> = cols
+        .iter()
+        .map(|c| format!("{} {}", quote_ident(&c.name), sql_type(c.ty)))
+        .collect();
+    col_defs.push("\"_knot_valid_from\" INTEGER NOT NULL".to_string());
+    col_defs.push("\"_knot_valid_to\" INTEGER".to_string());
+
+    let sql = format!(
+        "CREATE TABLE IF NOT EXISTS {} ({});",
+        history_table,
+        col_defs.join(", ")
+    );
+    debug_sql(&sql);
+    db_ref.conn.execute_batch(&sql).unwrap_or_else(|e| {
+        panic!(
+            "knot runtime: failed to create history table for '{}': {}",
+            name, e
+        )
+    });
+
+    // Index on valid_from/valid_to for efficient temporal queries
+    let idx_sql = format!(
+        "CREATE INDEX IF NOT EXISTS {} ON {} (\"_knot_valid_from\", \"_knot_valid_to\");",
+        quote_ident(&format!("_knot_{}_history_time", name)),
+        history_table
+    );
+    debug_sql(&idx_sql);
+    let _ = db_ref.conn.execute_batch(&idx_sql);
+}
+
+/// Snapshot the current state of a source into its history table.
+/// Called before each write to a history-enabled source.
+/// Closes out any open history rows (valid_to IS NULL) and inserts
+/// the current state with valid_from = now and valid_to = NULL.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_history_snapshot(
+    db: *mut c_void,
+    name_ptr: *const u8,
+    name_len: usize,
+    schema_ptr: *const u8,
+    schema_len: usize,
+) {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let name = unsafe { str_from_raw(name_ptr, name_len) };
+    let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
+    let cols = parse_schema(schema);
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    let table = quote_ident(&format!("_knot_{}", name));
+    let history_table = quote_ident(&format!("_knot_{}_history", name));
+
+    // Close out currently-open history rows
+    let close_sql = format!(
+        "UPDATE {} SET \"_knot_valid_to\" = ?1 WHERE \"_knot_valid_to\" IS NULL;",
+        history_table
+    );
+    debug_sql(&close_sql);
+    db_ref
+        .conn
+        .execute(&close_sql, rusqlite::params![now_ms])
+        .unwrap_or_else(|e| {
+            panic!(
+                "knot runtime: failed to close history rows for '{}': {}",
+                name, e
+            )
+        });
+
+    // Insert current state as new open rows
+    if !cols.is_empty() {
+        let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
+        let insert_sql = format!(
+            "INSERT INTO {} ({}, \"_knot_valid_from\", \"_knot_valid_to\") SELECT {}, ?1, NULL FROM {};",
+            history_table,
+            col_names.join(", "),
+            col_names.join(", "),
+            table
+        );
+        debug_sql(&insert_sql);
+        db_ref
+            .conn
+            .execute(&insert_sql, rusqlite::params![now_ms])
+            .unwrap_or_else(|e| {
+                panic!(
+                    "knot runtime: failed to snapshot history for '{}': {}",
+                    name, e
+                )
+            });
+    }
+}
+
+/// Read a source relation at a specific point in time.
+/// Returns the rows that were valid at the given timestamp (milliseconds since epoch).
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_source_read_at(
+    db: *mut c_void,
+    name_ptr: *const u8,
+    name_len: usize,
+    schema_ptr: *const u8,
+    schema_len: usize,
+    timestamp: *mut Value,
+) -> *mut Value {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let name = unsafe { str_from_raw(name_ptr, name_len) };
+    let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
+    let cols = parse_schema(schema);
+
+    let ts = match unsafe { as_ref(timestamp) } {
+        Value::Int(n) => *n,
+        _ => panic!(
+            "knot runtime: temporal query timestamp must be Int, got {}",
+            type_name(timestamp)
+        ),
+    };
+
+    let history_table = quote_ident(&format!("_knot_{}_history", name));
+    let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
+
+    let sql = format!(
+        "SELECT {} FROM {} WHERE \"_knot_valid_from\" <= ?1 AND (\"_knot_valid_to\" IS NULL OR \"_knot_valid_to\" > ?1)",
+        if col_names.is_empty() {
+            "1".to_string()
+        } else {
+            col_names.join(", ")
+        },
+        history_table
+    );
+
+    debug_sql(&sql);
+    let mut stmt = db_ref
+        .conn
+        .prepare(&sql)
+        .unwrap_or_else(|e| panic!("knot runtime: temporal query error: {}", e));
+
+    let mut rows: Vec<*mut Value> = Vec::new();
+    let mut result_rows = stmt
+        .query(rusqlite::params![ts])
+        .unwrap_or_else(|e| panic!("knot runtime: temporal query exec error: {}", e));
+
+    while let Some(row) = result_rows
+        .next()
+        .unwrap_or_else(|e| panic!("knot runtime: temporal row fetch error: {}", e))
+    {
+        let record = knot_record_empty(cols.len());
+        for (i, col) in cols.iter().enumerate() {
+            let val = match col.ty {
+                ColType::Int => knot_value_int(row.get::<_, i64>(i).unwrap()),
+                ColType::Float => knot_value_float(row.get::<_, f64>(i).unwrap()),
+                ColType::Text => {
+                    let s: String = row.get(i).unwrap();
+                    alloc(Value::Text(s))
+                }
+                ColType::Bool => knot_value_bool(row.get::<_, i32>(i).unwrap()),
+            };
+            let field_name = col.name.as_bytes();
+            knot_record_set_field(record, field_name.as_ptr(), field_name.len(), val);
+        }
+        rows.push(record);
+    }
+
+    alloc(Value::Relation(rows))
+}
+
 // ── Atomic (transactions) ─────────────────────────────────────────
 
 #[unsafe(no_mangle)]

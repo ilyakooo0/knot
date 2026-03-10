@@ -445,9 +445,9 @@ impl Parser {
         if self.eat(&TokenKind::Colon) {
             // Source declaration: *name : type
             let ty = self.parse_type()?;
-            // Optional `with history`
+            // Optional `with history` (may be on the next line)
             let mut history = false;
-            // Check for 'with history'
+            self.skip_newlines();
             if self.eat(&TokenKind::With) {
                 if matches!(self.peek(), TokenKind::Lower(s) if s == "history") {
                     self.advance();

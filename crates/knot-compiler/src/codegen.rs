@@ -17,6 +17,7 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 use knot::ast;
 use std::collections::{HashMap, HashSet};
 
+
 // ── Codegen state ─────────────────────────────────────────────────
 
 pub struct Codegen {
@@ -79,6 +80,9 @@ pub struct Codegen {
 
     // Track which types implement which trait: trait_name -> [(type_name, impl_span)]
     trait_impl_types: HashMap<String, Vec<(String, knot::ast::Span)>>,
+
+    // Sources with `with history` enabled
+    history_sources: HashSet<String>,
 }
 
 /// Provenance info for a view declaration, extracted at compile time.
@@ -185,6 +189,7 @@ pub fn compile(
     cg.db_path = format!("{}.db", stem);
     cg.source_schemas = type_env.source_schemas.clone();
     cg.migrate_schemas = type_env.migrate_schemas.clone();
+    cg.history_sources = type_env.history_sources.clone();
     for (name, fields) in &type_env.constructors {
         let field_strs: Vec<(String, String)> = fields
             .iter()
@@ -262,6 +267,7 @@ impl Codegen {
             derived_methods: Vec::new(),
             trait_supertraits: HashMap::new(),
             trait_impl_types: HashMap::new(),
+            history_sources: HashSet::new(),
         }
     }
 
@@ -362,6 +368,12 @@ impl Codegen {
 
         // Type tag inspection (for trait dispatch)
         self.declare_rt("knot_value_get_tag", &[p], &[types::I32]);
+
+        // Temporal queries (history)
+        self.declare_rt("knot_now", &[], &[p]);
+        self.declare_rt("knot_history_init", &[p, p, p, p, p], &[]);
+        self.declare_rt("knot_history_snapshot", &[p, p, p, p, p], &[]);
+        self.declare_rt("knot_source_read_at", &[p, p, p, p, p, p], &[p]);
     }
 
     fn declare_rt(&mut self, name: &str, params: &[types::Type], returns: &[types::Type]) {
@@ -1216,6 +1228,7 @@ impl Codegen {
             }
 
             // Initialize source tables
+            let history_sources = cg.history_sources.clone();
             for decl in &decls {
                 if let ast::DeclKind::Source { name, .. } = &decl.node {
                     let schema = cg
@@ -1230,6 +1243,17 @@ impl Codegen {
                         init_ref,
                         &[db, name_ptr, name_len, schema_ptr, schema_len],
                     );
+
+                    // Initialize history table for sources with `with history`
+                    if history_sources.contains(name) {
+                        let (hn_ptr, hn_len) = cg.string_ptr(builder, name);
+                        let (hs_ptr, hs_len) = cg.string_ptr(builder, &schema);
+                        cg.call_rt_void(
+                            builder,
+                            "knot_history_init",
+                            &[db, hn_ptr, hn_len, hs_ptr, hs_len],
+                        );
+                    }
                 }
             }
 
@@ -1276,6 +1300,9 @@ impl Codegen {
             ast::ExprKind::Lit(lit) => self.compile_lit(builder, lit),
 
             ast::ExprKind::Var(name) => {
+                if name == "now" {
+                    return self.call_rt(builder, "knot_now", &[]);
+                }
                 if env.bindings.contains_key(name) {
                     env.get(name)
                 } else if let Some((func_id, n_params)) =
@@ -1544,6 +1571,9 @@ impl Codegen {
                         .cloned()
                         .unwrap_or_default();
 
+                    // Snapshot history before writing (if history-enabled)
+                    self.emit_history_snapshot(builder, db, name, &schema);
+
                     if let Some(new_rows_expr) = self.match_union_append(name, value) {
                         // 1. Append: union *rel <new> → INSERT only
                         let new_rows = self.compile_expr(builder, new_rows_expr, env, db);
@@ -1729,6 +1759,10 @@ impl Codegen {
                         .get(name)
                         .cloned()
                         .unwrap_or_default();
+
+                    // Snapshot history before writing (if history-enabled)
+                    self.emit_history_snapshot(builder, db, name, &schema);
+
                     let val = self.compile_expr(builder, value, env, db);
                     let (name_ptr, name_len) = self.string_ptr(builder, name);
                     let (schema_ptr, schema_len) =
@@ -1756,9 +1790,27 @@ impl Codegen {
                 arms,
             } => self.compile_case(builder, scrutinee, arms, env, db),
 
-            ast::ExprKind::At { .. } => {
-                // Temporal queries not yet supported
-                self.call_rt(builder, "knot_value_unit", &[])
+            ast::ExprKind::At { relation, time } => {
+                // Temporal query: *source @(timestamp)
+                if let ast::ExprKind::SourceRef(name) = &relation.node {
+                    let schema = self
+                        .source_schemas
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_default();
+                    let timestamp = self.compile_expr(builder, time, env, db);
+                    let (name_ptr, name_len) = self.string_ptr(builder, name);
+                    let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
+                    self.call_rt(
+                        builder,
+                        "knot_source_read_at",
+                        &[db, name_ptr, name_len, schema_ptr, schema_len, timestamp],
+                    )
+                } else {
+                    // For non-source At expressions, compile the relation normally
+                    // (future: could support views with history)
+                    self.compile_expr(builder, relation, env, db)
+                }
             }
         }
     }
@@ -2538,6 +2590,25 @@ impl Codegen {
         data_id
     }
 
+    /// Emit a history snapshot call if the source has `with history`.
+    fn emit_history_snapshot(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        db: Value,
+        name: &str,
+        schema: &str,
+    ) {
+        if self.history_sources.contains(name) {
+            let (name_ptr, name_len) = self.string_ptr(builder, name);
+            let (schema_ptr, schema_len) = self.string_ptr(builder, schema);
+            self.call_rt_void(
+                builder,
+                "knot_history_snapshot",
+                &[db, name_ptr, name_len, schema_ptr, schema_len],
+            );
+        }
+    }
+
     /// Get the pointer and length of a string constant as Cranelift Values.
     fn string_ptr(
         &mut self,
@@ -3282,6 +3353,7 @@ fn is_builtin_name(name: &str) -> bool {
             | "filter"
             | "map"
             | "fold"
+            | "now"
     )
 }
 

@@ -1007,6 +1007,17 @@ fn source_with_history() {
     }
 }
 
+#[test]
+fn source_with_history_multiline() {
+    match first_decl("*employees : [Person]\n  with history") {
+        DeclKind::Source { name, history, .. } => {
+            assert_eq!(name, "employees");
+            assert!(history);
+        }
+        other => panic!("expected Source with history, got {:?}", other),
+    }
+}
+
 // ── View Declarations ───────────────────────────────────────────────
 
 #[test]

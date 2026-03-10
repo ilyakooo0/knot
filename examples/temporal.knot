@@ -1,0 +1,29 @@
+-- Temporal queries example: history tracking on source relations
+
+*employees : [{name: Text, salary: Int}]
+  with history
+
+-- Add initial employees
+addEmployees = do
+  set *employees = union *employees [{name: "Alice", salary: 80000}]
+  set *employees = union *employees [{name: "Bob", salary: 90000}]
+  yield {}
+
+-- Give everyone a raise
+giveRaises = do
+  full set *employees = do
+    e <- *employees
+    yield {e | salary: e.salary + 10000}
+  yield {}
+
+main = do
+  addEmployees
+  let t1 = now
+  giveRaises
+  let current = *employees
+  let past = *employees @(t1)
+  println "Current employees:"
+  println current
+  println "Employees before raises:"
+  println past
+  yield {}

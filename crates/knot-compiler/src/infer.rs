@@ -951,7 +951,8 @@ impl Infer {
 
             ast::ExprKind::At { relation, time } => {
                 let rel_ty = self.infer_expr(relation);
-                let _ = self.infer_expr(time);
+                let time_ty = self.infer_expr(time);
+                self.unify(&time_ty, &Ty::Int, time.span);
                 rel_ty
             }
         }
@@ -1340,6 +1341,12 @@ impl Infer {
                 ty: Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::unit())),
             },
         );
+
+        // now : Int (current time in milliseconds since epoch)
+        self.bind_top(
+            "now",
+            Scheme::mono(Ty::Int),
+        );
     }
 
     fn register_trait_methods(
@@ -1681,5 +1688,28 @@ mod tests {
         assert!(check_src(
             "apply = \\f x -> f x\nmain = apply (\\x -> x + 1) 5"
         ).is_empty());
+    }
+
+    #[test]
+    fn now_builtin() {
+        // now should type as Int
+        assert!(check_src("main = now + 1000").is_empty());
+    }
+
+    #[test]
+    fn temporal_at_expression() {
+        // @(timestamp) on a source should preserve the relation type
+        assert!(check_src(
+            "*people : [{name: Text, age: Int}]\nmain = *people @(now)"
+        ).is_empty());
+    }
+
+    #[test]
+    fn temporal_at_requires_int_time() {
+        // time expression must be Int, not Text
+        let diags = check_src(
+            "*people : [{name: Text}]\nmain = *people @(\"yesterday\")"
+        );
+        assert!(has_error(&diags, "type mismatch"));
     }
 }

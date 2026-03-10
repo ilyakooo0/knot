@@ -403,6 +403,18 @@ impl Codegen {
                         .unwrap();
                     self.user_fns.insert(name.clone(), (func_id, n_params));
                 }
+                ast::DeclKind::Derived { name, .. } => {
+                    // Derived relations are 0-param functions (only db param)
+                    let mut sig = self.module.make_signature();
+                    sig.params.push(AbiParam::new(self.ptr_type)); // db
+                    sig.returns.push(AbiParam::new(self.ptr_type));
+                    let func_name = format!("knot_user_{}", name);
+                    let func_id = self
+                        .module
+                        .declare_function(&func_name, Linkage::Local, &sig)
+                        .unwrap();
+                    self.user_fns.insert(name.clone(), (func_id, 0));
+                }
                 ast::DeclKind::Data {
                     name,
                     constructors: ctors,
@@ -755,6 +767,9 @@ impl Codegen {
                             self.define_user_function(name, &[], body);
                         }
                     }
+                }
+                ast::DeclKind::Derived { name, body, .. } => {
+                    self.define_user_function(name, &[], body);
                 }
                 ast::DeclKind::Impl {
                     trait_name,

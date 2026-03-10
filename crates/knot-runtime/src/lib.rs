@@ -70,6 +70,8 @@ pub struct RecordField {
 /// SQLite database handle.
 pub struct KnotDb {
     pub conn: Connection,
+    /// Nesting depth for `atomic` savepoints.
+    atomic_depth: std::cell::Cell<usize>,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────
@@ -691,7 +693,10 @@ pub extern "C" fn knot_db_open(path_ptr: *const u8, path_len: usize) -> *mut c_v
     let conn = Connection::open(path).expect("knot runtime: failed to open database");
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
         .expect("knot runtime: failed to set pragmas");
-    let db = Box::new(KnotDb { conn });
+    let db = Box::new(KnotDb {
+        conn,
+        atomic_depth: std::cell::Cell::new(0),
+    });
     Box::into_raw(db) as *mut c_void
 }
 
@@ -1723,28 +1728,34 @@ pub extern "C" fn knot_source_read_at(
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_atomic_begin(db: *mut c_void) {
     let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let depth = db_ref.atomic_depth.get() + 1;
+    db_ref.atomic_depth.set(depth);
     db_ref
         .conn
-        .execute_batch("SAVEPOINT knot_atomic;")
+        .execute_batch(&format!("SAVEPOINT knot_atomic_{depth};"))
         .expect("knot runtime: failed to begin atomic");
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_atomic_commit(db: *mut c_void) {
     let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let depth = db_ref.atomic_depth.get();
     db_ref
         .conn
-        .execute_batch("RELEASE SAVEPOINT knot_atomic;")
+        .execute_batch(&format!("RELEASE SAVEPOINT knot_atomic_{depth};"))
         .expect("knot runtime: failed to commit atomic");
+    db_ref.atomic_depth.set(depth - 1);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_atomic_rollback(db: *mut c_void) {
     let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let depth = db_ref.atomic_depth.get();
     db_ref
         .conn
-        .execute_batch("ROLLBACK TO SAVEPOINT knot_atomic;")
+        .execute_batch(&format!("ROLLBACK TO SAVEPOINT knot_atomic_{depth};"))
         .expect("knot runtime: failed to rollback atomic");
+    db_ref.atomic_depth.set(depth - 1);
 }
 
 // ── Record update ─────────────────────────────────────────────────

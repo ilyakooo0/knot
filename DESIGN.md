@@ -142,7 +142,7 @@ Use `set` with a `map` over the outer relation that transforms the nested relati
 
 ```knot
 -- Add a member to a team
-addMember teamName person =
+addMember = \teamName person ->
   set *teams = do
     t <- *teams
     yield (if t.name == teamName
@@ -150,7 +150,7 @@ addMember teamName person =
       else t)
 
 -- Remove a member from all teams
-removePerson personName =
+removePerson = \personName ->
   set *teams = do
     t <- *teams
     yield {t | members: do
@@ -244,12 +244,12 @@ trait Foldable (t : Type -> Type) where
   yield {e.name, e.salary, d.budget}
 
 -- do with Maybe
-safeDivide a b = do
+safeDivide = \a b -> do
   where b != 0
   yield (a / b)
 
 -- do with Result
-parseConfig text = do
+parseConfig = \text -> do
   json <- parseJson text
   name <- getField "name" json
   yield name
@@ -302,13 +302,13 @@ Everything else is built from trait methods + `set`. The compiler recognizes the
 **`where`** — conditional empty (requires `Alternative`):
 
 ```knot
-where cond = if cond then yield {} else empty
+where = \cond -> if cond then yield {} else empty
 ```
 
 **`filter`** — filter rows:
 
 ```knot
-filter p rel = do
+filter = \p rel -> do
   x <- rel
   where (p x)
   yield x
@@ -317,7 +317,7 @@ filter p rel = do
 **`project`** — pick fields (just `yield` with fewer fields):
 
 ```knot
-projectName rel = do
+projectName = \rel -> do
   x <- rel
   yield {x.name}
 ```
@@ -325,7 +325,7 @@ projectName rel = do
 **`join`** — combine relations on a condition:
 
 ```knot
-join a b = do
+join = \a b -> do
   x <- a
   y <- b
   where (x.id == y.id)
@@ -335,9 +335,9 @@ join a b = do
 **`diff`** — rows in one relation but not another:
 
 ```knot
-contains x rel = fold (\acc r -> acc || r == x) False {} rel
+contains = \x rel -> fold (\acc r -> acc || r == x) False {} rel
 
-diff a b = do
+diff = \a b -> do
   x <- a
   where (not (contains x b))
   yield x
@@ -346,7 +346,7 @@ diff a b = do
 **`inter`** — rows in both relations:
 
 ```knot
-inter a b = do
+inter = \a b -> do
   x <- a
   where (contains x b)
   yield x
@@ -355,32 +355,32 @@ inter a b = do
 **`insert`** — add a value (union with a singleton):
 
 ```knot
-insert x rel = set rel (union rel (yield x))
+insert = \x rel -> set rel (union rel (yield x))
 ```
 
 **`delete`** — remove matching rows:
 
 ```knot
-delete p rel = set rel (filter (\x -> not (p x)) rel)
+delete = \p rel -> set rel (filter (\x -> not (p x)) rel)
 ```
 
 **`update`** — transform matching rows:
 
 ```knot
-update p f rel = set rel (map (\x -> if p x then f x else x) rel)
+update = \p f rel -> set rel (map (\x -> if p x then f x else x) rel)
 ```
 
 **`count`**, **`sum`**, **`avg`** — folds:
 
 ```knot
-count rel = fold (\n _ -> n + 1) 0 rel
-sum f rel = fold (\acc x -> acc + f x) 0 rel
+count = \rel -> fold (\n _ -> n + 1) 0 rel
+sum = \f rel -> fold (\acc x -> acc + f x) 0 rel
 ```
 
 **`match`** — filter to one variant:
 
 ```knot
-match Circle shapes = do
+match = \Circle shapes -> do
   Circle c <- shapes
   yield c
 ```
@@ -446,7 +446,7 @@ Pattern matching on `<-` filters and binds in one step:
 Operate on the whole relation with `case`:
 
 ```knot
-scale factor =
+scale = \factor ->
   set *shapes = do
     s <- *shapes
     yield (case s of
@@ -457,7 +457,7 @@ scale factor =
 ### Pattern Matching on Relations
 
 ```knot
-describe rel = case rel of
+describe = \rel -> case rel of
   []          -> "empty"
   [{name: n}] -> "just " ++ n
   _           -> show (count rel) ++ " rows"
@@ -471,22 +471,22 @@ Effects are inferred, fine-grained capabilities — not a monolithic `IO` type. 
 
 ```knot
 -- Pure (inferred: no effects)
-formatName n = toUpper (take 1 n) ++ drop 1 n
+formatName = \n -> toUpper (take 1 n) ++ drop 1 n
 
 -- DB read (inferred: {reads *people})
 &seniors = *people |> filter (\p -> p.age > 65)
 
 -- DB write (inferred: {reads *people, writes *people})
-birthday name =
+birthday = \name ->
   set *people = do
     p <- *people
     yield (if p.name == name then {p | age: p.age + 1} else p)
 
 -- IO (inferred: {console})
-greet name = putLine ("hello " ++ name)
+greet = \name -> putLine ("hello " ++ name)
 
 -- IO (inferred: {network})
-notify url msg = httpPost url {body: msg}
+notify = \url msg -> httpPost url {body: msg}
 
 -- Mixed (inferred: {reads *people, network})
 &notifyAll = do
@@ -511,7 +511,7 @@ Effects propagate through calls:
 
 ```knot
 -- Inferred: {reads *people, writes *people}
-birthdayParty names = for names birthday
+birthdayParty = \names -> for names birthday
 ```
 
 ### What the Compiler Knows
@@ -531,7 +531,7 @@ Effect signatures are inferred but can be written explicitly:
 
 ```knot
 birthday : {reads *people, writes *people} Text -> {}
-birthday name =
+birthday = \name ->
   set *people = do
     p <- *people
     yield (if p.name == name then {p | age: p.age + 1} else p)
@@ -545,7 +545,7 @@ DB writes are transactional — they roll back on failure. IO cannot be undone. 
 
 ```knot
 -- DB writes go in `atomic`, IO happens after commit
-handleOrder req = do
+handleOrder = \req -> do
   orderId <- atomic do
     set *orders = union *orders [{item: req.body.item, qty: 1}]
     yield (count *orders)
@@ -557,7 +557,7 @@ If `atomic` fails, execution stops — the IO is never reached. If it succeeds, 
 
 ```knot
 -- Compile error: cannot mix IO with DB writes
-bad req = do
+bad = \req -> do
   sendEmail "test@co.com" "starting"                      -- {network}
   set *orders = union *orders [{item: req.body.item}]    -- {writes *orders}
   -- Error: cannot mix {network} with {writes *orders} in the same block.
@@ -596,7 +596,7 @@ Dispatch is pattern matching — the compiler ensures exhaustive handling:
 
 ```knot
 serve : Api -> Response
-serve req = case req of
+serve = \req -> case req of
   GetTodos {user, page, limit} -> pendingFor user page limit
   AddTodo {title, owner, priority} -> do
     atomic (add title owner priority)
@@ -676,7 +676,7 @@ route Api = TodoApi | AdminApi
 DB writes within handlers must use `atomic`. IO happens outside `atomic`:
 
 ```knot
-serve req = case req of
+serve = \req -> case req of
   CreateOrder {item, qty} -> do
   orderId <- atomic do
     set *orders = union *orders [{item, qty}]
@@ -688,7 +688,7 @@ serve req = case req of
 For sub-transaction boundaries:
 
 ```knot
-batchTransfer transfers =
+batchTransfer = \transfers ->
   for transfers \t ->
     atomic (transfer t.from t.to t.amount)
 ```
@@ -910,7 +910,7 @@ Optional history tracking:
 *employees : [{name: Text, salary: Int}]
   with history
 
-salaryLastYear name =
+salaryLastYear = \name ->
   *employees @(now - 365 days)
     |> filter (\e -> e.name == name)
     |> project {salary}
@@ -925,7 +925,7 @@ Functions can be generic over records and relations with specific fields:
 
 ```knot
 getName : {name: Text | r} -> Text
-getName r = r.name
+getName = \r -> r.name
 ```
 
 ### Row-Polymorphic Variants
@@ -933,7 +933,7 @@ getName r = r.name
 Functions can be generic over any ADT that has a particular variant:
 
 ```knot
-countOpen rel =
+countOpen = \rel ->
   rel |> filter (\r -> case r.status of Open {} -> True {}; _ -> False {}) |> count
 
 -- Inferred: [{status: <Open {} | r> | s}] -> Int
@@ -961,7 +961,7 @@ Trait bounds constrain type variables. They are inferred but can be written expl
 
 ```knot
 -- Bounds are inferred from usage
-printAll rel = do
+printAll = \rel -> do
   r <- rel
   yield (display r)
 
@@ -1029,13 +1029,13 @@ Traits compose naturally with relational queries:
 
 ```knot
 -- Works on any relation whose rows are displayable
-report rel = do
+report = \rel -> do
   r <- rel
   yield {summary: display r}
 
 -- Works on any relation with a numeric column named `amount`
 totalAmount : Num n => [{amount: n | r}] -> n
-totalAmount rel = fold (\acc r -> acc + r.amount) 0 rel
+totalAmount = \rel -> fold (\acc r -> acc + r.amount) 0 rel
 ```
 
 #### Default Implementations
@@ -1079,25 +1079,25 @@ route Api where
   PUT  {owner: Text, msg: Text}      /todos/{title: Text}/resolve  -> {ok: Bool}                             = ResolveTodo
   GET                                /workload                     -> [{owner: Text, count: Int}]          = GetWorkload
 
-formatTitle title = toUpper (take 1 title) ++ drop 1 title
+formatTitle = \title -> toUpper (take 1 title) ++ drop 1 title
 
-pendingFor user = do
+pendingFor = \user -> do
   t <- *todos
   where t.owner == user
   Open {} <- t.status
   yield {t.title, t.priority}
 
-add title owner priority =
+add = \title owner priority ->
   set *todos = union *todos [{title: formatTitle title, owner, priority, status: Open {}}]
 
-assign title owner person =
+assign = \title owner person ->
   set *todos = do
     t <- *todos
     yield (if t.title == title && t.owner == owner
       then {t | status: InProgress {assignee: person}}
       else t)
 
-resolve title owner msg =
+resolve = \title owner msg ->
   set *todos = do
     t <- *todos
     yield (if t.title == title && t.owner == owner
@@ -1111,7 +1111,7 @@ resolve title owner msg =
   yield {owner: t.owner, count: count t}
 
 serve : Api -> Response
-serve req = case req of
+serve = \req -> case req of
   GetTodos {user} -> pendingFor user
   AddTodo {title, owner, priority} -> do
     atomic (add title owner priority)

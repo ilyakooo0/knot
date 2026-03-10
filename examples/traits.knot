@@ -38,7 +38,7 @@ impl Area Shape where
     Circle {radius} -> radius * radius * 3
     Rect {width, height} -> width * height
 
-showInfo x = describe x
+showInfo = \x -> describe x
 
 main = do
   println (describe 42)

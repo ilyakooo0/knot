@@ -78,7 +78,8 @@ Key codegen patterns:
 - All values are pointer-typed (`ptr_type`) in Cranelift IR — uniform representation
 - `do` blocks compile to nested loops with SSA block params for iteration counters
 - `where` clauses become conditional branches; skip blocks jump to the loop's continue block
-- Lambdas compile as separate functions; free variables captured in a record-valued closure environment; multi-param lambdas (`\a b c -> body`) are curried into nested single-param lambdas at compile time
+- Functions are constants bound to lambdas (`add = \x y -> x + y`); when a Fun's body is a Lambda, the compiler extracts its params for direct Cranelift function compilation (no closure overhead)
+- Standalone lambdas compile as separate functions; free variables captured in a record-valued closure environment; multi-param lambdas (`\a b c -> body`) are curried into nested single-param lambdas at compile time
 - Runtime functions are pre-declared as imports; `call_rt`/`call_rt_void` helpers emit calls
 - `knot_relation_len` returns raw `usize`, not a boxed `Value` — use directly as loop bound
 - Trait impl methods compile as mangled functions (`TraitName_TypeName_methodName`); a dispatcher function checks `knot_value_get_tag` at runtime and calls the matching impl; missing impls panic with a clear error message

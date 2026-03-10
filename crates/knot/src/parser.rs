@@ -515,27 +515,17 @@ impl Parser {
 
         let (name, _) = self.expect_lower("expected function name").ok()?;
 
-        // Check: is this a type signature (name : type) or a function definition?
+        // Check: is this a type signature (name : type) or a definition?
         if self.at(&TokenKind::Colon) {
-            // Type signature — for now, skip it as a standalone signature.
-            // Parse it and try to attach to next declaration.
+            // Type signature — parse it and try to attach to next definition.
             self.advance(); // consume `:`
             let ts = self.parse_type_scheme();
             self.skip_newlines();
 
-            // Now check if the next line is the function body.
+            // Now check if the next line is the definition body.
             if matches!(self.peek(), TokenKind::Lower(n) if *n == name) {
                 let saved = self.save();
                 self.advance(); // consume name again
-
-                let mut params = Vec::new();
-                while self.can_start_pat() && !self.at(&TokenKind::Eq) {
-                    if let Some(p) = self.try_parse_pat() {
-                        params.push(p);
-                    } else {
-                        break;
-                    }
-                }
 
                 if self.eat(&TokenKind::Eq) {
                     let body = self.parse_expr()?;
@@ -545,14 +535,12 @@ impl Parser {
                         DeclKind::Fun {
                             name,
                             ty: ts,
-                            params,
                             body,
                         },
                         Span::new(start.start, end.end),
                     ));
                 } else {
-                    // Not a function def after the signature — restore and return
-                    // just a fun with no body. We shouldn't normally get here.
+                    // Not a definition after the signature — restore.
                     self.restore(saved);
                 }
             }
@@ -560,30 +548,18 @@ impl Parser {
             // Return a Fun with just a type signature and a placeholder body.
             let end = self.prev_span();
             self.pop_context();
-            // We need a body — use an empty record as placeholder.
             let body_span = Span::new(end.end, end.end);
             return Some(Spanned::new(
                 DeclKind::Fun {
                     name,
                     ty: ts,
-                    params: vec![],
                     body: Spanned::new(ExprKind::Record(vec![]), body_span),
                 },
                 Span::new(start.start, end.end),
             ));
         }
 
-        // Parse parameters (patterns before `=`).
-        let mut params = Vec::new();
-        while self.can_start_pat() && !self.at(&TokenKind::Eq) {
-            if let Some(p) = self.try_parse_pat() {
-                params.push(p);
-            } else {
-                break;
-            }
-        }
-
-        self.expect(&TokenKind::Eq, "expected '=' in function definition")
+        self.expect(&TokenKind::Eq, "expected '=' in definition")
             .ok()?;
         let body = self.parse_expr()?;
 
@@ -593,7 +569,6 @@ impl Parser {
             DeclKind::Fun {
                 name,
                 ty: None,
-                params,
                 body,
             },
             Span::new(start.start, end.end),
@@ -2492,40 +2467,9 @@ mod tests {
         assert!(diags.is_empty(), "diags: {:?}", diags);
         assert_eq!(module.decls.len(), 1);
         match &module.decls[0].node {
-            DeclKind::Fun {
-                name, params, body, ..
-            } => {
+            DeclKind::Fun { name, body, .. } => {
                 assert_eq!(name, "x");
-                assert!(params.is_empty());
                 assert!(matches!(body.node, ExprKind::Lit(Literal::Int(42))));
-            }
-            other => panic!("expected Fun, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_fun_with_params() {
-        // add a b = a
-        let source = "add a b = a".to_string();
-        let tokens = toks(vec![
-            (TokenKind::Lower("add".into()), 0, 3),
-            (TokenKind::Lower("a".into()), 4, 5),
-            (TokenKind::Lower("b".into()), 6, 7),
-            (TokenKind::Eq, 8, 9),
-            (TokenKind::Lower("a".into()), 10, 11),
-            (TokenKind::Eof, 11, 11),
-        ]);
-        let (module, diags) = Parser::new(source, tokens).parse_module();
-        assert!(diags.is_empty(), "diags: {:?}", diags);
-        match &module.decls[0].node {
-            DeclKind::Fun {
-                name, params, body, ..
-            } => {
-                assert_eq!(name, "add");
-                assert_eq!(params.len(), 2);
-                assert!(matches!(&params[0].node, PatKind::Var(n) if n == "a"));
-                assert!(matches!(&params[1].node, PatKind::Var(n) if n == "b"));
-                assert!(matches!(&body.node, ExprKind::Var(n) if n == "a"));
             }
             other => panic!("expected Fun, got {:?}", other),
         }
@@ -2566,25 +2510,27 @@ mod tests {
 
     #[test]
     fn parse_if_expr() {
-        // f x = if x then 1 else 2
-        let source = "f x = if x then 1 else 2".to_string();
+        // f = \x -> if x then 1 else 2
+        let source = r"f = \x -> if x then 1 else 2".to_string();
         let tokens = toks(vec![
             (TokenKind::Lower("f".into()), 0, 1),
-            (TokenKind::Lower("x".into()), 2, 3),
-            (TokenKind::Eq, 4, 5),
-            (TokenKind::If, 6, 8),
-            (TokenKind::Lower("x".into()), 9, 10),
-            (TokenKind::Then, 11, 15),
-            (TokenKind::Int(1), 16, 17),
-            (TokenKind::Else, 18, 22),
-            (TokenKind::Int(2), 23, 24),
-            (TokenKind::Eof, 24, 24),
+            (TokenKind::Eq, 2, 3),
+            (TokenKind::Backslash, 4, 5),
+            (TokenKind::Lower("x".into()), 5, 6),
+            (TokenKind::Arrow, 7, 9),
+            (TokenKind::If, 10, 12),
+            (TokenKind::Lower("x".into()), 13, 14),
+            (TokenKind::Then, 15, 19),
+            (TokenKind::Int(1), 20, 21),
+            (TokenKind::Else, 22, 26),
+            (TokenKind::Int(2), 27, 28),
+            (TokenKind::Eof, 28, 28),
         ]);
         let (module, diags) = Parser::new(source, tokens).parse_module();
         assert!(diags.is_empty(), "diags: {:?}", diags);
         match &module.decls[0].node {
             DeclKind::Fun { body, .. } => {
-                assert!(matches!(&body.node, ExprKind::If { .. }));
+                assert!(matches!(&body.node, ExprKind::Lambda { .. }));
             }
             other => panic!("expected Fun, got {:?}", other),
         }
@@ -2771,15 +2717,14 @@ mod tests {
     #[test]
     fn parse_field_access() {
         // f x = x.name
-        let source = "f x = x.name".to_string();
+        let source = "f = x.name".to_string();
         let tokens = toks(vec![
             (TokenKind::Lower("f".into()), 0, 1),
-            (TokenKind::Lower("x".into()), 2, 3),
-            (TokenKind::Eq, 4, 5),
-            (TokenKind::Lower("x".into()), 6, 7),
-            (TokenKind::Dot, 7, 8),
-            (TokenKind::Lower("name".into()), 8, 12),
-            (TokenKind::Eof, 12, 12),
+            (TokenKind::Eq, 2, 3),
+            (TokenKind::Lower("x".into()), 4, 5),
+            (TokenKind::Dot, 5, 6),
+            (TokenKind::Lower("name".into()), 6, 10),
+            (TokenKind::Eof, 10, 10),
         ]);
         let (module, diags) = Parser::new(source, tokens).parse_module();
         assert!(diags.is_empty(), "diags: {:?}", diags);
@@ -2908,20 +2853,19 @@ mod tests {
 
     #[test]
     fn parse_record_update() {
-        // f t = {t | age: 30}
-        let source = "f t = {t | age: 30}".to_string();
+        // f = {t | age: 30}
+        let source = "f = {t | age: 30}".to_string();
         let tokens = toks(vec![
             (TokenKind::Lower("f".into()), 0, 1),
-            (TokenKind::Lower("t".into()), 2, 3),
-            (TokenKind::Eq, 4, 5),
-            (TokenKind::LBrace, 6, 7),
-            (TokenKind::Lower("t".into()), 7, 8),
-            (TokenKind::Pipe, 9, 10),
-            (TokenKind::Lower("age".into()), 11, 14),
-            (TokenKind::Colon, 14, 15),
-            (TokenKind::Int(30), 16, 18),
-            (TokenKind::RBrace, 18, 19),
-            (TokenKind::Eof, 19, 19),
+            (TokenKind::Eq, 2, 3),
+            (TokenKind::LBrace, 4, 5),
+            (TokenKind::Lower("t".into()), 5, 6),
+            (TokenKind::Pipe, 7, 8),
+            (TokenKind::Lower("age".into()), 9, 12),
+            (TokenKind::Colon, 12, 13),
+            (TokenKind::Int(30), 14, 16),
+            (TokenKind::RBrace, 16, 17),
+            (TokenKind::Eof, 17, 17),
         ]);
         let (module, diags) = Parser::new(source, tokens).parse_module();
         assert!(diags.is_empty(), "diags: {:?}", diags);

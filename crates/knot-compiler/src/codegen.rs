@@ -373,8 +373,12 @@ impl Codegen {
     fn collect_declarations(&mut self, module: &ast::Module) {
         for decl in &module.decls {
             match &decl.node {
-                ast::DeclKind::Fun { name, params, .. } => {
-                    let n_params = params.len();
+                ast::DeclKind::Fun { name, body, .. } => {
+                    // If the body is a lambda, extract its params for direct-call optimization.
+                    let n_params = match &body.node {
+                        ast::ExprKind::Lambda { params, .. } => params.len(),
+                        _ => 0,
+                    };
                     let mut sig = self.module.make_signature();
                     sig.params.push(AbiParam::new(self.ptr_type)); // db
                     for _ in 0..n_params {
@@ -646,13 +650,16 @@ impl Codegen {
     fn define_functions(&mut self, module: &ast::Module, _type_env: &TypeEnv) {
         for decl in &module.decls {
             match &decl.node {
-                ast::DeclKind::Fun {
-                    name,
-                    params,
-                    body,
-                    ..
-                } => {
-                    self.define_user_function(name, params, body);
+                ast::DeclKind::Fun { name, body, .. } => {
+                    // If body is a lambda, extract its params for direct compilation.
+                    match &body.node {
+                        ast::ExprKind::Lambda { params, body: lambda_body } => {
+                            self.define_user_function(name, params, lambda_body);
+                        }
+                        _ => {
+                            self.define_user_function(name, &[], body);
+                        }
+                    }
                 }
                 ast::DeclKind::Impl {
                     trait_name,

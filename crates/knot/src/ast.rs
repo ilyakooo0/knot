@@ -90,11 +90,10 @@ pub enum DeclKind {
         body: Expr,
     },
 
-    /// `formatTitle title = ...` — function or constant (no sigil prefix).
+    /// `add = \x y -> x + y` — constant binding (functions are lambdas).
     Fun {
         name: Name,
         ty: Option<TypeScheme>,
-        params: Vec<Pat>,
         body: Expr,
     },
 

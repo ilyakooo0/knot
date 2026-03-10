@@ -1055,14 +1055,8 @@ fn derived_with_pipe() {
 #[test]
 fn constant_fun() {
     match first_decl("maxRetries = 3") {
-        DeclKind::Fun {
-            name,
-            params,
-            body,
-            ..
-        } => {
+        DeclKind::Fun { name, body, .. } => {
             assert_eq!(name, "maxRetries");
-            assert!(params.is_empty());
             assert!(matches!(&body.node, ExprKind::Lit(Literal::Int(3))));
         }
         other => panic!("expected Fun, got {:?}", other),
@@ -1070,14 +1064,17 @@ fn constant_fun() {
 }
 
 #[test]
-fn fun_with_params() {
-    match first_decl("add a b = a + b") {
-        DeclKind::Fun {
-            name, params, body, ..
-        } => {
+fn fun_as_lambda() {
+    match first_decl(r"add = \a b -> a + b") {
+        DeclKind::Fun { name, body, .. } => {
             assert_eq!(name, "add");
-            assert_eq!(params.len(), 2);
-            assert!(matches!(&body.node, ExprKind::BinOp { op: BinOp::Add, .. }));
+            match &body.node {
+                ExprKind::Lambda { params, body } => {
+                    assert_eq!(params.len(), 2);
+                    assert!(matches!(&body.node, ExprKind::BinOp { op: BinOp::Add, .. }));
+                }
+                other => panic!("expected Lambda, got {:?}", other),
+            }
         }
         other => panic!("expected Fun, got {:?}", other),
     }
@@ -1085,13 +1082,18 @@ fn fun_with_params() {
 
 #[test]
 fn fun_with_multiline_body() {
-    let src = "add title owner priority =\n  set *todos = union *todos [{title: title}]";
+    let src = r"add = \title owner priority -> set *todos = union *todos [{title: title}]";
     match first_decl(src) {
         DeclKind::Fun { name, body, .. } => {
             assert_eq!(name, "add");
-            assert!(matches!(&body.node, ExprKind::Set { .. }));
+            match &body.node {
+                ExprKind::Lambda { body, .. } => {
+                    assert!(matches!(&body.node, ExprKind::Set { .. }));
+                }
+                other => panic!("expected Lambda, got {:?}", other),
+            }
         }
-        other => panic!("expected Fun with Set body, got {:?}", other),
+        other => panic!("expected Fun with Lambda body, got {:?}", other),
     }
 }
 
@@ -1286,7 +1288,7 @@ fn list_pattern() {
 
 #[test]
 fn multiple_functions() {
-    let m = parse_ok("f x = x\ng y = y\nh z = z");
+    let m = parse_ok("f = \\x -> x\ng = \\y -> y\nh = \\z -> z");
     assert_eq!(m.decls.len(), 3);
     for decl in &m.decls {
         assert!(matches!(&decl.node, DeclKind::Fun { .. }));
@@ -1304,7 +1306,7 @@ type Name = Text
 
 &seniors = *people
 
-f x = x";
+f = \\x -> x";
     let m = parse_ok(src);
     assert_eq!(m.decls.len(), 5);
     assert!(matches!(&m.decls[0].node, DeclKind::Data { .. }));
@@ -1530,7 +1532,7 @@ data Status
 #[test]
 fn function_with_do_bind_and_where() {
     let src = "\
-pendingFor user = do
+pendingFor = \\user -> do
   t <- *todos
   where t.owner == user
   Open {} <- t.status
@@ -1538,7 +1540,11 @@ pendingFor user = do
     match first_decl(src) {
         DeclKind::Fun { name, body, .. } => {
             assert_eq!(name, "pendingFor");
-            match &body.node {
+            let lambda_body = match &body.node {
+                ExprKind::Lambda { body, .. } => body,
+                other => panic!("expected Lambda, got {:?}", other),
+            };
+            match &lambda_body.node {
                 ExprKind::Do(stmts) => {
                     assert_eq!(stmts.len(), 4);
                     // First: t <- *todos
@@ -1573,11 +1579,16 @@ pendingFor user = do
 #[test]
 fn function_with_set_and_union() {
     let src =
-        "add title owner priority =\n  set *todos = union *todos [{title: title, owner, priority, status: Open {}}]";
+        "add = \\title owner priority -> set *todos = union *todos [{title: title, owner, priority, status: Open {}}]";
     match first_decl(src) {
         DeclKind::Fun { name, body, .. } => {
             assert_eq!(name, "add");
-            assert!(matches!(&body.node, ExprKind::Set { .. }));
+            match &body.node {
+                ExprKind::Lambda { body, .. } => {
+                    assert!(matches!(&body.node, ExprKind::Set { .. }));
+                }
+                other => panic!("expected Lambda, got {:?}", other),
+            }
         }
         other => panic!("expected Fun, got {:?}", other),
     }
@@ -1586,13 +1597,17 @@ fn function_with_set_and_union() {
 #[test]
 fn function_with_case_expression() {
     let src = "\
-scale factor shapes = case shapes of
+scale = \\factor shapes -> case shapes of
   Circle {radius} -> Circle {radius: radius * factor}
   Rect {width, height} -> Rect {width: width * factor, height: height * factor}";
     match first_decl(src) {
         DeclKind::Fun { name, body, .. } => {
             assert_eq!(name, "scale");
-            match &body.node {
+            let lambda_body = match &body.node {
+                ExprKind::Lambda { body, .. } => body,
+                other => panic!("expected Lambda, got {:?}", other),
+            };
+            match &lambda_body.node {
                 ExprKind::Case { arms, .. } => {
                     assert_eq!(arms.len(), 2);
                     // First arm: Circle {radius} -> Circle {radius: ...}
@@ -1686,14 +1701,14 @@ data Status
 
 *todos : [{title: Text, owner: Text, priority: Priority, status: Status}]
 
-formatTitle title = toUpper (take 1 title) ++ drop 1 title
+formatTitle = \\title -> toUpper (take 1 title) ++ drop 1 title
 
-pendingFor user = do
+pendingFor = \\user -> do
   t <- *todos
   where t.owner == user
   yield {title: t.title, priority: t.priority}
 
-add title owner priority =
+add = \\title owner priority ->
   set *todos = union *todos [{title: formatTitle title, owner, priority, status: Open {}}]
 
 &workload = do
@@ -2084,8 +2099,8 @@ fn variant_type_with_rest() {
 
 #[test]
 fn function_with_type_signature_and_body() {
-    let src = "add : Int -> Int -> Int\nadd x y = x + y";
-    let m = parse_ok(src);
+    let src = r"add : Int -> Int -> Int\nadd = \x y -> x + y".replace(r"\n", "\n");
+    let m = parse_ok(&src);
     // Should produce a Fun with type annotation and body
     let fun = m
         .decls
@@ -2093,12 +2108,10 @@ fn function_with_type_signature_and_body() {
         .find(|d| matches!(&d.node, DeclKind::Fun { name, .. } if name == "add"))
         .expect("should find 'add'");
     match &fun.node {
-        DeclKind::Fun {
-            name, ty, params, ..
-        } => {
+        DeclKind::Fun { name, ty, body, .. } => {
             assert_eq!(name, "add");
             assert!(ty.is_some());
-            assert_eq!(params.len(), 2);
+            assert!(matches!(&body.node, ExprKind::Lambda { .. }));
         }
         other => panic!("expected Fun, got {:?}", other),
     }
@@ -2484,7 +2497,7 @@ fn record_pattern_with_explicit_binding() {
 #[test]
 fn constructor_without_explicit_payload() {
     // Constructor with no {} or variable after it — implicit empty record
-    let src = "f x = case x of\n  Nothing -> 0\n  Just v -> v";
+    let src = "f = case x of\n  Nothing -> 0\n  Just v -> v";
     match fun_body(src) {
         ExprKind::Case { arms, .. } => {
             match &arms[0].pat.node {
@@ -2508,13 +2521,16 @@ fn constructor_without_explicit_payload() {
 }
 
 #[test]
-fn parenthesized_pattern() {
-    let src = "f (x) = x";
+fn parenthesized_pattern_in_lambda() {
+    let src = r"f = \(x) -> x";
     match first_decl(src) {
-        DeclKind::Fun { params, .. } => {
-            assert_eq!(params.len(), 1);
-            assert!(matches!(&params[0].node, PatKind::Var(n) if n == "x"));
-        }
+        DeclKind::Fun { body, .. } => match &body.node {
+            ExprKind::Lambda { params, .. } => {
+                assert_eq!(params.len(), 1);
+                assert!(matches!(&params[0].node, PatKind::Var(n) if n == "x"));
+            }
+            other => panic!("expected Lambda, got {:?}", other),
+        },
         other => panic!("expected Fun, got {:?}", other),
     }
 }

@@ -7,6 +7,10 @@
       "path": ".",
       "file-types": ["knot"],
       "highlights": "queries/highlights.scm",
+      "locals": "queries/locals.scm",
+      "tags": "queries/tags.scm",
+      "folds": "queries/folds.scm",
+      "indents": "queries/indents.scm",
       "injection-regex": "^knot$"
     }
   ],

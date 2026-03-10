@@ -1,0 +1,20 @@
+{
+  "name": "tree-sitter-knot",
+  "version": "0.1.0",
+  "description": "Tree-sitter grammar for the Knot programming language",
+  "main": "bindings/node",
+  "keywords": ["parser", "tree-sitter", "knot"],
+  "dependencies": {
+    "node-gyp-build": "^4.8.0"
+  },
+  "devDependencies": {
+    "tree-sitter-cli": "^0.25.0"
+  },
+  "tree-sitter": [
+    {
+      "scope": "source.knot",
+      "file-types": ["knot"],
+      "highlights": "queries/highlights.scm"
+    }
+  ]
+}

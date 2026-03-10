@@ -1,0 +1,19 @@
+{
+  "grammars": [
+    {
+      "name": "knot",
+      "camelCase": false,
+      "scope": "source.knot",
+      "path": ".",
+      "file-types": ["knot"],
+      "highlights": "queries/highlights.scm",
+      "injection-regex": "^knot$"
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "links": {
+      "repository": "https://github.com/example/tree-sitter-knot"
+    }
+  }
+}

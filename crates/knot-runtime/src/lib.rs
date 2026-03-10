@@ -324,6 +324,16 @@ pub extern "C" fn knot_relation_push(rel: *mut Value, row: *mut Value) {
     }
 }
 
+/// If the value is already a relation, return it as-is.
+/// Otherwise, wrap it in a singleton relation.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_ensure_relation(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Relation(_) => v,
+        _ => alloc(Value::Relation(vec![v])),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_relation_len(rel: *mut Value) -> usize {
     match unsafe { as_ref(rel) } {

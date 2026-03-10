@@ -362,6 +362,7 @@ impl Codegen {
         // Constructor matching
         self.declare_rt("knot_constructor_matches", &[p, p, p], &[types::I32]);
         self.declare_rt("knot_constructor_payload", &[p], &[p]);
+        self.declare_rt("knot_ensure_relation", &[p], &[p]);
 
         // Trait dispatch error
         self.declare_rt("knot_trait_no_impl", &[p, p, p], &[p]);
@@ -2257,7 +2258,15 @@ impl Codegen {
         for (stmt_idx, stmt) in stmts.iter().enumerate() {
             match &stmt.node {
                 ast::StmtKind::Bind { pat, expr } => {
-                    let rel = self.compile_expr(builder, expr, env, db);
+                    let val = self.compile_expr(builder, expr, env, db);
+                    // For constructor patterns, the RHS might be a single value
+                    // (e.g., `InProgress ip <- t.status`). Wrap in a singleton
+                    // relation so the loop logic works uniformly.
+                    let rel = if matches!(&pat.node, ast::PatKind::Constructor { .. }) {
+                        self.call_rt(builder, "knot_ensure_relation", &[val])
+                    } else {
+                        val
+                    };
                     // knot_relation_len returns a raw usize, not a boxed Value
                     let len = self.call_rt(builder, "knot_relation_len", &[rel]);
 
@@ -2280,15 +2289,16 @@ impl Codegen {
 
                     let row = self.call_rt(builder, "knot_relation_get", &[rel, i]);
 
-                    // Bind pattern
-                    bind_do_pattern(builder, self, pat, row, env);
+                    // Bind pattern (constructor patterns emit filter branches)
+                    let mut pattern_skips = Vec::new();
+                    bind_do_pattern(builder, self, pat, row, env, &mut pattern_skips);
 
                     loop_stack.push(LoopInfo {
                         header,
                         continue_blk,
                         exit,
                         index_var: i,
-                        where_skips: Vec::new(),
+                        where_skips: pattern_skips,
                     });
                 }
 
@@ -3164,6 +3174,7 @@ fn bind_do_pattern(
     pat: &ast::Pat,
     val: Value,
     env: &mut Env,
+    skips: &mut Vec<cranelift_codegen::ir::Block>,
 ) {
     match &pat.node {
         ast::PatKind::Var(name) => env.set(name, val),
@@ -3174,18 +3185,35 @@ fn bind_do_pattern(
                 let field_val =
                     cg.call_rt(builder, "knot_record_field", &[val, key_ptr, key_len]);
                 if let Some(inner_pat) = &fp.pattern {
-                    bind_do_pattern(builder, cg, inner_pat, field_val, env);
+                    bind_do_pattern(builder, cg, inner_pat, field_val, env, skips);
                 } else {
                     env.set(&fp.name, field_val);
                 }
             }
         }
-        ast::PatKind::Constructor { name: _, payload } => {
+        ast::PatKind::Constructor { name, payload } => {
             // Pattern match bind: `Circle c <- *shapes`
-            // This filters — only rows matching the constructor are bound
-            // For now, just extract the payload
+            // Filter: only rows matching the constructor tag continue
+            let (tag_ptr, tag_len) = cg.string_ptr(builder, name);
+            let matches = cg.call_rt_typed(
+                builder,
+                "knot_constructor_matches",
+                &[val, tag_ptr, tag_len],
+                types::I32,
+            );
+            let is_match = builder.ins().icmp_imm(IntCC::NotEqual, matches, 0);
+
+            let then_block = builder.create_block();
+            let skip_block = builder.create_block();
+            builder.ins().brif(is_match, then_block, &[], skip_block, &[]);
+
+            builder.switch_to_block(then_block);
+            builder.seal_block(then_block);
+            skips.push(skip_block);
+
+            // Extract payload and bind inner pattern
             let inner = cg.call_rt(builder, "knot_constructor_payload", &[val]);
-            bind_do_pattern(builder, cg, payload, inner, env);
+            bind_do_pattern(builder, cg, payload, inner, env, skips);
         }
         _ => {}
     }

@@ -1085,13 +1085,26 @@ impl Infer {
             match &stmt.node {
                 ast::StmtKind::Bind { pat, expr } => {
                     let expr_ty = self.infer_expr(expr);
-                    let elem_ty = self.fresh();
-                    self.unify(
-                        &expr_ty,
-                        &Ty::Relation(Box::new(elem_ty.clone())),
-                        expr.span,
-                    );
-                    self.check_pattern(pat, &elem_ty);
+                    let resolved = self.apply(&expr_ty);
+                    let is_ctor_pat =
+                        matches!(&pat.node, ast::PatKind::Constructor { .. });
+
+                    if is_ctor_pat
+                        && !matches!(&resolved, Ty::Relation(_) | Ty::Var(_))
+                    {
+                        // Value pattern match: `Constructor pat <- value_expr`
+                        // Filters the enclosing iteration (skip if no match)
+                        self.check_pattern(pat, &expr_ty);
+                    } else {
+                        // Normal relation bind
+                        let elem_ty = self.fresh();
+                        self.unify(
+                            &expr_ty,
+                            &Ty::Relation(Box::new(elem_ty.clone())),
+                            expr.span,
+                        );
+                        self.check_pattern(pat, &elem_ty);
+                    }
                 }
                 ast::StmtKind::Let { pat, expr } => {
                     let expr_ty = self.infer_expr(expr);

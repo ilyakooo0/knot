@@ -1,2 +1,5 @@
 /target
 *.db
+examples/hello
+examples/todo
+examples/traits

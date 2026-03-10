@@ -89,9 +89,9 @@ Key codegen patterns:
 
 ## Supported Language Features
 
-Currently compiled: source declarations, type aliases, data declarations, functions, literals, records, field access, record updates, relation literals, binary/unary operations, if/else, do blocks (bind/where/yield/let), set expressions, lambdas, closures, function application, case expressions, constructors, atomic transactions, migrations (schema tracking + `migrate` blocks), schema lockfile (`<name>.schema.lock`), views (`*view = do { ... yield {...} }` with bidirectional read/write, constant column filtering, auto-fill on write), traits and impls (single-dispatch on runtime type tags for primitives and ADTs, default methods, deriving from defaults), built-ins (println, print, show, union, count).
+Currently compiled: source declarations, type aliases, data declarations, functions, literals, records, field access, record updates, relation literals, binary/unary operations, if/else, do blocks (bind/where/yield/let), set expressions, lambdas, closures, function application, case expressions, constructors, atomic transactions, migrations (schema tracking + `migrate` blocks), schema lockfile (`<name>.schema.lock`), views (`*view = do { ... yield {...} }` with bidirectional read/write, constant column filtering, auto-fill on write), traits and impls (single-dispatch on runtime type tags for primitives and ADTs, default methods, deriving from defaults, supertrait enforcement), built-ins (println, print, show, union, count).
 
-Not yet implemented: supertraits (parsed but not enforced), associated types (parsed but not compiled), derived relations, routes, temporal queries, pattern matching in do-bind (constructor patterns filter but don't branch).
+Not yet implemented: associated types (parsed but not compiled), derived relations, routes, temporal queries, pattern matching in do-bind (constructor patterns filter but don't branch).
 
 ## Version Control
 

@@ -15,7 +15,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use knot::ast;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // ── Codegen state ─────────────────────────────────────────────────
 
@@ -73,6 +73,12 @@ pub struct Codegen {
 
     // Derived method bodies to define (from `deriving` clauses)
     derived_methods: Vec<DerivedMethodDef>,
+
+    // Supertrait relationships: trait_name -> direct supertrait names
+    trait_supertraits: HashMap<String, Vec<String>>,
+
+    // Track which types implement which trait: trait_name -> [(type_name, impl_span)]
+    trait_impl_types: HashMap<String, Vec<(String, knot::ast::Span)>>,
 }
 
 /// Provenance info for a view declaration, extracted at compile time.
@@ -251,6 +257,8 @@ impl Codegen {
             data_constructors: HashMap::new(),
             trait_dispatcher_fns: HashMap::new(),
             derived_methods: Vec::new(),
+            trait_supertraits: HashMap::new(),
+            trait_impl_types: HashMap::new(),
         }
     }
 
@@ -403,9 +411,18 @@ impl Codegen {
                 }
                 ast::DeclKind::Trait {
                     name: trait_name,
+                    supertraits,
                     items,
                     ..
                 } => {
+                    // Store supertrait relationships
+                    let supertrait_names: Vec<String> = supertraits
+                        .iter()
+                        .map(|c| c.trait_name.clone())
+                        .collect();
+                    self.trait_supertraits
+                        .insert(trait_name.clone(), supertrait_names);
+
                     let mut defaults = HashMap::new();
                     for item in items {
                         if let ast::TraitItem::Method {
@@ -550,6 +567,12 @@ impl Codegen {
                                     });
                             }
                         }
+
+                        // Track this impl for supertrait validation
+                        self.trait_impl_types
+                            .entry(trait_name.clone())
+                            .or_default()
+                            .push((type_name.clone(), decl.span));
                     }
                 }
                 _ => {}
@@ -612,9 +635,18 @@ impl Codegen {
                             });
                         }
                     }
+
+                    // Track derived impl for supertrait validation
+                    self.trait_impl_types
+                        .entry(trait_name.clone())
+                        .or_default()
+                        .push((type_name.clone(), decl.span));
                 }
             }
         }
+
+        // Validate supertrait constraints
+        self.validate_supertraits();
 
         // Create dispatcher functions for trait methods
         // (skip methods that collide with user-defined functions)
@@ -642,6 +674,56 @@ impl Codegen {
                 .insert(method_name.clone(), (func_id, param_count));
             self.trait_dispatcher_fns
                 .insert(method_name, func_id);
+        }
+    }
+
+    // ── Supertrait validation ────────────────────────────────────
+
+    /// Check that every impl (including derived) satisfies its supertrait
+    /// constraints. If `trait A => B`, then `impl B T` requires `impl A T`.
+    fn validate_supertraits(&mut self) {
+        // Build a set of (trait_name, type_name) for O(1) lookup
+        let impl_set: HashSet<(&str, &str)> = self
+            .trait_impl_types
+            .iter()
+            .flat_map(|(trait_name, types)| {
+                types
+                    .iter()
+                    .map(move |(type_name, _)| (trait_name.as_str(), type_name.as_str()))
+            })
+            .collect();
+
+        // Clone the data we need to iterate so we can push diagnostics
+        let impl_types: Vec<(String, Vec<(String, ast::Span)>)> = self
+            .trait_impl_types
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let supertraits: HashMap<String, Vec<String>> = self.trait_supertraits.clone();
+
+        for (trait_name, types) in &impl_types {
+            if let Some(required) = supertraits.get(trait_name) {
+                for supertrait in required {
+                    for (type_name, span) in types {
+                        if !impl_set.contains(&(supertrait.as_str(), type_name.as_str())) {
+                            self.diagnostics.push(
+                                knot::diagnostic::Diagnostic::error(format!(
+                                    "impl `{trait_name}` for `{type_name}` requires `{supertrait}` \
+                                     to be implemented for `{type_name}`"
+                                ))
+                                .label(
+                                    *span,
+                                    format!("this impl requires `{supertrait}`"),
+                                )
+                                .note(format!(
+                                    "add `impl {supertrait} {type_name} where ...` \
+                                     or derive it with `deriving ({supertrait})`"
+                                )),
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

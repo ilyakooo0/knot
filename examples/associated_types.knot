@@ -1,0 +1,21 @@
+-- Associated types: type-level functions defined per impl
+
+trait Container c where
+  type Elem c
+  empty : c
+  insert : c -> Elem c -> c
+  size : c -> Int
+  toList : c -> [Elem c]
+
+impl Container [a] where
+  type Elem [a] = a
+  empty = []
+  insert xs x = union xs (yield x)
+  size xs = count xs
+  toList xs = xs
+
+main = do
+  let xs = insert (insert (insert empty 1) 2) 3
+  println (size xs)
+  println (toList xs)
+  yield {}

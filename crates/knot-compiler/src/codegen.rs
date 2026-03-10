@@ -123,6 +123,9 @@ struct DefaultMethod {
 /// Info about a trait declaration (methods with optional defaults).
 struct TraitDef {
     defaults: HashMap<String, DefaultMethod>,
+    /// Names of associated types declared in this trait.
+    #[allow(dead_code)]
+    associated_types: Vec<String>,
 }
 
 /// Tracks pending derived method definitions (mangled_name -> default method).
@@ -424,39 +427,49 @@ impl Codegen {
                         .insert(trait_name.clone(), supertrait_names);
 
                     let mut defaults = HashMap::new();
+                    let mut assoc_type_names = Vec::new();
                     for item in items {
-                        if let ast::TraitItem::Method {
-                            name: method_name,
-                            ty,
-                            default_params,
-                            default_body,
-                        } = item
-                        {
-                            let param_count = if default_body.is_some() {
-                                default_params.len()
-                            } else {
-                                count_fn_params(&ty.ty)
-                            };
-                            self.trait_methods
-                                .entry(method_name.clone())
-                                .or_insert(TraitMethodInfo {
-                                    param_count,
-                                    impls: Vec::new(),
-                                });
-                            if let Some(body) = default_body {
-                                defaults.insert(
-                                    method_name.clone(),
-                                    DefaultMethod {
-                                        params: default_params.clone(),
-                                        body: body.clone(),
-                                    },
-                                );
+                        match item {
+                            ast::TraitItem::Method {
+                                name: method_name,
+                                ty,
+                                default_params,
+                                default_body,
+                            } => {
+                                let param_count = if default_body.is_some() {
+                                    default_params.len()
+                                } else {
+                                    count_fn_params(&ty.ty)
+                                };
+                                self.trait_methods
+                                    .entry(method_name.clone())
+                                    .or_insert(TraitMethodInfo {
+                                        param_count,
+                                        impls: Vec::new(),
+                                    });
+                                if let Some(body) = default_body {
+                                    defaults.insert(
+                                        method_name.clone(),
+                                        DefaultMethod {
+                                            params: default_params.clone(),
+                                            body: body.clone(),
+                                        },
+                                    );
+                                }
+                            }
+                            ast::TraitItem::AssociatedType {
+                                name, ..
+                            } => {
+                                assoc_type_names.push(name.clone());
                             }
                         }
                     }
                     self.trait_defs.insert(
                         trait_name.clone(),
-                        TraitDef { defaults },
+                        TraitDef {
+                            defaults,
+                            associated_types: assoc_type_names,
+                        },
                     );
                 }
                 ast::DeclKind::Impl {
@@ -866,6 +879,21 @@ impl Codegen {
                 for i in 0..param_count {
                     all_params.push(builder.block_params(entry)[i + 1]);
                 }
+
+                // 0-param methods (e.g. `empty : c`) can't dispatch at runtime;
+                // call the single impl directly
+                if param_count == 0 {
+                    if let Some((_, impl_func_id)) = impls.first() {
+                        let impl_ref = cg
+                            .module
+                            .declare_func_in_func(*impl_func_id, builder.func);
+                        let call = builder.ins().call(impl_ref, &[db]);
+                        let result = builder.inst_results(call)[0];
+                        builder.ins().return_(&[result]);
+                        return;
+                    }
+                }
+
                 let dispatch_arg = all_params[0];
 
                 let merge_block = builder.create_block();
@@ -1235,16 +1263,24 @@ impl Codegen {
             ast::ExprKind::Var(name) => {
                 if env.bindings.contains_key(name) {
                     env.get(name)
-                } else if let Some((func_id, _n_params)) =
+                } else if let Some((func_id, n_params)) =
                     self.user_fns.get(name).copied()
                 {
-                    // Create a function value wrapping the user function
-                    let func_ref =
-                        self.module.declare_func_in_func(func_id, builder.func);
-                    let fn_addr = builder.ins().func_addr(self.ptr_type, func_ref);
-                    let null = builder.ins().iconst(self.ptr_type, 0);
-                    let (src_ptr, src_len) = self.string_ptr(builder, name);
-                    self.call_rt(builder, "knot_value_function", &[fn_addr, null, src_ptr, src_len])
+                    if n_params == 0 {
+                        // 0-param function is a constant — call it directly
+                        let func_ref =
+                            self.module.declare_func_in_func(func_id, builder.func);
+                        let call = builder.ins().call(func_ref, &[db]);
+                        builder.inst_results(call)[0]
+                    } else {
+                        // Create a function value wrapping the user function
+                        let func_ref =
+                            self.module.declare_func_in_func(func_id, builder.func);
+                        let fn_addr = builder.ins().func_addr(self.ptr_type, func_ref);
+                        let null = builder.ins().iconst(self.ptr_type, 0);
+                        let (src_ptr, src_len) = self.string_ptr(builder, name);
+                        self.call_rt(builder, "knot_value_function", &[fn_addr, null, src_ptr, src_len])
+                    }
                 } else {
                     panic!("codegen: undefined variable '{}'", name)
                 }

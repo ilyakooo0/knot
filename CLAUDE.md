@@ -40,7 +40,7 @@ Compiled binaries create a `knot.db` SQLite database in the current directory fo
 ### Compilation Pipeline
 
 ```
-source.knot → Lexer → Tokens → Parser → AST → Type Resolution → Cranelift IR → .o → cc link → executable
+source.knot → Lexer → Tokens → Parser → AST → Type Inference → Type Resolution → Cranelift IR → .o → cc link → executable
 ```
 
 ### Frontend (`crates/knot/`)
@@ -69,6 +69,7 @@ Compiled as a `staticlib` (with `rlib` for workspace dependency resolution). All
 
 ### Compiler (`crates/knot-compiler/`)
 
+- **Type inference** (`infer.rs`): Hindley-Milner type inference with row-polymorphic records, let-generalization, unification with occurs check, ADT constructor typing, trait method registration, and associated type erasure
 - **Type resolution** (`types.rs`): Resolves aliases, computes SQLite schemas from Knot type annotations
 - **Codegen** (`codegen.rs`): Cranelift IR generation — the `build_function` pattern moves `ctx`/`builder_ctx` out of `self` to avoid borrow conflicts while allowing `self.method()` calls during IR building
 - **Linker** (`linker.rs`): Invokes `cc` with platform-appropriate flags
@@ -89,9 +90,9 @@ Key codegen patterns:
 
 ## Supported Language Features
 
-Currently compiled: source declarations, type aliases, data declarations, functions, literals, records, field access, record updates, relation literals, binary/unary operations, if/else, do blocks (bind/where/yield/let), set expressions, lambdas, closures, function application, case expressions, constructors, atomic transactions, migrations (schema tracking + `migrate` blocks), schema lockfile (`<name>.schema.lock`), views (`*view = do { ... yield {...} }` with bidirectional read/write, constant column filtering, auto-fill on write), derived relations (`&name = expr` — read-only computed relations, compiled as 0-param functions recomputed on each access), traits and impls (single-dispatch on runtime type tags for primitives and ADTs, default methods, deriving from defaults, supertrait enforcement, associated types with type-level pattern matching), built-ins (println, print, show, union, count).
+Currently compiled: source declarations, type aliases, data declarations, functions, literals, records, field access, record updates, relation literals, binary/unary operations, if/else, do blocks (bind/where/yield/let), set expressions, lambdas, closures, function application, case expressions, constructors, atomic transactions, migrations (schema tracking + `migrate` blocks), schema lockfile (`<name>.schema.lock`), views (`*view = do { ... yield {...} }` with bidirectional read/write, constant column filtering, auto-fill on write), derived relations (`&name = expr` — read-only computed relations, compiled as 0-param functions recomputed on each access), traits and impls (single-dispatch on runtime type tags for primitives and ADTs, default methods, deriving from defaults, supertrait enforcement, associated types with type-level pattern matching), type inference (Hindley-Milner with row polymorphism, let-generalization, ADT/trait/view-aware), built-ins (println, print, show, union, count).
 
-Not yet implemented: routes, temporal queries, pattern matching in do-bind (constructor patterns filter but don't branch).
+Not yet implemented: routes, temporal queries, pattern matching in do-bind (constructor patterns filter but don't branch), exhaustiveness checking in case expressions.
 
 ## Version Control
 

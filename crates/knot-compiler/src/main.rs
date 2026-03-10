@@ -3,6 +3,7 @@
 //! Usage: knotc build <file.knot>
 
 mod codegen;
+mod infer;
 mod linker;
 mod lockfile;
 mod types;
@@ -78,6 +79,20 @@ fn cmd_build(source_file: &str) {
 
     // Resolve types
     let type_env = types::TypeEnv::from_module(&module);
+
+    // Type inference
+    let infer_diags = infer::check(&module);
+    if !infer_diags.is_empty() {
+        for diag in &infer_diags {
+            eprintln!("{}", diag.render(&source, &filename));
+        }
+        if infer_diags
+            .iter()
+            .any(|d| d.severity == knot::diagnostic::Severity::Error)
+        {
+            process::exit(1);
+        }
+    }
 
     // Check schema lockfile
     let lock_diags = lockfile::check(&source_path, &module, &type_env);

@@ -2209,6 +2209,37 @@ impl Codegen {
         env: &mut Env,
         _db: Value,
     ) -> Value {
+        self.compile_lambda_inner(builder, params, body, env, _db, None)
+    }
+
+    fn compile_lambda_inner(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        params: &[ast::Pat],
+        body: &ast::Expr,
+        env: &mut Env,
+        _db: Value,
+        source_override: Option<String>,
+    ) -> Value {
+        // Curry multi-param lambdas: \a b c -> body  =>  \a -> \b -> \c -> body
+        if params.len() > 1 {
+            let source_text = source_override.unwrap_or_else(|| {
+                let ps: Vec<String> = params.iter().map(pretty_pat).collect();
+                format!("\\{} -> {}", ps.join(" "), pretty_expr(body))
+            });
+            let inner_lambda = ast::Spanned::new(
+                ast::ExprKind::Lambda {
+                    params: params[1..].to_vec(),
+                    body: Box::new(body.clone()),
+                },
+                body.span,
+            );
+            return self.compile_lambda_inner(
+                builder, &params[0..1], &inner_lambda, env, _db,
+                Some(source_text),
+            );
+        }
+
         let lambda_name = format!("knot_lambda_{}", self.lambda_counter);
         self.lambda_counter += 1;
 
@@ -2264,10 +2295,10 @@ impl Codegen {
         };
 
         // Generate source representation for this lambda
-        let source_text = {
+        let source_text = source_override.unwrap_or_else(|| {
             let ps: Vec<String> = params.iter().map(pretty_pat).collect();
             format!("\\{} -> {}", ps.join(" "), pretty_expr(body))
-        };
+        });
         let (src_ptr, src_len) = self.string_ptr(builder, &source_text);
         self.call_rt(builder, "knot_value_function", &[fn_addr, env_val, src_ptr, src_len])
     }

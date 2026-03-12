@@ -908,6 +908,8 @@ impl Infer {
                     self.pop_scope();
                 }
 
+                self.check_exhaustiveness(&scrut_ty, arms, expr.span);
+
                 result_ty
             }
 
@@ -1073,6 +1075,76 @@ impl Infer {
                 self.unify(expected, &list_ty, pat.span);
             }
         }
+    }
+
+    // ── Exhaustiveness checking ────────────────────────────────
+
+    /// Check that a case expression covers all constructors of the
+    /// scrutinee's type.  Emits an error listing missing patterns when
+    /// the match is non-exhaustive.
+    fn check_exhaustiveness(
+        &mut self,
+        scrut_ty: &Ty,
+        arms: &[ast::CaseArm],
+        span: Span,
+    ) {
+        // Resolve the scrutinee type through substitution.
+        let resolved = self.apply(scrut_ty);
+
+        // Only check ADTs — primitives (Int, Text, etc.) have infinite
+        // domains and can't be exhaustively matched by constructors.
+        let type_name = match &resolved {
+            Ty::Con(name, _) => name.clone(),
+            _ => return,
+        };
+
+        let data_info = match self.data_types.get(&type_name) {
+            Some(info) => info.clone(),
+            None => return,
+        };
+
+        // If any arm has an unconditional catch-all pattern (wildcard or
+        // variable) at the top level, the match is trivially exhaustive.
+        let has_catchall = arms.iter().any(|arm| {
+            matches!(
+                &arm.pat.node,
+                ast::PatKind::Wildcard | ast::PatKind::Var(_)
+            )
+        });
+        if has_catchall {
+            return;
+        }
+
+        // Collect which constructors are covered by the arms.
+        let covered: HashSet<&str> = arms
+            .iter()
+            .filter_map(|arm| match &arm.pat.node {
+                ast::PatKind::Constructor { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        let all_ctors: Vec<&str> =
+            data_info.ctors.iter().map(|(n, _)| n.as_str()).collect();
+
+        let missing: Vec<&str> = all_ctors
+            .iter()
+            .copied()
+            .filter(|c| !covered.contains(c))
+            .collect();
+
+        if missing.is_empty() {
+            return;
+        }
+
+        let missing_list = missing.join(", ");
+        self.error(
+            format!(
+                "non-exhaustive pattern match — missing: {}",
+                missing_list,
+            ),
+            span,
+        );
     }
 
     // ── Do-block inference ───────────────────────────────────────
@@ -1724,5 +1796,81 @@ mod tests {
             "*people : [{name: Text}]\nmain = *people @(\"yesterday\")"
         );
         assert!(has_error(&diags, "type mismatch"));
+    }
+
+    // ── Exhaustiveness checking ─────────────────────────────────
+
+    #[test]
+    fn exhaustive_case_all_constructors() {
+        // Covering all constructors is fine.
+        assert!(check_src(
+            "data Shape = Circle {r: Int} | Rect {w: Int, h: Int}\n\
+             f = \\s -> case s of\n  Circle {r} -> r\n  Rect {w, h} -> w * h\n\
+             main = f (Circle {r: 5})"
+        ).is_empty());
+    }
+
+    #[test]
+    fn exhaustive_case_wildcard() {
+        // A wildcard catch-all makes any match exhaustive.
+        assert!(check_src(
+            "data Shape = Circle {r: Int} | Rect {w: Int, h: Int}\n\
+             f = \\s -> case s of\n  Circle {r} -> r\n  _ -> 0\n\
+             main = f (Circle {r: 5})"
+        ).is_empty());
+    }
+
+    #[test]
+    fn exhaustive_case_var_catchall() {
+        // A variable catch-all also makes it exhaustive.
+        assert!(check_src(
+            "data Shape = Circle {r: Int} | Rect {w: Int, h: Int}\n\
+             f = \\s -> case s of\n  Circle {r} -> r\n  other -> 0\n\
+             main = f (Circle {r: 5})"
+        ).is_empty());
+    }
+
+    #[test]
+    fn non_exhaustive_case_missing_constructor() {
+        // Missing Rect — should produce an error.
+        let diags = check_src(
+            "data Shape = Circle {r: Int} | Rect {w: Int, h: Int}\n\
+             f = \\s -> case s of\n  Circle {r} -> r\n\
+             main = f (Circle {r: 5})"
+        );
+        assert!(has_error(&diags, "non-exhaustive"));
+        assert!(has_error(&diags, "Rect"));
+    }
+
+    #[test]
+    fn non_exhaustive_case_missing_multiple() {
+        // Missing two out of three constructors.
+        let diags = check_src(
+            "data Color = Red {} | Green {} | Blue {}\n\
+             f = \\c -> case c of\n  Red {} -> 1\n\
+             main = f (Red {})"
+        );
+        assert!(has_error(&diags, "non-exhaustive"));
+        assert!(has_error(&diags, "Green"));
+        assert!(has_error(&diags, "Blue"));
+    }
+
+    #[test]
+    fn exhaustive_case_single_constructor() {
+        // Data type with one constructor — a single arm is exhaustive.
+        assert!(check_src(
+            "data Wrapper = Wrap {val: Int}\n\
+             f = \\w -> case w of\n  Wrap {val} -> val\n\
+             main = f (Wrap {val: 42})"
+        ).is_empty());
+    }
+
+    #[test]
+    fn case_on_primitive_skips_exhaustiveness() {
+        // Matching on Int — no exhaustiveness check (infinite domain).
+        assert!(check_src(
+            "f = \\n -> case n of\n  0 -> 1\n  1 -> 2\n\
+             main = f 0"
+        ).is_empty());
     }
 }

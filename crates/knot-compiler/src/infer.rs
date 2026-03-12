@@ -31,6 +31,11 @@ enum Ty {
     Relation(Box<Ty>),
     /// Named algebraic data type with optional type arguments.
     Con(String, Vec<Ty>),
+    /// Unapplied type constructor (e.g. `[]`, `Maybe`).
+    /// Used for higher-kinded type polymorphism.
+    TyCon(String),
+    /// Type-level application (e.g. `f a` where `f` is a HK variable).
+    App(Box<Ty>, Box<Ty>),
     /// Error sentinel — suppresses cascading errors.
     Error,
 }
@@ -180,7 +185,28 @@ impl Infer {
                 name.clone(),
                 args.iter().map(|a| self.apply(a)).collect(),
             ),
+            Ty::TyCon(_) => ty.clone(),
+            Ty::App(f, a) => {
+                let f = self.apply(f);
+                let a = self.apply(a);
+                Self::normalize_app(f, a)
+            }
             _ => ty.clone(),
+        }
+    }
+
+    /// Normalize a type-level application after substitution.
+    /// Reduces `App(TyCon("[]"), a)` → `Relation(a)`,
+    /// `App(TyCon(name), a)` → `Con(name, [a])`, etc.
+    fn normalize_app(f: Ty, a: Ty) -> Ty {
+        match f {
+            Ty::TyCon(ref name) if name == "[]" => Ty::Relation(Box::new(a)),
+            Ty::TyCon(name) => Ty::Con(name, vec![a]),
+            Ty::Con(name, mut args) => {
+                args.push(a);
+                Ty::Con(name, args)
+            }
+            _ => Ty::App(Box::new(f), Box::new(a)),
         }
     }
 
@@ -216,6 +242,10 @@ impl Infer {
             }
             Ty::Relation(inner) => self.occurs_in(var, inner),
             Ty::Con(_, args) => args.iter().any(|a| self.occurs_in(var, a)),
+            Ty::TyCon(_) => false,
+            Ty::App(f, a) => {
+                self.occurs_in(var, f) || self.occurs_in(var, a)
+            }
             _ => false,
         }
     }
@@ -275,6 +305,48 @@ impl Infer {
                 let (f1, r1) = (f1.clone(), *r1);
                 let (f2, r2) = (f2.clone(), *r2);
                 self.unify_records(&f1, r1, &f2, r2, span);
+            }
+            // ── Higher-kinded type support ─────────────────────
+            (Ty::TyCon(a), Ty::TyCon(b)) if a == b => {}
+            (Ty::App(f1, a1), Ty::App(f2, a2)) => {
+                let (f1, a1) = (f1.clone(), a1.clone());
+                let (f2, a2) = (f2.clone(), a2.clone());
+                self.unify(&f1, &f2, span);
+                self.unify(&a1, &a2, span);
+            }
+            // App(f, a) vs Relation(b) → f = [], a = b
+            (Ty::App(f, a), Ty::Relation(b))
+            | (Ty::Relation(b), Ty::App(f, a)) => {
+                let (f, a, b) = (f.clone(), a.clone(), b.clone());
+                self.unify(&f, &Ty::TyCon("[]".into()), span);
+                self.unify(&a, &b, span);
+            }
+            // App(f, a) vs Con(name, args) — decompose the constructor
+            (Ty::App(f, a), Ty::Con(name, args))
+            | (Ty::Con(name, args), Ty::App(f, a)) => {
+                let (f, a) = (f.clone(), a.clone());
+                if args.is_empty() {
+                    let d1 = self.display_ty(&t1);
+                    let d2 = self.display_ty(&t2);
+                    self.error(
+                        format!(
+                            "type mismatch: expected {}, found {}",
+                            d1, d2
+                        ),
+                        span,
+                    );
+                } else {
+                    let last = args.last().unwrap().clone();
+                    let init: Vec<Ty> =
+                        args[..args.len() - 1].to_vec();
+                    let partial = if init.is_empty() {
+                        Ty::TyCon(name.clone())
+                    } else {
+                        Ty::Con(name.clone(), init)
+                    };
+                    self.unify(&f, &partial, span);
+                    self.unify(&a, &last, span);
+                }
             }
             _ => {
                 let d1 = self.display_ty(&t1);
@@ -429,6 +501,11 @@ impl Infer {
                 name.clone(),
                 args.iter().map(|a| self.subst_ty(a, mapping)).collect(),
             ),
+            Ty::TyCon(_) => ty.clone(),
+            Ty::App(f, a) => Ty::App(
+                Box::new(self.subst_ty(f, mapping)),
+                Box::new(self.subst_ty(a, mapping)),
+            ),
             _ => ty.clone(),
         }
     }
@@ -483,6 +560,11 @@ impl Infer {
                 for a in args {
                     self.collect_free_vars(a, out);
                 }
+            }
+            Ty::TyCon(_) => {}
+            Ty::App(f, a) => {
+                self.collect_free_vars(f, out);
+                self.collect_free_vars(a, out);
             }
             _ => {}
         }
@@ -553,9 +635,18 @@ impl Infer {
                 "Float" => Ty::Float,
                 "Text" => Ty::Text,
                 "Bool" => Ty::Bool,
+                "[]" => Ty::TyCon("[]".into()),
                 _ => {
                     if let Some(aliased) = self.aliases.get(name).cloned() {
                         aliased
+                    } else if self
+                        .data_types
+                        .get(name)
+                        .map_or(false, |d| !d.params.is_empty())
+                    {
+                        // Parameterized data type used without arguments
+                        // → type constructor (for HKT support).
+                        Ty::TyCon(name.clone())
                     } else {
                         Ty::Con(name.clone(), vec![])
                     }
@@ -585,17 +676,26 @@ impl Infer {
                 Box::new(self.ast_type_to_ty(result)),
             ),
             ast::TypeKind::App { func, arg } => {
+                // Check for associated type applications first.
                 if let ast::TypeKind::Named(name) = &func.node {
-                    // Associated type applications (e.g. Elem c) are
-                    // type-level computations; treat as fresh variables
-                    // since HM can't resolve them.
                     if self.assoc_type_names.contains(name) {
                         return self.fresh();
                     }
-                    let arg_ty = self.ast_type_to_ty(arg);
-                    Ty::Con(name.clone(), vec![arg_ty])
-                } else {
-                    Ty::Error
+                }
+                let arg_ty = self.ast_type_to_ty(arg);
+                let func_ty = self.ast_type_to_ty(func);
+                match func_ty {
+                    // Named constructor accumulates arguments.
+                    Ty::Con(name, mut args) => {
+                        args.push(arg_ty);
+                        Ty::Con(name, args)
+                    }
+                    // HK type variable or nested App — produce App node.
+                    Ty::Var(_) | Ty::App(_, _) | Ty::TyCon(_) => {
+                        Ty::App(Box::new(func_ty), Box::new(arg_ty))
+                    }
+                    Ty::Error => Ty::Error,
+                    _ => Ty::Error,
                 }
             }
             ast::TypeKind::Variant { .. } => Ty::Error,
@@ -690,6 +790,14 @@ impl Infer {
                         args.iter().map(|a| self.display_ty(a)).collect();
                     format!("{} {}", name, args_str.join(" "))
                 }
+            }
+            Ty::TyCon(name) => name.clone(),
+            Ty::App(f, a) => {
+                format!(
+                    "({} {})",
+                    self.display_ty(f),
+                    self.display_ty(a)
+                )
             }
             Ty::Error => "<error>".into(),
         }
@@ -1871,6 +1979,120 @@ mod tests {
         assert!(check_src(
             "f = \\n -> case n of\n  0 -> 1\n  1 -> 2\n\
              main = f 0"
+        ).is_empty());
+    }
+
+    // ── Higher-kinded types ───────────────────────────────────────
+
+    #[test]
+    fn hkt_trait_method_with_relation() {
+        // map : (a -> b) -> f a -> f b, used with [] (relation)
+        assert!(check_src(
+            "trait Functor (f : Type -> Type) where\n\
+             \x20 fmap : (a -> b) -> f a -> f b\n\
+             impl Functor [] where\n\
+             \x20 fmap f rel = do\n\
+             \x20   x <- rel\n\
+             \x20   yield (f x)\n\
+             main = fmap (\\x -> x + 1) [1, 2, 3]"
+        ).is_empty());
+    }
+
+    #[test]
+    fn hkt_trait_method_type_propagation() {
+        // The result of fmap should have the correct element type
+        assert!(check_src(
+            "trait Functor (f : Type -> Type) where\n\
+             \x20 fmap : (a -> b) -> f a -> f b\n\
+             impl Functor [] where\n\
+             \x20 fmap f rel = do\n\
+             \x20   x <- rel\n\
+             \x20   yield (f x)\n\
+             main = do\n\
+             \x20 x <- fmap (\\n -> show n) [1, 2, 3]\n\
+             \x20 yield (x ++ \"!\")"
+        ).is_empty());
+    }
+
+    #[test]
+    fn hkt_trait_method_type_error() {
+        // fmap expects a function, not a plain value
+        let diags = check_src(
+            "trait Functor (f : Type -> Type) where\n\
+             \x20 fmap : (a -> b) -> f a -> f b\n\
+             impl Functor [] where\n\
+             \x20 fmap f rel = do\n\
+             \x20   x <- rel\n\
+             \x20   yield (f x)\n\
+             main = fmap 42 [1, 2, 3]"
+        );
+        assert!(has_error(&diags, "type mismatch"));
+    }
+
+    #[test]
+    fn hkt_with_adt() {
+        // HKT trait with an ADT type constructor
+        assert!(check_src(
+            "data Maybe a = Nothing {} | Just {value: a}\n\
+             trait Functor (f : Type -> Type) where\n\
+             \x20 fmap : (a -> b) -> f a -> f b\n\
+             impl Functor Maybe where\n\
+             \x20 fmap f m = case m of\n\
+             \x20   Nothing {} -> Nothing {}\n\
+             \x20   Just {value} -> Just {value: f value}\n\
+             main = fmap (\\x -> x + 1) (Just {value: 42})"
+        ).is_empty());
+    }
+
+    #[test]
+    fn hkt_multiple_methods() {
+        // Trait with multiple HK-parameterized methods
+        assert!(check_src(
+            "trait Container (f : Type -> Type) where\n\
+             \x20 wrap : a -> f a\n\
+             \x20 unwrap : f a -> a\n\
+             impl Container [] where\n\
+             \x20 wrap x = [x]\n\
+             \x20 unwrap rel = do\n\
+             \x20   x <- rel\n\
+             \x20   yield x\n\
+             main = wrap 42"
+        ).is_empty());
+    }
+
+    #[test]
+    fn hkt_bare_relation_constructor() {
+        // [] used as a bare type in impl should work
+        assert!(check_src(
+            "trait Empty (f : Type -> Type) where\n\
+             \x20 empty : f a\n\
+             impl Empty [] where\n\
+             \x20 empty = []\n\
+             main = empty"
+        ).is_empty());
+    }
+
+    #[test]
+    fn hkt_tycon_unifies_with_relation() {
+        // When HK var is solved to [], App([], a) should equal [a]
+        assert!(check_src(
+            "*nums : [Int]\n\
+             trait Functor (f : Type -> Type) where\n\
+             \x20 fmap : (a -> b) -> f a -> f b\n\
+             impl Functor [] where\n\
+             \x20 fmap f rel = do\n\
+             \x20   x <- rel\n\
+             \x20   yield (f x)\n\
+             main = fmap (\\x -> x + 1) *nums"
+        ).is_empty());
+    }
+
+    #[test]
+    fn hkt_multi_arg_type_application() {
+        // Multi-arg type constructors in annotations should work
+        assert!(check_src(
+            "data Pair a b = MkPair {fst: a, snd: b}\n\
+             main = MkPair {fst: 1, snd: \"hello\"}"
         ).is_empty());
     }
 }

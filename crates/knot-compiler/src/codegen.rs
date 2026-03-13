@@ -102,6 +102,20 @@ pub struct Codegen {
 
     // Resolved monad types for desugared do-blocks (from type inference)
     monad_info: MonadInfo,
+
+    // Nullable-encoded ADTs: ctor_name -> NullableInfo
+    // Types isomorphic to Maybe (one nullary ctor, one non-nullary ctor)
+    // are encoded as nullable pointers: null = none variant, bare payload = some variant.
+    nullable_ctors: HashMap<String, NullableRole>,
+}
+
+/// Role of a constructor in a nullable-encoded ADT.
+#[derive(Clone, Debug)]
+enum NullableRole {
+    /// The nullary constructor (e.g. Nothing) — encoded as null pointer
+    None,
+    /// The constructor with fields (e.g. Just) — encoded as bare payload
+    Some,
 }
 
 /// Provenance info for a view declaration, extracted at compile time.
@@ -296,6 +310,7 @@ impl Codegen {
             route_entries: HashMap::new(),
             user_fn_trampolines: HashMap::new(),
             monad_info: HashMap::new(),
+            nullable_ctors: HashMap::new(),
         }
     }
 
@@ -514,6 +529,23 @@ impl Codegen {
                     let ctor_names: Vec<String> =
                         ctors.iter().map(|c| c.name.clone()).collect();
                     self.data_constructors.insert(name.clone(), ctor_names);
+
+                    // Detect Maybe-isomorphic types: exactly 2 constructors,
+                    // one nullary (0 fields) and one with fields.
+                    if ctors.len() == 2 {
+                        let (nullary, non_nullary): (Vec<_>, Vec<_>) =
+                            ctors.iter().partition(|c| c.fields.is_empty());
+                        if nullary.len() == 1 && non_nullary.len() == 1 {
+                            self.nullable_ctors.insert(
+                                nullary[0].name.clone(),
+                                NullableRole::None,
+                            );
+                            self.nullable_ctors.insert(
+                                non_nullary[0].name.clone(),
+                                NullableRole::Some,
+                            );
+                        }
+                    }
                 }
                 ast::DeclKind::Trait {
                     name: trait_name,
@@ -1013,6 +1045,7 @@ impl Codegen {
             sig.returns.push(AbiParam::new(self.ptr_type));
 
             let data_ctors_ref = data_ctors.clone();
+            let nullable_ctors_ref = self.nullable_ctors.clone();
 
             self.build_function(dispatcher_id, sig, |cg, builder, entry| {
                 let db = builder.block_params(entry)[0];
@@ -1040,24 +1073,65 @@ impl Codegen {
                 let merge_block = builder.create_block();
                 merge_block_param(builder, merge_block, cg.ptr_type);
 
-                // Get value tag for dispatch
+                // Separate primitive, normal ADT, and nullable ADT impls
+                let mut primitive_impls: Vec<(i64, FuncId)> = Vec::new();
+                let mut adt_impls: Vec<(Vec<String>, FuncId)> = Vec::new();
+                let mut nullable_adt_impls: Vec<FuncId> = Vec::new();
+                for (type_name, impl_func_id) in &impls {
+                    if let Some(runtime_tag) = type_name_to_tag(type_name) {
+                        primitive_impls.push((runtime_tag, *impl_func_id));
+                    } else if let Some(ctors) = data_ctors_ref.get(type_name) {
+                        let is_nullable = ctors.iter().any(|c| nullable_ctors_ref.contains_key(c));
+                        if is_nullable {
+                            nullable_adt_impls.push(*impl_func_id);
+                        } else {
+                            adt_impls.push((ctors.clone(), *impl_func_id));
+                        }
+                    }
+                }
+
+                // For nullable ADTs: check null first (before dereferencing)
+                let tag_block = builder.create_block();
+                if !nullable_adt_impls.is_empty() {
+                    let nullable_impl_block = builder.create_block();
+                    let is_null = builder.ins().icmp_imm(
+                        IntCC::Equal,
+                        dispatch_arg,
+                        0,
+                    );
+                    builder.ins().brif(
+                        is_null,
+                        nullable_impl_block,
+                        &[],
+                        tag_block,
+                        &[],
+                    );
+
+                    // Null → dispatch to the nullable ADT impl
+                    builder.switch_to_block(nullable_impl_block);
+                    builder.seal_block(nullable_impl_block);
+                    let impl_ref = cg
+                        .module
+                        .declare_func_in_func(nullable_adt_impls[0], builder.func);
+                    let mut call_args = vec![db];
+                    call_args.extend(&all_params);
+                    let call = builder.ins().call(impl_ref, &call_args);
+                    let result = builder.inst_results(call)[0];
+                    builder.ins().jump(merge_block, &[result]);
+                } else {
+                    builder.ins().jump(tag_block, &[]);
+                }
+
+                builder.switch_to_block(tag_block);
+                builder.seal_block(tag_block);
+
+                // Get value tag for dispatch (safe: value is non-null here)
                 let tag = cg.call_rt_typed(
                     builder,
                     "knot_value_get_tag",
                     &[dispatch_arg],
                     types::I32,
                 );
-
-                // Separate primitive and ADT impls
-                let mut primitive_impls: Vec<(i64, FuncId)> = Vec::new();
-                let mut adt_impls: Vec<(Vec<String>, FuncId)> = Vec::new();
-                for (type_name, impl_func_id) in &impls {
-                    if let Some(runtime_tag) = type_name_to_tag(type_name) {
-                        primitive_impls.push((runtime_tag, *impl_func_id));
-                    } else if let Some(ctors) = data_ctors_ref.get(type_name) {
-                        adt_impls.push((ctors.clone(), *impl_func_id));
-                    }
-                }
 
                 // Generate primitive type checks
                 for (runtime_tag, impl_func_id) in &primitive_impls {
@@ -1091,7 +1165,7 @@ impl Codegen {
                     builder.seal_block(next_block);
                 }
 
-                // Generate ADT type checks (Constructor tag + constructor name)
+                // Generate normal ADT type checks (Constructor tag + constructor name)
                 for (ctors, impl_func_id) in &adt_impls {
                     if ctors.is_empty() {
                         continue;
@@ -1165,6 +1239,39 @@ impl Codegen {
 
                     builder.switch_to_block(next_adt_block);
                     builder.seal_block(next_adt_block);
+                }
+
+                // Nullable ADT "Some" dispatch: non-null bare payload
+                // (value didn't match any Constructor-based ADT)
+                for impl_func_id in &nullable_adt_impls {
+                    let impl_block = builder.create_block();
+                    let next_block = builder.create_block();
+
+                    // Non-null, non-Constructor → must be a nullable Some variant
+                    let tag_7 = builder.ins().iconst(types::I32, 7);
+                    let is_not_ctor =
+                        builder.ins().icmp(IntCC::NotEqual, tag, tag_7);
+                    builder.ins().brif(
+                        is_not_ctor,
+                        impl_block,
+                        &[],
+                        next_block,
+                        &[],
+                    );
+
+                    builder.switch_to_block(impl_block);
+                    builder.seal_block(impl_block);
+                    let impl_ref = cg
+                        .module
+                        .declare_func_in_func(*impl_func_id, builder.func);
+                    let mut call_args = vec![db];
+                    call_args.extend(&all_params);
+                    let call = builder.ins().call(impl_ref, &call_args);
+                    let result = builder.inst_results(call)[0];
+                    builder.ins().jump(merge_block, &[result]);
+
+                    builder.switch_to_block(next_block);
+                    builder.seal_block(next_block);
                 }
 
                 // Fallback: runtime error (no matching impl found)
@@ -1570,12 +1677,15 @@ impl Codegen {
             }
 
             ast::ExprKind::Constructor(name) => {
-                // Bare constructor reference — return as a unit constructor
-                let (tag_ptr, tag_len) = self.string_ptr(builder, name);
-                let unit = self.call_rt(builder, "knot_value_unit", &[]);
-                let ctor =
-                    self.call_rt(builder, "knot_value_constructor", &[tag_ptr, tag_len, unit]);
-                ctor
+                if matches!(self.nullable_ctors.get(name), Some(NullableRole::None)) {
+                    // Nullable none: encode as null pointer
+                    builder.ins().iconst(self.ptr_type, 0)
+                } else {
+                    // Bare constructor reference — return as a unit constructor
+                    let (tag_ptr, tag_len) = self.string_ptr(builder, name);
+                    let unit = self.call_rt(builder, "knot_value_unit", &[]);
+                    self.call_rt(builder, "knot_value_constructor", &[tag_ptr, tag_len, unit])
+                }
             }
 
             ast::ExprKind::SourceRef(name) => {
@@ -2430,17 +2540,33 @@ impl Codegen {
 
             // Constructor application: `Circle {radius: 3.14}`
             ast::ExprKind::Constructor(name) => {
-                let (tag_ptr, tag_len) = self.string_ptr(builder, name);
-                let payload = if compiled_args.len() == 1 {
-                    compiled_args[0]
-                } else {
-                    self.call_rt(builder, "knot_value_unit", &[])
-                };
-                self.call_rt(
-                    builder,
-                    "knot_value_constructor",
-                    &[tag_ptr, tag_len, payload],
-                )
+                match self.nullable_ctors.get(name).cloned() {
+                    Some(NullableRole::None) => {
+                        // Nullable none: ignore args, return null
+                        builder.ins().iconst(self.ptr_type, 0)
+                    }
+                    Some(NullableRole::Some) => {
+                        // Nullable some: return bare payload (no Constructor wrapper)
+                        if compiled_args.len() == 1 {
+                            compiled_args[0]
+                        } else {
+                            self.call_rt(builder, "knot_value_unit", &[])
+                        }
+                    }
+                    None => {
+                        let (tag_ptr, tag_len) = self.string_ptr(builder, name);
+                        let payload = if compiled_args.len() == 1 {
+                            compiled_args[0]
+                        } else {
+                            self.call_rt(builder, "knot_value_unit", &[])
+                        };
+                        self.call_rt(
+                            builder,
+                            "knot_value_constructor",
+                            &[tag_ptr, tag_len, payload],
+                        )
+                    }
+                }
             }
 
             // Dynamic call through a function value
@@ -2499,18 +2625,58 @@ impl Codegen {
                     builder.ins().jump(arm_block, &[]);
                 }
                 ast::PatKind::Constructor { name, .. } => {
-                    let (tag_ptr, tag_len) = self.string_ptr(builder, name);
-                    let matches = self.call_rt_typed(
-                        builder,
-                        "knot_constructor_matches",
-                        &[scrut, tag_ptr, tag_len],
-                        types::I32,
-                    );
-                    let is_match =
-                        builder.ins().icmp_imm(IntCC::NotEqual, matches, 0);
-                    builder
-                        .ins()
-                        .brif(is_match, arm_block, &[], next_block, &[]);
+                    match self.nullable_ctors.get(name).cloned() {
+                        Some(NullableRole::None) => {
+                            // Nullable none: check if scrutinee is null
+                            let is_null = builder.ins().icmp_imm(
+                                IntCC::Equal,
+                                scrut,
+                                0,
+                            );
+                            builder.ins().brif(
+                                is_null,
+                                arm_block,
+                                &[],
+                                next_block,
+                                &[],
+                            );
+                        }
+                        Some(NullableRole::Some) => {
+                            // Nullable some: check if scrutinee is non-null
+                            let is_some = builder.ins().icmp_imm(
+                                IntCC::NotEqual,
+                                scrut,
+                                0,
+                            );
+                            builder.ins().brif(
+                                is_some,
+                                arm_block,
+                                &[],
+                                next_block,
+                                &[],
+                            );
+                        }
+                        None => {
+                            let (tag_ptr, tag_len) =
+                                self.string_ptr(builder, name);
+                            let matches = self.call_rt_typed(
+                                builder,
+                                "knot_constructor_matches",
+                                &[scrut, tag_ptr, tag_len],
+                                types::I32,
+                            );
+                            let is_match = builder
+                                .ins()
+                                .icmp_imm(IntCC::NotEqual, matches, 0);
+                            builder.ins().brif(
+                                is_match,
+                                arm_block,
+                                &[],
+                                next_block,
+                                &[],
+                            );
+                        }
+                    }
                 }
                 ast::PatKind::Lit(lit) => {
                     let lit_val = self.compile_lit(builder, lit);
@@ -2572,9 +2738,14 @@ impl Codegen {
         match &pat.node {
             ast::PatKind::Var(name) => env.set(name, val),
             ast::PatKind::Wildcard => {}
-            ast::PatKind::Constructor { name: _, payload } => {
-                let inner = self.call_rt(builder, "knot_constructor_payload", &[val]);
-                self.bind_case_pattern(builder, payload, inner, env);
+            ast::PatKind::Constructor { name, payload } => {
+                if self.nullable_ctors.contains_key(name) {
+                    // Nullable: val is the bare payload (or null for none)
+                    self.bind_case_pattern(builder, payload, val, env);
+                } else {
+                    let inner = self.call_rt(builder, "knot_constructor_payload", &[val]);
+                    self.bind_case_pattern(builder, payload, inner, env);
+                }
             }
             ast::PatKind::Record(fields) => {
                 for fp in fields {
@@ -3597,14 +3768,24 @@ fn bind_do_pattern(
         ast::PatKind::Constructor { name, payload } => {
             // Pattern match bind: `Circle c <- *shapes`
             // Filter: only rows matching the constructor tag continue
-            let (tag_ptr, tag_len) = cg.string_ptr(builder, name);
-            let matches = cg.call_rt_typed(
-                builder,
-                "knot_constructor_matches",
-                &[val, tag_ptr, tag_len],
-                types::I32,
-            );
-            let is_match = builder.ins().icmp_imm(IntCC::NotEqual, matches, 0);
+            let is_match = match cg.nullable_ctors.get(name).cloned() {
+                Some(NullableRole::None) => {
+                    builder.ins().icmp_imm(IntCC::Equal, val, 0)
+                }
+                Some(NullableRole::Some) => {
+                    builder.ins().icmp_imm(IntCC::NotEqual, val, 0)
+                }
+                None => {
+                    let (tag_ptr, tag_len) = cg.string_ptr(builder, name);
+                    let matches = cg.call_rt_typed(
+                        builder,
+                        "knot_constructor_matches",
+                        &[val, tag_ptr, tag_len],
+                        types::I32,
+                    );
+                    builder.ins().icmp_imm(IntCC::NotEqual, matches, 0)
+                }
+            };
 
             let then_block = builder.create_block();
             let skip_block = builder.create_block();
@@ -3615,8 +3796,13 @@ fn bind_do_pattern(
             skips.push(skip_block);
 
             // Extract payload and bind inner pattern
-            let inner = cg.call_rt(builder, "knot_constructor_payload", &[val]);
-            bind_do_pattern(builder, cg, payload, inner, env, skips);
+            if cg.nullable_ctors.contains_key(name) {
+                // Nullable: val is the bare payload (or null for none)
+                bind_do_pattern(builder, cg, payload, val, env, skips);
+            } else {
+                let inner = cg.call_rt(builder, "knot_constructor_payload", &[val]);
+                bind_do_pattern(builder, cg, payload, inner, env, skips);
+            }
         }
         _ => {}
     }

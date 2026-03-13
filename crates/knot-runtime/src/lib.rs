@@ -4,6 +4,7 @@
 //! and SQLite-backed persistence. This crate is compiled as a static
 //! library and linked into every compiled Knot program.
 
+use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use std::ffi::c_void;
 use std::slice;
@@ -229,6 +230,9 @@ pub extern "C" fn knot_value_get_bool(v: *mut Value) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_get_tag(v: *mut Value) -> i32 {
+    if v.is_null() {
+        return 9; // Nullable none (null pointer)
+    }
     match unsafe { as_ref(v) } {
         Value::Int(_) => 0,
         Value::Float(_) => 1,
@@ -277,6 +281,10 @@ pub extern "C" fn knot_record_field(
     key_ptr: *const u8,
     key_len: usize,
 ) -> *mut Value {
+    if record.is_null() {
+        let name = unsafe { str_from_raw(key_ptr, key_len) };
+        panic!("knot runtime: field '{}' access on null (nullable none variant)", name);
+    }
     let name = unsafe { str_from_raw(key_ptr, key_len) };
     match unsafe { as_ref(record) } {
         Value::Record(fields) => {
@@ -326,8 +334,12 @@ pub extern "C" fn knot_relation_push(rel: *mut Value, row: *mut Value) {
 
 /// If the value is already a relation, return it as-is.
 /// Otherwise, wrap it in a singleton relation.
+/// Null (nullable none) wraps as a singleton containing null.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_ensure_relation(v: *mut Value) -> *mut Value {
+    if v.is_null() {
+        return alloc(Value::Relation(vec![v]));
+    }
     match unsafe { as_ref(v) } {
         Value::Relation(_) => v,
         _ => alloc(Value::Relation(vec![v])),
@@ -410,6 +422,10 @@ pub extern "C" fn knot_relation_bind(
 fn values_equal(a: *mut Value, b: *mut Value) -> bool {
     if a == b {
         return true;
+    }
+    // Nullable encoding: null represents the "none" variant
+    if a.is_null() || b.is_null() {
+        return false; // a == b already handled both-null
     }
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Int(x), Value::Int(y)) => x == y,
@@ -991,6 +1007,22 @@ fn sql_type(ty: ColType) -> &'static str {
     }
 }
 
+/// Read a column value from a SQLite row, returning null pointer for SQL NULL.
+fn read_sql_column(row: &rusqlite::Row, i: usize, ty: ColType) -> *mut Value {
+    if matches!(row.get_ref(i).unwrap(), ValueRef::Null) {
+        return std::ptr::null_mut();
+    }
+    match ty {
+        ColType::Int => knot_value_int(row.get::<_, i64>(i).unwrap()),
+        ColType::Float => knot_value_float(row.get::<_, f64>(i).unwrap()),
+        ColType::Text => {
+            let s: String = row.get(i).unwrap();
+            alloc(Value::Text(s))
+        }
+        ColType::Bool => knot_value_bool(row.get::<_, i32>(i).unwrap()),
+    }
+}
+
 /// Initialize a source table. Creates it if it doesn't exist.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_source_init(
@@ -1108,16 +1140,7 @@ pub extern "C" fn knot_source_read(
     {
         let record = knot_record_empty(cols.len());
         for (i, col) in cols.iter().enumerate() {
-            let val = match col.ty {
-                ColType::Int => knot_value_int(row.get::<_, i64>(i).unwrap()),
-                ColType::Float => knot_value_float(row.get::<_, f64>(i).unwrap()),
-                ColType::Text => {
-                    let s: String = row.get(i).unwrap();
-                    let v = alloc(Value::Text(s));
-                    v
-                }
-                ColType::Bool => knot_value_bool(row.get::<_, i32>(i).unwrap()),
-            };
+            let val = read_sql_column(row, i, col.ty);
             // Set the field
             let name = col.name.as_bytes();
             knot_record_set_field(record, name.as_ptr(), name.len(), val);
@@ -1553,6 +1576,9 @@ pub extern "C" fn knot_source_update_where(
 }
 
 fn value_to_sql_param(v: *mut Value) -> rusqlite::types::Value {
+    if v.is_null() {
+        return rusqlite::types::Value::Null;
+    }
     match unsafe { as_ref(v) } {
         Value::Int(n) => rusqlite::types::Value::Integer(*n),
         Value::Float(n) => rusqlite::types::Value::Real(*n),
@@ -1567,6 +1593,9 @@ fn value_to_sql_param(v: *mut Value) -> rusqlite::types::Value {
 }
 
 fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
+    if v.is_null() {
+        return rusqlite::types::Value::Null;
+    }
     match (unsafe { as_ref(v) }, ty) {
         (Value::Int(n), _) => rusqlite::types::Value::Integer(*n),
         (Value::Float(n), _) => rusqlite::types::Value::Real(*n),
@@ -1754,15 +1783,7 @@ pub extern "C" fn knot_source_read_at(
     {
         let record = knot_record_empty(cols.len());
         for (i, col) in cols.iter().enumerate() {
-            let val = match col.ty {
-                ColType::Int => knot_value_int(row.get::<_, i64>(i).unwrap()),
-                ColType::Float => knot_value_float(row.get::<_, f64>(i).unwrap()),
-                ColType::Text => {
-                    let s: String = row.get(i).unwrap();
-                    alloc(Value::Text(s))
-                }
-                ColType::Bool => knot_value_bool(row.get::<_, i32>(i).unwrap()),
-            };
+            let val = read_sql_column(row, i, col.ty);
             let field_name = col.name.as_bytes();
             knot_record_set_field(record, field_name.as_ptr(), field_name.len(), val);
         }
@@ -2030,15 +2051,7 @@ pub extern "C" fn knot_view_read(
     {
         let record = knot_record_empty(cols.len());
         for (i, col) in cols.iter().enumerate() {
-            let val = match col.ty {
-                ColType::Int => knot_value_int(row.get::<_, i64>(i).unwrap()),
-                ColType::Float => knot_value_float(row.get::<_, f64>(i).unwrap()),
-                ColType::Text => {
-                    let s: String = row.get(i).unwrap();
-                    alloc(Value::Text(s))
-                }
-                ColType::Bool => knot_value_bool(row.get::<_, i32>(i).unwrap()),
-            };
+            let val = read_sql_column(row, i, col.ty);
             let name_bytes = col.name.as_bytes();
             knot_record_set_field(record, name_bytes.as_ptr(), name_bytes.len(), val);
         }
@@ -2238,6 +2251,9 @@ pub extern "C" fn knot_constructor_matches(
     tag_ptr: *const u8,
     tag_len: usize,
 ) -> i32 {
+    if v.is_null() {
+        return 0; // Null (nullable none) never matches a constructor tag
+    }
     let tag = unsafe { str_from_raw(tag_ptr, tag_len) };
     match unsafe { as_ref(v) } {
         Value::Constructor(t, _) => (t == tag) as i32,
@@ -2246,8 +2262,12 @@ pub extern "C" fn knot_constructor_matches(
 }
 
 /// Get the payload of a constructor value.
+/// For nullable-encoded types, the value IS the payload (or null for none).
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_constructor_payload(v: *mut Value) -> *mut Value {
+    if v.is_null() {
+        return v; // Nullable none: return null
+    }
     match unsafe { as_ref(v) } {
         Value::Constructor(_, payload) => *payload,
         _ => panic!("knot runtime: expected Constructor, got {}", type_name(v)),

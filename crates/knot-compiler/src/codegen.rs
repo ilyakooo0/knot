@@ -2305,6 +2305,14 @@ impl Codegen {
                     self.call_rt(builder, "knot_value_unit", &[])
                 }
             }
+            ast::ExprKind::Var(name) if name == "respond" => {
+                // respond is identity at runtime — just return the value
+                if compiled_args.len() == 1 {
+                    compiled_args[0]
+                } else {
+                    self.call_rt(builder, "knot_value_unit", &[])
+                }
+            }
             ast::ExprKind::Var(name) if name == "listen" => {
                 if compiled_args.len() == 2 {
                     // listen port handler
@@ -3727,6 +3735,7 @@ fn is_builtin_name(name: &str) -> bool {
             | "now"
             | "__bind"
             | "listen"
+            | "respond"
     )
 }
 

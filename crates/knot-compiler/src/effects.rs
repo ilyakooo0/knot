@@ -186,6 +186,7 @@ impl EffectChecker {
         builtin_effects.insert("filter".into(), EffectSet::empty());
         builtin_effects.insert("map".into(), EffectSet::empty());
         builtin_effects.insert("fold".into(), EffectSet::empty());
+        builtin_effects.insert("respond".into(), EffectSet::empty());
 
         Self {
             decl_effects: HashMap::new(),

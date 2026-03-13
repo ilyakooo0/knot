@@ -1562,17 +1562,32 @@ impl Infer {
             },
         );
 
-        // listen : ∀a b. Int -> (a -> b) -> {}
+        // respond : ∀a. a -> Response (erases type for HTTP responses)
         let a = self.fresh_var();
-        let b = self.fresh_var();
+        self.bind_top(
+            "respond",
+            Scheme {
+                vars: vec![a],
+                ty: Ty::Fun(
+                    Box::new(Ty::Var(a)),
+                    Box::new(Ty::Con("Response".into(), vec![])),
+                ),
+            },
+        );
+
+        // listen : ∀a. Int -> (a -> Response) -> {}
+        let a = self.fresh_var();
         self.bind_top(
             "listen",
             Scheme {
-                vars: vec![a, b],
+                vars: vec![a],
                 ty: Ty::Fun(
                     Box::new(Ty::Int),
                     Box::new(Ty::Fun(
-                        Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
+                        Box::new(Ty::Fun(
+                            Box::new(Ty::Var(a)),
+                            Box::new(Ty::Con("Response".into(), vec![])),
+                        )),
                         Box::new(Ty::unit()),
                     )),
                 ),

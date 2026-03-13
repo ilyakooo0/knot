@@ -726,8 +726,16 @@ impl Parser {
         }
 
         // Method: name : type_scheme  (or name params = expr for default)
-        if let TokenKind::Lower(_) = self.peek() {
-            let (name, _) = self.expect_lower("expected method name").ok()?;
+        // Allow `yield` keyword as a method name in trait definitions
+        let method_name = match self.peek().clone() {
+            TokenKind::Lower(_) => Some(self.expect_lower("expected method name").ok()?.0),
+            TokenKind::Yield => {
+                self.advance();
+                Some("yield".to_string())
+            }
+            _ => None,
+        };
+        if let Some(name) = method_name {
 
             if self.at(&TokenKind::Colon) {
                 self.advance();
@@ -853,8 +861,16 @@ impl Parser {
         }
 
         // Method: name params* = expr
-        if let TokenKind::Lower(_) = self.peek() {
-            let (name, _) = self.expect_lower("expected method name in impl").ok()?;
+        // Allow `yield` keyword as a method name in impl definitions
+        let method_name = match self.peek().clone() {
+            TokenKind::Lower(_) => Some(self.expect_lower("expected method name in impl").ok()?.0),
+            TokenKind::Yield => {
+                self.advance();
+                Some("yield".to_string())
+            }
+            _ => None,
+        };
+        if let Some(name) = method_name {
             let mut params = Vec::new();
             while self.can_start_pat() && !self.at(&TokenKind::Eq) {
                 if let Some(p) = self.try_parse_pat() {

@@ -5,6 +5,7 @@
 //! values (managed by the runtime). The generated code calls into runtime
 //! functions for value construction, operations, and SQLite persistence.
 
+use crate::infer::{MonadInfo, MonadKind};
 use crate::types::TypeEnv;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types;
@@ -98,6 +99,9 @@ pub struct Codegen {
 
     // Trampolines for user functions used as values: fn_name -> trampoline_func_id
     user_fn_trampolines: HashMap<String, FuncId>,
+
+    // Resolved monad types for desugared do-blocks (from type inference)
+    monad_info: MonadInfo,
 }
 
 /// Provenance info for a view declaration, extracted at compile time.
@@ -194,6 +198,7 @@ pub fn compile(
     module: &ast::Module,
     type_env: &TypeEnv,
     source_file: &str,
+    monad_info: &MonadInfo,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     let mut cg = Codegen::new();
     // Derive database path from source filename: "foo.knot" → "foo.db"
@@ -206,6 +211,7 @@ pub fn compile(
     cg.migrate_schemas = type_env.migrate_schemas.clone();
     cg.history_sources = type_env.history_sources.clone();
     cg.subset_constraints = type_env.subset_constraints.clone();
+    cg.monad_info = monad_info.clone();
     for (name, fields) in &type_env.constructors {
         let field_strs: Vec<(String, String)> = fields
             .iter()
@@ -289,6 +295,7 @@ impl Codegen {
             recursive_body_fns: HashMap::new(),
             route_entries: HashMap::new(),
             user_fn_trampolines: HashMap::new(),
+            monad_info: HashMap::new(),
         }
     }
 
@@ -1527,6 +1534,10 @@ impl Codegen {
         match &expr.node {
             ast::ExprKind::Lit(lit) => self.compile_lit(builder, lit),
 
+            ast::ExprKind::Var(name) if name == "__empty" => {
+                return self.compile_monadic_empty(builder, expr.span, db);
+            }
+
             ast::ExprKind::Var(name) => {
                 if name == "now" {
                     return self.call_rt(builder, "knot_now", &[]);
@@ -1779,7 +1790,14 @@ impl Codegen {
                 self.compile_lambda(builder, params, body, env, db)
             }
 
-            ast::ExprKind::App { func: _, arg: _ } => {
+            ast::ExprKind::App { func, arg } => {
+                // Check for monadic yield: __yield(e)
+                if let ast::ExprKind::Var(name) = &func.node {
+                    if name == "__yield" {
+                        let val = self.compile_expr(builder, arg, env, db);
+                        return self.compile_monadic_yield(builder, val, func.span, db);
+                    }
+                }
                 self.compile_app(builder, expr, env, db)
             }
 
@@ -2231,6 +2249,50 @@ impl Codegen {
             .collect();
 
         match &func_expr.node {
+            // Monadic bind: __bind(f, m) — dispatch based on monad type
+            ast::ExprKind::Var(name) if name == "__bind" => {
+                if compiled_args.len() == 2 {
+                    if let Some(MonadKind::Adt(type_name)) =
+                        self.monad_info.get(&func_expr.span)
+                    {
+                        let bind_fn = format!("Monad_{}_bind", type_name);
+                        if let Some(&(func_id, _)) = self.user_fns.get(&bind_fn) {
+                            let func_ref = self
+                                .module
+                                .declare_func_in_func(func_id, builder.func);
+                            let call = builder.ins().call(
+                                func_ref,
+                                &[db, compiled_args[0], compiled_args[1]],
+                            );
+                            return builder.inst_results(call)[0];
+                        }
+                    }
+                }
+                // Fall through: relation monad — call built-in __bind
+                let (func_id, expected_params) = self.user_fns["__bind"];
+                if compiled_args.len() == expected_params {
+                    let func_ref = self
+                        .module
+                        .declare_func_in_func(func_id, builder.func);
+                    let mut call_args = vec![db];
+                    call_args.extend(&compiled_args);
+                    let call = builder.ins().call(func_ref, &call_args);
+                    builder.inst_results(call)[0]
+                } else {
+                    let func_val =
+                        self.compile_expr(builder, func_expr, env, db);
+                    let mut result = func_val;
+                    for arg in &compiled_args {
+                        result = self.call_rt(
+                            builder,
+                            "knot_value_call",
+                            &[db, result, *arg],
+                        );
+                    }
+                    result
+                }
+            }
+
             // Direct call to a known user function
             ast::ExprKind::Var(name)
                 if self.user_fns.contains_key(name) =>
@@ -2536,6 +2598,51 @@ impl Codegen {
         }
     }
 
+    // ── Monadic operation compilation ─────────────────────────────
+
+    /// Compile `__yield(val)` — wraps a value into the appropriate monad.
+    fn compile_monadic_yield(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        val: Value,
+        span: ast::Span,
+        _db: Value,
+    ) -> Value {
+        if let Some(MonadKind::Adt(type_name)) = self.monad_info.get(&span) {
+            let yield_fn = format!("Applicative_{}_yield", type_name);
+            if let Some(&(func_id, _)) = self.user_fns.get(&yield_fn) {
+                let func_ref = self
+                    .module
+                    .declare_func_in_func(func_id, builder.func);
+                let call = builder.ins().call(func_ref, &[_db, val]);
+                return builder.inst_results(call)[0];
+            }
+        }
+        // Default: relation singleton
+        self.call_rt(builder, "knot_relation_singleton", &[val])
+    }
+
+    /// Compile `__empty` — produces the empty/failure value for the monad.
+    fn compile_monadic_empty(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        span: ast::Span,
+        db: Value,
+    ) -> Value {
+        if let Some(MonadKind::Adt(type_name)) = self.monad_info.get(&span) {
+            let empty_fn = format!("Alternative_{}_empty", type_name);
+            if let Some(&(func_id, _)) = self.user_fns.get(&empty_fn) {
+                let func_ref = self
+                    .module
+                    .declare_func_in_func(func_id, builder.func);
+                let call = builder.ins().call(func_ref, &[db]);
+                return builder.inst_results(call)[0];
+            }
+        }
+        // Default: empty relation
+        self.call_rt(builder, "knot_relation_empty", &[])
+    }
+
     // ── Do-block compilation ──────────────────────────────────────
 
     fn compile_do(
@@ -2746,7 +2853,10 @@ impl Codegen {
                 _ => None,
             })
             .collect();
-        let free_vars = find_free_vars(body, &param_names);
+        let free_vars: Vec<String> = find_free_vars(body, &param_names)
+            .into_iter()
+            .filter(|v| !self.user_fns.contains_key(v))
+            .collect();
 
         // Declare the lambda function: (db, env, arg) -> result
         let mut sig = self.module.make_signature();
@@ -3726,6 +3836,8 @@ fn is_builtin_name(name: &str) -> bool {
             | "fold"
             | "now"
             | "__bind"
+            | "__yield"
+            | "__empty"
             | "listen"
     )
 }

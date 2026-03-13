@@ -9,6 +9,20 @@ use knot::ast::Span;
 use knot::diagnostic::Diagnostic;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+// ── Monad info (shared with codegen) ──────────────────────────────
+
+/// Which monad a desugared do-block targets.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MonadKind {
+    /// The built-in `[]` relation monad.
+    Relation,
+    /// An ADT-based monad (e.g., `Maybe`, `Result`).
+    Adt(String),
+}
+
+/// Maps desugared do-block spans to their resolved monad type.
+pub type MonadInfo = HashMap<Span, MonadKind>;
+
 // ── Internal type representation ──────────────────────────────────
 
 type TyVar = u32;
@@ -110,6 +124,11 @@ struct Infer {
 
     /// Accumulated type errors.
     errors: Vec<(String, Span)>,
+
+    /// Monad type-constructor variables from desugared do-blocks.
+    /// Each entry records (span, monad_tyvar) so we can resolve the
+    /// concrete monad after inference completes.
+    monad_vars: Vec<(Span, TyVar)>,
 }
 
 // ── Core operations ───────────────────────────────────────────────
@@ -129,6 +148,7 @@ impl Infer {
             aliases: HashMap::new(),
             annotation_vars: HashMap::new(),
             errors: Vec::new(),
+            monad_vars: Vec::new(),
         }
     }
 
@@ -841,6 +861,55 @@ impl Infer {
     fn infer_expr(&mut self, expr: &ast::Expr) -> Ty {
         match &expr.node {
             ast::ExprKind::Lit(lit) => self.literal_type(lit),
+
+            ast::ExprKind::Var(name) if name == "__yield" => {
+                // ∀m a. a -> App(m, a)  — monadic yield (from do-desugaring)
+                let m = self.fresh_var();
+                let a = self.fresh_var();
+                self.monad_vars.push((expr.span, m));
+                Ty::Fun(
+                    Box::new(Ty::Var(a)),
+                    Box::new(Ty::App(
+                        Box::new(Ty::Var(m)),
+                        Box::new(Ty::Var(a)),
+                    )),
+                )
+            }
+
+            ast::ExprKind::Var(name) if name == "__empty" => {
+                // ∀m a. App(m, a)  — monadic empty (from do-desugaring)
+                let m = self.fresh_var();
+                let a = self.fresh_var();
+                self.monad_vars.push((expr.span, m));
+                Ty::App(Box::new(Ty::Var(m)), Box::new(Ty::Var(a)))
+            }
+
+            ast::ExprKind::Var(name) if name == "__bind" => {
+                // ∀m a b. (a -> App(m, b)) -> App(m, a) -> App(m, b)
+                let m = self.fresh_var();
+                let a = self.fresh_var();
+                let b = self.fresh_var();
+                self.monad_vars.push((expr.span, m));
+                Ty::Fun(
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Var(a)),
+                        Box::new(Ty::App(
+                            Box::new(Ty::Var(m)),
+                            Box::new(Ty::Var(b)),
+                        )),
+                    )),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::App(
+                            Box::new(Ty::Var(m)),
+                            Box::new(Ty::Var(a)),
+                        )),
+                        Box::new(Ty::App(
+                            Box::new(Ty::Var(m)),
+                            Box::new(Ty::Var(b)),
+                        )),
+                    )),
+                )
+            }
 
             ast::ExprKind::Var(name) => {
                 if let Some(ty) = self.lookup_instantiate(name) {
@@ -1706,9 +1775,9 @@ impl Infer {
 
 // ── Public API ────────────────────────────────────────────────────
 
-/// Run type inference on a parsed module. Returns diagnostics for any
-/// type errors found. An empty result means the program is well-typed.
-pub fn check(module: &ast::Module) -> Vec<Diagnostic> {
+/// Run type inference on a parsed module. Returns diagnostics and
+/// resolved monad info for desugared do-blocks.
+pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo) {
     let mut infer = Infer::new();
 
     // Phase 1: Collect type aliases, data types, constructors
@@ -1723,7 +1792,20 @@ pub fn check(module: &ast::Module) -> Vec<Diagnostic> {
     // Phase 4: Infer all declaration bodies
     infer.infer_declarations(module);
 
-    infer.to_diagnostics()
+    // Phase 5: Resolve monad types from desugared do-blocks
+    let mut monad_info = MonadInfo::new();
+    for (span, m_var) in &infer.monad_vars {
+        let resolved = infer.apply(&Ty::Var(*m_var));
+        let kind = match &resolved {
+            Ty::TyCon(name) if name == "[]" => MonadKind::Relation,
+            Ty::TyCon(name) => MonadKind::Adt(name.clone()),
+            Ty::Relation(_) => MonadKind::Relation,
+            _ => MonadKind::Relation, // default unresolved to Relation
+        };
+        monad_info.insert(*span, kind);
+    }
+
+    (infer.to_diagnostics(), monad_info)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
@@ -1741,7 +1823,8 @@ mod tests {
     }
 
     fn check_src(src: &str) -> Vec<Diagnostic> {
-        check(&parse(src))
+        let (diags, _monad_info) = check(&parse(src));
+        diags
     }
 
     fn has_error(diags: &[Diagnostic], needle: &str) -> bool {

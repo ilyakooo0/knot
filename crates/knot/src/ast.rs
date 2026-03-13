@@ -3,7 +3,7 @@
 // ── Spans ──────────────────────────────────────────────────────────
 
 /// Byte-offset span in source code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Span {
     pub start: usize,
     pub end: usize,

@@ -354,9 +354,16 @@ fn desugar_stmts(stmts: &[Stmt], span: Span) -> Expr {
     // Base case: single statement
     if stmts.len() == 1 {
         return match &stmts[0].node {
-            StmtKind::Expr(e) => e.clone(),
+            StmtKind::Expr(e) => {
+                // Transform yield e -> __yield(e) for generic monad support
+                if let ExprKind::Yield(inner) = &e.node {
+                    mk_yield((**inner).clone(), span)
+                } else {
+                    e.clone()
+                }
+            }
             // Shouldn't happen for valid pure comprehensions (last must be yield)
-            _ => spanned(ExprKind::List(vec![]), span),
+            _ => spanned(ExprKind::Var("__empty".into()), span),
         };
     }
 
@@ -384,18 +391,15 @@ fn desugar_stmts(stmts: &[Stmt], span: Span) -> Expr {
         }
 
         StmtKind::Where { cond } => {
-            // App(App(__bind, \_ -> rest), if cond then yield {} else [])
+            // App(App(__bind, \_ -> rest), if cond then __yield({}) else __empty)
             let guard = spanned(
                 ExprKind::If {
                     cond: Box::new(cond.clone()),
-                    then_branch: Box::new(spanned(
-                        ExprKind::Yield(Box::new(spanned(
-                            ExprKind::Record(vec![]),
-                            span,
-                        ))),
+                    then_branch: Box::new(mk_yield(
+                        spanned(ExprKind::Record(vec![]), span),
                         span,
                     )),
-                    else_branch: Box::new(spanned(ExprKind::List(vec![]), span)),
+                    else_branch: Box::new(spanned(ExprKind::Var("__empty".into()), span)),
                 },
                 span,
             );
@@ -453,7 +457,7 @@ fn desugar_ctor_bind(pat: &Pat, expr: &Expr, rest: &Expr, span: Span) -> Expr {
                 },
                 CaseArm {
                     pat: spanned(PatKind::Wildcard, span),
-                    body: spanned(ExprKind::List(vec![]), span),
+                    body: spanned(ExprKind::Var("__empty".into()), span),
                 },
             ],
         },
@@ -469,6 +473,17 @@ fn desugar_ctor_bind(pat: &Pat, expr: &Expr, rest: &Expr, span: Span) -> Expr {
             span,
         ),
         expr.clone(),
+        span,
+    )
+}
+
+/// Build `App(Var("__yield"), inner)` — monadic yield for generic do-blocks.
+fn mk_yield(inner: Expr, span: Span) -> Expr {
+    spanned(
+        ExprKind::App {
+            func: Box::new(spanned(ExprKind::Var("__yield".into()), span)),
+            arg: Box::new(inner),
+        },
         span,
     )
 }

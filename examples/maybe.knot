@@ -1,0 +1,64 @@
+-- Generic monadic do-blocks with Maybe
+
+data Maybe a
+  = Nothing {}
+  | Just {value: a}
+
+-- Trait hierarchy (minimal, just what do-desugaring needs)
+
+trait Applicative (f : Type -> Type) where
+  yield : a -> f a
+
+trait Applicative m => Monad (m : Type -> Type) where
+  bind : (a -> m b) -> m a -> m b
+
+trait Applicative f => Alternative (f : Type -> Type) where
+  empty : f a
+
+-- Implementations for Maybe
+
+impl Applicative Maybe where
+  yield x = Just {value: x}
+
+impl Monad Maybe where
+  bind f m = case m of
+    Nothing {} -> Nothing {}
+    Just {value} -> f value
+
+impl Alternative Maybe where
+  empty = Nothing {}
+
+-- Test: a simple do-block that uses Maybe as the monad
+safeDivide = \x y -> if y == 0 then Nothing {} else Just {value: x / y}
+
+result1 = do
+  a <- Just {value: 10}
+  b <- Just {value: 2}
+  c <- safeDivide a b
+  yield c
+
+result2 = do
+  a <- Just {value: 10}
+  b <- Just {value: 0}
+  c <- safeDivide a b
+  yield c
+
+-- Test where clause (uses __empty for filtering)
+result3 = do
+  a <- Just {value: 10}
+  b <- Just {value: 3}
+  where b > 2
+  yield a + b
+
+result4 = do
+  a <- Just {value: 10}
+  b <- Just {value: 1}
+  where b > 2
+  yield a + b
+
+main = do
+  println (show result1)
+  println (show result2)
+  println (show result3)
+  println (show result4)
+  yield {}

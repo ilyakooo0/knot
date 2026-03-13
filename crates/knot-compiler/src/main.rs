@@ -86,7 +86,7 @@ fn cmd_build(source_file: &str) {
     let type_env = types::TypeEnv::from_module(&module);
 
     // Type inference
-    let infer_diags = infer::check(&module);
+    let (infer_diags, monad_info) = infer::check(&module);
     if !infer_diags.is_empty() {
         for diag in &infer_diags {
             eprintln!("{}", diag.render(&source, &filename));
@@ -128,7 +128,7 @@ fn cmd_build(source_file: &str) {
     }
 
     // Code generation
-    let obj_bytes = match codegen::compile(&module, &type_env, source_file) {
+    let obj_bytes = match codegen::compile(&module, &type_env, source_file, &monad_info) {
         Ok(bytes) => bytes,
         Err(diags) => {
             for diag in &diags {

@@ -2606,7 +2606,7 @@ pub extern "C" fn knot_http_listen(
                     });
                 }
 
-                // Body fields (JSON)
+                // Body fields (JSON) — wrapped in a `body` record
                 if !entry.body_fields.is_empty() {
                     let mut body_bytes = Vec::new();
                     request
@@ -2615,17 +2615,22 @@ pub extern "C" fn knot_http_listen(
                         .unwrap_or(0);
                     let body_str = String::from_utf8_lossy(&body_bytes);
                     let json_fields = parse_json_object(&body_str);
+                    let mut body_record_fields: Vec<RecordField> = Vec::new();
                     for (bname, bty) in &entry.body_fields {
                         let val = json_fields
                             .iter()
                             .find(|(k, _)| k == bname)
                             .map(|(_, v)| v.as_str())
                             .unwrap_or("");
-                        fields.push(RecordField {
+                        body_record_fields.push(RecordField {
                             name: bname.clone(),
                             value: string_to_value(val, bty),
                         });
                     }
+                    fields.push(RecordField {
+                        name: "body".to_string(),
+                        value: alloc(Value::Record(body_record_fields)),
+                    });
                 }
 
                 let record = alloc(Value::Record(fields));

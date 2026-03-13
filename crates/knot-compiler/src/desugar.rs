@@ -113,11 +113,26 @@ fn route_entries_to_constructors(entries: &[RouteEntry]) -> Vec<ConstructorDef> 
                     value: qp.value.clone(),
                 });
             }
-            // Body fields
-            for bf in &entry.body_fields {
+            // Body fields wrapped in a `body` record field
+            if !entry.body_fields.is_empty() {
+                let body_record_fields: Vec<Field<Type>> = entry
+                    .body_fields
+                    .iter()
+                    .map(|bf| Field {
+                        name: bf.name.clone(),
+                        value: bf.value.clone(),
+                    })
+                    .collect();
+                let dummy_span = Span::new(0, 0);
                 fields.push(Field {
-                    name: bf.name.clone(),
-                    value: bf.value.clone(),
+                    name: "body".to_string(),
+                    value: Spanned::new(
+                        TypeKind::Record {
+                            fields: body_record_fields,
+                            rest: None,
+                        },
+                        dummy_span,
+                    ),
                 });
             }
             ConstructorDef {

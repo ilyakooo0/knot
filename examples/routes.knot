@@ -16,8 +16,8 @@ getTodos = \owner -> do
 
 serve = \req -> case req of
   GetTodos {owner} -> getTodos owner
-  CreateTodo {title, owner, priority} -> do
-    addTodo title owner priority
-    yield {title: title, owner: owner, priority: priority}
+  CreateTodo {body} -> do
+    addTodo body.title body.owner body.priority
+    yield body
 
 main = listen 8080 serve

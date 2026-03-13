@@ -1,0 +1,23 @@
+type Person = {name: Text, age: Int}
+
+*teams : [{name: Text, members: [Person]}]
+
+main = do
+  set *teams = [
+    {name: "Engineering", members: [{name: "Alice", age: 30}, {name: "Bob", age: 25}, {name: "Eve", age: 22}]},
+    {name: "Design", members: [{name: "Carol", age: 35}, {name: "Eve", age: 22}]}
+  ]
+
+  -- Remove Eve from all teams
+  set *teams = do
+    t <- *teams
+    yield {t | members: do
+      m <- t.members
+      where m.name != "Eve"
+      yield m
+    }
+
+  -- Show remaining members
+  t <- *teams
+  m <- t.members
+  yield (t.name ++ ": " ++ m.name)

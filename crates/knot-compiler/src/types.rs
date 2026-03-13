@@ -282,11 +282,21 @@ fn col_type_str(ty: &ResolvedType) -> &'static str {
     }
 }
 
+/// Format a single field for a schema descriptor.
+/// Nested relations are inlined as `field:[child_schema]`.
+fn format_schema_field(name: &str, ty: &ResolvedType) -> String {
+    if let ResolvedType::Relation(inner) = ty {
+        format!("{}:[{}]", name, schema_descriptor(inner))
+    } else {
+        format!("{}:{}", name, col_type_str(ty))
+    }
+}
+
 fn schema_descriptor(ty: &ResolvedType) -> String {
     match ty {
         ResolvedType::Record(fields) => fields
             .iter()
-            .map(|(name, ty)| format!("{}:{}", name, col_type_str(ty)))
+            .map(|(name, ty)| format_schema_field(name, ty))
             .collect::<Vec<_>>()
             .join(","),
         ResolvedType::Adt(ctors) => {
@@ -300,7 +310,11 @@ fn schema_descriptor(ty: &ResolvedType) -> String {
                         let field_specs: Vec<String> = fields
                             .iter()
                             .map(|(fname, fty)| {
-                                format!("{}={}", fname, col_type_str(fty))
+                                if let ResolvedType::Relation(inner) = fty {
+                                    format!("{}=[{}]", fname, schema_descriptor(inner))
+                                } else {
+                                    format!("{}={}", fname, col_type_str(fty))
+                                }
                             })
                             .collect();
                         format!("{}:{}", ctor_name, field_specs.join(";"))

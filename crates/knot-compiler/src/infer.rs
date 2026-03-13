@@ -1561,6 +1561,23 @@ impl Infer {
                 ),
             },
         );
+
+        // listen : ∀a b. Int -> (a -> b) -> {}
+        let a = self.fresh_var();
+        let b = self.fresh_var();
+        self.bind_top(
+            "listen",
+            Scheme {
+                vars: vec![a, b],
+                ty: Ty::Fun(
+                    Box::new(Ty::Int),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
+                        Box::new(Ty::unit()),
+                    )),
+                ),
+            },
+        );
     }
 
     fn register_trait_methods(

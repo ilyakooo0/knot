@@ -1,0 +1,23 @@
+type Todo = {title: Text, owner: Text, priority: Text}
+
+*todos : [Todo]
+
+route TodoApi where
+  GET /todos/{owner: Text} -> [Todo] = GetTodos
+  POST {title: Text, owner: Text, priority: Text} /todos -> Todo = CreateTodo
+
+addTodo = \title owner priority ->
+  set *todos = union *todos [{title: title, owner: owner, priority: priority}]
+
+getTodos = \owner -> do
+  t <- *todos
+  where t.owner == owner
+  yield t
+
+serve = \req -> case req of
+  GetTodos {owner} -> getTodos owner
+  CreateTodo {title, owner, priority} -> do
+    addTodo title owner priority
+    yield {title: title, owner: owner, priority: priority}
+
+main = listen 8080 serve

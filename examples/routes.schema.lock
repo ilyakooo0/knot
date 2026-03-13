@@ -1,0 +1,14 @@
+-- schema.lock (auto-generated, do not edit)
+-- Commit to source control.
+
+route TodoApi where
+  GET /todos/{owner: Text} -> [Todo] = GetTodos
+  POST {title: Text, owner: Text, priority: Text} /todos -> Todo = CreateTodo
+
+
+
+type Todo = {title: Text, owner: Text, priority: Text}
+
+*todos : [Todo]
+
+

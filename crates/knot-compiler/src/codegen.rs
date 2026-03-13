@@ -92,6 +92,12 @@ pub struct Codegen {
 
     // Body function IDs for recursive derived relations: name -> func_id
     recursive_body_fns: HashMap<String, FuncId>,
+
+    // Route entries: route_name -> entries (for HTTP codegen)
+    route_entries: HashMap<String, Vec<ast::RouteEntry>>,
+
+    // Trampolines for user functions used as values: fn_name -> trampoline_func_id
+    user_fn_trampolines: HashMap<String, FuncId>,
 }
 
 /// Provenance info for a view declaration, extracted at compile time.
@@ -281,6 +287,8 @@ impl Codegen {
             subset_constraints: Vec::new(),
             recursive_derived: HashSet::new(),
             recursive_body_fns: HashMap::new(),
+            route_entries: HashMap::new(),
+            user_fn_trampolines: HashMap::new(),
         }
     }
 
@@ -397,6 +405,15 @@ impl Codegen {
 
         // Fixpoint iteration for recursive derived relations
         self.declare_rt("knot_relation_fixpoint", &[p, p, p], &[p]);
+
+        // HTTP server (routes)
+        self.declare_rt("knot_route_table_new", &[], &[p]);
+        self.declare_rt(
+            "knot_route_table_add",
+            &[p, p, p, p, p, p, p, p, p, p, p],
+            &[],
+        );
+        self.declare_rt("knot_http_listen", &[p, p, p, p], &[p]);
     }
 
     fn declare_rt(&mut self, name: &str, params: &[types::Type], returns: &[types::Type]) {
@@ -666,6 +683,18 @@ impl Codegen {
                             .or_default()
                             .push((type_name.clone(), decl.span));
                     }
+                }
+                ast::DeclKind::Route { name, entries } => {
+                    self.route_entries.insert(name.clone(), entries.clone());
+                }
+                ast::DeclKind::RouteComposite { name, components } => {
+                    let mut all = Vec::new();
+                    for comp in components {
+                        if let Some(entries) = self.route_entries.get(comp) {
+                            all.extend(entries.clone());
+                        }
+                    }
+                    self.route_entries.insert(name.clone(), all);
                 }
                 _ => {}
             }
@@ -1299,6 +1328,54 @@ impl Codegen {
         });
     }
 
+    /// Get or create a trampoline function that wraps a user function with the
+    /// standard lambda calling convention (db, env, arg) -> result.
+    /// For 1-param user functions: trampoline(db, env, arg) calls user_fn(db, arg).
+    /// For n-param: trampoline(db, env, arg) partially applies (curries remaining args).
+    fn get_or_create_trampoline(&mut self, name: &str, _n_params: usize) -> FuncId {
+        if let Some(&id) = self.user_fn_trampolines.get(name) {
+            return id;
+        }
+        let trampoline_name = format!("__trampoline_{}", name);
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(self.ptr_type)); // db
+        sig.params.push(AbiParam::new(self.ptr_type)); // env
+        sig.params.push(AbiParam::new(self.ptr_type)); // arg
+        sig.returns.push(AbiParam::new(self.ptr_type));
+        let trampoline_id = self
+            .module
+            .declare_function(&trampoline_name, Linkage::Local, &sig)
+            .unwrap();
+
+        // For 1-param functions: body is App(Var(name), Var(param))
+        // For multi-param: body is App(Var(name), Var(param)) which creates a partial application
+        // (compile_app handles partial application by wrapping in dynamic calls)
+        let dummy_span = ast::Span::new(0, 0);
+        let body = ast::Spanned::new(
+            ast::ExprKind::App {
+                func: Box::new(ast::Spanned::new(
+                    ast::ExprKind::Var(name.to_string()),
+                    dummy_span,
+                )),
+                arg: Box::new(ast::Spanned::new(
+                    ast::ExprKind::Var("__trampoline_arg".into()),
+                    dummy_span,
+                )),
+            },
+            dummy_span,
+        );
+
+        self.pending_lambdas.push(PendingLambda {
+            func_id: trampoline_id,
+            params: vec!["__trampoline_arg".to_string()],
+            body,
+            free_vars: vec![],
+        });
+
+        self.user_fn_trampolines.insert(name.to_string(), trampoline_id);
+        trampoline_id
+    }
+
     // ── Main function generation ──────────────────────────────────
 
     fn generate_main(&mut self, module: &ast::Module) {
@@ -1466,9 +1543,11 @@ impl Codegen {
                         let call = builder.ins().call(func_ref, &[db]);
                         builder.inst_results(call)[0]
                     } else {
-                        // Create a function value wrapping the user function
+                        // Create a trampoline that bridges (db, env, arg) calling
+                        // convention to the user function's (db, arg1, ...) convention.
+                        let trampoline_id = self.get_or_create_trampoline(name, n_params);
                         let func_ref =
-                            self.module.declare_func_in_func(func_id, builder.func);
+                            self.module.declare_func_in_func(trampoline_id, builder.func);
                         let fn_addr = builder.ins().func_addr(self.ptr_type, func_ref);
                         let null = builder.ins().iconst(self.ptr_type, 0);
                         let (src_ptr, src_len) = self.string_ptr(builder, name);
@@ -2222,6 +2301,66 @@ impl Codegen {
                     let len =
                         self.call_rt(builder, "knot_relation_len", &[compiled_args[0]]);
                     self.call_rt(builder, "knot_value_int", &[len])
+                } else {
+                    self.call_rt(builder, "knot_value_unit", &[])
+                }
+            }
+            ast::ExprKind::Var(name) if name == "listen" => {
+                if compiled_args.len() == 2 {
+                    // listen port handler
+                    // Build route table from known route declarations
+                    let table = self.call_rt(builder, "knot_route_table_new", &[]);
+
+                    // Find route entries — use the first available route
+                    let entries: Vec<ast::RouteEntry> = self
+                        .route_entries
+                        .values()
+                        .next()
+                        .cloned()
+                        .unwrap_or_default();
+
+                    for entry in &entries {
+                        let method_str = match entry.method {
+                            ast::HttpMethod::Get => "GET",
+                            ast::HttpMethod::Post => "POST",
+                            ast::HttpMethod::Put => "PUT",
+                            ast::HttpMethod::Delete => "DELETE",
+                            ast::HttpMethod::Patch => "PATCH",
+                        };
+                        let (method_ptr, method_len) =
+                            self.string_ptr(builder, method_str);
+
+                        let path_pattern = path_segments_to_pattern(&entry.path);
+                        let (path_ptr, path_len) =
+                            self.string_ptr(builder, &path_pattern);
+
+                        let (ctor_ptr, ctor_len) =
+                            self.string_ptr(builder, &entry.constructor);
+
+                        let body_desc = fields_to_descriptor(&entry.body_fields);
+                        let (body_ptr, body_len) =
+                            self.string_ptr(builder, &body_desc);
+
+                        let query_desc = fields_to_descriptor(&entry.query_params);
+                        let (query_ptr, query_len) =
+                            self.string_ptr(builder, &query_desc);
+
+                        self.call_rt_void(
+                            builder,
+                            "knot_route_table_add",
+                            &[
+                                table, method_ptr, method_len, path_ptr, path_len,
+                                ctor_ptr, ctor_len, body_ptr, body_len, query_ptr,
+                                query_len,
+                            ],
+                        );
+                    }
+
+                    self.call_rt(
+                        builder,
+                        "knot_http_listen",
+                        &[db, compiled_args[0], table, compiled_args[1]],
+                    )
                 } else {
                     self.call_rt(builder, "knot_value_unit", &[])
                 }
@@ -3587,6 +3726,7 @@ fn is_builtin_name(name: &str) -> bool {
             | "fold"
             | "now"
             | "__bind"
+            | "listen"
     )
 }
 
@@ -3802,5 +3942,45 @@ fn type_name_to_tag(name: &str) -> Option<i64> {
         "Unit" => Some(4),
         "Relation" => Some(6),
         _ => None,
+    }
+}
+
+/// Convert route path segments to a pattern string like "/todos/{owner:text}".
+fn path_segments_to_pattern(segments: &[ast::PathSegment]) -> String {
+    let mut parts = Vec::new();
+    for seg in segments {
+        match seg {
+            ast::PathSegment::Literal(s) => parts.push(s.clone()),
+            ast::PathSegment::Param { name, ty } => {
+                let ty_str = ast_type_to_descriptor_type(ty);
+                parts.push(format!("{{{name}:{ty_str}}}"));
+            }
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
+/// Convert typed fields to a descriptor string like "name:text,age:int".
+fn fields_to_descriptor(fields: &[ast::Field<ast::Type>]) -> String {
+    fields
+        .iter()
+        .map(|f| {
+            let ty_str = ast_type_to_descriptor_type(&f.value);
+            format!("{}:{}", f.name, ty_str)
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn ast_type_to_descriptor_type(ty: &ast::Type) -> String {
+    match &ty.node {
+        ast::TypeKind::Named(n) => match n.as_str() {
+            "Int" => "int".to_string(),
+            "Float" => "float".to_string(),
+            "Bool" => "bool".to_string(),
+            "Text" => "text".to_string(),
+            _ => "text".to_string(),
+        },
+        _ => "text".to_string(),
     }
 }

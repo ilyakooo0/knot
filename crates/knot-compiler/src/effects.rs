@@ -171,6 +171,14 @@ impl EffectChecker {
         };
         builtin_effects.insert("now".into(), clock_effect);
 
+        // listen: network effect
+        let network_effect = {
+            let mut e = EffectSet::empty();
+            e.network = true;
+            e
+        };
+        builtin_effects.insert("listen".into(), network_effect);
+
         // Pure builtins
         builtin_effects.insert("show".into(), EffectSet::empty());
         builtin_effects.insert("union".into(), EffectSet::empty());

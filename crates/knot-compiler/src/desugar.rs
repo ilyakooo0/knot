@@ -24,11 +24,108 @@
 use knot::ast::*;
 
 /// Desugar a module in place. Transforms pure-comprehension do blocks
-/// into nested bind/yield/empty expressions.
+/// into nested bind/yield/empty expressions, and routes into data declarations.
 pub fn desugar(module: &mut Module) {
+    desugar_routes(module);
     for decl in &mut module.decls {
         desugar_decl(&mut decl.node);
     }
+}
+
+/// Generate `Data` declarations from `Route` and `RouteComposite` declarations.
+/// The original route declarations are kept in place for codegen to extract HTTP metadata.
+fn desugar_routes(module: &mut Module) {
+    let mut new_decls: Vec<Decl> = Vec::new();
+
+    // Collect route entries by name for RouteComposite lookup
+    let route_map: std::collections::HashMap<String, Vec<RouteEntry>> = module
+        .decls
+        .iter()
+        .filter_map(|d| {
+            if let DeclKind::Route { name, entries } = &d.node {
+                Some((name.clone(), entries.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for decl in &module.decls {
+        match &decl.node {
+            DeclKind::Route { name, entries } => {
+                let ctors = route_entries_to_constructors(entries);
+                new_decls.push(Spanned::new(
+                    DeclKind::Data {
+                        name: name.clone(),
+                        params: vec![],
+                        constructors: ctors,
+                        deriving: vec![],
+                    },
+                    decl.span,
+                ));
+            }
+            DeclKind::RouteComposite { name, components } => {
+                let mut all_entries = Vec::new();
+                for comp in components {
+                    if let Some(entries) = route_map.get(comp) {
+                        all_entries.extend(entries.clone());
+                    }
+                }
+                let ctors = route_entries_to_constructors(&all_entries);
+                new_decls.push(Spanned::new(
+                    DeclKind::Data {
+                        name: name.clone(),
+                        params: vec![],
+                        constructors: ctors,
+                        deriving: vec![],
+                    },
+                    decl.span,
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    // Prepend synthetic data decls so they're available before route decls
+    new_decls.append(&mut module.decls);
+    module.decls = new_decls;
+}
+
+/// Convert route entries into constructor definitions.
+fn route_entries_to_constructors(entries: &[RouteEntry]) -> Vec<ConstructorDef> {
+    entries
+        .iter()
+        .map(|entry| {
+            let mut fields: Vec<Field<Type>> = Vec::new();
+            // Path params
+            for seg in &entry.path {
+                if let PathSegment::Param { name, ty } = seg {
+                    fields.push(Field {
+                        name: name.clone(),
+                        value: ty.clone(),
+                    });
+                }
+            }
+            // Query params
+            for qp in &entry.query_params {
+                fields.push(Field {
+                    name: qp.name.clone(),
+                    value: qp.value.clone(),
+                });
+            }
+            // Body fields
+            for bf in &entry.body_fields {
+                fields.push(Field {
+                    name: bf.name.clone(),
+                    value: bf.value.clone(),
+                });
+            }
+            ConstructorDef {
+                name: entry.constructor.clone(),
+                fields,
+            }
+        })
+        .collect()
 }
 
 fn desugar_decl(decl: &mut DeclKind) {

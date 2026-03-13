@@ -2277,3 +2277,384 @@ pub extern "C" fn knot_relation_fixpoint(
     }
     panic!("knot runtime: recursive derived relation did not converge after 10000 iterations");
 }
+
+// ── HTTP server (routes) ──────────────────────────────────────────
+
+enum PathPart {
+    Literal(String),
+    Param(String, String), // (name, type)
+}
+
+struct RouteTableEntry {
+    method: String,
+    path_parts: Vec<PathPart>,
+    constructor: String,
+    body_fields: Vec<(String, String)>,
+    query_fields: Vec<(String, String)>,
+}
+
+struct RouteTable {
+    entries: Vec<RouteTableEntry>,
+}
+
+fn parse_descriptor(desc: &str) -> Vec<(String, String)> {
+    if desc.is_empty() {
+        return Vec::new();
+    }
+    desc.split(',')
+        .map(|part| {
+            let mut split = part.splitn(2, ':');
+            let name = split.next().unwrap_or("").to_string();
+            let ty = split.next().unwrap_or("text").to_string();
+            (name, ty)
+        })
+        .collect()
+}
+
+fn parse_path_pattern(path: &str) -> Vec<PathPart> {
+    path.split('/')
+        .filter(|s| !s.is_empty())
+        .map(|seg| {
+            if seg.starts_with('{') && seg.ends_with('}') {
+                let inner = &seg[1..seg.len() - 1];
+                let mut split = inner.splitn(2, ':');
+                let name = split.next().unwrap_or("").to_string();
+                let ty = split.next().unwrap_or("text").to_string();
+                PathPart::Param(name, ty)
+            } else {
+                PathPart::Literal(seg.to_string())
+            }
+        })
+        .collect()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_route_table_new() -> *mut c_void {
+    let table = Box::new(RouteTable {
+        entries: Vec::new(),
+    });
+    Box::into_raw(table) as *mut c_void
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_route_table_add(
+    table: *mut c_void,
+    method_ptr: *const u8,
+    method_len: usize,
+    path_ptr: *const u8,
+    path_len: usize,
+    ctor_ptr: *const u8,
+    ctor_len: usize,
+    body_desc_ptr: *const u8,
+    body_desc_len: usize,
+    query_desc_ptr: *const u8,
+    query_desc_len: usize,
+) {
+    let table = unsafe { &mut *(table as *mut RouteTable) };
+    let method = unsafe { str_from_raw(method_ptr, method_len) }.to_string();
+    let path = unsafe { str_from_raw(path_ptr, path_len) };
+    let ctor = unsafe { str_from_raw(ctor_ptr, ctor_len) }.to_string();
+    let body_desc = unsafe { str_from_raw(body_desc_ptr, body_desc_len) };
+    let query_desc = unsafe { str_from_raw(query_desc_ptr, query_desc_len) };
+
+    table.entries.push(RouteTableEntry {
+        method,
+        path_parts: parse_path_pattern(path),
+        constructor: ctor,
+        body_fields: parse_descriptor(body_desc),
+        query_fields: parse_descriptor(query_desc),
+    });
+}
+
+fn match_route<'a>(
+    entries: &'a [RouteTableEntry],
+    method: &str,
+    path_segments: &[&str],
+) -> Option<(&'a RouteTableEntry, Vec<(String, String)>)> {
+    for entry in entries {
+        if !entry.method.eq_ignore_ascii_case(method) {
+            continue;
+        }
+        if entry.path_parts.len() != path_segments.len() {
+            continue;
+        }
+        let mut params = Vec::new();
+        let mut matched = true;
+        for (part, seg) in entry.path_parts.iter().zip(path_segments.iter()) {
+            match part {
+                PathPart::Literal(lit) => {
+                    if lit != seg {
+                        matched = false;
+                        break;
+                    }
+                }
+                PathPart::Param(name, _ty) => {
+                    params.push((name.clone(), seg.to_string()));
+                }
+            }
+        }
+        if matched {
+            return Some((entry, params));
+        }
+    }
+    None
+}
+
+fn parse_query_string(qs: &str) -> Vec<(String, String)> {
+    if qs.is_empty() {
+        return Vec::new();
+    }
+    qs.split('&')
+        .filter_map(|pair| {
+            let mut split = pair.splitn(2, '=');
+            let key = split.next()?;
+            let val = split.next().unwrap_or("");
+            Some((
+                url_decode(key),
+                url_decode(val),
+            ))
+        })
+        .collect()
+}
+
+fn url_decode(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let h = chars.next().unwrap_or(b'0');
+            let l = chars.next().unwrap_or(b'0');
+            let val = hex_val(h) * 16 + hex_val(l);
+            result.push(val as char);
+        } else if b == b'+' {
+            result.push(' ');
+        } else {
+            result.push(b as char);
+        }
+    }
+    result
+}
+
+fn hex_val(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        b'A'..=b'F' => b - b'A' + 10,
+        _ => 0,
+    }
+}
+
+/// Minimal JSON object parser. Handles {"key": value, ...} with string, number, bool, null values.
+fn parse_json_object(s: &str) -> Vec<(String, String)> {
+    let s = s.trim();
+    if !s.starts_with('{') || !s.ends_with('}') {
+        return Vec::new();
+    }
+    let inner = &s[1..s.len() - 1];
+    let mut result = Vec::new();
+    let mut rest = inner.trim();
+    while !rest.is_empty() {
+        // Parse key
+        let key;
+        if rest.starts_with('"') {
+            let end = rest[1..].find('"').map(|i| i + 1).unwrap_or(rest.len());
+            key = rest[1..end].to_string();
+            rest = rest[end + 1..].trim();
+        } else {
+            break;
+        }
+        // Skip colon
+        if rest.starts_with(':') {
+            rest = rest[1..].trim();
+        } else {
+            break;
+        }
+        // Parse value
+        if rest.starts_with('"') {
+            let end = rest[1..].find('"').map(|i| i + 1).unwrap_or(rest.len());
+            let val = rest[1..end].to_string();
+            rest = rest[end + 1..].trim();
+            result.push((key, val));
+        } else {
+            // number, bool, null — read until comma or end
+            let end = rest.find(',').unwrap_or(rest.len());
+            let val = rest[..end].trim().to_string();
+            rest = rest[end..].trim_start();
+            result.push((key, val));
+        }
+        // Skip comma
+        if rest.starts_with(',') {
+            rest = rest[1..].trim();
+        }
+    }
+    result
+}
+
+fn string_to_value(s: &str, ty: &str) -> *mut Value {
+    match ty {
+        "int" => {
+            let n: i64 = s.parse().unwrap_or(0);
+            alloc(Value::Int(n))
+        }
+        "float" => {
+            let n: f64 = s.parse().unwrap_or(0.0);
+            alloc(Value::Float(n))
+        }
+        "bool" => {
+            let b = s == "true" || s == "True";
+            alloc(Value::Bool(b))
+        }
+        _ => alloc(Value::Text(s.to_string())),
+    }
+}
+
+fn value_to_json(v: *mut Value) -> String {
+    if v.is_null() {
+        return "null".to_string();
+    }
+    match unsafe { as_ref(v) } {
+        Value::Int(n) => n.to_string(),
+        Value::Float(n) => n.to_string(),
+        Value::Text(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
+        Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+        Value::Unit => "{}".to_string(),
+        Value::Record(fields) => {
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|f| format!("\"{}\":{}", f.name, value_to_json(f.value)))
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        }
+        Value::Relation(rows) => {
+            let parts: Vec<String> = rows.iter().map(|r| value_to_json(*r)).collect();
+            format!("[{}]", parts.join(","))
+        }
+        Value::Constructor(tag, payload) => {
+            let p = value_to_json(*payload);
+            format!("{{\"tag\":\"{}\",\"value\":{}}}", tag, p)
+        }
+        Value::Function(_, _, src) => format!("\"<function: {}>\"", src),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_http_listen(
+    db: *mut c_void,
+    port_val: *mut Value,
+    route_table: *mut c_void,
+    handler: *mut Value,
+) -> *mut Value {
+    let port = match unsafe { as_ref(port_val) } {
+        Value::Int(n) => *n as u16,
+        _ => panic!("knot runtime: listen expects Int port, got {}", type_name(port_val)),
+    };
+    let table = unsafe { &*(route_table as *mut RouteTable) };
+    let addr = format!("0.0.0.0:{}", port);
+    let server = tiny_http::Server::http(&addr)
+        .unwrap_or_else(|e| panic!("knot runtime: failed to start HTTP server on {}: {}", addr, e));
+    eprintln!("Knot HTTP server listening on http://0.0.0.0:{}", port);
+
+    loop {
+        let mut request = match server.recv() {
+            Ok(req) => req,
+            Err(e) => {
+                eprintln!("knot runtime: error receiving request: {}", e);
+                continue;
+            }
+        };
+
+        let method = request.method().as_str().to_string();
+        let url = request.url().to_string();
+        let (path, query_string) = match url.split_once('?') {
+            Some((p, q)) => (p, q),
+            None => (url.as_str(), ""),
+        };
+        let path_segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+        match match_route(&table.entries, &method, &path_segments) {
+            Some((entry, path_params)) => {
+                // Build record from path params, query params, and body
+                let mut fields: Vec<RecordField> = Vec::new();
+
+                // Path params
+                for (name, val) in &path_params {
+                    let ty = entry
+                        .path_parts
+                        .iter()
+                        .find_map(|p| match p {
+                            PathPart::Param(n, t) if n == name => Some(t.as_str()),
+                            _ => None,
+                        })
+                        .unwrap_or("text");
+                    fields.push(RecordField {
+                        name: name.clone(),
+                        value: string_to_value(val, ty),
+                    });
+                }
+
+                // Query params
+                let qs = parse_query_string(query_string);
+                for (qname, qty) in &entry.query_fields {
+                    let val = qs
+                        .iter()
+                        .find(|(k, _)| k == qname)
+                        .map(|(_, v)| v.as_str())
+                        .unwrap_or("");
+                    fields.push(RecordField {
+                        name: qname.clone(),
+                        value: string_to_value(val, qty),
+                    });
+                }
+
+                // Body fields (JSON)
+                if !entry.body_fields.is_empty() {
+                    let mut body_bytes = Vec::new();
+                    request
+                        .as_reader()
+                        .read_to_end(&mut body_bytes)
+                        .unwrap_or(0);
+                    let body_str = String::from_utf8_lossy(&body_bytes);
+                    let json_fields = parse_json_object(&body_str);
+                    for (bname, bty) in &entry.body_fields {
+                        let val = json_fields
+                            .iter()
+                            .find(|(k, _)| k == bname)
+                            .map(|(_, v)| v.as_str())
+                            .unwrap_or("");
+                        fields.push(RecordField {
+                            name: bname.clone(),
+                            value: string_to_value(val, bty),
+                        });
+                    }
+                }
+
+                let record = alloc(Value::Record(fields));
+                // Wrap in constructor
+                let tag = entry.constructor.clone();
+                let ctor_val = alloc(Value::Constructor(tag, record));
+
+                // Call handler
+                let result = knot_value_call(db, handler, ctor_val);
+                let json = value_to_json(result);
+
+                let response = tiny_http::Response::from_string(&json)
+                    .with_header(
+                        "Content-Type: application/json"
+                            .parse::<tiny_http::Header>()
+                            .unwrap(),
+                    );
+                let _ = request.respond(response);
+            }
+            None => {
+                let response = tiny_http::Response::from_string("{\"error\":\"not found\"}")
+                    .with_status_code(404)
+                    .with_header(
+                        "Content-Type: application/json"
+                            .parse::<tiny_http::Header>()
+                            .unwrap(),
+                    );
+                let _ = request.respond(response);
+            }
+        }
+    }
+}

@@ -3,6 +3,7 @@
 //! Usage: knotc build <file.knot>
 
 mod codegen;
+mod effects;
 mod infer;
 mod linker;
 mod lockfile;
@@ -87,6 +88,20 @@ fn cmd_build(source_file: &str) {
             eprintln!("{}", diag.render(&source, &filename));
         }
         if infer_diags
+            .iter()
+            .any(|d| d.severity == knot::diagnostic::Severity::Error)
+        {
+            process::exit(1);
+        }
+    }
+
+    // Effect inference
+    let effect_diags = effects::check(&module);
+    if !effect_diags.is_empty() {
+        for diag in &effect_diags {
+            eprintln!("{}", diag.render(&source, &filename));
+        }
+        if effect_diags
             .iter()
             .any(|d| d.severity == knot::diagnostic::Severity::Error)
         {

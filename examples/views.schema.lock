@@ -11,3 +11,5 @@ data Status = Open {} | Done {}
 type Todo = {title: Text, owner: Text, priority: Priority, status: Status}
 
 *todos : [Todo]
+
+

@@ -6,7 +6,7 @@
 //! functions for value construction, operations, and SQLite persistence.
 
 use crate::infer::{MonadInfo, MonadKind};
-use crate::types::TypeEnv;
+use crate::types::{ResolvedType, TypeEnv};
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, Value};
@@ -96,6 +96,9 @@ pub struct Codegen {
 
     // Route entries: route_name -> entries (for HTTP codegen)
     route_entries: HashMap<String, Vec<ast::RouteEntry>>,
+
+    // Type aliases for resolving response types in OpenAPI descriptors
+    type_aliases: HashMap<String, ResolvedType>,
 
     // Trampolines for user functions used as values: fn_name -> trampoline_func_id
     user_fn_trampolines: HashMap<String, FuncId>,
@@ -223,6 +226,7 @@ pub fn compile(
     cg.db_path = format!("{}.db", stem);
     cg.source_schemas = type_env.source_schemas.clone();
     cg.migrate_schemas = type_env.migrate_schemas.clone();
+    cg.type_aliases = type_env.aliases.clone();
     cg.history_sources = type_env.history_sources.clone();
     cg.subset_constraints = type_env.subset_constraints.clone();
     cg.monad_info = monad_info.clone();
@@ -308,6 +312,7 @@ impl Codegen {
             recursive_derived: HashSet::new(),
             recursive_body_fns: HashMap::new(),
             route_entries: HashMap::new(),
+            type_aliases: HashMap::new(),
             user_fn_trampolines: HashMap::new(),
             monad_info: HashMap::new(),
             nullable_ctors: HashMap::new(),
@@ -432,10 +437,14 @@ impl Codegen {
         self.declare_rt("knot_route_table_new", &[], &[p]);
         self.declare_rt(
             "knot_route_table_add",
-            &[p, p, p, p, p, p, p, p, p, p, p],
+            &[p, p, p, p, p, p, p, p, p, p, p, p, p],
             &[],
         );
         self.declare_rt("knot_http_listen", &[p, p, p, p], &[p]);
+
+        // OpenAPI / api command
+        self.declare_rt("knot_api_register", &[p, p, p], &[]);
+        self.declare_rt("knot_api_handle", &[types::I32, p], &[types::I32]);
     }
 
     fn declare_rt(&mut self, name: &str, params: &[types::Type], returns: &[types::Type]) {
@@ -1494,6 +1503,8 @@ impl Codegen {
 
     fn generate_main(&mut self, module: &ast::Module) {
         let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I32)); // argc
+        sig.params.push(AbiParam::new(self.ptr_type)); // argv
         sig.returns.push(AbiParam::new(types::I32));
         let main_id = self
             .module
@@ -1502,8 +1513,68 @@ impl Codegen {
 
         let decls: Vec<ast::Decl> = module.decls.clone();
         let user_main = self.user_fns.get("main").copied();
+        let all_routes: Vec<(String, Vec<ast::RouteEntry>)> =
+            self.route_entries.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
-        self.build_function(main_id, sig, |cg, builder, _entry| {
+        self.build_function(main_id, sig, |cg, builder, entry| {
+            let argc = builder.block_params(entry)[0];
+            let argv = builder.block_params(entry)[1];
+
+            // Register route tables for the api command
+            for (route_name, entries) in &all_routes {
+                let table = cg.call_rt(builder, "knot_route_table_new", &[]);
+                for route_entry in entries {
+                    let method_str = match route_entry.method {
+                        ast::HttpMethod::Get => "GET",
+                        ast::HttpMethod::Post => "POST",
+                        ast::HttpMethod::Put => "PUT",
+                        ast::HttpMethod::Delete => "DELETE",
+                        ast::HttpMethod::Patch => "PATCH",
+                    };
+                    let (method_ptr, method_len) = cg.string_ptr(builder, method_str);
+                    let path_pattern = path_segments_to_pattern(&route_entry.path);
+                    let (path_ptr, path_len) = cg.string_ptr(builder, &path_pattern);
+                    let (ctor_ptr, ctor_len) = cg.string_ptr(builder, &route_entry.constructor);
+                    let body_desc = fields_to_descriptor(&route_entry.body_fields);
+                    let (body_ptr, body_len) = cg.string_ptr(builder, &body_desc);
+                    let query_desc = fields_to_descriptor(&route_entry.query_params);
+                    let (query_ptr, query_len) = cg.string_ptr(builder, &query_desc);
+                    let resp_desc = response_type_descriptor(&route_entry.response_ty, &cg.type_aliases);
+                    let (resp_ptr, resp_len) = cg.string_ptr(builder, &resp_desc);
+                    cg.call_rt_void(
+                        builder,
+                        "knot_route_table_add",
+                        &[
+                            table, method_ptr, method_len, path_ptr, path_len,
+                            ctor_ptr, ctor_len, body_ptr, body_len, query_ptr,
+                            query_len, resp_ptr, resp_len,
+                        ],
+                    );
+                }
+                let (name_ptr, name_len) = cg.string_ptr(builder, route_name);
+                cg.call_rt_void(builder, "knot_api_register", &[name_ptr, name_len, table]);
+            }
+
+            // Check if this is an "api" command
+            let api_result = {
+                let func_id = cg.runtime_fns["knot_api_handle"];
+                let func_ref = cg.module.declare_func_in_func(func_id, builder.func);
+                let call = builder.ins().call(func_ref, &[argc, argv]);
+                builder.inst_results(call)[0]
+            };
+
+            let normal_block = builder.create_block();
+            let api_exit_block = builder.create_block();
+            builder.ins().brif(api_result, api_exit_block, &[], normal_block, &[]);
+
+            builder.switch_to_block(api_exit_block);
+            builder.seal_block(api_exit_block);
+            let zero = builder.ins().iconst(types::I32, 0);
+            builder.ins().return_(&[zero]);
+
+            builder.switch_to_block(normal_block);
+            builder.seal_block(normal_block);
+
             // Check --debug flag
             let debug_init_ref = cg.import_rt(builder, "knot_debug_init");
             builder.ins().call(debug_init_ref, &[]);
@@ -2517,13 +2588,17 @@ impl Codegen {
                         let (query_ptr, query_len) =
                             self.string_ptr(builder, &query_desc);
 
+                        let resp_desc = response_type_descriptor(&entry.response_ty, &self.type_aliases);
+                        let (resp_ptr, resp_len) =
+                            self.string_ptr(builder, &resp_desc);
+
                         self.call_rt_void(
                             builder,
                             "knot_route_table_add",
                             &[
                                 table, method_ptr, method_len, path_ptr, path_len,
                                 ctor_ptr, ctor_len, body_ptr, body_len, query_ptr,
-                                query_len,
+                                query_len, resp_ptr, resp_len,
                             ],
                         );
                     }
@@ -4279,6 +4354,92 @@ fn ast_type_to_descriptor_type(ty: &ast::Type) -> String {
             "Text" => "text".to_string(),
             _ => "text".to_string(),
         },
+        _ => "text".to_string(),
+    }
+}
+
+/// Convert an optional response type to a descriptor string for OpenAPI generation.
+///
+/// Format: `int`, `float`, `text`, `bool`, `unit`,
+///         `[<inner>]` for relations/arrays,
+///         `{name:type,name:type}` for records.
+fn response_type_descriptor(
+    ty: &Option<ast::Type>,
+    aliases: &std::collections::HashMap<String, ResolvedType>,
+) -> String {
+    match ty {
+        None => String::new(),
+        Some(t) => {
+            let resolved = resolve_type_for_descriptor(t, aliases);
+            resolved_type_to_descriptor(&resolved)
+        }
+    }
+}
+
+fn resolve_type_for_descriptor(
+    ty: &ast::Type,
+    aliases: &std::collections::HashMap<String, ResolvedType>,
+) -> ResolvedType {
+    match &ty.node {
+        ast::TypeKind::Named(n) => match n.as_str() {
+            "Int" => ResolvedType::Int,
+            "Float" => ResolvedType::Float,
+            "Bool" => ResolvedType::Bool,
+            "Text" => ResolvedType::Text,
+            _ => aliases
+                .get(n)
+                .cloned()
+                .unwrap_or(ResolvedType::Named(n.clone())),
+        },
+        ast::TypeKind::Record { fields, .. } => {
+            let resolved: Vec<(String, ResolvedType)> = fields
+                .iter()
+                .map(|f| {
+                    (f.name.clone(), resolve_type_for_descriptor(&f.value, aliases))
+                })
+                .collect();
+            ResolvedType::Record(resolved)
+        }
+        ast::TypeKind::Relation(inner) => {
+            ResolvedType::Relation(Box::new(
+                resolve_type_for_descriptor(inner, aliases),
+            ))
+        }
+        _ => ResolvedType::Text,
+    }
+}
+
+fn resolved_type_to_descriptor(ty: &ResolvedType) -> String {
+    match ty {
+        ResolvedType::Int => "int".to_string(),
+        ResolvedType::Float => "float".to_string(),
+        ResolvedType::Bool => "bool".to_string(),
+        ResolvedType::Text => "text".to_string(),
+        ResolvedType::Unit => "unit".to_string(),
+        ResolvedType::Record(fields) => {
+            let inner: Vec<String> = fields
+                .iter()
+                .map(|(name, ty)| format!("{}:{}", name, resolved_type_to_descriptor(ty)))
+                .collect();
+            format!("{{{}}}", inner.join(","))
+        }
+        ResolvedType::Relation(inner) => {
+            format!("[{}]", resolved_type_to_descriptor(inner))
+        }
+        ResolvedType::Adt(ctors) => {
+            // Represent ADT as object with _tag + all constructor fields
+            let mut fields: Vec<String> = vec!["_tag:text".to_string()];
+            let mut seen = std::collections::HashSet::<String>::new();
+            for (_ctor_name, ctor_fields) in ctors {
+                for (fname, fty) in ctor_fields {
+                    if seen.insert(fname.clone()) {
+                        fields.push(format!("{}:{}", fname, resolved_type_to_descriptor(fty)));
+                    }
+                }
+            }
+            format!("{{{}}}", fields.join(","))
+        }
+        ResolvedType::Named(n) => n.to_lowercase(),
         _ => "text".to_string(),
     }
 }

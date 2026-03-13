@@ -2722,6 +2722,7 @@ struct RouteTableEntry {
     constructor: String,
     body_fields: Vec<(String, String)>,
     query_fields: Vec<(String, String)>,
+    response_type: String,
 }
 
 struct RouteTable {
@@ -2780,6 +2781,8 @@ pub extern "C" fn knot_route_table_add(
     body_desc_len: usize,
     query_desc_ptr: *const u8,
     query_desc_len: usize,
+    resp_ptr: *const u8,
+    resp_len: usize,
 ) {
     let table = unsafe { &mut *(table as *mut RouteTable) };
     let method = unsafe { str_from_raw(method_ptr, method_len) }.to_string();
@@ -2787,6 +2790,7 @@ pub extern "C" fn knot_route_table_add(
     let ctor = unsafe { str_from_raw(ctor_ptr, ctor_len) }.to_string();
     let body_desc = unsafe { str_from_raw(body_desc_ptr, body_desc_len) };
     let query_desc = unsafe { str_from_raw(query_desc_ptr, query_desc_len) };
+    let resp = unsafe { str_from_raw(resp_ptr, resp_len) }.to_string();
 
     table.entries.push(RouteTableEntry {
         method,
@@ -2794,6 +2798,7 @@ pub extern "C" fn knot_route_table_add(
         constructor: ctor,
         body_fields: parse_descriptor(body_desc),
         query_fields: parse_descriptor(query_desc),
+        response_type: resp,
     });
 }
 
@@ -3110,4 +3115,332 @@ pub extern "C" fn knot_http_listen(
             }
         }
     }
+}
+
+// ── OpenAPI spec generation ──────────────────────────────────────
+
+use std::sync::Mutex;
+
+struct SendPtr(*mut c_void);
+unsafe impl Send for SendPtr {}
+
+static API_REGISTRY: Mutex<Vec<(String, SendPtr)>> = Mutex::new(Vec::new());
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_api_register(
+    name_ptr: *const u8,
+    name_len: usize,
+    table: *mut c_void,
+) {
+    let name = unsafe { str_from_raw(name_ptr, name_len) }.to_string();
+    API_REGISTRY.lock().unwrap().push((name, SendPtr(table)));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_api_handle(argc: i32, argv: *const *const u8) -> i32 {
+    if argc < 2 {
+        return 0;
+    }
+    let args: Vec<String> = (0..argc as usize)
+        .map(|i| unsafe {
+            let ptr = *argv.add(i);
+            let mut len = 0;
+            while *ptr.add(len) != 0 {
+                len += 1;
+            }
+            String::from_utf8_lossy(std::slice::from_raw_parts(ptr, len)).to_string()
+        })
+        .collect();
+
+    if args.get(1).map(|s| s.as_str()) != Some("api") {
+        return 0;
+    }
+
+    let registry = API_REGISTRY.lock().unwrap();
+
+    if argc < 3 {
+        eprintln!("Usage: <program> api <RouteName>");
+        eprintln!();
+        eprintln!("Available routes:");
+        for (name, _) in registry.iter() {
+            eprintln!("  {}", name);
+        }
+        std::process::exit(1);
+    }
+
+    let route_name = &args[2];
+
+    for (name, SendPtr(table_ptr)) in registry.iter() {
+        if name == route_name {
+            let table = unsafe { &*(*table_ptr as *const RouteTable) };
+            let spec = generate_openapi(name, table);
+            println!("{}", spec);
+            return 1;
+        }
+    }
+
+    eprintln!("Unknown route: {}", route_name);
+    eprintln!();
+    eprintln!("Available routes:");
+    for (name, _) in registry.iter() {
+        eprintln!("  {}", name);
+    }
+    std::process::exit(1);
+}
+
+fn generate_openapi(name: &str, table: &RouteTable) -> String {
+    let mut out = String::new();
+    out.push_str("{\n");
+    out.push_str("  \"openapi\": \"3.0.3\",\n");
+    out.push_str(&format!(
+        "  \"info\": {{ \"title\": \"{}\", \"version\": \"1.0.0\" }},\n",
+        json_escape(name)
+    ));
+    out.push_str("  \"paths\": {\n");
+
+    // Group entries by path
+    let mut paths: Vec<(String, Vec<&RouteTableEntry>)> = Vec::new();
+    for entry in &table.entries {
+        let path_str = openapi_path(&entry.path_parts);
+        if let Some(group) = paths.iter_mut().find(|(p, _)| *p == path_str) {
+            group.1.push(entry);
+        } else {
+            paths.push((path_str, vec![entry]));
+        }
+    }
+
+    for (i, (path, entries)) in paths.iter().enumerate() {
+        out.push_str(&format!("    \"{}\": {{\n", json_escape(path)));
+        for (j, entry) in entries.iter().enumerate() {
+            let method = entry.method.to_lowercase();
+            out.push_str(&format!("      \"{}\": {{\n", method));
+            out.push_str(&format!(
+                "        \"operationId\": \"{}\",\n",
+                json_escape(&entry.constructor)
+            ));
+
+            // Collect parameters (path + query)
+            let mut params = Vec::new();
+            for part in &entry.path_parts {
+                if let PathPart::Param(pname, pty) = part {
+                    params.push(format!(
+                        "{{ \"name\": \"{}\", \"in\": \"path\", \"required\": true, \"schema\": {} }}",
+                        json_escape(pname),
+                        type_to_openapi_schema(pty)
+                    ));
+                }
+            }
+            for (qname, qty) in &entry.query_fields {
+                params.push(format!(
+                    "{{ \"name\": \"{}\", \"in\": \"query\", \"required\": false, \"schema\": {} }}",
+                    json_escape(qname),
+                    type_to_openapi_schema(qty)
+                ));
+            }
+
+            let has_body = !entry.body_fields.is_empty();
+            let has_response = !entry.response_type.is_empty();
+
+            if !params.is_empty() {
+                out.push_str("        \"parameters\": [\n");
+                for (k, param) in params.iter().enumerate() {
+                    out.push_str(&format!("          {}", param));
+                    if k + 1 < params.len() {
+                        out.push(',');
+                    }
+                    out.push('\n');
+                }
+                out.push_str("        ]");
+                if has_body || has_response {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+
+            // Request body
+            if has_body {
+                out.push_str("        \"requestBody\": {\n");
+                out.push_str("          \"required\": true,\n");
+                out.push_str("          \"content\": {\n");
+                out.push_str("            \"application/json\": {\n");
+                out.push_str("              \"schema\": {\n");
+                out.push_str("                \"type\": \"object\",\n");
+                out.push_str("                \"properties\": {\n");
+                for (k, (fname, fty)) in entry.body_fields.iter().enumerate() {
+                    out.push_str(&format!(
+                        "                  \"{}\": {}",
+                        json_escape(fname),
+                        type_to_openapi_schema(fty)
+                    ));
+                    if k + 1 < entry.body_fields.len() {
+                        out.push(',');
+                    }
+                    out.push('\n');
+                }
+                out.push_str("                },\n");
+                out.push_str("                \"required\": [");
+                for (k, (fname, _)) in entry.body_fields.iter().enumerate() {
+                    out.push_str(&format!("\"{}\"", json_escape(fname)));
+                    if k + 1 < entry.body_fields.len() {
+                        out.push_str(", ");
+                    }
+                }
+                out.push_str("]\n");
+                out.push_str("              }\n");
+                out.push_str("            }\n");
+                out.push_str("          }\n");
+                out.push_str("        }");
+                if has_response {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+
+            // Response
+            out.push_str("        \"responses\": {\n");
+            out.push_str("          \"200\": {\n");
+            out.push_str("            \"description\": \"Successful response\"");
+            if has_response {
+                out.push_str(",\n");
+                out.push_str("            \"content\": {\n");
+                out.push_str("              \"application/json\": {\n");
+                out.push_str(&format!(
+                    "                \"schema\": {}\n",
+                    response_type_to_schema(&entry.response_type)
+                ));
+                out.push_str("              }\n");
+                out.push_str("            }\n");
+            } else {
+                out.push('\n');
+            }
+            out.push_str("          }\n");
+            out.push_str("        }\n");
+
+            out.push_str("      }");
+            if j + 1 < entries.len() {
+                out.push(',');
+            }
+            out.push('\n');
+        }
+        out.push_str("    }");
+        if i + 1 < paths.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+
+    out.push_str("  }\n");
+    out.push_str("}\n");
+    out
+}
+
+fn openapi_path(parts: &[PathPart]) -> String {
+    if parts.is_empty() {
+        return "/".to_string();
+    }
+    let mut s = String::new();
+    for part in parts {
+        s.push('/');
+        match part {
+            PathPart::Literal(lit) => s.push_str(lit),
+            PathPart::Param(name, _) => {
+                s.push('{');
+                s.push_str(name);
+                s.push('}');
+            }
+        }
+    }
+    s
+}
+
+fn type_to_openapi_schema(ty: &str) -> String {
+    match ty {
+        "int" => "{ \"type\": \"integer\" }".to_string(),
+        "float" => "{ \"type\": \"number\" }".to_string(),
+        "bool" => "{ \"type\": \"boolean\" }".to_string(),
+        "text" => "{ \"type\": \"string\" }".to_string(),
+        _ => "{ \"type\": \"string\" }".to_string(),
+    }
+}
+
+/// Parse a response type descriptor and produce an OpenAPI schema JSON string.
+///
+/// Descriptor format:
+/// - `int` / `float` / `text` / `bool` — primitives
+/// - `[<inner>]` — array of inner type
+/// - `{name:type,name:type}` — object
+/// - Anything else — treated as string
+fn response_type_to_schema(desc: &str) -> String {
+    let desc = desc.trim();
+    if desc.is_empty() {
+        return "{}".to_string();
+    }
+    match desc {
+        "int" => "{ \"type\": \"integer\" }".to_string(),
+        "float" => "{ \"type\": \"number\" }".to_string(),
+        "bool" => "{ \"type\": \"boolean\" }".to_string(),
+        "text" => "{ \"type\": \"string\" }".to_string(),
+        "unit" => "{ \"type\": \"object\" }".to_string(),
+        _ if desc.starts_with('[') && desc.ends_with(']') => {
+            let inner = &desc[1..desc.len() - 1];
+            format!(
+                "{{ \"type\": \"array\", \"items\": {} }}",
+                response_type_to_schema(inner)
+            )
+        }
+        _ if desc.starts_with('{') && desc.ends_with('}') => {
+            let inner = &desc[1..desc.len() - 1];
+            let fields = parse_response_fields(inner);
+            let mut s = String::new();
+            s.push_str("{ \"type\": \"object\", \"properties\": { ");
+            for (i, (fname, fty)) in fields.iter().enumerate() {
+                s.push_str(&format!(
+                    "\"{}\": {}",
+                    json_escape(fname),
+                    response_type_to_schema(fty)
+                ));
+                if i + 1 < fields.len() {
+                    s.push_str(", ");
+                }
+            }
+            s.push_str(" } }");
+            s
+        }
+        _ => "{ \"type\": \"string\" }".to_string(),
+    }
+}
+
+/// Parse comma-separated `name:type` fields, respecting nested brackets/braces.
+fn parse_response_fields(s: &str) -> Vec<(String, String)> {
+    let mut fields = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    let bytes = s.as_bytes();
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'[' | b'{' => depth += 1,
+            b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                let part = s[start..i].trim();
+                if let Some((name, ty)) = part.split_once(':') {
+                    fields.push((name.trim().to_string(), ty.trim().to_string()));
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let part = s[start..].trim();
+    if let Some((name, ty)) = part.split_once(':') {
+        fields.push((name.trim().to_string(), ty.trim().to_string()));
+    }
+    fields
+}
+
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
 }

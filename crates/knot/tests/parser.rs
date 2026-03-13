@@ -1061,6 +1061,27 @@ fn derived_with_pipe() {
     }
 }
 
+#[test]
+fn derived_self_referencing() {
+    // A recursive derived relation: body references &reportsTo itself
+    let src = "&reportsTo = union &base &reportsTo";
+    match first_decl(src) {
+        DeclKind::Derived { name, body, .. } => {
+            assert_eq!(name, "reportsTo");
+            // Body should be App(App(Var("union"), DerivedRef("base")), DerivedRef("reportsTo"))
+            if let ExprKind::App { arg, .. } = &body.node {
+                assert!(
+                    matches!(&arg.node, ExprKind::DerivedRef(n) if n == "reportsTo"),
+                    "expected self-referencing DerivedRef"
+                );
+            } else {
+                panic!("expected App, got {:?}", body.node);
+            }
+        }
+        other => panic!("expected Derived, got {:?}", other),
+    }
+}
+
 // ── Function Declarations ───────────────────────────────────────────
 
 #[test]

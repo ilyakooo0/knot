@@ -1,0 +1,6 @@
+-- schema.lock (auto-generated, do not edit)
+-- Commit to source control.
+
+*manages : [{manager: Text, report: Text}]
+
+

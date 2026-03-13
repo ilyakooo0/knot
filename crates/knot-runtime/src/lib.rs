@@ -2253,3 +2253,27 @@ pub extern "C" fn knot_constructor_payload(v: *mut Value) -> *mut Value {
         _ => panic!("knot runtime: expected Constructor, got {}", type_name(v)),
     }
 }
+
+// ── Recursive derived relations (fixpoint iteration) ──────────────
+
+/// Iterates a body function to a fixed point for recursive derived relations.
+/// `body` is a raw function pointer: `extern "C" fn(db, current) -> new_result`.
+/// Starts with `initial` and calls body repeatedly until the result stabilizes.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_fixpoint(
+    db: *mut c_void,
+    body: *const u8,
+    initial: *mut Value,
+) -> *mut Value {
+    let body_fn: extern "C" fn(*mut c_void, *mut Value) -> *mut Value =
+        unsafe { std::mem::transmute(body) };
+    let mut current = initial;
+    for _ in 0..10_000 {
+        let next = body_fn(db, current);
+        if values_equal(current, next) {
+            return next;
+        }
+        current = next;
+    }
+    panic!("knot runtime: recursive derived relation did not converge after 10000 iterations");
+}

@@ -1,0 +1,26 @@
+-- Recursive derived relations (transitive closure)
+--
+-- &reportsTo computes the transitive closure of *manages
+-- using Datalog-style fixpoint iteration.
+
+*manages : [{manager: Text, report: Text}]
+
+&base = do
+  m <- *manages
+  yield {ancestor: m.manager, descendant: m.report}
+
+&reportsTo = do
+  let step = do
+    r <- &reportsTo
+    m <- *manages
+    where r.descendant == m.manager
+    yield {ancestor: r.ancestor, descendant: m.report}
+  r <- union &base step
+  yield r
+
+main = do
+  set *manages = [{manager: "Alice", report: "Bob"}, {manager: "Bob", report: "Carol"}, {manager: "Carol", report: "Dave"}]
+  println "All reports-to relationships:"
+  r <- &reportsTo
+  println (r.ancestor ++ " -> " ++ r.descendant)
+  yield {}

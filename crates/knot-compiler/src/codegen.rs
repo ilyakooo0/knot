@@ -86,6 +86,12 @@ pub struct Codegen {
 
     // Subset constraints: (sub, sup) relation paths
     subset_constraints: Vec<(knot::ast::RelationPath, knot::ast::RelationPath)>,
+
+    // Names of derived relations that are self-referencing (recursive)
+    recursive_derived: HashSet<String>,
+
+    // Body function IDs for recursive derived relations: name -> func_id
+    recursive_body_fns: HashMap<String, FuncId>,
 }
 
 /// Provenance info for a view declaration, extracted at compile time.
@@ -273,6 +279,8 @@ impl Codegen {
             trait_impl_types: HashMap::new(),
             history_sources: HashSet::new(),
             subset_constraints: Vec::new(),
+            recursive_derived: HashSet::new(),
+            recursive_body_fns: HashMap::new(),
         }
     }
 
@@ -386,6 +394,9 @@ impl Codegen {
 
         // Monadic bind for relations (do-desugaring)
         self.declare_rt("knot_relation_bind", &[p, p, p], &[p]);
+
+        // Fixpoint iteration for recursive derived relations
+        self.declare_rt("knot_relation_fixpoint", &[p, p, p], &[p]);
     }
 
     fn declare_rt(&mut self, name: &str, params: &[types::Type], returns: &[types::Type]) {
@@ -442,7 +453,7 @@ impl Codegen {
                         .unwrap();
                     self.user_fns.insert(name.clone(), (func_id, n_params));
                 }
-                ast::DeclKind::Derived { name, .. } => {
+                ast::DeclKind::Derived { name, body, .. } => {
                     // Derived relations are 0-param functions (only db param)
                     let mut sig = self.module.make_signature();
                     sig.params.push(AbiParam::new(self.ptr_type)); // db
@@ -453,6 +464,23 @@ impl Codegen {
                         .declare_function(&func_name, Linkage::Local, &sig)
                         .unwrap();
                     self.user_fns.insert(name.clone(), (func_id, 0));
+
+                    // Detect self-referencing (recursive) derived relations
+                    if expr_contains_derived_ref(body, name) {
+                        self.recursive_derived.insert(name.clone());
+
+                        // Declare body function: (db, self_val) -> result
+                        let mut body_sig = self.module.make_signature();
+                        body_sig.params.push(AbiParam::new(self.ptr_type)); // db
+                        body_sig.params.push(AbiParam::new(self.ptr_type)); // self_val
+                        body_sig.returns.push(AbiParam::new(self.ptr_type));
+                        let body_func_name = format!("knot_user_{}_body", name);
+                        let body_func_id = self
+                            .module
+                            .declare_function(&body_func_name, Linkage::Local, &body_sig)
+                            .unwrap();
+                        self.recursive_body_fns.insert(name.clone(), body_func_id);
+                    }
                 }
                 ast::DeclKind::Data {
                     name,
@@ -827,7 +855,11 @@ impl Codegen {
                     }
                 }
                 ast::DeclKind::Derived { name, body, .. } => {
-                    self.define_user_function(name, &[], body);
+                    if self.recursive_derived.contains(name) {
+                        self.define_recursive_derived(name, body);
+                    } else {
+                        self.define_user_function(name, &[], body);
+                    }
                 }
                 ast::DeclKind::Impl {
                     trait_name,
@@ -1177,6 +1209,60 @@ impl Codegen {
         });
     }
 
+    /// Define a recursive derived relation using fixpoint iteration.
+    /// Generates two functions:
+    /// - `knot_user_<name>_body(db, self_val)`: the body with self-references
+    ///   reading from `self_val` instead of recursing
+    /// - `knot_user_<name>(db)`: wrapper that calls `knot_relation_fixpoint`
+    fn define_recursive_derived(&mut self, name: &str, body: &ast::Expr) {
+        let body_func_id = self.recursive_body_fns[name];
+        let name_owned = name.to_string();
+        let body_owned = body.clone();
+
+        // 1. Define the body function: (db, self_val) -> result
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(self.ptr_type)); // db
+            sig.params.push(AbiParam::new(self.ptr_type)); // self_val
+            sig.returns.push(AbiParam::new(self.ptr_type));
+
+            let self_key = format!("__derived_self_{}", name_owned);
+
+            self.build_function(body_func_id, sig, |cg, builder, entry| {
+                let mut env = Env::new();
+                let db = builder.block_params(entry)[0];
+                let self_val = builder.block_params(entry)[1];
+                // Inject self-reference into env so DerivedRef uses it
+                env.set(&self_key, self_val);
+
+                let result = cg.compile_expr(builder, &body_owned, &mut env, db);
+                builder.ins().return_(&[result]);
+            });
+        }
+
+        // 2. Define the wrapper function: (db) -> result
+        //    Calls knot_relation_fixpoint(db, body_fn_ptr, empty_relation)
+        {
+            let (wrapper_func_id, _) = self.user_fns[name];
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(self.ptr_type)); // db
+            sig.returns.push(AbiParam::new(self.ptr_type));
+
+            self.build_function(wrapper_func_id, sig, |cg, builder, entry| {
+                let db = builder.block_params(entry)[0];
+                let initial = cg.call_rt(builder, "knot_relation_empty", &[]);
+                let body_ref = cg.module.declare_func_in_func(body_func_id, builder.func);
+                let body_addr = builder.ins().func_addr(cg.ptr_type, body_ref);
+                let result = cg.call_rt(
+                    builder,
+                    "knot_relation_fixpoint",
+                    &[db, body_addr, initial],
+                );
+                builder.ins().return_(&[result]);
+            });
+        }
+    }
+
     fn define_lambda_function(&mut self, lambda: &PendingLambda) {
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(self.ptr_type)); // db
@@ -1474,8 +1560,12 @@ impl Codegen {
             }
 
             ast::ExprKind::DerivedRef(name) => {
-                // For now, treat derived refs like function calls
-                if let Some((func_id, 0)) = self.user_fns.get(name).copied() {
+                // For recursive derived relations, self-references use the
+                // current accumulator value passed via the environment.
+                let self_key = format!("__derived_self_{}", name);
+                if let Some(&self_val) = env.bindings.get(&self_key) {
+                    self_val
+                } else if let Some((func_id, 0)) = self.user_fns.get(name).copied() {
                     let func_ref =
                         self.module.declare_func_in_func(func_id, builder.func);
                     let call = builder.ins().call(func_ref, &[db]);
@@ -3292,6 +3382,56 @@ fn uncurry_app(expr: &ast::Expr) -> (&ast::Expr, Vec<&ast::Expr>) {
             (f, args)
         }
         _ => (expr, Vec::new()),
+    }
+}
+
+/// Check if an expression contains a DerivedRef to the given name (self-reference detection).
+fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
+    match &expr.node {
+        ast::ExprKind::DerivedRef(n) => n == name,
+        ast::ExprKind::Lit(_) | ast::ExprKind::Var(_) | ast::ExprKind::Constructor(_)
+        | ast::ExprKind::SourceRef(_) => false,
+        ast::ExprKind::Record(fields) => {
+            fields.iter().any(|f| expr_contains_derived_ref(&f.value, name))
+        }
+        ast::ExprKind::RecordUpdate { base, fields } => {
+            expr_contains_derived_ref(base, name)
+                || fields.iter().any(|f| expr_contains_derived_ref(&f.value, name))
+        }
+        ast::ExprKind::FieldAccess { expr, .. } => expr_contains_derived_ref(expr, name),
+        ast::ExprKind::List(elems) => elems.iter().any(|e| expr_contains_derived_ref(e, name)),
+        ast::ExprKind::Lambda { body, .. } => expr_contains_derived_ref(body, name),
+        ast::ExprKind::App { func, arg } => {
+            expr_contains_derived_ref(func, name) || expr_contains_derived_ref(arg, name)
+        }
+        ast::ExprKind::BinOp { lhs, rhs, .. } => {
+            expr_contains_derived_ref(lhs, name) || expr_contains_derived_ref(rhs, name)
+        }
+        ast::ExprKind::UnaryOp { operand, .. } => expr_contains_derived_ref(operand, name),
+        ast::ExprKind::If { cond, then_branch, else_branch } => {
+            expr_contains_derived_ref(cond, name)
+                || expr_contains_derived_ref(then_branch, name)
+                || expr_contains_derived_ref(else_branch, name)
+        }
+        ast::ExprKind::Case { scrutinee, arms } => {
+            expr_contains_derived_ref(scrutinee, name)
+                || arms.iter().any(|a| expr_contains_derived_ref(&a.body, name))
+        }
+        ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
+            ast::StmtKind::Bind { expr, .. } => expr_contains_derived_ref(expr, name),
+            ast::StmtKind::Let { expr, .. } => expr_contains_derived_ref(expr, name),
+            ast::StmtKind::Where { cond } => expr_contains_derived_ref(cond, name),
+            ast::StmtKind::Expr(e) => expr_contains_derived_ref(e, name),
+        }),
+        ast::ExprKind::Yield(inner) | ast::ExprKind::Atomic(inner) => {
+            expr_contains_derived_ref(inner, name)
+        }
+        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+            expr_contains_derived_ref(target, name) || expr_contains_derived_ref(value, name)
+        }
+        ast::ExprKind::At { relation, time } => {
+            expr_contains_derived_ref(relation, name) || expr_contains_derived_ref(time, name)
+        }
     }
 }
 

@@ -2981,3 +2981,60 @@ fn data_multiple_type_params() {
         other => panic!("expected Data, got {:?}", other),
     }
 }
+
+// ── Subset constraints ──────────────────────────────────────────────
+
+#[test]
+fn subset_constraint_referential_integrity() {
+    // *orders.customer <= *people.name
+    match first_decl("*orders.customer <= *people.name") {
+        DeclKind::SubsetConstraint { sub, sup } => {
+            assert_eq!(sub.relation, "orders");
+            assert_eq!(sub.field.as_deref(), Some("customer"));
+            assert_eq!(sup.relation, "people");
+            assert_eq!(sup.field.as_deref(), Some("name"));
+        }
+        other => panic!("expected SubsetConstraint, got {:?}", other),
+    }
+}
+
+#[test]
+fn subset_constraint_uniqueness() {
+    // *users <= *users.email
+    match first_decl("*users <= *users.email") {
+        DeclKind::SubsetConstraint { sub, sup } => {
+            assert_eq!(sub.relation, "users");
+            assert!(sub.field.is_none());
+            assert_eq!(sup.relation, "users");
+            assert_eq!(sup.field.as_deref(), Some("email"));
+        }
+        other => panic!("expected SubsetConstraint, got {:?}", other),
+    }
+}
+
+#[test]
+fn subset_constraint_whole_relation() {
+    // *a <= *b
+    match first_decl("*a <= *b") {
+        DeclKind::SubsetConstraint { sub, sup } => {
+            assert_eq!(sub.relation, "a");
+            assert!(sub.field.is_none());
+            assert_eq!(sup.relation, "b");
+            assert!(sup.field.is_none());
+        }
+        other => panic!("expected SubsetConstraint, got {:?}", other),
+    }
+}
+
+#[test]
+fn subset_constraint_with_source_decls() {
+    let src = "\
+*people : [{name: Text, age: Int}]
+*orders : [{customer: Text, amount: Int}]
+*orders.customer <= *people.name";
+    let m = parse_ok(src);
+    assert_eq!(m.decls.len(), 3);
+    assert!(matches!(&m.decls[0].node, DeclKind::Source { name, .. } if name == "people"));
+    assert!(matches!(&m.decls[1].node, DeclKind::Source { name, .. } if name == "orders"));
+    assert!(matches!(&m.decls[2].node, DeclKind::SubsetConstraint { .. }));
+}

@@ -1,0 +1,11 @@
+-- schema.lock (auto-generated, do not edit)
+-- Commit to source control.
+
+type Person = {name: Text, age: Int, email: Text}
+
+*people : [Person]
+
+
+*orders : [{customer: Text, amount: Int}]
+
+

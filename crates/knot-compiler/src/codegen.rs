@@ -83,6 +83,9 @@ pub struct Codegen {
 
     // Sources with `with history` enabled
     history_sources: HashSet<String>,
+
+    // Subset constraints: (sub, sup) relation paths
+    subset_constraints: Vec<(knot::ast::RelationPath, knot::ast::RelationPath)>,
 }
 
 /// Provenance info for a view declaration, extracted at compile time.
@@ -190,6 +193,7 @@ pub fn compile(
     cg.source_schemas = type_env.source_schemas.clone();
     cg.migrate_schemas = type_env.migrate_schemas.clone();
     cg.history_sources = type_env.history_sources.clone();
+    cg.subset_constraints = type_env.subset_constraints.clone();
     for (name, fields) in &type_env.constructors {
         let field_strs: Vec<(String, String)> = fields
             .iter()
@@ -268,6 +272,7 @@ impl Codegen {
             trait_supertraits: HashMap::new(),
             trait_impl_types: HashMap::new(),
             history_sources: HashSet::new(),
+            subset_constraints: Vec::new(),
         }
     }
 
@@ -375,6 +380,9 @@ impl Codegen {
         self.declare_rt("knot_history_init", &[p, p, p, p, p], &[]);
         self.declare_rt("knot_history_snapshot", &[p, p, p, p, p], &[]);
         self.declare_rt("knot_source_read_at", &[p, p, p, p, p, p], &[p]);
+
+        // Subset constraints
+        self.declare_rt("knot_constraint_register", &[p, p, p, p, p, p, p, p, p], &[]);
     }
 
     fn declare_rt(&mut self, name: &str, params: &[types::Type], returns: &[types::Type]) {
@@ -1256,6 +1264,25 @@ impl Codegen {
                         );
                     }
                 }
+            }
+
+            // Register subset constraints
+            let constraints = cg.subset_constraints.clone();
+            for (sub, sup) in &constraints {
+                let (sub_rel_ptr, sub_rel_len) = cg.string_ptr(builder, &sub.relation);
+                let sub_field_str = sub.field.as_deref().unwrap_or("");
+                let (sub_field_ptr, sub_field_len) = cg.string_ptr(builder, sub_field_str);
+                let (sup_rel_ptr, sup_rel_len) = cg.string_ptr(builder, &sup.relation);
+                let sup_field_str = sup.field.as_deref().unwrap_or("");
+                let (sup_field_ptr, sup_field_len) = cg.string_ptr(builder, sup_field_str);
+                cg.call_rt_void(
+                    builder,
+                    "knot_constraint_register",
+                    &[
+                        db, sub_rel_ptr, sub_rel_len, sub_field_ptr, sub_field_len,
+                        sup_rel_ptr, sup_rel_len, sup_field_ptr, sup_field_len,
+                    ],
+                );
             }
 
             // Call user's main function if it exists

@@ -441,6 +441,12 @@ impl Parser {
 
         let (name, _) = self.expect_lower("expected name after '*'").ok()?;
 
+        // Subset constraint: *name.field <= ... or *name <= ...
+        if self.at(&TokenKind::Dot) || self.at(&TokenKind::Le) {
+            self.pop_context();
+            return self.parse_subset_constraint_rest(start, name);
+        }
+
         // Peek: if `:` → source declaration, if `=` → view declaration.
         if self.eat(&TokenKind::Colon) {
             // Source declaration: *name : type
@@ -476,10 +482,57 @@ impl Parser {
                 Span::new(start.start, end.end),
             ))
         } else {
-            self.error("expected ':' or '=' after source/view name");
+            self.error("expected ':', '=', or '<=' after source/view name");
             self.pop_context();
             None
         }
+    }
+
+    // ── subset constraint ────────────────────────────────────────────
+
+    /// Parse the rest of a subset constraint after `*name` has been consumed.
+    /// Handles: `*name.field <= *other.field` and `*name <= *other.field`.
+    fn parse_subset_constraint_rest(&mut self, start: Span, left_relation: Name) -> Option<Decl> {
+        self.push_context("subset constraint");
+
+        let left_field = if self.eat(&TokenKind::Dot) {
+            let (field, _) = self.expect_lower("expected field name after '.'").ok()?;
+            Some(field)
+        } else {
+            None
+        };
+
+        self.expect(&TokenKind::Le, "expected '<=' in subset constraint").ok()?;
+
+        // Parse right side: *relation.field or *relation
+        self.expect(&TokenKind::Star, "expected '*' before relation name in subset constraint")
+            .ok()?;
+        let (right_relation, _) = self
+            .expect_lower("expected relation name after '*' in subset constraint")
+            .ok()?;
+
+        let right_field = if self.eat(&TokenKind::Dot) {
+            let (field, _) = self.expect_lower("expected field name after '.'").ok()?;
+            Some(field)
+        } else {
+            None
+        };
+
+        let end = self.prev_span();
+        self.pop_context();
+        Some(Spanned::new(
+            DeclKind::SubsetConstraint {
+                sub: RelationPath {
+                    relation: left_relation,
+                    field: left_field,
+                },
+                sup: RelationPath {
+                    relation: right_relation,
+                    field: right_field,
+                },
+            },
+            Span::new(start.start, end.end),
+        ))
     }
 
     // ── derived ──────────────────────────────────────────────────────

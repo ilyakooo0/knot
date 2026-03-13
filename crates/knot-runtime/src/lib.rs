@@ -1172,6 +1172,7 @@ pub extern "C" fn knot_source_write(
         }
     }
 
+
     db_ref
         .conn
         .execute_batch("COMMIT;")
@@ -1261,6 +1262,7 @@ pub extern "C" fn knot_source_append(
             ),
         }
     }
+
 
     db_ref
         .conn
@@ -1418,6 +1420,7 @@ pub extern "C" fn knot_source_diff_write(
         .conn
         .execute_batch(&drop_temp)
         .expect("knot runtime: failed to drop temp table");
+
 
     db_ref
         .conn
@@ -1731,6 +1734,127 @@ pub extern "C" fn knot_source_read_at(
     }
 
     alloc(Value::Relation(rows))
+}
+
+// ── Subset constraints ────────────────────────────────────────────
+
+/// Register a subset constraint. Called at program startup.
+/// Empty field strings mean "no field" (whole relation).
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_constraint_register(
+    db: *mut c_void,
+    sub_rel_ptr: *const u8,
+    sub_rel_len: usize,
+    sub_field_ptr: *const u8,
+    sub_field_len: usize,
+    sup_rel_ptr: *const u8,
+    sup_rel_len: usize,
+    sup_field_ptr: *const u8,
+    sup_field_len: usize,
+) {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let sub_rel = unsafe { str_from_raw(sub_rel_ptr, sub_rel_len) }.to_string();
+    let sub_field_str = unsafe { str_from_raw(sub_field_ptr, sub_field_len) };
+    let sub_field = if sub_field_str.is_empty() {
+        None
+    } else {
+        Some(sub_field_str.to_string())
+    };
+    let sup_rel = unsafe { str_from_raw(sup_rel_ptr, sup_rel_len) }.to_string();
+    let sup_field_str = unsafe { str_from_raw(sup_field_ptr, sup_field_len) };
+    let sup_field = if sup_field_str.is_empty() {
+        None
+    } else {
+        Some(sup_field_str.to_string())
+    };
+
+    // Enforce constraint via SQL indexes and triggers
+    match (&sub_field, &sup_field) {
+        // Uniqueness: *rel <= *rel.field — index + trigger
+        (None, Some(sf)) if sub_rel == sup_rel => {
+            let table = quote_ident(&format!("_knot_{}", sub_rel));
+            let col = quote_ident(sf);
+
+            // Index for efficient lookups
+            let idx_sql = format!(
+                "CREATE INDEX IF NOT EXISTS {} ON {} ({});",
+                quote_ident(&format!("_knot_{}_idx_{}", sub_rel, sf)),
+                table,
+                col,
+            );
+            debug_sql(&idx_sql);
+            let _ = db_ref.conn.execute_batch(&idx_sql);
+
+            // Trigger: reject INSERT if value already exists
+            let msg = format!(
+                "uniqueness constraint violated: *{} <= *{}.{}",
+                sub_rel, sup_rel, sf
+            );
+            let trigger_sql = format!(
+                "CREATE TRIGGER IF NOT EXISTS {trg} \
+                 BEFORE INSERT ON {table} \
+                 FOR EACH ROW \
+                 WHEN EXISTS (SELECT 1 FROM {table} WHERE {col} = NEW.{col}) \
+                 BEGIN SELECT RAISE(ABORT, '{msg}'); END;",
+                trg = quote_ident(&format!("_knot_uniq_{}_{}_ins", sub_rel, sf)),
+                table = table,
+                col = col,
+                msg = msg,
+            );
+            debug_sql(&trigger_sql);
+            db_ref.conn.execute_batch(&trigger_sql)
+                .expect("knot runtime: failed to create uniqueness trigger");
+        }
+        // Referential integrity: *sub.sf <= *sup.spf — indexes + triggers
+        (Some(sf), Some(spf)) => {
+            // Indexes for efficient lookups
+            let sub_idx = format!(
+                "CREATE INDEX IF NOT EXISTS {} ON {} ({});",
+                quote_ident(&format!("_knot_{}_idx_{}", sub_rel, sf)),
+                quote_ident(&format!("_knot_{}", sub_rel)),
+                quote_ident(sf),
+            );
+            debug_sql(&sub_idx);
+            let _ = db_ref.conn.execute_batch(&sub_idx);
+
+            let sup_idx = format!(
+                "CREATE INDEX IF NOT EXISTS {} ON {} ({});",
+                quote_ident(&format!("_knot_{}_idx_{}", sup_rel, spf)),
+                quote_ident(&format!("_knot_{}", sup_rel)),
+                quote_ident(spf),
+            );
+            debug_sql(&sup_idx);
+            let _ = db_ref.conn.execute_batch(&sup_idx);
+
+            let sub_table = quote_ident(&format!("_knot_{}", sub_rel));
+            let sup_table = quote_ident(&format!("_knot_{}", sup_rel));
+            let sub_col = quote_ident(sf);
+            let sup_col = quote_ident(spf);
+            let msg = format!(
+                "subset constraint violated: *{}.{} <= *{}.{}",
+                sub_rel, sf, sup_rel, spf
+            );
+
+            // Trigger: reject INSERT into sub if value doesn't exist in sup
+            let insert_trigger = format!(
+                "CREATE TRIGGER IF NOT EXISTS {trg} \
+                 BEFORE INSERT ON {sub_table} \
+                 FOR EACH ROW \
+                 WHEN NOT EXISTS (SELECT 1 FROM {sup_table} WHERE {sup_col} = NEW.{sub_col}) \
+                 BEGIN SELECT RAISE(ABORT, '{msg}'); END;",
+                trg = quote_ident(&format!("_knot_fk_{}_{}_ins", sub_rel, sf)),
+                sub_table = sub_table,
+                sup_table = sup_table,
+                sub_col = sub_col,
+                sup_col = sup_col,
+                msg = msg,
+            );
+            debug_sql(&insert_trigger);
+            db_ref.conn.execute_batch(&insert_trigger)
+                .expect("knot runtime: failed to create insert trigger");
+        }
+        _ => {}
+    }
 }
 
 // ── Atomic (transactions) ─────────────────────────────────────────

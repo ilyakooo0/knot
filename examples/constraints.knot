@@ -1,0 +1,26 @@
+-- Example: subset constraints
+
+type Person = {name: Text, age: Int, email: Text}
+
+*people : [Person]
+*orders : [{customer: Text, amount: Int}]
+
+-- Referential integrity: every order's customer must be a person's name
+*orders.customer <= *people.name
+
+-- Uniqueness: email uniquely identifies a person
+*people <= *people.email
+
+main = do
+  -- Insert some people
+  set *people = [{name: "Alice", age: 30, email: "alice@example.com"}, {name: "Bob", age: 25, email: "bob@example.com"}]
+
+  -- Insert a valid order (Alice exists in people)
+  set *orders = [{customer: "Alice", amount: 100}]
+
+  -- Print current state
+  println "People:"
+  println (show *people)
+  println "Orders:"
+  println (show *orders)
+  yield {}

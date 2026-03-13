@@ -42,6 +42,8 @@ pub struct TypeEnv {
     pub associated_types: HashMap<String, Vec<AssocTypeDef>>,
     /// Sources with `with history` enabled
     pub history_sources: HashSet<String>,
+    /// Subset constraints: (sub, sup)
+    pub subset_constraints: Vec<(RelationPath, RelationPath)>,
 }
 
 impl TypeEnv {
@@ -130,7 +132,8 @@ impl TypeEnv {
             }
         }
 
-        // Second pass: compute source schemas and migration schemas
+        // Second pass: compute source schemas, migration schemas, and subset constraints
+        let mut subset_constraints = Vec::new();
         for decl in &module.decls {
             match &decl.node {
                 DeclKind::Source { name, ty, history } => {
@@ -156,6 +159,9 @@ impl TypeEnv {
                     migrate_schemas
                         .insert(relation.clone(), (old_schema, new_schema));
                 }
+                DeclKind::SubsetConstraint { sub, sup } => {
+                    subset_constraints.push((sub.clone(), sup.clone()));
+                }
                 _ => {}
             }
         }
@@ -167,6 +173,7 @@ impl TypeEnv {
             migrate_schemas,
             associated_types,
             history_sources,
+            subset_constraints,
         }
     }
 }

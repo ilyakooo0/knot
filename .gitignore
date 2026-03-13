@@ -1,8 +1,11 @@
 /target
 *.db
+*.db-shm
+*.db-wal
 examples/hello
 examples/todo
 examples/traits
 examples/associated_types
 examples/temporal
 examples/views
+examples/constraints

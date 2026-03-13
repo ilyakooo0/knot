@@ -3,6 +3,7 @@
 //! Usage: knotc build <file.knot>
 
 mod codegen;
+mod desugar;
 mod effects;
 mod infer;
 mod linker;
@@ -67,7 +68,7 @@ fn cmd_build(source_file: &str) {
 
     // Parse
     let parser = knot::parser::Parser::new(source.clone(), tokens);
-    let (module, parse_diags) = parser.parse_module();
+    let (mut module, parse_diags) = parser.parse_module();
     let has_errors = parse_diags
         .iter()
         .any(|d| d.severity == knot::diagnostic::Severity::Error);
@@ -77,6 +78,9 @@ fn cmd_build(source_file: &str) {
         }
         process::exit(1);
     }
+
+    // Desugar monadic do blocks into trait method calls
+    desugar::desugar(&mut module);
 
     // Resolve types
     let type_env = types::TypeEnv::from_module(&module);

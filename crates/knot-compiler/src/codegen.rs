@@ -383,6 +383,9 @@ impl Codegen {
 
         // Subset constraints
         self.declare_rt("knot_constraint_register", &[p, p, p, p, p, p, p, p, p], &[]);
+
+        // Monadic bind for relations (do-desugaring)
+        self.declare_rt("knot_relation_bind", &[p, p, p], &[p]);
     }
 
     fn declare_rt(&mut self, name: &str, params: &[types::Type], returns: &[types::Type]) {
@@ -403,6 +406,21 @@ impl Codegen {
     // ── Declaration collection ────────────────────────────────────
 
     fn collect_declarations(&mut self, module: &ast::Module) {
+        // Register built-in __bind function for do-block desugaring.
+        // __bind(func, collection) calls knot_relation_bind(db, func, collection).
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(self.ptr_type)); // db
+            sig.params.push(AbiParam::new(self.ptr_type)); // func
+            sig.params.push(AbiParam::new(self.ptr_type)); // collection
+            sig.returns.push(AbiParam::new(self.ptr_type));
+            let func_id = self
+                .module
+                .declare_function("knot_user___bind", Linkage::Local, &sig)
+                .unwrap();
+            self.user_fns.insert("__bind".into(), (func_id, 2));
+        }
+
         for decl in &module.decls {
             match &decl.node {
                 ast::DeclKind::Fun { name, body, .. } => {
@@ -776,6 +794,25 @@ impl Codegen {
     // ── Function definitions ──────────────────────────────────────
 
     fn define_functions(&mut self, module: &ast::Module, _type_env: &TypeEnv) {
+        // Define built-in __bind: delegates to knot_relation_bind(db, func, collection)
+        {
+            let (bind_id, _) = self.user_fns["__bind"];
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(self.ptr_type)); // db
+            sig.params.push(AbiParam::new(self.ptr_type)); // func
+            sig.params.push(AbiParam::new(self.ptr_type)); // collection
+            sig.returns.push(AbiParam::new(self.ptr_type));
+
+            self.build_function(bind_id, sig, |cg, builder, entry| {
+                let db = builder.block_params(entry)[0];
+                let func = builder.block_params(entry)[1];
+                let collection = builder.block_params(entry)[2];
+                let result =
+                    cg.call_rt(builder, "knot_relation_bind", &[db, func, collection]);
+                builder.ins().return_(&[result]);
+            });
+        }
+
         for decl in &module.decls {
             match &decl.node {
                 ast::DeclKind::Fun { name, body, .. } => {
@@ -3409,6 +3446,7 @@ fn is_builtin_name(name: &str) -> bool {
             | "map"
             | "fold"
             | "now"
+            | "__bind"
     )
 }
 

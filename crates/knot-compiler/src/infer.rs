@@ -1540,6 +1540,27 @@ impl Infer {
             "now",
             Scheme::mono(Ty::Int),
         );
+
+        // __bind : ∀a b. (a -> [b]) -> [a] -> [b]
+        // Used by do-block desugaring for relation comprehensions.
+        let a = self.fresh_var();
+        let b = self.fresh_var();
+        self.bind_top(
+            "__bind",
+            Scheme {
+                vars: vec![a, b],
+                ty: Ty::Fun(
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Var(a)),
+                        Box::new(Ty::Relation(Box::new(Ty::Var(b)))),
+                    )),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        Box::new(Ty::Relation(Box::new(Ty::Var(b)))),
+                    )),
+                ),
+            },
+        );
     }
 
     fn register_trait_methods(

@@ -369,6 +369,42 @@ pub extern "C" fn knot_relation_union(a: *mut Value, b: *mut Value) -> *mut Valu
     alloc(Value::Relation(result))
 }
 
+/// Monadic bind for relations: iterate `rel`, call `func` on each element,
+/// union all resulting relations into one.
+/// Signature: (db, func, rel) -> rel
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_bind(
+    db: *mut c_void,
+    func: *mut Value,
+    rel: *mut Value,
+) -> *mut Value {
+    let rows = match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => rows.clone(),
+        _ => panic!(
+            "knot runtime: expected Relation in bind, got {}",
+            type_name(rel)
+        ),
+    };
+    let mut result: Vec<*mut Value> = Vec::new();
+    for row in rows {
+        let sub = knot_value_call(db, func, row);
+        match unsafe { as_ref(sub) } {
+            Value::Relation(sub_rows) => {
+                for &r in sub_rows {
+                    if !result.iter().any(|existing| values_equal(*existing, r)) {
+                        result.push(r);
+                    }
+                }
+            }
+            _ => panic!(
+                "knot runtime: bind function must return a Relation, got {}",
+                type_name(sub)
+            ),
+        }
+    }
+    alloc(Value::Relation(result))
+}
+
 // ── Value equality ────────────────────────────────────────────────
 
 fn values_equal(a: *mut Value, b: *mut Value) -> bool {

@@ -2969,7 +2969,8 @@ fn value_to_json(v: *mut Value) -> String {
 }
 
 /// Identity function used as the `respond` field in route constructors.
-/// At runtime, respond just passes through the value unchanged.
+/// At runtime, respond just passes through the value unchanged — the type system
+/// uses it to check that each handler branch returns the declared response type.
 extern "C" fn respond_identity(
     _db: *mut c_void,
     _env: *mut Value,
@@ -3047,7 +3048,7 @@ pub extern "C" fn knot_http_listen(
                     });
                 }
 
-                // Body fields (JSON) — wrapped in a `body` record
+                // Body fields (JSON) — flat, same level as path/query params
                 if !entry.body_fields.is_empty() {
                     let mut body_bytes = Vec::new();
                     request
@@ -3056,25 +3057,21 @@ pub extern "C" fn knot_http_listen(
                         .unwrap_or(0);
                     let body_str = String::from_utf8_lossy(&body_bytes);
                     let json_fields = parse_json_object(&body_str);
-                    let mut body_record_fields: Vec<RecordField> = Vec::new();
                     for (bname, bty) in &entry.body_fields {
                         let val = json_fields
                             .iter()
                             .find(|(k, _)| k == bname)
                             .map(|(_, v)| v.as_str())
                             .unwrap_or("");
-                        body_record_fields.push(RecordField {
+                        fields.push(RecordField {
                             name: bname.clone(),
                             value: string_to_value(val, bty),
                         });
                     }
-                    fields.push(RecordField {
-                        name: "body".to_string(),
-                        value: alloc(Value::Record(body_record_fields)),
-                    });
                 }
 
                 // Add `respond` field — identity function at runtime
+                // (the type system uses it for per-branch response type checking)
                 fields.push(RecordField {
                     name: "respond".to_string(),
                     value: alloc(Value::Function(

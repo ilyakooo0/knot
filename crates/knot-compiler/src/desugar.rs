@@ -92,6 +92,9 @@ fn desugar_routes(module: &mut Module) {
 }
 
 /// Convert route entries into constructor definitions.
+/// All fields (path params, query params, body fields) are top-level constructor fields.
+/// Routes with a response type get a `respond : ResponseType -> Response` field
+/// that provides compile-time type safety for each handler branch.
 fn route_entries_to_constructors(entries: &[RouteEntry]) -> Vec<ConstructorDef> {
     entries
         .iter()
@@ -113,26 +116,11 @@ fn route_entries_to_constructors(entries: &[RouteEntry]) -> Vec<ConstructorDef> 
                     value: qp.value.clone(),
                 });
             }
-            // Body fields wrapped in a `body` record field
-            if !entry.body_fields.is_empty() {
-                let body_record_fields: Vec<Field<Type>> = entry
-                    .body_fields
-                    .iter()
-                    .map(|bf| Field {
-                        name: bf.name.clone(),
-                        value: bf.value.clone(),
-                    })
-                    .collect();
-                let dummy_span = Span::new(0, 0);
+            // Body fields — flat, same level as path/query params
+            for bf in &entry.body_fields {
                 fields.push(Field {
-                    name: "body".to_string(),
-                    value: Spanned::new(
-                        TypeKind::Record {
-                            fields: body_record_fields,
-                            rest: None,
-                        },
-                        dummy_span,
-                    ),
+                    name: bf.name.clone(),
+                    value: bf.value.clone(),
                 });
             }
             // Add `respond : <response_ty> -> Response` field if route has a response type

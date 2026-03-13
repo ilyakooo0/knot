@@ -917,7 +917,8 @@ impl Parser {
         self.expect(&TokenKind::Where, "expected 'where' or '=' after route name")
             .ok()?;
 
-        let entries = self.parse_block(|p| p.parse_route_entry());
+        let no_prefix: Vec<PathSegment> = vec![];
+        let entries = self.parse_route_entries_with_prefix(&no_prefix);
 
         let end = self.prev_span();
         self.pop_context();
@@ -925,6 +926,48 @@ impl Parser {
             DeclKind::Route { name, entries },
             Span::new(start.start, end.end),
         ))
+    }
+
+    /// Parse route entries, supporting path prefix nesting.
+    /// A line starting with `/` (no HTTP method) introduces a prefix group;
+    /// nested entries under it have the prefix prepended to their paths.
+    fn parse_route_entries_with_prefix(&mut self, prefix: &[PathSegment]) -> Vec<RouteEntry> {
+        self.skip_newlines();
+        if self.at_eof() {
+            return vec![];
+        }
+        let indent = self.column_of(&self.span());
+        let mut entries = vec![];
+        loop {
+            self.skip_newlines();
+            if self.at_eof() {
+                break;
+            }
+            let col = self.column_of(&self.span());
+            if col < indent {
+                break;
+            }
+            if self.at(&TokenKind::Slash) {
+                // Path prefix group: `/prefix` followed by nested entries
+                let prefix_path = self.parse_route_path();
+                let mut combined = prefix.to_vec();
+                combined.extend(prefix_path);
+                let nested = self.parse_route_entries_with_prefix(&combined);
+                entries.extend(nested);
+            } else {
+                // Route entry (starts with HTTP method)
+                match self.parse_route_entry() {
+                    Some(mut entry) => {
+                        let mut full_path = prefix.to_vec();
+                        full_path.extend(entry.path);
+                        entry.path = full_path;
+                        entries.push(entry);
+                    }
+                    None => break,
+                }
+            }
+        }
+        entries
     }
 
     fn parse_route_entry(&mut self) -> Option<RouteEntry> {

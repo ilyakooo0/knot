@@ -1,13 +1,22 @@
-type Todo = {title: Text, owner: Text, priority: Text}
+data Priority = Low {} | Medium {} | High {} | Critical {}
+
+type Todo = {title: Text, owner: Text, priority: Priority}
 
 *todos : [Todo]
 
 route TodoApi where
-  GET /todos/{owner: Text} -> [Todo] = GetTodos
-  POST {title: Text, owner: Text, priority: Text} /todos -> Todo = CreateTodo
+  /todos
+    GET /{owner: Text} -> [Todo] = GetTodos
+    POST {title: Text, owner: Text, priority: Text} / -> Todo = CreateTodo
+
+route AdminApi where
+  /admin
+    GET /count -> Int = GetCount
+
+route Api = TodoApi | AdminApi
 
 addTodo = \title owner priority ->
-  set *todos = union *todos [{title: title, owner: owner, priority: priority}]
+  set *todos = union *todos [{title: title, owner: owner, priority: Low {}}]
 
 getTodos = \owner -> do
   t <- *todos
@@ -16,6 +25,9 @@ getTodos = \owner -> do
 
 serve = \req -> case req of
   GetTodos {owner, respond} -> respond (getTodos owner)
-  CreateTodo {body, respond} -> addTodo body.title body.owner body.priority |> (\_ -> respond body)
+  CreateTodo {title, owner, priority, respond} ->
+    addTodo title owner priority
+      |> (\_ -> respond {title: title, owner: owner, priority: Low {}})
+  GetCount {respond} -> respond (count *todos)
 
 main = listen 8080 serve

@@ -2413,6 +2413,118 @@ route Api where
     }
 }
 
+// ── Route Path Prefix Nesting ───────────────────────────────────────
+
+#[test]
+fn route_prefix_nesting() {
+    let src = "\
+route Api where
+  /todos
+    GET /{user: Text} = GetTodos
+    POST {title: Text, owner: Text} / = AddTodo
+  /admin
+    GET /stats = Stats
+    POST /reset = Reset";
+    match first_decl(src) {
+        DeclKind::Route { name, entries } => {
+            assert_eq!(name, "Api");
+            assert_eq!(entries.len(), 4);
+            // GetTodos: /todos/{user: Text}
+            assert_eq!(entries[0].constructor, "GetTodos");
+            assert_eq!(entries[0].path.len(), 2);
+            assert!(matches!(&entries[0].path[0], PathSegment::Literal(s) if s == "todos"));
+            assert!(matches!(&entries[0].path[1], PathSegment::Param { name, .. } if name == "user"));
+            // AddTodo: /todos/
+            assert_eq!(entries[1].constructor, "AddTodo");
+            assert_eq!(entries[1].path.len(), 1);
+            assert!(matches!(&entries[1].path[0], PathSegment::Literal(s) if s == "todos"));
+            assert_eq!(entries[1].body_fields.len(), 2);
+            // Stats: /admin/stats
+            assert_eq!(entries[2].constructor, "Stats");
+            assert_eq!(entries[2].path.len(), 2);
+            assert!(matches!(&entries[2].path[0], PathSegment::Literal(s) if s == "admin"));
+            assert!(matches!(&entries[2].path[1], PathSegment::Literal(s) if s == "stats"));
+            // Reset: /admin/reset
+            assert_eq!(entries[3].constructor, "Reset");
+            assert_eq!(entries[3].path.len(), 2);
+            assert!(matches!(&entries[3].path[0], PathSegment::Literal(s) if s == "admin"));
+            assert!(matches!(&entries[3].path[1], PathSegment::Literal(s) if s == "reset"));
+        }
+        other => panic!("expected Route, got {:?}", other),
+    }
+}
+
+#[test]
+fn route_deeply_nested_prefixes() {
+    let src = "\
+route Api where
+  /api/v1
+    /users
+      GET / = ListUsers
+      GET /{id: Int} = GetUser
+      POST {name: Text, email: Text} / = CreateUser
+    /teams
+      GET / = ListTeams
+      GET /{id: Int}/members = GetMembers";
+    match first_decl(src) {
+        DeclKind::Route { name, entries } => {
+            assert_eq!(name, "Api");
+            assert_eq!(entries.len(), 5);
+            // ListUsers: /api/v1/users/
+            assert_eq!(entries[0].constructor, "ListUsers");
+            assert_eq!(entries[0].path.len(), 3);
+            assert!(matches!(&entries[0].path[0], PathSegment::Literal(s) if s == "api"));
+            assert!(matches!(&entries[0].path[1], PathSegment::Literal(s) if s == "v1"));
+            assert!(matches!(&entries[0].path[2], PathSegment::Literal(s) if s == "users"));
+            // GetUser: /api/v1/users/{id: Int}
+            assert_eq!(entries[1].constructor, "GetUser");
+            assert_eq!(entries[1].path.len(), 4);
+            assert!(matches!(&entries[1].path[3], PathSegment::Param { name, .. } if name == "id"));
+            // CreateUser: /api/v1/users/ with body
+            assert_eq!(entries[2].constructor, "CreateUser");
+            assert_eq!(entries[2].body_fields.len(), 2);
+            // ListTeams: /api/v1/teams/
+            assert_eq!(entries[3].constructor, "ListTeams");
+            assert_eq!(entries[3].path.len(), 3);
+            assert!(matches!(&entries[3].path[2], PathSegment::Literal(s) if s == "teams"));
+            // GetMembers: /api/v1/teams/{id: Int}/members
+            assert_eq!(entries[4].constructor, "GetMembers");
+            assert_eq!(entries[4].path.len(), 5);
+            assert!(matches!(&entries[4].path[2], PathSegment::Literal(s) if s == "teams"));
+            assert!(matches!(&entries[4].path[3], PathSegment::Param { name, .. } if name == "id"));
+            assert!(matches!(&entries[4].path[4], PathSegment::Literal(s) if s == "members"));
+        }
+        other => panic!("expected Route, got {:?}", other),
+    }
+}
+
+#[test]
+fn route_mixed_flat_and_nested() {
+    let src = "\
+route Api where
+  GET /health = Health
+  /todos
+    GET /{user: Text} = GetTodos
+    POST {title: Text} / = AddTodo";
+    match first_decl(src) {
+        DeclKind::Route { name, entries } => {
+            assert_eq!(name, "Api");
+            assert_eq!(entries.len(), 3);
+            // Health: /health (flat, no prefix)
+            assert_eq!(entries[0].constructor, "Health");
+            assert_eq!(entries[0].path.len(), 1);
+            assert!(matches!(&entries[0].path[0], PathSegment::Literal(s) if s == "health"));
+            // GetTodos: /todos/{user: Text} (nested under /todos)
+            assert_eq!(entries[1].constructor, "GetTodos");
+            assert_eq!(entries[1].path.len(), 2);
+            // AddTodo: /todos/ (nested under /todos)
+            assert_eq!(entries[2].constructor, "AddTodo");
+            assert_eq!(entries[2].path.len(), 1);
+        }
+        other => panic!("expected Route, got {:?}", other),
+    }
+}
+
 // ── Record Punning ──────────────────────────────────────────────────
 
 #[test]

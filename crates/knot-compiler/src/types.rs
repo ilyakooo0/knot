@@ -18,6 +18,8 @@ pub enum ResolvedType {
     Relation(Box<ResolvedType>),
     Function(Box<ResolvedType>, Box<ResolvedType>),
     Named(String),
+    /// Multi-variant ADT: Vec<(constructor_name, constructor_fields)>
+    Adt(Vec<(String, Vec<(String, ResolvedType)>)>),
 }
 
 /// An associated type definition from an impl block.
@@ -93,7 +95,8 @@ impl TypeEnv {
                         );
                         constructors.insert(ctor.name.clone(), fields);
                     } else {
-                        // Multi-variant: register each constructor
+                        // Multi-variant: register each constructor and create Adt alias
+                        let mut adt_ctors = Vec::new();
                         for ctor in ctors {
                             let fields: Vec<(String, ResolvedType)> = ctor
                                 .fields
@@ -109,8 +112,10 @@ impl TypeEnv {
                                     )
                                 })
                                 .collect();
-                            constructors.insert(ctor.name.clone(), fields);
+                            constructors.insert(ctor.name.clone(), fields.clone());
+                            adt_ctors.push((ctor.name.clone(), fields));
                         }
+                        aliases.insert(name.clone(), ResolvedType::Adt(adt_ctors));
                     }
                 }
                 DeclKind::Impl { items, .. } => {
@@ -258,22 +263,52 @@ fn schema_for_source(
     }
 }
 
+/// Column type string for a resolved type used as a record field.
+fn col_type_str(ty: &ResolvedType) -> &'static str {
+    match ty {
+        ResolvedType::Int => "int",
+        ResolvedType::Float => "float",
+        ResolvedType::Text => "text",
+        ResolvedType::Bool => "bool",
+        ResolvedType::Adt(ctors) => {
+            // Enum-like ADTs (all nullary) get the "tag" type
+            if ctors.iter().all(|(_, fields)| fields.is_empty()) {
+                "tag"
+            } else {
+                "text" // payload-bearing ADTs fall back to text for now
+            }
+        }
+        _ => "text",
+    }
+}
+
 fn schema_descriptor(ty: &ResolvedType) -> String {
     match ty {
         ResolvedType::Record(fields) => fields
             .iter()
-            .map(|(name, ty)| {
-                let col_type = match ty {
-                    ResolvedType::Int => "int",
-                    ResolvedType::Float => "float",
-                    ResolvedType::Text => "text",
-                    ResolvedType::Bool => "bool",
-                    _ => "text",
-                };
-                format!("{}:{}", name, col_type)
-            })
+            .map(|(name, ty)| format!("{}:{}", name, col_type_str(ty)))
             .collect::<Vec<_>>()
             .join(","),
+        ResolvedType::Adt(ctors) => {
+            // Direct ADT relation: generate #Ctor1:f1=t1;f2=t2|Ctor2|...
+            let parts: Vec<String> = ctors
+                .iter()
+                .map(|(ctor_name, fields)| {
+                    if fields.is_empty() {
+                        ctor_name.clone()
+                    } else {
+                        let field_specs: Vec<String> = fields
+                            .iter()
+                            .map(|(fname, fty)| {
+                                format!("{}={}", fname, col_type_str(fty))
+                            })
+                            .collect();
+                        format!("{}:{}", ctor_name, field_specs.join(";"))
+                    }
+                })
+                .collect();
+            format!("#{}", parts.join("|"))
+        }
         _ => String::new(),
     }
 }

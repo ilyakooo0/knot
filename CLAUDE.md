@@ -65,14 +65,16 @@ Compiled as a `staticlib` (with `rlib` for workspace dependency resolution). All
 - All Knot values are `*mut Value` (heap-allocated tagged enum)
 - `rusqlite` with `bundled` feature statically links SQLite into every compiled binary
 - Source relations map to SQLite tables with schema derived from Knot types
-- Schema descriptor format: `"name:text,age:int"` (passed as string constants from generated code)
+- Schema descriptor format for records: `"name:text,age:int"` (passed as string constants from generated code)
+- Schema descriptor format for direct ADT relations: `"#Circle:radius=float|Rect:width=float;height=float"` — `#` prefix signals ADT schema, `|` separates constructors, `:` separates name from fields, `;` separates fields, `=` separates field name from type; runtime creates wide table with `_tag TEXT` + all constructor fields as nullable columns
+- Column type `tag` for enum-like ADT fields (all nullary constructors): stored as TEXT in SQLite, reconstructed as `Constructor(tag, Unit)` on read
 
 ### Compiler (`crates/knot-compiler/`)
 
 - **Desugaring** (`desugar.rs`): Transforms "pure comprehension" do blocks into nested calls to `__bind`, `yield`, and `[]` (empty). A pure comprehension is a do block with only Bind/Where/Let/Yield statements (no bare side-effecting expressions). Do blocks that are direct values of `set`/`full set` expressions are NOT desugared (preserves SQL optimization patterns). Mixed/sequential do blocks (e.g. `main = do { println ...; yield {} }`) remain as `Do(stmts)` nodes for imperative codegen. The `__bind` function calls `knot_relation_bind` in the runtime, which iterates a relation, applies a function to each element, and unions all resulting relations.
 - **Type inference** (`infer.rs`): Hindley-Milner type inference with row-polymorphic records, let-generalization, unification with occurs check, ADT constructor typing, trait method registration, associated type erasure, and higher-kinded type polymorphism (`TyCon`/`App` type nodes with normalization-based unification)
 - **Effect inference** (`effects.rs`): Infers per-declaration effects (`{reads *rel}`, `{writes *rel}`, `{console}`, `{clock}`, etc.), checks IO-in-atomic constraints, validates explicit effect annotations against inferred effects
-- **Type resolution** (`types.rs`): Resolves aliases, computes SQLite schemas from Knot type annotations, collects subset constraints
+- **Type resolution** (`types.rs`): Resolves aliases (including multi-variant ADTs to `ResolvedType::Adt`), computes SQLite schemas from Knot type annotations, collects subset constraints
 - **Codegen** (`codegen.rs`): Cranelift IR generation — the `build_function` pattern moves `ctx`/`builder_ctx` out of `self` to avoid borrow conflicts while allowing `self.method()` calls during IR building
 - **Linker** (`linker.rs`): Invokes `cc` with platform-appropriate flags
 - **CLI** (`main.rs`): `knotc build <file.knot>` entry point

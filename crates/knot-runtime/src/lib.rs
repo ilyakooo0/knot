@@ -964,7 +964,8 @@ pub extern "C" fn knot_source_migrate(
 // ── Source operations ─────────────────────────────────────────────
 
 /// Schema descriptor format: "col1:type1,col2:type2,..."
-/// Types: "int", "float", "text", "bool"
+/// Types: "int", "float", "text", "bool", "tag"
+/// ADT schema format: "#Ctor1:f1=t1;f2=t2|Ctor2|Ctor3:f3=t3"
 struct ColumnSpec {
     name: String,
     ty: ColType,
@@ -976,6 +977,80 @@ enum ColType {
     Float,
     Text,
     Bool,
+    /// Stored as TEXT, reconstructed as Constructor on read
+    Tag,
+}
+
+/// ADT constructor schema: constructor name and its fields
+struct CtorSpec {
+    name: String,
+    fields: Vec<ColumnSpec>,
+}
+
+/// Parsed ADT schema for direct ADT relations
+struct AdtSpec {
+    constructors: Vec<CtorSpec>,
+    /// Union of all fields across all constructors (for wide table columns)
+    all_fields: Vec<ColumnSpec>,
+}
+
+/// Determine if a schema descriptor is an ADT schema (starts with '#')
+fn is_adt_schema(spec: &str) -> bool {
+    spec.starts_with('#')
+}
+
+/// Parse an ADT schema descriptor: "#Ctor1:f1=t1;f2=t2|Ctor2|Ctor3:f3=t3"
+fn parse_adt_schema(spec: &str) -> AdtSpec {
+    let body = &spec[1..]; // strip '#'
+    let mut constructors = Vec::new();
+    let mut all_field_names: Vec<String> = Vec::new();
+    let mut all_fields: Vec<ColumnSpec> = Vec::new();
+
+    for ctor_part in body.split('|') {
+        let mut parts = ctor_part.splitn(2, ':');
+        let name = parts.next().unwrap().to_string();
+        let fields: Vec<ColumnSpec> = if let Some(field_spec) = parts.next() {
+            field_spec
+                .split(';')
+                .map(|f| {
+                    let mut fp = f.splitn(2, '=');
+                    let fname = fp.next().unwrap().to_string();
+                    let fty = match fp.next().unwrap_or("text") {
+                        "int" => ColType::Int,
+                        "float" => ColType::Float,
+                        "text" => ColType::Text,
+                        "bool" => ColType::Bool,
+                        "tag" => ColType::Tag,
+                        other => panic!("knot runtime: unknown ADT field type '{}'", other),
+                    };
+                    ColumnSpec {
+                        name: fname,
+                        ty: fty,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Add unique fields to the all_fields list
+        for f in &fields {
+            if !all_field_names.contains(&f.name) {
+                all_field_names.push(f.name.clone());
+                all_fields.push(ColumnSpec {
+                    name: f.name.clone(),
+                    ty: f.ty,
+                });
+            }
+        }
+
+        constructors.push(CtorSpec { name, fields });
+    }
+
+    AdtSpec {
+        constructors,
+        all_fields,
+    }
 }
 
 fn parse_schema(spec: &str) -> Vec<ColumnSpec> {
@@ -991,6 +1066,7 @@ fn parse_schema(spec: &str) -> Vec<ColumnSpec> {
                 "float" => ColType::Float,
                 "text" => ColType::Text,
                 "bool" => ColType::Bool,
+                "tag" => ColType::Tag,
                 other => panic!("knot runtime: unknown column type '{}'", other),
             };
             ColumnSpec { name, ty }
@@ -1004,6 +1080,7 @@ fn sql_type(ty: ColType) -> &'static str {
         ColType::Float => "REAL",
         ColType::Text => "TEXT",
         ColType::Bool => "INTEGER",
+        ColType::Tag => "TEXT",
     }
 }
 
@@ -1020,6 +1097,11 @@ fn read_sql_column(row: &rusqlite::Row, i: usize, ty: ColType) -> *mut Value {
             alloc(Value::Text(s))
         }
         ColType::Bool => knot_value_bool(row.get::<_, i32>(i).unwrap()),
+        ColType::Tag => {
+            // Read TEXT but reconstruct as a Constructor with Unit payload
+            let tag: String = row.get(i).unwrap();
+            alloc(Value::Constructor(tag, alloc(Value::Unit)))
+        }
     }
 }
 
@@ -1035,35 +1117,80 @@ pub extern "C" fn knot_source_init(
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
-    let cols = parse_schema(schema);
 
     let table = quote_ident(&format!("_knot_{}", name));
-    let col_defs: Vec<String> = cols
-        .iter()
-        .map(|c| format!("{} {}", quote_ident(&c.name), sql_type(c.ty)))
-        .collect();
-    let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
 
-    let sql = format!(
-        "CREATE TABLE IF NOT EXISTS {} ({});",
-        table,
-        col_defs.join(", ")
-    );
-    debug_sql(&sql);
-    db_ref.conn.execute_batch(&sql).unwrap_or_else(|e| {
-        panic!("knot runtime: failed to create table '{}': {}", name, e)
-    });
+    if is_adt_schema(schema) {
+        // ADT schema: create wide table with _tag + all constructor fields
+        let adt = parse_adt_schema(schema);
+        let mut col_defs = vec![format!("{} TEXT NOT NULL", quote_ident("_tag"))];
+        let mut col_names = vec![quote_ident("_tag")];
+        for f in &adt.all_fields {
+            col_defs.push(format!("{} {}", quote_ident(&f.name), sql_type(f.ty)));
+            col_names.push(quote_ident(&f.name));
+        }
 
-    // Create unique index for set semantics (ignore if already exists)
-    if !cols.is_empty() {
+        let sql = format!(
+            "CREATE TABLE IF NOT EXISTS {} ({});",
+            table,
+            col_defs.join(", ")
+        );
+        debug_sql(&sql);
+        db_ref.conn.execute_batch(&sql).unwrap_or_else(|e| {
+            panic!("knot runtime: failed to create table '{}': {}", name, e)
+        });
+
+        // Unique index using COALESCE to treat NULLs as equal
+        let coalesced: Vec<String> = std::iter::once(quote_ident("_tag"))
+            .chain(adt.all_fields.iter().map(|f| {
+                let col = quote_ident(&f.name);
+                let default = match f.ty {
+                    ColType::Int | ColType::Bool => "COALESCE(".to_string() + &col + ", -9223372036854775808)",
+                    ColType::Float => "COALESCE(".to_string() + &col + ", -1.7976931348623157e+308)",
+                    _ => "COALESCE(".to_string() + &col + ", X'00')",
+                };
+                default
+            }))
+            .collect();
         let idx_sql = format!(
             "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({});",
             quote_ident(&format!("_knot_{}_unique", name)),
             table,
-            col_names.join(", ")
+            coalesced.join(", ")
         );
         debug_sql(&idx_sql);
         let _ = db_ref.conn.execute_batch(&idx_sql);
+    } else {
+        // Regular record schema
+        let cols = parse_schema(schema);
+
+        let col_defs: Vec<String> = cols
+            .iter()
+            .map(|c| format!("{} {}", quote_ident(&c.name), sql_type(c.ty)))
+            .collect();
+        let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
+
+        let sql = format!(
+            "CREATE TABLE IF NOT EXISTS {} ({});",
+            table,
+            col_defs.join(", ")
+        );
+        debug_sql(&sql);
+        db_ref.conn.execute_batch(&sql).unwrap_or_else(|e| {
+            panic!("knot runtime: failed to create table '{}': {}", name, e)
+        });
+
+        // Create unique index for set semantics (ignore if already exists)
+        if !cols.is_empty() {
+            let idx_sql = format!(
+                "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({});",
+                quote_ident(&format!("_knot_{}_unique", name)),
+                table,
+                col_names.join(", ")
+            );
+            debug_sql(&idx_sql);
+            let _ = db_ref.conn.execute_batch(&idx_sql);
+        }
     }
 
     // Check stored schema against compiled schema
@@ -1110,45 +1237,164 @@ pub extern "C" fn knot_source_read(
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
-    let cols = parse_schema(schema);
 
-    let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
-    let sql = format!(
-        "SELECT {} FROM {}",
-        if col_names.is_empty() {
-            "1".to_string()
-        } else {
-            col_names.join(", ")
-        },
-        quote_ident(&format!("_knot_{}", name))
-    );
+    let table = quote_ident(&format!("_knot_{}", name));
 
-    debug_sql(&sql);
-    let mut stmt = db_ref
-        .conn
-        .prepare(&sql)
-        .unwrap_or_else(|e| panic!("knot runtime: query error: {}", e));
-
-    let mut rows: Vec<*mut Value> = Vec::new();
-    let mut result_rows = stmt
-        .query([])
-        .unwrap_or_else(|e| panic!("knot runtime: query exec error: {}", e));
-
-    while let Some(row) = result_rows
-        .next()
-        .unwrap_or_else(|e| panic!("knot runtime: row fetch error: {}", e))
-    {
-        let record = knot_record_empty(cols.len());
-        for (i, col) in cols.iter().enumerate() {
-            let val = read_sql_column(row, i, col.ty);
-            // Set the field
-            let name = col.name.as_bytes();
-            knot_record_set_field(record, name.as_ptr(), name.len(), val);
+    if is_adt_schema(schema) {
+        let adt = parse_adt_schema(schema);
+        // SELECT _tag + all fields from the wide table
+        let mut select_cols = vec![quote_ident("_tag")];
+        for f in &adt.all_fields {
+            select_cols.push(quote_ident(&f.name));
         }
-        rows.push(record);
-    }
+        let sql = format!("SELECT {} FROM {}", select_cols.join(", "), table);
+        debug_sql(&sql);
 
-    alloc(Value::Relation(rows))
+        let mut stmt = db_ref
+            .conn
+            .prepare(&sql)
+            .unwrap_or_else(|e| panic!("knot runtime: query error: {}", e));
+        let mut rows: Vec<*mut Value> = Vec::new();
+        let mut result_rows = stmt
+            .query([])
+            .unwrap_or_else(|e| panic!("knot runtime: query exec error: {}", e));
+
+        while let Some(row) = result_rows
+            .next()
+            .unwrap_or_else(|e| panic!("knot runtime: row fetch error: {}", e))
+        {
+            let tag: String = row.get(0).unwrap();
+            // Find the constructor spec for this tag
+            let ctor = adt.constructors.iter().find(|c| c.name == tag);
+            let payload = if let Some(ctor) = ctor {
+                if ctor.fields.is_empty() {
+                    alloc(Value::Unit)
+                } else {
+                    // Build a record from the constructor's specific fields
+                    let record = knot_record_empty(ctor.fields.len());
+                    for field in &ctor.fields {
+                        // Find this field's index in all_fields
+                        let col_idx = adt
+                            .all_fields
+                            .iter()
+                            .position(|f| f.name == field.name)
+                            .unwrap();
+                        let val = read_sql_column(row, col_idx + 1, field.ty); // +1 for _tag
+                        let fname = field.name.as_bytes();
+                        knot_record_set_field(record, fname.as_ptr(), fname.len(), val);
+                    }
+                    record
+                }
+            } else {
+                // Unknown constructor: include all non-NULL fields
+                let record = knot_record_empty(adt.all_fields.len());
+                let mut has_fields = false;
+                for (i, field) in adt.all_fields.iter().enumerate() {
+                    if !matches!(row.get_ref(i + 1).unwrap(), ValueRef::Null) {
+                        let val = read_sql_column(row, i + 1, field.ty);
+                        let fname = field.name.as_bytes();
+                        knot_record_set_field(record, fname.as_ptr(), fname.len(), val);
+                        has_fields = true;
+                    }
+                }
+                if has_fields {
+                    record
+                } else {
+                    alloc(Value::Unit)
+                }
+            };
+            rows.push(alloc(Value::Constructor(tag, payload)));
+        }
+        alloc(Value::Relation(rows))
+    } else {
+        let cols = parse_schema(schema);
+
+        let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
+        let sql = format!(
+            "SELECT {} FROM {}",
+            if col_names.is_empty() {
+                "1".to_string()
+            } else {
+                col_names.join(", ")
+            },
+            table
+        );
+
+        debug_sql(&sql);
+        let mut stmt = db_ref
+            .conn
+            .prepare(&sql)
+            .unwrap_or_else(|e| panic!("knot runtime: query error: {}", e));
+
+        let mut rows: Vec<*mut Value> = Vec::new();
+        let mut result_rows = stmt
+            .query([])
+            .unwrap_or_else(|e| panic!("knot runtime: query exec error: {}", e));
+
+        while let Some(row) = result_rows
+            .next()
+            .unwrap_or_else(|e| panic!("knot runtime: row fetch error: {}", e))
+        {
+            let record = knot_record_empty(cols.len());
+            for (i, col) in cols.iter().enumerate() {
+                let val = read_sql_column(row, i, col.ty);
+                let name = col.name.as_bytes();
+                knot_record_set_field(record, name.as_ptr(), name.len(), val);
+            }
+            rows.push(record);
+        }
+
+        alloc(Value::Relation(rows))
+    }
+}
+
+/// Serialize a Constructor value into SQL params for an ADT wide table.
+/// Returns params for [_tag, field1, field2, ...] columns.
+fn adt_row_to_params(
+    row_ptr: *mut Value,
+    adt: &AdtSpec,
+) -> Vec<rusqlite::types::Value> {
+    let row = unsafe { as_ref(row_ptr) };
+    match row {
+        Value::Constructor(tag, payload) => {
+            let mut params = Vec::with_capacity(1 + adt.all_fields.len());
+            // First column: _tag
+            params.push(rusqlite::types::Value::Text(tag.clone()));
+
+            // Find which fields belong to this constructor
+            let ctor = adt.constructors.iter().find(|c| c.name == *tag);
+            let ctor_field_names: Vec<&str> = ctor
+                .map(|c| c.fields.iter().map(|f| f.name.as_str()).collect())
+                .unwrap_or_default();
+
+            // For each field in the wide table
+            for field in &adt.all_fields {
+                if ctor_field_names.contains(&field.name.as_str()) {
+                    // This field belongs to this constructor — extract from payload
+                    let payload_ref = unsafe { as_ref(*payload) };
+                    match payload_ref {
+                        Value::Record(fields) => {
+                            let val = fields
+                                .iter()
+                                .find(|f| f.name == field.name)
+                                .map(|f| value_to_sqlite(f.value, field.ty))
+                                .unwrap_or(rusqlite::types::Value::Null);
+                            params.push(val);
+                        }
+                        _ => params.push(rusqlite::types::Value::Null),
+                    }
+                } else {
+                    // Field doesn't belong to this constructor — NULL
+                    params.push(rusqlite::types::Value::Null);
+                }
+            }
+            params
+        }
+        _ => panic!(
+            "knot runtime: ADT source rows must be Constructors, got {}",
+            type_name(row_ptr)
+        ),
+    }
 }
 
 /// Write a relation to a source (replaces all rows).
@@ -1164,7 +1410,6 @@ pub extern "C" fn knot_source_write(
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
-    let cols = parse_schema(schema);
 
     let rows = match unsafe { as_ref(relation) } {
         Value::Relation(rows) => rows,
@@ -1185,9 +1430,173 @@ pub extern "C" fn knot_source_write(
         .execute_batch(&delete_sql)
         .expect("knot runtime: failed to delete rows");
 
-    if !cols.is_empty() && !rows.is_empty() {
+    if is_adt_schema(schema) {
+        let adt = parse_adt_schema(schema);
+        if !rows.is_empty() {
+            let mut col_names = vec![quote_ident("_tag")];
+            for f in &adt.all_fields {
+                col_names.push(quote_ident(&f.name));
+            }
+            let placeholders: Vec<String> = (1..=col_names.len())
+                .map(|i| format!("?{}", i))
+                .collect();
+            let insert_sql = format!(
+                "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
+                table,
+                col_names.join(", "),
+                placeholders.join(", ")
+            );
+            debug_sql(&insert_sql);
+
+            let mut stmt = db_ref
+                .conn
+                .prepare(&insert_sql)
+                .expect("knot runtime: failed to prepare insert");
+
+            for row_ptr in rows {
+                let params = adt_row_to_params(*row_ptr, &adt);
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+                stmt.execute(param_refs.as_slice()).unwrap_or_else(|e| {
+                    panic!("knot runtime: insert error: {}", e)
+                });
+            }
+        }
+    } else {
+        let cols = parse_schema(schema);
+        if !cols.is_empty() && !rows.is_empty() {
+            let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
+            let placeholders: Vec<String> = cols.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+            let insert_sql = format!(
+                "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
+                table,
+                col_names.join(", "),
+                placeholders.join(", ")
+            );
+            debug_sql(&insert_sql);
+
+            let mut stmt = db_ref
+                .conn
+                .prepare(&insert_sql)
+                .expect("knot runtime: failed to prepare insert");
+
+            for row_ptr in rows {
+                let row = unsafe { as_ref(*row_ptr) };
+                match row {
+                    Value::Record(fields) => {
+                        let params: Vec<rusqlite::types::Value> = cols
+                            .iter()
+                            .map(|col| {
+                                let field = fields
+                                    .iter()
+                                    .find(|f| f.name == col.name)
+                                    .unwrap_or_else(|| {
+                                        panic!(
+                                            "knot runtime: missing field '{}' in record",
+                                            col.name
+                                        )
+                                    });
+                                value_to_sqlite(field.value, col.ty)
+                            })
+                            .collect();
+                        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                            params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+                        stmt.execute(param_refs.as_slice()).unwrap_or_else(|e| {
+                            panic!("knot runtime: insert error: {}", e)
+                        });
+                    }
+                    _ => panic!("knot runtime: relation rows must be Records, got {}", type_name(*row_ptr)),
+                }
+            }
+        }
+    }
+
+    db_ref
+        .conn
+        .execute_batch("COMMIT;")
+        .expect("knot runtime: failed to commit transaction");
+}
+
+/// Append rows to a source relation (INSERT only, no DELETE).
+/// Used when the compiler detects `set *rel = union *rel <new_rows>`.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_source_append(
+    db: *mut c_void,
+    name_ptr: *const u8,
+    name_len: usize,
+    schema_ptr: *const u8,
+    schema_len: usize,
+    relation: *mut Value,
+) {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let name = unsafe { str_from_raw(name_ptr, name_len) };
+    let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
+
+    let rows = match unsafe { as_ref(relation) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: source_append expects a Relation, got {}",
+            type_name(relation)
+        ),
+    };
+
+    if rows.is_empty() {
+        return;
+    }
+
+    let table = quote_ident(&format!("_knot_{}", name));
+
+    db_ref
+        .conn
+        .execute_batch("BEGIN;")
+        .expect("knot runtime: failed to begin transaction");
+
+    if is_adt_schema(schema) {
+        let adt = parse_adt_schema(schema);
+        let mut col_names = vec![quote_ident("_tag")];
+        for f in &adt.all_fields {
+            col_names.push(quote_ident(&f.name));
+        }
+        let placeholders: Vec<String> = (1..=col_names.len())
+            .map(|i| format!("?{}", i))
+            .collect();
+        let insert_sql = format!(
+            "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
+            table,
+            col_names.join(", "),
+            placeholders.join(", ")
+        );
+        debug_sql(&insert_sql);
+
+        let mut stmt = db_ref
+            .conn
+            .prepare(&insert_sql)
+            .expect("knot runtime: failed to prepare insert");
+
+        for row_ptr in rows {
+            let params = adt_row_to_params(*row_ptr, &adt);
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+            stmt.execute(param_refs.as_slice()).unwrap_or_else(|e| {
+                panic!("knot runtime: insert error: {}", e)
+            });
+        }
+    } else {
+        let cols = parse_schema(schema);
+        if cols.is_empty() {
+            db_ref
+                .conn
+                .execute_batch("COMMIT;")
+                .expect("knot runtime: failed to commit transaction");
+            return;
+        }
+
         let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
-        let placeholders: Vec<String> = cols.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+        let placeholders: Vec<String> = cols
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect();
         let insert_sql = format!(
             "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
             table,
@@ -1226,102 +1635,13 @@ pub extern "C" fn knot_source_write(
                         panic!("knot runtime: insert error: {}", e)
                     });
                 }
-                _ => panic!("knot runtime: relation rows must be Records, got {}", type_name(*row_ptr)),
+                _ => panic!(
+                    "knot runtime: relation rows must be Records, got {}",
+                    type_name(*row_ptr)
+                ),
             }
         }
     }
-
-
-    db_ref
-        .conn
-        .execute_batch("COMMIT;")
-        .expect("knot runtime: failed to commit transaction");
-}
-
-/// Append rows to a source relation (INSERT only, no DELETE).
-/// Used when the compiler detects `set *rel = union *rel <new_rows>`.
-#[unsafe(no_mangle)]
-pub extern "C" fn knot_source_append(
-    db: *mut c_void,
-    name_ptr: *const u8,
-    name_len: usize,
-    schema_ptr: *const u8,
-    schema_len: usize,
-    relation: *mut Value,
-) {
-    let db_ref = unsafe { &*(db as *mut KnotDb) };
-    let name = unsafe { str_from_raw(name_ptr, name_len) };
-    let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
-    let cols = parse_schema(schema);
-
-    let rows = match unsafe { as_ref(relation) } {
-        Value::Relation(rows) => rows,
-        _ => panic!(
-            "knot runtime: source_append expects a Relation, got {}",
-            type_name(relation)
-        ),
-    };
-
-    if cols.is_empty() || rows.is_empty() {
-        return;
-    }
-
-    db_ref
-        .conn
-        .execute_batch("BEGIN;")
-        .expect("knot runtime: failed to begin transaction");
-
-    let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
-    let placeholders: Vec<String> = cols
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("?{}", i + 1))
-        .collect();
-    let insert_sql = format!(
-        "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
-        quote_ident(&format!("_knot_{}", name)),
-        col_names.join(", "),
-        placeholders.join(", ")
-    );
-    debug_sql(&insert_sql);
-
-    let mut stmt = db_ref
-        .conn
-        .prepare(&insert_sql)
-        .expect("knot runtime: failed to prepare insert");
-
-    for row_ptr in rows {
-        let row = unsafe { as_ref(*row_ptr) };
-        match row {
-            Value::Record(fields) => {
-                let params: Vec<rusqlite::types::Value> = cols
-                    .iter()
-                    .map(|col| {
-                        let field = fields
-                            .iter()
-                            .find(|f| f.name == col.name)
-                            .unwrap_or_else(|| {
-                                panic!(
-                                    "knot runtime: missing field '{}' in record",
-                                    col.name
-                                )
-                            });
-                        value_to_sqlite(field.value, col.ty)
-                    })
-                    .collect();
-                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-                stmt.execute(param_refs.as_slice()).unwrap_or_else(|e| {
-                    panic!("knot runtime: insert error: {}", e)
-                });
-            }
-            _ => panic!(
-                "knot runtime: relation rows must be Records, got {}",
-                type_name(*row_ptr)
-            ),
-        }
-    }
-
 
     db_ref
         .conn
@@ -1343,7 +1663,6 @@ pub extern "C" fn knot_source_diff_write(
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
-    let cols = parse_schema(schema);
 
     let rows = match unsafe { as_ref(relation) } {
         Value::Relation(rows) => rows,
@@ -1361,87 +1680,63 @@ pub extern "C" fn knot_source_diff_write(
         .execute_batch("BEGIN;")
         .expect("knot runtime: failed to begin transaction");
 
-    // 1. Create temp table with same schema
-    let col_defs: Vec<String> = cols
-        .iter()
-        .map(|c| format!("{} {}", quote_ident(&c.name), sql_type(c.ty)))
-        .collect();
-    let create_temp = format!(
-        "CREATE TEMP TABLE {} ({});",
-        temp,
-        col_defs.join(", ")
-    );
-    debug_sql(&create_temp);
-    db_ref
-        .conn
-        .execute_batch(&create_temp)
-        .expect("knot runtime: failed to create temp table");
+    if is_adt_schema(schema) {
+        let adt = parse_adt_schema(schema);
 
-    // 2. Insert all new rows into temp
-    if !cols.is_empty() && !rows.is_empty() {
-        let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
-        let placeholders: Vec<String> = cols
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 1))
-            .collect();
-        let insert_sql = format!(
-            "INSERT INTO {} ({}) VALUES ({});",
+        // 1. Create temp table with ADT columns
+        let mut col_defs = vec![format!("{} TEXT NOT NULL", quote_ident("_tag"))];
+        let mut col_names = vec![quote_ident("_tag")];
+        for f in &adt.all_fields {
+            col_defs.push(format!("{} {}", quote_ident(&f.name), sql_type(f.ty)));
+            col_names.push(quote_ident(&f.name));
+        }
+        let create_temp = format!(
+            "CREATE TEMP TABLE {} ({});",
             temp,
-            col_names.join(", "),
-            placeholders.join(", ")
+            col_defs.join(", ")
         );
-        debug_sql(&insert_sql);
-
-        let mut stmt = db_ref
+        debug_sql(&create_temp);
+        db_ref
             .conn
-            .prepare(&insert_sql)
-            .expect("knot runtime: failed to prepare temp insert");
+            .execute_batch(&create_temp)
+            .expect("knot runtime: failed to create temp table");
 
-        for row_ptr in rows {
-            let row = unsafe { as_ref(*row_ptr) };
-            match row {
-                Value::Record(fields) => {
-                    let params: Vec<rusqlite::types::Value> = cols
-                        .iter()
-                        .map(|col| {
-                            let field = fields
-                                .iter()
-                                .find(|f| f.name == col.name)
-                                .unwrap_or_else(|| {
-                                    panic!(
-                                        "knot runtime: missing field '{}' in record",
-                                        col.name
-                                    )
-                                });
-                            value_to_sqlite(field.value, col.ty)
-                        })
-                        .collect();
-                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                        params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-                    stmt.execute(param_refs.as_slice()).unwrap_or_else(|e| {
-                        panic!("knot runtime: temp insert error: {}", e)
-                    });
-                }
-                _ => panic!(
-                    "knot runtime: relation rows must be Records, got {}",
-                    type_name(*row_ptr)
-                ),
+        // 2. Insert new rows into temp
+        if !rows.is_empty() {
+            let placeholders: Vec<String> = (1..=col_names.len())
+                .map(|i| format!("?{}", i))
+                .collect();
+            let insert_sql = format!(
+                "INSERT INTO {} ({}) VALUES ({});",
+                temp,
+                col_names.join(", "),
+                placeholders.join(", ")
+            );
+            debug_sql(&insert_sql);
+            let mut stmt = db_ref
+                .conn
+                .prepare(&insert_sql)
+                .expect("knot runtime: failed to prepare temp insert");
+
+            for row_ptr in rows {
+                let params = adt_row_to_params(*row_ptr, &adt);
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+                stmt.execute(param_refs.as_slice()).unwrap_or_else(|e| {
+                    panic!("knot runtime: temp insert error: {}", e)
+                });
             }
         }
-    }
 
-    // 3. DELETE rows from main that are not in temp
-    if !cols.is_empty() {
-        let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
-        let match_conds: Vec<String> = cols
+        // 3. DELETE rows from main not in temp (use COALESCE for NULL comparison)
+        let match_conds: Vec<String> = col_names
             .iter()
             .map(|c| {
                 format!(
-                    "{t}.{c} = {m}.{c}",
+                    "COALESCE({t}.{c}, '') = COALESCE({m}.{c}, '')",
                     t = temp,
                     m = table,
-                    c = quote_ident(&c.name)
+                    c = c
                 )
             })
             .collect();
@@ -1457,7 +1752,7 @@ pub extern "C" fn knot_source_diff_write(
             .execute_batch(&delete_sql)
             .expect("knot runtime: failed to delete removed rows");
 
-        // 4. INSERT rows from temp that are not in main
+        // 4. INSERT rows from temp not in main
         let insert_new_sql = format!(
             "INSERT OR IGNORE INTO {} ({}) SELECT {} FROM {};",
             table,
@@ -1470,6 +1765,119 @@ pub extern "C" fn knot_source_diff_write(
             .conn
             .execute_batch(&insert_new_sql)
             .expect("knot runtime: failed to insert new rows");
+    } else {
+        let cols = parse_schema(schema);
+
+        // 1. Create temp table with same schema
+        let col_defs: Vec<String> = cols
+            .iter()
+            .map(|c| format!("{} {}", quote_ident(&c.name), sql_type(c.ty)))
+            .collect();
+        let create_temp = format!(
+            "CREATE TEMP TABLE {} ({});",
+            temp,
+            col_defs.join(", ")
+        );
+        debug_sql(&create_temp);
+        db_ref
+            .conn
+            .execute_batch(&create_temp)
+            .expect("knot runtime: failed to create temp table");
+
+        // 2. Insert all new rows into temp
+        if !cols.is_empty() && !rows.is_empty() {
+            let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
+            let placeholders: Vec<String> = cols
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect();
+            let insert_sql = format!(
+                "INSERT INTO {} ({}) VALUES ({});",
+                temp,
+                col_names.join(", "),
+                placeholders.join(", ")
+            );
+            debug_sql(&insert_sql);
+
+            let mut stmt = db_ref
+                .conn
+                .prepare(&insert_sql)
+                .expect("knot runtime: failed to prepare temp insert");
+
+            for row_ptr in rows {
+                let row = unsafe { as_ref(*row_ptr) };
+                match row {
+                    Value::Record(fields) => {
+                        let params: Vec<rusqlite::types::Value> = cols
+                            .iter()
+                            .map(|col| {
+                                let field = fields
+                                    .iter()
+                                    .find(|f| f.name == col.name)
+                                    .unwrap_or_else(|| {
+                                        panic!(
+                                            "knot runtime: missing field '{}' in record",
+                                            col.name
+                                        )
+                                    });
+                                value_to_sqlite(field.value, col.ty)
+                            })
+                            .collect();
+                        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                            params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+                        stmt.execute(param_refs.as_slice()).unwrap_or_else(|e| {
+                            panic!("knot runtime: temp insert error: {}", e)
+                        });
+                    }
+                    _ => panic!(
+                        "knot runtime: relation rows must be Records, got {}",
+                        type_name(*row_ptr)
+                    ),
+                }
+            }
+        }
+
+        // 3. DELETE rows from main that are not in temp
+        if !cols.is_empty() {
+            let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
+            let match_conds: Vec<String> = cols
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{t}.{c} = {m}.{c}",
+                        t = temp,
+                        m = table,
+                        c = quote_ident(&c.name)
+                    )
+                })
+                .collect();
+            let delete_sql = format!(
+                "DELETE FROM {} WHERE NOT EXISTS (SELECT 1 FROM {} WHERE {});",
+                table,
+                temp,
+                match_conds.join(" AND ")
+            );
+            debug_sql(&delete_sql);
+            db_ref
+                .conn
+                .execute_batch(&delete_sql)
+                .expect("knot runtime: failed to delete removed rows");
+
+            // 4. INSERT rows from temp that are not in main
+            let insert_new_sql = format!(
+                "INSERT OR IGNORE INTO {} ({}) SELECT {} FROM {};",
+                table,
+                col_names.join(", "),
+                col_names.join(", "),
+                temp
+            );
+            debug_sql(&insert_new_sql);
+            db_ref
+                .conn
+                .execute_batch(&insert_new_sql)
+                .expect("knot runtime: failed to insert new rows");
+        }
     }
 
     // 5. Drop temp table
@@ -1601,6 +2009,9 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
         (Value::Float(n), _) => rusqlite::types::Value::Real(*n),
         (Value::Text(s), _) => rusqlite::types::Value::Text(s.clone()),
         (Value::Bool(b), _) => rusqlite::types::Value::Integer(*b as i64),
+        (Value::Constructor(tag, _), ColType::Tag) => {
+            rusqlite::types::Value::Text(tag.clone())
+        }
         (Value::Constructor(tag, _), _) => rusqlite::types::Value::Text(tag.clone()),
         _ => panic!("knot runtime: cannot convert {} to SQL", brief_value(v)),
     }

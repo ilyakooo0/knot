@@ -15,7 +15,7 @@ getTodos = \owner -> do
   yield t
 
 serve = \req -> case req of
-  GetTodos {owner} -> respond (getTodos owner)
-  CreateTodo {body} -> addTodo body.title body.owner body.priority |> (\_ -> respond body)
+  GetTodos {owner, respond} -> respond (getTodos owner)
+  CreateTodo {body, respond} -> addTodo body.title body.owner body.priority |> (\_ -> respond body)
 
 main = listen 8080 serve

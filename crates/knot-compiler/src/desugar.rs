@@ -135,6 +135,23 @@ fn route_entries_to_constructors(entries: &[RouteEntry]) -> Vec<ConstructorDef> 
                     ),
                 });
             }
+            // Add `respond : <response_ty> -> Response` field if route has a response type
+            if let Some(response_ty) = &entry.response_ty {
+                let dummy_span = Span::new(0, 0);
+                fields.push(Field {
+                    name: "respond".to_string(),
+                    value: Spanned::new(
+                        TypeKind::Function {
+                            param: Box::new(response_ty.clone()),
+                            result: Box::new(Spanned::new(
+                                TypeKind::Named("Response".into()),
+                                dummy_span,
+                            )),
+                        },
+                        dummy_span,
+                    ),
+                });
+            }
             ConstructorDef {
                 name: entry.constructor.clone(),
                 fields,

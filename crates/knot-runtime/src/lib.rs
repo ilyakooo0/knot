@@ -2537,6 +2537,16 @@ fn value_to_json(v: *mut Value) -> String {
     }
 }
 
+/// Identity function used as the `respond` field in route constructors.
+/// At runtime, respond just passes through the value unchanged.
+extern "C" fn respond_identity(
+    _db: *mut c_void,
+    _env: *mut Value,
+    arg: *mut Value,
+) -> *mut Value {
+    arg
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_http_listen(
     db: *mut c_void,
@@ -2632,6 +2642,16 @@ pub extern "C" fn knot_http_listen(
                         value: alloc(Value::Record(body_record_fields)),
                     });
                 }
+
+                // Add `respond` field — identity function at runtime
+                fields.push(RecordField {
+                    name: "respond".to_string(),
+                    value: alloc(Value::Function(
+                        respond_identity as *const u8,
+                        std::ptr::null_mut(),
+                        "respond".to_string(),
+                    )),
+                });
 
                 let record = alloc(Value::Record(fields));
                 // Wrap in constructor

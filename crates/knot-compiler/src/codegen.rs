@@ -3241,8 +3241,23 @@ impl Codegen {
                         .ins()
                         .brif(is_eq, arm_block, &[], next_block, &[]);
                 }
-                _ => {
-                    // Default: try matching
+                ast::PatKind::List(pats) => {
+                    // Check if relation length matches the number of patterns
+                    let len = self.call_rt(builder, "knot_relation_len", &[scrut]);
+                    let expected =
+                        builder.ins().iconst(types::I64, pats.len() as i64);
+                    let is_match =
+                        builder.ins().icmp(IntCC::Equal, len, expected);
+                    builder.ins().brif(
+                        is_match,
+                        arm_block,
+                        &[],
+                        next_block,
+                        &[],
+                    );
+                }
+                ast::PatKind::Record(_) => {
+                    // Record patterns always match (no top-level guard)
                     builder.ins().jump(arm_block, &[]);
                 }
             }
@@ -3310,8 +3325,13 @@ impl Codegen {
             ast::PatKind::Lit(_) => {
                 // Literal patterns don't bind anything
             }
-            ast::PatKind::List(_) => {
-                // List pattern not yet implemented in codegen
+            ast::PatKind::List(pats) => {
+                for (idx, elem_pat) in pats.iter().enumerate() {
+                    let index = builder.ins().iconst(types::I64, idx as i64);
+                    let elem =
+                        self.call_rt(builder, "knot_relation_get", &[val, index]);
+                    self.bind_case_pattern(builder, elem_pat, elem, env);
+                }
             }
         }
     }

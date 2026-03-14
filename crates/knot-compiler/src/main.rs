@@ -10,6 +10,7 @@ mod linker;
 mod lockfile;
 mod base;
 mod modules;
+mod stratify;
 mod types;
 
 use std::path::PathBuf;
@@ -119,6 +120,20 @@ fn cmd_build(source_file: &str) {
             eprintln!("{}", diag.render(&source, &filename));
         }
         if effect_diags
+            .iter()
+            .any(|d| d.severity == knot::diagnostic::Severity::Error)
+        {
+            process::exit(1);
+        }
+    }
+
+    // Stratification check for recursive derived relations
+    let strat_diags = stratify::check(&module);
+    if !strat_diags.is_empty() {
+        for diag in &strat_diags {
+            eprintln!("{}", diag.render(&source, &filename));
+        }
+        if strat_diags
             .iter()
             .any(|d| d.severity == knot::diagnostic::Severity::Error)
         {

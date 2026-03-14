@@ -252,7 +252,7 @@ pub enum ExprKind {
 
 #[derive(Debug, Clone)]
 pub enum Literal {
-    Int(i64),
+    Int(String),
     Float(f64),
     Text(String),
     Bytes(Vec<u8>),

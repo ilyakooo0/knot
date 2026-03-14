@@ -62,7 +62,7 @@ let (module, parse_diags) = parser.parse_module();
 
 Compiled as a `staticlib` (with `rlib` for workspace dependency resolution). All functions use `extern "C"` ABI, called by Cranelift-generated code via symbol references.
 
-- All Knot values are `*mut Value` (heap-allocated tagged enum)
+- All Knot values are `*mut Value` (heap-allocated tagged enum); integers are unbounded (`num_bigint::BigInt`)
 - `rusqlite` with `bundled` feature statically links SQLite into every compiled binary
 - Source relations map to SQLite tables with schema derived from Knot types
 - Schema descriptor format for records: `"name:text,age:int"` (passed as string constants from generated code)

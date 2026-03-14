@@ -1569,14 +1569,14 @@ impl Parser {
     /// `hours`, `days`, `weeks`), consume it and desugar `n unit` into `n * factor`
     /// where factor is the millisecond equivalent.
     fn maybe_time_unit(&mut self, lit: Expr) -> Option<Expr> {
-        let factor = match self.peek() {
+        let factor: Option<&str> = match self.peek() {
             TokenKind::Lower(u) => match u.as_str() {
-                "ms" => Some(1_i64),
-                "seconds" => Some(1_000),
-                "minutes" => Some(60_000),
-                "hours" => Some(3_600_000),
-                "days" => Some(86_400_000),
-                "weeks" => Some(604_800_000),
+                "ms" => Some("1"),
+                "seconds" => Some("1000"),
+                "minutes" => Some("60000"),
+                "hours" => Some("3600000"),
+                "days" => Some("86400000"),
+                "weeks" => Some("604800000"),
                 _ => None,
             },
             _ => None,
@@ -1590,7 +1590,7 @@ impl Parser {
                         op: BinOp::Mul,
                         lhs: Box::new(lit),
                         rhs: Box::new(Spanned::new(
-                            ExprKind::Lit(Literal::Int(f)),
+                            ExprKind::Lit(Literal::Int(f.to_string())),
                             unit_tok.span,
                         )),
                     },
@@ -2760,7 +2760,7 @@ mod tests {
         let tokens = toks(vec![
             (TokenKind::Lower("x".into()), 0, 1),
             (TokenKind::Eq, 2, 3),
-            (TokenKind::Int(42), 4, 6),
+            (TokenKind::Int("42".into()), 4, 6),
             (TokenKind::Eof, 6, 6),
         ]);
         let (module, diags) = Parser::new(source, tokens).parse_module();
@@ -2769,7 +2769,7 @@ mod tests {
         match &module.decls[0].node {
             DeclKind::Fun { name, body, .. } => {
                 assert_eq!(name, "x");
-                assert!(matches!(body.node, ExprKind::Lit(Literal::Int(42))));
+                assert!(matches!(&body.node, ExprKind::Lit(Literal::Int(n)) if n == "42"));
             }
             other => panic!("expected Fun, got {:?}", other),
         }
@@ -2821,9 +2821,9 @@ mod tests {
             (TokenKind::If, 10, 12),
             (TokenKind::Lower("x".into()), 13, 14),
             (TokenKind::Then, 15, 19),
-            (TokenKind::Int(1), 20, 21),
+            (TokenKind::Int("1".into()), 20, 21),
             (TokenKind::Else, 22, 26),
-            (TokenKind::Int(2), 27, 28),
+            (TokenKind::Int("2".into()), 27, 28),
             (TokenKind::Eof, 28, 28),
         ]);
         let (module, diags) = Parser::new(source, tokens).parse_module();
@@ -2936,7 +2936,7 @@ mod tests {
             (TokenKind::Comma, 18, 19),
             (TokenKind::Lower("age".into()), 20, 23),
             (TokenKind::Colon, 23, 24),
-            (TokenKind::Int(30), 25, 27),
+            (TokenKind::Int("30".into()), 25, 27),
             (TokenKind::RBrace, 27, 28),
             (TokenKind::Eof, 28, 28),
         ]);
@@ -3082,11 +3082,11 @@ mod tests {
             (TokenKind::Lower("xs".into()), 0, 2),
             (TokenKind::Eq, 3, 4),
             (TokenKind::LBracket, 5, 6),
-            (TokenKind::Int(1), 6, 7),
+            (TokenKind::Int("1".into()), 6, 7),
             (TokenKind::Comma, 7, 8),
-            (TokenKind::Int(2), 9, 10),
+            (TokenKind::Int("2".into()), 9, 10),
             (TokenKind::Comma, 10, 11),
-            (TokenKind::Int(3), 12, 13),
+            (TokenKind::Int("3".into()), 12, 13),
             (TokenKind::RBracket, 13, 14),
             (TokenKind::Eof, 14, 14),
         ]);
@@ -3163,7 +3163,7 @@ mod tests {
             (TokenKind::Pipe, 7, 8),
             (TokenKind::Lower("age".into()), 9, 12),
             (TokenKind::Colon, 12, 13),
-            (TokenKind::Int(30), 14, 16),
+            (TokenKind::Int("30".into()), 14, 16),
             (TokenKind::RBrace, 16, 17),
             (TokenKind::Eof, 17, 17),
         ]);
@@ -3196,7 +3196,7 @@ mod tests {
             // Second declaration at column 0.
             (TokenKind::Lower("x".into()), 14, 15),
             (TokenKind::Eq, 16, 17),
-            (TokenKind::Int(1), 18, 19),
+            (TokenKind::Int("1".into()), 18, 19),
             (TokenKind::Eof, 19, 19),
         ]);
         let (module, diags) = Parser::new(source, tokens).parse_module();

@@ -334,6 +334,7 @@ impl Codegen {
 
         // Value constructors
         self.declare_rt("knot_value_int", &[types::I64], &[p]);
+        self.declare_rt("knot_value_int_from_str", &[p, p], &[p]);
         self.declare_rt("knot_value_float", &[types::F64], &[p]);
         self.declare_rt("knot_value_text", &[p, p], &[p]);
         self.declare_rt("knot_value_bool", &[types::I32], &[p]);
@@ -4167,8 +4168,8 @@ impl Codegen {
     ) -> Value {
         match lit {
             ast::Literal::Int(n) => {
-                let n_val = builder.ins().iconst(types::I64, *n);
-                self.call_rt(builder, "knot_value_int", &[n_val])
+                let (ptr, len) = self.string_ptr(builder, n);
+                self.call_rt(builder, "knot_value_int_from_str", &[ptr, len])
             }
             ast::Literal::Float(n) => {
                 let n_val = builder.ins().f64const(*n);

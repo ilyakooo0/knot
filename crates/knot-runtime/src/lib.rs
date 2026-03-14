@@ -4,6 +4,9 @@
 //! and SQLite-backed persistence. This crate is compiled as a static
 //! library and linked into every compiled Knot program.
 
+use num_bigint::BigInt;
+use num_traits::ToPrimitive;
+use num_traits::Zero;
 use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use std::cell::RefCell;
@@ -53,7 +56,7 @@ pub extern "C" fn knot_debug_init() {
 /// Every Knot expression evaluates to a heap-allocated `Value`.
 /// The Cranelift-generated code works exclusively with `*mut Value` pointers.
 pub enum Value {
-    Int(i64),
+    Int(BigInt),
     Float(f64),
     Text(String),
     Bool(bool),
@@ -222,6 +225,13 @@ fn quote_ident(name: &str) -> String {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_int(n: i64) -> *mut Value {
+    alloc(Value::Int(BigInt::from(n)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_value_int_from_str(ptr: *const u8, len: usize) -> *mut Value {
+    let s = unsafe { str_from_raw(ptr, len) };
+    let n = s.parse::<BigInt>().unwrap_or_else(|_| BigInt::ZERO);
     alloc(Value::Int(n))
 }
 
@@ -282,7 +292,7 @@ pub extern "C" fn knot_value_bytes(ptr: *const u8, len: usize) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_get_int(v: *mut Value) -> i64 {
     match unsafe { as_ref(v) } {
-        Value::Int(n) => *n,
+        Value::Int(n) => n.to_i64().expect("knot runtime: Int too large for i64"),
         _ => panic!("knot runtime: expected Int, got {}", brief_value(v)),
     }
 }
@@ -739,13 +749,17 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
 
 // ── Binary operations ─────────────────────────────────────────────
 
+fn bigint_to_f64(n: &BigInt) -> f64 {
+    n.to_f64().unwrap_or(if n.sign() == num_bigint::Sign::Minus { f64::NEG_INFINITY } else { f64::INFINITY })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_add(a: *mut Value, b: *mut Value) -> *mut Value {
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Int(x), Value::Int(y)) => alloc(Value::Int(x + y)),
         (Value::Float(x), Value::Float(y)) => alloc(Value::Float(x + y)),
-        (Value::Int(x), Value::Float(y)) => alloc(Value::Float(*x as f64 + y)),
-        (Value::Float(x), Value::Int(y)) => alloc(Value::Float(x + *y as f64)),
+        (Value::Int(x), Value::Float(y)) => alloc(Value::Float(bigint_to_f64(x) + y)),
+        (Value::Float(x), Value::Int(y)) => alloc(Value::Float(x + bigint_to_f64(y))),
         _ => panic!("knot runtime: cannot add {} + {}", type_name(a), type_name(b)),
     }
 }
@@ -755,8 +769,8 @@ pub extern "C" fn knot_value_sub(a: *mut Value, b: *mut Value) -> *mut Value {
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Int(x), Value::Int(y)) => alloc(Value::Int(x - y)),
         (Value::Float(x), Value::Float(y)) => alloc(Value::Float(x - y)),
-        (Value::Int(x), Value::Float(y)) => alloc(Value::Float(*x as f64 - y)),
-        (Value::Float(x), Value::Int(y)) => alloc(Value::Float(x - *y as f64)),
+        (Value::Int(x), Value::Float(y)) => alloc(Value::Float(bigint_to_f64(x) - y)),
+        (Value::Float(x), Value::Int(y)) => alloc(Value::Float(x - bigint_to_f64(y))),
         _ => panic!("knot runtime: cannot subtract {} - {}", type_name(a), type_name(b)),
     }
 }
@@ -766,8 +780,8 @@ pub extern "C" fn knot_value_mul(a: *mut Value, b: *mut Value) -> *mut Value {
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Int(x), Value::Int(y)) => alloc(Value::Int(x * y)),
         (Value::Float(x), Value::Float(y)) => alloc(Value::Float(x * y)),
-        (Value::Int(x), Value::Float(y)) => alloc(Value::Float(*x as f64 * y)),
-        (Value::Float(x), Value::Int(y)) => alloc(Value::Float(x * *y as f64)),
+        (Value::Int(x), Value::Float(y)) => alloc(Value::Float(bigint_to_f64(x) * y)),
+        (Value::Float(x), Value::Int(y)) => alloc(Value::Float(x * bigint_to_f64(y))),
         _ => panic!("knot runtime: cannot multiply {} * {}", type_name(a), type_name(b)),
     }
 }
@@ -776,14 +790,14 @@ pub extern "C" fn knot_value_mul(a: *mut Value, b: *mut Value) -> *mut Value {
 pub extern "C" fn knot_value_div(a: *mut Value, b: *mut Value) -> *mut Value {
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Int(x), Value::Int(y)) => {
-            if *y == 0 {
+            if y.is_zero() {
                 panic!("knot runtime: division by zero");
             }
             alloc(Value::Int(x / y))
         }
         (Value::Float(x), Value::Float(y)) => alloc(Value::Float(x / y)),
-        (Value::Int(x), Value::Float(y)) => alloc(Value::Float(*x as f64 / y)),
-        (Value::Float(x), Value::Int(y)) => alloc(Value::Float(x / *y as f64)),
+        (Value::Int(x), Value::Float(y)) => alloc(Value::Float(bigint_to_f64(x) / y)),
+        (Value::Float(x), Value::Int(y)) => alloc(Value::Float(x / bigint_to_f64(y))),
         _ => panic!("knot runtime: cannot divide {} / {}", type_name(a), type_name(b)),
     }
 }
@@ -803,8 +817,8 @@ pub extern "C" fn knot_value_lt(a: *mut Value, b: *mut Value) -> *mut Value {
     let result = match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Int(x), Value::Int(y)) => x < y,
         (Value::Float(x), Value::Float(y)) => x < y,
-        (Value::Int(x), Value::Float(y)) => (*x as f64) < *y,
-        (Value::Float(x), Value::Int(y)) => *x < (*y as f64),
+        (Value::Int(x), Value::Float(y)) => bigint_to_f64(x) < *y,
+        (Value::Float(x), Value::Int(y)) => *x < bigint_to_f64(y),
         (Value::Text(x), Value::Text(y)) => x < y,
         _ => panic!("knot runtime: cannot compare {} < {}", type_name(a), type_name(b)),
     };
@@ -816,8 +830,8 @@ pub extern "C" fn knot_value_gt(a: *mut Value, b: *mut Value) -> *mut Value {
     let result = match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Int(x), Value::Int(y)) => x > y,
         (Value::Float(x), Value::Float(y)) => x > y,
-        (Value::Int(x), Value::Float(y)) => (*x as f64) > *y,
-        (Value::Float(x), Value::Int(y)) => *x > (*y as f64),
+        (Value::Int(x), Value::Float(y)) => bigint_to_f64(x) > *y,
+        (Value::Float(x), Value::Int(y)) => *x > bigint_to_f64(y),
         (Value::Text(x), Value::Text(y)) => x > y,
         _ => panic!("knot runtime: cannot compare {} > {}", type_name(a), type_name(b)),
     };
@@ -829,8 +843,8 @@ pub extern "C" fn knot_value_le(a: *mut Value, b: *mut Value) -> *mut Value {
     let result = match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Int(x), Value::Int(y)) => x <= y,
         (Value::Float(x), Value::Float(y)) => x <= y,
-        (Value::Int(x), Value::Float(y)) => (*x as f64) <= *y,
-        (Value::Float(x), Value::Int(y)) => *x <= (*y as f64),
+        (Value::Int(x), Value::Float(y)) => bigint_to_f64(x) <= *y,
+        (Value::Float(x), Value::Int(y)) => *x <= bigint_to_f64(y),
         (Value::Text(x), Value::Text(y)) => x <= y,
         _ => panic!("knot runtime: cannot compare {} <= {}", type_name(a), type_name(b)),
     };
@@ -842,8 +856,8 @@ pub extern "C" fn knot_value_ge(a: *mut Value, b: *mut Value) -> *mut Value {
     let result = match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Int(x), Value::Int(y)) => x >= y,
         (Value::Float(x), Value::Float(y)) => x >= y,
-        (Value::Int(x), Value::Float(y)) => (*x as f64) >= *y,
-        (Value::Float(x), Value::Int(y)) => *x >= (*y as f64),
+        (Value::Int(x), Value::Float(y)) => bigint_to_f64(x) >= *y,
+        (Value::Float(x), Value::Int(y)) => *x >= bigint_to_f64(y),
         (Value::Text(x), Value::Text(y)) => x >= y,
         _ => panic!("knot runtime: cannot compare {} >= {}", type_name(a), type_name(b)),
     };
@@ -892,10 +906,10 @@ pub extern "C" fn knot_value_compare(a: *mut Value, b: *mut Value) -> *mut Value
             x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
         }
         (Value::Int(x), Value::Float(y)) => {
-            (*x as f64).partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+            bigint_to_f64(x).partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
         }
         (Value::Float(x), Value::Int(y)) => {
-            x.partial_cmp(&(*y as f64)).unwrap_or(std::cmp::Ordering::Equal)
+            x.partial_cmp(&bigint_to_f64(y)).unwrap_or(std::cmp::Ordering::Equal)
         }
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
         _ => panic!(
@@ -1282,7 +1296,7 @@ pub extern "C" fn knot_relation_sum(
             type_name(rel)
         ),
     };
-    let mut acc = alloc(Value::Int(0));
+    let mut acc = alloc(Value::Int(BigInt::ZERO));
     for row in rows {
         let val = knot_value_call(db, f, row);
         acc = knot_value_add(acc, val);
@@ -1312,7 +1326,7 @@ pub extern "C" fn knot_relation_avg(
     for row in rows {
         let val = knot_value_call(db, f, row);
         match unsafe { as_ref(val) } {
-            Value::Int(n) => total += *n as f64,
+            Value::Int(n) => total += bigint_to_f64(n),
             Value::Float(n) => total += n,
             _ => panic!(
                 "knot runtime: avg projection must return Int or Float, got {}",
@@ -1347,7 +1361,7 @@ pub extern "C" fn knot_text_to_lower(v: *mut Value) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_text_take(n: *mut Value, text: *mut Value) -> *mut Value {
     let n = match unsafe { as_ref(n) } {
-        Value::Int(n) => *n as usize,
+        Value::Int(n) => n.to_usize().expect("knot runtime: take index out of range"),
         _ => panic!("knot runtime: take expected Int as first arg, got {}", type_name(n)),
     };
     match unsafe { as_ref(text) } {
@@ -1363,7 +1377,7 @@ pub extern "C" fn knot_text_take(n: *mut Value, text: *mut Value) -> *mut Value 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_text_drop(n: *mut Value, text: *mut Value) -> *mut Value {
     let n = match unsafe { as_ref(n) } {
-        Value::Int(n) => *n as usize,
+        Value::Int(n) => n.to_usize().expect("knot runtime: drop index out of range"),
         _ => panic!("knot runtime: drop expected Int as first arg, got {}", type_name(n)),
     };
     match unsafe { as_ref(text) } {
@@ -1466,11 +1480,11 @@ pub extern "C" fn knot_bytes_slice(
     bytes: *mut Value,
 ) -> *mut Value {
     let start = match unsafe { as_ref(start) } {
-        Value::Int(n) => *n as usize,
+        Value::Int(n) => n.to_usize().expect("knot runtime: bytesSlice start out of range"),
         _ => panic!("knot runtime: bytesSlice expected Int as first arg"),
     };
     let len = match unsafe { as_ref(len) } {
-        Value::Int(n) => *n as usize,
+        Value::Int(n) => n.to_usize().expect("knot runtime: bytesSlice len out of range"),
         _ => panic!("knot runtime: bytesSlice expected Int as second arg"),
     };
     match unsafe { as_ref(bytes) } {
@@ -1543,7 +1557,7 @@ pub extern "C" fn knot_bytes_from_hex(v: *mut Value) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_bytes_get(index: *mut Value, bytes: *mut Value) -> *mut Value {
     let i = match unsafe { as_ref(index) } {
-        Value::Int(n) => *n as usize,
+        Value::Int(n) => n.to_usize().expect("knot runtime: bytesGet index out of range"),
         _ => panic!("knot runtime: bytesGet expected Int as first arg"),
     };
     match unsafe { as_ref(bytes) } {
@@ -1674,7 +1688,7 @@ fn parse_json_number(s: &str) -> (*mut Value, &str) {
         let n: f64 = num_str.parse().unwrap_or(0.0);
         (alloc(Value::Float(n)), rest)
     } else {
-        let n: i64 = num_str.parse().unwrap_or(0);
+        let n: BigInt = num_str.parse().unwrap_or(BigInt::ZERO);
         (alloc(Value::Int(n)), rest)
     }
 }
@@ -2266,7 +2280,7 @@ fn parse_schema(spec: &str) -> Vec<ColumnSpec> {
 
 fn sql_type(ty: ColType) -> &'static str {
     match ty {
-        ColType::Int => "INTEGER",
+        ColType::Int => "BLOB",
         ColType::Float => "REAL",
         ColType::Text => "TEXT",
         ColType::Bool => "INTEGER",
@@ -2281,7 +2295,22 @@ fn read_sql_column(row: &rusqlite::Row, i: usize, ty: ColType) -> *mut Value {
         return std::ptr::null_mut();
     }
     match ty {
-        ColType::Int => knot_value_int(row.get::<_, i64>(i).unwrap()),
+        ColType::Int => {
+            match row.get_ref(i).unwrap() {
+                ValueRef::Integer(n) => alloc(Value::Int(BigInt::from(n))),
+                ValueRef::Blob(b) => {
+                    let s = std::str::from_utf8(b).expect("knot runtime: invalid UTF-8 in bigint blob");
+                    let n: BigInt = s.parse().expect("knot runtime: invalid bigint in column");
+                    alloc(Value::Int(n))
+                }
+                ValueRef::Text(s) => {
+                    let s = std::str::from_utf8(s).expect("knot runtime: invalid UTF-8 in int column");
+                    let n: BigInt = s.parse().expect("knot runtime: invalid bigint in column");
+                    alloc(Value::Int(n))
+                }
+                other => panic!("knot runtime: unexpected SQLite type for Int column: {:?}", other),
+            }
+        }
         ColType::Float => knot_value_float(row.get::<_, f64>(i).unwrap()),
         ColType::Text => {
             let s: String = row.get(i).unwrap();
@@ -3694,7 +3723,10 @@ fn value_to_sql_param(v: *mut Value) -> rusqlite::types::Value {
         return rusqlite::types::Value::Null;
     }
     match unsafe { as_ref(v) } {
-        Value::Int(n) => rusqlite::types::Value::Integer(*n),
+        Value::Int(n) => match n.to_i64() {
+            Some(i) => rusqlite::types::Value::Integer(i),
+            None => rusqlite::types::Value::Blob(n.to_string().into_bytes()),
+        },
         Value::Float(n) => rusqlite::types::Value::Real(*n),
         Value::Text(s) => rusqlite::types::Value::Text(s.clone()),
         Value::Bool(b) => rusqlite::types::Value::Integer(*b as i64),
@@ -3715,7 +3747,10 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
         return rusqlite::types::Value::Null;
     }
     match (unsafe { as_ref(v) }, ty) {
-        (Value::Int(n), _) => rusqlite::types::Value::Integer(*n),
+        (Value::Int(n), _) => match n.to_i64() {
+            Some(i) => rusqlite::types::Value::Integer(i),
+            None => rusqlite::types::Value::Blob(n.to_string().into_bytes()),
+        },
         (Value::Float(n), _) => rusqlite::types::Value::Real(*n),
         (Value::Text(s), _) => rusqlite::types::Value::Text(s.clone()),
         (Value::Bool(b), _) => rusqlite::types::Value::Integer(*b as i64),
@@ -3868,7 +3903,7 @@ pub extern "C" fn knot_source_read_at(
     let cols = parse_schema(schema);
 
     let ts = match unsafe { as_ref(timestamp) } {
-        Value::Int(n) => *n,
+        Value::Int(n) => n.to_i64().expect("knot runtime: timestamp too large for i64"),
         _ => panic!(
             "knot runtime: temporal query timestamp must be Int, got {}",
             type_name(timestamp)
@@ -4204,7 +4239,7 @@ pub extern "C" fn knot_view_read_at(
     let cols = parse_schema(view_schema);
 
     let ts = match unsafe { as_ref(timestamp) } {
-        Value::Int(n) => *n,
+        Value::Int(n) => n.to_i64().expect("knot runtime: timestamp too large for i64"),
         _ => panic!(
             "knot runtime: temporal query timestamp must be Int, got {}",
             type_name(timestamp)
@@ -4750,7 +4785,7 @@ fn parse_json_object(s: &str) -> Vec<(String, String)> {
 fn string_to_value(s: &str, ty: &str) -> *mut Value {
     match ty {
         "int" => {
-            let n: i64 = s.parse().unwrap_or(0);
+            let n: BigInt = s.parse().unwrap_or(BigInt::ZERO);
             alloc(Value::Int(n))
         }
         "float" => {
@@ -4817,7 +4852,7 @@ pub extern "C" fn knot_http_listen(
     handler: *mut Value,
 ) -> *mut Value {
     let port = match unsafe { as_ref(port_val) } {
-        Value::Int(n) => *n as u16,
+        Value::Int(n) => n.to_u16().expect("knot runtime: port number out of range"),
         _ => panic!("knot runtime: listen expects Int port, got {}", type_name(port_val)),
     };
     let table = unsafe { &*(route_table as *mut RouteTable) };

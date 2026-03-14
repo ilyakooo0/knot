@@ -9,3 +9,6 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 rusqlite = { workspace = true }
 tiny_http = { workspace = true }
+num-bigint = { workspace = true }
+num-traits = { workspace = true }
+num-integer = { workspace = true }

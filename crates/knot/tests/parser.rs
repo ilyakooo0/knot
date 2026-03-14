@@ -70,7 +70,7 @@ fn empty_module() {
 
 #[test]
 fn int_literal() {
-    assert!(matches!(fun_body("x = 42"), ExprKind::Lit(Literal::Int(42))));
+    assert!(matches!(fun_body("x = 42"), ExprKind::Lit(Literal::Int(n)) if n == "42"));
 }
 
 #[test]
@@ -93,7 +93,7 @@ fn string_literal() {
 fn int_with_underscores() {
     assert!(matches!(
         fun_body("x = 1_000_000"),
-        ExprKind::Lit(Literal::Int(1_000_000))
+        ExprKind::Lit(Literal::Int(n)) if n == "1000000"
     ));
 }
 
@@ -448,7 +448,7 @@ fn record_with_fields() {
             assert_eq!(fields[0].name, "name");
             assert_eq!(fields[1].name, "age");
             assert!(matches!(&fields[0].value.node, ExprKind::Lit(Literal::Text(s)) if s == "Alice"));
-            assert!(matches!(&fields[1].value.node, ExprKind::Lit(Literal::Int(30))));
+            assert!(matches!(&fields[1].value.node, ExprKind::Lit(Literal::Int(n)) if n == "30"));
         }
         other => panic!("expected Record, got {:?}", other),
     }
@@ -492,9 +492,9 @@ fn list_of_ints() {
     match fun_body("x = [1, 2, 3]") {
         ExprKind::List(elems) => {
             assert_eq!(elems.len(), 3);
-            assert!(matches!(&elems[0].node, ExprKind::Lit(Literal::Int(1))));
-            assert!(matches!(&elems[1].node, ExprKind::Lit(Literal::Int(2))));
-            assert!(matches!(&elems[2].node, ExprKind::Lit(Literal::Int(3))));
+            assert!(matches!(&elems[0].node, ExprKind::Lit(Literal::Int(n)) if n == "1"));
+            assert!(matches!(&elems[1].node, ExprKind::Lit(Literal::Int(n)) if n == "2"));
+            assert!(matches!(&elems[2].node, ExprKind::Lit(Literal::Int(n)) if n == "3"));
         }
         other => panic!("expected List, got {:?}", other),
     }
@@ -568,8 +568,8 @@ fn simple_if() {
             else_branch,
         } => {
             assert!(matches!(&cond.node, ExprKind::Var(n) if n == "a"));
-            assert!(matches!(&then_branch.node, ExprKind::Lit(Literal::Int(1))));
-            assert!(matches!(&else_branch.node, ExprKind::Lit(Literal::Int(2))));
+            assert!(matches!(&then_branch.node, ExprKind::Lit(Literal::Int(n)) if n == "1"));
+            assert!(matches!(&else_branch.node, ExprKind::Lit(Literal::Int(n)) if n == "2"));
         }
         other => panic!("expected If, got {:?}", other),
     }
@@ -584,7 +584,7 @@ fn nested_if() {
             ..
         } => {
             assert!(matches!(&then_branch.node, ExprKind::If { .. }));
-            assert!(matches!(&else_branch.node, ExprKind::Lit(Literal::Int(3))));
+            assert!(matches!(&else_branch.node, ExprKind::Lit(Literal::Int(n)) if n == "3"));
         }
         other => panic!("expected nested If, got {:?}", other),
     }
@@ -609,7 +609,7 @@ fn simple_case() {
         ExprKind::Case { scrutinee, arms } => {
             assert!(matches!(&scrutinee.node, ExprKind::Var(n) if n == "y"));
             assert_eq!(arms.len(), 2);
-            assert!(matches!(&arms[0].pat.node, PatKind::Lit(Literal::Int(0))));
+            assert!(matches!(&arms[0].pat.node, PatKind::Lit(Literal::Int(n)) if n == "0"));
             assert!(matches!(&arms[1].pat.node, PatKind::Wildcard));
         }
         other => panic!("expected Case, got {:?}", other),
@@ -680,7 +680,7 @@ fn do_with_let() {
             match &stmts[0].node {
                 StmtKind::Let { pat, expr } => {
                     assert!(matches!(&pat.node, PatKind::Var(n) if n == "y"));
-                    assert!(matches!(&expr.node, ExprKind::Lit(Literal::Int(5))));
+                    assert!(matches!(&expr.node, ExprKind::Lit(Literal::Int(n)) if n == "5"));
                 }
                 other => panic!("expected Let, got {:?}", other),
             }
@@ -753,7 +753,7 @@ fn set_with_union() {
 fn standalone_yield() {
     match fun_body("x = yield 42") {
         ExprKind::Yield(inner) => {
-            assert!(matches!(&inner.node, ExprKind::Lit(Literal::Int(42))));
+            assert!(matches!(&inner.node, ExprKind::Lit(Literal::Int(n)) if n == "42"));
         }
         other => panic!("expected Yield, got {:?}", other),
     }
@@ -1075,7 +1075,7 @@ fn constant_fun() {
     match first_decl("maxRetries = 3") {
         DeclKind::Fun { name, body, .. } => {
             assert_eq!(name, "maxRetries");
-            assert!(matches!(&body.node, ExprKind::Lit(Literal::Int(3))));
+            assert!(matches!(&body.node, ExprKind::Lit(Literal::Int(n)) if n == "3"));
         }
         other => panic!("expected Fun, got {:?}", other),
     }
@@ -2085,8 +2085,8 @@ fn temporal_at_chained_with_pipe() {
 fn time_unit_days() {
     match fun_body("x = 365 days") {
         ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
-            assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(365))));
-            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(86_400_000))));
+            assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(n)) if n == "365"));
+            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(n)) if n == "86400000"));
         }
         other => panic!("expected Mul, got {:?}", other),
     }
@@ -2096,8 +2096,8 @@ fn time_unit_days() {
 fn time_unit_hours() {
     match fun_body("x = 2 hours") {
         ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
-            assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(2))));
-            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(3_600_000))));
+            assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(n)) if n == "2"));
+            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(n)) if n == "3600000"));
         }
         other => panic!("expected Mul, got {:?}", other),
     }
@@ -2107,8 +2107,8 @@ fn time_unit_hours() {
 fn time_unit_minutes() {
     match fun_body("x = 30 minutes") {
         ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
-            assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(30))));
-            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(60_000))));
+            assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(n)) if n == "30"));
+            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(n)) if n == "60000"));
         }
         other => panic!("expected Mul, got {:?}", other),
     }
@@ -2118,8 +2118,8 @@ fn time_unit_minutes() {
 fn time_unit_seconds() {
     match fun_body("x = 10 seconds") {
         ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
-            assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(10))));
-            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(1_000))));
+            assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(n)) if n == "10"));
+            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(n)) if n == "1000"));
         }
         other => panic!("expected Mul, got {:?}", other),
     }
@@ -2129,8 +2129,8 @@ fn time_unit_seconds() {
 fn time_unit_ms() {
     match fun_body("x = 500 ms") {
         ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
-            assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(500))));
-            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(1))));
+            assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(n)) if n == "500"));
+            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(n)) if n == "1"));
         }
         other => panic!("expected Mul, got {:?}", other),
     }
@@ -2140,8 +2140,8 @@ fn time_unit_ms() {
 fn time_unit_weeks() {
     match fun_body("x = 2 weeks") {
         ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
-            assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(2))));
-            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(604_800_000))));
+            assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(n)) if n == "2"));
+            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(n)) if n == "604800000"));
         }
         other => panic!("expected Mul, got {:?}", other),
     }
@@ -2155,8 +2155,8 @@ fn time_unit_in_temporal_query() {
                 ExprKind::BinOp { op: BinOp::Sub, rhs, .. } => {
                     match &rhs.node {
                         ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
-                            assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(365))));
-                            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(86_400_000))));
+                            assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(n)) if n == "365"));
+                            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(n)) if n == "86400000"));
                         }
                         other => panic!("expected Mul for days, got {:?}", other),
                     }
@@ -2173,7 +2173,7 @@ fn time_unit_with_float() {
     match fun_body("x = 1.5 hours") {
         ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
             assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Float(f)) if *f == 1.5));
-            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(3_600_000))));
+            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(n)) if n == "3600000"));
         }
         other => panic!("expected Mul, got {:?}", other),
     }
@@ -2184,7 +2184,7 @@ fn non_time_unit_identifier_not_consumed() {
     // `365 foo` should NOT be treated as a time unit — `foo` is parsed as application
     match fun_body("x = 365 foo") {
         ExprKind::App { func, arg } => {
-            assert!(matches!(&func.node, ExprKind::Lit(Literal::Int(365))));
+            assert!(matches!(&func.node, ExprKind::Lit(Literal::Int(n)) if n == "365"));
             assert!(matches!(&arg.node, ExprKind::Var(n) if n == "foo"));
         }
         other => panic!("expected App, got {:?}", other),
@@ -2715,7 +2715,7 @@ fn record_mixed_punned_and_explicit() {
             assert_eq!(fields[0].name, "name");
             assert!(matches!(&fields[0].value.node, ExprKind::Var(n) if n == "name"));
             assert_eq!(fields[1].name, "age");
-            assert!(matches!(&fields[1].value.node, ExprKind::Lit(Literal::Int(30))));
+            assert!(matches!(&fields[1].value.node, ExprKind::Lit(Literal::Int(n)) if n == "30"));
         }
         other => panic!("expected Record, got {:?}", other),
     }
@@ -2729,7 +2729,7 @@ fn let_in_expression() {
     match fun_body("f = let x = 1 in x + 1") {
         ExprKind::App { func, arg } => {
             assert!(matches!(&func.node, ExprKind::Lambda { .. }));
-            assert!(matches!(&arg.node, ExprKind::Lit(Literal::Int(1))));
+            assert!(matches!(&arg.node, ExprKind::Lit(Literal::Int(n)) if n == "1"));
         }
         other => panic!("expected App(Lambda, Int) from let-in desugar, got {:?}", other),
     }
@@ -2743,8 +2743,8 @@ fn literal_int_pattern() {
     match fun_body(src) {
         ExprKind::Case { arms, .. } => {
             assert_eq!(arms.len(), 3);
-            assert!(matches!(&arms[0].pat.node, PatKind::Lit(Literal::Int(0))));
-            assert!(matches!(&arms[1].pat.node, PatKind::Lit(Literal::Int(1))));
+            assert!(matches!(&arms[0].pat.node, PatKind::Lit(Literal::Int(n)) if n == "0"));
+            assert!(matches!(&arms[1].pat.node, PatKind::Lit(Literal::Int(n)) if n == "1"));
             assert!(matches!(&arms[2].pat.node, PatKind::Wildcard));
         }
         other => panic!("expected Case, got {:?}", other),
@@ -3024,7 +3024,7 @@ fn single_element_list() {
     match fun_body("x = [42]") {
         ExprKind::List(elems) => {
             assert_eq!(elems.len(), 1);
-            assert!(matches!(&elems[0].node, ExprKind::Lit(Literal::Int(42))));
+            assert!(matches!(&elems[0].node, ExprKind::Lit(Literal::Int(n)) if n == "42"));
         }
         other => panic!("expected single-element List, got {:?}", other),
     }

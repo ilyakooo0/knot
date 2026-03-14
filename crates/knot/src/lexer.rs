@@ -11,7 +11,7 @@ use crate::diagnostic::Diagnostic;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     // Literals
-    Int(i64),
+    Int(String),
     Float(f64),
     Text(String),
     Bytes(Vec<u8>),
@@ -428,8 +428,7 @@ impl<'src> Lexer<'src> {
             TokenKind::Float(value)
         } else {
             let raw = self.slice(start, self.pos).replace('_', "");
-            let value = raw.parse::<i64>().unwrap_or(0);
-            TokenKind::Int(value)
+            TokenKind::Int(raw)
         }
     }
 
@@ -725,10 +724,10 @@ mod tests {
 
     #[test]
     fn integers() {
-        assert_eq!(kinds("42"), vec![TokenKind::Int(42), TokenKind::Eof]);
+        assert_eq!(kinds("42"), vec![TokenKind::Int("42".into()), TokenKind::Eof]);
         assert_eq!(
             kinds("1_000_000"),
-            vec![TokenKind::Int(1_000_000), TokenKind::Eof],
+            vec![TokenKind::Int("1000000".into()), TokenKind::Eof],
         );
     }
 
@@ -901,7 +900,7 @@ mod tests {
 
     #[test]
     fn display_names() {
-        assert_eq!(TokenKind::Int(0).display_name(), "integer literal");
+        assert_eq!(TokenKind::Int("0".into()).display_name(), "integer literal");
         assert_eq!(TokenKind::Eof.display_name(), "end of file");
         assert_eq!(TokenKind::Plus.display_name(), "'+'");
         assert_eq!(TokenKind::If.display_name(), "'if'");

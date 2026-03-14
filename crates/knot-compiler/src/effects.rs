@@ -690,7 +690,7 @@ mod tests {
 
     #[test]
     fn literal_is_pure() {
-        let body = spanned(ExprKind::Lit(Literal::Int(42)));
+        let body = spanned(ExprKind::Lit(Literal::Int("42".into())));
         let (diags, effects) = check_module(vec![make_fun("f", body)]);
         assert!(diags.is_empty());
         assert!(effects["f"].is_pure());
@@ -931,7 +931,7 @@ mod tests {
     #[test]
     fn if_unions_branches() {
         let body = spanned(ExprKind::If {
-            cond: Box::new(spanned(ExprKind::Lit(Literal::Int(1)))),
+            cond: Box::new(spanned(ExprKind::Lit(Literal::Int("1".into())))),
             then_branch: Box::new(spanned(ExprKind::SourceRef("a".into()))),
             else_branch: Box::new(spanned(ExprKind::SourceRef("b".into()))),
         });
@@ -951,7 +951,7 @@ mod tests {
             scrutinee: Box::new(spanned(ExprKind::Var("x".into()))),
             arms: vec![
                 CaseArm {
-                    pat: spanned(PatKind::Lit(Literal::Int(1))),
+                    pat: spanned(PatKind::Lit(Literal::Int("1".into()))),
                     body: spanned(ExprKind::SourceRef("a".into())),
                 },
                 CaseArm {

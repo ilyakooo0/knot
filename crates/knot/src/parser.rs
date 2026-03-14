@@ -60,8 +60,12 @@ impl Parser {
             if self.at_eof() {
                 break;
             }
+            let exported = self.eat(&TokenKind::Export);
             match self.parse_decl() {
-                Some(d) => decls.push(d),
+                Some(mut d) => {
+                    d.exported = exported;
+                    decls.push(d);
+                }
                 None => {
                     // Error recovery: skip to next declaration boundary.
                     if !self.at_eof() {
@@ -207,7 +211,8 @@ impl Parser {
             let col = self.column_of(&self.span());
             if col == 0 {
                 match self.peek() {
-                    TokenKind::Data
+                    TokenKind::Export
+                    | TokenKind::Data
                     | TokenKind::Type
                     | TokenKind::Trait
                     | TokenKind::Impl
@@ -474,15 +479,16 @@ impl Parser {
 
         let end = self.prev_span();
         self.pop_context();
-        Some(Spanned::new(
-            DeclKind::Data {
+        Some(Decl {
+            node: DeclKind::Data {
                 name,
                 params,
                 constructors,
                 deriving,
             },
-            Span::new(start.start, end.end),
-        ))
+            span: Span::new(start.start, end.end),
+            exported: false,
+        })
     }
 
     fn parse_constructor_def(&mut self) -> Option<ConstructorDef> {
@@ -532,10 +538,11 @@ impl Parser {
 
         let end = self.prev_span();
         self.pop_context();
-        Some(Spanned::new(
-            DeclKind::TypeAlias { name, params, ty },
-            Span::new(start.start, end.end),
-        ))
+        Some(Decl {
+            node: DeclKind::TypeAlias { name, params, ty },
+            span: Span::new(start.start, end.end),
+            exported: false,
+        })
     }
 
     // ── source / view ────────────────────────────────────────────────
@@ -570,23 +577,25 @@ impl Parser {
             }
             let end = self.prev_span();
             self.pop_context();
-            Some(Spanned::new(
-                DeclKind::Source { name, ty, history },
-                Span::new(start.start, end.end),
-            ))
+            Some(Decl {
+                node: DeclKind::Source { name, ty, history },
+                span: Span::new(start.start, end.end),
+                exported: false,
+            })
         } else if self.eat(&TokenKind::Eq) {
             // View declaration: *name = expr
             let body = self.parse_expr()?;
             let end = self.prev_span();
             self.pop_context();
-            Some(Spanned::new(
-                DeclKind::View {
+            Some(Decl {
+                node: DeclKind::View {
                     name,
                     ty: None,
                     body,
                 },
-                Span::new(start.start, end.end),
-            ))
+                span: Span::new(start.start, end.end),
+                exported: false,
+            })
         } else {
             self.error("expected ':', '=', or '<=' after source/view name");
             self.pop_context();
@@ -626,8 +635,8 @@ impl Parser {
 
         let end = self.prev_span();
         self.pop_context();
-        Some(Spanned::new(
-            DeclKind::SubsetConstraint {
+        Some(Decl {
+            node: DeclKind::SubsetConstraint {
                 sub: RelationPath {
                     relation: left_relation,
                     field: left_field,
@@ -637,8 +646,9 @@ impl Parser {
                     field: right_field,
                 },
             },
-            Span::new(start.start, end.end),
-        ))
+            span: Span::new(start.start, end.end),
+            exported: false,
+        })
     }
 
     // ── derived ──────────────────────────────────────────────────────
@@ -656,14 +666,15 @@ impl Parser {
 
         let end = self.prev_span();
         self.pop_context();
-        Some(Spanned::new(
-            DeclKind::Derived {
+        Some(Decl {
+            node: DeclKind::Derived {
                 name,
                 ty: None,
                 body,
             },
-            Span::new(start.start, end.end),
-        ))
+            span: Span::new(start.start, end.end),
+            exported: false,
+        })
     }
 
     // ── function / constant ──────────────────────────────────────────
@@ -690,14 +701,15 @@ impl Parser {
                     let body = self.parse_expr()?;
                     let end = self.prev_span();
                     self.pop_context();
-                    return Some(Spanned::new(
-                        DeclKind::Fun {
+                    return Some(Decl {
+                        node: DeclKind::Fun {
                             name,
                             ty: ts,
                             body,
                         },
-                        Span::new(start.start, end.end),
-                    ));
+                        span: Span::new(start.start, end.end),
+                        exported: false,
+                    });
                 } else {
                     // Not a definition after the signature — restore.
                     self.restore(saved);
@@ -708,14 +720,15 @@ impl Parser {
             let end = self.prev_span();
             self.pop_context();
             let body_span = Span::new(end.end, end.end);
-            return Some(Spanned::new(
-                DeclKind::Fun {
+            return Some(Decl {
+                node: DeclKind::Fun {
                     name,
                     ty: ts,
                     body: Spanned::new(ExprKind::Record(vec![]), body_span),
                 },
-                Span::new(start.start, end.end),
-            ));
+                span: Span::new(start.start, end.end),
+                exported: false,
+            });
         }
 
         self.expect(&TokenKind::Eq, "expected '=' in definition")
@@ -724,14 +737,15 @@ impl Parser {
 
         let end = self.prev_span();
         self.pop_context();
-        Some(Spanned::new(
-            DeclKind::Fun {
+        Some(Decl {
+            node: DeclKind::Fun {
                 name,
                 ty: None,
                 body,
             },
-            Span::new(start.start, end.end),
-        ))
+            span: Span::new(start.start, end.end),
+            exported: false,
+        })
     }
 
     // ── trait ─────────────────────────────────────────────────────────
@@ -799,15 +813,16 @@ impl Parser {
 
         let end = self.prev_span();
         self.pop_context();
-        Some(Spanned::new(
-            DeclKind::Trait {
+        Some(Decl {
+            node: DeclKind::Trait {
                 name,
                 params,
                 supertraits,
                 items,
             },
-            Span::new(start.start, end.end),
-        ))
+            span: Span::new(start.start, end.end),
+            exported: false,
+        })
     }
 
     fn parse_trait_item(&mut self) -> Option<TraitItem> {
@@ -927,15 +942,16 @@ impl Parser {
 
         let end = self.prev_span();
         self.pop_context();
-        Some(Spanned::new(
-            DeclKind::Impl {
+        Some(Decl {
+            node: DeclKind::Impl {
                 trait_name,
                 args,
                 constraints,
                 items,
             },
-            Span::new(start.start, end.end),
-        ))
+            span: Span::new(start.start, end.end),
+            exported: false,
+        })
     }
 
     fn parse_impl_item(&mut self) -> Option<ImplItem> {
@@ -1014,10 +1030,11 @@ impl Parser {
             }
             let end = self.prev_span();
             self.pop_context();
-            return Some(Spanned::new(
-                DeclKind::RouteComposite { name, components },
-                Span::new(start.start, end.end),
-            ));
+            return Some(Decl {
+                node: DeclKind::RouteComposite { name, components },
+                span: Span::new(start.start, end.end),
+                exported: false,
+            });
         }
 
         self.expect(&TokenKind::Where, "expected 'where' or '=' after route name")
@@ -1028,10 +1045,11 @@ impl Parser {
 
         let end = self.prev_span();
         self.pop_context();
-        Some(Spanned::new(
-            DeclKind::Route { name, entries },
-            Span::new(start.start, end.end),
-        ))
+        Some(Decl {
+            node: DeclKind::Route { name, entries },
+            span: Span::new(start.start, end.end),
+            exported: false,
+        })
     }
 
     /// Parse route entries, supporting path prefix nesting.
@@ -1255,15 +1273,16 @@ impl Parser {
 
         let end = self.prev_span();
         self.pop_context();
-        Some(Spanned::new(
-            DeclKind::Migrate {
+        Some(Decl {
+            node: DeclKind::Migrate {
                 relation,
                 from_ty,
                 to_ty,
                 using_fn,
             },
-            Span::new(start.start, end.end),
-        ))
+            span: Span::new(start.start, end.end),
+            exported: false,
+        })
     }
 
     /// Try to parse `(Constraint =>)+`. Returns None if it doesn't look like constraints.

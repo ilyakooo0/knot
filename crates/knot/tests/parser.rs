@@ -3280,3 +3280,47 @@ fn import_no_imports() {
     assert!(m.imports.is_empty());
     assert_eq!(m.decls.len(), 1);
 }
+
+// ── Export ──────────────────────────────────────────────────────────
+
+#[test]
+fn export_data() {
+    let m = parse_ok("export data Priority = Low {} | High {}");
+    assert_eq!(m.decls.len(), 1);
+    assert!(m.decls[0].exported);
+    assert!(matches!(&m.decls[0].node, DeclKind::Data { name, .. } if name == "Priority"));
+}
+
+#[test]
+fn export_fun() {
+    let m = parse_ok("export f = \\x -> x + 1");
+    assert_eq!(m.decls.len(), 1);
+    assert!(m.decls[0].exported);
+    assert!(matches!(&m.decls[0].node, DeclKind::Fun { name, .. } if name == "f"));
+}
+
+#[test]
+fn export_multiple() {
+    let m = parse_ok("export type Person = {name: Text}\ninternalHelper = \\x -> x\nexport greet = \\x -> x");
+    assert_eq!(m.decls.len(), 3);
+    assert!(m.decls[0].exported);
+    assert!(!m.decls[1].exported);
+    assert!(m.decls[2].exported);
+}
+
+#[test]
+fn no_export_is_false() {
+    let m = parse_ok("data Color = Red {} | Blue {}\nf = 1");
+    for d in &m.decls {
+        assert!(!d.exported);
+    }
+}
+
+#[test]
+fn export_with_imports() {
+    let m = parse_ok("import ./types\n\nexport f = 1\ng = 2");
+    assert_eq!(m.imports.len(), 1);
+    assert_eq!(m.decls.len(), 2);
+    assert!(m.decls[0].exported);
+    assert!(!m.decls[1].exported);
+}

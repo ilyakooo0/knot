@@ -113,16 +113,42 @@ fn resolve_recursive(
             continue;
         }
 
-        // Filter declarations based on selective import list
-        let decls = if let Some(items) = &imp.items {
-            let names: HashSet<&str> = items.iter().map(|i| i.name.as_str()).collect();
+        // Filter by export visibility: if the imported module has any `export`
+        // declarations, only those (plus always-visible items) pass through.
+        // If no exports exist, everything is visible (backwards compat).
+        let has_exports = imported_module.decls.iter().any(|d| d.exported);
+        let visible_decls = if has_exports {
+            let exported_names: HashSet<String> = imported_module
+                .decls
+                .iter()
+                .filter(|d| d.exported)
+                .filter_map(|d| decl_name(&d.node))
+                .collect();
             imported_module
                 .decls
+                .into_iter()
+                .filter(|d| {
+                    d.exported
+                        || matches!(
+                            &d.node,
+                            ast::DeclKind::Migrate { .. } | ast::DeclKind::SubsetConstraint { .. }
+                        )
+                        || matches!(&d.node, ast::DeclKind::Impl { trait_name, .. } if exported_names.contains(trait_name))
+                })
+                .collect()
+        } else {
+            imported_module.decls
+        };
+
+        // Filter declarations based on selective import list
+        let decls: Vec<ast::Decl> = if let Some(items) = &imp.items {
+            let names: HashSet<&str> = items.iter().map(|i| i.name.as_str()).collect();
+            visible_decls
                 .into_iter()
                 .filter(|d| should_include_decl(d, &names))
                 .collect()
         } else {
-            imported_module.decls
+            visible_decls
         };
 
         imported_decls.extend(decls);
@@ -137,6 +163,24 @@ fn resolve_recursive(
     module.decls = imported_decls;
 
     Ok(())
+}
+
+/// Extract the primary name from a declaration, if it has one.
+fn decl_name(decl: &ast::DeclKind) -> Option<String> {
+    match decl {
+        ast::DeclKind::Data { name, .. }
+        | ast::DeclKind::TypeAlias { name, .. }
+        | ast::DeclKind::Source { name, .. }
+        | ast::DeclKind::View { name, .. }
+        | ast::DeclKind::Derived { name, .. }
+        | ast::DeclKind::Fun { name, .. }
+        | ast::DeclKind::Trait { name, .. }
+        | ast::DeclKind::Route { name, .. }
+        | ast::DeclKind::RouteComposite { name, .. } => Some(name.clone()),
+        ast::DeclKind::Impl { .. }
+        | ast::DeclKind::Migrate { .. }
+        | ast::DeclKind::SubsetConstraint { .. } => None,
+    }
 }
 
 /// Check whether a declaration should be included based on a selective import list.

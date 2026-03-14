@@ -1,5 +1,7 @@
 module Types
 
-type Person = {name: Text, age: Int}
+export type Person = {name: Text, age: Int}
 
-data Priority = Low {} | Medium {} | High {}
+export data Priority = Low {} | Medium {} | High {}
+
+internalHelper = \x -> x + 1

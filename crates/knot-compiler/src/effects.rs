@@ -658,8 +658,12 @@ mod tests {
         (checker.diagnostics, checker.decl_effects)
     }
 
+    fn make_decl(node: DeclKind) -> Decl {
+        Decl { node, span: span(), exported: false }
+    }
+
     fn make_source(name: &str) -> Decl {
-        spanned(DeclKind::Source {
+        make_decl(DeclKind::Source {
             name: name.into(),
             ty: spanned(TypeKind::Relation(Box::new(spanned(TypeKind::Named(
                 "T".into(),
@@ -669,7 +673,7 @@ mod tests {
     }
 
     fn make_fun(name: &str, body: Expr) -> Decl {
-        spanned(DeclKind::Fun {
+        make_decl(DeclKind::Fun {
             name: name.into(),
             ty: None,
             body,
@@ -677,7 +681,7 @@ mod tests {
     }
 
     fn make_fun_with_type(name: &str, body: Expr, ty: TypeScheme) -> Decl {
-        spanned(DeclKind::Fun {
+        make_decl(DeclKind::Fun {
             name: name.into(),
             ty: Some(ty),
             body,
@@ -847,7 +851,7 @@ mod tests {
                 ExprKind::Var("p".into()),
             )))))),
         ]));
-        let derived = spanned(DeclKind::Derived {
+        let derived = make_decl(DeclKind::Derived {
             name: "seniors".into(),
             ty: None,
             body: derived_body,

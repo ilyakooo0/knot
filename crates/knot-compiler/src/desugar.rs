@@ -54,15 +54,16 @@ fn desugar_routes(module: &mut Module) {
         match &decl.node {
             DeclKind::Route { name, entries } => {
                 let ctors = route_entries_to_constructors(entries);
-                new_decls.push(Spanned::new(
-                    DeclKind::Data {
+                new_decls.push(Decl {
+                    node: DeclKind::Data {
                         name: name.clone(),
                         params: vec![],
                         constructors: ctors,
                         deriving: vec![],
                     },
-                    decl.span,
-                ));
+                    span: decl.span,
+                    exported: decl.exported,
+                });
             }
             DeclKind::RouteComposite { name, components } => {
                 let mut all_entries = Vec::new();
@@ -72,15 +73,16 @@ fn desugar_routes(module: &mut Module) {
                     }
                 }
                 let ctors = route_entries_to_constructors(&all_entries);
-                new_decls.push(Spanned::new(
-                    DeclKind::Data {
+                new_decls.push(Decl {
+                    node: DeclKind::Data {
                         name: name.clone(),
                         params: vec![],
                         constructors: ctors,
                         deriving: vec![],
                     },
-                    decl.span,
-                ));
+                    span: decl.span,
+                    exported: decl.exported,
+                });
             }
             _ => {}
         }

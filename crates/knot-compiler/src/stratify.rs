@@ -340,7 +340,7 @@ mod tests {
     }
 
     fn derived(name: &str, body: Expr) -> Decl {
-        spanned(DeclKind::Derived { name: name.to_string(), ty: None, body })
+        Decl { node: DeclKind::Derived { name: name.to_string(), ty: None, body }, span: span(), exported: false }
     }
 
     fn derived_ref(name: &str) -> Expr {

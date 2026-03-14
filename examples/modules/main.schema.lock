@@ -1,0 +1,21 @@
+-- schema.lock (auto-generated, do not edit)
+-- Commit to source control.
+
+s
+
+*people : [Person]
+
+main = do
+  set 
+
+/types
+import ./utils
+
+*people : [Pe
+
+in = do
+  set *people = [{name: formatName "al
+
+*people : [Person]
+
+

@@ -38,7 +38,12 @@ pub type Name = String;
 pub type Expr = Spanned<ExprKind>;
 pub type Pat = Spanned<PatKind>;
 pub type Type = Spanned<TypeKind>;
-pub type Decl = Spanned<DeclKind>;
+#[derive(Debug, Clone)]
+pub struct Decl {
+    pub node: DeclKind,
+    pub span: Span,
+    pub exported: bool,
+}
 pub type Stmt = Spanned<StmtKind>;
 
 // ── Module ─────────────────────────────────────────────────────────

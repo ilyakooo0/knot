@@ -45,6 +45,7 @@ pub enum TokenKind {
     Atomic,
     Deriving,
     With,
+    Export,
 
     // Delimiters
     LParen,
@@ -127,6 +128,7 @@ impl TokenKind {
             TokenKind::Atomic => "'atomic'",
             TokenKind::Deriving => "'deriving'",
             TokenKind::With => "'with'",
+            TokenKind::Export => "'export'",
             TokenKind::LParen => "'('",
             TokenKind::RParen => "')'",
             TokenKind::LBrace => "'{'",
@@ -387,6 +389,7 @@ impl<'src> Lexer<'src> {
                 "atomic" => return TokenKind::Atomic,
                 "deriving" => return TokenKind::Deriving,
                 "with" => return TokenKind::With,
+                "export" => return TokenKind::Export,
                 _ => {}
             }
             TokenKind::Lower(text.to_owned())

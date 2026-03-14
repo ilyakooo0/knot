@@ -1108,8 +1108,6 @@ Full Hindley-Milner style inference extended with row polymorphism and trait bou
 ## Full Example
 
 ```knot
-module TodoApp
-
 data Priority = Low {} | Medium {} | High {} | Critical {}
 
 data Status

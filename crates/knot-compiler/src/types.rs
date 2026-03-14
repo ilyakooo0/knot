@@ -38,8 +38,8 @@ pub struct TypeEnv {
     pub constructors: HashMap<String, Vec<(String, ResolvedType)>>,
     /// source_name -> schema descriptor string ("col:type,col:type,...")
     pub source_schemas: HashMap<String, String>,
-    /// relation_name -> (old_schema, new_schema) from `migrate` declarations
-    pub migrate_schemas: HashMap<String, (String, String)>,
+    /// relation_name -> Vec<(old_schema, new_schema)> from `migrate` declarations
+    pub migrate_schemas: HashMap<String, Vec<(String, String)>>,
     /// Associated type definitions: assoc_type_name -> definitions from impls
     #[allow(dead_code)]
     pub associated_types: HashMap<String, Vec<AssocTypeDef>>,
@@ -54,7 +54,7 @@ impl TypeEnv {
         let mut aliases = HashMap::new();
         let mut constructors = HashMap::new();
         let mut source_schemas = HashMap::new();
-        let mut migrate_schemas = HashMap::new();
+        let mut migrate_schemas: HashMap<String, Vec<(String, String)>> = HashMap::new();
         let mut associated_types: HashMap<String, Vec<AssocTypeDef>> = HashMap::new();
         let mut history_sources = HashSet::new();
 
@@ -163,7 +163,9 @@ impl TypeEnv {
                     let old_schema = schema_descriptor(&old_resolved);
                     let new_schema = schema_descriptor(&new_resolved);
                     migrate_schemas
-                        .insert(relation.clone(), (old_schema, new_schema));
+                        .entry(relation.clone())
+                        .or_default()
+                        .push((old_schema, new_schema));
                 }
                 DeclKind::SubsetConstraint { sub, sup } => {
                     subset_constraints.push((sub.clone(), sup.clone()));

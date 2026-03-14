@@ -52,8 +52,8 @@ pub struct Codegen {
     // Database path baked into the compiled binary
     db_path: String,
 
-    // Migration schemas: relation_name -> (old_schema, new_schema)
-    migrate_schemas: HashMap<String, (String, String)>,
+    // Migration schemas: relation_name -> Vec<(old_schema, new_schema)>
+    migrate_schemas: HashMap<String, Vec<(String, String)>>,
 
     // View declarations: view_name -> provenance info
     views: HashMap<String, ViewInfo>,
@@ -2299,6 +2299,7 @@ impl Codegen {
 
             // Apply pending migrations (before source init)
             let migrate_schemas = cg.migrate_schemas.clone();
+            let mut migrate_counters: HashMap<String, usize> = HashMap::new();
             for decl in &decls {
                 if let ast::DeclKind::Migrate {
                     relation,
@@ -2306,24 +2307,28 @@ impl Codegen {
                     ..
                 } = &decl.node
                 {
-                    if let Some((old_schema, new_schema)) = migrate_schemas.get(relation) {
-                        let (name_ptr, name_len) = cg.string_ptr(builder, relation);
-                        let (old_ptr, old_len) = cg.string_ptr(builder, old_schema);
-                        let (new_ptr, new_len) = cg.string_ptr(builder, new_schema);
+                    if let Some(migrations) = migrate_schemas.get(relation) {
+                        let idx = migrate_counters.entry(relation.clone()).or_insert(0);
+                        if let Some((old_schema, new_schema)) = migrations.get(*idx) {
+                            let (name_ptr, name_len) = cg.string_ptr(builder, relation);
+                            let (old_ptr, old_len) = cg.string_ptr(builder, old_schema);
+                            let (new_ptr, new_len) = cg.string_ptr(builder, new_schema);
 
-                        // Compile the using expression (typically a lambda)
-                        let mut env = Env::new();
-                        let migrate_fn_val =
-                            cg.compile_expr(builder, using_fn, &mut env, db);
+                            // Compile the using expression (typically a lambda)
+                            let mut env = Env::new();
+                            let migrate_fn_val =
+                                cg.compile_expr(builder, using_fn, &mut env, db);
 
-                        cg.call_rt_void(
-                            builder,
-                            "knot_source_migrate",
-                            &[
-                                db, name_ptr, name_len, old_ptr, old_len, new_ptr,
-                                new_len, migrate_fn_val,
-                            ],
-                        );
+                            cg.call_rt_void(
+                                builder,
+                                "knot_source_migrate",
+                                &[
+                                    db, name_ptr, name_len, old_ptr, old_len, new_ptr,
+                                    new_len, migrate_fn_val,
+                                ],
+                            );
+                            *idx += 1;
+                        }
                     }
                 }
             }

@@ -2387,6 +2387,192 @@ fn init_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &Nested
     }
 }
 
+/// Try to auto-apply a safe schema change (e.g. adding ADT constructors).
+/// Returns true if the change was applied, false if it's a breaking change.
+fn auto_apply_schema_change(
+    conn: &Connection,
+    name: &str,
+    stored: &str,
+    compiled: &str,
+) -> bool {
+    let table = format!("_knot_{}", name);
+    let stored_is_adt = is_adt_schema(stored);
+    let compiled_is_adt = is_adt_schema(compiled);
+
+    if stored_is_adt != compiled_is_adt {
+        return false;
+    }
+
+    if stored_is_adt {
+        auto_apply_adt_change(conn, &table, name, stored, compiled)
+    } else {
+        auto_apply_record_change(conn, &table, name, stored, compiled)
+    }
+}
+
+fn auto_apply_adt_change(
+    conn: &Connection,
+    table: &str,
+    name: &str,
+    stored: &str,
+    compiled: &str,
+) -> bool {
+    let old_adt = parse_adt_schema(stored);
+    let new_adt = parse_adt_schema(compiled);
+
+    // Every old constructor must exist in new with identical fields
+    for old_ctor in &old_adt.constructors {
+        match new_adt.constructors.iter().find(|c| c.name == old_ctor.name) {
+            Some(new_ctor) => {
+                if old_ctor.fields.len() != new_ctor.fields.len() {
+                    return false;
+                }
+                for (of, nf) in old_ctor.fields.iter().zip(&new_ctor.fields) {
+                    if of.name != nf.name || std::mem::discriminant(&of.ty) != std::mem::discriminant(&nf.ty) {
+                        return false;
+                    }
+                }
+            }
+            None => return false,
+        }
+    }
+
+    // Add new columns for new constructor fields
+    let old_field_names: Vec<&str> = old_adt.all_fields.iter().map(|f| f.name.as_str()).collect();
+    for f in &new_adt.all_fields {
+        if !old_field_names.contains(&f.name.as_str()) {
+            let sql = format!(
+                "ALTER TABLE {} ADD COLUMN {} {};",
+                quote_ident(table),
+                quote_ident(&f.name),
+                sql_type(f.ty)
+            );
+            debug_sql(&sql);
+            if conn.execute_batch(&sql).is_err() {
+                return false;
+            }
+        }
+    }
+
+    // Drop and recreate unique index with full column set
+    let drop_idx = format!(
+        "DROP INDEX IF EXISTS {};",
+        quote_ident(&format!("{}_unique", table))
+    );
+    debug_sql(&drop_idx);
+    let _ = conn.execute_batch(&drop_idx);
+
+    let coalesced: Vec<String> = std::iter::once(quote_ident("_tag"))
+        .chain(new_adt.all_fields.iter().map(|f| {
+            let col = quote_ident(&f.name);
+            match f.ty {
+                ColType::Int | ColType::Bool => format!("COALESCE({}, -9223372036854775808)", col),
+                ColType::Float => format!("COALESCE({}, -1.7976931348623157e+308)", col),
+                _ => format!("COALESCE({}, X'00')", col),
+            }
+        }))
+        .collect();
+    let idx_sql = format!(
+        "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({});",
+        quote_ident(&format!("{}_unique", table)),
+        quote_ident(table),
+        coalesced.join(", ")
+    );
+    debug_sql(&idx_sql);
+    let _ = conn.execute_batch(&idx_sql);
+
+    // Update stored schema
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO _knot_schema (name, schema) VALUES (?1, ?2);",
+        rusqlite::params![name, compiled],
+    );
+
+    true
+}
+
+fn auto_apply_record_change(
+    conn: &Connection,
+    table: &str,
+    name: &str,
+    stored: &str,
+    compiled: &str,
+) -> bool {
+    let old_rec = parse_record_schema(stored);
+    let new_rec = parse_record_schema(compiled);
+
+    // Every old column must exist in new with same type
+    for old_col in &old_rec.columns {
+        match new_rec.columns.iter().find(|c| c.name == old_col.name) {
+            Some(new_col) => {
+                if std::mem::discriminant(&old_col.ty) != std::mem::discriminant(&new_col.ty) {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    }
+
+    // Any removed nested fields → breaking
+    for old_nf in &old_rec.nested {
+        if !new_rec.nested.iter().any(|n| n.name == old_nf.name) {
+            return false;
+        }
+    }
+
+    // Add new columns
+    let old_col_names: Vec<&str> = old_rec.columns.iter().map(|c| c.name.as_str()).collect();
+    for c in &new_rec.columns {
+        if !old_col_names.contains(&c.name.as_str()) {
+            let sql = format!(
+                "ALTER TABLE {} ADD COLUMN {} {};",
+                quote_ident(table),
+                quote_ident(&c.name),
+                sql_type(c.ty)
+            );
+            debug_sql(&sql);
+            if conn.execute_batch(&sql).is_err() {
+                return false;
+            }
+        }
+    }
+
+    // Drop and recreate unique index with full column set
+    let drop_idx = format!(
+        "DROP INDEX IF EXISTS {};",
+        quote_ident(&format!("{}_unique", table))
+    );
+    debug_sql(&drop_idx);
+    let _ = conn.execute_batch(&drop_idx);
+
+    let unique_cols: Vec<String> = new_rec.columns.iter().map(|c| quote_ident(&c.name)).collect();
+    if !unique_cols.is_empty() {
+        let idx_sql = format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({});",
+            quote_ident(&format!("{}_unique", table)),
+            quote_ident(table),
+            unique_cols.join(", ")
+        );
+        debug_sql(&idx_sql);
+        let _ = conn.execute_batch(&idx_sql);
+    }
+
+    // Initialize any new child tables for nested relations
+    let old_nested_names: Vec<&str> = old_rec.nested.iter().map(|n| n.name.as_str()).collect();
+    for nf in &new_rec.nested {
+        if !old_nested_names.contains(&nf.name.as_str()) {
+            init_child_table(conn, table, nf);
+        }
+    }
+
+    // Update stored schema
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO _knot_schema (name, schema) VALUES (?1, ?2);",
+        rusqlite::params![name, compiled],
+    );
+
+    true
+}
+
 /// Initialize a source table. Creates it if it doesn't exist.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_source_init(
@@ -2463,13 +2649,15 @@ pub extern "C" fn knot_source_init(
 
     if let Some(ref stored_schema) = stored {
         if stored_schema != schema {
-            panic!(
-                "knot runtime: schema mismatch for source '*{}'.\n\
-                 Stored:   {}\n\
-                 Compiled: {}\n\
-                 Add a `migrate *{} from {{...}} to {{...}} using (\\old -> ...)` block to your source.",
-                name, stored_schema, schema, name
-            );
+            if !auto_apply_schema_change(&db_ref.conn, name, stored_schema, schema) {
+                panic!(
+                    "knot runtime: schema mismatch for source '*{}'.\n\
+                     Stored:   {}\n\
+                     Compiled: {}\n\
+                     Add a `migrate *{} from {{...}} to {{...}} using (\\old -> ...)` block to your source.",
+                    name, stored_schema, schema, name
+                );
+            }
         }
     }
 

@@ -420,6 +420,7 @@ impl EffectChecker {
             ast::StmtKind::Bind { expr, .. } => self.infer_effects(expr),
             ast::StmtKind::Let { expr, .. } => self.infer_effects(expr),
             ast::StmtKind::Where { cond } => self.infer_effects(cond),
+            ast::StmtKind::GroupBy { key } => self.infer_effects(key),
             ast::StmtKind::Expr(expr) => self.infer_effects(expr),
         }
     }

@@ -3171,3 +3171,26 @@ fn subset_constraint_with_source_decls() {
     assert!(matches!(&m.decls[1].node, DeclKind::Source { name, .. } if name == "orders"));
     assert!(matches!(&m.decls[2].node, DeclKind::SubsetConstraint { .. }));
 }
+
+#[test]
+fn do_with_group_by() {
+    let src = "x = do\n  t <- xs\n  groupBy {t.owner}\n  yield {owner: t.owner, count: count t}";
+    match fun_body(src) {
+        ExprKind::Do(stmts) => {
+            assert_eq!(stmts.len(), 3);
+            assert!(matches!(&stmts[0].node, StmtKind::Bind { .. }));
+            match &stmts[1].node {
+                StmtKind::GroupBy { key } => {
+                    // Key should be a record {owner: t.owner}
+                    assert!(matches!(&key.node, ExprKind::Record(_)));
+                }
+                other => panic!("expected GroupBy, got {:?}", other),
+            }
+            match &stmts[2].node {
+                StmtKind::Expr(e) => assert!(matches!(&e.node, ExprKind::Yield(_))),
+                other => panic!("expected Expr(Yield), got {:?}", other),
+            }
+        }
+        other => panic!("expected Do, got {:?}", other),
+    }
+}

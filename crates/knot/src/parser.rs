@@ -1912,6 +1912,17 @@ impl Parser {
             ));
         }
 
+        // `groupBy expr`
+        if matches!(self.peek(), TokenKind::Lower(n) if n == "groupBy") {
+            self.advance();
+            let key = self.parse_expr()?;
+            let end_sp = key.span;
+            return Some(Spanned::new(
+                StmtKind::GroupBy { key },
+                Span::new(start.start, end_sp.end),
+            ));
+        }
+
         // `let pat = expr`
         if self.at(&TokenKind::Let) {
             self.advance();

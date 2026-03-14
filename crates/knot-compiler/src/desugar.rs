@@ -280,6 +280,7 @@ fn desugar_stmt(stmt: &mut Stmt) {
         StmtKind::Bind { expr, .. } => desugar_expr(expr),
         StmtKind::Let { expr, .. } => desugar_expr(expr),
         StmtKind::Where { cond } => desugar_expr(cond),
+        StmtKind::GroupBy { key } => desugar_expr(key),
         StmtKind::Expr(e) => desugar_expr(e),
     }
 }
@@ -302,6 +303,11 @@ fn is_pure_comprehension(stmts: &[Stmt]) -> bool {
         )
     });
     if !has_bind_or_where {
+        return false;
+    }
+
+    // GroupBy requires loop-based codegen — not eligible for desugaring
+    if stmts.iter().any(|s| matches!(&s.node, StmtKind::GroupBy { .. })) {
         return false;
     }
 
@@ -419,6 +425,11 @@ fn desugar_stmts(stmts: &[Stmt], span: Span) -> Expr {
                 },
                 span,
             )
+        }
+
+        StmtKind::GroupBy { .. } => {
+            // GroupBy blocks are not desugared (filtered by is_pure_comprehension)
+            unreachable!("groupBy should not appear in desugared do blocks")
         }
 
         StmtKind::Expr(_) => {
@@ -650,6 +661,30 @@ mod tests {
                 if name == "filtered" {
                     assert!(has_bind_var(body));
                     assert!(!has_do_block(body));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn groupby_do_not_desugared() {
+        let src = r#"
+            *items : [{x: Int, cat: Text}]
+            grouped = do
+              i <- *items
+              groupBy {i.cat}
+              yield {cat: i.cat, n: count i}
+        "#;
+        let mut module = parse(src);
+        desugar(&mut module);
+        // groupBy do blocks must stay as Do nodes (loop-based codegen)
+        for decl in &module.decls {
+            if let DeclKind::Fun { name, body, .. } = &decl.node {
+                if name == "grouped" {
+                    assert!(
+                        matches!(&body.node, ExprKind::Do(_)),
+                        "groupBy do block should not be desugared"
+                    );
                 }
             }
         }

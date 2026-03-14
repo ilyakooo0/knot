@@ -318,6 +318,15 @@ pub extern "C" fn knot_record_field(
             // Delegate to the payload (which should be a record)
             knot_record_field(*payload, key_ptr, key_len)
         }
+        Value::Relation(rows) => {
+            // After groupBy, field access on a group relation delegates to first element.
+            // All elements in a group share the key fields, so this is well-defined.
+            if rows.is_empty() {
+                let name = unsafe { str_from_raw(key_ptr, key_len) };
+                panic!("knot runtime: field '{}' access on empty relation group", name);
+            }
+            knot_record_field(rows[0], key_ptr, key_len)
+        }
         _ => panic!(
             "knot runtime: expected Record in field access, got {}",
             brief_value(record)
@@ -428,6 +437,198 @@ pub extern "C" fn knot_relation_bind(
             ),
         }
     }
+    alloc(Value::Relation(result))
+}
+
+/// Group a relation by key columns using SQLite ORDER BY for efficient grouping.
+/// Inserts key columns + row indices into a temp table, sorts via ORDER BY,
+/// then groups consecutive rows with matching keys in O(n).
+/// Signature: (db, rel, schema_ptr, schema_len, key_cols_ptr, key_cols_len) -> [[row]]
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_group_by(
+    db: *mut c_void,
+    rel: *mut Value,
+    schema_ptr: *const u8,
+    schema_len: usize,
+    key_cols_ptr: *const u8,
+    key_cols_len: usize,
+) -> *mut Value {
+    let rows = match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => rows.clone(),
+        _ => panic!(
+            "knot runtime: expected Relation in group_by, got {}",
+            type_name(rel)
+        ),
+    };
+
+    if rows.is_empty() {
+        return alloc(Value::Relation(Vec::new()));
+    }
+
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let schema_str = unsafe { str_from_raw(schema_ptr, schema_len) };
+    let key_cols_str = unsafe { str_from_raw(key_cols_ptr, key_cols_len) };
+    let schema = parse_record_schema(schema_str);
+    let key_col_names: Vec<&str> = key_cols_str.split(',').collect();
+
+    // Find key column specs in the schema
+    let key_specs: Vec<&ColumnSpec> = key_col_names
+        .iter()
+        .map(|kc| {
+            schema
+                .columns
+                .iter()
+                .find(|c| c.name == *kc)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "knot runtime: key column '{}' not found in schema",
+                        kc
+                    )
+                })
+        })
+        .collect();
+
+    let temp_name = "_knot_tmp_groupby";
+    let temp = quote_ident(temp_name);
+
+    // Drop any leftover temp table
+    let _ = db_ref
+        .conn
+        .execute_batch(&format!("DROP TABLE IF EXISTS {};", temp));
+
+    // Create temp table: _idx INTEGER + key columns only
+    let mut col_defs = vec!["_idx INTEGER".to_string()];
+    for ks in &key_specs {
+        col_defs.push(format!("{} {}", quote_ident(&ks.name), sql_type(ks.ty)));
+    }
+    let create_sql = format!(
+        "CREATE TEMP TABLE {} ({});",
+        temp,
+        col_defs.join(", ")
+    );
+    debug_sql(&create_sql);
+    db_ref
+        .conn
+        .execute_batch(&create_sql)
+        .expect("knot runtime: failed to create groupby temp table");
+
+    // Insert row indices + key column values
+    let mut insert_col_names = vec!["\"_idx\"".to_string()];
+    for ks in &key_specs {
+        insert_col_names.push(quote_ident(&ks.name));
+    }
+    let placeholders: Vec<String> = (1..=insert_col_names.len())
+        .map(|i| format!("?{}", i))
+        .collect();
+    let insert_sql = format!(
+        "INSERT INTO {} ({}) VALUES ({});",
+        temp,
+        insert_col_names.join(", "),
+        placeholders.join(", ")
+    );
+    debug_sql(&insert_sql);
+
+    {
+        let mut insert_stmt = db_ref
+            .conn
+            .prepare(&insert_sql)
+            .expect("knot runtime: failed to prepare groupby insert");
+
+        for (idx, row_ptr) in rows.iter().enumerate() {
+            let fields = match unsafe { as_ref(*row_ptr) } {
+                Value::Record(fields) => fields,
+                _ => panic!("knot runtime: groupby rows must be Records"),
+            };
+
+            let mut params: Vec<rusqlite::types::Value> =
+                vec![rusqlite::types::Value::Integer(idx as i64)];
+            for ks in &key_specs {
+                let field = fields
+                    .iter()
+                    .find(|f| f.name == ks.name)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "knot runtime: missing field '{}' in record",
+                            ks.name
+                        )
+                    });
+                params.push(value_to_sqlite(field.value, ks.ty));
+            }
+
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+            insert_stmt
+                .execute(param_refs.as_slice())
+                .expect("knot runtime: groupby insert error");
+        }
+    } // insert_stmt dropped here
+
+    // SELECT with ORDER BY key columns; group consecutive rows
+    let order_cols: Vec<String> = key_specs
+        .iter()
+        .map(|ks| quote_ident(&ks.name))
+        .collect();
+    let select_sql = format!(
+        "SELECT {} FROM {} ORDER BY {}",
+        insert_col_names.join(", "),
+        temp,
+        order_cols.join(", ")
+    );
+    debug_sql(&select_sql);
+
+    let groups = {
+        let mut select_stmt = db_ref
+            .conn
+            .prepare(&select_sql)
+            .expect("knot runtime: failed to prepare groupby select");
+        let mut result_rows = select_stmt
+            .query([])
+            .expect("knot runtime: groupby select error");
+
+        let mut groups: Vec<Vec<*mut Value>> = Vec::new();
+        let mut current_group: Vec<*mut Value> = Vec::new();
+        let mut prev_keys: Option<Vec<rusqlite::types::Value>> = None;
+
+        while let Some(row) = result_rows
+            .next()
+            .unwrap_or_else(|e| panic!("knot runtime: groupby fetch error: {}", e))
+        {
+            let idx: i64 = row.get(0).unwrap();
+
+            // Extract key values for comparison
+            let keys: Vec<rusqlite::types::Value> = (1..=key_specs.len())
+                .map(|i| row.get(i).unwrap())
+                .collect();
+
+            // Detect group boundary
+            if let Some(ref prev) = prev_keys {
+                if keys != *prev {
+                    groups.push(std::mem::take(&mut current_group));
+                }
+            }
+
+            current_group.push(rows[idx as usize]);
+            prev_keys = Some(keys);
+        }
+
+        if !current_group.is_empty() {
+            groups.push(current_group);
+        }
+
+        groups
+    }; // select_stmt + result_rows dropped here
+
+    // Clean up temp table
+    let _ = db_ref
+        .conn
+        .execute_batch(&format!("DROP TABLE IF EXISTS {};", temp));
+
+    // Convert to a relation of relations
+    let result: Vec<*mut Value> = groups
+        .into_iter()
+        .map(|rows| alloc(Value::Relation(rows)))
+        .collect();
+
     alloc(Value::Relation(result))
 }
 

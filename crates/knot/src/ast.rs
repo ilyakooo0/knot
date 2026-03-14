@@ -308,6 +308,9 @@ pub enum StmtKind {
     /// `where cond` — guard / filter (requires `Alternative`).
     Where { cond: Expr },
 
+    /// `groupBy expr` — group rows by key expression.
+    GroupBy { key: Expr },
+
     /// Bare expression (including `yield expr`).
     Expr(Expr),
 }

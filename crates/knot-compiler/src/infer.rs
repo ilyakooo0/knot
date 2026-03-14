@@ -993,13 +993,22 @@ impl Infer {
 
             ast::ExprKind::FieldAccess { expr: e, field } => {
                 let expr_ty = self.infer_expr(e);
+                let resolved = self.apply(&expr_ty);
+                // If the expression is a relation (e.g., after groupBy), unwrap
+                // to access fields on the element type. At runtime, this accesses
+                // the field from the first element of the relation.
+                let base_ty = if let Ty::Relation(elem) = resolved {
+                    *elem
+                } else {
+                    expr_ty
+                };
                 let field_ty = self.fresh();
                 let rv = self.fresh_var();
                 let constraint = Ty::Record(
                     BTreeMap::from([(field.clone(), field_ty.clone())]),
                     Some(rv),
                 );
-                self.unify(&expr_ty, &constraint, e.span);
+                self.unify(&base_ty, &constraint, e.span);
                 field_ty
             }
 
@@ -1367,6 +1376,25 @@ impl Infer {
                 ast::StmtKind::Where { cond } => {
                     let cond_ty = self.infer_expr(cond);
                     self.unify(&cond_ty, &Ty::Bool, cond.span);
+                }
+                ast::StmtKind::GroupBy { key } => {
+                    // Infer the key expression type (must be a record)
+                    let _ = self.infer_expr(key);
+                    // After groupBy, rebind all preceding Bind variables
+                    // from T to [T] (they now represent groups)
+                    for prev_stmt in stmts {
+                        if std::ptr::eq(prev_stmt, stmt) {
+                            break;
+                        }
+                        if let ast::StmtKind::Bind { pat, .. } = &prev_stmt.node {
+                            if let ast::PatKind::Var(name) = &pat.node {
+                                if let Some(scheme) = self.lookup(name).cloned() {
+                                    let ty = self.instantiate(&scheme);
+                                    self.bind(name, Scheme::mono(Ty::Relation(Box::new(ty))));
+                                }
+                            }
+                        }
+                    }
                 }
                 ast::StmtKind::Expr(expr) => {
                     if let ast::ExprKind::Yield(inner) = &expr.node {

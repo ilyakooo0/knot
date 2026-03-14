@@ -463,6 +463,31 @@ describe = \rel -> case rel of
   _           -> show (count rel) ++ " rows"
 ```
 
+### Grouping
+
+`groupBy` partitions a relation by key fields, like SQL's `GROUP BY`. After `groupBy`, the bound variable becomes a sub-relation (the group), enabling aggregation:
+
+```knot
+&workload = do
+  t <- *todos
+  where t.done == 0
+  groupBy {t.owner}
+  yield {owner: t.owner, count: count t}
+```
+
+The key expression is a record literal whose fields select the grouping columns. After `groupBy {t.owner}`, `t` is rebound from a single row to a sub-relation of all rows sharing that `owner` value. Field access on a group (e.g. `t.owner`) returns the shared key value. Aggregate functions like `count` operate on the whole group.
+
+Multiple key fields group by their combination:
+
+```knot
+&summary = do
+  o <- *orders
+  groupBy {o.region, o.status}
+  yield {region: o.region, status: o.status, total: count o}
+```
+
+Grouping is executed via SQLite — key columns are inserted into a temp table and sorted with `ORDER BY`, then consecutive rows with matching keys are collected into groups.
+
 ## Effects
 
 ### Inferred Capabilities

@@ -1,0 +1,24 @@
+type Todo = {title: Text, owner: Text, done: Int}
+
+*todos : [Todo]
+
+main = do
+  set *todos = [
+    {title: "Write parser", owner: "Alice", done: 0},
+    {title: "Write codegen", owner: "Alice", done: 0},
+    {title: "Write runtime", owner: "Bob", done: 0},
+    {title: "Fix bug", owner: "Alice", done: 1},
+    {title: "Deploy", owner: "Bob", done: 1}
+  ]
+
+  -- Group pending todos by owner and count them
+  let workload = do
+    t <- *todos
+    where t.done == 0
+    groupBy {t.owner}
+    yield {owner: t.owner, count: count t}
+
+  println "Pending work per person:"
+  w <- workload
+  println (w.owner ++ ": " ++ show w.count)
+  yield {}

@@ -430,6 +430,9 @@ impl Codegen {
         // Monadic bind for relations (do-desugaring)
         self.declare_rt("knot_relation_bind", &[p, p, p], &[p]);
 
+        // GroupBy: group relation by key columns using SQLite ORDER BY
+        self.declare_rt("knot_relation_group_by", &[p, p, p, p, p, p], &[p]);
+
         // Standard library: relation operations
         self.declare_rt("knot_relation_filter", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_map", &[p, p, p], &[p]);
@@ -3188,6 +3191,20 @@ impl Codegen {
         let result = self.call_rt(builder, "knot_relation_empty", &[]);
         let mut loop_stack: Vec<LoopInfo> = Vec::new();
 
+        // Pre-scan: if there's a groupBy, create a temp relation to collect
+        // pre-group rows. This must be allocated before any loops start.
+        let group_by_pos = stmts.iter().position(|s| {
+            matches!(&s.node, ast::StmtKind::GroupBy { .. })
+        });
+        let temp = if group_by_pos.is_some() {
+            self.call_rt(builder, "knot_relation_empty", &[])
+        } else {
+            // Placeholder — never used when there's no groupBy
+            result
+        };
+        let mut primary_var: Option<String> = None;
+        let mut primary_source: Option<String> = None;
+
         for (stmt_idx, stmt) in stmts.iter().enumerate() {
             match &stmt.node {
                 ast::StmtKind::Bind { pat, expr } => {
@@ -3225,6 +3242,17 @@ impl Codegen {
                     // Bind pattern (constructor patterns emit filter branches)
                     let mut pattern_skips = Vec::new();
                     bind_do_pattern(builder, self, pat, row, env, &mut pattern_skips);
+
+                    // Track the primary bind variable (most recent Var pattern)
+                    // and source name for groupBy
+                    if group_by_pos.is_some() {
+                        if let ast::PatKind::Var(name) = &pat.node {
+                            primary_var = Some(name.clone());
+                        }
+                        if let ast::ExprKind::SourceRef(name) = &expr.node {
+                            primary_source = Some(name.clone());
+                        }
+                    }
 
                     loop_stack.push(LoopInfo {
                         header,
@@ -3268,6 +3296,129 @@ impl Codegen {
                 ast::StmtKind::Let { pat, expr } => {
                     let val = self.compile_expr(builder, expr, env, db);
                     bind_pattern_env(pat, val, env);
+                }
+
+                ast::StmtKind::GroupBy { key } => {
+                    // ── Phase transition: pre-group → post-group ──
+                    //
+                    // 1. Push the primary bind variable's value into temp
+                    //    (we're inside the pre-group loops)
+                    let var_name = primary_var.as_ref().expect(
+                        "groupBy requires a preceding bind statement with a variable pattern"
+                    );
+                    let var_val = env.get(var_name);
+                    self.call_rt_void(
+                        builder,
+                        "knot_relation_push",
+                        &[temp, var_val],
+                    );
+
+                    // 2. Close all pre-group loops
+                    while let Some(info) = loop_stack.pop() {
+                        builder.ins().jump(info.continue_blk, &[]);
+                        for skip in &info.where_skips {
+                            builder.switch_to_block(*skip);
+                            builder.seal_block(*skip);
+                            builder.ins().jump(info.continue_blk, &[]);
+                        }
+                        builder.switch_to_block(info.continue_blk);
+                        builder.seal_block(info.continue_blk);
+                        let one = builder.ins().iconst(types::I64, 1);
+                        let next_i = builder.ins().iadd(info.index_var, one);
+                        builder.ins().jump(info.header, &[next_i]);
+                        builder.seal_block(info.header);
+                        builder.switch_to_block(info.exit);
+                        builder.seal_block(info.exit);
+                    }
+
+                    // 3. Extract schema and key column names for SQLite grouping
+                    let source_name = primary_source.as_ref().expect(
+                        "groupBy requires a preceding bind from a source relation (*name)"
+                    );
+                    let schema = self
+                        .source_schemas
+                        .get(source_name)
+                        .cloned()
+                        .unwrap_or_default();
+
+                    // Extract key column names from the key record expression
+                    let key_cols: Vec<String> = match &key.node {
+                        ast::ExprKind::Record(fields) => fields
+                            .iter()
+                            .map(|f| match &f.value.node {
+                                ast::ExprKind::FieldAccess { field, .. } => {
+                                    field.clone()
+                                }
+                                _ => f.name.clone(),
+                            })
+                            .collect(),
+                        _ => panic!(
+                            "groupBy key must be a record expression"
+                        ),
+                    };
+                    let key_cols_str = key_cols.join(",");
+
+                    let (schema_ptr, schema_len) =
+                        self.string_ptr(builder, &schema);
+                    let (key_cols_ptr, key_cols_len) =
+                        self.string_ptr(builder, &key_cols_str);
+
+                    // 4. Call runtime groupBy (SQLite-based)
+                    let groups = self.call_rt(
+                        builder,
+                        "knot_relation_group_by",
+                        &[
+                            db,
+                            temp,
+                            schema_ptr,
+                            schema_len,
+                            key_cols_ptr,
+                            key_cols_len,
+                        ],
+                    );
+
+                    // 5. Start a new loop over the groups
+                    let groups_len = self.call_rt(
+                        builder,
+                        "knot_relation_len",
+                        &[groups],
+                    );
+
+                    let g_header = builder.create_block();
+                    let g_body = builder.create_block();
+                    let g_continue = builder.create_block();
+                    let g_exit = builder.create_block();
+
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    builder.ins().jump(g_header, &[zero]);
+
+                    builder.switch_to_block(g_header);
+                    let g_i = builder.append_block_param(g_header, types::I64);
+                    let g_cond = builder
+                        .ins()
+                        .icmp(IntCC::SignedLessThan, g_i, groups_len);
+                    builder
+                        .ins()
+                        .brif(g_cond, g_body, &[], g_exit, &[]);
+
+                    builder.switch_to_block(g_body);
+                    builder.seal_block(g_body);
+
+                    // 6. Rebind the primary variable to the current group
+                    let group = self.call_rt(
+                        builder,
+                        "knot_relation_get",
+                        &[groups, g_i],
+                    );
+                    env.set(var_name, group);
+
+                    loop_stack.push(LoopInfo {
+                        header: g_header,
+                        continue_blk: g_continue,
+                        exit: g_exit,
+                        index_var: g_i,
+                        where_skips: Vec::new(),
+                    });
                 }
 
                 ast::StmtKind::Expr(expr) => {
@@ -3648,6 +3799,7 @@ impl Codegen {
                 ast::StmtKind::Bind { expr, .. } => Self::references_source(expr, source_name),
                 ast::StmtKind::Let { expr, .. } => Self::references_source(expr, source_name),
                 ast::StmtKind::Where { cond } => Self::references_source(cond, source_name),
+                ast::StmtKind::GroupBy { key } => Self::references_source(key, source_name),
                 ast::StmtKind::Expr(e) => Self::references_source(e, source_name),
             }),
             ast::ExprKind::Yield(inner) => Self::references_source(inner, source_name),
@@ -4250,6 +4402,7 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
             ast::StmtKind::Bind { expr, .. } => expr_contains_derived_ref(expr, name),
             ast::StmtKind::Let { expr, .. } => expr_contains_derived_ref(expr, name),
             ast::StmtKind::Where { cond } => expr_contains_derived_ref(cond, name),
+            ast::StmtKind::GroupBy { key } => expr_contains_derived_ref(key, name),
             ast::StmtKind::Expr(e) => expr_contains_derived_ref(e, name),
         }),
         ast::ExprKind::Yield(inner) | ast::ExprKind::Atomic(inner) => {
@@ -4352,6 +4505,9 @@ fn collect_free_vars(expr: &ast::Expr, bound: &[String], free: &mut Vec<String>)
                     }
                     ast::StmtKind::Where { cond } => {
                         collect_free_vars(cond, &do_bound, free);
+                    }
+                    ast::StmtKind::GroupBy { key } => {
+                        collect_free_vars(key, &do_bound, free);
                     }
                     ast::StmtKind::Expr(e) => {
                         collect_free_vars(e, &do_bound, free);
@@ -4612,6 +4768,7 @@ fn pretty_stmt(stmt: &ast::Stmt) -> String {
             format!("let {} = {}", pretty_pat(pat), pretty_expr(expr))
         }
         ast::StmtKind::Where { cond } => format!("where {}", pretty_expr(cond)),
+        ast::StmtKind::GroupBy { key } => format!("groupBy {}", pretty_expr(key)),
         ast::StmtKind::Expr(e) => pretty_expr(e),
     }
 }

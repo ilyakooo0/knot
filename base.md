@@ -340,6 +340,90 @@ listen : Int -> (a -> b) -> {}
 ```
 Start an HTTP server on the given port with a handler function. The handler receives a route ADT value and returns a response. Has the `{network}` effect. See `route` declarations in the language spec for defining typed endpoints.
 
+## Traits
+
+The following traits are defined in the prelude. All types that implement a trait can use its methods without imports.
+
+### Eq
+
+```knot
+trait Eq a where
+  eq : a -> a -> Bool
+```
+Structural equality as a trait method. Built-in impls for `Int`, `Float`, `Text`, `Bool`.
+
+### Ord
+
+```knot
+trait Eq a => Ord a where
+  compare : a -> a -> Int
+```
+Ordering comparison. Returns `-1`, `0`, or `1`. Requires `Eq`. Built-in impls for `Int`, `Float`, `Text`.
+
+### Num
+
+```knot
+trait Eq a => Num a where
+  add : a -> a -> a
+  sub : a -> a -> a
+  mul : a -> a -> a
+  div : a -> a -> a
+  negate : a -> a
+```
+Numeric operations as trait methods. Requires `Eq`. Built-in impls for `Int` and `Float`. Use as a trait bound for generic numeric code:
+
+```knot
+double : Num a => a -> a
+double = \x -> add x x
+
+double 21      -- 42
+double 1.5     -- 3.0
+```
+
+The methods wrap the corresponding built-in operators (`+`, `-`, `*`, `/`, unary `-`), but can be passed as values and used in higher-order functions:
+
+```knot
+fold add 0 [1, 2, 3]    -- 6
+```
+
+### Functor
+
+```knot
+trait Functor (f : Type -> Type) where
+  map : (a -> b) -> f a -> f b
+```
+
+### Applicative
+
+```knot
+trait Functor f => Applicative (f : Type -> Type) where
+  yield : a -> f a
+  ap : f (a -> b) -> f a -> f b
+```
+
+### Monad
+
+```knot
+trait Applicative m => Monad (m : Type -> Type) where
+  bind : (a -> m b) -> m a -> m b
+```
+
+### Alternative
+
+```knot
+trait Applicative f => Alternative (f : Type -> Type) where
+  empty : f a
+  alt : f a -> f a -> f a
+```
+Built-in impl for `[]`: `empty = []`, `alt = union`.
+
+### Foldable
+
+```knot
+trait Foldable (t : Type -> Type) where
+  fold : (b -> a -> b) -> b -> t a -> b
+```
+
 ## Operators
 
 These are not functions but are available as infix operators:

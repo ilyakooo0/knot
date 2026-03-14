@@ -1,6 +1,6 @@
 //! Built-in trait declarations and standard implementations.
 //!
-//! Defines the core trait hierarchy (Eq, Ord, Functor, Applicative, Monad,
+//! Defines the core trait hierarchy (Eq, Ord, Num, Functor, Applicative, Monad,
 //! Alternative, Foldable) and primitive/[] implementations. Trait declarations
 //! and simple impls are parsed from Knot source; complex [] impls for HKT
 //! traits (Functor, Applicative, Monad, Foldable) are registered directly
@@ -55,6 +55,27 @@ impl Ord Float where
 
 impl Ord Text where
   compare a b = if a < b then 0 - 1 else if a > b then 1 else 0
+
+trait Eq a => Num a where
+  add : a -> a -> a
+  sub : a -> a -> a
+  mul : a -> a -> a
+  div : a -> a -> a
+  negate : a -> a
+
+impl Num Int where
+  add a b = a + b
+  sub a b = a - b
+  mul a b = a * b
+  div a b = a / b
+  negate a = 0 - a
+
+impl Num Float where
+  add a b = a + b
+  sub a b = a - b
+  mul a b = a * b
+  div a b = a / b
+  negate a = 0.0 - a
 
 impl Alternative [] where
   empty = []

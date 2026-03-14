@@ -430,6 +430,27 @@ impl Codegen {
         // Monadic bind for relations (do-desugaring)
         self.declare_rt("knot_relation_bind", &[p, p, p], &[p]);
 
+        // Standard library: relation operations
+        self.declare_rt("knot_relation_filter", &[p, p, p], &[p]);
+        self.declare_rt("knot_relation_map", &[p, p, p], &[p]);
+        self.declare_rt("knot_relation_fold", &[p, p, p, p], &[p]);
+        self.declare_rt("knot_relation_single", &[p], &[p]);
+
+        // Standard library: text operations
+        self.declare_rt("knot_text_to_upper", &[p], &[p]);
+        self.declare_rt("knot_text_to_lower", &[p], &[p]);
+        self.declare_rt("knot_text_take", &[p, p], &[p]);
+        self.declare_rt("knot_text_drop", &[p, p], &[p]);
+        self.declare_rt("knot_text_length", &[p], &[p]);
+        self.declare_rt("knot_text_trim", &[p], &[p]);
+        self.declare_rt("knot_text_contains", &[p, p], &[p]);
+        self.declare_rt("knot_text_reverse", &[p], &[p]);
+        self.declare_rt("knot_text_chars", &[p], &[p]);
+
+        // Standard library: utility
+        self.declare_rt("knot_value_id", &[p], &[p]);
+        self.declare_rt("knot_value_not_fn", &[p], &[p]);
+
         // Fixpoint iteration for recursive derived relations
         self.declare_rt("knot_relation_fixpoint", &[p, p, p], &[p]);
 
@@ -462,6 +483,202 @@ impl Codegen {
         self.runtime_fns.insert(name.to_string(), id);
     }
 
+    /// Register a standard library function as a user_fn.
+    /// All stdlib functions are registered as 1-param so they curry properly.
+    fn register_stdlib_fn(&mut self, name: &str) {
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(self.ptr_type)); // db
+        sig.params.push(AbiParam::new(self.ptr_type)); // arg1
+        sig.returns.push(AbiParam::new(self.ptr_type));
+        let func_name = format!("knot_user_{}", name);
+        let func_id = self
+            .module
+            .declare_function(&func_name, Linkage::Local, &sig)
+            .unwrap();
+        self.user_fns.insert(name.into(), (func_id, 1));
+    }
+
+    /// Declare a helper closure function with the standard (db, env, arg) -> result signature.
+    fn declare_closure_fn(&mut self, name: &str) -> FuncId {
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(self.ptr_type)); // db
+        sig.params.push(AbiParam::new(self.ptr_type)); // env
+        sig.params.push(AbiParam::new(self.ptr_type)); // arg
+        sig.returns.push(AbiParam::new(self.ptr_type));
+        self.module
+            .declare_function(name, Linkage::Local, &sig)
+            .unwrap()
+    }
+
+    /// Define a 1-param stdlib function that directly delegates to a runtime function.
+    fn define_stdlib_fn_1(&mut self, name: &str, rt_name: &str) {
+        let (func_id, _) = self.user_fns[name];
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(self.ptr_type)); // db
+        sig.params.push(AbiParam::new(self.ptr_type)); // arg
+        sig.returns.push(AbiParam::new(self.ptr_type));
+
+        let rt_name = rt_name.to_string();
+        self.build_function(func_id, sig, |cg, builder, entry| {
+            let arg = builder.block_params(entry)[1];
+            let result = cg.call_rt(builder, &rt_name, &[arg]);
+            builder.ins().return_(&[result]);
+        });
+    }
+
+    /// Define a 2-param stdlib function using currying:
+    /// outer(db, arg1) -> Function(inner, env={arg1}, name)
+    /// inner(db, env, arg2) -> rt_fn(db, arg1, arg2)
+    fn define_stdlib_fn_2(
+        &mut self,
+        name: &str,
+        rt_name: &str,
+        rt_needs_db: bool,
+    ) {
+        let inner_id = self.declare_closure_fn(&format!("__stdlib_{}_apply", name));
+
+        // Define the outer function: captures arg1, returns closure
+        let (func_id, _) = self.user_fns[name];
+        let mut outer_sig = self.module.make_signature();
+        outer_sig.params.push(AbiParam::new(self.ptr_type)); // db
+        outer_sig.params.push(AbiParam::new(self.ptr_type)); // arg1
+        outer_sig.returns.push(AbiParam::new(self.ptr_type));
+
+        let fn_name = name.to_string();
+        self.build_function(func_id, outer_sig, |cg, builder, entry| {
+            let arg1 = builder.block_params(entry)[1];
+
+            // Build env record with arg1
+            let n = builder.ins().iconst(cg.ptr_type, 1);
+            let env = cg.call_rt(builder, "knot_record_empty", &[n]);
+            let (k_ptr, k_len) = cg.string_ptr(builder, "0");
+            cg.call_rt_void(builder, "knot_record_set_field", &[env, k_ptr, k_len, arg1]);
+
+            // Create Function value pointing to inner closure
+            let inner_ref = cg.module.declare_func_in_func(inner_id, builder.func);
+            let fn_addr = builder.ins().func_addr(cg.ptr_type, inner_ref);
+            let (src_ptr, src_len) = cg.string_ptr(builder, &fn_name);
+            let result =
+                cg.call_rt(builder, "knot_value_function", &[fn_addr, env, src_ptr, src_len]);
+            builder.ins().return_(&[result]);
+        });
+
+        // Define the inner closure: extracts arg1 from env, calls runtime
+        let mut inner_sig = self.module.make_signature();
+        inner_sig.params.push(AbiParam::new(self.ptr_type)); // db
+        inner_sig.params.push(AbiParam::new(self.ptr_type)); // env
+        inner_sig.params.push(AbiParam::new(self.ptr_type)); // arg2
+        inner_sig.returns.push(AbiParam::new(self.ptr_type));
+
+        let rt_name = rt_name.to_string();
+        self.build_function(inner_id, inner_sig, |cg, builder, entry| {
+            let db = builder.block_params(entry)[0];
+            let env = builder.block_params(entry)[1];
+            let arg2 = builder.block_params(entry)[2];
+
+            // Extract arg1 from env
+            let (k_ptr, k_len) = cg.string_ptr(builder, "0");
+            let arg1 = cg.call_rt(builder, "knot_record_field", &[env, k_ptr, k_len]);
+
+            let result = if rt_needs_db {
+                cg.call_rt(builder, &rt_name, &[db, arg1, arg2])
+            } else {
+                cg.call_rt(builder, &rt_name, &[arg1, arg2])
+            };
+            builder.ins().return_(&[result]);
+        });
+    }
+
+    /// Define a 3-param stdlib function using double currying:
+    /// outer(db, arg1) -> Function(middle, {arg1})
+    /// middle(db, {arg1}, arg2) -> Function(inner, {arg1, arg2})
+    /// inner(db, {arg1, arg2}, arg3) -> rt_fn(db, arg1, arg2, arg3)
+    fn define_stdlib_fn_3(
+        &mut self,
+        name: &str,
+        rt_name: &str,
+    ) {
+        let middle_id = self.declare_closure_fn(&format!("__stdlib_{}_mid", name));
+        let inner_id = self.declare_closure_fn(&format!("__stdlib_{}_apply", name));
+
+        // Outer: captures arg1, returns Function(middle)
+        let (func_id, _) = self.user_fns[name];
+        let mut outer_sig = self.module.make_signature();
+        outer_sig.params.push(AbiParam::new(self.ptr_type));
+        outer_sig.params.push(AbiParam::new(self.ptr_type));
+        outer_sig.returns.push(AbiParam::new(self.ptr_type));
+
+        let fn_name = name.to_string();
+        self.build_function(func_id, outer_sig, |cg, builder, entry| {
+            let arg1 = builder.block_params(entry)[1];
+
+            let n = builder.ins().iconst(cg.ptr_type, 1);
+            let env = cg.call_rt(builder, "knot_record_empty", &[n]);
+            let (k_ptr, k_len) = cg.string_ptr(builder, "0");
+            cg.call_rt_void(builder, "knot_record_set_field", &[env, k_ptr, k_len, arg1]);
+
+            let mid_ref = cg.module.declare_func_in_func(middle_id, builder.func);
+            let fn_addr = builder.ins().func_addr(cg.ptr_type, mid_ref);
+            let (src_ptr, src_len) = cg.string_ptr(builder, &fn_name);
+            let result =
+                cg.call_rt(builder, "knot_value_function", &[fn_addr, env, src_ptr, src_len]);
+            builder.ins().return_(&[result]);
+        });
+
+        // Middle: captures arg1 + arg2, returns Function(inner)
+        let mut mid_sig = self.module.make_signature();
+        mid_sig.params.push(AbiParam::new(self.ptr_type));
+        mid_sig.params.push(AbiParam::new(self.ptr_type));
+        mid_sig.params.push(AbiParam::new(self.ptr_type));
+        mid_sig.returns.push(AbiParam::new(self.ptr_type));
+
+        let fn_name = name.to_string();
+        self.build_function(middle_id, mid_sig, |cg, builder, entry| {
+            let prev_env = builder.block_params(entry)[1];
+            let arg2 = builder.block_params(entry)[2];
+
+            // Extract arg1 from previous env
+            let (k0_ptr, k0_len) = cg.string_ptr(builder, "0");
+            let arg1 = cg.call_rt(builder, "knot_record_field", &[prev_env, k0_ptr, k0_len]);
+
+            // Build new env with both args
+            let n = builder.ins().iconst(cg.ptr_type, 2);
+            let env = cg.call_rt(builder, "knot_record_empty", &[n]);
+            cg.call_rt_void(builder, "knot_record_set_field", &[env, k0_ptr, k0_len, arg1]);
+            let (k1_ptr, k1_len) = cg.string_ptr(builder, "1");
+            cg.call_rt_void(builder, "knot_record_set_field", &[env, k1_ptr, k1_len, arg2]);
+
+            let inner_ref = cg.module.declare_func_in_func(inner_id, builder.func);
+            let fn_addr = builder.ins().func_addr(cg.ptr_type, inner_ref);
+            let (src_ptr, src_len) = cg.string_ptr(builder, &fn_name);
+            let result =
+                cg.call_rt(builder, "knot_value_function", &[fn_addr, env, src_ptr, src_len]);
+            builder.ins().return_(&[result]);
+        });
+
+        // Inner: extracts arg1, arg2 from env, calls runtime with all 3 + db
+        let mut inner_sig = self.module.make_signature();
+        inner_sig.params.push(AbiParam::new(self.ptr_type));
+        inner_sig.params.push(AbiParam::new(self.ptr_type));
+        inner_sig.params.push(AbiParam::new(self.ptr_type));
+        inner_sig.returns.push(AbiParam::new(self.ptr_type));
+
+        let rt_name = rt_name.to_string();
+        self.build_function(inner_id, inner_sig, |cg, builder, entry| {
+            let db = builder.block_params(entry)[0];
+            let env = builder.block_params(entry)[1];
+            let arg3 = builder.block_params(entry)[2];
+
+            let (k0_ptr, k0_len) = cg.string_ptr(builder, "0");
+            let arg1 = cg.call_rt(builder, "knot_record_field", &[env, k0_ptr, k0_len]);
+            let (k1_ptr, k1_len) = cg.string_ptr(builder, "1");
+            let arg2 = cg.call_rt(builder, "knot_record_field", &[env, k1_ptr, k1_len]);
+
+            let result = cg.call_rt(builder, &rt_name, &[db, arg1, arg2, arg3]);
+            builder.ins().return_(&[result]);
+        });
+    }
+
     // ── Declaration collection ────────────────────────────────────
 
     fn collect_declarations(&mut self, module: &ast::Module) {
@@ -478,6 +695,17 @@ impl Codegen {
                 .declare_function("knot_user___bind", Linkage::Local, &sig)
                 .unwrap();
             self.user_fns.insert("__bind".into(), (func_id, 2));
+        }
+
+        // Register standard library functions (all as 1-param for proper currying)
+        let stdlib_names = [
+            "filter", "map", "fold", "single",
+            "toUpper", "toLower", "take", "drop",
+            "length", "trim", "contains", "reverse",
+            "chars", "id", "not",
+        ];
+        for name in &stdlib_names {
+            self.register_stdlib_fn(name);
         }
 
         for decl in &module.decls {
@@ -917,6 +1145,28 @@ impl Codegen {
                 builder.ins().return_(&[result]);
             });
         }
+
+        // Define standard library functions
+        // 1-param: direct delegation to runtime
+        self.define_stdlib_fn_1("single", "knot_relation_single");
+        self.define_stdlib_fn_1("toUpper", "knot_text_to_upper");
+        self.define_stdlib_fn_1("toLower", "knot_text_to_lower");
+        self.define_stdlib_fn_1("length", "knot_text_length");
+        self.define_stdlib_fn_1("trim", "knot_text_trim");
+        self.define_stdlib_fn_1("reverse", "knot_text_reverse");
+        self.define_stdlib_fn_1("chars", "knot_text_chars");
+        self.define_stdlib_fn_1("id", "knot_value_id");
+        self.define_stdlib_fn_1("not", "knot_value_not_fn");
+
+        // 2-param: curried (outer captures arg1, inner calls runtime)
+        self.define_stdlib_fn_2("filter", "knot_relation_filter", true);
+        self.define_stdlib_fn_2("map", "knot_relation_map", true);
+        self.define_stdlib_fn_2("take", "knot_text_take", false);
+        self.define_stdlib_fn_2("drop", "knot_text_drop", false);
+        self.define_stdlib_fn_2("contains", "knot_text_contains", false);
+
+        // 3-param: double-curried
+        self.define_stdlib_fn_3("fold", "knot_relation_fold");
 
         for decl in &module.decls {
             match &decl.node {
@@ -4100,6 +4350,18 @@ fn is_builtin_name(name: &str) -> bool {
             | "__yield"
             | "__empty"
             | "listen"
+            | "single"
+            | "toUpper"
+            | "toLower"
+            | "take"
+            | "drop"
+            | "length"
+            | "trim"
+            | "contains"
+            | "reverse"
+            | "chars"
+            | "id"
+            | "not"
     )
 }
 

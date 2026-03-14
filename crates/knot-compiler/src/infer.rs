@@ -1647,6 +1647,159 @@ impl Infer {
                 ),
             },
         );
+
+        // ── Standard library ─────────────────────────────────────
+
+        // filter : ∀a. (a -> Bool) -> [a] -> [a]
+        let a = self.fresh_var();
+        self.bind_top(
+            "filter",
+            Scheme {
+                vars: vec![a],
+                ty: Ty::Fun(
+                    Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Bool))),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                    )),
+                ),
+            },
+        );
+
+        // map : ∀a b. (a -> b) -> [a] -> [b]
+        let a = self.fresh_var();
+        let b = self.fresh_var();
+        self.bind_top(
+            "map",
+            Scheme {
+                vars: vec![a, b],
+                ty: Ty::Fun(
+                    Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        Box::new(Ty::Relation(Box::new(Ty::Var(b)))),
+                    )),
+                ),
+            },
+        );
+
+        // fold : ∀a b. (b -> a -> b) -> b -> [a] -> b
+        let a = self.fresh_var();
+        let b = self.fresh_var();
+        self.bind_top(
+            "fold",
+            Scheme {
+                vars: vec![a, b],
+                ty: Ty::Fun(
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Var(b)),
+                        Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
+                    )),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Var(b)),
+                        Box::new(Ty::Fun(
+                            Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                            Box::new(Ty::Var(b)),
+                        )),
+                    )),
+                ),
+            },
+        );
+
+        // single : ∀a. [a] -> a
+        let a = self.fresh_var();
+        self.bind_top(
+            "single",
+            Scheme {
+                vars: vec![a],
+                ty: Ty::Fun(
+                    Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                    Box::new(Ty::Var(a)),
+                ),
+            },
+        );
+
+        // toUpper : Text -> Text
+        self.bind_top(
+            "toUpper",
+            Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Text))),
+        );
+
+        // toLower : Text -> Text
+        self.bind_top(
+            "toLower",
+            Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Text))),
+        );
+
+        // take : Int -> Text -> Text
+        self.bind_top(
+            "take",
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Int),
+                Box::new(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Text))),
+            )),
+        );
+
+        // drop : Int -> Text -> Text
+        self.bind_top(
+            "drop",
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Int),
+                Box::new(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Text))),
+            )),
+        );
+
+        // length : Text -> Int
+        self.bind_top(
+            "length",
+            Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Int))),
+        );
+
+        // trim : Text -> Text
+        self.bind_top(
+            "trim",
+            Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Text))),
+        );
+
+        // contains : Text -> Text -> Bool
+        self.bind_top(
+            "contains",
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Text),
+                Box::new(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Bool))),
+            )),
+        );
+
+        // reverse : Text -> Text
+        self.bind_top(
+            "reverse",
+            Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Text))),
+        );
+
+        // chars : Text -> [Text]
+        self.bind_top(
+            "chars",
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Text),
+                Box::new(Ty::Relation(Box::new(Ty::Text))),
+            )),
+        );
+
+        // id : ∀a. a -> a
+        let a = self.fresh_var();
+        self.bind_top(
+            "id",
+            Scheme {
+                vars: vec![a],
+                ty: Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(a))),
+            },
+        );
+
+        // not : Bool -> Bool
+        self.bind_top(
+            "not",
+            Scheme::mono(Ty::Fun(Box::new(Ty::Bool), Box::new(Ty::Bool))),
+        );
     }
 
     fn register_trait_methods(

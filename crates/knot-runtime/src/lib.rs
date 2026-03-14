@@ -747,6 +747,218 @@ pub extern "C" fn knot_value_show(v: *mut Value) -> *mut Value {
     alloc(Value::Text(show_inner(v)))
 }
 
+// ── Standard library: relation operations ─────────────────────────
+
+/// filter(pred, rel) — keep rows where pred returns true
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_filter(
+    db: *mut c_void,
+    pred: *mut Value,
+    rel: *mut Value,
+) -> *mut Value {
+    let rows = match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => rows.clone(),
+        _ => panic!(
+            "knot runtime: filter expected Relation, got {}",
+            type_name(rel)
+        ),
+    };
+    let mut result: Vec<*mut Value> = Vec::new();
+    for row in rows {
+        let v = knot_value_call(db, pred, row);
+        match unsafe { as_ref(v) } {
+            Value::Bool(true) => result.push(row),
+            Value::Bool(false) => {}
+            _ => panic!("knot runtime: filter predicate must return Bool"),
+        }
+    }
+    alloc(Value::Relation(result))
+}
+
+/// map(f, rel) — apply f to each row, collect results (deduplicating)
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_map(
+    db: *mut c_void,
+    func: *mut Value,
+    rel: *mut Value,
+) -> *mut Value {
+    let rows = match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => rows.clone(),
+        _ => panic!(
+            "knot runtime: map expected Relation, got {}",
+            type_name(rel)
+        ),
+    };
+    let mut result: Vec<*mut Value> = Vec::new();
+    for row in rows {
+        let v = knot_value_call(db, func, row);
+        if !result.iter().any(|existing| values_equal(*existing, v)) {
+            result.push(v);
+        }
+    }
+    alloc(Value::Relation(result))
+}
+
+/// fold(f, init, rel) — left fold over a relation
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_fold(
+    db: *mut c_void,
+    func: *mut Value,
+    init: *mut Value,
+    rel: *mut Value,
+) -> *mut Value {
+    let rows = match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => rows.clone(),
+        _ => panic!(
+            "knot runtime: fold expected Relation, got {}",
+            type_name(rel)
+        ),
+    };
+    let mut acc = init;
+    for row in rows {
+        // func is curried: func(acc) returns a function, then that function(row) returns new acc
+        let partial = knot_value_call(db, func, acc);
+        acc = knot_value_call(db, partial, row);
+    }
+    acc
+}
+
+/// single(rel) — extract the single element from a one-element relation
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_single(rel: *mut Value) -> *mut Value {
+    let rows = match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: single expected Relation, got {}",
+            type_name(rel)
+        ),
+    };
+    match rows.len() {
+        1 => rows[0],
+        0 => panic!("knot runtime: single called on empty relation"),
+        n => panic!("knot runtime: single called on relation with {} elements", n),
+    }
+}
+
+// ── Standard library: text operations ─────────────────────────────
+
+/// toUpper(text) — convert text to uppercase
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_text_to_upper(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Text(s) => alloc(Value::Text(s.to_uppercase())),
+        _ => panic!("knot runtime: toUpper expected Text, got {}", type_name(v)),
+    }
+}
+
+/// toLower(text) — convert text to lowercase
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_text_to_lower(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Text(s) => alloc(Value::Text(s.to_lowercase())),
+        _ => panic!("knot runtime: toLower expected Text, got {}", type_name(v)),
+    }
+}
+
+/// take(n, text) — first n characters
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_text_take(n: *mut Value, text: *mut Value) -> *mut Value {
+    let n = match unsafe { as_ref(n) } {
+        Value::Int(n) => *n as usize,
+        _ => panic!("knot runtime: take expected Int as first arg, got {}", type_name(n)),
+    };
+    match unsafe { as_ref(text) } {
+        Value::Text(s) => {
+            let result: String = s.chars().take(n).collect();
+            alloc(Value::Text(result))
+        }
+        _ => panic!("knot runtime: take expected Text as second arg, got {}", type_name(text)),
+    }
+}
+
+/// drop(n, text) — skip first n characters
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_text_drop(n: *mut Value, text: *mut Value) -> *mut Value {
+    let n = match unsafe { as_ref(n) } {
+        Value::Int(n) => *n as usize,
+        _ => panic!("knot runtime: drop expected Int as first arg, got {}", type_name(n)),
+    };
+    match unsafe { as_ref(text) } {
+        Value::Text(s) => {
+            let result: String = s.chars().skip(n).collect();
+            alloc(Value::Text(result))
+        }
+        _ => panic!("knot runtime: drop expected Text as second arg, got {}", type_name(text)),
+    }
+}
+
+/// length(text) — character count of a text value
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_text_length(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Text(s) => knot_value_int(s.chars().count() as i64),
+        _ => panic!("knot runtime: length expected Text, got {}", type_name(v)),
+    }
+}
+
+/// trim(text) — strip leading and trailing whitespace
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_text_trim(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Text(s) => alloc(Value::Text(s.trim().to_string())),
+        _ => panic!("knot runtime: trim expected Text, got {}", type_name(v)),
+    }
+}
+
+/// contains(needle, haystack) — check if text contains a substring
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_text_contains(needle: *mut Value, haystack: *mut Value) -> *mut Value {
+    let needle = match unsafe { as_ref(needle) } {
+        Value::Text(s) => s.clone(),
+        _ => panic!("knot runtime: contains expected Text as first arg"),
+    };
+    match unsafe { as_ref(haystack) } {
+        Value::Text(s) => alloc(Value::Bool(s.contains(&needle))),
+        _ => panic!("knot runtime: contains expected Text as second arg"),
+    }
+}
+
+/// reverse(text) — reverse a text value
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_text_reverse(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Text(s) => alloc(Value::Text(s.chars().rev().collect())),
+        _ => panic!("knot runtime: reverse expected Text, got {}", type_name(v)),
+    }
+}
+
+/// chars(text) — convert text to a relation of single characters
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_text_chars(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Text(s) => {
+            let rows: Vec<*mut Value> = s
+                .chars()
+                .map(|c| alloc(Value::Text(c.to_string())))
+                .collect();
+            alloc(Value::Relation(rows))
+        }
+        _ => panic!("knot runtime: chars expected Text, got {}", type_name(v)),
+    }
+}
+
+/// id(x) — identity function, returns its argument unchanged
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_value_id(v: *mut Value) -> *mut Value {
+    v
+}
+
+/// not(bool) — boolean negation (function form of !)
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_value_not_fn(v: *mut Value) -> *mut Value {
+    knot_value_not(v)
+}
+
 // ── Database operations ───────────────────────────────────────────
 
 #[unsafe(no_mangle)]

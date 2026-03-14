@@ -186,6 +186,18 @@ impl EffectChecker {
         builtin_effects.insert("filter".into(), EffectSet::empty());
         builtin_effects.insert("map".into(), EffectSet::empty());
         builtin_effects.insert("fold".into(), EffectSet::empty());
+        builtin_effects.insert("single".into(), EffectSet::empty());
+        builtin_effects.insert("toUpper".into(), EffectSet::empty());
+        builtin_effects.insert("toLower".into(), EffectSet::empty());
+        builtin_effects.insert("take".into(), EffectSet::empty());
+        builtin_effects.insert("drop".into(), EffectSet::empty());
+        builtin_effects.insert("length".into(), EffectSet::empty());
+        builtin_effects.insert("trim".into(), EffectSet::empty());
+        builtin_effects.insert("contains".into(), EffectSet::empty());
+        builtin_effects.insert("reverse".into(), EffectSet::empty());
+        builtin_effects.insert("chars".into(), EffectSet::empty());
+        builtin_effects.insert("id".into(), EffectSet::empty());
+        builtin_effects.insert("not".into(), EffectSet::empty());
 
         Self {
             decl_effects: HashMap::new(),

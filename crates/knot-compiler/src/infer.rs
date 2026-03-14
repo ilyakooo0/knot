@@ -1614,10 +1614,19 @@ impl Infer {
             }
             ast::PatKind::Wildcard => {}
             ast::PatKind::Constructor { name, payload } => {
-                if let Some((data_ty, record_ty)) =
+                if let Some((_data_ty, record_ty)) =
                     self.instantiate_ctor(name, pat.span)
                 {
-                    self.unify(expected, &data_ty, pat.span);
+                    // Create an open variant with just this constructor.
+                    // This enables row-polymorphic variant matching: the
+                    // scrutinee only needs to *contain* this constructor,
+                    // not be the exact nominal ADT that defines it.
+                    let row_var = self.fresh_var();
+                    let mut ctors = BTreeMap::new();
+                    ctors.insert(name.clone(), record_ty.clone());
+                    let variant_ty =
+                        Ty::Variant(ctors, Some(row_var));
+                    self.unify(expected, &variant_ty, pat.span);
                     self.check_pattern(payload, &record_ty);
                 } else {
                     self.error(
@@ -1674,18 +1683,6 @@ impl Infer {
         // Resolve the scrutinee type through substitution.
         let resolved = self.apply(scrut_ty);
 
-        // Only check ADTs — primitives (Int, Text, etc.) have infinite
-        // domains and can't be exhaustively matched by constructors.
-        let type_name = match &resolved {
-            Ty::Con(name, _) => name.clone(),
-            _ => return,
-        };
-
-        let data_info = match self.data_types.get(&type_name) {
-            Some(info) => info.clone(),
-            None => return,
-        };
-
         // If any arm has an unconditional catch-all pattern (wildcard or
         // variable) at the top level, the match is trivially exhaustive.
         let has_catchall = arms.iter().any(|arm| {
@@ -1698,36 +1695,152 @@ impl Infer {
             return;
         }
 
-        // Collect which constructors are covered by the arms.
-        let covered: HashSet<&str> = arms
-            .iter()
-            .filter_map(|arm| match &arm.pat.node {
-                ast::PatKind::Constructor { name, .. } => Some(name.as_str()),
-                _ => None,
-            })
-            .collect();
+        match &resolved {
+            Ty::Con(name, _) => {
+                let data_info = match self.data_types.get(name) {
+                    Some(info) => info.clone(),
+                    None => return,
+                };
 
-        let all_ctors: Vec<&str> =
-            data_info.ctors.iter().map(|(n, _)| n.as_str()).collect();
+                let covered: HashSet<&str> = arms
+                    .iter()
+                    .filter_map(|arm| match &arm.pat.node {
+                        ast::PatKind::Constructor { name, .. } => {
+                            Some(name.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect();
 
-        let missing: Vec<&str> = all_ctors
-            .iter()
-            .copied()
-            .filter(|c| !covered.contains(c))
-            .collect();
+                let missing: Vec<&str> = data_info
+                    .ctors
+                    .iter()
+                    .map(|(n, _)| n.as_str())
+                    .filter(|c| !covered.contains(c))
+                    .collect();
 
-        if missing.is_empty() {
-            return;
+                if !missing.is_empty() {
+                    self.error(
+                        format!(
+                            "non-exhaustive pattern match — missing: {}",
+                            missing.join(", "),
+                        ),
+                        span,
+                    );
+                }
+            }
+            Ty::Variant(ctors, row) => {
+                let covered: HashSet<&str> = arms
+                    .iter()
+                    .filter_map(|arm| match &arm.pat.node {
+                        ast::PatKind::Constructor { name, .. } => {
+                            Some(name.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+
+                if let Some(rv) = row {
+                    // Open variant — check if the covered constructors
+                    // exhaust a known data type; if so, close the row.
+                    let mut data_type_name = None;
+                    let mut all_same = true;
+                    for ctor_name in ctors.keys() {
+                        if let Some(info) =
+                            self.constructors.get(ctor_name)
+                        {
+                            match &data_type_name {
+                                None => {
+                                    data_type_name =
+                                        Some(info.data_type.clone())
+                                }
+                                Some(dt)
+                                    if *dt == info.data_type => {}
+                                _ => {
+                                    all_same = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if all_same {
+                        if let Some(dt) = &data_type_name {
+                            if let Some(dt_info) =
+                                self.data_types.get(dt).cloned()
+                            {
+                                let all_ctors: HashSet<&str> = dt_info
+                                    .ctors
+                                    .iter()
+                                    .map(|(n, _)| n.as_str())
+                                    .collect();
+                                if covered == all_ctors {
+                                    // All constructors of a known type
+                                    // are covered — close the row var.
+                                    let rv = *rv;
+                                    self.subst.insert(
+                                        rv,
+                                        Ty::Variant(
+                                            BTreeMap::new(),
+                                            None,
+                                        ),
+                                    );
+                                    return;
+                                }
+                                // Some constructors of the type are
+                                // missing — report which ones.
+                                let missing: Vec<&str> = all_ctors
+                                    .iter()
+                                    .copied()
+                                    .filter(|c| !covered.contains(c))
+                                    .collect();
+                                if !missing.is_empty() {
+                                    self.error(
+                                        format!(
+                                            "non-exhaustive pattern \
+                                             match — missing: {}",
+                                            missing.join(", "),
+                                        ),
+                                        span,
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
+                    // Open variant with unknown remaining
+                    // constructors — a wildcard is required.
+                    self.error(
+                        "non-exhaustive pattern match on open variant \
+                         — add a wildcard `_` case"
+                            .into(),
+                        span,
+                    );
+                } else {
+                    // Closed variant — check all constructors covered.
+                    let all: HashSet<&str> =
+                        ctors.keys().map(|s| s.as_str()).collect();
+                    let missing: Vec<&str> = all
+                        .iter()
+                        .copied()
+                        .filter(|c| !covered.contains(c))
+                        .collect();
+                    if !missing.is_empty() {
+                        self.error(
+                            format!(
+                                "non-exhaustive pattern match \
+                                 — missing: {}",
+                                missing.join(", "),
+                            ),
+                            span,
+                        );
+                    }
+                }
+            }
+            // Primitives (Int, Text, etc.) have infinite domains.
+            _ => {}
         }
-
-        let missing_list = missing.join(", ");
-        self.error(
-            format!(
-                "non-exhaustive pattern match — missing: {}",
-                missing_list,
-            ),
-            span,
-        );
     }
 
     // ── Do-block inference ───────────────────────────────────────
@@ -3276,6 +3389,79 @@ mod tests {
              isOpen : <Open {} | r> -> Int\n\
              isOpen = \\s -> 1\n\
              main = isOpen (Open {})",
+        );
+        assert!(diags.is_empty(), "unexpected errors: {:?}", diags);
+    }
+
+    #[test]
+    fn case_pattern_infers_open_variant() {
+        // Matching one constructor with wildcard should accept any ADT
+        // that has that constructor — row-polymorphic variant inference.
+        let diags = check_src(
+            "data Status = Open {} | Closed {}\n\
+             data TaskStatus = Open {} | Done {}\n\
+             f = \\s -> case s of\n\
+             \x20 Open {} -> 1\n\
+             \x20 _ -> 0\n\
+             main = f (Open {})",
+        );
+        assert!(diags.is_empty(), "unexpected errors: {:?}", diags);
+    }
+
+    #[test]
+    fn case_all_constructors_closes_variant() {
+        // Matching all constructors without wildcard should close the
+        // variant and the exhaustiveness check should pass.
+        let diags = check_src(
+            "data Shape = Circle {r: Float} | Rect {w: Float, h: Float}\n\
+             area = \\s -> case s of\n\
+             \x20 Circle {r} -> r\n\
+             \x20 Rect {w, h} -> w * h\n\
+             main = area (Circle {r: 3.0})",
+        );
+        assert!(diags.is_empty(), "unexpected errors: {:?}", diags);
+    }
+
+    #[test]
+    fn open_variant_requires_wildcard() {
+        // Partial match without wildcard on an open variant.
+        let diags = check_src(
+            "data Color = Red {} | Green {} | Blue {}\n\
+             f = \\c -> case c of\n\
+             \x20 Red {} -> 1\n\
+             \x20 Green {} -> 2\n\
+             main = f (Red {})",
+        );
+        assert!(has_error(&diags, "non-exhaustive"));
+        assert!(has_error(&diags, "Blue"));
+    }
+
+    #[test]
+    fn do_bind_pattern_infers_open_variant() {
+        // Constructor pattern in do-bind should work with open variants.
+        let diags = check_src(
+            "data Status = Open {} | Closed {} | InProgress {assignee: Text}\n\
+             *items : [{name: Text, status: Status}]\n\
+             &openItems = do\n\
+             \x20 i <- *items\n\
+             \x20 Open {} <- i.status\n\
+             \x20 yield {name: i.name}\n\
+             main = &openItems",
+        );
+        assert!(diags.is_empty(), "unexpected errors: {:?}", diags);
+    }
+
+    #[test]
+    fn open_variant_applied_to_multiple_adts() {
+        // A function with an inferred open variant type should accept
+        // values from different ADTs that share the matched constructor.
+        let diags = check_src(
+            "data AB = A {} | B {}\n\
+             data AC = A {} | C {}\n\
+             hasA = \\x -> case x of\n\
+             \x20 A {} -> 1\n\
+             \x20 _ -> 0\n\
+             main = hasA (A {})",
         );
         assert!(diags.is_empty(), "unexpected errors: {:?}", diags);
     }

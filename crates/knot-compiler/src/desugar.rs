@@ -313,6 +313,17 @@ fn is_pure_comprehension(stmts: &[Stmt]) -> bool {
         return false;
     }
 
+    // Constructor pattern binds may be value pattern matches (not monadic
+    // binds). The desugarer can't tell syntactically whether the expression
+    // is a relation or a value, so we leave these for direct codegen which
+    // handles both cases correctly.
+    if stmts.iter().any(|s| matches!(
+        &s.node,
+        StmtKind::Bind { pat, .. } if matches!(&pat.node, PatKind::Constructor { .. })
+    )) {
+        return false;
+    }
+
     // Check that all non-final statements are Bind/Where/Let
     for stmt in &stmts[..stmts.len() - 1] {
         match &stmt.node {
@@ -686,6 +697,33 @@ mod tests {
                     assert!(
                         matches!(&body.node, ExprKind::Do(_)),
                         "groupBy do block should not be desugared"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ctor_pattern_bind_not_desugared() {
+        // Constructor pattern binds may be value pattern matches
+        // (not monadic binds) — the desugarer can't distinguish, so
+        // these do blocks are left for direct codegen.
+        let src = r#"
+            data Status = Open {} | Closed {}
+            *items : [{name: Text, status: Status}]
+            main = do
+              i <- *items
+              Open {} <- i.status
+              yield {name: i.name}
+        "#;
+        let mut module = parse(src);
+        desugar(&mut module);
+        for decl in &module.decls {
+            if let DeclKind::Fun { name, body, .. } = &decl.node {
+                if name == "main" {
+                    assert!(
+                        matches!(&body.node, ExprKind::Do(_)),
+                        "ctor pattern bind do block should not be desugared"
                     );
                 }
             }

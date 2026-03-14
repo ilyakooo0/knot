@@ -972,6 +972,7 @@ pub extern "C" fn knot_value_show(v: *mut Value) -> *mut Value {
 
 // ── Standard library: relation operations ─────────────────────────
 
+
 /// filter(pred, rel) — keep rows where pred returns true
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_relation_filter(
@@ -993,6 +994,38 @@ pub extern "C" fn knot_relation_filter(
             Value::Bool(true) => result.push(row),
             Value::Bool(false) => {}
             _ => panic!("knot runtime: filter predicate must return Bool"),
+        }
+    }
+    alloc(Value::Relation(result))
+}
+
+/// match(ctor, rel) — filter relation to rows matching a constructor tag, extract payloads
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_match(
+    ctor: *mut Value,
+    rel: *mut Value,
+) -> *mut Value {
+    let tag = match unsafe { as_ref(ctor) } {
+        Value::Constructor(t, _) => t.clone(),
+        _ => panic!(
+            "knot runtime: match expected Constructor, got {}",
+            type_name(ctor)
+        ),
+    };
+    let rows = match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => rows.clone(),
+        _ => panic!(
+            "knot runtime: match expected Relation, got {}",
+            type_name(rel)
+        ),
+    };
+    let mut result: Vec<*mut Value> = Vec::new();
+    for row in rows {
+        match unsafe { as_ref(row) } {
+            Value::Constructor(t, payload) if t == &tag => {
+                result.push(*payload);
+            }
+            _ => {}
         }
     }
     alloc(Value::Relation(result))
@@ -2220,6 +2253,85 @@ pub extern "C" fn knot_source_read(
     } else {
         let rec = parse_record_schema(schema);
         read_record_table(&db_ref.conn, &format!("_knot_{}", name), &rec)
+    }
+}
+
+/// Read rows from a source ADT relation matching a specific constructor tag.
+/// Executes `SELECT <ctor_fields> FROM table WHERE _tag = ?` at the SQL level.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_source_match(
+    db: *mut c_void,
+    name_ptr: *const u8,
+    name_len: usize,
+    schema_ptr: *const u8,
+    schema_len: usize,
+    tag_ptr: *const u8,
+    tag_len: usize,
+) -> *mut Value {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let name = unsafe { str_from_raw(name_ptr, name_len) };
+    let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
+    let tag = unsafe { str_from_raw(tag_ptr, tag_len) };
+
+    let table = quote_ident(&format!("_knot_{}", name));
+    let adt = parse_adt_schema(schema);
+
+    let ctor = adt
+        .constructors
+        .iter()
+        .find(|c| c.name == tag)
+        .unwrap_or_else(|| panic!("knot runtime: match: unknown constructor '{}'", tag));
+
+    if ctor.fields.is_empty() {
+        // Nullary constructor: count matching rows, return that many Unit values
+        let sql = format!(
+            "SELECT COUNT(*) FROM {} WHERE {} = ?1",
+            table,
+            quote_ident("_tag")
+        );
+        debug_sql(&sql);
+        let count: i64 = db_ref
+            .conn
+            .query_row(&sql, rusqlite::params![tag], |row| row.get(0))
+            .unwrap();
+        let mut rows = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            rows.push(alloc(Value::Unit));
+        }
+        alloc(Value::Relation(rows))
+    } else {
+        let select_cols: Vec<String> =
+            ctor.fields.iter().map(|f| quote_ident(&f.name)).collect();
+        let sql = format!(
+            "SELECT {} FROM {} WHERE {} = ?1",
+            select_cols.join(", "),
+            table,
+            quote_ident("_tag")
+        );
+        debug_sql(&sql);
+
+        let mut stmt = db_ref
+            .conn
+            .prepare(&sql)
+            .unwrap_or_else(|e| panic!("knot runtime: match query error: {}", e));
+        let mut rows: Vec<*mut Value> = Vec::new();
+        let mut result_rows = stmt
+            .query(rusqlite::params![tag])
+            .unwrap_or_else(|e| panic!("knot runtime: match query exec error: {}", e));
+
+        while let Some(row) = result_rows
+            .next()
+            .unwrap_or_else(|e| panic!("knot runtime: match row fetch error: {}", e))
+        {
+            let record = knot_record_empty(ctor.fields.len());
+            for (i, field) in ctor.fields.iter().enumerate() {
+                let val = read_sql_column(row, i, field.ty);
+                let fname = field.name.as_bytes();
+                knot_record_set_field(record, fname.as_ptr(), fname.len(), val);
+            }
+            rows.push(record);
+        }
+        alloc(Value::Relation(rows))
     }
 }
 

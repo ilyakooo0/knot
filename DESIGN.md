@@ -536,7 +536,7 @@ Effects propagate through calls:
 
 ```knot
 -- Inferred: {reads *people, writes *people}
-birthdayParty = \names -> for names birthday
+birthdayParty = \names -> map birthday names
 ```
 
 ### What the Compiler Knows
@@ -714,8 +714,7 @@ For sub-transaction boundaries:
 
 ```knot
 batchTransfer = \transfers ->
-  for transfers \t ->
-    atomic (transfer t.from t.to t.amount)
+  map (\t -> atomic (transfer t.from t.to t.amount)) transfers
 ```
 
 ## Persistence

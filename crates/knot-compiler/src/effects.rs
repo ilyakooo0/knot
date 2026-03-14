@@ -184,6 +184,7 @@ impl EffectChecker {
         builtin_effects.insert("union".into(), EffectSet::empty());
         builtin_effects.insert("count".into(), EffectSet::empty());
         builtin_effects.insert("filter".into(), EffectSet::empty());
+        builtin_effects.insert("match".into(), EffectSet::empty());
         builtin_effects.insert("map".into(), EffectSet::empty());
         builtin_effects.insert("fold".into(), EffectSet::empty());
         builtin_effects.insert("single".into(), EffectSet::empty());

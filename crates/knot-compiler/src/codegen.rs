@@ -439,6 +439,8 @@ impl Codegen {
 
         // Standard library: relation operations
         self.declare_rt("knot_relation_filter", &[p, p, p], &[p]);
+        self.declare_rt("knot_relation_match", &[p, p], &[p]);
+        self.declare_rt("knot_source_match", &[p, p, p, p, p, p, p], &[p]);
         self.declare_rt("knot_relation_map", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_ap", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_fold", &[p, p, p, p], &[p]);
@@ -724,7 +726,7 @@ impl Codegen {
         // map and fold are now trait methods (Functor.map, Foldable.fold)
         // with [] impls registered directly in register_builtin_relation_impls.
         let stdlib_names = [
-            "filter", "single",
+            "filter", "match", "single",
             "toUpper", "toLower", "take", "drop",
             "length", "trim", "contains", "reverse",
             "chars", "id", "not",
@@ -1358,6 +1360,7 @@ impl Codegen {
 
         // 2-param: curried (outer captures arg1, inner calls runtime)
         self.define_stdlib_fn_2("filter", "knot_relation_filter", true);
+        self.define_stdlib_fn_2("match", "knot_relation_match", false);
         self.define_stdlib_fn_2("take", "knot_text_take", false);
         self.define_stdlib_fn_2("drop", "knot_text_drop", false);
         self.define_stdlib_fn_2("contains", "knot_text_contains", false);
@@ -2366,6 +2369,39 @@ impl Codegen {
 
             ast::ExprKind::BinOp { op, lhs, rhs } => {
                 if matches!(op, ast::BinOp::Pipe) {
+                    // Check for: source |> match Constructor → SQL-level match
+                    if let ast::ExprKind::App { func: match_fn, arg: match_arg } = &rhs.node {
+                        if let (ast::ExprKind::Var(fn_name), ast::ExprKind::Constructor(ctor_name)) = (&match_fn.node, &match_arg.node) {
+                            if fn_name == "match" {
+                                if let ast::ExprKind::SourceRef(source_name) = &lhs.node {
+                                    if let Some(schema) = self.source_schemas.get(source_name).cloned() {
+                                        let (name_ptr, name_len) =
+                                            self.string_ptr(builder, source_name);
+                                        let (schema_ptr, schema_len) =
+                                            self.string_ptr(builder, &schema);
+                                        let (tag_ptr, tag_len) =
+                                            self.string_ptr(builder, ctor_name);
+                                        return self.call_rt(
+                                            builder,
+                                            "knot_source_match",
+                                            &[
+                                                db, name_ptr, name_len, schema_ptr,
+                                                schema_len, tag_ptr, tag_len,
+                                            ],
+                                        );
+                                    }
+                                }
+                                // Non-source: value-level match
+                                let rel = self.compile_expr(builder, lhs, env, db);
+                                let ctor = self.compile_expr(builder, match_arg, env, db);
+                                return self.call_rt(
+                                    builder,
+                                    "knot_relation_match",
+                                    &[ctor, rel],
+                                );
+                            }
+                        }
+                    }
                     // lhs |> rhs  =>  rhs(lhs)
                     let arg = self.compile_expr(builder, lhs, env, db);
                     let func = self.compile_expr(builder, rhs, env, db);
@@ -2896,6 +2932,41 @@ impl Codegen {
     ) -> Value {
         // Uncurry nested applications
         let (func_expr, args) = uncurry_app(expr);
+
+        // Special case: match Constructor SourceRef → SQL-level filtered read
+        if let ast::ExprKind::Var(name) = &func_expr.node {
+            if name == "match" && args.len() == 2 {
+                if let ast::ExprKind::Constructor(ctor_name) = &args[0].node {
+                    if let ast::ExprKind::SourceRef(source_name) = &args[1].node {
+                        if let Some(schema) = self.source_schemas.get(source_name).cloned() {
+                            let (name_ptr, name_len) =
+                                self.string_ptr(builder, source_name);
+                            let (schema_ptr, schema_len) =
+                                self.string_ptr(builder, &schema);
+                            let (tag_ptr, tag_len) =
+                                self.string_ptr(builder, ctor_name);
+                            return self.call_rt(
+                                builder,
+                                "knot_source_match",
+                                &[
+                                    db, name_ptr, name_len, schema_ptr,
+                                    schema_len, tag_ptr, tag_len,
+                                ],
+                            );
+                        }
+                    }
+                    // Non-source relation: compile and use value-level match
+                    let rel = self.compile_expr(builder, &args[1], env, db);
+                    let ctor = self.compile_expr(builder, &args[0], env, db);
+                    return self.call_rt(
+                        builder,
+                        "knot_relation_match",
+                        &[ctor, rel],
+                    );
+                }
+            }
+        }
+
         let compiled_args: Vec<Value> = args
             .iter()
             .map(|a| self.compile_expr(builder, a, env, db))

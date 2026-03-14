@@ -1,10 +1,10 @@
 //! Built-in trait declarations and standard implementations.
 //!
-//! Defines the core trait hierarchy (Eq, Ord, Num, Functor, Applicative, Monad,
-//! Alternative, Foldable) and primitive/[] implementations. Trait declarations
-//! and simple impls are parsed from Knot source; complex [] impls for HKT
-//! traits (Functor, Applicative, Monad, Foldable) are registered directly
-//! in codegen to avoid span collision issues.
+//! Defines the core trait hierarchy (Eq, Ord, Num, Display, Functor, Applicative,
+//! Monad, Alternative, Foldable) and primitive/[] implementations. Trait
+//! declarations and simple impls are parsed from Knot source; complex [] impls
+//! for HKT traits (Functor, Applicative, Monad, Foldable) are registered
+//! directly in codegen to avoid span collision issues.
 
 use knot::ast;
 use std::collections::HashSet;
@@ -76,6 +76,21 @@ impl Num Float where
   mul a b = a * b
   div a b = a / b
   negate a = 0.0 - a
+
+trait Display a where
+  display : a -> Text
+
+impl Display Int where
+  display x = show x
+
+impl Display Float where
+  display x = show x
+
+impl Display Text where
+  display x = x
+
+impl Display Bool where
+  display x = show x
 
 impl Alternative [] where
   empty = []

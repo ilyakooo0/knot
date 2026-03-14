@@ -386,6 +386,35 @@ The methods wrap the corresponding built-in operators (`+`, `-`, `*`, `/`, unary
 fold add 0 [1, 2, 3]    -- 6
 ```
 
+### Display
+
+```knot
+trait Display a where
+  display : a -> Text
+```
+Convert a value to its text representation. Built-in impls for `Int`, `Float`, `Text`, `Bool`. The `Text` impl returns the value as-is; the others delegate to `show`.
+
+Use as a trait bound for generic formatting:
+
+```knot
+displayAll : Display a => [a] -> [Text]
+displayAll = \rel -> do
+  r <- rel
+  yield (display r)
+```
+
+Implement for your own types:
+
+```knot
+data Color = Red {} | Green {} | Blue {}
+
+impl Display Color where
+  display c = case c of
+    Red {} -> "red"
+    Green {} -> "green"
+    Blue {} -> "blue"
+```
+
 ### Functor
 
 ```knot

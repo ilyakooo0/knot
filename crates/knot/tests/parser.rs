@@ -2079,6 +2079,118 @@ fn temporal_at_chained_with_pipe() {
     }
 }
 
+// ── Time Units ──────────────────────────────────────────────────────
+
+#[test]
+fn time_unit_days() {
+    match fun_body("x = 365 days") {
+        ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
+            assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(365))));
+            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(86_400_000))));
+        }
+        other => panic!("expected Mul, got {:?}", other),
+    }
+}
+
+#[test]
+fn time_unit_hours() {
+    match fun_body("x = 2 hours") {
+        ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
+            assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(2))));
+            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(3_600_000))));
+        }
+        other => panic!("expected Mul, got {:?}", other),
+    }
+}
+
+#[test]
+fn time_unit_minutes() {
+    match fun_body("x = 30 minutes") {
+        ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
+            assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(30))));
+            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(60_000))));
+        }
+        other => panic!("expected Mul, got {:?}", other),
+    }
+}
+
+#[test]
+fn time_unit_seconds() {
+    match fun_body("x = 10 seconds") {
+        ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
+            assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(10))));
+            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(1_000))));
+        }
+        other => panic!("expected Mul, got {:?}", other),
+    }
+}
+
+#[test]
+fn time_unit_ms() {
+    match fun_body("x = 500 ms") {
+        ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
+            assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(500))));
+            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(1))));
+        }
+        other => panic!("expected Mul, got {:?}", other),
+    }
+}
+
+#[test]
+fn time_unit_weeks() {
+    match fun_body("x = 2 weeks") {
+        ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
+            assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(2))));
+            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(604_800_000))));
+        }
+        other => panic!("expected Mul, got {:?}", other),
+    }
+}
+
+#[test]
+fn time_unit_in_temporal_query() {
+    match fun_body("x = *employees @(now - 365 days)") {
+        ExprKind::At { time, .. } => {
+            match &time.node {
+                ExprKind::BinOp { op: BinOp::Sub, rhs, .. } => {
+                    match &rhs.node {
+                        ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
+                            assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(365))));
+                            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(86_400_000))));
+                        }
+                        other => panic!("expected Mul for days, got {:?}", other),
+                    }
+                }
+                other => panic!("expected Sub, got {:?}", other),
+            }
+        }
+        other => panic!("expected At, got {:?}", other),
+    }
+}
+
+#[test]
+fn time_unit_with_float() {
+    match fun_body("x = 1.5 hours") {
+        ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
+            assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Float(f)) if *f == 1.5));
+            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(3_600_000))));
+        }
+        other => panic!("expected Mul, got {:?}", other),
+    }
+}
+
+#[test]
+fn non_time_unit_identifier_not_consumed() {
+    // `365 foo` should NOT be treated as a time unit — `foo` is parsed as application
+    match fun_body("x = 365 foo") {
+        ExprKind::App { func, arg } => {
+            assert!(matches!(&func.node, ExprKind::Lit(Literal::Int(365))));
+            assert!(matches!(&arg.node, ExprKind::Var(n) if n == "foo"));
+        }
+        other => panic!("expected App, got {:?}", other),
+    }
+}
+
 // ── Effectful Types ─────────────────────────────────────────────────
 
 #[test]

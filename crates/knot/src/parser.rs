@@ -1565,16 +1565,54 @@ impl Parser {
         Some(expr)
     }
 
+    /// If the next token is a time-unit identifier (`ms`, `seconds`, `minutes`,
+    /// `hours`, `days`, `weeks`), consume it and desugar `n unit` into `n * factor`
+    /// where factor is the millisecond equivalent.
+    fn maybe_time_unit(&mut self, lit: Expr) -> Option<Expr> {
+        let factor = match self.peek() {
+            TokenKind::Lower(u) => match u.as_str() {
+                "ms" => Some(1_i64),
+                "seconds" => Some(1_000),
+                "minutes" => Some(60_000),
+                "hours" => Some(3_600_000),
+                "days" => Some(86_400_000),
+                "weeks" => Some(604_800_000),
+                _ => None,
+            },
+            _ => None,
+        };
+        match factor {
+            Some(f) => {
+                let unit_tok = self.advance();
+                let span = Span::new(lit.span.start, unit_tok.span.end);
+                Some(Spanned::new(
+                    ExprKind::BinOp {
+                        op: BinOp::Mul,
+                        lhs: Box::new(lit),
+                        rhs: Box::new(Spanned::new(
+                            ExprKind::Lit(Literal::Int(f)),
+                            unit_tok.span,
+                        )),
+                    },
+                    span,
+                ))
+            }
+            None => Some(lit),
+        }
+    }
+
     fn parse_atom(&mut self) -> Option<Expr> {
         let start = self.span();
         match self.peek().clone() {
             TokenKind::Int(n) => {
                 let tok = self.advance();
-                Some(Spanned::new(ExprKind::Lit(Literal::Int(n)), tok.span))
+                let lit = Spanned::new(ExprKind::Lit(Literal::Int(n)), tok.span);
+                self.maybe_time_unit(lit)
             }
             TokenKind::Float(f) => {
                 let tok = self.advance();
-                Some(Spanned::new(ExprKind::Lit(Literal::Float(f)), tok.span))
+                let lit = Spanned::new(ExprKind::Lit(Literal::Float(f)), tok.span);
+                self.maybe_time_unit(lit)
             }
             TokenKind::Text(s) => {
                 let tok = self.advance();

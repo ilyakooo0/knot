@@ -61,17 +61,58 @@ impl Ty {
     }
 }
 
-/// Polymorphic type scheme: ∀ vars. ty
+/// A trait constraint on a type variable: `TraitName a`.
+#[derive(Debug, Clone)]
+struct TyConstraint {
+    trait_name: String,
+    type_var: TyVar,
+}
+
+/// Polymorphic type scheme: ∀ vars. constraints => ty
 #[derive(Debug, Clone)]
 struct Scheme {
     vars: Vec<TyVar>,
+    constraints: Vec<TyConstraint>,
     ty: Ty,
 }
 
 impl Scheme {
     fn mono(ty: Ty) -> Self {
-        Scheme { vars: vec![], ty }
+        Scheme {
+            vars: vec![],
+            constraints: vec![],
+            ty,
+        }
     }
+
+    fn poly(vars: Vec<TyVar>, ty: Ty) -> Self {
+        Scheme {
+            vars,
+            constraints: vec![],
+            ty,
+        }
+    }
+
+    fn constrained(
+        vars: Vec<TyVar>,
+        constraints: Vec<TyConstraint>,
+        ty: Ty,
+    ) -> Self {
+        Scheme {
+            vars,
+            constraints,
+            ty,
+        }
+    }
+}
+
+/// A deferred constraint check: after inference resolves type variables,
+/// verify that the concrete type satisfies the required trait.
+#[derive(Debug, Clone)]
+struct DeferredConstraint {
+    trait_name: String,
+    type_var: TyVar,
+    span: Span,
 }
 
 // ── Constructor and data type metadata ────────────────────────────
@@ -130,6 +171,19 @@ struct Infer {
     /// Each entry records (span, monad_tyvar) so we can resolve the
     /// concrete monad after inference completes.
     monad_vars: Vec<(Span, TyVar)>,
+
+    /// Trait method → trait name mapping (e.g. "display" → "Display").
+    trait_method_traits: HashMap<String, String>,
+
+    /// Known trait implementations: (trait_name, type_name).
+    known_impls: HashSet<(String, String)>,
+
+    /// Deferred trait constraint checks, resolved after inference.
+    deferred_constraints: Vec<DeferredConstraint>,
+
+    /// Trait definitions: trait_name → list of param names.
+    trait_params: HashMap<String, Vec<String>>,
+
 }
 
 // ── Core operations ───────────────────────────────────────────────
@@ -150,6 +204,10 @@ impl Infer {
             annotation_vars: HashMap::new(),
             errors: Vec::new(),
             monad_vars: Vec::new(),
+            trait_method_traits: HashMap::new(),
+            known_impls: HashSet::new(),
+            deferred_constraints: Vec::new(),
+            trait_params: HashMap::new(),
         }
     }
 
@@ -472,6 +530,10 @@ impl Infer {
     // ── Scheme operations ────────────────────────────────────────
 
     fn instantiate(&mut self, scheme: &Scheme) -> Ty {
+        self.instantiate_at(scheme, Span::new(0, 0))
+    }
+
+    fn instantiate_at(&mut self, scheme: &Scheme, span: Span) -> Ty {
         if scheme.vars.is_empty() {
             return scheme.ty.clone();
         }
@@ -480,6 +542,16 @@ impl Infer {
             .iter()
             .map(|v| (*v, self.fresh()))
             .collect();
+        // Create deferred constraints for each constraint in the scheme
+        for c in &scheme.constraints {
+            if let Some(Ty::Var(new_var)) = mapping.get(&c.type_var) {
+                self.deferred_constraints.push(DeferredConstraint {
+                    trait_name: c.trait_name.clone(),
+                    type_var: *new_var,
+                    span,
+                });
+            }
+        }
         self.subst_ty(&scheme.ty, &mapping)
     }
 
@@ -533,13 +605,34 @@ impl Infer {
     }
 
     fn generalize(&self, ty: &Ty) -> Scheme {
+        self.generalize_with_constraints(ty, vec![])
+    }
+
+    fn generalize_with_constraints(
+        &self,
+        ty: &Ty,
+        all_constraints: Vec<TyConstraint>,
+    ) -> Scheme {
         let applied = self.apply(ty);
         let env_fv = self.free_vars_in_env();
         let ty_fv = self.free_vars(&applied);
         let gen_vars: Vec<TyVar> =
             ty_fv.difference(&env_fv).copied().collect();
+        let gen_set: HashSet<TyVar> = gen_vars.iter().copied().collect();
+        // Only keep constraints on generalized variables
+        let constraints: Vec<TyConstraint> = all_constraints
+            .into_iter()
+            .filter(|c| {
+                let resolved = self.apply(&Ty::Var(c.type_var));
+                match resolved {
+                    Ty::Var(v) => gen_set.contains(&v),
+                    _ => false, // concrete type — will be checked immediately
+                }
+            })
+            .collect();
         Scheme {
             vars: gen_vars,
+            constraints,
             ty: applied,
         }
     }
@@ -646,6 +739,15 @@ impl Infer {
     fn lookup_instantiate(&mut self, name: &str) -> Option<Ty> {
         let scheme = self.lookup(name)?.clone();
         Some(self.instantiate(&scheme))
+    }
+
+    fn lookup_instantiate_at(
+        &mut self,
+        name: &str,
+        span: Span,
+    ) -> Option<Ty> {
+        let scheme = self.lookup(name)?.clone();
+        Some(self.instantiate_at(&scheme, span))
     }
 
     // ── AST type → Ty ────────────────────────────────────────────
@@ -916,7 +1018,7 @@ impl Infer {
             }
 
             ast::ExprKind::Var(name) => {
-                if let Some(ty) = self.lookup_instantiate(name) {
+                if let Some(ty) = self.lookup_instantiate_at(name, expr.span) {
                     ty
                 } else {
                     self.error(
@@ -1539,6 +1641,53 @@ impl Infer {
         }
     }
 
+    // ── Impl collection (phase 2b) ─────────────────────────────
+
+    fn collect_impls(&mut self, module: &ast::Module) {
+        for decl in &module.decls {
+            if let ast::DeclKind::Impl {
+                trait_name, args, ..
+            } = &decl.node
+            {
+                // Extract type name from impl args
+                // e.g. `impl Display Int where` → ("Display", "Int")
+                // e.g. `impl Functor [] where` → ("Functor", "[]")
+                if let Some(first_arg) = args.first() {
+                    let type_name = Self::type_name_from_ast(first_arg);
+                    if let Some(name) = type_name {
+                        self.known_impls
+                            .insert((trait_name.clone(), name));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Extract a simple type name from an AST type node.
+    fn type_name_from_ast(ty: &ast::Type) -> Option<String> {
+        match &ty.node {
+            ast::TypeKind::Named(name) => Some(name.clone()),
+            ast::TypeKind::Relation(_) => Some("[]".into()),
+            _ => None,
+        }
+    }
+
+    /// Get the type name of a resolved Ty for impl lookup.
+    fn type_name_of(&self, ty: &Ty) -> Option<String> {
+        let resolved = self.apply(ty);
+        match &resolved {
+            Ty::Int => Some("Int".into()),
+            Ty::Float => Some("Float".into()),
+            Ty::Text => Some("Text".into()),
+            Ty::Bool => Some("Bool".into()),
+            Ty::Bytes => Some("Bytes".into()),
+            Ty::Relation(_) => Some("[]".into()),
+            Ty::TyCon(name) => Some(name.clone()),
+            Ty::Con(name, _) => Some(name.clone()),
+            _ => None,
+        }
+    }
+
     // ── Pre-registration (phase 3) ───────────────────────────────
 
     fn pre_register(&mut self, module: &ast::Module) {
@@ -1550,17 +1699,38 @@ impl Infer {
                 ast::DeclKind::Fun { name, ty, .. } => {
                     if let Some(scheme) = ty {
                         self.annotation_vars.clear();
+                        // Convert AST constraints to internal constraints
+                        let mut constraints = Vec::new();
+                        for c in &scheme.constraints {
+                            for arg in &c.args {
+                                if let ast::TypeKind::Var(var_name) = &arg.node {
+                                    let v = self.annotation_var(var_name);
+                                    constraints.push(TyConstraint {
+                                        trait_name: c.trait_name.clone(),
+                                        type_var: v,
+                                    });
+                                }
+                            }
+                        }
                         let ty = self.ast_type_to_ty(&scheme.ty);
                         let vars: Vec<TyVar> =
                             self.annotation_vars.values().copied().collect();
-                        self.bind_top(name, Scheme { vars, ty });
+                        self.bind_top(
+                            name,
+                            Scheme::constrained(vars, constraints, ty),
+                        );
                     } else {
                         let var = self.fresh();
                         self.bind_top(name, Scheme::mono(var));
                     }
                 }
-                ast::DeclKind::Trait { items, params, .. } => {
-                    self.register_trait_methods(params, items);
+                ast::DeclKind::Trait {
+                    name: trait_name,
+                    items,
+                    params,
+                    ..
+                } => {
+                    self.register_trait_methods(trait_name, params, items);
                 }
                 _ => {}
             }
@@ -1572,76 +1742,61 @@ impl Infer {
         let a = self.fresh_var();
         self.bind_top(
             "println",
-            Scheme {
-                vars: vec![a],
-                ty: Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::unit())),
-            },
+            Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::unit()))),
         );
 
         // print : ∀a. a -> {}
         let a = self.fresh_var();
         self.bind_top(
             "print",
-            Scheme {
-                vars: vec![a],
-                ty: Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::unit())),
-            },
+            Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::unit()))),
         );
 
         // show : ∀a. a -> Text
         let a = self.fresh_var();
         self.bind_top(
             "show",
-            Scheme {
-                vars: vec![a],
-                ty: Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Text)),
-            },
+            Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Text))),
         );
 
         // union : ∀a. [a] -> [a] -> [a]
         let a = self.fresh_var();
         self.bind_top(
             "union",
-            Scheme {
-                vars: vec![a],
-                ty: Ty::Fun(
+            Scheme::poly(
+                vec![a],
+                Ty::Fun(
                     Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
                     Box::new(Ty::Fun(
                         Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
                         Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
                     )),
                 ),
-            },
+            ),
         );
 
         // count : ∀a. [a] -> Int
         let a = self.fresh_var();
         self.bind_top(
             "count",
-            Scheme {
-                vars: vec![a],
-                ty: Ty::Fun(
+            Scheme::poly(
+                vec![a],
+                Ty::Fun(
                     Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
                     Box::new(Ty::Int),
                 ),
-            },
+            ),
         );
 
         // putLine : ∀a. a -> {} (alias for println)
         let a = self.fresh_var();
         self.bind_top(
             "putLine",
-            Scheme {
-                vars: vec![a],
-                ty: Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::unit())),
-            },
+            Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::unit()))),
         );
 
         // now : Int (current time in milliseconds since epoch)
-        self.bind_top(
-            "now",
-            Scheme::mono(Ty::Int),
-        );
+        self.bind_top("now", Scheme::mono(Ty::Int));
 
         // __bind : ∀a b. (a -> [b]) -> [a] -> [b]
         // Used by do-block desugaring for relation comprehensions.
@@ -1649,9 +1804,9 @@ impl Infer {
         let b = self.fresh_var();
         self.bind_top(
             "__bind",
-            Scheme {
-                vars: vec![a, b],
-                ty: Ty::Fun(
+            Scheme::poly(
+                vec![a, b],
+                Ty::Fun(
                     Box::new(Ty::Fun(
                         Box::new(Ty::Var(a)),
                         Box::new(Ty::Relation(Box::new(Ty::Var(b)))),
@@ -1661,7 +1816,7 @@ impl Infer {
                         Box::new(Ty::Relation(Box::new(Ty::Var(b)))),
                     )),
                 ),
-            },
+            ),
         );
 
         // listen : ∀a b. Int -> (a -> b) -> {}
@@ -1669,16 +1824,16 @@ impl Infer {
         let b = self.fresh_var();
         self.bind_top(
             "listen",
-            Scheme {
-                vars: vec![a, b],
-                ty: Ty::Fun(
+            Scheme::poly(
+                vec![a, b],
+                Ty::Fun(
                     Box::new(Ty::Int),
                     Box::new(Ty::Fun(
                         Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
                         Box::new(Ty::unit()),
                     )),
                 ),
-            },
+            ),
         );
 
         // ── Standard library ─────────────────────────────────────
@@ -1687,16 +1842,16 @@ impl Infer {
         let a = self.fresh_var();
         self.bind_top(
             "filter",
-            Scheme {
-                vars: vec![a],
-                ty: Ty::Fun(
+            Scheme::poly(
+                vec![a],
+                Ty::Fun(
                     Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Bool))),
                     Box::new(Ty::Fun(
                         Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
                         Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
                     )),
                 ),
-            },
+            ),
         );
 
         // map and fold are now trait methods (Functor.map, Foldable.fold)
@@ -1706,13 +1861,13 @@ impl Infer {
         let a = self.fresh_var();
         self.bind_top(
             "single",
-            Scheme {
-                vars: vec![a],
-                ty: Ty::Fun(
+            Scheme::poly(
+                vec![a],
+                Ty::Fun(
                     Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
                     Box::new(Ty::Var(a)),
                 ),
-            },
+            ),
         );
 
         // toUpper : Text -> Text
@@ -1785,10 +1940,7 @@ impl Infer {
         let a = self.fresh_var();
         self.bind_top(
             "id",
-            Scheme {
-                vars: vec![a],
-                ty: Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(a))),
-            },
+            Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(a)))),
         );
 
         // not : Bool -> Bool
@@ -1803,20 +1955,14 @@ impl Infer {
         let a = self.fresh_var();
         self.bind_top(
             "toJson",
-            Scheme {
-                vars: vec![a],
-                ty: Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Text)),
-            },
+            Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Text))),
         );
 
         // parseJson : ∀a. Text -> a
         let a = self.fresh_var();
         self.bind_top(
             "parseJson",
-            Scheme {
-                vars: vec![a],
-                ty: Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Var(a))),
-            },
+            Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Var(a)))),
         );
 
         // ── Bytes standard library ────────────────────────────────
@@ -1884,9 +2030,16 @@ impl Infer {
 
     fn register_trait_methods(
         &mut self,
+        trait_name: &str,
         params: &[ast::TraitParam],
         items: &[ast::TraitItem],
     ) {
+        // Record trait param names
+        self.trait_params.insert(
+            trait_name.to_string(),
+            params.iter().map(|p| p.name.clone()).collect(),
+        );
+
         for item in items {
             if let ast::TraitItem::Method { name, ty, .. } = item {
                 // Skip default-body entries with placeholder types
@@ -1903,12 +2056,25 @@ impl Infer {
                 let method_ty = self.ast_type_to_ty(&ty.ty);
                 let vars: Vec<TyVar> =
                     self.annotation_vars.values().copied().collect();
+
+                // Build constraints: each trait param must implement this trait
+                let constraints: Vec<TyConstraint> = params
+                    .iter()
+                    .filter_map(|p| {
+                        self.annotation_vars.get(&p.name).map(|&v| TyConstraint {
+                            trait_name: trait_name.to_string(),
+                            type_var: v,
+                        })
+                    })
+                    .collect();
+
+                // Record method → trait mapping
+                self.trait_method_traits
+                    .insert(name.clone(), trait_name.to_string());
+
                 self.bind_top(
                     name,
-                    Scheme {
-                        vars,
-                        ty: method_ty,
-                    },
+                    Scheme::constrained(vars, constraints, method_ty),
                 );
             }
         }
@@ -1919,7 +2085,7 @@ impl Infer {
     fn infer_declarations(&mut self, module: &ast::Module) {
         for decl in &module.decls {
             match &decl.node {
-                ast::DeclKind::Fun { name, body, .. } => {
+                ast::DeclKind::Fun { name, body, ty, .. } => {
                     let expected =
                         self.lookup_instantiate(name).unwrap_or_else(|| {
                             self.fresh()
@@ -1933,9 +2099,45 @@ impl Infer {
                     if let Some(scope) = self.scopes.first_mut() {
                         scope.remove(name.as_str());
                     }
-                    let applied = self.apply(&inferred);
-                    let scheme = self.generalize(&applied);
-                    self.bind_top(name, scheme);
+
+                    // If the function has explicit constraints in its
+                    // annotation, rebuild the scheme from the annotation.
+                    // (We already verified the body matches via unification.)
+                    let has_constraints = ty
+                        .as_ref()
+                        .map_or(false, |ts| !ts.constraints.is_empty());
+                    if has_constraints {
+                        let ts = ty.as_ref().unwrap();
+                        self.annotation_vars.clear();
+                        let mut constraints = Vec::new();
+                        for c in &ts.constraints {
+                            for arg in &c.args {
+                                if let ast::TypeKind::Var(var_name) =
+                                    &arg.node
+                                {
+                                    let v = self.annotation_var(var_name);
+                                    constraints.push(TyConstraint {
+                                        trait_name: c.trait_name.clone(),
+                                        type_var: v,
+                                    });
+                                }
+                            }
+                        }
+                        let ann_ty = self.ast_type_to_ty(&ts.ty);
+                        let vars: Vec<TyVar> = self
+                            .annotation_vars
+                            .values()
+                            .copied()
+                            .collect();
+                        self.bind_top(
+                            name,
+                            Scheme::constrained(vars, constraints, ann_ty),
+                        );
+                    } else {
+                        let applied = self.apply(&inferred);
+                        let scheme = self.generalize(&applied);
+                        self.bind_top(name, scheme);
+                    }
                 }
                 ast::DeclKind::View { name, body, .. } => {
                     let expected =
@@ -1994,6 +2196,37 @@ impl Infer {
         }
     }
 
+    // ── Constraint checking ─────────────────────────────────────
+
+    /// Check all deferred constraints after inference is complete.
+    /// For each constraint (trait_name, type_var), resolve the type variable
+    /// and verify that the concrete type has an implementation of the trait.
+    fn check_constraints(&mut self) {
+        let constraints = std::mem::take(&mut self.deferred_constraints);
+        for dc in &constraints {
+            let resolved = self.apply(&Ty::Var(dc.type_var));
+            // Skip unresolved type variables (polymorphic — checked at use site)
+            if matches!(resolved, Ty::Var(_)) {
+                continue;
+            }
+            if let Some(type_name) = self.type_name_of(&resolved) {
+                let key = (dc.trait_name.clone(), type_name.clone());
+                if !self.known_impls.contains(&key) {
+                    // Only emit error if the span is real (not dummy)
+                    if dc.span.start != 0 || dc.span.end != 0 {
+                        self.error(
+                            format!(
+                                "no implementation of trait '{}' for type '{}'",
+                                dc.trait_name, type_name
+                            ),
+                            dc.span,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // ── Error conversion ─────────────────────────────────────────
 
     fn to_diagnostics(&self) -> Vec<Diagnostic> {
@@ -2019,11 +2252,17 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo) {
     // Phase 2: Register source/view/derived relation types
     infer.collect_sources(module);
 
+    // Phase 2b: Collect known trait implementations
+    infer.collect_impls(module);
+
     // Phase 3: Pre-register top-level names (builtins, functions, trait methods)
     infer.pre_register(module);
 
     // Phase 4: Infer all declaration bodies
     infer.infer_declarations(module);
+
+    // Phase 4b: Check deferred trait constraints
+    infer.check_constraints();
 
     // Phase 5: Resolve monad types from desugared do-blocks
     let mut monad_info = MonadInfo::new();
@@ -2448,5 +2687,148 @@ mod tests {
             "data Pair a b = MkPair {fst: a, snd: b}\n\
              main = MkPair {fst: 1, snd: \"hello\"}"
         ).is_empty());
+    }
+
+    // ── Trait bounds ────────────────────────────────────────────────
+
+    #[test]
+    fn explicit_trait_bound_satisfied() {
+        // Calling a function with explicit trait bounds on a type that has an impl
+        assert!(check_src(
+            "trait Display a where\n\
+             \x20 display : a -> Text\n\
+             impl Display Int where\n\
+             \x20 display n = show n\n\
+             printAll : Display a => [a] -> [Text]\n\
+             printAll = \\rel -> do\n\
+             \x20 r <- rel\n\
+             \x20 yield (display r)\n\
+             main = printAll [1, 2, 3]"
+        ).is_empty());
+    }
+
+    #[test]
+    fn explicit_trait_bound_unsatisfied() {
+        // Calling a function with trait bounds on a type without an impl
+        let diags = check_src(
+            "trait Display a where\n\
+             \x20 display : a -> Text\n\
+             impl Display Int where\n\
+             \x20 display n = show n\n\
+             printAll : Display a => [a] -> [Text]\n\
+             printAll = \\rel -> do\n\
+             \x20 r <- rel\n\
+             \x20 yield (display r)\n\
+             main = printAll [\"hello\"]"
+        );
+        assert!(has_error(&diags, "no implementation of trait 'Display' for type 'Text'"));
+    }
+
+    #[test]
+    fn trait_method_constraint_satisfied() {
+        // Using a trait method directly with a type that has an impl
+        assert!(check_src(
+            "trait Display a where\n\
+             \x20 display : a -> Text\n\
+             impl Display Int where\n\
+             \x20 display n = show n\n\
+             main = display 42"
+        ).is_empty());
+    }
+
+    #[test]
+    fn trait_method_constraint_unsatisfied() {
+        // Using a trait method with a type that doesn't have an impl
+        let diags = check_src(
+            "trait Display a where\n\
+             \x20 display : a -> Text\n\
+             impl Display Int where\n\
+             \x20 display n = show n\n\
+             main = display \"hello\""
+        );
+        assert!(has_error(&diags, "no implementation of trait 'Display' for type 'Text'"));
+    }
+
+    #[test]
+    fn multiple_trait_bounds() {
+        // Multiple constraints: Display a => Eq a => ...
+        assert!(check_src(
+            "trait Display a where\n\
+             \x20 display : a -> Text\n\
+             trait Eq_ a where\n\
+             \x20 eq : a -> a -> Bool\n\
+             impl Display Int where\n\
+             \x20 display n = show n\n\
+             impl Eq_ Int where\n\
+             \x20 eq a b = a == b\n\
+             showAndCompare : Display a => Eq_ a => a -> a -> Text\n\
+             showAndCompare = \\x y -> if eq x y then display x else display y\n\
+             main = showAndCompare 1 2"
+        ).is_empty());
+    }
+
+    #[test]
+    fn multiple_trait_bounds_one_missing() {
+        // One of multiple bounds is unsatisfied
+        let diags = check_src(
+            "trait Display a where\n\
+             \x20 display : a -> Text\n\
+             trait Eq_ a where\n\
+             \x20 eq : a -> a -> Bool\n\
+             impl Display Int where\n\
+             \x20 display n = show n\n\
+             showAndCompare : Display a => Eq_ a => a -> a -> Text\n\
+             showAndCompare = \\x y -> display x\n\
+             main = showAndCompare 1 2"
+        );
+        // Eq_ Int is missing
+        assert!(has_error(&diags, "no implementation of trait 'Eq_' for type 'Int'"));
+    }
+
+    #[test]
+    fn trait_bound_polymorphic_passthrough() {
+        // When a constrained function is called with a still-polymorphic
+        // variable, the constraint should not trigger (it's checked later)
+        assert!(check_src(
+            "trait Display a where\n\
+             \x20 display : a -> Text\n\
+             impl Display Int where\n\
+             \x20 display n = show n\n\
+             printAll : Display a => [a] -> [Text]\n\
+             printAll = \\rel -> do\n\
+             \x20 r <- rel\n\
+             \x20 yield (display r)\n\
+             main = println 42"
+        ).is_empty());
+    }
+
+    #[test]
+    fn hkt_trait_bound_satisfied() {
+        // HKT trait method call with [] should succeed (impl exists)
+        assert!(check_src(
+            "trait Functor (f : Type -> Type) where\n\
+             \x20 fmap : (a -> b) -> f a -> f b\n\
+             impl Functor [] where\n\
+             \x20 fmap f rel = do\n\
+             \x20   x <- rel\n\
+             \x20   yield (f x)\n\
+             main = fmap (\\x -> x + 1) [1, 2, 3]"
+        ).is_empty());
+    }
+
+    #[test]
+    fn hkt_trait_bound_unsatisfied() {
+        // HKT trait method call with a type that doesn't have an impl
+        let diags = check_src(
+            "data Box a = MkBox {value: a}\n\
+             trait Functor (f : Type -> Type) where\n\
+             \x20 fmap : (a -> b) -> f a -> f b\n\
+             impl Functor [] where\n\
+             \x20 fmap f rel = do\n\
+             \x20   x <- rel\n\
+             \x20   yield (f x)\n\
+             main = fmap (\\x -> x + 1) (MkBox {value: 42})"
+        );
+        assert!(has_error(&diags, "no implementation of trait 'Functor'"));
     }
 }

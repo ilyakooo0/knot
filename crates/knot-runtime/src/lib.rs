@@ -1096,6 +1096,190 @@ pub extern "C" fn knot_bytes_get(index: *mut Value, bytes: *mut Value) -> *mut V
     }
 }
 
+// ── Standard library: JSON operations ─────────────────────────
+
+/// toJson(value) — convert any Knot value to its JSON text representation
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_json_encode(v: *mut Value) -> *mut Value {
+    alloc(Value::Text(value_to_json(v)))
+}
+
+/// parseJson(text) — parse a JSON string into a Knot value
+///
+/// Mapping:
+///   JSON object  → Record
+///   JSON array   → Relation
+///   JSON string  → Text
+///   JSON number  → Int (if no decimal point) or Float
+///   JSON boolean → Bool
+///   JSON null    → Unit
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_json_decode(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Text(s) => {
+            let s = s.trim();
+            let (val, _) = parse_json_value(s);
+            val
+        }
+        _ => panic!("knot runtime: parseJson expected Text, got {}", type_name(v)),
+    }
+}
+
+/// Recursive JSON parser. Returns (parsed_value, rest_of_input).
+fn parse_json_value(s: &str) -> (*mut Value, &str) {
+    let s = s.trim();
+    if s.is_empty() {
+        return (alloc(Value::Unit), s);
+    }
+    match s.as_bytes()[0] {
+        b'"' => parse_json_string(s),
+        b'{' => parse_json_obj(s),
+        b'[' => parse_json_array(s),
+        b't' if s.starts_with("true") => (alloc(Value::Bool(true)), &s[4..]),
+        b'f' if s.starts_with("false") => (alloc(Value::Bool(false)), &s[5..]),
+        b'n' if s.starts_with("null") => (alloc(Value::Unit), &s[4..]),
+        _ => parse_json_number(s),
+    }
+}
+
+fn parse_json_string(s: &str) -> (*mut Value, &str) {
+    debug_assert!(s.starts_with('"'));
+    let mut chars = s[1..].chars();
+    let mut result = String::new();
+    loop {
+        match chars.next() {
+            None => break,
+            Some('"') => {
+                let rest = chars.as_str();
+                return (alloc(Value::Text(result)), rest);
+            }
+            Some('\\') => match chars.next() {
+                Some('"') => result.push('"'),
+                Some('\\') => result.push('\\'),
+                Some('/') => result.push('/'),
+                Some('n') => result.push('\n'),
+                Some('r') => result.push('\r'),
+                Some('t') => result.push('\t'),
+                Some('u') => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    if let Ok(cp) = u32::from_str_radix(&hex, 16) {
+                        if let Some(c) = char::from_u32(cp) {
+                            result.push(c);
+                        }
+                    }
+                }
+                Some(c) => {
+                    result.push('\\');
+                    result.push(c);
+                }
+                None => break,
+            },
+            Some(c) => result.push(c),
+        }
+    }
+    (alloc(Value::Text(result)), "")
+}
+
+fn parse_json_number(s: &str) -> (*mut Value, &str) {
+    let mut end = 0;
+    let mut is_float = false;
+    let bytes = s.as_bytes();
+    if end < bytes.len() && (bytes[end] == b'-' || bytes[end] == b'+') {
+        end += 1;
+    }
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end < bytes.len() && bytes[end] == b'.' {
+        is_float = true;
+        end += 1;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+    }
+    if end < bytes.len() && (bytes[end] == b'e' || bytes[end] == b'E') {
+        is_float = true;
+        end += 1;
+        if end < bytes.len() && (bytes[end] == b'-' || bytes[end] == b'+') {
+            end += 1;
+        }
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+    }
+    let num_str = &s[..end];
+    let rest = &s[end..];
+    if is_float {
+        let n: f64 = num_str.parse().unwrap_or(0.0);
+        (alloc(Value::Float(n)), rest)
+    } else {
+        let n: i64 = num_str.parse().unwrap_or(0);
+        (alloc(Value::Int(n)), rest)
+    }
+}
+
+fn parse_json_obj(s: &str) -> (*mut Value, &str) {
+    debug_assert!(s.starts_with('{'));
+    let mut rest = s[1..].trim();
+    let mut fields: Vec<RecordField> = Vec::new();
+    if rest.starts_with('}') {
+        return (alloc(Value::Unit), &rest[1..]);
+    }
+    loop {
+        // Parse key (must be a string)
+        if !rest.starts_with('"') {
+            break;
+        }
+        let (key_val, after_key) = parse_json_string(rest);
+        let key = match unsafe { as_ref(key_val) } {
+            Value::Text(s) => s.clone(),
+            _ => unreachable!(),
+        };
+        rest = after_key.trim();
+        // Skip colon
+        if rest.starts_with(':') {
+            rest = rest[1..].trim();
+        }
+        // Parse value
+        let (val, after_val) = parse_json_value(rest);
+        rest = after_val.trim();
+        fields.push(RecordField { name: key, value: val });
+        // Skip comma or end
+        if rest.starts_with(',') {
+            rest = rest[1..].trim();
+        } else if rest.starts_with('}') {
+            rest = &rest[1..];
+            break;
+        } else {
+            break;
+        }
+    }
+    (alloc(Value::Record(fields)), rest)
+}
+
+fn parse_json_array(s: &str) -> (*mut Value, &str) {
+    debug_assert!(s.starts_with('['));
+    let mut rest = s[1..].trim();
+    let mut items: Vec<*mut Value> = Vec::new();
+    if rest.starts_with(']') {
+        return (alloc(Value::Relation(items)), &rest[1..]);
+    }
+    loop {
+        let (val, after_val) = parse_json_value(rest);
+        rest = after_val.trim();
+        items.push(val);
+        if rest.starts_with(',') {
+            rest = rest[1..].trim();
+        } else if rest.starts_with(']') {
+            rest = &rest[1..];
+            break;
+        } else {
+            break;
+        }
+    }
+    (alloc(Value::Relation(items)), rest)
+}
+
 // ── Standard library: utility operations ──────────────────────
 
 /// id(x) — identity function, returns its argument unchanged

@@ -451,6 +451,10 @@ impl Codegen {
         self.declare_rt("knot_value_id", &[p], &[p]);
         self.declare_rt("knot_value_not_fn", &[p], &[p]);
 
+        // Standard library: JSON
+        self.declare_rt("knot_json_encode", &[p], &[p]);
+        self.declare_rt("knot_json_decode", &[p], &[p]);
+
         // Bytes value constructor and standard library
         self.declare_rt("knot_value_bytes", &[p, p], &[p]);
         self.declare_rt("knot_bytes_length", &[p], &[p]);
@@ -714,6 +718,7 @@ impl Codegen {
             "toUpper", "toLower", "take", "drop",
             "length", "trim", "contains", "reverse",
             "chars", "id", "not",
+            "toJson", "parseJson",
             "bytesLength", "bytesSlice", "bytesConcat",
             "textToBytes", "bytesToText", "bytesToHex", "bytesFromHex",
             "bytesGet",
@@ -1181,6 +1186,10 @@ impl Codegen {
 
         // 3-param: double-curried
         self.define_stdlib_fn_3("fold", "knot_relation_fold");
+
+        // JSON: 1-param
+        self.define_stdlib_fn_1("toJson", "knot_json_encode");
+        self.define_stdlib_fn_1("parseJson", "knot_json_decode");
 
         // Bytes: 1-param
         self.define_stdlib_fn_1("bytesLength", "knot_bytes_length");

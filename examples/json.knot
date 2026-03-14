@@ -1,0 +1,29 @@
+main = do
+  -- Encode values to JSON
+  println (toJson 42)
+  println (toJson 3.14)
+  println (toJson "hello")
+  println (toJson {})
+
+  -- Encode a record
+  println (toJson {name: "Alice", age: 30})
+
+  -- Encode a relation (becomes JSON array)
+  let nums = [{x: 1}, {x: 2}, {x: 3}]
+  println (toJson nums)
+
+  -- Round-trip: encode then decode
+  let json = toJson {x: 10, y: 20}
+  println json
+  let parsed = parseJson json
+  println (show parsed)
+
+  -- Parse a JSON array
+  let arr = parseJson "[1, 2, 3]"
+  println (show arr)
+
+  -- Parse nested JSON
+  let nested = parseJson "{\"user\": {\"name\": \"Bob\", \"scores\": [95, 87, 92]}}"
+  println (show nested)
+
+  yield {}

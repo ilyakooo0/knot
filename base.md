@@ -156,6 +156,79 @@ now : Int
 ```
 Current time in milliseconds since the Unix epoch. Has the `{clock}` effect.
 
+## JSON
+
+```knot
+toJson : a -> Text
+```
+Convert any value to its JSON text representation. Records become JSON objects, relations become JSON arrays, `Int`/`Float` become numbers, `Text` becomes a JSON string, `Bool` becomes `true`/`false`, and `{}` becomes `{}`.
+
+```knot
+toJson {name: "Alice", age: 30}    -- "{\"name\":\"Alice\",\"age\":30}"
+toJson [1, 2, 3]                   -- "[1,2,3]"
+```
+
+```knot
+parseJson : Text -> a
+```
+Parse a JSON string into a Knot value. JSON objects become records, arrays become relations, strings become `Text`, integers become `Int`, decimals become `Float`, booleans become `Bool`, and `null` becomes `{}`. Handles standard JSON escape sequences.
+
+```knot
+parseJson "{\"x\": 10}"           -- {x: 10}
+parseJson "[1, 2, 3]"             -- [1, 2, 3]
+
+-- Round-trip
+let json = toJson {name: "Bob"}
+parseJson json                     -- {name: "Bob"}
+```
+
+## Bytes
+
+```knot
+bytesLength : Bytes -> Int
+```
+Number of bytes in a byte string.
+
+```knot
+bytesSlice : Int -> Int -> Bytes -> Bytes
+```
+Extract a sub-range. `bytesSlice start len bytes` returns `len` bytes starting at offset `start`.
+
+```knot
+bytesConcat : Bytes -> Bytes -> Bytes
+```
+Concatenate two byte strings.
+
+```knot
+bytesGet : Int -> Bytes -> Int
+```
+Get the byte value (0–255) at the given index.
+
+```knot
+textToBytes : Text -> Bytes
+```
+UTF-8 encode a text value into bytes.
+
+```knot
+bytesToText : Bytes -> Text
+```
+UTF-8 decode bytes into text.
+
+```knot
+bytesToHex : Bytes -> Text
+```
+Encode bytes as a hexadecimal text string.
+
+```knot
+bytesFromHex : Text -> Bytes
+```
+Decode a hexadecimal text string into bytes.
+
+```knot
+bytesToHex (textToBytes "hi")    -- "6869"
+bytesFromHex "6869" |> bytesToText  -- "hi"
+```
+
 ## Server
 
 ```knot

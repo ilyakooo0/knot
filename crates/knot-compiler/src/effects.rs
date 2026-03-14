@@ -198,6 +198,8 @@ impl EffectChecker {
         builtin_effects.insert("chars".into(), EffectSet::empty());
         builtin_effects.insert("id".into(), EffectSet::empty());
         builtin_effects.insert("not".into(), EffectSet::empty());
+        builtin_effects.insert("toJson".into(), EffectSet::empty());
+        builtin_effects.insert("parseJson".into(), EffectSet::empty());
 
         Self {
             decl_effects: HashMap::new(),

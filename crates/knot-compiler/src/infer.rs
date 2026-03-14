@@ -1806,6 +1806,28 @@ impl Infer {
             Scheme::mono(Ty::Fun(Box::new(Ty::Bool), Box::new(Ty::Bool))),
         );
 
+        // ── JSON standard library ─────────────────────────────────
+
+        // toJson : ∀a. a -> Text
+        let a = self.fresh_var();
+        self.bind_top(
+            "toJson",
+            Scheme {
+                vars: vec![a],
+                ty: Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Text)),
+            },
+        );
+
+        // parseJson : ∀a. Text -> a
+        let a = self.fresh_var();
+        self.bind_top(
+            "parseJson",
+            Scheme {
+                vars: vec![a],
+                ty: Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Var(a))),
+            },
+        );
+
         // ── Bytes standard library ────────────────────────────────
 
         // bytesLength : Bytes -> Int

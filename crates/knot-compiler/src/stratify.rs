@@ -360,7 +360,7 @@ mod tests {
     }
 
     fn module(decls: Vec<Decl>) -> Module {
-        Module { name: None, imports: Vec::new(), decls }
+        Module { imports: Vec::new(), decls }
     }
 
     /// `diff a b` → `App(App(Var("diff"), a), b)`

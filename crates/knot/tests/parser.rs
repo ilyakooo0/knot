@@ -63,21 +63,7 @@ fn fun_body(source: &str) -> ExprKind {
 #[test]
 fn empty_module() {
     let m = parse_ok("");
-    assert!(m.name.is_none());
     assert!(m.decls.is_empty());
-}
-
-#[test]
-fn named_module() {
-    let m = parse_ok("module MyApp");
-    assert_eq!(m.name.as_deref(), Some("MyApp"));
-}
-
-#[test]
-fn module_with_decls() {
-    let m = parse_ok("module Foo\n\nx = 1\ny = 2");
-    assert_eq!(m.name.as_deref(), Some("Foo"));
-    assert_eq!(m.decls.len(), 2);
 }
 
 // ── Literals ────────────────────────────────────────────────────────
@@ -1722,8 +1708,6 @@ f = do
 #[test]
 fn full_program() {
     let src = "\
-module TodoApp
-
 data Priority = Low {} | Medium {} | High {} | Critical {}
 
 data Status
@@ -1748,7 +1732,6 @@ add = \\title owner priority ->
   yield {owner: t.owner, count: count t}";
 
     let m = parse_ok(src);
-    assert_eq!(m.name.as_deref(), Some("TodoApp"));
     assert_eq!(m.decls.len(), 7);
     assert!(matches!(&m.decls[0].node, DeclKind::Data { name, .. } if name == "Priority"));
     assert!(matches!(&m.decls[1].node, DeclKind::Data { name, .. } if name == "Status"));
@@ -3323,9 +3306,8 @@ fn import_multiple() {
 }
 
 #[test]
-fn import_with_module_name() {
-    let m = parse_ok("module App\n\nimport ./models\nimport ./utils\n\nfoo = 1");
-    assert_eq!(m.name.as_deref(), Some("App"));
+fn import_with_decls() {
+    let m = parse_ok("import ./models\nimport ./utils\n\nfoo = 1");
     assert_eq!(m.imports.len(), 2);
     assert_eq!(m.decls.len(), 1);
 }

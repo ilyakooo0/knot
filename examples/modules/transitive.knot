@@ -1,5 +1,3 @@
-module Transitive
-
 import ./lib/helpers
 
 main = do

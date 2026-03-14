@@ -21,7 +21,6 @@ pub enum TokenKind {
     Upper(String),
 
     // Keywords
-    Module,
     Import,
     Data,
     Type,
@@ -104,7 +103,6 @@ impl TokenKind {
             TokenKind::Bytes(_) => "byte string literal",
             TokenKind::Lower(_) => "identifier",
             TokenKind::Upper(_) => "type name",
-            TokenKind::Module => "'module'",
             TokenKind::Import => "'import'",
             TokenKind::Data => "'data'",
             TokenKind::Type => "'type'",
@@ -365,7 +363,6 @@ impl<'src> Lexer<'src> {
         // Keywords (only lowercase identifiers can be keywords)
         if first.is_ascii_lowercase() || first == b'_' {
             match text {
-                "module" => return TokenKind::Module,
                 "import" => return TokenKind::Import,
                 "data" => return TokenKind::Data,
                 "type" => return TokenKind::Type,

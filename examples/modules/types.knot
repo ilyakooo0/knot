@@ -1,5 +1,3 @@
-module Types
-
 export type Person = {name: Text, age: Int}
 
 export data Priority = Low {} | Medium {} | High {}

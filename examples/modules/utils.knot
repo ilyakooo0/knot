@@ -1,5 +1,3 @@
-module Utils
-
 formatName = \n -> toUpper (take 1 n) ++ drop 1 n
 
 double = \x -> x * 2

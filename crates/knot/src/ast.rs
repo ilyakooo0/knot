@@ -51,7 +51,6 @@ pub type Stmt = Spanned<StmtKind>;
 /// A complete Knot source file.
 #[derive(Debug, Clone)]
 pub struct Module {
-    pub name: Option<Name>,
     pub imports: Vec<Import>,
     pub decls: Vec<Decl>,
 }

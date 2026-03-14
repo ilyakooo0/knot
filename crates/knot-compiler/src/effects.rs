@@ -652,7 +652,7 @@ mod tests {
     // ── Expression inference tests ───────────────────────────────
 
     fn check_module(decls: Vec<Decl>) -> (Vec<Diagnostic>, HashMap<String, EffectSet>) {
-        let module = Module { name: None, imports: vec![], decls };
+        let module = Module { imports: vec![], decls };
         let mut checker = EffectChecker::new();
         checker.run(&module);
         (checker.diagnostics, checker.decl_effects)

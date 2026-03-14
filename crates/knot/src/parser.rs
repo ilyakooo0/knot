@@ -28,21 +28,6 @@ impl Parser {
     }
 
     pub fn parse_module(mut self) -> (Module, Vec<Diagnostic>) {
-        let name = if self.eat(&TokenKind::Module) {
-            match self.peek().clone() {
-                TokenKind::Upper(n) => {
-                    self.advance();
-                    Some(n)
-                }
-                _ => {
-                    self.error("expected module name after 'module'");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         self.skip_newlines();
 
         // Parse imports (must come before other declarations)
@@ -77,7 +62,7 @@ impl Parser {
             self.skip_newlines();
         }
 
-        (Module { name, imports, decls }, self.diagnostics)
+        (Module { imports, decls }, self.diagnostics)
     }
 }
 
@@ -2727,21 +2712,7 @@ mod tests {
         let tokens = toks(vec![(TokenKind::Eof, 0, 0)]);
         let (module, diags) = Parser::new(String::new(), tokens).parse_module();
         assert!(diags.is_empty());
-        assert!(module.name.is_none());
         assert!(module.decls.is_empty());
-    }
-
-    #[test]
-    fn parse_named_module() {
-        let source = "module Foo".to_string();
-        let tokens = toks(vec![
-            (TokenKind::Module, 0, 6),
-            (TokenKind::Upper("Foo".into()), 7, 10),
-            (TokenKind::Eof, 10, 10),
-        ]);
-        let (module, diags) = Parser::new(source, tokens).parse_module();
-        assert!(diags.is_empty());
-        assert_eq!(module.name.as_deref(), Some("Foo"));
     }
 
     #[test]

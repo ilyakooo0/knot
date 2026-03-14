@@ -1,6 +1,8 @@
 -- schema.lock (auto-generated, do not edit)
 -- Commit to source control.
 
+on = {name: Text, age: Int, email: Text
+
 type Person = {name: Text, age: Int, email: Text}
 
 *people : [Person]

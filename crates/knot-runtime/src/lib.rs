@@ -882,6 +882,39 @@ pub extern "C" fn knot_value_concat(a: *mut Value, b: *mut Value) -> *mut Value 
     }
 }
 
+// ── Comparison (returns Ordering ADT) ─────────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_value_compare(a: *mut Value, b: *mut Value) -> *mut Value {
+    let ordering = match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Float(x), Value::Float(y)) => {
+            x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (Value::Int(x), Value::Float(y)) => {
+            (*x as f64).partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (Value::Float(x), Value::Int(y)) => {
+            x.partial_cmp(&(*y as f64)).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        _ => panic!(
+            "knot runtime: cannot compare {} with {}",
+            type_name(a),
+            type_name(b)
+        ),
+    };
+    let tag = match ordering {
+        std::cmp::Ordering::Less => "LT",
+        std::cmp::Ordering::Equal => "EQ",
+        std::cmp::Ordering::Greater => "GT",
+    };
+    alloc(Value::Constructor(
+        tag.to_string(),
+        alloc(Value::Unit),
+    ))
+}
+
 // ── Unary operations ──────────────────────────────────────────────
 
 #[unsafe(no_mangle)]

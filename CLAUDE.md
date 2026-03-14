@@ -89,7 +89,8 @@ Key codegen patterns:
 - Standalone lambdas compile as separate functions; free variables captured in a record-valued closure environment; multi-param lambdas (`\a b c -> body`) are curried into nested single-param lambdas at compile time
 - Runtime functions are pre-declared as imports; `call_rt`/`call_rt_void` helpers emit calls
 - `knot_relation_len` returns raw `usize`, not a boxed `Value` — use directly as loop bound
-- Trait impl methods compile as mangled functions (`TraitName_TypeName_methodName`); a dispatcher function checks `knot_value_get_tag` at runtime and calls the matching impl; missing impls panic with a clear error message
+- Trait impl methods compile as mangled functions (`TraitName_TypeName_methodName`); a dispatcher function checks `knot_value_get_tag` at runtime and calls the matching impl; missing impls panic with a clear error message (except operator-mapped methods like `eq`/`compare`/`add`/`sub`/`mul`/`div`/`negate` which fall back to runtime functions for types without explicit impls)
+- Operator trait dispatch: arithmetic operators (`+`, `-`, `*`, `/`) dispatch through `Num` trait methods (`add`, `sub`, `mul`, `div`); unary negation dispatches through `Num.negate`; `==` dispatches through `Eq.eq`; `!=` dispatches through `Eq.eq` then negates; comparison operators (`<`, `>`, `<=`, `>=`) dispatch through `Ord.compare` and check the resulting `Ordering` constructor tag; `&&`/`||`/`++` remain direct runtime calls (no trait). Primitive impls (Int, Float, Text, Bool) are registered as intrinsic codegen impls that delegate to runtime functions, avoiding circular dependencies (the prelude source does NOT contain these impls)
 - Default trait methods: if an impl omits a method with a default body, the default is auto-compiled for that type
 - `deriving (TraitName)` on data types auto-generates impls using the trait's default method bodies
 - `show` calls `knot_value_show` (converts any value to Text representation)

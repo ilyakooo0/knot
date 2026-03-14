@@ -37,47 +37,12 @@ trait Applicative f => Alternative (f : Type -> Type) where
 trait Foldable (t : Type -> Type) where
   fold : (b -> a -> b) -> b -> t a -> b
 
-impl Eq Int where
-  eq a b = a == b
-
-impl Eq Float where
-  eq a b = a == b
-
-impl Eq Text where
-  eq a b = a == b
-
-impl Eq Bool where
-  eq a b = a == b
-
-impl Ord Int where
-  compare a b = if a < b then LT {} else if a > b then GT {} else EQ {}
-
-impl Ord Float where
-  compare a b = if a < b then LT {} else if a > b then GT {} else EQ {}
-
-impl Ord Text where
-  compare a b = if a < b then LT {} else if a > b then GT {} else EQ {}
-
 trait Eq a => Num a where
   add : a -> a -> a
   sub : a -> a -> a
   mul : a -> a -> a
   div : a -> a -> a
   negate : a -> a
-
-impl Num Int where
-  add a b = a + b
-  sub a b = a - b
-  mul a b = a * b
-  div a b = a / b
-  negate a = 0 - a
-
-impl Num Float where
-  add a b = a + b
-  sub a b = a - b
-  mul a b = a * b
-  div a b = a / b
-  negate a = 0.0 - a
 
 trait Display a where
   display : a -> Text

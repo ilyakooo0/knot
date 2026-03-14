@@ -1,6 +1,8 @@
 -- schema.lock (auto-generated, do not edit)
 -- Commit to source control.
 
+ams : [{name: Text, members: [Person]}]
+
 type Person = {name: Text, age: Int}
 
 *teams : [{name: Text, members: [Person]}]

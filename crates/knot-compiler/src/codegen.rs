@@ -375,6 +375,9 @@ impl Codegen {
         self.declare_rt("knot_value_or", &[p, p], &[p]);
         self.declare_rt("knot_value_concat", &[p, p], &[p]);
 
+        // Comparison (returns Ordering ADT)
+        self.declare_rt("knot_value_compare", &[p, p], &[p]);
+
         // Unary operations
         self.declare_rt("knot_value_negate", &[p], &[p]);
         self.declare_rt("knot_value_not", &[p], &[p]);
@@ -1102,6 +1105,11 @@ impl Codegen {
         // with base-parsed source.
         self.register_builtin_relation_impls();
 
+        // Register built-in primitive impls for Eq, Ord, Num traits.
+        // These delegate to runtime functions to avoid circular dependencies
+        // (e.g. `impl Eq Int where eq a b = a == b` would loop if == dispatches through eq).
+        self.register_builtin_primitive_impls();
+
         // Validate supertrait constraints
         self.validate_supertraits();
 
@@ -1203,6 +1211,82 @@ impl Codegen {
                 })
                 .or_default()
                 .push(("Relation".to_string(), ast::Span { start: 0, end: 0 }));
+        }
+    }
+
+    /// Register built-in primitive impls for Eq, Ord, Num traits.
+    /// These delegate directly to runtime functions, avoiding circular dependencies.
+    fn register_builtin_primitive_impls(&mut self) {
+        // (mangled_name, trait_method_name, type_name, n_user_params, trait_name)
+        let impls = [
+            // Eq impls
+            ("Eq_Int_eq", "eq", "Int", 2, "Eq"),
+            ("Eq_Float_eq", "eq", "Float", 2, "Eq"),
+            ("Eq_Text_eq", "eq", "Text", 2, "Eq"),
+            ("Eq_Bool_eq", "eq", "Bool", 2, "Eq"),
+            // Ord impls
+            ("Ord_Int_compare", "compare", "Int", 2, "Ord"),
+            ("Ord_Float_compare", "compare", "Float", 2, "Ord"),
+            ("Ord_Text_compare", "compare", "Text", 2, "Ord"),
+            // Num impls
+            ("Num_Int_add", "add", "Int", 2, "Num"),
+            ("Num_Int_sub", "sub", "Int", 2, "Num"),
+            ("Num_Int_mul", "mul", "Int", 2, "Num"),
+            ("Num_Int_div", "div", "Int", 2, "Num"),
+            ("Num_Int_negate", "negate", "Int", 1, "Num"),
+            ("Num_Float_add", "add", "Float", 2, "Num"),
+            ("Num_Float_sub", "sub", "Float", 2, "Num"),
+            ("Num_Float_mul", "mul", "Float", 2, "Num"),
+            ("Num_Float_div", "div", "Float", 2, "Num"),
+            ("Num_Float_negate", "negate", "Float", 1, "Num"),
+        ];
+        for (mangled, method_name, type_name, n_params, trait_name) in &impls {
+            // Don't register if already defined (by user impl or prelude)
+            if self.user_fns.contains_key(*mangled) {
+                continue;
+            }
+            let already_has_impl = self
+                .trait_methods
+                .get(*method_name)
+                .map(|info| info.impls.iter().any(|e| e.type_name == *type_name))
+                .unwrap_or(false);
+            if already_has_impl {
+                continue;
+            }
+
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(self.ptr_type)); // db
+            for _ in 0..*n_params {
+                sig.params.push(AbiParam::new(self.ptr_type));
+            }
+            sig.returns.push(AbiParam::new(self.ptr_type));
+            let func_name = format!("knot_user_{}", mangled);
+            let func_id = self
+                .module
+                .declare_function(&func_name, Linkage::Local, &sig)
+                .unwrap();
+            self.user_fns
+                .insert(mangled.to_string(), (func_id, *n_params));
+            self.registered_builtin_impls.insert(mangled.to_string());
+
+            self.trait_methods
+                .entry(method_name.to_string())
+                .or_insert(TraitMethodInfo {
+                    param_count: *n_params,
+                    dispatch_index: None,
+                    impls: Vec::new(),
+                })
+                .impls
+                .push(ImplEntry {
+                    type_name: type_name.to_string(),
+                    func_id,
+                });
+
+            // Track for supertrait validation
+            self.trait_impl_types
+                .entry(trait_name.to_string())
+                .or_default()
+                .push((type_name.to_string(), ast::Span { start: 0, end: 0 }));
         }
     }
 
@@ -1327,6 +1411,82 @@ impl Codegen {
         });
     }
 
+    /// Define Cranelift IR bodies for built-in primitive impls (Eq, Ord, Num).
+    /// Each impl delegates to the corresponding runtime function.
+    fn define_builtin_primitive_impls(&mut self) {
+        macro_rules! define_if_registered {
+            ($name:expr, $body:expr) => {
+                if self.registered_builtin_impls.contains($name) {
+                    if let Some(&(func_id, _)) = self.user_fns.get($name) {
+                        $body(self, func_id);
+                    }
+                }
+            };
+        }
+
+        // Helper: define a 2-param impl that delegates to a runtime function
+        // Signature: (db, a, b) → rt_fn(a, b)
+        macro_rules! define_binop_impl {
+            ($mangled:expr, $rt_fn:expr) => {
+                define_if_registered!($mangled, |cg: &mut Self, func_id: FuncId| {
+                    let mut sig = cg.module.make_signature();
+                    sig.params.push(AbiParam::new(cg.ptr_type)); // db
+                    sig.params.push(AbiParam::new(cg.ptr_type)); // a
+                    sig.params.push(AbiParam::new(cg.ptr_type)); // b
+                    sig.returns.push(AbiParam::new(cg.ptr_type));
+                    cg.build_function(func_id, sig, |cg, builder, entry| {
+                        let a = builder.block_params(entry)[1];
+                        let b = builder.block_params(entry)[2];
+                        let result = cg.call_rt(builder, $rt_fn, &[a, b]);
+                        builder.ins().return_(&[result]);
+                    });
+                });
+            };
+        }
+
+        // Helper: define a 1-param impl that delegates to a runtime function
+        // Signature: (db, a) → rt_fn(a)
+        macro_rules! define_unop_impl {
+            ($mangled:expr, $rt_fn:expr) => {
+                define_if_registered!($mangled, |cg: &mut Self, func_id: FuncId| {
+                    let mut sig = cg.module.make_signature();
+                    sig.params.push(AbiParam::new(cg.ptr_type)); // db
+                    sig.params.push(AbiParam::new(cg.ptr_type)); // a
+                    sig.returns.push(AbiParam::new(cg.ptr_type));
+                    cg.build_function(func_id, sig, |cg, builder, entry| {
+                        let a = builder.block_params(entry)[1];
+                        let result = cg.call_rt(builder, $rt_fn, &[a]);
+                        builder.ins().return_(&[result]);
+                    });
+                });
+            };
+        }
+
+        // Eq impls: eq(a, b) → knot_value_eq(a, b)
+        define_binop_impl!("Eq_Int_eq", "knot_value_eq");
+        define_binop_impl!("Eq_Float_eq", "knot_value_eq");
+        define_binop_impl!("Eq_Text_eq", "knot_value_eq");
+        define_binop_impl!("Eq_Bool_eq", "knot_value_eq");
+
+        // Ord impls: compare(a, b) → knot_value_compare(a, b)
+        define_binop_impl!("Ord_Int_compare", "knot_value_compare");
+        define_binop_impl!("Ord_Float_compare", "knot_value_compare");
+        define_binop_impl!("Ord_Text_compare", "knot_value_compare");
+
+        // Num impls: add/sub/mul/div(a, b) → knot_value_add/sub/mul/div(a, b)
+        define_binop_impl!("Num_Int_add", "knot_value_add");
+        define_binop_impl!("Num_Int_sub", "knot_value_sub");
+        define_binop_impl!("Num_Int_mul", "knot_value_mul");
+        define_binop_impl!("Num_Int_div", "knot_value_div");
+        define_unop_impl!("Num_Int_negate", "knot_value_negate");
+
+        define_binop_impl!("Num_Float_add", "knot_value_add");
+        define_binop_impl!("Num_Float_sub", "knot_value_sub");
+        define_binop_impl!("Num_Float_mul", "knot_value_mul");
+        define_binop_impl!("Num_Float_div", "knot_value_div");
+        define_unop_impl!("Num_Float_negate", "knot_value_negate");
+    }
+
     // ── Supertrait validation ────────────────────────────────────
 
     /// Check that every impl (including derived) satisfies its supertrait
@@ -1436,6 +1596,9 @@ impl Codegen {
 
         // Define built-in [] impls for HKT traits
         self.define_builtin_relation_impls();
+
+        // Define built-in primitive impls for Eq, Ord, Num traits
+        self.define_builtin_primitive_impls();
 
         for decl in &module.decls {
             match &decl.node {
@@ -1809,15 +1972,32 @@ impl Codegen {
                     builder.seal_block(next_block);
                 }
 
-                // Fallback: runtime error (no matching impl found)
-                let (name_ptr, name_len) =
-                    cg.string_ptr(builder, &method_name);
-                let err = cg.call_rt(
-                    builder,
-                    "knot_trait_no_impl",
-                    &[name_ptr, name_len, dispatch_arg],
-                );
-                builder.ins().jump(merge_block, &[err]);
+                // Fallback: for operator-mapped trait methods, delegate to the
+                // runtime function (handles types without explicit impls like
+                // Record == Record). For other traits, panic with no-impl error.
+                let fallback_rt = match method_name.as_str() {
+                    "eq" => Some("knot_value_eq"),
+                    "compare" => Some("knot_value_compare"),
+                    "add" => Some("knot_value_add"),
+                    "sub" => Some("knot_value_sub"),
+                    "mul" => Some("knot_value_mul"),
+                    "div" => Some("knot_value_div"),
+                    "negate" => Some("knot_value_negate"),
+                    _ => None,
+                };
+                if let Some(rt_fn) = fallback_rt {
+                    let result = cg.call_rt(builder, rt_fn, &all_params);
+                    builder.ins().jump(merge_block, &[result]);
+                } else {
+                    let (name_ptr, name_len) =
+                        cg.string_ptr(builder, &method_name);
+                    let err = cg.call_rt(
+                        builder,
+                        "knot_trait_no_impl",
+                        &[name_ptr, name_len, dispatch_arg],
+                    );
+                    builder.ins().jump(merge_block, &[err]);
+                }
 
                 builder.switch_to_block(merge_block);
                 builder.seal_block(merge_block);
@@ -2460,33 +2640,40 @@ impl Codegen {
                 } else {
                     let l = self.compile_expr(builder, lhs, env, db);
                     let r = self.compile_expr(builder, rhs, env, db);
-                    let fn_name = match op {
-                        ast::BinOp::Add => "knot_value_add",
-                        ast::BinOp::Sub => "knot_value_sub",
-                        ast::BinOp::Mul => "knot_value_mul",
-                        ast::BinOp::Div => "knot_value_div",
-                        ast::BinOp::Eq => "knot_value_eq",
-                        ast::BinOp::Neq => "knot_value_neq",
-                        ast::BinOp::Lt => "knot_value_lt",
-                        ast::BinOp::Gt => "knot_value_gt",
-                        ast::BinOp::Le => "knot_value_le",
-                        ast::BinOp::Ge => "knot_value_ge",
-                        ast::BinOp::And => "knot_value_and",
-                        ast::BinOp::Or => "knot_value_or",
-                        ast::BinOp::Concat => "knot_value_concat",
+                    match op {
+                        // Arithmetic: dispatch through Num trait
+                        ast::BinOp::Add => self.compile_trait_binop(builder, "add", l, r, db, "knot_value_add"),
+                        ast::BinOp::Sub => self.compile_trait_binop(builder, "sub", l, r, db, "knot_value_sub"),
+                        ast::BinOp::Mul => self.compile_trait_binop(builder, "mul", l, r, db, "knot_value_mul"),
+                        ast::BinOp::Div => self.compile_trait_binop(builder, "div", l, r, db, "knot_value_div"),
+                        // Equality: dispatch through Eq trait
+                        ast::BinOp::Eq => self.compile_trait_binop(builder, "eq", l, r, db, "knot_value_eq"),
+                        ast::BinOp::Neq => {
+                            let eq_result = self.compile_trait_binop(builder, "eq", l, r, db, "knot_value_eq");
+                            self.call_rt(builder, "knot_value_not", &[eq_result])
+                        }
+                        // Comparison: dispatch through Ord trait (compare → Ordering)
+                        ast::BinOp::Lt => self.compile_comparison(builder, l, r, db, "LT", false),
+                        ast::BinOp::Gt => self.compile_comparison(builder, l, r, db, "GT", false),
+                        ast::BinOp::Le => self.compile_comparison(builder, l, r, db, "GT", true),
+                        ast::BinOp::Ge => self.compile_comparison(builder, l, r, db, "LT", true),
+                        // Boolean / string ops: no trait dispatch
+                        ast::BinOp::And => self.call_rt(builder, "knot_value_and", &[l, r]),
+                        ast::BinOp::Or => self.call_rt(builder, "knot_value_or", &[l, r]),
+                        ast::BinOp::Concat => self.call_rt(builder, "knot_value_concat", &[l, r]),
                         ast::BinOp::Pipe => unreachable!(),
-                    };
-                    self.call_rt(builder, fn_name, &[l, r])
+                    }
                 }
             }
 
             ast::ExprKind::UnaryOp { op, operand } => {
                 let val = self.compile_expr(builder, operand, env, db);
-                let fn_name = match op {
-                    ast::UnaryOp::Neg => "knot_value_negate",
-                    ast::UnaryOp::Not => "knot_value_not",
-                };
-                self.call_rt(builder, fn_name, &[val])
+                match op {
+                    // Negation: dispatch through Num trait
+                    ast::UnaryOp::Neg => self.compile_trait_unop(builder, "negate", val, db, "knot_value_negate"),
+                    // Boolean not: no trait dispatch
+                    ast::UnaryOp::Not => self.call_rt(builder, "knot_value_not", &[val]),
+                }
             }
 
             ast::ExprKind::If {
@@ -4445,6 +4632,95 @@ impl Codegen {
             self.call_rt_void(builder, "knot_relation_push", &[rel, val]);
         }
         rel
+    }
+
+    // ── Operator trait dispatch helpers ────────────────────────────
+
+    /// Compile a binary operator via trait dispatch (e.g., `+` → `add` dispatcher).
+    /// Falls back to `fallback_rt` if no dispatcher exists (e.g., user redefined the trait).
+    fn compile_trait_binop(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        method: &str,
+        l: Value,
+        r: Value,
+        db: Value,
+        fallback_rt: &str,
+    ) -> Value {
+        if let Some(&func_id) = self.trait_dispatcher_fns.get(method) {
+            let func_ref = self.module.declare_func_in_func(func_id, builder.func);
+            let call = builder.ins().call(func_ref, &[db, l, r]);
+            builder.inst_results(call)[0]
+        } else {
+            self.call_rt(builder, fallback_rt, &[l, r])
+        }
+    }
+
+    /// Compile a unary operator via trait dispatch (e.g., `-x` → `negate` dispatcher).
+    fn compile_trait_unop(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        method: &str,
+        val: Value,
+        db: Value,
+        fallback_rt: &str,
+    ) -> Value {
+        if let Some(&func_id) = self.trait_dispatcher_fns.get(method) {
+            let func_ref = self.module.declare_func_in_func(func_id, builder.func);
+            let call = builder.ins().call(func_ref, &[db, val]);
+            builder.inst_results(call)[0]
+        } else {
+            self.call_rt(builder, fallback_rt, &[val])
+        }
+    }
+
+    /// Compile a comparison operator via the `compare` trait dispatcher.
+    /// Calls `compare(l, r)` to get an Ordering value, then checks the constructor tag.
+    /// `match_tag` is the Ordering constructor to check ("LT" or "GT").
+    /// `negate` inverts the result (for `<=` and `>=`).
+    fn compile_comparison(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        l: Value,
+        r: Value,
+        db: Value,
+        match_tag: &str,
+        negate: bool,
+    ) -> Value {
+        if let Some(&func_id) = self.trait_dispatcher_fns.get("compare") {
+            let func_ref = self.module.declare_func_in_func(func_id, builder.func);
+            let call = builder.ins().call(func_ref, &[db, l, r]);
+            let ordering = builder.inst_results(call)[0];
+
+            // Check if ordering matches the tag
+            let (tag_ptr, tag_len) = self.string_ptr(builder, match_tag);
+            let matches = self.call_rt_typed(
+                builder,
+                "knot_constructor_matches",
+                &[ordering, tag_ptr, tag_len],
+                types::I32,
+            );
+
+            let result_i32 = if negate {
+                // Negate: 1 → 0, 0 → 1  (e.g., <= means NOT GT)
+                let one = builder.ins().iconst(types::I32, 1);
+                builder.ins().isub(one, matches)
+            } else {
+                matches
+            };
+
+            self.call_rt(builder, "knot_value_bool", &[result_i32])
+        } else {
+            // Fallback to direct runtime comparison
+            let rt_fn = match (match_tag, negate) {
+                ("LT", false) => "knot_value_lt",
+                ("GT", false) => "knot_value_gt",
+                ("GT", true) => "knot_value_le",
+                ("LT", true) => "knot_value_ge",
+                _ => unreachable!(),
+            };
+            self.call_rt(builder, rt_fn, &[l, r])
+        }
     }
 }
 

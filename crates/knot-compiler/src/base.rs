@@ -15,8 +15,10 @@ const PRELUDE_SOURCE: &str = r#"
 trait Eq a where
   eq : a -> a -> Bool
 
+data Ordering = LT {} | EQ {} | GT {}
+
 trait Eq a => Ord a where
-  compare : a -> a -> Int
+  compare : a -> a -> Ordering
 
 trait Functor (f : Type -> Type) where
   map : (a -> b) -> f a -> f b
@@ -48,13 +50,13 @@ impl Eq Bool where
   eq a b = a == b
 
 impl Ord Int where
-  compare a b = if a < b then 0 - 1 else if a > b then 1 else 0
+  compare a b = if a < b then LT {} else if a > b then GT {} else EQ {}
 
 impl Ord Float where
-  compare a b = if a < b then 0 - 1 else if a > b then 1 else 0
+  compare a b = if a < b then LT {} else if a > b then GT {} else EQ {}
 
 impl Ord Text where
-  compare a b = if a < b then 0 - 1 else if a > b then 1 else 0
+  compare a b = if a < b then LT {} else if a > b then GT {} else EQ {}
 
 trait Eq a => Num a where
   add : a -> a -> a

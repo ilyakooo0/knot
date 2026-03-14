@@ -15,3 +15,5 @@ examples/maybe
 examples/adt_*
 examples/bytes
 examples/groupby
+examples/json
+examples/nested

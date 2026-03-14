@@ -1191,6 +1191,105 @@ pub extern "C" fn knot_relation_single(rel: *mut Value) -> *mut Value {
     }
 }
 
+// ── Standard library: derived relation operations ────────────────
+
+/// diff(a, b) — rows in a but not in b
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_diff(a: *mut Value, b: *mut Value) -> *mut Value {
+    let rows_a = match unsafe { as_ref(a) } {
+        Value::Relation(rows) => rows.clone(),
+        _ => panic!("knot runtime: diff expected Relation, got {}", type_name(a)),
+    };
+    let rows_b = match unsafe { as_ref(b) } {
+        Value::Relation(rows) => rows.clone(),
+        _ => panic!("knot runtime: diff expected Relation, got {}", type_name(b)),
+    };
+    let result: Vec<*mut Value> = rows_a
+        .into_iter()
+        .filter(|r| !rows_b.iter().any(|b| values_equal(*r, *b)))
+        .collect();
+    alloc(Value::Relation(result))
+}
+
+/// inter(a, b) — rows in both a and b
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_inter(a: *mut Value, b: *mut Value) -> *mut Value {
+    let rows_a = match unsafe { as_ref(a) } {
+        Value::Relation(rows) => rows.clone(),
+        _ => panic!(
+            "knot runtime: inter expected Relation, got {}",
+            type_name(a)
+        ),
+    };
+    let rows_b = match unsafe { as_ref(b) } {
+        Value::Relation(rows) => rows.clone(),
+        _ => panic!(
+            "knot runtime: inter expected Relation, got {}",
+            type_name(b)
+        ),
+    };
+    let result: Vec<*mut Value> = rows_a
+        .into_iter()
+        .filter(|r| rows_b.iter().any(|b| values_equal(*r, *b)))
+        .collect();
+    alloc(Value::Relation(result))
+}
+
+/// sum(f, rel) — sum of f(x) for each x in rel
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_sum(
+    db: *mut c_void,
+    f: *mut Value,
+    rel: *mut Value,
+) -> *mut Value {
+    let rows = match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => rows.clone(),
+        _ => panic!(
+            "knot runtime: sum expected Relation, got {}",
+            type_name(rel)
+        ),
+    };
+    let mut acc = alloc(Value::Int(0));
+    for row in rows {
+        let val = knot_value_call(db, f, row);
+        acc = knot_value_add(acc, val);
+    }
+    acc
+}
+
+/// avg(f, rel) — average of f(x) for each x in rel (returns Float)
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_avg(
+    db: *mut c_void,
+    f: *mut Value,
+    rel: *mut Value,
+) -> *mut Value {
+    let rows = match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => rows.clone(),
+        _ => panic!(
+            "knot runtime: avg expected Relation, got {}",
+            type_name(rel)
+        ),
+    };
+    if rows.is_empty() {
+        return alloc(Value::Float(0.0));
+    }
+    let mut total = 0.0f64;
+    let count = rows.len();
+    for row in rows {
+        let val = knot_value_call(db, f, row);
+        match unsafe { as_ref(val) } {
+            Value::Int(n) => total += *n as f64,
+            Value::Float(n) => total += n,
+            _ => panic!(
+                "knot runtime: avg projection must return Int or Float, got {}",
+                type_name(val)
+            ),
+        }
+    }
+    alloc(Value::Float(total / count as f64))
+}
+
 // ── Standard library: text operations ─────────────────────────────
 
 /// toUpper(text) — convert text to uppercase

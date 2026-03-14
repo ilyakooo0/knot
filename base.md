@@ -75,6 +75,51 @@ Extract the single element from a one-element relation. Panics if the relation i
 single [{name: "Alice"}]    -- {name: "Alice"}
 ```
 
+```knot
+diff : [a] -> [a] -> [a]
+```
+Set difference. Returns rows in the first relation that are not in the second.
+
+```knot
+diff [1, 2, 3, 4, 5] [2, 4]    -- [1, 3, 5]
+
+-- Remove known users from a list
+diff *allUsers *bannedUsers
+```
+
+```knot
+inter : [a] -> [a] -> [a]
+```
+Set intersection. Returns rows that appear in both relations.
+
+```knot
+inter [1, 2, 3, 4, 5] [2, 4, 6]    -- [2, 4]
+
+-- Find users who are also admins
+inter *users *admins
+```
+
+```knot
+sum : (a -> b) -> [a] -> b
+```
+Sum a numeric projection over a relation. The projection function extracts the value to sum from each row. Works with both `Int` and `Float`.
+
+```knot
+sum (\x -> x) [10, 20, 30]              -- 60
+sum (\o -> o.amount) *orders             -- total of all order amounts
+*orders |> sum (\o -> o.amount)          -- same with pipe
+```
+
+```knot
+avg : (a -> Float) -> [a] -> Float
+```
+Average a numeric projection over a relation. Always returns `Float`. Returns `0.0` for an empty relation.
+
+```knot
+avg (\x -> x) [10.0, 20.0, 30.0]        -- 20.0
+avg (\e -> e.salary) *employees          -- mean salary
+```
+
 ## Text
 
 ```knot

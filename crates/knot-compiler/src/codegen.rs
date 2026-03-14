@@ -445,6 +445,10 @@ impl Codegen {
         self.declare_rt("knot_relation_ap", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_fold", &[p, p, p, p], &[p]);
         self.declare_rt("knot_relation_single", &[p], &[p]);
+        self.declare_rt("knot_relation_diff", &[p, p], &[p]);
+        self.declare_rt("knot_relation_inter", &[p, p], &[p]);
+        self.declare_rt("knot_relation_sum", &[p, p, p], &[p]);
+        self.declare_rt("knot_relation_avg", &[p, p, p], &[p]);
 
         // Standard library: text operations
         self.declare_rt("knot_text_to_upper", &[p], &[p]);
@@ -734,7 +738,7 @@ impl Codegen {
         // map and fold are now trait methods (Functor.map, Foldable.fold)
         // with [] impls registered directly in register_builtin_relation_impls.
         let stdlib_names = [
-            "filter", "match", "single",
+            "filter", "match", "single", "diff", "inter", "sum", "avg",
             "toUpper", "toLower", "take", "drop",
             "length", "trim", "contains", "reverse",
             "chars", "id", "not",
@@ -1374,6 +1378,10 @@ impl Codegen {
         self.define_stdlib_fn_2("take", "knot_text_take", false);
         self.define_stdlib_fn_2("drop", "knot_text_drop", false);
         self.define_stdlib_fn_2("contains", "knot_text_contains", false);
+        self.define_stdlib_fn_2("diff", "knot_relation_diff", false);
+        self.define_stdlib_fn_2("inter", "knot_relation_inter", false);
+        self.define_stdlib_fn_2("sum", "knot_relation_sum", true);
+        self.define_stdlib_fn_2("avg", "knot_relation_avg", true);
 
         // JSON: 1-param
         self.define_stdlib_fn_1("toJson", "knot_json_encode");

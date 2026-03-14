@@ -2147,6 +2147,70 @@ impl Infer {
         // map and fold are now trait methods (Functor.map, Foldable.fold)
         // registered via the prelude's trait declarations.
 
+        // diff : ∀a. [a] -> [a] -> [a]
+        let a = self.fresh_var();
+        self.bind_top(
+            "diff",
+            Scheme::poly(
+                vec![a],
+                Ty::Fun(
+                    Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                    )),
+                ),
+            ),
+        );
+
+        // inter : ∀a. [a] -> [a] -> [a]
+        let a = self.fresh_var();
+        self.bind_top(
+            "inter",
+            Scheme::poly(
+                vec![a],
+                Ty::Fun(
+                    Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                    )),
+                ),
+            ),
+        );
+
+        // sum : ∀a b. (a -> b) -> [a] -> b
+        let a = self.fresh_var();
+        let b = self.fresh_var();
+        self.bind_top(
+            "sum",
+            Scheme::poly(
+                vec![a, b],
+                Ty::Fun(
+                    Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        Box::new(Ty::Var(b)),
+                    )),
+                ),
+            ),
+        );
+
+        // avg : ∀a. (a -> Float) -> [a] -> Float
+        let a = self.fresh_var();
+        self.bind_top(
+            "avg",
+            Scheme::poly(
+                vec![a],
+                Ty::Fun(
+                    Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Float))),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        Box::new(Ty::Float),
+                    )),
+                ),
+            ),
+        );
 
         // match : ∀a b. (a -> b) -> [b] -> [a]
         let a = self.fresh_var();

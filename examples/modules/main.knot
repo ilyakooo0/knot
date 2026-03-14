@@ -1,0 +1,12 @@
+module Main
+
+import ./types
+import ./utils
+
+*people : [Person]
+
+main = do
+  set *people = [{name: formatName "alice", age: double 15}]
+  p <- *people
+  println (p.name ++ " is " ++ show p.age)
+  yield {}

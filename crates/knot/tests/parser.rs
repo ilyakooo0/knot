@@ -3194,3 +3194,89 @@ fn do_with_group_by() {
         other => panic!("expected Do, got {:?}", other),
     }
 }
+
+// ── Import tests ────────────────────────────────────────────────────
+
+#[test]
+fn import_simple() {
+    let m = parse_ok("import ./utils\n\nfoo = 1");
+    assert_eq!(m.imports.len(), 1);
+    assert_eq!(m.imports[0].path, "./utils");
+    assert!(m.imports[0].items.is_none());
+    assert_eq!(m.decls.len(), 1);
+}
+
+#[test]
+fn import_nested_path() {
+    let m = parse_ok("import ./lib/helpers\n\nfoo = 1");
+    assert_eq!(m.imports.len(), 1);
+    assert_eq!(m.imports[0].path, "./lib/helpers");
+}
+
+#[test]
+fn import_parent_dir() {
+    let m = parse_ok("import ../shared\n\nfoo = 1");
+    assert_eq!(m.imports.len(), 1);
+    assert_eq!(m.imports[0].path, "../shared");
+}
+
+#[test]
+fn import_deeply_nested_parent() {
+    let m = parse_ok("import ../../core/types\n\nfoo = 1");
+    assert_eq!(m.imports.len(), 1);
+    assert_eq!(m.imports[0].path, "../../core/types");
+}
+
+#[test]
+fn import_selective() {
+    let m = parse_ok("import ./models (Person, Status)\n\nfoo = 1");
+    assert_eq!(m.imports.len(), 1);
+    assert_eq!(m.imports[0].path, "./models");
+    let items = m.imports[0].items.as_ref().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].name, "Person");
+    assert_eq!(items[1].name, "Status");
+}
+
+#[test]
+fn import_selective_lower() {
+    let m = parse_ok("import ./utils (add, formatName)\n\nfoo = 1");
+    let items = m.imports[0].items.as_ref().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].name, "add");
+    assert_eq!(items[1].name, "formatName");
+}
+
+#[test]
+fn import_selective_mixed() {
+    let m = parse_ok("import ./lib (Shape, format, Priority)\n\nfoo = 1");
+    let items = m.imports[0].items.as_ref().unwrap();
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0].name, "Shape");
+    assert_eq!(items[1].name, "format");
+    assert_eq!(items[2].name, "Priority");
+}
+
+#[test]
+fn import_multiple() {
+    let m = parse_ok("import ./models\nimport ./utils\nimport ./helpers\n\nfoo = 1");
+    assert_eq!(m.imports.len(), 3);
+    assert_eq!(m.imports[0].path, "./models");
+    assert_eq!(m.imports[1].path, "./utils");
+    assert_eq!(m.imports[2].path, "./helpers");
+}
+
+#[test]
+fn import_with_module_name() {
+    let m = parse_ok("module App\n\nimport ./models\nimport ./utils\n\nfoo = 1");
+    assert_eq!(m.name.as_deref(), Some("App"));
+    assert_eq!(m.imports.len(), 2);
+    assert_eq!(m.decls.len(), 1);
+}
+
+#[test]
+fn import_no_imports() {
+    let m = parse_ok("foo = 1");
+    assert!(m.imports.is_empty());
+    assert_eq!(m.decls.len(), 1);
+}

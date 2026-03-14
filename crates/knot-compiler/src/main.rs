@@ -9,6 +9,7 @@ mod infer;
 mod linker;
 mod lockfile;
 mod base;
+mod modules;
 mod types;
 
 use std::path::PathBuf;
@@ -76,6 +77,14 @@ fn cmd_build(source_file: &str) {
     if has_errors {
         for diag in &parse_diags {
             eprintln!("{}", diag.render(&source, &filename));
+        }
+        process::exit(1);
+    }
+
+    // Resolve imports — load, parse, and merge imported modules
+    if let Err(diags) = modules::resolve_imports(&mut module, &source_path) {
+        for diag in &diags {
+            eprintln!("{}", diag);
         }
         process::exit(1);
     }

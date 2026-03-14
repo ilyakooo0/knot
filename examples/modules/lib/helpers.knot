@@ -1,0 +1,5 @@
+module Helpers
+
+import ./core
+
+greet = \name -> greeting ++ ", " ++ name ++ "!"

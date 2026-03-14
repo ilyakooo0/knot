@@ -1,0 +1,5 @@
+module Types
+
+type Person = {name: Text, age: Int}
+
+data Priority = Low {} | Medium {} | High {}

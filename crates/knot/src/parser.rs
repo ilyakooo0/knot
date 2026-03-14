@@ -45,6 +45,15 @@ impl Parser {
 
         self.skip_newlines();
 
+        // Parse imports (must come before other declarations)
+        let mut imports = Vec::new();
+        while self.at(&TokenKind::Import) {
+            if let Some(imp) = self.parse_import() {
+                imports.push(imp);
+            }
+            self.skip_newlines();
+        }
+
         let mut decls = Vec::new();
         while !self.at_eof() {
             self.skip_newlines();
@@ -64,7 +73,7 @@ impl Parser {
             self.skip_newlines();
         }
 
-        (Module { name, decls }, self.diagnostics)
+        (Module { name, imports, decls }, self.diagnostics)
     }
 }
 
@@ -263,6 +272,103 @@ impl Parser {
                 Err(())
             }
         }
+    }
+}
+
+// ── Imports ─────────────────────────────────────────────────────────
+
+impl Parser {
+    /// Parse `import ./path` or `import ./path (A, b)`.
+    /// Path is assembled from Dot, Slash, and identifier tokens.
+    fn parse_import(&mut self) -> Option<Import> {
+        let start = self.span();
+        self.advance(); // consume `import`
+
+        // Parse the relative path: ./foo, ../bar/baz, etc.
+        let mut path = String::new();
+
+        // Must start with `.`
+        if !self.at(&TokenKind::Dot) {
+            self.error("expected relative path starting with '.' after 'import'");
+            return None;
+        }
+        self.advance();
+        path.push('.');
+
+        // Could be `..` (parent directory)
+        while self.at(&TokenKind::Dot) {
+            self.advance();
+            path.push('.');
+        }
+
+        // Consume `/segment` pairs (segment can be an identifier or `..`)
+        loop {
+            if !self.at(&TokenKind::Slash) {
+                break;
+            }
+            self.advance();
+            path.push('/');
+
+            if self.at(&TokenKind::Dot) {
+                // `..` parent directory segment within path
+                self.advance();
+                path.push('.');
+                if self.at(&TokenKind::Dot) {
+                    self.advance();
+                    path.push('.');
+                }
+            } else {
+                match self.peek().clone() {
+                    TokenKind::Lower(name) | TokenKind::Upper(name) => {
+                        self.advance();
+                        path.push_str(&name);
+                    }
+                    _ => {
+                        self.error("expected path segment after '/'");
+                        return None;
+                    }
+                }
+            }
+        }
+
+        // Optional selective import list: (A, b, C)
+        let items = if self.at(&TokenKind::LParen) {
+            self.advance();
+            let mut items = Vec::new();
+            loop {
+                if self.at(&TokenKind::RParen) {
+                    self.advance();
+                    break;
+                }
+                let item_span = self.span();
+                let name = match self.peek().clone() {
+                    TokenKind::Upper(n) | TokenKind::Lower(n) => {
+                        self.advance();
+                        n
+                    }
+                    _ => {
+                        self.error("expected name in import list");
+                        return None;
+                    }
+                };
+                items.push(ImportItem {
+                    name,
+                    span: item_span,
+                });
+                if !self.eat(&TokenKind::Comma) {
+                    self.expect(&TokenKind::RParen, "expected ',' or ')' in import list")
+                        .ok()?;
+                    break;
+                }
+            }
+            Some(items)
+        } else {
+            None
+        };
+
+        let end = self.span();
+        let span = Span::new(start.start, end.start);
+        Some(Import { path, items, span })
     }
 }
 

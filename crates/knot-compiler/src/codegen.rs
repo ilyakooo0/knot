@@ -106,6 +106,9 @@ pub struct Codegen {
     // Resolved monad types for desugared do-blocks (from type inference)
     monad_info: MonadInfo,
 
+    // Builtin relation impls that were actually registered (not already provided by user/prelude)
+    registered_builtin_impls: HashSet<String>,
+
     // Nullable-encoded ADTs: ctor_name -> NullableInfo
     // Types isomorphic to Maybe (one nullary ctor, one non-nullary ctor)
     // are encoded as nullable pointers: null = none variant, bare payload = some variant.
@@ -319,6 +322,7 @@ impl Codegen {
             type_aliases: HashMap::new(),
             user_fn_trampolines: HashMap::new(),
             monad_info: HashMap::new(),
+            registered_builtin_impls: HashSet::new(),
             nullable_ctors: HashMap::new(),
         }
     }
@@ -719,20 +723,10 @@ impl Codegen {
     // ── Declaration collection ────────────────────────────────────
 
     fn collect_declarations(&mut self, module: &ast::Module) {
-        // Register built-in __bind function for do-block desugaring.
-        // __bind(func, collection) calls knot_relation_bind(db, func, collection).
-        {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(self.ptr_type)); // db
-            sig.params.push(AbiParam::new(self.ptr_type)); // func
-            sig.params.push(AbiParam::new(self.ptr_type)); // collection
-            sig.returns.push(AbiParam::new(self.ptr_type));
-            let func_id = self
-                .module
-                .declare_function("knot_user___bind", Linkage::Local, &sig)
-                .unwrap();
-            self.user_fns.insert("__bind".into(), (func_id, 2));
-        }
+        // __bind/__yield/__empty are desugared do-block operations that dispatch
+        // through Monad/Applicative/Alternative trait impls (see compile_app,
+        // compile_monadic_yield, compile_monadic_empty). No standalone user
+        // function is registered — dispatch is compile-time via monad_info.
 
         // Register standard library functions (all as 1-param for proper currying)
         // map and fold are now trait methods (Functor.map, Foldable.fold)
@@ -1142,7 +1136,7 @@ impl Codegen {
 
     // ── Built-in [] impls for HKT traits ─────────────────────────
 
-    /// Register mangled functions for Functor/Applicative/Monad/Foldable [] impls.
+    /// Register mangled functions for Functor/Applicative/Monad/Alternative/Foldable [] impls.
     /// Called from `collect_declarations` after user impls are processed.
     fn register_builtin_relation_impls(&mut self) {
         // (mangled_name, trait_method_name, n_user_params)
@@ -1151,10 +1145,15 @@ impl Codegen {
             ("Applicative_Relation_yield", "yield", 1),
             ("Applicative_Relation_ap", "ap", 2),
             ("Monad_Relation_bind", "bind", 2),
+            ("Alternative_Relation_empty", "empty", 0),
+            ("Alternative_Relation_alt", "alt", 2),
             ("Foldable_Relation_fold", "fold", 3),
         ];
         for (mangled, method_name, n_params) in &impls {
-            // Don't register if the user already defined this impl
+            // Don't register if already defined (by user impl or prelude)
+            if self.user_fns.contains_key(*mangled) {
+                continue;
+            }
             let already_has_relation_impl = self
                 .trait_methods
                 .get(*method_name)
@@ -1177,6 +1176,7 @@ impl Codegen {
                 .unwrap();
             self.user_fns
                 .insert(mangled.to_string(), (func_id, *n_params));
+            self.registered_builtin_impls.insert(mangled.to_string());
 
             self.trait_methods
                 .entry(method_name.to_string())
@@ -1197,6 +1197,7 @@ impl Codegen {
                     "map" => "Functor".to_string(),
                     "yield" | "ap" => "Applicative".to_string(),
                     "bind" => "Monad".to_string(),
+                    "empty" | "alt" => "Alternative".to_string(),
                     "fold" => "Foldable".to_string(),
                     _ => continue,
                 })
@@ -1206,78 +1207,116 @@ impl Codegen {
     }
 
     /// Define Cranelift IR bodies for built-in [] impls of HKT traits.
-    /// Called from `define_functions` after stdlib definitions.
+    /// Only defines impls that were actually registered by `register_builtin_relation_impls`
+    /// (not those already provided by user code or the prelude).
     fn define_builtin_relation_impls(&mut self) {
+        // Helper macro: only define if this impl was registered by the builtin path
+        macro_rules! define_if_registered {
+            ($name:expr, $body:expr) => {
+                if self.registered_builtin_impls.contains($name) {
+                    if let Some(&(func_id, _)) = self.user_fns.get($name) {
+                        $body(self, func_id);
+                    }
+                }
+            };
+        }
+
         // Functor_Relation_map(db, f, rel) → knot_relation_map(db, f, rel)
-        if let Some(&(func_id, _)) = self.user_fns.get("Functor_Relation_map") {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(self.ptr_type)); // db
-            sig.params.push(AbiParam::new(self.ptr_type)); // f
-            sig.params.push(AbiParam::new(self.ptr_type)); // rel
-            sig.returns.push(AbiParam::new(self.ptr_type));
-            self.build_function(func_id, sig, |cg, builder, entry| {
+        define_if_registered!("Functor_Relation_map", |cg: &mut Self, func_id: FuncId| {
+            let mut sig = cg.module.make_signature();
+            sig.params.push(AbiParam::new(cg.ptr_type)); // db
+            sig.params.push(AbiParam::new(cg.ptr_type)); // f
+            sig.params.push(AbiParam::new(cg.ptr_type)); // rel
+            sig.returns.push(AbiParam::new(cg.ptr_type));
+            cg.build_function(func_id, sig, |cg, builder, entry| {
                 let db = builder.block_params(entry)[0];
                 let f = builder.block_params(entry)[1];
                 let rel = builder.block_params(entry)[2];
                 let result = cg.call_rt(builder, "knot_relation_map", &[db, f, rel]);
                 builder.ins().return_(&[result]);
             });
-        }
+        });
 
         // Applicative_Relation_yield(db, x) → knot_relation_singleton(x)
-        if let Some(&(func_id, _)) = self.user_fns.get("Applicative_Relation_yield") {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(self.ptr_type)); // db
-            sig.params.push(AbiParam::new(self.ptr_type)); // x
-            sig.returns.push(AbiParam::new(self.ptr_type));
-            self.build_function(func_id, sig, |cg, builder, entry| {
+        define_if_registered!("Applicative_Relation_yield", |cg: &mut Self, func_id: FuncId| {
+            let mut sig = cg.module.make_signature();
+            sig.params.push(AbiParam::new(cg.ptr_type)); // db
+            sig.params.push(AbiParam::new(cg.ptr_type)); // x
+            sig.returns.push(AbiParam::new(cg.ptr_type));
+            cg.build_function(func_id, sig, |cg, builder, entry| {
                 let x = builder.block_params(entry)[1];
                 let result = cg.call_rt(builder, "knot_relation_singleton", &[x]);
                 builder.ins().return_(&[result]);
             });
-        }
+        });
 
         // Applicative_Relation_ap(db, fs, xs) → knot_relation_ap(db, fs, xs)
-        if let Some(&(func_id, _)) = self.user_fns.get("Applicative_Relation_ap") {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(self.ptr_type)); // db
-            sig.params.push(AbiParam::new(self.ptr_type)); // fs
-            sig.params.push(AbiParam::new(self.ptr_type)); // xs
-            sig.returns.push(AbiParam::new(self.ptr_type));
-            self.build_function(func_id, sig, |cg, builder, entry| {
+        define_if_registered!("Applicative_Relation_ap", |cg: &mut Self, func_id: FuncId| {
+            let mut sig = cg.module.make_signature();
+            sig.params.push(AbiParam::new(cg.ptr_type)); // db
+            sig.params.push(AbiParam::new(cg.ptr_type)); // fs
+            sig.params.push(AbiParam::new(cg.ptr_type)); // xs
+            sig.returns.push(AbiParam::new(cg.ptr_type));
+            cg.build_function(func_id, sig, |cg, builder, entry| {
                 let db = builder.block_params(entry)[0];
                 let fs = builder.block_params(entry)[1];
                 let xs = builder.block_params(entry)[2];
                 let result = cg.call_rt(builder, "knot_relation_ap", &[db, fs, xs]);
                 builder.ins().return_(&[result]);
             });
-        }
+        });
 
         // Monad_Relation_bind(db, f, rel) → knot_relation_bind(db, f, rel)
-        if let Some(&(func_id, _)) = self.user_fns.get("Monad_Relation_bind") {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(self.ptr_type)); // db
-            sig.params.push(AbiParam::new(self.ptr_type)); // f
-            sig.params.push(AbiParam::new(self.ptr_type)); // rel
-            sig.returns.push(AbiParam::new(self.ptr_type));
-            self.build_function(func_id, sig, |cg, builder, entry| {
+        define_if_registered!("Monad_Relation_bind", |cg: &mut Self, func_id: FuncId| {
+            let mut sig = cg.module.make_signature();
+            sig.params.push(AbiParam::new(cg.ptr_type)); // db
+            sig.params.push(AbiParam::new(cg.ptr_type)); // f
+            sig.params.push(AbiParam::new(cg.ptr_type)); // rel
+            sig.returns.push(AbiParam::new(cg.ptr_type));
+            cg.build_function(func_id, sig, |cg, builder, entry| {
                 let db = builder.block_params(entry)[0];
                 let f = builder.block_params(entry)[1];
                 let rel = builder.block_params(entry)[2];
                 let result = cg.call_rt(builder, "knot_relation_bind", &[db, f, rel]);
                 builder.ins().return_(&[result]);
             });
-        }
+        });
+
+        // Alternative_Relation_empty(db) → knot_relation_empty()
+        define_if_registered!("Alternative_Relation_empty", |cg: &mut Self, func_id: FuncId| {
+            let mut sig = cg.module.make_signature();
+            sig.params.push(AbiParam::new(cg.ptr_type)); // db
+            sig.returns.push(AbiParam::new(cg.ptr_type));
+            cg.build_function(func_id, sig, |cg, builder, _entry| {
+                let result = cg.call_rt(builder, "knot_relation_empty", &[]);
+                builder.ins().return_(&[result]);
+            });
+        });
+
+        // Alternative_Relation_alt(db, a, b) → knot_relation_union(a, b)
+        define_if_registered!("Alternative_Relation_alt", |cg: &mut Self, func_id: FuncId| {
+            let mut sig = cg.module.make_signature();
+            sig.params.push(AbiParam::new(cg.ptr_type)); // db
+            sig.params.push(AbiParam::new(cg.ptr_type)); // a
+            sig.params.push(AbiParam::new(cg.ptr_type)); // b
+            sig.returns.push(AbiParam::new(cg.ptr_type));
+            cg.build_function(func_id, sig, |cg, builder, entry| {
+                let a = builder.block_params(entry)[1];
+                let b = builder.block_params(entry)[2];
+                let result = cg.call_rt(builder, "knot_relation_union", &[a, b]);
+                builder.ins().return_(&[result]);
+            });
+        });
 
         // Foldable_Relation_fold(db, f, init, rel) → knot_relation_fold(db, f, init, rel)
-        if let Some(&(func_id, _)) = self.user_fns.get("Foldable_Relation_fold") {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(self.ptr_type)); // db
-            sig.params.push(AbiParam::new(self.ptr_type)); // f
-            sig.params.push(AbiParam::new(self.ptr_type)); // init
-            sig.params.push(AbiParam::new(self.ptr_type)); // rel
-            sig.returns.push(AbiParam::new(self.ptr_type));
-            self.build_function(func_id, sig, |cg, builder, entry| {
+        define_if_registered!("Foldable_Relation_fold", |cg: &mut Self, func_id: FuncId| {
+            let mut sig = cg.module.make_signature();
+            sig.params.push(AbiParam::new(cg.ptr_type)); // db
+            sig.params.push(AbiParam::new(cg.ptr_type)); // f
+            sig.params.push(AbiParam::new(cg.ptr_type)); // init
+            sig.params.push(AbiParam::new(cg.ptr_type)); // rel
+            sig.returns.push(AbiParam::new(cg.ptr_type));
+            cg.build_function(func_id, sig, |cg, builder, entry| {
                 let db = builder.block_params(entry)[0];
                 let f = builder.block_params(entry)[1];
                 let init = builder.block_params(entry)[2];
@@ -1285,7 +1324,7 @@ impl Codegen {
                 let result = cg.call_rt(builder, "knot_relation_fold", &[db, f, init, rel]);
                 builder.ins().return_(&[result]);
             });
-        }
+        });
     }
 
     // ── Supertrait validation ────────────────────────────────────
@@ -1341,24 +1380,8 @@ impl Codegen {
     // ── Function definitions ──────────────────────────────────────
 
     fn define_functions(&mut self, module: &ast::Module, _type_env: &TypeEnv) {
-        // Define built-in __bind: delegates to knot_relation_bind(db, func, collection)
-        {
-            let (bind_id, _) = self.user_fns["__bind"];
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(self.ptr_type)); // db
-            sig.params.push(AbiParam::new(self.ptr_type)); // func
-            sig.params.push(AbiParam::new(self.ptr_type)); // collection
-            sig.returns.push(AbiParam::new(self.ptr_type));
-
-            self.build_function(bind_id, sig, |cg, builder, entry| {
-                let db = builder.block_params(entry)[0];
-                let func = builder.block_params(entry)[1];
-                let collection = builder.block_params(entry)[2];
-                let result =
-                    cg.call_rt(builder, "knot_relation_bind", &[db, func, collection]);
-                builder.ins().return_(&[result]);
-            });
-        }
+        // __bind is no longer a standalone function — it dispatches through
+        // Monad_{type}_bind trait impls (see compile_app).
 
         // Define standard library functions
         // 1-param: direct delegation to runtime
@@ -3003,46 +3026,30 @@ impl Codegen {
         match &func_expr.node {
             // Monadic bind: __bind(f, m) — dispatch based on monad type
             ast::ExprKind::Var(name) if name == "__bind" => {
+                // Dispatch through Monad trait impls based on resolved monad type
                 if compiled_args.len() == 2 {
-                    if let Some(MonadKind::Adt(type_name)) =
-                        self.monad_info.get(&func_expr.span)
-                    {
-                        let bind_fn = format!("Monad_{}_bind", type_name);
-                        if let Some(&(func_id, _)) = self.user_fns.get(&bind_fn) {
-                            let func_ref = self
-                                .module
-                                .declare_func_in_func(func_id, builder.func);
-                            let call = builder.ins().call(
-                                func_ref,
-                                &[db, compiled_args[0], compiled_args[1]],
-                            );
-                            return builder.inst_results(call)[0];
-                        }
-                    }
-                }
-                // Fall through: relation monad — call built-in __bind
-                let (func_id, expected_params) = self.user_fns["__bind"];
-                if compiled_args.len() == expected_params {
-                    let func_ref = self
-                        .module
-                        .declare_func_in_func(func_id, builder.func);
-                    let mut call_args = vec![db];
-                    call_args.extend(&compiled_args);
-                    let call = builder.ins().call(func_ref, &call_args);
-                    builder.inst_results(call)[0]
-                } else {
-                    let func_val =
-                        self.compile_expr(builder, func_expr, env, db);
-                    let mut result = func_val;
-                    for arg in &compiled_args {
-                        result = self.call_rt(
-                            builder,
-                            "knot_value_call",
-                            &[db, result, *arg],
+                    let type_name = match self.monad_info.get(&func_expr.span) {
+                        Some(MonadKind::Adt(name)) => name.clone(),
+                        _ => "Relation".to_string(),
+                    };
+                    let bind_fn = format!("Monad_{}_bind", type_name);
+                    if let Some(&(func_id, _)) = self.user_fns.get(&bind_fn) {
+                        let func_ref = self
+                            .module
+                            .declare_func_in_func(func_id, builder.func);
+                        let call = builder.ins().call(
+                            func_ref,
+                            &[db, compiled_args[0], compiled_args[1]],
                         );
+                        return builder.inst_results(call)[0];
                     }
-                    result
                 }
+                // Ultimate fallback: direct runtime call
+                self.call_rt(
+                    builder,
+                    "knot_relation_bind",
+                    &[db, compiled_args[0], compiled_args[1]],
+                )
             }
 
             // Direct call to a known user function
@@ -3437,46 +3444,50 @@ impl Codegen {
 
     // ── Monadic operation compilation ─────────────────────────────
 
-    /// Compile `__yield(val)` — wraps a value into the appropriate monad.
+    /// Compile `__yield(val)` — dispatches through Applicative trait impl.
     fn compile_monadic_yield(
         &mut self,
         builder: &mut FunctionBuilder,
         val: Value,
         span: ast::Span,
-        _db: Value,
+        db: Value,
     ) -> Value {
-        if let Some(MonadKind::Adt(type_name)) = self.monad_info.get(&span) {
-            let yield_fn = format!("Applicative_{}_yield", type_name);
-            if let Some(&(func_id, _)) = self.user_fns.get(&yield_fn) {
-                let func_ref = self
-                    .module
-                    .declare_func_in_func(func_id, builder.func);
-                let call = builder.ins().call(func_ref, &[_db, val]);
-                return builder.inst_results(call)[0];
-            }
+        let type_name = match self.monad_info.get(&span) {
+            Some(MonadKind::Adt(name)) => name.clone(),
+            _ => "Relation".to_string(),
+        };
+        let yield_fn = format!("Applicative_{}_yield", type_name);
+        if let Some(&(func_id, _)) = self.user_fns.get(&yield_fn) {
+            let func_ref = self
+                .module
+                .declare_func_in_func(func_id, builder.func);
+            let call = builder.ins().call(func_ref, &[db, val]);
+            return builder.inst_results(call)[0];
         }
-        // Default: relation singleton
+        // Ultimate fallback: direct runtime call
         self.call_rt(builder, "knot_relation_singleton", &[val])
     }
 
-    /// Compile `__empty` — produces the empty/failure value for the monad.
+    /// Compile `__empty` — dispatches through Alternative trait impl.
     fn compile_monadic_empty(
         &mut self,
         builder: &mut FunctionBuilder,
         span: ast::Span,
         db: Value,
     ) -> Value {
-        if let Some(MonadKind::Adt(type_name)) = self.monad_info.get(&span) {
-            let empty_fn = format!("Alternative_{}_empty", type_name);
-            if let Some(&(func_id, _)) = self.user_fns.get(&empty_fn) {
-                let func_ref = self
-                    .module
-                    .declare_func_in_func(func_id, builder.func);
-                let call = builder.ins().call(func_ref, &[db]);
-                return builder.inst_results(call)[0];
-            }
+        let type_name = match self.monad_info.get(&span) {
+            Some(MonadKind::Adt(name)) => name.clone(),
+            _ => "Relation".to_string(),
+        };
+        let empty_fn = format!("Alternative_{}_empty", type_name);
+        if let Some(&(func_id, _)) = self.user_fns.get(&empty_fn) {
+            let func_ref = self
+                .module
+                .declare_func_in_func(func_id, builder.func);
+            let call = builder.ins().call(func_ref, &[db]);
+            return builder.inst_results(call)[0];
         }
-        // Default: empty relation
+        // Ultimate fallback: direct runtime call
         self.call_rt(builder, "knot_relation_empty", &[])
     }
 

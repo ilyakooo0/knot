@@ -2088,26 +2088,9 @@ impl Infer {
         // now : Int (current time in milliseconds since epoch)
         self.bind_top("now", Scheme::mono(Ty::Int));
 
-        // __bind : ∀a b. (a -> [b]) -> [a] -> [b]
-        // Used by do-block desugaring for relation comprehensions.
-        let a = self.fresh_var();
-        let b = self.fresh_var();
-        self.bind_top(
-            "__bind",
-            Scheme::poly(
-                vec![a, b],
-                Ty::Fun(
-                    Box::new(Ty::Fun(
-                        Box::new(Ty::Var(a)),
-                        Box::new(Ty::Relation(Box::new(Ty::Var(b)))),
-                    )),
-                    Box::new(Ty::Fun(
-                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                        Box::new(Ty::Relation(Box::new(Ty::Var(b)))),
-                    )),
-                ),
-            ),
-        );
+        // __bind, __yield, __empty are handled as special cases in infer_expr
+        // with polymorphic HKT types: ∀m a b. (a -> m b) -> m a -> m b, etc.
+        // This allows do-block desugaring to work with any monad, not just [].
 
         // listen : ∀a b. Int -> (a -> b) -> {}
         let a = self.fresh_var();

@@ -46,6 +46,9 @@ enum Ty {
     Relation(Box<Ty>),
     /// Named algebraic data type with optional type arguments.
     Con(String, Vec<Ty>),
+    /// Variant with named constructors and optional row variable (open variant).
+    /// Each constructor maps to its field types as a Record.
+    Variant(BTreeMap<String, Ty>, Option<TyVar>),
     /// Unapplied type constructor (e.g. `[]`, `Maybe`).
     /// Used for higher-kinded type polymorphism.
     TyCon(String),
@@ -257,6 +260,27 @@ impl Infer {
                     Ty::Record(applied, None)
                 }
             }
+            Ty::Variant(ctors, row) => {
+                let mut applied: BTreeMap<String, Ty> = ctors
+                    .iter()
+                    .map(|(k, v)| (k.clone(), self.apply(v)))
+                    .collect();
+                if let Some(rv) = row {
+                    let resolved = self.apply(&Ty::Var(*rv));
+                    match resolved {
+                        Ty::Variant(extra, rest) => {
+                            for (k, v) in extra {
+                                applied.entry(k).or_insert(v);
+                            }
+                            Ty::Variant(applied, rest)
+                        }
+                        Ty::Var(rv2) => Ty::Variant(applied, Some(rv2)),
+                        _ => Ty::Variant(applied, None),
+                    }
+                } else {
+                    Ty::Variant(applied, None)
+                }
+            }
             Ty::Relation(inner) => {
                 Ty::Relation(Box::new(self.apply(inner)))
             }
@@ -307,6 +331,20 @@ impl Infer {
             }
             Ty::Record(fields, row) => {
                 if fields.values().any(|v| self.occurs_in(var, v)) {
+                    return true;
+                }
+                if let Some(rv) = row {
+                    if *rv == var {
+                        return true;
+                    }
+                    if let Some(resolved) = self.subst.get(rv) {
+                        return self.occurs_in(var, resolved);
+                    }
+                }
+                false
+            }
+            Ty::Variant(ctors, row) => {
+                if ctors.values().any(|v| self.occurs_in(var, v)) {
                     return true;
                 }
                 if let Some(rv) = row {
@@ -428,6 +466,54 @@ impl Infer {
                     self.unify(&a, &last, span);
                 }
             }
+            // ── Row-polymorphic variants ────────────────────────
+            (Ty::Variant(c1, r1), Ty::Variant(c2, r2)) => {
+                let (c1, r1) = (c1.clone(), *r1);
+                let (c2, r2) = (c2.clone(), *r2);
+                self.unify_variants(&c1, r1, &c2, r2, span);
+            }
+            (Ty::Con(name, args), Ty::Variant(c2, r2)) => {
+                let (name, args) = (name.clone(), args.clone());
+                let (c2, r2) = (c2.clone(), *r2);
+                if let Some(expanded) = self.con_to_variant(&name, &args) {
+                    let (ec, er) = match expanded {
+                        Ty::Variant(c, r) => (c, r),
+                        _ => unreachable!(),
+                    };
+                    self.unify_variants(&ec, er, &c2, r2, span);
+                } else {
+                    let d1 = self.display_ty(&t1);
+                    let d2 = self.display_ty(&t2);
+                    self.error(
+                        format!(
+                            "type mismatch: expected {}, found {}",
+                            d1, d2
+                        ),
+                        span,
+                    );
+                }
+            }
+            (Ty::Variant(c1, r1), Ty::Con(name, args)) => {
+                let (name, args) = (name.clone(), args.clone());
+                let (c1, r1) = (c1.clone(), *r1);
+                if let Some(expanded) = self.con_to_variant(&name, &args) {
+                    let (ec, er) = match expanded {
+                        Ty::Variant(c, r) => (c, r),
+                        _ => unreachable!(),
+                    };
+                    self.unify_variants(&c1, r1, &ec, er, span);
+                } else {
+                    let d1 = self.display_ty(&t1);
+                    let d2 = self.display_ty(&t2);
+                    self.error(
+                        format!(
+                            "type mismatch: expected {}, found {}",
+                            d1, d2
+                        ),
+                        span,
+                    );
+                }
+            }
             _ => {
                 let d1 = self.display_ty(&t1);
                 let d2 = self.display_ty(&t2);
@@ -527,6 +613,127 @@ impl Infer {
         }
     }
 
+    fn unify_variants(
+        &mut self,
+        c1: &BTreeMap<String, Ty>,
+        r1: Option<TyVar>,
+        c2: &BTreeMap<String, Ty>,
+        r2: Option<TyVar>,
+        span: Span,
+    ) {
+        let keys1: HashSet<&String> = c1.keys().collect();
+        let keys2: HashSet<&String> = c2.keys().collect();
+
+        // Unify common constructors' field types
+        for key in keys1.intersection(&keys2) {
+            let t1 = c1[*key].clone();
+            let t2 = c2[*key].clone();
+            self.unify(&t1, &t2, span);
+        }
+
+        let only1: BTreeMap<String, Ty> = c1
+            .iter()
+            .filter(|(k, _)| !keys2.contains(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let only2: BTreeMap<String, Ty> = c2
+            .iter()
+            .filter(|(k, _)| !keys1.contains(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        match (r1, r2) {
+            (None, None) => {
+                if !only1.is_empty() || !only2.is_empty() {
+                    let extras: Vec<_> =
+                        only1.keys().chain(only2.keys()).cloned().collect();
+                    self.error(
+                        format!(
+                            "variant constructors don't match: extra constructors {}",
+                            extras.join(", ")
+                        ),
+                        span,
+                    );
+                }
+            }
+            (Some(rv), None) => {
+                if !only1.is_empty() {
+                    let names: Vec<_> = only1.keys().cloned().collect();
+                    self.error(
+                        format!(
+                            "variant has unexpected constructors: {}",
+                            names.join(", ")
+                        ),
+                        span,
+                    );
+                }
+                self.subst.insert(rv, Ty::Variant(only2, None));
+            }
+            (None, Some(rv)) => {
+                if !only2.is_empty() {
+                    let names: Vec<_> = only2.keys().cloned().collect();
+                    self.error(
+                        format!(
+                            "variant has unexpected constructors: {}",
+                            names.join(", ")
+                        ),
+                        span,
+                    );
+                }
+                self.subst.insert(rv, Ty::Variant(only1, None));
+            }
+            (Some(rv1), Some(rv2)) => {
+                if rv1 == rv2 {
+                    if !only1.is_empty() || !only2.is_empty() {
+                        self.error(
+                            "variant constructors don't match".into(),
+                            span,
+                        );
+                    }
+                } else {
+                    let fresh = self.fresh_var();
+                    self.subst
+                        .insert(rv1, Ty::Variant(only2, Some(fresh)));
+                    self.subst
+                        .insert(rv2, Ty::Variant(only1, Some(fresh)));
+                }
+            }
+        }
+    }
+
+    /// Expand a nominal ADT (`Con(name, args)`) to a structural `Variant`.
+    fn con_to_variant(
+        &mut self,
+        name: &str,
+        args: &[Ty],
+    ) -> Option<Ty> {
+        let info = self.data_types.get(name)?.clone();
+        // Build param → arg mapping
+        let mapping: HashMap<TyVar, Ty> = info
+            .params
+            .iter()
+            .zip(args.iter())
+            .map(|(param_name, arg_ty)| {
+                let var = self.annotation_var(param_name);
+                (var, arg_ty.clone())
+            })
+            .collect();
+        let mut ctors = BTreeMap::new();
+        for (ctor_name, fields) in &info.ctors {
+            let field_tys: BTreeMap<String, Ty> = fields
+                .iter()
+                .map(|(fname, fty)| {
+                    let ty = self.ast_type_to_ty(fty);
+                    let ty = self.subst_ty(&ty, &mapping);
+                    (fname.clone(), ty)
+                })
+                .collect();
+            ctors.insert(ctor_name.clone(), Ty::Record(field_tys, None));
+        }
+        self.annotation_vars.clear();
+        Some(Ty::Variant(ctors, None))
+    }
+
     // ── Scheme operations ────────────────────────────────────────
 
     fn instantiate(&mut self, scheme: &Scheme) -> Ty {
@@ -587,6 +794,23 @@ impl Infer {
                     }
                 });
                 Ty::Record(new_fields, new_row)
+            }
+            Ty::Variant(ctors, row) => {
+                let new_ctors: BTreeMap<_, _> = ctors
+                    .iter()
+                    .map(|(k, v)| (k.clone(), self.subst_ty(v, mapping)))
+                    .collect();
+                let new_row = row.and_then(|rv| {
+                    if let Some(replacement) = mapping.get(&rv) {
+                        match replacement {
+                            Ty::Var(new_rv) => Some(*new_rv),
+                            _ => None,
+                        }
+                    } else {
+                        Some(rv)
+                    }
+                });
+                Ty::Variant(new_ctors, new_row)
             }
             Ty::Relation(inner) => {
                 Ty::Relation(Box::new(self.subst_ty(inner, mapping)))
@@ -657,6 +881,21 @@ impl Infer {
             }
             Ty::Record(fields, row) => {
                 for v in fields.values() {
+                    self.collect_free_vars(v, out);
+                }
+                if let Some(rv) = row {
+                    match self.subst.get(rv) {
+                        Some(resolved) => {
+                            self.collect_free_vars(resolved, out)
+                        }
+                        None => {
+                            out.insert(*rv);
+                        }
+                    }
+                }
+            }
+            Ty::Variant(ctors, row) => {
+                for v in ctors.values() {
                     self.collect_free_vars(v, out);
                 }
                 if let Some(rv) = row {
@@ -824,7 +1063,30 @@ impl Infer {
                 }
             }
             ast::TypeKind::Hole => self.fresh(),
-            ast::TypeKind::Variant { .. } => Ty::Error,
+            ast::TypeKind::Variant {
+                constructors,
+                rest,
+            } => {
+                let ctor_tys: BTreeMap<String, Ty> = constructors
+                    .iter()
+                    .map(|c| {
+                        let field_tys: BTreeMap<String, Ty> = c
+                            .fields
+                            .iter()
+                            .map(|f| {
+                                (
+                                    f.name.clone(),
+                                    self.ast_type_to_ty(&f.value),
+                                )
+                            })
+                            .collect();
+                        (c.name.clone(), Ty::Record(field_tys, None))
+                    })
+                    .collect();
+                let row_var =
+                    rest.as_ref().map(|name| self.annotation_var(name));
+                Ty::Variant(ctor_tys, row_var)
+            }
             ast::TypeKind::Effectful { ty, .. } => self.ast_type_to_ty(ty),
         }
     }
@@ -917,6 +1179,33 @@ impl Infer {
                         args.iter().map(|a| self.display_ty(a)).collect();
                     format!("{} {}", name, args_str.join(" "))
                 }
+            }
+            Ty::Variant(ctors, row) => {
+                let mut parts: Vec<String> = ctors
+                    .iter()
+                    .map(|(name, fields_ty)| {
+                        let fields_str =
+                            self.display_ty_inner(fields_ty, false);
+                        format!("{} {}", name, fields_str)
+                    })
+                    .collect();
+                if let Some(rv) = row {
+                    match self.subst.get(rv) {
+                        Some(resolved) => {
+                            parts.push(self.display_ty(resolved));
+                        }
+                        None => {
+                            let idx = *rv as usize;
+                            let name = if idx < 26 {
+                                format!("{}", (b'a' + idx as u8) as char)
+                            } else {
+                                format!("r{}", rv)
+                            };
+                            parts.push(name);
+                        }
+                    }
+                }
+                format!("<{}>", parts.join(" | "))
             }
             Ty::TyCon(name) => name.clone(),
             Ty::App(f, a) => {
@@ -2831,5 +3120,51 @@ mod tests {
              main = fmap (\\x -> x + 1) (MkBox {value: 42})"
         );
         assert!(has_error(&diags, "no implementation of trait 'Functor'"));
+    }
+
+    // ── Row-polymorphic variants ─────────────────────────────────
+
+    #[test]
+    fn closed_variant_unifies_with_matching_adt() {
+        let diags = check_src(
+            "data Shape = Circle {radius: Float} | Rect {w: Float, h: Float}\n\
+             f : <Circle {radius: Float} | Rect {w: Float, h: Float}> -> Float\n\
+             f = \\s -> 1.0\n\
+             main = f (Circle {radius: 3.0})",
+        );
+        assert!(diags.is_empty(), "unexpected errors: {:?}", diags);
+    }
+
+    #[test]
+    fn open_variant_accepts_adt_with_extra_constructors() {
+        let diags = check_src(
+            "data Shape = Circle {radius: Float} | Rect {w: Float, h: Float}\n\
+             f : <Circle {radius: Float} | r> -> Float\n\
+             f = \\s -> 1.0\n\
+             main = f (Circle {radius: 3.0})",
+        );
+        assert!(diags.is_empty(), "unexpected errors: {:?}", diags);
+    }
+
+    #[test]
+    fn variant_missing_constructor_error() {
+        let diags = check_src(
+            "data Color = Red {} | Blue {}\n\
+             f : <Red {} | Blue {} | Green {}> -> Int\n\
+             f = \\c -> 1\n\
+             main = f (Red {})",
+        );
+        assert!(has_error(&diags, "variant constructors don't match"));
+    }
+
+    #[test]
+    fn open_variant_polymorphic_function() {
+        let diags = check_src(
+            "data Status = Open {} | Closed {} | InProgress {assignee: Text}\n\
+             isOpen : <Open {} | r> -> Int\n\
+             isOpen = \\s -> 1\n\
+             main = isOpen (Open {})",
+        );
+        assert!(diags.is_empty(), "unexpected errors: {:?}", diags);
     }
 }

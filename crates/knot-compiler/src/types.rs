@@ -245,7 +245,28 @@ fn resolve_type(
             ResolvedType::Named("unknown".into())
         }
         TypeKind::Hole => ResolvedType::Named("unknown".into()),
-        TypeKind::Variant { .. } => ResolvedType::Named("unknown".into()),
+        TypeKind::Variant { constructors, .. } => {
+            let ctors: Vec<(String, Vec<(String, ResolvedType)>)> =
+                constructors
+                    .iter()
+                    .map(|c| {
+                        let fields: Vec<(String, ResolvedType)> = c
+                            .fields
+                            .iter()
+                            .map(|f| {
+                                (
+                                    f.name.clone(),
+                                    resolve_type(
+                                        &f.value, aliases, assoc_types,
+                                    ),
+                                )
+                            })
+                            .collect();
+                        (c.name.clone(), fields)
+                    })
+                    .collect();
+            ResolvedType::Adt(ctors)
+        }
         TypeKind::Effectful { ty, .. } => {
             resolve_type(ty, aliases, assoc_types)
         }

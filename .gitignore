@@ -18,3 +18,4 @@ examples/groupby
 examples/json
 examples/nested
 examples/modules/main
+examples/views_history

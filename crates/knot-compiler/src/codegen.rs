@@ -434,6 +434,7 @@ impl Codegen {
         self.declare_rt("knot_history_init", &[p, p, p, p, p], &[]);
         self.declare_rt("knot_history_snapshot", &[p, p, p, p, p], &[]);
         self.declare_rt("knot_source_read_at", &[p, p, p, p, p, p], &[p]);
+        self.declare_rt("knot_view_read_at", &[p, p, p, p, p, p, p, p, p], &[p]);
 
         // Subset constraints
         self.declare_rt("knot_constraint_register", &[p, p, p, p, p, p, p, p, p], &[]);
@@ -2970,24 +2971,82 @@ impl Codegen {
             } => self.compile_case(builder, scrutinee, arms, env, db),
 
             ast::ExprKind::At { relation, time } => {
-                // Temporal query: *source @(timestamp)
+                // Temporal query: *source @(timestamp) or *view @(timestamp)
                 if let ast::ExprKind::SourceRef(name) = &relation.node {
-                    let schema = self
-                        .source_schemas
-                        .get(name)
-                        .cloned()
-                        .unwrap_or_default();
-                    let timestamp = self.compile_expr(builder, time, env, db);
-                    let (name_ptr, name_len) = self.string_ptr(builder, name);
-                    let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
-                    self.call_rt(
-                        builder,
-                        "knot_source_read_at",
-                        &[db, name_ptr, name_len, schema_ptr, schema_len, timestamp],
-                    )
+                    let view_info = self.views.get(name).cloned();
+                    if let Some(view) = view_info {
+                        // View temporal query — read from underlying source's history
+                        let timestamp = self.compile_expr(builder, time, env, db);
+                        let source_name = &view.source_name;
+                        let (name_ptr, name_len) =
+                            self.string_ptr(builder, source_name);
+
+                        if view.constant_columns.is_empty() {
+                            // Simple alias view: read all columns from source history
+                            let schema = self
+                                .source_schemas
+                                .get(source_name)
+                                .cloned()
+                                .unwrap_or_default();
+                            let (schema_ptr, schema_len) =
+                                self.string_ptr(builder, &schema);
+                            self.call_rt(
+                                builder,
+                                "knot_source_read_at",
+                                &[db, name_ptr, name_len, schema_ptr, schema_len, timestamp],
+                            )
+                        } else {
+                            // Filtered view: read view columns with constant filter
+                            let view_schema = self.compute_view_schema(&view);
+                            let (filter_where, constant_cols) =
+                                self.compute_view_filter(&view);
+                            let filter_params = self.compile_view_filter_params(
+                                builder,
+                                &constant_cols,
+                                env,
+                                db,
+                            );
+
+                            let (schema_ptr, schema_len) =
+                                self.string_ptr(builder, &view_schema);
+                            let (filter_ptr, filter_len) =
+                                self.string_ptr(builder, &filter_where);
+
+                            self.call_rt(
+                                builder,
+                                "knot_view_read_at",
+                                &[
+                                    db,
+                                    name_ptr,
+                                    name_len,
+                                    schema_ptr,
+                                    schema_len,
+                                    filter_ptr,
+                                    filter_len,
+                                    filter_params,
+                                    timestamp,
+                                ],
+                            )
+                        }
+                    } else {
+                        // Direct source temporal query
+                        let schema = self
+                            .source_schemas
+                            .get(name)
+                            .cloned()
+                            .unwrap_or_default();
+                        let timestamp = self.compile_expr(builder, time, env, db);
+                        let (name_ptr, name_len) = self.string_ptr(builder, name);
+                        let (schema_ptr, schema_len) =
+                            self.string_ptr(builder, &schema);
+                        self.call_rt(
+                            builder,
+                            "knot_source_read_at",
+                            &[db, name_ptr, name_len, schema_ptr, schema_len, timestamp],
+                        )
+                    }
                 } else {
                     // For non-source At expressions, compile the relation normally
-                    // (future: could support views with history)
                     self.compile_expr(builder, relation, env, db)
                 }
             }
@@ -3045,6 +3104,9 @@ impl Codegen {
             .get(&source_name)
             .cloned()
             .unwrap_or_default();
+
+        // Snapshot history before writing (if underlying source has history)
+        self.emit_history_snapshot(builder, db, &source_name, &source_schema);
 
         // Check for append optimization: set *view = union *view newRows
         if let Some(new_rows_expr) = self.match_union_append(view_name, value) {

@@ -153,7 +153,17 @@ fn route_entries_to_constructors(entries: &[RouteEntry]) -> Vec<ConstructorDef> 
 fn desugar_decl(decl: &mut DeclKind) {
     match decl {
         DeclKind::Fun { body, .. } => desugar_expr(body),
-        DeclKind::View { body, .. } => desugar_expr(body),
+        DeclKind::View { body, .. } => {
+            // Don't desugar the top-level do block of a view body
+            // (preserve structure for analyze_view), but recurse into sub-exprs.
+            if let ExprKind::Do(stmts) = &mut body.node {
+                for stmt in stmts.iter_mut() {
+                    desugar_stmt(stmt);
+                }
+            } else {
+                desugar_expr(body);
+            }
+        }
         DeclKind::Derived { body, .. } => desugar_expr(body),
         DeclKind::Migrate { using_fn, .. } => desugar_expr(using_fn),
         DeclKind::Impl { items, .. } => {

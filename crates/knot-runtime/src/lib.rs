@@ -3995,6 +3995,116 @@ pub extern "C" fn knot_view_read(
     alloc(Value::Relation(rows))
 }
 
+/// Read a view at a specific point in time, combining temporal and view filtering.
+/// Queries the underlying source's history table with both temporal and constant column filters.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_view_read_at(
+    db: *mut c_void,
+    name_ptr: *const u8,
+    name_len: usize,
+    schema_ptr: *const u8,
+    schema_len: usize,
+    filter_ptr: *const u8,
+    filter_len: usize,
+    filter_params: *mut Value,
+    timestamp: *mut Value,
+) -> *mut Value {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let name = unsafe { str_from_raw(name_ptr, name_len) };
+    let view_schema = unsafe { str_from_raw(schema_ptr, schema_len) };
+    let filter_where = unsafe { str_from_raw(filter_ptr, filter_len) };
+    let cols = parse_schema(view_schema);
+
+    let ts = match unsafe { as_ref(timestamp) } {
+        Value::Int(n) => *n,
+        _ => panic!(
+            "knot runtime: temporal query timestamp must be Int, got {}",
+            type_name(timestamp)
+        ),
+    };
+
+    let filter_values = match unsafe { as_ref(filter_params) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: view_read_at filter_params must be Relation, got {}",
+            type_name(filter_params)
+        ),
+    };
+
+    let history_table = quote_ident(&format!("_knot_{}_history", name));
+    let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
+
+    // Temporal condition uses the first parameter slot
+    let temporal_cond =
+        "\"_knot_valid_from\" <= ?1 AND (\"_knot_valid_to\" IS NULL OR \"_knot_valid_to\" > ?1)";
+
+    // View filter params are offset by 1 (timestamp takes ?1)
+    let view_filter = if filter_where.is_empty() {
+        String::new()
+    } else {
+        // Rewrite ?1, ?2, ... to ?2, ?3, ... to account for timestamp param
+        let mut rewritten = filter_where.to_string();
+        // Replace from highest to lowest to avoid ?1 -> ?2 then ?2 -> ?3
+        for i in (1..=filter_values.len()).rev() {
+            rewritten = rewritten.replace(
+                &format!("?{}", i),
+                &format!("?{}", i + 1),
+            );
+        }
+        format!(" AND {}", rewritten)
+    };
+
+    let sql = format!(
+        "SELECT {} FROM {} WHERE {}{}",
+        if col_names.is_empty() {
+            "1".to_string()
+        } else {
+            col_names.join(", ")
+        },
+        history_table,
+        temporal_cond,
+        view_filter,
+    );
+
+    // Build params: timestamp first, then view filter values
+    let mut sql_params: Vec<rusqlite::types::Value> = Vec::new();
+    sql_params.push(rusqlite::types::Value::Integer(ts));
+    for v in filter_values.iter() {
+        sql_params.push(value_to_sql_param(*v));
+    }
+
+    debug_sql_params(&sql, &sql_params);
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = sql_params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
+
+    let mut stmt = db_ref
+        .conn
+        .prepare(&sql)
+        .unwrap_or_else(|e| panic!("knot runtime: view_read_at query error: {}", e));
+
+    let mut rows: Vec<*mut Value> = Vec::new();
+    let mut result_rows = stmt
+        .query(param_refs.as_slice())
+        .unwrap_or_else(|e| panic!("knot runtime: view_read_at exec error: {}", e));
+
+    while let Some(row) = result_rows
+        .next()
+        .unwrap_or_else(|e| panic!("knot runtime: view_read_at fetch error: {}", e))
+    {
+        let record = knot_record_empty(cols.len());
+        for (i, col) in cols.iter().enumerate() {
+            let val = read_sql_column(row, i, col.ty);
+            let name_bytes = col.name.as_bytes();
+            knot_record_set_field(record, name_bytes.as_ptr(), name_bytes.len(), val);
+        }
+        rows.push(record);
+    }
+
+    alloc(Value::Relation(rows))
+}
+
 /// Add fields from `extra_fields` record to each row in `relation`.
 /// Returns a new relation with augmented rows.
 #[unsafe(no_mangle)]

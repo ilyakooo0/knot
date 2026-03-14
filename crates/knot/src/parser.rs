@@ -2254,6 +2254,7 @@ impl Parser {
             self.peek(),
             TokenKind::Upper(_)
                 | TokenKind::Lower(_)
+                | TokenKind::Underscore
                 | TokenKind::LBrace
                 | TokenKind::LBracket
                 | TokenKind::LParen
@@ -2271,6 +2272,10 @@ impl Parser {
             TokenKind::Lower(name) => {
                 let tok = self.advance();
                 Some(Spanned::new(TypeKind::Var(name), tok.span))
+            }
+            TokenKind::Underscore => {
+                let tok = self.advance();
+                Some(Spanned::new(TypeKind::Hole, tok.span))
             }
             TokenKind::LBrace => {
                 self.advance();

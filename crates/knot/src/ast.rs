@@ -362,6 +362,9 @@ pub enum TypeKind {
         effects: Vec<Effect>,
         ty: Box<Type>,
     },
+
+    /// `_` — type hole, inferred by the type checker.
+    Hole,
 }
 
 /// A type with optional trait constraints: `Display a => [a] -> [Text]`.

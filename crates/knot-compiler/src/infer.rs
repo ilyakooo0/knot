@@ -823,6 +823,7 @@ impl Infer {
                     _ => Ty::Error,
                 }
             }
+            ast::TypeKind::Hole => self.fresh(),
             ast::TypeKind::Variant { .. } => Ty::Error,
             ast::TypeKind::Effectful { ty, .. } => self.ast_type_to_ty(ty),
         }

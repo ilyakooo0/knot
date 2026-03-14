@@ -244,6 +244,7 @@ fn resolve_type(
             }
             ResolvedType::Named("unknown".into())
         }
+        TypeKind::Hole => ResolvedType::Named("unknown".into()),
         TypeKind::Variant { .. } => ResolvedType::Named("unknown".into()),
         TypeKind::Effectful { ty, .. } => {
             resolve_type(ty, aliases, assoc_types)
@@ -445,6 +446,7 @@ fn apply_type_subst(ty: &Type, subst: &HashMap<String, Type>) -> Type {
             effects: effects.clone(),
             ty: Box::new(apply_type_subst(inner, subst)),
         },
+        TypeKind::Hole => TypeKind::Hole,
     };
     Spanned::new(new_node, ty.span)
 }

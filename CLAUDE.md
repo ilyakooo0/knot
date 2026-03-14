@@ -68,6 +68,7 @@ Compiled as a `staticlib` (with `rlib` for workspace dependency resolution). All
 - Schema descriptor format for records: `"name:text,age:int"` (passed as string constants from generated code)
 - Schema descriptor format for direct ADT relations: `"#Circle:radius=float|Rect:width=float;height=float"` — `#` prefix signals ADT schema, `|` separates constructors, `:` separates name from fields, `;` separates fields, `=` separates field name from type; runtime creates wide table with `_tag TEXT` + all constructor fields as nullable columns
 - Column type `tag` for enum-like ADT fields (all nullary constructors): stored as TEXT in SQLite, reconstructed as `Constructor(tag, Unit)` on read
+- Automatic indexing: the runtime observes query patterns and creates indexes lazily — ADT tables get a `_tag` index at init; columns in `DELETE WHERE` and `UPDATE WHERE` clauses are auto-indexed on first use; `KnotDb` tracks created indexes in a per-session `HashSet` to avoid redundant DDL; uses `CREATE INDEX IF NOT EXISTS` for cross-session idempotency
 - Nested relation fields (`[T]` inside records): stored in **child tables** (`_knot_{source}__{field}`) with `_parent_id` FK linking to parent's `_id`; parent tables with nested children get `_id INTEGER PRIMARY KEY AUTOINCREMENT`; schema descriptor format `field:[child_schema]` (bracket-aware parsing via `split_respecting_brackets`); deeply nested relations recurse arbitrarily
 
 ### Compiler (`crates/knot-compiler/`)

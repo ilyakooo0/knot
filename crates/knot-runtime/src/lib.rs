@@ -6,6 +6,8 @@
 
 use rusqlite::types::ValueRef;
 use rusqlite::Connection;
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -74,6 +76,66 @@ pub struct KnotDb {
     pub conn: Connection,
     /// Nesting depth for `atomic` savepoints.
     atomic_depth: std::cell::Cell<usize>,
+    /// Tracks which indexes have been created this session to avoid redundant DDL.
+    indexed: RefCell<HashSet<String>>,
+}
+
+impl KnotDb {
+    /// Create an index on `column` of `table` if one hasn't been created yet.
+    fn ensure_index(&self, table: &str, column: &str) {
+        let key = format!("{}:{}", table, column);
+        if self.indexed.borrow().contains(&key) {
+            return;
+        }
+        let idx_name = format!("_knot_auto_{}_{}", table, column);
+        let sql = format!(
+            "CREATE INDEX IF NOT EXISTS {} ON {} ({});",
+            quote_ident(&idx_name),
+            quote_ident(table),
+            quote_ident(column)
+        );
+        debug_sql(&sql);
+        let _ = self.conn.execute_batch(&sql);
+        self.indexed.borrow_mut().insert(key);
+    }
+
+    /// Ensure indexes on all columns referenced in a WHERE clause.
+    /// Column names in generated SQL are always double-quoted identifiers.
+    fn ensure_indexes_for_where(&self, table: &str, where_clause: &str) {
+        for col in extract_where_columns(where_clause) {
+            self.ensure_index(table, &col);
+        }
+    }
+}
+
+/// Extract column names from a generated SQL WHERE clause.
+/// Columns are always double-quoted identifiers (e.g. `"age"`, `"name"`).
+fn extract_where_columns(sql: &str) -> Vec<String> {
+    let mut columns = Vec::new();
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            let mut col = String::new();
+            loop {
+                match chars.next() {
+                    Some('"') => {
+                        if chars.peek() == Some(&'"') {
+                            col.push('"');
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    Some(ch) => col.push(ch),
+                    None => break,
+                }
+            }
+            if !columns.contains(&col) {
+                columns.push(col);
+            }
+        }
+    }
+    columns
 }
 
 // ── Helpers ───────────────────────────────────────────────────────
@@ -1688,6 +1750,7 @@ pub extern "C" fn knot_db_open(path_ptr: *const u8, path_len: usize) -> *mut c_v
     let db = Box::new(KnotDb {
         conn,
         atomic_depth: std::cell::Cell::new(0),
+        indexed: RefCell::new(HashSet::new()),
     });
     Box::into_raw(db) as *mut c_void
 }
@@ -2247,6 +2310,9 @@ pub extern "C" fn knot_source_init(
         );
         debug_sql(&idx_sql);
         let _ = db_ref.conn.execute_batch(&idx_sql);
+
+        // Auto-index _tag for efficient pattern matching (WHERE _tag = ?)
+        db_ref.ensure_index(&format!("_knot_{}", name), "_tag");
     } else {
         // Regular record schema (may include nested relations)
         let rec = parse_record_schema(schema);
@@ -3223,6 +3289,10 @@ pub extern "C" fn knot_source_delete_where(
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     let where_clause = unsafe { str_from_raw(where_ptr, where_len) };
 
+    // Auto-index columns used in the WHERE clause
+    let table = format!("_knot_{}", name);
+    db_ref.ensure_indexes_for_where(&table, where_clause);
+
     let param_values = match unsafe { as_ref(params) } {
         Value::Relation(rows) => rows,
         _ => panic!(
@@ -3233,7 +3303,7 @@ pub extern "C" fn knot_source_delete_where(
 
     let sql = format!(
         "DELETE FROM {} WHERE NOT ({});",
-        quote_ident(&format!("_knot_{}", name)),
+        quote_ident(&table),
         where_clause
     );
 
@@ -3268,6 +3338,10 @@ pub extern "C" fn knot_source_update_where(
     let set_clause = unsafe { str_from_raw(set_clause_ptr, set_clause_len) };
     let where_clause = unsafe { str_from_raw(where_ptr, where_len) };
 
+    // Auto-index columns used in the WHERE clause
+    let table = format!("_knot_{}", name);
+    db_ref.ensure_indexes_for_where(&table, where_clause);
+
     let param_values = match unsafe { as_ref(params) } {
         Value::Relation(rows) => rows,
         _ => panic!(
@@ -3278,7 +3352,7 @@ pub extern "C" fn knot_source_update_where(
 
     let sql = format!(
         "UPDATE OR REPLACE {} SET {} WHERE {};",
-        quote_ident(&format!("_knot_{}", name)),
+        quote_ident(&table),
         set_clause,
         where_clause
     );

@@ -8,6 +8,7 @@ mod effects;
 mod infer;
 mod linker;
 mod lockfile;
+mod base;
 mod types;
 
 use std::path::PathBuf;
@@ -78,6 +79,9 @@ fn cmd_build(source_file: &str) {
         }
         process::exit(1);
     }
+
+    // Inject built-in trait declarations and primitive impls
+    base::inject_prelude(&mut module);
 
     // Desugar monadic do blocks into trait method calls
     desugar::desugar(&mut module);

@@ -1699,45 +1699,8 @@ impl Infer {
             },
         );
 
-        // map : ∀a b. (a -> b) -> [a] -> [b]
-        let a = self.fresh_var();
-        let b = self.fresh_var();
-        self.bind_top(
-            "map",
-            Scheme {
-                vars: vec![a, b],
-                ty: Ty::Fun(
-                    Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
-                    Box::new(Ty::Fun(
-                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                        Box::new(Ty::Relation(Box::new(Ty::Var(b)))),
-                    )),
-                ),
-            },
-        );
-
-        // fold : ∀a b. (b -> a -> b) -> b -> [a] -> b
-        let a = self.fresh_var();
-        let b = self.fresh_var();
-        self.bind_top(
-            "fold",
-            Scheme {
-                vars: vec![a, b],
-                ty: Ty::Fun(
-                    Box::new(Ty::Fun(
-                        Box::new(Ty::Var(b)),
-                        Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
-                    )),
-                    Box::new(Ty::Fun(
-                        Box::new(Ty::Var(b)),
-                        Box::new(Ty::Fun(
-                            Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                            Box::new(Ty::Var(b)),
-                        )),
-                    )),
-                ),
-            },
-        );
+        // map and fold are now trait methods (Functor.map, Foldable.fold)
+        // registered via the prelude's trait declarations.
 
         // single : ∀a. [a] -> a
         let a = self.fresh_var();

@@ -1022,6 +1022,39 @@ pub extern "C" fn knot_relation_map(
     alloc(Value::Relation(result))
 }
 
+/// ap(fs, xs) — applicative apply: apply each function in fs to each value in xs
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_ap(
+    db: *mut c_void,
+    fs: *mut Value,
+    xs: *mut Value,
+) -> *mut Value {
+    let funcs = match unsafe { as_ref(fs) } {
+        Value::Relation(rows) => rows.clone(),
+        _ => panic!(
+            "knot runtime: ap expected Relation of functions, got {}",
+            type_name(fs)
+        ),
+    };
+    let vals = match unsafe { as_ref(xs) } {
+        Value::Relation(rows) => rows.clone(),
+        _ => panic!(
+            "knot runtime: ap expected Relation of values, got {}",
+            type_name(xs)
+        ),
+    };
+    let mut result: Vec<*mut Value> = Vec::new();
+    for f in &funcs {
+        for x in &vals {
+            let v = knot_value_call(db, *f, *x);
+            if !result.iter().any(|existing| values_equal(*existing, v)) {
+                result.push(v);
+            }
+        }
+    }
+    alloc(Value::Relation(result))
+}
+
 /// fold(f, init, rel) — left fold over a relation
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_relation_fold(

@@ -145,6 +145,10 @@ struct PendingLambda {
 /// Information about a trait method for runtime dispatch.
 struct TraitMethodInfo {
     param_count: usize,
+    /// Which parameter to dispatch on (index into params, after db).
+    /// None means dispatch is impossible (e.g. `yield : a -> f a` where
+    /// the type constructor only appears in the return type).
+    dispatch_index: Option<usize>,
     impls: Vec<ImplEntry>,
 }
 
@@ -436,6 +440,7 @@ impl Codegen {
         // Standard library: relation operations
         self.declare_rt("knot_relation_filter", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_map", &[p, p, p], &[p]);
+        self.declare_rt("knot_relation_ap", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_fold", &[p, p, p, p], &[p]);
         self.declare_rt("knot_relation_single", &[p], &[p]);
 
@@ -716,8 +721,10 @@ impl Codegen {
         }
 
         // Register standard library functions (all as 1-param for proper currying)
+        // map and fold are now trait methods (Functor.map, Foldable.fold)
+        // with [] impls registered directly in register_builtin_relation_impls.
         let stdlib_names = [
-            "filter", "map", "fold", "single",
+            "filter", "single",
             "toUpper", "toLower", "take", "drop",
             "length", "trim", "contains", "reverse",
             "chars", "id", "not",
@@ -808,10 +815,18 @@ impl Codegen {
                 }
                 ast::DeclKind::Trait {
                     name: trait_name,
+                    params,
                     supertraits,
                     items,
-                    ..
                 } => {
+                    // Extract HKT param name (e.g., "f" from `(f : Type -> Type)`)
+                    let hkt_param_name: Option<String> = params.iter().find_map(|p| {
+                        if p.kind.is_some() {
+                            Some(p.name.clone())
+                        } else {
+                            None
+                        }
+                    });
                     // Store supertrait relationships
                     let supertrait_names: Vec<String> = supertraits
                         .iter()
@@ -835,10 +850,15 @@ impl Codegen {
                                 } else {
                                     count_fn_params(&ty.ty)
                                 };
+                                let dispatch_index = find_dispatch_index(
+                                    hkt_param_name.as_deref(),
+                                    &ty.ty,
+                                );
                                 self.trait_methods
                                     .entry(method_name.clone())
                                     .or_insert(TraitMethodInfo {
                                         param_count,
+                                        dispatch_index,
                                         impls: Vec::new(),
                                     });
                                 if let Some(body) = default_body {
@@ -918,6 +938,7 @@ impl Codegen {
                                     .entry(method_name.clone())
                                     .or_insert(TraitMethodInfo {
                                         param_count: n_params,
+                                        dispatch_index: None,
                                         impls: Vec::new(),
                                     })
                                     .impls
@@ -965,6 +986,7 @@ impl Codegen {
                                     .entry(method_name.clone())
                                     .or_insert(TraitMethodInfo {
                                         param_count: n_params,
+                                        dispatch_index: None,
                                         impls: Vec::new(),
                                     })
                                     .impls
@@ -1040,6 +1062,7 @@ impl Codegen {
                                 .entry(method_name.clone())
                                 .or_insert(TraitMethodInfo {
                                     param_count: n_params,
+                                    dispatch_index: None,
                                     impls: Vec::new(),
                                 })
                                 .impls
@@ -1063,6 +1086,11 @@ impl Codegen {
                 }
             }
         }
+
+        // Register built-in [] impls for HKT traits (Functor, Applicative, Monad, Foldable)
+        // These are registered directly in codegen to avoid span collision issues
+        // with base-parsed source.
+        self.register_builtin_relation_impls();
 
         // Validate supertrait constraints
         self.validate_supertraits();
@@ -1093,6 +1121,154 @@ impl Codegen {
                 .insert(method_name.clone(), (func_id, param_count));
             self.trait_dispatcher_fns
                 .insert(method_name, func_id);
+        }
+    }
+
+    // ── Built-in [] impls for HKT traits ─────────────────────────
+
+    /// Register mangled functions for Functor/Applicative/Monad/Foldable [] impls.
+    /// Called from `collect_declarations` after user impls are processed.
+    fn register_builtin_relation_impls(&mut self) {
+        // (mangled_name, trait_method_name, n_user_params)
+        let impls = [
+            ("Functor_Relation_map", "map", 2),
+            ("Applicative_Relation_yield", "yield", 1),
+            ("Applicative_Relation_ap", "ap", 2),
+            ("Monad_Relation_bind", "bind", 2),
+            ("Foldable_Relation_fold", "fold", 3),
+        ];
+        for (mangled, method_name, n_params) in &impls {
+            // Don't register if the user already defined this impl
+            let already_has_relation_impl = self
+                .trait_methods
+                .get(*method_name)
+                .map(|info| info.impls.iter().any(|e| e.type_name == "Relation"))
+                .unwrap_or(false);
+            if already_has_relation_impl {
+                continue;
+            }
+
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(self.ptr_type)); // db
+            for _ in 0..*n_params {
+                sig.params.push(AbiParam::new(self.ptr_type));
+            }
+            sig.returns.push(AbiParam::new(self.ptr_type));
+            let func_name = format!("knot_user_{}", mangled);
+            let func_id = self
+                .module
+                .declare_function(&func_name, Linkage::Local, &sig)
+                .unwrap();
+            self.user_fns
+                .insert(mangled.to_string(), (func_id, *n_params));
+
+            self.trait_methods
+                .entry(method_name.to_string())
+                .or_insert(TraitMethodInfo {
+                    param_count: *n_params,
+                    dispatch_index: None,
+                    impls: Vec::new(),
+                })
+                .impls
+                .push(ImplEntry {
+                    type_name: "Relation".to_string(),
+                    func_id,
+                });
+
+            // Track for supertrait validation
+            self.trait_impl_types
+                .entry(match *method_name {
+                    "map" => "Functor".to_string(),
+                    "yield" | "ap" => "Applicative".to_string(),
+                    "bind" => "Monad".to_string(),
+                    "fold" => "Foldable".to_string(),
+                    _ => continue,
+                })
+                .or_default()
+                .push(("Relation".to_string(), ast::Span { start: 0, end: 0 }));
+        }
+    }
+
+    /// Define Cranelift IR bodies for built-in [] impls of HKT traits.
+    /// Called from `define_functions` after stdlib definitions.
+    fn define_builtin_relation_impls(&mut self) {
+        // Functor_Relation_map(db, f, rel) → knot_relation_map(db, f, rel)
+        if let Some(&(func_id, _)) = self.user_fns.get("Functor_Relation_map") {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(self.ptr_type)); // db
+            sig.params.push(AbiParam::new(self.ptr_type)); // f
+            sig.params.push(AbiParam::new(self.ptr_type)); // rel
+            sig.returns.push(AbiParam::new(self.ptr_type));
+            self.build_function(func_id, sig, |cg, builder, entry| {
+                let db = builder.block_params(entry)[0];
+                let f = builder.block_params(entry)[1];
+                let rel = builder.block_params(entry)[2];
+                let result = cg.call_rt(builder, "knot_relation_map", &[db, f, rel]);
+                builder.ins().return_(&[result]);
+            });
+        }
+
+        // Applicative_Relation_yield(db, x) → knot_relation_singleton(x)
+        if let Some(&(func_id, _)) = self.user_fns.get("Applicative_Relation_yield") {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(self.ptr_type)); // db
+            sig.params.push(AbiParam::new(self.ptr_type)); // x
+            sig.returns.push(AbiParam::new(self.ptr_type));
+            self.build_function(func_id, sig, |cg, builder, entry| {
+                let x = builder.block_params(entry)[1];
+                let result = cg.call_rt(builder, "knot_relation_singleton", &[x]);
+                builder.ins().return_(&[result]);
+            });
+        }
+
+        // Applicative_Relation_ap(db, fs, xs) → knot_relation_ap(db, fs, xs)
+        if let Some(&(func_id, _)) = self.user_fns.get("Applicative_Relation_ap") {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(self.ptr_type)); // db
+            sig.params.push(AbiParam::new(self.ptr_type)); // fs
+            sig.params.push(AbiParam::new(self.ptr_type)); // xs
+            sig.returns.push(AbiParam::new(self.ptr_type));
+            self.build_function(func_id, sig, |cg, builder, entry| {
+                let db = builder.block_params(entry)[0];
+                let fs = builder.block_params(entry)[1];
+                let xs = builder.block_params(entry)[2];
+                let result = cg.call_rt(builder, "knot_relation_ap", &[db, fs, xs]);
+                builder.ins().return_(&[result]);
+            });
+        }
+
+        // Monad_Relation_bind(db, f, rel) → knot_relation_bind(db, f, rel)
+        if let Some(&(func_id, _)) = self.user_fns.get("Monad_Relation_bind") {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(self.ptr_type)); // db
+            sig.params.push(AbiParam::new(self.ptr_type)); // f
+            sig.params.push(AbiParam::new(self.ptr_type)); // rel
+            sig.returns.push(AbiParam::new(self.ptr_type));
+            self.build_function(func_id, sig, |cg, builder, entry| {
+                let db = builder.block_params(entry)[0];
+                let f = builder.block_params(entry)[1];
+                let rel = builder.block_params(entry)[2];
+                let result = cg.call_rt(builder, "knot_relation_bind", &[db, f, rel]);
+                builder.ins().return_(&[result]);
+            });
+        }
+
+        // Foldable_Relation_fold(db, f, init, rel) → knot_relation_fold(db, f, init, rel)
+        if let Some(&(func_id, _)) = self.user_fns.get("Foldable_Relation_fold") {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(self.ptr_type)); // db
+            sig.params.push(AbiParam::new(self.ptr_type)); // f
+            sig.params.push(AbiParam::new(self.ptr_type)); // init
+            sig.params.push(AbiParam::new(self.ptr_type)); // rel
+            sig.returns.push(AbiParam::new(self.ptr_type));
+            self.build_function(func_id, sig, |cg, builder, entry| {
+                let db = builder.block_params(entry)[0];
+                let f = builder.block_params(entry)[1];
+                let init = builder.block_params(entry)[2];
+                let rel = builder.block_params(entry)[3];
+                let result = cg.call_rt(builder, "knot_relation_fold", &[db, f, init, rel]);
+                builder.ins().return_(&[result]);
+            });
         }
     }
 
@@ -1182,13 +1358,9 @@ impl Codegen {
 
         // 2-param: curried (outer captures arg1, inner calls runtime)
         self.define_stdlib_fn_2("filter", "knot_relation_filter", true);
-        self.define_stdlib_fn_2("map", "knot_relation_map", true);
         self.define_stdlib_fn_2("take", "knot_text_take", false);
         self.define_stdlib_fn_2("drop", "knot_text_drop", false);
         self.define_stdlib_fn_2("contains", "knot_text_contains", false);
-
-        // 3-param: double-curried
-        self.define_stdlib_fn_3("fold", "knot_relation_fold");
 
         // JSON: 1-param
         self.define_stdlib_fn_1("toJson", "knot_json_encode");
@@ -1207,6 +1379,9 @@ impl Codegen {
 
         // Bytes: 3-param (double-curried)
         self.define_stdlib_fn_3("bytesSlice", "knot_bytes_slice");
+
+        // Define built-in [] impls for HKT traits
+        self.define_builtin_relation_impls();
 
         for decl in &module.decls {
             match &decl.node {
@@ -1319,23 +1494,30 @@ impl Codegen {
     /// Each dispatcher checks the runtime type tag of the first argument
     /// and calls the appropriate impl method.
     fn define_trait_dispatchers(&mut self) {
-        let dispatcher_info: Vec<(String, FuncId, usize, Vec<(String, FuncId)>)> = self
-            .trait_dispatcher_fns
-            .iter()
-            .filter_map(|(method_name, &dispatcher_id)| {
-                let info = self.trait_methods.get(method_name)?;
-                let impls: Vec<(String, FuncId)> = info
-                    .impls
-                    .iter()
-                    .map(|e| (e.type_name.clone(), e.func_id))
-                    .collect();
-                Some((method_name.clone(), dispatcher_id, info.param_count, impls))
-            })
-            .collect();
+        // (method_name, dispatcher_id, param_count, dispatch_index, impls)
+        let dispatcher_info: Vec<(String, FuncId, usize, Option<usize>, Vec<(String, FuncId)>)> =
+            self.trait_dispatcher_fns
+                .iter()
+                .filter_map(|(method_name, &dispatcher_id)| {
+                    let info = self.trait_methods.get(method_name)?;
+                    let impls: Vec<(String, FuncId)> = info
+                        .impls
+                        .iter()
+                        .map(|e| (e.type_name.clone(), e.func_id))
+                        .collect();
+                    Some((
+                        method_name.clone(),
+                        dispatcher_id,
+                        info.param_count,
+                        info.dispatch_index,
+                        impls,
+                    ))
+                })
+                .collect();
 
         let data_ctors = self.data_constructors.clone();
 
-        for (method_name, dispatcher_id, param_count, impls) in dispatcher_info {
+        for (method_name, dispatcher_id, param_count, dispatch_index, impls) in dispatcher_info {
             let mut sig = self.module.make_signature();
             sig.params.push(AbiParam::new(self.ptr_type)); // db
             for _ in 0..param_count {
@@ -1367,7 +1549,7 @@ impl Codegen {
                     }
                 }
 
-                let dispatch_arg = all_params[0];
+                let dispatch_arg = all_params[dispatch_index.unwrap_or(0)];
 
                 let merge_block = builder.create_block();
                 merge_block_param(builder, merge_block, cg.ptr_type);
@@ -4587,6 +4769,13 @@ fn is_builtin_name(name: &str) -> bool {
             | "chars"
             | "id"
             | "not"
+            // Built-in trait methods
+            | "eq"
+            | "compare"
+            | "ap"
+            | "bind"
+            | "alt"
+            | "empty"
     )
 }
 
@@ -4775,6 +4964,40 @@ fn pretty_stmt(stmt: &ast::Stmt) -> String {
 
 // ── Trait support helpers ─────────────────────────────────────────
 
+/// Find the dispatch parameter index for an HKT trait method.
+/// Returns `Some(index)` if the method has a parameter whose outermost type
+/// constructor is the trait's HKT variable (e.g., `f a` where `f` is the trait param).
+/// Returns `None` if no parameter uses the HKT variable (e.g., `yield : a -> f a`).
+fn find_dispatch_index(hkt_param: Option<&str>, ty: &ast::Type) -> Option<usize> {
+    let param_name = hkt_param?;
+    let mut current = ty;
+    let mut index = 0;
+    loop {
+        match &current.node {
+            ast::TypeKind::Function { param, result } => {
+                if type_uses_hkt_var(param, param_name) {
+                    return Some(index);
+                }
+                index += 1;
+                current = result;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Check if a type's outermost constructor is the given HKT variable.
+/// e.g., `f a` matches param_name `f`, `[a]` does not match unless param_name is `[]`.
+fn type_uses_hkt_var(ty: &ast::Type, param_name: &str) -> bool {
+    match &ty.node {
+        ast::TypeKind::App { func, .. } => match &func.node {
+            ast::TypeKind::Var(name) => name == param_name,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Count the number of function parameters from a type annotation.
 /// `a -> b -> c` has 2 parameters.
 fn count_fn_params(ty: &ast::Type) -> usize {
@@ -4791,7 +5014,14 @@ fn impl_type_name(args: &[ast::Type]) -> Option<String> {
         return None;
     }
     match &args[0].node {
-        ast::TypeKind::Named(name) => Some(name.clone()),
+        ast::TypeKind::Named(name) => {
+            // Normalize `[]` (bare type constructor) to "Relation"
+            if name == "[]" {
+                Some("Relation".to_string())
+            } else {
+                Some(name.clone())
+            }
+        }
         ast::TypeKind::Relation(_) => Some("Relation".to_string()),
         _ => None,
     }

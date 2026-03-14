@@ -1914,6 +1914,62 @@ fn constructor_applied_to_empty_record() {
 }
 
 #[test]
+fn constructor_greedy_binding() {
+    // `f Circle {radius: 5}` should parse as `f (Circle {radius: 5})`
+    // not `(f Circle) {radius: 5}`.
+    match fun_body("x = f Circle {radius: 5}") {
+        ExprKind::App { func, arg } => {
+            assert!(matches!(&func.node, ExprKind::Var(n) if n == "f"));
+            // arg should be App(Constructor("Circle"), Record(...))
+            match &arg.node {
+                ExprKind::App { func: inner_f, arg: inner_a } => {
+                    assert!(matches!(&inner_f.node, ExprKind::Constructor(n) if n == "Circle"));
+                    assert!(matches!(&inner_a.node, ExprKind::Record(_)));
+                }
+                other => panic!("expected App(Constructor, Record), got {:?}", other),
+            }
+        }
+        other => panic!("expected App(Var, App(Constructor, Record)), got {:?}", other),
+    }
+}
+
+#[test]
+fn constructor_greedy_nested() {
+    // `Just Nothing {}` should parse as `Just (Nothing {})`
+    match fun_body("x = Just Nothing {}") {
+        ExprKind::App { func, arg } => {
+            assert!(matches!(&func.node, ExprKind::Constructor(n) if n == "Just"));
+            match &arg.node {
+                ExprKind::App { func: inner_f, arg: inner_a } => {
+                    assert!(matches!(&inner_f.node, ExprKind::Constructor(n) if n == "Nothing"));
+                    assert!(matches!(&inner_a.node, ExprKind::Record(fs) if fs.is_empty()));
+                }
+                other => panic!("expected App(Constructor, Record), got {:?}", other),
+            }
+        }
+        other => panic!("expected App(Just, App(Nothing, Record)), got {:?}", other),
+    }
+}
+
+#[test]
+fn constructor_greedy_with_field_access() {
+    // `Circle {radius: 5}.radius` should parse as `(Circle {radius: 5}).radius`
+    match fun_body("x = Circle {radius: 5}.radius") {
+        ExprKind::FieldAccess { expr, field } => {
+            assert_eq!(field, "radius");
+            match &expr.node {
+                ExprKind::App { func, arg } => {
+                    assert!(matches!(&func.node, ExprKind::Constructor(n) if n == "Circle"));
+                    assert!(matches!(&arg.node, ExprKind::Record(_)));
+                }
+                other => panic!("expected App(Constructor, Record), got {:?}", other),
+            }
+        }
+        other => panic!("expected FieldAccess(App(...), radius), got {:?}", other),
+    }
+}
+
+#[test]
 fn nested_lambdas() {
     match fun_body("x = \\a -> \\b -> a + b") {
         ExprKind::Lambda { body, .. } => {

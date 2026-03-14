@@ -1518,8 +1518,31 @@ impl Parser {
         }
     }
 
+    /// Parse atom with constructor greedy binding.
+    /// A bare constructor greedily binds with the next atom, so
+    /// `f Circle {radius: 5}` parses as `f (Circle {radius: 5})`
+    /// rather than `(f Circle) {radius: 5}`.
+    /// Nested constructors are handled recursively:
+    /// `Just Nothing {}` parses as `Just (Nothing {})`.
+    fn parse_constructor_or_atom(&mut self) -> Option<Expr> {
+        let expr = self.parse_atom()?;
+        if matches!(expr.node, ExprKind::Constructor(_)) && self.can_start_atom() {
+            let arg = self.parse_constructor_or_atom()?;
+            let span = Span::new(expr.span.start, arg.span.end);
+            Some(Spanned::new(
+                ExprKind::App {
+                    func: Box::new(expr),
+                    arg: Box::new(arg),
+                },
+                span,
+            ))
+        } else {
+            Some(expr)
+        }
+    }
+
     fn parse_postfix(&mut self) -> Option<Expr> {
-        let mut expr = self.parse_atom()?;
+        let mut expr = self.parse_constructor_or_atom()?;
 
         loop {
             if self.at(&TokenKind::Dot) {

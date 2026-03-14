@@ -235,6 +235,7 @@ pub enum Literal {
     Int(i64),
     Float(f64),
     Text(String),
+    Bytes(Vec<u8>),
 }
 
 // ── Operators ──────────────────────────────────────────────────────

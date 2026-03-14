@@ -55,6 +55,7 @@ pub enum Value {
     Float(f64),
     Text(String),
     Bool(bool),
+    Bytes(Vec<u8>),
     Unit,
     Record(Vec<RecordField>),
     Relation(Vec<*mut Value>),
@@ -113,6 +114,7 @@ fn type_name(v: *mut Value) -> &'static str {
         Value::Float(_) => "Float",
         Value::Text(_) => "Text",
         Value::Bool(_) => "Bool",
+        Value::Bytes(_) => "Bytes",
         Value::Unit => "Unit",
         Value::Record(_) => "Record",
         Value::Relation(_) => "Relation",
@@ -136,6 +138,7 @@ fn brief_value(v: *mut Value) -> String {
             }
         }
         Value::Bool(b) => format!("Bool({})", b),
+        Value::Bytes(b) => format!("Bytes({} bytes)", b.len()),
         Value::Unit => "Unit".to_string(),
         Value::Record(fields) => {
             let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
@@ -202,6 +205,16 @@ pub extern "C" fn knot_value_constructor(
     alloc(Value::Constructor(tag, payload))
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_value_bytes(ptr: *const u8, len: usize) -> *mut Value {
+    let bytes = if ptr.is_null() || len == 0 {
+        Vec::new()
+    } else {
+        unsafe { slice::from_raw_parts(ptr, len) }.to_vec()
+    };
+    alloc(Value::Bytes(bytes))
+}
+
 // ── Value accessors ───────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
@@ -243,6 +256,7 @@ pub extern "C" fn knot_value_get_tag(v: *mut Value) -> i32 {
         Value::Relation(_) => 6,
         Value::Constructor(_, _) => 7,
         Value::Function(_, _, _) => 8,
+        Value::Bytes(_) => 10,
     }
 }
 
@@ -432,6 +446,7 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
         (Value::Float(x), Value::Float(y)) => x == y,
         (Value::Text(x), Value::Text(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Bytes(x), Value::Bytes(y)) => x == y,
         (Value::Unit, Value::Unit) => true,
         (Value::Record(fa), Value::Record(fb)) => {
             if fa.len() != fb.len() {
@@ -658,6 +673,10 @@ fn format_value(v: *mut Value) -> String {
             }
         }
         Value::Text(s) => format!("\"{}\"", s),
+        Value::Bytes(b) => {
+            let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
+            format!("b\"{}\"", hex)
+        }
         Value::Bool(b) => {
             if *b {
                 "True {}".to_string()
@@ -718,6 +737,9 @@ pub extern "C" fn knot_value_show(v: *mut Value) -> *mut Value {
                 }
             }
             Value::Text(s) => s.clone(),
+            Value::Bytes(b) => {
+                b.iter().map(|byte| format!("{:02x}", byte)).collect()
+            }
             Value::Bool(b) => {
                 if *b { "True".to_string() } else { "False".to_string() }
             }
@@ -946,6 +968,135 @@ pub extern "C" fn knot_text_chars(v: *mut Value) -> *mut Value {
         _ => panic!("knot runtime: chars expected Text, got {}", type_name(v)),
     }
 }
+
+// ── Standard library: bytes operations ─────────────────────────
+
+/// bytesLength(bytes) — byte count
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_bytes_length(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Bytes(b) => knot_value_int(b.len() as i64),
+        _ => panic!("knot runtime: bytesLength expected Bytes, got {}", type_name(v)),
+    }
+}
+
+/// bytesConcat(a, b) — concatenate two byte strings
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_bytes_concat(a: *mut Value, b: *mut Value) -> *mut Value {
+    let a_bytes = match unsafe { as_ref(a) } {
+        Value::Bytes(b) => b,
+        _ => panic!("knot runtime: bytesConcat expected Bytes as first arg, got {}", type_name(a)),
+    };
+    let b_bytes = match unsafe { as_ref(b) } {
+        Value::Bytes(b) => b,
+        _ => panic!("knot runtime: bytesConcat expected Bytes as second arg, got {}", type_name(b)),
+    };
+    let mut result = a_bytes.clone();
+    result.extend_from_slice(b_bytes);
+    alloc(Value::Bytes(result))
+}
+
+/// bytesSlice(start, len, bytes) — extract a sub-range of bytes
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_bytes_slice(
+    _db: *mut c_void,
+    start: *mut Value,
+    len: *mut Value,
+    bytes: *mut Value,
+) -> *mut Value {
+    let start = match unsafe { as_ref(start) } {
+        Value::Int(n) => *n as usize,
+        _ => panic!("knot runtime: bytesSlice expected Int as first arg"),
+    };
+    let len = match unsafe { as_ref(len) } {
+        Value::Int(n) => *n as usize,
+        _ => panic!("knot runtime: bytesSlice expected Int as second arg"),
+    };
+    match unsafe { as_ref(bytes) } {
+        Value::Bytes(b) => {
+            let end = (start + len).min(b.len());
+            let s = start.min(b.len());
+            alloc(Value::Bytes(b[s..end].to_vec()))
+        }
+        _ => panic!("knot runtime: bytesSlice expected Bytes as third arg, got {}", type_name(bytes)),
+    }
+}
+
+/// textToBytes(text) — encode text as UTF-8 bytes
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_text_to_bytes(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Text(s) => alloc(Value::Bytes(s.as_bytes().to_vec())),
+        _ => panic!("knot runtime: textToBytes expected Text, got {}", type_name(v)),
+    }
+}
+
+/// bytesToText(bytes) — decode UTF-8 bytes to text
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_bytes_to_text(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Bytes(b) => {
+            let s = String::from_utf8(b.clone())
+                .unwrap_or_else(|e| panic!("knot runtime: bytesToText: invalid UTF-8: {}", e));
+            alloc(Value::Text(s))
+        }
+        _ => panic!("knot runtime: bytesToText expected Bytes, got {}", type_name(v)),
+    }
+}
+
+/// bytesToHex(bytes) — encode bytes as hex string
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_bytes_to_hex(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Bytes(b) => {
+            let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
+            alloc(Value::Text(hex))
+        }
+        _ => panic!("knot runtime: bytesToHex expected Bytes, got {}", type_name(v)),
+    }
+}
+
+/// bytesFromHex(text) — decode hex string to bytes
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_bytes_from_hex(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Text(s) => {
+            let s = s.trim();
+            if s.len() % 2 != 0 {
+                panic!("knot runtime: bytesFromHex: odd-length hex string");
+            }
+            let bytes: Vec<u8> = (0..s.len())
+                .step_by(2)
+                .map(|i| {
+                    u8::from_str_radix(&s[i..i + 2], 16)
+                        .unwrap_or_else(|_| panic!("knot runtime: bytesFromHex: invalid hex at position {}", i))
+                })
+                .collect();
+            alloc(Value::Bytes(bytes))
+        }
+        _ => panic!("knot runtime: bytesFromHex expected Text, got {}", type_name(v)),
+    }
+}
+
+/// bytesGet(index, bytes) — get byte at index as Int (0-255)
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_bytes_get(index: *mut Value, bytes: *mut Value) -> *mut Value {
+    let i = match unsafe { as_ref(index) } {
+        Value::Int(n) => *n as usize,
+        _ => panic!("knot runtime: bytesGet expected Int as first arg"),
+    };
+    match unsafe { as_ref(bytes) } {
+        Value::Bytes(b) => {
+            if i >= b.len() {
+                panic!("knot runtime: bytesGet index {} out of bounds (length {})", i, b.len());
+            }
+            knot_value_int(b[i] as i64)
+        }
+        _ => panic!("knot runtime: bytesGet expected Bytes as second arg, got {}", type_name(bytes)),
+    }
+}
+
+// ── Standard library: utility operations ──────────────────────
 
 /// id(x) — identity function, returns its argument unchanged
 #[unsafe(no_mangle)]
@@ -1190,6 +1341,7 @@ enum ColType {
     Float,
     Text,
     Bool,
+    Bytes,
     /// Stored as TEXT, reconstructed as Constructor on read
     Tag,
 }
@@ -1250,6 +1402,7 @@ fn parse_adt_schema(spec: &str) -> AdtSpec {
                         "float" => ColType::Float,
                         "text" => ColType::Text,
                         "bool" => ColType::Bool,
+                        "bytes" => ColType::Bytes,
                         "tag" => ColType::Tag,
                         other => panic!("knot runtime: unknown ADT field type '{}'", other),
                     };
@@ -1309,6 +1462,7 @@ fn parse_col_type(s: &str) -> ColType {
         "float" => ColType::Float,
         "text" => ColType::Text,
         "bool" => ColType::Bool,
+        "bytes" => ColType::Bytes,
         "tag" => ColType::Tag,
         other => panic!("knot runtime: unknown column type '{}'", other),
     }
@@ -1354,6 +1508,7 @@ fn sql_type(ty: ColType) -> &'static str {
         ColType::Float => "REAL",
         ColType::Text => "TEXT",
         ColType::Bool => "INTEGER",
+        ColType::Bytes => "BLOB",
         ColType::Tag => "TEXT",
     }
 }
@@ -1371,6 +1526,10 @@ fn read_sql_column(row: &rusqlite::Row, i: usize, ty: ColType) -> *mut Value {
             alloc(Value::Text(s))
         }
         ColType::Bool => knot_value_bool(row.get::<_, i32>(i).unwrap()),
+        ColType::Bytes => {
+            let b: Vec<u8> = row.get(i).unwrap();
+            alloc(Value::Bytes(b))
+        }
         ColType::Tag => {
             // Read TEXT but reconstruct as a Constructor with Unit payload
             let tag: String = row.get(i).unwrap();
@@ -2499,6 +2658,7 @@ fn value_to_sql_param(v: *mut Value) -> rusqlite::types::Value {
         Value::Float(n) => rusqlite::types::Value::Real(*n),
         Value::Text(s) => rusqlite::types::Value::Text(s.clone()),
         Value::Bool(b) => rusqlite::types::Value::Integer(*b as i64),
+        Value::Bytes(b) => rusqlite::types::Value::Blob(b.clone()),
         Value::Constructor(tag, _) => rusqlite::types::Value::Text(tag.clone()),
         Value::Relation(_) | Value::Record(_) => {
             rusqlite::types::Value::Text(value_to_json(v))
@@ -2519,6 +2679,7 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
         (Value::Float(n), _) => rusqlite::types::Value::Real(*n),
         (Value::Text(s), _) => rusqlite::types::Value::Text(s.clone()),
         (Value::Bool(b), _) => rusqlite::types::Value::Integer(*b as i64),
+        (Value::Bytes(b), _) => rusqlite::types::Value::Blob(b.clone()),
         (Value::Constructor(tag, _), ColType::Tag) => {
             rusqlite::types::Value::Text(tag.clone())
         }
@@ -3463,6 +3624,10 @@ fn value_to_json(v: *mut Value) -> String {
         Value::Float(n) => n.to_string(),
         Value::Text(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
         Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+        Value::Bytes(b) => {
+            let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
+            format!("\"{}\"", hex)
+        }
         Value::Unit => "{}".to_string(),
         Value::Record(fields) => {
             let parts: Vec<String> = fields

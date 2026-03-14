@@ -37,6 +37,7 @@ enum Ty {
     Float,
     Text,
     Bool,
+    Bytes,
     /// Function type.
     Fun(Box<Ty>, Box<Ty>),
     /// Record with named fields and optional row variable (open record).
@@ -298,7 +299,8 @@ impl Infer {
             (Ty::Int, Ty::Int)
             | (Ty::Float, Ty::Float)
             | (Ty::Text, Ty::Text)
-            | (Ty::Bool, Ty::Bool) => {}
+            | (Ty::Bool, Ty::Bool)
+            | (Ty::Bytes, Ty::Bytes) => {}
             (Ty::Fun(p1, r1), Ty::Fun(p2, r2)) => {
                 let (p1, p2) = (p1.clone(), p2.clone());
                 let (r1, r2) = (r1.clone(), r2.clone());
@@ -655,6 +657,7 @@ impl Infer {
                 "Float" => Ty::Float,
                 "Text" => Ty::Text,
                 "Bool" => Ty::Bool,
+                "Bytes" => Ty::Bytes,
                 "[]" => Ty::TyCon("[]".into()),
                 _ => {
                     if let Some(aliased) = self.aliases.get(name).cloned() {
@@ -756,6 +759,7 @@ impl Infer {
             Ty::Float => "Float".into(),
             Ty::Text => "Text".into(),
             Ty::Bool => "Bool".into(),
+            Ty::Bytes => "Bytes".into(),
             Ty::Fun(p, r) => {
                 let s = format!(
                     "{} -> {}",
@@ -1196,6 +1200,7 @@ impl Infer {
             ast::Literal::Int(_) => Ty::Int,
             ast::Literal::Float(_) => Ty::Float,
             ast::Literal::Text(_) => Ty::Text,
+            ast::Literal::Bytes(_) => Ty::Bytes,
         }
     }
 
@@ -1799,6 +1804,68 @@ impl Infer {
         self.bind_top(
             "not",
             Scheme::mono(Ty::Fun(Box::new(Ty::Bool), Box::new(Ty::Bool))),
+        );
+
+        // ── Bytes standard library ────────────────────────────────
+
+        // bytesLength : Bytes -> Int
+        self.bind_top(
+            "bytesLength",
+            Scheme::mono(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Int))),
+        );
+
+        // bytesSlice : Int -> Int -> Bytes -> Bytes
+        self.bind_top(
+            "bytesSlice",
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Int),
+                Box::new(Ty::Fun(
+                    Box::new(Ty::Int),
+                    Box::new(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Bytes))),
+                )),
+            )),
+        );
+
+        // bytesConcat : Bytes -> Bytes -> Bytes
+        self.bind_top(
+            "bytesConcat",
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Bytes),
+                Box::new(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Bytes))),
+            )),
+        );
+
+        // textToBytes : Text -> Bytes
+        self.bind_top(
+            "textToBytes",
+            Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Bytes))),
+        );
+
+        // bytesToText : Bytes -> Text
+        self.bind_top(
+            "bytesToText",
+            Scheme::mono(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Text))),
+        );
+
+        // bytesToHex : Bytes -> Text
+        self.bind_top(
+            "bytesToHex",
+            Scheme::mono(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Text))),
+        );
+
+        // bytesFromHex : Text -> Bytes
+        self.bind_top(
+            "bytesFromHex",
+            Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Bytes))),
+        );
+
+        // bytesGet : Int -> Bytes -> Int
+        self.bind_top(
+            "bytesGet",
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Int),
+                Box::new(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Int))),
+            )),
         );
     }
 

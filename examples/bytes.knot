@@ -1,0 +1,34 @@
+-- ByteString example
+
+main = do
+  -- Byte string literals
+  let raw = b"hello"
+  println (bytesLength raw)        -- 5
+
+  -- Convert text <-> bytes
+  let encoded = textToBytes "world"
+  println (bytesLength encoded)    -- 5
+  println (bytesToText encoded)    -- world
+
+  -- Hex encoding/decoding
+  let hex = bytesToHex raw
+  println hex                      -- 68656c6c6f
+  let decoded = bytesFromHex hex
+  println (bytesToText decoded)    -- hello
+
+  -- Concatenation
+  let combined = bytesConcat raw encoded
+  println (bytesLength combined)   -- 10
+
+  -- Slicing
+  let slice = bytesSlice 0 5 combined
+  println (bytesToText slice)      -- hello
+
+  -- Byte access
+  println (bytesGet 0 raw)         -- 104 (ascii 'h')
+
+  -- Hex escapes in literals
+  let withHex = b"\x48\x49"
+  println (bytesToText withHex)    -- HI
+
+  yield {}

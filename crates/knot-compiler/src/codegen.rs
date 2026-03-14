@@ -451,6 +451,17 @@ impl Codegen {
         self.declare_rt("knot_value_id", &[p], &[p]);
         self.declare_rt("knot_value_not_fn", &[p], &[p]);
 
+        // Bytes value constructor and standard library
+        self.declare_rt("knot_value_bytes", &[p, p], &[p]);
+        self.declare_rt("knot_bytes_length", &[p], &[p]);
+        self.declare_rt("knot_bytes_concat", &[p, p], &[p]);
+        self.declare_rt("knot_bytes_slice", &[p, p, p, p], &[p]);
+        self.declare_rt("knot_text_to_bytes", &[p], &[p]);
+        self.declare_rt("knot_bytes_to_text", &[p], &[p]);
+        self.declare_rt("knot_bytes_to_hex", &[p], &[p]);
+        self.declare_rt("knot_bytes_from_hex", &[p], &[p]);
+        self.declare_rt("knot_bytes_get", &[p, p], &[p]);
+
         // Fixpoint iteration for recursive derived relations
         self.declare_rt("knot_relation_fixpoint", &[p, p, p], &[p]);
 
@@ -703,6 +714,9 @@ impl Codegen {
             "toUpper", "toLower", "take", "drop",
             "length", "trim", "contains", "reverse",
             "chars", "id", "not",
+            "bytesLength", "bytesSlice", "bytesConcat",
+            "textToBytes", "bytesToText", "bytesToHex", "bytesFromHex",
+            "bytesGet",
         ];
         for name in &stdlib_names {
             self.register_stdlib_fn(name);
@@ -1167,6 +1181,20 @@ impl Codegen {
 
         // 3-param: double-curried
         self.define_stdlib_fn_3("fold", "knot_relation_fold");
+
+        // Bytes: 1-param
+        self.define_stdlib_fn_1("bytesLength", "knot_bytes_length");
+        self.define_stdlib_fn_1("textToBytes", "knot_text_to_bytes");
+        self.define_stdlib_fn_1("bytesToText", "knot_bytes_to_text");
+        self.define_stdlib_fn_1("bytesToHex", "knot_bytes_to_hex");
+        self.define_stdlib_fn_1("bytesFromHex", "knot_bytes_from_hex");
+
+        // Bytes: 2-param (curried)
+        self.define_stdlib_fn_2("bytesConcat", "knot_bytes_concat", false);
+        self.define_stdlib_fn_2("bytesGet", "knot_bytes_get", false);
+
+        // Bytes: 3-param (double-curried)
+        self.define_stdlib_fn_3("bytesSlice", "knot_bytes_slice");
 
         for decl in &module.decls {
             match &decl.node {
@@ -3424,6 +3452,10 @@ impl Codegen {
                 let (ptr, len) = self.string_ptr(builder, s);
                 self.call_rt(builder, "knot_value_text", &[ptr, len])
             }
+            ast::Literal::Bytes(b) => {
+                let (ptr, len) = self.bytes_ptr(builder, b);
+                self.call_rt(builder, "knot_value_bytes", &[ptr, len])
+            }
         }
     }
 
@@ -3531,6 +3563,34 @@ impl Codegen {
         let ptr = builder.ins().global_value(self.ptr_type, gv);
         let len = builder.ins().iconst(self.ptr_type, s.len() as i64);
         (ptr, len)
+    }
+
+    /// Get the pointer and length of a byte string constant as Cranelift Values.
+    fn bytes_ptr(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        b: &[u8],
+    ) -> (Value, Value) {
+        let data_id = self.ensure_bytes(b);
+        let gv = self
+            .module
+            .declare_data_in_func(data_id, builder.func);
+        let ptr = builder.ins().global_value(self.ptr_type, gv);
+        let len = builder.ins().iconst(self.ptr_type, b.len() as i64);
+        (ptr, len)
+    }
+
+    fn ensure_bytes(&mut self, b: &[u8]) -> DataId {
+        let name = format!(".bytes.{}", self.string_counter);
+        self.string_counter += 1;
+        let data_id = self
+            .module
+            .declare_data(&name, Linkage::Local, false, false)
+            .unwrap();
+        let mut desc = DataDescription::new();
+        desc.define(b.to_vec().into_boxed_slice());
+        self.module.define_data(data_id, &desc).unwrap();
+        data_id
     }
 
     // ── Set-expression analysis ──────────────────────────────────
@@ -4508,6 +4568,10 @@ fn pretty_lit(lit: &ast::Literal) -> String {
             }
         }
         ast::Literal::Text(s) => format!("\"{}\"", s),
+        ast::Literal::Bytes(b) => {
+            let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
+            format!("b\"{}\"", hex)
+        }
     }
 }
 

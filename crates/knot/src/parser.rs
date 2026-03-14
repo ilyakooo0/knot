@@ -1363,6 +1363,7 @@ impl Parser {
             TokenKind::Int(_)
             | TokenKind::Float(_)
             | TokenKind::Text(_)
+            | TokenKind::Bytes(_)
             | TokenKind::Lower(_)
             | TokenKind::Upper(_)
             | TokenKind::LParen
@@ -1445,6 +1446,10 @@ impl Parser {
             TokenKind::Text(s) => {
                 let tok = self.advance();
                 Some(Spanned::new(ExprKind::Lit(Literal::Text(s)), tok.span))
+            }
+            TokenKind::Bytes(b) => {
+                let tok = self.advance();
+                Some(Spanned::new(ExprKind::Lit(Literal::Bytes(b)), tok.span))
             }
             TokenKind::Lower(name) => {
                 let tok = self.advance();
@@ -1965,6 +1970,7 @@ impl Parser {
                 | TokenKind::Int(_)
                 | TokenKind::Float(_)
                 | TokenKind::Text(_)
+                | TokenKind::Bytes(_)
         )
     }
 
@@ -2049,6 +2055,10 @@ impl Parser {
                 let tok = self.advance();
                 Some(Spanned::new(PatKind::Lit(Literal::Text(s)), tok.span))
             }
+            TokenKind::Bytes(b) => {
+                let tok = self.advance();
+                Some(Spanned::new(PatKind::Lit(Literal::Bytes(b)), tok.span))
+            }
             _ => {
                 self.error("expected pattern");
                 None
@@ -2068,6 +2078,7 @@ impl Parser {
                 | TokenKind::Int(_)
                 | TokenKind::Float(_)
                 | TokenKind::Text(_)
+                | TokenKind::Bytes(_)
         )
     }
 
@@ -2116,6 +2127,10 @@ impl Parser {
             TokenKind::Text(s) => {
                 let tok = self.advance();
                 Some(Spanned::new(PatKind::Lit(Literal::Text(s)), tok.span))
+            }
+            TokenKind::Bytes(b) => {
+                let tok = self.advance();
+                Some(Spanned::new(PatKind::Lit(Literal::Bytes(b)), tok.span))
             }
             _ => {
                 self.error("expected pattern atom");

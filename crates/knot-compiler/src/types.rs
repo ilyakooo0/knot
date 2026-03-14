@@ -13,6 +13,7 @@ pub enum ResolvedType {
     Float,
     Text,
     Bool,
+    Bytes,
     Unit,
     Record(Vec<(String, ResolvedType)>),
     Relation(Box<ResolvedType>),
@@ -194,6 +195,7 @@ fn resolve_type(
             "Float" => ResolvedType::Float,
             "Text" => ResolvedType::Text,
             "Bool" => ResolvedType::Bool,
+            "Bytes" => ResolvedType::Bytes,
             _ => aliases
                 .get(name)
                 .cloned()
@@ -270,6 +272,7 @@ fn col_type_str(ty: &ResolvedType) -> &'static str {
         ResolvedType::Float => "float",
         ResolvedType::Text => "text",
         ResolvedType::Bool => "bool",
+        ResolvedType::Bytes => "bytes",
         ResolvedType::Adt(ctors) => {
             // Enum-like ADTs (all nullary) get the "tag" type
             if ctors.iter().all(|(_, fields)| fields.is_empty()) {

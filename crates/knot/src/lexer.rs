@@ -14,6 +14,7 @@ pub enum TokenKind {
     Int(i64),
     Float(f64),
     Text(String),
+    Bytes(Vec<u8>),
 
     // Identifiers
     Lower(String),
@@ -98,6 +99,7 @@ impl TokenKind {
             TokenKind::Int(_) => "integer literal",
             TokenKind::Float(_) => "float literal",
             TokenKind::Text(_) => "string literal",
+            TokenKind::Bytes(_) => "byte string literal",
             TokenKind::Lower(_) => "identifier",
             TokenKind::Upper(_) => "type name",
             TokenKind::Module => "'module'",
@@ -315,6 +317,11 @@ impl<'src> Lexer<'src> {
     fn lex_token(&mut self) -> Option<TokenKind> {
         let ch = self.bytes[self.pos];
 
+        // Byte string literal: b"..."
+        if ch == b'b' && self.peek_at(1) == Some(b'"') {
+            return Some(self.lex_byte_string());
+        }
+
         // Identifiers and keywords
         if ch.is_ascii_alphabetic() || ch == b'_' {
             return Some(self.lex_identifier());
@@ -489,6 +496,101 @@ impl<'src> Lexer<'src> {
                     let ch = self.source[self.pos..].chars().next().unwrap();
                     self.pos += ch.len_utf8();
                     value.push(ch);
+                }
+            }
+        }
+    }
+
+    // ── Byte strings ─────────────────────────────────────────────────
+
+    fn lex_byte_string(&mut self) -> TokenKind {
+        let start = self.pos;
+        self.advance(); // skip 'b'
+        self.advance(); // skip opening '"'
+
+        let mut value = Vec::new();
+
+        loop {
+            match self.peek() {
+                None | Some(b'\n') => {
+                    let span = self.span_from(start);
+                    self.diagnostics.push(
+                        Diagnostic::error("unterminated byte string literal")
+                            .label(span, "byte string starts here"),
+                    );
+                    return TokenKind::Bytes(value);
+                }
+                Some(b'"') => {
+                    self.advance();
+                    return TokenKind::Bytes(value);
+                }
+                Some(b'\\') => {
+                    self.advance();
+                    match self.peek() {
+                        Some(b'\\') => {
+                            self.advance();
+                            value.push(b'\\');
+                        }
+                        Some(b'"') => {
+                            self.advance();
+                            value.push(b'"');
+                        }
+                        Some(b'n') => {
+                            self.advance();
+                            value.push(b'\n');
+                        }
+                        Some(b't') => {
+                            self.advance();
+                            value.push(b'\t');
+                        }
+                        Some(b'r') => {
+                            self.advance();
+                            value.push(b'\r');
+                        }
+                        Some(b'0') => {
+                            self.advance();
+                            value.push(0);
+                        }
+                        Some(b'x') => {
+                            self.advance();
+                            // Hex escape: \xHH
+                            let h1 = self.peek().and_then(|b| (b as char).to_digit(16));
+                            if let Some(d1) = h1 {
+                                self.advance();
+                                let h2 = self.peek().and_then(|b| (b as char).to_digit(16));
+                                if let Some(d2) = h2 {
+                                    self.advance();
+                                    value.push((d1 * 16 + d2) as u8);
+                                } else {
+                                    let span = Span::new(self.pos - 3, self.pos);
+                                    self.diagnostics.push(
+                                        Diagnostic::error("invalid hex escape in byte string")
+                                            .label(span, "expected two hex digits after \\x"),
+                                    );
+                                }
+                            } else {
+                                let span = Span::new(self.pos - 2, self.pos);
+                                self.diagnostics.push(
+                                    Diagnostic::error("invalid hex escape in byte string")
+                                        .label(span, "expected two hex digits after \\x"),
+                                );
+                            }
+                        }
+                        Some(_) => {
+                            let esc_start = self.pos - 1;
+                            self.advance();
+                            let span = Span::new(esc_start, self.pos);
+                            self.diagnostics.push(
+                                Diagnostic::error("unknown escape sequence in byte string")
+                                    .label(span, "unknown escape"),
+                            );
+                        }
+                        None => {}
+                    }
+                }
+                Some(b) => {
+                    self.advance();
+                    value.push(b);
                 }
             }
         }

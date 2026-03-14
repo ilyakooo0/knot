@@ -179,6 +179,19 @@ impl EffectChecker {
         };
         builtin_effects.insert("listen".into(), network_effect);
 
+        // File system: fs effect
+        let fs_effect = {
+            let mut e = EffectSet::empty();
+            e.fs = true;
+            e
+        };
+        builtin_effects.insert("readFile".into(), fs_effect.clone());
+        builtin_effects.insert("writeFile".into(), fs_effect.clone());
+        builtin_effects.insert("appendFile".into(), fs_effect.clone());
+        builtin_effects.insert("fileExists".into(), fs_effect.clone());
+        builtin_effects.insert("removeFile".into(), fs_effect.clone());
+        builtin_effects.insert("listDir".into(), fs_effect);
+
         // Pure builtins
         builtin_effects.insert("show".into(), EffectSet::empty());
         builtin_effects.insert("union".into(), EffectSet::empty());

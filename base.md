@@ -229,6 +229,65 @@ bytesToHex (textToBytes "hi")    -- "6869"
 bytesFromHex "6869" |> bytesToText  -- "hi"
 ```
 
+## File System
+
+All file system functions carry the `{fs}` effect.
+
+```knot
+readFile : Text -> Text
+```
+Read the entire contents of a file as text.
+
+```knot
+readFile "config.json"    -- "{\"port\": 8080}"
+```
+
+```knot
+writeFile : Text -> Text -> {}
+```
+Write text to a file. Creates the file if it doesn't exist, overwrites if it does. The first argument is the path, the second is the contents.
+
+```knot
+writeFile "output.txt" "hello"
+```
+
+```knot
+appendFile : Text -> Text -> {}
+```
+Append text to a file. Creates the file if it doesn't exist.
+
+```knot
+appendFile "app.log" ("event at " ++ show now ++ "\n")
+```
+
+```knot
+fileExists : Text -> Bool
+```
+Check whether a file or directory exists at the given path.
+
+```knot
+if fileExists "config.json"
+  then readFile "config.json"
+  else "{}"
+```
+
+```knot
+removeFile : Text -> {}
+```
+Delete a file.
+
+```knot
+listDir : Text -> [Text]
+```
+List the entries of a directory as a relation of filenames.
+
+```knot
+listDir "."    -- ["main.knot", "lib.knot", "knot.db"]
+
+-- Filter to specific files
+listDir "src" |> filter (\f -> contains ".knot" f)
+```
+
 ## Server
 
 ```knot

@@ -2273,6 +2273,53 @@ impl Infer {
             Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Var(a)))),
         );
 
+        // ── File system standard library ─────────────────────────
+
+        // readFile : Text -> Text
+        self.bind_top(
+            "readFile",
+            Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Text))),
+        );
+
+        // writeFile : Text -> Text -> {}
+        self.bind_top(
+            "writeFile",
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Text),
+                Box::new(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::unit()))),
+            )),
+        );
+
+        // appendFile : Text -> Text -> {}
+        self.bind_top(
+            "appendFile",
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Text),
+                Box::new(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::unit()))),
+            )),
+        );
+
+        // fileExists : Text -> Bool
+        self.bind_top(
+            "fileExists",
+            Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Bool))),
+        );
+
+        // removeFile : Text -> {}
+        self.bind_top(
+            "removeFile",
+            Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::unit()))),
+        );
+
+        // listDir : Text -> [Text]
+        self.bind_top(
+            "listDir",
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Text),
+                Box::new(Ty::Relation(Box::new(Ty::Text))),
+            )),
+        );
+
         // ── Bytes standard library ────────────────────────────────
 
         // bytesLength : Bytes -> Int

@@ -510,13 +510,8 @@ birthday = \name ->
 -- IO (inferred: {console})
 greet = \name -> putLine ("hello " ++ name)
 
--- IO (inferred: {network})
-notify = \url msg -> httpPost url {body: msg}
-
--- Mixed (inferred: {reads *people, network})
-&notifyAll = do
-  p <- *people
-  httpPost "https://api.example.com/notify" {name: p.name}
+-- IO (inferred: {fs})
+saveReport = \path content -> writeFile path content
 ```
 
 ### Capability Types
@@ -548,8 +543,7 @@ formatName : Text -> Text                                   -- pure
 &seniors   : {reads *people} [{name: Text, age: Int}]     -- DB read
 birthday   : {reads *people, writes *people} Text -> {}     -- DB write
 greet      : {console} Text -> {}                           -- IO
-notify     : {network} Url -> Text -> {}                    -- IO
-&notifyAll : {reads *people, network} {} -> {}              -- DB read + IO
+saveReport : {fs} Text -> Text -> {}                        -- IO
 ```
 
 Effect signatures are inferred but can be written explicitly:
@@ -574,7 +568,7 @@ handleOrder = \req -> do
   orderId <- atomic do
     set *orders = union *orders [{item: req.body.item, qty: 1}]
     yield (count *orders)
-  sendEmail "orders@co.com" ("New order #" ++ show orderId)
+  println ("New order #" ++ show orderId)
   yield {orderId}
 ```
 
@@ -583,21 +577,51 @@ If `atomic` fails, execution stops — the IO is never reached. If it succeeds, 
 ```knot
 -- Compile error: cannot mix IO with DB writes
 bad = \req -> do
-  sendEmail "test@co.com" "starting"                      -- {network}
+  println "starting"                                       -- {console}
   set *orders = union *orders [{item: req.body.item}]    -- {writes *orders}
-  -- Error: cannot mix {network} with {writes *orders} in the same block.
+  -- Error: cannot mix {console} with {writes *orders} in the same block.
   --        Wrap DB writes in `atomic`.
 ```
 
 DB reads can mix freely with IO — reads are safe to retry:
 
 ```knot
--- Fine: {reads *orders, network}
-&statusPage = do
-  n <- count *orders
-  httpPost "https://metrics.co/gauge" {orders: n}
+-- Fine: {reads *orders, fs}
+&exportOrders = do
+  o <- *orders
+  writeFile ("/tmp/" ++ o.customer ++ ".txt") (show o.amount)
 ```
 
+
+### File System
+
+Built-in functions for file I/O. All carry the `{fs}` effect.
+
+| Function | Type | Description |
+|----------|------|-------------|
+| `readFile` | `Text -> Text` | Read entire file contents as text |
+| `writeFile` | `Text -> Text -> {}` | Write text to a file (creates or overwrites) |
+| `appendFile` | `Text -> Text -> {}` | Append text to a file |
+| `fileExists` | `Text -> Bool` | Check whether a path exists |
+| `removeFile` | `Text -> {}` | Delete a file |
+| `listDir` | `Text -> [Text]` | List directory entries as a relation of filenames |
+
+```knot
+-- Copy a file
+copyFile = \src dst -> writeFile dst (readFile src)
+
+-- Append a log line
+log = \msg -> appendFile "app.log" (msg ++ "\n")
+
+-- List .knot files (filter is pure, listDir carries {fs})
+knotFiles = listDir "." |> filter (\f -> contains ".knot" f)
+
+-- Conditional read
+loadConfig = \path ->
+  if fileExists path
+    then readFile path
+    else "{}"
+```
 
 ### Routes
 
@@ -706,7 +730,7 @@ serve = \req -> case req of
   orderId <- atomic do
     set *orders = union *orders [{item, qty}]
     yield (count *orders)
-  sendEmail "orders@co.com" ("New order #" ++ show orderId)
+  println ("New order #" ++ show orderId)
   yield {orderId}
 ```
 

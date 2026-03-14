@@ -1561,6 +1561,122 @@ pub extern "C" fn knot_value_not_fn(v: *mut Value) -> *mut Value {
     knot_value_not(v)
 }
 
+// ── Standard library: file system operations ──────────────────
+
+/// readFile(path) — read entire file contents as Text
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_fs_read_file(path: *mut Value) -> *mut Value {
+    match unsafe { as_ref(path) } {
+        Value::Text(p) => match std::fs::read_to_string(p) {
+            Ok(contents) => alloc(Value::Text(contents)),
+            Err(e) => panic!("knot runtime: readFile failed for {:?}: {}", p, e),
+        },
+        _ => panic!(
+            "knot runtime: readFile expected Text, got {}",
+            type_name(path)
+        ),
+    }
+}
+
+/// writeFile(path, contents) — write Text to a file (creates or overwrites)
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_fs_write_file(path: *mut Value, contents: *mut Value) -> *mut Value {
+    let p = match unsafe { as_ref(path) } {
+        Value::Text(s) => s.clone(),
+        _ => panic!(
+            "knot runtime: writeFile expected Text as first arg, got {}",
+            type_name(path)
+        ),
+    };
+    let c = match unsafe { as_ref(contents) } {
+        Value::Text(s) => s.clone(),
+        _ => panic!(
+            "knot runtime: writeFile expected Text as second arg, got {}",
+            type_name(contents)
+        ),
+    };
+    match std::fs::write(&p, &c) {
+        Ok(()) => alloc(Value::Unit),
+        Err(e) => panic!("knot runtime: writeFile failed for {:?}: {}", p, e),
+    }
+}
+
+/// appendFile(path, contents) — append Text to a file
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_fs_append_file(path: *mut Value, contents: *mut Value) -> *mut Value {
+    use std::io::Write;
+    let p = match unsafe { as_ref(path) } {
+        Value::Text(s) => s.clone(),
+        _ => panic!(
+            "knot runtime: appendFile expected Text as first arg, got {}",
+            type_name(path)
+        ),
+    };
+    let c = match unsafe { as_ref(contents) } {
+        Value::Text(s) => s.clone(),
+        _ => panic!(
+            "knot runtime: appendFile expected Text as second arg, got {}",
+            type_name(contents)
+        ),
+    };
+    match std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+        Ok(mut f) => {
+            f.write_all(c.as_bytes())
+                .unwrap_or_else(|e| panic!("knot runtime: appendFile write failed for {:?}: {}", p, e));
+            alloc(Value::Unit)
+        }
+        Err(e) => panic!("knot runtime: appendFile failed for {:?}: {}", p, e),
+    }
+}
+
+/// fileExists(path) — check whether a file exists
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_fs_file_exists(path: *mut Value) -> *mut Value {
+    match unsafe { as_ref(path) } {
+        Value::Text(p) => alloc(Value::Bool(std::path::Path::new(p).exists())),
+        _ => panic!(
+            "knot runtime: fileExists expected Text, got {}",
+            type_name(path)
+        ),
+    }
+}
+
+/// removeFile(path) — delete a file
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_fs_remove_file(path: *mut Value) -> *mut Value {
+    match unsafe { as_ref(path) } {
+        Value::Text(p) => match std::fs::remove_file(p) {
+            Ok(()) => alloc(Value::Unit),
+            Err(e) => panic!("knot runtime: removeFile failed for {:?}: {}", p, e),
+        },
+        _ => panic!(
+            "knot runtime: removeFile expected Text, got {}",
+            type_name(path)
+        ),
+    }
+}
+
+/// listDir(path) — list directory entries as a relation of Text
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_fs_list_dir(path: *mut Value) -> *mut Value {
+    match unsafe { as_ref(path) } {
+        Value::Text(p) => {
+            let entries: Vec<*mut Value> = match std::fs::read_dir(p) {
+                Ok(rd) => rd
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| alloc(Value::Text(entry.file_name().to_string_lossy().into_owned())))
+                    .collect(),
+                Err(e) => panic!("knot runtime: listDir failed for {:?}: {}", p, e),
+            };
+            alloc(Value::Relation(entries))
+        }
+        _ => panic!(
+            "knot runtime: listDir expected Text, got {}",
+            type_name(path)
+        ),
+    }
+}
+
 // ── Database operations ───────────────────────────────────────────
 
 #[unsafe(no_mangle)]

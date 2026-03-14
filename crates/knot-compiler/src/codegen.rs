@@ -476,6 +476,14 @@ impl Codegen {
         self.declare_rt("knot_bytes_from_hex", &[p], &[p]);
         self.declare_rt("knot_bytes_get", &[p, p], &[p]);
 
+        // Standard library: file system operations
+        self.declare_rt("knot_fs_read_file", &[p], &[p]);
+        self.declare_rt("knot_fs_write_file", &[p, p], &[p]);
+        self.declare_rt("knot_fs_append_file", &[p, p], &[p]);
+        self.declare_rt("knot_fs_file_exists", &[p], &[p]);
+        self.declare_rt("knot_fs_remove_file", &[p], &[p]);
+        self.declare_rt("knot_fs_list_dir", &[p], &[p]);
+
         // Fixpoint iteration for recursive derived relations
         self.declare_rt("knot_relation_fixpoint", &[p, p, p], &[p]);
 
@@ -734,6 +742,8 @@ impl Codegen {
             "bytesLength", "bytesSlice", "bytesConcat",
             "textToBytes", "bytesToText", "bytesToHex", "bytesFromHex",
             "bytesGet",
+            "readFile", "writeFile", "appendFile",
+            "fileExists", "removeFile", "listDir",
         ];
         for name in &stdlib_names {
             self.register_stdlib_fn(name);
@@ -1382,6 +1392,16 @@ impl Codegen {
 
         // Bytes: 3-param (double-curried)
         self.define_stdlib_fn_3("bytesSlice", "knot_bytes_slice");
+
+        // File system: 1-param
+        self.define_stdlib_fn_1("readFile", "knot_fs_read_file");
+        self.define_stdlib_fn_1("fileExists", "knot_fs_file_exists");
+        self.define_stdlib_fn_1("removeFile", "knot_fs_remove_file");
+        self.define_stdlib_fn_1("listDir", "knot_fs_list_dir");
+
+        // File system: 2-param (curried)
+        self.define_stdlib_fn_2("writeFile", "knot_fs_write_file", false);
+        self.define_stdlib_fn_2("appendFile", "knot_fs_append_file", false);
 
         // Define built-in [] impls for HKT traits
         self.define_builtin_relation_impls();
@@ -4867,6 +4887,12 @@ fn is_builtin_name(name: &str) -> bool {
             | "bind"
             | "alt"
             | "empty"
+            | "readFile"
+            | "writeFile"
+            | "appendFile"
+            | "fileExists"
+            | "removeFile"
+            | "listDir"
     )
 }
 

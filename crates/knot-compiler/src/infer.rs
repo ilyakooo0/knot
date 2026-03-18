@@ -2141,6 +2141,38 @@ impl Infer {
     }
 
     fn register_builtins(&mut self) {
+        // Built-in ADT: data Maybe a = Nothing {} | Just {value: a}
+        let dummy_span = Span::new(0, 0);
+        self.constructors.insert(
+            "Nothing".into(),
+            CtorInfo {
+                data_type: "Maybe".into(),
+                data_params: vec!["a".into()],
+                fields: vec![],
+            },
+        );
+        self.constructors.insert(
+            "Just".into(),
+            CtorInfo {
+                data_type: "Maybe".into(),
+                data_params: vec!["a".into()],
+                fields: vec![(
+                    "value".into(),
+                    ast::Type::new(ast::TypeKind::Var("a".into()), dummy_span),
+                )],
+            },
+        );
+        self.data_types.insert(
+            "Maybe".into(),
+            DataInfo {
+                params: vec!["a".into()],
+                ctors: vec![
+                    ("Nothing".into(), vec![]),
+                    ("Just".into(), vec![("value".into(), ast::Type::new(ast::TypeKind::Var("a".into()), dummy_span))]),
+                ],
+            },
+        );
+
         // println : ∀a. a -> {}
         let a = self.fresh_var();
         self.bind_top(
@@ -2325,7 +2357,7 @@ impl Infer {
             ),
         );
 
-        // single : ∀a. [a] -> a
+        // single : ∀a. [a] -> Maybe a
         let a = self.fresh_var();
         self.bind_top(
             "single",
@@ -2333,7 +2365,7 @@ impl Infer {
                 vec![a],
                 Ty::Fun(
                     Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                    Box::new(Ty::Var(a)),
+                    Box::new(Ty::Con("Maybe".into(), vec![Ty::Var(a)])),
                 ),
             ),
         );

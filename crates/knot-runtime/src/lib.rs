@@ -1221,7 +1221,8 @@ pub extern "C" fn knot_relation_fold(
     acc
 }
 
-/// single(rel) — extract the single element from a one-element relation
+/// single(rel) — extract the single element from a one-element relation.
+/// Returns `Just {value: x}` for a singleton, `Nothing {}` otherwise.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_relation_single(rel: *mut Value) -> *mut Value {
     let rows = match unsafe { as_ref(rel) } {
@@ -1231,10 +1232,11 @@ pub extern "C" fn knot_relation_single(rel: *mut Value) -> *mut Value {
             type_name(rel)
         ),
     };
-    match rows.len() {
-        1 => rows[0],
-        0 => panic!("knot runtime: single called on empty relation"),
-        n => panic!("knot runtime: single called on relation with {} elements", n),
+    if rows.len() == 1 {
+        let record = alloc(Value::Record(vec![RecordField { name: "value".into(), value: rows[0] }]));
+        alloc(Value::Constructor("Just".into(), record))
+    } else {
+        alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit)))
     }
 }
 

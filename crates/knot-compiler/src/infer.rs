@@ -2221,6 +2221,9 @@ impl Infer {
             Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::unit()))),
         );
 
+        // readLine : Text (reads a line from stdin)
+        self.bind_top("readLine", Scheme::mono(Ty::Text));
+
         // show : ∀a. a -> Text
         let a = self.fresh_var();
         self.bind_top(

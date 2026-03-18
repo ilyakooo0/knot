@@ -161,7 +161,8 @@ impl EffectChecker {
         };
         builtin_effects.insert("println".into(), console_effect.clone());
         builtin_effects.insert("putLine".into(), console_effect.clone());
-        builtin_effects.insert("print".into(), console_effect);
+        builtin_effects.insert("print".into(), console_effect.clone());
+        builtin_effects.insert("readLine".into(), console_effect);
 
         // now: clock effect
         let clock_effect = {
@@ -301,6 +302,11 @@ impl EffectChecker {
                 if name == "randomFloat" {
                     let mut e = EffectSet::empty();
                     e.random = true;
+                    return e;
+                }
+                if name == "readLine" {
+                    let mut e = EffectSet::empty();
+                    e.console = true;
                     return e;
                 }
                 EffectSet::empty()

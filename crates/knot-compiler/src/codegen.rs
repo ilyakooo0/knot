@@ -386,7 +386,8 @@ impl Codegen {
         // Function calls
         self.declare_rt("knot_value_call", &[p, p, p], &[p]);
 
-        // Printing / show
+        // Printing / reading / show
+        self.declare_rt("knot_read_line", &[], &[p]);
         self.declare_rt("knot_print", &[p], &[p]);
         self.declare_rt("knot_println", &[p], &[p]);
         self.declare_rt("knot_value_show", &[p], &[p]);
@@ -2451,6 +2452,9 @@ impl Codegen {
                 }
                 if name == "randomFloat" {
                     return self.call_rt(builder, "knot_random_float", &[]);
+                }
+                if name == "readLine" {
+                    return self.call_rt(builder, "knot_read_line", &[]);
                 }
                 if env.bindings.contains_key(name) {
                     env.get(name)

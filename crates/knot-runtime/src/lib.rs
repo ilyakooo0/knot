@@ -1068,6 +1068,22 @@ fn format_value(v: *mut Value) -> String {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn knot_read_line() -> *mut Value {
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .expect("knot runtime: failed to read from stdin");
+    // Strip trailing newline
+    if line.ends_with('\n') {
+        line.pop();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+    }
+    alloc(Value::Text(line))
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn knot_print(v: *mut Value) -> *mut Value {
     print!("{}", format_value(v));
     alloc(Value::Unit)

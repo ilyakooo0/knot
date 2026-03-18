@@ -3016,6 +3016,66 @@ pub extern "C" fn knot_source_read_where(
     }
 }
 
+/// Execute an arbitrary SQL SELECT and return results as a relation of records.
+/// Used by the compiler for full SQL query compilation of do-blocks.
+///
+/// `sql` is the complete SELECT statement (with `?` placeholders).
+/// `result_schema` is a record schema descriptor for constructing result records
+/// (e.g., `"name:text,dept:text,budget:int"`).
+/// `params` is a Relation of parameter values to bind to `?` placeholders.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_source_query(
+    db: *mut c_void,
+    sql_ptr: *const u8,
+    sql_len: usize,
+    result_schema_ptr: *const u8,
+    result_schema_len: usize,
+    params: *mut Value,
+) -> *mut Value {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let sql = unsafe { str_from_raw(sql_ptr, sql_len) };
+    let result_schema = unsafe { str_from_raw(result_schema_ptr, result_schema_len) };
+
+    let param_values = match unsafe { as_ref(params) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: source_query params must be a Relation, got {}",
+            type_name(params)
+        ),
+    };
+    let sql_params: Vec<rusqlite::types::Value> =
+        param_values.iter().map(|v| value_to_sql_param(*v)).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+
+    debug_sql_params(sql, &sql_params);
+
+    let rec = parse_record_schema(result_schema);
+
+    let mut stmt = db_ref
+        .conn
+        .prepare(sql)
+        .unwrap_or_else(|e| panic!("knot runtime: source_query error: {}\n  SQL: {}", e, sql));
+    let mut rows: Vec<*mut Value> = Vec::new();
+    let mut result_rows = stmt
+        .query(param_refs.as_slice())
+        .unwrap_or_else(|e| panic!("knot runtime: source_query exec error: {}\n  SQL: {}", e, sql));
+
+    while let Some(row) = result_rows
+        .next()
+        .unwrap_or_else(|e| panic!("knot runtime: source_query row fetch error: {}", e))
+    {
+        let record = knot_record_empty(rec.columns.len());
+        for (i, col) in rec.columns.iter().enumerate() {
+            let val = read_sql_column(row, i, col.ty);
+            let cname = col.name.as_bytes();
+            knot_record_set_field(record, cname.as_ptr(), cname.len(), val);
+        }
+        rows.push(record);
+    }
+    alloc(Value::Relation(rows))
+}
+
 /// Read rows from a source ADT relation matching a specific constructor tag.
 /// Executes `SELECT <ctor_fields> FROM table WHERE _tag = ?` at the SQL level.
 #[unsafe(no_mangle)]

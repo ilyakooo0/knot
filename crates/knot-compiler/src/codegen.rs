@@ -399,6 +399,7 @@ impl Codegen {
         self.declare_rt("knot_source_read", &[p, p, p, p, p], &[p]);
         self.declare_rt("knot_source_count", &[p, p, p], &[p]);
         self.declare_rt("knot_source_read_where", &[p, p, p, p, p, p, p, p], &[p]);
+        self.declare_rt("knot_source_query", &[p, p, p, p, p, p], &[p]);
         self.declare_rt("knot_source_write", &[p, p, p, p, p, p], &[]);
         self.declare_rt("knot_source_append", &[p, p, p, p, p, p], &[]);
         self.declare_rt("knot_source_diff_write", &[p, p, p, p, p, p], &[]);
@@ -3782,6 +3783,11 @@ impl Codegen {
         env: &mut Env,
         db: Value,
     ) -> Value {
+        // Try to compile as a single SQL query (multi-table joins, filters).
+        if let Some(val) = self.try_compile_full_sql(builder, stmts, env, db) {
+            return val;
+        }
+
         let result = self.call_rt(builder, "knot_relation_empty", &[]);
         let mut loop_stack: Vec<LoopInfo> = Vec::new();
 
@@ -4692,6 +4698,295 @@ impl Codegen {
         None
     }
 
+    // ── Full SQL query compilation ─────────────────────────────────
+
+    /// Try to compile a do-block as a single SQL query.
+    /// Returns Some(result) if successful, None to fall back to loop codegen.
+    fn try_compile_full_sql(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        stmts: &[ast::Stmt],
+        env: &mut Env,
+        db: Value,
+    ) -> Option<Value> {
+        let plan = self.analyze_sql_plan(stmts, env)?;
+
+        let sql = plan.build_sql();
+        let result_schema = plan.build_result_schema();
+
+        let params_rel = self.compile_sql_params(builder, &plan.params, env);
+        let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+        let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
+        Some(self.call_rt(
+            builder,
+            "knot_source_query",
+            &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+        ))
+    }
+
+    /// Analyze do-block statements and produce a SQL query plan.
+    /// Returns None if the block can't be compiled to a single SQL query.
+    fn analyze_sql_plan(
+        &self,
+        stmts: &[ast::Stmt],
+        env: &Env,
+    ) -> Option<SqlQueryPlan> {
+        let mut tables: Vec<SqlTable> = Vec::new();
+        let mut bind_to_alias: HashMap<String, String> = HashMap::new();
+        let mut bind_to_schema: HashMap<String, String> = HashMap::new();
+        let mut conditions: Vec<String> = Vec::new();
+        let mut params: Vec<SqlParamSource> = Vec::new();
+
+        for stmt in &stmts[..stmts.len() - 1] {
+            match &stmt.node {
+                ast::StmtKind::Bind { pat, expr } => {
+                    let var_name = if let ast::PatKind::Var(name) = &pat.node {
+                        name.clone()
+                    } else {
+                        return None;
+                    };
+                    let source_name = if let ast::ExprKind::SourceRef(name) = &expr.node {
+                        name.clone()
+                    } else {
+                        return None;
+                    };
+
+                    if self.views.contains_key(&source_name) {
+                        return None;
+                    }
+                    let schema = self.source_schemas.get(&source_name)?.clone();
+                    if schema.starts_with('#') || schema.contains('[') {
+                        return None;
+                    }
+
+                    let alias = format!("t{}", tables.len());
+                    bind_to_alias.insert(var_name.clone(), alias.clone());
+                    bind_to_schema.insert(var_name.clone(), schema.clone());
+                    tables.push(SqlTable {
+                        source_name,
+                        alias,
+                    });
+                }
+                ast::StmtKind::Where { cond } => {
+                    let frag = Self::try_compile_multi_table_sql_expr(
+                        &bind_to_alias, cond, env,
+                    )?;
+                    conditions.push(frag.sql);
+                    params.extend(frag.params);
+                }
+                _ => return None,
+            }
+        }
+
+        if tables.is_empty() {
+            return None;
+        }
+
+        // Parse the yield statement
+        let yield_expr = match &stmts.last()?.node {
+            ast::StmtKind::Expr(e) => {
+                if let ast::ExprKind::Yield(inner) = &e.node {
+                    inner
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+
+        let mut select_columns: Vec<SqlSelectColumn> = Vec::new();
+
+        match &yield_expr.node {
+            ast::ExprKind::Record(fields) => {
+                for field in fields {
+                    if let ast::ExprKind::FieldAccess { expr, field: col_name } = &field.value.node
+                    {
+                        if let ast::ExprKind::Var(var_name) = &expr.node {
+                            let alias = bind_to_alias.get(var_name)?.clone();
+                            let schema = bind_to_schema.get(var_name)?;
+                            let type_str = lookup_col_type_from_schema(schema, col_name)?;
+                            select_columns.push(SqlSelectColumn {
+                                result_field: field.name.clone(),
+                                alias,
+                                source_col: col_name.clone(),
+                                type_str,
+                            });
+                        } else {
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    }
+                }
+            }
+            ast::ExprKind::Var(var_name) => {
+                if tables.len() != 1 {
+                    return None;
+                }
+                let alias = bind_to_alias.get(var_name)?.clone();
+                let schema = bind_to_schema.get(var_name)?;
+                for (col_name, type_str) in parse_schema_columns(schema) {
+                    select_columns.push(SqlSelectColumn {
+                        result_field: col_name.clone(),
+                        alias: alias.clone(),
+                        source_col: col_name,
+                        type_str,
+                    });
+                }
+            }
+            _ => return None,
+        }
+
+        Some(SqlQueryPlan {
+            tables,
+            conditions,
+            params,
+            select_columns,
+        })
+    }
+
+    /// Compile a multi-table Where condition to a SQL fragment.
+    /// Handles both join conditions (field = field) and filter conditions (field op ?).
+    fn try_compile_multi_table_sql_expr(
+        bind_aliases: &HashMap<String, String>,
+        expr: &ast::Expr,
+        env: &Env,
+    ) -> Option<SqlFragment> {
+        match &expr.node {
+            ast::ExprKind::BinOp { op, lhs, rhs } => match op {
+                ast::BinOp::And => {
+                    let l = Self::try_compile_multi_table_sql_expr(bind_aliases, lhs, env)?;
+                    let r = Self::try_compile_multi_table_sql_expr(bind_aliases, rhs, env)?;
+                    let mut params = l.params;
+                    params.extend(r.params);
+                    Some(SqlFragment {
+                        sql: format!("({}) AND ({})", l.sql, r.sql),
+                        params,
+                    })
+                }
+                ast::BinOp::Or => {
+                    let l = Self::try_compile_multi_table_sql_expr(bind_aliases, lhs, env)?;
+                    let r = Self::try_compile_multi_table_sql_expr(bind_aliases, rhs, env)?;
+                    let mut params = l.params;
+                    params.extend(r.params);
+                    Some(SqlFragment {
+                        sql: format!("({}) OR ({})", l.sql, r.sql),
+                        params,
+                    })
+                }
+                ast::BinOp::Eq | ast::BinOp::Neq | ast::BinOp::Lt
+                | ast::BinOp::Gt | ast::BinOp::Le | ast::BinOp::Ge => {
+                    let sql_op = match op {
+                        ast::BinOp::Eq => "=",
+                        ast::BinOp::Neq => "!=",
+                        ast::BinOp::Lt => "<",
+                        ast::BinOp::Gt => ">",
+                        ast::BinOp::Le => "<=",
+                        ast::BinOp::Ge => ">=",
+                        _ => unreachable!(),
+                    };
+                    Self::try_compile_multi_table_comparison(bind_aliases, lhs, rhs, sql_op, env)
+                        .or_else(|| {
+                            let rev = match sql_op {
+                                "=" | "!=" => sql_op,
+                                "<" => ">",
+                                ">" => "<",
+                                "<=" => ">=",
+                                ">=" => "<=",
+                                _ => return None,
+                            };
+                            Self::try_compile_multi_table_comparison(
+                                bind_aliases, rhs, lhs, rev, env,
+                            )
+                        })
+                }
+                _ => None,
+            },
+            ast::ExprKind::UnaryOp {
+                op: ast::UnaryOp::Not,
+                operand,
+            } => {
+                let inner = Self::try_compile_multi_table_sql_expr(bind_aliases, operand, env)?;
+                Some(SqlFragment {
+                    sql: format!("NOT ({})", inner.sql),
+                    params: inner.params,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Compile a multi-table comparison. LHS must be a bound variable field access.
+    /// RHS can be another bound field access (join) or a literal/var (filter param).
+    fn try_compile_multi_table_comparison(
+        bind_aliases: &HashMap<String, String>,
+        lhs: &ast::Expr,
+        rhs: &ast::Expr,
+        op: &str,
+        env: &Env,
+    ) -> Option<SqlFragment> {
+        // LHS must be a field access on a bound variable
+        let (lhs_alias, lhs_col) = match &lhs.node {
+            ast::ExprKind::FieldAccess { expr, field } => {
+                if let ast::ExprKind::Var(name) = &expr.node {
+                    let alias = bind_aliases.get(name.as_str())?;
+                    (alias.clone(), field.clone())
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+
+        match &rhs.node {
+            ast::ExprKind::FieldAccess { expr, field } => {
+                if let ast::ExprKind::Var(name) = &expr.node {
+                    if let Some(rhs_alias) = bind_aliases.get(name.as_str()) {
+                        // Join condition: bound_field op bound_field
+                        Some(SqlFragment {
+                            sql: format!(
+                                "{}.{} {} {}.{}",
+                                lhs_alias,
+                                quote_sql_ident(&lhs_col),
+                                op,
+                                rhs_alias,
+                                quote_sql_ident(field)
+                            ),
+                            params: vec![],
+                        })
+                    } else if env.bindings.contains_key(name) {
+                        // Filter: bound_field op outer_var.field
+                        Some(SqlFragment {
+                            sql: format!("{}.{} {} ?", lhs_alias, quote_sql_ident(&lhs_col), op),
+                            params: vec![SqlParamSource::FieldAccess(name.clone(), field.clone())],
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            ast::ExprKind::Lit(lit) => Some(SqlFragment {
+                sql: format!("{}.{} {} ?", lhs_alias, quote_sql_ident(&lhs_col), op),
+                params: vec![SqlParamSource::Literal(lit.clone())],
+            }),
+            ast::ExprKind::Var(name) => {
+                if bind_aliases.contains_key(name.as_str()) {
+                    None // Can't compare column with entire row
+                } else if env.bindings.contains_key(name) {
+                    Some(SqlFragment {
+                        sql: format!("{}.{} {} ?", lhs_alias, quote_sql_ident(&lhs_col), op),
+                        params: vec![SqlParamSource::Var(name.clone())],
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     // ── SQL expression compilation ──────────────────────────────────
 
     /// Try to compile a Knot condition to a SQL WHERE fragment.
@@ -5251,6 +5546,90 @@ enum SqlParamSource {
     Literal(ast::Literal),
     Var(String),
     FieldAccess(String, String), // (var_name, field_name)
+}
+
+// ── SQL query plan types ────────────────────────────────────────
+
+struct SqlQueryPlan {
+    tables: Vec<SqlTable>,
+    conditions: Vec<String>,
+    params: Vec<SqlParamSource>,
+    select_columns: Vec<SqlSelectColumn>,
+}
+
+struct SqlTable {
+    source_name: String,
+    alias: String,
+}
+
+struct SqlSelectColumn {
+    result_field: String,
+    alias: String,
+    source_col: String,
+    type_str: String,
+}
+
+impl SqlQueryPlan {
+    fn build_sql(&self) -> String {
+        let select = self
+            .select_columns
+            .iter()
+            .map(|c| format!("{}.{}", c.alias, quote_sql_ident(&c.source_col)))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let from = self
+            .tables
+            .iter()
+            .map(|t| {
+                format!(
+                    "{} AS {}",
+                    quote_sql_ident(&format!("_knot_{}", t.source_name)),
+                    t.alias
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        if self.conditions.is_empty() {
+            format!("SELECT {} FROM {}", select, from)
+        } else {
+            let where_clause = self.conditions.join(" AND ");
+            format!("SELECT {} FROM {} WHERE {}", select, from, where_clause)
+        }
+    }
+
+    fn build_result_schema(&self) -> String {
+        self.select_columns
+            .iter()
+            .map(|c| format!("{}:{}", c.result_field, c.type_str))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+fn lookup_col_type_from_schema(schema: &str, col_name: &str) -> Option<String> {
+    for part in schema.split(',') {
+        let colon = part.find(':')?;
+        let name = &part[..colon];
+        let ty = &part[colon + 1..];
+        if name == col_name {
+            return Some(ty.to_string());
+        }
+    }
+    None
+}
+
+fn parse_schema_columns(schema: &str) -> Vec<(String, String)> {
+    schema
+        .split(',')
+        .filter_map(|part| {
+            let colon = part.find(':')?;
+            let name = part[..colon].to_string();
+            let ty = part[colon + 1..].to_string();
+            Some((name, ty))
+        })
+        .collect()
 }
 
 // ── Free functions ────────────────────────────────────────────────

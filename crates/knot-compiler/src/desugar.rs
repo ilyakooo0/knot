@@ -211,8 +211,25 @@ fn desugar_expr(expr: &mut Expr) {
     }
 
     // Now check if this expression is a desugaring-eligible Do block.
-    if let ExprKind::Do(stmts) = &expr.node {
-        if is_pure_comprehension(stmts) {
+    // Check eligibility with immutable borrows first to avoid borrow conflicts.
+    let (sql_compilable, pure_comp) = if let ExprKind::Do(stmts) = &expr.node {
+        (is_sql_compilable(stmts), is_pure_comprehension(stmts))
+    } else {
+        (false, false)
+    };
+
+    if sql_compilable {
+        // SQL-compilable do-blocks are preserved for codegen to compile
+        // to a single SQL query. Still recurse into sub-expressions.
+        if let ExprKind::Do(stmts) = &mut expr.node {
+            for stmt in stmts.iter_mut() {
+                desugar_stmt(stmt);
+            }
+        }
+        return;
+    }
+    if pure_comp {
+        if let ExprKind::Do(stmts) = &expr.node {
             let span = expr.span;
             let desugared = desugar_stmts(stmts, span);
             *expr = desugared;
@@ -298,6 +315,105 @@ fn desugar_stmt(stmt: &mut Stmt) {
 }
 
 // ── Eligibility check ────────────────────────────────────────────
+
+/// A do block is SQL-compilable if:
+/// 1. All non-final stmts are Bind(Var, SourceRef) or Where
+/// 2. All Where conditions use only field accesses, literals, variables,
+///    comparison operators, and boolean connectives
+/// 3. The final stmt is Yield(Record) where each field is a field access
+///    on a bound variable, or Yield(Var(bound_var)) for single-table
+/// 4. At least one Bind
+///
+/// This is a purely syntactic check. The codegen does additional validation
+/// (schema shape, views, etc.) and falls back to loop-based compilation
+/// if the SQL path is not viable.
+fn is_sql_compilable(stmts: &[Stmt]) -> bool {
+    if stmts.len() < 2 {
+        return false;
+    }
+
+    let mut bind_vars: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    for stmt in &stmts[..stmts.len() - 1] {
+        match &stmt.node {
+            StmtKind::Bind { pat, expr } => {
+                if let (PatKind::Var(name), ExprKind::SourceRef(_)) = (&pat.node, &expr.node) {
+                    bind_vars.insert(name.as_str());
+                } else {
+                    return false;
+                }
+            }
+            StmtKind::Where { cond } => {
+                if !is_sql_where_expr(cond, &bind_vars) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+
+    if bind_vars.is_empty() {
+        return false;
+    }
+
+    // Final statement must be yield of a record of field accesses or a bound var
+    match &stmts.last().unwrap().node {
+        StmtKind::Expr(e) => {
+            if let ExprKind::Yield(inner) = &e.node {
+                match &inner.node {
+                    ExprKind::Record(fields) => {
+                        !fields.is_empty()
+                            && fields.iter().all(|f| is_bound_field_access(&f.value, &bind_vars))
+                    }
+                    ExprKind::Var(name) => bind_vars.contains(name.as_str()),
+                    _ => false,
+                }
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+fn is_sql_where_expr(expr: &Expr, bind_vars: &std::collections::HashSet<&str>) -> bool {
+    match &expr.node {
+        ExprKind::BinOp { op, lhs, rhs } => match op {
+            BinOp::And | BinOp::Or => {
+                is_sql_where_expr(lhs, bind_vars) && is_sql_where_expr(rhs, bind_vars)
+            }
+            BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
+                let l_ok = is_sql_atom(lhs);
+                let r_ok = is_sql_atom(rhs);
+                let l_bound = is_bound_field_access(lhs, bind_vars);
+                let r_bound = is_bound_field_access(rhs, bind_vars);
+                l_ok && r_ok && (l_bound || r_bound)
+            }
+            _ => false,
+        },
+        ExprKind::UnaryOp {
+            op: UnaryOp::Not,
+            operand,
+        } => is_sql_where_expr(operand, bind_vars),
+        _ => false,
+    }
+}
+
+fn is_sql_atom(expr: &Expr) -> bool {
+    matches!(
+        &expr.node,
+        ExprKind::FieldAccess { expr, .. } if matches!(&expr.node, ExprKind::Var(_))
+    ) || matches!(&expr.node, ExprKind::Lit(_) | ExprKind::Var(_))
+}
+
+fn is_bound_field_access(expr: &Expr, bind_vars: &std::collections::HashSet<&str>) -> bool {
+    if let ExprKind::FieldAccess { expr, .. } = &expr.node {
+        if let ExprKind::Var(name) = &expr.node {
+            return bind_vars.contains(name.as_str());
+        }
+    }
+    false
+}
 
 /// A do block is a "pure comprehension" if:
 /// 1. It contains at least one Bind or Where statement
@@ -669,7 +785,9 @@ mod tests {
     }
 
     #[test]
-    fn where_desugars_to_guard() {
+    fn sql_compilable_do_preserved() {
+        // SQL-compilable do-blocks (Bind→SourceRef + Where + Yield(Var))
+        // are preserved as Do nodes for codegen to compile to SQL.
         let src = r#"
             *items : [{x: Int}]
             filtered = do
@@ -682,8 +800,33 @@ mod tests {
         for decl in &module.decls {
             if let DeclKind::Fun { name, body, .. } = &decl.node {
                 if name == "filtered" {
-                    assert!(has_bind_var(body));
-                    assert!(!has_do_block(body));
+                    assert!(
+                        matches!(&body.node, ExprKind::Do(_)),
+                        "sql-compilable do block should be preserved for codegen"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn where_with_non_record_yield_desugared() {
+        // When yield is not a record or bound var, the block is not
+        // sql-compilable and gets desugared normally.
+        let src = r#"
+            *items : [{x: Int, name: Text}]
+            names = do
+              i <- *items
+              where i.x > 0
+              yield i.name
+        "#;
+        let mut module = parse(src);
+        desugar(&mut module);
+        for decl in &module.decls {
+            if let DeclKind::Fun { name, body, .. } = &decl.node {
+                if name == "names" {
+                    assert!(has_bind_var(body), "expected __bind in desugared body");
+                    assert!(!has_do_block(body), "expected no Do block after desugaring");
                 }
             }
         }
@@ -707,6 +850,31 @@ mod tests {
                     assert!(
                         matches!(&body.node, ExprKind::Do(_)),
                         "groupBy do block should not be desugared"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multi_table_sql_compilable_preserved() {
+        let src = r#"
+            *employees : [{name: Text, dept: Text}]
+            *departments : [{name: Text, budget: Int}]
+            joined = do
+              e <- *employees
+              d <- *departments
+              where e.dept == d.name
+              yield {name: e.name, budget: d.budget}
+        "#;
+        let mut module = parse(src);
+        desugar(&mut module);
+        for decl in &module.decls {
+            if let DeclKind::Fun { name, body, .. } = &decl.node {
+                if name == "joined" {
+                    assert!(
+                        matches!(&body.node, ExprKind::Do(_)),
+                        "multi-table sql-compilable do block should be preserved"
                     );
                 }
             }

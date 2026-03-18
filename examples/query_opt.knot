@@ -11,7 +11,7 @@ countDemo = do
   println ("Employee count: " ++ show (count *employees))
   yield {}
 
--- 2. Filter pushdown: where clause → SQL WHERE
+-- 2. Filter pushdown: where clause → SQL WHERE (mixed do-block with println)
 filterDemo = do
   println "High earners (salary > 75):"
   e <- *employees
@@ -19,13 +19,38 @@ filterDemo = do
   println ("  " ++ e.name ++ " ($" ++ show e.salary ++ ")")
   yield {}
 
--- 3. Hash join: equi-join via hash index
+-- 3. Hash join: equi-join via hash index (mixed do-block with println)
 joinDemo = do
   println "Employee departments:"
   e <- *employees
   d <- *departments
   where e.dept == d.name
   println ("  " ++ e.name ++ " works in " ++ d.name ++ " (budget: $" ++ show d.budget ++ ")")
+  yield {}
+
+-- 4. Full SQL: single-table filter → one SQL SELECT
+filterQuery = do
+  e <- *employees
+  where e.salary > 75
+  yield {name: e.name, salary: e.salary}
+
+-- 5. Full SQL: multi-table join + filter → one SQL SELECT
+joinQuery = do
+  e <- *employees
+  d <- *departments
+  where e.dept == d.name
+  where e.salary > 75
+  yield {name: e.name, dept: d.name, budget: d.budget}
+
+-- 6. Full SQL: yield entire row (single-table)
+allEmployees = do
+  e <- *employees
+  yield e
+
+printQuery = \label results -> do
+  println (label ++ ":")
+  r <- results
+  println ("  " ++ show r)
   yield {}
 
 main = do
@@ -43,4 +68,7 @@ main = do
   countDemo
   filterDemo
   joinDemo
+  printQuery "Filter query (salary > 75)" filterQuery
+  printQuery "Join query (salary > 75, with dept)" joinQuery
+  printQuery "All employees" allEmployees
   yield {}

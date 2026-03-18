@@ -15,6 +15,45 @@ use std::ffi::c_void;
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+// ── Arena allocator ──────────────────────────────────────────────
+
+/// A mark-and-reset arena for `Value` allocations.
+///
+/// All `*mut Value` pointers are heap-allocated via `Box` and tracked here.
+/// `mark()` snapshots the current position; `reset_to(mark)` drops and frees
+/// every allocation made after that mark. Dropping a `Value` frees its owned
+/// data (String, Vec, BigInt) but does NOT recurse into child `*mut Value`
+/// pointers — those are independently tracked in the arena.
+struct Arena {
+    ptrs: Vec<*mut Value>,
+}
+
+impl Arena {
+    fn new() -> Self {
+        Arena { ptrs: Vec::new() }
+    }
+
+    fn alloc(&mut self, v: Value) -> *mut Value {
+        let ptr = Box::into_raw(Box::new(v));
+        self.ptrs.push(ptr);
+        ptr
+    }
+
+    fn mark(&self) -> usize {
+        self.ptrs.len()
+    }
+
+    fn reset_to(&mut self, mark: usize) {
+        for ptr in self.ptrs.drain(mark..) {
+            unsafe { drop(Box::from_raw(ptr)); }
+        }
+    }
+}
+
+thread_local! {
+    static ARENA: RefCell<Arena> = RefCell::new(Arena::new());
+}
+
 // ── Debug mode ───────────────────────────────────────────────────
 
 static DEBUG: AtomicBool = AtomicBool::new(false);
@@ -144,7 +183,17 @@ fn extract_where_columns(sql: &str) -> Vec<String> {
 // ── Helpers ───────────────────────────────────────────────────────
 
 fn alloc(v: Value) -> *mut Value {
-    Box::into_raw(Box::new(v))
+    ARENA.with(|a| a.borrow_mut().alloc(v))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_arena_mark() -> usize {
+    ARENA.with(|a| a.borrow().mark())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_arena_reset_to(mark: usize) {
+    ARENA.with(|a| a.borrow_mut().reset_to(mark));
 }
 
 unsafe fn as_ref<'a>(v: *mut Value) -> &'a Value {
@@ -4863,7 +4912,13 @@ pub extern "C" fn knot_http_listen(
         .unwrap_or_else(|e| panic!("knot runtime: failed to start HTTP server on {}: {}", addr, e));
     eprintln!("Knot HTTP server listening on http://0.0.0.0:{}", port);
 
+    // Mark the arena so that per-request allocations can be freed.
+    // Everything allocated before this point (handler, env, etc.) survives.
+    let arena_mark = knot_arena_mark();
+
     loop {
+        knot_arena_reset_to(arena_mark);
+
         let mut request = match server.recv() {
             Ok(req) => req,
             Err(e) => {

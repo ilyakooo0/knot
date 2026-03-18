@@ -397,6 +397,8 @@ impl Codegen {
         self.declare_rt("knot_db_exec", &[p, p, p], &[]);
         self.declare_rt("knot_source_init", &[p, p, p, p, p], &[]);
         self.declare_rt("knot_source_read", &[p, p, p, p, p], &[p]);
+        self.declare_rt("knot_source_count", &[p, p, p], &[p]);
+        self.declare_rt("knot_source_read_where", &[p, p, p, p, p, p, p, p], &[p]);
         self.declare_rt("knot_source_write", &[p, p, p, p, p, p], &[]);
         self.declare_rt("knot_source_append", &[p, p, p, p, p, p], &[]);
         self.declare_rt("knot_source_diff_write", &[p, p, p, p, p, p], &[]);
@@ -496,6 +498,11 @@ impl Codegen {
         self.declare_rt("knot_fs_file_exists", &[p], &[p]);
         self.declare_rt("knot_fs_remove_file", &[p], &[p]);
         self.declare_rt("knot_fs_list_dir", &[p], &[p]);
+
+        // Hash index for equi-join optimization
+        self.declare_rt("knot_relation_build_index", &[p, p, p], &[p]);
+        self.declare_rt("knot_relation_index_lookup", &[p, p], &[p]);
+        self.declare_rt("knot_relation_index_free", &[p], &[]);
 
         // Fixpoint iteration for recursive derived relations
         self.declare_rt("knot_relation_fixpoint", &[p, p, p], &[p]);
@@ -3239,6 +3246,26 @@ impl Codegen {
         // Uncurry nested applications
         let (func_expr, args) = uncurry_app(expr);
 
+        // Special case: count *rel → SQL COUNT(*)
+        if let ast::ExprKind::Var(name) = &func_expr.node {
+            if name == "count" && args.len() == 1 {
+                if let ast::ExprKind::SourceRef(source_name) = &args[0].node {
+                    // Only for actual sources, not views
+                    if !self.views.contains_key(source_name)
+                        && self.source_schemas.contains_key(source_name)
+                    {
+                        let (name_ptr, name_len) =
+                            self.string_ptr(builder, source_name);
+                        return self.call_rt(
+                            builder,
+                            "knot_source_count",
+                            &[db, name_ptr, name_len],
+                        );
+                    }
+                }
+            }
+        }
+
         // Special case: match Constructor SourceRef → SQL-level filtered read
         if let ast::ExprKind::Var(name) = &func_expr.node {
             if name == "match" && args.len() == 2 {
@@ -3772,10 +3799,251 @@ impl Codegen {
         let mut primary_var: Option<String> = None;
         let mut primary_source: Option<String> = None;
 
+        // ── Pre-scan for hash join patterns ──────────────────────────
+        // Look for: Bind(a, expr1) ... Bind(b, expr2) ... Where(a.f == b.g)
+        // where expr2 does NOT reference a (so it can be hoisted).
+        let mut consumed_wheres: HashSet<usize> = HashSet::new();
+        // hash_join_info: inner_bind_idx -> (outer_var, outer_field, inner_field, inner_expr)
+        struct HashJoinPlan {
+            outer_var: String,
+            outer_field: String,
+            inner_field: String,
+            _where_idx: usize,
+        }
+        let mut hash_join_plans: HashMap<usize, HashJoinPlan> = HashMap::new();
+
+        // Collect bind stmts: (idx, var_name, expr)
+        let bind_stmts: Vec<(usize, &str, &ast::Expr)> = stmts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                if let ast::StmtKind::Bind { pat, expr } = &s.node {
+                    if let ast::PatKind::Var(name) = &pat.node {
+                        return Some((i, name.as_str(), expr));
+                    }
+                }
+                None
+            })
+            .collect();
+
+        // For each pair of binds, look for equi-join Where clauses
+        for w in 0..bind_stmts.len() {
+            for v in 0..w {
+                let (_outer_idx, outer_var, _outer_expr) = bind_stmts[v];
+                let (inner_idx, inner_var, inner_expr) = bind_stmts[w];
+
+                // Inner expr must not reference the outer bind var
+                if expr_references_var(inner_expr, outer_var) {
+                    continue;
+                }
+                // Inner expr must be hoistable (source, derived, var, or list)
+                let hoistable = matches!(
+                    &inner_expr.node,
+                    ast::ExprKind::SourceRef(_)
+                        | ast::ExprKind::DerivedRef(_)
+                        | ast::ExprKind::Var(_)
+                        | ast::ExprKind::List(_)
+                );
+                if !hoistable {
+                    continue;
+                }
+
+                // Scan Wheres between inner bind and the next bind/let/groupBy
+                let search_end = stmts[inner_idx + 1..]
+                    .iter()
+                    .position(|s| {
+                        matches!(
+                            &s.node,
+                            ast::StmtKind::Bind { .. }
+                                | ast::StmtKind::Let { .. }
+                                | ast::StmtKind::GroupBy { .. }
+                        )
+                    })
+                    .map_or(stmts.len(), |p| inner_idx + 1 + p);
+
+                for wi in (inner_idx + 1)..search_end {
+                    if consumed_wheres.contains(&wi) {
+                        continue;
+                    }
+                    if let ast::StmtKind::Where { cond } = &stmts[wi].node {
+                        if let Some((ov, of, iv, inf)) =
+                            Self::match_equi_join(cond, outer_var, inner_var)
+                        {
+                            // Ensure the matched vars are the correct pair
+                            if ov == outer_var && iv == inner_var {
+                                consumed_wheres.insert(wi);
+                                hash_join_plans.insert(
+                                    inner_idx,
+                                    HashJoinPlan {
+                                        outer_var: ov.to_string(),
+                                        outer_field: of.to_string(),
+                                        inner_field: inf.to_string(),
+                                        _where_idx: wi,
+                                    },
+                                );
+                                break; // one join per bind pair
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         for (stmt_idx, stmt) in stmts.iter().enumerate() {
             match &stmt.node {
                 ast::StmtKind::Bind { pat, expr } => {
-                    let val = self.compile_expr(builder, expr, env, db);
+                    // ── Hash join path: build index inline and lookup ──
+                    if let Some(plan) = hash_join_plans.get(&stmt_idx) {
+                        // Build the hash index from the inner relation right here
+                        let inner_rel = self.compile_expr(builder, expr, env, db);
+                        let (field_ptr, field_len) =
+                            self.string_ptr(builder, &plan.inner_field);
+                        let idx_val = self.call_rt(
+                            builder,
+                            "knot_relation_build_index",
+                            &[inner_rel, field_ptr, field_len],
+                        );
+
+                        // Look up matching rows via the hash index
+                        let outer_val = env.get(&plan.outer_var);
+                        let (fptr, flen) =
+                            self.string_ptr(builder, &plan.outer_field);
+                        let key =
+                            self.call_rt(builder, "knot_record_field", &[outer_val, fptr, flen]);
+                        let rel =
+                            self.call_rt(builder, "knot_relation_index_lookup", &[idx_val, key]);
+
+                        // Free the index immediately — we have the result relation
+                        self.call_rt_void(builder, "knot_relation_index_free", &[idx_val]);
+
+                        let len = self.call_rt(builder, "knot_relation_len", &[rel]);
+                        let header = builder.create_block();
+                        let body = builder.create_block();
+                        let continue_blk = builder.create_block();
+                        let exit = builder.create_block();
+
+                        let zero = builder.ins().iconst(types::I64, 0);
+                        builder.ins().jump(header, &[zero]);
+                        builder.switch_to_block(header);
+                        let i = builder.append_block_param(header, types::I64);
+                        let cond = builder.ins().icmp(IntCC::SignedLessThan, i, len);
+                        builder.ins().brif(cond, body, &[], exit, &[]);
+                        builder.switch_to_block(body);
+                        builder.seal_block(body);
+
+                        let row = self.call_rt(builder, "knot_relation_get", &[rel, i]);
+                        let mut pattern_skips = Vec::new();
+                        bind_do_pattern(builder, self, pat, row, env, &mut pattern_skips);
+
+                        if group_by_pos.is_some() {
+                            if let ast::PatKind::Var(name) = &pat.node {
+                                primary_var = Some(name.clone());
+                            }
+                        }
+
+                        loop_stack.push(LoopInfo {
+                            header,
+                            continue_blk,
+                            exit,
+                            index_var: i,
+                            where_skips: pattern_skips,
+                        });
+                        continue;
+                    }
+
+                    // ── Filter pushdown: try to push Where clauses into SQL ──
+                    let use_filter_pushdown = if let ast::PatKind::Var(bind_var) = &pat.node {
+                        if let ast::ExprKind::SourceRef(source_name) = &expr.node {
+                            if !self.views.contains_key(source_name)
+                                && self.source_schemas.contains_key(source_name)
+                            {
+                                // Look ahead at subsequent Where stmts
+                                let mut sql_fragments: Vec<(usize, SqlFragment)> = Vec::new();
+                                let search_end = stmts[stmt_idx + 1..]
+                                    .iter()
+                                    .position(|s| {
+                                        matches!(
+                                            &s.node,
+                                            ast::StmtKind::Bind { .. }
+                                                | ast::StmtKind::Let { .. }
+                                                | ast::StmtKind::GroupBy { .. }
+                                        )
+                                    })
+                                    .map_or(stmts.len(), |p| stmt_idx + 1 + p);
+
+                                for wi in (stmt_idx + 1)..search_end {
+                                    if consumed_wheres.contains(&wi) {
+                                        continue;
+                                    }
+                                    if let ast::StmtKind::Where { cond } = &stmts[wi].node {
+                                        // Check all param sources are in scope
+                                        if let Some(frag) =
+                                            Self::try_compile_sql_expr(bind_var, cond)
+                                        {
+                                            let params_ok = frag.params.iter().all(|p| match p {
+                                                SqlParamSource::Literal(_) => true,
+                                                SqlParamSource::Var(v) => {
+                                                    v != bind_var && env.bindings.contains_key(v)
+                                                }
+                                                SqlParamSource::FieldAccess(v, _) => {
+                                                    v != bind_var && env.bindings.contains_key(v)
+                                                }
+                                            });
+                                            if params_ok {
+                                                sql_fragments.push((wi, frag));
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if !sql_fragments.is_empty() {
+                                    // Mark consumed and emit knot_source_read_where
+                                    let mut all_sql = Vec::new();
+                                    let mut all_params = Vec::new();
+                                    for (wi, frag) in &sql_fragments {
+                                        consumed_wheres.insert(*wi);
+                                        all_sql.push(format!("({})", frag.sql));
+                                        all_params.extend(frag.params.clone());
+                                    }
+                                    let where_sql = all_sql.join(" AND ");
+                                    let schema = self.source_schemas.get(source_name).cloned().unwrap();
+                                    let (name_ptr, name_len) =
+                                        self.string_ptr(builder, source_name);
+                                    let (schema_ptr, schema_len) =
+                                        self.string_ptr(builder, &schema);
+                                    let (where_ptr, where_len) =
+                                        self.string_ptr(builder, &where_sql);
+                                    let params_rel =
+                                        self.compile_sql_params(builder, &all_params, env);
+                                    let val = self.call_rt(
+                                        builder,
+                                        "knot_source_read_where",
+                                        &[
+                                            db, name_ptr, name_len, schema_ptr,
+                                            schema_len, where_ptr, where_len,
+                                            params_rel,
+                                        ],
+                                    );
+                                    Some(val)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    let val = if let Some(pushed_val) = use_filter_pushdown {
+                        pushed_val
+                    } else {
+                        self.compile_expr(builder, expr, env, db)
+                    };
+
                     // For constructor patterns, the RHS might be a single value
                     // (e.g., `InProgress ip <- t.status`). Wrap in a singleton
                     // relation so the loop logic works uniformly.
@@ -3831,6 +4099,11 @@ impl Codegen {
                 }
 
                 ast::StmtKind::Where { cond } => {
+                    // Skip consumed Where stmts (pushed down to SQL or consumed by hash join)
+                    if consumed_wheres.contains(&stmt_idx) {
+                        continue;
+                    }
+
                     let cond_val = self.compile_expr(builder, cond, env, db);
                     let bool_val = self.call_rt_typed(
                         builder,
@@ -4516,6 +4789,17 @@ impl Codegen {
         let param = match &value_side.node {
             ast::ExprKind::Lit(lit) => SqlParamSource::Literal(lit.clone()),
             ast::ExprKind::Var(name) => SqlParamSource::Var(name.clone()),
+            ast::ExprKind::FieldAccess { expr, field } => {
+                if let ast::ExprKind::Var(var_name) = &expr.node {
+                    if var_name != bind_var {
+                        SqlParamSource::FieldAccess(var_name.clone(), field.clone())
+                    } else {
+                        return None; // both sides are bind_var fields
+                    }
+                } else {
+                    return None;
+                }
+            }
             _ => return None,
         };
 
@@ -4523,6 +4807,43 @@ impl Codegen {
             sql: format!("{} {} ?", quote_sql_ident(&col_name), op),
             params: vec![param],
         })
+    }
+
+    /// Match an equi-join pattern: `a.f == b.g` where a and b are two different
+    /// bind variables. Returns (var1, field1, var2, field2) if matched.
+    fn match_equi_join<'a>(
+        cond: &'a ast::Expr,
+        var_a: &str,
+        var_b: &str,
+    ) -> Option<(&'a str, &'a str, &'a str, &'a str)> {
+        if let ast::ExprKind::BinOp {
+            op: ast::BinOp::Eq,
+            lhs,
+            rhs,
+        } = &cond.node
+        {
+            let extract_field_access =
+                |e: &'a ast::Expr| -> Option<(&'a str, &'a str)> {
+                    if let ast::ExprKind::FieldAccess { expr, field } = &e.node {
+                        if let ast::ExprKind::Var(name) = &expr.node {
+                            return Some((name.as_str(), field.as_str()));
+                        }
+                    }
+                    None
+                };
+
+            let (lv, lf) = extract_field_access(lhs)?;
+            let (rv, rf) = extract_field_access(rhs)?;
+
+            // Check that we have one from each side
+            if lv == var_a && rv == var_b {
+                return Some((lv, lf, rv, rf));
+            }
+            if lv == var_b && rv == var_a {
+                return Some((rv, rf, lv, lf));
+            }
+        }
+        None
     }
 
     // ── Additional set-expression pattern matchers ───────────────────
@@ -4696,6 +5017,11 @@ impl Codegen {
             let val = match param {
                 SqlParamSource::Literal(lit) => self.compile_lit(builder, lit),
                 SqlParamSource::Var(name) => env.get(name),
+                SqlParamSource::FieldAccess(var, field) => {
+                    let record = env.get(var);
+                    let (fptr, flen) = self.string_ptr(builder, field);
+                    self.call_rt(builder, "knot_record_field", &[record, fptr, flen])
+                }
             };
             self.call_rt_void(builder, "knot_relation_push", &[rel, val]);
         }
@@ -4924,6 +5250,7 @@ struct SqlFragment {
 enum SqlParamSource {
     Literal(ast::Literal),
     Var(String),
+    FieldAccess(String, String), // (var_name, field_name)
 }
 
 // ── Free functions ────────────────────────────────────────────────

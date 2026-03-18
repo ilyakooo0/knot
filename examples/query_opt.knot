@@ -1,0 +1,46 @@
+-- Query optimization examples
+
+type Employee = {name: Text, dept: Text, salary: Int}
+type Department = {name: Text, budget: Int}
+
+*employees : [Employee]
+*departments : [Department]
+
+-- 1. Count pushdown: count *rel → SQL COUNT(*)
+countDemo = do
+  println ("Employee count: " ++ show (count *employees))
+  yield {}
+
+-- 2. Filter pushdown: where clause → SQL WHERE
+filterDemo = do
+  println "High earners (salary > 75):"
+  e <- *employees
+  where e.salary > 75
+  println ("  " ++ e.name ++ " ($" ++ show e.salary ++ ")")
+  yield {}
+
+-- 3. Hash join: equi-join via hash index
+joinDemo = do
+  println "Employee departments:"
+  e <- *employees
+  d <- *departments
+  where e.dept == d.name
+  println ("  " ++ e.name ++ " works in " ++ d.name ++ " (budget: $" ++ show d.budget ++ ")")
+  yield {}
+
+main = do
+  set *employees = [
+    {name: "Alice", dept: "Eng", salary: 90},
+    {name: "Bob", dept: "Eng", salary: 80},
+    {name: "Carol", dept: "Sales", salary: 70},
+    {name: "Dave", dept: "Sales", salary: 60},
+    {name: "Eve", dept: "Eng", salary: 100}
+  ]
+  set *departments = [
+    {name: "Eng", budget: 500},
+    {name: "Sales", budget: 200}
+  ]
+  countDemo
+  filterDemo
+  joinDemo
+  yield {}

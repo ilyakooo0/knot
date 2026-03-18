@@ -10,7 +10,7 @@ use num_traits::Zero;
 use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2838,6 +2838,184 @@ pub extern "C" fn knot_source_read(
     }
 }
 
+/// Count rows in a source relation via SQL COUNT(*).
+/// Returns a boxed Int value.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_source_count(
+    db: *mut c_void,
+    name_ptr: *const u8,
+    name_len: usize,
+) -> *mut Value {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let name = unsafe { str_from_raw(name_ptr, name_len) };
+    let table = quote_ident(&format!("_knot_{}", name));
+    let sql = format!("SELECT COUNT(*) FROM {}", table);
+    debug_sql(&sql);
+    let count: i64 = db_ref
+        .conn
+        .query_row(&sql, [], |row| row.get(0))
+        .unwrap_or_else(|e| panic!("knot runtime: count error: {}", e));
+    alloc(Value::Int(BigInt::from(count)))
+}
+
+/// Read rows from a source relation with a WHERE clause.
+/// Params is a Relation of bind parameter values (?1, ?2, ...).
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_source_read_where(
+    db: *mut c_void,
+    name_ptr: *const u8,
+    name_len: usize,
+    schema_ptr: *const u8,
+    schema_len: usize,
+    where_ptr: *const u8,
+    where_len: usize,
+    params: *mut Value,
+) -> *mut Value {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let name = unsafe { str_from_raw(name_ptr, name_len) };
+    let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
+    let where_clause = unsafe { str_from_raw(where_ptr, where_len) };
+
+    let table_name = format!("_knot_{}", name);
+    let table = quote_ident(&table_name);
+
+    // Auto-index columns used in the WHERE clause
+    db_ref.ensure_indexes_for_where(&table_name, where_clause);
+
+    let param_values = match unsafe { as_ref(params) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: read_where params must be a Relation, got {}",
+            type_name(params)
+        ),
+    };
+    let sql_params: Vec<rusqlite::types::Value> =
+        param_values.iter().map(|v| value_to_sql_param(*v)).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+
+    if is_adt_schema(schema) {
+        let adt = parse_adt_schema(schema);
+        let mut select_cols = vec![quote_ident("_tag")];
+        for f in &adt.all_fields {
+            select_cols.push(quote_ident(&f.name));
+        }
+        let sql = format!(
+            "SELECT {} FROM {} WHERE {}",
+            select_cols.join(", "),
+            table,
+            where_clause
+        );
+        debug_sql_params(&sql, &sql_params);
+
+        let mut stmt = db_ref
+            .conn
+            .prepare(&sql)
+            .unwrap_or_else(|e| panic!("knot runtime: read_where query error: {}", e));
+        let mut rows: Vec<*mut Value> = Vec::new();
+        let mut result_rows = stmt
+            .query(param_refs.as_slice())
+            .unwrap_or_else(|e| panic!("knot runtime: read_where query exec error: {}", e));
+
+        while let Some(row) = result_rows
+            .next()
+            .unwrap_or_else(|e| panic!("knot runtime: read_where row fetch error: {}", e))
+        {
+            let tag: String = row.get(0).unwrap();
+            let ctor = adt.constructors.iter().find(|c| c.name == tag);
+            let payload = if let Some(ctor) = ctor {
+                if ctor.fields.is_empty() {
+                    alloc(Value::Unit)
+                } else {
+                    let record = knot_record_empty(ctor.fields.len());
+                    for field in &ctor.fields {
+                        let col_idx = adt
+                            .all_fields
+                            .iter()
+                            .position(|f| f.name == field.name)
+                            .unwrap();
+                        let val = read_sql_column(row, col_idx + 1, field.ty);
+                        let fname = field.name.as_bytes();
+                        knot_record_set_field(record, fname.as_ptr(), fname.len(), val);
+                    }
+                    record
+                }
+            } else {
+                let record = knot_record_empty(adt.all_fields.len());
+                let mut has_fields = false;
+                for (i, field) in adt.all_fields.iter().enumerate() {
+                    if !matches!(row.get_ref(i + 1).unwrap(), ValueRef::Null) {
+                        let val = read_sql_column(row, i + 1, field.ty);
+                        let fname = field.name.as_bytes();
+                        knot_record_set_field(record, fname.as_ptr(), fname.len(), val);
+                        has_fields = true;
+                    }
+                }
+                if has_fields { record } else { alloc(Value::Unit) }
+            };
+            rows.push(alloc(Value::Constructor(tag, payload)));
+        }
+        alloc(Value::Relation(rows))
+    } else {
+        let rec = parse_record_schema(schema);
+        let table_q = quote_ident(&table_name);
+        let has_children = !rec.nested.is_empty();
+
+        let mut select_cols: Vec<String> = Vec::new();
+        if has_children {
+            select_cols.push(quote_ident("_id"));
+        }
+        for c in &rec.columns {
+            select_cols.push(quote_ident(&c.name));
+        }
+
+        let sql = format!(
+            "SELECT {} FROM {} WHERE {}",
+            if select_cols.is_empty() { "1".to_string() } else { select_cols.join(", ") },
+            table_q,
+            where_clause
+        );
+        debug_sql_params(&sql, &sql_params);
+
+        let mut stmt = db_ref
+            .conn
+            .prepare(&sql)
+            .unwrap_or_else(|e| panic!("knot runtime: read_where query error: {}", e));
+        let mut rows: Vec<*mut Value> = Vec::new();
+        let mut result_rows = stmt
+            .query(param_refs.as_slice())
+            .unwrap_or_else(|e| panic!("knot runtime: read_where query exec error: {}", e));
+
+        while let Some(row) = result_rows
+            .next()
+            .unwrap_or_else(|e| panic!("knot runtime: read_where row fetch error: {}", e))
+        {
+            let total_fields = rec.columns.len() + rec.nested.len();
+            let record = knot_record_empty(total_fields);
+            let col_offset = if has_children { 1 } else { 0 };
+
+            for (i, col) in rec.columns.iter().enumerate() {
+                let val = read_sql_column(row, i + col_offset, col.ty);
+                let cname = col.name.as_bytes();
+                knot_record_set_field(record, cname.as_ptr(), cname.len(), val);
+            }
+
+            if has_children {
+                let parent_id: i64 = row.get(0).unwrap();
+                for nf in &rec.nested {
+                    let child_table_name = format!("{}__{}", table_name, nf.name);
+                    let val = read_child_table(&db_ref.conn, &child_table_name, nf, parent_id);
+                    let fname = nf.name.as_bytes();
+                    knot_record_set_field(record, fname.as_ptr(), fname.len(), val);
+                }
+            }
+
+            rows.push(record);
+        }
+        alloc(Value::Relation(rows))
+    }
+}
+
 /// Read rows from a source ADT relation matching a specific constructor tag.
 /// Executes `SELECT <ctor_fields> FROM table WHERE _tag = ?` at the SQL level.
 #[unsafe(no_mangle)]
@@ -5360,4 +5538,102 @@ fn json_escape(s: &str) -> String {
         .replace('\n', "\\n")
         .replace('\r', "\\r")
         .replace('\t', "\\t")
+}
+
+// ── Hash index for equi-join optimization ──────────────────────────
+
+struct HashIndex {
+    map: HashMap<Vec<u8>, Vec<*mut Value>>,
+}
+
+/// Serialize a Value to compact bytes for use as a hash key.
+fn serialize_value_for_hash(v: *mut Value) -> Vec<u8> {
+    let mut buf = Vec::new();
+    match unsafe { as_ref(v) } {
+        Value::Int(n) => {
+            buf.push(0);
+            buf.extend_from_slice(n.to_string().as_bytes());
+        }
+        Value::Float(f) => {
+            buf.push(1);
+            buf.extend_from_slice(&f.to_bits().to_le_bytes());
+        }
+        Value::Text(s) => {
+            buf.push(2);
+            buf.extend_from_slice(s.as_bytes());
+        }
+        Value::Bool(b) => {
+            buf.push(3);
+            buf.push(*b as u8);
+        }
+        Value::Unit => {
+            buf.push(4);
+        }
+        Value::Constructor(tag, _) => {
+            buf.push(5);
+            buf.extend_from_slice(tag.as_bytes());
+        }
+        _ => {
+            // Fallback: use the show representation
+            buf.push(6);
+            buf.extend_from_slice(brief_value(v).as_bytes());
+        }
+    }
+    buf
+}
+
+/// Build a hash index over a relation on a given field.
+/// Returns an opaque pointer to a heap-allocated HashIndex.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_build_index(
+    rel: *mut Value,
+    field_ptr: *const u8,
+    field_len: usize,
+) -> *mut c_void {
+    let field_name = unsafe { str_from_raw(field_ptr, field_len) };
+    let rows = match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => rows,
+        _ => panic!("knot runtime: build_index expected Relation, got {}", type_name(rel)),
+    };
+
+    let mut map: HashMap<Vec<u8>, Vec<*mut Value>> = HashMap::new();
+    for &row in rows {
+        let key_val = knot_record_field(row, field_ptr, field_len);
+        let key = serialize_value_for_hash(key_val);
+        map.entry(key).or_default().push(row);
+    }
+
+    if debug_enabled() {
+        eprintln!(
+            "[OPT] hash index on .{}: {} keys from {} rows",
+            field_name,
+            map.len(),
+            rows.len()
+        );
+    }
+
+    Box::into_raw(Box::new(HashIndex { map })) as *mut c_void
+}
+
+/// Look up matching rows in a hash index by key value.
+/// Returns a Relation of matching rows (empty if no match).
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_index_lookup(
+    index: *mut c_void,
+    key: *mut Value,
+) -> *mut Value {
+    let idx = unsafe { &*(index as *mut HashIndex) };
+    let hash_key = serialize_value_for_hash(key);
+    match idx.map.get(&hash_key) {
+        Some(rows) => alloc(Value::Relation(rows.clone())),
+        None => alloc(Value::Relation(Vec::new())),
+    }
+}
+
+/// Free a hash index.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_index_free(index: *mut c_void) {
+    unsafe {
+        drop(Box::from_raw(index as *mut HashIndex));
+    }
 }

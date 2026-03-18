@@ -2173,6 +2173,40 @@ impl Infer {
             },
         );
 
+        // Built-in ADT: data Result e a = Err {error: e} | Ok {value: a}
+        self.constructors.insert(
+            "Err".into(),
+            CtorInfo {
+                data_type: "Result".into(),
+                data_params: vec!["e".into(), "a".into()],
+                fields: vec![(
+                    "error".into(),
+                    ast::Type::new(ast::TypeKind::Var("e".into()), dummy_span),
+                )],
+            },
+        );
+        self.constructors.insert(
+            "Ok".into(),
+            CtorInfo {
+                data_type: "Result".into(),
+                data_params: vec!["e".into(), "a".into()],
+                fields: vec![(
+                    "value".into(),
+                    ast::Type::new(ast::TypeKind::Var("a".into()), dummy_span),
+                )],
+            },
+        );
+        self.data_types.insert(
+            "Result".into(),
+            DataInfo {
+                params: vec!["e".into(), "a".into()],
+                ctors: vec![
+                    ("Err".into(), vec![("error".into(), ast::Type::new(ast::TypeKind::Var("e".into()), dummy_span))]),
+                    ("Ok".into(), vec![("value".into(), ast::Type::new(ast::TypeKind::Var("a".into()), dummy_span))]),
+                ],
+            },
+        );
+
         // println : ∀a. a -> {}
         let a = self.fresh_var();
         self.bind_top(
@@ -2819,6 +2853,13 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo) {
             Ty::TyCon(name) if name == "[]" => MonadKind::Relation,
             Ty::TyCon(name) => MonadKind::Adt(name.clone()),
             Ty::Relation(_) => MonadKind::Relation,
+            // Partially applied type constructor, e.g. Result e (App(TyCon("Result"), e))
+            Ty::App(f, _) => match f.as_ref() {
+                Ty::TyCon(name) => MonadKind::Adt(name.clone()),
+                _ => MonadKind::Relation,
+            },
+            // Saturated ADT used as monad, e.g. Con("Result", [Text]) from Result Text a
+            Ty::Con(name, _) => MonadKind::Adt(name.clone()),
             _ => MonadKind::Relation, // default unresolved to Relation
         };
         monad_info.insert(*span, kind);

@@ -1,0 +1,56 @@
+-- Generic monadic do-blocks with Result
+--
+-- Result e a represents a computation that can fail with an error of type e
+-- or succeed with a value of type a. Like Maybe, it uses the prelude's trait
+-- hierarchy (Functor, Applicative, Monad). Errors short-circuit through bind.
+
+data Result e a
+  = Err {error: e}
+  | Ok {value: a}
+
+-- Implementations for Result
+
+impl Functor (Result e) where
+  map f m = case m of
+    Err {error} -> Err {error}
+    Ok {value} -> Ok {value: f value}
+
+impl Applicative (Result e) where
+  yield x = Ok {value: x}
+  ap fs xs = case fs of
+    Err {error} -> Err {error}
+    Ok {value: f} -> case xs of
+      Err {error} -> Err {error}
+      Ok {value: x} -> Ok {value: f x}
+
+impl Monad (Result e) where
+  bind f m = case m of
+    Err {error} -> Err {error}
+    Ok {value} -> f value
+
+-- Test: basic do-block chaining with Result
+safeDivide = \x y -> if y == 0 then Err {error: "division by zero"} else Ok {value: x / y}
+
+result1 = do
+  a <- Ok {value: 10}
+  b <- Ok {value: 2}
+  c <- safeDivide a b
+  yield c
+
+result2 = do
+  a <- Ok {value: 10}
+  b <- Ok {value: 0}
+  c <- safeDivide a b
+  yield c
+
+-- Test: error propagation — first Err short-circuits the rest
+result3 = do
+  a <- Err {error: "no input"}
+  b <- Ok {value: 42}
+  yield a + b
+
+main = do
+  println (show result1)
+  println (show result2)
+  println (show result3)
+  yield {}

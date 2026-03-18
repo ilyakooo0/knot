@@ -12,6 +12,7 @@ examples/constraints
 examples/recursive
 examples/routes
 examples/maybe
+examples/result
 examples/adt_*
 examples/bytes
 examples/groupby

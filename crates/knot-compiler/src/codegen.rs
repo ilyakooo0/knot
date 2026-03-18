@@ -5503,6 +5503,11 @@ fn impl_type_name(args: &[ast::Type]) -> Option<String> {
             }
         }
         ast::TypeKind::Relation(_) => Some("Relation".to_string()),
+        // Partially applied type constructor, e.g. (Result e) in `impl Monad (Result e)`
+        ast::TypeKind::App { func, .. } => match &func.node {
+            ast::TypeKind::Named(name) => Some(name.clone()),
+            _ => None,
+        },
         _ => None,
     }
 }

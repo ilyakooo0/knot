@@ -2267,6 +2267,15 @@ impl Infer {
         // now : Int (current time in milliseconds since epoch)
         self.bind_top("now", Scheme::mono(Ty::Int));
 
+        // randomInt : Int -> Int (random integer in [0, bound))
+        self.bind_top(
+            "randomInt",
+            Scheme::mono(Ty::Fun(Box::new(Ty::Int), Box::new(Ty::Int))),
+        );
+
+        // randomFloat : Float (random float in [0.0, 1.0))
+        self.bind_top("randomFloat", Scheme::mono(Ty::Float));
+
         // __bind, __yield, __empty are handled as special cases in infer_expr
         // with polymorphic HKT types: ∀m a b. (a -> m b) -> m a -> m b, etc.
         // This allows do-block desugaring to work with any monad, not just [].

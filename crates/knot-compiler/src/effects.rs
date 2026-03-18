@@ -171,6 +171,15 @@ impl EffectChecker {
         };
         builtin_effects.insert("now".into(), clock_effect);
 
+        // random: random effect
+        let random_effect = {
+            let mut e = EffectSet::empty();
+            e.random = true;
+            e
+        };
+        builtin_effects.insert("randomInt".into(), random_effect.clone());
+        builtin_effects.insert("randomFloat".into(), random_effect);
+
         // listen: network effect
         let network_effect = {
             let mut e = EffectSet::empty();
@@ -287,6 +296,11 @@ impl EffectChecker {
                 if name == "now" {
                     let mut e = EffectSet::empty();
                     e.clock = true;
+                    return e;
+                }
+                if name == "randomFloat" {
+                    let mut e = EffectSet::empty();
+                    e.random = true;
                     return e;
                 }
                 EffectSet::empty()

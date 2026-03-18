@@ -4064,6 +4064,38 @@ pub extern "C" fn knot_now() -> *mut Value {
     knot_value_int(ms)
 }
 
+// ── Random number generation ─────────────────────────────────────
+
+/// Return a random integer in [0, bound).
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_random_int(bound: *mut Value) -> *mut Value {
+    let n = match unsafe { as_ref(bound) } {
+        Value::Int(i) => i.to_u64().expect("knot runtime: randomInt bound must be positive"),
+        _ => panic!(
+            "knot runtime: randomInt expected Int, got {}",
+            type_name(bound)
+        ),
+    };
+    assert!(n > 0, "knot runtime: randomInt bound must be > 0");
+    // Use getrandom for platform-independent cryptographic randomness
+    let mut buf = [0u8; 8];
+    getrandom::fill(&mut buf).expect("knot runtime: failed to get random bytes");
+    let raw = u64::from_le_bytes(buf);
+    let result = (raw % n) as i64;
+    knot_value_int(result)
+}
+
+/// Return a random Float in [0.0, 1.0).
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_random_float() -> *mut Value {
+    let mut buf = [0u8; 8];
+    getrandom::fill(&mut buf).expect("knot runtime: failed to get random bytes");
+    let raw = u64::from_le_bytes(buf);
+    // Divide by u64::MAX+1 to get [0.0, 1.0)
+    let result = (raw as f64) / ((u64::MAX as f64) + 1.0);
+    alloc(Value::Float(result))
+}
+
 /// Initialize a history table for a source with `with history`.
 /// Creates `_knot_{name}_history` with the same columns plus `_knot_valid_from`
 /// and `_knot_valid_to` timestamp columns.

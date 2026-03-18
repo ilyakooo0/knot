@@ -433,6 +433,10 @@ impl Codegen {
         // Type tag inspection (for trait dispatch)
         self.declare_rt("knot_value_get_tag", &[p], &[types::I32]);
 
+        // Random number generation
+        self.declare_rt("knot_random_int", &[p], &[p]);
+        self.declare_rt("knot_random_float", &[], &[p]);
+
         // Temporal queries (history)
         self.declare_rt("knot_now", &[], &[p]);
         self.declare_rt("knot_history_init", &[p, p, p, p, p], &[]);
@@ -755,6 +759,7 @@ impl Codegen {
             "bytesGet",
             "readFile", "writeFile", "appendFile",
             "fileExists", "removeFile", "listDir",
+            "randomInt",
         ];
         for name in &stdlib_names {
             self.register_stdlib_fn(name);
@@ -1593,6 +1598,9 @@ impl Codegen {
 
         // Bytes: 3-param (double-curried)
         self.define_stdlib_fn_3("bytesSlice", "knot_bytes_slice");
+
+        // Random: 1-param
+        self.define_stdlib_fn_1("randomInt", "knot_random_int");
 
         // File system: 1-param
         self.define_stdlib_fn_1("readFile", "knot_fs_read_file");
@@ -2440,6 +2448,9 @@ impl Codegen {
             ast::ExprKind::Var(name) => {
                 if name == "now" {
                     return self.call_rt(builder, "knot_now", &[]);
+                }
+                if name == "randomFloat" {
+                    return self.call_rt(builder, "knot_random_float", &[]);
                 }
                 if env.bindings.contains_key(name) {
                     env.get(name)

@@ -1404,56 +1404,77 @@ pub extern "C" fn knot_value_neq(a: *mut Value, b: *mut Value) -> *mut Value {
     alloc(Value::Bool(!values_equal(a, b)))
 }
 
+// Unboxed variants returning i32 (0/1) — avoid Bool allocation when result feeds a branch
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_lt(a: *mut Value, b: *mut Value) -> *mut Value {
-    let result = match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
+pub extern "C" fn knot_value_eq_i32(a: *mut Value, b: *mut Value) -> i32 {
+    values_equal(a, b) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_value_neq_i32(a: *mut Value, b: *mut Value) -> i32 {
+    !values_equal(a, b) as i32
+}
+
+fn compare_lt(a: *mut Value, b: *mut Value) -> bool {
+    match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Int(x), Value::Int(y)) => x < y,
         (Value::Float(x), Value::Float(y)) => x < y,
         (Value::Int(x), Value::Float(y)) => bigint_to_f64(x) < *y,
         (Value::Float(x), Value::Int(y)) => *x < bigint_to_f64(y),
         (Value::Text(x), Value::Text(y)) => x < y,
         _ => panic!("knot runtime: cannot compare {} < {}", type_name(a), type_name(b)),
-    };
-    alloc(Value::Bool(result))
+    }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn knot_value_gt(a: *mut Value, b: *mut Value) -> *mut Value {
-    let result = match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
+fn compare_gt(a: *mut Value, b: *mut Value) -> bool {
+    match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Int(x), Value::Int(y)) => x > y,
         (Value::Float(x), Value::Float(y)) => x > y,
         (Value::Int(x), Value::Float(y)) => bigint_to_f64(x) > *y,
         (Value::Float(x), Value::Int(y)) => *x > bigint_to_f64(y),
         (Value::Text(x), Value::Text(y)) => x > y,
         _ => panic!("knot runtime: cannot compare {} > {}", type_name(a), type_name(b)),
-    };
-    alloc(Value::Bool(result))
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_value_lt(a: *mut Value, b: *mut Value) -> *mut Value {
+    alloc(Value::Bool(compare_lt(a, b)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_value_gt(a: *mut Value, b: *mut Value) -> *mut Value {
+    alloc(Value::Bool(compare_gt(a, b)))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_le(a: *mut Value, b: *mut Value) -> *mut Value {
-    let result = match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
-        (Value::Int(x), Value::Int(y)) => x <= y,
-        (Value::Float(x), Value::Float(y)) => x <= y,
-        (Value::Int(x), Value::Float(y)) => bigint_to_f64(x) <= *y,
-        (Value::Float(x), Value::Int(y)) => *x <= bigint_to_f64(y),
-        (Value::Text(x), Value::Text(y)) => x <= y,
-        _ => panic!("knot runtime: cannot compare {} <= {}", type_name(a), type_name(b)),
-    };
-    alloc(Value::Bool(result))
+    alloc(Value::Bool(!compare_gt(a, b)))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_ge(a: *mut Value, b: *mut Value) -> *mut Value {
-    let result = match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
-        (Value::Int(x), Value::Int(y)) => x >= y,
-        (Value::Float(x), Value::Float(y)) => x >= y,
-        (Value::Int(x), Value::Float(y)) => bigint_to_f64(x) >= *y,
-        (Value::Float(x), Value::Int(y)) => *x >= bigint_to_f64(y),
-        (Value::Text(x), Value::Text(y)) => x >= y,
-        _ => panic!("knot runtime: cannot compare {} >= {}", type_name(a), type_name(b)),
-    };
-    alloc(Value::Bool(result))
+    alloc(Value::Bool(!compare_lt(a, b)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_value_lt_i32(a: *mut Value, b: *mut Value) -> i32 {
+    compare_lt(a, b) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_value_gt_i32(a: *mut Value, b: *mut Value) -> i32 {
+    compare_gt(a, b) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_value_le_i32(a: *mut Value, b: *mut Value) -> i32 {
+    !compare_gt(a, b) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_value_ge_i32(a: *mut Value, b: *mut Value) -> i32 {
+    !compare_lt(a, b) as i32
 }
 
 #[unsafe(no_mangle)]

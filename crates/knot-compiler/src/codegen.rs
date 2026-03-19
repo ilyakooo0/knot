@@ -373,6 +373,12 @@ impl Codegen {
         self.declare_rt("knot_value_gt", &[p, p], &[p]);
         self.declare_rt("knot_value_le", &[p, p], &[p]);
         self.declare_rt("knot_value_ge", &[p, p], &[p]);
+        self.declare_rt("knot_value_eq_i32", &[p, p], &[types::I32]);
+        self.declare_rt("knot_value_neq_i32", &[p, p], &[types::I32]);
+        self.declare_rt("knot_value_lt_i32", &[p, p], &[types::I32]);
+        self.declare_rt("knot_value_gt_i32", &[p, p], &[types::I32]);
+        self.declare_rt("knot_value_le_i32", &[p, p], &[types::I32]);
+        self.declare_rt("knot_value_ge_i32", &[p, p], &[types::I32]);
         self.declare_rt("knot_value_compare_ord", &[p, p], &[types::I32]);
         self.declare_rt("knot_value_and", &[p, p], &[p]);
         self.declare_rt("knot_value_or", &[p, p], &[p]);
@@ -2731,10 +2737,7 @@ impl Codegen {
                         ast::BinOp::Div => self.compile_trait_binop(builder, "div", l, r, db, "knot_value_div"),
                         // Equality: dispatch through Eq trait
                         ast::BinOp::Eq => self.compile_trait_binop(builder, "eq", l, r, db, "knot_value_eq"),
-                        ast::BinOp::Neq => {
-                            let eq_result = self.compile_trait_binop(builder, "eq", l, r, db, "knot_value_eq");
-                            self.call_rt(builder, "knot_value_not", &[eq_result])
-                        }
+                        ast::BinOp::Neq => self.compile_trait_binop(builder, "eq", l, r, db, "knot_value_neq"),
                         // Comparison: dispatch through Ord trait (compare → Ordering)
                         ast::BinOp::Lt => self.compile_comparison(builder, l, r, db, "LT", false),
                         ast::BinOp::Gt => self.compile_comparison(builder, l, r, db, "GT", false),
@@ -2765,11 +2768,9 @@ impl Codegen {
                 then_branch,
                 else_branch,
             } => {
-                let cond_val = self.compile_expr(builder, cond, env, db);
-                let bool_val =
-                    self.call_rt_typed(builder, "knot_value_get_bool", &[cond_val], types::I32);
+                let cond_i32 = self.compile_condition(builder, cond, env, db);
                 let is_true =
-                    builder.ins().icmp_imm(IntCC::NotEqual, bool_val, 0);
+                    builder.ins().icmp_imm(IntCC::NotEqual, cond_i32, 0);
 
                 let then_block = builder.create_block();
                 let else_block = builder.create_block();
@@ -3727,16 +3728,10 @@ impl Codegen {
                 }
                 ast::PatKind::Lit(lit) => {
                     let lit_val = self.compile_lit(builder, lit);
-                    let eq =
-                        self.call_rt(builder, "knot_value_eq", &[scrut, lit_val]);
-                    let eq_bool = self.call_rt_typed(
-                        builder,
-                        "knot_value_get_bool",
-                        &[eq],
-                        types::I32,
-                    );
+                    let eq_i32 =
+                        self.call_rt_typed(builder, "knot_value_eq_i32", &[scrut, lit_val], types::I32);
                     let is_eq =
-                        builder.ins().icmp_imm(IntCC::NotEqual, eq_bool, 0);
+                        builder.ins().icmp_imm(IntCC::NotEqual, eq_i32, 0);
                     builder
                         .ins()
                         .brif(is_eq, arm_block, &[], next_block, &[]);
@@ -4221,15 +4216,9 @@ impl Codegen {
                         continue;
                     }
 
-                    let cond_val = self.compile_expr(builder, cond, env, db);
-                    let bool_val = self.call_rt_typed(
-                        builder,
-                        "knot_value_get_bool",
-                        &[cond_val],
-                        types::I32,
-                    );
+                    let cond_i32 = self.compile_condition(builder, cond, env, db);
                     let is_true =
-                        builder.ins().icmp_imm(IntCC::NotEqual, bool_val, 0);
+                        builder.ins().icmp_imm(IntCC::NotEqual, cond_i32, 0);
 
                     let then_block = builder.create_block();
                     let skip_block = builder.create_block();
@@ -5833,6 +5822,181 @@ impl Codegen {
                 _ => unreachable!(),
             };
             self.call_rt(builder, rt_fn, &[l, r])
+        }
+    }
+
+    /// Compile a comparison to unboxed i32 (0/1) — avoids Bool allocation.
+    /// Used by `compile_condition` when the result feeds directly into a branch.
+    fn compile_comparison_i32(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        l: Value,
+        r: Value,
+        db: Value,
+        match_tag: &str,
+        negate: bool,
+    ) -> Value {
+        let has_adt_ord_impls = self.trait_methods.get("compare").map_or(false, |info| {
+            info.impls.iter().any(|e| type_name_to_tag(&e.type_name).is_none())
+        });
+
+        if has_adt_ord_impls {
+            if let Some(&func_id) = self.trait_dispatcher_fns.get("compare") {
+                let func_ref = self.module.declare_func_in_func(func_id, builder.func);
+                let call = builder.ins().call(func_ref, &[db, l, r]);
+                let ordering = builder.inst_results(call)[0];
+
+                let (tag_ptr, tag_len) = self.string_ptr(builder, match_tag);
+                let matches = self.call_rt_typed(
+                    builder,
+                    "knot_constructor_matches",
+                    &[ordering, tag_ptr, tag_len],
+                    types::I32,
+                );
+
+                if negate {
+                    let one = builder.ins().iconst(types::I32, 1);
+                    builder.ins().isub(one, matches)
+                } else {
+                    matches
+                }
+            } else {
+                let rt_fn = match (match_tag, negate) {
+                    ("LT", false) => "knot_value_lt_i32",
+                    ("GT", false) => "knot_value_gt_i32",
+                    ("GT", true) => "knot_value_le_i32",
+                    ("LT", true) => "knot_value_ge_i32",
+                    _ => unreachable!(),
+                };
+                self.call_rt_typed(builder, rt_fn, &[l, r], types::I32)
+            }
+        } else {
+            let rt_fn = match (match_tag, negate) {
+                ("LT", false) => "knot_value_lt_i32",
+                ("GT", false) => "knot_value_gt_i32",
+                ("GT", true) => "knot_value_le_i32",
+                ("LT", true) => "knot_value_ge_i32",
+                _ => unreachable!(),
+            };
+            self.call_rt_typed(builder, rt_fn, &[l, r], types::I32)
+        }
+    }
+
+    /// Compile an expression used as a boolean condition directly to i32 (0/1),
+    /// avoiding the Bool box/unbox round-trip when possible.
+    /// Falls back to compile_expr + knot_value_get_bool for non-optimizable cases.
+    fn compile_condition(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        expr: &ast::Expr,
+        env: &mut Env,
+        db: Value,
+    ) -> Value {
+        match &expr.node {
+            ast::ExprKind::BinOp { op, lhs, rhs } => {
+                match op {
+                    // Equality — unboxed when no trait dispatcher
+                    ast::BinOp::Eq => {
+                        let l = self.compile_expr(builder, lhs, env, db);
+                        let r = self.compile_expr(builder, rhs, env, db);
+                        if self.trait_dispatcher_fns.contains_key("eq") {
+                            // Trait dispatcher returns boxed Bool — must unbox
+                            let boxed = self.compile_trait_binop(builder, "eq", l, r, db, "knot_value_eq");
+                            self.call_rt_typed(builder, "knot_value_get_bool", &[boxed], types::I32)
+                        } else {
+                            self.call_rt_typed(builder, "knot_value_eq_i32", &[l, r], types::I32)
+                        }
+                    }
+                    ast::BinOp::Neq => {
+                        let l = self.compile_expr(builder, lhs, env, db);
+                        let r = self.compile_expr(builder, rhs, env, db);
+                        if self.trait_dispatcher_fns.contains_key("eq") {
+                            let boxed = self.compile_trait_binop(builder, "eq", l, r, db, "knot_value_neq");
+                            self.call_rt_typed(builder, "knot_value_get_bool", &[boxed], types::I32)
+                        } else {
+                            self.call_rt_typed(builder, "knot_value_neq_i32", &[l, r], types::I32)
+                        }
+                    }
+                    // Comparisons — unboxed
+                    ast::BinOp::Lt => {
+                        let l = self.compile_expr(builder, lhs, env, db);
+                        let r = self.compile_expr(builder, rhs, env, db);
+                        self.compile_comparison_i32(builder, l, r, db, "LT", false)
+                    }
+                    ast::BinOp::Gt => {
+                        let l = self.compile_expr(builder, lhs, env, db);
+                        let r = self.compile_expr(builder, rhs, env, db);
+                        self.compile_comparison_i32(builder, l, r, db, "GT", false)
+                    }
+                    ast::BinOp::Le => {
+                        let l = self.compile_expr(builder, lhs, env, db);
+                        let r = self.compile_expr(builder, rhs, env, db);
+                        self.compile_comparison_i32(builder, l, r, db, "GT", true)
+                    }
+                    ast::BinOp::Ge => {
+                        let l = self.compile_expr(builder, lhs, env, db);
+                        let r = self.compile_expr(builder, rhs, env, db);
+                        self.compile_comparison_i32(builder, l, r, db, "LT", true)
+                    }
+                    // Short-circuit &&
+                    ast::BinOp::And => {
+                        let l_i32 = self.compile_condition(builder, lhs, env, db);
+                        let l_true = builder.ins().icmp_imm(IntCC::NotEqual, l_i32, 0);
+
+                        let rhs_block = builder.create_block();
+                        let merge_block = builder.create_block();
+                        merge_block_param(builder, merge_block, types::I32);
+
+                        let zero = builder.ins().iconst(types::I32, 0);
+                        builder.ins().brif(l_true, rhs_block, &[], merge_block, &[zero]);
+
+                        builder.switch_to_block(rhs_block);
+                        builder.seal_block(rhs_block);
+                        let r_i32 = self.compile_condition(builder, rhs, env, db);
+                        builder.ins().jump(merge_block, &[r_i32]);
+
+                        builder.switch_to_block(merge_block);
+                        builder.seal_block(merge_block);
+                        builder.block_params(merge_block)[0]
+                    }
+                    // Short-circuit ||
+                    ast::BinOp::Or => {
+                        let l_i32 = self.compile_condition(builder, lhs, env, db);
+                        let l_true = builder.ins().icmp_imm(IntCC::NotEqual, l_i32, 0);
+
+                        let rhs_block = builder.create_block();
+                        let merge_block = builder.create_block();
+                        merge_block_param(builder, merge_block, types::I32);
+
+                        let one = builder.ins().iconst(types::I32, 1);
+                        builder.ins().brif(l_true, merge_block, &[one], rhs_block, &[]);
+
+                        builder.switch_to_block(rhs_block);
+                        builder.seal_block(rhs_block);
+                        let r_i32 = self.compile_condition(builder, rhs, env, db);
+                        builder.ins().jump(merge_block, &[r_i32]);
+
+                        builder.switch_to_block(merge_block);
+                        builder.seal_block(merge_block);
+                        builder.block_params(merge_block)[0]
+                    }
+                    // Other binary ops — fall back
+                    _ => {
+                        let val = self.compile_expr(builder, expr, env, db);
+                        self.call_rt_typed(builder, "knot_value_get_bool", &[val], types::I32)
+                    }
+                }
+            }
+            ast::ExprKind::UnaryOp { op: ast::UnaryOp::Not, operand } => {
+                let inner = self.compile_condition(builder, operand, env, db);
+                let one = builder.ins().iconst(types::I32, 1);
+                builder.ins().isub(one, inner)
+            }
+            // Fall back: compile as boxed Value, then unbox
+            _ => {
+                let val = self.compile_expr(builder, expr, env, db);
+                self.call_rt_typed(builder, "knot_value_get_bool", &[val], types::I32)
+            }
         }
     }
 }

@@ -31,4 +31,8 @@ main = do
   let withHex = b"\x48\x49"
   println (bytesToText withHex)    -- HI
 
+  -- JSON encoding (base64)
+  println (toJson raw)             -- "aGVsbG8="
+  println (toJson {payload: raw})   -- {"payload":"aGVsbG8="}
+
   yield {}

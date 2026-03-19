@@ -5170,6 +5170,31 @@ fn string_to_value(s: &str, ty: &str) -> *mut Value {
     }
 }
 
+const BASE64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(BASE64_CHARS[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(BASE64_CHARS[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(BASE64_CHARS[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(BASE64_CHARS[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
 fn value_to_json(v: *mut Value) -> String {
     if v.is_null() {
         return "null".to_string();
@@ -5180,8 +5205,7 @@ fn value_to_json(v: *mut Value) -> String {
         Value::Text(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
         Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         Value::Bytes(b) => {
-            let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
-            format!("\"{}\"", hex)
+            format!("\"{}\"", base64_encode(b))
         }
         Value::Unit => "{}".to_string(),
         Value::Record(fields) => {

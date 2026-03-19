@@ -48,9 +48,24 @@ impl EffectSet {
     }
 
     pub fn union(&self, other: &EffectSet) -> EffectSet {
+        // Fast paths for empty sets
+        let reads = if self.reads.is_empty() {
+            other.reads.clone()
+        } else if other.reads.is_empty() {
+            self.reads.clone()
+        } else {
+            self.reads.union(&other.reads).cloned().collect()
+        };
+        let writes = if self.writes.is_empty() {
+            other.writes.clone()
+        } else if other.writes.is_empty() {
+            self.writes.clone()
+        } else {
+            self.writes.union(&other.writes).cloned().collect()
+        };
         EffectSet {
-            reads: self.reads.union(&other.reads).cloned().collect(),
-            writes: self.writes.union(&other.writes).cloned().collect(),
+            reads,
+            writes,
             console: self.console || other.console,
             network: self.network || other.network,
             fs: self.fs || other.fs,
@@ -71,9 +86,19 @@ impl EffectSet {
 
     /// Returns effects in `self` that are not in `other`.
     pub fn difference(&self, other: &EffectSet) -> EffectSet {
+        let reads = if other.reads.is_empty() {
+            self.reads.clone()
+        } else {
+            self.reads.difference(&other.reads).cloned().collect()
+        };
+        let writes = if other.writes.is_empty() {
+            self.writes.clone()
+        } else {
+            self.writes.difference(&other.writes).cloned().collect()
+        };
         EffectSet {
-            reads: self.reads.difference(&other.reads).cloned().collect(),
-            writes: self.writes.difference(&other.writes).cloned().collect(),
+            reads,
+            writes,
             console: self.console && !other.console,
             network: self.network && !other.network,
             fs: self.fs && !other.fs,
@@ -153,83 +178,41 @@ impl EffectChecker {
     fn new() -> Self {
         let mut builtin_effects = HashMap::new();
 
-        // println, print: console effect
-        let console_effect = {
-            let mut e = EffectSet::empty();
-            e.console = true;
-            e
+        // Helper: batch-insert same effect for multiple builtins
+        let mut insert_many = |names: &[&str], effect: EffectSet| {
+            for name in names {
+                builtin_effects.insert((*name).into(), effect.clone());
+            }
         };
-        builtin_effects.insert("println".into(), console_effect.clone());
-        builtin_effects.insert("putLine".into(), console_effect.clone());
-        builtin_effects.insert("print".into(), console_effect.clone());
-        builtin_effects.insert("readLine".into(), console_effect);
 
-        // now: clock effect
-        let clock_effect = {
-            let mut e = EffectSet::empty();
-            e.clock = true;
-            e
-        };
-        builtin_effects.insert("now".into(), clock_effect);
+        let mut console_effect = EffectSet::empty();
+        console_effect.console = true;
+        insert_many(&["println", "putLine", "print", "readLine"], console_effect);
 
-        // random: random effect
-        let random_effect = {
-            let mut e = EffectSet::empty();
-            e.random = true;
-            e
-        };
-        builtin_effects.insert("randomInt".into(), random_effect.clone());
-        builtin_effects.insert("randomFloat".into(), random_effect.clone());
-        builtin_effects.insert("generateKeyPair".into(), random_effect.clone());
-        builtin_effects.insert("generateSigningKeyPair".into(), random_effect.clone());
-        builtin_effects.insert("encrypt".into(), random_effect.clone()); // ephemeral key + nonce
-        builtin_effects.insert("decrypt".into(), EffectSet::empty());
-        builtin_effects.insert("sign".into(), EffectSet::empty());
-        builtin_effects.insert("verify".into(), EffectSet::empty());
+        let mut clock_effect = EffectSet::empty();
+        clock_effect.clock = true;
+        insert_many(&["now"], clock_effect);
 
-        // listen: network effect
-        let network_effect = {
-            let mut e = EffectSet::empty();
-            e.network = true;
-            e
-        };
-        builtin_effects.insert("listen".into(), network_effect);
+        let mut random_effect = EffectSet::empty();
+        random_effect.random = true;
+        insert_many(&["randomInt", "randomFloat", "generateKeyPair",
+                       "generateSigningKeyPair", "encrypt"], random_effect);
+        insert_many(&["decrypt", "sign", "verify"], EffectSet::empty());
 
-        // File system: fs effect
-        let fs_effect = {
-            let mut e = EffectSet::empty();
-            e.fs = true;
-            e
-        };
-        builtin_effects.insert("readFile".into(), fs_effect.clone());
-        builtin_effects.insert("writeFile".into(), fs_effect.clone());
-        builtin_effects.insert("appendFile".into(), fs_effect.clone());
-        builtin_effects.insert("fileExists".into(), fs_effect.clone());
-        builtin_effects.insert("removeFile".into(), fs_effect.clone());
-        builtin_effects.insert("listDir".into(), fs_effect);
+        let mut network_effect = EffectSet::empty();
+        network_effect.network = true;
+        insert_many(&["listen"], network_effect);
+
+        let mut fs_effect = EffectSet::empty();
+        fs_effect.fs = true;
+        insert_many(&["readFile", "writeFile", "appendFile",
+                       "fileExists", "removeFile", "listDir"], fs_effect);
 
         // Pure builtins
-        builtin_effects.insert("show".into(), EffectSet::empty());
-        builtin_effects.insert("union".into(), EffectSet::empty());
-        builtin_effects.insert("count".into(), EffectSet::empty());
-        builtin_effects.insert("filter".into(), EffectSet::empty());
-        builtin_effects.insert("match".into(), EffectSet::empty());
-        builtin_effects.insert("map".into(), EffectSet::empty());
-        builtin_effects.insert("fold".into(), EffectSet::empty());
-        builtin_effects.insert("single".into(), EffectSet::empty());
-        builtin_effects.insert("toUpper".into(), EffectSet::empty());
-        builtin_effects.insert("toLower".into(), EffectSet::empty());
-        builtin_effects.insert("take".into(), EffectSet::empty());
-        builtin_effects.insert("drop".into(), EffectSet::empty());
-        builtin_effects.insert("length".into(), EffectSet::empty());
-        builtin_effects.insert("trim".into(), EffectSet::empty());
-        builtin_effects.insert("contains".into(), EffectSet::empty());
-        builtin_effects.insert("reverse".into(), EffectSet::empty());
-        builtin_effects.insert("chars".into(), EffectSet::empty());
-        builtin_effects.insert("id".into(), EffectSet::empty());
-        builtin_effects.insert("not".into(), EffectSet::empty());
-        builtin_effects.insert("toJson".into(), EffectSet::empty());
-        builtin_effects.insert("parseJson".into(), EffectSet::empty());
+        insert_many(&["show", "union", "count", "filter", "match", "map",
+                       "fold", "single", "toUpper", "toLower", "take", "drop",
+                       "length", "trim", "contains", "reverse", "chars",
+                       "id", "not", "toJson", "parseJson"], EffectSet::empty());
 
         Self {
             decl_effects: HashMap::new(),

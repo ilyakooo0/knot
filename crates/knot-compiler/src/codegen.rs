@@ -2498,8 +2498,8 @@ impl Codegen {
                 if name == "readLine" {
                     return self.call_rt(builder, "knot_read_line", &[]);
                 }
-                if env.bindings.contains_key(name) {
-                    env.get(name)
+                if let Some(&val) = env.bindings.get(name) {
+                    val
                 } else if let Some((func_id, n_params)) =
                     self.user_fns.get(name).copied()
                 {
@@ -6439,16 +6439,17 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
 /// Find free variables in an expression (variables not bound by params).
 fn find_free_vars(expr: &ast::Expr, bound: &[String]) -> Vec<String> {
     let mut free = Vec::new();
-    collect_free_vars(expr, bound, &mut free);
+    let bound_set: HashSet<&str> = bound.iter().map(|s| s.as_str()).collect();
+    collect_free_vars(expr, &bound_set, &mut free);
     free.sort();
     free.dedup();
     free
 }
 
-fn collect_free_vars(expr: &ast::Expr, bound: &[String], free: &mut Vec<String>) {
+fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<String>) {
     match &expr.node {
         ast::ExprKind::Var(name) => {
-            if !bound.contains(name) && !is_builtin_name(name) {
+            if !bound.contains(name.as_str()) && !is_builtin_name(name) {
                 free.push(name.clone());
             }
         }
@@ -6474,10 +6475,10 @@ fn collect_free_vars(expr: &ast::Expr, bound: &[String], free: &mut Vec<String>)
             }
         }
         ast::ExprKind::Lambda { params, body } => {
-            let mut new_bound: Vec<String> = bound.to_vec();
+            let mut new_bound = bound.clone();
             for p in params {
                 if let ast::PatKind::Var(name) = &p.node {
-                    new_bound.push(name.clone());
+                    new_bound.insert(name.as_str());
                 }
             }
             collect_free_vars(body, &new_bound, free);
@@ -6505,22 +6506,22 @@ fn collect_free_vars(expr: &ast::Expr, bound: &[String], free: &mut Vec<String>)
         ast::ExprKind::Case { scrutinee, arms } => {
             collect_free_vars(scrutinee, bound, free);
             for arm in arms {
-                let mut arm_bound = bound.to_vec();
-                collect_pat_bindings(&arm.pat, &mut arm_bound);
+                let mut arm_bound = bound.clone();
+                collect_pat_bindings_set(&arm.pat, &mut arm_bound);
                 collect_free_vars(&arm.body, &arm_bound, free);
             }
         }
         ast::ExprKind::Do(stmts) => {
-            let mut do_bound = bound.to_vec();
+            let mut do_bound = bound.clone();
             for stmt in stmts {
                 match &stmt.node {
                     ast::StmtKind::Bind { pat, expr } => {
                         collect_free_vars(expr, &do_bound, free);
-                        collect_pat_bindings(pat, &mut do_bound);
+                        collect_pat_bindings_set(pat, &mut do_bound);
                     }
                     ast::StmtKind::Let { pat, expr } => {
                         collect_free_vars(expr, &do_bound, free);
-                        collect_pat_bindings(pat, &mut do_bound);
+                        collect_pat_bindings_set(pat, &mut do_bound);
                     }
                     ast::StmtKind::Where { cond } => {
                         collect_free_vars(cond, &do_bound, free);
@@ -6552,26 +6553,26 @@ fn collect_free_vars(expr: &ast::Expr, bound: &[String], free: &mut Vec<String>)
     }
 }
 
-fn collect_pat_bindings(pat: &ast::Pat, bound: &mut Vec<String>) {
+fn collect_pat_bindings_set<'a>(pat: &'a ast::Pat, bound: &mut HashSet<&'a str>) {
     match &pat.node {
-        ast::PatKind::Var(name) => bound.push(name.clone()),
+        ast::PatKind::Var(name) => { bound.insert(name.as_str()); }
         ast::PatKind::Wildcard => {}
         ast::PatKind::Constructor { payload, .. } => {
-            collect_pat_bindings(payload, bound);
+            collect_pat_bindings_set(payload, bound);
         }
         ast::PatKind::Record(fields) => {
             for f in fields {
                 if let Some(p) = &f.pattern {
-                    collect_pat_bindings(p, bound);
+                    collect_pat_bindings_set(p, bound);
                 } else {
-                    bound.push(f.name.clone());
+                    bound.insert(f.name.as_str());
                 }
             }
         }
         ast::PatKind::Lit(_) => {}
         ast::PatKind::List(pats) => {
             for p in pats {
-                collect_pat_bindings(p, bound);
+                collect_pat_bindings_set(p, bound);
             }
         }
     }

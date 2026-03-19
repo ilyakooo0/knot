@@ -268,7 +268,22 @@ fn brief_value(v: *mut Value) -> String {
 /// Escape a SQL identifier by wrapping it in double quotes and doubling
 /// any internal `"` characters, per the SQL standard.
 fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
+    if name.contains('"') {
+        let mut s = String::with_capacity(name.len() + 2);
+        s.push('"');
+        for ch in name.chars() {
+            if ch == '"' { s.push('"'); }
+            s.push(ch);
+        }
+        s.push('"');
+        s
+    } else {
+        let mut s = String::with_capacity(name.len() + 2);
+        s.push('"');
+        s.push_str(name);
+        s.push('"');
+        s
+    }
 }
 
 // ── Value constructors ────────────────────────────────────────────
@@ -2084,11 +2099,11 @@ pub extern "C" fn knot_text_trim(v: *mut Value) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_text_contains(needle: *mut Value, haystack: *mut Value) -> *mut Value {
     let needle = match unsafe { as_ref(needle) } {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.as_str(),
         _ => panic!("knot runtime: contains expected Text as first arg"),
     };
     match unsafe { as_ref(haystack) } {
-        Value::Text(s) => alloc(Value::Bool(s.contains(&needle))),
+        Value::Text(s) => alloc(Value::Bool(s.contains(needle))),
         _ => panic!("knot runtime: contains expected Text as second arg"),
     }
 }
@@ -2467,20 +2482,20 @@ pub extern "C" fn knot_fs_read_file(path: *mut Value) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_fs_write_file(path: *mut Value, contents: *mut Value) -> *mut Value {
     let p = match unsafe { as_ref(path) } {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.as_str(),
         _ => panic!(
             "knot runtime: writeFile expected Text as first arg, got {}",
             type_name(path)
         ),
     };
     let c = match unsafe { as_ref(contents) } {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.as_str(),
         _ => panic!(
             "knot runtime: writeFile expected Text as second arg, got {}",
             type_name(contents)
         ),
     };
-    match std::fs::write(&p, &c) {
+    match std::fs::write(p, c) {
         Ok(()) => alloc(Value::Unit),
         Err(e) => panic!("knot runtime: writeFile failed for {:?}: {}", p, e),
     }
@@ -2491,20 +2506,20 @@ pub extern "C" fn knot_fs_write_file(path: *mut Value, contents: *mut Value) -> 
 pub extern "C" fn knot_fs_append_file(path: *mut Value, contents: *mut Value) -> *mut Value {
     use std::io::Write;
     let p = match unsafe { as_ref(path) } {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.as_str(),
         _ => panic!(
             "knot runtime: appendFile expected Text as first arg, got {}",
             type_name(path)
         ),
     };
     let c = match unsafe { as_ref(contents) } {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.as_str(),
         _ => panic!(
             "knot runtime: appendFile expected Text as second arg, got {}",
             type_name(contents)
         ),
     };
-    match std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+    match std::fs::OpenOptions::new().create(true).append(true).open(p) {
         Ok(mut f) => {
             f.write_all(c.as_bytes())
                 .unwrap_or_else(|e| panic!("knot runtime: appendFile write failed for {:?}: {}", p, e));
@@ -3394,6 +3409,9 @@ pub extern "C" fn knot_source_read(
 
     if is_adt_schema(schema) {
         let adt = parse_adt_schema(schema);
+        // Build field name → index map for O(1) lookups
+        let field_idx: HashMap<&str, usize> = adt.all_fields.iter().enumerate()
+            .map(|(i, f)| (f.name.as_str(), i)).collect();
         // SELECT _tag + all fields from the wide table
         let mut select_cols = vec![quote_ident("_tag")];
         for f in &adt.all_fields {
@@ -3425,12 +3443,7 @@ pub extern "C" fn knot_source_read(
                     // Build a record from the constructor's specific fields
                     let record = knot_record_empty(ctor.fields.len());
                     for field in &ctor.fields {
-                        // Find this field's index in all_fields
-                        let col_idx = adt
-                            .all_fields
-                            .iter()
-                            .position(|f| f.name == field.name)
-                            .unwrap();
+                        let col_idx = field_idx[field.name.as_str()];
                         let val = read_sql_column(row, col_idx + 1, field.ty); // +1 for _tag
                         let fname = field.name.as_bytes();
                         knot_record_set_field(record, fname.as_ptr(), fname.len(), val);
@@ -3588,6 +3601,8 @@ pub extern "C" fn knot_source_read_where(
 
     if is_adt_schema(schema) {
         let adt = parse_adt_schema(schema);
+        let field_idx: HashMap<&str, usize> = adt.all_fields.iter().enumerate()
+            .map(|(i, f)| (f.name.as_str(), i)).collect();
         let mut select_cols = vec![quote_ident("_tag")];
         for f in &adt.all_fields {
             select_cols.push(quote_ident(&f.name));
@@ -3621,11 +3636,7 @@ pub extern "C" fn knot_source_read_where(
                 } else {
                     let record = knot_record_empty(ctor.fields.len());
                     for field in &ctor.fields {
-                        let col_idx = adt
-                            .all_fields
-                            .iter()
-                            .position(|f| f.name == field.name)
-                            .unwrap();
+                        let col_idx = field_idx[field.name.as_str()];
                         let val = read_sql_column(row, col_idx + 1, field.ty);
                         let fname = field.name.as_bytes();
                         knot_record_set_field(record, fname.as_ptr(), fname.len(), val);

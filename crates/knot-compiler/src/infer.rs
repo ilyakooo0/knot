@@ -1587,11 +1587,10 @@ impl Infer {
                 self.unify(&rhs_ty, &Ty::Bool, rhs.span);
                 Ty::Bool
             }
-            // Concat: both Text, result Text
+            // Concat: both same type (Semigroup), result same type
             ast::BinOp::Concat => {
-                self.unify(&lhs_ty, &Ty::Text, lhs.span);
-                self.unify(&rhs_ty, &Ty::Text, rhs.span);
-                Ty::Text
+                self.unify(&lhs_ty, &rhs_ty, span);
+                lhs_ty
             }
             // Pipe: a |> f  =  f a
             ast::BinOp::Pipe => {
@@ -2995,9 +2994,11 @@ mod tests {
     }
 
     #[test]
-    fn concat_requires_text() {
+    fn concat_is_polymorphic() {
+        // ++ is now Semigroup: both sides must agree, but any type is allowed
         assert!(check_src("main = \"a\" ++ \"b\"").is_empty());
-        let diags = check_src("main = 1 ++ 2");
+        assert!(check_src("main = [1, 2] ++ [3, 4]").is_empty());
+        let diags = check_src("main = \"a\" ++ 1");
         assert!(has_error(&diags, "type mismatch"));
     }
 

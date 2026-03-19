@@ -1,7 +1,7 @@
 //! Built-in trait declarations and standard implementations.
 //!
-//! Defines the core trait hierarchy (Eq, Ord, Num, Display, Functor, Applicative,
-//! Monad, Alternative, Foldable) and primitive/[] implementations. Trait
+//! Defines the core trait hierarchy (Eq, Ord, Num, Semigroup, Display, Functor,
+//! Applicative, Monad, Alternative, Foldable) and primitive/[] implementations. Trait
 //! declarations and simple impls are parsed from Knot source; complex [] impls
 //! for HKT traits (Functor, Applicative, Monad, Foldable) are registered
 //! directly in codegen to avoid span collision issues.
@@ -43,6 +43,9 @@ trait Eq a => Num a where
   mul : a -> a -> a
   div : a -> a -> a
   negate : a -> a
+
+trait Semigroup a where
+  append : a -> a -> a
 
 trait Display a where
   display : a -> Text

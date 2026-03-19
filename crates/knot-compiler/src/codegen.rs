@@ -1183,6 +1183,7 @@ impl Codegen {
             ("Alternative_Relation_empty", "empty", 0),
             ("Alternative_Relation_alt", "alt", 2),
             ("Foldable_Relation_fold", "fold", 3),
+            ("Semigroup_Relation_append", "append", 2),
         ];
         for (mangled, method_name, n_params) in &impls {
             // Don't register if already defined (by user impl or prelude)
@@ -1234,6 +1235,7 @@ impl Codegen {
                     "bind" => "Monad".to_string(),
                     "empty" | "alt" => "Alternative".to_string(),
                     "fold" => "Foldable".to_string(),
+                    "append" => "Semigroup".to_string(),
                     _ => continue,
                 })
                 .or_default()
@@ -1266,6 +1268,8 @@ impl Codegen {
             ("Num_Float_mul", "mul", "Float", 2, "Num"),
             ("Num_Float_div", "div", "Float", 2, "Num"),
             ("Num_Float_negate", "negate", "Float", 1, "Num"),
+            // Semigroup impls
+            ("Semigroup_Text_append", "append", "Text", 2, "Semigroup"),
         ];
         for (mangled, method_name, type_name, n_params, trait_name) in &impls {
             // Don't register if already defined (by user impl or prelude)
@@ -1437,6 +1441,21 @@ impl Codegen {
                 builder.ins().return_(&[result]);
             });
         });
+
+        // Semigroup_Relation_append(db, a, b) → knot_value_concat(a, b)
+        define_if_registered!("Semigroup_Relation_append", |cg: &mut Self, func_id: FuncId| {
+            let mut sig = cg.module.make_signature();
+            sig.params.push(AbiParam::new(cg.ptr_type)); // db
+            sig.params.push(AbiParam::new(cg.ptr_type)); // a
+            sig.params.push(AbiParam::new(cg.ptr_type)); // b
+            sig.returns.push(AbiParam::new(cg.ptr_type));
+            cg.build_function(func_id, sig, |cg, builder, entry| {
+                let a = builder.block_params(entry)[1];
+                let b = builder.block_params(entry)[2];
+                let result = cg.call_rt(builder, "knot_value_concat", &[a, b]);
+                builder.ins().return_(&[result]);
+            });
+        });
     }
 
     /// Define Cranelift IR bodies for built-in primitive impls (Eq, Ord, Num).
@@ -1513,6 +1532,9 @@ impl Codegen {
         define_binop_impl!("Num_Float_mul", "knot_value_mul");
         define_binop_impl!("Num_Float_div", "knot_value_div");
         define_unop_impl!("Num_Float_negate", "knot_value_negate");
+
+        // Semigroup impls: append(a, b) → knot_value_concat(a, b)
+        define_binop_impl!("Semigroup_Text_append", "knot_value_concat");
     }
 
     // ── Supertrait validation ────────────────────────────────────
@@ -2717,10 +2739,11 @@ impl Codegen {
                         ast::BinOp::Gt => self.compile_comparison(builder, l, r, db, "GT", false),
                         ast::BinOp::Le => self.compile_comparison(builder, l, r, db, "GT", true),
                         ast::BinOp::Ge => self.compile_comparison(builder, l, r, db, "LT", true),
-                        // Boolean / string ops: no trait dispatch
+                        // Boolean ops: no trait dispatch
                         ast::BinOp::And => self.call_rt(builder, "knot_value_and", &[l, r]),
                         ast::BinOp::Or => self.call_rt(builder, "knot_value_or", &[l, r]),
-                        ast::BinOp::Concat => self.call_rt(builder, "knot_value_concat", &[l, r]),
+                        // Semigroup: dispatch through Semigroup trait
+                        ast::BinOp::Concat => self.compile_trait_binop(builder, "append", l, r, db, "knot_value_concat"),
                         ast::BinOp::Pipe => unreachable!(),
                     }
                 }

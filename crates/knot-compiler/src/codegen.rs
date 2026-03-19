@@ -359,7 +359,7 @@ impl Codegen {
         self.declare_rt("knot_relation_push", &[p, p], &[]);
         self.declare_rt("knot_relation_len", &[p], &[p]);
         self.declare_rt("knot_relation_get", &[p, p], &[p]);
-        self.declare_rt("knot_relation_union", &[p, p], &[p]);
+        self.declare_rt("knot_relation_union", &[p, p, p], &[p]);
 
         // Binary operations
         self.declare_rt("knot_value_add", &[p, p], &[p]);
@@ -472,8 +472,8 @@ impl Codegen {
         self.declare_rt("knot_relation_ap", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_fold", &[p, p, p, p], &[p]);
         self.declare_rt("knot_relation_single", &[p], &[p]);
-        self.declare_rt("knot_relation_diff", &[p, p], &[p]);
-        self.declare_rt("knot_relation_inter", &[p, p], &[p]);
+        self.declare_rt("knot_relation_diff", &[p, p, p], &[p]);
+        self.declare_rt("knot_relation_inter", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_sum", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_avg", &[p, p, p], &[p]);
 
@@ -1404,7 +1404,7 @@ impl Codegen {
             });
         });
 
-        // Alternative_Relation_alt(db, a, b) → knot_relation_union(a, b)
+        // Alternative_Relation_alt(db, a, b) → knot_relation_union(db, a, b)
         define_if_registered!("Alternative_Relation_alt", |cg: &mut Self, func_id: FuncId| {
             let mut sig = cg.module.make_signature();
             sig.params.push(AbiParam::new(cg.ptr_type)); // db
@@ -1412,9 +1412,10 @@ impl Codegen {
             sig.params.push(AbiParam::new(cg.ptr_type)); // b
             sig.returns.push(AbiParam::new(cg.ptr_type));
             cg.build_function(func_id, sig, |cg, builder, entry| {
+                let db = builder.block_params(entry)[0];
                 let a = builder.block_params(entry)[1];
                 let b = builder.block_params(entry)[2];
-                let result = cg.call_rt(builder, "knot_relation_union", &[a, b]);
+                let result = cg.call_rt(builder, "knot_relation_union", &[db, a, b]);
                 builder.ins().return_(&[result]);
             });
         });
@@ -1588,8 +1589,8 @@ impl Codegen {
         self.define_stdlib_fn_2("take", "knot_text_take", false);
         self.define_stdlib_fn_2("drop", "knot_text_drop", false);
         self.define_stdlib_fn_2("contains", "knot_text_contains", false);
-        self.define_stdlib_fn_2("diff", "knot_relation_diff", false);
-        self.define_stdlib_fn_2("inter", "knot_relation_inter", false);
+        self.define_stdlib_fn_2("diff", "knot_relation_diff", true);
+        self.define_stdlib_fn_2("inter", "knot_relation_inter", true);
         self.define_stdlib_fn_2("sum", "knot_relation_sum", true);
         self.define_stdlib_fn_2("avg", "knot_relation_avg", true);
 
@@ -3460,7 +3461,7 @@ impl Codegen {
                     self.call_rt(
                         builder,
                         "knot_relation_union",
-                        &[compiled_args[0], compiled_args[1]],
+                        &[db, compiled_args[0], compiled_args[1]],
                     )
                 } else {
                     self.call_rt(builder, "knot_value_unit", &[])

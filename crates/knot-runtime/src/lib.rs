@@ -459,6 +459,407 @@ pub extern "C" fn knot_record_field(
     }
 }
 
+// ── SQLite-backed temp tables for relation operations ─────────────
+
+thread_local! {
+    static TEMP_COUNTER: std::cell::Cell<u64> = std::cell::Cell::new(0);
+}
+
+fn next_temp_name() -> String {
+    TEMP_COUNTER.with(|c| {
+        let n = c.get();
+        c.set(n + 1);
+        format!("_knot_tmp_{}", n)
+    })
+}
+
+/// Schema for SQLite temp tables, inferred from relation values at runtime.
+enum TempSchema {
+    /// Records: named columns with SQL types
+    Record(Vec<(String, ColType)>),
+    /// Scalars (Int, Float, Text, Bool, Bytes): single `_val` column
+    Scalar(ColType),
+    /// ADT constructors: `_tag TEXT` + nullable fields from all constructors
+    Adt {
+        constructors: Vec<(String, Vec<(String, ColType)>)>,
+        all_fields: Vec<(String, ColType)>,
+    },
+    /// Unit values
+    Unit,
+}
+
+/// Infer the SQL column type from a runtime Value.
+fn infer_col_type(v: *mut Value) -> Option<ColType> {
+    if v.is_null() {
+        return Some(ColType::Text);
+    }
+    match unsafe { as_ref(v) } {
+        Value::Int(_) => Some(ColType::Int),
+        Value::Float(_) => Some(ColType::Float),
+        Value::Text(_) => Some(ColType::Text),
+        Value::Bool(_) => Some(ColType::Bool),
+        Value::Bytes(_) => Some(ColType::Bytes),
+        Value::Unit => None,
+        Value::Constructor(_, _) => Some(ColType::Tag),
+        _ => None,
+    }
+}
+
+/// Infer a TempSchema from a non-empty slice of values.
+/// Returns None if the values contain unsupported types (Function, nested Relation).
+fn infer_temp_schema(rows: &[*mut Value]) -> Option<TempSchema> {
+    if rows.is_empty() {
+        return Some(TempSchema::Unit);
+    }
+    let first = rows[0];
+    if first.is_null() {
+        return Some(TempSchema::Scalar(ColType::Text));
+    }
+    match unsafe { as_ref(first) } {
+        Value::Record(fields) => {
+            let mut cols = Vec::with_capacity(fields.len());
+            for f in fields {
+                match unsafe { as_ref(f.value) } {
+                    Value::Relation(_) | Value::Function(_, _, _) => return None,
+                    _ => {}
+                }
+                let ty = infer_col_type(f.value)?;
+                cols.push((f.name.clone(), ty));
+            }
+            Some(TempSchema::Record(cols))
+        }
+        Value::Constructor(_, _) => {
+            // Scan all rows to collect all constructor variants
+            let mut ctors: Vec<(String, Vec<(String, ColType)>)> = Vec::new();
+            let mut all_field_names: Vec<String> = Vec::new();
+            let mut all_fields: Vec<(String, ColType)> = Vec::new();
+
+            for row in rows {
+                if row.is_null() { continue; }
+                match unsafe { as_ref(*row) } {
+                    Value::Constructor(tag, payload) => {
+                        if ctors.iter().any(|(t, _)| t == tag) {
+                            continue;
+                        }
+                        let ctor_fields = match unsafe { as_ref(*payload) } {
+                            Value::Unit => Vec::new(),
+                            Value::Record(fields) => {
+                                let mut cf = Vec::new();
+                                for f in fields {
+                                    let ty = infer_col_type(f.value)?;
+                                    cf.push((f.name.clone(), ty));
+                                    if !all_field_names.contains(&f.name) {
+                                        all_field_names.push(f.name.clone());
+                                        all_fields.push((f.name.clone(), ty));
+                                    }
+                                }
+                                cf
+                            }
+                            _ => return None,
+                        };
+                        ctors.push((tag.clone(), ctor_fields));
+                    }
+                    _ => return None,
+                }
+            }
+            Some(TempSchema::Adt { constructors: ctors, all_fields })
+        }
+        Value::Unit => Some(TempSchema::Unit),
+        Value::Int(_) => Some(TempSchema::Scalar(ColType::Int)),
+        Value::Float(_) => Some(TempSchema::Scalar(ColType::Float)),
+        Value::Text(_) => Some(TempSchema::Scalar(ColType::Text)),
+        Value::Bool(_) => Some(TempSchema::Scalar(ColType::Bool)),
+        Value::Bytes(_) => Some(TempSchema::Scalar(ColType::Bytes)),
+        _ => None,
+    }
+}
+
+/// Create a temp table with the given schema.
+fn create_temp_table(conn: &Connection, name: &str, schema: &TempSchema) {
+    let table = quote_ident(name);
+    let col_defs = match schema {
+        TempSchema::Record(cols) => {
+            if cols.is_empty() {
+                "\"_dummy\" INTEGER DEFAULT 0".to_string()
+            } else {
+                cols.iter()
+                    .map(|(name, ty)| format!("{} {}", quote_ident(name), sql_type(*ty)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        }
+        TempSchema::Scalar(ty) => format!("\"_val\" {}", sql_type(*ty)),
+        TempSchema::Adt { all_fields, .. } => {
+            let mut defs = vec!["\"_tag\" TEXT NOT NULL".to_string()];
+            for (name, ty) in all_fields {
+                defs.push(format!("{} {}", quote_ident(name), sql_type(*ty)));
+            }
+            defs.join(", ")
+        }
+        TempSchema::Unit => "\"_dummy\" INTEGER DEFAULT 0".to_string(),
+    };
+    let sql = format!("CREATE TEMP TABLE {} ({});", table, col_defs);
+    debug_sql(&sql);
+    conn.execute_batch(&sql)
+        .unwrap_or_else(|e| panic!("knot runtime: failed to create temp table: {}", e));
+}
+
+/// Build an INSERT SQL statement for a temp table.
+fn temp_insert_sql(name: &str, schema: &TempSchema) -> String {
+    let table = quote_ident(name);
+    let (col_names, n_cols) = match schema {
+        TempSchema::Record(cols) => {
+            if cols.is_empty() {
+                ("\"_dummy\"".to_string(), 1)
+            } else {
+                let names: Vec<String> = cols.iter().map(|(n, _)| quote_ident(n)).collect();
+                let n = names.len();
+                (names.join(", "), n)
+            }
+        }
+        TempSchema::Scalar(_) => ("\"_val\"".to_string(), 1),
+        TempSchema::Adt { all_fields, .. } => {
+            let mut names = vec!["\"_tag\"".to_string()];
+            for (n, _) in all_fields {
+                names.push(quote_ident(n));
+            }
+            let n = names.len();
+            (names.join(", "), n)
+        }
+        TempSchema::Unit => ("\"_dummy\"".to_string(), 1),
+    };
+    let placeholders: Vec<String> = (1..=n_cols).map(|i| format!("?{}", i)).collect();
+    format!("INSERT INTO {} ({}) VALUES ({});", table, col_names, placeholders.join(", "))
+}
+
+/// Convert a Value to SQL params for temp table insertion.
+fn temp_row_to_params(v: *mut Value, schema: &TempSchema) -> Vec<rusqlite::types::Value> {
+    match schema {
+        TempSchema::Record(cols) => {
+            if cols.is_empty() {
+                return vec![rusqlite::types::Value::Integer(0)];
+            }
+            let fields = match unsafe { as_ref(v) } {
+                Value::Record(fields) => fields,
+                _ => panic!("knot runtime: expected Record for temp table insert, got {}", type_name(v)),
+            };
+            cols.iter()
+                .map(|(name, ty)| {
+                    let field = fields.iter().find(|f| f.name == *name);
+                    match field {
+                        Some(f) => value_to_sqlite(f.value, *ty),
+                        None => rusqlite::types::Value::Null,
+                    }
+                })
+                .collect()
+        }
+        TempSchema::Scalar(ty) => vec![value_to_sqlite(v, *ty)],
+        TempSchema::Adt { all_fields, constructors } => {
+            match unsafe { as_ref(v) } {
+                Value::Constructor(tag, payload) => {
+                    let mut params = vec![rusqlite::types::Value::Text(tag.clone())];
+                    let ctor = constructors.iter().find(|(t, _)| t == tag);
+                    for (fname, fty) in all_fields {
+                        let has_field = ctor.map_or(false, |(_, fields)| {
+                            fields.iter().any(|(n, _)| n == fname)
+                        });
+                        if has_field {
+                            match unsafe { as_ref(*payload) } {
+                                Value::Record(fields) => {
+                                    let field = fields.iter().find(|f| f.name == *fname);
+                                    params.push(match field {
+                                        Some(f) => value_to_sqlite(f.value, *fty),
+                                        None => rusqlite::types::Value::Null,
+                                    });
+                                }
+                                _ => params.push(rusqlite::types::Value::Null),
+                            }
+                        } else {
+                            params.push(rusqlite::types::Value::Null);
+                        }
+                    }
+                    params
+                }
+                _ => panic!("knot runtime: expected Constructor for ADT temp table"),
+            }
+        }
+        TempSchema::Unit => vec![rusqlite::types::Value::Integer(0)],
+    }
+}
+
+/// Read a single row from a query result and convert to a Value using TempSchema.
+fn read_temp_row(row: &rusqlite::Row, schema: &TempSchema) -> *mut Value {
+    match schema {
+        TempSchema::Record(cols) => {
+            if cols.is_empty() {
+                return knot_record_empty(0);
+            }
+            let record = knot_record_empty(cols.len());
+            for (i, (name, ty)) in cols.iter().enumerate() {
+                let val = read_sql_column(row, i, *ty);
+                let name_bytes = name.as_bytes();
+                knot_record_set_field(record, name_bytes.as_ptr(), name_bytes.len(), val);
+            }
+            record
+        }
+        TempSchema::Scalar(ty) => read_sql_column(row, 0, *ty),
+        TempSchema::Adt { constructors, all_fields } => {
+            let tag: String = row.get(0).unwrap();
+            let ctor = constructors.iter().find(|(t, _)| t == &tag);
+            let payload = if let Some((_, fields)) = ctor {
+                if fields.is_empty() {
+                    alloc(Value::Unit)
+                } else {
+                    let record = knot_record_empty(fields.len());
+                    for (fname, fty) in fields {
+                        let col_idx = all_fields.iter().position(|(n, _)| n == fname).unwrap();
+                        let val = read_sql_column(row, col_idx + 1, *fty);
+                        let name_bytes = fname.as_bytes();
+                        knot_record_set_field(record, name_bytes.as_ptr(), name_bytes.len(), val);
+                    }
+                    record
+                }
+            } else {
+                alloc(Value::Unit)
+            };
+            alloc(Value::Constructor(tag, payload))
+        }
+        TempSchema::Unit => alloc(Value::Unit),
+    }
+}
+
+/// Read rows from an arbitrary SQL query using a TempSchema.
+fn read_query_rows(conn: &Connection, sql: &str, schema: &TempSchema) -> Vec<*mut Value> {
+    debug_sql(sql);
+    let mut stmt = conn
+        .prepare_cached(sql)
+        .unwrap_or_else(|e| panic!("knot runtime: temp query error: {}\n  SQL: {}", e, sql));
+    let mut result_rows = stmt
+        .query([])
+        .unwrap_or_else(|e| panic!("knot runtime: temp query exec error: {}\n  SQL: {}", e, sql));
+
+    let mut rows: Vec<*mut Value> = Vec::new();
+    while let Some(row) = result_rows
+        .next()
+        .unwrap_or_else(|e| panic!("knot runtime: temp query fetch error: {}", e))
+    {
+        rows.push(read_temp_row(row, schema));
+    }
+    rows
+}
+
+/// Drop a temp table.
+fn drop_temp_table(conn: &Connection, name: &str) {
+    let sql = format!("DROP TABLE IF EXISTS {};", quote_ident(name));
+    debug_sql(&sql);
+    let _ = conn.execute_batch(&sql);
+}
+
+/// Materialize a relation into a temp table and return the table name.
+fn materialize_relation(conn: &Connection, rows: &[*mut Value], schema: &TempSchema) -> String {
+    let name = next_temp_name();
+    create_temp_table(conn, &name, schema);
+    if !rows.is_empty() {
+        let ins_sql = temp_insert_sql(&name, schema);
+        debug_sql(&ins_sql);
+        let mut stmt = conn
+            .prepare_cached(&ins_sql)
+            .unwrap_or_else(|e| panic!("knot runtime: temp insert prepare error: {}", e));
+        for row in rows {
+            let params = temp_row_to_params(*row, schema);
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+            stmt.execute(param_refs.as_slice())
+                .unwrap_or_else(|e| panic!("knot runtime: temp table insert error: {}", e));
+        }
+    }
+    name
+}
+
+/// In-memory dedup fallback for relations that can't be stored in SQL.
+fn in_memory_dedup(rows: Vec<*mut Value>) -> Vec<*mut Value> {
+    let mut result: Vec<*mut Value> = Vec::new();
+    for row in rows {
+        if !result.iter().any(|existing| values_equal(*existing, row)) {
+            result.push(row);
+        }
+    }
+    result
+}
+
+/// Perform a set operation (UNION/EXCEPT/INTERSECT) using SQLite.
+fn sql_set_op(
+    conn: &Connection,
+    a: &[*mut Value],
+    b: &[*mut Value],
+    op: &str,
+) -> Option<Vec<*mut Value>> {
+    let sample = if !a.is_empty() { a } else { b };
+    if sample.is_empty() {
+        return Some(Vec::new());
+    }
+    let schema = infer_temp_schema(sample)?;
+
+    let t1 = materialize_relation(conn, a, &schema);
+    let t2 = materialize_relation(conn, b, &schema);
+
+    let sql = format!(
+        "SELECT * FROM {} {} SELECT * FROM {}",
+        quote_ident(&t1),
+        op,
+        quote_ident(&t2)
+    );
+    let result = read_query_rows(conn, &sql, &schema);
+
+    drop_temp_table(conn, &t1);
+    drop_temp_table(conn, &t2);
+
+    Some(result)
+}
+
+/// Dedup a list of values using a SQL temp table with SELECT DISTINCT.
+fn sql_dedup(conn: &Connection, rows: &[*mut Value]) -> Option<Vec<*mut Value>> {
+    if rows.is_empty() {
+        return Some(Vec::new());
+    }
+    let schema = infer_temp_schema(rows)?;
+    let tmp = materialize_relation(conn, rows, &schema);
+    let sql = format!("SELECT DISTINCT * FROM {}", quote_ident(&tmp));
+    let result = read_query_rows(conn, &sql, &schema);
+    drop_temp_table(conn, &tmp);
+    Some(result)
+}
+
+/// Check if two relations are equal using SQL EXCEPT (symmetric difference).
+fn sql_relations_equal(conn: &Connection, a: &[*mut Value], b: &[*mut Value]) -> Option<bool> {
+    if a.len() != b.len() {
+        return Some(false);
+    }
+    if a.is_empty() {
+        return Some(true);
+    }
+    let schema = infer_temp_schema(a)?;
+
+    let t1 = materialize_relation(conn, a, &schema);
+    let t2 = materialize_relation(conn, b, &schema);
+
+    // Check symmetric difference: (a EXCEPT b) UNION ALL (b EXCEPT a) should be empty
+    let sql = format!(
+        "SELECT 1 FROM (SELECT * FROM {} EXCEPT SELECT * FROM {} UNION ALL SELECT * FROM {} EXCEPT SELECT * FROM {}) LIMIT 1",
+        quote_ident(&t1), quote_ident(&t2), quote_ident(&t2), quote_ident(&t1)
+    );
+    debug_sql(&sql);
+    let has_diff = conn
+        .prepare_cached(&sql)
+        .and_then(|mut s| s.query_row([], |_| Ok(true)))
+        .unwrap_or(false);
+
+    drop_temp_table(conn, &t1);
+    drop_temp_table(conn, &t2);
+
+    Some(!has_diff)
+}
+
 // ── Relation operations ───────────────────────────────────────────
 
 #[unsafe(no_mangle)]
@@ -511,19 +912,33 @@ pub extern "C" fn knot_relation_get(rel: *mut Value, index: usize) -> *mut Value
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_union(a: *mut Value, b: *mut Value) -> *mut Value {
+pub extern "C" fn knot_relation_union(
+    db: *mut c_void,
+    a: *mut Value,
+    b: *mut Value,
+) -> *mut Value {
     let rows_a = match unsafe { as_ref(a) } {
-        Value::Relation(rows) => rows.clone(),
+        Value::Relation(rows) => rows,
         _ => panic!("knot runtime: expected Relation in union, got {}", type_name(a)),
     };
     let rows_b = match unsafe { as_ref(b) } {
-        Value::Relation(rows) => rows.clone(),
+        Value::Relation(rows) => rows,
         _ => panic!("knot runtime: expected Relation in union, got {}", type_name(b)),
     };
-    let mut result = rows_a;
+
+    if rows_a.is_empty() { return b; }
+    if rows_b.is_empty() { return a; }
+
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    if let Some(result) = sql_set_op(&db_ref.conn, rows_a, rows_b, "UNION") {
+        return alloc(Value::Relation(result));
+    }
+
+    // Fallback: in-memory O(n²) dedup
+    let mut result = rows_a.clone();
     for row in rows_b {
-        if !result.iter().any(|existing| values_equal(*existing, row)) {
-            result.push(row);
+        if !result.iter().any(|existing| values_equal(*existing, *row)) {
+            result.push(*row);
         }
     }
     alloc(Value::Relation(result))
@@ -539,22 +954,24 @@ pub extern "C" fn knot_relation_bind(
     rel: *mut Value,
 ) -> *mut Value {
     let rows = match unsafe { as_ref(rel) } {
-        Value::Relation(rows) => rows.clone(),
+        Value::Relation(rows) => rows,
         _ => panic!(
             "knot runtime: expected Relation in bind, got {}",
             type_name(rel)
         ),
     };
-    let mut result: Vec<*mut Value> = Vec::new();
-    for row in rows {
+
+    if rows.is_empty() {
+        return alloc(Value::Relation(Vec::new()));
+    }
+
+    // Collect all sub-relation rows
+    let mut all_rows: Vec<*mut Value> = Vec::new();
+    for &row in rows {
         let sub = knot_value_call(db, func, row);
         match unsafe { as_ref(sub) } {
             Value::Relation(sub_rows) => {
-                for &r in sub_rows {
-                    if !result.iter().any(|existing| values_equal(*existing, r)) {
-                        result.push(r);
-                    }
-                }
+                all_rows.extend_from_slice(sub_rows);
             }
             _ => panic!(
                 "knot runtime: bind function must return a Relation, got {}",
@@ -562,7 +979,19 @@ pub extern "C" fn knot_relation_bind(
             ),
         }
     }
-    alloc(Value::Relation(result))
+
+    if all_rows.is_empty() {
+        return alloc(Value::Relation(Vec::new()));
+    }
+
+    // Dedup via SQLite
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    if let Some(result) = sql_dedup(&db_ref.conn, &all_rows) {
+        return alloc(Value::Relation(result));
+    }
+
+    // Fallback: in-memory dedup
+    alloc(Value::Relation(in_memory_dedup(all_rows)))
 }
 
 /// Group a relation by key columns using SQLite ORDER BY for efficient grouping.
@@ -941,9 +1370,15 @@ pub extern "C" fn knot_value_concat(a: *mut Value, b: *mut Value) -> *mut Value 
             s.push_str(y);
             alloc(Value::Text(s))
         }
-        (Value::Relation(_x), Value::Relation(_y)) => {
-            // ++ on relations is union
-            knot_relation_union(a, b)
+        (Value::Relation(rows_a), Value::Relation(rows_b)) => {
+            // ++ on relations is union (in-memory fallback — no db available here)
+            let mut result = rows_a.clone();
+            for row in rows_b {
+                if !result.iter().any(|existing| values_equal(*existing, *row)) {
+                    result.push(*row);
+                }
+            }
+            alloc(Value::Relation(result))
         }
         _ => panic!("knot runtime: ++ requires Text or Relation operands, got {} ++ {}", type_name(a), type_name(b)),
     }
@@ -1217,20 +1652,28 @@ pub extern "C" fn knot_relation_map(
     rel: *mut Value,
 ) -> *mut Value {
     let rows = match unsafe { as_ref(rel) } {
-        Value::Relation(rows) => rows.clone(),
+        Value::Relation(rows) => rows,
         _ => panic!(
             "knot runtime: map expected Relation, got {}",
             type_name(rel)
         ),
     };
-    let mut result: Vec<*mut Value> = Vec::new();
-    for row in rows {
-        let v = knot_value_call(db, func, row);
-        if !result.iter().any(|existing| values_equal(*existing, v)) {
-            result.push(v);
-        }
+
+    if rows.is_empty() {
+        return alloc(Value::Relation(Vec::new()));
     }
-    alloc(Value::Relation(result))
+
+    // Apply function to all rows
+    let mapped: Vec<*mut Value> = rows.iter().map(|&r| knot_value_call(db, func, r)).collect();
+
+    // Dedup via SQLite
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    if let Some(result) = sql_dedup(&db_ref.conn, &mapped) {
+        return alloc(Value::Relation(result));
+    }
+
+    // Fallback: in-memory dedup
+    alloc(Value::Relation(in_memory_dedup(mapped)))
 }
 
 /// ap(fs, xs) — applicative apply: apply each function in fs to each value in xs
@@ -1241,29 +1684,40 @@ pub extern "C" fn knot_relation_ap(
     xs: *mut Value,
 ) -> *mut Value {
     let funcs = match unsafe { as_ref(fs) } {
-        Value::Relation(rows) => rows.clone(),
+        Value::Relation(rows) => rows,
         _ => panic!(
             "knot runtime: ap expected Relation of functions, got {}",
             type_name(fs)
         ),
     };
     let vals = match unsafe { as_ref(xs) } {
-        Value::Relation(rows) => rows.clone(),
+        Value::Relation(rows) => rows,
         _ => panic!(
             "knot runtime: ap expected Relation of values, got {}",
             type_name(xs)
         ),
     };
-    let mut result: Vec<*mut Value> = Vec::new();
-    for f in &funcs {
-        for x in &vals {
-            let v = knot_value_call(db, *f, *x);
-            if !result.iter().any(|existing| values_equal(*existing, v)) {
-                result.push(v);
-            }
+
+    if funcs.is_empty() || vals.is_empty() {
+        return alloc(Value::Relation(Vec::new()));
+    }
+
+    // Apply all function-value pairs
+    let mut all: Vec<*mut Value> = Vec::with_capacity(funcs.len() * vals.len());
+    for &f in funcs {
+        for &x in vals {
+            all.push(knot_value_call(db, f, x));
         }
     }
-    alloc(Value::Relation(result))
+
+    // Dedup via SQLite
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    if let Some(result) = sql_dedup(&db_ref.conn, &all) {
+        return alloc(Value::Relation(result));
+    }
+
+    // Fallback: in-memory dedup
+    alloc(Value::Relation(in_memory_dedup(all)))
 }
 
 /// fold(f, init, rel) — left fold over a relation
@@ -1313,17 +1767,31 @@ pub extern "C" fn knot_relation_single(rel: *mut Value) -> *mut Value {
 
 /// diff(a, b) — rows in a but not in b
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_diff(a: *mut Value, b: *mut Value) -> *mut Value {
+pub extern "C" fn knot_relation_diff(
+    db: *mut c_void,
+    a: *mut Value,
+    b: *mut Value,
+) -> *mut Value {
     let rows_a = match unsafe { as_ref(a) } {
-        Value::Relation(rows) => rows.clone(),
+        Value::Relation(rows) => rows,
         _ => panic!("knot runtime: diff expected Relation, got {}", type_name(a)),
     };
     let rows_b = match unsafe { as_ref(b) } {
-        Value::Relation(rows) => rows.clone(),
+        Value::Relation(rows) => rows,
         _ => panic!("knot runtime: diff expected Relation, got {}", type_name(b)),
     };
+
+    if rows_a.is_empty() || rows_b.is_empty() { return a; }
+
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    if let Some(result) = sql_set_op(&db_ref.conn, rows_a, rows_b, "EXCEPT") {
+        return alloc(Value::Relation(result));
+    }
+
+    // Fallback: in-memory
     let result: Vec<*mut Value> = rows_a
-        .into_iter()
+        .iter()
+        .copied()
         .filter(|r| !rows_b.iter().any(|b| values_equal(*r, *b)))
         .collect();
     alloc(Value::Relation(result))
@@ -1331,23 +1799,39 @@ pub extern "C" fn knot_relation_diff(a: *mut Value, b: *mut Value) -> *mut Value
 
 /// inter(a, b) — rows in both a and b
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_inter(a: *mut Value, b: *mut Value) -> *mut Value {
+pub extern "C" fn knot_relation_inter(
+    db: *mut c_void,
+    a: *mut Value,
+    b: *mut Value,
+) -> *mut Value {
     let rows_a = match unsafe { as_ref(a) } {
-        Value::Relation(rows) => rows.clone(),
+        Value::Relation(rows) => rows,
         _ => panic!(
             "knot runtime: inter expected Relation, got {}",
             type_name(a)
         ),
     };
     let rows_b = match unsafe { as_ref(b) } {
-        Value::Relation(rows) => rows.clone(),
+        Value::Relation(rows) => rows,
         _ => panic!(
             "knot runtime: inter expected Relation, got {}",
             type_name(b)
         ),
     };
+
+    if rows_a.is_empty() || rows_b.is_empty() {
+        return alloc(Value::Relation(Vec::new()));
+    }
+
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    if let Some(result) = sql_set_op(&db_ref.conn, rows_a, rows_b, "INTERSECT") {
+        return alloc(Value::Relation(result));
+    }
+
+    // Fallback: in-memory
     let result: Vec<*mut Value> = rows_a
-        .into_iter()
+        .iter()
+        .copied()
         .filter(|r| rows_b.iter().any(|b| values_equal(*r, *b)))
         .collect();
     alloc(Value::Relation(result))
@@ -4961,10 +5445,21 @@ pub extern "C" fn knot_relation_fixpoint(
 ) -> *mut Value {
     let body_fn: extern "C" fn(*mut c_void, *mut Value) -> *mut Value =
         unsafe { std::mem::transmute(body) };
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
     let mut current = initial;
     for _ in 0..10_000 {
         let next = body_fn(db, current);
-        if values_equal(current, next) {
+
+        // Try SQL-based equality check (O(n log n) via EXCEPT)
+        let equal = match (unsafe { as_ref(current) }, unsafe { as_ref(next) }) {
+            (Value::Relation(curr_rows), Value::Relation(next_rows)) => {
+                sql_relations_equal(&db_ref.conn, curr_rows, next_rows)
+                    .unwrap_or_else(|| values_equal(current, next))
+            }
+            _ => values_equal(current, next),
+        };
+
+        if equal {
             return next;
         }
         current = next;

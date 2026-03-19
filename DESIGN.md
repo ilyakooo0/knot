@@ -314,14 +314,6 @@ filter = \p rel -> do
   yield x
 ```
 
-**`project`** — pick fields (just `yield` with fewer fields):
-
-```knot
-projectName = \rel -> do
-  x <- rel
-  yield {x.name}
-```
-
 **`join`** — combine relations on a condition:
 
 ```knot
@@ -410,7 +402,7 @@ Derived combinators like `filter` compose with `|>`:
 &highEarners =
   *employees
     |> filter (\e -> e.salary > 150000)
-    |> project {name, salary}
+    |> map (\e -> {name: e.name, salary: e.salary})
 ```
 
 ### Querying by Variant: `match`
@@ -961,7 +953,7 @@ Optional history tracking:
 salaryLastYear = \name ->
   *employees @(now - 365 days)
     |> filter (\e -> e.name == name)
-    |> project {salary}
+    |> map (\e -> e.salary)
     |> single
 ```
 

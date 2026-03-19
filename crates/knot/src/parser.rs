@@ -216,9 +216,10 @@ impl Parser {
 
     /// Expect a lower-case identifier, returning the name.
     fn expect_lower(&mut self, msg: &str) -> Result<(Name, Span), ()> {
-        match self.peek().clone() {
-            TokenKind::Lower(n) => {
+        match self.peek() {
+            TokenKind::Lower(_) => {
                 let tok = self.advance();
+                let TokenKind::Lower(n) = tok.kind else { unreachable!() };
                 Ok((n, tok.span))
             }
             TokenKind::Where
@@ -252,9 +253,10 @@ impl Parser {
 
     /// Expect an upper-case identifier, returning the name.
     fn expect_upper(&mut self, msg: &str) -> Result<(Name, Span), ()> {
-        match self.peek().clone() {
-            TokenKind::Upper(n) => {
+        match self.peek() {
+            TokenKind::Upper(_) => {
                 let tok = self.advance();
+                let TokenKind::Upper(n) = tok.kind else { unreachable!() };
                 Ok((n, tok.span))
             }
             _ => {
@@ -308,9 +310,13 @@ impl Parser {
                     path.push('.');
                 }
             } else {
-                match self.peek().clone() {
-                    TokenKind::Lower(name) | TokenKind::Upper(name) => {
-                        self.advance();
+                match self.peek() {
+                    TokenKind::Lower(_) | TokenKind::Upper(_) => {
+                        let tok = self.advance();
+                        let name = match tok.kind {
+                            TokenKind::Lower(n) | TokenKind::Upper(n) => n,
+                            _ => unreachable!(),
+                        };
                         path.push_str(&name);
                     }
                     _ => {
@@ -331,10 +337,13 @@ impl Parser {
                     break;
                 }
                 let item_span = self.span();
-                let name = match self.peek().clone() {
-                    TokenKind::Upper(n) | TokenKind::Lower(n) => {
-                        self.advance();
-                        n
+                let name = match self.peek() {
+                    TokenKind::Upper(_) | TokenKind::Lower(_) => {
+                        let tok = self.advance();
+                        match tok.kind {
+                            TokenKind::Upper(n) | TokenKind::Lower(n) => n,
+                            _ => unreachable!(),
+                        }
                     }
                     _ => {
                         self.error("expected name in import list");
@@ -395,7 +404,7 @@ impl Parser {
 impl Parser {
     fn parse_decl(&mut self) -> Option<Decl> {
         let start = self.span();
-        match self.peek().clone() {
+        match self.peek() {
             TokenKind::Data => self.parse_data(),
             TokenKind::Type => self.parse_type_alias(),
             TokenKind::Star => self.parse_source_or_view(),
@@ -423,8 +432,9 @@ impl Parser {
 
         // Parse type parameters (lowercase identifiers before `=`).
         let mut params = Vec::new();
-        while let TokenKind::Lower(p) = self.peek().clone() {
-            self.advance();
+        while matches!(self.peek(), TokenKind::Lower(_)) {
+            let tok = self.advance();
+            let TokenKind::Lower(p) = tok.kind else { unreachable!() };
             params.push(p);
         }
 
@@ -448,8 +458,9 @@ impl Parser {
         if self.eat(&TokenKind::Deriving) {
             self.expect(&TokenKind::LParen, "expected '(' after 'deriving'").ok()?;
             loop {
-                if let TokenKind::Upper(n) = self.peek().clone() {
-                    self.advance();
+                if matches!(self.peek(), TokenKind::Upper(_)) {
+                    let tok = self.advance();
+                    let TokenKind::Upper(n) = tok.kind else { unreachable!() };
                     deriving.push(n);
                 } else {
                     break;
@@ -513,8 +524,9 @@ impl Parser {
         let (name, _) = self.expect_upper("expected type name after 'type'").ok()?;
 
         let mut params = Vec::new();
-        while let TokenKind::Lower(p) = self.peek().clone() {
-            self.advance();
+        while matches!(self.peek(), TokenKind::Lower(_)) {
+            let tok = self.advance();
+            let TokenKind::Lower(p) = tok.kind else { unreachable!() };
             params.push(p);
         }
 
@@ -780,8 +792,9 @@ impl Parser {
                 self.expect(&TokenKind::RParen, "expected ')' after trait parameter")
                     .ok()?;
                 params.push(TraitParam { name: pname, kind });
-            } else if let TokenKind::Lower(pname) = self.peek().clone() {
-                self.advance();
+            } else if matches!(self.peek(), TokenKind::Lower(_)) {
+                let tok = self.advance();
+                let TokenKind::Lower(pname) = tok.kind else { unreachable!() };
                 params.push(TraitParam {
                     name: pname,
                     kind: None,
@@ -821,8 +834,9 @@ impl Parser {
             self.advance();
             let (name, _) = self.expect_upper("expected associated type name").ok()?;
             let mut assoc_params = Vec::new();
-            while let TokenKind::Lower(p) = self.peek().clone() {
-                self.advance();
+            while matches!(self.peek(), TokenKind::Lower(_)) {
+                let tok = self.advance();
+                let TokenKind::Lower(p) = tok.kind else { unreachable!() };
                 assoc_params.push(p);
             }
             return Some(TraitItem::AssociatedType {
@@ -833,7 +847,7 @@ impl Parser {
 
         // Method: name : type_scheme  (or name params = expr for default)
         // Allow `yield` keyword as a method name in trait definitions
-        let method_name = match self.peek().clone() {
+        let method_name = match self.peek() {
             TokenKind::Lower(_) => Some(self.expect_lower("expected method name").ok()?.0),
             TokenKind::Yield => {
                 self.advance();
@@ -969,7 +983,7 @@ impl Parser {
 
         // Method: name params* = expr
         // Allow `yield` keyword as a method name in impl definitions
-        let method_name = match self.peek().clone() {
+        let method_name = match self.peek() {
             TokenKind::Lower(_) => Some(self.expect_lower("expected method name in impl").ok()?.0),
             TokenKind::Yield => {
                 self.advance();
@@ -1195,12 +1209,14 @@ impl Parser {
                     }
                 }
                 let _ = self.expect(&TokenKind::RBrace, "expected '}' to close path parameter");
-            } else if let TokenKind::Lower(s) = self.peek().clone() {
-                self.advance();
+            } else if matches!(self.peek(), TokenKind::Lower(_)) {
+                let tok = self.advance();
+                let TokenKind::Lower(s) = tok.kind else { unreachable!() };
                 segments.push(PathSegment::Literal(s));
-            } else if let TokenKind::Upper(s) = self.peek().clone() {
+            } else if matches!(self.peek(), TokenKind::Upper(_)) {
                 // uppercase segment like /api/v1 — unlikely but handle
-                self.advance();
+                let tok = self.advance();
+                let TokenKind::Upper(s) = tok.kind else { unreachable!() };
                 segments.push(PathSegment::Literal(s));
             } else {
                 // Just a trailing `/`
@@ -1275,8 +1291,9 @@ impl Parser {
         let mut constraints = Vec::new();
         loop {
             let saved = self.save();
-            if let TokenKind::Upper(trait_name) = self.peek().clone() {
-                self.advance();
+            if matches!(self.peek(), TokenKind::Upper(_)) {
+                let tok = self.advance();
+                let TokenKind::Upper(trait_name) = tok.kind else { unreachable!() };
                 let mut args = Vec::new();
                 while self.can_start_type_atom()
                     && !self.at(&TokenKind::FatArrow)
@@ -1603,31 +1620,37 @@ impl Parser {
 
     fn parse_atom(&mut self) -> Option<Expr> {
         let start = self.span();
-        match self.peek().clone() {
-            TokenKind::Int(n) => {
+        match self.peek() {
+            TokenKind::Int(_) => {
                 let tok = self.advance();
+                let TokenKind::Int(n) = tok.kind else { unreachable!() };
                 let lit = Spanned::new(ExprKind::Lit(Literal::Int(n)), tok.span);
                 self.maybe_time_unit(lit)
             }
-            TokenKind::Float(f) => {
+            TokenKind::Float(_) => {
                 let tok = self.advance();
+                let TokenKind::Float(f) = tok.kind else { unreachable!() };
                 let lit = Spanned::new(ExprKind::Lit(Literal::Float(f)), tok.span);
                 self.maybe_time_unit(lit)
             }
-            TokenKind::Text(s) => {
+            TokenKind::Text(_) => {
                 let tok = self.advance();
+                let TokenKind::Text(s) = tok.kind else { unreachable!() };
                 Some(Spanned::new(ExprKind::Lit(Literal::Text(s)), tok.span))
             }
-            TokenKind::Bytes(b) => {
+            TokenKind::Bytes(_) => {
                 let tok = self.advance();
+                let TokenKind::Bytes(b) = tok.kind else { unreachable!() };
                 Some(Spanned::new(ExprKind::Lit(Literal::Bytes(b)), tok.span))
             }
-            TokenKind::Lower(name) => {
+            TokenKind::Lower(_) => {
                 let tok = self.advance();
+                let TokenKind::Lower(name) = tok.kind else { unreachable!() };
                 Some(Spanned::new(ExprKind::Var(name), tok.span))
             }
-            TokenKind::Upper(name) => {
+            TokenKind::Upper(_) => {
                 let tok = self.advance();
+                let TokenKind::Upper(name) = tok.kind else { unreachable!() };
                 Some(Spanned::new(ExprKind::Constructor(name), tok.span))
             }
             TokenKind::Full => {
@@ -1637,9 +1660,10 @@ impl Parser {
             TokenKind::Star => {
                 // *name — source reference
                 self.advance();
-                match self.peek().clone() {
-                    TokenKind::Lower(name) => {
+                match self.peek() {
+                    TokenKind::Lower(_) => {
                         let tok = self.advance();
+                        let TokenKind::Lower(name) = tok.kind else { unreachable!() };
                         Some(Spanned::new(
                             ExprKind::SourceRef(name),
                             Span::new(start.start, tok.span.end),
@@ -1654,9 +1678,10 @@ impl Parser {
             TokenKind::Ampersand => {
                 // &name — derived reference
                 self.advance();
-                match self.peek().clone() {
-                    TokenKind::Lower(name) => {
+                match self.peek() {
+                    TokenKind::Lower(_) => {
                         let tok = self.advance();
+                        let TokenKind::Lower(name) = tok.kind else { unreachable!() };
                         Some(Spanned::new(
                             ExprKind::DerivedRef(name),
                             Span::new(start.start, tok.span.end),
@@ -1799,12 +1824,12 @@ impl Parser {
                 break;
             }
 
-            if let TokenKind::Lower(ref fname) = self.peek().clone() {
-                let fname = fname.clone();
+            if matches!(self.peek(), TokenKind::Lower(_)) {
                 // Check if next token after the identifier is `:` (record literal field)
                 if matches!(self.peek_ahead(1), TokenKind::Colon) {
                     // Record literal field: name: expr
-                    self.advance(); // consume name
+                    let tok = self.advance(); // consume name
+                    let TokenKind::Lower(fname) = tok.kind else { unreachable!() };
                     self.advance(); // consume `:`
                     let val = self.parse_expr()?;
                     fields.push(Field {
@@ -2175,17 +2200,19 @@ impl Parser {
 
     fn parse_pat(&mut self) -> Option<Pat> {
         let start = self.span();
-        match self.peek().clone() {
+        match self.peek() {
             TokenKind::Underscore => {
                 let tok = self.advance();
                 Some(Spanned::new(PatKind::Wildcard, tok.span))
             }
-            TokenKind::Lower(name) => {
+            TokenKind::Lower(_) => {
                 let tok = self.advance();
+                let TokenKind::Lower(name) = tok.kind else { unreachable!() };
                 Some(Spanned::new(PatKind::Var(name), tok.span))
             }
-            TokenKind::Upper(name) => {
+            TokenKind::Upper(_) => {
                 let tok = self.advance();
+                let TokenKind::Upper(name) = tok.kind else { unreachable!() };
                 // Constructor pattern: Upper payload
                 // Payload can be a record pattern `{...}` or a variable.
                 let payload = if self.can_start_pat_atom() {
@@ -2225,20 +2252,24 @@ impl Parser {
                     .ok()?;
                 Some(Spanned::new(inner.node, Span::new(start.start, end_tok.span.end)))
             }
-            TokenKind::Int(n) => {
+            TokenKind::Int(_) => {
                 let tok = self.advance();
+                let TokenKind::Int(n) = tok.kind else { unreachable!() };
                 Some(Spanned::new(PatKind::Lit(Literal::Int(n)), tok.span))
             }
-            TokenKind::Float(f) => {
+            TokenKind::Float(_) => {
                 let tok = self.advance();
+                let TokenKind::Float(f) = tok.kind else { unreachable!() };
                 Some(Spanned::new(PatKind::Lit(Literal::Float(f)), tok.span))
             }
-            TokenKind::Text(s) => {
+            TokenKind::Text(_) => {
                 let tok = self.advance();
+                let TokenKind::Text(s) = tok.kind else { unreachable!() };
                 Some(Spanned::new(PatKind::Lit(Literal::Text(s)), tok.span))
             }
-            TokenKind::Bytes(b) => {
+            TokenKind::Bytes(_) => {
                 let tok = self.advance();
+                let TokenKind::Bytes(b) = tok.kind else { unreachable!() };
                 Some(Spanned::new(PatKind::Lit(Literal::Bytes(b)), tok.span))
             }
             _ => {
@@ -2267,13 +2298,14 @@ impl Parser {
     /// Parse a pattern atom (non-constructor patterns, for use as constructor payloads).
     fn parse_pat_atom(&mut self) -> Option<Pat> {
         let start = self.span();
-        match self.peek().clone() {
+        match self.peek() {
             TokenKind::Underscore => {
                 let tok = self.advance();
                 Some(Spanned::new(PatKind::Wildcard, tok.span))
             }
-            TokenKind::Lower(name) => {
+            TokenKind::Lower(_) => {
                 let tok = self.advance();
+                let TokenKind::Lower(name) = tok.kind else { unreachable!() };
                 Some(Spanned::new(PatKind::Var(name), tok.span))
             }
             TokenKind::LBrace => {
@@ -2298,20 +2330,24 @@ impl Parser {
                     .ok()?;
                 Some(Spanned::new(inner.node, Span::new(start.start, end_tok.span.end)))
             }
-            TokenKind::Int(n) => {
+            TokenKind::Int(_) => {
                 let tok = self.advance();
+                let TokenKind::Int(n) = tok.kind else { unreachable!() };
                 Some(Spanned::new(PatKind::Lit(Literal::Int(n)), tok.span))
             }
-            TokenKind::Float(f) => {
+            TokenKind::Float(_) => {
                 let tok = self.advance();
+                let TokenKind::Float(f) = tok.kind else { unreachable!() };
                 Some(Spanned::new(PatKind::Lit(Literal::Float(f)), tok.span))
             }
-            TokenKind::Text(s) => {
+            TokenKind::Text(_) => {
                 let tok = self.advance();
+                let TokenKind::Text(s) = tok.kind else { unreachable!() };
                 Some(Spanned::new(PatKind::Lit(Literal::Text(s)), tok.span))
             }
-            TokenKind::Bytes(b) => {
+            TokenKind::Bytes(_) => {
                 let tok = self.advance();
+                let TokenKind::Bytes(b) = tok.kind else { unreachable!() };
                 Some(Spanned::new(PatKind::Lit(Literal::Bytes(b)), tok.span))
             }
             _ => {
@@ -2435,13 +2471,15 @@ impl Parser {
 
     fn parse_type_atom(&mut self) -> Option<Type> {
         let start = self.span();
-        match self.peek().clone() {
-            TokenKind::Upper(name) => {
+        match self.peek() {
+            TokenKind::Upper(_) => {
                 let tok = self.advance();
+                let TokenKind::Upper(name) = tok.kind else { unreachable!() };
                 Some(Spanned::new(TypeKind::Named(name), tok.span))
             }
-            TokenKind::Lower(name) => {
+            TokenKind::Lower(_) => {
                 let tok = self.advance();
+                let TokenKind::Lower(name) = tok.kind else { unreachable!() };
                 Some(Spanned::new(TypeKind::Var(name), tok.span))
             }
             TokenKind::Underscore => {
@@ -2676,10 +2714,11 @@ impl Parser {
                 self.advance();
                 self.skip_newlines();
                 // Could be a rest variable or another constructor.
-                if let TokenKind::Lower(name) = self.peek().clone() {
+                if matches!(self.peek(), TokenKind::Lower(_)) {
                     // Check if this is followed by `>` — if so, it's a rest variable.
                     if matches!(self.peek_ahead(1), TokenKind::Gt) {
-                        self.advance();
+                        let tok = self.advance();
+                        let TokenKind::Lower(name) = tok.kind else { unreachable!() };
                         rest = Some(name);
                         break;
                     }
@@ -2688,9 +2727,10 @@ impl Parser {
             }
             if let TokenKind::Upper(_) = self.peek() {
                 constructors.push(self.parse_constructor_def()?);
-            } else if let TokenKind::Lower(name) = self.peek().clone() {
+            } else if matches!(self.peek(), TokenKind::Lower(_)) {
                 // Rest variable.
-                self.advance();
+                let tok = self.advance();
+                let TokenKind::Lower(name) = tok.kind else { unreachable!() };
                 rest = Some(name);
                 break;
             } else {

@@ -3,6 +3,10 @@ name = "knot-compiler"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+name = "knot_compiler"
+path = "src/lib.rs"
+
 [[bin]]
 name = "knotc"
 path = "src/main.rs"

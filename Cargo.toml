@@ -8,6 +8,7 @@ edition = "2024"
 
 [workspace.dependencies]
 knot = { path = "crates/knot" }
+knot-compiler = { path = "crates/knot-compiler" }
 knot-runtime = { path = "crates/knot-runtime" }
 cranelift-codegen = "0.116"
 cranelift-frontend = "0.116"

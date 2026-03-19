@@ -2,16 +2,7 @@
 //!
 //! Usage: knotc build <file.knot>
 
-mod codegen;
-mod desugar;
-mod effects;
-mod infer;
-mod linker;
-mod lockfile;
-mod base;
-mod modules;
-mod stratify;
-mod types;
+use knot_compiler::{base, codegen, desugar, effects, infer, linker, lockfile, modules, stratify, types};
 
 use std::path::PathBuf;
 use std::process;

@@ -423,11 +423,13 @@ impl<'src> Lexer<'src> {
                     break;
                 }
             }
-            let raw = self.slice(start, self.pos).replace('_', "");
+            let slice = self.slice(start, self.pos);
+            let raw = if slice.contains('_') { slice.replace('_', "") } else { slice.to_string() };
             let value = raw.parse::<f64>().unwrap_or(0.0);
             TokenKind::Float(value)
         } else {
-            let raw = self.slice(start, self.pos).replace('_', "");
+            let slice = self.slice(start, self.pos);
+            let raw = if slice.contains('_') { slice.replace('_', "") } else { slice.to_string() };
             TokenKind::Int(raw)
         }
     }

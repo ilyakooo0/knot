@@ -726,9 +726,11 @@ fn read_temp_row(row: &rusqlite::Row, schema: &TempSchema) -> *mut Value {
                 if fields.is_empty() {
                     alloc(Value::Unit)
                 } else {
+                    let field_idx: HashMap<&str, usize> = all_fields.iter().enumerate()
+                        .map(|(i, (n, _))| (n.as_str(), i)).collect();
                     let record = knot_record_empty(fields.len());
                     for (fname, fty) in fields {
-                        let col_idx = all_fields.iter().position(|(n, _)| n == fname).unwrap();
+                        let col_idx = field_idx[fname.as_str()];
                         let val = read_sql_column(row, col_idx + 1, *fty);
                         let name_bytes = fname.as_bytes();
                         knot_record_set_field(record, name_bytes.as_ptr(), name_bytes.len(), val);
@@ -1117,17 +1119,17 @@ pub extern "C" fn knot_relation_group_by(
                 _ => panic!("knot runtime: groupby rows must be Records"),
             };
 
-            let field_map: HashMap<&str, *mut Value> = fields.iter().map(|f| (f.name.as_str(), f.value)).collect();
             let mut params: Vec<rusqlite::types::Value> =
                 vec![rusqlite::types::Value::Integer(idx as i64)];
             for ks in &key_specs {
-                let value = field_map.get(ks.name.as_str()).unwrap_or_else(|| {
-                    panic!(
-                        "knot runtime: missing field '{}' in record",
-                        ks.name
-                    )
-                });
-                params.push(value_to_sqlite(*value, ks.ty));
+                let value = fields.iter().find(|f| f.name == ks.name)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "knot runtime: missing field '{}' in record",
+                            ks.name
+                        )
+                    });
+                params.push(value_to_sqlite(value.value, ks.ty));
             }
 
             let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -1580,8 +1582,14 @@ fn format_value(v: *mut Value) -> String {
         }
         Value::Text(s) => format!("\"{}\"", s),
         Value::Bytes(b) => {
-            let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
-            format!("b\"{}\"", hex)
+            let mut hex = String::with_capacity(b.len() * 2 + 3);
+            hex.push_str("b\"");
+            for byte in b {
+                use std::fmt::Write;
+                let _ = write!(hex, "{:02x}", byte);
+            }
+            hex.push('"');
+            hex
         }
         Value::Bool(b) => {
             if *b {
@@ -2853,7 +2861,7 @@ fn is_adt_schema(spec: &str) -> bool {
 fn parse_adt_schema(spec: &str) -> AdtSpec {
     let body = &spec[1..]; // strip '#'
     let mut constructors = Vec::new();
-    let mut all_field_names: Vec<String> = Vec::new();
+    let mut all_field_names: HashSet<String> = HashSet::new();
     let mut all_fields: Vec<ColumnSpec> = Vec::new();
 
     for ctor_part in body.split('|') {
@@ -2886,8 +2894,7 @@ fn parse_adt_schema(spec: &str) -> AdtSpec {
 
         // Add unique fields to the all_fields list
         for f in &fields {
-            if !all_field_names.contains(&f.name) {
-                all_field_names.push(f.name.clone());
+            if all_field_names.insert(f.name.clone()) {
                 all_fields.push(ColumnSpec {
                     name: f.name.clone(),
                     ty: f.ty,
@@ -3159,9 +3166,9 @@ fn auto_apply_adt_change(
     }
 
     // Add new columns for new constructor fields
-    let old_field_names: Vec<&str> = old_adt.all_fields.iter().map(|f| f.name.as_str()).collect();
+    let old_field_names: HashSet<&str> = old_adt.all_fields.iter().map(|f| f.name.as_str()).collect();
     for f in &new_adt.all_fields {
-        if !old_field_names.contains(&f.name.as_str()) {
+        if !old_field_names.contains(f.name.as_str()) {
             let sql = format!(
                 "ALTER TABLE {} ADD COLUMN {} {};",
                 quote_ident(table),
@@ -3241,9 +3248,9 @@ fn auto_apply_record_change(
     }
 
     // Add new columns
-    let old_col_names: Vec<&str> = old_rec.columns.iter().map(|c| c.name.as_str()).collect();
+    let old_col_names: HashSet<&str> = old_rec.columns.iter().map(|c| c.name.as_str()).collect();
     for c in &new_rec.columns {
-        if !old_col_names.contains(&c.name.as_str()) {
+        if !old_col_names.contains(c.name.as_str()) {
             let sql = format!(
                 "ALTER TABLE {} ADD COLUMN {} {};",
                 quote_ident(table),
@@ -3278,9 +3285,9 @@ fn auto_apply_record_change(
     }
 
     // Initialize any new child tables for nested relations
-    let old_nested_names: Vec<&str> = old_rec.nested.iter().map(|n| n.name.as_str()).collect();
+    let old_nested_names: HashSet<&str> = old_rec.nested.iter().map(|n| n.name.as_str()).collect();
     for nf in &new_rec.nested {
-        if !old_nested_names.contains(&nf.name.as_str()) {
+        if !old_nested_names.contains(nf.name.as_str()) {
             init_child_table(conn, table, nf);
         }
     }
@@ -6127,15 +6134,12 @@ fn generate_openapi(name: &str, table: &RouteTable) -> String {
     out.push_str("  \"paths\": {\n");
 
     // Group entries by path
-    let mut paths: Vec<(String, Vec<&RouteTableEntry>)> = Vec::new();
+    let mut path_map: HashMap<String, Vec<&RouteTableEntry>> = HashMap::new();
     for entry in &table.entries {
         let path_str = openapi_path(&entry.path_parts);
-        if let Some(group) = paths.iter_mut().find(|(p, _)| *p == path_str) {
-            group.1.push(entry);
-        } else {
-            paths.push((path_str, vec![entry]));
-        }
+        path_map.entry(path_str).or_default().push(entry);
     }
+    let paths: Vec<(String, Vec<&RouteTableEntry>)> = path_map.into_iter().collect();
 
     for (i, (path, entries)) in paths.iter().enumerate() {
         out.push_str(&format!("    \"{}\": {{\n", json_escape(path)));
@@ -6281,13 +6285,13 @@ fn openapi_path(parts: &[PathPart]) -> String {
     s
 }
 
-fn type_to_openapi_schema(ty: &str) -> String {
+fn type_to_openapi_schema(ty: &str) -> &'static str {
     match ty {
-        "int" => "{ \"type\": \"integer\" }".to_string(),
-        "float" => "{ \"type\": \"number\" }".to_string(),
-        "bool" => "{ \"type\": \"boolean\" }".to_string(),
-        "text" => "{ \"type\": \"string\" }".to_string(),
-        _ => "{ \"type\": \"string\" }".to_string(),
+        "int" => "{ \"type\": \"integer\" }",
+        "float" => "{ \"type\": \"number\" }",
+        "bool" => "{ \"type\": \"boolean\" }",
+        "text" => "{ \"type\": \"string\" }",
+        _ => "{ \"type\": \"string\" }",
     }
 }
 

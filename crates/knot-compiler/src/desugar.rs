@@ -38,12 +38,12 @@ fn desugar_routes(module: &mut Module) {
     let mut new_decls: Vec<Decl> = Vec::new();
 
     // Collect route entries by name for RouteComposite lookup
-    let route_map: std::collections::HashMap<String, Vec<RouteEntry>> = module
+    let route_map: std::collections::HashMap<&str, &Vec<RouteEntry>> = module
         .decls
         .iter()
         .filter_map(|d| {
             if let DeclKind::Route { name, entries } = &d.node {
-                Some((name.clone(), entries.clone()))
+                Some((name.as_str(), entries))
             } else {
                 None
             }
@@ -68,8 +68,8 @@ fn desugar_routes(module: &mut Module) {
             DeclKind::RouteComposite { name, components } => {
                 let mut all_entries = Vec::new();
                 for comp in components {
-                    if let Some(entries) = route_map.get(comp) {
-                        all_entries.extend(entries.clone());
+                    if let Some(entries) = route_map.get(comp.as_str()) {
+                        all_entries.extend(entries.iter().cloned());
                     }
                 }
                 let ctors = route_entries_to_constructors(&all_entries);

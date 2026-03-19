@@ -63,13 +63,18 @@ impl Diagnostic {
 /// Returns `(line, col)` for a byte offset. Line is 1-based, column is 0-based.
 pub fn line_col(source: &str, byte_offset: usize) -> (usize, usize) {
     let offset = byte_offset.min(source.len());
-    let before = &source[..offset];
-    let line = before.chars().filter(|&c| c == '\n').count() + 1;
-    let col = match before.rfind('\n') {
+    let before = source[..offset].as_bytes();
+    let line = before.iter().filter(|&&b| b == b'\n').count() + 1;
+    let col = match memrchr(b'\n', before) {
         Some(nl) => offset - nl - 1,
         None => offset,
     };
     (line, col)
+}
+
+/// Find the last occurrence of a byte in a slice.
+fn memrchr(needle: u8, haystack: &[u8]) -> Option<usize> {
+    haystack.iter().rposition(|&b| b == needle)
 }
 
 /// Returns the content of a 1-based line number. Returns `""` if out of bounds.
@@ -77,7 +82,23 @@ pub fn get_line(source: &str, line: usize) -> &str {
     if line == 0 {
         return "";
     }
-    source.split('\n').nth(line - 1).unwrap_or("")
+    // Find the start of the target line by counting newlines in bytes
+    let bytes = source.as_bytes();
+    let mut current_line = 1;
+    let mut start = 0;
+    while current_line < line {
+        match bytes[start..].iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                start += pos + 1;
+                current_line += 1;
+            }
+            None => return "",
+        }
+    }
+    // Find the end of this line
+    let end = bytes[start..].iter().position(|&b| b == b'\n')
+        .map_or(source.len(), |pos| start + pos);
+    &source[start..end]
 }
 
 // ── ANSI color helpers ───────────────────────────────────────────────
@@ -150,7 +171,7 @@ impl Diagnostic {
 
         // Compute gutter width from the largest line number we'll display.
         let max_line = by_line.keys().last().copied().unwrap_or(1);
-        let gutter = max_line.to_string().len();
+        let gutter = if max_line == 0 { 1 } else { (max_line.ilog10() + 1) as usize };
 
         for (&line_no, labels) in &by_line {
             let src_line = get_line(source, line_no);

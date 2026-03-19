@@ -417,12 +417,9 @@ impl Infer {
             (Ty::Con(n1, a1), Ty::Con(n2, a2))
                 if n1 == n2 && a1.len() == a2.len() =>
             {
-                let pairs: Vec<_> = a1
-                    .iter()
-                    .zip(a2.iter())
-                    .map(|(a, b)| (a.clone(), b.clone()))
-                    .collect();
-                for (a, b) in &pairs {
+                let a1 = a1.clone();
+                let a2 = a2.clone();
+                for (a, b) in a1.iter().zip(a2.iter()) {
                     self.unify(a, b, span);
                 }
             }

@@ -172,19 +172,18 @@ impl Parser {
         self.context.pop();
     }
 
-    fn error(&mut self, msg: impl Into<String>) -> Diagnostic {
-        self.error_at(self.span(), msg)
+    fn error(&mut self, msg: impl Into<String>) {
+        self.error_at(self.span(), msg);
     }
 
-    fn error_at(&mut self, span: Span, msg: impl Into<String>) -> Diagnostic {
+    fn error_at(&mut self, span: Span, msg: impl Into<String>) {
         let mut diag = Diagnostic::error(msg).label(span, "here");
         // Add context notes from the stack.
         for &(ctx, ctx_span) in self.context.iter().rev() {
             let (line, _) = crate::diagnostic::line_col(&self.source, ctx_span.start);
             diag = diag.note(format!("while parsing {ctx} starting at line {line}"));
         }
-        self.diagnostics.push(diag.clone());
-        diag
+        self.diagnostics.push(diag);
     }
 
     /// Skip tokens until we reach what looks like a new declaration boundary.

@@ -778,9 +778,10 @@ fn materialize_relation(conn: &Connection, rows: &[*mut Value], schema: &TempSch
 
 /// In-memory dedup fallback for relations that can't be stored in SQL.
 fn in_memory_dedup(rows: Vec<*mut Value>) -> Vec<*mut Value> {
-    let mut result: Vec<*mut Value> = Vec::new();
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
     for row in rows {
-        if !result.iter().any(|existing| values_equal(*existing, row)) {
+        if seen.insert(value_hash_key(row)) {
             result.push(row);
         }
     }
@@ -1188,6 +1189,86 @@ pub extern "C" fn knot_relation_group_by(
 
 // ── Value equality ────────────────────────────────────────────────
 
+/// Recursively serialize a Value to bytes for hash-based set comparison.
+fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
+    if v.is_null() {
+        buf.push(0xFF);
+        return;
+    }
+    match unsafe { as_ref(v) } {
+        Value::Int(n) => {
+            buf.push(0);
+            let bytes = n.to_signed_bytes_le();
+            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&bytes);
+        }
+        Value::Float(f) => {
+            buf.push(1);
+            buf.extend_from_slice(&f.to_bits().to_le_bytes());
+        }
+        Value::Text(s) => {
+            buf.push(2);
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+        Value::Bool(b) => {
+            buf.push(3);
+            buf.push(*b as u8);
+        }
+        Value::Bytes(b) => {
+            buf.push(4);
+            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(b);
+        }
+        Value::Unit => {
+            buf.push(5);
+        }
+        Value::Record(fields) => {
+            buf.push(6);
+            buf.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+            for field in fields {
+                buf.extend_from_slice(&(field.name.len() as u32).to_le_bytes());
+                buf.extend_from_slice(field.name.as_bytes());
+                value_to_hash_bytes(field.value, buf);
+            }
+        }
+        Value::Constructor(tag, payload) => {
+            buf.push(7);
+            buf.extend_from_slice(&(tag.len() as u32).to_le_bytes());
+            buf.extend_from_slice(tag.as_bytes());
+            value_to_hash_bytes(*payload, buf);
+        }
+        Value::Relation(rows) => {
+            buf.push(8);
+            buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+            // Sort serialized rows for order-independent comparison
+            let mut row_bytes: Vec<Vec<u8>> = rows
+                .iter()
+                .map(|r| {
+                    let mut rb = Vec::new();
+                    value_to_hash_bytes(*r, &mut rb);
+                    rb
+                })
+                .collect();
+            row_bytes.sort_unstable();
+            for rb in &row_bytes {
+                buf.extend_from_slice(&(rb.len() as u32).to_le_bytes());
+                buf.extend_from_slice(rb);
+            }
+        }
+        Value::Function(_, _, src) => {
+            buf.push(9);
+            buf.extend_from_slice(src.as_bytes());
+        }
+    }
+}
+
+fn value_hash_key(v: *mut Value) -> Vec<u8> {
+    let mut buf = Vec::new();
+    value_to_hash_bytes(v, &mut buf);
+    buf
+}
+
 fn values_equal(a: *mut Value, b: *mut Value) -> bool {
     if a == b {
         return true;
@@ -1219,11 +1300,9 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
             if ra.len() != rb.len() {
                 return false;
             }
-            ra.iter()
-                .all(|row_a| rb.iter().any(|row_b| values_equal(*row_a, *row_b)))
-                && rb
-                    .iter()
-                    .all(|row_b| ra.iter().any(|row_a| values_equal(*row_a, *row_b)))
+            let set_a: HashSet<Vec<u8>> = ra.iter().map(|r| value_hash_key(*r)).collect();
+            let set_b: HashSet<Vec<u8>> = rb.iter().map(|r| value_hash_key(*r)).collect();
+            set_a == set_b
         }
         _ => false,
     }

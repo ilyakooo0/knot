@@ -425,6 +425,23 @@ pub extern "C" fn knot_record_set_field(
     }
 }
 
+/// Batch-construct a record from pre-sorted field pairs.
+/// `data` points to a flat array of triples: [key_ptr, key_len, value, ...]
+/// where each element is pointer-sized. Fields MUST be pre-sorted by name.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_record_from_pairs(data: *const usize, count: usize) -> *mut Value {
+    let mut fields = Vec::with_capacity(count);
+    for i in 0..count {
+        let offset = i * 3;
+        let key_ptr = unsafe { *data.add(offset) as *const u8 };
+        let key_len = unsafe { *data.add(offset + 1) };
+        let value = unsafe { *data.add(offset + 2) as *mut Value };
+        let name = unsafe { str_from_raw(key_ptr, key_len) }.to_string();
+        fields.push(RecordField { name, value });
+    }
+    alloc(Value::Record(fields))
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_record_field(
     record: *mut Value,
@@ -472,6 +489,16 @@ pub extern "C" fn knot_record_field(
             "knot runtime: expected Record in field access, got {}",
             brief_value(record)
         ),
+    }
+}
+
+/// Direct index-based field access for closure environments.
+/// Index corresponds to the field's position in sorted order.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_record_field_by_index(record: *mut Value, index: usize) -> *mut Value {
+    match unsafe { as_ref(record) } {
+        Value::Record(fields) => fields[index].value,
+        _ => panic!("knot runtime: expected Record in field_by_index, got {}", type_name(record)),
     }
 }
 
@@ -1497,15 +1524,17 @@ pub extern "C" fn knot_value_or(a: *mut Value, b: *mut Value) -> *mut Value {
 pub extern "C" fn knot_value_concat(a: *mut Value, b: *mut Value) -> *mut Value {
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Text(x), Value::Text(y)) => {
-            let mut s = x.clone();
+            let mut s = String::with_capacity(x.len() + y.len());
+            s.push_str(x);
             s.push_str(y);
             alloc(Value::Text(s))
         }
         (Value::Relation(rows_a), Value::Relation(rows_b)) => {
             // ++ on relations is union (in-memory hash-based dedup)
-            let mut seen = HashSet::new();
-            let mut result = Vec::new();
-            let mut buf = Vec::new();
+            let total = rows_a.len() + rows_b.len();
+            let mut seen = HashSet::with_capacity(total);
+            let mut result = Vec::with_capacity(total);
+            let mut buf = Vec::with_capacity(128);
             for &row in rows_a.iter().chain(rows_b.iter()) {
                 buf.clear();
                 value_to_hash_bytes(row, &mut buf);

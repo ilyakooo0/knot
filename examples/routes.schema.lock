@@ -1,21 +1,6 @@
 -- schema.lock (auto-generated, do not edit)
 -- Commit to source control.
 
-route TodoApi where
-  /todos
-    GET /{owner: Text} -> [Todo] = GetTodos
-    POST {title: Text, owner: Text, priority: Text} / -> Todo = CreateTodo
-
-
-
-route AdminApi where
-  /admin
-    GET /count -> Int = GetCount
-
-
-
-route Api = TodoApi | AdminApi
-
 data Priority = Low {} | Medium {} | High {} | Critical {}
 
 

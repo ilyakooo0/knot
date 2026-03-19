@@ -1,9 +1,5 @@
 -- schema.lock (auto-generated, do not edit)
 -- Commit to source control.
 
-king on source relations
-
-*employees : 
-
 *employees : [{name: Text, salary: Int}]
   with history

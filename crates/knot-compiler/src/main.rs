@@ -82,6 +82,10 @@ fn cmd_build(source_file: &str) {
         process::exit(1);
     }
 
+    // Save original decls before mutations (imports/prelude/desugar add decls
+    // with spans referencing other source texts — lockfile needs original spans).
+    let original_decls = module.decls.clone();
+
     // Resolve imports — load, parse, and merge imported modules
     if let Err(diags) = modules::resolve_imports(&mut module, &source_path) {
         for diag in &diags {
@@ -187,8 +191,13 @@ fn cmd_build(source_file: &str) {
     // Clean up
     let _ = std::fs::remove_file(&obj_path);
 
-    // Update schema lockfile
-    if let Err(e) = lockfile::update(&source_path, &source, &module) {
+    // Update schema lockfile (use original decls — the mutated module contains
+    // prelude/import decls whose spans don't correspond to this source text).
+    let lockfile_module = knot::ast::Module {
+        imports: vec![],
+        decls: original_decls,
+    };
+    if let Err(e) = lockfile::update(&source_path, &source, &lockfile_module) {
         eprintln!("Warning: {}", e);
     }
 

@@ -1,0 +1,11 @@
+-- schema.lock (auto-generated, do not edit)
+-- Commit to source control.
+
+data Status = Open {} | Done {}
+
+
+
+type Todo = {title: Text, owner: Text, status: Status}
+
+*todos : [Todo]
+  with history

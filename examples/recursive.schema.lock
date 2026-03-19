@@ -1,10 +1,6 @@
 -- schema.lock (auto-generated, do not edit)
 -- Commit to source control.
 
-e closure)
---
--- &reportsTo computes th
-
 *manages : [{manager: Text, report: Text}]
 
 

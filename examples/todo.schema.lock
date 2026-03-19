@@ -1,12 +1,6 @@
 -- schema.lock (auto-generated, do not edit)
 -- Commit to source control.
 
-ne: Int}
-
-*todos : [Todo]
-
-add = \title
-
 type Todo = {title: Text, owner: Text, done: Int}
 
 *todos : [Todo]

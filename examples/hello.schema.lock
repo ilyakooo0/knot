@@ -1,11 +1,6 @@
 -- schema.lock (auto-generated, do not edit)
 -- Commit to source control.
 
-ople : [Person]
-
-main = do
-  set *peopl
-
 type Person = {name: Text, age: Int}
 
 *people : [Person]

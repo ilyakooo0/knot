@@ -354,6 +354,7 @@ impl Codegen {
         self.declare_rt("knot_record_field_by_index", &[p, p], &[p]);
         self.declare_rt("knot_record_from_pairs", &[p, p], &[p]);
         self.declare_rt("knot_record_update", &[p], &[p]);
+        self.declare_rt("knot_record_update_batch", &[p, p, p], &[p]);
 
         // Relation operations
         self.declare_rt("knot_relation_empty", &[], &[p]);
@@ -388,6 +389,7 @@ impl Codegen {
 
         // Comparison (returns Ordering ADT)
         self.declare_rt("knot_value_compare", &[p, p], &[p]);
+        self.declare_rt("knot_ordering_tag_i32", &[p], &[types::I32]);
 
         // Unary operations
         self.declare_rt("knot_value_negate", &[p], &[p]);
@@ -438,6 +440,9 @@ impl Codegen {
         // Constructor matching
         self.declare_rt("knot_constructor_matches", &[p, p, p], &[types::I32]);
         self.declare_rt("knot_constructor_payload", &[p], &[p]);
+        self.declare_rt("knot_constructor_tag_ptr", &[p], &[p]);
+        self.declare_rt("knot_constructor_tag_len", &[p], &[p]);
+        self.declare_rt("knot_str_eq", &[p, p, p, p], &[types::I32]);
         self.declare_rt("knot_ensure_relation", &[p], &[p]);
 
         // Trait dispatch error
@@ -606,8 +611,8 @@ impl Codegen {
     }
 
     /// Define a 2-param stdlib function using currying:
-    /// outer(db, arg1) -> Function(inner, env={arg1}, name)
-    /// inner(db, env, arg2) -> rt_fn(db, arg1, arg2)
+    /// outer(db, arg1) -> Function(inner, arg1, name)  — arg1 passed directly as env
+    /// inner(db, env=arg1, arg2) -> rt_fn(db, arg1, arg2)
     fn define_stdlib_fn_2(
         &mut self,
         name: &str,
@@ -616,7 +621,7 @@ impl Codegen {
     ) {
         let inner_id = self.declare_closure_fn(&format!("__stdlib_{}_apply", name));
 
-        // Define the outer function: captures arg1, returns closure
+        // Define the outer function: passes arg1 directly as env (no record allocation)
         let (func_id, _) = self.user_fns[name];
         let mut outer_sig = self.module.make_signature();
         outer_sig.params.push(AbiParam::new(self.ptr_type)); // db
@@ -627,37 +632,27 @@ impl Codegen {
         self.build_function(func_id, outer_sig, |cg, builder, entry| {
             let arg1 = builder.block_params(entry)[1];
 
-            // Build env record with arg1
-            let n = builder.ins().iconst(cg.ptr_type, 1);
-            let env = cg.call_rt(builder, "knot_record_empty", &[n]);
-            let (k_ptr, k_len) = cg.string_ptr(builder, "0");
-            cg.call_rt_void(builder, "knot_record_set_field", &[env, k_ptr, k_len, arg1]);
-
-            // Create Function value pointing to inner closure
+            // Pass arg1 directly as env — no record wrapping needed
             let inner_ref = cg.module.declare_func_in_func(inner_id, builder.func);
             let fn_addr = builder.ins().func_addr(cg.ptr_type, inner_ref);
             let (src_ptr, src_len) = cg.string_ptr(builder, &fn_name);
             let result =
-                cg.call_rt(builder, "knot_value_function", &[fn_addr, env, src_ptr, src_len]);
+                cg.call_rt(builder, "knot_value_function", &[fn_addr, arg1, src_ptr, src_len]);
             builder.ins().return_(&[result]);
         });
 
-        // Define the inner closure: extracts arg1 from env, calls runtime
+        // Define the inner closure: env IS arg1 directly (no record extraction)
         let mut inner_sig = self.module.make_signature();
         inner_sig.params.push(AbiParam::new(self.ptr_type)); // db
-        inner_sig.params.push(AbiParam::new(self.ptr_type)); // env
+        inner_sig.params.push(AbiParam::new(self.ptr_type)); // env = arg1
         inner_sig.params.push(AbiParam::new(self.ptr_type)); // arg2
         inner_sig.returns.push(AbiParam::new(self.ptr_type));
 
         let rt_name = rt_name.to_string();
         self.build_function(inner_id, inner_sig, |cg, builder, entry| {
             let db = builder.block_params(entry)[0];
-            let env = builder.block_params(entry)[1];
+            let arg1 = builder.block_params(entry)[1]; // env IS arg1
             let arg2 = builder.block_params(entry)[2];
-
-            // Extract arg1 from env by index
-            let idx0 = builder.ins().iconst(cg.ptr_type, 0);
-            let arg1 = cg.call_rt(builder, "knot_record_field_by_index", &[env, idx0]);
 
             let result = if rt_needs_db {
                 cg.call_rt(builder, &rt_name, &[db, arg1, arg2])
@@ -680,7 +675,7 @@ impl Codegen {
         let middle_id = self.declare_closure_fn(&format!("__stdlib_{}_mid", name));
         let inner_id = self.declare_closure_fn(&format!("__stdlib_{}_apply", name));
 
-        // Outer: captures arg1, returns Function(middle)
+        // Outer: passes arg1 directly as env (no record allocation)
         let (func_id, _) = self.user_fns[name];
         let mut outer_sig = self.module.make_signature();
         outer_sig.params.push(AbiParam::new(self.ptr_type));
@@ -691,20 +686,16 @@ impl Codegen {
         self.build_function(func_id, outer_sig, |cg, builder, entry| {
             let arg1 = builder.block_params(entry)[1];
 
-            let n = builder.ins().iconst(cg.ptr_type, 1);
-            let env = cg.call_rt(builder, "knot_record_empty", &[n]);
-            let (k_ptr, k_len) = cg.string_ptr(builder, "0");
-            cg.call_rt_void(builder, "knot_record_set_field", &[env, k_ptr, k_len, arg1]);
-
+            // Pass arg1 directly as env — no record wrapping needed
             let mid_ref = cg.module.declare_func_in_func(middle_id, builder.func);
             let fn_addr = builder.ins().func_addr(cg.ptr_type, mid_ref);
             let (src_ptr, src_len) = cg.string_ptr(builder, &fn_name);
             let result =
-                cg.call_rt(builder, "knot_value_function", &[fn_addr, env, src_ptr, src_len]);
+                cg.call_rt(builder, "knot_value_function", &[fn_addr, arg1, src_ptr, src_len]);
             builder.ins().return_(&[result]);
         });
 
-        // Middle: captures arg1 + arg2, returns Function(inner)
+        // Middle: env IS arg1 directly; captures (arg1, arg2) in record for inner
         let mut mid_sig = self.module.make_signature();
         mid_sig.params.push(AbiParam::new(self.ptr_type));
         mid_sig.params.push(AbiParam::new(self.ptr_type));
@@ -713,12 +704,8 @@ impl Codegen {
 
         let fn_name = name.to_string();
         self.build_function(middle_id, mid_sig, |cg, builder, entry| {
-            let prev_env = builder.block_params(entry)[1];
+            let arg1 = builder.block_params(entry)[1]; // env IS arg1
             let arg2 = builder.block_params(entry)[2];
-
-            // Extract arg1 from previous env by index
-            let idx0 = builder.ins().iconst(cg.ptr_type, 0);
-            let arg1 = cg.call_rt(builder, "knot_record_field_by_index", &[prev_env, idx0]);
 
             // Build new env with both args (keys "0","1" are pre-sorted)
             let ptr_bytes = cg.ptr_type.bytes() as i32;
@@ -1960,16 +1947,20 @@ impl Codegen {
                         &[],
                     );
 
-                    // Check each constructor name
+                    // Check each constructor name — extract tag once, compare with knot_str_eq
                     builder.switch_to_block(ctor_check_block);
                     builder.seal_block(ctor_check_block);
+                    // We know dispatch_arg is a Constructor (checked tag == 7 above),
+                    // so extract the tag string pointer+length once for all comparisons
+                    let ctor_tag_ptr = cg.call_rt(builder, "knot_constructor_tag_ptr", &[dispatch_arg]);
+                    let ctor_tag_len = cg.call_rt(builder, "knot_constructor_tag_len", &[dispatch_arg]);
                     for (j, ctor_name) in ctors.iter().enumerate() {
-                        let (tag_ptr, tag_len) =
+                        let (expected_ptr, expected_len) =
                             cg.string_ptr(builder, ctor_name);
                         let matches = cg.call_rt_typed(
                             builder,
-                            "knot_constructor_matches",
-                            &[dispatch_arg, tag_ptr, tag_len],
+                            "knot_str_eq",
+                            &[ctor_tag_ptr, ctor_tag_len, expected_ptr, expected_len],
                             types::I32,
                         );
                         let is_match = builder
@@ -2214,14 +2205,20 @@ impl Codegen {
             let closure_env = builder.block_params(entry)[1];
             let arg = builder.block_params(entry)[2];
 
-            // Unpack free variables from closure env by index (sorted order)
-            let mut sorted_vars: Vec<&str> = free_vars.iter().map(|s| s.as_str()).collect();
-            sorted_vars.sort();
-            for (i, var_name) in sorted_vars.iter().enumerate() {
-                let idx = builder.ins().iconst(cg.ptr_type, i as i64);
-                let field_val =
-                    cg.call_rt(builder, "knot_record_field_by_index", &[closure_env, idx]);
-                env.set(var_name, field_val);
+            // Unpack free variables from closure env
+            if free_vars.len() == 1 {
+                // Single capture: env IS the value directly (no record)
+                env.set(&free_vars[0], closure_env);
+            } else {
+                // Multi-capture: env is a record, extract by index (sorted order)
+                let mut sorted_vars: Vec<&str> = free_vars.iter().map(|s| s.as_str()).collect();
+                sorted_vars.sort();
+                for (i, var_name) in sorted_vars.iter().enumerate() {
+                    let idx = builder.ins().iconst(cg.ptr_type, i as i64);
+                    let field_val =
+                        cg.call_rt(builder, "knot_record_field_by_index", &[closure_env, idx]);
+                    env.set(var_name, field_val);
+                }
             }
 
             // Bind parameter
@@ -2681,17 +2678,30 @@ impl Codegen {
 
             ast::ExprKind::RecordUpdate { base, fields } => {
                 let base_val = self.compile_expr(builder, base, env, db);
-                let updated = self.call_rt(builder, "knot_record_update", &[base_val]);
-                for field in fields {
-                    let val = self.compile_expr(builder, &field.value, env, db);
-                    let (key_ptr, key_len) = self.string_ptr(builder, &field.name);
-                    self.call_rt_void(
-                        builder,
-                        "knot_record_set_field",
-                        &[updated, key_ptr, key_len, val],
-                    );
+                let n = fields.len();
+                // Compile and sort update fields for batch merge
+                let mut compiled: Vec<(&str, Value)> = Vec::with_capacity(n);
+                for f in fields {
+                    let val = self.compile_expr(builder, &f.value, env, db);
+                    compiled.push((&f.name, val));
                 }
-                updated
+                compiled.sort_by_key(|(name, _)| *name);
+
+                let ptr_bytes = self.ptr_type.bytes() as i32;
+                let slot_size = (3 * n as u32) * ptr_bytes as u32;
+                let slot = builder.create_sized_stack_slot(
+                    StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 0),
+                );
+                for (i, (name, val)) in compiled.iter().enumerate() {
+                    let (key_ptr, key_len) = self.string_ptr(builder, name);
+                    let base_off = (i as i32) * (3 * ptr_bytes);
+                    builder.ins().stack_store(key_ptr, slot, base_off);
+                    builder.ins().stack_store(key_len, slot, base_off + ptr_bytes);
+                    builder.ins().stack_store(*val, slot, base_off + 2 * ptr_bytes);
+                }
+                let data_ptr = builder.ins().stack_addr(self.ptr_type, slot, 0);
+                let count = builder.ins().iconst(self.ptr_type, n as i64);
+                self.call_rt(builder, "knot_record_update_batch", &[base_val, data_ptr, count])
             }
 
             ast::ExprKind::FieldAccess { expr, field } => {
@@ -4552,6 +4562,9 @@ impl Codegen {
 
         let env_val = if free_vars.is_empty() {
             builder.ins().iconst(self.ptr_type, 0) // null env
+        } else if free_vars.len() == 1 {
+            // Single capture: pass value directly as env (no record allocation)
+            env.get(&free_vars[0])
         } else {
             let n = free_vars.len();
             // Sort free vars so index-based extraction matches
@@ -5837,19 +5850,27 @@ impl Codegen {
                 let call = builder.ins().call(func_ref, &[db, l, r]);
                 let ordering = builder.inst_results(call)[0];
 
-                let (tag_ptr, tag_len) = self.string_ptr(builder, match_tag);
-                let matches = self.call_rt_typed(
+                // Use integer tag (0=LT, 1=EQ, 2=GT) instead of string comparison
+                let ord_i32 = self.call_rt_typed(
                     builder,
-                    "knot_constructor_matches",
-                    &[ordering, tag_ptr, tag_len],
+                    "knot_ordering_tag_i32",
+                    &[ordering],
                     types::I32,
                 );
+                let expected = match match_tag {
+                    "LT" => 0i64,
+                    "EQ" => 1,
+                    "GT" => 2,
+                    _ => unreachable!(),
+                };
+                let matches = builder.ins().icmp_imm(IntCC::Equal, ord_i32, expected);
+                let result_i32 = builder.ins().uextend(types::I32, matches);
 
                 let result_i32 = if negate {
                     let one = builder.ins().iconst(types::I32, 1);
-                    builder.ins().isub(one, matches)
+                    builder.ins().isub(one, result_i32)
                 } else {
-                    matches
+                    result_i32
                 };
 
                 self.call_rt(builder, "knot_value_bool", &[result_i32])
@@ -5898,19 +5919,27 @@ impl Codegen {
                 let call = builder.ins().call(func_ref, &[db, l, r]);
                 let ordering = builder.inst_results(call)[0];
 
-                let (tag_ptr, tag_len) = self.string_ptr(builder, match_tag);
-                let matches = self.call_rt_typed(
+                // Use integer tag (0=LT, 1=EQ, 2=GT) instead of string comparison
+                let ord_i32 = self.call_rt_typed(
                     builder,
-                    "knot_constructor_matches",
-                    &[ordering, tag_ptr, tag_len],
+                    "knot_ordering_tag_i32",
+                    &[ordering],
                     types::I32,
                 );
+                let expected = match match_tag {
+                    "LT" => 0i64,
+                    "EQ" => 1,
+                    "GT" => 2,
+                    _ => unreachable!(),
+                };
+                let matches = builder.ins().icmp_imm(IntCC::Equal, ord_i32, expected);
+                let result_i32 = builder.ins().uextend(types::I32, matches);
 
                 if negate {
                     let one = builder.ins().iconst(types::I32, 1);
-                    builder.ins().isub(one, matches)
+                    builder.ins().isub(one, result_i32)
                 } else {
-                    matches
+                    result_i32
                 }
             } else {
                 let rt_fn = match (match_tag, negate) {

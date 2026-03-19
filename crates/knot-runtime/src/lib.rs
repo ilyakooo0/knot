@@ -288,9 +288,26 @@ fn quote_ident(name: &str) -> String {
 
 // ── Value constructors ────────────────────────────────────────────
 
+// ── Small integer cache ───────────────────────────────────────────
+
+const SMALL_INT_MIN: i64 = -128;
+const SMALL_INT_MAX: i64 = 127;
+
+thread_local! {
+    static SMALL_INT_CACHE: Vec<*mut Value> = {
+        (SMALL_INT_MIN..=SMALL_INT_MAX)
+            .map(|n| Box::into_raw(Box::new(Value::Int(BigInt::from(n)))))
+            .collect()
+    };
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_int(n: i64) -> *mut Value {
-    alloc(Value::Int(BigInt::from(n)))
+    if n >= SMALL_INT_MIN && n <= SMALL_INT_MAX {
+        SMALL_INT_CACHE.with(|cache| cache[(n - SMALL_INT_MIN) as usize])
+    } else {
+        alloc(Value::Int(BigInt::from(n)))
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1608,6 +1625,21 @@ pub extern "C" fn knot_value_compare_ord(a: *mut Value, b: *mut Value) -> i32 {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// Extract Ordering constructor tag as i32: 0=LT, 1=EQ, 2=GT.
+/// Avoids string comparison when checking comparison results.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_ordering_tag_i32(v: *mut Value) -> i32 {
+    match unsafe { as_ref(v) } {
+        Value::Constructor(tag, _) => match tag.as_str() {
+            "LT" => 0,
+            "EQ" => 1,
+            "GT" => 2,
+            _ => panic!("knot runtime: expected Ordering constructor, got {}", tag),
+        },
+        _ => panic!("knot runtime: expected Ordering Constructor, got {}", type_name(v)),
     }
 }
 
@@ -5247,6 +5279,83 @@ pub extern "C" fn knot_record_update(base: *mut Value) -> *mut Value {
     }
 }
 
+/// Batch record update: copy base and merge sorted update fields in one pass.
+/// `data` points to a flat array of triples: [key_ptr, key_len, value, ...]
+/// Fields MUST be pre-sorted by name. O(n+m) merge vs O(m log n) repeated insert.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_record_update_batch(
+    base: *mut Value,
+    data: *const usize,
+    count: usize,
+) -> *mut Value {
+    let base_fields = match unsafe { as_ref(base) } {
+        Value::Record(fields) => fields,
+        _ => panic!("knot runtime: record update requires a Record base, got {}", type_name(base)),
+    };
+
+    // Parse update fields from flat array
+    let updates: Vec<(&str, *mut Value)> = (0..count)
+        .map(|i| {
+            let offset = i * 3;
+            let key_ptr = unsafe { *data.add(offset) as *const u8 };
+            let key_len = unsafe { *data.add(offset + 1) };
+            let value = unsafe { *data.add(offset + 2) as *mut Value };
+            let name = unsafe { str_from_raw(key_ptr, key_len) };
+            (name, value)
+        })
+        .collect();
+
+    // Merge sorted base fields with sorted update fields
+    let mut result = Vec::with_capacity(base_fields.len() + count);
+    let mut base_idx = 0;
+    let mut upd_idx = 0;
+
+    while base_idx < base_fields.len() && upd_idx < updates.len() {
+        let base_name = base_fields[base_idx].name.as_str();
+        let upd_name = updates[upd_idx].0;
+        match base_name.cmp(upd_name) {
+            std::cmp::Ordering::Less => {
+                result.push(RecordField {
+                    name: base_fields[base_idx].name.clone(),
+                    value: base_fields[base_idx].value,
+                });
+                base_idx += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                result.push(RecordField {
+                    name: base_fields[base_idx].name.clone(),
+                    value: updates[upd_idx].1,
+                });
+                base_idx += 1;
+                upd_idx += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                result.push(RecordField {
+                    name: updates[upd_idx].0.to_string(),
+                    value: updates[upd_idx].1,
+                });
+                upd_idx += 1;
+            }
+        }
+    }
+    while base_idx < base_fields.len() {
+        result.push(RecordField {
+            name: base_fields[base_idx].name.clone(),
+            value: base_fields[base_idx].value,
+        });
+        base_idx += 1;
+    }
+    while upd_idx < updates.len() {
+        result.push(RecordField {
+            name: updates[upd_idx].0.to_string(),
+            value: updates[upd_idx].1,
+        });
+        upd_idx += 1;
+    }
+
+    alloc(Value::Record(result))
+}
+
 // ── View operations ──────────────────────────────────────────────
 
 /// Read through a view: SELECT only view columns WHERE constant columns match.
@@ -5646,6 +5755,42 @@ pub extern "C" fn knot_constructor_matches(
         Value::Constructor(t, _) => (t == tag) as i32,
         _ => 0,
     }
+}
+
+/// Return a pointer to the constructor tag string data.
+/// Used to extract the tag once and compare multiple times.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_constructor_tag_ptr(v: *mut Value) -> *const u8 {
+    match unsafe { as_ref(v) } {
+        Value::Constructor(t, _) => t.as_ptr(),
+        _ => panic!("knot runtime: expected Constructor in tag_ptr, got {}", type_name(v)),
+    }
+}
+
+/// Return the length of the constructor tag string.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_constructor_tag_len(v: *mut Value) -> usize {
+    match unsafe { as_ref(v) } {
+        Value::Constructor(t, _) => t.len(),
+        _ => panic!("knot runtime: expected Constructor in tag_len, got {}", type_name(v)),
+    }
+}
+
+/// Pure string equality comparison (no Value deref needed).
+/// Used for comparing extracted constructor tags against static strings.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_str_eq(
+    a_ptr: *const u8,
+    a_len: usize,
+    b_ptr: *const u8,
+    b_len: usize,
+) -> i32 {
+    if a_len != b_len {
+        return 0;
+    }
+    let a = unsafe { slice::from_raw_parts(a_ptr, a_len) };
+    let b = unsafe { slice::from_raw_parts(b_ptr, b_len) };
+    (a == b) as i32
 }
 
 /// Get the payload of a constructor value.

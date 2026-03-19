@@ -1294,9 +1294,9 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
             if fa.len() != fb.len() {
                 return false;
             }
-            fa.iter().all(|field_a| {
-                fb.iter()
-                    .any(|field_b| field_a.name == field_b.name && values_equal(field_a.value, field_b.value))
+            // Fields are sorted by name — linear comparison
+            fa.iter().zip(fb.iter()).all(|(a, b)| {
+                a.name == b.name && values_equal(a.value, b.value)
             })
         }
         (Value::Constructor(ta, pa), Value::Constructor(tb, pb)) => {
@@ -1886,11 +1886,21 @@ pub extern "C" fn knot_relation_diff(
         return alloc(Value::Relation(result));
     }
 
-    // Fallback: in-memory
+    // Fallback: in-memory — hash-based O(n)
+    let mut buf = Vec::new();
+    let set_b: HashSet<Vec<u8>> = rows_b.iter().map(|r| {
+        buf.clear();
+        value_to_hash_bytes(*r, &mut buf);
+        buf.clone()
+    }).collect();
     let result: Vec<*mut Value> = rows_a
         .iter()
         .copied()
-        .filter(|r| !rows_b.iter().any(|b| values_equal(*r, *b)))
+        .filter(|r| {
+            buf.clear();
+            value_to_hash_bytes(*r, &mut buf);
+            !set_b.contains(buf.as_slice())
+        })
         .collect();
     alloc(Value::Relation(result))
 }
@@ -1926,11 +1936,21 @@ pub extern "C" fn knot_relation_inter(
         return alloc(Value::Relation(result));
     }
 
-    // Fallback: in-memory
+    // Fallback: in-memory — hash-based O(n)
+    let mut buf = Vec::new();
+    let set_b: HashSet<Vec<u8>> = rows_b.iter().map(|r| {
+        buf.clear();
+        value_to_hash_bytes(*r, &mut buf);
+        buf.clone()
+    }).collect();
     let result: Vec<*mut Value> = rows_a
         .iter()
         .copied()
-        .filter(|r| rows_b.iter().any(|b| values_equal(*r, *b)))
+        .filter(|r| {
+            buf.clear();
+            value_to_hash_bytes(*r, &mut buf);
+            set_b.contains(buf.as_slice())
+        })
         .collect();
     alloc(Value::Relation(result))
 }

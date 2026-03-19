@@ -408,14 +408,11 @@ impl Infer {
             | (Ty::Bool, Ty::Bool)
             | (Ty::Bytes, Ty::Bytes) => {}
             (Ty::Fun(p1, r1), Ty::Fun(p2, r2)) => {
-                let (p1, p2) = (p1.clone(), p2.clone());
-                let (r1, r2) = (r1.clone(), r2.clone());
-                self.unify(&p1, &p2, span);
-                self.unify(&r1, &r2, span);
+                self.unify(p1, p2, span);
+                self.unify(r1, r2, span);
             }
             (Ty::Relation(a), Ty::Relation(b)) => {
-                let (a, b) = (a.clone(), b.clone());
-                self.unify(&a, &b, span);
+                self.unify(a, b, span);
             }
             (Ty::Con(n1, a1), Ty::Con(n2, a2))
                 if n1 == n2 && a1.len() == a2.len() =>
@@ -430,29 +427,23 @@ impl Infer {
                 }
             }
             (Ty::Record(f1, r1), Ty::Record(f2, r2)) => {
-                let (f1, r1) = (f1.clone(), *r1);
-                let (f2, r2) = (f2.clone(), *r2);
-                self.unify_records(&f1, r1, &f2, r2, span);
+                self.unify_records(f1, *r1, f2, *r2, span);
             }
             // ── Higher-kinded type support ─────────────────────
             (Ty::TyCon(a), Ty::TyCon(b)) if a == b => {}
             (Ty::App(f1, a1), Ty::App(f2, a2)) => {
-                let (f1, a1) = (f1.clone(), a1.clone());
-                let (f2, a2) = (f2.clone(), a2.clone());
-                self.unify(&f1, &f2, span);
-                self.unify(&a1, &a2, span);
+                self.unify(f1, f2, span);
+                self.unify(a1, a2, span);
             }
             // App(f, a) vs Relation(b) → f = [], a = b
             (Ty::App(f, a), Ty::Relation(b))
             | (Ty::Relation(b), Ty::App(f, a)) => {
-                let (f, a, b) = (f.clone(), a.clone(), b.clone());
-                self.unify(&f, &Ty::TyCon("[]".into()), span);
-                self.unify(&a, &b, span);
+                self.unify(f, &Ty::TyCon("[]".into()), span);
+                self.unify(a, b, span);
             }
             // App(f, a) vs Con(name, args) — decompose the constructor
             (Ty::App(f, a), Ty::Con(name, args))
             | (Ty::Con(name, args), Ty::App(f, a)) => {
-                let (f, a) = (f.clone(), a.clone());
                 if args.is_empty() {
                     let d1 = self.display_ty(&t1);
                     let d2 = self.display_ty(&t2);
@@ -478,19 +469,15 @@ impl Infer {
             }
             // ── Row-polymorphic variants ────────────────────────
             (Ty::Variant(c1, r1), Ty::Variant(c2, r2)) => {
-                let (c1, r1) = (c1.clone(), *r1);
-                let (c2, r2) = (c2.clone(), *r2);
-                self.unify_variants(&c1, r1, &c2, r2, span);
+                self.unify_variants(c1, *r1, c2, *r2, span);
             }
             (Ty::Con(name, args), Ty::Variant(c2, r2)) => {
-                let (name, args) = (name.clone(), args.clone());
-                let (c2, r2) = (c2.clone(), *r2);
-                if let Some(expanded) = self.con_to_variant(&name, &args) {
+                if let Some(expanded) = self.con_to_variant(name, args) {
                     let (ec, er) = match expanded {
                         Ty::Variant(c, r) => (c, r),
                         _ => unreachable!(),
                     };
-                    self.unify_variants(&ec, er, &c2, r2, span);
+                    self.unify_variants(&ec, er, c2, *r2, span);
                 } else {
                     let d1 = self.display_ty(&t1);
                     let d2 = self.display_ty(&t2);
@@ -504,14 +491,12 @@ impl Infer {
                 }
             }
             (Ty::Variant(c1, r1), Ty::Con(name, args)) => {
-                let (name, args) = (name.clone(), args.clone());
-                let (c1, r1) = (c1.clone(), *r1);
-                if let Some(expanded) = self.con_to_variant(&name, &args) {
+                if let Some(expanded) = self.con_to_variant(name, args) {
                     let (ec, er) = match expanded {
                         Ty::Variant(c, r) => (c, r),
                         _ => unreachable!(),
                     };
-                    self.unify_variants(&c1, r1, &ec, er, span);
+                    self.unify_variants(c1, *r1, &ec, er, span);
                 } else {
                     let d1 = self.display_ty(&t1);
                     let d2 = self.display_ty(&t2);
@@ -543,24 +528,21 @@ impl Infer {
         r2: Option<TyVar>,
         span: Span,
     ) {
-        let keys1: HashSet<&String> = f1.keys().collect();
-        let keys2: HashSet<&String> = f2.keys().collect();
-
-        // Unify common fields
-        for key in keys1.intersection(&keys2) {
-            let t1 = f1[*key].clone();
-            let t2 = f2[*key].clone();
-            self.unify(&t1, &t2, span);
+        // Unify common fields (BTreeMap lookup is O(log n), no HashSet needed)
+        for (key, ty1) in f1 {
+            if let Some(ty2) = f2.get(key) {
+                self.unify(ty1, ty2, span);
+            }
         }
 
         let only1: BTreeMap<String, Ty> = f1
             .iter()
-            .filter(|(k, _)| !keys2.contains(k))
+            .filter(|(k, _)| !f2.contains_key(*k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let only2: BTreeMap<String, Ty> = f2
             .iter()
-            .filter(|(k, _)| !keys1.contains(k))
+            .filter(|(k, _)| !f1.contains_key(*k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
@@ -631,24 +613,21 @@ impl Infer {
         r2: Option<TyVar>,
         span: Span,
     ) {
-        let keys1: HashSet<&String> = c1.keys().collect();
-        let keys2: HashSet<&String> = c2.keys().collect();
-
-        // Unify common constructors' field types
-        for key in keys1.intersection(&keys2) {
-            let t1 = c1[*key].clone();
-            let t2 = c2[*key].clone();
-            self.unify(&t1, &t2, span);
+        // Unify common constructors' field types (BTreeMap lookup is O(log n))
+        for (key, ty1) in c1 {
+            if let Some(ty2) = c2.get(key) {
+                self.unify(ty1, ty2, span);
+            }
         }
 
         let only1: BTreeMap<String, Ty> = c1
             .iter()
-            .filter(|(k, _)| !keys2.contains(k))
+            .filter(|(k, _)| !c2.contains_key(*k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let only2: BTreeMap<String, Ty> = c2
             .iter()
-            .filter(|(k, _)| !keys1.contains(k))
+            .filter(|(k, _)| !c1.contains_key(*k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 

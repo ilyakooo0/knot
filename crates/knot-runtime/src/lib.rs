@@ -532,14 +532,15 @@ fn infer_temp_schema(rows: &[*mut Value]) -> Option<TempSchema> {
         Value::Constructor(_, _) => {
             // Scan all rows to collect all constructor variants
             let mut ctors: Vec<(String, Vec<(String, ColType)>)> = Vec::new();
-            let mut all_field_names: Vec<String> = Vec::new();
+            let mut seen_tags: HashSet<&str> = HashSet::new();
+            let mut seen_field_names: HashSet<String> = HashSet::new();
             let mut all_fields: Vec<(String, ColType)> = Vec::new();
 
             for row in rows {
                 if row.is_null() { continue; }
                 match unsafe { as_ref(*row) } {
                     Value::Constructor(tag, payload) => {
-                        if ctors.iter().any(|(t, _)| t == tag) {
+                        if !seen_tags.insert(tag.as_str()) {
                             continue;
                         }
                         let ctor_fields = match unsafe { as_ref(*payload) } {
@@ -549,8 +550,7 @@ fn infer_temp_schema(rows: &[*mut Value]) -> Option<TempSchema> {
                                 for f in fields {
                                     let ty = infer_col_type(f.value)?;
                                     cf.push((f.name.clone(), ty));
-                                    if !all_field_names.contains(&f.name) {
-                                        all_field_names.push(f.name.clone());
+                                    if seen_field_names.insert(f.name.clone()) {
                                         all_fields.push((f.name.clone(), ty));
                                     }
                                 }
@@ -786,7 +786,7 @@ fn in_memory_dedup(rows: Vec<*mut Value>) -> Vec<*mut Value> {
         buf.clear();
         value_to_hash_bytes(row, &mut buf);
         if !seen.contains(buf.as_slice()) {
-            seen.insert(buf.clone());
+            seen.insert(std::mem::take(&mut buf));
             result.push(row);
         }
     }
@@ -1036,20 +1036,17 @@ pub extern "C" fn knot_relation_group_by(
     let schema = parse_record_schema(schema_str);
     let key_col_names: Vec<&str> = key_cols_str.split(',').collect();
 
-    // Find key column specs in the schema
+    // Find key column specs in the schema via HashMap lookup
+    let col_map: HashMap<&str, &ColumnSpec> = schema.columns.iter().map(|c| (c.name.as_str(), c)).collect();
     let key_specs: Vec<&ColumnSpec> = key_col_names
         .iter()
         .map(|kc| {
-            schema
-                .columns
-                .iter()
-                .find(|c| c.name == *kc)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "knot runtime: key column '{}' not found in schema",
-                        kc
-                    )
-                })
+            *col_map.get(kc).unwrap_or_else(|| {
+                panic!(
+                    "knot runtime: key column '{}' not found in schema",
+                    kc
+                )
+            })
         })
         .collect();
 
@@ -1105,19 +1102,17 @@ pub extern "C" fn knot_relation_group_by(
                 _ => panic!("knot runtime: groupby rows must be Records"),
             };
 
+            let field_map: HashMap<&str, *mut Value> = fields.iter().map(|f| (f.name.as_str(), f.value)).collect();
             let mut params: Vec<rusqlite::types::Value> =
                 vec![rusqlite::types::Value::Integer(idx as i64)];
             for ks in &key_specs {
-                let field = fields
-                    .iter()
-                    .find(|f| f.name == ks.name)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "knot runtime: missing field '{}' in record",
-                            ks.name
-                        )
-                    });
-                params.push(value_to_sqlite(field.value, ks.ty));
+                let value = field_map.get(ks.name.as_str()).unwrap_or_else(|| {
+                    panic!(
+                        "knot runtime: missing field '{}' in record",
+                        ks.name
+                    )
+                });
+                params.push(value_to_sqlite(*value, ks.ty));
             }
 
             let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -1306,12 +1301,12 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
             if ra.len() != rb.len() {
                 return false;
             }
-            let mut buf = Vec::new();
             let set_a: HashSet<Vec<u8>> = ra.iter().map(|r| {
-                buf.clear();
+                let mut buf = Vec::new();
                 value_to_hash_bytes(*r, &mut buf);
-                buf.clone()
+                buf
             }).collect();
+            let mut buf = Vec::new();
             rb.iter().all(|r| {
                 buf.clear();
                 value_to_hash_bytes(*r, &mut buf);
@@ -1472,7 +1467,7 @@ pub extern "C" fn knot_value_concat(a: *mut Value, b: *mut Value) -> *mut Value 
                 buf.clear();
                 value_to_hash_bytes(row, &mut buf);
                 if !seen.contains(buf.as_slice()) {
-                    seen.insert(buf.clone());
+                    seen.insert(std::mem::take(&mut buf));
                     result.push(row);
                 }
             }
@@ -1887,12 +1882,12 @@ pub extern "C" fn knot_relation_diff(
     }
 
     // Fallback: in-memory — hash-based O(n)
-    let mut buf = Vec::new();
     let set_b: HashSet<Vec<u8>> = rows_b.iter().map(|r| {
-        buf.clear();
+        let mut buf = Vec::new();
         value_to_hash_bytes(*r, &mut buf);
-        buf.clone()
+        buf
     }).collect();
+    let mut buf = Vec::new();
     let result: Vec<*mut Value> = rows_a
         .iter()
         .copied()
@@ -1937,12 +1932,12 @@ pub extern "C" fn knot_relation_inter(
     }
 
     // Fallback: in-memory — hash-based O(n)
-    let mut buf = Vec::new();
     let set_b: HashSet<Vec<u8>> = rows_b.iter().map(|r| {
-        buf.clear();
+        let mut buf = Vec::new();
         value_to_hash_bytes(*r, &mut buf);
-        buf.clone()
+        buf
     }).collect();
+    let mut buf = Vec::new();
     let result: Vec<*mut Value> = rows_a
         .iter()
         .copied()

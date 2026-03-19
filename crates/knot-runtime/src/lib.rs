@@ -891,6 +891,11 @@ pub extern "C" fn knot_relation_empty() -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_with_capacity(cap: usize) -> *mut Value {
+    alloc(Value::Relation(Vec::with_capacity(cap)))
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn knot_relation_singleton(v: *mut Value) -> *mut Value {
     alloc(Value::Relation(vec![v]))
 }
@@ -1525,6 +1530,35 @@ pub extern "C" fn knot_value_compare(a: *mut Value, b: *mut Value) -> *mut Value
         tag.to_string(),
         alloc(Value::Unit),
     ))
+}
+
+/// Compare two values and return a raw i32: -1 (LT), 0 (EQ), 1 (GT).
+/// Avoids allocating an Ordering constructor for use in comparison operators.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_value_compare_ord(a: *mut Value, b: *mut Value) -> i32 {
+    let ordering = match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Float(x), Value::Float(y)) => {
+            x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (Value::Int(x), Value::Float(y)) => {
+            bigint_to_f64(x).partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (Value::Float(x), Value::Int(y)) => {
+            x.partial_cmp(&bigint_to_f64(y)).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        _ => panic!(
+            "knot runtime: cannot compare {} with {}",
+            type_name(a),
+            type_name(b)
+        ),
+    };
+    match ordering {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
 }
 
 // ── Unary operations ──────────────────────────────────────────────

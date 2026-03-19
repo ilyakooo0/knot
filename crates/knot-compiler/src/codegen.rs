@@ -355,6 +355,7 @@ impl Codegen {
 
         // Relation operations
         self.declare_rt("knot_relation_empty", &[], &[p]);
+        self.declare_rt("knot_relation_with_capacity", &[p], &[p]);
         self.declare_rt("knot_relation_singleton", &[p], &[p]);
         self.declare_rt("knot_relation_push", &[p, p], &[]);
         self.declare_rt("knot_relation_len", &[p], &[p]);
@@ -372,6 +373,7 @@ impl Codegen {
         self.declare_rt("knot_value_gt", &[p, p], &[p]);
         self.declare_rt("knot_value_le", &[p, p], &[p]);
         self.declare_rt("knot_value_ge", &[p, p], &[p]);
+        self.declare_rt("knot_value_compare_ord", &[p, p], &[types::I32]);
         self.declare_rt("knot_value_and", &[p, p], &[p]);
         self.declare_rt("knot_value_or", &[p, p], &[p]);
         self.declare_rt("knot_value_concat", &[p, p], &[p]);
@@ -2662,7 +2664,12 @@ impl Codegen {
             }
 
             ast::ExprKind::List(elems) => {
-                let rel = self.call_rt(builder, "knot_relation_empty", &[]);
+                let rel = if elems.is_empty() {
+                    self.call_rt(builder, "knot_relation_empty", &[])
+                } else {
+                    let cap = builder.ins().iconst(self.ptr_type, elems.len() as i64);
+                    self.call_rt(builder, "knot_relation_with_capacity", &[cap])
+                };
                 for elem in elems {
                     let val = self.compile_expr(builder, elem, env, db);
                     self.call_rt_void(builder, "knot_relation_push", &[rel, val]);
@@ -5700,7 +5707,12 @@ impl Codegen {
         params: &[SqlParamSource],
         env: &mut Env,
     ) -> Value {
-        let rel = self.call_rt(builder, "knot_relation_empty", &[]);
+        let rel = if params.is_empty() {
+            self.call_rt(builder, "knot_relation_empty", &[])
+        } else {
+            let cap = builder.ins().iconst(self.ptr_type, params.len() as i64);
+            self.call_rt(builder, "knot_relation_with_capacity", &[cap])
+        };
         for param in params {
             let val = match param {
                 SqlParamSource::Literal(lit) => self.compile_lit(builder, lit),
@@ -5756,8 +5768,11 @@ impl Codegen {
         }
     }
 
-    /// Compile a comparison operator via the `compare` trait dispatcher.
-    /// Calls `compare(l, r)` to get an Ordering value, then checks the constructor tag.
+    /// Compile a comparison operator.
+    /// When no custom Ord trait impls exist for ADTs, uses direct runtime comparison
+    /// functions (`knot_value_lt` etc.) which return Bool in a single call.
+    /// When a `compare` dispatcher exists (ADT Ord impls), calls the dispatcher
+    /// to get an Ordering value and checks its constructor tag.
     /// `match_tag` is the Ordering constructor to check ("LT" or "GT").
     /// `negate` inverts the result (for `<=` and `>=`).
     fn compile_comparison(
@@ -5769,31 +5784,47 @@ impl Codegen {
         match_tag: &str,
         negate: bool,
     ) -> Value {
-        if let Some(&func_id) = self.trait_dispatcher_fns.get("compare") {
-            let func_ref = self.module.declare_func_in_func(func_id, builder.func);
-            let call = builder.ins().call(func_ref, &[db, l, r]);
-            let ordering = builder.inst_results(call)[0];
+        // Check if any non-primitive Ord impls exist (ADT types)
+        let has_adt_ord_impls = self.trait_methods.get("compare").map_or(false, |info| {
+            info.impls.iter().any(|e| type_name_to_tag(&e.type_name).is_none())
+        });
 
-            // Check if ordering matches the tag
-            let (tag_ptr, tag_len) = self.string_ptr(builder, match_tag);
-            let matches = self.call_rt_typed(
-                builder,
-                "knot_constructor_matches",
-                &[ordering, tag_ptr, tag_len],
-                types::I32,
-            );
+        if has_adt_ord_impls {
+            if let Some(&func_id) = self.trait_dispatcher_fns.get("compare") {
+                // Must dispatch through Ordering for ADT types
+                let func_ref = self.module.declare_func_in_func(func_id, builder.func);
+                let call = builder.ins().call(func_ref, &[db, l, r]);
+                let ordering = builder.inst_results(call)[0];
 
-            let result_i32 = if negate {
-                // Negate: 1 → 0, 0 → 1  (e.g., <= means NOT GT)
-                let one = builder.ins().iconst(types::I32, 1);
-                builder.ins().isub(one, matches)
+                let (tag_ptr, tag_len) = self.string_ptr(builder, match_tag);
+                let matches = self.call_rt_typed(
+                    builder,
+                    "knot_constructor_matches",
+                    &[ordering, tag_ptr, tag_len],
+                    types::I32,
+                );
+
+                let result_i32 = if negate {
+                    let one = builder.ins().iconst(types::I32, 1);
+                    builder.ins().isub(one, matches)
+                } else {
+                    matches
+                };
+
+                self.call_rt(builder, "knot_value_bool", &[result_i32])
             } else {
-                matches
-            };
-
-            self.call_rt(builder, "knot_value_bool", &[result_i32])
+                // Fallback
+                let rt_fn = match (match_tag, negate) {
+                    ("LT", false) => "knot_value_lt",
+                    ("GT", false) => "knot_value_gt",
+                    ("GT", true) => "knot_value_le",
+                    ("LT", true) => "knot_value_ge",
+                    _ => unreachable!(),
+                };
+                self.call_rt(builder, rt_fn, &[l, r])
+            }
         } else {
-            // Fallback to direct runtime comparison
+            // No ADT Ord impls — use direct runtime comparison (1 call, 1 alloc)
             let rt_fn = match (match_tag, negate) {
                 ("LT", false) => "knot_value_lt",
                 ("GT", false) => "knot_value_gt",

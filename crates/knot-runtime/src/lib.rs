@@ -153,6 +153,7 @@ impl KnotDb {
 /// Extract column names from a generated SQL WHERE clause.
 /// Columns are always double-quoted identifiers (e.g. `"age"`, `"name"`).
 fn extract_where_columns(sql: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
     let mut columns = Vec::new();
     let mut chars = sql.chars().peekable();
     while let Some(c) = chars.next() {
@@ -172,7 +173,7 @@ fn extract_where_columns(sql: &str) -> Vec<String> {
                     None => break,
                 }
             }
-            if !columns.contains(&col) {
+            if seen.insert(col.clone()) {
                 columns.push(col);
             }
         }

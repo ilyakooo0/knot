@@ -3346,6 +3346,25 @@ impl Codegen {
             }
         }
 
+        // Special case: filter/sum/avg with lambda on source → SQL
+        if let ast::ExprKind::Var(name) = &func_expr.node {
+            if args.len() == 2 {
+                if let ast::ExprKind::SourceRef(source_name) = &args[1].node {
+                    if !self.views.contains_key(source_name) {
+                        if let Some(schema) = self.source_schemas.get(source_name).cloned() {
+                            if !schema.starts_with('#') && !schema.contains('[') {
+                                if let Some(result) = self.try_compile_app_sql(
+                                    builder, name, &args[0], source_name, &schema, env, db,
+                                ) {
+                                    return result;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // SQL set operations: diff/inter/union on two source relations
         if let ast::ExprKind::Var(name) = &func_expr.node {
             let sql_op = match name.as_str() {
@@ -4792,6 +4811,48 @@ impl Codegen {
         ))
     }
 
+    /// Try to compile application-form `filter/sum/avg lambda *source` to SQL.
+    fn try_compile_app_sql(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        fn_name: &str,
+        lambda_arg: &ast::Expr,
+        source_name: &str,
+        schema: &str,
+        env: &mut Env,
+        db: Value,
+    ) -> Option<Value> {
+        let (bind_var, body) = extract_single_param_lambda(lambda_arg)?;
+        let table = quote_sql_ident(&format!("_knot_{}", source_name));
+
+        match fn_name {
+            "filter" => {
+                // Use unqualified column names for knot_source_read_where
+                let frag = Self::try_compile_sql_expr(&bind_var, body)?;
+                let params_rel = self.compile_sql_params(builder, &frag.params, env);
+                let (name_ptr, name_len) = self.string_ptr(builder, source_name);
+                let (schema_ptr, schema_len) = self.string_ptr(builder, schema);
+                let (where_ptr, where_len) = self.string_ptr(builder, &frag.sql);
+                Some(self.call_rt(
+                    builder,
+                    "knot_source_read_where",
+                    &[db, name_ptr, name_len, schema_ptr, schema_len, where_ptr, where_len, params_rel],
+                ))
+            }
+            "sum" | "avg" => {
+                // Use unqualified column names for direct SQL aggregate
+                let col_sql = extract_sql_field_access(&bind_var, body, "", schema)?;
+                let func = if fn_name == "sum" { "SUM" } else { "AVG" };
+                let sql = format!("SELECT {}({}) FROM {}", func, col_sql, table);
+                let params_rel = self.compile_sql_params(builder, &[], env);
+                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                let rt_fn = if fn_name == "avg" { "knot_source_query_float" } else { "knot_source_query_count" };
+                Some(self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]))
+            }
+            _ => None,
+        }
+    }
+
     /// Try to compile a pipe chain like `*source |> filter f |> map g` to a single SQL query.
     fn try_compile_pipe_sql(
         &mut self,
@@ -6057,7 +6118,7 @@ fn expr_to_sql_param(expr: &ast::Expr) -> Option<SqlParamSource> {
 }
 
 /// Extract a SQL column reference from a lambda body like `\x -> x.price`.
-/// Returns the SQL fragment e.g. `t0."price"`.
+/// Returns the SQL fragment e.g. `t0."price"` (or just `"price"` if alias is empty).
 fn extract_sql_field_access(
     bind_var: &str,
     body: &ast::Expr,
@@ -6069,12 +6130,21 @@ fn extract_sql_field_access(
             if name == bind_var {
                 // Verify column exists in schema
                 lookup_col_type_from_schema(schema, col_name)?;
-                return Some(format!("{}.{}", alias, quote_sql_ident(col_name)));
+                return Some(sql_col_ref(alias, col_name));
             }
         }
     }
     // Also handle arithmetic expressions like `\x -> x.price * x.qty`
     try_sql_arithmetic_expr(bind_var, body, alias, schema)
+}
+
+/// Format a column reference, with or without table alias.
+fn sql_col_ref(alias: &str, col_name: &str) -> String {
+    if alias.is_empty() {
+        quote_sql_ident(col_name)
+    } else {
+        format!("{}.{}", alias, quote_sql_ident(col_name))
+    }
 }
 
 /// Try to compile an arithmetic expression to a SQL fragment.
@@ -6090,7 +6160,7 @@ fn try_sql_arithmetic_expr(
             if let ast::ExprKind::Var(name) = &inner.node {
                 if name == bind_var {
                     lookup_col_type_from_schema(schema, col_name)?;
-                    return Some(format!("{}.{}", alias, quote_sql_ident(col_name)));
+                    return Some(sql_col_ref(alias, col_name));
                 }
             }
             None

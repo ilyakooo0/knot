@@ -1051,7 +1051,7 @@ impl Codegen {
                     let mut all = Vec::new();
                     for comp in components {
                         if let Some(entries) = self.route_entries.get(comp) {
-                            all.extend(entries.clone());
+                            all.extend_from_slice(entries);
                         }
                     }
                     self.route_entries.insert(name.clone(), all);
@@ -1070,10 +1070,9 @@ impl Codegen {
             {
                 for trait_name in deriving {
                     if let Some(trait_def) = self.trait_defs.get(trait_name) {
-                        let defaults_to_derive: Vec<(String, DefaultMethod)> = trait_def
+                        let defaults_to_derive: Vec<(&String, &DefaultMethod)> = trait_def
                             .defaults
                             .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
                             .collect();
                         for (method_name, default) in defaults_to_derive {
                             let mangled = format!(
@@ -1553,20 +1552,15 @@ impl Codegen {
             })
             .collect();
 
-        // Clone the data we need to iterate so we can push diagnostics
-        let impl_types: Vec<(String, Vec<(String, ast::Span)>)> = self
-            .trait_impl_types
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let supertraits: HashMap<String, Vec<String>> = self.trait_supertraits.clone();
+        // Collect diagnostics separately to avoid borrow conflict with self
+        let mut diags = Vec::new();
 
-        for (trait_name, types) in &impl_types {
-            if let Some(required) = supertraits.get(trait_name) {
+        for (trait_name, types) in &self.trait_impl_types {
+            if let Some(required) = self.trait_supertraits.get(trait_name) {
                 for supertrait in required {
                     for (type_name, span) in types {
                         if !impl_set.contains(&(supertrait.as_str(), type_name.as_str())) {
-                            self.diagnostics.push(
+                            diags.push(
                                 knot::diagnostic::Diagnostic::error(format!(
                                     "impl `{trait_name}` for `{type_name}` requires `{supertrait}` \
                                      to be implemented for `{type_name}`"
@@ -1585,6 +1579,7 @@ impl Codegen {
                 }
             }
         }
+        self.diagnostics.extend(diags);
     }
 
     // ── Function definitions ──────────────────────────────────────
@@ -1688,11 +1683,11 @@ impl Codegen {
                     ..
                 } => {
                     if let Some(type_name) = impl_type_name(args) {
-                        let provided_methods: Vec<String> = items
+                        let provided_methods: HashSet<&str> = items
                             .iter()
                             .filter_map(|item| {
                                 if let ast::ImplItem::Method { name, .. } = item {
-                                    Some(name.clone())
+                                    Some(name.as_str())
                                 } else {
                                     None
                                 }
@@ -1710,27 +1705,25 @@ impl Codegen {
                             }
                         }
 
-                        // Define default method bodies for methods not in this impl
-                        if let Some(trait_def) = self.trait_defs.get(trait_name) {
-                            let defaults_to_define: Vec<(String, DefaultMethod)> =
-                                trait_def
-                                    .defaults
-                                    .iter()
-                                    .filter(|(method_name, _)| {
-                                        !provided_methods.contains(method_name)
-                                    })
-                                    .map(|(k, v)| (k.clone(), v.clone()))
-                                    .collect();
-                            for (method_name, default) in defaults_to_define {
-                                let mangled = format!(
-                                    "{}_{}_{}", trait_name, type_name, method_name
-                                );
-                                self.define_user_function(
-                                    &mangled,
-                                    &default.params,
-                                    &default.body,
-                                );
-                            }
+                        // Define default method bodies for methods not in this impl.
+                        // Collect (name, params, body) to avoid holding borrow on self.trait_defs
+                        // across self.define_user_function calls.
+                        let defaults_to_define: Vec<(String, Vec<ast::Pat>, ast::Expr)> =
+                            self.trait_defs.get(trait_name)
+                                .map(|td| td.defaults.iter()
+                                    .filter(|(m, _)| !provided_methods.contains(m.as_str()))
+                                    .map(|(k, v)| (k.clone(), v.params.clone(), v.body.clone()))
+                                    .collect())
+                                .unwrap_or_default();
+                        for (method_name, params, body) in &defaults_to_define {
+                            let mangled = format!(
+                                "{}_{}_{}", trait_name, type_name, method_name
+                            );
+                            self.define_user_function(
+                                &mangled,
+                                params,
+                                body,
+                            );
                         }
                     }
                 }
@@ -1793,7 +1786,8 @@ impl Codegen {
                 })
                 .collect();
 
-        let data_ctors = self.data_constructors.clone();
+        let data_ctors = std::rc::Rc::new(self.data_constructors.clone());
+        let nullable_ctors = std::rc::Rc::new(self.nullable_ctors.clone());
 
         for (method_name, dispatcher_id, param_count, dispatch_index, impls) in dispatcher_info {
             let mut sig = self.module.make_signature();
@@ -1804,7 +1798,7 @@ impl Codegen {
             sig.returns.push(AbiParam::new(self.ptr_type));
 
             let data_ctors_ref = data_ctors.clone();
-            let nullable_ctors_ref = self.nullable_ctors.clone();
+            let nullable_ctors_ref = nullable_ctors.clone();
 
             self.build_function(dispatcher_id, sig, |cg, builder, entry| {
                 let db = builder.block_params(entry)[0];

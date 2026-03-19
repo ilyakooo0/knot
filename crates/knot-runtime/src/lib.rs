@@ -1645,7 +1645,12 @@ pub extern "C" fn knot_value_show(v: *mut Value) -> *mut Value {
             }
             Value::Text(s) => s.clone(),
             Value::Bytes(b) => {
-                b.iter().map(|byte| format!("{:02x}", byte)).collect()
+                let mut hex = String::with_capacity(b.len() * 2);
+                for byte in b {
+                    use std::fmt::Write;
+                    let _ = write!(hex, "{:02x}", byte);
+                }
+                hex
             }
             Value::Bool(b) => {
                 if *b { "True".to_string() } else { "False".to_string() }
@@ -2192,7 +2197,11 @@ pub extern "C" fn knot_bytes_to_text(v: *mut Value) -> *mut Value {
 pub extern "C" fn knot_bytes_to_hex(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Bytes(b) => {
-            let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
+            let mut hex = String::with_capacity(b.len() * 2);
+            for byte in b {
+                use std::fmt::Write;
+                let _ = write!(hex, "{:02x}", byte);
+            }
             alloc(Value::Text(hex))
         }
         _ => panic!("knot runtime: bytesToHex expected Bytes, got {}", type_name(v)),
@@ -3981,13 +3990,13 @@ fn adt_row_to_params(
 
             // Find which fields belong to this constructor
             let ctor = adt.constructors.iter().find(|c| c.name == *tag);
-            let ctor_field_names: Vec<&str> = ctor
+            let ctor_field_names: HashSet<&str> = ctor
                 .map(|c| c.fields.iter().map(|f| f.name.as_str()).collect())
                 .unwrap_or_default();
 
             // For each field in the wide table
             for field in &adt.all_fields {
-                if ctor_field_names.contains(&field.name.as_str()) {
+                if ctor_field_names.contains(field.name.as_str()) {
                     // This field belongs to this constructor — extract from payload
                     let payload_ref = unsafe { as_ref(*payload) };
                     match payload_ref {
@@ -4085,13 +4094,16 @@ fn write_record_rows(
             _ => panic!("knot runtime: relation rows must be Records, got {}", type_name(*row_ptr)),
         };
 
+        // Build field lookup map for O(1) access
+        let field_map: HashMap<&str, *mut Value> = fields.iter().map(|f| (f.name.as_str(), f.value)).collect();
+
         // Build scalar params
         let params: Vec<rusqlite::types::Value> = schema.columns
             .iter()
             .map(|col| {
-                let field = fields.iter().find(|f| f.name == col.name)
+                let value = field_map.get(col.name.as_str())
                     .unwrap_or_else(|| panic!("knot runtime: missing field '{}' in record", col.name));
-                value_to_sqlite(field.value, col.ty)
+                value_to_sqlite(*value, col.ty)
             })
             .collect();
 
@@ -4112,8 +4124,8 @@ fn write_record_rows(
             let parent_id = conn.last_insert_rowid();
             for nf in &schema.nested {
                 let child_table = format!("{}__{}", table_name, nf.name);
-                let child_val = fields.iter().find(|f| f.name == nf.name)
-                    .map(|f| f.value)
+                let child_val = field_map.get(nf.name.as_str())
+                    .copied()
                     .unwrap_or(std::ptr::null_mut());
                 if !child_val.is_null() {
                     if let Value::Relation(child_rows) = unsafe { as_ref(child_val) } {
@@ -4161,13 +4173,15 @@ fn write_child_rows(
             _ => panic!("knot runtime: child rows must be Records"),
         };
 
+        let field_map: HashMap<&str, *mut Value> = fields.iter().map(|f| (f.name.as_str(), f.value)).collect();
+
         let mut params: Vec<rusqlite::types::Value> = vec![
             rusqlite::types::Value::Integer(parent_id),
         ];
         for col in &nf.columns {
-            let field = fields.iter().find(|f| f.name == col.name)
+            let value = field_map.get(col.name.as_str())
                 .unwrap_or_else(|| panic!("knot runtime: missing field '{}' in child record", col.name));
-            params.push(value_to_sqlite(field.value, col.ty));
+            params.push(value_to_sqlite(*value, col.ty));
         }
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -4181,8 +4195,8 @@ fn write_child_rows(
             let child_id = conn.last_insert_rowid();
             for grandchild in &nf.nested {
                 let gc_table = format!("{}__{}", table_name, grandchild.name);
-                let gc_val = fields.iter().find(|f| f.name == grandchild.name)
-                    .map(|f| f.value)
+                let gc_val = field_map.get(grandchild.name.as_str())
+                    .copied()
                     .unwrap_or(std::ptr::null_mut());
                 if !gc_val.is_null() {
                     if let Value::Relation(gc_rows) = unsafe { as_ref(gc_val) } {
@@ -5707,9 +5721,9 @@ fn match_route<'a>(
     None
 }
 
-fn parse_query_string(qs: &str) -> Vec<(String, String)> {
+fn parse_query_string(qs: &str) -> HashMap<String, String> {
     if qs.is_empty() {
-        return Vec::new();
+        return HashMap::new();
     }
     qs.split('&')
         .filter_map(|pair| {
@@ -5752,13 +5766,13 @@ fn hex_val(b: u8) -> u8 {
 }
 
 /// Minimal JSON object parser. Handles {"key": value, ...} with string, number, bool, null values.
-fn parse_json_object(s: &str) -> Vec<(String, String)> {
+fn parse_json_object(s: &str) -> HashMap<String, String> {
     let s = s.trim();
     if !s.starts_with('{') || !s.ends_with('}') {
-        return Vec::new();
+        return HashMap::new();
     }
     let inner = &s[1..s.len() - 1];
-    let mut result = Vec::new();
+    let mut result = HashMap::new();
     let mut rest = inner.trim();
     while !rest.is_empty() {
         // Parse key
@@ -5781,13 +5795,13 @@ fn parse_json_object(s: &str) -> Vec<(String, String)> {
             let end = rest[1..].find('"').map(|i| i + 1).unwrap_or(rest.len());
             let val = rest[1..end].to_string();
             rest = rest[end + 1..].trim();
-            result.push((key, val));
+            result.insert(key, val);
         } else {
             // number, bool, null — read until comma or end
             let end = rest.find(',').unwrap_or(rest.len());
             let val = rest[..end].trim().to_string();
             rest = rest[end..].trim_start();
-            result.push((key, val));
+            result.insert(key, val);
         }
         // Skip comma
         if rest.starts_with(',') {
@@ -5948,9 +5962,8 @@ pub extern "C" fn knot_http_listen(
                 let qs = parse_query_string(query_string);
                 for (qname, qty) in &entry.query_fields {
                     let val = qs
-                        .iter()
-                        .find(|(k, _)| k == qname)
-                        .map(|(_, v)| v.as_str())
+                        .get(qname)
+                        .map(|v| v.as_str())
                         .unwrap_or("");
                     fields.push(RecordField {
                         name: qname.clone(),
@@ -5969,9 +5982,8 @@ pub extern "C" fn knot_http_listen(
                     let json_fields = parse_json_object(&body_str);
                     for (bname, bty) in &entry.body_fields {
                         let val = json_fields
-                            .iter()
-                            .find(|(k, _)| k == bname)
-                            .map(|(_, v)| v.as_str())
+                            .get(bname)
+                            .map(|v| v.as_str())
                             .unwrap_or("");
                         fields.push(RecordField {
                             name: bname.clone(),

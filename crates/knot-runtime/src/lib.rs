@@ -399,11 +399,10 @@ pub extern "C" fn knot_record_set_field(
     let rec = unsafe { &mut *record };
     match rec {
         Value::Record(fields) => {
-            // Update existing field or add new one
-            if let Some(field) = fields.iter_mut().find(|f| f.name == name) {
-                field.value = value;
-            } else {
-                fields.push(RecordField { name, value });
+            // Maintain sorted order by field name for O(log n) lookup
+            match fields.binary_search_by(|f| f.name.as_str().cmp(&name)) {
+                Ok(idx) => fields[idx].value = value,
+                Err(idx) => fields.insert(idx, RecordField { name, value }),
             }
         }
         _ => panic!("knot runtime: expected Record in set_field, got {}", type_name(record)),
@@ -423,6 +422,11 @@ pub extern "C" fn knot_record_field(
     let name = unsafe { str_from_raw(key_ptr, key_len) };
     match unsafe { as_ref(record) } {
         Value::Record(fields) => {
+            // Binary search for O(log n) lookup (fields are kept sorted)
+            if let Ok(idx) = fields.binary_search_by(|f| f.name.as_str().cmp(name)) {
+                return fields[idx].value;
+            }
+            // Fallback: linear scan for records not built via set_field
             for field in fields {
                 if field.name == name {
                     return field.value;
@@ -652,7 +656,7 @@ pub extern "C" fn knot_relation_group_by(
     {
         let mut insert_stmt = db_ref
             .conn
-            .prepare(&insert_sql)
+            .prepare_cached(&insert_sql)
             .expect("knot runtime: failed to prepare groupby insert");
 
         for (idx, row_ptr) in rows.iter().enumerate() {
@@ -700,7 +704,7 @@ pub extern "C" fn knot_relation_group_by(
     let groups = {
         let mut select_stmt = db_ref
             .conn
-            .prepare(&select_sql)
+            .prepare_cached(&select_sql)
             .expect("knot runtime: failed to prepare groupby select");
         let mut result_rows = select_stmt
             .query([])
@@ -2118,7 +2122,7 @@ pub extern "C" fn knot_source_migrate(
 
         let mut stmt = db_ref
             .conn
-            .prepare(&insert_sql)
+            .prepare_cached(&insert_sql)
             .expect("knot runtime: failed to prepare insert during migration");
 
         for row_ptr in &new_rows {
@@ -2794,7 +2798,7 @@ pub extern "C" fn knot_source_read(
 
         let mut stmt = db_ref
             .conn
-            .prepare(&sql)
+            .prepare_cached(&sql)
             .unwrap_or_else(|e| panic!("knot runtime: query error: {}", e));
         let mut rows: Vec<*mut Value> = Vec::new();
         let mut result_rows = stmt
@@ -2887,6 +2891,39 @@ pub extern "C" fn knot_source_query_count(
     alloc(Value::Int(BigInt::from(count)))
 }
 
+/// Execute a SQL aggregate query returning a float (e.g. AVG).
+/// Returns a boxed Float value.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_source_query_float(
+    db: *mut c_void,
+    sql_ptr: *const u8,
+    sql_len: usize,
+    params: *mut Value,
+) -> *mut Value {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let sql = unsafe { str_from_raw(sql_ptr, sql_len) };
+
+    let param_values = match unsafe { as_ref(params) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: query_float params must be a Relation, got {}",
+            type_name(params)
+        ),
+    };
+    let sql_params: Vec<rusqlite::types::Value> =
+        param_values.iter().map(|v| value_to_sql_param(*v)).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+
+    debug_sql_params(sql, &sql_params);
+
+    let result: f64 = db_ref
+        .conn
+        .query_row(sql, param_refs.as_slice(), |row| row.get(0))
+        .unwrap_or_else(|e| panic!("knot runtime: query_float error: {}\n  SQL: {}", e, sql));
+    alloc(Value::Float(result))
+}
+
 /// Count rows in a source relation via SQL COUNT(*).
 /// Returns a boxed Int value.
 #[unsafe(no_mangle)]
@@ -2959,7 +2996,7 @@ pub extern "C" fn knot_source_read_where(
 
         let mut stmt = db_ref
             .conn
-            .prepare(&sql)
+            .prepare_cached(&sql)
             .unwrap_or_else(|e| panic!("knot runtime: read_where query error: {}", e));
         let mut rows: Vec<*mut Value> = Vec::new();
         let mut result_rows = stmt
@@ -3028,7 +3065,7 @@ pub extern "C" fn knot_source_read_where(
 
         let mut stmt = db_ref
             .conn
-            .prepare(&sql)
+            .prepare_cached(&sql)
             .unwrap_or_else(|e| panic!("knot runtime: read_where query error: {}", e));
         let mut rows: Vec<*mut Value> = Vec::new();
         let mut result_rows = stmt
@@ -3103,7 +3140,7 @@ pub extern "C" fn knot_source_query(
 
     let mut stmt = db_ref
         .conn
-        .prepare(sql)
+        .prepare_cached(sql)
         .unwrap_or_else(|e| panic!("knot runtime: source_query error: {}\n  SQL: {}", e, sql));
     let mut rows: Vec<*mut Value> = Vec::new();
     let mut result_rows = stmt
@@ -3181,7 +3218,7 @@ pub extern "C" fn knot_source_match(
 
         let mut stmt = db_ref
             .conn
-            .prepare(&sql)
+            .prepare_cached(&sql)
             .unwrap_or_else(|e| panic!("knot runtime: match query error: {}", e));
         let mut rows: Vec<*mut Value> = Vec::new();
         let mut result_rows = stmt
@@ -3230,7 +3267,7 @@ fn read_record_table(
     debug_sql(&sql);
 
     let mut stmt = conn
-        .prepare(&sql)
+        .prepare_cached(&sql)
         .unwrap_or_else(|e| panic!("knot runtime: query error: {}", e));
     let mut rows: Vec<*mut Value> = Vec::new();
     let mut result_rows = stmt
@@ -3295,7 +3332,7 @@ fn read_child_table(
     debug_sql(&sql);
 
     let mut stmt = conn
-        .prepare(&sql)
+        .prepare_cached(&sql)
         .unwrap_or_else(|e| panic!("knot runtime: child query error: {}", e));
     let mut rows: Vec<*mut Value> = Vec::new();
     let mut result_rows = stmt
@@ -3442,7 +3479,7 @@ fn write_record_rows(
     };
     debug_sql(&insert_sql);
 
-    let mut stmt = conn.prepare(&insert_sql).expect("knot runtime: failed to prepare insert");
+    let mut stmt = conn.prepare_cached(&insert_sql).expect("knot runtime: failed to prepare insert");
 
     for row_ptr in rows {
         let row = unsafe { as_ref(*row_ptr) };
@@ -3518,7 +3555,7 @@ fn write_child_rows(
     );
     debug_sql(&insert_sql);
 
-    let mut stmt = conn.prepare(&insert_sql).expect("knot runtime: failed to prepare child insert");
+    let mut stmt = conn.prepare_cached(&insert_sql).expect("knot runtime: failed to prepare child insert");
 
     for row_ptr in rows {
         let row = unsafe { as_ref(*row_ptr) };
@@ -3613,7 +3650,7 @@ pub extern "C" fn knot_source_write(
 
             let mut stmt = db_ref
                 .conn
-                .prepare(&insert_sql)
+                .prepare_cached(&insert_sql)
                 .expect("knot runtime: failed to prepare insert");
 
             for row_ptr in rows {
@@ -3692,7 +3729,7 @@ pub extern "C" fn knot_source_append(
 
         let mut stmt = db_ref
             .conn
-            .prepare(&insert_sql)
+            .prepare_cached(&insert_sql)
             .expect("knot runtime: failed to prepare insert");
 
         for row_ptr in rows {
@@ -3780,7 +3817,7 @@ pub extern "C" fn knot_source_diff_write(
             debug_sql(&insert_sql);
             let mut stmt = db_ref
                 .conn
-                .prepare(&insert_sql)
+                .prepare_cached(&insert_sql)
                 .expect("knot runtime: failed to prepare temp insert");
 
             for row_ptr in rows {
@@ -3867,7 +3904,7 @@ pub extern "C" fn knot_source_diff_write(
 
             let mut stmt = db_ref
                 .conn
-                .prepare(&insert_sql)
+                .prepare_cached(&insert_sql)
                 .expect("knot runtime: failed to prepare temp insert");
 
             for row_ptr in rows {
@@ -4296,7 +4333,7 @@ pub extern "C" fn knot_source_read_at(
     debug_sql(&sql);
     let mut stmt = db_ref
         .conn
-        .prepare(&sql)
+        .prepare_cached(&sql)
         .unwrap_or_else(|e| panic!("knot runtime: temporal query error: {}", e));
 
     let mut rows: Vec<*mut Value> = Vec::new();
@@ -4564,7 +4601,7 @@ pub extern "C" fn knot_view_read(
 
     let mut stmt = db_ref
         .conn
-        .prepare(&sql)
+        .prepare_cached(&sql)
         .unwrap_or_else(|e| panic!("knot runtime: view_read query error: {}", e));
 
     let mut rows: Vec<*mut Value> = Vec::new();
@@ -4674,7 +4711,7 @@ pub extern "C" fn knot_view_read_at(
 
     let mut stmt = db_ref
         .conn
-        .prepare(&sql)
+        .prepare_cached(&sql)
         .unwrap_or_else(|e| panic!("knot runtime: view_read_at query error: {}", e));
 
     let mut rows: Vec<*mut Value> = Vec::new();
@@ -4823,7 +4860,7 @@ pub extern "C" fn knot_view_write(
 
         let mut stmt = db_ref
             .conn
-            .prepare(&insert_sql)
+            .prepare_cached(&insert_sql)
             .expect("knot runtime: view_write prepare insert failed");
 
         for row_ptr in rows {

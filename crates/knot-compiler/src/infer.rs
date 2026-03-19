@@ -228,6 +228,16 @@ impl Infer {
         self.errors.push((msg, span));
     }
 
+    /// Compress all substitution chains so every variable points directly
+    /// to its fully resolved type. Makes subsequent `apply` calls O(1).
+    fn compress_substitution(&mut self) {
+        let vars: Vec<TyVar> = self.subst.keys().copied().collect();
+        for v in vars {
+            let resolved = self.apply(&Ty::Var(v));
+            self.subst.insert(v, resolved);
+        }
+    }
+
     // ── Substitution application ─────────────────────────────────
 
     fn apply(&self, ty: &Ty) -> Ty {
@@ -2917,6 +2927,9 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo) {
 
     // Phase 4b: Check deferred trait constraints
     infer.check_constraints();
+
+    // Phase 4c: Compress substitution chains for faster resolution
+    infer.compress_substitution();
 
     // Phase 5: Resolve monad types from desugared do-blocks
     let mut monad_info = MonadInfo::new();

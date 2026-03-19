@@ -2619,6 +2619,60 @@ impl Infer {
                 Box::new(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Int))),
             )),
         );
+
+        // Elliptic curve cryptography
+
+        // generateKeyPair : {privateKey: Bytes, publicKey: Bytes}
+        let key_pair_record = Ty::Record(
+            BTreeMap::from([
+                ("privateKey".into(), Ty::Bytes),
+                ("publicKey".into(), Ty::Bytes),
+            ]),
+            None,
+        );
+        self.bind_top("generateKeyPair", Scheme::mono(key_pair_record.clone()));
+
+        // generateSigningKeyPair : {privateKey: Bytes, publicKey: Bytes}
+        self.bind_top("generateSigningKeyPair", Scheme::mono(key_pair_record));
+
+        // encrypt : Bytes -> Bytes -> Bytes
+        self.bind_top(
+            "encrypt",
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Bytes),
+                Box::new(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Bytes))),
+            )),
+        );
+
+        // decrypt : Bytes -> Bytes -> Bytes
+        self.bind_top(
+            "decrypt",
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Bytes),
+                Box::new(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Bytes))),
+            )),
+        );
+
+        // sign : Bytes -> Bytes -> Bytes
+        self.bind_top(
+            "sign",
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Bytes),
+                Box::new(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Bytes))),
+            )),
+        );
+
+        // verify : Bytes -> Bytes -> Bytes -> Bool
+        self.bind_top(
+            "verify",
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Bytes),
+                Box::new(Ty::Fun(
+                    Box::new(Ty::Bytes),
+                    Box::new(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Bool))),
+                )),
+            )),
+        );
     }
 
     fn register_trait_methods(

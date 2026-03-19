@@ -439,6 +439,14 @@ impl Codegen {
         self.declare_rt("knot_random_int", &[p], &[p]);
         self.declare_rt("knot_random_float", &[], &[p]);
 
+        // Elliptic curve cryptography
+        self.declare_rt("knot_crypto_generate_key_pair", &[], &[p]);
+        self.declare_rt("knot_crypto_generate_signing_key_pair", &[], &[p]);
+        self.declare_rt("knot_crypto_encrypt", &[p, p], &[p]);
+        self.declare_rt("knot_crypto_decrypt", &[p, p], &[p]);
+        self.declare_rt("knot_crypto_sign", &[p, p], &[p]);
+        self.declare_rt("knot_crypto_verify", &[p, p, p, p], &[p]);
+
         // Temporal queries (history)
         self.declare_rt("knot_now", &[], &[p]);
         self.declare_rt("knot_history_init", &[p, p, p, p, p], &[]);
@@ -762,6 +770,7 @@ impl Codegen {
             "readFile", "writeFile", "appendFile",
             "fileExists", "removeFile", "listDir",
             "randomInt",
+            "encrypt", "decrypt", "sign", "verify",
         ];
         for name in &stdlib_names {
             self.register_stdlib_fn(name);
@@ -1603,6 +1612,14 @@ impl Codegen {
 
         // Random: 1-param
         self.define_stdlib_fn_1("randomInt", "knot_random_int");
+
+        // Crypto: 2-param (curried)
+        self.define_stdlib_fn_2("encrypt", "knot_crypto_encrypt", false);
+        self.define_stdlib_fn_2("decrypt", "knot_crypto_decrypt", false);
+        self.define_stdlib_fn_2("sign", "knot_crypto_sign", false);
+
+        // Crypto: 3-param (double-curried)
+        self.define_stdlib_fn_3("verify", "knot_crypto_verify");
 
         // File system: 1-param
         self.define_stdlib_fn_1("readFile", "knot_fs_read_file");
@@ -2453,6 +2470,12 @@ impl Codegen {
                 }
                 if name == "randomFloat" {
                     return self.call_rt(builder, "knot_random_float", &[]);
+                }
+                if name == "generateKeyPair" {
+                    return self.call_rt(builder, "knot_crypto_generate_key_pair", &[]);
+                }
+                if name == "generateSigningKeyPair" {
+                    return self.call_rt(builder, "knot_crypto_generate_signing_key_pair", &[]);
                 }
                 if name == "readLine" {
                     return self.call_rt(builder, "knot_read_line", &[]);
@@ -6211,6 +6234,12 @@ fn is_builtin_name(name: &str) -> bool {
             | "fileExists"
             | "removeFile"
             | "listDir"
+            | "generateKeyPair"
+            | "generateSigningKeyPair"
+            | "encrypt"
+            | "decrypt"
+            | "sign"
+            | "verify"
     )
 }
 

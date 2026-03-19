@@ -1,0 +1,34 @@
+-- Elliptic curve cryptography demo
+
+main = do
+  -- Key pair generation for encryption (X25519)
+  let keys = generateKeyPair
+  println "Encryption key pair generated"
+  println ("  Public key: " ++ bytesToHex keys.publicKey)
+
+  -- Encrypt and decrypt a message
+  let message = textToBytes "Hello, cryptography!"
+  let ciphertext = encrypt keys.publicKey message
+  println ("  Ciphertext: " ++ bytesToHex ciphertext)
+
+  let decrypted = decrypt keys.privateKey ciphertext
+  println ("  Decrypted: " ++ bytesToText decrypted)
+
+  -- Signing key pair generation (Ed25519)
+  let sigKeys = generateSigningKeyPair
+  println "Signing key pair generated"
+  println ("  Public key: " ++ bytesToHex sigKeys.publicKey)
+
+  -- Sign and verify a message
+  let sig = sign sigKeys.privateKey message
+  println ("  Signature: " ++ bytesToHex sig)
+
+  let valid = verify sigKeys.publicKey message sig
+  println ("  Valid: " ++ show valid)
+
+  -- Verify with wrong message should fail
+  let wrongMsg = textToBytes "Wrong message"
+  let invalid = verify sigKeys.publicKey wrongMsg sig
+  println ("  Invalid (wrong msg): " ++ show invalid)
+
+  yield {}

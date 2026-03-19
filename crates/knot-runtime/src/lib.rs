@@ -5802,3 +5802,184 @@ pub extern "C" fn knot_relation_index_free(index: *mut c_void) {
         drop(Box::from_raw(index as *mut HashIndex));
     }
 }
+
+// ── Elliptic curve cryptography ──────────────────────────────────
+
+/// Generate an X25519 key pair for encryption.
+/// Returns Record {privateKey: Bytes, publicKey: Bytes}.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_crypto_generate_key_pair() -> *mut Value {
+    let mut secret_bytes = [0u8; 32];
+    getrandom::fill(&mut secret_bytes).expect("knot runtime: failed to generate random bytes");
+    let secret = x25519_dalek::StaticSecret::from(secret_bytes);
+    let public = x25519_dalek::PublicKey::from(&secret);
+
+    let record = knot_record_empty(2);
+    let k = b"privateKey";
+    knot_record_set_field(record, k.as_ptr(), k.len(), alloc(Value::Bytes(secret_bytes.to_vec())));
+    let k = b"publicKey";
+    knot_record_set_field(record, k.as_ptr(), k.len(), alloc(Value::Bytes(public.as_bytes().to_vec())));
+    record
+}
+
+/// Generate an Ed25519 key pair for signing.
+/// Returns Record {privateKey: Bytes, publicKey: Bytes}.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_crypto_generate_signing_key_pair() -> *mut Value {
+    let mut secret_bytes = [0u8; 32];
+    getrandom::fill(&mut secret_bytes).expect("knot runtime: failed to generate random bytes");
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret_bytes);
+    let verifying_key = signing_key.verifying_key();
+
+    let record = knot_record_empty(2);
+    let k = b"privateKey";
+    knot_record_set_field(record, k.as_ptr(), k.len(), alloc(Value::Bytes(signing_key.to_bytes().to_vec())));
+    let k = b"publicKey";
+    knot_record_set_field(record, k.as_ptr(), k.len(), alloc(Value::Bytes(verifying_key.to_bytes().to_vec())));
+    record
+}
+
+/// Sealed-box encryption: X25519 ECDH + ChaCha20-Poly1305.
+/// Takes (publicKey: Bytes, plaintext: Bytes), returns ciphertext Bytes.
+/// Format: [ephemeral_pub: 32][nonce: 12][encrypted + tag: len+16]
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_crypto_encrypt(public_key: *mut Value, plaintext: *mut Value) -> *mut Value {
+    use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
+    use chacha20poly1305::aead::Aead;
+
+    let pub_bytes = match unsafe { as_ref(public_key) } {
+        Value::Bytes(b) => b,
+        _ => panic!("knot runtime: encrypt expected Bytes for publicKey, got {}", type_name(public_key)),
+    };
+    let plain = match unsafe { as_ref(plaintext) } {
+        Value::Bytes(b) => b,
+        _ => panic!("knot runtime: encrypt expected Bytes for plaintext, got {}", type_name(plaintext)),
+    };
+
+    let recipient_pub: [u8; 32] = pub_bytes.as_slice().try_into()
+        .expect("knot runtime: encrypt publicKey must be 32 bytes");
+    let recipient_public = x25519_dalek::PublicKey::from(recipient_pub);
+
+    // Generate ephemeral key pair
+    let mut eph_secret_bytes = [0u8; 32];
+    getrandom::fill(&mut eph_secret_bytes).expect("knot runtime: failed to generate random bytes");
+    let eph_secret = x25519_dalek::StaticSecret::from(eph_secret_bytes);
+    let eph_public = x25519_dalek::PublicKey::from(&eph_secret);
+
+    // ECDH shared secret
+    let shared = eph_secret.diffie_hellman(&recipient_public);
+    let key = chacha20poly1305::Key::from_slice(shared.as_bytes());
+    let cipher = ChaCha20Poly1305::new(key);
+
+    // Random nonce
+    let mut nonce_bytes = [0u8; 12];
+    getrandom::fill(&mut nonce_bytes).expect("knot runtime: failed to generate nonce");
+    let nonce = chacha20poly1305::Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher.encrypt(nonce, plain.as_slice())
+        .expect("knot runtime: encryption failed");
+
+    // Pack: ephemeral_public (32) + nonce (12) + ciphertext
+    let mut result = Vec::with_capacity(32 + 12 + ciphertext.len());
+    result.extend_from_slice(eph_public.as_bytes());
+    result.extend_from_slice(&nonce_bytes);
+    result.extend_from_slice(&ciphertext);
+    alloc(Value::Bytes(result))
+}
+
+/// Sealed-box decryption: reverse of encrypt.
+/// Takes (privateKey: Bytes, ciphertext: Bytes), returns plaintext Bytes.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_crypto_decrypt(private_key: *mut Value, ciphertext: *mut Value) -> *mut Value {
+    use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
+    use chacha20poly1305::aead::Aead;
+
+    let priv_bytes = match unsafe { as_ref(private_key) } {
+        Value::Bytes(b) => b,
+        _ => panic!("knot runtime: decrypt expected Bytes for privateKey, got {}", type_name(private_key)),
+    };
+    let ct = match unsafe { as_ref(ciphertext) } {
+        Value::Bytes(b) => b,
+        _ => panic!("knot runtime: decrypt expected Bytes for ciphertext, got {}", type_name(ciphertext)),
+    };
+
+    if ct.len() < 32 + 12 + 16 {
+        panic!("knot runtime: decrypt ciphertext too short (need at least 60 bytes, got {})", ct.len());
+    }
+
+    let secret_bytes: [u8; 32] = priv_bytes.as_slice().try_into()
+        .expect("knot runtime: decrypt privateKey must be 32 bytes");
+    let secret = x25519_dalek::StaticSecret::from(secret_bytes);
+
+    // Unpack
+    let eph_pub_bytes: [u8; 32] = ct[..32].try_into().unwrap();
+    let nonce_bytes: [u8; 12] = ct[32..44].try_into().unwrap();
+    let encrypted = &ct[44..];
+
+    let eph_public = x25519_dalek::PublicKey::from(eph_pub_bytes);
+    let shared = secret.diffie_hellman(&eph_public);
+    let key = chacha20poly1305::Key::from_slice(shared.as_bytes());
+    let cipher = ChaCha20Poly1305::new(key);
+    let nonce = chacha20poly1305::Nonce::from_slice(&nonce_bytes);
+
+    let plaintext = cipher.decrypt(nonce, encrypted)
+        .expect("knot runtime: decryption failed (invalid key or corrupted ciphertext)");
+    alloc(Value::Bytes(plaintext))
+}
+
+/// Ed25519 signing. Takes (privateKey: Bytes, message: Bytes), returns signature Bytes.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_crypto_sign(private_key: *mut Value, message: *mut Value) -> *mut Value {
+    use ed25519_dalek::Signer;
+
+    let priv_bytes = match unsafe { as_ref(private_key) } {
+        Value::Bytes(b) => b,
+        _ => panic!("knot runtime: sign expected Bytes for privateKey, got {}", type_name(private_key)),
+    };
+    let msg = match unsafe { as_ref(message) } {
+        Value::Bytes(b) => b,
+        _ => panic!("knot runtime: sign expected Bytes for message, got {}", type_name(message)),
+    };
+
+    let secret_bytes: [u8; 32] = priv_bytes.as_slice().try_into()
+        .expect("knot runtime: sign privateKey must be 32 bytes");
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret_bytes);
+    let signature = signing_key.sign(msg);
+    alloc(Value::Bytes(signature.to_bytes().to_vec()))
+}
+
+/// Ed25519 verification. Takes (db, publicKey: Bytes, message: Bytes, signature: Bytes), returns Bool.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_crypto_verify(
+    _db: *mut c_void,
+    public_key: *mut Value,
+    message: *mut Value,
+    signature: *mut Value,
+) -> *mut Value {
+    use ed25519_dalek::Verifier;
+
+    let pub_bytes = match unsafe { as_ref(public_key) } {
+        Value::Bytes(b) => b,
+        _ => panic!("knot runtime: verify expected Bytes for publicKey, got {}", type_name(public_key)),
+    };
+    let msg = match unsafe { as_ref(message) } {
+        Value::Bytes(b) => b,
+        _ => panic!("knot runtime: verify expected Bytes for message, got {}", type_name(message)),
+    };
+    let sig_bytes = match unsafe { as_ref(signature) } {
+        Value::Bytes(b) => b,
+        _ => panic!("knot runtime: verify expected Bytes for signature, got {}", type_name(signature)),
+    };
+
+    let pub_arr: [u8; 32] = pub_bytes.as_slice().try_into()
+        .expect("knot runtime: verify publicKey must be 32 bytes");
+    let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into()
+        .expect("knot runtime: verify signature must be 64 bytes");
+
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pub_arr)
+        .expect("knot runtime: verify invalid public key");
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
+
+    let valid = verifying_key.verify(msg, &signature).is_ok();
+    alloc(Value::Bool(valid))
+}

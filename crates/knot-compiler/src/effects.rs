@@ -179,7 +179,13 @@ impl EffectChecker {
             e
         };
         builtin_effects.insert("randomInt".into(), random_effect.clone());
-        builtin_effects.insert("randomFloat".into(), random_effect);
+        builtin_effects.insert("randomFloat".into(), random_effect.clone());
+        builtin_effects.insert("generateKeyPair".into(), random_effect.clone());
+        builtin_effects.insert("generateSigningKeyPair".into(), random_effect.clone());
+        builtin_effects.insert("encrypt".into(), random_effect.clone()); // ephemeral key + nonce
+        builtin_effects.insert("decrypt".into(), EffectSet::empty());
+        builtin_effects.insert("sign".into(), EffectSet::empty());
+        builtin_effects.insert("verify".into(), EffectSet::empty());
 
         // listen: network effect
         let network_effect = {

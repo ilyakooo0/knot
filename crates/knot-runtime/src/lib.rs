@@ -935,11 +935,12 @@ pub extern "C" fn knot_relation_union(
         return alloc(Value::Relation(result));
     }
 
-    // Fallback: in-memory O(n²) dedup
-    let mut result = rows_a.clone();
-    for row in rows_b {
-        if !result.iter().any(|existing| values_equal(*existing, *row)) {
-            result.push(*row);
+    // Fallback: in-memory hash-based dedup
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for &row in rows_a.iter().chain(rows_b.iter()) {
+        if seen.insert(value_hash_key(row)) {
+            result.push(row);
         }
     }
     alloc(Value::Relation(result))
@@ -1009,7 +1010,7 @@ pub extern "C" fn knot_relation_group_by(
     key_cols_len: usize,
 ) -> *mut Value {
     let rows = match unsafe { as_ref(rel) } {
-        Value::Relation(rows) => rows.clone(),
+        Value::Relation(rows) => rows,
         _ => panic!(
             "knot runtime: expected Relation in group_by, got {}",
             type_name(rel)
@@ -1450,11 +1451,12 @@ pub extern "C" fn knot_value_concat(a: *mut Value, b: *mut Value) -> *mut Value 
             alloc(Value::Text(s))
         }
         (Value::Relation(rows_a), Value::Relation(rows_b)) => {
-            // ++ on relations is union (in-memory fallback — no db available here)
-            let mut result = rows_a.clone();
-            for row in rows_b {
-                if !result.iter().any(|existing| values_equal(*existing, *row)) {
-                    result.push(*row);
+            // ++ on relations is union (in-memory hash-based dedup)
+            let mut seen = HashSet::new();
+            let mut result = Vec::new();
+            for &row in rows_a.iter().chain(rows_b.iter()) {
+                if seen.insert(value_hash_key(row)) {
+                    result.push(row);
                 }
             }
             alloc(Value::Relation(result))
@@ -1673,14 +1675,14 @@ pub extern "C" fn knot_relation_filter(
     rel: *mut Value,
 ) -> *mut Value {
     let rows = match unsafe { as_ref(rel) } {
-        Value::Relation(rows) => rows.clone(),
+        Value::Relation(rows) => rows,
         _ => panic!(
             "knot runtime: filter expected Relation, got {}",
             type_name(rel)
         ),
     };
     let mut result: Vec<*mut Value> = Vec::new();
-    for row in rows {
+    for &row in rows {
         let v = knot_value_call(db, pred, row);
         match unsafe { as_ref(v) } {
             Value::Bool(true) => result.push(row),
@@ -1698,23 +1700,23 @@ pub extern "C" fn knot_relation_match(
     rel: *mut Value,
 ) -> *mut Value {
     let tag = match unsafe { as_ref(ctor) } {
-        Value::Constructor(t, _) => t.clone(),
+        Value::Constructor(t, _) => t.as_str(),
         _ => panic!(
             "knot runtime: match expected Constructor, got {}",
             type_name(ctor)
         ),
     };
     let rows = match unsafe { as_ref(rel) } {
-        Value::Relation(rows) => rows.clone(),
+        Value::Relation(rows) => rows,
         _ => panic!(
             "knot runtime: match expected Relation, got {}",
             type_name(rel)
         ),
     };
     let mut result: Vec<*mut Value> = Vec::new();
-    for row in rows {
+    for &row in rows {
         match unsafe { as_ref(row) } {
-            Value::Constructor(t, payload) if t == &tag => {
+            Value::Constructor(t, payload) if t == tag => {
                 result.push(*payload);
             }
             _ => {}
@@ -1808,14 +1810,14 @@ pub extern "C" fn knot_relation_fold(
     rel: *mut Value,
 ) -> *mut Value {
     let rows = match unsafe { as_ref(rel) } {
-        Value::Relation(rows) => rows.clone(),
+        Value::Relation(rows) => rows,
         _ => panic!(
             "knot runtime: fold expected Relation, got {}",
             type_name(rel)
         ),
     };
     let mut acc = init;
-    for row in rows {
+    for &row in rows {
         // func is curried: func(acc) returns a function, then that function(row) returns new acc
         let partial = knot_value_call(db, func, acc);
         acc = knot_value_call(db, partial, row);
@@ -1924,14 +1926,14 @@ pub extern "C" fn knot_relation_sum(
     rel: *mut Value,
 ) -> *mut Value {
     let rows = match unsafe { as_ref(rel) } {
-        Value::Relation(rows) => rows.clone(),
+        Value::Relation(rows) => rows,
         _ => panic!(
             "knot runtime: sum expected Relation, got {}",
             type_name(rel)
         ),
     };
     let mut acc = alloc(Value::Int(BigInt::ZERO));
-    for row in rows {
+    for &row in rows {
         let val = knot_value_call(db, f, row);
         acc = knot_value_add(acc, val);
     }
@@ -1946,7 +1948,7 @@ pub extern "C" fn knot_relation_avg(
     rel: *mut Value,
 ) -> *mut Value {
     let rows = match unsafe { as_ref(rel) } {
-        Value::Relation(rows) => rows.clone(),
+        Value::Relation(rows) => rows,
         _ => panic!(
             "knot runtime: avg expected Relation, got {}",
             type_name(rel)
@@ -1957,7 +1959,7 @@ pub extern "C" fn knot_relation_avg(
     }
     let mut total = 0.0f64;
     let count = rows.len();
-    for row in rows {
+    for &row in rows {
         let val = knot_value_call(db, f, row);
         match unsafe { as_ref(val) } {
             Value::Int(n) => total += bigint_to_f64(n),

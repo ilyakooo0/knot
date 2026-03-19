@@ -2854,6 +2854,39 @@ pub extern "C" fn knot_source_read(
     }
 }
 
+/// Execute an arbitrary SQL query that returns COUNT(*), with bind parameters.
+/// Returns a boxed Int value.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_source_query_count(
+    db: *mut c_void,
+    sql_ptr: *const u8,
+    sql_len: usize,
+    params: *mut Value,
+) -> *mut Value {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let sql = unsafe { str_from_raw(sql_ptr, sql_len) };
+
+    let param_values = match unsafe { as_ref(params) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: query_count params must be a Relation, got {}",
+            type_name(params)
+        ),
+    };
+    let sql_params: Vec<rusqlite::types::Value> =
+        param_values.iter().map(|v| value_to_sql_param(*v)).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+
+    debug_sql_params(sql, &sql_params);
+
+    let count: i64 = db_ref
+        .conn
+        .query_row(sql, param_refs.as_slice(), |row| row.get(0))
+        .unwrap_or_else(|e| panic!("knot runtime: query_count error: {}\n  SQL: {}", e, sql));
+    alloc(Value::Int(BigInt::from(count)))
+}
+
 /// Count rows in a source relation via SQL COUNT(*).
 /// Returns a boxed Int value.
 #[unsafe(no_mangle)]

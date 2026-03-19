@@ -399,6 +399,7 @@ impl Codegen {
         self.declare_rt("knot_source_init", &[p, p, p, p, p], &[]);
         self.declare_rt("knot_source_read", &[p, p, p, p, p], &[p]);
         self.declare_rt("knot_source_count", &[p, p, p], &[p]);
+        self.declare_rt("knot_source_query_count", &[p, p, p, p], &[p]);
         self.declare_rt("knot_source_read_where", &[p, p, p, p, p, p, p, p], &[p]);
         self.declare_rt("knot_source_query", &[p, p, p, p, p, p], &[p]);
         self.declare_rt("knot_source_write", &[p, p, p, p, p, p], &[]);
@@ -2663,6 +2664,10 @@ impl Codegen {
                             }
                         }
                     }
+                    // Try to compile the entire pipe chain to a single SQL query
+                    if let Some(val) = self.try_compile_pipe_sql(builder, expr, env, db) {
+                        return val;
+                    }
                     // lhs |> rhs  =>  rhs(lhs)
                     let arg = self.compile_expr(builder, lhs, env, db);
                     let func = self.compile_expr(builder, rhs, env, db);
@@ -4739,6 +4744,126 @@ impl Codegen {
         ))
     }
 
+    /// Try to compile a pipe chain like `*source |> filter f |> map g` to a single SQL query.
+    fn try_compile_pipe_sql(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        expr: &ast::Expr,
+        env: &mut Env,
+        db: Value,
+    ) -> Option<Value> {
+        let (source, ops) = flatten_pipe_chain(expr)?;
+        if ops.is_empty() {
+            return None;
+        }
+
+        // Source must be a SourceRef to a plain source relation
+        let source_name = match &source.node {
+            ast::ExprKind::SourceRef(name) => name.clone(),
+            _ => return None,
+        };
+        if self.views.contains_key(&source_name) {
+            return None;
+        }
+        let schema = self.source_schemas.get(&source_name)?.clone();
+        if schema.starts_with('#') || schema.contains('[') {
+            return None;
+        }
+
+        let alias = "t0".to_string();
+        let mut bind_aliases: HashMap<String, String> = HashMap::new();
+        let mut conditions: Vec<String> = Vec::new();
+        let mut params: Vec<SqlParamSource> = Vec::new();
+        let mut select_override: Option<Vec<SqlSelectColumn>> = None;
+        let mut is_count = false;
+
+        for op in &ops {
+            match op {
+                PipeOp::Filter { bind_var, body } => {
+                    if is_count {
+                        return None; // filter after count makes no sense
+                    }
+                    bind_aliases.insert(bind_var.clone(), alias.clone());
+                    let frag = Self::try_compile_multi_table_sql_expr(
+                        &bind_aliases, body, env,
+                    )?;
+                    conditions.push(frag.sql);
+                    params.extend(frag.params);
+                }
+                PipeOp::Map { bind_var, body } => {
+                    if is_count || select_override.is_some() {
+                        return None; // map after count or double map
+                    }
+                    bind_aliases.insert(bind_var.clone(), alias.clone());
+                    let cols =
+                        analyze_map_select(bind_var, body, &alias, &schema)?;
+                    select_override = Some(cols);
+                }
+                PipeOp::Count => {
+                    if is_count {
+                        return None;
+                    }
+                    is_count = true;
+                }
+            }
+        }
+
+        if is_count {
+            let table = quote_sql_ident(&format!("_knot_{}", source_name));
+            let sql = if conditions.is_empty() {
+                format!("SELECT COUNT(*) FROM {}", table)
+            } else {
+                format!(
+                    "SELECT COUNT(*) FROM {} AS {} WHERE {}",
+                    table, alias, conditions.join(" AND ")
+                )
+            };
+            let params_rel = self.compile_sql_params(builder, &params, env);
+            let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+            Some(self.call_rt(
+                builder,
+                "knot_source_query_count",
+                &[db, sql_ptr, sql_len, params_rel],
+            ))
+        } else {
+            let select_columns = if let Some(cols) = select_override {
+                cols
+            } else {
+                // SELECT * — all columns from schema
+                parse_schema_columns(&schema)
+                    .into_iter()
+                    .map(|(col_name, type_str)| SqlSelectColumn {
+                        result_field: col_name.clone(),
+                        alias: alias.clone(),
+                        source_col: col_name,
+                        type_str,
+                    })
+                    .collect()
+            };
+
+            let plan = SqlQueryPlan {
+                tables: vec![SqlTable {
+                    source_name,
+                    alias,
+                }],
+                conditions,
+                params,
+                select_columns,
+            };
+
+            let sql = plan.build_sql();
+            let result_schema = plan.build_result_schema();
+            let params_rel = self.compile_sql_params(builder, &plan.params, env);
+            let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+            let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
+            Some(self.call_rt(
+                builder,
+                "knot_source_query",
+                &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+            ))
+        }
+    }
+
     /// Analyze do-block statements and produce a SQL query plan.
     /// Returns None if the block can't be compiled to a single SQL query.
     fn analyze_sql_plan(
@@ -5645,6 +5770,115 @@ fn parse_schema_columns(schema: &str) -> Vec<(String, String)> {
             Some((name, ty))
         })
         .collect()
+}
+
+// ── Pipe chain analysis ───────────────────────────────────────────
+
+enum PipeOp<'a> {
+    Filter { bind_var: String, body: &'a ast::Expr },
+    Map { bind_var: String, body: &'a ast::Expr },
+    Count,
+}
+
+/// Flatten a nested pipe chain `a |> f |> g |> h` into `(a, [f, g, h])`.
+/// Each operation must be a recognized stdlib function (filter, map, count).
+fn flatten_pipe_chain(expr: &ast::Expr) -> Option<(&ast::Expr, Vec<PipeOp<'_>>)> {
+    let mut ops = Vec::new();
+    let mut current = expr;
+
+    loop {
+        match &current.node {
+            ast::ExprKind::BinOp {
+                op: ast::BinOp::Pipe,
+                lhs,
+                rhs,
+            } => {
+                let pipe_op = analyze_pipe_op(rhs)?;
+                ops.push(pipe_op);
+                current = lhs;
+            }
+            _ => break,
+        }
+    }
+
+    ops.reverse();
+    Some((current, ops))
+}
+
+/// Recognize a pipe RHS as a SQL-compilable operation.
+fn analyze_pipe_op(expr: &ast::Expr) -> Option<PipeOp<'_>> {
+    match &expr.node {
+        ast::ExprKind::Var(name) if name == "count" => Some(PipeOp::Count),
+        ast::ExprKind::App { func, arg } => {
+            if let ast::ExprKind::Var(name) = &func.node {
+                match name.as_str() {
+                    "filter" => extract_single_param_lambda(arg).map(|(bind_var, body)| {
+                        PipeOp::Filter { bind_var, body }
+                    }),
+                    "map" => extract_single_param_lambda(arg).map(|(bind_var, body)| {
+                        PipeOp::Map { bind_var, body }
+                    }),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Extract bind variable name and body from a single-parameter lambda.
+fn extract_single_param_lambda(expr: &ast::Expr) -> Option<(String, &ast::Expr)> {
+    if let ast::ExprKind::Lambda { params, body } = &expr.node {
+        if params.len() == 1 {
+            if let ast::PatKind::Var(name) = &params[0].node {
+                return Some((name.clone(), body));
+            }
+        }
+    }
+    None
+}
+
+/// Analyze a map lambda body to extract SQL SELECT columns.
+/// The body must be a record where each field is `bind_var.column`.
+fn analyze_map_select(
+    bind_var: &str,
+    body: &ast::Expr,
+    alias: &str,
+    schema: &str,
+) -> Option<Vec<SqlSelectColumn>> {
+    if let ast::ExprKind::Record(fields) = &body.node {
+        let mut cols = Vec::new();
+        for field in fields {
+            if let ast::ExprKind::FieldAccess {
+                expr,
+                field: col_name,
+            } = &field.value.node
+            {
+                if let ast::ExprKind::Var(name) = &expr.node {
+                    if name == bind_var {
+                        let type_str = lookup_col_type_from_schema(schema, col_name)?;
+                        cols.push(SqlSelectColumn {
+                            result_field: field.name.clone(),
+                            alias: alias.to_string(),
+                            source_col: col_name.clone(),
+                            type_str,
+                        });
+                    } else {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        }
+        Some(cols)
+    } else {
+        None
+    }
 }
 
 // ── Free functions ────────────────────────────────────────────────

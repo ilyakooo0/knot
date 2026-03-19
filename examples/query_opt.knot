@@ -53,6 +53,20 @@ printQuery = \label results -> do
   println ("  " ++ show r)
   yield {}
 
+-- 7. Pipe: filter → SQL WHERE
+pipeFilter = *employees |> filter (\e -> e.salary > 75)
+
+-- 8. Pipe: filter + map → SQL WHERE + SELECT
+pipeFilterMap = *employees
+  |> filter (\e -> e.salary > 75)
+  |> map (\e -> {name: e.name, salary: e.salary})
+
+-- 9. Pipe: filter + count → SQL COUNT(*) WHERE
+pipeFilterCount = *employees |> filter (\e -> e.salary > 75) |> count
+
+-- 10. Pipe: map only → SQL SELECT
+pipeMap = *employees |> map (\e -> {name: e.name, dept: e.dept})
+
 main = do
   set *employees = [
     {name: "Alice", dept: "Eng", salary: 90},
@@ -71,4 +85,8 @@ main = do
   printQuery "Filter query (salary > 75)" filterQuery
   printQuery "Join query (salary > 75, with dept)" joinQuery
   printQuery "All employees" allEmployees
+  printQuery "Pipe filter (salary > 75)" pipeFilter
+  printQuery "Pipe filter+map (salary > 75)" pipeFilterMap
+  println ("Pipe filter+count (salary > 75): " ++ show pipeFilterCount)
+  printQuery "Pipe map (name, dept)" pipeMap
   yield {}

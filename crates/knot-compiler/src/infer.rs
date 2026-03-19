@@ -2848,6 +2848,13 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo) {
     // Phase 2b: Collect known trait implementations
     infer.collect_impls(module);
 
+    // Phase 2c: Register builtin [] impls for HKT traits
+    for trait_name in &["Functor", "Applicative", "Monad", "Alternative", "Foldable"] {
+        infer
+            .known_impls
+            .insert((trait_name.to_string(), "[]".to_string()));
+    }
+
     // Phase 3: Pre-register top-level names (builtins, functions, trait methods)
     infer.pre_register(module);
 

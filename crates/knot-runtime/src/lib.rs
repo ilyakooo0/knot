@@ -781,8 +781,12 @@ fn materialize_relation(conn: &Connection, rows: &[*mut Value], schema: &TempSch
 fn in_memory_dedup(rows: Vec<*mut Value>) -> Vec<*mut Value> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
+    let mut buf = Vec::new();
     for row in rows {
-        if seen.insert(value_hash_key(row)) {
+        buf.clear();
+        value_to_hash_bytes(row, &mut buf);
+        if !seen.contains(buf.as_slice()) {
+            seen.insert(buf.clone());
             result.push(row);
         }
     }
@@ -939,8 +943,12 @@ pub extern "C" fn knot_relation_union(
     // Fallback: in-memory hash-based dedup
     let mut seen = HashSet::new();
     let mut result = Vec::new();
+    let mut buf = Vec::new();
     for &row in rows_a.iter().chain(rows_b.iter()) {
-        if seen.insert(value_hash_key(row)) {
+        buf.clear();
+        value_to_hash_bytes(row, &mut buf);
+        if !seen.contains(buf.as_slice()) {
+            seen.insert(buf.clone());
             result.push(row);
         }
     }
@@ -1265,11 +1273,7 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
     }
 }
 
-fn value_hash_key(v: *mut Value) -> Vec<u8> {
-    let mut buf = Vec::new();
-    value_to_hash_bytes(v, &mut buf);
-    buf
-}
+
 
 fn values_equal(a: *mut Value, b: *mut Value) -> bool {
     if a == b {
@@ -1302,9 +1306,17 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
             if ra.len() != rb.len() {
                 return false;
             }
-            let set_a: HashSet<Vec<u8>> = ra.iter().map(|r| value_hash_key(*r)).collect();
-            let set_b: HashSet<Vec<u8>> = rb.iter().map(|r| value_hash_key(*r)).collect();
-            set_a == set_b
+            let mut buf = Vec::new();
+            let set_a: HashSet<Vec<u8>> = ra.iter().map(|r| {
+                buf.clear();
+                value_to_hash_bytes(*r, &mut buf);
+                buf.clone()
+            }).collect();
+            rb.iter().all(|r| {
+                buf.clear();
+                value_to_hash_bytes(*r, &mut buf);
+                set_a.contains(buf.as_slice())
+            })
         }
         _ => false,
     }
@@ -1455,8 +1467,12 @@ pub extern "C" fn knot_value_concat(a: *mut Value, b: *mut Value) -> *mut Value 
             // ++ on relations is union (in-memory hash-based dedup)
             let mut seen = HashSet::new();
             let mut result = Vec::new();
+            let mut buf = Vec::new();
             for &row in rows_a.iter().chain(rows_b.iter()) {
-                if seen.insert(value_hash_key(row)) {
+                buf.clear();
+                value_to_hash_bytes(row, &mut buf);
+                if !seen.contains(buf.as_slice()) {
+                    seen.insert(buf.clone());
                     result.push(row);
                 }
             }

@@ -1,7 +1,5 @@
 //! Error reporting infrastructure for the Knot compiler.
 
-use std::fmt::Write;
-
 use crate::ast::Span;
 
 // ── Types ────────────────────────────────────────────────────────────
@@ -58,7 +56,7 @@ impl Diagnostic {
     }
 }
 
-// ── Source helpers ────────────────────────────────────────────────────
+// ── Source helpers (still used by LSP and other consumers) ───────────
 
 /// Returns `(line, col)` for a byte offset. Line is 1-based, column is 0-based.
 pub fn line_col(source: &str, byte_offset: usize) -> (usize, usize) {
@@ -82,7 +80,6 @@ pub fn get_line(source: &str, line: usize) -> &str {
     if line == 0 {
         return "";
     }
-    // Find the start of the target line by counting newlines in bytes
     let bytes = source.as_bytes();
     let mut current_line = 1;
     let mut start = 0;
@@ -95,145 +92,53 @@ pub fn get_line(source: &str, line: usize) -> &str {
             None => return "",
         }
     }
-    // Find the end of this line
     let end = bytes[start..].iter().position(|&b| b == b'\n')
         .map_or(source.len(), |pos| start + pos);
     &source[start..end]
 }
 
-// ── ANSI color helpers ───────────────────────────────────────────────
-
-fn use_color() -> bool {
-    if std::env::var_os("NO_COLOR").is_some() {
-        return false;
-    }
-    std::io::IsTerminal::is_terminal(&std::io::stderr())
-}
-
-struct Colors {
-    red: &'static str,
-    yellow: &'static str,
-    cyan: &'static str,
-    blue: &'static str,
-    bold: &'static str,
-    reset: &'static str,
-}
-
-const COLORS_ON: Colors = Colors {
-    red: "\x1b[31m",
-    yellow: "\x1b[33m",
-    cyan: "\x1b[36m",
-    blue: "\x1b[34m",
-    bold: "\x1b[1m",
-    reset: "\x1b[0m",
-};
-
-const COLORS_OFF: Colors = Colors {
-    red: "",
-    yellow: "",
-    cyan: "",
-    blue: "",
-    bold: "",
-    reset: "",
-};
-
-fn colors() -> &'static Colors {
-    if use_color() { &COLORS_ON } else { &COLORS_OFF }
-}
-
-// ── Rendering ────────────────────────────────────────────────────────
+// ── Rendering (ariadne) ─────────────────────────────────────────────
 
 impl Diagnostic {
     pub fn render(&self, source: &str, filename: &str) -> String {
-        let mut out = String::new();
-        let c = colors();
+        use ariadne::{CharSet, Config, ColorGenerator, Label as ALabel, Report, ReportKind, Source};
 
-        // Header: "error: message" or "warning: message"
-        let (sev, sev_color) = match self.severity {
-            Severity::Error => ("error", c.red),
-            Severity::Warning => ("warning", c.yellow),
+        let kind = match self.severity {
+            Severity::Error => ReportKind::Error,
+            Severity::Warning => ReportKind::Warning,
         };
-        let _ = writeln!(
-            out,
-            "{sev_color}{bold}{sev}{reset}: {bold}{msg}{reset}",
-            bold = c.bold,
-            reset = c.reset,
-            msg = self.message,
-        );
 
-        // Group labels by line number so we only show each source line once.
-        let mut by_line: std::collections::BTreeMap<usize, Vec<&Label>> =
-            std::collections::BTreeMap::new();
+        // Pick the offset for the report header from the first label, or 0.
+        let header_offset = self.labels.first().map_or(0, |l| l.span.start);
+
+        let mut colors = ColorGenerator::new();
+
+        let mut builder = Report::build(kind, header_offset..header_offset)
+            .with_message(&self.message)
+            .with_config(Config::default().with_char_set(CharSet::Unicode));
+
         for label in &self.labels {
-            let (line, _) = line_col(source, label.span.start);
-            by_line.entry(line).or_default().push(label);
+            let color = colors.next();
+            builder = builder.with_label(
+                ALabel::new(label.span.start..label.span.end)
+                    .with_message(&label.message)
+                    .with_color(color),
+            );
         }
 
-        // Compute gutter width from the largest line number we'll display.
-        let max_line = by_line.keys().last().copied().unwrap_or(1);
-        let gutter = if max_line == 0 { 1 } else { (max_line.ilog10() + 1) as usize };
-
-        for (&line_no, labels) in &by_line {
-            let src_line = get_line(source, line_no);
-
-            // Location arrow for the first label in this group.
-            let (_, first_col) = line_col(source, labels[0].span.start);
-            let _ = writeln!(
-                out,
-                "{blue}{:>gutter$}--> {reset}{filename}:{line_no}:{col}",
-                "",
-                col = first_col + 1,
-                blue = c.blue,
-                reset = c.reset,
-            );
-            let _ = writeln!(out, "{blue}{:>gutter$} |{reset}", "", blue = c.blue, reset = c.reset);
-
-            // Source line.
-            let _ = writeln!(
-                out,
-                "{blue}{line_no:>gutter$} |{reset} {src_line}",
-                blue = c.blue,
-                reset = c.reset,
-            );
-
-            // Underline + message for each label on this line.
-            let ul_color = match self.severity {
-                Severity::Error => c.red,
-                Severity::Warning => c.yellow,
-            };
-            for label in labels {
-                let (_, col) = line_col(source, label.span.start);
-                let span_len = (label.span.end - label.span.start).max(1);
-                let _ = writeln!(
-                    out,
-                    "{blue}{:>gutter$} |{reset} {:>col$}{ul_color}{bold}{carets}{reset} {ul_color}{msg}{reset}",
-                    "",
-                    "",
-                    carets = "^".repeat(span_len),
-                    msg = label.message,
-                    blue = c.blue,
-                    reset = c.reset,
-                    ul_color = ul_color,
-                    bold = c.bold,
-                );
-            }
-
-            let _ = writeln!(out, "{blue}{:>gutter$} |{reset}", "", blue = c.blue, reset = c.reset);
-        }
-
-        // Notes.
         for note in &self.notes {
-            let _ = writeln!(
-                out,
-                "{blue}{:>gutter$} = {cyan}help:{reset} {note}",
-                "",
-                blue = c.blue,
-                cyan = c.cyan,
-                reset = c.reset,
-            );
+            builder = builder.with_help(note);
         }
 
-        out
+        let report = builder.finish();
+
+        let mut buf = Vec::new();
+        report.write(Source::from(source), &mut buf).expect("write to Vec cannot fail");
+
+        // Replace the default `<unknown>` filename with the actual filename.
+        String::from_utf8(buf)
+            .expect("ariadne output is always UTF-8")
+            .replace("<unknown>", filename)
     }
 }
 
@@ -276,9 +181,9 @@ mod tests {
             .label(Span::new(12, 17), "expected `then` after this")
             .note("add `then` before the consequent");
         let rendered = diag.render(src, "input");
-        assert!(rendered.contains("error: expected `then` after condition"));
-        assert!(rendered.contains("--> input:2:3"));
-        assert!(rendered.contains("^^^^^"));
-        assert!(rendered.contains("= help: add `then`"));
+        assert!(rendered.contains("Error"), "should contain error header: {}", rendered);
+        assert!(rendered.contains("expected `then` after condition"), "should contain message: {}", rendered);
+        assert!(rendered.contains("expected `then` after this"), "should contain label: {}", rendered);
+        assert!(rendered.contains("add `then`"), "should contain help note: {}", rendered);
     }
 }

@@ -2,3 +2,6 @@
 name = "knot"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+ariadne = { workspace = true }

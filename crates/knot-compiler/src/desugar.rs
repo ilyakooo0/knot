@@ -439,6 +439,15 @@ fn is_pure_comprehension(stmts: &[Stmt]) -> bool {
         return false;
     }
 
+    // IO do blocks use a dedicated codegen path (compile_io_do) — not eligible
+    // for desugaring. Check if any bind or bare expression calls an IO builtin.
+    if stmts.iter().any(|s| match &s.node {
+        StmtKind::Bind { expr, .. } | StmtKind::Expr(expr) => expr_is_io(expr),
+        _ => false,
+    }) {
+        return false;
+    }
+
     // Constructor pattern binds may be value pattern matches (not monadic
     // binds). The desugarer can't tell syntactically whether the expression
     // is a relation or a value, so we leave these for direct codegen which
@@ -461,6 +470,21 @@ fn is_pure_comprehension(stmts: &[Stmt]) -> bool {
     // Final statement must be yield
     match &stmts.last().unwrap().node {
         StmtKind::Expr(e) => matches!(&e.node, ExprKind::Yield(_)),
+        _ => false,
+    }
+}
+
+/// Check if an expression syntactically calls an IO-returning builtin.
+fn expr_is_io(expr: &Expr) -> bool {
+    match &expr.node {
+        ExprKind::App { func, .. } => expr_is_io(func),
+        ExprKind::Var(name) => matches!(
+            name.as_str(),
+            "println" | "putLine" | "print" | "readLine" | "readFile"
+                | "writeFile" | "appendFile" | "fileExists" | "removeFile"
+                | "listDir" | "now" | "randomInt" | "randomFloat"
+                | "fetch" | "fetchWith"
+        ),
         _ => false,
     }
 }

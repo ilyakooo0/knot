@@ -1302,7 +1302,11 @@ impl Infer {
             .map(|(name, ty)| (name.clone(), self.ast_type_to_ty(ty)))
             .collect();
 
-        let data_ty = Ty::Con(info.data_type.clone(), param_tys);
+        let data_ty = if info.data_type == "Bool" {
+            Ty::Bool
+        } else {
+            Ty::Con(info.data_type.clone(), param_tys)
+        };
         let record_ty = Ty::Record(field_tys, None);
 
         Some((data_ty, record_ty))
@@ -2337,6 +2341,34 @@ impl Infer {
                 ctors: vec![
                     ("Nothing".into(), vec![]),
                     ("Just".into(), vec![("value".into(), ast::Type::new(ast::TypeKind::Var("a".into()), dummy_span))]),
+                ],
+            },
+        );
+
+        // Built-in ADT: data Bool = True {} | False {}
+        self.constructors.insert(
+            "True".into(),
+            CtorInfo {
+                data_type: "Bool".into(),
+                data_params: vec![],
+                fields: vec![],
+            },
+        );
+        self.constructors.insert(
+            "False".into(),
+            CtorInfo {
+                data_type: "Bool".into(),
+                data_params: vec![],
+                fields: vec![],
+            },
+        );
+        self.data_types.insert(
+            "Bool".into(),
+            DataInfo {
+                params: vec![],
+                ctors: vec![
+                    ("True".into(), vec![]),
+                    ("False".into(), vec![]),
                 ],
             },
         );

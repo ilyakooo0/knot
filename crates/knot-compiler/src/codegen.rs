@@ -2607,7 +2607,11 @@ impl Codegen {
             }
 
             ast::ExprKind::Constructor(name) => {
-                if matches!(self.nullable_ctors.get(name), Some(NullableRole::None)) {
+                if name == "True" || name == "False" {
+                    let val = if name == "True" { 1i64 } else { 0i64 };
+                    let arg = builder.ins().iconst(cranelift_codegen::ir::types::I32, val);
+                    self.call_rt(builder, "knot_value_bool", &[arg])
+                } else if matches!(self.nullable_ctors.get(name), Some(NullableRole::None)) {
                     // Nullable none: encode as null pointer
                     builder.ins().iconst(self.ptr_type, 0)
                 } else {
@@ -3575,6 +3579,7 @@ impl Codegen {
                 if compiled_args.len() == 2 {
                     let type_name = match self.monad_info.get(&func_expr.span) {
                         Some(MonadKind::Adt(name)) => name.clone(),
+                        Some(MonadKind::IO) => "IO".to_string(),
                         _ => "Relation".to_string(),
                     };
                     let bind_fn = format!("Monad_{}_bind", type_name);
@@ -3736,6 +3741,11 @@ impl Codegen {
             }
 
             // Constructor application: `Circle {radius: 3.14}`
+            ast::ExprKind::Constructor(name) if name == "True" || name == "False" => {
+                let val = if name == "True" { 1i64 } else { 0i64 };
+                let arg = builder.ins().iconst(cranelift_codegen::ir::types::I32, val);
+                self.call_rt(builder, "knot_value_bool", &[arg])
+            }
             ast::ExprKind::Constructor(name) => {
                 match self.nullable_ctors.get(name).cloned() {
                     Some(NullableRole::None) => {
@@ -3924,6 +3934,18 @@ impl Codegen {
                 ast::PatKind::Wildcard | ast::PatKind::Var(_) => {
                     // Always matches
                     builder.ins().jump(arm_block, &[]);
+                }
+                ast::PatKind::Constructor { name, .. } if name == "True" || name == "False" => {
+                    let bool_val = self.call_rt_typed(builder, "knot_value_get_bool", &[scrut], types::I32);
+                    let expected = if name == "True" { 1i64 } else { 0i64 };
+                    let is_match = builder.ins().icmp_imm(IntCC::Equal, bool_val, expected);
+                    builder.ins().brif(
+                        is_match,
+                        arm_block,
+                        &[],
+                        next_block,
+                        &[],
+                    );
                 }
                 ast::PatKind::Constructor { name, .. } => {
                     match self.nullable_ctors.get(name).cloned() {
@@ -4118,6 +4140,7 @@ impl Codegen {
     ) -> Value {
         let type_name = match self.monad_info.get(&span) {
             Some(MonadKind::Adt(name)) => name.clone(),
+            Some(MonadKind::IO) => "IO".to_string(),
             _ => "Relation".to_string(),
         };
         let yield_fn = format!("Applicative_{}_yield", type_name);
@@ -4141,6 +4164,7 @@ impl Codegen {
     ) -> Value {
         let type_name = match self.monad_info.get(&span) {
             Some(MonadKind::Adt(name)) => name.clone(),
+            Some(MonadKind::IO) => "IO".to_string(),
             _ => "Relation".to_string(),
         };
         let empty_fn = format!("Alternative_{}_empty", type_name);

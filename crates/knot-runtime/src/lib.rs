@@ -299,6 +299,11 @@ thread_local! {
             .map(|n| Box::into_raw(Box::new(Value::Int(BigInt::from(n)))))
             .collect()
     };
+    static UNIT_SINGLETON: *mut Value = Box::into_raw(Box::new(Value::Unit));
+    static BOOL_TRUE: *mut Value = Box::into_raw(Box::new(Value::Bool(true)));
+    static BOOL_FALSE: *mut Value = Box::into_raw(Box::new(Value::Bool(false)));
+    static FLOAT_ZERO: *mut Value = Box::into_raw(Box::new(Value::Float(0.0)));
+    static FLOAT_ONE: *mut Value = Box::into_raw(Box::new(Value::Float(1.0)));
 }
 
 #[unsafe(no_mangle)]
@@ -319,7 +324,13 @@ pub extern "C" fn knot_value_int_from_str(ptr: *const u8, len: usize) -> *mut Va
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_float(n: f64) -> *mut Value {
-    alloc(Value::Float(n))
+    if n == 0.0 {
+        FLOAT_ZERO.with(|p| *p)
+    } else if n == 1.0 {
+        FLOAT_ONE.with(|p| *p)
+    } else {
+        alloc(Value::Float(n))
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -330,12 +341,16 @@ pub extern "C" fn knot_value_text(ptr: *const u8, len: usize) -> *mut Value {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_bool(b: i32) -> *mut Value {
-    alloc(Value::Bool(b != 0))
+    if b != 0 {
+        BOOL_TRUE.with(|p| *p)
+    } else {
+        BOOL_FALSE.with(|p| *p)
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_unit() -> *mut Value {
-    alloc(Value::Unit)
+    UNIT_SINGLETON.with(|p| *p)
 }
 
 #[unsafe(no_mangle)]

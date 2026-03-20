@@ -2767,6 +2767,32 @@ impl Codegen {
                     let arg = self.compile_expr(builder, lhs, env, db);
                     let func = self.compile_expr(builder, rhs, env, db);
                     self.call_rt(builder, "knot_value_call", &[db, func, arg])
+                } else if matches!(op, ast::BinOp::And | ast::BinOp::Or) {
+                    // Short-circuit boolean ops: don't evaluate RHS if LHS determines result
+                    let l = self.compile_expr(builder, lhs, env, db);
+                    let l_bool = self.call_rt_typed(builder, "knot_value_get_bool", &[l], types::I32);
+                    let l_true = builder.ins().icmp_imm(IntCC::NotEqual, l_bool, 0);
+
+                    let rhs_block = builder.create_block();
+                    let merge_block = builder.create_block();
+                    merge_block_param(builder, merge_block, self.ptr_type);
+
+                    if matches!(op, ast::BinOp::And) {
+                        // &&: if l is false, short-circuit with l (false)
+                        builder.ins().brif(l_true, rhs_block, &[], merge_block, &[l]);
+                    } else {
+                        // ||: if l is true, short-circuit with l (true)
+                        builder.ins().brif(l_true, merge_block, &[l], rhs_block, &[]);
+                    }
+
+                    builder.switch_to_block(rhs_block);
+                    builder.seal_block(rhs_block);
+                    let r = self.compile_expr(builder, rhs, env, db);
+                    builder.ins().jump(merge_block, &[r]);
+
+                    builder.switch_to_block(merge_block);
+                    builder.seal_block(merge_block);
+                    builder.block_params(merge_block)[0]
                 } else {
                     let l = self.compile_expr(builder, lhs, env, db);
                     let r = self.compile_expr(builder, rhs, env, db);
@@ -2792,11 +2818,9 @@ impl Codegen {
                         ast::BinOp::Gt => self.compile_comparison(builder, l, r, db, "GT", false),
                         ast::BinOp::Le => self.compile_comparison(builder, l, r, db, "GT", true),
                         ast::BinOp::Ge => self.compile_comparison(builder, l, r, db, "LT", true),
-                        // Boolean ops: no trait dispatch
-                        ast::BinOp::And => self.call_rt(builder, "knot_value_and", &[l, r]),
-                        ast::BinOp::Or => self.call_rt(builder, "knot_value_or", &[l, r]),
                         // Semigroup: dispatch through Semigroup trait
                         ast::BinOp::Concat => self.compile_trait_binop(builder, "append", l, r, db, "knot_value_concat"),
+                        ast::BinOp::And | ast::BinOp::Or => unreachable!(),
                         ast::BinOp::Pipe => unreachable!(),
                     }
                 }
@@ -3697,6 +3721,24 @@ impl Codegen {
         let merge_block = builder.create_block();
         merge_block_param(builder, merge_block, self.ptr_type);
 
+        // Count non-nullable constructor arms to decide whether to extract tag once
+        let non_nullable_ctor_count = arms.iter().filter(|a| {
+            if let ast::PatKind::Constructor { name, .. } = &a.pat.node {
+                !self.nullable_ctors.contains_key(name)
+            } else {
+                false
+            }
+        }).count();
+
+        // Extract constructor tag pointer+length once if multiple constructor arms
+        let cached_tag = if non_nullable_ctor_count >= 2 {
+            let tag_ptr = self.call_rt(builder, "knot_constructor_tag_ptr", &[scrut]);
+            let tag_len = self.call_rt(builder, "knot_constructor_tag_len", &[scrut]);
+            Some((tag_ptr, tag_len))
+        } else {
+            None
+        };
+
         for (i, arm) in arms.iter().enumerate() {
             let is_last = i == arms.len() - 1;
             let arm_block = builder.create_block();
@@ -3754,24 +3796,46 @@ impl Codegen {
                             );
                         }
                         None => {
-                            let (tag_ptr, tag_len) =
-                                self.string_ptr(builder, name);
-                            let matches = self.call_rt_typed(
-                                builder,
-                                "knot_constructor_matches",
-                                &[scrut, tag_ptr, tag_len],
-                                types::I32,
-                            );
-                            let is_match = builder
-                                .ins()
-                                .icmp_imm(IntCC::NotEqual, matches, 0);
-                            builder.ins().brif(
-                                is_match,
-                                arm_block,
-                                &[],
-                                next_block,
-                                &[],
-                            );
+                            if let Some((tag_ptr, tag_len)) = cached_tag {
+                                // Use pre-extracted tag for fast string comparison
+                                let (expected_ptr, expected_len) =
+                                    self.string_ptr(builder, name);
+                                let matches = self.call_rt_typed(
+                                    builder,
+                                    "knot_str_eq",
+                                    &[tag_ptr, tag_len, expected_ptr, expected_len],
+                                    types::I32,
+                                );
+                                let is_match = builder
+                                    .ins()
+                                    .icmp_imm(IntCC::NotEqual, matches, 0);
+                                builder.ins().brif(
+                                    is_match,
+                                    arm_block,
+                                    &[],
+                                    next_block,
+                                    &[],
+                                );
+                            } else {
+                                let (tag_ptr, tag_len) =
+                                    self.string_ptr(builder, name);
+                                let matches = self.call_rt_typed(
+                                    builder,
+                                    "knot_constructor_matches",
+                                    &[scrut, tag_ptr, tag_len],
+                                    types::I32,
+                                );
+                                let is_match = builder
+                                    .ins()
+                                    .icmp_imm(IntCC::NotEqual, matches, 0);
+                                builder.ins().brif(
+                                    is_match,
+                                    arm_block,
+                                    &[],
+                                    next_block,
+                                    &[],
+                                );
+                            }
                         }
                     }
                 }
@@ -4208,8 +4272,20 @@ impl Codegen {
                     // For constructor patterns, the RHS might be a single value
                     // (e.g., `InProgress ip <- t.status`). Wrap in a singleton
                     // relation so the loop logic works uniformly.
+                    // Skip the call if the source is statically known to be a relation.
                     let rel = if matches!(&pat.node, ast::PatKind::Constructor { .. }) {
-                        self.call_rt(builder, "knot_ensure_relation", &[val])
+                        let is_known_relation = matches!(
+                            &expr.node,
+                            ast::ExprKind::SourceRef(_)
+                                | ast::ExprKind::DerivedRef(_)
+                                | ast::ExprKind::List(_)
+                                | ast::ExprKind::Do(_)
+                        );
+                        if is_known_relation {
+                            val
+                        } else {
+                            self.call_rt(builder, "knot_ensure_relation", &[val])
+                        }
                     } else {
                         val
                     };
@@ -5784,8 +5860,16 @@ impl Codegen {
 
     // ── Operator trait dispatch helpers ────────────────────────────
 
+    /// Check if a trait method has any non-primitive (ADT) implementations.
+    fn has_adt_impls(&self, method: &str) -> bool {
+        self.trait_methods.get(method).map_or(false, |info| {
+            info.impls.iter().any(|e| type_name_to_tag(&e.type_name).is_none())
+        })
+    }
+
     /// Compile a binary operator via trait dispatch (e.g., `+` → `add` dispatcher).
     /// Falls back to `fallback_rt` if no dispatcher exists (e.g., user redefined the trait).
+    /// Skips the dispatcher entirely when only primitive impls exist.
     fn compile_trait_binop(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -5795,16 +5879,18 @@ impl Codegen {
         db: Value,
         fallback_rt: &str,
     ) -> Value {
-        if let Some(&func_id) = self.trait_dispatcher_fns.get(method) {
-            let func_ref = self.module.declare_func_in_func(func_id, builder.func);
-            let call = builder.ins().call(func_ref, &[db, l, r]);
-            builder.inst_results(call)[0]
-        } else {
-            self.call_rt(builder, fallback_rt, &[l, r])
+        if self.has_adt_impls(method) {
+            if let Some(&func_id) = self.trait_dispatcher_fns.get(method) {
+                let func_ref = self.module.declare_func_in_func(func_id, builder.func);
+                let call = builder.ins().call(func_ref, &[db, l, r]);
+                return builder.inst_results(call)[0];
+            }
         }
+        self.call_rt(builder, fallback_rt, &[l, r])
     }
 
     /// Compile a unary operator via trait dispatch (e.g., `-x` → `negate` dispatcher).
+    /// Skips the dispatcher entirely when only primitive impls exist.
     fn compile_trait_unop(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -5813,13 +5899,14 @@ impl Codegen {
         db: Value,
         fallback_rt: &str,
     ) -> Value {
-        if let Some(&func_id) = self.trait_dispatcher_fns.get(method) {
-            let func_ref = self.module.declare_func_in_func(func_id, builder.func);
-            let call = builder.ins().call(func_ref, &[db, val]);
-            builder.inst_results(call)[0]
-        } else {
-            self.call_rt(builder, fallback_rt, &[val])
+        if self.has_adt_impls(method) {
+            if let Some(&func_id) = self.trait_dispatcher_fns.get(method) {
+                let func_ref = self.module.declare_func_in_func(func_id, builder.func);
+                let call = builder.ins().call(func_ref, &[db, val]);
+                return builder.inst_results(call)[0];
+            }
         }
+        self.call_rt(builder, fallback_rt, &[val])
     }
 
     /// Compile a comparison operator.

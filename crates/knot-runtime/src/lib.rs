@@ -4,6 +4,8 @@
 //! and SQLite-backed persistence. This crate is compiled as a static
 //! library and linked into every compiled Knot program.
 
+mod tui;
+
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use num_traits::Zero;
@@ -6633,6 +6635,40 @@ pub extern "C" fn knot_api_handle(argc: i32, argv: *const *const u8) -> i32 {
         eprintln!("  {}", name);
     }
     std::process::exit(1);
+}
+
+/// Handle `<program> db` subcommand: launch TUI database explorer.
+/// Returns 1 if handled (caller should exit), 0 otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_db_handle(
+    argc: i32,
+    argv: *const *const u8,
+    db_path_ptr: *const u8,
+    db_path_len: usize,
+) -> i32 {
+    if argc < 2 {
+        return 0;
+    }
+    let arg1 = unsafe {
+        let ptr = *argv.add(1);
+        let mut len = 0;
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf8_lossy(std::slice::from_raw_parts(ptr, len)).to_string()
+    };
+
+    if arg1 != "db" {
+        return 0;
+    }
+
+    let db_path = unsafe { str_from_raw(db_path_ptr, db_path_len) };
+
+    if let Err(e) = tui::run_db_explorer(db_path) {
+        eprintln!("knot db: {}", e);
+        std::process::exit(1);
+    }
+    1
 }
 
 fn generate_openapi(name: &str, table: &RouteTable) -> String {

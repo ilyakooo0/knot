@@ -573,6 +573,9 @@ impl Codegen {
         // OpenAPI / api command
         self.declare_rt("knot_api_register", &[p, p, p], &[]);
         self.declare_rt("knot_api_handle", &[types::I32, p], &[types::I32]);
+
+        // DB explorer TUI
+        self.declare_rt("knot_db_handle", &[types::I32, p, p, p], &[types::I32]);
     }
 
     fn declare_rt(&mut self, name: &str, params: &[types::Type], returns: &[types::Type]) {
@@ -2377,6 +2380,28 @@ impl Codegen {
 
             builder.switch_to_block(normal_block);
             builder.seal_block(normal_block);
+
+            // Check if this is a "db" command (TUI explorer)
+            let db_path = cg.db_path.clone();
+            let (db_path_ptr_pre, db_path_len_pre) = cg.string_ptr(builder, &db_path);
+            let db_result = {
+                let func_id = cg.runtime_fns["knot_db_handle"];
+                let func_ref = cg.module.declare_func_in_func(func_id, builder.func);
+                let call = builder.ins().call(func_ref, &[argc, argv, db_path_ptr_pre, db_path_len_pre]);
+                builder.inst_results(call)[0]
+            };
+
+            let normal_block2 = builder.create_block();
+            let db_exit_block = builder.create_block();
+            builder.ins().brif(db_result, db_exit_block, &[], normal_block2, &[]);
+
+            builder.switch_to_block(db_exit_block);
+            builder.seal_block(db_exit_block);
+            let zero2 = builder.ins().iconst(types::I32, 0);
+            builder.ins().return_(&[zero2]);
+
+            builder.switch_to_block(normal_block2);
+            builder.seal_block(normal_block2);
 
             // Check --debug flag
             let debug_init_ref = cg.import_rt(builder, "knot_debug_init");

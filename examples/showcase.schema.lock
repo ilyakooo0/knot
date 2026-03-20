@@ -1,0 +1,90 @@
+-- schema.lock (auto-generated, do not edit)
+-- Commit to source control.
+
+data Priority = Low {} | Medium {} | High {} | Critical {}
+
+
+
+data Status
+  = Open {}
+  | InProgress {assignee: Text}
+  | Done {}
+  | Blocked {reason: Text}
+
+
+
+data Department
+  = Engineering {}
+  | Design {}
+  | Marketing {}
+  | Sales {}
+  | Support {}
+
+
+
+data Active = Yes {} | No {}
+
+
+
+type Employee = {name: Text, age: Int, salary: Float, dept: Department, active: Active}
+
+type Project = {name: Text, lead: Text, budget: Float, priority: Priority}
+
+type Ticket = {title: Text, project: Text, status: Status, priority: Priority, points: Int}
+
+type Customer = {name: Text, email: Text, tier: Tier}
+
+data Tier = Free {} | Pro {} | Enterprise {}
+
+
+
+type Order = {customer: Text, product: Text, quantity: Int, total: Float}
+
+type Product = {name: Text, price: Float, category: Category, inStock: Active}
+
+data Category
+  = Electronics {}
+  | Books {}
+  | Clothing {}
+  | Food {}
+  | Software {}
+
+
+
+type Team = {name: Text, members: [{name: Text, role: Text}]}
+
+type LogEntry = {timestamp: Int, level: Level, message: Text, source: Text}
+
+data Level = Debug {} | Info {} | Warn {} | Error {}
+
+
+
+type Metric = {name: Text, value: Float, tags: Text}
+
+*employees : [Employee]
+
+
+*projects : [Project]
+
+
+*tickets : [Ticket]
+
+
+*customers : [Customer]
+
+
+*orders : [Order]
+
+
+*products : [Product]
+
+
+*teams : [Team]
+
+
+*logs : [LogEntry]
+
+
+*metrics : [Metric]
+
+

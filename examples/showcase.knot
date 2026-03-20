@@ -1,0 +1,319 @@
+-- Showcase: exercises many data types, ADTs, nested relations, and bulk data
+-- Run: knotc build examples/showcase.knot && ./examples/showcase
+-- Then: ./examples/showcase db
+
+-- ── Types ────────────────────────────────────────────────────────
+
+data Priority = Low {} | Medium {} | High {} | Critical {}
+
+data Status
+  = Open {}
+  | InProgress {assignee: Text}
+  | Done {}
+  | Blocked {reason: Text}
+
+data Department
+  = Engineering {}
+  | Design {}
+  | Marketing {}
+  | Sales {}
+  | Support {}
+
+data Active = Yes {} | No {}
+
+type Employee = {name: Text, age: Int, salary: Float, dept: Department, active: Active}
+
+type Project = {name: Text, lead: Text, budget: Float, priority: Priority}
+
+type Ticket = {title: Text, project: Text, status: Status, priority: Priority, points: Int}
+
+type Customer = {name: Text, email: Text, tier: Tier}
+
+data Tier = Free {} | Pro {} | Enterprise {}
+
+type Order = {customer: Text, product: Text, quantity: Int, total: Float}
+
+type Product = {name: Text, price: Float, category: Category, inStock: Active}
+
+data Category
+  = Electronics {}
+  | Books {}
+  | Clothing {}
+  | Food {}
+  | Software {}
+
+type Team = {name: Text, members: [{name: Text, role: Text}]}
+
+type LogEntry = {timestamp: Int, level: Level, message: Text, source: Text}
+
+data Level = Debug {} | Info {} | Warn {} | Error {}
+
+type Metric = {name: Text, value: Float, tags: Text}
+
+-- ── Sources ──────────────────────────────────────────────────────
+
+*employees : [Employee]
+*projects : [Project]
+*tickets : [Ticket]
+*customers : [Customer]
+*orders : [Order]
+*products : [Product]
+*teams : [Team]
+*logs : [LogEntry]
+*metrics : [Metric]
+
+-- ── Seed data ────────────────────────────────────────────────────
+
+seedEmployees = do
+  set *employees = [
+    {name: "Alice Chen",     age: 34, salary: 142000.0, dept: Engineering {}, active: Yes {}},
+    {name: "Bob Martinez",   age: 28, salary: 95000.0,  dept: Engineering {}, active: Yes {}},
+    {name: "Carol Davis",    age: 41, salary: 155000.0, dept: Engineering {}, active: Yes {}},
+    {name: "Dan Wilson",     age: 25, salary: 78000.0,  dept: Engineering {}, active: Yes {}},
+    {name: "Eve Johnson",    age: 37, salary: 130000.0, dept: Design {},      active: Yes {}},
+    {name: "Frank Lee",      age: 45, salary: 160000.0, dept: Engineering {}, active: Yes {}},
+    {name: "Grace Kim",      age: 30, salary: 112000.0, dept: Marketing {},   active: Yes {}},
+    {name: "Hank Brown",     age: 52, salary: 175000.0, dept: Engineering {}, active: No {}},
+    {name: "Iris Patel",     age: 29, salary: 98000.0,  dept: Support {},     active: Yes {}},
+    {name: "Jack Thompson",  age: 33, salary: 125000.0, dept: Sales {},       active: Yes {}},
+    {name: "Kate White",     age: 38, salary: 140000.0, dept: Design {},      active: Yes {}},
+    {name: "Leo Garcia",     age: 26, salary: 85000.0,  dept: Engineering {}, active: Yes {}},
+    {name: "Mia Robinson",   age: 44, salary: 168000.0, dept: Engineering {}, active: Yes {}},
+    {name: "Noah Clark",     age: 31, salary: 105000.0, dept: Marketing {},   active: Yes {}},
+    {name: "Olivia Hall",    age: 36, salary: 138000.0, dept: Sales {},       active: Yes {}},
+    {name: "Pat Young",      age: 48, salary: 152000.0, dept: Support {},     active: Yes {}},
+    {name: "Quinn Adams",    age: 27, salary: 92000.0,  dept: Design {},      active: Yes {}},
+    {name: "Rita Baker",     age: 39, salary: 145000.0, dept: Engineering {}, active: Yes {}},
+    {name: "Sam Torres",     age: 42, salary: 158000.0, dept: Marketing {},   active: No {}},
+    {name: "Tina Flores",    age: 35, salary: 132000.0, dept: Sales {},       active: Yes {}}
+  ]
+  yield {}
+
+seedProjects = do
+  set *projects = [
+    {name: "Phoenix",    lead: "Alice Chen",     budget: 500000.0,  priority: Critical {}},
+    {name: "Atlas",      lead: "Carol Davis",    budget: 350000.0,  priority: High {}},
+    {name: "Meridian",   lead: "Frank Lee",      budget: 200000.0,  priority: Medium {}},
+    {name: "Horizon",    lead: "Mia Robinson",   budget: 750000.0,  priority: Critical {}},
+    {name: "Compass",    lead: "Eve Johnson",    budget: 150000.0,  priority: Low {}},
+    {name: "Vanguard",   lead: "Rita Baker",     budget: 420000.0,  priority: High {}},
+    {name: "Echo",       lead: "Bob Martinez",   budget: 180000.0,  priority: Medium {}},
+    {name: "Nimbus",     lead: "Kate White",     budget: 280000.0,  priority: High {}}
+  ]
+  yield {}
+
+seedTickets = do
+  set *tickets = [
+    {title: "Fix auth timeout",           project: "Phoenix",  status: InProgress {assignee: "Bob Martinez"},   priority: Critical {}, points: 8},
+    {title: "Add dark mode",              project: "Phoenix",  status: Open {},                                  priority: Medium {},   points: 5},
+    {title: "Optimize query planner",     project: "Phoenix",  status: InProgress {assignee: "Alice Chen"},     priority: High {},     points: 13},
+    {title: "Write API docs",             project: "Phoenix",  status: Done {},                                  priority: Low {},      points: 3},
+    {title: "Database migration tool",    project: "Atlas",    status: Blocked {reason: "Waiting for schema freeze"}, priority: High {}, points: 8},
+    {title: "Add CSV export",             project: "Atlas",    status: Open {},                                  priority: Medium {},   points: 5},
+    {title: "Fix N+1 queries",            project: "Atlas",    status: InProgress {assignee: "Dan Wilson"},     priority: Critical {}, points: 8},
+    {title: "Update CI pipeline",         project: "Meridian", status: Done {},                                  priority: Medium {},   points: 3},
+    {title: "Add rate limiting",          project: "Meridian", status: Open {},                                  priority: High {},     points: 5},
+    {title: "Redesign dashboard",         project: "Horizon",  status: InProgress {assignee: "Eve Johnson"},    priority: High {},     points: 13},
+    {title: "Mobile responsive layout",   project: "Horizon",  status: Open {},                                  priority: Medium {},   points: 8},
+    {title: "Fix memory leak",            project: "Horizon",  status: Blocked {reason: "Need profiler access"}, priority: Critical {}, points: 5},
+    {title: "Logo redesign",              project: "Compass",  status: Done {},                                  priority: Low {},      points: 2},
+    {title: "Brand guidelines doc",       project: "Compass",  status: InProgress {assignee: "Kate White"},     priority: Low {},      points: 3},
+    {title: "Set up monitoring",          project: "Vanguard", status: Open {},                                  priority: High {},     points: 5},
+    {title: "Implement caching layer",    project: "Vanguard", status: InProgress {assignee: "Carol Davis"},    priority: Critical {}, points: 13},
+    {title: "Add search indexing",        project: "Vanguard", status: Open {},                                  priority: Medium {},   points: 8},
+    {title: "Fix date parsing bug",       project: "Echo",     status: Done {},                                  priority: High {},     points: 3},
+    {title: "Add webhook support",        project: "Echo",     status: Open {},                                  priority: Medium {},   points: 8},
+    {title: "Migrate to new SDK",         project: "Echo",     status: Blocked {reason: "SDK not released yet"}, priority: Low {},     points: 5},
+    {title: "Design system components",   project: "Nimbus",   status: InProgress {assignee: "Quinn Adams"},    priority: High {},     points: 8},
+    {title: "Accessibility audit",        project: "Nimbus",   status: Open {},                                  priority: Medium {},   points: 5},
+    {title: "Performance benchmarks",     project: "Phoenix",  status: Open {},                                  priority: High {},     points: 5},
+    {title: "Implement SSO",              project: "Phoenix",  status: Open {},                                  priority: Critical {}, points: 13},
+    {title: "Add telemetry",              project: "Atlas",    status: Open {},                                  priority: Medium {},   points: 5}
+  ]
+  yield {}
+
+seedCustomers = do
+  set *customers = [
+    {name: "Acme Corp",         email: "admin@acme.com",        tier: Enterprise {}},
+    {name: "Widgets Inc",       email: "hello@widgets.io",      tier: Pro {}},
+    {name: "Startup Labs",      email: "team@startuplabs.dev",  tier: Free {}},
+    {name: "MegaTech",          email: "info@megatech.com",     tier: Enterprise {}},
+    {name: "Cloud Nine",        email: "ops@cloudnine.co",      tier: Pro {}},
+    {name: "DataFlow",          email: "admin@dataflow.io",     tier: Pro {}},
+    {name: "ByteWorks",         email: "hello@byteworks.dev",   tier: Free {}},
+    {name: "Quantum Systems",   email: "sales@quantumsys.com",  tier: Enterprise {}},
+    {name: "NexGen",            email: "support@nexgen.io",     tier: Pro {}},
+    {name: "TechVista",         email: "info@techvista.com",    tier: Free {}},
+    {name: "Alpine Digital",    email: "hello@alpine.digital",  tier: Pro {}},
+    {name: "CoreStack",         email: "admin@corestack.io",    tier: Enterprise {}}
+  ]
+  yield {}
+
+seedProducts = do
+  set *products = [
+    {name: "Laptop Pro 16",    price: 2499.99, category: Electronics {}, inStock: Yes {}},
+    {name: "Wireless Mouse",   price: 49.99,   category: Electronics {}, inStock: Yes {}},
+    {name: "USB-C Hub",        price: 79.99,   category: Electronics {}, inStock: No {}},
+    {name: "Mechanical KB",    price: 159.99,  category: Electronics {}, inStock: Yes {}},
+    {name: "4K Monitor",       price: 599.99,  category: Electronics {}, inStock: Yes {}},
+    {name: "Clean Code",       price: 39.99,   category: Books {},       inStock: Yes {}},
+    {name: "SICP",             price: 65.00,   category: Books {},       inStock: Yes {}},
+    {name: "The Art of SQL",   price: 45.50,   category: Books {},       inStock: No {}},
+    {name: "Hoodie (Black)",   price: 59.99,   category: Clothing {},    inStock: Yes {}},
+    {name: "T-Shirt (Logo)",   price: 24.99,   category: Clothing {},    inStock: Yes {}},
+    {name: "Coffee Beans 1kg", price: 18.99,   category: Food {},        inStock: Yes {}},
+    {name: "Green Tea Box",    price: 12.50,   category: Food {},        inStock: Yes {}},
+    {name: "IDE License",      price: 199.99,  category: Software {},    inStock: Yes {}},
+    {name: "CI/CD Platform",   price: 499.99,  category: Software {},    inStock: Yes {}},
+    {name: "Monitoring Suite",  price: 299.99,  category: Software {},    inStock: Yes {}}
+  ]
+  yield {}
+
+seedOrders = do
+  set *orders = [
+    {customer: "Acme Corp",       product: "Laptop Pro 16",    quantity: 50,  total: 124999.50},
+    {customer: "Acme Corp",       product: "4K Monitor",       quantity: 50,  total: 29999.50},
+    {customer: "Acme Corp",       product: "IDE License",      quantity: 100, total: 19999.00},
+    {customer: "Widgets Inc",     product: "Mechanical KB",    quantity: 20,  total: 3199.80},
+    {customer: "Widgets Inc",     product: "Wireless Mouse",   quantity: 20,  total: 999.80},
+    {customer: "MegaTech",        product: "Laptop Pro 16",    quantity: 200, total: 499998.00},
+    {customer: "MegaTech",        product: "CI/CD Platform",   quantity: 1,   total: 499.99},
+    {customer: "MegaTech",        product: "Monitoring Suite",  quantity: 1,   total: 299.99},
+    {customer: "Cloud Nine",      product: "IDE License",      quantity: 15,  total: 2999.85},
+    {customer: "Cloud Nine",      product: "Coffee Beans 1kg", quantity: 5,   total: 94.95},
+    {customer: "DataFlow",        product: "CI/CD Platform",   quantity: 1,   total: 499.99},
+    {customer: "DataFlow",        product: "4K Monitor",       quantity: 10,  total: 5999.90},
+    {customer: "Startup Labs",    product: "Coffee Beans 1kg", quantity: 2,   total: 37.98},
+    {customer: "Startup Labs",    product: "Clean Code",       quantity: 5,   total: 199.95},
+    {customer: "ByteWorks",       product: "T-Shirt (Logo)",   quantity: 10,  total: 249.90},
+    {customer: "Quantum Systems", product: "Laptop Pro 16",    quantity: 100, total: 249999.00},
+    {customer: "Quantum Systems", product: "Monitoring Suite",  quantity: 3,   total: 899.97},
+    {customer: "NexGen",          product: "Hoodie (Black)",   quantity: 25,  total: 1499.75},
+    {customer: "NexGen",          product: "SICP",             quantity: 10,  total: 650.00},
+    {customer: "TechVista",       product: "Green Tea Box",    quantity: 20,  total: 250.00},
+    {customer: "Alpine Digital",  product: "USB-C Hub",        quantity: 30,  total: 2399.70},
+    {customer: "Alpine Digital",  product: "Mechanical KB",    quantity: 15,  total: 2399.85},
+    {customer: "CoreStack",       product: "Laptop Pro 16",    quantity: 75,  total: 187499.25},
+    {customer: "CoreStack",       product: "IDE License",      quantity: 75,  total: 14999.25},
+    {customer: "CoreStack",       product: "CI/CD Platform",   quantity: 2,   total: 999.98}
+  ]
+  yield {}
+
+seedTeams = do
+  set *teams = [
+    {name: "Platform", members: [
+      {name: "Alice Chen",    role: "Lead"},
+      {name: "Bob Martinez",  role: "Senior"},
+      {name: "Dan Wilson",    role: "Junior"},
+      {name: "Leo Garcia",    role: "Junior"}
+    ]},
+    {name: "Frontend", members: [
+      {name: "Eve Johnson",   role: "Lead"},
+      {name: "Kate White",    role: "Senior"},
+      {name: "Quinn Adams",   role: "Junior"}
+    ]},
+    {name: "Infrastructure", members: [
+      {name: "Carol Davis",   role: "Lead"},
+      {name: "Frank Lee",     role: "Senior"},
+      {name: "Rita Baker",    role: "Senior"}
+    ]},
+    {name: "Growth", members: [
+      {name: "Grace Kim",      role: "Lead"},
+      {name: "Noah Clark",     role: "Senior"},
+      {name: "Jack Thompson",  role: "Senior"},
+      {name: "Olivia Hall",    role: "Senior"},
+      {name: "Tina Flores",    role: "Senior"}
+    ]},
+    {name: "Customer Success", members: [
+      {name: "Iris Patel",    role: "Lead"},
+      {name: "Pat Young",     role: "Senior"}
+    ]}
+  ]
+  yield {}
+
+seedLogs = do
+  set *logs = [
+    {timestamp: 1710900000, level: Info {},  message: "Server started on port 8080",              source: "main"},
+    {timestamp: 1710900001, level: Info {},  message: "Database connection pool initialized (10)", source: "db"},
+    {timestamp: 1710900005, level: Debug {}, message: "Loading configuration from env",            source: "config"},
+    {timestamp: 1710900012, level: Info {},  message: "Health check endpoint registered",          source: "routes"},
+    {timestamp: 1710900030, level: Warn {},  message: "Slow query detected: 2340ms",              source: "db"},
+    {timestamp: 1710900045, level: Info {},  message: "Request: GET /api/users (200, 45ms)",       source: "http"},
+    {timestamp: 1710900046, level: Info {},  message: "Request: POST /api/orders (201, 120ms)",    source: "http"},
+    {timestamp: 1710900047, level: Debug {}, message: "Cache miss for key: user:1234",             source: "cache"},
+    {timestamp: 1710900048, level: Info {},  message: "Request: GET /api/products (200, 32ms)",    source: "http"},
+    {timestamp: 1710900060, level: Error {}, message: "Connection refused: redis://localhost:6379", source: "cache"},
+    {timestamp: 1710900061, level: Warn {},  message: "Falling back to in-memory cache",           source: "cache"},
+    {timestamp: 1710900090, level: Info {},  message: "Request: PUT /api/users/42 (200, 88ms)",    source: "http"},
+    {timestamp: 1710900100, level: Error {}, message: "Timeout: external payment API (5000ms)",    source: "payments"},
+    {timestamp: 1710900101, level: Warn {},  message: "Retrying payment request (attempt 2/3)",    source: "payments"},
+    {timestamp: 1710900105, level: Info {},  message: "Payment processed: order #7821",            source: "payments"},
+    {timestamp: 1710900120, level: Debug {}, message: "GC pause: 12ms",                            source: "runtime"},
+    {timestamp: 1710900150, level: Info {},  message: "Cron: daily report generation started",     source: "scheduler"},
+    {timestamp: 1710900180, level: Info {},  message: "Report generated: 1,247 rows exported",     source: "scheduler"},
+    {timestamp: 1710900200, level: Warn {},  message: "Disk usage at 82%",                         source: "monitor"},
+    {timestamp: 1710900300, level: Info {},  message: "Request: DELETE /api/sessions/old (200)",    source: "http"},
+    {timestamp: 1710900301, level: Info {},  message: "Cleaned 847 expired sessions",              source: "auth"},
+    {timestamp: 1710900400, level: Error {}, message: "TLS certificate expires in 7 days",         source: "monitor"},
+    {timestamp: 1710900500, level: Info {},  message: "Backup completed: 2.4GB compressed",        source: "backup"},
+    {timestamp: 1710900600, level: Debug {}, message: "WebSocket connections: 142 active",         source: "ws"},
+    {timestamp: 1710900700, level: Info {},  message: "Rate limit applied: 10.0.5.23 (429)",       source: "http"}
+  ]
+  yield {}
+
+seedMetrics = do
+  set *metrics = [
+    {name: "http_requests_total",     value: 48291.0,  tags: "method=GET,status=200"},
+    {name: "http_requests_total",     value: 12847.0,  tags: "method=POST,status=201"},
+    {name: "http_requests_total",     value: 342.0,    tags: "method=POST,status=400"},
+    {name: "http_requests_total",     value: 89.0,     tags: "method=GET,status=404"},
+    {name: "http_requests_total",     value: 23.0,     tags: "method=GET,status=500"},
+    {name: "http_request_duration_ms", value: 45.2,    tags: "endpoint=/api/users,p50"},
+    {name: "http_request_duration_ms", value: 120.8,   tags: "endpoint=/api/users,p95"},
+    {name: "http_request_duration_ms", value: 340.1,   tags: "endpoint=/api/users,p99"},
+    {name: "http_request_duration_ms", value: 12.4,    tags: "endpoint=/api/health,p50"},
+    {name: "http_request_duration_ms", value: 31.6,    tags: "endpoint=/api/products,p50"},
+    {name: "http_request_duration_ms", value: 88.9,    tags: "endpoint=/api/products,p95"},
+    {name: "db_connections_active",    value: 8.0,     tags: "pool=primary"},
+    {name: "db_connections_active",    value: 3.0,     tags: "pool=replica"},
+    {name: "db_query_duration_ms",     value: 2.1,     tags: "query=select,table=users"},
+    {name: "db_query_duration_ms",     value: 15.8,    tags: "query=select,table=orders"},
+    {name: "db_query_duration_ms",     value: 0.8,     tags: "query=select,table=products"},
+    {name: "memory_usage_bytes",       value: 524288000.0, tags: "type=heap"},
+    {name: "memory_usage_bytes",       value: 134217728.0, tags: "type=stack"},
+    {name: "cpu_usage_percent",        value: 34.5,    tags: "core=0"},
+    {name: "cpu_usage_percent",        value: 67.2,    tags: "core=1"},
+    {name: "cpu_usage_percent",        value: 22.1,    tags: "core=2"},
+    {name: "cpu_usage_percent",        value: 45.8,    tags: "core=3"},
+    {name: "cache_hit_ratio",          value: 0.847,   tags: "cache=redis"},
+    {name: "cache_hit_ratio",          value: 0.923,   tags: "cache=local"},
+    {name: "websocket_connections",    value: 142.0,   tags: ""},
+    {name: "queue_depth",              value: 37.0,    tags: "queue=email"},
+    {name: "queue_depth",              value: 12.0,    tags: "queue=webhook"},
+    {name: "queue_depth",              value: 0.0,     tags: "queue=analytics"},
+    {name: "disk_usage_percent",       value: 82.3,    tags: "mount=/data"},
+    {name: "disk_usage_percent",       value: 45.1,    tags: "mount=/logs"}
+  ]
+  yield {}
+
+-- ── Main ─────────────────────────────────────────────────────────
+
+main = do
+  seedEmployees
+  seedProjects
+  seedTickets
+  seedCustomers
+  seedProducts
+  seedOrders
+  seedTeams
+  seedLogs
+  seedMetrics
+  yield (show (count *employees) ++ " employees, "
+    ++ show (count *projects) ++ " projects, "
+    ++ show (count *tickets) ++ " tickets, "
+    ++ show (count *customers) ++ " customers, "
+    ++ show (count *products) ++ " products, "
+    ++ show (count *orders) ++ " orders, "
+    ++ show (count *teams) ++ " teams, "
+    ++ show (count *logs) ++ " logs, "
+    ++ show (count *metrics) ++ " metrics")

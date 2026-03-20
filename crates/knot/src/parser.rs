@@ -1147,6 +1147,7 @@ impl Parser {
         let path = self.parse_route_path();
 
         // Optional query params: ?{name: Type, ...}
+        self.skip_newlines();
         let mut query_params = Vec::new();
         if self.eat(&TokenKind::Question) {
             if self.eat(&TokenKind::LBrace) {
@@ -1174,9 +1175,11 @@ impl Parser {
         }
 
         // Optional request headers: `headers {name: Type, ...}`
+        self.skip_newlines();
         let request_headers = self.parse_route_headers();
 
         // Optional response type: `-> Type`
+        self.skip_newlines();
         // Set stop_type_at_headers so parse_type won't consume `headers` as a type variable.
         let response_ty = if self.eat(&TokenKind::Arrow) {
             self.stop_type_at_headers = true;
@@ -1188,9 +1191,11 @@ impl Parser {
         };
 
         // Optional response headers: `headers {name: Type, ...}`
+        self.skip_newlines();
         let response_headers = self.parse_route_headers();
 
         // `= ConstructorName`
+        self.skip_newlines();
         self.expect(&TokenKind::Eq, "expected '=' before route constructor name")
             .ok()?;
         let (constructor, _) = self
@@ -2160,6 +2165,15 @@ impl Parser {
     fn parse_stmt(&mut self) -> Option<Stmt> {
         self.skip_newlines();
         if self.at_eof() {
+            return None;
+        }
+
+        // Closing delimiters from an enclosing expression end the do block
+        // without an error (e.g. `(do ... )` or `[do ... ]`).
+        if matches!(
+            self.peek(),
+            TokenKind::RParen | TokenKind::RBrace | TokenKind::RBracket
+        ) {
             return None;
         }
 

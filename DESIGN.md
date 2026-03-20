@@ -618,13 +618,17 @@ loadConfig = \path -> do
 
 ### Routes
 
-Routes are first-class. A `route` declaration defines an ADT and its HTTP mapping in one place. Each line maps a method + typed path to a constructor. The constructor's fields are the union of path params, query params, and body fields.
+Routes are first-class. A `route` declaration defines an ADT and its HTTP mapping in one place. Each line maps a method + typed path to a constructor. The constructor's fields are the union of path params, query params, body fields, and request headers.
 
 - `/{name: Type}` in the path — path parameter
 - `?{name: Type, ...}` after the path — query parameters
 - `{name: Type, ...}` after the verb — request body
+- `headers {name: Type, ...}` after query params — request headers
+- `headers {name: Type, ...}` after response type — response headers
 
-Constructors are bare names — their fields are automatically the union of path, query, and body params.
+Header field names use camelCase and auto-convert to HTTP-Header-Case (`authorization` → `Authorization`, `contentType` → `Content-Type`, `xRequestId` → `X-Request-Id`). Optional headers use `Maybe` type.
+
+Constructors are bare names — their fields are automatically the union of path, query, body, and header params.
 
 ```knot
 route Api where
@@ -665,6 +669,48 @@ route Api where
 ```
 
 The compiler checks that each `serve` branch returns the declared type.
+
+#### Typed Headers
+
+Request and response headers are declared with the `headers` keyword:
+
+```knot
+route Api where
+  GET /todos headers {authorization: Text} -> [Todo] headers {xTotalCount: Int, xPage: Int} = GetTodos
+  POST {title: Text} /todos headers {authorization: Text, xIdempotencyKey: Text} -> {id: Int} = CreateTodo
+  GET /health -> {status: Text} = HealthCheck
+```
+
+Request headers become constructor fields, just like body/query/path params. The handler destructures them:
+
+```knot
+serve = \req -> case req of
+  GetTodos {authorization, respond} ->
+    let todos = allTodos
+    respond todos {xTotalCount: length todos, xPage: 1}
+  CreateTodo {title, authorization, xIdempotencyKey, respond} ->
+    let id = addTodo title
+    respond {id: id} {}
+  HealthCheck {respond} -> respond {status: "ok"}
+```
+
+When response headers are declared, `respond` takes two arguments — body then headers record. Without response headers, `respond` takes just the body.
+
+Optional headers use `Maybe`:
+
+```knot
+route Api where
+  GET /todos headers {authorization: Maybe Text} -> [Todo] = GetTodos
+```
+
+The server gets `Nothing {}` if the header is absent, `Just {value: "..."}` if present. In `fetch`, `Nothing` headers are skipped.
+
+On the fetch side, request headers are sent automatically from constructor fields. When response headers are declared, the result wraps as `{body: ResponseType, headers: {h: T}}`:
+
+```knot
+result <- fetch "https://api.example.com" (GetTodos {authorization: "Bearer tok"})
+-- result : IO {network} (Result ... {body: [Todo], headers: {xTotalCount: Int, xPage: Int}})
+```
 
 #### Path Prefixes
 

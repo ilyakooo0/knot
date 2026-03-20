@@ -496,7 +496,9 @@ pub struct RouteEntry {
     pub path: Vec<PathSegment>,
     pub body_fields: Vec<Field<Type>>,
     pub query_params: Vec<Field<Type>>,
+    pub request_headers: Vec<Field<Type>>,
     pub response_ty: Option<Type>,
+    pub response_headers: Vec<Field<Type>>,
     pub constructor: Name,
 }
 

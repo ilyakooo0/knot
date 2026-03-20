@@ -212,6 +212,9 @@ struct Infer {
 
     /// Route constructor → response type mapping (for `fetch` return type resolution).
     fetch_response_types: HashMap<String, ast::Type>,
+
+    /// Route constructor → response header fields (for `fetch` response wrapping).
+    fetch_response_headers: HashMap<String, Vec<ast::Field<ast::Type>>>,
 }
 
 // ── Core operations ───────────────────────────────────────────────
@@ -238,6 +241,7 @@ impl Infer {
             binding_types: Vec::new(),
             trait_params: HashMap::new(),
             fetch_response_types: HashMap::new(),
+            fetch_response_headers: HashMap::new(),
         }
     }
 
@@ -1665,13 +1669,33 @@ impl Infer {
         }
 
         // Build the return type: IO {network} (Result {status, message} ResponseTy)
+        // When response headers are declared, wrap as {body: ResponseTy, headers: {h: T, ...}}
         let resp_ty = self
             .fetch_response_types
             .get(ctor_name)
             .cloned();
-        let body_ty = match resp_ty {
+        let raw_body_ty = match resp_ty {
             Some(ref ty) => self.ast_type_to_ty(ty),
             None => Ty::Text,
+        };
+        let ok_ty = match self.fetch_response_headers.get(ctor_name).cloned() {
+            Some(ref hdr_fields) if !hdr_fields.is_empty() => {
+                let headers_ty = Ty::Record(
+                    hdr_fields
+                        .iter()
+                        .map(|f| (f.name.clone(), self.ast_type_to_ty(&f.value)))
+                        .collect(),
+                    None,
+                );
+                Ty::Record(
+                    BTreeMap::from([
+                        ("body".into(), raw_body_ty),
+                        ("headers".into(), headers_ty),
+                    ]),
+                    None,
+                )
+            }
+            _ => raw_body_ty,
         };
         let err_ty = Ty::Record(
             BTreeMap::from([
@@ -1680,7 +1704,7 @@ impl Infer {
             ]),
             None,
         );
-        let result_adt = Ty::Con("Result".into(), vec![err_ty, body_ty]);
+        let result_adt = Ty::Con("Result".into(), vec![err_ty, ok_ty]);
         Some(Ty::IO(
             BTreeSet::from([IoEffect::Network]),
             Box::new(result_adt),
@@ -2304,6 +2328,10 @@ impl Infer {
                         if let Some(ref resp_ty) = entry.response_ty {
                             self.fetch_response_types
                                 .insert(entry.constructor.clone(), resp_ty.clone());
+                        }
+                        if !entry.response_headers.is_empty() {
+                            self.fetch_response_headers
+                                .insert(entry.constructor.clone(), entry.response_headers.clone());
                         }
                     }
                 }

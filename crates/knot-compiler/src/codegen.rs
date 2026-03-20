@@ -564,19 +564,23 @@ impl Codegen {
 
         // HTTP server (routes)
         self.declare_rt("knot_route_table_new", &[], &[p]);
+        // (table, method, method_len, path, path_len, ctor, ctor_len,
+        //  body, body_len, query, query_len, resp, resp_len,
+        //  req_hdrs, req_hdrs_len, resp_hdrs, resp_hdrs_len)
         self.declare_rt(
             "knot_route_table_add",
-            &[p, p, p, p, p, p, p, p, p, p, p, p, p],
+            &[p, p, p, p, p, p, p, p, p, p, p, p, p, p, p, p, p],
             &[],
         );
         self.declare_rt("knot_http_listen", &[p, p, p, p], &[p]);
 
         // HTTP client (fetch)
         // (base_url, method_ptr, method_len, path_ptr, path_len, payload,
-        //  body_ptr, body_len, query_ptr, query_len, resp_ptr, resp_len, headers)
+        //  body_ptr, body_len, query_ptr, query_len, resp_ptr, resp_len,
+        //  headers, req_hdrs_ptr, req_hdrs_len, resp_hdrs_ptr, resp_hdrs_len)
         self.declare_rt(
             "knot_http_fetch_io",
-            &[p, p, p, p, p, p, p, p, p, p, p, p, p],
+            &[p, p, p, p, p, p, p, p, p, p, p, p, p, p, p, p, p],
             &[p],
         );
 
@@ -2357,6 +2361,10 @@ impl Codegen {
                     let (query_ptr, query_len) = cg.string_ptr(builder, &query_desc);
                     let resp_desc = response_type_descriptor(&route_entry.response_ty, &cg.type_aliases);
                     let (resp_ptr, resp_len) = cg.string_ptr(builder, &resp_desc);
+                    let req_hdrs_desc = fields_to_descriptor(&route_entry.request_headers);
+                    let (req_hdrs_ptr, req_hdrs_len) = cg.string_ptr(builder, &req_hdrs_desc);
+                    let resp_hdrs_desc = fields_to_descriptor(&route_entry.response_headers);
+                    let (resp_hdrs_ptr, resp_hdrs_len) = cg.string_ptr(builder, &resp_hdrs_desc);
                     cg.call_rt_void(
                         builder,
                         "knot_route_table_add",
@@ -2364,6 +2372,7 @@ impl Codegen {
                             table, method_ptr, method_len, path_ptr, path_len,
                             ctor_ptr, ctor_len, body_ptr, body_len, query_ptr,
                             query_len, resp_ptr, resp_len,
+                            req_hdrs_ptr, req_hdrs_len, resp_hdrs_ptr, resp_hdrs_len,
                         ],
                     );
                 }
@@ -3719,6 +3728,14 @@ impl Codegen {
                         let (resp_ptr, resp_len) =
                             self.string_ptr(builder, &resp_desc);
 
+                        let req_hdrs_desc = fields_to_descriptor(&entry.request_headers);
+                        let (req_hdrs_ptr, req_hdrs_len) =
+                            self.string_ptr(builder, &req_hdrs_desc);
+
+                        let resp_hdrs_desc = fields_to_descriptor(&entry.response_headers);
+                        let (resp_hdrs_ptr, resp_hdrs_len) =
+                            self.string_ptr(builder, &resp_hdrs_desc);
+
                         self.call_rt_void(
                             builder,
                             "knot_route_table_add",
@@ -3726,6 +3743,7 @@ impl Codegen {
                                 table, method_ptr, method_len, path_ptr, path_len,
                                 ctor_ptr, ctor_len, body_ptr, body_len, query_ptr,
                                 query_len, resp_ptr, resp_len,
+                                req_hdrs_ptr, req_hdrs_len, resp_hdrs_ptr, resp_hdrs_len,
                             ],
                         );
                     }
@@ -3861,12 +3879,16 @@ impl Codegen {
         let query_desc = fields_to_descriptor(&entry.query_params);
         let resp_desc =
             response_type_descriptor(&entry.response_ty, &self.type_aliases);
+        let req_hdrs_desc = fields_to_descriptor(&entry.request_headers);
+        let resp_hdrs_desc = fields_to_descriptor(&entry.response_headers);
 
         let (method_ptr, method_len) = self.string_ptr(builder, method_str);
         let (path_ptr, path_len) = self.string_ptr(builder, &path_pattern);
         let (body_ptr, body_len) = self.string_ptr(builder, &body_desc);
         let (query_ptr, query_len) = self.string_ptr(builder, &query_desc);
         let (resp_ptr, resp_len) = self.string_ptr(builder, &resp_desc);
+        let (req_hdrs_ptr, req_hdrs_len) = self.string_ptr(builder, &req_hdrs_desc);
+        let (resp_hdrs_ptr, resp_hdrs_len) = self.string_ptr(builder, &resp_hdrs_desc);
 
         self.call_rt(
             builder,
@@ -3874,7 +3896,7 @@ impl Codegen {
             &[
                 base_url, method_ptr, method_len, path_ptr, path_len, payload,
                 body_ptr, body_len, query_ptr, query_len, resp_ptr, resp_len,
-                headers,
+                headers, req_hdrs_ptr, req_hdrs_len, resp_hdrs_ptr, resp_hdrs_len,
             ],
         )
     }

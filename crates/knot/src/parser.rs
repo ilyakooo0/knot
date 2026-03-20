@@ -12,6 +12,10 @@ pub struct Parser {
     pos: usize,
     diagnostics: Vec<Diagnostic>,
     context: Vec<(&'static str, Span)>,
+    /// When true, `can_start_type_atom` returns false for `Lower("headers")`.
+    /// Used in route entry parsing to prevent the type parser from consuming
+    /// the `headers` keyword.
+    stop_type_at_headers: bool,
 }
 
 // ── Public API ──────────────────────────────────────────────────────
@@ -24,6 +28,7 @@ impl Parser {
             pos: 0,
             diagnostics: Vec::new(),
             context: Vec::new(),
+            stop_type_at_headers: false,
         }
     }
 
@@ -1168,12 +1173,22 @@ impl Parser {
             }
         }
 
+        // Optional request headers: `headers {name: Type, ...}`
+        let request_headers = self.parse_route_headers();
+
         // Optional response type: `-> Type`
+        // Set stop_type_at_headers so parse_type won't consume `headers` as a type variable.
         let response_ty = if self.eat(&TokenKind::Arrow) {
-            Some(self.parse_type()?)
+            self.stop_type_at_headers = true;
+            let ty = self.parse_type();
+            self.stop_type_at_headers = false;
+            Some(ty?)
         } else {
             None
         };
+
+        // Optional response headers: `headers {name: Type, ...}`
+        let response_headers = self.parse_route_headers();
 
         // `= ConstructorName`
         self.expect(&TokenKind::Eq, "expected '=' before route constructor name")
@@ -1187,7 +1202,9 @@ impl Parser {
             path,
             body_fields,
             query_params,
+            request_headers,
             response_ty,
+            response_headers,
             constructor,
         })
     }
@@ -1222,6 +1239,49 @@ impl Parser {
             }
         }
         segments
+    }
+
+    /// Parse an optional `headers {name: Type, ...}` block in a route entry.
+    /// Returns empty vec if no `headers` keyword is present.
+    fn parse_route_headers(&mut self) -> Vec<Field<Type>> {
+        if !matches!(self.peek(), TokenKind::Lower(s) if s == "headers") {
+            return Vec::new();
+        }
+        self.advance(); // consume `headers`
+        self.parse_route_header_fields()
+    }
+
+    /// Parse `{name: Type, ...}` header fields (the `headers` keyword already consumed).
+    fn parse_route_header_fields(&mut self) -> Vec<Field<Type>> {
+        let mut fields = Vec::new();
+        if self.eat(&TokenKind::LBrace) {
+            if !self.at(&TokenKind::RBrace) {
+                loop {
+                    self.skip_newlines();
+                    let (fname, _) = match self.expect_lower("expected header field name") {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    };
+                    if self.expect(&TokenKind::Colon, "expected ':' after header field name").is_err() {
+                        break;
+                    }
+                    let ty = match self.parse_type() {
+                        Some(t) => t,
+                        None => break,
+                    };
+                    fields.push(Field {
+                        name: fname,
+                        value: ty,
+                    });
+                    self.skip_newlines();
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            let _ = self.expect(&TokenKind::RBrace, "expected '}' to close headers");
+        }
+        fields
     }
 
     // ── migrate ──────────────────────────────────────────────────────
@@ -2476,6 +2536,11 @@ impl Parser {
     }
 
     fn can_start_type_atom(&self) -> bool {
+        if self.stop_type_at_headers {
+            if matches!(self.peek(), TokenKind::Lower(s) if s == "headers") {
+                return false;
+            }
+        }
         matches!(
             self.peek(),
             TokenKind::Upper(_)

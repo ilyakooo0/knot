@@ -2676,6 +2676,92 @@ route Api where
     }
 }
 
+// ── Route Headers ───────────────────────────────────────────────────
+
+#[test]
+fn route_request_headers() {
+    let src = "\
+route Api where
+  GET /todos headers {authorization: Text} = ListTodos";
+    match first_decl(src) {
+        DeclKind::Route { entries, .. } => {
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].request_headers.len(), 1);
+            assert_eq!(entries[0].request_headers[0].name, "authorization");
+            assert!(entries[0].response_headers.is_empty());
+        }
+        other => panic!("expected Route, got {:?}", other),
+    }
+}
+
+#[test]
+fn route_response_headers() {
+    let src = "\
+route Api where
+  GET /todos -> [Todo] headers {xTotalCount: Int} = ListTodos";
+    match first_decl(src) {
+        DeclKind::Route { entries, .. } => {
+            assert_eq!(entries.len(), 1);
+            assert!(entries[0].response_ty.is_some());
+            assert_eq!(entries[0].response_headers.len(), 1);
+            assert_eq!(entries[0].response_headers[0].name, "xTotalCount");
+            assert!(entries[0].request_headers.is_empty());
+        }
+        other => panic!("expected Route, got {:?}", other),
+    }
+}
+
+#[test]
+fn route_both_headers() {
+    let src = "\
+route Api where
+  GET /todos headers {authorization: Text} -> [Todo] headers {xTotalCount: Int, xPage: Int} = ListTodos";
+    match first_decl(src) {
+        DeclKind::Route { entries, .. } => {
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].request_headers.len(), 1);
+            assert_eq!(entries[0].request_headers[0].name, "authorization");
+            assert_eq!(entries[0].response_headers.len(), 2);
+            assert_eq!(entries[0].response_headers[0].name, "xTotalCount");
+            assert_eq!(entries[0].response_headers[1].name, "xPage");
+        }
+        other => panic!("expected Route, got {:?}", other),
+    }
+}
+
+#[test]
+fn route_no_headers_unchanged() {
+    let src = "\
+route Api where
+  GET /todos = ListTodos";
+    match first_decl(src) {
+        DeclKind::Route { entries, .. } => {
+            assert!(entries[0].request_headers.is_empty());
+            assert!(entries[0].response_headers.is_empty());
+        }
+        other => panic!("expected Route, got {:?}", other),
+    }
+}
+
+#[test]
+fn route_headers_with_body_and_query() {
+    let src = "\
+route Api where
+  POST {title: Text} /todos?{notify: Bool} headers {authorization: Text} -> {id: Int} headers {xRequestId: Text} = CreateTodo";
+    match first_decl(src) {
+        DeclKind::Route { entries, .. } => {
+            assert_eq!(entries[0].body_fields.len(), 1);
+            assert_eq!(entries[0].query_params.len(), 1);
+            assert_eq!(entries[0].request_headers.len(), 1);
+            assert_eq!(entries[0].request_headers[0].name, "authorization");
+            assert!(entries[0].response_ty.is_some());
+            assert_eq!(entries[0].response_headers.len(), 1);
+            assert_eq!(entries[0].response_headers[0].name, "xRequestId");
+        }
+        other => panic!("expected Route, got {:?}", other),
+    }
+}
+
 // ── Record Punning ──────────────────────────────────────────────────
 
 #[test]

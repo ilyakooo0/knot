@@ -581,7 +581,7 @@ IO and DB writes cannot mix inside `atomic`.
 
 ## Routes
 
-HTTP routing with typed paths, query params, and bodies:
+HTTP routing with typed paths, query params, bodies, and headers:
 
 ```knot
 route TodoApi where
@@ -606,6 +606,49 @@ main = listen 8080 serve
 ```
 
 Each route constructor gets a `respond` callback for type-safe responses.
+
+### Typed Headers
+
+Request and response headers use the `headers` keyword:
+
+```knot
+route Api where
+  GET /todos headers {authorization: Text}
+    -> [Todo] headers {xTotalCount: Int}
+    = GetTodos
+  POST {title: Text} /todos headers {authorization: Text}
+    -> {id: Int}
+    = CreateTodo
+```
+
+Field names use camelCase, auto-converted to HTTP-Header-Case: `authorization` → `Authorization`, `contentType` → `Content-Type`, `xRequestId` → `X-Request-Id`.
+
+Request headers become constructor fields. When response headers are declared, `respond` takes two arguments — body then headers:
+
+```knot
+serve = \req -> case req of
+  GetTodos {authorization, respond} ->
+    let todos = allTodos
+    respond todos {xTotalCount: length todos}
+  CreateTodo {title, authorization, respond} ->
+    respond (addTodo title) {}
+```
+
+Optional headers use `Maybe`:
+
+```knot
+route Api where
+  GET /todos headers {authorization: Maybe Text} -> [Todo] = GetTodos
+```
+
+Server gets `Nothing {}` if absent, `Just {value: "..."}` if present. In `fetch`, `Nothing` headers are skipped.
+
+On the `fetch` side, header fields are sent automatically. When response headers are declared, the result wraps as `{body: T, headers: H}`:
+
+```knot
+result <- fetch "https://api.example.com" (GetTodos {authorization: "Bearer tok"})
+-- result : IO {network} (Result ... {body: [Todo], headers: {xTotalCount: Int}})
+```
 
 ---
 

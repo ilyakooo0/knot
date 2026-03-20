@@ -6160,6 +6160,8 @@ struct RouteTableEntry {
     body_fields: Vec<(String, String)>,
     query_fields: Vec<(String, String)>,
     response_type: String,
+    request_headers: Vec<(String, String)>,
+    response_headers: Vec<(String, String)>,
 }
 
 struct RouteTable {
@@ -6220,6 +6222,10 @@ pub extern "C" fn knot_route_table_add(
     query_desc_len: usize,
     resp_ptr: *const u8,
     resp_len: usize,
+    req_hdrs_ptr: *const u8,
+    req_hdrs_len: usize,
+    resp_hdrs_ptr: *const u8,
+    resp_hdrs_len: usize,
 ) {
     let table = unsafe { &mut *(table as *mut RouteTable) };
     let method = unsafe { str_from_raw(method_ptr, method_len) }.to_string();
@@ -6228,6 +6234,8 @@ pub extern "C" fn knot_route_table_add(
     let body_desc = unsafe { str_from_raw(body_desc_ptr, body_desc_len) };
     let query_desc = unsafe { str_from_raw(query_desc_ptr, query_desc_len) };
     let resp = unsafe { str_from_raw(resp_ptr, resp_len) }.to_string();
+    let req_hdrs = unsafe { str_from_raw(req_hdrs_ptr, req_hdrs_len) };
+    let resp_hdrs = unsafe { str_from_raw(resp_hdrs_ptr, resp_hdrs_len) };
 
     table.entries.push(RouteTableEntry {
         method,
@@ -6236,6 +6244,8 @@ pub extern "C" fn knot_route_table_add(
         body_fields: parse_descriptor(body_desc),
         query_fields: parse_descriptor(query_desc),
         response_type: resp,
+        request_headers: parse_descriptor(req_hdrs),
+        response_headers: parse_descriptor(resp_hdrs),
     });
 }
 
@@ -6439,6 +6449,24 @@ fn value_to_json(v: *mut Value) -> String {
     }
 }
 
+/// Convert camelCase field name to HTTP-Header-Case.
+/// e.g. "authorization" → "Authorization", "contentType" → "Content-Type",
+///      "xRequestId" → "X-Request-Id"
+fn camel_to_header_case(s: &str) -> String {
+    let mut result = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i == 0 {
+            result.extend(c.to_uppercase());
+        } else if c.is_uppercase() {
+            result.push('-');
+            result.push(c);
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 /// Identity function used as the `respond` field in route constructors.
 /// At runtime, respond just passes through the value unchanged — the type system
 /// uses it to check that each handler branch returns the declared response type.
@@ -6448,6 +6476,36 @@ extern "C" fn respond_identity(
     arg: *mut Value,
 ) -> *mut Value {
     arg
+}
+
+/// Curried respond function for routes with response headers.
+/// First call with body returns a closure; second call with headers record
+/// returns `{body: body, headers: headers}`.
+extern "C" fn respond_with_headers(
+    _db: *mut c_void,
+    _env: *mut Value,
+    body: *mut Value,
+) -> *mut Value {
+    let env = alloc(Value::Record(vec![
+        RecordField { name: "body".into(), value: body },
+    ]));
+    alloc(Value::Function(
+        respond_headers_inner as *const u8,
+        env,
+        "respond".to_string(),
+    ))
+}
+
+extern "C" fn respond_headers_inner(
+    _db: *mut c_void,
+    env: *mut Value,
+    headers: *mut Value,
+) -> *mut Value {
+    let body = knot_record_field_by_index(env, 0); // "body" is first (only) field
+    alloc(Value::Record(vec![
+        RecordField { name: "body".into(), value: body },
+        RecordField { name: "headers".into(), value: headers },
+    ]))
 }
 
 #[unsafe(no_mangle)]
@@ -6545,16 +6603,58 @@ pub extern "C" fn knot_http_listen(
                     }
                 }
 
-                // Add `respond` field — identity function at runtime
-                // (the type system uses it for per-branch response type checking)
-                fields.push(RecordField {
-                    name: "respond".to_string(),
-                    value: alloc(Value::Function(
-                        respond_identity as *const u8,
-                        std::ptr::null_mut(),
-                        "respond".to_string(),
-                    )),
-                });
+                // Request headers — extract from HTTP request headers
+                for (hname, hty) in &entry.request_headers {
+                    let http_name = camel_to_header_case(hname);
+                    let is_maybe = hty.starts_with('?');
+                    let inner_ty = if is_maybe { &hty[1..] } else { hty.as_str() };
+                    let raw_val = request.headers().iter()
+                        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(&http_name))
+                        .map(|h| h.value.as_str().to_string());
+                    let value = if is_maybe {
+                        match raw_val {
+                            Some(v) => {
+                                let inner = string_to_value(&v, inner_ty);
+                                alloc(Value::Constructor(
+                                    "Just".into(),
+                                    alloc(Value::Record(vec![
+                                        RecordField { name: "value".into(), value: inner },
+                                    ])),
+                                ))
+                            }
+                            None => std::ptr::null_mut(), // Nothing (nullable)
+                        }
+                    } else {
+                        let v = raw_val.unwrap_or_default();
+                        string_to_value(&v, inner_ty)
+                    };
+                    fields.push(RecordField {
+                        name: hname.clone(),
+                        value,
+                    });
+                }
+
+                // Add `respond` field — identity or curried with headers
+                let has_resp_headers = !entry.response_headers.is_empty();
+                if has_resp_headers {
+                    fields.push(RecordField {
+                        name: "respond".to_string(),
+                        value: alloc(Value::Function(
+                            respond_with_headers as *const u8,
+                            std::ptr::null_mut(),
+                            "respond".to_string(),
+                        )),
+                    });
+                } else {
+                    fields.push(RecordField {
+                        name: "respond".to_string(),
+                        value: alloc(Value::Function(
+                            respond_identity as *const u8,
+                            std::ptr::null_mut(),
+                            "respond".to_string(),
+                        )),
+                    });
+                }
 
                 let record = alloc(Value::Record(fields));
                 // Wrap in constructor
@@ -6563,15 +6663,41 @@ pub extern "C" fn knot_http_listen(
 
                 // Call handler
                 let result = knot_value_call(db, handler, ctor_val);
-                let json = value_to_json(result);
 
-                let response = tiny_http::Response::from_string(&json)
-                    .with_header(
-                        "Content-Type: application/json"
-                            .parse::<tiny_http::Header>()
-                            .unwrap(),
-                    );
-                let _ = request.respond(response);
+                if has_resp_headers {
+                    // Result is {body: ..., headers: ...}
+                    let body_val = knot_record_field(result, "body".as_ptr(), 4);
+                    let hdrs_val = knot_record_field(result, "headers".as_ptr(), 7);
+                    let json = value_to_json(body_val);
+                    let mut response = tiny_http::Response::from_string(&json)
+                        .with_header(
+                            "Content-Type: application/json"
+                                .parse::<tiny_http::Header>()
+                                .unwrap(),
+                        );
+                    // Set response headers from the headers record
+                    if let Value::Record(hdr_fields) = unsafe { as_ref(hdrs_val) } {
+                        for hf in hdr_fields {
+                            let http_name = camel_to_header_case(&hf.name);
+                            let hdr_value = fetch_value_to_text(hf.value);
+                            if let Ok(header) = format!("{}: {}", http_name, hdr_value)
+                                .parse::<tiny_http::Header>()
+                            {
+                                response = response.with_header(header);
+                            }
+                        }
+                    }
+                    let _ = request.respond(response);
+                } else {
+                    let json = value_to_json(result);
+                    let response = tiny_http::Response::from_string(&json)
+                        .with_header(
+                            "Content-Type: application/json"
+                                .parse::<tiny_http::Header>()
+                                .unwrap(),
+                        );
+                    let _ = request.respond(response);
+                }
             }
             None => {
                 let response = tiny_http::Response::from_string("{\"error\":\"not found\"}")
@@ -6604,6 +6730,10 @@ pub extern "C" fn knot_http_fetch_io(
     resp_ptr: *const u8,
     resp_len: usize,
     headers: *mut Value,
+    req_hdrs_ptr: *const u8,
+    req_hdrs_len: usize,
+    resp_hdrs_ptr: *const u8,
+    resp_hdrs_len: usize,
 ) -> *mut Value {
     let method = alloc(Value::Text(
         unsafe { str_from_raw(method_ptr, method_len) }.to_string(),
@@ -6620,9 +6750,16 @@ pub extern "C" fn knot_http_fetch_io(
     let resp_desc = alloc(Value::Text(
         unsafe { str_from_raw(resp_ptr, resp_len) }.to_string(),
     ));
+    let req_hdrs_desc = alloc(Value::Text(
+        unsafe { str_from_raw(req_hdrs_ptr, req_hdrs_len) }.to_string(),
+    ));
+    let resp_hdrs_desc = alloc(Value::Text(
+        unsafe { str_from_raw(resp_hdrs_ptr, resp_hdrs_len) }.to_string(),
+    ));
 
     // Env record — fields sorted alphabetically for index-based access
-    // 0: base_url, 1: body_desc, 2: headers, 3: method, 4: path, 5: payload, 6: query_desc, 7: resp_desc
+    // 0: base_url, 1: body_desc, 2: headers, 3: method, 4: path, 5: payload,
+    // 6: query_desc, 7: req_hdrs_desc, 8: resp_desc, 9: resp_hdrs_desc
     let env = alloc(Value::Record(vec![
         RecordField { name: "base_url".into(), value: base_url },
         RecordField { name: "body_desc".into(), value: body_desc },
@@ -6631,7 +6768,9 @@ pub extern "C" fn knot_http_fetch_io(
         RecordField { name: "path".into(), value: path },
         RecordField { name: "payload".into(), value: payload },
         RecordField { name: "query_desc".into(), value: query_desc },
+        RecordField { name: "req_hdrs_desc".into(), value: req_hdrs_desc },
         RecordField { name: "resp_desc".into(), value: resp_desc },
+        RecordField { name: "resp_hdrs_desc".into(), value: resp_hdrs_desc },
     ]));
 
     extern "C" fn fetch_thunk(_db: *mut c_void, env: *mut Value) -> *mut Value {
@@ -6642,7 +6781,9 @@ pub extern "C" fn knot_http_fetch_io(
         let path = knot_record_field_by_index(env, 4);
         let payload = knot_record_field_by_index(env, 5);
         let query_desc = knot_record_field_by_index(env, 6);
-        let resp_desc = knot_record_field_by_index(env, 7);
+        let req_hdrs_desc = knot_record_field_by_index(env, 7);
+        let resp_desc = knot_record_field_by_index(env, 8);
+        let resp_hdrs_desc = knot_record_field_by_index(env, 9);
 
         let base = match unsafe { as_ref(base_url) } {
             Value::Text(s) => s.clone(),
@@ -6687,13 +6828,41 @@ pub extern "C" fn knot_http_fetch_io(
             _ => panic!("knot runtime: fetch unsupported method: {}", method_str),
         };
 
-        // Set headers from relation
+        // Set ad-hoc headers from fetchWith options (relation of {name, value})
         if !headers.is_null() {
             if let Value::Relation(rows) = unsafe { as_ref(headers) } {
                 for row in rows {
                     let n = fetch_record_text_field(*row, "name");
                     let v = fetch_record_text_field(*row, "value");
                     request = request.set(&n, &v);
+                }
+            }
+        }
+
+        // Set route-declared request headers from payload fields
+        let req_hdrs_str = match unsafe { as_ref(req_hdrs_desc) } {
+            Value::Text(s) => s.clone(),
+            _ => String::new(),
+        };
+        if !req_hdrs_str.is_empty() {
+            for field_desc in req_hdrs_str.split(',') {
+                if field_desc.is_empty() { continue; }
+                let (name, ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
+                let is_maybe = ty.starts_with('?');
+                let http_name = camel_to_header_case(name);
+                let field_val = knot_record_field(payload, name.as_ptr(), name.len());
+                if is_maybe {
+                    // Maybe type: skip Nothing, extract Just value
+                    if !field_val.is_null() {
+                        if let Value::Constructor(tag, inner) = unsafe { as_ref(field_val) } {
+                            if tag == "Just" {
+                                let v = knot_record_field(*inner, "value".as_ptr(), 5);
+                                request = request.set(&http_name, &fetch_value_to_text(v));
+                            }
+                        }
+                    }
+                } else {
+                    request = request.set(&http_name, &fetch_value_to_text(field_val));
                 }
             }
         }
@@ -6706,23 +6875,59 @@ pub extern "C" fn knot_http_fetch_io(
             None => request.call(),
         };
 
+        // Check if we need to parse response headers
+        let resp_hdrs_str = match unsafe { as_ref(resp_hdrs_desc) } {
+            Value::Text(s) => s.clone(),
+            _ => String::new(),
+        };
+        let has_resp_hdrs = !resp_hdrs_str.is_empty();
+
         // Build Result ADT
         match result {
             Ok(response) => {
-                let _status = response.status();
+                // Parse response headers before consuming the response body
+                let parsed_headers = if has_resp_hdrs {
+                    let mut hdr_fields = Vec::new();
+                    for field_desc in resp_hdrs_str.split(',') {
+                        if field_desc.is_empty() { continue; }
+                        let (name, ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
+                        let http_name = camel_to_header_case(name);
+                        let raw = response.header(&http_name)
+                            .map(|s| s.to_string())
+                            .unwrap_or_default();
+                        hdr_fields.push(RecordField {
+                            name: name.to_string(),
+                            value: string_to_value(&raw, ty),
+                        });
+                    }
+                    Some(alloc(Value::Record(hdr_fields)))
+                } else {
+                    None
+                };
+
                 let body_text = response.into_string().unwrap_or_default();
                 let has_resp_schema = matches!(unsafe { as_ref(resp_desc) }, Value::Text(s) if !s.is_empty());
-                let parsed = if has_resp_schema {
+                let parsed_body = if has_resp_schema {
                     let (val, _) = parse_json_value(&body_text);
                     val
                 } else {
                     alloc(Value::Text(body_text))
                 };
-                // Ok {value: parsed}
+
+                // Wrap with headers if response headers declared
+                let ok_value = match parsed_headers {
+                    Some(hdrs) => alloc(Value::Record(vec![
+                        RecordField { name: "body".into(), value: parsed_body },
+                        RecordField { name: "headers".into(), value: hdrs },
+                    ])),
+                    None => parsed_body,
+                };
+
+                // Ok {value: ok_value}
                 alloc(Value::Constructor(
                     "Ok".into(),
                     alloc(Value::Record(vec![
-                        RecordField { name: "value".into(), value: parsed },
+                        RecordField { name: "value".into(), value: ok_value },
                     ])),
                 ))
             }

@@ -125,21 +125,56 @@ fn route_entries_to_constructors(entries: &[RouteEntry]) -> Vec<ConstructorDef> 
                     value: bf.value.clone(),
                 });
             }
-            // Add `respond : <response_ty> -> Response` field if route has a response type
+            // Request header fields — flat, same level as other params
+            for hf in &entry.request_headers {
+                fields.push(Field {
+                    name: hf.name.clone(),
+                    value: hf.value.clone(),
+                });
+            }
+            // Add `respond` field if route has a response type.
+            // With response headers: `respond : ResponseType -> {h1: T, ...} -> Response`
+            // Without: `respond : ResponseType -> Response`
             if let Some(response_ty) = &entry.response_ty {
                 let dummy_span = Span::new(0, 0);
-                fields.push(Field {
-                    name: "respond".to_string(),
-                    value: Spanned::new(
+                let response_named = Spanned::new(
+                    TypeKind::Named("Response".into()),
+                    dummy_span,
+                );
+                let respond_ty = if entry.response_headers.is_empty() {
+                    Spanned::new(
+                        TypeKind::Function {
+                            param: Box::new(response_ty.clone()),
+                            result: Box::new(response_named),
+                        },
+                        dummy_span,
+                    )
+                } else {
+                    // respond : ResponseType -> {h1: T, ...} -> Response
+                    let headers_record = Spanned::new(
+                        TypeKind::Record {
+                            fields: entry.response_headers.clone(),
+                            rest: None,
+                        },
+                        dummy_span,
+                    );
+                    Spanned::new(
                         TypeKind::Function {
                             param: Box::new(response_ty.clone()),
                             result: Box::new(Spanned::new(
-                                TypeKind::Named("Response".into()),
+                                TypeKind::Function {
+                                    param: Box::new(headers_record),
+                                    result: Box::new(response_named),
+                                },
                                 dummy_span,
                             )),
                         },
                         dummy_span,
-                    ),
+                    )
+                };
+                fields.push(Field {
+                    name: "respond".to_string(),
+                    value: respond_ty,
                 });
             }
             ConstructorDef {

@@ -571,6 +571,15 @@ impl Codegen {
         );
         self.declare_rt("knot_http_listen", &[p, p, p, p], &[p]);
 
+        // HTTP client (fetch)
+        // (base_url, method_ptr, method_len, path_ptr, path_len, payload,
+        //  body_ptr, body_len, query_ptr, query_len, resp_ptr, resp_len, headers)
+        self.declare_rt(
+            "knot_http_fetch_io",
+            &[p, p, p, p, p, p, p, p, p, p, p, p, p],
+            &[p],
+        );
+
         // OpenAPI / api command
         self.declare_rt("knot_api_register", &[p, p, p], &[]);
         self.declare_rt("knot_api_handle", &[types::I32, p], &[types::I32]);
@@ -3545,6 +3554,15 @@ impl Codegen {
             }
         }
 
+        // Special case: fetch/fetchWith
+        if let ast::ExprKind::Var(name) = &func_expr.node {
+            if (name == "fetch" && args.len() == 2)
+                || (name == "fetchWith" && args.len() == 3)
+            {
+                return self.compile_fetch(builder, &args, name == "fetchWith", env, db);
+            }
+        }
+
         let compiled_args: Vec<Value> = args
             .iter()
             .map(|a| self.compile_expr(builder, a, env, db))
@@ -3763,6 +3781,92 @@ impl Codegen {
                 result
             }
         }
+    }
+
+    // ── HTTP fetch compilation ────────────────────────────────────
+
+    /// Compile `fetch url (Ctor {..})` or `fetchWith url opts (Ctor {..})`.
+    fn compile_fetch(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        args: &[&ast::Expr],
+        with_opts: bool,
+        env: &mut Env,
+        db: Value,
+    ) -> Value {
+        let base_url = self.compile_expr(builder, args[0], env, db);
+
+        let (headers, ctor_expr) = if with_opts {
+            // fetchWith url opts (Ctor {..})
+            let opts = self.compile_expr(builder, args[1], env, db);
+            let (h_ptr, h_len) = self.string_ptr(builder, "headers");
+            let headers =
+                self.call_rt(builder, "knot_record_field", &[opts, h_ptr, h_len]);
+            (headers, args[2])
+        } else {
+            // fetch url (Ctor {..})
+            let null = builder.ins().iconst(self.ptr_type, 0);
+            (null, args[1])
+        };
+
+        // Extract constructor name and record argument from the AST
+        let (ctor_name, record_expr) = match &ctor_expr.node {
+            ast::ExprKind::App { func, arg } => {
+                if let ast::ExprKind::Constructor(name) = &func.node {
+                    (name.clone(), Some(arg.as_ref()))
+                } else {
+                    panic!("fetch: expected constructor application as last argument");
+                }
+            }
+            ast::ExprKind::Constructor(name) => (name.clone(), None),
+            _ => panic!("fetch: expected constructor application as last argument"),
+        };
+
+        // Compile just the record payload (skip the Constructor wrapper)
+        let payload = match record_expr {
+            Some(expr) => self.compile_expr(builder, expr, env, db),
+            None => self.call_rt(builder, "knot_value_unit", &[]),
+        };
+
+        // Look up route entry for this constructor
+        let entry = self
+            .route_entries
+            .values()
+            .flat_map(|entries| entries.iter())
+            .find(|e| e.constructor == ctor_name)
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("fetch: no route entry found for constructor '{}'", ctor_name)
+            });
+
+        let method_str = match entry.method {
+            ast::HttpMethod::Get => "GET",
+            ast::HttpMethod::Post => "POST",
+            ast::HttpMethod::Put => "PUT",
+            ast::HttpMethod::Delete => "DELETE",
+            ast::HttpMethod::Patch => "PATCH",
+        };
+        let path_pattern = path_segments_to_pattern(&entry.path);
+        let body_desc = fields_to_descriptor(&entry.body_fields);
+        let query_desc = fields_to_descriptor(&entry.query_params);
+        let resp_desc =
+            response_type_descriptor(&entry.response_ty, &self.type_aliases);
+
+        let (method_ptr, method_len) = self.string_ptr(builder, method_str);
+        let (path_ptr, path_len) = self.string_ptr(builder, &path_pattern);
+        let (body_ptr, body_len) = self.string_ptr(builder, &body_desc);
+        let (query_ptr, query_len) = self.string_ptr(builder, &query_desc);
+        let (resp_ptr, resp_len) = self.string_ptr(builder, &resp_desc);
+
+        self.call_rt(
+            builder,
+            "knot_http_fetch_io",
+            &[
+                base_url, method_ptr, method_len, path_ptr, path_len, payload,
+                body_ptr, body_len, query_ptr, query_len, resp_ptr, resp_len,
+                headers,
+            ],
+        )
     }
 
     // ── Case expression compilation ───────────────────────────────
@@ -4082,6 +4186,7 @@ impl Codegen {
                 "println" | "putLine" | "print" | "readLine" | "readFile"
                     | "writeFile" | "appendFile" | "fileExists" | "removeFile"
                     | "listDir" | "now" | "randomInt" | "randomFloat"
+                    | "fetch" | "fetchWith"
             ),
             _ => false,
         }
@@ -7236,6 +7341,8 @@ fn is_builtin_name(name: &str) -> bool {
             | "__yield"
             | "__empty"
             | "listen"
+            | "fetch"
+            | "fetchWith"
             | "single"
             | "toUpper"
             | "toLower"

@@ -201,7 +201,7 @@ impl EffectChecker {
 
         let mut network_effect = EffectSet::empty();
         network_effect.network = true;
-        insert_many(&["listen"], network_effect);
+        insert_many(&["listen", "fetch", "fetchWith"], network_effect);
 
         let mut fs_effect = EffectSet::empty();
         fs_effect.fs = true;

@@ -18,6 +18,7 @@ cranelift-native = "0.116"
 target-lexicon = "0.13"
 rusqlite = { version = "0.34", features = ["bundled", "collation"] }
 tiny_http = "0.12"
+ureq = "2"
 num-bigint = "0.4"
 num-traits = "0.2"
 num-integer = "0.1"

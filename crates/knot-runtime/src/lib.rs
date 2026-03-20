@@ -6587,6 +6587,265 @@ pub extern "C" fn knot_http_listen(
     }
 }
 
+// ── HTTP client (fetch) ─────────────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_http_fetch_io(
+    base_url: *mut Value,
+    method_ptr: *const u8,
+    method_len: usize,
+    path_ptr: *const u8,
+    path_len: usize,
+    payload: *mut Value,
+    body_ptr: *const u8,
+    body_len: usize,
+    query_ptr: *const u8,
+    query_len: usize,
+    resp_ptr: *const u8,
+    resp_len: usize,
+    headers: *mut Value,
+) -> *mut Value {
+    let method = alloc(Value::Text(
+        unsafe { str_from_raw(method_ptr, method_len) }.to_string(),
+    ));
+    let path = alloc(Value::Text(
+        unsafe { str_from_raw(path_ptr, path_len) }.to_string(),
+    ));
+    let body_desc = alloc(Value::Text(
+        unsafe { str_from_raw(body_ptr, body_len) }.to_string(),
+    ));
+    let query_desc = alloc(Value::Text(
+        unsafe { str_from_raw(query_ptr, query_len) }.to_string(),
+    ));
+    let resp_desc = alloc(Value::Text(
+        unsafe { str_from_raw(resp_ptr, resp_len) }.to_string(),
+    ));
+
+    // Env record — fields sorted alphabetically for index-based access
+    // 0: base_url, 1: body_desc, 2: headers, 3: method, 4: path, 5: payload, 6: query_desc, 7: resp_desc
+    let env = alloc(Value::Record(vec![
+        RecordField { name: "base_url".into(), value: base_url },
+        RecordField { name: "body_desc".into(), value: body_desc },
+        RecordField { name: "headers".into(), value: headers },
+        RecordField { name: "method".into(), value: method },
+        RecordField { name: "path".into(), value: path },
+        RecordField { name: "payload".into(), value: payload },
+        RecordField { name: "query_desc".into(), value: query_desc },
+        RecordField { name: "resp_desc".into(), value: resp_desc },
+    ]));
+
+    extern "C" fn fetch_thunk(_db: *mut c_void, env: *mut Value) -> *mut Value {
+        let base_url = knot_record_field_by_index(env, 0);
+        let body_desc = knot_record_field_by_index(env, 1);
+        let headers = knot_record_field_by_index(env, 2);
+        let method = knot_record_field_by_index(env, 3);
+        let path = knot_record_field_by_index(env, 4);
+        let payload = knot_record_field_by_index(env, 5);
+        let query_desc = knot_record_field_by_index(env, 6);
+        let resp_desc = knot_record_field_by_index(env, 7);
+
+        let base = match unsafe { as_ref(base_url) } {
+            Value::Text(s) => s.clone(),
+            _ => panic!("knot runtime: fetch expected Text base URL"),
+        };
+        let path_pattern = match unsafe { as_ref(path) } {
+            Value::Text(s) => s.clone(),
+            _ => panic!("knot runtime: fetch expected Text path"),
+        };
+        let method_str = match unsafe { as_ref(method) } {
+            Value::Text(s) => s.clone(),
+            _ => panic!("knot runtime: fetch expected Text method"),
+        };
+
+        // Build URL with path param substitution
+        let url = fetch_build_url(&base, &path_pattern, payload);
+
+        // Build body JSON from body field descriptor
+        let body_json = match unsafe { as_ref(body_desc) } {
+            Value::Text(s) if !s.is_empty() => Some(fetch_build_body(s, payload)),
+            _ => None,
+        };
+
+        // Build query string from query field descriptor
+        let query_string = match unsafe { as_ref(query_desc) } {
+            Value::Text(s) if !s.is_empty() => Some(fetch_build_query(s, payload)),
+            _ => None,
+        };
+
+        let full_url = match &query_string {
+            Some(qs) if !qs.is_empty() => format!("{}?{}", url, qs),
+            _ => url,
+        };
+
+        // Build ureq request
+        let mut request = match method_str.as_str() {
+            "GET" => ureq::get(&full_url),
+            "POST" => ureq::post(&full_url),
+            "PUT" => ureq::put(&full_url),
+            "DELETE" => ureq::delete(&full_url),
+            "PATCH" => ureq::patch(&full_url),
+            _ => panic!("knot runtime: fetch unsupported method: {}", method_str),
+        };
+
+        // Set headers from relation
+        if !headers.is_null() {
+            if let Value::Relation(rows) = unsafe { as_ref(headers) } {
+                for row in rows {
+                    let n = fetch_record_text_field(*row, "name");
+                    let v = fetch_record_text_field(*row, "value");
+                    request = request.set(&n, &v);
+                }
+            }
+        }
+
+        // Send request
+        let result = match body_json {
+            Some(ref json) => request
+                .set("Content-Type", "application/json")
+                .send_string(json),
+            None => request.call(),
+        };
+
+        // Build Result ADT
+        match result {
+            Ok(response) => {
+                let _status = response.status();
+                let body_text = response.into_string().unwrap_or_default();
+                let has_resp_schema = matches!(unsafe { as_ref(resp_desc) }, Value::Text(s) if !s.is_empty());
+                let parsed = if has_resp_schema {
+                    let (val, _) = parse_json_value(&body_text);
+                    val
+                } else {
+                    alloc(Value::Text(body_text))
+                };
+                // Ok {value: parsed}
+                alloc(Value::Constructor(
+                    "Ok".into(),
+                    alloc(Value::Record(vec![
+                        RecordField { name: "value".into(), value: parsed },
+                    ])),
+                ))
+            }
+            Err(ureq::Error::Status(code, response)) => {
+                let body_text = response.into_string().unwrap_or_default();
+                fetch_build_err(code, &body_text)
+            }
+            Err(ureq::Error::Transport(e)) => {
+                fetch_build_err(0, &format!("Network error: {}", e))
+            }
+        }
+    }
+
+    alloc(Value::IO(fetch_thunk as *const u8, env))
+}
+
+/// Build a full URL by substituting `{name:type}` path params from a record.
+fn fetch_build_url(base: &str, path_pattern: &str, payload: *mut Value) -> String {
+    let mut url = base.trim_end_matches('/').to_string();
+    let mut remaining = path_pattern;
+    while let Some(start) = remaining.find('{') {
+        url.push_str(&remaining[..start]);
+        let end = remaining.find('}').expect("unmatched { in path pattern");
+        let param = &remaining[start + 1..end];
+        let (name, _ty) = param.split_once(':').unwrap_or((param, "text"));
+        let field_val = knot_record_field(payload, name.as_ptr(), name.len());
+        url.push_str(&fetch_value_to_text(field_val));
+        remaining = &remaining[end + 1..];
+    }
+    url.push_str(remaining);
+    url
+}
+
+/// Build a JSON body string from a field descriptor and record payload.
+fn fetch_build_body(body_desc: &str, payload: *mut Value) -> String {
+    let mut json = String::from("{");
+    for (i, field_desc) in body_desc.split(',').enumerate() {
+        if field_desc.is_empty() {
+            continue;
+        }
+        let (name, _ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
+        let field_val = knot_record_field(payload, name.as_ptr(), name.len());
+        if i > 0 {
+            json.push(',');
+        }
+        json.push('"');
+        json.push_str(name);
+        json.push_str("\":");
+        json.push_str(&value_to_json(field_val));
+    }
+    json.push('}');
+    json
+}
+
+/// Build a query string from a field descriptor and record payload.
+fn fetch_build_query(query_desc: &str, payload: *mut Value) -> String {
+    let mut parts = Vec::new();
+    for field_desc in query_desc.split(',') {
+        if field_desc.is_empty() {
+            continue;
+        }
+        let (name, _ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
+        let field_val = knot_record_field(payload, name.as_ptr(), name.len());
+        let val_str = fetch_value_to_text(field_val);
+        // Percent-encode the value
+        let encoded: String = val_str
+            .bytes()
+            .flat_map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    vec![b as char]
+                }
+                _ => format!("%{:02X}", b).chars().collect(),
+            })
+            .collect();
+        parts.push(format!("{}={}", name, encoded));
+    }
+    parts.join("&")
+}
+
+/// Convert a Knot value to its text representation for URL params.
+fn fetch_value_to_text(v: *mut Value) -> String {
+    match unsafe { as_ref(v) } {
+        Value::Int(n) => n.to_string(),
+        Value::Float(n) => n.to_string(),
+        Value::Text(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        _ => panic!(
+            "knot runtime: cannot convert {} to text for URL parameter",
+            type_name(v)
+        ),
+    }
+}
+
+/// Extract a Text field from a record by name.
+fn fetch_record_text_field(record: *mut Value, field: &str) -> String {
+    let val = knot_record_field(record, field.as_ptr(), field.len());
+    match unsafe { as_ref(val) } {
+        Value::Text(s) => s.clone(),
+        _ => String::new(),
+    }
+}
+
+/// Build an Err {error: {message: Text, status: Int}} value.
+fn fetch_build_err(status: u16, message: &str) -> *mut Value {
+    let error_record = alloc(Value::Record(vec![
+        RecordField {
+            name: "message".into(),
+            value: alloc(Value::Text(message.to_string())),
+        },
+        RecordField {
+            name: "status".into(),
+            value: alloc(Value::Int(BigInt::from(status))),
+        },
+    ]));
+    alloc(Value::Constructor(
+        "Err".into(),
+        alloc(Value::Record(vec![RecordField {
+            name: "error".into(),
+            value: error_record,
+        }])),
+    ))
+}
+
 // ── OpenAPI spec generation ──────────────────────────────────────
 
 use std::sync::Mutex;

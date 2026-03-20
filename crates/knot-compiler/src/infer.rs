@@ -209,6 +209,9 @@ struct Infer {
 
     /// Spans of local variable bindings and their types (for LSP hover).
     binding_types: Vec<(Span, Ty)>,
+
+    /// Route constructor → response type mapping (for `fetch` return type resolution).
+    fetch_response_types: HashMap<String, ast::Type>,
 }
 
 // ── Core operations ───────────────────────────────────────────────
@@ -234,6 +237,7 @@ impl Infer {
             deferred_constraints: Vec::new(),
             binding_types: Vec::new(),
             trait_params: HashMap::new(),
+            fetch_response_types: HashMap::new(),
         }
     }
 
@@ -1484,6 +1488,12 @@ impl Infer {
             }
 
             ast::ExprKind::App { func, arg } => {
+                // Special case: fully handle `fetch url (Ctor {..})` to
+                // skip the `respond` field and resolve the response type.
+                if let Some(ty) = self.try_infer_fetch(expr) {
+                    return ty;
+                }
+
                 let func_ty = self.infer_expr(func);
                 let arg_ty = self.infer_expr(arg);
                 let result_ty = self.fresh();
@@ -1592,6 +1602,85 @@ impl Infer {
                 rel_ty
             }
         }
+    }
+
+    /// Try to infer a `fetch` call. Returns `Some(ty)` if the expression
+    /// is `fetch url (Ctor {..})` or `fetch url opts (Ctor {..})`.
+    /// This skips the constructor's `respond` field and resolves the
+    /// response type from route metadata.
+    fn try_infer_fetch(&mut self, expr: &ast::Expr) -> Option<Ty> {
+        let ctor_name = fetch_ctor_name(expr)?;
+
+        // Collect all App arguments and the root function
+        let (func_expr, args) = uncurry_fetch(expr);
+
+        // Root must be Var("fetch") or Var("fetchWith")
+        let is_fetch_with = match &func_expr.node {
+            ast::ExprKind::Var(name) if name == "fetch" => false,
+            ast::ExprKind::Var(name) if name == "fetchWith" => true,
+            _ => return None,
+        };
+
+        // Validate arg count: fetch needs 2, fetchWith needs 3
+        if (!is_fetch_with && args.len() != 2) || (is_fetch_with && args.len() != 3) {
+            return None;
+        }
+
+        // Infer URL argument (should be Text)
+        let url_ty = self.infer_expr(args[0]);
+        self.unify(&url_ty, &Ty::Text, args[0].span);
+
+        // If fetchWith, infer the options record
+        if is_fetch_with {
+            let _opts_ty = self.infer_expr(args[1]);
+        }
+
+        // Infer the constructor's record payload WITHOUT the `respond` field.
+        let ctor_arg = args.last().unwrap();
+        let record_arg = match &ctor_arg.node {
+            ast::ExprKind::App { arg, .. } => arg.as_ref(),
+            _ => ctor_arg,
+        };
+        let record_ty = self.infer_expr(record_arg);
+
+        // Build the expected request fields from the route entry (exclude `respond`)
+        if let Some(info) = self.constructors.get(ctor_name).cloned() {
+            self.annotation_vars.clear();
+            for p in &info.data_params {
+                let v = self.fresh_var();
+                self.annotation_vars.insert(p.clone(), v);
+            }
+            let field_tys: BTreeMap<String, Ty> = info
+                .fields
+                .iter()
+                .filter(|(name, _)| name != "respond")
+                .map(|(name, ty)| (name.clone(), self.ast_type_to_ty(ty)))
+                .collect();
+            let expected_record = Ty::Record(field_tys, None);
+            self.unify(&record_ty, &expected_record, ctor_arg.span);
+        }
+
+        // Build the return type: IO {network} (Result {status, message} ResponseTy)
+        let resp_ty = self
+            .fetch_response_types
+            .get(ctor_name)
+            .cloned();
+        let body_ty = match resp_ty {
+            Some(ref ty) => self.ast_type_to_ty(ty),
+            None => Ty::Text,
+        };
+        let err_ty = Ty::Record(
+            BTreeMap::from([
+                ("message".into(), Ty::Text),
+                ("status".into(), Ty::Int),
+            ]),
+            None,
+        );
+        let result_adt = Ty::Con("Result".into(), vec![err_ty, body_ty]);
+        Some(Ty::IO(
+            BTreeSet::from([IoEffect::Network]),
+            Box::new(result_adt),
+        ))
     }
 
     fn infer_binop(
@@ -2206,6 +2295,14 @@ impl Infer {
                 } => {
                     self.register_trait_methods(trait_name, params, items);
                 }
+                ast::DeclKind::Route { entries, .. } => {
+                    for entry in entries {
+                        if let Some(ref resp_ty) = entry.response_ty {
+                            self.fetch_response_types
+                                .insert(entry.constructor.clone(), resp_ty.clone());
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -2388,6 +2485,54 @@ impl Infer {
                 ),
             ),
         );
+
+        // fetch : ∀a b. Text -> a -> IO {network} (Result {status: Int, message: Text} b)
+        // (also accepts 3-arg form with options record in the middle)
+        // The response type `b` is resolved via special inference when the
+        // second/third arg is a route constructor with a known response type.
+        {
+            let a = self.fresh_var();
+            let b = self.fresh_var();
+            let err_ty = Ty::Record(
+                BTreeMap::from([
+                    ("message".into(), Ty::Text),
+                    ("status".into(), Ty::Int),
+                ]),
+                None,
+            );
+            let result_ty = Ty::Con("Result".into(), vec![err_ty.clone(), Ty::Var(b)]);
+            let io_ty = Ty::IO(BTreeSet::from([IoEffect::Network]), Box::new(result_ty));
+            self.bind_top(
+                "fetch",
+                Scheme::poly(
+                    vec![a, b],
+                    Ty::Fun(
+                        Box::new(Ty::Text),
+                        Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(io_ty))),
+                    ),
+                ),
+            );
+
+            // fetchWith : ∀a b c. Text -> c -> a -> IO {network} (Result ... b)
+            let a2 = self.fresh_var();
+            let b2 = self.fresh_var();
+            let c2 = self.fresh_var();
+            let result_ty2 = Ty::Con("Result".into(), vec![err_ty, Ty::Var(b2)]);
+            let io_ty2 = Ty::IO(BTreeSet::from([IoEffect::Network]), Box::new(result_ty2));
+            self.bind_top(
+                "fetchWith",
+                Scheme::poly(
+                    vec![a2, b2, c2],
+                    Ty::Fun(
+                        Box::new(Ty::Text),
+                        Box::new(Ty::Fun(
+                            Box::new(Ty::Var(c2)),
+                            Box::new(Ty::Fun(Box::new(Ty::Var(a2)), Box::new(io_ty2))),
+                        )),
+                    ),
+                ),
+            );
+        }
 
         // ── Standard library ─────────────────────────────────────
 
@@ -3938,5 +4083,49 @@ mod tests {
              main = hasA (A {})",
         );
         assert!(diags.is_empty(), "unexpected errors: {:?}", diags);
+    }
+}
+
+/// Extract the constructor name from a `fetch url (Ctor {..})` or
+/// `fetch url opts (Ctor {..})` expression tree.  Returns `None` if
+/// the expression is not a fetch call with a constructor argument.
+fn fetch_ctor_name(expr: &ast::Expr) -> Option<&str> {
+    let ast::ExprKind::App { func, arg } = &expr.node else {
+        return None;
+    };
+    // The last argument should be a constructor application
+    let ctor_name = match &arg.node {
+        ast::ExprKind::App { func: ctor_func, .. } => {
+            if let ast::ExprKind::Constructor(name) = &ctor_func.node {
+                name.as_str()
+            } else {
+                return None;
+            }
+        }
+        ast::ExprKind::Constructor(name) => name.as_str(),
+        _ => return None,
+    };
+    // Walk the function chain to find Var("fetch") or Var("fetchWith") at the root
+    let mut f = func.as_ref();
+    loop {
+        match &f.node {
+            ast::ExprKind::Var(name) if name == "fetch" || name == "fetchWith" => {
+                return Some(ctor_name);
+            }
+            ast::ExprKind::App { func: inner, .. } => f = inner.as_ref(),
+            _ => return None,
+        }
+    }
+}
+
+/// Uncurry a fetch application into its root function and arguments.
+fn uncurry_fetch<'a>(expr: &'a ast::Expr) -> (&'a ast::Expr, Vec<&'a ast::Expr>) {
+    match &expr.node {
+        ast::ExprKind::App { func, arg } => {
+            let (f, mut args) = uncurry_fetch(func);
+            args.push(arg);
+            (f, args)
+        }
+        _ => (expr, Vec::new()),
     }
 }

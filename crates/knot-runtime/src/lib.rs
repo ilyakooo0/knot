@@ -2989,6 +2989,12 @@ pub extern "C" fn knot_fs_list_dir(path: *mut Value) -> *mut Value {
 pub extern "C" fn knot_db_open(path_ptr: *const u8, path_len: usize) -> *mut c_void {
     let path = unsafe { str_from_raw(path_ptr, path_len) };
     let conn = Connection::open(path).expect("knot runtime: failed to open database");
+    conn.create_collation("KNOT_INT", |a: &str, b: &str| {
+        let pa: BigInt = a.parse().unwrap_or_default();
+        let pb: BigInt = b.parse().unwrap_or_default();
+        pa.cmp(&pb)
+    })
+    .expect("knot runtime: failed to create KNOT_INT collation");
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
         .expect("knot runtime: failed to set pragmas");
     let db = Box::new(KnotDb {
@@ -3377,7 +3383,7 @@ fn parse_schema(spec: &str) -> Vec<ColumnSpec> {
 
 fn sql_type(ty: ColType) -> &'static str {
     match ty {
-        ColType::Int => "BLOB",
+        ColType::Int => "TEXT COLLATE KNOT_INT",
         ColType::Float => "REAL",
         ColType::Text => "TEXT",
         ColType::Bool => "INTEGER",
@@ -5125,10 +5131,7 @@ fn value_to_sql_param(v: *mut Value) -> rusqlite::types::Value {
         return rusqlite::types::Value::Null;
     }
     match unsafe { as_ref(v) } {
-        Value::Int(n) => match n.to_i64() {
-            Some(i) => rusqlite::types::Value::Integer(i),
-            None => rusqlite::types::Value::Blob(n.to_string().into_bytes()),
-        },
+        Value::Int(n) => rusqlite::types::Value::Text(n.to_string()),
         Value::Float(n) => rusqlite::types::Value::Real(*n),
         Value::Text(s) => rusqlite::types::Value::Text(s.clone()),
         Value::Bool(b) => rusqlite::types::Value::Integer(*b as i64),
@@ -5149,10 +5152,7 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
         return rusqlite::types::Value::Null;
     }
     match (unsafe { as_ref(v) }, ty) {
-        (Value::Int(n), _) => match n.to_i64() {
-            Some(i) => rusqlite::types::Value::Integer(i),
-            None => rusqlite::types::Value::Blob(n.to_string().into_bytes()),
-        },
+        (Value::Int(n), _) => rusqlite::types::Value::Text(n.to_string()),
         (Value::Float(n), _) => rusqlite::types::Value::Real(*n),
         (Value::Text(s), _) => rusqlite::types::Value::Text(s.clone()),
         (Value::Bool(b), _) => rusqlite::types::Value::Integer(*b as i64),

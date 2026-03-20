@@ -189,6 +189,36 @@ fn alloc(v: Value) -> *mut Value {
     ARENA.with(|a| a.borrow_mut().alloc(v))
 }
 
+/// Allocate an integer, returning a cached pointer for small values.
+fn alloc_int(n: BigInt) -> *mut Value {
+    if let Some(small) = n.to_i64() {
+        if small >= SMALL_INT_MIN && small <= SMALL_INT_MAX {
+            return SMALL_INT_CACHE.with(|cache| cache[(small - SMALL_INT_MIN) as usize]);
+        }
+    }
+    alloc(Value::Int(n))
+}
+
+/// Return the cached Bool singleton.
+fn alloc_bool(b: bool) -> *mut Value {
+    if b {
+        BOOL_TRUE.with(|p| *p)
+    } else {
+        BOOL_FALSE.with(|p| *p)
+    }
+}
+
+/// Allocate a float, returning a cached pointer for 0.0 and 1.0.
+fn alloc_float(n: f64) -> *mut Value {
+    if n == 0.0 {
+        FLOAT_ZERO.with(|p| *p)
+    } else if n == 1.0 {
+        FLOAT_ONE.with(|p| *p)
+    } else {
+        alloc(Value::Float(n))
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_arena_mark() -> usize {
     ARENA.with(|a| a.borrow().mark())
@@ -1415,10 +1445,10 @@ fn bigint_to_f64(n: &BigInt) -> f64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_add(a: *mut Value, b: *mut Value) -> *mut Value {
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
-        (Value::Int(x), Value::Int(y)) => alloc(Value::Int(x + y)),
-        (Value::Float(x), Value::Float(y)) => alloc(Value::Float(x + y)),
-        (Value::Int(x), Value::Float(y)) => alloc(Value::Float(bigint_to_f64(x) + y)),
-        (Value::Float(x), Value::Int(y)) => alloc(Value::Float(x + bigint_to_f64(y))),
+        (Value::Int(x), Value::Int(y)) => alloc_int(x + y),
+        (Value::Float(x), Value::Float(y)) => alloc_float(x + y),
+        (Value::Int(x), Value::Float(y)) => alloc_float(bigint_to_f64(x) + y),
+        (Value::Float(x), Value::Int(y)) => alloc_float(x + bigint_to_f64(y)),
         _ => panic!("knot runtime: cannot add {} + {}", type_name(a), type_name(b)),
     }
 }
@@ -1426,10 +1456,10 @@ pub extern "C" fn knot_value_add(a: *mut Value, b: *mut Value) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_sub(a: *mut Value, b: *mut Value) -> *mut Value {
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
-        (Value::Int(x), Value::Int(y)) => alloc(Value::Int(x - y)),
-        (Value::Float(x), Value::Float(y)) => alloc(Value::Float(x - y)),
-        (Value::Int(x), Value::Float(y)) => alloc(Value::Float(bigint_to_f64(x) - y)),
-        (Value::Float(x), Value::Int(y)) => alloc(Value::Float(x - bigint_to_f64(y))),
+        (Value::Int(x), Value::Int(y)) => alloc_int(x - y),
+        (Value::Float(x), Value::Float(y)) => alloc_float(x - y),
+        (Value::Int(x), Value::Float(y)) => alloc_float(bigint_to_f64(x) - y),
+        (Value::Float(x), Value::Int(y)) => alloc_float(x - bigint_to_f64(y)),
         _ => panic!("knot runtime: cannot subtract {} - {}", type_name(a), type_name(b)),
     }
 }
@@ -1437,10 +1467,10 @@ pub extern "C" fn knot_value_sub(a: *mut Value, b: *mut Value) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_mul(a: *mut Value, b: *mut Value) -> *mut Value {
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
-        (Value::Int(x), Value::Int(y)) => alloc(Value::Int(x * y)),
-        (Value::Float(x), Value::Float(y)) => alloc(Value::Float(x * y)),
-        (Value::Int(x), Value::Float(y)) => alloc(Value::Float(bigint_to_f64(x) * y)),
-        (Value::Float(x), Value::Int(y)) => alloc(Value::Float(x * bigint_to_f64(y))),
+        (Value::Int(x), Value::Int(y)) => alloc_int(x * y),
+        (Value::Float(x), Value::Float(y)) => alloc_float(x * y),
+        (Value::Int(x), Value::Float(y)) => alloc_float(bigint_to_f64(x) * y),
+        (Value::Float(x), Value::Int(y)) => alloc_float(x * bigint_to_f64(y)),
         _ => panic!("knot runtime: cannot multiply {} * {}", type_name(a), type_name(b)),
     }
 }
@@ -1452,23 +1482,23 @@ pub extern "C" fn knot_value_div(a: *mut Value, b: *mut Value) -> *mut Value {
             if y.is_zero() {
                 panic!("knot runtime: division by zero");
             }
-            alloc(Value::Int(x / y))
+            alloc_int(x / y)
         }
-        (Value::Float(x), Value::Float(y)) => alloc(Value::Float(x / y)),
-        (Value::Int(x), Value::Float(y)) => alloc(Value::Float(bigint_to_f64(x) / y)),
-        (Value::Float(x), Value::Int(y)) => alloc(Value::Float(x / bigint_to_f64(y))),
+        (Value::Float(x), Value::Float(y)) => alloc_float(x / y),
+        (Value::Int(x), Value::Float(y)) => alloc_float(bigint_to_f64(x) / y),
+        (Value::Float(x), Value::Int(y)) => alloc_float(x / bigint_to_f64(y)),
         _ => panic!("knot runtime: cannot divide {} / {}", type_name(a), type_name(b)),
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_eq(a: *mut Value, b: *mut Value) -> *mut Value {
-    alloc(Value::Bool(values_equal(a, b)))
+    alloc_bool(values_equal(a, b))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_neq(a: *mut Value, b: *mut Value) -> *mut Value {
-    alloc(Value::Bool(!values_equal(a, b)))
+    alloc_bool(!values_equal(a, b))
 }
 
 // Unboxed variants returning i32 (0/1) — avoid Bool allocation when result feeds a branch
@@ -1506,22 +1536,22 @@ fn compare_gt(a: *mut Value, b: *mut Value) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_lt(a: *mut Value, b: *mut Value) -> *mut Value {
-    alloc(Value::Bool(compare_lt(a, b)))
+    alloc_bool(compare_lt(a, b))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_gt(a: *mut Value, b: *mut Value) -> *mut Value {
-    alloc(Value::Bool(compare_gt(a, b)))
+    alloc_bool(compare_gt(a, b))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_le(a: *mut Value, b: *mut Value) -> *mut Value {
-    alloc(Value::Bool(!compare_gt(a, b)))
+    alloc_bool(!compare_gt(a, b))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_ge(a: *mut Value, b: *mut Value) -> *mut Value {
-    alloc(Value::Bool(!compare_lt(a, b)))
+    alloc_bool(!compare_lt(a, b))
 }
 
 #[unsafe(no_mangle)]
@@ -1544,10 +1574,27 @@ pub extern "C" fn knot_value_ge_i32(a: *mut Value, b: *mut Value) -> i32 {
     !compare_lt(a, b) as i32
 }
 
+// Unboxed boolean operations returning i32 (0/1) — avoid Bool allocation in conditions
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_value_and_i32(a: *mut Value, b: *mut Value) -> i32 {
+    match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
+        (Value::Bool(x), Value::Bool(y)) => (*x && *y) as i32,
+        _ => panic!("knot runtime: && requires Bool operands, got {} && {}", type_name(a), type_name(b)),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_value_or_i32(a: *mut Value, b: *mut Value) -> i32 {
+    match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
+        (Value::Bool(x), Value::Bool(y)) => (*x || *y) as i32,
+        _ => panic!("knot runtime: || requires Bool operands, got {} || {}", type_name(a), type_name(b)),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_and(a: *mut Value, b: *mut Value) -> *mut Value {
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
-        (Value::Bool(x), Value::Bool(y)) => alloc(Value::Bool(*x && *y)),
+        (Value::Bool(x), Value::Bool(y)) => alloc_bool(*x && *y),
         _ => panic!("knot runtime: && requires Bool operands, got {} && {}", type_name(a), type_name(b)),
     }
 }
@@ -1555,7 +1602,7 @@ pub extern "C" fn knot_value_and(a: *mut Value, b: *mut Value) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_or(a: *mut Value, b: *mut Value) -> *mut Value {
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
-        (Value::Bool(x), Value::Bool(y)) => alloc(Value::Bool(*x || *y)),
+        (Value::Bool(x), Value::Bool(y)) => alloc_bool(*x || *y),
         _ => panic!("knot runtime: || requires Bool operands, got {} || {}", type_name(a), type_name(b)),
     }
 }
@@ -1671,8 +1718,8 @@ pub extern "C" fn knot_ordering_tag_i32(v: *mut Value) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_negate(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
-        Value::Int(n) => alloc(Value::Int(-n)),
-        Value::Float(n) => alloc(Value::Float(-n)),
+        Value::Int(n) => alloc_int(-n),
+        Value::Float(n) => alloc_float(-n),
         _ => panic!("knot runtime: cannot negate {}", type_name(v)),
     }
 }
@@ -1680,7 +1727,7 @@ pub extern "C" fn knot_value_negate(v: *mut Value) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_not(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
-        Value::Bool(b) => alloc(Value::Bool(!b)),
+        Value::Bool(b) => alloc_bool(!b),
         _ => panic!("knot runtime: 'not' requires Bool, got {}", type_name(v)),
     }
 }
@@ -2343,7 +2390,7 @@ pub extern "C" fn knot_relation_sum(
             type_name(rel)
         ),
     };
-    let mut acc = alloc(Value::Int(BigInt::ZERO));
+    let mut acc = alloc_int(BigInt::ZERO);
     for &row in rows {
         let val = knot_value_call(db, f, row);
         acc = knot_value_add(acc, val);
@@ -2366,7 +2413,7 @@ pub extern "C" fn knot_relation_avg(
         ),
     };
     if rows.is_empty() {
-        return alloc(Value::Float(0.0));
+        return alloc_float(0.0);
     }
     let mut total = 0.0f64;
     let count = rows.len();
@@ -2381,7 +2428,7 @@ pub extern "C" fn knot_relation_avg(
             ),
         }
     }
-    alloc(Value::Float(total / count as f64))
+    alloc_float(total / count as f64)
 }
 
 // ── Standard library: text operations ─────────────────────────────
@@ -2462,7 +2509,7 @@ pub extern "C" fn knot_text_contains(needle: *mut Value, haystack: *mut Value) -
         _ => panic!("knot runtime: contains expected Text as first arg"),
     };
     match unsafe { as_ref(haystack) } {
-        Value::Text(s) => alloc(Value::Bool(s.contains(needle))),
+        Value::Text(s) => alloc_bool(s.contains(needle)),
         _ => panic!("knot runtime: contains expected Text as second arg"),
     }
 }
@@ -2661,8 +2708,8 @@ fn parse_json_value(s: &str) -> (*mut Value, &str) {
         b'"' => parse_json_string(s),
         b'{' => parse_json_obj(s),
         b'[' => parse_json_array(s),
-        b't' if s.starts_with("true") => (alloc(Value::Bool(true)), &s[4..]),
-        b'f' if s.starts_with("false") => (alloc(Value::Bool(false)), &s[5..]),
+        b't' if s.starts_with("true") => (alloc_bool(true), &s[4..]),
+        b'f' if s.starts_with("false") => (alloc_bool(false), &s[5..]),
         b'n' if s.starts_with("null") => (alloc(Value::Unit), &s[4..]),
         _ => parse_json_number(s),
     }
@@ -2737,10 +2784,10 @@ fn parse_json_number(s: &str) -> (*mut Value, &str) {
     let rest = &s[end..];
     if is_float {
         let n: f64 = num_str.parse().unwrap_or(0.0);
-        (alloc(Value::Float(n)), rest)
+        (alloc_float(n), rest)
     } else {
         let n: BigInt = num_str.parse().unwrap_or(BigInt::ZERO);
-        (alloc(Value::Int(n)), rest)
+        (alloc_int(n), rest)
     }
 }
 
@@ -2892,7 +2939,7 @@ pub extern "C" fn knot_fs_append_file(path: *mut Value, contents: *mut Value) ->
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_fs_file_exists(path: *mut Value) -> *mut Value {
     match unsafe { as_ref(path) } {
-        Value::Text(p) => alloc(Value::Bool(std::path::Path::new(p).exists())),
+        Value::Text(p) => alloc_bool(std::path::Path::new(p).exists()),
         _ => panic!(
             "knot runtime: fileExists expected Text, got {}",
             type_name(path)
@@ -3347,16 +3394,16 @@ fn read_sql_column(row: &rusqlite::Row, i: usize, ty: ColType) -> *mut Value {
     match ty {
         ColType::Int => {
             match row.get_ref(i).unwrap() {
-                ValueRef::Integer(n) => alloc(Value::Int(BigInt::from(n))),
+                ValueRef::Integer(n) => alloc_int(BigInt::from(n)),
                 ValueRef::Blob(b) => {
                     let s = std::str::from_utf8(b).expect("knot runtime: invalid UTF-8 in bigint blob");
                     let n: BigInt = s.parse().expect("knot runtime: invalid bigint in column");
-                    alloc(Value::Int(n))
+                    alloc_int(n)
                 }
                 ValueRef::Text(s) => {
                     let s = std::str::from_utf8(s).expect("knot runtime: invalid UTF-8 in int column");
                     let n: BigInt = s.parse().expect("knot runtime: invalid bigint in column");
-                    alloc(Value::Int(n))
+                    alloc_int(n)
                 }
                 other => panic!("knot runtime: unexpected SQLite type for Int column: {:?}", other),
             }
@@ -3865,7 +3912,7 @@ pub extern "C" fn knot_source_query_count(
         .conn
         .query_row(sql, param_refs.as_slice(), |row| row.get(0))
         .unwrap_or_else(|e| panic!("knot runtime: query_count error: {}\n  SQL: {}", e, sql));
-    alloc(Value::Int(BigInt::from(count)))
+    alloc_int(BigInt::from(count))
 }
 
 /// Execute a SQL aggregate query returning a float (e.g. AVG).
@@ -3898,7 +3945,7 @@ pub extern "C" fn knot_source_query_float(
         .conn
         .query_row(sql, param_refs.as_slice(), |row| row.get(0))
         .unwrap_or_else(|e| panic!("knot runtime: query_float error: {}\n  SQL: {}", e, sql));
-    alloc(Value::Float(result))
+    alloc_float(result)
 }
 
 /// Count rows in a source relation via SQL COUNT(*).
@@ -3918,7 +3965,7 @@ pub extern "C" fn knot_source_count(
         .conn
         .query_row(&sql, [], |row| row.get(0))
         .unwrap_or_else(|e| panic!("knot runtime: count error: {}", e));
-    alloc(Value::Int(BigInt::from(count)))
+    alloc_int(BigInt::from(count))
 }
 
 /// Read rows from a source relation with a WHERE clause.
@@ -5159,7 +5206,7 @@ pub extern "C" fn knot_random_float() -> *mut Value {
     let raw = u64::from_le_bytes(buf);
     // Divide by u64::MAX+1 to get [0.0, 1.0)
     let result = (raw as f64) / ((u64::MAX as f64) + 1.0);
-    alloc(Value::Float(result))
+    alloc_float(result)
 }
 
 /// Initialize a history table for a source with `with history`.
@@ -6297,15 +6344,15 @@ fn string_to_value(s: &str, ty: &str) -> *mut Value {
     match ty {
         "int" => {
             let n: BigInt = s.parse().unwrap_or(BigInt::ZERO);
-            alloc(Value::Int(n))
+            alloc_int(n)
         }
         "float" => {
             let n: f64 = s.parse().unwrap_or(0.0);
-            alloc(Value::Float(n))
+            alloc_float(n)
         }
         "bool" => {
             let b = s == "true" || s == "True";
-            alloc(Value::Bool(b))
+            alloc_bool(b)
         }
         _ => alloc(Value::Text(s.to_string())),
     }
@@ -7118,5 +7165,5 @@ pub extern "C" fn knot_crypto_verify(
     let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
 
     let valid = verifying_key.verify(msg, &signature).is_ok();
-    alloc(Value::Bool(valid))
+    alloc_bool(valid)
 }

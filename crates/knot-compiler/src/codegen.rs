@@ -385,6 +385,8 @@ impl Codegen {
         self.declare_rt("knot_value_compare_ord", &[p, p], &[types::I32]);
         self.declare_rt("knot_value_and", &[p, p], &[p]);
         self.declare_rt("knot_value_or", &[p, p], &[p]);
+        self.declare_rt("knot_value_and_i32", &[p, p], &[types::I32]);
+        self.declare_rt("knot_value_or_i32", &[p, p], &[types::I32]);
         self.declare_rt("knot_value_concat", &[p, p], &[p]);
 
         // Comparison (returns Ordering ADT)
@@ -4479,6 +4481,8 @@ impl Codegen {
                                 | ast::ExprKind::DerivedRef(_)
                                 | ast::ExprKind::List(_)
                                 | ast::ExprKind::Do(_)
+                                | ast::ExprKind::Set { .. }
+                                | ast::ExprKind::FullSet { .. }
                         );
                         if is_known_relation {
                             val

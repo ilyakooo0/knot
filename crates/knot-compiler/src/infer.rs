@@ -38,6 +38,9 @@ pub type MonadInfo = HashMap<Span, MonadKind>;
 /// Maps declaration names to their inferred type display strings.
 pub type TypeInfo = HashMap<String, String>;
 
+/// Maps binding spans (local variables, params, patterns) to their inferred type strings.
+pub type LocalTypeInfo = HashMap<Span, String>;
+
 // ── Internal type representation ──────────────────────────────────
 
 type TyVar = u32;
@@ -204,6 +207,8 @@ struct Infer {
     /// Trait definitions: trait_name → list of param names.
     trait_params: HashMap<String, Vec<String>>,
 
+    /// Spans of local variable bindings and their types (for LSP hover).
+    binding_types: Vec<(Span, Ty)>,
 }
 
 // ── Core operations ───────────────────────────────────────────────
@@ -227,6 +232,7 @@ impl Infer {
             trait_method_traits: HashMap::new(),
             known_impls: HashSet::new(),
             deferred_constraints: Vec::new(),
+            binding_types: Vec::new(),
             trait_params: HashMap::new(),
         }
     }
@@ -1657,6 +1663,7 @@ impl Infer {
         match &pat.node {
             ast::PatKind::Var(name) => {
                 self.bind(name, Scheme::mono(expected.clone()));
+                self.binding_types.push((pat.span, expected.clone()));
             }
             ast::PatKind::Wildcard => {}
             ast::PatKind::Constructor { name, payload } => {
@@ -1693,7 +1700,8 @@ impl Infer {
                         self.check_pattern(p, &ft);
                     } else {
                         // Punned: {name} → bind variable 'name' to field type
-                        self.bind(&fp.name, Scheme::mono(ft));
+                        self.bind(&fp.name, Scheme::mono(ft.clone()));
+                        self.binding_types.push((pat.span, ft));
                     }
                 }
                 let row_var = self.fresh_var();
@@ -3008,6 +3016,16 @@ impl Infer {
         info
     }
 
+    fn extract_local_type_info(&self) -> LocalTypeInfo {
+        let mut info = LocalTypeInfo::new();
+        for (span, ty) in &self.binding_types {
+            let applied = self.apply(ty);
+            let var_map = var_map_for(&applied);
+            info.insert(*span, display_ty_clean(&applied, &var_map));
+        }
+        info
+    }
+
     fn display_scheme(&self, scheme: &Scheme) -> String {
         let applied = self.apply(&scheme.ty);
         let var_map = var_map_for(&applied);
@@ -3189,7 +3207,7 @@ fn display_ty_clean_inner(ty: &Ty, names: &HashMap<TyVar, usize>, in_fun: bool) 
 /// Run type inference on a parsed module. Returns diagnostics,
 /// resolved monad info for desugared do-blocks, and inferred type info
 /// mapping declaration names to their display type strings.
-pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo) {
+pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, LocalTypeInfo) {
     let mut infer = Infer::new();
 
     // Phase 1: Collect type aliases, data types, constructors
@@ -3242,8 +3260,9 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo) {
     }
 
     let type_info = infer.extract_type_info();
+    let local_type_info = infer.extract_local_type_info();
 
-    (infer.to_diagnostics(), monad_info, type_info)
+    (infer.to_diagnostics(), monad_info, type_info, local_type_info)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
@@ -3261,7 +3280,7 @@ mod tests {
     }
 
     fn check_src(src: &str) -> Vec<Diagnostic> {
-        let (diags, _monad_info, _type_info) = check(&parse(src));
+        let (diags, _monad_info, _type_info, _local_types) = check(&parse(src));
         diags
     }
 

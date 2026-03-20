@@ -95,7 +95,7 @@ fn cmd_build(source_file: &str) {
     let type_env = types::TypeEnv::from_module(&module);
 
     // Type inference
-    let (infer_diags, monad_info, _type_info) = infer::check(&module);
+    let (infer_diags, monad_info, _type_info, _local_types) = infer::check(&module);
     if !infer_diags.is_empty() {
         for diag in &infer_diags {
             eprintln!("{}", diag.render(&source, &filename));

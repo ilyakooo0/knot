@@ -19,6 +19,8 @@ struct DocumentState {
     definitions: HashMap<String, Span>,
     details: HashMap<String, String>,
     type_info: HashMap<String, String>,
+    /// Span-based type info for local bindings (let, bind, lambda params, case patterns).
+    local_type_info: HashMap<Span, String>,
     knot_diagnostics: Vec<diagnostic::Diagnostic>,
 }
 
@@ -145,6 +147,7 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
 fn analyze_document(uri: &Uri, source: &str) -> DocumentState {
     let mut all_diags = Vec::new();
     let mut type_info = HashMap::new();
+    let mut local_type_info = HashMap::new();
 
     // Lex
     let lexer = knot::lexer::Lexer::new(source);
@@ -178,10 +181,11 @@ fn analyze_document(uri: &Uri, source: &str) -> DocumentState {
         knot_compiler::desugar::desugar(&mut analysis_module);
 
         // Type inference
-        let (infer_diags, _monad_info, inferred_types) =
+        let (infer_diags, _monad_info, inferred_types, local_types) =
             knot_compiler::infer::check(&analysis_module);
         all_diags.extend(infer_diags);
         type_info = inferred_types;
+        local_type_info = local_types;
 
         // Effect inference
         all_diags.extend(knot_compiler::effects::check(&analysis_module));
@@ -197,6 +201,7 @@ fn analyze_document(uri: &Uri, source: &str) -> DocumentState {
         definitions,
         details,
         type_info,
+        local_type_info,
         knot_diagnostics: all_diags,
     }
 }
@@ -313,9 +318,28 @@ fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<Hover> {
     let doc = state.documents.get(uri)?;
 
     let word = word_at_position(&doc.source, pos)?;
+    let offset = position_to_offset(&doc.source, pos);
 
-    // Prefer AST-level details (richer for data/type decls), fall back to inferred types
-    let detail = if let Some(d) = doc.details.get(word) {
+    // Try local binding types first (let, bind, lambda params, case patterns).
+    // Check if cursor is on a binding site or on a usage that references one.
+    let local_type = doc
+        .local_type_info
+        .iter()
+        .find(|(span, _)| span.start <= offset && offset < span.end)
+        .map(|(_, ty)| ty.clone())
+        .or_else(|| {
+            // Cursor is on a usage — find the definition span and look up its type
+            let (_, def_span) = doc
+                .references
+                .iter()
+                .find(|(usage, _)| usage.start <= offset && offset < usage.end)?;
+            doc.local_type_info.get(def_span).cloned()
+        });
+
+    // Build hover detail
+    let detail = if let Some(ty) = local_type {
+        format!("{word} : {ty}")
+    } else if let Some(d) = doc.details.get(word) {
         // If we have an inferred type and the AST detail has no type annotation,
         // enhance with the inferred type
         if let Some(inferred) = doc.type_info.get(word) {

@@ -337,6 +337,7 @@ impl Codegen {
         self.declare_rt("knot_value_int_from_str", &[p, p], &[p]);
         self.declare_rt("knot_value_float", &[types::F64], &[p]);
         self.declare_rt("knot_value_text", &[p, p], &[p]);
+        self.declare_rt("knot_value_text_cached", &[p, p], &[p]);
         self.declare_rt("knot_value_bool", &[types::I32], &[p]);
         self.declare_rt("knot_value_unit", &[], &[p]);
         self.declare_rt("knot_value_function", &[p, p, p, p], &[p]);
@@ -4508,7 +4509,7 @@ impl Codegen {
                                 | ast::ExprKind::Do(_)
                                 | ast::ExprKind::Set { .. }
                                 | ast::ExprKind::FullSet { .. }
-                        );
+                        ) || self.expr_is_known_relation(expr);
                         if is_known_relation {
                             val
                         } else {
@@ -4925,7 +4926,7 @@ impl Codegen {
             }
             ast::Literal::Text(s) => {
                 let (ptr, len) = self.string_ptr(builder, s);
-                self.call_rt(builder, "knot_value_text", &[ptr, len])
+                self.call_rt(builder, "knot_value_text_cached", &[ptr, len])
             }
             ast::Literal::Bytes(b) => {
                 let (ptr, len) = self.bytes_ptr(builder, b);
@@ -6090,6 +6091,37 @@ impl Codegen {
         rel
     }
 
+    /// Check if an expression is statically known to produce a relation,
+    /// beyond the simple pattern match in compile_do.
+    fn expr_is_known_relation(&self, expr: &ast::Expr) -> bool {
+        match &expr.node {
+            // Pipe into filter/map/take/drop/diff/inter/union always yields a relation
+            ast::ExprKind::BinOp { op: ast::BinOp::Pipe, .. } => true,
+            // Application of known relation-returning stdlib functions
+            ast::ExprKind::App { func, .. } => {
+                if let ast::ExprKind::Var(name) = &func.node {
+                    matches!(name.as_str(),
+                        "filter" | "map" | "take" | "drop" | "diff" | "inter"
+                        | "union" | "reverse" | "chars" | "sort" | "sortBy"
+                    )
+                } else if let ast::ExprKind::App { func: inner, .. } = &func.node {
+                    // Curried: (filter pred) applied to relation
+                    if let ast::ExprKind::Var(name) = &inner.node {
+                        matches!(name.as_str(),
+                            "filter" | "map" | "take" | "drop" | "diff" | "inter"
+                            | "union" | "sort" | "sortBy"
+                        )
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
     // ── Operator trait dispatch helpers ────────────────────────────
 
     /// Check if a trait method has any non-primitive (ADT) implementations.
@@ -6163,47 +6195,9 @@ impl Codegen {
         });
 
         if has_adt_ord_impls {
-            if let Some(&func_id) = self.trait_dispatcher_fns.get("compare") {
-                // Must dispatch through Ordering for ADT types
-                let func_ref = self.module.declare_func_in_func(func_id, builder.func);
-                let call = builder.ins().call(func_ref, &[db, l, r]);
-                let ordering = builder.inst_results(call)[0];
-
-                // Use integer tag (0=LT, 1=EQ, 2=GT) instead of string comparison
-                let ord_i32 = self.call_rt_typed(
-                    builder,
-                    "knot_ordering_tag_i32",
-                    &[ordering],
-                    types::I32,
-                );
-                let expected = match match_tag {
-                    "LT" => 0i64,
-                    "EQ" => 1,
-                    "GT" => 2,
-                    _ => unreachable!(),
-                };
-                let matches = builder.ins().icmp_imm(IntCC::Equal, ord_i32, expected);
-                let result_i32 = builder.ins().uextend(types::I32, matches);
-
-                let result_i32 = if negate {
-                    let one = builder.ins().iconst(types::I32, 1);
-                    builder.ins().isub(one, result_i32)
-                } else {
-                    result_i32
-                };
-
-                self.call_rt(builder, "knot_value_bool", &[result_i32])
-            } else {
-                // Fallback
-                let rt_fn = match (match_tag, negate) {
-                    ("LT", false) => "knot_value_lt",
-                    ("GT", false) => "knot_value_gt",
-                    ("GT", true) => "knot_value_le",
-                    ("LT", true) => "knot_value_ge",
-                    _ => unreachable!(),
-                };
-                self.call_rt(builder, rt_fn, &[l, r])
-            }
+            // ADT path: compute i32 result via compile_comparison_i32, then box
+            let result_i32 = self.compile_comparison_i32(builder, l, r, db, match_tag, negate);
+            self.call_rt(builder, "knot_value_bool", &[result_i32])
         } else {
             // No ADT Ord impls — use direct runtime comparison (1 call, 1 alloc)
             let rt_fn = match (match_tag, negate) {
@@ -6439,6 +6433,10 @@ impl Codegen {
                 let inner = self.compile_condition(builder, operand, env, db);
                 let one = builder.ins().iconst(types::I32, 1);
                 builder.ins().isub(one, inner)
+            }
+            // Bool literal: return constant i32 directly, no allocation
+            ast::ExprKind::Lit(ast::Literal::Bool(b)) => {
+                builder.ins().iconst(types::I32, *b as i64)
             }
             // Fall back: compile as boxed Value, then unbox
             _ => {

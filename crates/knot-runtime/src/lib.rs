@@ -340,6 +340,9 @@ thread_local! {
     static BOOL_FALSE: *mut Value = Box::into_raw(Box::new(Value::Bool(false)));
     static FLOAT_ZERO: *mut Value = Box::into_raw(Box::new(Value::Float(0.0)));
     static FLOAT_ONE: *mut Value = Box::into_raw(Box::new(Value::Float(1.0)));
+    /// Cache for text literals keyed by static data pointer.
+    /// Values are allocated outside the arena so they survive arena resets.
+    static TEXT_LITERAL_CACHE: RefCell<HashMap<*const u8, *mut Value>> = RefCell::new(HashMap::new());
 }
 
 #[unsafe(no_mangle)]
@@ -373,6 +376,24 @@ pub extern "C" fn knot_value_float(n: f64) -> *mut Value {
 pub extern "C" fn knot_value_text(ptr: *const u8, len: usize) -> *mut Value {
     let s = unsafe { str_from_raw(ptr, len) };
     alloc(Value::Text(s.to_string()))
+}
+
+/// Like `knot_value_text` but caches by data pointer, avoiding repeated
+/// allocations for the same string literal.  Cached values live outside the
+/// arena so they survive `knot_arena_reset_to`.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_value_text_cached(ptr: *const u8, len: usize) -> *mut Value {
+    TEXT_LITERAL_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(&val) = cache.get(&ptr) {
+            val
+        } else {
+            let s = unsafe { str_from_raw(ptr, len) };
+            let val = Box::into_raw(Box::new(Value::Text(s.to_string())));
+            cache.insert(ptr, val);
+            val
+        }
+    })
 }
 
 #[unsafe(no_mangle)]

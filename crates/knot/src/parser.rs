@@ -16,6 +16,10 @@ pub struct Parser {
     /// Used in route entry parsing to prevent the type parser from consuming
     /// the `headers` keyword.
     stop_type_at_headers: bool,
+    /// Indentation level of the current block (set by `parse_block`).
+    /// Used by `parse_application` to allow multi-line function application
+    /// when continuation lines are indented past the block indent.
+    block_indent: usize,
 }
 
 // ── Public API ──────────────────────────────────────────────────────
@@ -29,6 +33,7 @@ impl Parser {
             diagnostics: Vec::new(),
             context: Vec::new(),
             stop_type_at_headers: false,
+            block_indent: usize::MAX,
         }
     }
 
@@ -384,6 +389,8 @@ impl Parser {
             return vec![];
         }
         let indent = self.column_of(&self.span());
+        let prev_block_indent = self.block_indent;
+        self.block_indent = indent;
         let mut items = vec![];
         loop {
             if self.at_eof() {
@@ -399,6 +406,7 @@ impl Parser {
             }
             self.skip_newlines();
         }
+        self.block_indent = prev_block_indent;
         items
     }
 }
@@ -1533,16 +1541,42 @@ impl Parser {
     fn parse_application(&mut self) -> Option<Expr> {
         let mut func = self.parse_postfix()?;
 
-        while self.can_start_atom() {
-            let arg = self.parse_postfix()?;
-            let span = Span::new(func.span.start, arg.span.end);
-            func = Spanned::new(
-                ExprKind::App {
-                    func: Box::new(func),
-                    arg: Box::new(arg),
-                },
-                span,
-            );
+        loop {
+            if self.can_start_atom() {
+                let arg = self.parse_postfix()?;
+                let span = Span::new(func.span.start, arg.span.end);
+                func = Spanned::new(
+                    ExprKind::App {
+                        func: Box::new(func),
+                        arg: Box::new(arg),
+                    },
+                    span,
+                );
+                continue;
+            }
+
+            // Try to continue across newlines: if the next non-newline token
+            // is indented past the current block indent, treat it as a
+            // continuation of this application (like multi-line fn args).
+            let saved = self.save();
+            self.skip_newlines();
+            if !self.at_eof()
+                && self.column_of(&self.span()) > self.block_indent
+                && self.can_start_atom()
+            {
+                let arg = self.parse_postfix()?;
+                let span = Span::new(func.span.start, arg.span.end);
+                func = Spanned::new(
+                    ExprKind::App {
+                        func: Box::new(func),
+                        arg: Box::new(arg),
+                    },
+                    span,
+                );
+            } else {
+                self.restore(saved);
+                break;
+            }
         }
 
         Some(func)

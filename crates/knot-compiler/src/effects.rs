@@ -534,10 +534,20 @@ fn extract_effects(ty: &ast::Type) -> Option<EffectSet> {
 
 // ── Public entry point ───────────────────────────────────────────
 
+/// Per-declaration effect information: maps declaration names to their inferred effects.
+pub type EffectInfo = HashMap<String, EffectSet>;
+
 pub fn check(module: &ast::Module) -> Vec<Diagnostic> {
     let mut checker = EffectChecker::new();
     checker.run(module);
     checker.diagnostics
+}
+
+/// Like `check` but also returns per-declaration effect information.
+pub fn check_with_effects(module: &ast::Module) -> (Vec<Diagnostic>, EffectInfo) {
+    let mut checker = EffectChecker::new();
+    checker.run(module);
+    (checker.diagnostics, checker.decl_effects)
 }
 
 // ── Tests ────────────────────────────────────────────────────────

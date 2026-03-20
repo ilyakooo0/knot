@@ -23,6 +23,8 @@ struct DocumentState {
     local_type_info: HashMap<Span, String>,
     /// Span-based type info for literal expressions.
     literal_types: Vec<(Span, String)>,
+    /// Per-declaration effect info (formatted strings).
+    effect_info: HashMap<String, String>,
     knot_diagnostics: Vec<diagnostic::Diagnostic>,
 }
 
@@ -47,6 +49,20 @@ fn main() {
         completion_provider: Some(CompletionOptions {
             trigger_characters: Some(vec![".".into(), "*".into(), "&".into()]),
             ..Default::default()
+        }),
+        references_provider: Some(OneOf::Left(true)),
+        rename_provider: Some(OneOf::Right(RenameOptions {
+            prepare_provider: Some(true),
+            work_done_progress_options: Default::default(),
+        })),
+        inlay_hint_provider: Some(OneOf::Left(true)),
+        signature_help_provider: Some(SignatureHelpOptions {
+            trigger_characters: Some(vec![" ".into()]),
+            retrigger_characters: None,
+            work_done_progress_options: Default::default(),
+        }),
+        code_lens_provider: Some(CodeLensOptions {
+            resolve_provider: Some(false),
         }),
         ..Default::default()
     })
@@ -101,6 +117,24 @@ fn handle_request(state: &mut ServerState, conn: &Connection, req: Request) {
     } else if let Some(params) = cast_request::<request::Completion>(&req) {
         let result = handle_completion(state, &params);
         send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::References>(&req) {
+        let result = handle_references(state, &params);
+        send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::PrepareRenameRequest>(&req) {
+        let result = handle_prepare_rename(state, &params);
+        send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::Rename>(&req) {
+        let result = handle_rename(state, &params);
+        send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::InlayHintRequest>(&req) {
+        let result = handle_inlay_hint(state, &params);
+        send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::SignatureHelpRequest>(&req) {
+        let result = handle_signature_help(state, &params);
+        send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::CodeLensRequest>(&req) {
+        let result = handle_code_lens(state, &params);
+        send_response(conn, id, result);
     }
 }
 
@@ -150,6 +184,7 @@ fn analyze_document(uri: &Uri, source: &str) -> DocumentState {
     let mut all_diags = Vec::new();
     let mut type_info = HashMap::new();
     let mut local_type_info = HashMap::new();
+    let mut effect_info = HashMap::new();
 
     // Lex
     let lexer = knot::lexer::Lexer::new(source);
@@ -190,7 +225,14 @@ fn analyze_document(uri: &Uri, source: &str) -> DocumentState {
         local_type_info = local_types;
 
         // Effect inference
-        all_diags.extend(knot_compiler::effects::check(&analysis_module));
+        let (effect_diags, effects) =
+            knot_compiler::effects::check_with_effects(&analysis_module);
+        all_diags.extend(effect_diags);
+        for (name, eff) in &effects {
+            if !eff.is_pure() {
+                effect_info.insert(name.clone(), format!("{eff}"));
+            }
+        }
 
         // Stratification
         all_diags.extend(knot_compiler::stratify::check(&analysis_module));
@@ -205,6 +247,7 @@ fn analyze_document(uri: &Uri, source: &str) -> DocumentState {
         type_info,
         local_type_info,
         literal_types,
+        effect_info,
         knot_diagnostics: all_diags,
     }
 }
@@ -363,7 +406,7 @@ fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<Hover> {
     } else if let Some(d) = doc.details.get(word) {
         // If we have an inferred type and the AST detail has no type annotation,
         // enhance with the inferred type
-        if let Some(inferred) = doc.type_info.get(word) {
+        let base = if let Some(inferred) = doc.type_info.get(word) {
             if !d.contains(':') {
                 format!("{d} : {inferred}")
             } else {
@@ -371,10 +414,20 @@ fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<Hover> {
             }
         } else {
             d.clone()
+        };
+        // Append effect info if available
+        if let Some(effects) = doc.effect_info.get(word) {
+            format!("{base}\n{effects}")
+        } else {
+            base
         }
     } else if let Some(inferred) = doc.type_info.get(word) {
-        // No AST detail but have inferred type (e.g. builtins, prelude functions)
-        format!("{word} : {inferred}")
+        let base = format!("{word} : {inferred}");
+        if let Some(effects) = doc.effect_info.get(word) {
+            format!("{base}\n{effects}")
+        } else {
+            base
+        }
     } else {
         return None;
     };
@@ -396,8 +449,91 @@ fn handle_completion(
 ) -> Option<CompletionResponse> {
     let uri = &params.text_document_position.text_document.uri;
     let doc = state.documents.get(uri)?;
+    let pos = params.text_document_position.position;
+
+    // Detect trigger context
+    let offset = position_to_offset(&doc.source, pos);
+    let trigger_char = if offset > 0 {
+        doc.source.as_bytes().get(offset - 1).copied()
+    } else {
+        None
+    };
 
     let mut items = Vec::new();
+
+    // Context-aware: after `*` only suggest source/view names
+    if trigger_char == Some(b'*') {
+        for decl in &doc.module.decls {
+            if let DeclKind::Source { name, .. } | DeclKind::View { name, .. } = &decl.node {
+                let detail = doc.type_info.get(name.as_str()).cloned();
+                items.push(CompletionItem {
+                    label: name.clone(),
+                    kind: Some(CompletionItemKind::VARIABLE),
+                    detail,
+                    ..Default::default()
+                });
+            }
+        }
+        return Some(CompletionResponse::Array(items));
+    }
+
+    // Context-aware: after `&` only suggest derived names
+    if trigger_char == Some(b'&') {
+        for decl in &doc.module.decls {
+            if let DeclKind::Derived { name, .. } = &decl.node {
+                let detail = doc.type_info.get(name.as_str()).cloned();
+                items.push(CompletionItem {
+                    label: name.clone(),
+                    kind: Some(CompletionItemKind::VARIABLE),
+                    detail,
+                    ..Default::default()
+                });
+            }
+        }
+        return Some(CompletionResponse::Array(items));
+    }
+
+    // Context-aware: after `.` suggest record field names from known types
+    if trigger_char == Some(b'.') {
+        // Collect all known field names from record types and data constructors
+        let mut fields = std::collections::HashSet::new();
+        for decl in &doc.module.decls {
+            match &decl.node {
+                DeclKind::TypeAlias { ty, .. } => {
+                    if let TypeKind::Record { fields: fs, .. } = &ty.node {
+                        for f in fs {
+                            fields.insert(f.name.clone());
+                        }
+                    }
+                }
+                DeclKind::Source { ty, .. } => {
+                    if let TypeKind::Record { fields: fs, .. } = &ty.node {
+                        for f in fs {
+                            fields.insert(f.name.clone());
+                        }
+                    }
+                }
+                DeclKind::Data { constructors, .. } => {
+                    for ctor in constructors {
+                        for f in &ctor.fields {
+                            fields.insert(f.name.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for name in fields {
+            items.push(CompletionItem {
+                label: name,
+                kind: Some(CompletionItemKind::FIELD),
+                ..Default::default()
+            });
+        }
+        return Some(CompletionResponse::Array(items));
+    }
+
+    // General completion: keywords + declarations + builtins
 
     // Keywords
     for kw in KEYWORDS {
@@ -408,7 +544,7 @@ fn handle_completion(
         });
     }
 
-    // Declarations from current document
+    // Declarations from current document with type details
     for decl in &doc.module.decls {
         match &decl.node {
             DeclKind::Data {
@@ -417,12 +553,14 @@ fn handle_completion(
                 items.push(CompletionItem {
                     label: name.clone(),
                     kind: Some(CompletionItemKind::STRUCT),
+                    detail: doc.details.get(name).cloned(),
                     ..Default::default()
                 });
                 for ctor in constructors {
                     items.push(CompletionItem {
                         label: ctor.name.clone(),
                         kind: Some(CompletionItemKind::ENUM_MEMBER),
+                        detail: doc.details.get(&ctor.name).cloned(),
                         ..Default::default()
                     });
                 }
@@ -431,6 +569,7 @@ fn handle_completion(
                 items.push(CompletionItem {
                     label: name.clone(),
                     kind: Some(CompletionItemKind::STRUCT),
+                    detail: doc.details.get(name).cloned(),
                     ..Default::default()
                 });
             }
@@ -439,6 +578,7 @@ fn handle_completion(
                     label: format!("*{name}"),
                     kind: Some(CompletionItemKind::VARIABLE),
                     insert_text: Some(format!("*{name}")),
+                    detail: doc.type_info.get(name.as_str()).cloned(),
                     ..Default::default()
                 });
             }
@@ -447,6 +587,7 @@ fn handle_completion(
                     label: format!("&{name}"),
                     kind: Some(CompletionItemKind::VARIABLE),
                     insert_text: Some(format!("&{name}")),
+                    detail: doc.type_info.get(name.as_str()).cloned(),
                     ..Default::default()
                 });
             }
@@ -454,6 +595,7 @@ fn handle_completion(
                 items.push(CompletionItem {
                     label: name.clone(),
                     kind: Some(CompletionItemKind::FUNCTION),
+                    detail: doc.type_info.get(name.as_str()).cloned(),
                     ..Default::default()
                 });
             }
@@ -461,6 +603,7 @@ fn handle_completion(
                 items.push(CompletionItem {
                     label: name.clone(),
                     kind: Some(CompletionItemKind::INTERFACE),
+                    detail: doc.details.get(name).cloned(),
                     ..Default::default()
                 });
             }
@@ -468,16 +611,462 @@ fn handle_completion(
         }
     }
 
-    // Built-in functions
+    // Built-in functions with type info
     for name in BUILTINS {
         items.push(CompletionItem {
             label: name.to_string(),
             kind: Some(CompletionItemKind::FUNCTION),
+            detail: doc.type_info.get(*name).cloned(),
             ..Default::default()
         });
     }
 
     Some(CompletionResponse::Array(items))
+}
+
+// ── Find References ─────────────────────────────────────────────────
+
+fn handle_references(
+    state: &ServerState,
+    params: &ReferenceParams,
+) -> Option<Vec<Location>> {
+    let uri = &params.text_document_position.text_document.uri;
+    let pos = params.text_document_position.position;
+    let doc = state.documents.get(uri)?;
+    let offset = position_to_offset(&doc.source, pos);
+
+    // Find the definition span for the symbol at cursor
+    let def_span = doc
+        .references
+        .iter()
+        .find(|(usage, _)| usage.start <= offset && offset < usage.end)
+        .map(|(_, def)| *def)
+        .or_else(|| {
+            // Cursor might be on a definition site itself
+            let word = word_at_position(&doc.source, pos)?;
+            doc.definitions.get(word).copied()
+        })
+        // Also check: cursor might be directly on a definition span
+        .or_else(|| {
+            doc.definitions.values().find(|span| span.start <= offset && offset < span.end).copied()
+        })?;
+
+    let mut locations = Vec::new();
+
+    // Include declaration if requested
+    if params.context.include_declaration {
+        locations.push(Location {
+            uri: uri.clone(),
+            range: span_to_range(def_span, &doc.source),
+        });
+    }
+
+    // Find all usages that point to this definition
+    for (usage_span, target_span) in &doc.references {
+        if *target_span == def_span {
+            locations.push(Location {
+                uri: uri.clone(),
+                range: span_to_range(*usage_span, &doc.source),
+            });
+        }
+    }
+
+    if locations.is_empty() {
+        None
+    } else {
+        Some(locations)
+    }
+}
+
+// ── Rename ──────────────────────────────────────────────────────────
+
+fn handle_prepare_rename(
+    state: &ServerState,
+    params: &TextDocumentPositionParams,
+) -> Option<PrepareRenameResponse> {
+    let doc = state.documents.get(&params.text_document.uri)?;
+    let pos = params.position;
+    let offset = position_to_offset(&doc.source, pos);
+
+    // Check if cursor is on a renameable symbol
+    let word = word_at_position(&doc.source, pos)?;
+
+    // Must be on a known definition or a reference to one
+    let is_ref = doc
+        .references
+        .iter()
+        .any(|(usage, _)| usage.start <= offset && offset < usage.end);
+    let is_def = doc.definitions.values().any(|span| span.start <= offset && offset < span.end);
+
+    if !is_ref && !is_def {
+        return None;
+    }
+
+    // Return the word range
+    let word_offset = position_to_offset(&doc.source, pos);
+    let bytes = doc.source.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let start = (0..word_offset)
+        .rev()
+        .find(|&i| !is_ident(bytes[i]))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let end = (word_offset..bytes.len())
+        .find(|&i| !is_ident(bytes[i]))
+        .unwrap_or(bytes.len());
+
+    let range = span_to_range(Span::new(start, end), &doc.source);
+    Some(PrepareRenameResponse::RangeWithPlaceholder {
+        range,
+        placeholder: word.to_string(),
+    })
+}
+
+fn handle_rename(
+    state: &ServerState,
+    params: &RenameParams,
+) -> Option<WorkspaceEdit> {
+    let uri = &params.text_document_position.text_document.uri;
+    let pos = params.text_document_position.position;
+    let doc = state.documents.get(uri)?;
+    let offset = position_to_offset(&doc.source, pos);
+    let new_name = &params.new_name;
+
+    // Find the definition span
+    let def_span = doc
+        .references
+        .iter()
+        .find(|(usage, _)| usage.start <= offset && offset < usage.end)
+        .map(|(_, def)| *def)
+        .or_else(|| {
+            doc.definitions.values().find(|span| span.start <= offset && offset < span.end).copied()
+        })?;
+
+    let mut edits = Vec::new();
+
+    // Rename at definition site
+    let def_range = span_to_range(def_span, &doc.source);
+    // Find the word within the definition span to rename precisely
+    let def_text = &doc.source[def_span.start..def_span.end];
+    let old_name = word_at_position(&doc.source, pos)?;
+    if let Some(name_start) = def_text.find(old_name) {
+        let name_span = Span::new(def_span.start + name_start, def_span.start + name_start + old_name.len());
+        edits.push(TextEdit {
+            range: span_to_range(name_span, &doc.source),
+            new_text: new_name.clone(),
+        });
+    } else {
+        edits.push(TextEdit {
+            range: def_range,
+            new_text: new_name.clone(),
+        });
+    }
+
+    // Rename all usage sites
+    for (usage_span, target_span) in &doc.references {
+        if *target_span == def_span {
+            edits.push(TextEdit {
+                range: span_to_range(*usage_span, &doc.source),
+                new_text: new_name.clone(),
+            });
+        }
+    }
+
+    let mut changes = HashMap::new();
+    changes.insert(uri.clone(), edits);
+
+    Some(WorkspaceEdit {
+        changes: Some(changes),
+        ..Default::default()
+    })
+}
+
+// ── Inlay Hints ─────────────────────────────────────────────────────
+
+fn handle_inlay_hint(
+    state: &ServerState,
+    params: &InlayHintParams,
+) -> Option<Vec<InlayHint>> {
+    let doc = state.documents.get(&params.text_document.uri)?;
+    let mut hints = Vec::new();
+
+    let range_start = position_to_offset(&doc.source, params.range.start);
+    let range_end = position_to_offset(&doc.source, params.range.end);
+
+    // Show inferred types for unannotated function declarations
+    for decl in &doc.module.decls {
+        // Only show hints within the visible range
+        if decl.span.end < range_start || decl.span.start > range_end {
+            continue;
+        }
+
+        match &decl.node {
+            DeclKind::Fun { name, ty: None, .. } => {
+                if let Some(inferred) = doc.type_info.get(name) {
+                    let decl_text = &doc.source[decl.span.start..decl.span.end.min(doc.source.len())];
+                    let name_end = decl_text.find(|c: char| !c.is_alphanumeric() && c != '_')
+                        .unwrap_or(name.len());
+                    let hint_offset = decl.span.start + name_end;
+                    let hint_pos = offset_to_position(&doc.source, hint_offset);
+                    hints.push(InlayHint {
+                        position: hint_pos,
+                        label: InlayHintLabel::String(format!(": {inferred}")),
+                        kind: Some(InlayHintKind::TYPE),
+                        text_edits: None,
+                        tooltip: None,
+                        padding_left: Some(true),
+                        padding_right: Some(true),
+                        data: None,
+                    });
+                }
+            }
+            DeclKind::View { name, ty: None, .. } | DeclKind::Derived { name, ty: None, .. } => {
+                if let Some(inferred) = doc.type_info.get(name) {
+                    let decl_text = &doc.source[decl.span.start..decl.span.end.min(doc.source.len())];
+                    let name_end = decl_text.find('=').unwrap_or(name.len() + 1);
+                    let hint_offset = decl.span.start + name_end;
+                    let hint_pos = offset_to_position(&doc.source, hint_offset);
+                    hints.push(InlayHint {
+                        position: hint_pos,
+                        label: InlayHintLabel::String(format!(": {inferred}")),
+                        kind: Some(InlayHintKind::TYPE),
+                        text_edits: None,
+                        tooltip: None,
+                        padding_left: Some(true),
+                        padding_right: Some(true),
+                        data: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Show inferred types for local bindings (let/bind in do blocks)
+    for (span, ty) in &doc.local_type_info {
+        if span.end < range_start || span.start > range_end {
+            continue;
+        }
+        let hint_pos = offset_to_position(&doc.source, span.end);
+        hints.push(InlayHint {
+            position: hint_pos,
+            label: InlayHintLabel::String(format!(": {ty}")),
+            kind: Some(InlayHintKind::TYPE),
+            text_edits: None,
+            tooltip: None,
+            padding_left: Some(true),
+            padding_right: None,
+            data: None,
+        });
+    }
+
+    Some(hints)
+}
+
+// ── Signature Help ──────────────────────────────────────────────────
+
+fn handle_signature_help(
+    state: &ServerState,
+    params: &SignatureHelpParams,
+) -> Option<SignatureHelp> {
+    let uri = &params.text_document_position_params.text_document.uri;
+    let pos = params.text_document_position_params.position;
+    let doc = state.documents.get(uri)?;
+    let offset = position_to_offset(&doc.source, pos);
+
+    // Walk backwards to find the function name being applied
+    // In Knot, function application is `f x y z` (juxtaposition)
+    // Find the start of the current "argument list" by looking backwards for a function name
+    let bytes = doc.source.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+
+    // Skip back over whitespace and the current word being typed
+    let mut i = offset;
+    // Skip current word
+    while i > 0 && is_ident(bytes[i - 1]) {
+        i -= 1;
+    }
+    // Skip whitespace
+    while i > 0 && bytes[i - 1] == b' ' {
+        i -= 1;
+    }
+
+    // Count how many arguments precede cursor (count spaces between function and cursor)
+    let mut active_param = 0u32;
+
+    // Now find the function name
+    let end = i;
+    while i > 0 && is_ident(bytes[i - 1]) {
+        i -= 1;
+    }
+    if i == end {
+        return None; // no function name found
+    }
+    let func_name = &doc.source[i..end];
+
+    // Count arguments between function and cursor
+    let between = &doc.source[end..offset];
+    for segment in between.split_whitespace() {
+        if !segment.is_empty() {
+            active_param += 1;
+        }
+    }
+
+    // Look up the function type
+    let type_str = doc.type_info.get(func_name)?;
+
+    // Parse arrow-separated parameters from the type string
+    let params_list = parse_function_params(type_str);
+    if params_list.is_empty() {
+        return None;
+    }
+
+    let param_infos: Vec<ParameterInformation> = params_list
+        .iter()
+        .map(|p| ParameterInformation {
+            label: ParameterLabel::Simple(p.clone()),
+            documentation: None,
+        })
+        .collect();
+
+    let signature = SignatureInformation {
+        label: format!("{func_name} : {type_str}"),
+        documentation: None,
+        parameters: Some(param_infos),
+        active_parameter: Some(active_param),
+    };
+
+    Some(SignatureHelp {
+        signatures: vec![signature],
+        active_signature: Some(0),
+        active_parameter: Some(active_param),
+    })
+}
+
+/// Parse a Knot type string like "Int -> Text -> Bool" into parameter types.
+fn parse_function_params(type_str: &str) -> Vec<String> {
+    let mut params = Vec::new();
+    let mut depth = 0i32;
+    let mut current = String::new();
+
+    let chars: Vec<char> = type_str.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        match chars[i] {
+            '(' | '[' | '{' | '<' => {
+                depth += 1;
+                current.push(chars[i]);
+            }
+            ')' | ']' | '}' | '>' => {
+                depth -= 1;
+                current.push(chars[i]);
+            }
+            '-' if depth == 0 && i + 1 < chars.len() && chars[i + 1] == '>' => {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    params.push(trimmed);
+                }
+                current.clear();
+                i += 2; // skip "->"
+                continue;
+            }
+            _ => {
+                current.push(chars[i]);
+            }
+        }
+        i += 1;
+    }
+
+    // The last segment is the return type, not a parameter
+    // But we still include all parts as the signature info
+    // Actually, keep all segments — the last is the return type
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        params.push(trimmed);
+    }
+
+    params
+}
+
+// ── Code Lens ───────────────────────────────────────────────────────
+
+fn handle_code_lens(
+    state: &ServerState,
+    params: &CodeLensParams,
+) -> Option<Vec<CodeLens>> {
+    let doc = state.documents.get(&params.text_document.uri)?;
+    let mut lenses = Vec::new();
+
+    for decl in &doc.module.decls {
+        match &decl.node {
+            DeclKind::Fun { .. }
+            | DeclKind::Source { .. }
+            | DeclKind::View { .. }
+            | DeclKind::Derived { .. }
+            | DeclKind::Data { .. }
+            | DeclKind::Trait { .. } => {}
+            _ => continue,
+        }
+
+        // Count references to this declaration
+        let ref_count = doc
+            .references
+            .iter()
+            .filter(|(_, def)| *def == decl.span)
+            .count();
+
+        let range = span_to_range(decl.span, &doc.source);
+        let title = if ref_count == 1 {
+            "1 reference".to_string()
+        } else {
+            format!("{ref_count} references")
+        };
+
+        lenses.push(CodeLens {
+            range: Range {
+                start: range.start,
+                end: range.start, // code lens goes on a single line
+            },
+            command: Some(Command {
+                title,
+                command: String::new(),
+                arguments: None,
+            }),
+            data: None,
+        });
+
+        // For traits: show number of implementations
+        if let DeclKind::Trait { name, .. } = &decl.node {
+            let impl_count = doc
+                .module
+                .decls
+                .iter()
+                .filter(|d| matches!(&d.node, DeclKind::Impl { trait_name, .. } if trait_name == name))
+                .count();
+            if impl_count > 0 {
+                let title = if impl_count == 1 {
+                    "1 implementation".to_string()
+                } else {
+                    format!("{impl_count} implementations")
+                };
+                lenses.push(CodeLens {
+                    range: Range {
+                        start: range.start,
+                        end: range.start,
+                    },
+                    command: Some(Command {
+                        title,
+                        command: String::new(),
+                        arguments: None,
+                    }),
+                    data: None,
+                });
+            }
+        }
+    }
+
+    Some(lenses)
 }
 
 const KEYWORDS: &[&str] = &[

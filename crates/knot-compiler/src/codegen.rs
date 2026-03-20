@@ -813,7 +813,7 @@ impl Codegen {
             "chars", "id", "not",
             "toJson", "parseJson",
             "bytesLength", "bytesSlice", "bytesConcat",
-            "textToBytes", "bytesToText", "bytesToHex", "bytesFromHex",
+            "textToBytes", "bytesToText", "bytesToHex", "bytesFromHex", "hexDecode",
             "bytesGet",
             "readFile", "writeFile", "appendFile",
             "fileExists", "removeFile", "listDir",
@@ -1668,6 +1668,7 @@ impl Codegen {
         self.define_stdlib_fn_1("bytesToText", "knot_bytes_to_text");
         self.define_stdlib_fn_1("bytesToHex", "knot_bytes_to_hex");
         self.define_stdlib_fn_1("bytesFromHex", "knot_bytes_from_hex");
+        self.define_stdlib_fn_1("hexDecode", "knot_bytes_from_hex");
 
         // Bytes: 2-param (curried)
         self.define_stdlib_fn_2("bytesConcat", "knot_bytes_concat", false);

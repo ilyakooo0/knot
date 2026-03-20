@@ -195,6 +195,15 @@ fn cmd_build(source_file: &str) {
     eprintln!("Compiled: {}", output_path.display());
 }
 
+/// Runtime library embedded at build time. The build.rs copies
+/// libknot_runtime.a into OUT_DIR; we include those bytes so the
+/// compiler binary is fully self-contained after `cargo install`.
+#[cfg(has_embedded_runtime)]
+const EMBEDDED_RUNTIME: Option<&[u8]> =
+    Some(include_bytes!(concat!(env!("OUT_DIR"), "/libknot_runtime.a")));
+#[cfg(not(has_embedded_runtime))]
+const EMBEDDED_RUNTIME: Option<&[u8]> = None;
+
 fn find_runtime() -> PathBuf {
     // 1. Environment variable override
     if let Ok(path) = std::env::var("KNOT_RUNTIME_LIB") {
@@ -211,6 +220,14 @@ fn find_runtime() -> PathBuf {
             if candidate.exists() {
                 return candidate;
             }
+        }
+    }
+
+    // 3. Extract embedded runtime to a temp file
+    if let Some(bytes) = EMBEDDED_RUNTIME {
+        let tmp = std::env::temp_dir().join("libknot_runtime.a");
+        if std::fs::write(&tmp, bytes).is_ok() {
+            return tmp;
         }
     }
 

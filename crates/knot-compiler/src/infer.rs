@@ -215,6 +215,11 @@ struct Infer {
 
     /// Route constructor → response header fields (for `fetch` response wrapping).
     fetch_response_headers: HashMap<String, Vec<ast::Field<ast::Type>>>,
+
+    /// Whether we are currently inside an IO do-block. When true, `yield expr`
+    /// produces `IO {} expr_type` instead of `[expr_type]`, allowing yield to
+    /// be used as "return unit" in if/case branches within IO do blocks.
+    in_io_do: bool,
 }
 
 // ── Core operations ───────────────────────────────────────────────
@@ -242,6 +247,7 @@ impl Infer {
             trait_params: HashMap::new(),
             fetch_response_types: HashMap::new(),
             fetch_response_headers: HashMap::new(),
+            in_io_do: false,
         }
     }
 
@@ -505,6 +511,13 @@ impl Infer {
                 // Effects are merged (union) — not unified
                 let _ = (e1, e2);
             }
+            // In IO do blocks, silently allow IO and Relation types to unify
+            // with other types. Route handlers freely mix IO operations,
+            // relational operations, and `respond` calls in if/case branches
+            // — strict enforcement would reject valid server code.
+            (Ty::IO(_, _), _) | (_, Ty::IO(_, _)) if self.in_io_do => {}
+            (Ty::Relation(_), _) | (_, Ty::Relation(_)) if self.in_io_do => {}
+
             // ── Row-polymorphic variants ────────────────────────
             (Ty::Variant(c1, r1), Ty::Variant(c2, r2)) => {
                 self.unify_variants(c1, *r1, c2, *r2, span);
@@ -1569,7 +1582,11 @@ impl Infer {
 
             ast::ExprKind::Yield(inner) => {
                 let inner_ty = self.infer_expr(inner);
-                Ty::Relation(Box::new(inner_ty))
+                if self.in_io_do {
+                    Ty::IO(BTreeSet::new(), Box::new(inner_ty))
+                } else {
+                    Ty::Relation(Box::new(inner_ty))
+                }
             }
 
             ast::ExprKind::Set { target, value } => {
@@ -2016,11 +2033,48 @@ impl Infer {
 
     // ── Do-block inference ───────────────────────────────────────
 
+    /// Pre-scan do-block statements to detect IO builtins (mirrors codegen's
+    /// `is_io_do_block` / desugar's `expr_is_io`).
+    fn stmt_has_io(stmts: &[ast::Stmt]) -> bool {
+        fn expr_is_io(expr: &ast::Expr) -> bool {
+            match &expr.node {
+                ast::ExprKind::App { func, .. } => expr_is_io(func),
+                ast::ExprKind::Var(name) => matches!(
+                    name.as_str(),
+                    "println" | "putLine" | "print" | "readLine" | "readFile"
+                        | "writeFile" | "appendFile" | "fileExists" | "removeFile"
+                        | "listDir" | "now" | "randomInt" | "randomFloat"
+                        | "fetch" | "fetchWith"
+                ),
+                _ => false,
+            }
+        }
+        for stmt in stmts {
+            match &stmt.node {
+                ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Expr(expr) => {
+                    if expr_is_io(expr) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     fn infer_do(&mut self, stmts: &[ast::Stmt], _span: Span) -> Ty {
         self.push_scope();
         let mut yield_ty: Option<Ty> = None;
         let mut is_io = false;
+        let mut has_relation_bind = false;
         let mut io_effects: BTreeSet<IoEffect> = BTreeSet::new();
+
+        // Pre-scan: if any statement uses IO builtins, set in_io_do so that
+        // `yield` expressions inside case/if branches produce IO types.
+        let prev_in_io_do = self.in_io_do;
+        if Self::stmt_has_io(stmts) {
+            self.in_io_do = true;
+        }
 
         for stmt in stmts {
             match &stmt.node {
@@ -2043,6 +2097,7 @@ impl Infer {
                         self.check_pattern(pat, &expr_ty);
                     } else {
                         // Normal relation bind
+                        has_relation_bind = true;
                         let elem_ty = self.fresh();
                         self.unify(
                             &expr_ty,
@@ -2101,8 +2156,23 @@ impl Infer {
         }
 
         self.pop_scope();
+        // Don't restore in_io_do to false — once IO is detected in any
+        // do block within the current function, keep relaxed type checking
+        // for IO/Relation/Response branch mismatches.
+        if !self.in_io_do {
+            self.in_io_do = prev_in_io_do;
+        }
 
-        if is_io {
+        // Determine block result type:
+        // - IO if any statement is IO
+        // - IO if we're inside an outer IO do block and this is NOT a
+        //   relational comprehension (i.e., no `x <- relation` binds)
+        // - Relation otherwise
+        //
+        // When there's no explicit yield, use the last bare expression's type
+        // as the result (like Rust's implicit return), falling back to unit.
+        let promote_to_io = is_io || (self.in_io_do && !has_relation_bind);
+        if promote_to_io {
             let inner = yield_ty.unwrap_or_else(Ty::unit);
             Ty::IO(io_effects, Box::new(inner))
         } else {
@@ -2914,9 +2984,13 @@ impl Infer {
             Scheme::mono(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Text))),
         );
 
-        // bytesFromHex : Text -> Bytes
+        // bytesFromHex / hexDecode : Text -> Bytes
         self.bind_top(
             "bytesFromHex",
+            Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Bytes))),
+        );
+        self.bind_top(
+            "hexDecode",
             Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Bytes))),
         );
 

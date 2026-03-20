@@ -15,6 +15,7 @@ struct DocumentState {
     module: Module,
     definitions: HashMap<String, Span>,
     details: HashMap<String, String>,
+    type_info: HashMap<String, String>,
     knot_diagnostics: Vec<diagnostic::Diagnostic>,
 }
 
@@ -140,6 +141,7 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
 
 fn analyze_document(uri: &Uri, source: &str) -> DocumentState {
     let mut all_diags = Vec::new();
+    let mut type_info = HashMap::new();
 
     // Lex
     let lexer = knot::lexer::Lexer::new(source);
@@ -173,8 +175,10 @@ fn analyze_document(uri: &Uri, source: &str) -> DocumentState {
         knot_compiler::desugar::desugar(&mut analysis_module);
 
         // Type inference
-        let (infer_diags, _monad_info) = knot_compiler::infer::check(&analysis_module);
+        let (infer_diags, _monad_info, inferred_types) =
+            knot_compiler::infer::check(&analysis_module);
         all_diags.extend(infer_diags);
+        type_info = inferred_types;
 
         // Effect inference
         all_diags.extend(knot_compiler::effects::check(&analysis_module));
@@ -188,6 +192,7 @@ fn analyze_document(uri: &Uri, source: &str) -> DocumentState {
         module,
         definitions,
         details,
+        type_info,
         knot_diagnostics: all_diags,
     }
 }
@@ -293,7 +298,26 @@ fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<Hover> {
     let doc = state.documents.get(uri)?;
 
     let word = word_at_position(&doc.source, pos)?;
-    let detail = doc.details.get(word)?;
+
+    // Prefer AST-level details (richer for data/type decls), fall back to inferred types
+    let detail = if let Some(d) = doc.details.get(word) {
+        // If we have an inferred type and the AST detail has no type annotation,
+        // enhance with the inferred type
+        if let Some(inferred) = doc.type_info.get(word) {
+            if !d.contains(':') {
+                format!("{d} : {inferred}")
+            } else {
+                d.clone()
+            }
+        } else {
+            d.clone()
+        }
+    } else if let Some(inferred) = doc.type_info.get(word) {
+        // No AST detail but have inferred type (e.g. builtins, prelude functions)
+        format!("{word} : {inferred}")
+    } else {
+        return None;
+    };
 
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {

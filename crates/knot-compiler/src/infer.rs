@@ -35,6 +35,9 @@ pub enum IoEffect {
 /// Maps desugared do-block spans to their resolved monad type.
 pub type MonadInfo = HashMap<Span, MonadKind>;
 
+/// Maps declaration names to their inferred type display strings.
+pub type TypeInfo = HashMap<String, String>;
+
 // ── Internal type representation ──────────────────────────────────
 
 type TyVar = u32;
@@ -2977,13 +2980,216 @@ impl Infer {
             })
             .collect()
     }
+
+    // ── Type info extraction ────────────────────────────────────
+
+    fn extract_type_info(&self) -> TypeInfo {
+        let mut info = TypeInfo::new();
+
+        if let Some(scope) = self.scopes.first() {
+            for (name, scheme) in scope {
+                if name.starts_with("__") {
+                    continue;
+                }
+                info.insert(name.clone(), self.display_scheme(scheme));
+            }
+        }
+
+        for (name, ty) in &self.source_types {
+            let applied = self.apply(ty);
+            info.insert(name.clone(), display_ty_clean(&applied, &var_map_for(&applied)));
+        }
+
+        for (name, ty) in &self.derived_types {
+            let applied = self.apply(ty);
+            info.insert(name.clone(), display_ty_clean(&applied, &var_map_for(&applied)));
+        }
+
+        info
+    }
+
+    fn display_scheme(&self, scheme: &Scheme) -> String {
+        let applied = self.apply(&scheme.ty);
+        let var_map = var_map_for(&applied);
+        let ty_str = display_ty_clean(&applied, &var_map);
+
+        if scheme.constraints.is_empty() {
+            return ty_str;
+        }
+
+        let mut parts = Vec::new();
+        for c in &scheme.constraints {
+            let resolved = self.apply(&Ty::Var(c.type_var));
+            if let Ty::Var(v) = resolved {
+                let name = var_letter(var_map.get(&v).copied().unwrap_or(v as usize));
+                parts.push(format!("{} {}", c.trait_name, name));
+            }
+        }
+
+        if parts.is_empty() {
+            ty_str
+        } else {
+            format!("{} => {}", parts.join(" => "), ty_str)
+        }
+    }
+}
+
+// ── Standalone type display (for export, no subst lookups) ────────
+
+fn var_map_for(ty: &Ty) -> HashMap<TyVar, usize> {
+    let mut vars = Vec::new();
+    collect_vars_ordered(ty, &mut vars);
+    vars.iter()
+        .enumerate()
+        .map(|(i, &v)| (v, i))
+        .collect()
+}
+
+fn collect_vars_ordered(ty: &Ty, out: &mut Vec<TyVar>) {
+    match ty {
+        Ty::Var(v) => {
+            if !out.contains(v) {
+                out.push(*v);
+            }
+        }
+        Ty::Fun(p, r) => {
+            collect_vars_ordered(p, out);
+            collect_vars_ordered(r, out);
+        }
+        Ty::Record(fields, row) => {
+            for t in fields.values() {
+                collect_vars_ordered(t, out);
+            }
+            if let Some(rv) = row {
+                if !out.contains(rv) {
+                    out.push(*rv);
+                }
+            }
+        }
+        Ty::Relation(inner) => collect_vars_ordered(inner, out),
+        Ty::Con(_, args) => {
+            for a in args {
+                collect_vars_ordered(a, out);
+            }
+        }
+        Ty::Variant(ctors, row) => {
+            for t in ctors.values() {
+                collect_vars_ordered(t, out);
+            }
+            if let Some(rv) = row {
+                if !out.contains(rv) {
+                    out.push(*rv);
+                }
+            }
+        }
+        Ty::App(f, a) => {
+            collect_vars_ordered(f, out);
+            collect_vars_ordered(a, out);
+        }
+        Ty::IO(_, inner) => collect_vars_ordered(inner, out),
+        _ => {}
+    }
+}
+
+fn var_letter(idx: usize) -> String {
+    if idx < 26 {
+        format!("{}", (b'a' + idx as u8) as char)
+    } else {
+        format!("t{}", idx)
+    }
+}
+
+fn display_ty_clean(ty: &Ty, names: &HashMap<TyVar, usize>) -> String {
+    display_ty_clean_inner(ty, names, false)
+}
+
+fn display_ty_clean_inner(ty: &Ty, names: &HashMap<TyVar, usize>, in_fun: bool) -> String {
+    match ty {
+        Ty::Var(v) => var_letter(names.get(v).copied().unwrap_or(*v as usize)),
+        Ty::Int => "Int".into(),
+        Ty::Float => "Float".into(),
+        Ty::Text => "Text".into(),
+        Ty::Bool => "Bool".into(),
+        Ty::Bytes => "Bytes".into(),
+        Ty::Fun(p, r) => {
+            let s = format!(
+                "{} -> {}",
+                display_ty_clean_inner(p, names, true),
+                display_ty_clean_inner(r, names, false)
+            );
+            if in_fun {
+                format!("({})", s)
+            } else {
+                s
+            }
+        }
+        Ty::Record(fields, row) => {
+            if fields.is_empty() && row.is_none() {
+                return "{}".into();
+            }
+            let mut parts: Vec<String> = fields
+                .iter()
+                .map(|(n, t)| format!("{}: {}", n, display_ty_clean(t, names)))
+                .collect();
+            if let Some(rv) = row {
+                parts.push(format!("| {}", var_letter(names.get(rv).copied().unwrap_or(*rv as usize))));
+            }
+            format!("{{{}}}", parts.join(", "))
+        }
+        Ty::Relation(inner) => format!("[{}]", display_ty_clean(inner, names)),
+        Ty::Con(name, args) => {
+            if args.is_empty() {
+                name.clone()
+            } else {
+                let args_str: Vec<String> =
+                    args.iter().map(|a| display_ty_clean(a, names)).collect();
+                format!("{} {}", name, args_str.join(" "))
+            }
+        }
+        Ty::Variant(ctors, row) => {
+            let mut parts: Vec<String> = ctors
+                .iter()
+                .map(|(name, ft)| format!("{} {}", name, display_ty_clean(ft, names)))
+                .collect();
+            if let Some(rv) = row {
+                parts.push(var_letter(names.get(rv).copied().unwrap_or(*rv as usize)));
+            }
+            format!("<{}>", parts.join(" | "))
+        }
+        Ty::TyCon(name) => name.clone(),
+        Ty::App(f, a) => format!(
+            "({} {})",
+            display_ty_clean(f, names),
+            display_ty_clean(a, names)
+        ),
+        Ty::IO(effects, inner) => {
+            let effects_str = if effects.is_empty() {
+                String::new()
+            } else {
+                let eff_names: Vec<&str> = effects
+                    .iter()
+                    .map(|e| match e {
+                        IoEffect::Console => "console",
+                        IoEffect::Fs => "fs",
+                        IoEffect::Network => "network",
+                        IoEffect::Clock => "clock",
+                        IoEffect::Random => "random",
+                    })
+                    .collect();
+                format!(" {{{}}}", eff_names.join(", "))
+            };
+            format!("IO{} {}", effects_str, display_ty_clean(inner, names))
+        }
+        Ty::Error => "<error>".into(),
+    }
 }
 
 // ── Public API ────────────────────────────────────────────────────
 
-/// Run type inference on a parsed module. Returns diagnostics and
-/// resolved monad info for desugared do-blocks.
-pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo) {
+/// Run type inference on a parsed module. Returns diagnostics,
+/// resolved monad info for desugared do-blocks, and inferred type info
+/// mapping declaration names to their display type strings.
+pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo) {
     let mut infer = Infer::new();
 
     // Phase 1: Collect type aliases, data types, constructors
@@ -3035,7 +3241,9 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo) {
         monad_info.insert(*span, kind);
     }
 
-    (infer.to_diagnostics(), monad_info)
+    let type_info = infer.extract_type_info();
+
+    (infer.to_diagnostics(), monad_info, type_info)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
@@ -3053,7 +3261,7 @@ mod tests {
     }
 
     fn check_src(src: &str) -> Vec<Diagnostic> {
-        let (diags, _monad_info) = check(&parse(src));
+        let (diags, _monad_info, _type_info) = check(&parse(src));
         diags
     }
 

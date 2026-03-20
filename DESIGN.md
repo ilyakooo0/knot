@@ -84,8 +84,9 @@ Constructors are the interface for building values, inserting, and querying. The
 
 Every constructor requires `{}` — even those with no fields. This keeps the syntax uniform: a constructor is always `Name {fields}`, whether it has fields or not. There is no distinction between "a constructor" and "a constructor applied to a record."
 
+`Bool`, `Maybe`, and `Result` are built-in — their constructors (`True`/`False`, `Nothing`/`Just`, `Ok`/`Err`) are always available without a `data` declaration. `True {}` and `False {}` are interchangeable with the `true`/`false` literals and can be used in `case` patterns.
+
 ```knot
-data Bool = True {} | False {}
 data Maybe a = Nothing {} | Just {value: a}
 data List a = Nil {} | Cons {head: a, tail: List a}
 ```
@@ -229,11 +230,13 @@ trait Foldable (t : Type -> Type) where
 
 ### `do` Desugaring
 
-`do` syntax works for any `Monad`:
+`do` syntax works for any `Monad`. Do blocks can appear anywhere an expression is expected, including as function arguments: `f do ...` or `f (do ...)`.
 
 - `x <- expr` desugars to `bind (\x -> ...) expr`
 - `yield x` is `Applicative.yield`
 - `where cond` desugars to `if cond then yield {} else empty` (requires `Alternative`)
+
+IO do blocks (those containing IO-returning builtins like `println`, `readFile`, `now`) are not desugared — they use a dedicated compilation path that sequences IO actions directly.
 
 ```knot
 -- do with [] (relation comprehension)
@@ -530,7 +533,7 @@ Relation do-blocks (`<-` from `[T]`) still work exactly as before — no IO wrap
 -- type: [Person]
 ```
 
-The compiler detects whether a do-block is IO or relational based on the types of bound expressions.
+The compiler detects whether a do-block is IO or relational based on the types of bound expressions. IO do-blocks work correctly in all positions, including as branches of `if`/`then`/`else`.
 
 ### DB Effect Inference
 

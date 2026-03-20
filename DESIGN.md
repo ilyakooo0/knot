@@ -480,11 +480,61 @@ Multiple key fields group by their combination:
 
 Grouping is executed via SQLite — key columns are inserted into a temp table and sorted with `ORDER BY`, then consecutive rows with matching keys are collected into groups.
 
-## Effects
+## Effects and the IO Monad
 
-### Inferred Capabilities
+### Two Kinds of Effects
 
-Effects are inferred, fine-grained capabilities — not a monolithic `IO` type. The compiler tracks exactly which capabilities each function uses.
+Knot distinguishes two kinds of effects:
+
+1. **DB effects** (`reads`, `writes`) — implicit, inferred by the compiler, part of the relational core. These are not wrapped in IO.
+2. **External effects** (`console`, `fs`, `network`, `clock`, `random`) — tracked in the `IO` type. Functions that perform external effects return `IO {effects} a` values instead of executing immediately.
+
+### The IO Type
+
+External effects are pure — effectful functions return descriptions of effects (`IO {effects} a`) rather than performing them. IO values are thunks that execute when run.
+
+```knot
+-- println returns an IO action, doesn't print immediately
+println : a -> IO {console} {}
+
+-- readFile returns an IO action
+readFile : Text -> IO {fs} Text
+
+-- now returns an IO action
+now : IO {clock} Int
+```
+
+### IO Do-Blocks
+
+IO do-blocks sequence effects. The `<-` operator runs an IO action and binds its result:
+
+```knot
+main = do
+  content <- readFile "input.txt"    -- IO {fs} Text → binds Text
+  println content                     -- IO {console} {}
+  t <- now                            -- IO {clock} Int → binds Int
+  println ("time: " ++ show t)
+  yield {}
+-- overall type: IO {fs, console, clock} {}
+```
+
+### Relation Comprehensions Are Unaffected
+
+Relation do-blocks (`<-` from `[T]`) still work exactly as before — no IO wrapping:
+
+```knot
+&seniors = do
+  p <- *people          -- [Person] → binds Person
+  where p.age > 65
+  yield p
+-- type: [Person]
+```
+
+The compiler detects whether a do-block is IO or relational based on the types of bound expressions.
+
+### DB Effect Inference
+
+DB effects are still inferred as fine-grained capabilities:
 
 ```knot
 -- Pure (inferred: no effects)
@@ -498,45 +548,9 @@ birthday = \name ->
   set *people = do
     p <- *people
     yield (if p.name == name then {p | age: p.age + 1} else p)
-
--- IO (inferred: {console})
-greet = \name -> putLine ("hello " ++ name)
-
--- IO (inferred: {fs})
-saveReport = \path content -> writeFile path content
 ```
 
-### Capability Types
-
-```
-Pure                         -- no effects
-├── {reads rel}              -- DB read
-├── {writes rel}             -- DB write (set)
-├── {console}                -- stdin/stdout
-├── {network}                -- HTTP, TCP, etc.
-├── {fs}                     -- file system
-├── {clock}                  -- current time
-└── {random}                 -- randomness
-```
-
-Effects propagate through calls:
-
-```knot
--- Inferred: {reads *people, writes *people}
-birthdayParty = \names -> map birthday names
-```
-
-### What the Compiler Knows
-
-The compiler infers effect signatures internally:
-
-```
-formatName : Text -> Text                                   -- pure
-&seniors   : {reads *people} [{name: Text, age: Int}]     -- DB read
-birthday   : {reads *people, writes *people} Text -> {}     -- DB write
-greet      : {console} Text -> {}                           -- IO
-saveReport : {fs} Text -> Text -> {}                        -- IO
-```
+### Effect Annotations
 
 Effect signatures are inferred but can be written explicitly:
 
@@ -552,7 +566,7 @@ If the body uses a capability not listed in the signature, the compiler rejects 
 
 ### IO and Transactions
 
-DB writes are transactional — they roll back on failure. IO cannot be undone. The compiler enforces: **IO and DB writes cannot mix in the same transaction**. Use `atomic` to separate them.
+DB writes are transactional — they roll back on failure. IO cannot be undone. The compiler enforces: **IO effects and DB writes cannot mix in the same `atomic` block**.
 
 ```knot
 -- DB writes go in `atomic`, IO happens after commit
@@ -564,55 +578,39 @@ handleOrder = \req -> do
   yield {orderId}
 ```
 
-If `atomic` fails, execution stops — the IO is never reached. If it succeeds, the IO runs after commit.
-
-```knot
--- Compile error: cannot mix IO with DB writes
-bad = \req -> do
-  println "starting"                                       -- {console}
-  set *orders = union *orders [{item: req.body.item}]    -- {writes *orders}
-  -- Error: cannot mix {console} with {writes *orders} in the same block.
-  --        Wrap DB writes in `atomic`.
-```
-
-DB reads can mix freely with IO — reads are safe to retry:
-
-```knot
--- Fine: {reads *orders, fs}
-&exportOrders = do
-  o <- *orders
-  writeFile ("/tmp/" ++ o.customer ++ ".txt") (show o.amount)
-```
-
-
 ### File System
 
-Built-in functions for file I/O. All carry the `{fs}` effect.
+Built-in functions for file I/O. All return `IO {fs}` values.
 
 | Function | Type | Description |
 |----------|------|-------------|
-| `readFile` | `Text -> Text` | Read entire file contents as text |
-| `writeFile` | `Text -> Text -> {}` | Write text to a file (creates or overwrites) |
-| `appendFile` | `Text -> Text -> {}` | Append text to a file |
-| `fileExists` | `Text -> Bool` | Check whether a path exists |
-| `removeFile` | `Text -> {}` | Delete a file |
-| `listDir` | `Text -> [Text]` | List directory entries as a relation of filenames |
+| `readFile` | `Text -> IO {fs} Text` | Read entire file contents as text |
+| `writeFile` | `Text -> Text -> IO {fs} {}` | Write text to a file (creates or overwrites) |
+| `appendFile` | `Text -> Text -> IO {fs} {}` | Append text to a file |
+| `fileExists` | `Text -> IO {fs} Bool` | Check whether a path exists |
+| `removeFile` | `Text -> IO {fs} {}` | Delete a file |
+| `listDir` | `Text -> IO {fs} [Text]` | List directory entries as a relation of filenames |
 
 ```knot
--- Copy a file
-copyFile = \src dst -> writeFile dst (readFile src)
+-- Copy a file (IO do-block)
+copyFile = \src dst -> do
+  content <- readFile src
+  writeFile dst content
 
 -- Append a log line
 log = \msg -> appendFile "app.log" (msg ++ "\n")
 
--- List .knot files (filter is pure, listDir carries {fs})
-knotFiles = listDir "." |> filter (\f -> contains ".knot" f)
+-- List .knot files
+knotFiles = do
+  files <- listDir "."
+  yield (filter (\f -> contains ".knot" f) files)
 
 -- Conditional read
-loadConfig = \path ->
-  if fileExists path
+loadConfig = \path -> do
+  exists <- fileExists path
+  if exists
     then readFile path
-    else "{}"
+    else yield "{}"
 ```
 
 ### Routes
@@ -950,11 +948,12 @@ Optional history tracking:
 *employees : [{name: Text, salary: Int}]
   with history
 
-salaryLastYear = \name ->
-  *employees @(now - 365 days)
+salaryLastYear = \name -> do
+  t <- now
+  yield (*employees @(t - 365 days)
     |> filter (\e -> e.name == name)
     |> map (\e -> e.salary)
-    |> single
+    |> single)
 ```
 
 ## Type System

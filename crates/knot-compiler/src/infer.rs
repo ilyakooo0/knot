@@ -7,7 +7,7 @@
 use knot::ast;
 use knot::ast::Span;
 use knot::diagnostic::Diagnostic;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 // ── Monad info (shared with codegen) ──────────────────────────────
 
@@ -18,6 +18,18 @@ pub enum MonadKind {
     Relation,
     /// An ADT-based monad (e.g., `Maybe`, `Result`).
     Adt(String),
+    /// The IO monad for sequencing side effects.
+    IO,
+}
+
+/// IO effect kinds tracked in the IO type.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IoEffect {
+    Console,
+    Fs,
+    Network,
+    Clock,
+    Random,
 }
 
 /// Maps desugared do-block spans to their resolved monad type.
@@ -54,6 +66,8 @@ enum Ty {
     TyCon(String),
     /// Type-level application (e.g. `f a` where `f` is a HK variable).
     App(Box<Ty>, Box<Ty>),
+    /// IO monad with tracked effects: IO {console, fs} a
+    IO(BTreeSet<IoEffect>, Box<Ty>),
     /// Error sentinel — suppresses cascading errors.
     Error,
 }
@@ -304,6 +318,9 @@ impl Infer {
                 let a = self.apply(a);
                 Self::normalize_app(f, a)
             }
+            Ty::IO(effects, inner) => {
+                Ty::IO(effects.clone(), Box::new(self.apply(inner)))
+            }
             _ => ty.clone(),
         }
     }
@@ -373,6 +390,7 @@ impl Infer {
             Ty::App(f, a) => {
                 self.occurs_in(var, f) || self.occurs_in(var, a)
             }
+            Ty::IO(_, inner) => self.occurs_in(var, inner),
             _ => false,
         }
     }
@@ -463,6 +481,12 @@ impl Infer {
                     self.unify(&f, &partial, span);
                     self.unify(&a, &last, span);
                 }
+            }
+            // ── IO monad ──────────────────────────────────────
+            (Ty::IO(e1, a), Ty::IO(e2, b)) => {
+                self.unify(a, b, span);
+                // Effects are merged (union) — not unified
+                let _ = (e1, e2);
             }
             // ── Row-polymorphic variants ────────────────────────
             (Ty::Variant(c1, r1), Ty::Variant(c2, r2)) => {
@@ -810,6 +834,10 @@ impl Infer {
                 Box::new(self.subst_ty(f, mapping)),
                 Box::new(self.subst_ty(a, mapping)),
             ),
+            Ty::IO(effects, inner) => Ty::IO(
+                effects.clone(),
+                Box::new(self.subst_ty(inner, mapping)),
+            ),
             _ => ty.clone(),
         }
     }
@@ -905,6 +933,9 @@ impl Infer {
             Ty::App(f, a) => {
                 self.collect_free_vars(f, out);
                 self.collect_free_vars(a, out);
+            }
+            Ty::IO(_, inner) => {
+                self.collect_free_vars(inner, out);
             }
             _ => {}
         }
@@ -1074,6 +1105,17 @@ impl Infer {
                 Ty::Variant(ctor_tys, row_var)
             }
             ast::TypeKind::Effectful { ty, .. } => self.ast_type_to_ty(ty),
+            ast::TypeKind::IO { effects, ty } => {
+                let io_effects: BTreeSet<IoEffect> = effects.iter().filter_map(|e| match e.as_str() {
+                    "console" => Some(IoEffect::Console),
+                    "fs" => Some(IoEffect::Fs),
+                    "network" => Some(IoEffect::Network),
+                    "clock" => Some(IoEffect::Clock),
+                    "random" => Some(IoEffect::Random),
+                    _ => None,
+                }).collect();
+                Ty::IO(io_effects, Box::new(self.ast_type_to_ty(ty)))
+            }
         }
     }
 
@@ -1200,6 +1242,21 @@ impl Infer {
                     self.display_ty(f),
                     self.display_ty(a)
                 )
+            }
+            Ty::IO(effects, inner) => {
+                let effects_str = if effects.is_empty() {
+                    String::new()
+                } else {
+                    let names: Vec<&str> = effects.iter().map(|e| match e {
+                        IoEffect::Console => "console",
+                        IoEffect::Fs => "fs",
+                        IoEffect::Network => "network",
+                        IoEffect::Clock => "clock",
+                        IoEffect::Random => "random",
+                    }).collect();
+                    format!(" {{{}}}", names.join(", "))
+                };
+                format!("IO{} {}", effects_str, self.display_ty(inner))
             }
             Ty::Error => "<error>".into(),
         }
@@ -1833,6 +1890,8 @@ impl Infer {
     fn infer_do(&mut self, stmts: &[ast::Stmt], _span: Span) -> Ty {
         self.push_scope();
         let mut yield_ty: Option<Ty> = None;
+        let mut is_io = false;
+        let mut io_effects: BTreeSet<IoEffect> = BTreeSet::new();
 
         for stmt in stmts {
             match &stmt.node {
@@ -1842,7 +1901,12 @@ impl Infer {
                     let is_ctor_pat =
                         matches!(&pat.node, ast::PatKind::Constructor { .. });
 
-                    if is_ctor_pat
+                    if let Ty::IO(ref effects, ref inner) = resolved {
+                        // IO bind: x <- ioAction
+                        is_io = true;
+                        io_effects.extend(effects.iter().cloned());
+                        self.check_pattern(pat, inner);
+                    } else if is_ctor_pat
                         && !matches!(&resolved, Ty::Relation(_) | Ty::Var(_))
                     {
                         // Value pattern match: `Constructor pat <- value_expr`
@@ -1896,7 +1960,12 @@ impl Infer {
                             yield_ty = Some(inner_ty);
                         }
                     } else {
-                        let _ = self.infer_expr(expr);
+                        let expr_ty = self.infer_expr(expr);
+                        let resolved = self.apply(&expr_ty);
+                        if let Ty::IO(ref effects, _) = resolved {
+                            is_io = true;
+                            io_effects.extend(effects.iter().cloned());
+                        }
                     }
                 }
             }
@@ -1904,9 +1973,14 @@ impl Infer {
 
         self.pop_scope();
 
-        match yield_ty {
-            Some(ty) => Ty::Relation(Box::new(ty)),
-            None => Ty::Relation(Box::new(Ty::unit())),
+        if is_io {
+            let inner = yield_ty.unwrap_or_else(Ty::unit);
+            Ty::IO(io_effects, Box::new(inner))
+        } else {
+            match yield_ty {
+                Some(ty) => Ty::Relation(Box::new(ty)),
+                None => Ty::Relation(Box::new(Ty::unit())),
+            }
         }
     }
 
@@ -2192,22 +2266,30 @@ impl Infer {
             },
         );
 
-        // println : ∀a. a -> {}
+        // println : ∀a. a -> IO {console} {}
         let a = self.fresh_var();
         self.bind_top(
             "println",
-            Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::unit()))),
+            Scheme::poly(vec![a], Ty::Fun(
+                Box::new(Ty::Var(a)),
+                Box::new(Ty::IO(BTreeSet::from([IoEffect::Console]), Box::new(Ty::unit()))),
+            )),
         );
 
-        // print : ∀a. a -> {}
+        // print : ∀a. a -> IO {console} {}
         let a = self.fresh_var();
         self.bind_top(
             "print",
-            Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::unit()))),
+            Scheme::poly(vec![a], Ty::Fun(
+                Box::new(Ty::Var(a)),
+                Box::new(Ty::IO(BTreeSet::from([IoEffect::Console]), Box::new(Ty::unit()))),
+            )),
         );
 
-        // readLine : Text (reads a line from stdin)
-        self.bind_top("readLine", Scheme::mono(Ty::Text));
+        // readLine : IO {console} Text
+        self.bind_top("readLine", Scheme::mono(
+            Ty::IO(BTreeSet::from([IoEffect::Console]), Box::new(Ty::Text)),
+        ));
 
         // show : ∀a. a -> Text
         let a = self.fresh_var();
@@ -2245,24 +2327,34 @@ impl Infer {
             ),
         );
 
-        // putLine : ∀a. a -> {} (alias for println)
+        // putLine : ∀a. a -> IO {console} {} (alias for println)
         let a = self.fresh_var();
         self.bind_top(
             "putLine",
-            Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::unit()))),
+            Scheme::poly(vec![a], Ty::Fun(
+                Box::new(Ty::Var(a)),
+                Box::new(Ty::IO(BTreeSet::from([IoEffect::Console]), Box::new(Ty::unit()))),
+            )),
         );
 
-        // now : Int (current time in milliseconds since epoch)
-        self.bind_top("now", Scheme::mono(Ty::Int));
+        // now : IO {clock} Int
+        self.bind_top("now", Scheme::mono(
+            Ty::IO(BTreeSet::from([IoEffect::Clock]), Box::new(Ty::Int)),
+        ));
 
-        // randomInt : Int -> Int (random integer in [0, bound))
+        // randomInt : Int -> IO {random} Int
         self.bind_top(
             "randomInt",
-            Scheme::mono(Ty::Fun(Box::new(Ty::Int), Box::new(Ty::Int))),
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Int),
+                Box::new(Ty::IO(BTreeSet::from([IoEffect::Random]), Box::new(Ty::Int))),
+            )),
         );
 
-        // randomFloat : Float (random float in [0.0, 1.0))
-        self.bind_top("randomFloat", Scheme::mono(Ty::Float));
+        // randomFloat : IO {random} Float
+        self.bind_top("randomFloat", Scheme::mono(
+            Ty::IO(BTreeSet::from([IoEffect::Random]), Box::new(Ty::Float)),
+        ));
 
         // __bind, __yield, __empty are handled as special cases in infer_expr
         // with polymorphic HKT types: ∀m a b. (a -> m b) -> m a -> m b, etc.
@@ -2498,48 +2590,63 @@ impl Infer {
 
         // ── File system standard library ─────────────────────────
 
-        // readFile : Text -> Text
+        // readFile : Text -> IO {fs} Text
         self.bind_top(
             "readFile",
-            Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Text))),
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Text),
+                Box::new(Ty::IO(BTreeSet::from([IoEffect::Fs]), Box::new(Ty::Text))),
+            )),
         );
 
-        // writeFile : Text -> Text -> {}
+        // writeFile : Text -> Text -> IO {fs} {}
         self.bind_top(
             "writeFile",
             Scheme::mono(Ty::Fun(
                 Box::new(Ty::Text),
-                Box::new(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::unit()))),
+                Box::new(Ty::Fun(
+                    Box::new(Ty::Text),
+                    Box::new(Ty::IO(BTreeSet::from([IoEffect::Fs]), Box::new(Ty::unit()))),
+                )),
             )),
         );
 
-        // appendFile : Text -> Text -> {}
+        // appendFile : Text -> Text -> IO {fs} {}
         self.bind_top(
             "appendFile",
             Scheme::mono(Ty::Fun(
                 Box::new(Ty::Text),
-                Box::new(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::unit()))),
+                Box::new(Ty::Fun(
+                    Box::new(Ty::Text),
+                    Box::new(Ty::IO(BTreeSet::from([IoEffect::Fs]), Box::new(Ty::unit()))),
+                )),
             )),
         );
 
-        // fileExists : Text -> Bool
+        // fileExists : Text -> IO {fs} Bool
         self.bind_top(
             "fileExists",
-            Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Bool))),
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Text),
+                Box::new(Ty::IO(BTreeSet::from([IoEffect::Fs]), Box::new(Ty::Bool))),
+            )),
         );
 
-        // removeFile : Text -> {}
+        // removeFile : Text -> IO {fs} {}
         self.bind_top(
             "removeFile",
-            Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::unit()))),
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Text),
+                Box::new(Ty::IO(BTreeSet::from([IoEffect::Fs]), Box::new(Ty::unit()))),
+            )),
         );
 
-        // listDir : Text -> [Text]
+        // listDir : Text -> IO {fs} [Text]
         self.bind_top(
             "listDir",
             Scheme::mono(Ty::Fun(
                 Box::new(Ty::Text),
-                Box::new(Ty::Relation(Box::new(Ty::Text))),
+                Box::new(Ty::IO(BTreeSet::from([IoEffect::Fs]), Box::new(Ty::Relation(Box::new(Ty::Text))))),
             )),
         );
 
@@ -2914,6 +3021,7 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo) {
             Ty::TyCon(name) if name == "[]" => MonadKind::Relation,
             Ty::TyCon(name) => MonadKind::Adt(name.clone()),
             Ty::Relation(_) => MonadKind::Relation,
+            Ty::IO(_, _) => MonadKind::IO,
             // Partially applied type constructor, e.g. Result e (App(TyCon("Result"), e))
             Ty::App(f, _) => match f.as_ref() {
                 Ty::TyCon(name) => MonadKind::Adt(name.clone()),
@@ -3129,15 +3237,17 @@ mod tests {
 
     #[test]
     fn now_builtin() {
-        // now should type as Int
-        assert!(check_src("main = now + 1000").is_empty());
+        // now should type as IO {clock} Int — cannot directly add to Int
+        assert!(!check_src("main = now + 1000").is_empty());
+        // But using in IO do-block works:
+        assert!(check_src("main = do\n  t <- now\n  println t").is_empty());
     }
 
     #[test]
     fn temporal_at_expression() {
-        // @(timestamp) on a source should preserve the relation type
+        // @(timestamp) expects Int, now returns IO — need do-block to unwrap
         assert!(check_src(
-            "*people : [{name: Text, age: Int}]\nmain = *people @(now)"
+            "*people : [{name: Text, age: Int}]\nmain = do\n  t <- now\n  yield (*people @(t))"
         ).is_empty());
     }
 

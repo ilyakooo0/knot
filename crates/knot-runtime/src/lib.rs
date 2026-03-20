@@ -106,6 +106,8 @@ pub enum Value {
     Constructor(String, *mut Value),
     /// (fn_ptr, env, source) — fn_ptr has signature: extern "C" fn(db, env, arg) -> *mut Value
     Function(*const u8, *mut Value, String),
+    /// IO thunk — fn_ptr: extern "C" fn(db: *mut KnotDb, env: *mut Value) -> *mut Value
+    IO(*const u8, *mut Value),
 }
 
 pub struct RecordField {
@@ -235,6 +237,7 @@ fn type_name(v: *mut Value) -> &'static str {
         Value::Relation(_) => "Relation",
         Value::Constructor(_, _) => "Constructor",
         Value::Function(_, _, _) => "Function",
+        Value::IO(_, _) => "IO",
     }
 }
 
@@ -262,6 +265,7 @@ fn brief_value(v: *mut Value) -> String {
         Value::Relation(rows) => format!("Relation({} rows)", rows.len()),
         Value::Constructor(tag, _) => format!("Constructor({})", tag),
         Value::Function(_, _, src) => format!("Function({})", src),
+        Value::IO(_, _) => "IO".to_string(),
     }
 }
 
@@ -426,6 +430,7 @@ pub extern "C" fn knot_value_get_tag(v: *mut Value) -> i32 {
         Value::Constructor(_, _) => 7,
         Value::Function(_, _, _) => 8,
         Value::Bytes(_) => 10,
+        Value::IO(_, _) => 11,
     }
 }
 
@@ -1346,6 +1351,9 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
             buf.push(9);
             buf.extend_from_slice(src.as_bytes());
         }
+        Value::IO(_, _) => {
+            buf.push(11);
+        }
     }
 }
 
@@ -1750,6 +1758,7 @@ fn format_value(v: *mut Value) -> String {
             }
         }
         Value::Function(_, _, src) => src.clone(),
+        Value::IO(_, _) => "<<IO>>".to_string(),
     }
 }
 
@@ -1830,9 +1839,220 @@ pub extern "C" fn knot_value_show(v: *mut Value) -> *mut Value {
                 }
             }
             Value::Function(_, _, src) => src.clone(),
+            Value::IO(_, _) => "<<IO>>".to_string(),
         }
     }
     alloc(Value::Text(show_inner(v)))
+}
+
+// ── IO monad ─────────────────────────────────────────────────────
+
+/// Create an IO value wrapping a thunk function pointer and captured environment.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_io_wrap(fn_ptr: *const u8, env: *mut Value) -> *mut Value {
+    alloc(Value::IO(fn_ptr, env))
+}
+
+/// Wrap a pure value in an IO thunk (IO.pure / return).
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_io_pure(val: *mut Value) -> *mut Value {
+    // Create a thunk that just returns val.
+    // We encode this as IO with null fn_ptr — knot_io_run checks for this.
+    alloc(Value::IO(std::ptr::null(), val))
+}
+
+/// Execute an IO thunk. If the value is not IO, return it as-is.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_io_run(db: *mut c_void, val: *mut Value) -> *mut Value {
+    if val.is_null() {
+        return val;
+    }
+    match unsafe { as_ref(val) } {
+        Value::IO(fn_ptr, env) => {
+            let fn_ptr = *fn_ptr;
+            let env = *env;
+            if fn_ptr.is_null() {
+                // Pure value wrapped in IO — just return the environment (which holds the value)
+                env
+            } else {
+                let thunk: extern "C" fn(*mut c_void, *mut Value) -> *mut Value =
+                    unsafe { std::mem::transmute(fn_ptr) };
+                thunk(db, env)
+            }
+        }
+        _ => val, // Not IO, return as-is (backwards compat)
+    }
+}
+
+/// Monadic bind for IO: knot_io_bind(io, f) -> IO
+/// Creates a new IO thunk that, when run:
+///   1. Runs `io` to get result `a`
+///   2. Calls `f(a)` to get a new IO action
+///   3. Runs that IO action
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_io_bind(io: *mut Value, f: *mut Value) -> *mut Value {
+    // Build a closure env holding (io, f)
+    let env = alloc(Value::Record(vec![
+        RecordField { name: "_io".to_string(), value: io },
+        RecordField { name: "_f".to_string(), value: f },
+    ]));
+
+    extern "C" fn bind_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let io = knot_record_field(env, "_io\0".as_ptr(), 3);
+        let f = knot_record_field(env, "_f\0".as_ptr(), 2);
+        let a = knot_io_run(db, io);
+        let io2 = knot_value_call(db, f, a);
+        knot_io_run(db, io2)
+    }
+
+    alloc(Value::IO(bind_thunk as *const u8, env))
+}
+
+/// Sequence two IO actions, discarding the first result: knot_io_then(io1, io2) -> IO
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_io_then(io1: *mut Value, io2: *mut Value) -> *mut Value {
+    let env = alloc(Value::Record(vec![
+        RecordField { name: "_io1".to_string(), value: io1 },
+        RecordField { name: "_io2".to_string(), value: io2 },
+    ]));
+
+    extern "C" fn then_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let io1 = knot_record_field(env, "_io1\0".as_ptr(), 4);
+        let io2 = knot_record_field(env, "_io2\0".as_ptr(), 4);
+        knot_io_run(db, io1);
+        knot_io_run(db, io2)
+    }
+
+    alloc(Value::IO(then_thunk as *const u8, env))
+}
+
+// ── IO wrappers for effectful functions ──────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_println_io(v: *mut Value) -> *mut Value {
+    let env = v;
+    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let _ = db;
+        knot_println(env)
+    }
+    alloc(Value::IO(thunk as *const u8, env))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_print_io(v: *mut Value) -> *mut Value {
+    let env = v;
+    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let _ = db;
+        knot_print(env)
+    }
+    alloc(Value::IO(thunk as *const u8, env))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_read_line_io() -> *mut Value {
+    extern "C" fn thunk(db: *mut c_void, _env: *mut Value) -> *mut Value {
+        let _ = db;
+        knot_read_line()
+    }
+    alloc(Value::IO(thunk as *const u8, std::ptr::null_mut()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_fs_read_file_io(path: *mut Value) -> *mut Value {
+    let env = path;
+    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let _ = db;
+        knot_fs_read_file(env)
+    }
+    alloc(Value::IO(thunk as *const u8, env))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_fs_write_file_io(path: *mut Value, contents: *mut Value) -> *mut Value {
+    let env = alloc(Value::Record(vec![
+        RecordField { name: "_p".to_string(), value: path },
+        RecordField { name: "_c".to_string(), value: contents },
+    ]));
+    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let _ = db;
+        let p = knot_record_field(env, "_p\0".as_ptr(), 2);
+        let c = knot_record_field(env, "_c\0".as_ptr(), 2);
+        knot_fs_write_file(p, c)
+    }
+    alloc(Value::IO(thunk as *const u8, env))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_fs_append_file_io(path: *mut Value, contents: *mut Value) -> *mut Value {
+    let env = alloc(Value::Record(vec![
+        RecordField { name: "_p".to_string(), value: path },
+        RecordField { name: "_c".to_string(), value: contents },
+    ]));
+    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let _ = db;
+        let p = knot_record_field(env, "_p\0".as_ptr(), 2);
+        let c = knot_record_field(env, "_c\0".as_ptr(), 2);
+        knot_fs_append_file(p, c)
+    }
+    alloc(Value::IO(thunk as *const u8, env))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_fs_file_exists_io(path: *mut Value) -> *mut Value {
+    let env = path;
+    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let _ = db;
+        knot_fs_file_exists(env)
+    }
+    alloc(Value::IO(thunk as *const u8, env))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_fs_remove_file_io(path: *mut Value) -> *mut Value {
+    let env = path;
+    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let _ = db;
+        knot_fs_remove_file(env)
+    }
+    alloc(Value::IO(thunk as *const u8, env))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_fs_list_dir_io(path: *mut Value) -> *mut Value {
+    let env = path;
+    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let _ = db;
+        knot_fs_list_dir(env)
+    }
+    alloc(Value::IO(thunk as *const u8, env))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_now_io() -> *mut Value {
+    extern "C" fn thunk(db: *mut c_void, _env: *mut Value) -> *mut Value {
+        let _ = db;
+        knot_now()
+    }
+    alloc(Value::IO(thunk as *const u8, std::ptr::null_mut()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_random_int_io(bound: *mut Value) -> *mut Value {
+    let env = bound;
+    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let _ = db;
+        knot_random_int(env)
+    }
+    alloc(Value::IO(thunk as *const u8, env))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_random_float_io() -> *mut Value {
+    extern "C" fn thunk(db: *mut c_void, _env: *mut Value) -> *mut Value {
+        let _ = db;
+        knot_random_float()
+    }
+    alloc(Value::IO(thunk as *const u8, std::ptr::null_mut()))
 }
 
 // ── Standard library: relation operations ─────────────────────────
@@ -6145,6 +6365,7 @@ fn value_to_json(v: *mut Value) -> String {
             format!("{{\"tag\":\"{}\",\"value\":{}}}", tag, p)
         }
         Value::Function(_, _, src) => format!("\"<function: {}>\"", src),
+        Value::IO(_, _) => "\"<<IO>>\"".to_string(),
     }
 }
 

@@ -4,20 +4,41 @@ Every function listed here is built in to the compiler. No imports needed.
 
 ## IO
 
-```knot
-println : a -> {}
-```
-Print a value followed by a newline. Works on any type.
+Effectful functions return `IO` values — pure descriptions of side effects. IO actions are executed when the program runs (via `main`). Use do-blocks with `<-` to sequence IO actions and extract their results.
 
 ```knot
-print : a -> {}
+println : a -> IO {console} {}
+```
+Print a value followed by a newline. Works on any type. Returns an IO action.
+
+```knot
+print : a -> IO {console} {}
 ```
 Print a value without a trailing newline.
 
 ```knot
+readLine : IO {console} Text
+```
+Read a line from stdin.
+
+```knot
 show : a -> Text
 ```
-Convert any value to its text representation. Records print as `{field: value, ...}`, relations as `[v1, v2, ...]`, constructors as `Tag {fields}`.
+Convert any value to its text representation. Records print as `{field: value, ...}`, relations as `[v1, v2, ...]`, constructors as `Tag {fields}`. This is a pure function (no IO).
+
+### IO Do-Blocks
+
+Use `do` to sequence IO actions:
+
+```knot
+main = do
+  println "What is your name?"
+  name <- readLine
+  println ("Hello, " ++ name)
+  yield {}
+```
+
+The `<-` operator runs an IO action and binds its result. Bare IO expressions (like `println`) are also executed. The overall block type is `IO {union of effects} result`.
 
 ## Relations
 
@@ -197,9 +218,26 @@ not : Bool -> Bool
 Boolean negation. Function form of the `!` operator.
 
 ```knot
-now : Int
+now : IO {clock} Int
 ```
-Current time in milliseconds since the Unix epoch. Has the `{clock}` effect.
+Current time in milliseconds since the Unix epoch. Returns an IO action. Use `<-` in a do-block to get the value:
+
+```knot
+main = do
+  t <- now
+  println ("Time: " ++ show t)
+  yield {}
+```
+
+```knot
+randomInt : Int -> IO {random} Int
+```
+Random integer in `[0, bound)`. Returns an IO action.
+
+```knot
+randomFloat : IO {random} Float
+```
+Random float in `[0.0, 1.0)`. Returns an IO action.
 
 ## JSON
 
@@ -276,19 +314,22 @@ bytesFromHex "6869" |> bytesToText  -- "hi"
 
 ## File System
 
-All file system functions carry the `{fs}` effect.
+All file system functions return `IO {fs}` values.
 
 ```knot
-readFile : Text -> Text
+readFile : Text -> IO {fs} Text
 ```
-Read the entire contents of a file as text.
+Read the entire contents of a file as text. Returns an IO action.
 
 ```knot
-readFile "config.json"    -- "{\"port\": 8080}"
+main = do
+  content <- readFile "config.json"
+  println content
+  yield {}
 ```
 
 ```knot
-writeFile : Text -> Text -> {}
+writeFile : Text -> Text -> IO {fs} {}
 ```
 Write text to a file. Creates the file if it doesn't exist, overwrites if it does. The first argument is the path, the second is the contents.
 
@@ -297,40 +338,44 @@ writeFile "output.txt" "hello"
 ```
 
 ```knot
-appendFile : Text -> Text -> {}
+appendFile : Text -> Text -> IO {fs} {}
 ```
 Append text to a file. Creates the file if it doesn't exist.
 
 ```knot
-appendFile "app.log" ("event at " ++ show now ++ "\n")
+main = do
+  t <- now
+  appendFile "app.log" ("event at " ++ show t ++ "\n")
 ```
 
 ```knot
-fileExists : Text -> Bool
+fileExists : Text -> IO {fs} Bool
 ```
 Check whether a file or directory exists at the given path.
 
 ```knot
-if fileExists "config.json"
-  then readFile "config.json"
-  else "{}"
+loadConfig = \path -> do
+  exists <- fileExists path
+  if exists
+    then readFile path
+    else yield "{}"
 ```
 
 ```knot
-removeFile : Text -> {}
+removeFile : Text -> IO {fs} {}
 ```
 Delete a file.
 
 ```knot
-listDir : Text -> [Text]
+listDir : Text -> IO {fs} [Text]
 ```
 List the entries of a directory as a relation of filenames.
 
 ```knot
-listDir "."    -- ["main.knot", "lib.knot", "knot.db"]
-
--- Filter to specific files
-listDir "src" |> filter (\f -> contains ".knot" f)
+main = do
+  files <- listDir "."
+  println files
+  yield {}
 ```
 
 ## Server
@@ -339,6 +384,18 @@ listDir "src" |> filter (\f -> contains ".knot" f)
 listen : Int -> (a -> b) -> {}
 ```
 Start an HTTP server on the given port with a handler function. The handler receives a route ADT value and returns a response. Has the `{network}` effect. See `route` declarations in the language spec for defining typed endpoints.
+
+## IO Type Syntax
+
+IO types can be annotated in type signatures:
+
+```knot
+IO {console} {}         -- IO action with console effect, returns unit
+IO {fs} Text            -- IO action with fs effect, returns Text
+IO {clock, random} Int  -- IO action with multiple effects
+```
+
+Effects tracked in IO types: `console`, `fs`, `network`, `clock`, `random`.
 
 ## Traits
 

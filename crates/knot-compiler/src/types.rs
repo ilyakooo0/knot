@@ -272,6 +272,10 @@ fn resolve_type(
         TypeKind::Effectful { ty, .. } => {
             resolve_type(ty, aliases, assoc_types)
         }
+        TypeKind::IO { ty, .. } => {
+            // IO values aren't persisted — resolve inner type for diagnostics
+            resolve_type(ty, aliases, assoc_types)
+        }
     }
 }
 
@@ -466,6 +470,10 @@ fn apply_type_subst(ty: &Type, subst: &HashMap<String, Type>) -> Type {
             rest: rest.clone(),
         },
         TypeKind::Effectful { effects, ty: inner } => TypeKind::Effectful {
+            effects: effects.clone(),
+            ty: Box::new(apply_type_subst(inner, subst)),
+        },
+        TypeKind::IO { effects, ty: inner } => TypeKind::IO {
             effects: effects.clone(),
             ty: Box::new(apply_type_subst(inner, subst)),
         },

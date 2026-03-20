@@ -2474,7 +2474,33 @@ impl Parser {
             TokenKind::Upper(_) => {
                 let tok = self.advance();
                 let TokenKind::Upper(name) = tok.kind else { unreachable!() };
-                Some(Spanned::new(TypeKind::Named(name), tok.span))
+                if name == "IO" && matches!(self.peek(), TokenKind::LBrace) {
+                    // Parse IO {effects} Type
+                    self.advance(); // consume '{'
+                    let mut effects = Vec::new();
+                    loop {
+                        match self.peek() {
+                            TokenKind::RBrace => { self.advance(); break; }
+                            TokenKind::Lower(eff) => {
+                                let eff_name = eff.clone();
+                                self.advance();
+                                effects.push(eff_name);
+                                if matches!(self.peek(), TokenKind::Comma) {
+                                    self.advance();
+                                }
+                            }
+                            _ => {
+                                self.error("expected effect name or '}'");
+                                break;
+                            }
+                        }
+                    }
+                    let inner = self.parse_type_atom()?;
+                    let span = Span::new(tok.span.start, inner.span.end);
+                    Some(Spanned::new(TypeKind::IO { effects, ty: Box::new(inner) }, span))
+                } else {
+                    Some(Spanned::new(TypeKind::Named(name), tok.span))
+                }
             }
             TokenKind::Lower(_) => {
                 let tok = self.advance();

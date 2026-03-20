@@ -383,6 +383,12 @@ pub enum TypeKind {
         ty: Box<Type>,
     },
 
+    /// `IO {effects} a` — IO monad type with effect set.
+    IO {
+        effects: Vec<String>,
+        ty: Box<Type>,
+    },
+
     /// `_` — type hole, inferred by the type checker.
     Hole,
 }

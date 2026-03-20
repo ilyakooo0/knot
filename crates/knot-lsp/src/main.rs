@@ -13,6 +13,9 @@ use knot::diagnostic;
 struct DocumentState {
     source: String,
     module: Module,
+    /// Span-based references: (usage_span → definition_span).
+    references: Vec<(Span, Span)>,
+    /// Fallback name-based definitions for names not covered by AST walk.
     definitions: HashMap<String, Span>,
     details: HashMap<String, String>,
     type_info: HashMap<String, String>,
@@ -154,7 +157,7 @@ fn analyze_document(uri: &Uri, source: &str) -> DocumentState {
     all_diags.extend(parse_diags);
 
     // Build navigation data from original AST
-    let definitions = build_definitions(&module);
+    let (definitions, references) = resolve_definitions(&module);
     let details = build_details(&module);
 
     // Run deeper analysis if no parse errors
@@ -190,6 +193,7 @@ fn analyze_document(uri: &Uri, source: &str) -> DocumentState {
     DocumentState {
         source: source.to_string(),
         module,
+        references,
         definitions,
         details,
         type_info,
@@ -280,10 +284,21 @@ fn handle_goto_definition(
     let pos = params.text_document_position_params.position;
     let doc = state.documents.get(uri)?;
 
-    let word = word_at_position(&doc.source, pos)?;
-    let span = doc.definitions.get(word)?;
+    let offset = position_to_offset(&doc.source, pos);
 
-    let range = span_to_range(*span, &doc.source);
+    // Try span-based reference lookup first
+    let def_span = doc
+        .references
+        .iter()
+        .find(|(usage, _)| usage.start <= offset && offset < usage.end)
+        .map(|(_, def)| *def)
+        .or_else(|| {
+            // Fallback: name-based lookup
+            let word = word_at_position(&doc.source, pos)?;
+            doc.definitions.get(word).copied()
+        })?;
+
+    let range = span_to_range(def_span, &doc.source);
     Some(GotoDefinitionResponse::Scalar(Location {
         uri: uri.clone(),
         range,
@@ -433,49 +448,259 @@ const BUILTINS: &[&str] = &[
     "appendFile", "fileExists", "removeFile", "listDir",
 ];
 
-// ── Build navigation data ───────────────────────────────────────────
+// ── Definition resolution ────────────────────────────────────────────
 
-fn build_definitions(module: &Module) -> HashMap<String, Span> {
-    let mut defs = HashMap::new();
+/// Resolve definitions: returns (name_map, span_references).
+/// name_map is a fallback HashMap<String, Span> for name-based lookup.
+/// span_references is a Vec<(usage_span, def_span)> from scope-aware AST walk.
+fn resolve_definitions(module: &Module) -> (HashMap<String, Span>, Vec<(Span, Span)>) {
+    let mut resolver = DefResolver {
+        scopes: vec![HashMap::new()],
+        refs: Vec::new(),
+    };
 
+    // Phase 1: register all top-level declarations
     for decl in &module.decls {
         match &decl.node {
             DeclKind::Data {
                 name, constructors, ..
             } => {
-                defs.insert(name.clone(), decl.span);
+                resolver.define(name, decl.span);
                 for ctor in constructors {
-                    defs.insert(ctor.name.clone(), decl.span);
+                    resolver.define(&ctor.name, decl.span);
                 }
             }
             DeclKind::TypeAlias { name, .. } => {
-                defs.insert(name.clone(), decl.span);
+                resolver.define(name, decl.span);
             }
             DeclKind::Source { name, .. } | DeclKind::View { name, .. } => {
-                defs.insert(name.clone(), decl.span);
+                resolver.define(name, decl.span);
             }
             DeclKind::Derived { name, .. } => {
-                defs.insert(name.clone(), decl.span);
+                resolver.define(name, decl.span);
             }
             DeclKind::Fun { name, .. } => {
-                defs.insert(name.clone(), decl.span);
+                resolver.define(name, decl.span);
             }
             DeclKind::Trait { name, items, .. } => {
-                defs.insert(name.clone(), decl.span);
+                resolver.define(name, decl.span);
                 for item in items {
                     if let ast::TraitItem::Method { name, .. } = item {
-                        defs.insert(name.clone(), decl.span);
+                        resolver.define(name, decl.span);
                     }
                 }
             }
             DeclKind::Route { name, .. } | DeclKind::RouteComposite { name, .. } => {
-                defs.insert(name.clone(), decl.span);
+                resolver.define(name, decl.span);
             }
             _ => {}
         }
     }
 
-    defs
+    // Phase 2: walk declaration bodies to resolve references
+    for decl in &module.decls {
+        match &decl.node {
+            DeclKind::Fun { body, .. }
+            | DeclKind::View { body, .. }
+            | DeclKind::Derived { body, .. } => {
+                resolver.resolve_expr(body);
+            }
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { params, body, .. } = item {
+                        resolver.push_scope();
+                        for p in params {
+                            resolver.define_pat(p);
+                        }
+                        resolver.resolve_expr(body);
+                        resolver.pop_scope();
+                    }
+                }
+            }
+            DeclKind::Trait { items, .. } => {
+                for item in items {
+                    if let ast::TraitItem::Method {
+                        default_params,
+                        default_body: Some(body),
+                        ..
+                    } = item
+                    {
+                        resolver.push_scope();
+                        for p in default_params {
+                            resolver.define_pat(p);
+                        }
+                        resolver.resolve_expr(body);
+                        resolver.pop_scope();
+                    }
+                }
+            }
+            DeclKind::Migrate { using_fn, .. } => {
+                resolver.resolve_expr(using_fn);
+            }
+            _ => {}
+        }
+    }
+
+    // Build the fallback name map from global scope
+    let name_map = resolver.scopes[0].clone();
+    (name_map, resolver.refs)
+}
+
+struct DefResolver {
+    scopes: Vec<HashMap<String, Span>>,
+    refs: Vec<(Span, Span)>,
+}
+
+impl DefResolver {
+    fn push_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    fn pop_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    fn define(&mut self, name: &str, span: Span) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert(name.to_string(), span);
+        }
+    }
+
+    fn lookup(&self, name: &str) -> Option<Span> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(span) = scope.get(name) {
+                return Some(*span);
+            }
+        }
+        None
+    }
+
+    fn add_ref(&mut self, usage: Span, name: &str) {
+        if let Some(def) = self.lookup(name) {
+            self.refs.push((usage, def));
+        }
+    }
+
+    fn define_pat(&mut self, pat: &ast::Pat) {
+        match &pat.node {
+            ast::PatKind::Var(name) => self.define(name, pat.span),
+            ast::PatKind::Constructor { name, payload } => {
+                // The constructor name is a reference
+                self.add_ref(pat.span, name);
+                self.define_pat(payload);
+            }
+            ast::PatKind::Record(fields) => {
+                for f in fields {
+                    if let Some(p) = &f.pattern {
+                        self.define_pat(p);
+                    } else {
+                        // Punned: `{name}` introduces `name`
+                        self.define(&f.name, pat.span);
+                    }
+                }
+            }
+            ast::PatKind::List(pats) => {
+                for p in pats {
+                    self.define_pat(p);
+                }
+            }
+            ast::PatKind::Wildcard | ast::PatKind::Lit(_) => {}
+        }
+    }
+
+    fn resolve_expr(&mut self, expr: &ast::Expr) {
+        match &expr.node {
+            ast::ExprKind::Var(name) => self.add_ref(expr.span, name),
+            ast::ExprKind::Constructor(name) => self.add_ref(expr.span, name),
+            ast::ExprKind::SourceRef(name) => self.add_ref(expr.span, name),
+            ast::ExprKind::DerivedRef(name) => self.add_ref(expr.span, name),
+
+            ast::ExprKind::Lambda { params, body } => {
+                self.push_scope();
+                for p in params {
+                    self.define_pat(p);
+                }
+                self.resolve_expr(body);
+                self.pop_scope();
+            }
+
+            ast::ExprKind::Do(stmts) => {
+                self.push_scope();
+                for stmt in stmts {
+                    match &stmt.node {
+                        ast::StmtKind::Bind { pat, expr } => {
+                            self.resolve_expr(expr);
+                            self.define_pat(pat);
+                        }
+                        ast::StmtKind::Let { pat, expr } => {
+                            self.resolve_expr(expr);
+                            self.define_pat(pat);
+                        }
+                        ast::StmtKind::Where { cond } => self.resolve_expr(cond),
+                        ast::StmtKind::GroupBy { key } => self.resolve_expr(key),
+                        ast::StmtKind::Expr(e) => self.resolve_expr(e),
+                    }
+                }
+                self.pop_scope();
+            }
+
+            ast::ExprKind::Case { scrutinee, arms } => {
+                self.resolve_expr(scrutinee);
+                for arm in arms {
+                    self.push_scope();
+                    self.define_pat(&arm.pat);
+                    self.resolve_expr(&arm.body);
+                    self.pop_scope();
+                }
+            }
+
+            ast::ExprKind::App { func, arg } => {
+                self.resolve_expr(func);
+                self.resolve_expr(arg);
+            }
+            ast::ExprKind::BinOp { lhs, rhs, .. } => {
+                self.resolve_expr(lhs);
+                self.resolve_expr(rhs);
+            }
+            ast::ExprKind::UnaryOp { operand, .. } => self.resolve_expr(operand),
+            ast::ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                self.resolve_expr(cond);
+                self.resolve_expr(then_branch);
+                self.resolve_expr(else_branch);
+            }
+            ast::ExprKind::Yield(e) | ast::ExprKind::Atomic(e) => self.resolve_expr(e),
+            ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+                self.resolve_expr(target);
+                self.resolve_expr(value);
+            }
+            ast::ExprKind::At { relation, time } => {
+                self.resolve_expr(relation);
+                self.resolve_expr(time);
+            }
+            ast::ExprKind::Record(fields) => {
+                for f in fields {
+                    self.resolve_expr(&f.value);
+                }
+            }
+            ast::ExprKind::RecordUpdate { base, fields } => {
+                self.resolve_expr(base);
+                for f in fields {
+                    self.resolve_expr(&f.value);
+                }
+            }
+            ast::ExprKind::FieldAccess { expr, .. } => self.resolve_expr(expr),
+            ast::ExprKind::List(elems) => {
+                for e in elems {
+                    self.resolve_expr(e);
+                }
+            }
+            ast::ExprKind::Lit(_) => {}
+        }
+    }
 }
 
 fn build_details(module: &Module) -> HashMap<String, String> {

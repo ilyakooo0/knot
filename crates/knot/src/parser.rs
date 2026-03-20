@@ -1496,7 +1496,8 @@ impl Parser {
             | TokenKind::LParen
             | TokenKind::LBrace
             | TokenKind::LBracket
-            | TokenKind::Underscore => true,
+            | TokenKind::Underscore
+            | TokenKind::Do => true,
             TokenKind::Star => {
                 // Source ref `*name` only when `*` is immediately adjacent to a Lower token
                 // (no whitespace). This avoids ambiguity with the `*` multiplication operator.
@@ -1720,6 +1721,7 @@ impl Parser {
                     Span::new(start.start, end_tok.span.end),
                 ))
             }
+            TokenKind::Do => self.parse_do_expr(),
             TokenKind::LBrace => {
                 self.advance();
                 self.parse_record_or_update(start)

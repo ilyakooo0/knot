@@ -256,6 +256,7 @@ pub enum Literal {
     Float(f64),
     Text(String),
     Bytes(Vec<u8>),
+    Bool(bool),
 }
 
 // ── Operators ──────────────────────────────────────────────────────

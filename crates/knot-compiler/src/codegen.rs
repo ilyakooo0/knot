@@ -4931,6 +4931,10 @@ impl Codegen {
                 let (ptr, len) = self.bytes_ptr(builder, b);
                 self.call_rt(builder, "knot_value_bytes", &[ptr, len])
             }
+            ast::Literal::Bool(b) => {
+                let val = builder.ins().iconst(types::I32, *b as i64);
+                self.call_rt(builder, "knot_value_bool", &[val])
+            }
         }
     }
 
@@ -7415,6 +7419,7 @@ fn pretty_lit(lit: &ast::Literal) -> String {
             let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
             format!("b\"{}\"", hex)
         }
+        ast::Literal::Bool(b) => if *b { "true" } else { "false" }.to_string(),
     }
 }
 

@@ -1644,6 +1644,7 @@ impl Infer {
             ast::Literal::Float(_) => Ty::Float,
             ast::Literal::Text(_) => Ty::Text,
             ast::Literal::Bytes(_) => Ty::Bytes,
+            ast::Literal::Bool(_) => Ty::Bool,
         }
     }
 

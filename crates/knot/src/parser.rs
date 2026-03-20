@@ -1490,6 +1490,7 @@ impl Parser {
             | TokenKind::Float(_)
             | TokenKind::Text(_)
             | TokenKind::Bytes(_)
+            | TokenKind::Bool(_)
             | TokenKind::Lower(_)
             | TokenKind::Upper(_)
             | TokenKind::LParen
@@ -1641,6 +1642,11 @@ impl Parser {
                 let tok = self.advance();
                 let TokenKind::Bytes(b) = tok.kind else { unreachable!() };
                 Some(Spanned::new(ExprKind::Lit(Literal::Bytes(b)), tok.span))
+            }
+            TokenKind::Bool(_) => {
+                let tok = self.advance();
+                let TokenKind::Bool(b) = tok.kind else { unreachable!() };
+                Some(Spanned::new(ExprKind::Lit(Literal::Bool(b)), tok.span))
             }
             TokenKind::Lower(_) => {
                 let tok = self.advance();
@@ -2177,6 +2183,7 @@ impl Parser {
                 | TokenKind::Float(_)
                 | TokenKind::Text(_)
                 | TokenKind::Bytes(_)
+                | TokenKind::Bool(_)
         )
     }
 
@@ -2271,6 +2278,11 @@ impl Parser {
                 let TokenKind::Bytes(b) = tok.kind else { unreachable!() };
                 Some(Spanned::new(PatKind::Lit(Literal::Bytes(b)), tok.span))
             }
+            TokenKind::Bool(_) => {
+                let tok = self.advance();
+                let TokenKind::Bool(b) = tok.kind else { unreachable!() };
+                Some(Spanned::new(PatKind::Lit(Literal::Bool(b)), tok.span))
+            }
             _ => {
                 self.error("expected pattern");
                 None
@@ -2291,6 +2303,7 @@ impl Parser {
                 | TokenKind::Float(_)
                 | TokenKind::Text(_)
                 | TokenKind::Bytes(_)
+                | TokenKind::Bool(_)
         )
     }
 
@@ -2348,6 +2361,11 @@ impl Parser {
                 let tok = self.advance();
                 let TokenKind::Bytes(b) = tok.kind else { unreachable!() };
                 Some(Spanned::new(PatKind::Lit(Literal::Bytes(b)), tok.span))
+            }
+            TokenKind::Bool(_) => {
+                let tok = self.advance();
+                let TokenKind::Bool(b) = tok.kind else { unreachable!() };
+                Some(Spanned::new(PatKind::Lit(Literal::Bool(b)), tok.span))
             }
             _ => {
                 self.error("expected pattern atom");

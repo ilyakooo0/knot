@@ -15,6 +15,7 @@ pub enum TokenKind {
     Float(f64),
     Text(String),
     Bytes(Vec<u8>),
+    Bool(bool),
 
     // Identifiers
     Lower(String),
@@ -101,6 +102,8 @@ impl TokenKind {
             TokenKind::Float(_) => "float literal",
             TokenKind::Text(_) => "string literal",
             TokenKind::Bytes(_) => "byte string literal",
+            TokenKind::Bool(true) => "'true'",
+            TokenKind::Bool(false) => "'false'",
             TokenKind::Lower(_) => "identifier",
             TokenKind::Upper(_) => "type name",
             TokenKind::Import => "'import'",
@@ -387,6 +390,8 @@ impl<'src> Lexer<'src> {
                 "deriving" => return TokenKind::Deriving,
                 "with" => return TokenKind::With,
                 "export" => return TokenKind::Export,
+                "true" => return TokenKind::Bool(true),
+                "false" => return TokenKind::Bool(false),
                 _ => {}
             }
             TokenKind::Lower(text.to_owned())

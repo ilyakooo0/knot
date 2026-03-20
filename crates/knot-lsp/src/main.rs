@@ -21,6 +21,8 @@ struct DocumentState {
     type_info: HashMap<String, String>,
     /// Span-based type info for local bindings (let, bind, lambda params, case patterns).
     local_type_info: HashMap<Span, String>,
+    /// Span-based type info for literal expressions.
+    literal_types: Vec<(Span, String)>,
     knot_diagnostics: Vec<diagnostic::Diagnostic>,
 }
 
@@ -160,7 +162,7 @@ fn analyze_document(uri: &Uri, source: &str) -> DocumentState {
     all_diags.extend(parse_diags);
 
     // Build navigation data from original AST
-    let (definitions, references) = resolve_definitions(&module);
+    let (definitions, references, literal_types) = resolve_definitions(&module);
     let details = build_details(&module);
 
     // Run deeper analysis if no parse errors
@@ -202,6 +204,7 @@ fn analyze_document(uri: &Uri, source: &str) -> DocumentState {
         details,
         type_info,
         local_type_info,
+        literal_types,
         knot_diagnostics: all_diags,
     }
 }
@@ -317,10 +320,28 @@ fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<Hover> {
     let pos = params.text_document_position_params.position;
     let doc = state.documents.get(uri)?;
 
-    let word = word_at_position(&doc.source, pos)?;
     let offset = position_to_offset(&doc.source, pos);
 
-    // Try local binding types first (let, bind, lambda params, case patterns).
+    // Try literal types first (span-based, works for strings/floats/etc.)
+    if let Some((span, ty)) = doc
+        .literal_types
+        .iter()
+        .find(|(span, _)| span.start <= offset && offset < span.end)
+    {
+        let source_text = &doc.source[span.start..span.end];
+        let detail = format!("{source_text} : {ty}");
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!("```knot\n{detail}\n```"),
+            }),
+            range: None,
+        });
+    }
+
+    let word = word_at_position(&doc.source, pos)?;
+
+    // Try local binding types (let, bind, lambda params, case patterns).
     // Check if cursor is on a binding site or on a usage that references one.
     let local_type = doc
         .local_type_info
@@ -477,10 +498,13 @@ const BUILTINS: &[&str] = &[
 /// Resolve definitions: returns (name_map, span_references).
 /// name_map is a fallback HashMap<String, Span> for name-based lookup.
 /// span_references is a Vec<(usage_span, def_span)> from scope-aware AST walk.
-fn resolve_definitions(module: &Module) -> (HashMap<String, Span>, Vec<(Span, Span)>) {
+fn resolve_definitions(
+    module: &Module,
+) -> (HashMap<String, Span>, Vec<(Span, Span)>, Vec<(Span, String)>) {
     let mut resolver = DefResolver {
         scopes: vec![HashMap::new()],
         refs: Vec::new(),
+        literals: Vec::new(),
     };
 
     // Phase 1: register all top-level declarations
@@ -567,12 +591,13 @@ fn resolve_definitions(module: &Module) -> (HashMap<String, Span>, Vec<(Span, Sp
 
     // Build the fallback name map from global scope
     let name_map = resolver.scopes[0].clone();
-    (name_map, resolver.refs)
+    (name_map, resolver.refs, resolver.literals)
 }
 
 struct DefResolver {
     scopes: Vec<HashMap<String, Span>>,
     refs: Vec<(Span, Span)>,
+    literals: Vec<(Span, String)>,
 }
 
 impl DefResolver {
@@ -722,7 +747,16 @@ impl DefResolver {
                     self.resolve_expr(e);
                 }
             }
-            ast::ExprKind::Lit(_) => {}
+            ast::ExprKind::Lit(lit) => {
+                let ty = match lit {
+                    ast::Literal::Int(_) => "Int",
+                    ast::Literal::Float(_) => "Float",
+                    ast::Literal::Text(_) => "Text",
+                    ast::Literal::Bool(_) => "Bool",
+                    ast::Literal::Bytes(_) => "Bytes",
+                };
+                self.literals.push((expr.span, ty.to_string()));
+            }
         }
     }
 }

@@ -4,6 +4,20 @@ fn is_valid_lib(p: &Path) -> bool {
     p.exists() && std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false)
 }
 
+/// Check that `lib` is at least as new as the runtime source file.
+fn is_fresh_lib(lib: &Path, workspace_root: &Path) -> bool {
+    if !is_valid_lib(lib) {
+        return false;
+    }
+    let src = workspace_root.join("crates/knot-runtime/src/lib.rs");
+    let src_mtime = std::fs::metadata(&src).and_then(|m| m.modified()).ok();
+    let lib_mtime = std::fs::metadata(lib).and_then(|m| m.modified()).ok();
+    match (src_mtime, lib_mtime) {
+        (Some(s), Some(l)) => l >= s,
+        _ => true, // can't compare, assume valid
+    }
+}
+
 fn main() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let out_path = PathBuf::from(&out_dir);
@@ -28,7 +42,7 @@ fn main() {
             out_path
                 .ancestors()
                 .map(|p| p.join("libknot_runtime.a"))
-                .find(|p| is_valid_lib(p))
+                .find(|p| is_fresh_lib(p, &workspace_root))
         })
         // 3. Check workspace target directory, respecting CARGO_TARGET_DIR
         .or_else(|| {
@@ -38,7 +52,7 @@ fn main() {
             ["release", "debug"]
                 .iter()
                 .map(|profile| target_dir.join(profile).join("libknot_runtime.a"))
-                .find(|p| is_valid_lib(p))
+                .find(|p| is_fresh_lib(p, &workspace_root))
         })
         // 4. Build the runtime ourselves (needed for `cargo install` where the
         //    staticlib isn't produced as a dependency artifact). Uses a separate

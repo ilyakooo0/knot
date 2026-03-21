@@ -6237,6 +6237,10 @@ pub extern "C" fn knot_route_table_add(
     let req_hdrs = unsafe { str_from_raw(req_hdrs_ptr, req_hdrs_len) };
     let resp_hdrs = unsafe { str_from_raw(resp_hdrs_ptr, resp_hdrs_len) };
 
+    if debug_enabled() {
+        eprintln!("[ROUTE] {} {} -> {}", method, path, ctor);
+    }
+
     table.entries.push(RouteTableEntry {
         method,
         path_parts: parse_path_pattern(path),
@@ -6542,6 +6546,13 @@ pub extern "C" fn knot_http_listen(
 
         let method = request.method().as_str().to_string();
         let url = request.url().to_string();
+
+        if debug_enabled() {
+            eprintln!("[HTTP] <-- {} {}", method, url);
+            for header in request.headers() {
+                eprintln!("[HTTP]     {}: {}", header.field, header.value);
+            }
+        }
         let (path, query_string) = match url.split_once('?') {
             Some((p, q)) => (p, q),
             None => (url.as_str(), ""),
@@ -6590,6 +6601,9 @@ pub extern "C" fn knot_http_listen(
                         .read_to_end(&mut body_bytes)
                         .unwrap_or(0);
                     let body_str = String::from_utf8_lossy(&body_bytes);
+                    if debug_enabled() {
+                        eprintln!("[HTTP]     body: {}", body_str);
+                    }
                     let json_fields = parse_json_object(&body_str);
                     for (bname, bty) in &entry.body_fields {
                         let val = json_fields
@@ -6661,8 +6675,11 @@ pub extern "C" fn knot_http_listen(
                 let tag = entry.constructor.clone();
                 let ctor_val = alloc(Value::Constructor(tag, record));
 
-                // Call handler
-                let result = knot_value_call(db, handler, ctor_val);
+                // Call handler — run IO thunks until we get a plain value
+                let mut result = knot_value_call(db, handler, ctor_val);
+                while matches!(unsafe { as_ref(result) }, Value::IO(..)) {
+                    result = knot_io_run(db, result);
+                }
 
                 if has_resp_headers {
                     // Result is {body: ..., headers: ...}
@@ -6687,9 +6704,15 @@ pub extern "C" fn knot_http_listen(
                             }
                         }
                     }
+                    if debug_enabled() {
+                        eprintln!("[HTTP] --> 200 {}", json);
+                    }
                     let _ = request.respond(response);
                 } else {
                     let json = value_to_json(result);
+                    if debug_enabled() {
+                        eprintln!("[HTTP] --> 200 {}", json);
+                    }
                     let response = tiny_http::Response::from_string(&json)
                         .with_header(
                             "Content-Type: application/json"
@@ -6700,6 +6723,9 @@ pub extern "C" fn knot_http_listen(
                 }
             }
             None => {
+                if debug_enabled() {
+                    eprintln!("[HTTP] --> 404 not found");
+                }
                 let response = tiny_http::Response::from_string("{\"error\":\"not found\"}")
                     .with_status_code(404)
                     .with_header(
@@ -6867,6 +6893,14 @@ pub extern "C" fn knot_http_fetch_io(
             }
         }
 
+        // Debug log outgoing fetch
+        if debug_enabled() {
+            eprintln!("[HTTP] --> {} {}", method_str, full_url);
+            if let Some(ref json) = body_json {
+                eprintln!("[HTTP]     body: {}", json);
+            }
+        }
+
         // Send request
         let result = match body_json {
             Some(ref json) => request
@@ -6885,6 +6919,9 @@ pub extern "C" fn knot_http_fetch_io(
         // Build Result ADT
         match result {
             Ok(response) => {
+                if debug_enabled() {
+                    eprintln!("[HTTP] <-- {} {}", response.status(), full_url);
+                }
                 // Parse response headers before consuming the response body
                 let parsed_headers = if has_resp_hdrs {
                     let mut hdr_fields = Vec::new();
@@ -6932,10 +6969,16 @@ pub extern "C" fn knot_http_fetch_io(
                 ))
             }
             Err(ureq::Error::Status(code, response)) => {
+                if debug_enabled() {
+                    eprintln!("[HTTP] <-- {} {}", code, full_url);
+                }
                 let body_text = response.into_string().unwrap_or_default();
                 fetch_build_err(code, &body_text)
             }
             Err(ureq::Error::Transport(e)) => {
+                if debug_enabled() {
+                    eprintln!("[HTTP] <-- ERR {}", e);
+                }
                 fetch_build_err(0, &format!("Network error: {}", e))
             }
         }

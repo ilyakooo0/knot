@@ -113,6 +113,9 @@ pub struct Codegen {
     // Types isomorphic to Maybe (one nullary ctor, one non-nullary ctor)
     // are encoded as nullable pointers: null = none variant, bare payload = some variant.
     nullable_ctors: HashMap<String, NullableRole>,
+
+    // User-defined functions whose bodies (transitively) produce IO values
+    io_functions: HashSet<String>,
 }
 
 /// Role of a constructor in a nullable-encoded ADT.
@@ -324,6 +327,7 @@ impl Codegen {
             monad_info: HashMap::new(),
             registered_builtin_impls: HashSet::new(),
             nullable_ctors: HashMap::new(),
+            io_functions: HashSet::new(),
         }
     }
 
@@ -1106,6 +1110,9 @@ impl Codegen {
                 _ => {}
             }
         }
+
+        // Detect user functions that produce IO values (fixed-point iteration)
+        self.detect_io_functions(&module.decls);
 
         // Process deriving clauses: auto-generate impl methods from trait defaults
         for decl in &module.decls {
@@ -3691,11 +3698,12 @@ impl Codegen {
                     // Build route table from known route declarations
                     let table = self.call_rt(builder, "knot_route_table_new", &[]);
 
-                    // Find route entries — use the first available route
+                    // Find route entries — use the route with the most entries
+                    // (composite routes aggregate sub-routes, so the largest is typically the top-level one)
                     let entries: Vec<ast::RouteEntry> = self
                         .route_entries
                         .values()
-                        .next()
+                        .max_by_key(|v| v.len())
                         .cloned()
                         .unwrap_or_default();
 
@@ -4204,37 +4212,116 @@ impl Codegen {
 
     // ── Do-block compilation ──────────────────────────────────────
 
-    /// Check if a do-block should be compiled as IO (contains IO-producing builtins).
+    /// Check if a do-block should be compiled as IO (contains IO-producing builtins,
+    /// or is purely sequential with no relational binds/yields).
     fn is_io_do_block(&self, stmts: &[ast::Stmt]) -> bool {
+        let mut has_bind = false;
+        let mut has_yield = false;
+        let mut has_io = false;
         for stmt in stmts {
             match &stmt.node {
                 ast::StmtKind::Bind { expr, .. } => {
-                    if Self::expr_is_io(expr) {
-                        return true;
+                    has_bind = true;
+                    if self.expr_is_io(expr) {
+                        has_io = true;
                     }
                 }
                 ast::StmtKind::Expr(expr) => {
-                    if Self::expr_is_io(expr) {
-                        return true;
+                    if self.expr_is_io(expr) {
+                        has_io = true;
                     }
+                    if matches!(&expr.node, ast::ExprKind::Yield(_)) {
+                        has_yield = true;
+                    }
+                }
+                ast::StmtKind::Where { .. } => {
+                    // where clauses imply relational context
+                    has_bind = true;
                 }
                 _ => {}
             }
         }
-        false
+        // IO if it has IO calls, or if it's purely sequential (no binds, no yields)
+        has_io || (!has_bind && !has_yield)
     }
 
-    /// Check if an expression produces an IO value (calls an IO-returning builtin).
-    fn expr_is_io(expr: &ast::Expr) -> bool {
+    /// Detect user functions whose bodies (transitively) produce IO values.
+    /// Uses fixed-point iteration to handle transitive IO (e.g., genToken calls randomInt).
+    fn detect_io_functions(&mut self, decls: &[ast::Decl]) {
+        let io_builtins: HashSet<&str> = [
+            "println", "putLine", "print", "readLine", "readFile",
+            "writeFile", "appendFile", "fileExists", "removeFile",
+            "listDir", "now", "randomInt", "randomFloat", "fetch", "fetchWith",
+        ].into_iter().collect();
+
+        // Collect function bodies for analysis
+        let mut fun_bodies: Vec<(String, &ast::Expr)> = Vec::new();
+        for decl in decls {
+            if let ast::DeclKind::Fun { name, body, .. } = &decl.node {
+                fun_bodies.push((name.clone(), body));
+            }
+        }
+
+        // Fixed-point: keep iterating until no new IO functions are found
+        loop {
+            let mut changed = false;
+            for (name, body) in &fun_bodies {
+                if self.io_functions.contains(name) {
+                    continue;
+                }
+                if Self::expr_contains_io(body, &io_builtins, &self.io_functions) {
+                    self.io_functions.insert(name.clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    /// Check if an expression contains IO calls (builtins or known IO user functions).
+    fn expr_contains_io(expr: &ast::Expr, builtins: &HashSet<&str>, io_fns: &HashSet<String>) -> bool {
         match &expr.node {
-            ast::ExprKind::App { func, .. } => Self::expr_is_io(func),
-            ast::ExprKind::Var(name) => matches!(
-                name.as_str(),
-                "println" | "putLine" | "print" | "readLine" | "readFile"
-                    | "writeFile" | "appendFile" | "fileExists" | "removeFile"
-                    | "listDir" | "now" | "randomInt" | "randomFloat"
-                    | "fetch" | "fetchWith"
-            ),
+            ast::ExprKind::Var(name) => builtins.contains(name.as_str()) || io_fns.contains(name),
+            ast::ExprKind::App { func, arg } => {
+                Self::expr_contains_io(func, builtins, io_fns)
+                    || Self::expr_contains_io(arg, builtins, io_fns)
+            }
+            ast::ExprKind::Do(stmts) => {
+                stmts.iter().any(|s| match &s.node {
+                    ast::StmtKind::Bind { expr, .. } => Self::expr_contains_io(expr, builtins, io_fns),
+                    ast::StmtKind::Expr(expr) => Self::expr_contains_io(expr, builtins, io_fns),
+                    ast::StmtKind::Let { expr, .. } => Self::expr_contains_io(expr, builtins, io_fns),
+                    _ => false,
+                })
+            }
+            ast::ExprKind::Lambda { body, .. } => Self::expr_contains_io(body, builtins, io_fns),
+            ast::ExprKind::If { then_branch, else_branch, .. } => {
+                Self::expr_contains_io(then_branch, builtins, io_fns)
+                    || Self::expr_contains_io(else_branch, builtins, io_fns)
+            }
+            ast::ExprKind::Case { arms, .. } => {
+                arms.iter().any(|arm| Self::expr_contains_io(&arm.body, builtins, io_fns))
+            }
+            _ => false,
+        }
+    }
+
+    /// Check if an expression produces an IO value (calls an IO-returning builtin
+    /// or a user-defined IO function).
+    fn expr_is_io(&self, expr: &ast::Expr) -> bool {
+        match &expr.node {
+            ast::ExprKind::App { func, .. } => self.expr_is_io(func),
+            ast::ExprKind::Var(name) => {
+                matches!(
+                    name.as_str(),
+                    "println" | "putLine" | "print" | "readLine" | "readFile"
+                        | "writeFile" | "appendFile" | "fileExists" | "removeFile"
+                        | "listDir" | "now" | "randomInt" | "randomFloat"
+                        | "fetch" | "fetchWith"
+                ) || self.io_functions.contains(name)
+            }
             _ => false,
         }
     }

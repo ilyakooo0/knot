@@ -518,7 +518,7 @@ fn expr_is_io(expr: &Expr) -> bool {
             "println" | "putLine" | "print" | "readLine" | "readFile"
                 | "writeFile" | "appendFile" | "fileExists" | "removeFile"
                 | "listDir" | "now" | "randomInt" | "randomFloat"
-                | "fetch" | "fetchWith"
+                | "fetch" | "fetchWith" | "fork"
         ),
         _ => false,
     }

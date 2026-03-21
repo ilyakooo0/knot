@@ -566,6 +566,10 @@ impl Codegen {
         self.declare_rt("knot_random_int_io", &[p], &[p]);
         self.declare_rt("knot_random_float_io", &[], &[p]);
 
+        // Spawn / threading
+        self.declare_rt("knot_fork_io", &[p], &[p]);
+        self.declare_rt("knot_threads_join", &[], &[]);
+
         // HTTP server (routes)
         self.declare_rt("knot_route_table_new", &[], &[p]);
         // (table, method, method_len, path, path_len, ctor, ctor_len,
@@ -821,7 +825,7 @@ impl Codegen {
             "bytesGet",
             "readFile", "writeFile", "appendFile",
             "fileExists", "removeFile", "listDir",
-            "randomInt",
+            "randomInt", "fork",
             "encrypt", "decrypt", "sign", "verify",
         ];
         for name in &stdlib_names {
@@ -1687,6 +1691,9 @@ impl Codegen {
         // Random: 1-param (IO-returning)
         self.define_stdlib_fn_1("randomInt", "knot_random_int_io");
 
+        // Spawn (IO-returning)
+        self.define_stdlib_fn_1("fork", "knot_fork_io");
+
         // Crypto: 2-param (curried)
         self.define_stdlib_fn_2("encrypt", "knot_crypto_encrypt", false);
         self.define_stdlib_fn_2("decrypt", "knot_crypto_decrypt", false);
@@ -2547,6 +2554,10 @@ impl Codegen {
                     builder.ins().call(println_ref, &[executed]);
                 }
             }
+
+            // Join all spawned threads before closing
+            let threads_join_ref = cg.import_rt(builder, "knot_threads_join");
+            builder.ins().call(threads_join_ref, &[]);
 
             // Close database
             let db_close_ref = cg.import_rt(builder, "knot_db_close");
@@ -4252,6 +4263,7 @@ impl Codegen {
             "println", "putLine", "print", "readLine", "readFile",
             "writeFile", "appendFile", "fileExists", "removeFile",
             "listDir", "now", "randomInt", "randomFloat", "fetch", "fetchWith",
+            "spawn",
         ].into_iter().collect();
 
         // Collect function bodies for analysis
@@ -4319,7 +4331,7 @@ impl Codegen {
                     "println" | "putLine" | "print" | "readLine" | "readFile"
                         | "writeFile" | "appendFile" | "fileExists" | "removeFile"
                         | "listDir" | "now" | "randomInt" | "randomFloat"
-                        | "fetch" | "fetchWith"
+                        | "fetch" | "fetchWith" | "fork"
                 ) || self.io_functions.contains(name)
             }
             _ => false,

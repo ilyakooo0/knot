@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 // ── Arena allocator ──────────────────────────────────────────────
 
@@ -55,6 +56,14 @@ impl Arena {
 thread_local! {
     static ARENA: RefCell<Arena> = RefCell::new(Arena::new());
 }
+
+// ── Global state for spawn/threads ───────────────────────────────
+
+/// Database path — set in knot_db_open so spawned threads can open their own connections.
+static DB_PATH: Mutex<String> = Mutex::new(String::new());
+
+/// Join handles for spawned threads — drained in knot_threads_join.
+static THREAD_HANDLES: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
 
 // ── Debug mode ───────────────────────────────────────────────────
 
@@ -1996,6 +2005,91 @@ pub extern "C" fn knot_io_then(io1: *mut Value, io2: *mut Value) -> *mut Value {
     alloc(Value::IO(then_thunk as *const u8, env))
 }
 
+// ── Spawn / threading ────────────────────────────────────────────
+
+/// Deep-clone a Value tree so it can be sent to another thread.
+/// Uses Box::new (not the thread-local arena) so values survive arena resets.
+fn deep_clone_value(val: *mut Value) -> *mut Value {
+    if val.is_null() {
+        return val;
+    }
+    let cloned = match unsafe { &*val } {
+        Value::Int(n) => Value::Int(n.clone()),
+        Value::Float(f) => Value::Float(*f),
+        Value::Text(s) => Value::Text(s.clone()),
+        Value::Bool(b) => Value::Bool(*b),
+        Value::Bytes(b) => Value::Bytes(b.clone()),
+        Value::Unit => Value::Unit,
+        Value::Record(fields) => Value::Record(
+            fields
+                .iter()
+                .map(|f| RecordField {
+                    name: f.name.clone(),
+                    value: deep_clone_value(f.value),
+                })
+                .collect(),
+        ),
+        Value::Relation(rows) => {
+            Value::Relation(rows.iter().map(|r| deep_clone_value(*r)).collect())
+        }
+        Value::Constructor(tag, inner) => {
+            Value::Constructor(tag.clone(), deep_clone_value(*inner))
+        }
+        Value::Function(fn_ptr, env, source) => {
+            // fn_ptr is a code address (shared), env is data (cloned)
+            Value::Function(*fn_ptr, deep_clone_value(*env), source.clone())
+        }
+        Value::IO(fn_ptr, env) => {
+            // fn_ptr is a code address (shared), env is data (cloned)
+            Value::IO(*fn_ptr, deep_clone_value(*env))
+        }
+    };
+    Box::into_raw(Box::new(cloned))
+}
+
+/// Fork an IO action onto a new OS thread.
+/// Takes an IO value, returns an IO thunk that spawns the thread.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
+    // Capture the IO value in the thunk's environment
+    let env = io_val;
+
+    extern "C" fn spawn_thunk(_db: *mut c_void, env: *mut Value) -> *mut Value {
+        // Deep-clone the IO value on the parent thread before sending.
+        // Convert to usize to satisfy Send (deep_clone produces an independent tree).
+        let cloned_io = deep_clone_value(env) as *mut u8 as usize;
+
+        let handle = std::thread::spawn(move || {
+            let io = cloned_io as *mut u8 as *mut Value;
+            // Open a new DB connection for this thread
+            let db_path = DB_PATH.lock().unwrap().clone();
+            let db = knot_db_open(db_path.as_ptr(), db_path.len());
+
+            // Run the IO action
+            knot_io_run(db, io);
+
+            // Close DB and clean up cloned values
+            knot_db_close(db);
+        });
+
+        THREAD_HANDLES.lock().unwrap().push(handle);
+        alloc(Value::Unit)
+    }
+
+    alloc(Value::IO(spawn_thunk as *const u8, env))
+}
+
+/// Join all spawned threads. Called from generated main before db close.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_threads_join() {
+    let handles: Vec<_> = THREAD_HANDLES.lock().unwrap().drain(..).collect();
+    for handle in handles {
+        if let Err(e) = handle.join() {
+            eprintln!("knot runtime: spawned thread panicked: {:?}", e);
+        }
+    }
+}
+
 // ── IO wrappers for effectful functions ──────────────────────────
 
 #[unsafe(no_mangle)]
@@ -3011,6 +3105,8 @@ pub extern "C" fn knot_fs_list_dir(path: *mut Value) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_db_open(path_ptr: *const u8, path_len: usize) -> *mut c_void {
     let path = unsafe { str_from_raw(path_ptr, path_len) };
+    // Store path globally so spawned threads can open their own connections
+    *DB_PATH.lock().unwrap() = path.to_string();
     let conn = Connection::open(path).expect("knot runtime: failed to open database");
     conn.create_collation("KNOT_INT", |a: &str, b: &str| {
         let pa: BigInt = a.parse().unwrap_or_default();
@@ -7095,8 +7191,6 @@ fn fetch_build_err(status: u16, message: &str) -> *mut Value {
 }
 
 // ── OpenAPI spec generation ──────────────────────────────────────
-
-use std::sync::Mutex;
 
 struct SendPtr(*mut c_void);
 unsafe impl Send for SendPtr {}

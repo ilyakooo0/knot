@@ -2044,7 +2044,7 @@ impl Infer {
                     "println" | "putLine" | "print" | "readLine" | "readFile"
                         | "writeFile" | "appendFile" | "fileExists" | "removeFile"
                         | "listDir" | "now" | "randomInt" | "randomFloat"
-                        | "fetch" | "fetchWith"
+                        | "fetch" | "fetchWith" | "fork"
                 ),
                 _ => false,
             }
@@ -2594,6 +2594,16 @@ impl Infer {
         self.bind_top("randomFloat", Scheme::mono(
             Ty::IO(BTreeSet::from([IoEffect::Random]), Box::new(Ty::Float)),
         ));
+
+        // spawn : ∀a. a -> IO {} {}
+        let a = self.fresh_var();
+        self.bind_top(
+            "fork",
+            Scheme::poly(vec![a], Ty::Fun(
+                Box::new(Ty::Var(a)),
+                Box::new(Ty::IO(BTreeSet::new(), Box::new(Ty::unit()))),
+            )),
+        );
 
         // __bind, __yield, __empty are handled as special cases in infer_expr
         // with polymorphic HKT types: ∀m a b. (a -> m b) -> m a -> m b, etc.

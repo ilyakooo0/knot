@@ -365,6 +365,12 @@ impl EffectChecker {
                             ),
                     );
                 }
+                if inner_effects.reads.is_empty() && inner_effects.writes.is_empty() {
+                    self.diagnostics.push(
+                        Diagnostic::error("atomic block must interact with relations")
+                            .label(expr.span, "this atomic block has no relation reads or writes"),
+                    );
+                }
                 inner_effects
             }
 
@@ -814,8 +820,9 @@ mod tests {
             arg: Box::new(spanned(ExprKind::Lit(Literal::Text("hello".into())))),
         }))));
         let (diags, _effects) = check_module(vec![make_fun("f", body)]);
-        assert_eq!(diags.len(), 1);
+        assert_eq!(diags.len(), 2);
         assert!(diags[0].message.contains("IO effects"));
+        assert!(diags[1].message.contains("must interact with relations"));
     }
 
     #[test]
@@ -832,14 +839,14 @@ mod tests {
     }
 
     #[test]
-    fn atomic_clock_ok() {
-        // atomic (now) — clock is allowed in atomic
+    fn atomic_clock_without_relations_error() {
+        // atomic (now) — clock alone has no relation interaction
         let body = spanned(ExprKind::Atomic(Box::new(spanned(ExprKind::Var(
             "now".into(),
         )))));
-        let (diags, effects) = check_module(vec![make_fun("f", body)]);
-        assert!(diags.is_empty());
-        assert!(effects["f"].clock);
+        let (diags, _effects) = check_module(vec![make_fun("f", body)]);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("must interact with relations"));
     }
 
     #[test]

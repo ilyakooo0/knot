@@ -220,6 +220,9 @@ struct Infer {
     /// produces `IO {} expr_type` instead of `[expr_type]`, allowing yield to
     /// be used as "return unit" in if/case branches within IO do blocks.
     in_io_do: bool,
+
+    /// Whether we are currently inside an `atomic` block.
+    in_atomic: bool,
 }
 
 // ── Core operations ───────────────────────────────────────────────
@@ -248,6 +251,7 @@ impl Infer {
             fetch_response_types: HashMap::new(),
             fetch_response_headers: HashMap::new(),
             in_io_do: false,
+            in_atomic: false,
         }
     }
 
@@ -1385,6 +1389,12 @@ impl Infer {
             }
 
             ast::ExprKind::Var(name) => {
+                if name == "retry" && !self.in_atomic {
+                    self.error(
+                        "'retry' can only be used inside an 'atomic' block".to_string(),
+                        expr.span,
+                    );
+                }
                 if let Some(ty) = self.lookup_instantiate_at(name, expr.span) {
                     ty
                 } else {
@@ -1618,7 +1628,13 @@ impl Infer {
                 Ty::unit()
             }
 
-            ast::ExprKind::Atomic(inner) => self.infer_expr(inner),
+            ast::ExprKind::Atomic(inner) => {
+                let prev = self.in_atomic;
+                self.in_atomic = true;
+                let ty = self.infer_expr(inner);
+                self.in_atomic = prev;
+                ty
+            }
 
             ast::ExprKind::At { relation, time } => {
                 let rel_ty = self.infer_expr(relation);

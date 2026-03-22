@@ -2605,6 +2605,10 @@ impl Infer {
             )),
         );
 
+        // retry : ∀a. a (polymorphic bottom — usable in any context inside atomic)
+        let a = self.fresh_var();
+        self.bind_top("retry", Scheme::poly(vec![a], Ty::Var(a)));
+
         // __bind, __yield, __empty are handled as special cases in infer_expr
         // with polymorphic HKT types: ∀m a b. (a -> m b) -> m a -> m b, etc.
         // This allows do-block desugaring to work with any monad, not just [].

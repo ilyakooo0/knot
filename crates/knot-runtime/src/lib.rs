@@ -16,7 +16,8 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 // ── Arena allocator ──────────────────────────────────────────────
 
@@ -64,6 +65,25 @@ static DB_PATH: Mutex<String> = Mutex::new(String::new());
 
 /// Join handles for spawned threads — drained in knot_threads_join.
 static THREAD_HANDLES: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+
+// ── STM retry support ────────────────────────────────────────────
+
+/// Change counter + condvar for relation write notifications.
+/// `retry` waits here until a relation write increments the counter.
+static RELATION_CHANGED: (Mutex<u64>, Condvar) = (Mutex::new(0), Condvar::new());
+
+thread_local! {
+    /// Set by `knot_stm_retry`, checked by `knot_stm_check_and_clear` after atomic body.
+    static STM_RETRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Notify waiting `retry` callers that a relation has changed.
+fn notify_relation_changed() {
+    let (lock, cvar) = &RELATION_CHANGED;
+    let mut counter = lock.lock().unwrap();
+    *counter += 1;
+    cvar.notify_all();
+}
 
 // ── Debug mode ───────────────────────────────────────────────────
 
@@ -2088,6 +2108,45 @@ pub extern "C" fn knot_threads_join() {
             eprintln!("knot runtime: spawned thread panicked: {:?}", e);
         }
     }
+}
+
+// ── STM retry functions ──────────────────────────────────────────
+
+/// Called by `retry` in Knot. Sets thread-local flag and returns a dummy value.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_stm_retry() -> *mut Value {
+    STM_RETRY.with(|r| r.set(true));
+    alloc(Value::Unit)
+}
+
+/// Check if retry was requested, and clear the flag. Returns 1 if retry, 0 otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_stm_check_and_clear() -> i32 {
+    STM_RETRY.with(|r| {
+        let val = r.get();
+        r.set(false);
+        if val { 1 } else { 0 }
+    })
+}
+
+/// Snapshot the current relation change counter (for `knot_stm_wait`).
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_stm_snapshot() -> i64 {
+    let (lock, _) = &RELATION_CHANGED;
+    *lock.lock().unwrap() as i64
+}
+
+/// Wait until the change counter exceeds the given snapshot.
+/// Used after rollback in a retry loop.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_stm_wait(snapshot: i64) {
+    let (lock, cvar) = &RELATION_CHANGED;
+    let guard = lock.lock().unwrap();
+    let _ = cvar
+        .wait_timeout_while(guard, Duration::from_millis(100), |c| {
+            (*c as i64) <= snapshot
+        })
+        .unwrap();
 }
 
 // ── IO wrappers for effectful functions ──────────────────────────
@@ -4826,6 +4885,7 @@ pub extern "C" fn knot_source_write(
         .conn
         .execute_batch("COMMIT;")
         .expect("knot runtime: failed to commit transaction");
+    notify_relation_changed();
 }
 
 /// Append rows to a source relation (INSERT only, no DELETE).
@@ -4901,6 +4961,7 @@ pub extern "C" fn knot_source_append(
         .conn
         .execute_batch("COMMIT;")
         .expect("knot runtime: failed to commit transaction");
+    notify_relation_changed();
 }
 
 /// Diff-based write: compute minimal INSERT/DELETE against the existing table.
@@ -5147,6 +5208,7 @@ pub extern "C" fn knot_source_diff_write(
         .conn
         .execute_batch("COMMIT;")
         .expect("knot runtime: failed to commit transaction");
+    notify_relation_changed();
 }
 
 /// DELETE rows that don't match a WHERE condition.
@@ -5193,6 +5255,7 @@ pub extern "C" fn knot_source_delete_where(
         .conn
         .execute(&sql, param_refs.as_slice())
         .unwrap_or_else(|e| panic!("knot runtime: delete_where error: {}\n  SQL: {}", e, sql));
+    notify_relation_changed();
 }
 
 /// UPDATE rows matching a WHERE condition with new field values.
@@ -5243,6 +5306,7 @@ pub extern "C" fn knot_source_update_where(
         .conn
         .execute(&sql, param_refs.as_slice())
         .unwrap_or_else(|e| panic!("knot runtime: update_where error: {}\n  SQL: {}", e, sql));
+    notify_relation_changed();
 }
 
 fn value_to_sql_param(v: *mut Value) -> rusqlite::types::Value {
@@ -5646,6 +5710,9 @@ pub extern "C" fn knot_atomic_commit(db: *mut c_void) {
         .execute_batch(&format!("RELEASE SAVEPOINT knot_atomic_{depth};"))
         .expect("knot runtime: failed to commit atomic");
     db_ref.atomic_depth.set(depth - 1);
+    if depth == 1 {
+        notify_relation_changed();
+    }
 }
 
 #[unsafe(no_mangle)]

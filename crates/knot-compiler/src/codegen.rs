@@ -438,6 +438,7 @@ impl Codegen {
         // Transactions
         self.declare_rt("knot_atomic_begin", &[p], &[]);
         self.declare_rt("knot_atomic_commit", &[p], &[]);
+        self.declare_rt("knot_atomic_rollback", &[p], &[]);
 
         // View operations
         self.declare_rt("knot_view_read", &[p, p, p, p, p, p, p, p], &[p]);
@@ -569,6 +570,12 @@ impl Codegen {
         // Spawn / threading
         self.declare_rt("knot_fork_io", &[p], &[p]);
         self.declare_rt("knot_threads_join", &[], &[]);
+
+        // STM retry
+        self.declare_rt("knot_stm_retry", &[], &[p]);
+        self.declare_rt("knot_stm_check_and_clear", &[], &[types::I32]);
+        self.declare_rt("knot_stm_snapshot", &[], &[types::I64]);
+        self.declare_rt("knot_stm_wait", &[types::I64], &[]);
 
         // HTTP server (routes)
         self.declare_rt("knot_route_table_new", &[], &[p]);
@@ -2607,6 +2614,9 @@ impl Codegen {
                 if name == "readLine" {
                     return self.call_rt(builder, "knot_read_line_io", &[]);
                 }
+                if name == "retry" {
+                    return self.call_rt(builder, "knot_stm_retry", &[]);
+                }
                 if let Some(&val) = env.bindings.get(name) {
                     val
                 } else if let Some((func_id, n_params)) =
@@ -3216,10 +3226,41 @@ impl Codegen {
             }
 
             ast::ExprKind::Atomic(inner) => {
+                // Retry loop: if `retry` is called inside, rollback and wait for changes
+                let loop_block = builder.create_block();
+                let retry_block = builder.create_block();
+                let done_block = builder.create_block();
+                builder.append_block_param(done_block, self.ptr_type);
+
+                builder.ins().jump(loop_block, &[]);
+                // loop_block sealed after retry jump is emitted (two predecessors)
+                builder.switch_to_block(loop_block);
+
+                // Snapshot change counter before executing the body
+                let snapshot = self.call_rt(builder, "knot_stm_snapshot", &[]);
                 self.call_rt_void(builder, "knot_atomic_begin", &[db]);
                 let val = self.compile_expr(builder, inner, env, db);
+
+                // Check if retry was requested
+                let retry_flag = self.call_rt(builder, "knot_stm_check_and_clear", &[]);
+                builder.ins().brif(retry_flag, retry_block, &[], done_block, &[val]);
+
+                // Retry: rollback, wait for relation changes, loop back
+                builder.switch_to_block(retry_block);
+                builder.seal_block(retry_block);
+                self.call_rt_void(builder, "knot_atomic_rollback", &[db]);
+                self.call_rt_void(builder, "knot_stm_wait", &[snapshot]);
+                builder.ins().jump(loop_block, &[]);
+
+                // Now loop_block has both predecessors, seal it
+                builder.seal_block(loop_block);
+
+                // Done: commit and return value
+                builder.switch_to_block(done_block);
+                builder.seal_block(done_block);
+                let result = builder.block_params(done_block)[0];
                 self.call_rt_void(builder, "knot_atomic_commit", &[db]);
-                val
+                result
             }
 
             ast::ExprKind::Case {

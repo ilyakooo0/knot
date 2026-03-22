@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 // ── Arena allocator ──────────────────────────────────────────────
@@ -6311,6 +6311,7 @@ pub extern "C" fn knot_relation_fixpoint(
 
 // ── HTTP server (routes) ──────────────────────────────────────────
 
+#[derive(Clone)]
 enum PathPart {
     Literal(String),
     Param(String, String), // (name, type)
@@ -6677,7 +6678,7 @@ extern "C" fn respond_headers_inner(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_http_listen(
-    db: *mut c_void,
+    _db: *mut c_void,
     port_val: *mut Value,
     route_table: *mut c_void,
     handler: *mut Value,
@@ -6686,19 +6687,13 @@ pub extern "C" fn knot_http_listen(
         Value::Int(n) => n.to_u16().expect("knot runtime: port number out of range"),
         _ => panic!("knot runtime: listen expects Int port, got {}", type_name(port_val)),
     };
-    let table = unsafe { &*(route_table as *mut RouteTable) };
+    let table = Arc::new(unsafe { std::ptr::read(route_table as *const RouteTable) });
     let addr = format!("0.0.0.0:{}", port);
-    let server = tiny_http::Server::http(&addr)
-        .unwrap_or_else(|e| panic!("knot runtime: failed to start HTTP server on {}: {}", addr, e));
+    let server = Arc::new(tiny_http::Server::http(&addr)
+        .unwrap_or_else(|e| panic!("knot runtime: failed to start HTTP server on {}: {}", addr, e)));
     eprintln!("Knot HTTP server listening on http://0.0.0.0:{}", port);
 
-    // Mark the arena so that per-request allocations can be freed.
-    // Everything allocated before this point (handler, env, etc.) survives.
-    let arena_mark = knot_arena_mark();
-
     loop {
-        knot_arena_reset_to(arena_mark);
-
         let mut request = match server.recv() {
             Ok(req) => req,
             Err(e) => {
@@ -6716,174 +6711,204 @@ pub extern "C" fn knot_http_listen(
                 eprintln!("[HTTP]     {}: {}", header.field, header.value);
             }
         }
+
         let (path, query_string) = match url.split_once('?') {
-            Some((p, q)) => (p, q),
-            None => (url.as_str(), ""),
+            Some((p, q)) => (p.to_string(), q.to_string()),
+            None => (url.clone(), String::new()),
         };
-        let path_segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let path_segments: Vec<String> = path.split('/').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
 
-        match match_route(&table.entries, &method, &path_segments) {
+        let table = Arc::clone(&table);
+        let path_seg_refs: Vec<&str> = path_segments.iter().map(|s| s.as_str()).collect();
+        let matched = match_route(&table.entries, &method, &path_seg_refs);
+
+        match matched {
             Some((entry, path_params)) => {
-                // Build record from path params, query params, and body
-                let mut fields: Vec<RecordField> = Vec::new();
+                // Read the body on the main thread before moving the request
+                let body_bytes = if !entry.body_fields.is_empty() {
+                    let mut buf = Vec::new();
+                    request.as_reader().read_to_end(&mut buf).unwrap_or(0);
+                    buf
+                } else {
+                    Vec::new()
+                };
 
-                // Path params
-                for (name, val) in &path_params {
-                    let ty = entry
-                        .path_parts
-                        .iter()
-                        .find_map(|p| match p {
-                            PathPart::Param(n, t) if n == name => Some(t.as_str()),
-                            _ => None,
-                        })
-                        .unwrap_or("text");
-                    fields.push(RecordField {
-                        name: name.clone(),
-                        value: string_to_value(val, ty),
-                    });
-                }
+                // Collect request headers as owned strings
+                let req_headers: Vec<(String, String)> = request.headers().iter()
+                    .map(|h| (h.field.as_str().as_str().to_string(), h.value.as_str().to_string()))
+                    .collect();
 
-                // Query params
-                let qs = parse_query_string(query_string);
-                for (qname, qty) in &entry.query_fields {
-                    let val = qs
-                        .get(qname)
-                        .map(|v| v.as_str())
-                        .unwrap_or("");
-                    fields.push(RecordField {
-                        name: qname.clone(),
-                        value: string_to_value(val, qty),
-                    });
-                }
+                // Clone route entry data we need
+                let entry_body_fields = entry.body_fields.clone();
+                let entry_query_fields = entry.query_fields.clone();
+                let entry_path_parts = entry.path_parts.clone();
+                let entry_request_headers = entry.request_headers.clone();
+                let entry_response_headers = entry.response_headers.clone();
+                let entry_constructor = entry.constructor.clone();
 
-                // Body fields (JSON) — flat, same level as path/query params
-                if !entry.body_fields.is_empty() {
-                    let mut body_bytes = Vec::new();
-                    request
-                        .as_reader()
-                        .read_to_end(&mut body_bytes)
-                        .unwrap_or(0);
-                    let body_str = String::from_utf8_lossy(&body_bytes);
-                    if debug_enabled() {
-                        eprintln!("[HTTP]     body: {}", body_str);
+                // Deep-clone handler for the worker thread
+                let handler_cloned = deep_clone_value(handler) as usize;
+
+                std::thread::spawn(move || {
+                    let handler = handler_cloned as *mut Value;
+
+                    // Open a DB connection for this thread
+                    let db_path = DB_PATH.lock().unwrap().clone();
+                    let db = knot_db_open(db_path.as_ptr(), db_path.len());
+
+                    // Build record from path params, query params, and body
+                    let mut fields: Vec<RecordField> = Vec::new();
+
+                    // Path params
+                    for (name, val) in &path_params {
+                        let ty = entry_path_parts
+                            .iter()
+                            .find_map(|p| match p {
+                                PathPart::Param(n, t) if *n == *name => Some(t.as_str()),
+                                _ => None,
+                            })
+                            .unwrap_or("text");
+                        fields.push(RecordField {
+                            name: name.clone(),
+                            value: string_to_value(val, ty),
+                        });
                     }
-                    let json_fields = parse_json_object(&body_str);
-                    for (bname, bty) in &entry.body_fields {
-                        let val = json_fields
-                            .get(bname)
+
+                    // Query params
+                    let qs = parse_query_string(&query_string);
+                    for (qname, qty) in &entry_query_fields {
+                        let val = qs
+                            .get(qname)
                             .map(|v| v.as_str())
                             .unwrap_or("");
                         fields.push(RecordField {
-                            name: bname.clone(),
-                            value: string_to_value(val, bty),
+                            name: qname.clone(),
+                            value: string_to_value(val, qty),
                         });
                     }
-                }
 
-                // Request headers — extract from HTTP request headers
-                for (hname, hty) in &entry.request_headers {
-                    let http_name = camel_to_header_case(hname);
-                    let is_maybe = hty.starts_with('?');
-                    let inner_ty = if is_maybe { &hty[1..] } else { hty.as_str() };
-                    let raw_val = request.headers().iter()
-                        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(&http_name))
-                        .map(|h| h.value.as_str().to_string());
-                    let value = if is_maybe {
-                        match raw_val {
-                            Some(v) => {
-                                let inner = string_to_value(&v, inner_ty);
-                                alloc(Value::Constructor(
-                                    "Just".into(),
-                                    alloc(Value::Record(vec![
-                                        RecordField { name: "value".into(), value: inner },
-                                    ])),
-                                ))
-                            }
-                            None => std::ptr::null_mut(), // Nothing (nullable)
+                    // Body fields (JSON)
+                    if !entry_body_fields.is_empty() {
+                        let body_str = String::from_utf8_lossy(&body_bytes);
+                        if debug_enabled() {
+                            eprintln!("[HTTP]     body: {}", body_str);
                         }
+                        let json_fields = parse_json_object(&body_str);
+                        for (bname, bty) in &entry_body_fields {
+                            let val = json_fields
+                                .get(bname)
+                                .map(|v| v.as_str())
+                                .unwrap_or("");
+                            fields.push(RecordField {
+                                name: bname.clone(),
+                                value: string_to_value(val, bty),
+                            });
+                        }
+                    }
+
+                    // Request headers
+                    for (hname, hty) in &entry_request_headers {
+                        let http_name = camel_to_header_case(hname);
+                        let is_maybe = hty.starts_with('?');
+                        let inner_ty = if is_maybe { &hty[1..] } else { hty.as_str() };
+                        let raw_val = req_headers.iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(&http_name))
+                            .map(|(_, v)| v.clone());
+                        let value = if is_maybe {
+                            match raw_val {
+                                Some(v) => {
+                                    let inner = string_to_value(&v, inner_ty);
+                                    alloc(Value::Constructor(
+                                        "Just".into(),
+                                        alloc(Value::Record(vec![
+                                            RecordField { name: "value".into(), value: inner },
+                                        ])),
+                                    ))
+                                }
+                                None => std::ptr::null_mut(),
+                            }
+                        } else {
+                            let v = raw_val.unwrap_or_default();
+                            string_to_value(&v, inner_ty)
+                        };
+                        fields.push(RecordField {
+                            name: hname.clone(),
+                            value,
+                        });
+                    }
+
+                    // Add `respond` field
+                    let has_resp_headers = !entry_response_headers.is_empty();
+                    if has_resp_headers {
+                        fields.push(RecordField {
+                            name: "respond".to_string(),
+                            value: alloc(Value::Function(
+                                respond_with_headers as *const u8,
+                                std::ptr::null_mut(),
+                                "respond".to_string(),
+                            )),
+                        });
                     } else {
-                        let v = raw_val.unwrap_or_default();
-                        string_to_value(&v, inner_ty)
-                    };
-                    fields.push(RecordField {
-                        name: hname.clone(),
-                        value,
-                    });
-                }
+                        fields.push(RecordField {
+                            name: "respond".to_string(),
+                            value: alloc(Value::Function(
+                                respond_identity as *const u8,
+                                std::ptr::null_mut(),
+                                "respond".to_string(),
+                            )),
+                        });
+                    }
 
-                // Add `respond` field — identity or curried with headers
-                let has_resp_headers = !entry.response_headers.is_empty();
-                if has_resp_headers {
-                    fields.push(RecordField {
-                        name: "respond".to_string(),
-                        value: alloc(Value::Function(
-                            respond_with_headers as *const u8,
-                            std::ptr::null_mut(),
-                            "respond".to_string(),
-                        )),
-                    });
-                } else {
-                    fields.push(RecordField {
-                        name: "respond".to_string(),
-                        value: alloc(Value::Function(
-                            respond_identity as *const u8,
-                            std::ptr::null_mut(),
-                            "respond".to_string(),
-                        )),
-                    });
-                }
+                    let record = alloc(Value::Record(fields));
+                    let ctor_val = alloc(Value::Constructor(entry_constructor, record));
 
-                let record = alloc(Value::Record(fields));
-                // Wrap in constructor
-                let tag = entry.constructor.clone();
-                let ctor_val = alloc(Value::Constructor(tag, record));
+                    // Call handler
+                    let mut result = knot_value_call(db, handler, ctor_val);
+                    while matches!(unsafe { as_ref(result) }, Value::IO(..)) {
+                        result = knot_io_run(db, result);
+                    }
 
-                // Call handler — run IO thunks until we get a plain value
-                let mut result = knot_value_call(db, handler, ctor_val);
-                while matches!(unsafe { as_ref(result) }, Value::IO(..)) {
-                    result = knot_io_run(db, result);
-                }
-
-                if has_resp_headers {
-                    // Result is {body: ..., headers: ...}
-                    let body_val = knot_record_field(result, "body".as_ptr(), 4);
-                    let hdrs_val = knot_record_field(result, "headers".as_ptr(), 7);
-                    let json = value_to_json(body_val);
-                    let mut response = tiny_http::Response::from_string(&json)
-                        .with_header(
-                            "Content-Type: application/json"
-                                .parse::<tiny_http::Header>()
-                                .unwrap(),
-                        );
-                    // Set response headers from the headers record
-                    if let Value::Record(hdr_fields) = unsafe { as_ref(hdrs_val) } {
-                        for hf in hdr_fields {
-                            let http_name = camel_to_header_case(&hf.name);
-                            let hdr_value = fetch_value_to_text(hf.value);
-                            if let Ok(header) = format!("{}: {}", http_name, hdr_value)
-                                .parse::<tiny_http::Header>()
-                            {
-                                response = response.with_header(header);
+                    if has_resp_headers {
+                        let body_val = knot_record_field(result, "body".as_ptr(), 4);
+                        let hdrs_val = knot_record_field(result, "headers".as_ptr(), 7);
+                        let json = value_to_json(body_val);
+                        let mut response = tiny_http::Response::from_string(&json)
+                            .with_header(
+                                "Content-Type: application/json"
+                                    .parse::<tiny_http::Header>()
+                                    .unwrap(),
+                            );
+                        if let Value::Record(hdr_fields) = unsafe { as_ref(hdrs_val) } {
+                            for hf in hdr_fields {
+                                let http_name = camel_to_header_case(&hf.name);
+                                let hdr_value = fetch_value_to_text(hf.value);
+                                if let Ok(header) = format!("{}: {}", http_name, hdr_value)
+                                    .parse::<tiny_http::Header>()
+                                {
+                                    response = response.with_header(header);
+                                }
                             }
                         }
+                        if debug_enabled() {
+                            eprintln!("[HTTP] --> 200 {}", json);
+                        }
+                        let _ = request.respond(response);
+                    } else {
+                        let json = value_to_json(result);
+                        if debug_enabled() {
+                            eprintln!("[HTTP] --> 200 {}", json);
+                        }
+                        let response = tiny_http::Response::from_string(&json)
+                            .with_header(
+                                "Content-Type: application/json"
+                                    .parse::<tiny_http::Header>()
+                                    .unwrap(),
+                            );
+                        let _ = request.respond(response);
                     }
-                    if debug_enabled() {
-                        eprintln!("[HTTP] --> 200 {}", json);
-                    }
-                    let _ = request.respond(response);
-                } else {
-                    let json = value_to_json(result);
-                    if debug_enabled() {
-                        eprintln!("[HTTP] --> 200 {}", json);
-                    }
-                    let response = tiny_http::Response::from_string(&json)
-                        .with_header(
-                            "Content-Type: application/json"
-                                .parse::<tiny_http::Header>()
-                                .unwrap(),
-                        );
-                    let _ = request.respond(response);
-                }
+
+                    knot_db_close(db);
+                });
             }
             None => {
                 if debug_enabled() {

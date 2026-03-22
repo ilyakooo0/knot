@@ -515,11 +515,9 @@ impl Infer {
                 // Effects are merged (union) — not unified
                 let _ = (e1, e2);
             }
-            // In IO do blocks, silently allow IO and Relation types to unify
-            // with other types. Route handlers freely mix IO operations,
-            // relational operations, and `respond` calls in if/case branches
-            // — strict enforcement would reject valid server code.
-            (Ty::IO(_, _), _) | (_, Ty::IO(_, _)) if self.in_io_do => {}
+            // In IO do blocks, silently allow Relation types to unify
+            // with other types. Route handlers freely mix relational
+            // operations and `respond` calls in if/case branches.
             (Ty::Relation(_), _) | (_, Ty::Relation(_)) if self.in_io_do => {}
 
             // ── Row-polymorphic variants ────────────────────────
@@ -2611,12 +2609,13 @@ impl Infer {
             Ty::IO(BTreeSet::from([IoEffect::Random]), Box::new(Ty::Float)),
         ));
 
-        // spawn : ∀a. a -> IO {} {}
-        let a = self.fresh_var();
+        // fork : IO {} {} -> IO {} {}
+        // Argument must be an IO action. Empty effect set unifies with any
+        // concrete IO type since IO unification merges effect sets.
         self.bind_top(
             "fork",
-            Scheme::poly(vec![a], Ty::Fun(
-                Box::new(Ty::Var(a)),
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::IO(BTreeSet::new(), Box::new(Ty::unit()))),
                 Box::new(Ty::IO(BTreeSet::new(), Box::new(Ty::unit()))),
             )),
         );

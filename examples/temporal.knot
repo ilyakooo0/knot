@@ -18,7 +18,7 @@ giveRaises = do
 
 main = do
   addEmployees
-  let t1 = now
+  t1 <- now
   giveRaises
   let current = *employees
   let past = *employees @(t1)

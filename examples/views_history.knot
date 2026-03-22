@@ -18,7 +18,7 @@ main = do
   set *openTodos = union *openTodos [{title: "Fix bug", owner: "Bob"}]
 
   -- Snapshot time after initial adds
-  let t1 = now
+  t1 <- now
 
   -- Complete a todo (move from open to done)
   set *todos = do

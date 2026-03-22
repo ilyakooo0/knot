@@ -6495,51 +6495,7 @@ fn hex_val(b: u8) -> u8 {
     }
 }
 
-/// Minimal JSON object parser. Handles {"key": value, ...} with string, number, bool, null values.
-fn parse_json_object(s: &str) -> HashMap<String, String> {
-    let s = s.trim();
-    if !s.starts_with('{') || !s.ends_with('}') {
-        return HashMap::new();
-    }
-    let inner = &s[1..s.len() - 1];
-    let mut result = HashMap::new();
-    let mut rest = inner.trim();
-    while !rest.is_empty() {
-        // Parse key
-        let key;
-        if rest.starts_with('"') {
-            let end = rest[1..].find('"').map(|i| i + 1).unwrap_or(rest.len());
-            key = rest[1..end].to_string();
-            rest = rest[end + 1..].trim();
-        } else {
-            break;
-        }
-        // Skip colon
-        if rest.starts_with(':') {
-            rest = rest[1..].trim();
-        } else {
-            break;
-        }
-        // Parse value
-        if rest.starts_with('"') {
-            let end = rest[1..].find('"').map(|i| i + 1).unwrap_or(rest.len());
-            let val = rest[1..end].to_string();
-            rest = rest[end + 1..].trim();
-            result.insert(key, val);
-        } else {
-            // number, bool, null — read until comma or end
-            let end = rest.find(',').unwrap_or(rest.len());
-            let val = rest[..end].trim().to_string();
-            rest = rest[end..].trim_start();
-            result.insert(key, val);
-        }
-        // Skip comma
-        if rest.starts_with(',') {
-            rest = rest[1..].trim();
-        }
-    }
-    result
-}
+
 
 fn string_to_value(s: &str, ty: &str) -> *mut Value {
     match ty {
@@ -6793,16 +6749,28 @@ pub extern "C" fn knot_http_listen(
                         if debug_enabled() {
                             eprintln!("[HTTP]     body: {}", body_str);
                         }
-                        let json_fields = parse_json_object(&body_str);
-                        for (bname, bty) in &entry_body_fields {
-                            let val = json_fields
-                                .get(bname)
-                                .map(|v| v.as_str())
-                                .unwrap_or("");
-                            fields.push(RecordField {
-                                name: bname.clone(),
-                                value: string_to_value(val, bty),
-                            });
+                        let (body_val, _) = parse_json_value(&body_str);
+                        match unsafe { as_ref(body_val) } {
+                            Value::Record(body_fields) => {
+                                for (bname, _bty) in &entry_body_fields {
+                                    let val = body_fields.iter()
+                                        .find(|f| f.name == *bname)
+                                        .map(|f| f.value)
+                                        .unwrap_or_else(|| alloc(Value::Text(String::new())));
+                                    fields.push(RecordField {
+                                        name: bname.clone(),
+                                        value: val,
+                                    });
+                                }
+                            }
+                            _ => {
+                                for (bname, bty) in &entry_body_fields {
+                                    fields.push(RecordField {
+                                        name: bname.clone(),
+                                        value: string_to_value("", bty),
+                                    });
+                                }
+                            }
                         }
                     }
 

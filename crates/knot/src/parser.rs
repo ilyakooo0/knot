@@ -404,7 +404,17 @@ impl Parser {
                 Some(item) => items.push(item),
                 None => break,
             }
+            // Peek past newlines to check if the next item is still in
+            // this block. If not, DON'T consume the newlines — they act
+            // as separators for the outer parser (e.g. parse_application
+            // uses newlines to distinguish same-line args from multi-line
+            // continuation).
+            let saved = self.save();
             self.skip_newlines();
+            if self.at_eof() || self.column_of(&self.span()) < indent {
+                self.restore(saved);
+                break;
+            }
         }
         self.block_indent = prev_block_indent;
         items

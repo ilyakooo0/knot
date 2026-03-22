@@ -1640,9 +1640,19 @@ impl Infer {
             ast::ExprKind::Atomic(inner) => {
                 let prev = self.in_atomic;
                 self.in_atomic = true;
-                let ty = self.infer_expr(inner);
+                let inner_ty = self.infer_expr(inner);
                 self.in_atomic = prev;
-                ty
+                // atomic : IO {} a -> IO {} a
+                match &inner_ty {
+                    Ty::IO(_, _) => inner_ty,
+                    _ => {
+                        self.error(
+                            "atomic body must be an IO expression".to_string(),
+                            expr.span,
+                        );
+                        inner_ty
+                    }
+                }
             }
 
             ast::ExprKind::At { relation, time } => {

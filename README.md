@@ -34,14 +34,17 @@ examples/            Example .knot programs
 type Person = {name: Text, age: Int}
 *people : [Person]
 
-&seniors = *people |> filter (\p -> p.age > 65)
+&seniors = do
+  people <- *people
+  yield (filter (\p -> p.age > 65) people)
 
 main = do
   set *people = [
     {name: "Alice", age: 30},
     {name: "Bob", age: 70}
   ]
-  println (count &seniors)
+  seniors <- &seniors
+  println (count seniors)
   yield {}
 ```
 

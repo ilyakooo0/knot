@@ -44,7 +44,9 @@ defaultPriority = Low {}
 httpCodes = [{code: 200, name: "OK"}, {code: 404, name: "Not Found"}]
 
 -- Derived: references source relations, recomputed on access (read-only)
-&seniors = *people |> filter (\p -> p.age > 65)
+&seniors = do
+  people <- *people
+  yield (filter (\p -> p.age > 65) people)
 
 -- Type alias: just a name for a type
 type Person = {name: Text, age: Int}
@@ -124,17 +126,23 @@ Bind through multiple levels with `<-`:
 ```knot
 -- All people across all teams
 &allMembers = do
-  t <- *teams
-  m <- t.members
-  yield {team: t.name, member: m.name}
+  teams <- *teams
+  let result = do
+    t <- teams
+    m <- t.members
+    yield {team: t.name, member: m.name}
+  yield result
 
 -- Engineers on large teams
 &engineers = do
-  t <- *teams
-  where (count t.members) > 10
-  m <- t.members
-  where m.role == "engineer"
-  yield {team: t.name, name: m.name}
+  teams <- *teams
+  let result = do
+    t <- teams
+    where (count t.members) > 10
+    m <- t.members
+    where m.role == "engineer"
+    yield {team: t.name, name: m.name}
+  yield result
 ```
 
 #### Updating Nested Relations
@@ -143,17 +151,19 @@ Use `set` with a `map` over the outer relation that transforms the nested relati
 
 ```knot
 -- Add a member to a team
-addMember = \teamName person ->
+addMember = \teamName person -> do
+  teams <- *teams
   set *teams = do
-    t <- *teams
+    t <- teams
     yield (if t.name == teamName
       then {t | members: union t.members [person]}
       else t)
 
 -- Remove a member from all teams
-removePerson = \personName ->
+removePerson = \personName -> do
+  teams <- *teams
   set *teams = do
-    t <- *teams
+    t <- teams
     yield {t | members: do
       m <- t.members
       where m.name != personName
@@ -171,17 +181,23 @@ type FlatMembership = {team: Text, member: Text, age: Int}
 
 -- Nest: group a flat relation into nested structure
 &nested = do
-  t <- do m <- *memberships; yield m.team
-  yield {name: t, members: do
-    m <- *memberships
-    where m.team == t
-    yield {name: m.member, age: m.age}}
+  memberships <- *memberships
+  let result = do
+    t <- do m <- memberships; yield m.team
+    yield {name: t, members: do
+      m <- memberships
+      where m.team == t
+      yield {name: m.member, age: m.age}}
+  yield result
 
 -- Flatten: expand nested relation into flat rows
 &flat = do
-  t <- *teams
-  m <- t.members
-  yield {team: t.name, member: m.name, age: m.age}
+  teams <- *teams
+  let result = do
+    t <- teams
+    m <- t.members
+    yield {team: t.name, member: m.name, age: m.age}
+  yield result
 ```
 
 #### Deeply Nested Relations
@@ -195,12 +211,15 @@ type Course = {name: Text, students: [{name: Text, grades: [{subject: Text, scor
 
 -- Find all failing grades across all departments
 &failing = do
-  d <- *departments
-  c <- d.courses
-  s <- c.students
-  g <- s.grades
-  where g.score < 50
-  yield {dept: d.name, course: c.name, student: s.name, subject: g.subject, score: g.score}
+  departments <- *departments
+  let result = do
+    d <- departments
+    c <- d.courses
+    s <- c.students
+    g <- s.grades
+    where g.score < 50
+    yield {dept: d.name, course: c.name, student: s.name, subject: g.subject, score: g.score}
+  yield result
 ```
 
 ## Primitives
@@ -236,15 +255,21 @@ trait Foldable (t : Type -> Type) where
 - `yield x` is `Applicative.yield`
 - `where cond` desugars to `if cond then yield {} else empty` (requires `Alternative`)
 
-IO do blocks (those containing IO-returning builtins like `println`, `readFile`, `now`) are not desugared — they use a dedicated compilation path that sequences IO actions directly.
+IO do blocks (those containing IO-returning expressions like `*rel`, `println`, `readFile`, `now`) are not desugared — they use a dedicated compilation path that sequences IO actions directly.
 
 ```knot
--- do with [] (relation comprehension)
-&richEmployees = do
-  e <- *employees
-  d <- *departments
+-- do with [] (pure relation comprehension over plain values)
+richOnes = \employees departments -> do
+  e <- employees
+  d <- departments
   where e.dept == d.name
   yield {e.name, e.salary, d.budget}
+
+-- IO do block (binds from *rel, which returns IO)
+&richEmployees = do
+  employees <- *employees
+  departments <- *departments
+  yield (richOnes employees departments)
 
 -- do with Maybe
 safeDivide = \a b -> do
@@ -285,7 +310,7 @@ impl Foldable [] where
 
 | Primitive | Type | Description |
 |-----------|------|-------------|
-| `set` | `[a] -> [a] -> {}` | Set a persistent relation to a new value |
+| `set` | `*[a] -> [a] -> IO {} {}` | Set a persistent relation to a new value |
 
 Everything else comes from traits:
 
@@ -384,28 +409,33 @@ match = \Circle shapes -> do
 
 ### Comprehensions
 
-Relation comprehensions use `do` syntax with `yield` to produce rows:
+Relation comprehensions use `do` syntax with `yield` to produce rows. Since relation references (`*rel`, `&rel`) return `IO {} value`, you IO-bind to get the value, then use a pure comprehension on the plain value:
 
 ```knot
 &richEmployees = do
-  e <- *employees
-  d <- *departments
-  where e.dept == d.name
-  where d.budget > 1_000_000
-  yield {e.name, e.salary, d.budget}
+  employees <- *employees
+  departments <- *departments
+  let result = do
+    e <- employees
+    d <- departments
+    where e.dept == d.name
+    where d.budget > 1_000_000
+    yield {e.name, e.salary, d.budget}
+  yield result
 ```
 
-`<-` draws from a relation (like a `FROM` clause). `where` filters (like a `WHERE` clause). `yield` emits a row into the result relation. This desugars to relational algebra so the optimizer can work on it.
+The outer do-block is an IO do-block that binds from `*employees` (type `IO {} [Employee]`) and `*departments` (type `IO {} [Department]`). The inner `let result = do ...` is a pure comprehension over plain relation values. `<-` draws from a relation (like a `FROM` clause). `where` filters (like a `WHERE` clause). `yield` emits a row into the result relation.
 
 ### Pipe-Forward Composition
 
 Derived combinators like `filter` compose with `|>`:
 
 ```knot
-&highEarners =
-  *employees
+&highEarners = do
+  employees <- *employees
+  yield (employees
     |> filter (\e -> e.salary > 150000)
-    |> map (\e -> {name: e.name, salary: e.salary})
+    |> map (\e -> {name: e.name, salary: e.salary}))
 ```
 
 ### Querying by Variant: `match`
@@ -413,10 +443,17 @@ Derived combinators like `filter` compose with `|>`:
 `match` filters to one variant and exposes its fields:
 
 ```knot
-&circles = *shapes |> match Circle    -- : [{radius: Float}]
-&rects   = *shapes |> match Rect      -- : [{width: Float, height: Float}]
+&circles = do                              -- : IO {} [{radius: Float}]
+  shapes <- *shapes
+  yield (shapes |> match Circle)
 
-&bigCircles = &circles |> filter (\c -> c.radius > 10)
+&rects = do                                -- : IO {} [{width: Float, height: Float}]
+  shapes <- *shapes
+  yield (shapes |> match Rect)
+
+&bigCircles = do
+  circles <- &circles
+  yield (filter (\c -> c.radius > 10) circles)
 ```
 
 ### Pattern Matching in Comprehensions
@@ -425,15 +462,21 @@ Pattern matching on `<-` filters and binds in one step:
 
 ```knot
 &bigCircleAreas = do
-  Circle c <- *shapes
-  where c.radius > 10
-  yield {area: pi * c.radius * c.radius}
+  shapes <- *shapes
+  let result = do
+    Circle c <- shapes
+    where c.radius > 10
+    yield {area: pi * c.radius * c.radius}
+  yield result
 
 &blockedDetails = do
-  t <- *tickets
-  Blocked {dependencies} <- t.status
-  dep <- dependencies
-  yield {t.title, dep}
+  tickets <- *tickets
+  let result = do
+    t <- tickets
+    Blocked {dependencies} <- t.status
+    dep <- dependencies
+    yield {t.title, dep}
+  yield result
 ```
 
 ### Cross-Variant Operations
@@ -441,9 +484,10 @@ Pattern matching on `<-` filters and binds in one step:
 Operate on the whole relation with `case`:
 
 ```knot
-scale = \factor ->
+scale = \factor -> do
+  shapes <- *shapes
   set *shapes = do
-    s <- *shapes
+    s <- shapes
     yield (case s of
       Circle {radius}       -> Circle {radius: radius * factor}
       Rect {width, height}  -> Rect {width: width * factor, height: height * factor})
@@ -464,10 +508,13 @@ describe = \rel -> case rel of
 
 ```knot
 &workload = do
-  t <- *todos
-  where t.done == 0
-  groupBy {t.owner}
-  yield {owner: t.owner, count: count t}
+  todos <- *todos
+  let result = do
+    t <- todos
+    where t.done == 0
+    groupBy {t.owner}
+    yield {owner: t.owner, count: count t}
+  yield result
 ```
 
 The key expression is a record literal whose fields select the grouping columns. After `groupBy {t.owner}`, `t` is rebound from a single row to a sub-relation of all rows sharing that `owner` value. Field access on a group (e.g. `t.owner`) returns the shared key value. Aggregate functions like `count` operate on the whole group.
@@ -476,43 +523,53 @@ Multiple key fields group by their combination:
 
 ```knot
 &summary = do
-  o <- *orders
-  groupBy {o.region, o.status}
-  yield {region: o.region, status: o.status, total: count o}
+  orders <- *orders
+  let result = do
+    o <- orders
+    groupBy {o.region, o.status}
+    yield {region: o.region, status: o.status, total: count o}
+  yield result
 ```
 
 Grouping is executed via SQLite — key columns are inserted into a temp table and sorted with `ORDER BY`, then consecutive rows with matching keys are collected into groups.
 
 ## Effects and the IO Monad
 
-### Two Kinds of Effects
+### Unified Effect Model
 
-Knot distinguishes two kinds of effects:
+All state operations in Knot return IO values. The IO type carries an effect set that distinguishes DB operations from external effects:
 
-1. **DB effects** (`reads`, `writes`) — implicit, inferred by the compiler, part of the relational core. These are not wrapped in IO.
-2. **External effects** (`console`, `fs`, `network`, `clock`, `random`) — tracked in the `IO` type. Functions that perform external effects return `IO {effects} a` values instead of executing immediately.
+- **DB operations** return `IO {} value` — the empty effect set `{}` indicates pure database interaction with no external side effects. Source refs (`*rel`), derived refs (`&rel`), `set`, `full set`, and temporal queries (`@(timestamp)`) all return `IO {} value`.
+- **External effects** carry specific tags: `IO {console} {}`, `IO {fs} Text`, `IO {network} Result`, `IO {clock} Int`, `IO {random} Float`.
+
+This unified model means all stateful code lives in IO do-blocks, while pure comprehensions over plain values remain non-IO.
 
 ### The IO Type
 
-External effects are pure — effectful functions return descriptions of effects (`IO {effects} a`) rather than performing them. IO values are thunks that execute when run.
+Effectful functions return descriptions of effects (`IO {effects} a`) rather than performing them. IO values are thunks that execute when run.
 
 ```knot
--- println returns an IO action, doesn't print immediately
+-- DB operations return IO with empty effects
+*people : [Person]
+-- *people : IO {} [Person]
+
+-- println returns an IO action with console effect
 println : a -> IO {console} {}
 
--- readFile returns an IO action
+-- readFile returns an IO action with fs effect
 readFile : Text -> IO {fs} Text
 
--- now returns an IO action
+-- now returns an IO action with clock effect
 now : IO {clock} Int
 ```
 
 ### IO Do-Blocks
 
-IO do-blocks sequence effects. The `<-` operator runs an IO action and binds its result:
+IO do-blocks sequence effects. The `<-` operator runs an IO action and binds its result. Since relation references return IO, you bind to get the plain value, then use pure comprehensions:
 
 ```knot
 main = do
+  people <- *people                  -- IO {} [Person] → binds [Person]
   content <- readFile "input.txt"    -- IO {fs} Text → binds Text
   println content                     -- IO {console} {}
   t <- now                            -- IO {clock} Int → binds Int
@@ -521,35 +578,38 @@ main = do
 -- overall type: IO {fs, console, clock} {}
 ```
 
-### Relation Comprehensions Are Unaffected
-
-Relation do-blocks (`<-` from `[T]`) still work exactly as before — no IO wrapping:
+The pattern for querying relations is: IO-bind to get the value, then pure comprehension on the plain value:
 
 ```knot
-&seniors = do
-  p <- *people          -- [Person] → binds Person
-  where p.age > 65
-  yield p
--- type: [Person]
+&richEmployees = do
+  employees <- *employees       -- IO bind: [Employee] from IO {} [Employee]
+  let result = do               -- pure comprehension on the value
+    e <- employees
+    where e.salary > 100000
+    yield e
+  yield result
 ```
 
 The compiler detects whether a do-block is IO or relational based on the types of bound expressions. IO do-blocks work correctly in all positions, including as branches of `if`/`then`/`else`.
 
 ### DB Effect Inference
 
-DB effects are still inferred as fine-grained capabilities:
+DB effects are still inferred as fine-grained capabilities (`{reads *rel}`, `{writes *rel}`), but all relation access returns IO values:
 
 ```knot
 -- Pure (inferred: no effects)
 formatName = \n -> toUpper (take 1 n) ++ drop 1 n
 
 -- DB read (inferred: {reads *people})
-&seniors = *people |> filter (\p -> p.age > 65)
+&seniors = do
+  people <- *people
+  yield (filter (\p -> p.age > 65) people)
 
 -- DB write (inferred: {reads *people, writes *people})
-birthday = \name ->
+birthday = \name -> do
+  people <- *people
   set *people = do
-    p <- *people
+    p <- people
     yield (if p.name == name then {p | age: p.age + 1} else p)
 ```
 
@@ -558,10 +618,11 @@ birthday = \name ->
 Effect signatures are inferred but can be written explicitly:
 
 ```knot
-birthday : {reads *people, writes *people} Text -> {}
-birthday = \name ->
+birthday : {reads *people, writes *people} Text -> IO {} {}
+birthday = \name -> do
+  people <- *people
   set *people = do
-    p <- *people
+    p <- people
     yield (if p.name == name then {p | age: p.age + 1} else p)
 ```
 
@@ -569,16 +630,40 @@ If the body uses a capability not listed in the signature, the compiler rejects 
 
 ### IO and Transactions
 
-DB writes are transactional — they roll back on failure. IO cannot be undone. The compiler enforces: **IO effects and DB writes cannot mix in the same `atomic` block**.
+`atomic` takes an IO body and runs it in a transaction. The body must only contain DB interactions (empty effect set) — no external IO (console, fs, etc.) is allowed inside `atomic`.
+
+```knot
+atomic : IO {} a -> IO {} a
+```
 
 ```knot
 -- DB writes go in `atomic`, IO happens after commit
 handleOrder = \req -> do
   orderId <- atomic do
-    set *orders = union *orders [{item: req.body.item, qty: 1}]
-    yield (count *orders)
+    orders <- *orders
+    set *orders = union orders [{item: req.body.item, qty: 1}]
+    newOrders <- *orders
+    yield (count newOrders)
   println ("New order #" ++ show orderId)
   yield {orderId}
+```
+
+#### `retry`
+
+`retry` is used inside `atomic` blocks to implement STM (Software Transactional Memory) style concurrency. When executed, `retry` causes the transaction to rollback and wait until some relation changes, then re-executes the entire `atomic` block.
+
+```knot
+retry : forall a. a  -- bottom type, never returns
+```
+
+The compiler enforces that `retry` is only used inside `atomic`. This enables blocking waits on relation state without busy-polling:
+
+```knot
+-- Wait until a condition is met
+waitForReady = atomic do
+  status <- *status
+  where (count (filter (\s -> s.ready) status)) == 0
+  retry
 ```
 
 ### File System
@@ -616,6 +701,66 @@ loadConfig = \path -> do
     else yield "{}"
 ```
 
+### Concurrency
+
+#### `fork`
+
+`fork` runs an IO action on a new OS thread. It is fire-and-forget — the forked action runs independently. Each spawned thread gets its own SQLite connection (WAL mode enables concurrent access). The main thread waits for all spawned threads before exiting.
+
+```knot
+fork : IO {} {} -> IO {} {}
+```
+
+Do blocks can be passed as arguments without parentheses: `fork do ...`.
+
+```knot
+*counter : [{n: Int}]
+
+increment = do
+  c <- *counter
+  set *counter = [{n: (fold (\_ x -> x.n) 0 c) + 1}]
+
+main = do
+  set *counter = [{n: 0}]
+  fork do
+    increment
+    increment
+  fork do
+    increment
+    increment
+  -- main waits for all threads before exiting
+```
+
+#### `fork` + `atomic` + `retry`
+
+The combination of `fork`, `atomic`, and `retry` enables STM-style concurrent coordination:
+
+```knot
+*tasks : [{id: Int, status: Text}]
+
+waitForCompletion = \id -> atomic do
+  tasks <- *tasks
+  let task = do
+    t <- tasks
+    where t.id == id
+    where t.status == "done"
+    yield t
+  where (count task) == 0
+  retry
+  yield task
+
+main = do
+  set *tasks = [{id: 1, status: "pending"}]
+  fork do
+    -- simulate work
+    atomic do
+      set *tasks = [{id: 1, status: "done"}]
+  result <- waitForCompletion 1
+  println result
+```
+
+SQLite WAL mode ensures that concurrent readers and writers do not block each other. Each thread operates on its own connection, and `atomic` provides transaction isolation within a thread.
+
 ### Routes
 
 Routes are first-class. A `route` declaration defines an ADT and its HTTP mapping in one place. Each line maps a method + typed path to a constructor. The constructor's fields are the union of path params, query params, body fields, and request headers.
@@ -643,14 +788,18 @@ Dispatch is pattern matching — the compiler ensures exhaustive handling:
 ```knot
 serve : Api -> Response
 serve = \req -> case req of
-  GetTodos {user, page, limit} -> pendingFor user page limit
-  AddTodo {title, owner, priority} -> do
+  GetTodos {user, page, limit, respond} -> do
+    result <- pendingFor user page limit
+    respond result
+  AddTodo {title, owner, priority, respond} -> do
     atomic (add title owner priority)
-    yield {ok: True {}}
-  AssignTodo {title, owner, person} -> do
+    respond {ok: True {}}
+  AssignTodo {title, owner, person, respond} -> do
     atomic (assign title owner person)
-    yield {ok: True {}}
-  GetWorkload {} -> &workload
+    respond {ok: True {}}
+  GetWorkload {respond} -> do
+    result <- &workload
+    respond result
 
 main = listen 8080 serve
 ```
@@ -765,12 +914,14 @@ DB writes within handlers must use `atomic`. IO happens outside `atomic`:
 
 ```knot
 serve = \req -> case req of
-  CreateOrder {item, qty} -> do
-  orderId <- atomic do
-    set *orders = union *orders [{item, qty}]
-    yield (count *orders)
-  println ("New order #" ++ show orderId)
-  yield {orderId}
+  CreateOrder {item, qty, respond} -> do
+    orderId <- atomic do
+      orders <- *orders
+      set *orders = union orders [{item: item, qty: qty}]
+      newOrders <- *orders
+      yield (count newOrders)
+    println ("New order #" ++ show orderId)
+    respond {orderId: orderId}
 ```
 
 For sub-transaction boundaries:
@@ -784,19 +935,28 @@ batchTransfer = \transfers ->
 
 ### Mutation
 
-All mutation is done through `set`, which replaces a persistent relation with a new value. The runtime diffs the old and new sets to apply minimal changes.
+All mutation is done through `set`, which replaces a persistent relation with a new value. The runtime diffs the old and new sets to apply minimal changes. Since relation references return IO, you bind to get the current value first:
 
 ```knot
 -- Insert: union with a singleton
-set *people = union *people [{name: "Alice", age: 30}]
+addPerson = do
+  people <- *people
+  set *people = union people [{name: "Alice", age: 30}]
 
 -- Update: map with a conditional
-set *people = do
-  p <- *people
-  yield (if p.name == "Alice" then {p | age: p.age + 1} else p)
+birthday = \name -> do
+  people <- *people
+  set *people = do
+    p <- people
+    yield (if p.name == "Alice" then {p | age: p.age + 1} else p)
 
 -- Delete: filter to keep the rest
-set *people = filter (\p -> p.age >= 0) *people
+removePerson = \name -> do
+  people <- *people
+  set *people = do
+    p <- people
+    where p.name != name
+    yield p
 ```
 
 ### Identity is Structural
@@ -835,7 +995,9 @@ Automatic. The runtime observes query patterns and indexes accordingly. No `CREA
 A `*`-prefixed relation with a body is a **view** — a bidirectional query over source relations. Reads compute the query; writes propagate back to the underlying sources.
 
 ```knot
-&seniorStaff = filter (\e -> e.salary > 100000) *employees  -- read-only (& prefix)
+&seniorStaff = do                                            -- read-only (& prefix)
+  employees <- *employees
+  yield (filter (\e -> e.salary > 100000) employees)
 
 *openTodos = do                                              -- settable (* prefix)
   t <- *todos
@@ -871,15 +1033,19 @@ Writing through a view auto-fills constants and propagates source columns:
 
 ```knot
 -- Insert through view — status auto-filled as Open {}
-set *openTodos = union *openTodos [{title: "New task", owner: "Alice", priority: High {}}]
+addOpenTodo = do
+  openTodos <- *openTodos
+  set *openTodos = union openTodos [{title: "New task", owner: "Alice", priority: High {}}]
 -- Compiler rewrites →
 -- set *todos = union *todos [{title: "New task", owner: "Alice", priority: High {}, status: Open {}}]
 
 -- Delete through view — only affects rows matching the constant
-set *openTodos = do
-  t <- *openTodos
-  where t.owner != "Alice"
-  yield t
+removeAliceTodos = do
+  openTodos <- *openTodos
+  set *openTodos = do
+    t <- openTodos
+    where t.owner != "Alice"
+    yield t
 -- Only removes Alice's Open todos; resolved/in-progress ones are untouched
 ```
 
@@ -902,14 +1068,16 @@ Datalog-style transitive closure:
 ```knot
 *manages : [{manager: Text, report: Text}]
 
-&reportsTo : [{ancestor: Text, descendant: Text}] =
-  union
-    (do m <- *manages
+&reportsTo : [{ancestor: Text, descendant: Text}] = do
+  manages <- *manages
+  reportsTo <- &reportsTo
+  yield (union
+    (do m <- manages
         yield {m.manager, m.report})
-    (do r <- &reportsTo
-        m <- *manages
+    (do r <- reportsTo
+        m <- manages
         where r.descendant == m.manager
-        yield {r.ancestor, m.report})
+        yield {r.ancestor, m.report}))
 ```
 
 The compiler checks stratification.
@@ -999,7 +1167,8 @@ Optional history tracking:
 
 salaryLastYear = \name -> do
   t <- now
-  yield (*employees @(t - 365 days)
+  employees <- *employees @(t - 365 days)
+  yield (employees
     |> filter (\e -> e.name == name)
     |> map (\e -> e.salary)
     |> single)
@@ -1168,47 +1337,60 @@ route Api where
 formatTitle = \title -> toUpper (take 1 title) ++ drop 1 title
 
 pendingFor = \user -> do
-  t <- *todos
-  where t.owner == user
-  Open {} <- t.status
-  yield {t.title, t.priority}
+  todos <- *todos
+  let result = do
+    t <- todos
+    where t.owner == user
+    Open {} <- t.status
+    yield {t.title, t.priority}
+  yield result
 
-add = \title owner priority ->
-  set *todos = union *todos [{title: formatTitle title, owner, priority, status: Open {}}]
+add = \title owner priority -> do
+  todos <- *todos
+  set *todos = union todos [{title: formatTitle title, owner: owner, priority: priority, status: Open {}}]
 
-assign = \title owner person ->
+assign = \title owner person -> do
+  todos <- *todos
   set *todos = do
-    t <- *todos
+    t <- todos
     yield (if t.title == title && t.owner == owner
       then {t | status: InProgress {assignee: person}}
       else t)
 
-resolve = \title owner msg ->
+resolve = \title owner msg -> do
+  todos <- *todos
   set *todos = do
-    t <- *todos
+    t <- todos
     yield (if t.title == title && t.owner == owner
       then {t | status: Resolved {resolution: msg}}
       else t)
 
 &workload = do
-  t <- *todos
-  Open {} <- t.status
-  groupBy {t.owner}
-  yield {owner: t.owner, count: count t}
+  todos <- *todos
+  let result = do
+    t <- todos
+    Open {} <- t.status
+    groupBy {t.owner}
+    yield {owner: t.owner, count: count t}
+  yield result
 
 serve : Api -> Response
 serve = \req -> case req of
-  GetTodos {user} -> pendingFor user
-  AddTodo {title, owner, priority} -> do
+  GetTodos {user, respond} -> do
+    result <- pendingFor user
+    respond result
+  AddTodo {title, owner, priority, respond} -> do
     atomic (add title owner priority)
-    yield {ok: True {}}
-  AssignTodo {title, owner, person} -> do
+    respond {ok: True {}}
+  AssignTodo {title, owner, person, respond} -> do
     atomic (assign title owner person)
-    yield {ok: True {}}
-  ResolveTodo {title, owner, msg} -> do
+    respond {ok: True {}}
+  ResolveTodo {title, owner, msg, respond} -> do
     atomic (resolve title owner msg)
-    yield {ok: True {}}
-  GetWorkload {} -> &workload
+    respond {ok: True {}}
+  GetWorkload {respond} -> do
+    result <- &workload
+    respond result
 
 main = listen 8080 serve
 ```

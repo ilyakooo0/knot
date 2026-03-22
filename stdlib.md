@@ -5,6 +5,7 @@ Complete reference for all built-in functions, traits, and types.
 ## Table of Contents
 
 - [Relation Operations](#relation-operations)
+- [Concurrency](#concurrency)
 - [Text Operations](#text-operations)
 - [Console I/O](#console-io)
 - [File System](#file-system)
@@ -144,6 +145,70 @@ inter : [a] -> [a] -> [a]
 ```
 
 Set intersection — rows present in both relations.
+
+---
+
+## Concurrency
+
+### `fork`
+
+```
+fork : IO {} {} -> IO {} {}
+```
+
+Run an IO action on a new OS thread (fire-and-forget). Each thread gets its own SQLite connection via WAL mode for safe concurrent access. The main thread waits for all spawned threads before exiting.
+
+```knot
+main = do
+  fork do
+    println "hello from thread 1"
+  fork do
+    println "hello from thread 2"
+  println "hello from main"
+```
+
+Do blocks can be passed directly as arguments without parentheses.
+
+### `atomic`
+
+```
+atomic : IO {} a -> IO {} a
+```
+
+Run an IO body in a database transaction. The body must contain only DB operations — no external effects (console, fs, etc.) are allowed. If the body calls `retry`, the transaction rolls back and waits for a relation change before re-executing.
+
+```knot
+transfer = \from to amount -> atomic do
+  accounts <- *accounts
+  set *accounts = do
+    a <- accounts
+    yield (if a.name == from then {a | balance: a.balance - amount}
+           else if a.name == to then {a | balance: a.balance + amount}
+           else a)
+```
+
+### `retry`
+
+```
+retry : a
+```
+
+Used inside `atomic` blocks only. Causes the transaction to rollback and wait until some relation changes, then re-executes the atomic block. Implements STM (Software Transactional Memory) style concurrency.
+
+```knot
+waitForTask = \id -> atomic do
+  tasks <- *tasks
+  let done = do
+    t <- tasks
+    where t.id == id
+    where t.status == "done"
+    yield t
+  where (count done) == 0
+  retry
+  yield done
+```
+
+The compiler enforces that `retry` is only used inside `atomic`.
 
 ---
 

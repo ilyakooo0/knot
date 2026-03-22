@@ -26,6 +26,21 @@ show : a -> Text
 ```
 Convert any value to its text representation. Records print as `{field: value, ...}`, relations as `[v1, v2, ...]`, constructors as `Tag {fields}`. This is a pure function (no IO).
 
+```knot
+fork : IO {} {} -> IO {} {}
+```
+Run an IO action on a new OS thread (fire-and-forget). Each thread gets its own SQLite connection (WAL mode). Main waits for all threads before exiting.
+
+```knot
+atomic : IO {} a -> IO {} a
+```
+Run an IO body in a database transaction. Body must contain only DB operations. Supports `retry` for STM-style waiting.
+
+```knot
+retry : a
+```
+Inside `atomic` blocks only. Rolls back the transaction and waits for a relation change, then re-executes.
+
 ### IO Do-Blocks
 
 Use `do` to sequence IO actions:
@@ -41,6 +56,8 @@ main = do
 The `<-` operator runs an IO action and binds its result. Bare IO expressions (like `println`) are also executed. The overall block type is `IO {union of effects} result`.
 
 ## Relations
+
+Source relations (`*rel`) and derived relations (`&rel`) return `IO {} [T]`. Use `<-` in an IO do-block to unwrap the relation value before passing it to these functions.
 
 ```knot
 union : [a] -> [a] -> [a]
@@ -384,6 +401,48 @@ main = do
 listen : Int -> (a -> b) -> {}
 ```
 Start an HTTP server on the given port with a handler function. The handler receives a route ADT value and returns a response. Has the `{network}` effect. See `route` declarations in the language spec for defining typed endpoints.
+
+## Concurrency
+
+```knot
+fork : IO {} {} -> IO {} {}
+```
+Run an IO action on a new OS thread. Fire-and-forget — the spawned thread runs independently. Each thread gets its own SQLite connection (WAL mode). Main waits for all threads before exiting. Do blocks can be passed without parentheses: `fork do ...`.
+
+```knot
+main = do
+  fork do
+    println "from thread"
+  println "from main"
+  yield {}
+```
+
+```knot
+atomic : IO {} a -> IO {} a
+```
+Run an IO body as a database transaction. Body must contain only DB operations (no console, fs, etc.). Supports `retry` for STM-style waiting.
+
+```knot
+transfer = \from to amount -> atomic do
+  accounts <- *accounts
+  set *accounts = do
+    a <- accounts
+    yield (if a.name == from then {a | balance: a.balance - amount}
+           else if a.name == to then {a | balance: a.balance + amount}
+           else a)
+```
+
+```knot
+retry : a
+```
+Inside `atomic` blocks only. Rolls back the transaction and waits for a relation to change, then re-executes. Implements STM (Software Transactional Memory).
+
+```knot
+waitForReady = atomic do
+  status <- *status
+  where (count (filter (\s -> s.ready) status)) == 0
+  retry
+```
 
 ## IO Type Syntax
 

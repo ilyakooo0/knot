@@ -10,6 +10,8 @@
   (trait_declaration)
   (impl_declaration)
   (data_declaration)
+  (route_declaration)
+  (route_path_group)
 ] @indent
 
 ; Bracketed constructs
@@ -20,6 +22,7 @@
   (record_type_body)
   (list_expression)
   (parenthesized_expression)
+  (variant_type)
 ] @indent
 
 ; ── Outdent ───────────────────────────────────────────────
@@ -29,4 +32,5 @@
   "}"
   "]"
   ")"
+  ">"
 ] @outdent

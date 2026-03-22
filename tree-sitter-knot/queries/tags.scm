@@ -24,7 +24,7 @@
   name: (upper_identifier) @name) @definition.interface
 
 ; Trait methods
-(trait_item
+(trait_method
   name: (lower_identifier) @name) @definition.method
 
 ; Impl blocks
@@ -32,7 +32,7 @@
   trait: (upper_identifier) @name) @definition.implementation
 
 ; Impl methods
-(impl_item
+(impl_method
   name: (lower_identifier) @name) @definition.method
 
 ; Source relations
@@ -47,6 +47,24 @@
 (derived_declaration
   (derived_ref) @name) @definition.variable
 
+; Routes
+(route_declaration
+  name: (upper_identifier) @name) @definition.module
+
+(route_composite_declaration
+  name: (upper_identifier) @name) @definition.module
+
+; Route entry constructors
+(route_entry
+  constructor: (upper_identifier) @name) @definition.constructor
+
+; Associated types
+(trait_associated_type
+  (upper_identifier) @name) @definition.type
+
+(impl_associated_type
+  (upper_identifier) @name) @definition.type
+
 ; ── References ────────────────────────────────────────────
 
 ; Function calls (application of a variable)
@@ -56,3 +74,7 @@
 
 ; Constructor usage
 (constructor_expression) @name @reference.class
+
+; Import references
+(import_declaration
+  path: (import_path) @name) @reference.module

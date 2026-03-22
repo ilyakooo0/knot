@@ -17,7 +17,7 @@
 
 (let_in_expression) @local.scope
 
-(impl_item) @local.scope
+(impl_method) @local.scope
 
 (trait_default_body) @local.scope
 
@@ -49,11 +49,17 @@
 (trait_declaration
   name: (upper_identifier) @local.definition)
 
-(trait_item
+(trait_method
   name: (lower_identifier) @local.definition)
 
-(impl_item
+(impl_method
   name: (lower_identifier) @local.definition)
+
+; Import items
+(import_item
+  (upper_identifier) @local.definition)
+(import_item
+  (lower_identifier) @local.definition)
 
 ; ── References ────────────────────────────────────────────
 

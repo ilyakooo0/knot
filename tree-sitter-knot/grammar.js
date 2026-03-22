@@ -37,6 +37,10 @@ module.exports = grammar({
     [$.list_pattern, $.list_expression],
     [$.literal_pattern, $._atom_expression],
     [$.field_pattern, $.variable_expression],
+    // trait param vs type variable in trait declaration
+    [$._trait_param, $.type_variable],
+    // trait method with default body vs separate default body
+    [$.trait_method, $.trait_default_body],
   ],
 
   rules: {
@@ -53,6 +57,13 @@ module.exports = grammar({
     // ── Declarations ────────────────────────────────────────────────
     _declaration: ($) =>
       choice(
+        $.import_declaration,
+        $.export_declaration,
+        $._declaration_body,
+      ),
+
+    _declaration_body: ($) =>
+      choice(
         $.data_declaration,
         $.type_alias_declaration,
         $.source_declaration,
@@ -62,8 +73,30 @@ module.exports = grammar({
         $.trait_declaration,
         $.impl_declaration,
         $.migrate_declaration,
+        $.route_declaration,
+        $.route_composite_declaration,
+        $.subset_constraint,
       ),
 
+    // ── Import ──────────────────────────────────────────────────────
+    import_declaration: ($) =>
+      seq(
+        "import",
+        field("path", $.import_path),
+        optional(seq("(", sep1($.import_item, ","), ")")),
+      ),
+
+    import_path: ($) =>
+      seq(".", "/", sep1($.lower_identifier, "/")),
+
+    import_item: ($) =>
+      choice($.lower_identifier, $.upper_identifier),
+
+    // ── Export ───────────────────────────────────────────────────────
+    export_declaration: ($) =>
+      seq("export", $._declaration_body),
+
+    // ── Data ────────────────────────────────────────────────────────
     data_declaration: ($) =>
       seq(
         "data",
@@ -78,7 +111,10 @@ module.exports = grammar({
             $._dedent,
           ),
           // Single-line: constructors on same line as `data`
-          repeat1($.constructor_def),
+          seq(
+            repeat1($.constructor_def),
+            optional($.deriving_clause),
+          ),
         ),
       ),
 
@@ -92,6 +128,7 @@ module.exports = grammar({
     deriving_clause: ($) =>
       seq("deriving", "(", sep1($.upper_identifier, ","), ")"),
 
+    // ── Type alias ──────────────────────────────────────────────────
     type_alias_declaration: ($) =>
       seq(
         "type",
@@ -101,6 +138,7 @@ module.exports = grammar({
         field("type", $._type),
       ),
 
+    // ── Source ───────────────────────────────────────────────────────
     source_declaration: ($) =>
       seq(
         $.source_ref,
@@ -109,12 +147,15 @@ module.exports = grammar({
         optional(seq("with", "history")),
       ),
 
+    // ── View ────────────────────────────────────────────────────────
     view_declaration: ($) =>
       seq($.source_ref, "=", field("body", $._block_body)),
 
+    // ── Derived ─────────────────────────────────────────────────────
     derived_declaration: ($) =>
       seq($.derived_ref, "=", field("body", $._block_body)),
 
+    // ── Fun ─────────────────────────────────────────────────────────
     fun_declaration: ($) =>
       seq(
         field("name", $.lower_identifier),
@@ -128,16 +169,21 @@ module.exports = grammar({
         ),
       ),
 
+    // ── Trait ────────────────────────────────────────────────────────
     trait_declaration: ($) =>
       seq(
         "trait",
+        repeat($.supertrait),
         field("name", $.upper_identifier),
         field("params", repeat1($._trait_param)),
         "where",
         $._indent,
-        sep1($.trait_item, $._newline),
+        sep1($._trait_item, $._newline),
         $._dedent,
       ),
+
+    supertrait: ($) =>
+      prec.dynamic(1, seq($.upper_identifier, repeat1($._type_atom), "=>")),
 
     _trait_param: ($) =>
       choice(
@@ -145,20 +191,22 @@ module.exports = grammar({
         seq("(", $.lower_identifier, ":", $._type, ")"),
       ),
 
-    trait_item: ($) =>
+    _trait_item: ($) =>
+      choice($.trait_method, $.trait_associated_type, $.trait_default_body),
+
+    trait_method: ($) =>
       prec.right(
         seq(
           field("name", $.lower_identifier),
           choice(
-            seq(
-              ":",
-              field("type", $.type_scheme),
-              optional(seq($._newline, $.trait_default_body)),
-            ),
+            seq(":", field("type", $.type_scheme)),
             seq(repeat($._pattern_atom), "=", $._expression),
           ),
         ),
       ),
+
+    trait_associated_type: ($) =>
+      seq("type", $.upper_identifier, repeat($.lower_identifier)),
 
     trait_default_body: ($) =>
       seq(
@@ -168,18 +216,23 @@ module.exports = grammar({
         $._expression,
       ),
 
+    // ── Impl ────────────────────────────────────────────────────────
     impl_declaration: ($) =>
       seq(
         "impl",
+        repeat(seq($.constraint, "=>")),
         field("trait", $.upper_identifier),
         field("args", repeat1($._type_atom)),
         "where",
         $._indent,
-        sep1($.impl_item, $._newline),
+        sep1($._impl_item, $._newline),
         $._dedent,
       ),
 
-    impl_item: ($) =>
+    _impl_item: ($) =>
+      choice($.impl_method, $.impl_associated_type),
+
+    impl_method: ($) =>
       seq(
         field("name", $.lower_identifier),
         field("params", repeat($._pattern_atom)),
@@ -187,6 +240,10 @@ module.exports = grammar({
         field("body", $._block_body),
       ),
 
+    impl_associated_type: ($) =>
+      seq("type", $.upper_identifier, repeat($._type_atom), "=", $._type),
+
+    // ── Migrate ─────────────────────────────────────────────────────
     migrate_declaration: ($) =>
       seq(
         "migrate",
@@ -197,6 +254,77 @@ module.exports = grammar({
         field("to", $._type),
         "using",
         field("using", $._expression),
+      ),
+
+    // ── Route ───────────────────────────────────────────────────────
+    route_declaration: ($) =>
+      seq(
+        "route",
+        field("name", $.upper_identifier),
+        "where",
+        $._indent,
+        sep1($._route_item, $._newline),
+        $._dedent,
+      ),
+
+    route_composite_declaration: ($) =>
+      seq(
+        "route",
+        field("name", $.upper_identifier),
+        "=",
+        sep1($.upper_identifier, "|"),
+      ),
+
+    _route_item: ($) =>
+      choice($.route_entry, $.route_path_group),
+
+    route_path_group: ($) =>
+      seq(
+        repeat1($._route_path_segment),
+        $._indent,
+        sep1($._route_item, $._newline),
+        $._dedent,
+      ),
+
+    route_entry: ($) =>
+      prec.right(
+        seq(
+          field("method", $.http_method),
+          repeat(choice(
+            $._route_path_segment,
+            field("body", $.record_type_body),
+            seq("?", field("query", $.record_type_body)),
+            seq("headers", $.record_type_body),
+          )),
+          "->",
+          field("response", $._type),
+          optional(seq("headers", $.record_type_body)),
+          "=",
+          field("constructor", $.upper_identifier),
+        ),
+      ),
+
+    _route_path_segment: ($) =>
+      choice(
+        seq("/", field("name", $.lower_identifier)),
+        seq("/", token.immediate("{"), field("name", $.lower_identifier), ":", field("type", $._type), "}"),
+        "/",
+      ),
+
+    http_method: ($) => choice("GET", "POST", "PUT", "DELETE", "PATCH"),
+
+    // ── Subset constraints ──────────────────────────────────────────
+    subset_constraint: ($) =>
+      seq(
+        $._constraint_path,
+        "<=",
+        $._constraint_path,
+      ),
+
+    _constraint_path: ($) =>
+      choice(
+        seq($.source_ref, ".", $.lower_identifier),
+        $.source_ref,
       ),
 
     // ── Types ───────────────────────────────────────────────────────
@@ -226,6 +354,8 @@ module.exports = grammar({
         $.type_variable,
         $.record_type,
         $.relation_type,
+        $.variant_type,
+        $.type_hole,
         $.parenthesized_type,
       ),
 
@@ -236,12 +366,24 @@ module.exports = grammar({
       seq(
         "{",
         optional(
-          seq(
-            sep1($.type_field, ","),
-            optional(seq("|", $.lower_identifier)),
+          choice(
+            // Record fields: {name: Type, age: Int}
+            seq(
+              sep1($.type_field, ","),
+              optional(seq("|", $.lower_identifier)),
+            ),
+            // Bare identifiers for effect sets: {console, network}
+            // Also covers: reads *rel, writes *rel
+            sep1($.effect, ","),
           ),
         ),
         "}",
+      ),
+
+    effect: ($) =>
+      choice(
+        seq($.lower_identifier, $.source_ref),
+        $.lower_identifier,
       ),
 
     record_type_body: ($) =>
@@ -251,6 +393,19 @@ module.exports = grammar({
       seq(field("name", $.lower_identifier), ":", field("type", $._type)),
 
     relation_type: ($) => seq("[", optional($._type), "]"),
+
+    variant_type: ($) =>
+      seq(
+        "<",
+        sep1($.variant_constructor, "|"),
+        optional(seq("|", $.lower_identifier)),
+        ">",
+      ),
+
+    variant_constructor: ($) =>
+      seq($.upper_identifier, optional($.record_type_body)),
+
+    type_hole: ($) => "_",
 
     parenthesized_type: ($) => seq("(", $._type, ")"),
 
@@ -485,12 +640,18 @@ module.exports = grammar({
       ),
 
     _postfix_expression: ($) =>
-      choice($.field_access_expression, $._atom_expression),
+      choice($.field_access_expression, $.temporal_expression, $._atom_expression),
 
     field_access_expression: ($) =>
       prec.left(
         PREC.FIELD,
         seq($._postfix_expression, ".", $.lower_identifier),
+      ),
+
+    temporal_expression: ($) =>
+      prec.left(
+        PREC.FIELD,
+        seq($._postfix_expression, "@", "(", $._expression, ")"),
       ),
 
     _atom_expression: ($) =>
@@ -593,7 +754,13 @@ module.exports = grammar({
     // ── Literals ────────────────────────────────────────────────────
 
     _literal: ($) =>
-      choice($.integer_literal, $.float_literal, $.string_literal),
+      choice(
+        $.integer_literal,
+        $.float_literal,
+        $.string_literal,
+        $.boolean_literal,
+        $.bytes_literal,
+      ),
 
     integer_literal: ($) => /[0-9][0-9_]*/,
 
@@ -602,7 +769,12 @@ module.exports = grammar({
     string_literal: ($) =>
       seq('"', repeat(choice($.escape_sequence, $.string_content)), '"'),
 
-    escape_sequence: ($) => token.immediate(prec(1, /\\[\\\"ntr]/)),
+    boolean_literal: ($) => choice("true", "false"),
+
+    bytes_literal: ($) =>
+      seq('b"', repeat(choice($.escape_sequence, $.string_content)), '"'),
+
+    escape_sequence: ($) => token.immediate(prec(1, /\\([\\\"ntr]|x[0-9a-fA-F]{2})/)),
 
     string_content: ($) => token.immediate(prec(0, /[^"\\]+/)),
 

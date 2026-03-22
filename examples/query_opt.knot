@@ -8,44 +8,63 @@ type Department = {name: Text, budget: Int}
 
 -- 1. Count pushdown: count *rel → SQL COUNT(*)
 countDemo = do
-  println ("Employee count: " ++ show (count *employees))
-  yield {}
+  employees <- *employees
+  println ("Employee count: " ++ show (count employees))
 
--- 2. Filter pushdown: where clause → SQL WHERE (mixed do-block with println)
+-- 2. Filter pushdown: where clause → SQL WHERE
 filterDemo = do
+  employees <- *employees
   println "High earners (salary > 75):"
-  e <- *employees
-  where e.salary > 75
-  println ("  " ++ e.name ++ " ($" ++ show e.salary ++ ")")
+  let filtered = do
+    e <- employees
+    where e.salary > 75
+    yield ("  " ++ e.name ++ " ($" ++ show e.salary ++ ")")
+  r <- filtered
+  println r
   yield {}
 
--- 3. Hash join: equi-join via hash index (mixed do-block with println)
+-- 3. Hash join: equi-join via hash index
 joinDemo = do
+  employees <- *employees
+  departments <- *departments
   println "Employee departments:"
-  e <- *employees
-  d <- *departments
-  where e.dept == d.name
-  println ("  " ++ e.name ++ " works in " ++ d.name ++ " (budget: $" ++ show d.budget ++ ")")
+  let joined = do
+    e <- employees
+    d <- departments
+    where e.dept == d.name
+    yield ("  " ++ e.name ++ " works in " ++ d.name ++ " (budget: $" ++ show d.budget ++ ")")
+  r <- joined
+  println r
   yield {}
 
 -- 4. Full SQL: single-table filter → one SQL SELECT
 filterQuery = do
-  e <- *employees
-  where e.salary > 75
-  yield {name: e.name, salary: e.salary}
+  employees <- *employees
+  let result = do
+    e <- employees
+    where e.salary > 75
+    yield {name: e.name, salary: e.salary}
+  yield result
 
 -- 5. Full SQL: multi-table join + filter → one SQL SELECT
 joinQuery = do
-  e <- *employees
-  d <- *departments
-  where e.dept == d.name
-  where e.salary > 75
-  yield {name: e.name, dept: d.name, budget: d.budget}
+  employees <- *employees
+  departments <- *departments
+  let result = do
+    e <- employees
+    d <- departments
+    where e.dept == d.name
+    where e.salary > 75
+    yield {name: e.name, dept: d.name, budget: d.budget}
+  yield result
 
 -- 6. Full SQL: yield entire row (single-table)
 allEmployees = do
-  e <- *employees
-  yield e
+  employees <- *employees
+  let result = do
+    e <- employees
+    yield e
+  yield result
 
 printQuery = \label results -> do
   println (label ++ ":")
@@ -54,18 +73,27 @@ printQuery = \label results -> do
   yield {}
 
 -- 7. Pipe: filter → SQL WHERE
-pipeFilter = *employees |> filter (\e -> e.salary > 75)
+pipeFilter = do
+  employees <- *employees
+  yield (employees |> filter (\e -> e.salary > 75))
 
 -- 8. Pipe: filter + map → SQL WHERE + SELECT
-pipeFilterMap = *employees
-  |> filter (\e -> e.salary > 75)
-  |> map (\e -> {name: e.name, salary: e.salary})
+pipeFilterMap = do
+  employees <- *employees
+  yield (employees
+    |> filter (\e -> e.salary > 75)
+    |> map (\e -> {name: e.name, salary: e.salary}))
 
--- 9. Pipe: filter + count → SQL COUNT(*) WHERE
-pipeFilterCount = *employees |> filter (\e -> e.salary > 75) |> count
+-- 9. Pipe: filter + count
+pipeFilterCount = do
+  employees <- *employees
+  let filtered = employees |> filter (\e -> e.salary > 75)
+  yield (count filtered)
 
 -- 10. Pipe: map only → SQL SELECT
-pipeMap = *employees |> map (\e -> {name: e.name, dept: e.dept})
+pipeMap = do
+  employees <- *employees
+  yield (employees |> map (\e -> {name: e.name, dept: e.dept}))
 
 main = do
   set *employees = [
@@ -82,11 +110,18 @@ main = do
   countDemo
   filterDemo
   joinDemo
-  printQuery "Filter query (salary > 75)" filterQuery
-  printQuery "Join query (salary > 75, with dept)" joinQuery
-  printQuery "All employees" allEmployees
-  printQuery "Pipe filter (salary > 75)" pipeFilter
-  printQuery "Pipe filter+map (salary > 75)" pipeFilterMap
-  println ("Pipe filter+count (salary > 75): " ++ show pipeFilterCount)
-  printQuery "Pipe map (name, dept)" pipeMap
+  fq <- filterQuery
+  printQuery "Filter query (salary > 75)" fq
+  jq <- joinQuery
+  printQuery "Join query (salary > 75, with dept)" jq
+  ae <- allEmployees
+  printQuery "All employees" ae
+  pf <- pipeFilter
+  printQuery "Pipe filter (salary > 75)" pf
+  pfm <- pipeFilterMap
+  printQuery "Pipe filter+map (salary > 75)" pfm
+  pfc <- pipeFilterCount
+  println ("Pipe filter+count (salary > 75): " ++ show pfc)
+  pm <- pipeMap
+  printQuery "Pipe map (name, dept)" pm
   yield {}

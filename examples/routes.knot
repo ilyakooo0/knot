@@ -15,19 +15,27 @@ route AdminApi where
 
 route Api = TodoApi | AdminApi
 
-addTodo = \title owner priority ->
-  set *todos = union *todos [{title: title, owner: owner, priority: Low {}}]
+addTodo = \title owner priority -> do
+  todos <- *todos
+  set *todos = union todos [{title: title, owner: owner, priority: Low {}}]
 
 getTodos = \owner -> do
-  t <- *todos
-  where t.owner == owner
-  yield t
+  todos <- *todos
+  let result = do
+    t <- todos
+    where t.owner == owner
+    yield t
+  yield result
 
 serve = \req -> case req of
-  GetTodos {owner, respond} -> respond (getTodos owner)
-  CreateTodo {title, owner, priority, respond} ->
+  GetTodos {owner, respond} -> do
+    result <- getTodos owner
+    respond result
+  CreateTodo {title, owner, priority, respond} -> do
     addTodo title owner priority
-      |> (\_ -> respond {title: title, owner: owner, priority: Low {}})
-  GetCount {respond} -> respond (count *todos)
+    respond {title: title, owner: owner, priority: Low {}}
+  GetCount {respond} -> do
+    todos <- *todos
+    respond (count todos)
 
 main = listen 8080 serve

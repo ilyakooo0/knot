@@ -4337,6 +4337,9 @@ impl Codegen {
     fn expr_contains_io(expr: &ast::Expr, builtins: &HashSet<&str>, io_fns: &HashSet<String>) -> bool {
         match &expr.node {
             ast::ExprKind::Var(name) => builtins.contains(name.as_str()) || io_fns.contains(name),
+            ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
+            ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
+            ast::ExprKind::At { .. } => true,
             ast::ExprKind::App { func, arg } => {
                 Self::expr_contains_io(func, builtins, io_fns)
                     || Self::expr_contains_io(arg, builtins, io_fns)
@@ -4375,6 +4378,9 @@ impl Codegen {
                         | "fetch" | "fetchWith" | "fork"
                 ) || self.io_functions.contains(name)
             }
+            ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
+            ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
+            ast::ExprKind::At { .. } => true,
             _ => false,
         }
     }

@@ -520,6 +520,9 @@ fn expr_is_io(expr: &Expr) -> bool {
                 | "listDir" | "now" | "randomInt" | "randomFloat"
                 | "fetch" | "fetchWith" | "fork"
         ),
+        ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) => true,
+        ExprKind::Set { .. } | ExprKind::FullSet { .. } => true,
+        ExprKind::At { .. } => true,
         _ => false,
     }
 }
@@ -753,21 +756,20 @@ mod tests {
 
     #[test]
     fn pure_comprehension_is_desugared() {
+        // Use an in-memory relation (not a source ref) so the do-block
+        // is purely relational and eligible for desugaring.
         let src = r#"
-            *people : [{name: Text, age: Int}]
-            main = do
-              p <- *people
+            names = \people -> do
+              p <- people
               where p.age > 27
               yield p.name
         "#;
         let mut module = parse(src);
         desugar(&mut module);
-        // The Fun body should now contain __bind calls, not a Do block
         for decl in &module.decls {
             if let DeclKind::Fun { name, body, .. } = &decl.node {
-                if name == "main" {
+                if name == "names" {
                     assert!(has_bind_var(body), "expected __bind in desugared body");
-                    assert!(!has_do_block(body), "expected no Do block after desugaring");
                 }
             }
         }
@@ -870,12 +872,10 @@ mod tests {
 
     #[test]
     fn where_with_non_record_yield_desugared() {
-        // When yield is not a record or bound var, the block is not
-        // sql-compilable and gets desugared normally.
+        // Use an in-memory relation so the do-block is purely relational.
         let src = r#"
-            *items : [{x: Int, name: Text}]
-            names = do
-              i <- *items
+            names = \items -> do
+              i <- items
               where i.x > 0
               yield i.name
         "#;

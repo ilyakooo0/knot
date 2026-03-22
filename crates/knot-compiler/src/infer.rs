@@ -1420,7 +1420,7 @@ impl Infer {
 
             ast::ExprKind::SourceRef(name) => {
                 if let Some(ty) = self.source_types.get(name).cloned() {
-                    ty
+                    Ty::IO(BTreeSet::new(), Box::new(ty))
                 } else {
                     self.error(
                         format!("unknown source relation '*{}'", name),
@@ -1432,7 +1432,7 @@ impl Infer {
 
             ast::ExprKind::DerivedRef(name) => {
                 if let Some(ty) = self.derived_types.get(name).cloned() {
-                    ty
+                    Ty::IO(BTreeSet::new(), Box::new(ty))
                 } else {
                     self.error(
                         format!("unknown derived relation '&{}'", name),
@@ -1608,9 +1608,16 @@ impl Infer {
                 } else {
                     let target_ty = self.infer_expr(target);
                     let value_ty = self.infer_expr(value);
-                    self.unify(&target_ty, &value_ty, expr.span);
+                    // Unwrap IO from both sides for unification —
+                    // target is IO (source ref), value may also be IO
+                    // (do-block reading from relations).
+                    let unwrap_io = |ty: &Ty| match ty {
+                        Ty::IO(_, inner) => (**inner).clone(),
+                        other => other.clone(),
+                    };
+                    self.unify(&unwrap_io(&target_ty), &unwrap_io(&value_ty), expr.span);
                 }
-                Ty::unit()
+                Ty::IO(BTreeSet::new(), Box::new(Ty::unit()))
             }
 
             ast::ExprKind::FullSet { target, value } => {
@@ -1621,9 +1628,13 @@ impl Infer {
                 } else {
                     let target_ty = self.infer_expr(target);
                     let value_ty = self.infer_expr(value);
-                    self.unify(&target_ty, &value_ty, expr.span);
+                    let unwrap_io = |ty: &Ty| match ty {
+                        Ty::IO(_, inner) => (**inner).clone(),
+                        other => other.clone(),
+                    };
+                    self.unify(&unwrap_io(&target_ty), &unwrap_io(&value_ty), expr.span);
                 }
-                Ty::unit()
+                Ty::IO(BTreeSet::new(), Box::new(Ty::unit()))
             }
 
             ast::ExprKind::Atomic(inner) => {
@@ -1638,6 +1649,7 @@ impl Infer {
                 let rel_ty = self.infer_expr(relation);
                 let time_ty = self.infer_expr(time);
                 self.unify(&time_ty, &Ty::Int, time.span);
+                // Temporal query is a DB read — preserve IO wrapping
                 rel_ty
             }
         }
@@ -2060,6 +2072,9 @@ impl Infer {
                         | "listDir" | "now" | "randomInt" | "randomFloat"
                         | "fetch" | "fetchWith" | "fork"
                 ),
+                ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
+                ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
+                ast::ExprKind::At { .. } => true,
                 _ => false,
             }
         }
@@ -3965,15 +3980,15 @@ mod tests {
     #[test]
     fn hkt_tycon_unifies_with_relation() {
         // When HK var is solved to [], App([], a) should equal [a]
+        // Uses in-memory relation (not source ref) since source refs are IO.
         assert!(check_src(
-            "*nums : [Int]\n\
-             trait Functor (f : Type -> Type) where\n\
+            "trait Functor (f : Type -> Type) where\n\
              \x20 fmap : (a -> b) -> f a -> f b\n\
              impl Functor [] where\n\
              \x20 fmap f rel = do\n\
              \x20   x <- rel\n\
              \x20   yield (f x)\n\
-             main = fmap (\\x -> x + 1) *nums"
+             main = fmap (\\x -> x + 1) [1, 2, 3]"
         ).is_empty());
     }
 

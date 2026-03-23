@@ -62,7 +62,10 @@ impl Parser {
                     decls.push(d);
                 }
                 None => {
-                    // Error recovery: skip to next declaration boundary.
+                    // Error recovery: clear stale parser context entries
+                    // left by early returns via `?` in parse functions.
+                    self.context.clear();
+                    // Skip to next declaration boundary.
                     if !self.at_eof() {
                         self.advance();
                         self.skip_to_decl_boundary();
@@ -86,12 +89,11 @@ impl Parser {
             .unwrap_or(&TokenKind::Eof)
     }
 
-    fn peek_token(&self) -> &Token {
-        static EOF_TOKEN: std::sync::LazyLock<Token> = std::sync::LazyLock::new(|| Token {
+    fn peek_token(&self) -> Token {
+        self.tokens.get(self.pos).cloned().unwrap_or(Token {
             kind: TokenKind::Eof,
-            span: Span::new(0, 0),
-        });
-        self.tokens.get(self.pos).unwrap_or(&EOF_TOKEN)
+            span: self.eof_span(),
+        })
     }
 
     fn peek_ahead(&self, offset: usize) -> &TokenKind {
@@ -374,8 +376,8 @@ impl Parser {
             None
         };
 
-        let end = self.span();
-        let span = Span::new(start.start, end.start);
+        let end = self.prev_span();
+        let span = Span::new(start.start, end.end);
         Some(Import { path, items, span })
     }
 }
@@ -1429,8 +1431,9 @@ impl Parser {
             TokenKind::Set => self.parse_set(false),
             TokenKind::Full => {
                 if self.peek_ahead(1) == &TokenKind::Set {
+                    let full_start = self.span();
                     self.advance(); // consume `full`
-                    self.parse_set(true)
+                    self.parse_set_with_start(true, full_start)
                 } else {
                     // `full` used as a regular identifier
                     let tok = self.advance();
@@ -2143,7 +2146,10 @@ impl Parser {
     }
 
     fn parse_set(&mut self, full: bool) -> Option<Expr> {
-        let start = self.span();
+        self.parse_set_with_start(full, self.span())
+    }
+
+    fn parse_set_with_start(&mut self, full: bool, start: Span) -> Option<Expr> {
         self.push_context(if full { "full set expression" } else { "set expression" });
         self.advance(); // consume `set`
 

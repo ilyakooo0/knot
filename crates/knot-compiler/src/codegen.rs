@@ -2559,6 +2559,12 @@ impl Codegen {
 
                     let println_ref = cg.import_rt(builder, "knot_println");
                     builder.ins().call(println_ref, &[executed]);
+                } else {
+                    cg.diagnostics.push(
+                        knot::diagnostic::Diagnostic::error(
+                            "'main' must be a zero-parameter declaration, but it takes arguments"
+                        )
+                    );
                 }
             }
 
@@ -3976,10 +3982,12 @@ impl Codegen {
         let merge_block = builder.create_block();
         merge_block_param(builder, merge_block, self.ptr_type);
 
-        // Count non-nullable constructor arms to decide whether to extract tag once
+        // Count non-nullable constructor arms to decide whether to extract tag once.
+        // Exclude True/False — they compile to Value::Bool, not Value::Constructor,
+        // so calling knot_constructor_tag_ptr on them would panic.
         let non_nullable_ctor_count = arms.iter().filter(|a| {
             if let ast::PatKind::Constructor { name, .. } = &a.pat.node {
-                !self.nullable_ctors.contains_key(name)
+                !self.nullable_ctors.contains_key(name) && name != "True" && name != "False"
             } else {
                 false
             }
@@ -4264,37 +4272,13 @@ impl Codegen {
 
     // ── Do-block compilation ──────────────────────────────────────
 
-    /// Check if a do-block should be compiled as IO (contains IO-producing builtins,
-    /// or is purely sequential with no relational binds/yields).
+    /// Check if a do-block should be compiled as IO (contains IO-producing builtins).
     fn is_io_do_block(&self, stmts: &[ast::Stmt]) -> bool {
-        let mut has_bind = false;
-        let mut has_yield = false;
-        let mut has_io = false;
-        for stmt in stmts {
-            match &stmt.node {
-                ast::StmtKind::Bind { expr, .. } => {
-                    has_bind = true;
-                    if self.expr_is_io(expr) {
-                        has_io = true;
-                    }
-                }
-                ast::StmtKind::Expr(expr) => {
-                    if self.expr_is_io(expr) {
-                        has_io = true;
-                    }
-                    if matches!(&expr.node, ast::ExprKind::Yield(_)) {
-                        has_yield = true;
-                    }
-                }
-                ast::StmtKind::Where { .. } => {
-                    // where clauses imply relational context
-                    has_bind = true;
-                }
-                _ => {}
-            }
-        }
-        // IO if it has IO calls, or if it's purely sequential (no binds, no yields)
-        has_io || (!has_bind && !has_yield)
+        stmts.iter().any(|stmt| match &stmt.node {
+            ast::StmtKind::Bind { expr, .. } => self.expr_is_io(expr),
+            ast::StmtKind::Expr(expr) => self.expr_is_io(expr),
+            _ => false,
+        })
     }
 
     /// Detect user functions whose bodies (transitively) produce IO values.
@@ -4304,7 +4288,7 @@ impl Codegen {
             "println", "putLine", "print", "readLine", "readFile",
             "writeFile", "appendFile", "fileExists", "removeFile",
             "listDir", "now", "randomInt", "randomFloat", "fetch", "fetchWith",
-            "spawn",
+            "fork",
         ].into_iter().collect();
 
         // Collect function bodies for analysis
@@ -4394,46 +4378,7 @@ impl Codegen {
         env: &mut Env,
         db: Value,
     ) -> Value {
-        // IO do-blocks compile inline: each IO action is immediately sequenced
-        // using knot_io_bind/knot_io_then. The result is an IO value.
-        let mut current_io: Option<Value> = None;
-
-        for stmt in stmts {
-            match &stmt.node {
-                ast::StmtKind::Bind { pat: _, expr } => {
-                    let io_val = self.compile_expr(builder, expr, env, db);
-                    if let Some(prev) = current_io {
-                        // Sequence previous IO, then bind this one
-                        // Build: knot_io_then(prev, ???) but we need the bind...
-                        // Actually we need to run prev first, then run io_val and bind result
-                        // Use knot_io_bind approach: first sequence prev (discard), then bind io_val
-                        current_io = Some(self.call_rt(builder, "knot_io_then", &[prev, io_val]));
-                        // But wait — we need to bind the result of io_val to pat.
-                        // The bind approach: wrap the remaining computation as:
-                        //   knot_io_bind(io_val, \result -> rest...)
-                        // But we can't easily do this without nested closures at the Cranelift level.
-                        //
-                        // Simpler approach: IO do-blocks run sequentially at thunk execution time.
-                        // We compile the entire block *eagerly* with knot_io_run at each step.
-                        // The whole block is then wrapped in an IO thunk.
-                        //
-                        // Actually, the simplest correct approach:
-                        // Build the block as if running eagerly, but wrap the whole thing in an IO thunk.
-                        // This means we compile a helper function that runs each IO action.
-                    } else {
-                        current_io = Some(io_val);
-                    }
-                    // For binds, we actually need to run the IO at thunk-execution time.
-                    // Let's use the simpler approach: compile eagerly with io_run at each bind.
-                    // Discard the above — let me use a different strategy.
-                    let _ = current_io;
-                    break; // Will re-implement below
-                }
-                _ => {}
-            }
-        }
-
-        // Simpler approach: build the entire do-block as an IO thunk using a helper function.
+        // Build the entire do-block as an IO thunk using a helper function.
         // The helper function, when called, runs each IO action with knot_io_run.
         self.compile_io_do_as_thunk(builder, stmts, env, db)
     }

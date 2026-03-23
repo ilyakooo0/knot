@@ -693,8 +693,13 @@ impl<'src> Lexer<'src> {
             b'[' => TokenKind::LBracket,
             b']' => TokenKind::RBracket,
             _ => {
-                let span = Span::new(self.pos - 1, self.pos);
-                let c = self.source[self.pos - 1..].chars().next().unwrap_or('?');
+                let char_start = self.pos - 1;
+                // Skip remaining bytes of multi-byte UTF-8 character
+                while self.pos < self.bytes.len() && (self.bytes[self.pos] & 0xC0) == 0x80 {
+                    self.pos += 1;
+                }
+                let span = Span::new(char_start, self.pos);
+                let c = self.source[char_start..self.pos].chars().next().unwrap_or('?');
                 self.diagnostics.push(
                     Diagnostic::error(format!("unexpected character '{c}'"))
                         .label(span, "unexpected"),

@@ -107,9 +107,9 @@ impl EffectSet {
         }
     }
 
-    /// Returns true if any IO effects (console, network, fs) are present.
+    /// Returns true if any IO effects (console, network, fs, clock, random) are present.
     pub fn has_io(&self) -> bool {
-        self.console || self.network || self.fs
+        self.console || self.network || self.fs || self.clock || self.random
     }
 
     pub fn from_ast_effects(effects: &[ast::Effect]) -> EffectSet {
@@ -531,8 +531,12 @@ fn extract_effects(ty: &ast::Type) -> Option<EffectSet> {
     match &ty.node {
         ast::TypeKind::Effectful { effects, .. } => Some(EffectSet::from_ast_effects(effects)),
         ast::TypeKind::Function { param, result } => {
-            // Effects could be on the outermost function type or nested
-            extract_effects(param).or_else(|| extract_effects(result))
+            // Effects could be on either side of the function arrow — union both
+            match (extract_effects(param), extract_effects(result)) {
+                (Some(a), Some(b)) => Some(a.union(&b)),
+                (a @ Some(_), None) => a,
+                (None, b) => b,
+            }
         }
         _ => None,
     }
@@ -647,7 +651,7 @@ mod tests {
 
         e.console = false;
         e.clock = true;
-        assert!(!e.has_io());
+        assert!(e.has_io());
     }
 
     #[test]
@@ -845,8 +849,9 @@ mod tests {
             "now".into(),
         )))));
         let (diags, _effects) = check_module(vec![make_fun("f", body)]);
-        assert_eq!(diags.len(), 1);
-        assert!(diags[0].message.contains("must interact with relations"));
+        assert_eq!(diags.len(), 2);
+        assert!(diags[0].message.contains("IO effects are not allowed inside atomic"));
+        assert!(diags[1].message.contains("must interact with relations"));
     }
 
     #[test]

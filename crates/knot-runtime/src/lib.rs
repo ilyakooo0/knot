@@ -311,7 +311,8 @@ fn brief_value(v: *mut Value) -> String {
         Value::Float(n) => format!("Float({})", n),
         Value::Text(s) => {
             if s.len() > 30 {
-                format!("Text(\"{}...\")", &s[..27])
+                let truncated: String = s.chars().take(27).collect();
+                format!("Text(\"{}...\")", truncated)
             } else {
                 format!("Text(\"{}\")", s)
             }
@@ -1014,7 +1015,7 @@ fn sql_relations_equal(conn: &Connection, a: &[*mut Value], b: &[*mut Value]) ->
 
     // Check symmetric difference: (a EXCEPT b) UNION ALL (b EXCEPT a) should be empty
     let sql = format!(
-        "SELECT 1 FROM (SELECT * FROM {} EXCEPT SELECT * FROM {} UNION ALL SELECT * FROM {} EXCEPT SELECT * FROM {}) LIMIT 1",
+        "SELECT 1 FROM (SELECT * FROM {} EXCEPT SELECT * FROM {} UNION ALL (SELECT * FROM {} EXCEPT SELECT * FROM {})) LIMIT 1",
         quote_ident(&t1), quote_ident(&t2), quote_ident(&t2), quote_ident(&t1)
     );
     debug_sql(&sql);
@@ -1472,17 +1473,23 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
             if ra.len() != rb.len() {
                 return false;
             }
-            let set_a: HashSet<Vec<u8>> = ra.iter().map(|r| {
+            // Use a multiset (count occurrences) to correctly handle duplicates
+            let mut counts: HashMap<Vec<u8>, usize> = HashMap::new();
+            for r in ra.iter() {
                 let mut buf = Vec::new();
                 value_to_hash_bytes(*r, &mut buf);
-                buf
-            }).collect();
+                *counts.entry(buf).or_insert(0) += 1;
+            }
             let mut buf = Vec::new();
-            rb.iter().all(|r| {
+            for r in rb.iter() {
                 buf.clear();
                 value_to_hash_bytes(*r, &mut buf);
-                set_a.contains(buf.as_slice())
-            })
+                match counts.get_mut(buf.as_slice()) {
+                    Some(c) if *c > 0 => *c -= 1,
+                    _ => return false,
+                }
+            }
+            true
         }
         _ => false,
     }
@@ -2067,6 +2074,34 @@ fn deep_clone_value(val: *mut Value) -> *mut Value {
     Box::into_raw(Box::new(cloned))
 }
 
+/// Recursively free a value tree allocated by `deep_clone_value`.
+/// SAFETY: Every node in the tree must have been allocated by `Box::into_raw`.
+/// Do NOT call this on arena-allocated values.
+unsafe fn deep_drop_value(val: *mut Value) {
+    if val.is_null() {
+        return;
+    }
+    unsafe {
+        match &*val {
+            Value::Record(fields) => {
+                for f in fields {
+                    deep_drop_value(f.value);
+                }
+            }
+            Value::Relation(rows) => {
+                for r in rows {
+                    deep_drop_value(*r);
+                }
+            }
+            Value::Constructor(_, inner) => deep_drop_value(*inner),
+            Value::Function(_, env, _) => deep_drop_value(*env),
+            Value::IO(_, env) => deep_drop_value(*env),
+            _ => {}
+        }
+        drop(Box::from_raw(val));
+    }
+}
+
 /// Fork an IO action onto a new OS thread.
 /// Takes an IO value, returns an IO thunk that spawns the thread.
 #[unsafe(no_mangle)]
@@ -2089,6 +2124,7 @@ pub extern "C" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
             knot_io_run(db, io);
 
             // Close DB and clean up cloned values
+            unsafe { deep_drop_value(io); }
             knot_db_close(db);
         });
 
@@ -2912,7 +2948,22 @@ fn parse_json_string(s: &str) -> (*mut Value, &str) {
                 Some('u') => {
                     let hex: String = chars.by_ref().take(4).collect();
                     if let Ok(cp) = u32::from_str_radix(&hex, 16) {
-                        if let Some(c) = char::from_u32(cp) {
+                        if (0xD800..=0xDBFF).contains(&cp) {
+                            // High surrogate — expect \uXXXX low surrogate
+                            let mut low_cp = 0u32;
+                            if chars.next() == Some('\\') && chars.next() == Some('u') {
+                                let hex2: String = chars.by_ref().take(4).collect();
+                                if let Ok(lc) = u32::from_str_radix(&hex2, 16) {
+                                    low_cp = lc;
+                                }
+                            }
+                            if (0xDC00..=0xDFFF).contains(&low_cp) {
+                                let combined = 0x10000 + ((cp - 0xD800) << 10) + (low_cp - 0xDC00);
+                                if let Some(c) = char::from_u32(combined) {
+                                    result.push(c);
+                                }
+                            }
+                        } else if let Some(c) = char::from_u32(cp) {
                             result.push(c);
                         }
                     }
@@ -3003,6 +3054,7 @@ fn parse_json_obj(s: &str) -> (*mut Value, &str) {
             break;
         }
     }
+    fields.sort_by(|a, b| a.name.cmp(&b.name));
     (alloc(Value::Record(fields)), rest)
 }
 
@@ -3288,7 +3340,7 @@ pub extern "C" fn knot_source_migrate(
 
     db_ref
         .conn
-        .execute_batch("BEGIN IMMEDIATE;")
+        .execute_batch("SAVEPOINT knot_migrate;")
         .expect("knot runtime: failed to begin migration transaction");
 
     let drop_sql = format!("DROP TABLE IF EXISTS {};", table);
@@ -3376,7 +3428,7 @@ pub extern "C" fn knot_source_migrate(
 
     db_ref
         .conn
-        .execute_batch("COMMIT;")
+        .execute_batch("RELEASE SAVEPOINT knot_migrate;")
         .expect("knot runtime: failed to commit migration");
 
     eprintln!("Migrated source '{}': {} rows", name, old_rows.len());
@@ -4830,7 +4882,7 @@ pub extern "C" fn knot_source_write(
     // Delete all existing rows and insert new ones in a transaction
     db_ref
         .conn
-        .execute_batch("BEGIN;")
+        .execute_batch("SAVEPOINT knot_full_set;")
         .expect("knot runtime: failed to begin transaction");
 
     let table_name = format!("_knot_{}", name);
@@ -4883,7 +4935,7 @@ pub extern "C" fn knot_source_write(
 
     db_ref
         .conn
-        .execute_batch("COMMIT;")
+        .execute_batch("RELEASE SAVEPOINT knot_full_set;")
         .expect("knot runtime: failed to commit transaction");
     notify_relation_changed();
 }
@@ -4919,7 +4971,7 @@ pub extern "C" fn knot_source_append(
 
     db_ref
         .conn
-        .execute_batch("BEGIN;")
+        .execute_batch("SAVEPOINT knot_set;")
         .expect("knot runtime: failed to begin transaction");
 
     if is_adt_schema(schema) {
@@ -4959,7 +5011,7 @@ pub extern "C" fn knot_source_append(
 
     db_ref
         .conn
-        .execute_batch("COMMIT;")
+        .execute_batch("RELEASE SAVEPOINT knot_set;")
         .expect("knot runtime: failed to commit transaction");
     notify_relation_changed();
 }
@@ -4992,7 +5044,7 @@ pub extern "C" fn knot_source_diff_write(
 
     db_ref
         .conn
-        .execute_batch("BEGIN;")
+        .execute_batch("SAVEPOINT knot_diff_write;")
         .expect("knot runtime: failed to begin transaction");
 
     if is_adt_schema(schema) {
@@ -5206,7 +5258,7 @@ pub extern "C" fn knot_source_diff_write(
 
     db_ref
         .conn
-        .execute_batch("COMMIT;")
+        .execute_batch("RELEASE SAVEPOINT knot_diff_write;")
         .expect("knot runtime: failed to commit transaction");
     notify_relation_changed();
 }
@@ -5719,9 +5771,13 @@ pub extern "C" fn knot_atomic_commit(db: *mut c_void) {
 pub extern "C" fn knot_atomic_rollback(db: *mut c_void) {
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let depth = db_ref.atomic_depth.get();
+    // ROLLBACK TO undoes changes but keeps the savepoint alive.
+    // RELEASE then removes it so the next begin creates a clean one.
     db_ref
         .conn
-        .execute_batch(&format!("ROLLBACK TO SAVEPOINT knot_atomic_{depth};"))
+        .execute_batch(&format!(
+            "ROLLBACK TO SAVEPOINT knot_atomic_{depth}; RELEASE SAVEPOINT knot_atomic_{depth};"
+        ))
         .expect("knot runtime: failed to rollback atomic");
     db_ref.atomic_depth.set(depth - 1);
 }
@@ -6108,7 +6164,7 @@ pub extern "C" fn knot_view_write(
 
     db_ref
         .conn
-        .execute_batch("BEGIN;")
+        .execute_batch("SAVEPOINT knot_view_write;")
         .expect("knot runtime: view_write begin failed");
 
     // 1. Delete rows matching the view's constant filter
@@ -6190,7 +6246,7 @@ pub extern "C" fn knot_view_write(
 
     db_ref
         .conn
-        .execute_batch("COMMIT;")
+        .execute_batch("RELEASE SAVEPOINT knot_view_write;")
         .expect("knot runtime: view_write commit failed");
 }
 
@@ -6469,21 +6525,20 @@ fn parse_query_string(qs: &str) -> HashMap<String, String> {
 }
 
 fn url_decode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.bytes();
-    while let Some(b) = chars.next() {
+    let mut bytes = Vec::with_capacity(s.len());
+    let mut iter = s.bytes();
+    while let Some(b) = iter.next() {
         if b == b'%' {
-            let h = chars.next().unwrap_or(b'0');
-            let l = chars.next().unwrap_or(b'0');
-            let val = hex_val(h) * 16 + hex_val(l);
-            result.push(val as char);
+            let h = iter.next().unwrap_or(b'0');
+            let l = iter.next().unwrap_or(b'0');
+            bytes.push(hex_val(h) * 16 + hex_val(l));
         } else if b == b'+' {
-            result.push(' ');
+            bytes.push(b' ');
         } else {
-            result.push(b as char);
+            bytes.push(b);
         }
     }
-    result
+    String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 fn hex_val(b: u8) -> u8 {
@@ -6547,7 +6602,15 @@ fn value_to_json(v: *mut Value) -> String {
     match unsafe { as_ref(v) } {
         Value::Int(n) => n.to_string(),
         Value::Float(n) => n.to_string(),
-        Value::Text(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
+        Value::Text(s) => {
+            let escaped = s
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+            format!("\"{}\"", escaped)
+        }
         Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         Value::Bytes(b) => {
             format!("\"{}\"", base64_encode(b))
@@ -6556,7 +6619,10 @@ fn value_to_json(v: *mut Value) -> String {
         Value::Record(fields) => {
             let parts: Vec<String> = fields
                 .iter()
-                .map(|f| format!("\"{}\":{}", f.name, value_to_json(f.value)))
+                .map(|f| {
+                    let escaped_name = f.name.replace('\\', "\\\\").replace('"', "\\\"");
+                    format!("\"{}\":{}", escaped_name, value_to_json(f.value))
+                })
                 .collect();
             format!("{{{}}}", parts.join(","))
         }
@@ -6566,7 +6632,10 @@ fn value_to_json(v: *mut Value) -> String {
         }
         Value::Constructor(tag, payload) => {
             let p = value_to_json(*payload);
-            format!("{{\"tag\":\"{}\",\"value\":{}}}", tag, p)
+            let escaped_tag = tag
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"");
+            format!("{{\"tag\":\"{}\",\"value\":{}}}", escaped_tag, p)
         }
         Value::Function(_, _, src) => format!("\"<function: {}>\"", src),
         Value::IO(_, _) => "\"<<IO>>\"".to_string(),
@@ -6643,7 +6712,7 @@ pub extern "C" fn knot_http_listen(
         Value::Int(n) => n.to_u16().expect("knot runtime: port number out of range"),
         _ => panic!("knot runtime: listen expects Int port, got {}", type_name(port_val)),
     };
-    let table = Arc::new(unsafe { std::ptr::read(route_table as *const RouteTable) });
+    let table = Arc::new(unsafe { *Box::from_raw(route_table as *mut RouteTable) });
     let addr = format!("0.0.0.0:{}", port);
     let server = Arc::new(tiny_http::Server::http(&addr)
         .unwrap_or_else(|e| panic!("knot runtime: failed to start HTTP server on {}: {}", addr, e)));
@@ -6827,6 +6896,7 @@ pub extern "C" fn knot_http_listen(
                         });
                     }
 
+                    fields.sort_by(|a, b| a.name.cmp(&b.name));
                     let record = alloc(Value::Record(fields));
                     let ctor_val = alloc(Value::Constructor(entry_constructor, record));
 
@@ -6876,6 +6946,8 @@ pub extern "C" fn knot_http_listen(
                     }
 
                     knot_db_close(db);
+                    // Free the deep-cloned handler to avoid per-request memory leak
+                    unsafe { deep_drop_value(handler); }
                 });
             }
             None => {
@@ -7163,15 +7235,17 @@ fn fetch_build_url(base: &str, path_pattern: &str, payload: *mut Value) -> Strin
 /// Build a JSON body string from a field descriptor and record payload.
 fn fetch_build_body(body_desc: &str, payload: *mut Value) -> String {
     let mut json = String::from("{");
-    for (i, field_desc) in body_desc.split(',').enumerate() {
+    let mut first = true;
+    for field_desc in body_desc.split(',') {
         if field_desc.is_empty() {
             continue;
         }
         let (name, _ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
         let field_val = knot_record_field(payload, name.as_ptr(), name.len());
-        if i > 0 {
+        if !first {
             json.push(',');
         }
+        first = false;
         json.push('"');
         json.push_str(name);
         json.push_str("\":");

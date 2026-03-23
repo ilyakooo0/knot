@@ -772,7 +772,6 @@ impl Infer {
                 .collect();
             ctors.insert(ctor_name.clone(), Ty::Record(field_tys, None));
         }
-        self.annotation_vars.clear();
         Some(Ty::Variant(ctors, None))
     }
 
@@ -1304,6 +1303,9 @@ impl Infer {
     ) -> Option<(Ty, Ty)> {
         let info = self.constructors.get(name)?.clone();
 
+        // Save and restore annotation_vars so constructor instantiation
+        // doesn't corrupt the enclosing declaration's type variable mapping.
+        let saved_annotation_vars = self.annotation_vars.clone();
         self.annotation_vars.clear();
         let param_tys: Vec<Ty> = info
             .data_params
@@ -1328,6 +1330,7 @@ impl Infer {
         };
         let record_ty = Ty::Record(field_tys, None);
 
+        self.annotation_vars = saved_annotation_vars;
         Some((data_ty, record_ty))
     }
 
@@ -2195,12 +2198,7 @@ impl Infer {
         }
 
         self.pop_scope();
-        // Don't restore in_io_do to false — once IO is detected in any
-        // do block within the current function, keep relaxed type checking
-        // for IO/Relation/Response branch mismatches.
-        if !self.in_io_do {
-            self.in_io_do = prev_in_io_do;
-        }
+        self.in_io_do = prev_in_io_do;
 
         // Determine block result type:
         // - IO if any statement is IO

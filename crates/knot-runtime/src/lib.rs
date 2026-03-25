@@ -2902,183 +2902,48 @@ pub extern "C" fn knot_json_encode(v: *mut Value) -> *mut Value {
 pub extern "C" fn knot_json_decode(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Text(s) => {
-            let s = s.trim();
-            let (val, _) = parse_json_value(s);
-            val
+            match serde_json::from_str::<serde_json::Value>(s) {
+                Ok(json) => json_to_value(&json),
+                Err(e) => panic!("knot runtime: parseJson failed: {}", e),
+            }
         }
         _ => panic!("knot runtime: parseJson expected Text, got {}", type_name(v)),
     }
 }
 
-/// Recursive JSON parser. Returns (parsed_value, rest_of_input).
-fn parse_json_value(s: &str) -> (*mut Value, &str) {
-    let s = s.trim();
-    if s.is_empty() {
-        return (alloc(Value::Unit), s);
-    }
-    match s.as_bytes()[0] {
-        b'"' => parse_json_string(s),
-        b'{' => parse_json_obj(s),
-        b'[' => parse_json_array(s),
-        b't' if s.starts_with("true") => (alloc_bool(true), &s[4..]),
-        b'f' if s.starts_with("false") => (alloc_bool(false), &s[5..]),
-        b'n' if s.starts_with("null") => (alloc(Value::Unit), &s[4..]),
-        _ => parse_json_number(s),
-    }
-}
-
-fn parse_json_string(s: &str) -> (*mut Value, &str) {
-    debug_assert!(s.starts_with('"'));
-    let mut chars = s[1..].chars();
-    let mut result = String::new();
-    loop {
-        match chars.next() {
-            None => break,
-            Some('"') => {
-                let rest = chars.as_str();
-                return (alloc(Value::Text(result)), rest);
+/// Convert a serde_json::Value into a Knot *mut Value.
+fn json_to_value(json: &serde_json::Value) -> *mut Value {
+    match json {
+        serde_json::Value::Null => alloc(Value::Unit),
+        serde_json::Value::Bool(b) => alloc_bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                alloc_int(BigInt::from(i))
+            } else if let Some(u) = n.as_u64() {
+                alloc_int(BigInt::from(u))
+            } else if let Some(f) = n.as_f64() {
+                alloc_float(f)
+            } else {
+                alloc_int(BigInt::ZERO)
             }
-            Some('\\') => match chars.next() {
-                Some('"') => result.push('"'),
-                Some('\\') => result.push('\\'),
-                Some('/') => result.push('/'),
-                Some('n') => result.push('\n'),
-                Some('r') => result.push('\r'),
-                Some('t') => result.push('\t'),
-                Some('u') => {
-                    let hex: String = chars.by_ref().take(4).collect();
-                    if let Ok(cp) = u32::from_str_radix(&hex, 16) {
-                        if (0xD800..=0xDBFF).contains(&cp) {
-                            // High surrogate — expect \uXXXX low surrogate
-                            let mut low_cp = 0u32;
-                            if chars.next() == Some('\\') && chars.next() == Some('u') {
-                                let hex2: String = chars.by_ref().take(4).collect();
-                                if let Ok(lc) = u32::from_str_radix(&hex2, 16) {
-                                    low_cp = lc;
-                                }
-                            }
-                            if (0xDC00..=0xDFFF).contains(&low_cp) {
-                                let combined = 0x10000 + ((cp - 0xD800) << 10) + (low_cp - 0xDC00);
-                                if let Some(c) = char::from_u32(combined) {
-                                    result.push(c);
-                                }
-                            }
-                        } else if let Some(c) = char::from_u32(cp) {
-                            result.push(c);
-                        }
-                    }
-                }
-                Some(c) => {
-                    result.push('\\');
-                    result.push(c);
-                }
-                None => break,
-            },
-            Some(c) => result.push(c),
+        }
+        serde_json::Value::String(s) => alloc(Value::Text(s.clone())),
+        serde_json::Value::Array(arr) => {
+            let items: Vec<*mut Value> = arr.iter().map(json_to_value).collect();
+            alloc(Value::Relation(items))
+        }
+        serde_json::Value::Object(obj) => {
+            if obj.is_empty() {
+                return alloc(Value::Unit);
+            }
+            let mut fields: Vec<RecordField> = obj
+                .iter()
+                .map(|(k, v)| RecordField { name: k.clone(), value: json_to_value(v) })
+                .collect();
+            fields.sort_by(|a, b| a.name.cmp(&b.name));
+            alloc(Value::Record(fields))
         }
     }
-    (alloc(Value::Text(result)), "")
-}
-
-fn parse_json_number(s: &str) -> (*mut Value, &str) {
-    let mut end = 0;
-    let mut is_float = false;
-    let bytes = s.as_bytes();
-    if end < bytes.len() && (bytes[end] == b'-' || bytes[end] == b'+') {
-        end += 1;
-    }
-    while end < bytes.len() && bytes[end].is_ascii_digit() {
-        end += 1;
-    }
-    if end < bytes.len() && bytes[end] == b'.' {
-        is_float = true;
-        end += 1;
-        while end < bytes.len() && bytes[end].is_ascii_digit() {
-            end += 1;
-        }
-    }
-    if end < bytes.len() && (bytes[end] == b'e' || bytes[end] == b'E') {
-        is_float = true;
-        end += 1;
-        if end < bytes.len() && (bytes[end] == b'-' || bytes[end] == b'+') {
-            end += 1;
-        }
-        while end < bytes.len() && bytes[end].is_ascii_digit() {
-            end += 1;
-        }
-    }
-    let num_str = &s[..end];
-    let rest = &s[end..];
-    if is_float {
-        let n: f64 = num_str.parse().unwrap_or(0.0);
-        (alloc_float(n), rest)
-    } else {
-        let n: BigInt = num_str.parse().unwrap_or(BigInt::ZERO);
-        (alloc_int(n), rest)
-    }
-}
-
-fn parse_json_obj(s: &str) -> (*mut Value, &str) {
-    debug_assert!(s.starts_with('{'));
-    let mut rest = s[1..].trim();
-    let mut fields: Vec<RecordField> = Vec::new();
-    if rest.starts_with('}') {
-        return (alloc(Value::Unit), &rest[1..]);
-    }
-    loop {
-        // Parse key (must be a string)
-        if !rest.starts_with('"') {
-            break;
-        }
-        let (key_val, after_key) = parse_json_string(rest);
-        let key = match unsafe { as_ref(key_val) } {
-            Value::Text(s) => s.clone(),
-            _ => unreachable!(),
-        };
-        rest = after_key.trim();
-        // Skip colon
-        if rest.starts_with(':') {
-            rest = rest[1..].trim();
-        }
-        // Parse value
-        let (val, after_val) = parse_json_value(rest);
-        rest = after_val.trim();
-        fields.push(RecordField { name: key, value: val });
-        // Skip comma or end
-        if rest.starts_with(',') {
-            rest = rest[1..].trim();
-        } else if rest.starts_with('}') {
-            rest = &rest[1..];
-            break;
-        } else {
-            break;
-        }
-    }
-    fields.sort_by(|a, b| a.name.cmp(&b.name));
-    (alloc(Value::Record(fields)), rest)
-}
-
-fn parse_json_array(s: &str) -> (*mut Value, &str) {
-    debug_assert!(s.starts_with('['));
-    let mut rest = s[1..].trim();
-    let mut items: Vec<*mut Value> = Vec::new();
-    if rest.starts_with(']') {
-        return (alloc(Value::Relation(items)), &rest[1..]);
-    }
-    loop {
-        let (val, after_val) = parse_json_value(rest);
-        rest = after_val.trim();
-        items.push(val);
-        if rest.starts_with(',') {
-            rest = rest[1..].trim();
-        } else if rest.starts_with(']') {
-            rest = &rest[1..];
-            break;
-        } else {
-            break;
-        }
-    }
-    (alloc(Value::Relation(items)), rest)
 }
 
 // ── Standard library: utility operations ──────────────────────
@@ -6596,49 +6461,48 @@ fn base64_encode(data: &[u8]) -> String {
 }
 
 fn value_to_json(v: *mut Value) -> String {
+    serde_json::to_string(&value_to_serde_json(v)).unwrap_or_else(|_| "null".to_string())
+}
+
+/// Convert a Knot *mut Value into a serde_json::Value.
+fn value_to_serde_json(v: *mut Value) -> serde_json::Value {
     if v.is_null() {
-        return "null".to_string();
+        return serde_json::Value::Null;
     }
     match unsafe { as_ref(v) } {
-        Value::Int(n) => n.to_string(),
-        Value::Float(n) => n.to_string(),
-        Value::Text(s) => {
-            let escaped = s
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"")
-                .replace('\n', "\\n")
-                .replace('\r', "\\r")
-                .replace('\t', "\\t");
-            format!("\"{}\"", escaped)
+        Value::Int(n) => {
+            if let Some(i) = n.to_i64() {
+                serde_json::Value::Number(i.into())
+            } else {
+                // BigInt too large for i64 — encode as string
+                serde_json::Value::String(n.to_string())
+            }
         }
-        Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
-        Value::Bytes(b) => {
-            format!("\"{}\"", base64_encode(b))
+        Value::Float(n) => {
+            serde_json::json!(*n)
         }
-        Value::Unit => "{}".to_string(),
+        Value::Text(s) => serde_json::Value::String(s.clone()),
+        Value::Bool(b) => serde_json::Value::Bool(*b),
+        Value::Bytes(b) => serde_json::Value::String(base64_encode(b)),
+        Value::Unit => serde_json::Value::Object(serde_json::Map::new()),
         Value::Record(fields) => {
-            let parts: Vec<String> = fields
-                .iter()
-                .map(|f| {
-                    let escaped_name = f.name.replace('\\', "\\\\").replace('"', "\\\"");
-                    format!("\"{}\":{}", escaped_name, value_to_json(f.value))
-                })
-                .collect();
-            format!("{{{}}}", parts.join(","))
+            let mut map = serde_json::Map::with_capacity(fields.len());
+            for f in fields {
+                map.insert(f.name.clone(), value_to_serde_json(f.value));
+            }
+            serde_json::Value::Object(map)
         }
         Value::Relation(rows) => {
-            let parts: Vec<String> = rows.iter().map(|r| value_to_json(*r)).collect();
-            format!("[{}]", parts.join(","))
+            serde_json::Value::Array(rows.iter().map(|r| value_to_serde_json(*r)).collect())
         }
         Value::Constructor(tag, payload) => {
-            let p = value_to_json(*payload);
-            let escaped_tag = tag
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"");
-            format!("{{\"tag\":\"{}\",\"value\":{}}}", escaped_tag, p)
+            let mut map = serde_json::Map::with_capacity(2);
+            map.insert("tag".into(), serde_json::Value::String(tag.clone()));
+            map.insert("value".into(), value_to_serde_json(*payload));
+            serde_json::Value::Object(map)
         }
-        Value::Function(_, _, src) => format!("\"<function: {}>\"", src),
-        Value::IO(_, _) => "\"<<IO>>\"".to_string(),
+        Value::Function(_, _, src) => serde_json::Value::String(format!("<function: {}>", src)),
+        Value::IO(_, _) => serde_json::Value::String("<<IO>>".into()),
     }
 }
 
@@ -6818,7 +6682,10 @@ pub extern "C" fn knot_http_listen(
                         if debug_enabled() {
                             eprintln!("[HTTP]     body: {}", body_str);
                         }
-                        let (body_val, _) = parse_json_value(&body_str);
+                        let body_val = match serde_json::from_str::<serde_json::Value>(&body_str) {
+                            Ok(json) => json_to_value(&json),
+                            Err(_) => alloc(Value::Unit),
+                        };
                         match unsafe { as_ref(body_val) } {
                             Value::Record(body_fields) => {
                                 for (bname, _bty) in &entry_body_fields {
@@ -7173,8 +7040,10 @@ pub extern "C" fn knot_http_fetch_io(
                 let body_text = response.into_string().unwrap_or_default();
                 let has_resp_schema = matches!(unsafe { as_ref(resp_desc) }, Value::Text(s) if !s.is_empty());
                 let parsed_body = if has_resp_schema {
-                    let (val, _) = parse_json_value(&body_text);
-                    val
+                    match serde_json::from_str::<serde_json::Value>(&body_text) {
+                        Ok(json) => json_to_value(&json),
+                        Err(_) => alloc(Value::Unit),
+                    }
                 } else {
                     alloc(Value::Text(body_text))
                 };
@@ -7234,25 +7103,16 @@ fn fetch_build_url(base: &str, path_pattern: &str, payload: *mut Value) -> Strin
 
 /// Build a JSON body string from a field descriptor and record payload.
 fn fetch_build_body(body_desc: &str, payload: *mut Value) -> String {
-    let mut json = String::from("{");
-    let mut first = true;
+    let mut map = serde_json::Map::new();
     for field_desc in body_desc.split(',') {
         if field_desc.is_empty() {
             continue;
         }
         let (name, _ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
         let field_val = knot_record_field(payload, name.as_ptr(), name.len());
-        if !first {
-            json.push(',');
-        }
-        first = false;
-        json.push('"');
-        json.push_str(name);
-        json.push_str("\":");
-        json.push_str(&value_to_json(field_val));
+        map.insert(name.to_string(), value_to_serde_json(field_val));
     }
-    json.push('}');
-    json
+    serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// Build a query string from a field descriptor and record payload.
@@ -7674,11 +7534,10 @@ fn parse_response_fields(s: &str) -> Vec<(String, String)> {
 }
 
 fn json_escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+    // serde_json::to_string produces a quoted string with proper escaping;
+    // strip the surrounding quotes for use in manually-built JSON.
+    let quoted = serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s));
+    quoted[1..quoted.len() - 1].to_string()
 }
 
 // ── Hash index for equi-join optimization ──────────────────────────

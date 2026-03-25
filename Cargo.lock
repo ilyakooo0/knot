@@ -857,6 +857,7 @@ dependencies = [
  "num-traits",
  "ratatui",
  "rusqlite",
+ "serde_json",
  "tiny_http",
  "ureq",
  "x25519-dalek",

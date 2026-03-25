@@ -842,23 +842,25 @@ impl Codegen {
         for decl in &module.decls {
             match &decl.node {
                 ast::DeclKind::Fun { name, body, .. } => {
-                    // If the body is a lambda, extract its params for direct-call optimization.
-                    let n_params = match &body.node {
-                        ast::ExprKind::Lambda { params, .. } => params.len(),
-                        _ => 0,
-                    };
-                    let mut sig = self.module.make_signature();
-                    sig.params.push(AbiParam::new(self.ptr_type)); // db
-                    for _ in 0..n_params {
-                        sig.params.push(AbiParam::new(self.ptr_type));
+                    if let Some(body) = body {
+                        // If the body is a lambda, extract its params for direct-call optimization.
+                        let n_params = match &body.node {
+                            ast::ExprKind::Lambda { params, .. } => params.len(),
+                            _ => 0,
+                        };
+                        let mut sig = self.module.make_signature();
+                        sig.params.push(AbiParam::new(self.ptr_type)); // db
+                        for _ in 0..n_params {
+                            sig.params.push(AbiParam::new(self.ptr_type));
+                        }
+                        sig.returns.push(AbiParam::new(self.ptr_type));
+                        let func_name = format!("knot_user_{}", name);
+                        let func_id = self
+                            .module
+                            .declare_function(&func_name, Linkage::Local, &sig)
+                            .unwrap();
+                        self.user_fns.insert(name.clone(), (func_id, n_params));
                     }
-                    sig.returns.push(AbiParam::new(self.ptr_type));
-                    let func_name = format!("knot_user_{}", name);
-                    let func_id = self
-                        .module
-                        .declare_function(&func_name, Linkage::Local, &sig)
-                        .unwrap();
-                    self.user_fns.insert(name.clone(), (func_id, n_params));
                 }
                 ast::DeclKind::Derived { name, body, .. } => {
                     // Derived relations are 0-param functions (only db param)
@@ -1728,13 +1730,15 @@ impl Codegen {
         for decl in &module.decls {
             match &decl.node {
                 ast::DeclKind::Fun { name, body, .. } => {
-                    // If body is a lambda, extract its params for direct compilation.
-                    match &body.node {
-                        ast::ExprKind::Lambda { params, body: lambda_body } => {
-                            self.define_user_function(name, params, lambda_body);
-                        }
-                        _ => {
-                            self.define_user_function(name, &[], body);
+                    if let Some(body) = body {
+                        // If body is a lambda, extract its params for direct compilation.
+                        match &body.node {
+                            ast::ExprKind::Lambda { params, body: lambda_body } => {
+                                self.define_user_function(name, params, lambda_body);
+                            }
+                            _ => {
+                                self.define_user_function(name, &[], body);
+                            }
                         }
                     }
                 }
@@ -4128,7 +4132,7 @@ impl Codegen {
                     // Check if relation length matches the number of patterns
                     let len = self.call_rt(builder, "knot_relation_len", &[scrut]);
                     let expected =
-                        builder.ins().iconst(types::I64, pats.len() as i64);
+                        builder.ins().iconst(self.ptr_type, pats.len() as i64);
                     let is_match =
                         builder.ins().icmp(IntCC::Equal, len, expected);
                     builder.ins().brif(
@@ -4210,7 +4214,7 @@ impl Codegen {
             }
             ast::PatKind::List(pats) => {
                 for (idx, elem_pat) in pats.iter().enumerate() {
-                    let index = builder.ins().iconst(types::I64, idx as i64);
+                    let index = builder.ins().iconst(self.ptr_type, idx as i64);
                     let elem =
                         self.call_rt(builder, "knot_relation_get", &[val, index]);
                     self.bind_case_pattern(builder, elem_pat, elem, env);
@@ -4294,7 +4298,7 @@ impl Codegen {
         // Collect function bodies for analysis
         let mut fun_bodies: Vec<(String, &ast::Expr)> = Vec::new();
         for decl in decls {
-            if let ast::DeclKind::Fun { name, body, .. } = &decl.node {
+            if let ast::DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
                 fun_bodies.push((name.clone(), body));
             }
         }
@@ -4617,10 +4621,10 @@ impl Codegen {
                         let continue_blk = builder.create_block();
                         let exit = builder.create_block();
 
-                        let zero = builder.ins().iconst(types::I64, 0);
+                        let zero = builder.ins().iconst(self.ptr_type, 0);
                         builder.ins().jump(header, &[zero]);
                         builder.switch_to_block(header);
-                        let i = builder.append_block_param(header, types::I64);
+                        let i = builder.append_block_param(header, self.ptr_type);
                         let cond = builder.ins().icmp(IntCC::SignedLessThan, i, len);
                         builder.ins().brif(cond, body, &[], exit, &[]);
                         builder.switch_to_block(body);
@@ -4769,11 +4773,11 @@ impl Codegen {
                     let continue_blk = builder.create_block();
                     let exit = builder.create_block();
 
-                    let zero = builder.ins().iconst(types::I64, 0);
+                    let zero = builder.ins().iconst(self.ptr_type, 0);
                     builder.ins().jump(header, &[zero]);
 
                     builder.switch_to_block(header);
-                    let i = builder.append_block_param(header, types::I64);
+                    let i = builder.append_block_param(header, self.ptr_type);
                     let cond =
                         builder.ins().icmp(IntCC::SignedLessThan, i, len);
                     builder.ins().brif(cond, body, &[], exit, &[]);
@@ -4866,7 +4870,7 @@ impl Codegen {
                         }
                         builder.switch_to_block(info.continue_blk);
                         builder.seal_block(info.continue_blk);
-                        let one = builder.ins().iconst(types::I64, 1);
+                        let one = builder.ins().iconst(self.ptr_type, 1);
                         let next_i = builder.ins().iadd(info.index_var, one);
                         builder.ins().jump(info.header, &[next_i]);
                         builder.seal_block(info.header);
@@ -4932,11 +4936,11 @@ impl Codegen {
                     let g_continue = builder.create_block();
                     let g_exit = builder.create_block();
 
-                    let zero = builder.ins().iconst(types::I64, 0);
+                    let zero = builder.ins().iconst(self.ptr_type, 0);
                     builder.ins().jump(g_header, &[zero]);
 
                     builder.switch_to_block(g_header);
-                    let g_i = builder.append_block_param(g_header, types::I64);
+                    let g_i = builder.append_block_param(g_header, self.ptr_type);
                     let g_cond = builder
                         .ins()
                         .icmp(IntCC::SignedLessThan, g_i, groups_len);
@@ -5013,7 +5017,7 @@ impl Codegen {
             // Continue block: increment and loop back
             builder.switch_to_block(info.continue_blk);
             builder.seal_block(info.continue_blk);
-            let one = builder.ins().iconst(types::I64, 1);
+            let one = builder.ins().iconst(self.ptr_type, 1);
             let next_i = builder.ins().iadd(info.index_var, one);
             builder.ins().jump(info.header, &[next_i]);
 

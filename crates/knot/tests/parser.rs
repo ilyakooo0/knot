@@ -53,7 +53,7 @@ fn first_decl(source: &str) -> DeclKind {
 /// Get the body expression of the first Fun declaration.
 fn fun_body(source: &str) -> ExprKind {
     match first_decl(source) {
-        DeclKind::Fun { body, .. } => body.node,
+        DeclKind::Fun { body: Some(body), .. } => body.node,
         other => panic!("expected Fun, got {:?}", other),
     }
 }
@@ -1073,7 +1073,7 @@ fn derived_self_referencing() {
 #[test]
 fn constant_fun() {
     match first_decl("maxRetries = 3") {
-        DeclKind::Fun { name, body, .. } => {
+        DeclKind::Fun { name, body: Some(body), .. } => {
             assert_eq!(name, "maxRetries");
             assert!(matches!(&body.node, ExprKind::Lit(Literal::Int(n)) if n == "3"));
         }
@@ -1084,7 +1084,7 @@ fn constant_fun() {
 #[test]
 fn fun_as_lambda() {
     match first_decl(r"add = \a b -> a + b") {
-        DeclKind::Fun { name, body, .. } => {
+        DeclKind::Fun { name, body: Some(body), .. } => {
             assert_eq!(name, "add");
             match &body.node {
                 ExprKind::Lambda { params, body } => {
@@ -1102,7 +1102,7 @@ fn fun_as_lambda() {
 fn fun_with_multiline_body() {
     let src = r"add = \title owner priority -> set *todos = union *todos [{title: title}]";
     match first_decl(src) {
-        DeclKind::Fun { name, body, .. } => {
+        DeclKind::Fun { name, body: Some(body), .. } => {
             assert_eq!(name, "add");
             match &body.node {
                 ExprKind::Lambda { body, .. } => {
@@ -1556,7 +1556,7 @@ pendingFor = \\user -> do
   Open {} <- t.status
   yield {title: t.title, priority: t.priority}";
     match first_decl(src) {
-        DeclKind::Fun { name, body, .. } => {
+        DeclKind::Fun { name, body: Some(body), .. } => {
             assert_eq!(name, "pendingFor");
             let lambda_body = match &body.node {
                 ExprKind::Lambda { body, .. } => body,
@@ -1599,7 +1599,7 @@ fn function_with_set_and_union() {
     let src =
         "add = \\title owner priority -> set *todos = union *todos [{title: title, owner, priority, status: Open {}}]";
     match first_decl(src) {
-        DeclKind::Fun { name, body, .. } => {
+        DeclKind::Fun { name, body: Some(body), .. } => {
             assert_eq!(name, "add");
             match &body.node {
                 ExprKind::Lambda { body, .. } => {
@@ -1619,7 +1619,7 @@ scale = \\factor shapes -> case shapes of
   Circle {radius} -> Circle {radius: radius * factor}
   Rect {width, height} -> Rect {width: width * factor, height: height * factor}";
     match first_decl(src) {
-        DeclKind::Fun { name, body, .. } => {
+        DeclKind::Fun { name, body: Some(body), .. } => {
             assert_eq!(name, "scale");
             let lambda_body = match &body.node {
                 ExprKind::Lambda { body, .. } => body,
@@ -1861,7 +1861,7 @@ fn spans_are_correct() {
     assert_eq!(decl.span.start, 0);
     assert!(decl.span.end > 0);
     match &decl.node {
-        DeclKind::Fun { body, .. } => {
+        DeclKind::Fun { body: Some(body), .. } => {
             // "42" starts at byte 4
             assert_eq!(body.span.start, 4);
             assert_eq!(body.span.end, 6);
@@ -2291,7 +2291,7 @@ fn function_with_type_signature_and_body() {
         .find(|d| matches!(&d.node, DeclKind::Fun { name, .. } if name == "add"))
         .expect("should find 'add'");
     match &fun.node {
-        DeclKind::Fun { name, ty, body, .. } => {
+        DeclKind::Fun { name, ty, body: Some(body), .. } => {
             assert_eq!(name, "add");
             assert!(ty.is_some());
             assert!(matches!(&body.node, ExprKind::Lambda { .. }));
@@ -2905,7 +2905,7 @@ fn constructor_without_explicit_payload() {
 fn parenthesized_pattern_in_lambda() {
     let src = r"f = \(x) -> x";
     match first_decl(src) {
-        DeclKind::Fun { body, .. } => match &body.node {
+        DeclKind::Fun { body: Some(body), .. } => match &body.node {
             ExprKind::Lambda { params, .. } => {
                 assert_eq!(params.len(), 1);
                 assert!(matches!(&params[0].node, PatKind::Var(n) if n == "x"));

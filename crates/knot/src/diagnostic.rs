@@ -110,17 +110,18 @@ impl Diagnostic {
 
         // Pick the offset for the report header from the first label, or 0.
         let header_offset = self.labels.first().map_or(0, |l| l.span.start);
+        let fname = filename.to_string();
 
         let mut colors = ColorGenerator::new();
 
-        let mut builder = Report::build(kind, header_offset..header_offset)
+        let mut builder = Report::build(kind, (fname.clone(), header_offset..header_offset))
             .with_message(&self.message)
             .with_config(Config::default().with_char_set(CharSet::Unicode));
 
         for label in &self.labels {
             let color = colors.next();
             builder = builder.with_label(
-                ALabel::new(label.span.start..label.span.end)
+                ALabel::new((fname.clone(), label.span.start..label.span.end))
                     .with_message(&label.message)
                     .with_color(color),
             );
@@ -133,12 +134,13 @@ impl Diagnostic {
         let report = builder.finish();
 
         let mut buf = Vec::new();
-        report.write(Source::from(source), &mut buf).expect("write to Vec cannot fail");
+        report.write(
+            (filename.to_string(), Source::from(source)),
+            &mut buf,
+        ).expect("write to Vec cannot fail");
 
-        // Replace the default `<unknown>` filename with the actual filename.
         String::from_utf8(buf)
             .expect("ariadne output is always UTF-8")
-            .replace("<unknown>", filename)
     }
 }
 

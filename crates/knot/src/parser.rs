@@ -248,7 +248,15 @@ impl Parser {
             | TokenKind::Full
             | TokenKind::Atomic
             | TokenKind::Deriving
-            | TokenKind::With => {
+            | TokenKind::With
+            | TokenKind::Import
+            | TokenKind::Data
+            | TokenKind::Type
+            | TokenKind::Trait
+            | TokenKind::Impl
+            | TokenKind::Route
+            | TokenKind::Migrate
+            | TokenKind::Export => {
                 let kw = format!("{:?}", self.peek()).to_lowercase();
                 self.error(format!(
                     "'{kw}' is a keyword and cannot be used as a variable name"
@@ -594,6 +602,7 @@ impl Parser {
                     history = true;
                 } else {
                     self.error("expected 'history' after 'with'");
+                    self.advance(); // consume the bad token to avoid cascade errors
                 }
             }
             let end = self.prev_span();
@@ -726,7 +735,7 @@ impl Parser {
                         node: DeclKind::Fun {
                             name,
                             ty: ts,
-                            body,
+                            body: Some(body),
                         },
                         span: Span::new(start.start, end.end),
                         exported: false,
@@ -737,15 +746,14 @@ impl Parser {
                 }
             }
 
-            // Return a Fun with just a type signature and a placeholder body.
+            // Return a Fun with just a type signature and no body.
             let end = self.prev_span();
             self.pop_context();
-            let body_span = Span::new(end.end, end.end);
             return Some(Decl {
                 node: DeclKind::Fun {
                     name,
                     ty: ts,
-                    body: Spanned::new(ExprKind::Record(vec![]), body_span),
+                    body: None,
                 },
                 span: Span::new(start.start, end.end),
                 exported: false,
@@ -762,7 +770,7 @@ impl Parser {
             node: DeclKind::Fun {
                 name,
                 ty: None,
-                body,
+                body: Some(body),
             },
             span: Span::new(start.start, end.end),
             exported: false,
@@ -2988,7 +2996,7 @@ mod tests {
         assert!(diags.is_empty(), "diags: {:?}", diags);
         assert_eq!(module.decls.len(), 1);
         match &module.decls[0].node {
-            DeclKind::Fun { name, body, .. } => {
+            DeclKind::Fun { name, body: Some(body), .. } => {
                 assert_eq!(name, "x");
                 assert!(matches!(&body.node, ExprKind::Lit(Literal::Int(n)) if n == "42"));
             }
@@ -3014,7 +3022,7 @@ mod tests {
         assert!(diags.is_empty(), "diags: {:?}", diags);
         // Should parse as a + (b * c) due to precedence.
         match &module.decls[0].node {
-            DeclKind::Fun { body, .. } => match &body.node {
+            DeclKind::Fun { body: Some(body), .. } => match &body.node {
                 ExprKind::BinOp {
                     op: BinOp::Add,
                     lhs,
@@ -3050,7 +3058,7 @@ mod tests {
         let (module, diags) = Parser::new(source, tokens).parse_module();
         assert!(diags.is_empty(), "diags: {:?}", diags);
         match &module.decls[0].node {
-            DeclKind::Fun { body, .. } => {
+            DeclKind::Fun { body: Some(body), .. } => {
                 assert!(matches!(&body.node, ExprKind::Lambda { .. }));
             }
             other => panic!("expected Fun, got {:?}", other),
@@ -3136,7 +3144,7 @@ mod tests {
         let (module, diags) = Parser::new(source, tokens).parse_module();
         assert!(diags.is_empty(), "diags: {:?}", diags);
         match &module.decls[0].node {
-            DeclKind::Fun { body, .. } => {
+            DeclKind::Fun { body: Some(body), .. } => {
                 assert!(matches!(&body.node, ExprKind::Lambda { .. }));
             }
             other => panic!("expected Fun with lambda body, got {:?}", other),
@@ -3164,7 +3172,7 @@ mod tests {
         let (module, diags) = Parser::new(source, tokens).parse_module();
         assert!(diags.is_empty(), "diags: {:?}", diags);
         match &module.decls[0].node {
-            DeclKind::Fun { body, .. } => match &body.node {
+            DeclKind::Fun { body: Some(body), .. } => match &body.node {
                 ExprKind::Record(fields) => {
                     assert_eq!(fields.len(), 2);
                     assert_eq!(fields[0].name, "name");
@@ -3221,7 +3229,7 @@ mod tests {
         let (module, diags) = Parser::new(source, tokens).parse_module();
         assert!(diags.is_empty(), "diags: {:?}", diags);
         match &module.decls[0].node {
-            DeclKind::Fun { body, .. } => {
+            DeclKind::Fun { body: Some(body), .. } => {
                 // g x y => App(App(g, x), y)
                 match &body.node {
                     ExprKind::App { func, arg } => {
@@ -3250,7 +3258,7 @@ mod tests {
         let (module, diags) = Parser::new(source, tokens).parse_module();
         assert!(diags.is_empty(), "diags: {:?}", diags);
         match &module.decls[0].node {
-            DeclKind::Fun { body, .. } => {
+            DeclKind::Fun { body: Some(body), .. } => {
                 assert!(matches!(&body.node, ExprKind::FieldAccess { field, .. } if field == "name"));
             }
             other => panic!("expected Fun, got {:?}", other),
@@ -3314,7 +3322,7 @@ mod tests {
         let (module, diags) = Parser::new(source, tokens).parse_module();
         assert!(diags.is_empty(), "diags: {:?}", diags);
         match &module.decls[0].node {
-            DeclKind::Fun { body, .. } => match &body.node {
+            DeclKind::Fun { body: Some(body), .. } => match &body.node {
                 ExprKind::List(elems) => {
                     assert_eq!(elems.len(), 3);
                 }
@@ -3338,7 +3346,7 @@ mod tests {
         let (module, diags) = Parser::new(source, tokens).parse_module();
         assert!(diags.is_empty(), "diags: {:?}", diags);
         match &module.decls[0].node {
-            DeclKind::Fun { body, .. } => {
+            DeclKind::Fun { body: Some(body), .. } => {
                 assert!(matches!(
                     &body.node,
                     ExprKind::UnaryOp {
@@ -3365,7 +3373,7 @@ mod tests {
         let (module, diags) = Parser::new(source, tokens).parse_module();
         assert!(diags.is_empty(), "diags: {:?}", diags);
         match &module.decls[0].node {
-            DeclKind::Fun { body, .. } => {
+            DeclKind::Fun { body: Some(body), .. } => {
                 assert!(matches!(&body.node, ExprKind::SourceRef(n) if n == "people"));
             }
             other => panic!("expected Fun, got {:?}", other),
@@ -3391,7 +3399,7 @@ mod tests {
         let (module, diags) = Parser::new(source, tokens).parse_module();
         assert!(diags.is_empty(), "diags: {:?}", diags);
         match &module.decls[0].node {
-            DeclKind::Fun { body, .. } => match &body.node {
+            DeclKind::Fun { body: Some(body), .. } => match &body.node {
                 ExprKind::RecordUpdate { base, fields } => {
                     assert!(matches!(&base.node, ExprKind::Var(n) if n == "t"));
                     assert_eq!(fields.len(), 1);

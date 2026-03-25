@@ -1708,6 +1708,9 @@ impl Infer {
         let record_ty = self.infer_expr(record_arg);
 
         // Build the expected request fields from the route entry (exclude `respond`)
+        // Save and restore annotation_vars so fetch inference doesn't corrupt
+        // the enclosing declaration's type variable mapping.
+        let saved_annotation_vars = self.annotation_vars.clone();
         if let Some(info) = self.constructors.get(ctor_name).cloned() {
             self.annotation_vars.clear();
             for p in &info.data_params {
@@ -1761,6 +1764,7 @@ impl Infer {
             None,
         );
         let result_adt = Ty::Con("Result".into(), vec![err_ty, ok_ty]);
+        self.annotation_vars = saved_annotation_vars;
         Some(Ty::IO(
             BTreeSet::from([IoEffect::Network]),
             Box::new(result_adt),
@@ -3168,57 +3172,59 @@ impl Infer {
         for decl in &module.decls {
             match &decl.node {
                 ast::DeclKind::Fun { name, body, ty, .. } => {
-                    let expected =
-                        self.lookup_instantiate(name).unwrap_or_else(|| {
-                            self.fresh()
-                        });
-                    let inferred = self.infer_expr(body);
-                    self.unify(&expected, &inferred, body.span);
+                    if let Some(body) = body {
+                        let expected =
+                            self.lookup_instantiate(name).unwrap_or_else(|| {
+                                self.fresh()
+                            });
+                        let inferred = self.infer_expr(body);
+                        self.unify(&expected, &inferred, body.span);
 
-                    // Remove the old monomorphic binding before
-                    // generalizing, so its free variables don't block
-                    // quantification.
-                    if let Some(scope) = self.scopes.first_mut() {
-                        scope.remove(name.as_str());
-                    }
+                        // Remove the old monomorphic binding before
+                        // generalizing, so its free variables don't block
+                        // quantification.
+                        if let Some(scope) = self.scopes.first_mut() {
+                            scope.remove(name.as_str());
+                        }
 
-                    // If the function has explicit constraints in its
-                    // annotation, rebuild the scheme from the annotation.
-                    // (We already verified the body matches via unification.)
-                    let has_constraints = ty
-                        .as_ref()
-                        .map_or(false, |ts| !ts.constraints.is_empty());
-                    if has_constraints {
-                        let ts = ty.as_ref().unwrap();
-                        self.annotation_vars.clear();
-                        let mut constraints = Vec::new();
-                        for c in &ts.constraints {
-                            for arg in &c.args {
-                                if let ast::TypeKind::Var(var_name) =
-                                    &arg.node
-                                {
-                                    let v = self.annotation_var(var_name);
-                                    constraints.push(TyConstraint {
-                                        trait_name: c.trait_name.clone(),
-                                        type_var: v,
-                                    });
+                        // If the function has explicit constraints in its
+                        // annotation, rebuild the scheme from the annotation.
+                        // (We already verified the body matches via unification.)
+                        let has_constraints = ty
+                            .as_ref()
+                            .map_or(false, |ts| !ts.constraints.is_empty());
+                        if has_constraints {
+                            let ts = ty.as_ref().unwrap();
+                            self.annotation_vars.clear();
+                            let mut constraints = Vec::new();
+                            for c in &ts.constraints {
+                                for arg in &c.args {
+                                    if let ast::TypeKind::Var(var_name) =
+                                        &arg.node
+                                    {
+                                        let v = self.annotation_var(var_name);
+                                        constraints.push(TyConstraint {
+                                            trait_name: c.trait_name.clone(),
+                                            type_var: v,
+                                        });
+                                    }
                                 }
                             }
+                            let ann_ty = self.ast_type_to_ty(&ts.ty);
+                            let vars: Vec<TyVar> = self
+                                .annotation_vars
+                                .values()
+                                .copied()
+                                .collect();
+                            self.bind_top(
+                                name,
+                                Scheme::constrained(vars, constraints, ann_ty),
+                            );
+                        } else {
+                            let applied = self.apply(&inferred);
+                            let scheme = self.generalize(&applied);
+                            self.bind_top(name, scheme);
                         }
-                        let ann_ty = self.ast_type_to_ty(&ts.ty);
-                        let vars: Vec<TyVar> = self
-                            .annotation_vars
-                            .values()
-                            .copied()
-                            .collect();
-                        self.bind_top(
-                            name,
-                            Scheme::constrained(vars, constraints, ann_ty),
-                        );
-                    } else {
-                        let applied = self.apply(&inferred);
-                        let scheme = self.generalize(&applied);
-                        self.bind_top(name, scheme);
                     }
                 }
                 ast::DeclKind::View { name, body, .. } => {

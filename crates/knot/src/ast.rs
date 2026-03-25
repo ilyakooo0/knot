@@ -111,10 +111,11 @@ pub enum DeclKind {
     },
 
     /// `add = \x y -> x + y` — constant binding (functions are lambdas).
+    /// `body` is `None` for signature-only declarations (e.g. `f : Int -> Int`).
     Fun {
         name: Name,
         ty: Option<TypeScheme>,
-        body: Expr,
+        body: Option<Expr>,
     },
 
     /// `trait Functor (f : Type -> Type) where ...`

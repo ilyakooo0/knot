@@ -269,9 +269,11 @@ impl EffectChecker {
                 self.check_annotation(ty, &effects, decl.span);
             }
             ast::DeclKind::Fun { name, body, ty, .. } => {
-                let effects = self.fun_body_effects(body);
-                self.decl_effects.insert(name.clone(), effects.clone());
-                self.check_annotation(ty, &effects, decl.span);
+                if let Some(body) = body {
+                    let effects = self.fun_body_effects(body);
+                    self.decl_effects.insert(name.clone(), effects.clone());
+                    self.check_annotation(ty, &effects, decl.span);
+                }
             }
             _ => {}
         }
@@ -705,7 +707,7 @@ mod tests {
         make_decl(DeclKind::Fun {
             name: name.into(),
             ty: None,
-            body,
+            body: Some(body),
         })
     }
 
@@ -713,7 +715,7 @@ mod tests {
         make_decl(DeclKind::Fun {
             name: name.into(),
             ty: Some(ty),
-            body,
+            body: Some(body),
         })
     }
 

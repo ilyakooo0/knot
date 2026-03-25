@@ -247,9 +247,9 @@ fn alloc_bool(b: bool) -> *mut Value {
     }
 }
 
-/// Allocate a float, returning a cached pointer for 0.0 and 1.0.
+/// Allocate a float, returning a cached pointer for +0.0 and 1.0.
 fn alloc_float(n: f64) -> *mut Value {
-    if n == 0.0 {
+    if n.to_bits() == 0.0_f64.to_bits() {
         FLOAT_ZERO.with(|p| *p)
     } else if n == 1.0 {
         FLOAT_ONE.with(|p| *p)
@@ -401,7 +401,7 @@ pub extern "C" fn knot_value_int_from_str(ptr: *const u8, len: usize) -> *mut Va
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_float(n: f64) -> *mut Value {
-    if n == 0.0 {
+    if n.to_bits() == 0.0_f64.to_bits() {
         FLOAT_ZERO.with(|p| *p)
     } else if n == 1.0 {
         FLOAT_ONE.with(|p| *p)
@@ -5888,14 +5888,26 @@ pub extern "C" fn knot_view_read_at(
     let view_filter = if filter_where.is_empty() {
         String::new()
     } else {
-        // Rewrite ?1, ?2, ... to ?2, ?3, ... to account for timestamp param
-        let mut rewritten = filter_where.to_string();
-        // Replace from highest to lowest to avoid ?1 -> ?2 then ?2 -> ?3
-        for i in (1..=filter_values.len()).rev() {
-            rewritten = rewritten.replace(
-                &format!("?{}", i),
-                &format!("?{}", i + 1),
-            );
+        // Rewrite ?1, ?2, ... to ?2, ?3, ... to account for timestamp param.
+        // Use char-by-char scan to match exact parameter tokens (e.g. ?1 not
+        // the ?1 inside ?11).
+        let mut rewritten = String::with_capacity(filter_where.len() + 8);
+        let chars: Vec<char> = filter_where.chars().collect();
+        let mut ci = 0;
+        while ci < chars.len() {
+            if chars[ci] == '?' && ci + 1 < chars.len() && chars[ci + 1].is_ascii_digit() {
+                let start = ci + 1;
+                let mut end = start;
+                while end < chars.len() && chars[end].is_ascii_digit() {
+                    end += 1;
+                }
+                let num: usize = chars[start..end].iter().collect::<String>().parse().unwrap();
+                rewritten.push_str(&format!("?{}", num + 1));
+                ci = end;
+            } else {
+                rewritten.push(chars[ci]);
+                ci += 1;
+            }
         }
         format!(" AND {}", rewritten)
     };
@@ -7574,9 +7586,11 @@ fn serialize_value_for_hash(v: *mut Value) -> Vec<u8> {
         Value::Unit => {
             buf.push(4);
         }
-        Value::Constructor(tag, _) => {
+        Value::Constructor(tag, payload) => {
             buf.push(5);
             buf.extend_from_slice(tag.as_bytes());
+            buf.push(0); // separator between tag and payload
+            buf.extend_from_slice(&serialize_value_for_hash(*payload));
         }
         _ => {
             // Fallback: use the show representation

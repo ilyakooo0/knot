@@ -187,7 +187,8 @@ fn route_entries_to_constructors(entries: &[RouteEntry]) -> Vec<ConstructorDef> 
 
 fn desugar_decl(decl: &mut DeclKind) {
     match decl {
-        DeclKind::Fun { body, .. } => desugar_expr(body),
+        DeclKind::Fun { body: Some(body), .. } => desugar_expr(body),
+        DeclKind::Fun { body: None, .. } => {},
         DeclKind::View { body, .. } => {
             // Don't desugar the top-level do block of a view body
             // (preserve structure for analyze_view), but recurse into sub-exprs.
@@ -767,7 +768,7 @@ mod tests {
         let mut module = parse(src);
         desugar(&mut module);
         for decl in &module.decls {
-            if let DeclKind::Fun { name, body, .. } = &decl.node {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
                 if name == "names" {
                     assert!(has_bind_var(body), "expected __bind in desugared body");
                 }
@@ -788,7 +789,7 @@ mod tests {
         desugar(&mut module);
         // The main body should still be a Do block (mixed: has set + bind)
         for decl in &module.decls {
-            if let DeclKind::Fun { name, body, .. } = &decl.node {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
                 if name == "main" {
                     assert!(matches!(&body.node, ExprKind::Do(_)),
                         "mixed do block should not be desugared");
@@ -810,7 +811,7 @@ mod tests {
         desugar(&mut module);
         // The set value should still be a Do block
         for decl in &module.decls {
-            if let DeclKind::Fun { name, body, .. } = &decl.node {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
                 if name == "complete" {
                     // body is a lambda whose body is a set
                     if let ExprKind::Lambda { body: lbody, .. } = &body.node {
@@ -836,7 +837,7 @@ mod tests {
         desugar(&mut module);
         // No bind/where → sequential, should not be desugared
         for decl in &module.decls {
-            if let DeclKind::Fun { name, body, .. } = &decl.node {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
                 if name == "main" {
                     assert!(matches!(&body.node, ExprKind::Do(_)),
                         "sequential do block should not be desugared");
@@ -859,7 +860,7 @@ mod tests {
         let mut module = parse(src);
         desugar(&mut module);
         for decl in &module.decls {
-            if let DeclKind::Fun { name, body, .. } = &decl.node {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
                 if name == "filtered" {
                     assert!(
                         matches!(&body.node, ExprKind::Do(_)),
@@ -882,7 +883,7 @@ mod tests {
         let mut module = parse(src);
         desugar(&mut module);
         for decl in &module.decls {
-            if let DeclKind::Fun { name, body, .. } = &decl.node {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
                 if name == "names" {
                     assert!(has_bind_var(body), "expected __bind in desugared body");
                     assert!(!has_do_block(body), "expected no Do block after desugaring");
@@ -904,7 +905,7 @@ mod tests {
         desugar(&mut module);
         // groupBy do blocks must stay as Do nodes (loop-based codegen)
         for decl in &module.decls {
-            if let DeclKind::Fun { name, body, .. } = &decl.node {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
                 if name == "grouped" {
                     assert!(
                         matches!(&body.node, ExprKind::Do(_)),
@@ -929,7 +930,7 @@ mod tests {
         let mut module = parse(src);
         desugar(&mut module);
         for decl in &module.decls {
-            if let DeclKind::Fun { name, body, .. } = &decl.node {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
                 if name == "joined" {
                     assert!(
                         matches!(&body.node, ExprKind::Do(_)),
@@ -956,7 +957,7 @@ mod tests {
         let mut module = parse(src);
         desugar(&mut module);
         for decl in &module.decls {
-            if let DeclKind::Fun { name, body, .. } = &decl.node {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
                 if name == "main" {
                     assert!(
                         matches!(&body.node, ExprKind::Do(_)),

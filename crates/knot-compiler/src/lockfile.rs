@@ -109,10 +109,11 @@ fn parse_record_fields(spec: &str) -> Vec<(String, String)> {
     }
     split_respecting_brackets(spec, ',')
         .into_iter()
+        .filter(|part| !part.is_empty())
         .map(|part| {
             let colon = part.find(':').unwrap_or(0);
             let name = part[..colon].to_string();
-            let ty = part[colon + 1..].to_string();
+            let ty = if colon < part.len() { part[colon + 1..].to_string() } else { String::new() };
             (name, ty)
         })
         .collect()

@@ -1711,7 +1711,9 @@ impl<'a> TokenCollector<'a> {
                 if let Some(s) = find_word_in_source(self.source, name, decl.span.start, decl.span.start + name.len() + 20) {
                     self.add(s, TOK_FUNCTION, MOD_DECLARATION);
                 }
-                self.visit_expr(body);
+                if let Some(body) = body {
+                    self.visit_expr(body);
+                }
             }
             DeclKind::Data {
                 name, constructors, ..
@@ -1962,11 +1964,12 @@ fn handle_folding_range(
 
         // Fold sub-expressions within declarations
         match &decl.node {
-            DeclKind::Fun { body, .. }
+            DeclKind::Fun { body: Some(body), .. }
             | DeclKind::View { body, .. }
             | DeclKind::Derived { body, .. } => {
                 collect_folding_ranges_expr(body, &doc.source, &mut ranges);
             }
+            DeclKind::Fun { body: None, .. } => {}
             DeclKind::Impl { items, .. } => {
                 for item in items {
                     if let ast::ImplItem::Method { body, .. } = item {
@@ -2126,11 +2129,12 @@ fn build_selection_range(module: &Module, source: &str, offset: usize) -> Select
         if decl.span.start <= offset && offset < decl.span.end {
             spans.push(decl.span);
             match &decl.node {
-                DeclKind::Fun { body, .. }
+                DeclKind::Fun { body: Some(body), .. }
                 | DeclKind::View { body, .. }
                 | DeclKind::Derived { body, .. } => {
                     collect_containing_spans(body, offset, &mut spans);
                 }
+                DeclKind::Fun { body: None, .. } => {}
                 DeclKind::Impl { items, .. } => {
                     for item in items {
                         if let ast::ImplItem::Method { body, .. } = item {
@@ -2446,11 +2450,12 @@ fn handle_code_action(
     // Action: Fill case arms — check if cursor is inside a case expression
     for decl in &doc.module.decls {
         match &decl.node {
-            DeclKind::Fun { body, .. }
+            DeclKind::Fun { body: Some(body), .. }
             | DeclKind::View { body, .. }
             | DeclKind::Derived { body, .. } => {
                 find_case_actions(body, doc, uri, range_start, range_end, &mut actions);
             }
+            DeclKind::Fun { body: None, .. } => {}
             DeclKind::Impl { items, .. } => {
                 for item in items {
                     if let ast::ImplItem::Method { body, .. } = item {
@@ -2756,11 +2761,12 @@ fn resolve_definitions(
     // Phase 2: walk declaration bodies to resolve references
     for decl in &module.decls {
         match &decl.node {
-            DeclKind::Fun { body, .. }
+            DeclKind::Fun { body: Some(body), .. }
             | DeclKind::View { body, .. }
             | DeclKind::Derived { body, .. } => {
                 resolver.resolve_expr(body);
             }
+            DeclKind::Fun { body: None, .. } => {}
             DeclKind::Impl { items, .. } => {
                 for item in items {
                     if let ast::ImplItem::Method { params, body, .. } = item {

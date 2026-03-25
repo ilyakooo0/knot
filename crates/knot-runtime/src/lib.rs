@@ -54,6 +54,14 @@ impl Arena {
     }
 }
 
+impl Drop for Arena {
+    fn drop(&mut self) {
+        for ptr in self.ptrs.drain(..) {
+            unsafe { drop(Box::from_raw(ptr)); }
+        }
+    }
+}
+
 thread_local! {
     static ARENA: RefCell<Arena> = RefCell::new(Arena::new());
 }
@@ -1430,9 +1438,11 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
                 buf.extend_from_slice(rb);
             }
         }
-        Value::Function(_, _, src) => {
+        Value::Function(_, env, src) => {
             buf.push(9);
+            buf.extend_from_slice(&(src.len() as u32).to_le_bytes());
             buf.extend_from_slice(src.as_bytes());
+            value_to_hash_bytes(*env, buf);
         }
         Value::IO(_, _) => {
             buf.push(11);
@@ -1701,15 +1711,9 @@ pub extern "C" fn knot_value_concat(a: *mut Value, b: *mut Value) -> *mut Value 
 pub extern "C" fn knot_value_compare(a: *mut Value, b: *mut Value) -> *mut Value {
     let ordering = match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        (Value::Float(x), Value::Float(y)) => {
-            x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
-        }
-        (Value::Int(x), Value::Float(y)) => {
-            bigint_to_f64(x).partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
-        }
-        (Value::Float(x), Value::Int(y)) => {
-            x.partial_cmp(&bigint_to_f64(y)).unwrap_or(std::cmp::Ordering::Equal)
-        }
+        (Value::Float(x), Value::Float(y)) => x.total_cmp(y),
+        (Value::Int(x), Value::Float(y)) => bigint_to_f64(x).total_cmp(y),
+        (Value::Float(x), Value::Int(y)) => x.total_cmp(&bigint_to_f64(y)),
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
         _ => panic!(
             "knot runtime: cannot compare {} with {}",
@@ -1734,15 +1738,9 @@ pub extern "C" fn knot_value_compare(a: *mut Value, b: *mut Value) -> *mut Value
 pub extern "C" fn knot_value_compare_ord(a: *mut Value, b: *mut Value) -> i32 {
     let ordering = match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        (Value::Float(x), Value::Float(y)) => {
-            x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
-        }
-        (Value::Int(x), Value::Float(y)) => {
-            bigint_to_f64(x).partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
-        }
-        (Value::Float(x), Value::Int(y)) => {
-            x.partial_cmp(&bigint_to_f64(y)).unwrap_or(std::cmp::Ordering::Equal)
-        }
+        (Value::Float(x), Value::Float(y)) => x.total_cmp(y),
+        (Value::Int(x), Value::Float(y)) => bigint_to_f64(x).total_cmp(y),
+        (Value::Float(x), Value::Int(y)) => x.total_cmp(&bigint_to_f64(y)),
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
         _ => panic!(
             "knot runtime: cannot compare {} with {}",
@@ -4961,17 +4959,19 @@ pub extern "C" fn knot_source_diff_write(
         }
 
         // 3. DELETE rows from main not in temp (use COALESCE for NULL comparison)
-        let match_conds: Vec<String> = col_names
-            .iter()
-            .map(|c| {
-                format!(
-                    "COALESCE({t}.{c}, '') = COALESCE({m}.{c}, '')",
-                    t = temp,
-                    m = table,
-                    c = c
-                )
-            })
-            .collect();
+        // Use type-aware sentinel values to avoid conflating NULL with real values
+        let match_conds: Vec<String> = std::iter::once(
+            // _tag is NOT NULL TEXT, simple equality
+            format!("{t}.{c} = {m}.{c}", t = temp, m = table, c = quote_ident("_tag"))
+        ).chain(adt.all_fields.iter().map(|f| {
+            let c = quote_ident(&f.name);
+            let coalesce = |tbl: &str| match f.ty {
+                ColType::Int | ColType::Bool => format!("COALESCE({}.{}, -9223372036854775808)", tbl, c),
+                ColType::Float => format!("COALESCE({}.{}, -1.7976931348623157e+308)", tbl, c),
+                _ => format!("COALESCE({}.{}, X'00')", tbl, c),
+            };
+            format!("{} = {}", coalesce(&temp), coalesce(&table))
+        })).collect();
         let delete_sql = format!(
             "DELETE FROM {} WHERE NOT EXISTS (SELECT 1 FROM {} WHERE {});",
             table,
@@ -5290,11 +5290,16 @@ pub extern "C" fn knot_random_int(bound: *mut Value) -> *mut Value {
         ),
     };
     assert!(n > 0, "knot runtime: randomInt bound must be > 0");
-    // Use getrandom for platform-independent cryptographic randomness
-    let mut buf = [0u8; 8];
-    getrandom::fill(&mut buf).expect("knot runtime: failed to get random bytes");
-    let raw = u64::from_le_bytes(buf);
-    let result = (raw % n) as i64;
+    // Rejection sampling to avoid modulo bias
+    let threshold = u64::MAX - (u64::MAX % n);
+    let result = loop {
+        let mut buf = [0u8; 8];
+        getrandom::fill(&mut buf).expect("knot runtime: failed to get random bytes");
+        let raw = u64::from_le_bytes(buf);
+        if raw < threshold {
+            break (raw % n) as i64;
+        }
+    };
     knot_value_int(result)
 }
 

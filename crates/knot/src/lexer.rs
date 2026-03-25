@@ -487,7 +487,9 @@ impl<'src> Lexer<'src> {
                         }
                         Some(_) => {
                             let esc_start = self.pos - 1;
-                            self.advance();
+                            // Advance by one full UTF-8 character (not just one byte)
+                            let ch = self.source[self.pos..].chars().next().unwrap();
+                            self.pos += ch.len_utf8();
                             let span = Span::new(esc_start, self.pos);
                             self.diagnostics.push(
                                 Diagnostic::error("unknown escape sequence")
@@ -587,7 +589,9 @@ impl<'src> Lexer<'src> {
                         }
                         Some(_) => {
                             let esc_start = self.pos - 1;
-                            self.advance();
+                            // Advance by one full UTF-8 character (not just one byte)
+                            let ch = self.source[self.pos..].chars().next().unwrap();
+                            self.pos += ch.len_utf8();
                             let span = Span::new(esc_start, self.pos);
                             self.diagnostics.push(
                                 Diagnostic::error("unknown escape sequence in byte string")

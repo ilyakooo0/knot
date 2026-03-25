@@ -1475,6 +1475,13 @@ impl Parser {
             let saved_pos = self.save();
             self.skip_newlines();
 
+            // If the next token is at column 0, it's a new declaration — don't
+            // consume it as a binary operator.
+            if self.column_of(&self.span()) == 0 {
+                self.restore(saved_pos);
+                break;
+            }
+
             let (op, l_bp, r_bp) = match self.peek() {
                 TokenKind::PipeGt => (BinOp::Pipe, 1, 2),
                 TokenKind::OrOr => (BinOp::Or, 3, 4),

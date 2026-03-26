@@ -928,6 +928,9 @@ impl Parser {
                     default_body: Some(body),
                 });
             }
+
+            // Method name consumed but no ':' (type signature) or '=' (default body) found
+            self.error(format!("expected ':' or '=' after method name '{}'", name));
         }
 
         None

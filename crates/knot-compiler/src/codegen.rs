@@ -4007,8 +4007,16 @@ impl Codegen {
             }
         }).count();
 
+        // Only cache the tag when there are no wildcard/var catch-all arms.
+        // With a catch-all, the scrutinee could (defensively) be a non-Constructor
+        // value, and calling knot_constructor_tag_ptr would panic.
+        let has_catchall = arms.iter().any(|a| matches!(
+            &a.pat.node,
+            ast::PatKind::Wildcard | ast::PatKind::Var(_)
+        ));
+
         // Extract constructor tag pointer+length once if multiple constructor arms
-        let cached_tag = if non_nullable_ctor_count >= 2 {
+        let cached_tag = if non_nullable_ctor_count >= 2 && !has_catchall {
             let tag_ptr = self.call_rt(builder, "knot_constructor_tag_ptr", &[scrut]);
             let tag_len = self.call_rt(builder, "knot_constructor_tag_len", &[scrut]);
             Some((tag_ptr, tag_len))

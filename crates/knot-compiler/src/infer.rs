@@ -2703,7 +2703,7 @@ impl Infer {
         // with polymorphic HKT types: ∀m a b. (a -> m b) -> m a -> m b, etc.
         // This allows do-block desugaring to work with any monad, not just [].
 
-        // listen : ∀a b. Int -> (a -> b) -> {}
+        // listen : ∀a b. Int -> (a -> b) -> IO {network} {}
         let a = self.fresh_var();
         let b = self.fresh_var();
         self.bind_top(
@@ -2714,7 +2714,10 @@ impl Infer {
                     Box::new(Ty::Int),
                     Box::new(Ty::Fun(
                         Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
-                        Box::new(Ty::unit()),
+                        Box::new(Ty::IO(
+                            BTreeSet::from([IoEffect::Network]),
+                            Box::new(Ty::unit()),
+                        )),
                     )),
                 ),
             ),

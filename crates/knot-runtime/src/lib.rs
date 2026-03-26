@@ -5158,7 +5158,7 @@ pub extern "C" fn knot_source_diff_write(
     }
 
     // 5. Drop temp table
-    let drop_temp = format!("DROP TABLE {};", temp);
+    let drop_temp = format!("DROP TABLE IF EXISTS {};", temp);
     debug_sql(&drop_temp);
     db_ref
         .conn
@@ -5342,10 +5342,10 @@ pub extern "C" fn knot_random_int(bound: *mut Value) -> *mut Value {
         getrandom::fill(&mut buf).expect("knot runtime: failed to get random bytes");
         let raw = u64::from_le_bytes(buf);
         if raw < threshold {
-            break (raw % n) as i64;
+            break raw % n;
         }
     };
-    knot_value_int(result)
+    alloc(Value::Int(BigInt::from(result)))
 }
 
 /// Return a random Float in [0.0, 1.0).
@@ -6917,8 +6917,11 @@ pub extern "C" fn knot_http_listen(
                     }
 
                     knot_db_close(db);
-                    // Free the deep-cloned handler to avoid per-request memory leak
-                    unsafe { deep_drop_value(handler); }
+                    // Note: we intentionally do NOT call deep_drop_value(handler) here.
+                    // The handler execution may have stored pointers from the
+                    // deep-cloned tree into arena-allocated values. Freeing the
+                    // tree could cause use-after-free. The bounded leak (just the
+                    // closure environment) is reclaimed when the thread exits.
                 });
                 // Don't push HTTP request handles into THREAD_HANDLES — the
                 // server loop runs forever so they would accumulate without
@@ -7660,7 +7663,9 @@ fn serialize_value_for_hash(v: *mut Value) -> Vec<u8> {
     match unsafe { as_ref(v) } {
         Value::Int(n) => {
             buf.push(0);
-            buf.extend_from_slice(n.to_string().as_bytes());
+            let bytes = n.to_signed_bytes_le();
+            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&bytes);
         }
         Value::Float(f) => {
             buf.push(1);
@@ -7668,6 +7673,7 @@ fn serialize_value_for_hash(v: *mut Value) -> Vec<u8> {
         }
         Value::Text(s) => {
             buf.push(2);
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
             buf.extend_from_slice(s.as_bytes());
         }
         Value::Bool(b) => {
@@ -7687,7 +7693,9 @@ fn serialize_value_for_hash(v: *mut Value) -> Vec<u8> {
         _ => {
             // Fallback: use the show representation
             buf.push(6);
-            buf.extend_from_slice(brief_value(v).as_bytes());
+            let fallback = brief_value(v);
+            buf.extend_from_slice(&(fallback.len() as u32).to_le_bytes());
+            buf.extend_from_slice(fallback.as_bytes());
         }
     }
     buf

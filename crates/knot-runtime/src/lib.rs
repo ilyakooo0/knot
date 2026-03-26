@@ -341,7 +341,7 @@ fn brief_value(v: *mut Value) -> String {
 
 /// Escape a SQL identifier by wrapping it in double quotes and doubling
 /// any internal `"` characters, per the SQL standard.
-fn quote_ident(name: &str) -> String {
+pub(crate) fn quote_ident(name: &str) -> String {
     if name.contains('"') {
         let mut s = String::with_capacity(name.len() + 2);
         s.push('"');
@@ -1227,8 +1227,8 @@ pub extern "C" fn knot_relation_group_by(
         })
         .collect();
 
-    let temp_name = "_knot_tmp_groupby";
-    let temp = quote_ident(temp_name);
+    let temp_name = next_temp_name();
+    let temp = quote_ident(&temp_name);
 
     // Drop any leftover temp table
     let _ = db_ref
@@ -5648,6 +5648,7 @@ pub extern "C" fn knot_atomic_begin(db: *mut c_void) {
 pub extern "C" fn knot_atomic_commit(db: *mut c_void) {
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let depth = db_ref.atomic_depth.get();
+    assert!(depth > 0, "knot runtime: atomic commit without matching begin");
     db_ref
         .conn
         .execute_batch(&format!("RELEASE SAVEPOINT knot_atomic_{depth};"))
@@ -5662,6 +5663,7 @@ pub extern "C" fn knot_atomic_commit(db: *mut c_void) {
 pub extern "C" fn knot_atomic_rollback(db: *mut c_void) {
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let depth = db_ref.atomic_depth.get();
+    assert!(depth > 0, "knot runtime: atomic rollback without matching begin");
     // ROLLBACK TO undoes changes but keeps the savepoint alive.
     // RELEASE then removes it so the next begin creates a clean one.
     db_ref
@@ -6619,7 +6621,7 @@ pub extern "C" fn knot_http_listen(
         Value::Int(n) => n.to_u16().expect("knot runtime: port number out of range"),
         _ => panic!("knot runtime: listen expects Int port, got {}", type_name(port_val)),
     };
-    let table = Arc::new(unsafe { (route_table as *const RouteTable).read() });
+    let table = Arc::new(*unsafe { Box::from_raw(route_table as *mut RouteTable) });
     let addr = format!("0.0.0.0:{}", port);
     let server = Arc::new(tiny_http::Server::http(&addr)
         .unwrap_or_else(|e| panic!("knot runtime: failed to start HTTP server on {}: {}", addr, e)));
@@ -6859,7 +6861,10 @@ pub extern "C" fn knot_http_listen(
                     // Free the deep-cloned handler to avoid per-request memory leak
                     unsafe { deep_drop_value(handler); }
                 });
-                THREAD_HANDLES.lock().unwrap().push(handle);
+                // Don't push HTTP request handles into THREAD_HANDLES — the
+                // server loop runs forever so they would accumulate without
+                // bound.  Let request threads detach instead.
+                drop(handle);
             }
             None => {
                 if debug_enabled() {

@@ -130,9 +130,10 @@ fn load_relations(conn: &Connection) -> Vec<RelationInfo> {
     for row in rows {
         let (name, schema) = row.unwrap();
         let table_name = format!("_knot_{}", name);
+        let quoted_table = crate::quote_ident(&table_name);
         let count: usize = conn
             .query_row(
-                &format!("SELECT COUNT(*) FROM \"{}\"", table_name),
+                &format!("SELECT COUNT(*) FROM {}", quoted_table),
                 [],
                 |row| row.get(0),
             )
@@ -160,11 +161,13 @@ fn load_rows(conn: &Connection, rel: &RelationInfo) -> Vec<Vec<String>> {
     let schema = parse_schema_kind(&rel.schema);
     let table_name = format!("_knot_{}", rel.name);
 
+    let quoted_table = crate::quote_ident(&table_name);
+
     match &schema {
         SchemaKind::Unit => {
             let count: usize = conn
                 .query_row(
-                    &format!("SELECT COUNT(*) FROM \"{}\"", table_name),
+                    &format!("SELECT COUNT(*) FROM {}", quoted_table),
                     [],
                     |row| row.get(0),
                 )
@@ -175,14 +178,14 @@ fn load_rows(conn: &Connection, rel: &RelationInfo) -> Vec<Vec<String>> {
             let col_names: Vec<String> = fields
                 .iter()
                 .filter(|(_, ty)| !ty.starts_with('['))
-                .map(|(n, _)| format!("\"{}\"", n))
+                .map(|(n, _)| crate::quote_ident(n))
                 .collect();
 
             if col_names.is_empty() {
                 return Vec::new();
             }
 
-            let sql = format!("SELECT {} FROM \"{}\"", col_names.join(", "), table_name);
+            let sql = format!("SELECT {} FROM {}", col_names.join(", "), quoted_table);
             let mut stmt = match conn.prepare(&sql) {
                 Ok(s) => s,
                 Err(_) => return Vec::new(),
@@ -220,12 +223,12 @@ fn load_rows(conn: &Connection, rel: &RelationInfo) -> Vec<Vec<String>> {
                 }
             }
 
-            let mut select_cols = vec!["\"_tag\"".to_string()];
+            let mut select_cols = vec![crate::quote_ident("_tag")];
             for (fname, _) in &all_fields {
-                select_cols.push(format!("\"{}\"", fname));
+                select_cols.push(crate::quote_ident(fname));
             }
 
-            let sql = format!("SELECT {} FROM \"{}\"", select_cols.join(", "), table_name);
+            let sql = format!("SELECT {} FROM {}", select_cols.join(", "), quoted_table);
             let mut stmt = match conn.prepare(&sql) {
                 Ok(s) => s,
                 Err(_) => return Vec::new(),

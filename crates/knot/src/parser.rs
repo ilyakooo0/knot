@@ -184,6 +184,16 @@ impl Parser {
         self.context.pop();
     }
 
+    /// Push a parser context, run `f`, and always pop the context — even on
+    /// early `?` returns inside `f`.  This prevents stale "while parsing …"
+    /// notes from leaking into later diagnostics.
+    fn in_context<T>(&mut self, ctx: &'static str, f: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        self.push_context(ctx);
+        let result = f(self);
+        self.pop_context();
+        result
+    }
+
     fn error(&mut self, msg: impl Into<String>) {
         self.error_at(self.span(), msg);
     }
@@ -461,65 +471,65 @@ impl Parser {
 
     fn parse_data(&mut self) -> Option<Decl> {
         let start = self.span();
-        self.push_context("data declaration");
-        self.advance(); // consume `data`
+        self.in_context("data declaration", |this| {
+            this.advance(); // consume `data`
 
-        let (name, _) = self.expect_upper("expected type name after 'data'").ok()?;
+            let (name, _) = this.expect_upper("expected type name after 'data'").ok()?;
 
-        // Parse type parameters (lowercase identifiers before `=`).
-        let mut params = Vec::new();
-        while matches!(self.peek(), TokenKind::Lower(_)) {
-            let tok = self.advance();
-            let TokenKind::Lower(p) = tok.kind else { unreachable!() };
-            params.push(p);
-        }
-
-        self.skip_newlines();
-        self.expect(&TokenKind::Eq, "expected '=' in data declaration").ok()?;
-        self.skip_newlines();
-
-        let mut constructors = vec![self.parse_constructor_def()?];
-        loop {
-            self.skip_newlines();
-            if !self.eat(&TokenKind::Pipe) {
-                break;
+            // Parse type parameters (lowercase identifiers before `=`).
+            let mut params = Vec::new();
+            while matches!(this.peek(), TokenKind::Lower(_)) {
+                let tok = this.advance();
+                let TokenKind::Lower(p) = tok.kind else { unreachable!() };
+                params.push(p);
             }
-            self.skip_newlines();
-            constructors.push(self.parse_constructor_def()?);
-        }
 
-        // Optional deriving clause.
-        self.skip_newlines();
-        let mut deriving = Vec::new();
-        if self.eat(&TokenKind::Deriving) {
-            self.expect(&TokenKind::LParen, "expected '(' after 'deriving'").ok()?;
+            this.skip_newlines();
+            this.expect(&TokenKind::Eq, "expected '=' in data declaration").ok()?;
+            this.skip_newlines();
+
+            let mut constructors = vec![this.parse_constructor_def()?];
             loop {
-                if matches!(self.peek(), TokenKind::Upper(_)) {
-                    let tok = self.advance();
-                    let TokenKind::Upper(n) = tok.kind else { unreachable!() };
-                    deriving.push(n);
-                } else {
+                this.skip_newlines();
+                if !this.eat(&TokenKind::Pipe) {
                     break;
                 }
-                if !self.eat(&TokenKind::Comma) {
-                    break;
-                }
+                this.skip_newlines();
+                constructors.push(this.parse_constructor_def()?);
             }
-            self.expect(&TokenKind::RParen, "expected ')' to close deriving list")
-                .ok()?;
-        }
 
-        let end = self.prev_span();
-        self.pop_context();
-        Some(Decl {
-            node: DeclKind::Data {
-                name,
-                params,
-                constructors,
-                deriving,
-            },
-            span: Span::new(start.start, end.end),
-            exported: false,
+            // Optional deriving clause.
+            this.skip_newlines();
+            let mut deriving = Vec::new();
+            if this.eat(&TokenKind::Deriving) {
+                this.expect(&TokenKind::LParen, "expected '(' after 'deriving'").ok()?;
+                loop {
+                    if matches!(this.peek(), TokenKind::Upper(_)) {
+                        let tok = this.advance();
+                        let TokenKind::Upper(n) = tok.kind else { unreachable!() };
+                        deriving.push(n);
+                    } else {
+                        break;
+                    }
+                    if !this.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                this.expect(&TokenKind::RParen, "expected ')' to close deriving list")
+                    .ok()?;
+            }
+
+            let end = this.prev_span();
+            Some(Decl {
+                node: DeclKind::Data {
+                    name,
+                    params,
+                    constructors,
+                    deriving,
+                },
+                span: Span::new(start.start, end.end),
+                exported: false,
+            })
         })
     }
 
@@ -554,27 +564,27 @@ impl Parser {
 
     fn parse_type_alias(&mut self) -> Option<Decl> {
         let start = self.span();
-        self.push_context("type alias");
-        self.advance(); // consume `type`
+        self.in_context("type alias", |this| {
+            this.advance(); // consume `type`
 
-        let (name, _) = self.expect_upper("expected type name after 'type'").ok()?;
+            let (name, _) = this.expect_upper("expected type name after 'type'").ok()?;
 
-        let mut params = Vec::new();
-        while matches!(self.peek(), TokenKind::Lower(_)) {
-            let tok = self.advance();
-            let TokenKind::Lower(p) = tok.kind else { unreachable!() };
-            params.push(p);
-        }
+            let mut params = Vec::new();
+            while matches!(this.peek(), TokenKind::Lower(_)) {
+                let tok = this.advance();
+                let TokenKind::Lower(p) = tok.kind else { unreachable!() };
+                params.push(p);
+            }
 
-        self.expect(&TokenKind::Eq, "expected '=' in type alias").ok()?;
-        let ty = self.parse_type()?;
+            this.expect(&TokenKind::Eq, "expected '=' in type alias").ok()?;
+            let ty = this.parse_type()?;
 
-        let end = self.prev_span();
-        self.pop_context();
-        Some(Decl {
-            node: DeclKind::TypeAlias { name, params, ty },
-            span: Span::new(start.start, end.end),
-            exported: false,
+            let end = this.prev_span();
+            Some(Decl {
+                node: DeclKind::TypeAlias { name, params, ty },
+                span: Span::new(start.start, end.end),
+                exported: false,
+            })
         })
     }
 
@@ -582,59 +592,56 @@ impl Parser {
 
     fn parse_source_or_view(&mut self) -> Option<Decl> {
         let start = self.span();
-        self.push_context("source/view declaration");
-        self.advance(); // consume `*`
+        self.in_context("source/view declaration", |this| {
+            this.advance(); // consume `*`
 
-        let (name, _) = self.expect_lower("expected name after '*'").ok()?;
+            let (name, _) = this.expect_lower("expected name after '*'").ok()?;
 
-        // Subset constraint: *name.field <= ... or *name <= ...
-        if self.at(&TokenKind::Dot) || self.at(&TokenKind::Le) {
-            self.pop_context();
-            return self.parse_subset_constraint_rest(start, name);
-        }
-
-        // Peek: if `:` → source declaration, if `=` → view declaration.
-        if self.eat(&TokenKind::Colon) {
-            // Source declaration: *name : type
-            let ty = self.parse_type()?;
-            // Optional `with history` (may be on the next line)
-            let mut history = false;
-            self.skip_newlines();
-            if self.eat(&TokenKind::With) {
-                if matches!(self.peek(), TokenKind::Lower(s) if s == "history") {
-                    self.advance();
-                    history = true;
-                } else {
-                    self.error("expected 'history' after 'with'");
-                    self.advance(); // consume the bad token to avoid cascade errors
-                }
+            // Subset constraint: *name.field <= ... or *name <= ...
+            if this.at(&TokenKind::Dot) || this.at(&TokenKind::Le) {
+                return this.parse_subset_constraint_rest(start, name);
             }
-            let end = self.prev_span();
-            self.pop_context();
-            Some(Decl {
-                node: DeclKind::Source { name, ty, history },
-                span: Span::new(start.start, end.end),
-                exported: false,
-            })
-        } else if self.eat(&TokenKind::Eq) {
-            // View declaration: *name = expr
-            let body = self.parse_expr()?;
-            let end = self.prev_span();
-            self.pop_context();
-            Some(Decl {
-                node: DeclKind::View {
-                    name,
-                    ty: None,
-                    body,
-                },
-                span: Span::new(start.start, end.end),
-                exported: false,
-            })
-        } else {
-            self.error("expected ':', '=', or '<=' after source/view name");
-            self.pop_context();
-            None
-        }
+
+            // Peek: if `:` → source declaration, if `=` → view declaration.
+            if this.eat(&TokenKind::Colon) {
+                // Source declaration: *name : type
+                let ty = this.parse_type()?;
+                // Optional `with history` (may be on the next line)
+                let mut history = false;
+                this.skip_newlines();
+                if this.eat(&TokenKind::With) {
+                    if matches!(this.peek(), TokenKind::Lower(s) if s == "history") {
+                        this.advance();
+                        history = true;
+                    } else {
+                        this.error("expected 'history' after 'with'");
+                        this.advance(); // consume the bad token to avoid cascade errors
+                    }
+                }
+                let end = this.prev_span();
+                Some(Decl {
+                    node: DeclKind::Source { name, ty, history },
+                    span: Span::new(start.start, end.end),
+                    exported: false,
+                })
+            } else if this.eat(&TokenKind::Eq) {
+                // View declaration: *name = expr
+                let body = this.parse_expr()?;
+                let end = this.prev_span();
+                Some(Decl {
+                    node: DeclKind::View {
+                        name,
+                        ty: None,
+                        body,
+                    },
+                    span: Span::new(start.start, end.end),
+                    exported: false,
+                })
+            } else {
+                this.error("expected ':', '=', or '<=' after source/view name");
+                None
+            }
+        })
     }
 
     // ── subset constraint ────────────────────────────────────────────
@@ -642,33 +649,31 @@ impl Parser {
     /// Parse the rest of a subset constraint after `*name` has been consumed.
     /// Handles: `*name.field <= *other.field` and `*name <= *other.field`.
     fn parse_subset_constraint_rest(&mut self, start: Span, left_relation: Name) -> Option<Decl> {
-        self.push_context("subset constraint");
+        self.in_context("subset constraint", |this| {
+            let left_field = if this.eat(&TokenKind::Dot) {
+                let (field, _) = this.expect_lower("expected field name after '.'").ok()?;
+                Some(field)
+            } else {
+                None
+            };
 
-        let left_field = if self.eat(&TokenKind::Dot) {
-            let (field, _) = self.expect_lower("expected field name after '.'").ok()?;
-            Some(field)
-        } else {
-            None
-        };
+            this.expect(&TokenKind::Le, "expected '<=' in subset constraint").ok()?;
 
-        self.expect(&TokenKind::Le, "expected '<=' in subset constraint").ok()?;
+            // Parse right side: *relation.field or *relation
+            this.expect(&TokenKind::Star, "expected '*' before relation name in subset constraint")
+                .ok()?;
+            let (right_relation, _) = this
+                .expect_lower("expected relation name after '*' in subset constraint")
+                .ok()?;
 
-        // Parse right side: *relation.field or *relation
-        self.expect(&TokenKind::Star, "expected '*' before relation name in subset constraint")
-            .ok()?;
-        let (right_relation, _) = self
-            .expect_lower("expected relation name after '*' in subset constraint")
-            .ok()?;
+            let right_field = if this.eat(&TokenKind::Dot) {
+                let (field, _) = this.expect_lower("expected field name after '.'").ok()?;
+                Some(field)
+            } else {
+                None
+            };
 
-        let right_field = if self.eat(&TokenKind::Dot) {
-            let (field, _) = self.expect_lower("expected field name after '.'").ok()?;
-            Some(field)
-        } else {
-            None
-        };
-
-        let end = self.prev_span();
-        self.pop_context();
+            let end = this.prev_span();
         Some(Decl {
             node: DeclKind::SubsetConstraint {
                 sub: RelationPath {
@@ -680,8 +685,9 @@ impl Parser {
                     field: right_field,
                 },
             },
-            span: Span::new(start.start, end.end),
-            exported: false,
+                span: Span::new(start.start, end.end),
+                exported: false,
+            })
         })
     }
 
@@ -689,25 +695,25 @@ impl Parser {
 
     fn parse_derived(&mut self) -> Option<Decl> {
         let start = self.span();
-        self.push_context("derived declaration");
-        self.advance(); // consume `&`
+        self.in_context("derived declaration", |this| {
+            this.advance(); // consume `&`
 
-        let (name, _) = self.expect_lower("expected name after '&'").ok()?;
+            let (name, _) = this.expect_lower("expected name after '&'").ok()?;
 
-        self.expect(&TokenKind::Eq, "expected '=' in derived declaration")
-            .ok()?;
-        let body = self.parse_expr()?;
+            this.expect(&TokenKind::Eq, "expected '=' in derived declaration")
+                .ok()?;
+            let body = this.parse_expr()?;
 
-        let end = self.prev_span();
-        self.pop_context();
-        Some(Decl {
-            node: DeclKind::Derived {
-                name,
-                ty: None,
-                body,
-            },
-            span: Span::new(start.start, end.end),
-            exported: false,
+            let end = this.prev_span();
+            Some(Decl {
+                node: DeclKind::Derived {
+                    name,
+                    ty: None,
+                    body,
+                },
+                span: Span::new(start.start, end.end),
+                exported: false,
+            })
         })
     }
 
@@ -715,69 +721,66 @@ impl Parser {
 
     fn parse_fun(&mut self) -> Option<Decl> {
         let start = self.span();
-        self.push_context("function declaration");
+        self.in_context("function declaration", |this| {
+            let (name, _) = this.expect_lower("expected function name").ok()?;
 
-        let (name, _) = self.expect_lower("expected function name").ok()?;
+            // Check: is this a type signature (name : type) or a definition?
+            if this.at(&TokenKind::Colon) {
+                // Type signature — parse it and try to attach to next definition.
+                this.advance(); // consume `:`
+                let ts = this.parse_type_scheme();
+                this.skip_newlines();
 
-        // Check: is this a type signature (name : type) or a definition?
-        if self.at(&TokenKind::Colon) {
-            // Type signature — parse it and try to attach to next definition.
-            self.advance(); // consume `:`
-            let ts = self.parse_type_scheme();
-            self.skip_newlines();
+                // Now check if the next line is the definition body.
+                if matches!(this.peek(), TokenKind::Lower(n) if *n == name) {
+                    let saved = this.save();
+                    this.advance(); // consume name again
 
-            // Now check if the next line is the definition body.
-            if matches!(self.peek(), TokenKind::Lower(n) if *n == name) {
-                let saved = self.save();
-                self.advance(); // consume name again
-
-                if self.eat(&TokenKind::Eq) {
-                    let body = self.parse_expr()?;
-                    let end = self.prev_span();
-                    self.pop_context();
-                    return Some(Decl {
-                        node: DeclKind::Fun {
-                            name,
-                            ty: ts,
-                            body: Some(body),
-                        },
-                        span: Span::new(start.start, end.end),
-                        exported: false,
-                    });
-                } else {
-                    // Not a definition after the signature — restore.
-                    self.restore(saved);
+                    if this.eat(&TokenKind::Eq) {
+                        let body = this.parse_expr()?;
+                        let end = this.prev_span();
+                        return Some(Decl {
+                            node: DeclKind::Fun {
+                                name,
+                                ty: ts,
+                                body: Some(body),
+                            },
+                            span: Span::new(start.start, end.end),
+                            exported: false,
+                        });
+                    } else {
+                        // Not a definition after the signature — restore.
+                        this.restore(saved);
+                    }
                 }
+
+                // Return a Fun with just a type signature and no body.
+                let end = this.prev_span();
+                return Some(Decl {
+                    node: DeclKind::Fun {
+                        name,
+                        ty: ts,
+                        body: None,
+                    },
+                    span: Span::new(start.start, end.end),
+                    exported: false,
+                });
             }
 
-            // Return a Fun with just a type signature and no body.
-            let end = self.prev_span();
-            self.pop_context();
-            return Some(Decl {
+            this.expect(&TokenKind::Eq, "expected '=' in definition")
+                .ok()?;
+            let body = this.parse_expr()?;
+
+            let end = this.prev_span();
+            Some(Decl {
                 node: DeclKind::Fun {
                     name,
-                    ty: ts,
-                    body: None,
+                    ty: None,
+                    body: Some(body),
                 },
                 span: Span::new(start.start, end.end),
                 exported: false,
-            });
-        }
-
-        self.expect(&TokenKind::Eq, "expected '=' in definition")
-            .ok()?;
-        let body = self.parse_expr()?;
-
-        let end = self.prev_span();
-        self.pop_context();
-        Some(Decl {
-            node: DeclKind::Fun {
-                name,
-                ty: None,
-                body: Some(body),
-            },
-            span: Span::new(start.start, end.end),
-            exported: false,
+            })
         })
     }
 
@@ -785,77 +788,63 @@ impl Parser {
 
     fn parse_trait_decl(&mut self) -> Option<Decl> {
         let start = self.span();
-        self.push_context("trait declaration");
-        self.advance(); // consume `trait`
+        self.in_context("trait declaration", |this| {
+            this.advance(); // consume `trait`
 
-        // Parse optional supertraits: `Constraint =>` before trait name.
-        // Actually, the syntax is: trait (Constraint =>)* Name params* where
-        // But more commonly: trait Name params* where
-        // With supertraits: trait Functor f => Applicative (f : Type -> Type) where
-        // Let's handle: parse constraints, then name.
-        // Simpler approach: parse name first since it's Upper, then params.
+            let mut supertraits = Vec::new();
 
-        let mut supertraits = Vec::new();
-
-        // Check for supertraits: UpperName args => ... before the actual trait name
-        // We need lookahead to distinguish. Use a save/restore approach.
-        // Actually, looking at DESIGN.md examples:
-        //   trait Functor (f : Type -> Type) where
-        //   trait Functor f => Applicative (f : Type -> Type) where
-        // The supertraits come first. So pattern is:
-        //   (Upper type_args* => )* Upper trait_params* where
-        let saved = self.save();
-        if let Some(constraints) = self.try_parse_constraints() {
-            supertraits = constraints;
-        } else {
-            self.restore(saved);
-        }
-
-        let (name, _) = self.expect_upper("expected trait name").ok()?;
-
-        // Parse trait parameters: (name : kind?) or just lowercase name
-        let mut params = Vec::new();
-        loop {
-            if self.eat(&TokenKind::LParen) {
-                let (pname, _) = self
-                    .expect_lower("expected type parameter name in trait declaration")
-                    .ok()?;
-                let kind = if self.eat(&TokenKind::Colon) {
-                    Some(self.parse_type()?)
-                } else {
-                    None
-                };
-                self.expect(&TokenKind::RParen, "expected ')' after trait parameter")
-                    .ok()?;
-                params.push(TraitParam { name: pname, kind });
-            } else if matches!(self.peek(), TokenKind::Lower(_)) {
-                let tok = self.advance();
-                let TokenKind::Lower(pname) = tok.kind else { unreachable!() };
-                params.push(TraitParam {
-                    name: pname,
-                    kind: None,
-                });
+            let saved = this.save();
+            if let Some(constraints) = this.try_parse_constraints() {
+                supertraits = constraints;
             } else {
-                break;
+                this.restore(saved);
             }
-        }
 
-        self.expect(&TokenKind::Where, "expected 'where' in trait declaration")
-            .ok()?;
+            let (name, _) = this.expect_upper("expected trait name").ok()?;
 
-        let items = self.parse_block(|p| p.parse_trait_item());
+            // Parse trait parameters: (name : kind?) or just lowercase name
+            let mut params = Vec::new();
+            loop {
+                if this.eat(&TokenKind::LParen) {
+                    let (pname, _) = this
+                        .expect_lower("expected type parameter name in trait declaration")
+                        .ok()?;
+                    let kind = if this.eat(&TokenKind::Colon) {
+                        Some(this.parse_type()?)
+                    } else {
+                        None
+                    };
+                    this.expect(&TokenKind::RParen, "expected ')' after trait parameter")
+                        .ok()?;
+                    params.push(TraitParam { name: pname, kind });
+                } else if matches!(this.peek(), TokenKind::Lower(_)) {
+                    let tok = this.advance();
+                    let TokenKind::Lower(pname) = tok.kind else { unreachable!() };
+                    params.push(TraitParam {
+                        name: pname,
+                        kind: None,
+                    });
+                } else {
+                    break;
+                }
+            }
 
-        let end = self.prev_span();
-        self.pop_context();
-        Some(Decl {
-            node: DeclKind::Trait {
-                name,
-                params,
-                supertraits,
-                items,
-            },
-            span: Span::new(start.start, end.end),
-            exported: false,
+            this.expect(&TokenKind::Where, "expected 'where' in trait declaration")
+                .ok()?;
+
+            let items = this.parse_block(|p| p.parse_trait_item());
+
+            let end = this.prev_span();
+            Some(Decl {
+                node: DeclKind::Trait {
+                    name,
+                    params,
+                    supertraits,
+                    items,
+                },
+                span: Span::new(start.start, end.end),
+                exported: false,
+            })
         })
     }
 
@@ -942,50 +931,50 @@ impl Parser {
 
     fn parse_impl_decl(&mut self) -> Option<Decl> {
         let start = self.span();
-        self.push_context("impl declaration");
-        self.advance(); // consume `impl`
+        self.in_context("impl declaration", |this| {
+            this.advance(); // consume `impl`
 
-        // Parse optional constraints: (Constraint =>)*
-        let mut constraints = Vec::new();
-        let saved = self.save();
-        if let Some(cs) = self.try_parse_constraints() {
-            constraints = cs;
-        } else {
-            self.restore(saved);
-        }
-
-        let (trait_name, _) = self.expect_upper("expected trait name in impl").ok()?;
-
-        // Parse type arguments.
-        let mut args = Vec::new();
-        while self.can_start_type_atom()
-            && !self.at(&TokenKind::Where)
-            && !self.at(&TokenKind::Newline)
-            && !self.at_eof()
-        {
-            if let Some(ty) = self.try_parse_type_atom() {
-                args.push(ty);
+            // Parse optional constraints: (Constraint =>)*
+            let mut constraints = Vec::new();
+            let saved = this.save();
+            if let Some(cs) = this.try_parse_constraints() {
+                constraints = cs;
             } else {
-                break;
+                this.restore(saved);
             }
-        }
 
-        self.expect(&TokenKind::Where, "expected 'where' in impl declaration")
-            .ok()?;
+            let (trait_name, _) = this.expect_upper("expected trait name in impl").ok()?;
 
-        let items = self.parse_block(|p| p.parse_impl_item());
+            // Parse type arguments.
+            let mut args = Vec::new();
+            while this.can_start_type_atom()
+                && !this.at(&TokenKind::Where)
+                && !this.at(&TokenKind::Newline)
+                && !this.at_eof()
+            {
+                if let Some(ty) = this.try_parse_type_atom() {
+                    args.push(ty);
+                } else {
+                    break;
+                }
+            }
 
-        let end = self.prev_span();
-        self.pop_context();
-        Some(Decl {
-            node: DeclKind::Impl {
-                trait_name,
-                args,
-                constraints,
-                items,
-            },
-            span: Span::new(start.start, end.end),
-            exported: false,
+            this.expect(&TokenKind::Where, "expected 'where' in impl declaration")
+                .ok()?;
+
+            let items = this.parse_block(|p| p.parse_impl_item());
+
+            let end = this.prev_span();
+            Some(Decl {
+                node: DeclKind::Impl {
+                    trait_name,
+                    args,
+                    constraints,
+                    items,
+                },
+                span: Span::new(start.start, end.end),
+                exported: false,
+            })
         })
     }
 
@@ -1049,41 +1038,40 @@ impl Parser {
 
     fn parse_route_decl(&mut self) -> Option<Decl> {
         let start = self.span();
-        self.push_context("route declaration");
-        self.advance(); // consume `route`
+        self.in_context("route declaration", |this| {
+            this.advance(); // consume `route`
 
-        let (name, _) = self.expect_upper("expected route name").ok()?;
+            let (name, _) = this.expect_upper("expected route name").ok()?;
 
-        // Composite: `route Api = TodoApi | AdminApi`
-        if self.eat(&TokenKind::Eq) {
-            let mut components = Vec::new();
-            let (first, _) = self.expect_upper("expected route name in composite").ok()?;
-            components.push(first);
-            while self.eat(&TokenKind::Pipe) {
-                let (comp, _) = self.expect_upper("expected route name after '|'").ok()?;
-                components.push(comp);
+            // Composite: `route Api = TodoApi | AdminApi`
+            if this.eat(&TokenKind::Eq) {
+                let mut components = Vec::new();
+                let (first, _) = this.expect_upper("expected route name in composite").ok()?;
+                components.push(first);
+                while this.eat(&TokenKind::Pipe) {
+                    let (comp, _) = this.expect_upper("expected route name after '|'").ok()?;
+                    components.push(comp);
+                }
+                let end = this.prev_span();
+                return Some(Decl {
+                    node: DeclKind::RouteComposite { name, components },
+                    span: Span::new(start.start, end.end),
+                    exported: false,
+                });
             }
-            let end = self.prev_span();
-            self.pop_context();
-            return Some(Decl {
-                node: DeclKind::RouteComposite { name, components },
+
+            this.expect(&TokenKind::Where, "expected 'where' or '=' after route name")
+                .ok()?;
+
+            let no_prefix: Vec<PathSegment> = vec![];
+            let entries = this.parse_route_entries_with_prefix(&no_prefix);
+
+            let end = this.prev_span();
+            Some(Decl {
+                node: DeclKind::Route { name, entries },
                 span: Span::new(start.start, end.end),
                 exported: false,
-            });
-        }
-
-        self.expect(&TokenKind::Where, "expected 'where' or '=' after route name")
-            .ok()?;
-
-        let no_prefix: Vec<PathSegment> = vec![];
-        let entries = self.parse_route_entries_with_prefix(&no_prefix);
-
-        let end = self.prev_span();
-        self.pop_context();
-        Some(Decl {
-            node: DeclKind::Route { name, entries },
-            span: Span::new(start.start, end.end),
-            exported: false,
+            })
         })
     }
 
@@ -1328,60 +1316,57 @@ impl Parser {
 
     fn parse_migrate(&mut self) -> Option<Decl> {
         let start = self.span();
-        self.push_context("migrate declaration");
-        self.advance(); // consume `migrate`
+        self.in_context("migrate declaration", |this| {
+            this.advance(); // consume `migrate`
 
-        // Expect `*name`
-        self.expect(&TokenKind::Star, "expected '*' before relation name in migrate")
-            .ok()?;
-        let (relation, _) = self
-            .expect_lower("expected relation name after '*' in migrate")
-            .ok()?;
+            // Expect `*name`
+            this.expect(&TokenKind::Star, "expected '*' before relation name in migrate")
+                .ok()?;
+            let (relation, _) = this
+                .expect_lower("expected relation name after '*' in migrate")
+                .ok()?;
 
-        self.skip_newlines();
-        // `from`
-        if !matches!(self.peek(), TokenKind::Lower(s) if s == "from") {
-            self.error("expected 'from' in migrate declaration");
-            self.pop_context();
-            return None;
-        }
-        self.advance();
+            this.skip_newlines();
+            // `from`
+            if !matches!(this.peek(), TokenKind::Lower(s) if s == "from") {
+                this.error("expected 'from' in migrate declaration");
+                return None;
+            }
+            this.advance();
 
-        let from_ty = self.parse_type()?;
+            let from_ty = this.parse_type()?;
 
-        self.skip_newlines();
-        // `to`
-        if !matches!(self.peek(), TokenKind::Lower(s) if s == "to") {
-            self.error("expected 'to' in migrate declaration");
-            self.pop_context();
-            return None;
-        }
-        self.advance();
+            this.skip_newlines();
+            // `to`
+            if !matches!(this.peek(), TokenKind::Lower(s) if s == "to") {
+                this.error("expected 'to' in migrate declaration");
+                return None;
+            }
+            this.advance();
 
-        let to_ty = self.parse_type()?;
+            let to_ty = this.parse_type()?;
 
-        self.skip_newlines();
-        // `using`
-        if !matches!(self.peek(), TokenKind::Lower(s) if s == "using") {
-            self.error("expected 'using' in migrate declaration");
-            self.pop_context();
-            return None;
-        }
-        self.advance();
+            this.skip_newlines();
+            // `using`
+            if !matches!(this.peek(), TokenKind::Lower(s) if s == "using") {
+                this.error("expected 'using' in migrate declaration");
+                return None;
+            }
+            this.advance();
 
-        let using_fn = self.parse_expr()?;
+            let using_fn = this.parse_expr()?;
 
-        let end = self.prev_span();
-        self.pop_context();
-        Some(Decl {
-            node: DeclKind::Migrate {
-                relation,
-                from_ty,
-                to_ty,
-                using_fn,
-            },
-            span: Span::new(start.start, end.end),
-            exported: false,
+            let end = this.prev_span();
+            Some(Decl {
+                node: DeclKind::Migrate {
+                    relation,
+                    from_ty,
+                    to_ty,
+                    using_fn,
+                },
+                span: Span::new(start.start, end.end),
+                exported: false,
+            })
         })
     }
 
@@ -2057,84 +2042,84 @@ impl Parser {
 
     fn parse_lambda(&mut self) -> Option<Expr> {
         let start = self.span();
-        self.push_context("lambda expression");
-        self.advance(); // consume `\`
+        self.in_context("lambda expression", |this| {
+            this.advance(); // consume `\`
 
-        let mut params = Vec::new();
-        while !self.at(&TokenKind::Arrow) && !self.at_eof() {
-            let p = self.parse_pat()?;
-            params.push(p);
-        }
+            let mut params = Vec::new();
+            while !this.at(&TokenKind::Arrow) && !this.at_eof() {
+                let p = this.parse_pat()?;
+                params.push(p);
+            }
 
-        self.expect(&TokenKind::Arrow, "expected '->' in lambda expression")
-            .ok()?;
-        let body = self.parse_expr()?;
+            this.expect(&TokenKind::Arrow, "expected '->' in lambda expression")
+                .ok()?;
+            let body = this.parse_expr()?;
 
-        let end_sp = body.span;
-        self.pop_context();
-        Some(Spanned::new(
-            ExprKind::Lambda {
-                params,
-                body: Box::new(body),
-            },
-            Span::new(start.start, end_sp.end),
-        ))
+            let end_sp = body.span;
+            Some(Spanned::new(
+                ExprKind::Lambda {
+                    params,
+                    body: Box::new(body),
+                },
+                Span::new(start.start, end_sp.end),
+            ))
+        })
     }
 
     fn parse_if(&mut self) -> Option<Expr> {
         let start = self.span();
-        self.push_context("if expression");
-        self.advance(); // consume `if`
+        self.in_context("if expression", |this| {
+            this.advance(); // consume `if`
 
-        let cond = self.parse_expr()?;
-        self.skip_newlines();
-        self.expect(
-            &TokenKind::Then,
-            "expected 'then' after condition in 'if' expression",
-        )
-        .ok()?;
-        let then_branch = self.parse_expr()?;
-        self.skip_newlines();
-        self.expect(
-            &TokenKind::Else,
-            "expected 'else' after 'then' branch in 'if' expression",
-        )
-        .ok()?;
-        let else_branch = self.parse_expr()?;
+            let cond = this.parse_expr()?;
+            this.skip_newlines();
+            this.expect(
+                &TokenKind::Then,
+                "expected 'then' after condition in 'if' expression",
+            )
+            .ok()?;
+            let then_branch = this.parse_expr()?;
+            this.skip_newlines();
+            this.expect(
+                &TokenKind::Else,
+                "expected 'else' after 'then' branch in 'if' expression",
+            )
+            .ok()?;
+            let else_branch = this.parse_expr()?;
 
-        let end_sp = else_branch.span;
-        self.pop_context();
-        Some(Spanned::new(
-            ExprKind::If {
-                cond: Box::new(cond),
-                then_branch: Box::new(then_branch),
-                else_branch: Box::new(else_branch),
-            },
-            Span::new(start.start, end_sp.end),
-        ))
+            let end_sp = else_branch.span;
+            Some(Spanned::new(
+                ExprKind::If {
+                    cond: Box::new(cond),
+                    then_branch: Box::new(then_branch),
+                    else_branch: Box::new(else_branch),
+                },
+                Span::new(start.start, end_sp.end),
+            ))
+        })
     }
 
     fn parse_case(&mut self) -> Option<Expr> {
         let start = self.span();
-        self.push_context("case expression");
-        self.advance(); // consume `case`
+        self.in_context("case expression", |this| {
+            this.advance(); // consume `case`
 
-        let scrutinee = self.parse_expr()?;
-        self.skip_newlines();
-        self.expect(&TokenKind::Of, "expected 'of' after scrutinee in 'case' expression")
-            .ok()?;
+            let scrutinee = this.parse_expr()?;
+            this.skip_newlines();
+            this.expect(&TokenKind::Of, "expected 'of' after scrutinee in 'case' expression")
+                .ok()?;
 
-        let arms = self.parse_block(|p| p.parse_case_arm());
+            let arms = this.parse_block(|p| p.parse_case_arm());
 
-        let end = self.prev_span();
-        self.pop_context();
-        Some(Spanned::new(
-            ExprKind::Case {
-                scrutinee: Box::new(scrutinee),
-                arms,
-            },
-            Span::new(start.start, end.end),
-        ))
+            let end = this.prev_span();
+            Some(Spanned::new(
+                ExprKind::Case {
+                    scrutinee: Box::new(scrutinee),
+                    arms,
+                },
+                Span::new(start.start, end.end),
+            ))
+        })
     }
 
     fn parse_case_arm(&mut self) -> Option<CaseArm> {
@@ -2154,17 +2139,17 @@ impl Parser {
 
     fn parse_do_expr(&mut self) -> Option<Expr> {
         let start = self.span();
-        self.push_context("do expression");
-        self.advance(); // consume `do`
+        self.in_context("do expression", |this| {
+            this.advance(); // consume `do`
 
-        let stmts = self.parse_block(|p| p.parse_stmt());
+            let stmts = this.parse_block(|p| p.parse_stmt());
 
-        let end = self.prev_span();
-        self.pop_context();
-        Some(Spanned::new(
-            ExprKind::Do(stmts),
-            Span::new(start.start, end.end),
-        ))
+            let end = this.prev_span();
+            Some(Spanned::new(
+                ExprKind::Do(stmts),
+                Span::new(start.start, end.end),
+            ))
+        })
     }
 
     fn parse_set(&mut self, full: bool) -> Option<Expr> {
@@ -2172,62 +2157,63 @@ impl Parser {
     }
 
     fn parse_set_with_start(&mut self, full: bool, start: Span) -> Option<Expr> {
-        self.push_context(if full { "full set expression" } else { "set expression" });
-        self.advance(); // consume `set`
+        let ctx = if full { "full set expression" } else { "set expression" };
+        self.in_context(ctx, |this| {
+            this.advance(); // consume `set`
 
-        let target = self.parse_expr_bp(0)?;
+            let target = this.parse_expr_bp(0)?;
 
-        // `=` might follow. The spec says `set *rel = expr`.
-        self.expect(&TokenKind::Eq, "expected '=' after target in 'set' expression")
-            .ok()?;
-        let value = self.parse_expr()?;
+            // `=` might follow. The spec says `set *rel = expr`.
+            this.expect(&TokenKind::Eq, "expected '=' after target in 'set' expression")
+                .ok()?;
+            let value = this.parse_expr()?;
 
-        let end_sp = value.span;
-        self.pop_context();
-        let kind = if full {
-            ExprKind::FullSet {
-                target: Box::new(target),
-                value: Box::new(value),
-            }
-        } else {
-            ExprKind::Set {
-                target: Box::new(target),
-                value: Box::new(value),
-            }
-        };
-        Some(Spanned::new(kind, Span::new(start.start, end_sp.end)))
+            let end_sp = value.span;
+            let kind = if full {
+                ExprKind::FullSet {
+                    target: Box::new(target),
+                    value: Box::new(value),
+                }
+            } else {
+                ExprKind::Set {
+                    target: Box::new(target),
+                    value: Box::new(value),
+                }
+            };
+            Some(Spanned::new(kind, Span::new(start.start, end_sp.end)))
+        })
     }
 
     fn parse_let_in_expr(&mut self) -> Option<Expr> {
         let start = self.span();
-        self.push_context("let expression");
-        self.advance(); // consume `let`
+        self.in_context("let expression", |this| {
+            this.advance(); // consume `let`
 
-        let pat = self.parse_pat()?;
-        self.expect(&TokenKind::Eq, "expected '=' in let binding").ok()?;
-        let value = self.parse_expr()?;
-        self.skip_newlines();
-        self.expect(&TokenKind::In, "expected 'in' after let binding").ok()?;
-        let body = self.parse_expr()?;
+            let pat = this.parse_pat()?;
+            this.expect(&TokenKind::Eq, "expected '=' in let binding").ok()?;
+            let value = this.parse_expr()?;
+            this.skip_newlines();
+            this.expect(&TokenKind::In, "expected 'in' after let binding").ok()?;
+            let body = this.parse_expr()?;
 
-        // Desugar `let pat = value in body` as a lambda application.
-        // `(\pat -> body) value`
-        let end_sp = body.span;
-        let lam = Spanned::new(
-            ExprKind::Lambda {
-                params: vec![pat],
-                body: Box::new(body),
-            },
-            Span::new(start.start, end_sp.end),
-        );
-        self.pop_context();
-        Some(Spanned::new(
-            ExprKind::App {
-                func: Box::new(lam),
-                arg: Box::new(value),
-            },
-            Span::new(start.start, end_sp.end),
-        ))
+            // Desugar `let pat = value in body` as a lambda application.
+            // `(\pat -> body) value`
+            let end_sp = body.span;
+            let lam = Spanned::new(
+                ExprKind::Lambda {
+                    params: vec![pat],
+                    body: Box::new(body),
+                },
+                Span::new(start.start, end_sp.end),
+            );
+            Some(Spanned::new(
+                ExprKind::App {
+                    func: Box::new(lam),
+                    arg: Box::new(value),
+                },
+                Span::new(start.start, end_sp.end),
+            ))
+        })
     }
 }
 

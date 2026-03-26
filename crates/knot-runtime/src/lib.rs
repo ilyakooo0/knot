@@ -1832,7 +1832,9 @@ fn format_value(v: *mut Value) -> String {
     match unsafe { as_ref(v) } {
         Value::Int(n) => n.to_string(),
         Value::Float(n) => {
-            if *n == (*n as i64) as f64 {
+            if n.is_nan() || n.is_infinite() {
+                format!("{}", n)
+            } else if *n == (*n as i64) as f64 {
                 format!("{:.1}", n)
             } else {
                 n.to_string()
@@ -1925,7 +1927,9 @@ pub extern "C" fn knot_value_show(v: *mut Value) -> *mut Value {
         match unsafe { as_ref(v) } {
             Value::Int(n) => n.to_string(),
             Value::Float(n) => {
-                if *n == (*n as i64) as f64 {
+                if n.is_nan() || n.is_infinite() {
+                    format!("{}", n)
+                } else if *n == (*n as i64) as f64 {
                     format!("{:.1}", n)
                 } else {
                     n.to_string()
@@ -2142,8 +2146,11 @@ pub extern "C" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
             // Run the IO action
             knot_io_run(db, io);
 
-            // Close DB and clean up cloned values
-            unsafe { deep_drop_value(io); }
+            // Note: we intentionally do NOT call deep_drop_value(io) here.
+            // The IO thunk execution may have stored pointers from the
+            // deep-cloned tree into arena-allocated values. Freeing the
+            // tree could cause use-after-free. The bounded leak (just the
+            // closure environment) is reclaimed when the thread exits.
             knot_db_close(db);
         });
 
@@ -5019,7 +5026,24 @@ pub extern "C" fn knot_source_diff_write(
             .execute_batch(&insert_new_sql)
             .expect("knot runtime: failed to insert new rows");
     } else {
-        let cols = parse_schema(schema);
+        let rec_schema = parse_record_schema(schema);
+
+        // If there are nested relation fields, fall back to full clear + rewrite
+        // since the diff logic only handles scalar columns.
+        if !rec_schema.nested.is_empty() {
+            let table_name = format!("_knot_{}", name);
+            delete_record_table(&db_ref.conn, &table_name, &rec_schema);
+            write_record_rows(&db_ref.conn, &table_name, &rec_schema, rows);
+
+            db_ref
+                .conn
+                .execute_batch("RELEASE SAVEPOINT knot_diff_write;")
+                .expect("knot runtime: failed to commit transaction");
+            notify_relation_changed();
+            return;
+        }
+
+        let cols = rec_schema.columns;
 
         // 1. Create temp table with same schema
         let col_defs: Vec<String> = cols
@@ -5563,7 +5587,7 @@ pub extern "C" fn knot_constraint_register(
             let msg = format!(
                 "uniqueness constraint violated: *{} <= *{}.{}",
                 sub_rel, sup_rel, sf
-            );
+            ).replace('\'', "''");
             let trigger_sql = format!(
                 "CREATE TRIGGER IF NOT EXISTS {trg} \
                  BEFORE INSERT ON {table} \
@@ -5578,6 +5602,22 @@ pub extern "C" fn knot_constraint_register(
             debug_sql(&trigger_sql);
             db_ref.conn.execute_batch(&trigger_sql)
                 .expect("knot runtime: failed to create uniqueness trigger");
+
+            // Trigger: reject UPDATE if new value already exists
+            let upd_trigger_sql = format!(
+                "CREATE TRIGGER IF NOT EXISTS {trg} \
+                 BEFORE UPDATE OF {col} ON {table} \
+                 FOR EACH ROW \
+                 WHEN NEW.{col} != OLD.{col} AND EXISTS (SELECT 1 FROM {table} WHERE {col} = NEW.{col}) \
+                 BEGIN SELECT RAISE(ABORT, '{msg}'); END;",
+                trg = quote_ident(&format!("_knot_uniq_{}_{}_upd", sub_rel, sf)),
+                table = table,
+                col = col,
+                msg = msg,
+            );
+            debug_sql(&upd_trigger_sql);
+            db_ref.conn.execute_batch(&upd_trigger_sql)
+                .expect("knot runtime: failed to create uniqueness update trigger");
         }
         // Referential integrity: *sub.sf <= *sup.spf — indexes + triggers
         (Some(sf), Some(spf)) => {
@@ -5607,7 +5647,7 @@ pub extern "C" fn knot_constraint_register(
             let msg = format!(
                 "subset constraint violated: *{}.{} <= *{}.{}",
                 sub_rel, sf, sup_rel, spf
-            );
+            ).replace('\'', "''");
 
             // Trigger: reject INSERT into sub if value doesn't exist in sup
             let insert_trigger = format!(
@@ -5626,6 +5666,24 @@ pub extern "C" fn knot_constraint_register(
             debug_sql(&insert_trigger);
             db_ref.conn.execute_batch(&insert_trigger)
                 .expect("knot runtime: failed to create insert trigger");
+
+            // Trigger: reject UPDATE on sub if new value doesn't exist in sup
+            let update_trigger = format!(
+                "CREATE TRIGGER IF NOT EXISTS {trg} \
+                 BEFORE UPDATE OF {sub_col} ON {sub_table} \
+                 FOR EACH ROW \
+                 WHEN NEW.{sub_col} != OLD.{sub_col} AND NOT EXISTS (SELECT 1 FROM {sup_table} WHERE {sup_col} = NEW.{sub_col}) \
+                 BEGIN SELECT RAISE(ABORT, '{msg}'); END;",
+                trg = quote_ident(&format!("_knot_fk_{}_{}_upd", sub_rel, sf)),
+                sub_table = sub_table,
+                sup_table = sup_table,
+                sub_col = sub_col,
+                sup_col = sup_col,
+                msg = msg,
+            );
+            debug_sql(&update_trigger);
+            db_ref.conn.execute_batch(&update_trigger)
+                .expect("knot runtime: failed to create update trigger");
         }
         _ => {}
     }
@@ -6153,6 +6211,7 @@ pub extern "C" fn knot_view_write(
         .conn
         .execute_batch("RELEASE SAVEPOINT knot_view_write;")
         .expect("knot runtime: view_write commit failed");
+    notify_relation_changed();
 }
 
 // ── Pipe (|>) support ─────────────────────────────────────────────

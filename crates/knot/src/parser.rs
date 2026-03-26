@@ -20,6 +20,11 @@ pub struct Parser {
     /// Used by `parse_application` to allow multi-line function application
     /// when continuation lines are indented past the block indent.
     block_indent: usize,
+    /// Nesting depth inside delimiters (parens, brackets, braces).
+    /// When > 0, the column-0 check in `parse_expr_bp` is suppressed so that
+    /// operators at column 0 inside grouped expressions are not mistaken for
+    /// new top-level declarations.
+    delimiter_depth: usize,
 }
 
 // ── Public API ──────────────────────────────────────────────────────
@@ -34,6 +39,7 @@ impl Parser {
             context: Vec::new(),
             stop_type_at_headers: false,
             block_indent: usize::MAX,
+            delimiter_depth: 0,
         }
     }
 
@@ -1475,9 +1481,9 @@ impl Parser {
             let saved_pos = self.save();
             self.skip_newlines();
 
-            // If the next token is at column 0, it's a new declaration — don't
-            // consume it as a binary operator.
-            if self.column_of(&self.span()) == 0 {
+            // If the next token is at column 0 and we're NOT inside delimiters,
+            // it's a new declaration — don't consume it as a binary operator.
+            if self.delimiter_depth == 0 && self.column_of(&self.span()) == 0 {
                 self.restore(saved_pos);
                 break;
             }
@@ -1820,20 +1826,28 @@ impl Parser {
             }
             TokenKind::LParen => {
                 self.advance();
+                self.delimiter_depth += 1;
                 // Check for empty parens `()` as unit.
                 if self.eat(&TokenKind::RParen) {
+                    self.delimiter_depth -= 1;
                     return Some(Spanned::new(
                         ExprKind::Record(vec![]),
                         Span::new(start.start, self.prev_span().end),
                     ));
                 }
-                let inner = self.parse_expr()?;
+                let inner = self.parse_expr();
+                if inner.is_none() {
+                    self.delimiter_depth -= 1;
+                    return None;
+                }
+                let inner = inner.unwrap();
                 let end_tok = self
                     .expect(
                         &TokenKind::RParen,
                         "unclosed '(' — expected matching ')'",
-                    )
-                    .ok()?;
+                    );
+                self.delimiter_depth -= 1;
+                let end_tok = end_tok.ok()?;
                 // Keep the inner expression but update span to include parens.
                 Some(Spanned::new(
                     inner.node,
@@ -1843,11 +1857,17 @@ impl Parser {
             TokenKind::Do => self.parse_do_expr(),
             TokenKind::LBrace => {
                 self.advance();
-                self.parse_record_or_update(start)
+                self.delimiter_depth += 1;
+                let result = self.parse_record_or_update(start);
+                self.delimiter_depth -= 1;
+                result
             }
             TokenKind::LBracket => {
                 self.advance();
-                self.parse_list_expr(start)
+                self.delimiter_depth += 1;
+                let result = self.parse_list_expr(start);
+                self.delimiter_depth -= 1;
+                result
             }
             TokenKind::Underscore => {
                 self.error("unexpected '_' in expression — wildcards are only for patterns");
@@ -2278,7 +2298,13 @@ impl Parser {
 
         if let Some(pat) = self.try_parse_pat() {
             if self.eat(&TokenKind::LArrow) {
-                let expr = self.parse_expr()?;
+                // Committed to a bind statement — `<-` was consumed.
+                // If the expression fails, return None without trying
+                // to re-parse as an expression statement.
+                let expr = match self.parse_expr() {
+                    Some(expr) => expr,
+                    None => return None,
+                };
                 let end_sp = expr.span;
                 return Some(Spanned::new(
                     StmtKind::Bind { pat, expr },
@@ -2456,6 +2482,7 @@ impl Parser {
                 | TokenKind::LBrace
                 | TokenKind::LBracket
                 | TokenKind::LParen
+                | TokenKind::Minus
                 | TokenKind::Int(_)
                 | TokenKind::Float(_)
                 | TokenKind::Text(_)
@@ -2498,6 +2525,28 @@ impl Parser {
                     .expect(&TokenKind::RParen, "expected ')' to close pattern group")
                     .ok()?;
                 Some(Spanned::new(inner.node, Span::new(start.start, end_tok.span.end)))
+            }
+            TokenKind::Minus => {
+                let minus_tok = self.advance();
+                match self.peek() {
+                    TokenKind::Int(_) => {
+                        let tok = self.advance();
+                        let TokenKind::Int(n) = tok.kind else { unreachable!() };
+                        let neg = format!("-{}", n);
+                        let span = Span::new(minus_tok.span.start, tok.span.end);
+                        Some(Spanned::new(PatKind::Lit(Literal::Int(neg)), span))
+                    }
+                    TokenKind::Float(_) => {
+                        let tok = self.advance();
+                        let TokenKind::Float(f) = tok.kind else { unreachable!() };
+                        let span = Span::new(minus_tok.span.start, tok.span.end);
+                        Some(Spanned::new(PatKind::Lit(Literal::Float(-f)), span))
+                    }
+                    _ => {
+                        self.error("expected number after '-' in pattern");
+                        None
+                    }
+                }
             }
             TokenKind::Int(_) => {
                 let tok = self.advance();

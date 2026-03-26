@@ -289,7 +289,9 @@ fn format_cell(row: &rusqlite::Row, idx: usize, ty: &str) -> String {
         "float" => {
             match row.get_ref(idx) {
                 Ok(rusqlite::types::ValueRef::Real(f)) => {
-                    if f == (f as i64) as f64 {
+                    if f.is_nan() || f.is_infinite() {
+                        format!("{}", f)
+                    } else if f == (f as i64) as f64 {
                         format!("{:.1}", f)
                     } else {
                         f.to_string()

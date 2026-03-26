@@ -2108,29 +2108,13 @@ impl Infer {
 
     // ── Do-block inference ───────────────────────────────────────
 
-    /// Pre-scan do-block statements to detect IO builtins (mirrors codegen's
-    /// `is_io_do_block` / desugar's `expr_is_io`).
-    fn stmt_has_io(stmts: &[ast::Stmt]) -> bool {
-        fn expr_is_io(expr: &ast::Expr) -> bool {
-            match &expr.node {
-                ast::ExprKind::App { func, .. } => expr_is_io(func),
-                ast::ExprKind::Var(name) => matches!(
-                    name.as_str(),
-                    "println" | "putLine" | "print" | "readLine" | "readFile"
-                        | "writeFile" | "appendFile" | "fileExists" | "removeFile"
-                        | "listDir" | "now" | "randomInt" | "randomFloat"
-                        | "fetch" | "fetchWith" | "fork"
-                ),
-                ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
-                ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
-                ast::ExprKind::At { .. } => true,
-                _ => false,
-            }
-        }
+    /// Pre-scan do-block statements to detect IO builtins and user-defined IO
+    /// functions (mirrors codegen's `is_io_do_block` / `expr_is_io`).
+    fn stmt_has_io(&self, stmts: &[ast::Stmt]) -> bool {
         for stmt in stmts {
             match &stmt.node {
                 ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Expr(expr) => {
-                    if expr_is_io(expr) {
+                    if self.expr_is_io_prescan(expr) {
                         return true;
                     }
                 }
@@ -2138,6 +2122,36 @@ impl Infer {
             }
         }
         false
+    }
+
+    /// Check if an expression returns IO — checks builtins and user-defined
+    /// functions whose already-inferred type returns IO.
+    fn expr_is_io_prescan(&self, expr: &ast::Expr) -> bool {
+        match &expr.node {
+            ast::ExprKind::App { func, .. } => self.expr_is_io_prescan(func),
+            ast::ExprKind::Var(name) => {
+                matches!(
+                    name.as_str(),
+                    "println" | "putLine" | "print" | "readLine" | "readFile"
+                        | "writeFile" | "appendFile" | "fileExists" | "removeFile"
+                        | "listDir" | "now" | "randomInt" | "randomFloat"
+                        | "fetch" | "fetchWith" | "fork"
+                ) || self.lookup(name).map_or(false, |scheme| {
+                    fn returns_io(ty: &Ty) -> bool {
+                        match ty {
+                            Ty::IO(_, _) => true,
+                            Ty::Fun(_, ret) => returns_io(ret),
+                            _ => false,
+                        }
+                    }
+                    returns_io(&scheme.ty)
+                })
+            }
+            ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
+            ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
+            ast::ExprKind::At { .. } => true,
+            _ => false,
+        }
     }
 
     fn infer_do(&mut self, stmts: &[ast::Stmt], _span: Span) -> Ty {
@@ -2150,7 +2164,7 @@ impl Infer {
         // Pre-scan: if any statement uses IO builtins, set in_io_do so that
         // `yield` expressions inside case/if branches produce IO types.
         let prev_in_io_do = self.in_io_do;
-        if Self::stmt_has_io(stmts) {
+        if self.stmt_has_io(stmts) {
             self.in_io_do = true;
         }
 

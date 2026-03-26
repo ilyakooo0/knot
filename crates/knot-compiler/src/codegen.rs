@@ -144,6 +144,8 @@ struct ViewInfo {
 struct PendingLambda {
     func_id: FuncId,
     params: Vec<String>,
+    /// The original parameter pattern (for destructuring bind in the lambda body).
+    param_pat: Option<ast::Pat>,
     body: ast::Expr,
     free_vars: Vec<String>,
 }
@@ -2263,6 +2265,7 @@ impl Codegen {
 
         let func_id = lambda.func_id;
         let params = lambda.params.clone();
+        let param_pat = lambda.param_pat.clone();
         let body = lambda.body.clone();
         let free_vars = lambda.free_vars.clone();
 
@@ -2288,8 +2291,13 @@ impl Codegen {
                 }
             }
 
-            // Bind parameter
-            if params.len() == 1 {
+            // Bind parameter — use the original pattern for destructuring
+            if let Some(ref pat) = param_pat {
+                match &pat.node {
+                    ast::PatKind::Var(name) => env.set(name, arg),
+                    _ => cg.bind_io_pattern(builder, pat, arg, &mut env),
+                }
+            } else if params.len() == 1 {
                 env.set(&params[0], arg);
             }
 
@@ -2338,6 +2346,7 @@ impl Codegen {
         self.pending_lambdas.push(PendingLambda {
             func_id: trampoline_id,
             params: vec!["__trampoline_arg".to_string()],
+            param_pat: None,
             body,
             free_vars: vec![],
         });
@@ -4883,7 +4892,7 @@ impl Codegen {
 
                 ast::StmtKind::Let { pat, expr } => {
                     let val = self.compile_expr(builder, expr, env, db);
-                    bind_pattern_env(pat, val, env);
+                    self.bind_io_pattern(builder, pat, val, env);
                 }
 
                 ast::StmtKind::GroupBy { key } => {
@@ -5117,13 +5126,11 @@ impl Codegen {
         let lambda_name = format!("knot_lambda_{}", self.lambda_counter);
         self.lambda_counter += 1;
 
-        // Determine free variables
+        // Determine free variables — extract ALL names bound by patterns,
+        // not just top-level Var patterns (handles destructuring like \{x, y} -> ...)
         let param_names: Vec<String> = params
             .iter()
-            .filter_map(|p| match &p.node {
-                ast::PatKind::Var(name) => Some(name.clone()),
-                _ => None,
-            })
+            .flat_map(|p| pat_bound_names(p))
             .collect();
         let free_vars: Vec<String> = find_free_vars(body, &param_names)
             .into_iter()
@@ -5145,6 +5152,7 @@ impl Codegen {
         self.pending_lambdas.push(PendingLambda {
             func_id,
             params: param_names.clone(),
+            param_pat: if params.len() == 1 { Some(params[0].clone()) } else { None },
             body: body.clone(),
             free_vars: free_vars.clone(),
         });
@@ -7362,6 +7370,25 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
         ast::ExprKind::At { relation, time } => {
             expr_contains_derived_ref(relation, name) || expr_contains_derived_ref(time, name)
         }
+    }
+}
+
+/// Extract all variable names bound by a pattern (handles destructuring).
+fn pat_bound_names(pat: &ast::Pat) -> Vec<String> {
+    match &pat.node {
+        ast::PatKind::Var(name) => vec![name.clone()],
+        ast::PatKind::Record(fields) => fields
+            .iter()
+            .flat_map(|f| {
+                if let Some(ref inner) = f.pattern {
+                    pat_bound_names(inner)
+                } else {
+                    vec![f.name.clone()]
+                }
+            })
+            .collect(),
+        ast::PatKind::Constructor { payload, .. } => pat_bound_names(payload),
+        _ => vec![],
     }
 }
 

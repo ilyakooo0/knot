@@ -6206,7 +6206,11 @@ pub extern "C" fn knot_view_write(
         .expect("knot runtime: view_write begin failed");
 
     // 1. Delete rows matching the view's constant filter
-    let delete_sql = format!("DELETE FROM {} WHERE {};", table, filter_where);
+    let delete_sql = if filter_where.is_empty() {
+        format!("DELETE FROM {};", table)
+    } else {
+        format!("DELETE FROM {} WHERE {};", table, filter_where)
+    };
     let sql_params: Vec<rusqlite::types::Value> = filter_values
         .iter()
         .map(|v| value_to_sql_param(*v))
@@ -7002,8 +7006,19 @@ pub extern "C" fn knot_http_listen(
                 });
                 // Don't push HTTP request handles into THREAD_HANDLES — the
                 // server loop runs forever so they would accumulate without
-                // bound.  Let request threads detach instead.
-                drop(handle);
+                // bound.  Spawn a monitor thread to join and report panics.
+                std::thread::spawn(move || {
+                    if let Err(e) = handle.join() {
+                        let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else if let Some(s) = e.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "unknown panic".to_string()
+                        };
+                        eprintln!("[HTTP] handler thread panicked: {}", msg);
+                    }
+                });
             }
             None => {
                 if debug_enabled() {
@@ -7330,6 +7345,9 @@ fn fetch_build_query(query_desc: &str, payload: *mut Value) -> String {
 
 /// Convert a Knot value to its text representation for URL params.
 fn fetch_value_to_text(v: *mut Value) -> String {
+    if v.is_null() {
+        return String::new();
+    }
     match unsafe { as_ref(v) } {
         Value::Int(n) => n.to_string(),
         Value::Float(n) => n.to_string(),

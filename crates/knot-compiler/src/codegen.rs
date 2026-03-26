@@ -2930,8 +2930,10 @@ impl Codegen {
                         ast::BinOp::Eq => self.compile_trait_binop(builder, "eq", l, r, db, "knot_value_eq"),
                         ast::BinOp::Neq => {
                             let eq_result = self.compile_trait_binop(builder, "eq", l, r, db, "knot_value_neq");
-                            // When eq dispatcher exists, result is equality — negate for neq
-                            if self.trait_dispatcher_fns.contains_key("eq") {
+                            // When ADT eq impls exist, compile_trait_binop used the dispatcher
+                            // which returns equality — negate for neq. Otherwise it used the
+                            // fallback knot_value_neq which already returns inequality.
+                            if self.has_adt_impls("eq") {
                                 self.call_rt(builder, "knot_value_not", &[eq_result])
                             } else {
                                 eq_result
@@ -4345,10 +4347,17 @@ impl Codegen {
             ast::ExprKind::Var(name) => builtins.contains(name.as_str()) || io_fns.contains(name),
             ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
             ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
-            ast::ExprKind::At { .. } => true,
+            ast::ExprKind::At { .. } | ast::ExprKind::Atomic(_) => true,
             ast::ExprKind::App { func, arg } => {
                 Self::expr_contains_io(func, builtins, io_fns)
                     || Self::expr_contains_io(arg, builtins, io_fns)
+            }
+            ast::ExprKind::BinOp { lhs, rhs, .. } => {
+                Self::expr_contains_io(lhs, builtins, io_fns)
+                    || Self::expr_contains_io(rhs, builtins, io_fns)
+            }
+            ast::ExprKind::UnaryOp { operand, .. } => {
+                Self::expr_contains_io(operand, builtins, io_fns)
             }
             ast::ExprKind::Do(stmts) => {
                 stmts.iter().any(|s| match &s.node {
@@ -4359,13 +4368,29 @@ impl Codegen {
                 })
             }
             ast::ExprKind::Lambda { body, .. } => Self::expr_contains_io(body, builtins, io_fns),
-            ast::ExprKind::If { then_branch, else_branch, .. } => {
-                Self::expr_contains_io(then_branch, builtins, io_fns)
+            ast::ExprKind::If { cond, then_branch, else_branch, .. } => {
+                Self::expr_contains_io(cond, builtins, io_fns)
+                    || Self::expr_contains_io(then_branch, builtins, io_fns)
                     || Self::expr_contains_io(else_branch, builtins, io_fns)
             }
-            ast::ExprKind::Case { arms, .. } => {
-                arms.iter().any(|arm| Self::expr_contains_io(&arm.body, builtins, io_fns))
+            ast::ExprKind::Case { scrutinee, arms, .. } => {
+                Self::expr_contains_io(scrutinee, builtins, io_fns)
+                    || arms.iter().any(|arm| Self::expr_contains_io(&arm.body, builtins, io_fns))
             }
+            ast::ExprKind::Record(fields) => {
+                fields.iter().any(|f| Self::expr_contains_io(&f.value, builtins, io_fns))
+            }
+            ast::ExprKind::RecordUpdate { base, fields, .. } => {
+                Self::expr_contains_io(base, builtins, io_fns)
+                    || fields.iter().any(|f| Self::expr_contains_io(&f.value, builtins, io_fns))
+            }
+            ast::ExprKind::FieldAccess { expr, .. } => {
+                Self::expr_contains_io(expr, builtins, io_fns)
+            }
+            ast::ExprKind::List(elems) => {
+                elems.iter().any(|e| Self::expr_contains_io(e, builtins, io_fns))
+            }
+            ast::ExprKind::Yield(inner) => Self::expr_contains_io(inner, builtins, io_fns),
             _ => false,
         }
     }

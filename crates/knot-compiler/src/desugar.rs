@@ -519,7 +519,7 @@ fn expr_is_io(expr: &Expr) -> bool {
             "println" | "putLine" | "print" | "readLine" | "readFile"
                 | "writeFile" | "appendFile" | "fileExists" | "removeFile"
                 | "listDir" | "now" | "randomInt" | "randomFloat"
-                | "fetch" | "fetchWith" | "fork"
+                | "fetch" | "fetchWith" | "fork" | "listen"
         ),
         ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) => true,
         ExprKind::Set { .. } | ExprKind::FullSet { .. } => true,

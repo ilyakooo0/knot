@@ -4416,33 +4416,12 @@ impl Codegen {
                     // Run the IO action to get the result
                     let result = self.call_rt(builder, "knot_io_run", &[db, io_val]);
                     // Bind the result to the pattern
-                    if let ast::PatKind::Var(name) = &pat.node {
-                        env.bindings.insert(name.clone(), result);
-                    } else if let ast::PatKind::Record(fields) = &pat.node {
-                        for f in fields {
-                            let (field_ptr, field_len) = self.string_ptr(builder, &f.name);
-                            let field_val = self.call_rt(
-                                builder,
-                                "knot_record_field",
-                                &[result, field_ptr, field_len],
-                            );
-                            if let Some(ref inner_pat) = f.pattern {
-                                if let ast::PatKind::Var(name) = &inner_pat.node {
-                                    env.bindings.insert(name.clone(), field_val);
-                                }
-                            } else {
-                                // Punned: {name} means bind to variable `name`
-                                env.bindings.insert(f.name.clone(), field_val);
-                            }
-                        }
-                    }
+                    self.bind_io_pattern(builder, pat, result, env);
                     last_val = result;
                 }
                 ast::StmtKind::Let { pat, expr } => {
                     let val = self.compile_expr(builder, expr, env, db);
-                    if let ast::PatKind::Var(name) = &pat.node {
-                        env.bindings.insert(name.clone(), val);
-                    }
+                    self.bind_io_pattern(builder, pat, val, env);
                     last_val = val;
                 }
                 ast::StmtKind::Where { cond } => {
@@ -4483,6 +4462,48 @@ impl Codegen {
 
         // Wrap the final value in IO
         self.call_rt(builder, "knot_io_pure", &[last_val])
+    }
+
+    /// Bind a pattern in an IO do-block context (no skip/filter blocks — just destructure).
+    fn bind_io_pattern(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        pat: &ast::Pat,
+        val: Value,
+        env: &mut Env,
+    ) {
+        match &pat.node {
+            ast::PatKind::Var(name) => {
+                env.bindings.insert(name.clone(), val);
+            }
+            ast::PatKind::Wildcard => {}
+            ast::PatKind::Record(fields) => {
+                for f in fields {
+                    let (field_ptr, field_len) = self.string_ptr(builder, &f.name);
+                    let field_val = self.call_rt(
+                        builder,
+                        "knot_record_field",
+                        &[val, field_ptr, field_len],
+                    );
+                    if let Some(ref inner_pat) = f.pattern {
+                        self.bind_io_pattern(builder, inner_pat, field_val, env);
+                    } else {
+                        env.bindings.insert(f.name.clone(), field_val);
+                    }
+                }
+            }
+            ast::PatKind::Constructor { name, payload } => {
+                // Extract the constructor payload and bind the inner pattern
+                let inner = if self.nullable_ctors.contains_key(name) {
+                    // Nullable encoding: val is the bare payload
+                    val
+                } else {
+                    self.call_rt(builder, "knot_constructor_payload", &[val])
+                };
+                self.bind_io_pattern(builder, payload, inner, env);
+            }
+            _ => {}
+        }
     }
 
     fn compile_do(

@@ -338,6 +338,10 @@ impl Parser {
                         };
                         path.push_str(&name);
                     }
+                    ref tok if tok.keyword_str().is_some() => {
+                        let tok = self.advance();
+                        path.push_str(tok.kind.keyword_str().unwrap());
+                    }
                     _ => {
                         self.error("expected path segment after '/'");
                         return None;
@@ -1267,6 +1271,9 @@ impl Parser {
                 let tok = self.advance();
                 let TokenKind::Upper(s) = tok.kind else { unreachable!() };
                 segments.push(PathSegment::Literal(s));
+            } else if self.peek().keyword_str().is_some() {
+                let tok = self.advance();
+                segments.push(PathSegment::Literal(tok.kind.keyword_str().unwrap().to_string()));
             } else {
                 // Just a trailing `/`
             }
@@ -2325,6 +2332,7 @@ impl Parser {
                 | TokenKind::Text(_)
                 | TokenKind::Bytes(_)
                 | TokenKind::Bool(_)
+                | TokenKind::Minus
         )
     }
 
@@ -2398,6 +2406,28 @@ impl Parser {
                     .expect(&TokenKind::RParen, "expected ')' to close pattern group")
                     .ok()?;
                 Some(Spanned::new(inner.node, Span::new(start.start, end_tok.span.end)))
+            }
+            TokenKind::Minus => {
+                let minus_tok = self.advance();
+                match self.peek() {
+                    TokenKind::Int(_) => {
+                        let tok = self.advance();
+                        let TokenKind::Int(n) = tok.kind else { unreachable!() };
+                        let neg = format!("-{}", n);
+                        let span = Span::new(minus_tok.span.start, tok.span.end);
+                        Some(Spanned::new(PatKind::Lit(Literal::Int(neg)), span))
+                    }
+                    TokenKind::Float(_) => {
+                        let tok = self.advance();
+                        let TokenKind::Float(f) = tok.kind else { unreachable!() };
+                        let span = Span::new(minus_tok.span.start, tok.span.end);
+                        Some(Spanned::new(PatKind::Lit(Literal::Float(-f)), span))
+                    }
+                    _ => {
+                        self.error("expected number after '-' in pattern");
+                        None
+                    }
+                }
             }
             TokenKind::Int(_) => {
                 let tok = self.advance();

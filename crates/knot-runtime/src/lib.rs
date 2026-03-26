@@ -1023,7 +1023,7 @@ fn sql_relations_equal(conn: &Connection, a: &[*mut Value], b: &[*mut Value]) ->
 
     // Check symmetric difference: (a EXCEPT b) UNION ALL (b EXCEPT a) should be empty
     let sql = format!(
-        "SELECT 1 FROM (SELECT * FROM {} EXCEPT SELECT * FROM {} UNION ALL (SELECT * FROM {} EXCEPT SELECT * FROM {})) LIMIT 1",
+        "SELECT 1 FROM ((SELECT * FROM {} EXCEPT SELECT * FROM {}) UNION ALL (SELECT * FROM {} EXCEPT SELECT * FROM {})) LIMIT 1",
         quote_ident(&t1), quote_ident(&t2), quote_ident(&t2), quote_ident(&t1)
     );
     debug_sql(&sql);
@@ -2016,10 +2016,10 @@ pub extern "C" fn knot_io_run(db: *mut c_void, val: *mut Value) -> *mut Value {
 ///   3. Runs that IO action
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_io_bind(io: *mut Value, f: *mut Value) -> *mut Value {
-    // Build a closure env holding (io, f)
+    // Build a closure env holding (io, f) — fields sorted for binary search
     let env = alloc(Value::Record(vec![
-        RecordField { name: "_io".to_string(), value: io },
         RecordField { name: "_f".to_string(), value: f },
+        RecordField { name: "_io".to_string(), value: io },
     ]));
 
     extern "C" fn bind_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
@@ -2248,8 +2248,8 @@ pub extern "C" fn knot_fs_read_file_io(path: *mut Value) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_fs_write_file_io(path: *mut Value, contents: *mut Value) -> *mut Value {
     let env = alloc(Value::Record(vec![
-        RecordField { name: "_p".to_string(), value: path },
         RecordField { name: "_c".to_string(), value: contents },
+        RecordField { name: "_p".to_string(), value: path },
     ]));
     extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let _ = db;
@@ -2263,8 +2263,8 @@ pub extern "C" fn knot_fs_write_file_io(path: *mut Value, contents: *mut Value) 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_fs_append_file_io(path: *mut Value, contents: *mut Value) -> *mut Value {
     let env = alloc(Value::Record(vec![
-        RecordField { name: "_p".to_string(), value: path },
         RecordField { name: "_c".to_string(), value: contents },
+        RecordField { name: "_p".to_string(), value: path },
     ]));
     extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let _ = db;
@@ -6429,19 +6429,22 @@ fn parse_query_string(qs: &str) -> HashMap<String, String> {
 
 fn url_decode(s: &str) -> String {
     let mut bytes = Vec::with_capacity(s.len());
-    let mut iter = s.bytes();
-    while let Some(b) = iter.next() {
-        if b == b'%' {
-            match (iter.next().and_then(hex_val), iter.next().and_then(hex_val)) {
-                (Some(h), Some(l)) => bytes.push(h * 16 + l),
-                // Invalid or truncated percent-encoding: pass through as-is
-                _ => bytes.push(b'%'),
+    let raw = s.as_bytes();
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'%' && i + 2 < raw.len() {
+            if let (Some(h), Some(l)) = (hex_val(raw[i + 1]), hex_val(raw[i + 2])) {
+                bytes.push(h * 16 + l);
+                i += 3;
+                continue;
             }
-        } else if b == b'+' {
+        }
+        if raw[i] == b'+' {
             bytes.push(b' ');
         } else {
-            bytes.push(b);
+            bytes.push(raw[i]);
         }
+        i += 1;
     }
     String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
@@ -6616,7 +6619,7 @@ pub extern "C" fn knot_http_listen(
         Value::Int(n) => n.to_u16().expect("knot runtime: port number out of range"),
         _ => panic!("knot runtime: listen expects Int port, got {}", type_name(port_val)),
     };
-    let table = Arc::new(unsafe { *Box::from_raw(route_table as *mut RouteTable) });
+    let table = Arc::new(unsafe { (route_table as *const RouteTable).read() });
     let addr = format!("0.0.0.0:{}", port);
     let server = Arc::new(tiny_http::Server::http(&addr)
         .unwrap_or_else(|e| panic!("knot runtime: failed to start HTTP server on {}: {}", addr, e)));
@@ -7612,8 +7615,9 @@ fn serialize_value_for_hash(v: *mut Value) -> Vec<u8> {
         }
         Value::Constructor(tag, payload) => {
             buf.push(5);
-            buf.extend_from_slice(tag.as_bytes());
-            buf.push(0); // separator between tag and payload
+            let tag_bytes = tag.as_bytes();
+            buf.extend_from_slice(&(tag_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(tag_bytes);
             buf.extend_from_slice(&serialize_value_for_hash(*payload));
         }
         _ => {

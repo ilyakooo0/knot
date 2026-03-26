@@ -167,6 +167,37 @@ impl TokenKind {
             TokenKind::Eof => "end of file",
         }
     }
+
+    /// If this token is a keyword, return its string representation.
+    pub fn keyword_str(&self) -> Option<&'static str> {
+        match self {
+            TokenKind::Import => Some("import"),
+            TokenKind::Data => Some("data"),
+            TokenKind::Type => Some("type"),
+            TokenKind::Trait => Some("trait"),
+            TokenKind::Impl => Some("impl"),
+            TokenKind::Route => Some("route"),
+            TokenKind::Migrate => Some("migrate"),
+            TokenKind::Where => Some("where"),
+            TokenKind::Do => Some("do"),
+            TokenKind::Yield => Some("yield"),
+            TokenKind::Set => Some("set"),
+            TokenKind::If => Some("if"),
+            TokenKind::Then => Some("then"),
+            TokenKind::Else => Some("else"),
+            TokenKind::Case => Some("case"),
+            TokenKind::Of => Some("of"),
+            TokenKind::Let => Some("let"),
+            TokenKind::In => Some("in"),
+            TokenKind::Not => Some("not"),
+            TokenKind::Full => Some("full"),
+            TokenKind::Atomic => Some("atomic"),
+            TokenKind::Deriving => Some("deriving"),
+            TokenKind::With => Some("with"),
+            TokenKind::Export => Some("export"),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -750,6 +750,10 @@ impl Infer {
         args: &[Ty],
     ) -> Option<Ty> {
         let info = self.data_types.get(name)?.clone();
+        // Save and restore annotation_vars so this doesn't corrupt
+        // the enclosing declaration's type variable mapping.
+        let saved_annotation_vars = self.annotation_vars.clone();
+        self.annotation_vars.clear();
         // Build param → arg mapping
         let mapping: HashMap<TyVar, Ty> = info
             .params
@@ -772,6 +776,7 @@ impl Infer {
                 .collect();
             ctors.insert(ctor_name.clone(), Ty::Record(field_tys, None));
         }
+        self.annotation_vars = saved_annotation_vars;
         Some(Ty::Variant(ctors, None))
     }
 
@@ -2294,9 +2299,11 @@ impl Infer {
                     ctor_list.push((ctor.name.clone(), fields));
                 }
 
+                // Clear annotation_vars for data type field resolution
+                self.annotation_vars.clear();
+
                 // For single-variant data types, also register as alias
                 if ctors.len() == 1 {
-                    self.annotation_vars.clear();
                     for p in params {
                         let v = self.fresh_var();
                         self.annotation_vars.insert(p.clone(), v);

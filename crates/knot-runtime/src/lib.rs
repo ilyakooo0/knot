@@ -1462,7 +1462,7 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
     }
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Int(x), Value::Int(y)) => x == y,
-        (Value::Float(x), Value::Float(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
         (Value::Text(x), Value::Text(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Bytes(x), Value::Bytes(y)) => x == y,
@@ -1553,9 +1553,24 @@ pub extern "C" fn knot_value_div(a: *mut Value, b: *mut Value) -> *mut Value {
             }
             alloc_int(x / y)
         }
-        (Value::Float(x), Value::Float(y)) => alloc_float(x / y),
-        (Value::Int(x), Value::Float(y)) => alloc_float(bigint_to_f64(x) / y),
-        (Value::Float(x), Value::Int(y)) => alloc_float(x / bigint_to_f64(y)),
+        (Value::Float(x), Value::Float(y)) => {
+            if *y == 0.0 {
+                panic!("knot runtime: division by zero");
+            }
+            alloc_float(x / y)
+        }
+        (Value::Int(x), Value::Float(y)) => {
+            if *y == 0.0 {
+                panic!("knot runtime: division by zero");
+            }
+            alloc_float(bigint_to_f64(x) / y)
+        }
+        (Value::Float(x), Value::Int(y)) => {
+            if y.is_zero() {
+                panic!("knot runtime: division by zero");
+            }
+            alloc_float(x / bigint_to_f64(y))
+        }
         _ => panic!("knot runtime: cannot divide {} / {}", type_name(a), type_name(b)),
     }
 }
@@ -1895,6 +1910,12 @@ pub extern "C" fn knot_println(v: *mut Value) -> *mut Value {
 }
 
 /// Convert a value to its text representation (returned as a Value::Text).
+/// Panic when a `where` guard fails inside an IO do-block.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_guard_failed() {
+    panic!("knot runtime: where guard failed in IO do-block");
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_show(v: *mut Value) -> *mut Value {
     fn show_inner(v: *mut Value) -> String {
@@ -6411,9 +6432,11 @@ fn url_decode(s: &str) -> String {
     let mut iter = s.bytes();
     while let Some(b) = iter.next() {
         if b == b'%' {
-            let h = iter.next().unwrap_or(b'0');
-            let l = iter.next().unwrap_or(b'0');
-            bytes.push(hex_val(h) * 16 + hex_val(l));
+            match (iter.next().and_then(hex_val), iter.next().and_then(hex_val)) {
+                (Some(h), Some(l)) => bytes.push(h * 16 + l),
+                // Invalid or truncated percent-encoding: pass through as-is
+                _ => bytes.push(b'%'),
+            }
         } else if b == b'+' {
             bytes.push(b' ');
         } else {
@@ -6423,12 +6446,12 @@ fn url_decode(s: &str) -> String {
     String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
-fn hex_val(b: u8) -> u8 {
+fn hex_val(b: u8) -> Option<u8> {
     match b {
-        b'0'..=b'9' => b - b'0',
-        b'a'..=b'f' => b - b'a' + 10,
-        b'A'..=b'F' => b - b'A' + 10,
-        _ => 0,
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -6655,7 +6678,7 @@ pub extern "C" fn knot_http_listen(
                 // Deep-clone handler for the worker thread
                 let handler_cloned = deep_clone_value(handler) as usize;
 
-                std::thread::spawn(move || {
+                let handle = std::thread::spawn(move || {
                     let handler = handler_cloned as *mut Value;
 
                     // Open a DB connection for this thread
@@ -6833,6 +6856,7 @@ pub extern "C" fn knot_http_listen(
                     // Free the deep-cloned handler to avoid per-request memory leak
                     unsafe { deep_drop_value(handler); }
                 });
+                THREAD_HANDLES.lock().unwrap().push(handle);
             }
             None => {
                 if debug_enabled() {

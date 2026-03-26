@@ -1569,24 +1569,51 @@ impl Infer {
                 let then_ty = self.infer_expr(then_branch);
                 let else_ty = self.infer_expr(else_branch);
                 self.unify(&then_ty, &else_ty, expr.span);
-                then_ty
+                // Merge IO effects from both branches — unify only checks
+                // inner types and discards effect sets.
+                let applied_then = self.apply(&then_ty);
+                let applied_else = self.apply(&else_ty);
+                match (&applied_then, &applied_else) {
+                    (Ty::IO(e1, inner), Ty::IO(e2, _)) => {
+                        let mut merged = e1.clone();
+                        merged.extend(e2.iter().cloned());
+                        Ty::IO(merged, inner.clone())
+                    }
+                    _ => then_ty,
+                }
             }
 
             ast::ExprKind::Case { scrutinee, arms } => {
                 let scrut_ty = self.infer_expr(scrutinee);
                 let result_ty = self.fresh();
+                let mut case_io_effects: BTreeSet<IoEffect> = BTreeSet::new();
 
                 for arm in arms {
                     self.push_scope();
                     self.check_pattern(&arm.pat, &scrut_ty);
                     let body_ty = self.infer_expr(&arm.body);
                     self.unify(&result_ty, &body_ty, arm.body.span);
+                    // Collect IO effects from each arm
+                    let applied = self.apply(&body_ty);
+                    if let Ty::IO(ref effects, _) = applied {
+                        case_io_effects.extend(effects.iter().cloned());
+                    }
                     self.pop_scope();
                 }
 
                 self.check_exhaustiveness(&scrut_ty, arms, expr.span);
 
-                result_ty
+                // Merge IO effects from all arms into the result type
+                if !case_io_effects.is_empty() {
+                    let applied_result = self.apply(&result_ty);
+                    if let Ty::IO(_, inner) = applied_result {
+                        Ty::IO(case_io_effects, inner)
+                    } else {
+                        result_ty
+                    }
+                } else {
+                    result_ty
+                }
             }
 
             ast::ExprKind::Do(stmts) => self.infer_do(stmts, expr.span),

@@ -136,10 +136,10 @@ fn route_entries_to_constructors(entries: &[RouteEntry]) -> Vec<ConstructorDef> 
             // With response headers: `respond : ResponseType -> {h1: T, ...} -> Response`
             // Without: `respond : ResponseType -> Response`
             if let Some(response_ty) = &entry.response_ty {
-                let dummy_span = Span::new(0, 0);
+                let span = response_ty.span;
                 let response_named = Spanned::new(
                     TypeKind::Named("Response".into()),
-                    dummy_span,
+                    span,
                 );
                 let respond_ty = if entry.response_headers.is_empty() {
                     Spanned::new(
@@ -147,7 +147,7 @@ fn route_entries_to_constructors(entries: &[RouteEntry]) -> Vec<ConstructorDef> 
                             param: Box::new(response_ty.clone()),
                             result: Box::new(response_named),
                         },
-                        dummy_span,
+                        span,
                     )
                 } else {
                     // respond : ResponseType -> {h1: T, ...} -> Response
@@ -156,7 +156,7 @@ fn route_entries_to_constructors(entries: &[RouteEntry]) -> Vec<ConstructorDef> 
                             fields: entry.response_headers.clone(),
                             rest: None,
                         },
-                        dummy_span,
+                        span,
                     );
                     Spanned::new(
                         TypeKind::Function {
@@ -166,10 +166,10 @@ fn route_entries_to_constructors(entries: &[RouteEntry]) -> Vec<ConstructorDef> 
                                     param: Box::new(headers_record),
                                     result: Box::new(response_named),
                                 },
-                                dummy_span,
+                                span,
                             )),
                         },
-                        dummy_span,
+                        span,
                     )
                 };
                 fields.push(Field {

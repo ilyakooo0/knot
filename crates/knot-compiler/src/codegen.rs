@@ -410,6 +410,7 @@ impl Codegen {
         self.declare_rt("knot_print", &[p], &[p]);
         self.declare_rt("knot_println", &[p], &[p]);
         self.declare_rt("knot_value_show", &[p], &[p]);
+        self.declare_rt("knot_guard_failed", &[], &[]);
 
         // Database
         self.declare_rt("knot_db_open", &[p, p], &[p]);
@@ -4445,8 +4446,23 @@ impl Codegen {
                     last_val = val;
                 }
                 ast::StmtKind::Where { cond } => {
-                    // In IO do-blocks, where acts as an assertion/guard
-                    let _ = self.compile_expr(builder, cond, env, db);
+                    // In IO do-blocks, where acts as an assertion/guard:
+                    // if the condition is false, panic at runtime.
+                    let cond_i32 =
+                        self.compile_condition(builder, cond, env, db);
+                    let is_true =
+                        builder.ins().icmp_imm(IntCC::NotEqual, cond_i32, 0);
+                    let pass_block = builder.create_block();
+                    let fail_block = builder.create_block();
+                    builder
+                        .ins()
+                        .brif(is_true, pass_block, &[], fail_block, &[]);
+                    builder.switch_to_block(fail_block);
+                    builder.seal_block(fail_block);
+                    self.call_rt_void(builder, "knot_guard_failed", &[]);
+                    builder.ins().trap(cranelift_codegen::ir::TrapCode::user(0).unwrap());
+                    builder.switch_to_block(pass_block);
+                    builder.seal_block(pass_block);
                 }
                 ast::StmtKind::Expr(expr) => {
                     if let ast::ExprKind::Yield(inner) = &expr.node {
@@ -4833,10 +4849,14 @@ impl Codegen {
                     if let Some(loop_info) = loop_stack.last_mut() {
                         loop_info.where_skips.push(skip_block);
                     } else {
-                        // Where outside a loop — just seal the skip block
+                        // Where outside a loop — seal the skip block with a
+                        // guard failure (there's no loop to skip to), then
+                        // continue compiling in the then_block.
                         builder.switch_to_block(skip_block);
                         builder.seal_block(skip_block);
-                        // Switch back — this is a degenerate case
+                        self.call_rt_void(builder, "knot_guard_failed", &[]);
+                        builder.ins().trap(cranelift_codegen::ir::TrapCode::user(0).unwrap());
+                        builder.switch_to_block(then_block);
                     }
                 }
 

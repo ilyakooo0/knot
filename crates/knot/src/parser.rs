@@ -1444,9 +1444,9 @@ impl Parser {
                     self.advance(); // consume `full`
                     self.parse_set_with_start(true, full_start)
                 } else {
-                    // `full` used as a regular identifier
-                    let tok = self.advance();
-                    Some(Spanned::new(ExprKind::Var("full".into()), tok.span))
+                    // `full` used as a regular identifier — fall through to
+                    // Pratt parsing so binary operators and application work.
+                    self.parse_expr_bp(0)
                 }
             }
             TokenKind::Yield => {
@@ -1625,6 +1625,7 @@ impl Parser {
             | TokenKind::LBrace
             | TokenKind::LBracket
             | TokenKind::Underscore
+            | TokenKind::Full
             | TokenKind::Do => true,
             TokenKind::Star => {
                 // Source ref `*name` only when `*` is immediately adjacent to a Lower token

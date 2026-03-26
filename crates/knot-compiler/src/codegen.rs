@@ -2194,7 +2194,7 @@ impl Codegen {
             let db = builder.block_params(entry)[0];
             for (i, pat) in params_owned.iter().enumerate() {
                 let val = builder.block_params(entry)[i + 1];
-                bind_pattern_env(pat, val, &mut env);
+                cg.bind_io_pattern(builder, pat, val, &mut env);
             }
 
             let result = cg.compile_expr(builder, &body_owned, &mut env, db);
@@ -7244,14 +7244,6 @@ fn merge_block_param(
     builder.append_block_param(block, ty);
 }
 
-fn bind_pattern_env(pat: &ast::Pat, val: Value, env: &mut Env) {
-    match &pat.node {
-        ast::PatKind::Var(name) => env.set(name, val),
-        ast::PatKind::Wildcard => {}
-        _ => {} // Simplified: only var and wildcard bindings for now
-    }
-}
-
 fn bind_do_pattern(
     builder: &mut FunctionBuilder,
     cg: &mut Codegen,
@@ -7441,9 +7433,7 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
         ast::ExprKind::Lambda { params, body } => {
             let mut new_bound = bound.clone();
             for p in params {
-                if let ast::PatKind::Var(name) = &p.node {
-                    new_bound.insert(name.as_str());
-                }
+                collect_pat_bindings_set(p, &mut new_bound);
             }
             collect_free_vars(body, &new_bound, free);
         }
@@ -7592,6 +7582,9 @@ fn is_builtin_name(name: &str) -> bool {
             | "decrypt"
             | "sign"
             | "verify"
+            | "randomFloat"
+            | "readLine"
+            | "retry"
     )
 }
 

@@ -4611,10 +4611,12 @@ fn write_record_rows(
 
     let placeholders: Vec<String> = (1..=col_names.len()).map(|i| format!("?{}", i)).collect();
 
-    // For tables with children, we need the _id back
+    // For tables with children, we need the _id back.
+    // Use INSERT OR IGNORE to handle duplicate parent rows gracefully,
+    // then look up the existing _id if the insert was ignored.
     let insert_sql = if has_children && !col_names.is_empty() {
         format!(
-            "INSERT INTO {} ({}) VALUES ({});",
+            "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
             table, col_names.join(", "), placeholders.join(", ")
         )
     } else if has_children {
@@ -4627,6 +4629,22 @@ fn write_record_rows(
         )
     };
     debug_sql(&insert_sql);
+
+    // Prepare a SELECT to look up existing _id when INSERT OR IGNORE skips a duplicate
+    let select_id_sql = if has_children && !col_names.is_empty() {
+        let where_conds: Vec<String> = col_names
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{} IS ?{}", c, i + 1))
+            .collect();
+        Some(format!(
+            "SELECT _id FROM {} WHERE {} LIMIT 1;",
+            table,
+            where_conds.join(" AND ")
+        ))
+    } else {
+        None
+    };
 
     let mut stmt = conn.prepare_cached(&insert_sql).expect("knot runtime: failed to prepare insert");
 
@@ -4664,7 +4682,20 @@ fn write_record_rows(
 
         // Write nested relation fields to child tables
         if has_children {
-            let parent_id = conn.last_insert_rowid();
+            let parent_id = if conn.changes() == 0 {
+                // INSERT OR IGNORE skipped this row (duplicate) — look up existing _id
+                if let Some(ref sql) = select_id_sql {
+                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                        params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+                    conn.query_row(sql, param_refs.as_slice(), |row| row.get::<_, i64>(0))
+                        .expect("knot runtime: failed to look up existing parent _id")
+                } else {
+                    // No scalar columns — DEFAULT VALUES always inserts, so this shouldn't happen
+                    conn.last_insert_rowid()
+                }
+            } else {
+                conn.last_insert_rowid()
+            };
             for nf in &schema.nested {
                 let child_table = format!("{}__{}", table_name, nf.name);
                 let child_val = field_map.get(nf.name.as_str())
@@ -5121,11 +5152,12 @@ pub extern "C" fn knot_source_diff_write(
             let match_conds: Vec<String> = cols
                 .iter()
                 .map(|c| {
+                    let c_quoted = quote_ident(&c.name);
                     format!(
-                        "{t}.{c} = {m}.{c}",
+                        "({t}.{c} = {m}.{c} OR ({t}.{c} IS NULL AND {m}.{c} IS NULL))",
                         t = temp,
                         m = table,
-                        c = quote_ident(&c.name)
+                        c = c_quoted
                     )
                 })
                 .collect();

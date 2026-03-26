@@ -2111,6 +2111,7 @@ fn deep_clone_value(val: *mut Value) -> *mut Value {
 /// Recursively free a value tree allocated by `deep_clone_value`.
 /// SAFETY: Every node in the tree must have been allocated by `Box::into_raw`.
 /// Do NOT call this on arena-allocated values.
+#[allow(dead_code)]
 unsafe fn deep_drop_value(val: *mut Value) {
     if val.is_null() {
         return;
@@ -2836,7 +2837,7 @@ pub extern "C" fn knot_bytes_slice(
     };
     match unsafe { as_ref(bytes) } {
         Value::Bytes(b) => {
-            let end = (start + len).min(b.len());
+            let end = start.saturating_add(len).min(b.len());
             let s = start.min(b.len());
             alloc(Value::Bytes(b[s..end].to_vec()))
         }
@@ -5117,6 +5118,20 @@ pub extern "C" fn knot_source_diff_write(
             return;
         }
 
+        // Zero-column records have nothing to diff — fall back to clear + rewrite
+        if rec_schema.columns.is_empty() {
+            let table_name = format!("_knot_{}", name);
+            delete_record_table(&db_ref.conn, &table_name, &rec_schema);
+            write_record_rows(&db_ref.conn, &table_name, &rec_schema, rows);
+
+            db_ref
+                .conn
+                .execute_batch("RELEASE SAVEPOINT knot_diff_write;")
+                .expect("knot runtime: failed to commit transaction");
+            notify_relation_changed();
+            return;
+        }
+
         let cols = rec_schema.columns;
 
         // 1. Create temp table with same schema
@@ -5136,7 +5151,7 @@ pub extern "C" fn knot_source_diff_write(
             .expect("knot runtime: failed to create temp table");
 
         // 2. Insert all new rows into temp
-        if !cols.is_empty() && !rows.is_empty() {
+        if !rows.is_empty() {
             let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
             let placeholders: Vec<String> = cols
                 .iter()
@@ -6830,6 +6845,7 @@ pub extern "C" fn knot_http_listen(
                     let db_path = DB_PATH.lock().unwrap().clone();
                     let db = knot_db_open(db_path.as_ptr(), db_path.len());
 
+                    let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     // Build record from path params, query params, and body
                     let mut fields: Vec<RecordField> = Vec::new();
 
@@ -6957,7 +6973,12 @@ pub extern "C" fn knot_http_listen(
                     while matches!(unsafe { as_ref(result) }, Value::IO(..)) {
                         result = knot_io_run(db, result);
                     }
+                    result
+                    }));
 
+                    match panic_result {
+                        Ok(result) => {
+                    let has_resp_headers = !entry_response_headers.is_empty();
                     if has_resp_headers {
                         let body_val = knot_record_field(result, "body".as_ptr(), 4);
                         let hdrs_val = knot_record_field(result, "headers".as_ptr(), 7);
@@ -6995,6 +7016,27 @@ pub extern "C" fn knot_http_listen(
                                     .unwrap(),
                             );
                         let _ = request.respond(response);
+                    }
+                        }
+                        Err(panic_err) => {
+                            let msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else if let Some(s) = panic_err.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "internal server error".to_string()
+                            };
+                            eprintln!("[HTTP] handler panicked: {}", msg);
+                            let body = format!("{{\"error\":\"{}\"}}", msg.replace('"', "\\\""));
+                            let response = tiny_http::Response::from_string(&body)
+                                .with_status_code(500)
+                                .with_header(
+                                    "Content-Type: application/json"
+                                        .parse::<tiny_http::Header>()
+                                        .unwrap(),
+                                );
+                            let _ = request.respond(response);
+                        }
                     }
 
                     knot_db_close(db);
@@ -8035,4 +8077,39 @@ pub extern "C" fn knot_crypto_verify(
 
     let valid = verifying_key.verify(msg, &signature).is_ok();
     alloc_bool(valid)
+}
+
+// IO wrappers for effectful crypto builtins
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_crypto_generate_key_pair_io() -> *mut Value {
+    extern "C" fn thunk(_db: *mut c_void, _env: *mut Value) -> *mut Value {
+        knot_crypto_generate_key_pair()
+    }
+    alloc(Value::IO(thunk as *const u8, std::ptr::null_mut()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_crypto_generate_signing_key_pair_io() -> *mut Value {
+    extern "C" fn thunk(_db: *mut c_void, _env: *mut Value) -> *mut Value {
+        knot_crypto_generate_signing_key_pair()
+    }
+    alloc(Value::IO(thunk as *const u8, std::ptr::null_mut()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_crypto_encrypt_io(public_key: *mut Value, plaintext: *mut Value) -> *mut Value {
+    let env = knot_record_empty(2);
+    let k = b"a";
+    knot_record_set_field(env, k.as_ptr(), k.len(), public_key);
+    let k = b"b";
+    knot_record_set_field(env, k.as_ptr(), k.len(), plaintext);
+    extern "C" fn thunk(_db: *mut c_void, env: *mut Value) -> *mut Value {
+        let a = b"a";
+        let public_key = knot_record_field(env, a.as_ptr(), a.len());
+        let b = b"b";
+        let plaintext = knot_record_field(env, b.as_ptr(), b.len());
+        knot_crypto_encrypt(public_key, plaintext)
+    }
+    alloc(Value::IO(thunk as *const u8, env))
 }

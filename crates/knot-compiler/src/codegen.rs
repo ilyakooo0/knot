@@ -469,7 +469,10 @@ impl Codegen {
         // Elliptic curve cryptography
         self.declare_rt("knot_crypto_generate_key_pair", &[], &[p]);
         self.declare_rt("knot_crypto_generate_signing_key_pair", &[], &[p]);
+        self.declare_rt("knot_crypto_generate_key_pair_io", &[], &[p]);
+        self.declare_rt("knot_crypto_generate_signing_key_pair_io", &[], &[p]);
         self.declare_rt("knot_crypto_encrypt", &[p, p], &[p]);
+        self.declare_rt("knot_crypto_encrypt_io", &[p, p], &[p]);
         self.declare_rt("knot_crypto_decrypt", &[p, p], &[p]);
         self.declare_rt("knot_crypto_sign", &[p, p], &[p]);
         self.declare_rt("knot_crypto_verify", &[p, p, p, p], &[p]);
@@ -1707,7 +1710,7 @@ impl Codegen {
         self.define_stdlib_fn_1("fork", "knot_fork_io");
 
         // Crypto: 2-param (curried)
-        self.define_stdlib_fn_2("encrypt", "knot_crypto_encrypt", false);
+        self.define_stdlib_fn_2("encrypt", "knot_crypto_encrypt_io", false);
         self.define_stdlib_fn_2("decrypt", "knot_crypto_decrypt", false);
         self.define_stdlib_fn_2("sign", "knot_crypto_sign", false);
 
@@ -2626,10 +2629,10 @@ impl Codegen {
                     return self.call_rt(builder, "knot_random_float_io", &[]);
                 }
                 if name == "generateKeyPair" {
-                    return self.call_rt(builder, "knot_crypto_generate_key_pair", &[]);
+                    return self.call_rt(builder, "knot_crypto_generate_key_pair_io", &[]);
                 }
                 if name == "generateSigningKeyPair" {
-                    return self.call_rt(builder, "knot_crypto_generate_signing_key_pair", &[]);
+                    return self.call_rt(builder, "knot_crypto_generate_signing_key_pair_io", &[]);
                 }
                 if name == "readLine" {
                     return self.call_rt(builder, "knot_read_line_io", &[]);
@@ -3772,14 +3775,17 @@ impl Codegen {
                     // Build route table from known route declarations
                     let table = self.call_rt(builder, "knot_route_table_new", &[]);
 
-                    // Find route entries — use the route with the most entries
-                    // (composite routes aggregate sub-routes, so the largest is typically the top-level one)
-                    let entries: Vec<ast::RouteEntry> = self
-                        .route_entries
-                        .values()
-                        .max_by_key(|v| v.len())
-                        .cloned()
-                        .unwrap_or_default();
+                    // Collect all unique route entries across all declarations,
+                    // deduplicating by constructor name.
+                    let mut seen = std::collections::HashSet::new();
+                    let mut entries: Vec<ast::RouteEntry> = Vec::new();
+                    for route_entries in self.route_entries.values() {
+                        for entry in route_entries {
+                            if seen.insert(entry.constructor.clone()) {
+                                entries.push(entry.clone());
+                            }
+                        }
+                    }
 
                     for entry in &entries {
                         let method_str = match entry.method {
@@ -4406,7 +4412,8 @@ impl Codegen {
                     "println" | "putLine" | "print" | "readLine" | "readFile"
                         | "writeFile" | "appendFile" | "fileExists" | "removeFile"
                         | "listDir" | "now" | "randomInt" | "randomFloat"
-                        | "fetch" | "fetchWith" | "fork"
+                        | "fetch" | "fetchWith" | "fork" | "listen"
+                        | "generateKeyPair" | "generateSigningKeyPair" | "encrypt"
                 ) || self.io_functions.contains(name)
             }
             ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,

@@ -520,6 +520,7 @@ fn expr_is_io(expr: &Expr) -> bool {
                 | "writeFile" | "appendFile" | "fileExists" | "removeFile"
                 | "listDir" | "now" | "randomInt" | "randomFloat"
                 | "fetch" | "fetchWith" | "fork" | "listen"
+                | "generateKeyPair" | "generateSigningKeyPair" | "encrypt"
         ),
         ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) => true,
         ExprKind::Set { .. } | ExprKind::FullSet { .. } => true,

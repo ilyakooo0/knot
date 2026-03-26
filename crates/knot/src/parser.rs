@@ -1147,7 +1147,13 @@ impl Parser {
                     None
                 }
             },
-            _ => None,
+            _ => {
+                self.error(format!(
+                    "expected HTTP method (GET, POST, PUT, DELETE, PATCH), found '{:?}'",
+                    self.peek()
+                ));
+                None
+            }
         };
 
         let method = method?;
@@ -1261,6 +1267,11 @@ impl Parser {
                         if let Some(ty) = self.parse_type() {
                             segments.push(PathSegment::Param { name: pname, ty });
                         }
+                    } else {
+                        self.error(format!(
+                            "expected ':' and type after path parameter '{}' (e.g., {{{}: Int}})",
+                            pname, pname
+                        ));
                     }
                 }
                 let _ = self.expect(&TokenKind::RBrace, "expected '}' to close path parameter");

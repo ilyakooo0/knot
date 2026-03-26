@@ -2135,7 +2135,8 @@ impl Infer {
                     "println" | "putLine" | "print" | "readLine" | "readFile"
                         | "writeFile" | "appendFile" | "fileExists" | "removeFile"
                         | "listDir" | "now" | "randomInt" | "randomFloat"
-                        | "fetch" | "fetchWith" | "fork"
+                        | "fetch" | "fetchWith" | "fork" | "listen"
+                        | "generateKeyPair" | "generateSigningKeyPair" | "encrypt"
                 ) || self.lookup(name).map_or(false, |scheme| {
                     fn returns_io(ty: &Ty) -> bool {
                         match ty {
@@ -3112,7 +3113,7 @@ impl Infer {
 
         // Elliptic curve cryptography
 
-        // generateKeyPair : {privateKey: Bytes, publicKey: Bytes}
+        // generateKeyPair : IO {random} {privateKey: Bytes, publicKey: Bytes}
         let key_pair_record = Ty::Record(
             BTreeMap::from([
                 ("privateKey".into(), Ty::Bytes),
@@ -3120,17 +3121,24 @@ impl Infer {
             ]),
             None,
         );
-        self.bind_top("generateKeyPair", Scheme::mono(key_pair_record.clone()));
+        self.bind_top("generateKeyPair", Scheme::mono(
+            Ty::IO(BTreeSet::from([IoEffect::Random]), Box::new(key_pair_record.clone())),
+        ));
 
-        // generateSigningKeyPair : {privateKey: Bytes, publicKey: Bytes}
-        self.bind_top("generateSigningKeyPair", Scheme::mono(key_pair_record));
+        // generateSigningKeyPair : IO {random} {privateKey: Bytes, publicKey: Bytes}
+        self.bind_top("generateSigningKeyPair", Scheme::mono(
+            Ty::IO(BTreeSet::from([IoEffect::Random]), Box::new(key_pair_record)),
+        ));
 
-        // encrypt : Bytes -> Bytes -> Bytes
+        // encrypt : Bytes -> Bytes -> IO {random} Bytes
         self.bind_top(
             "encrypt",
             Scheme::mono(Ty::Fun(
                 Box::new(Ty::Bytes),
-                Box::new(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Bytes))),
+                Box::new(Ty::Fun(
+                    Box::new(Ty::Bytes),
+                    Box::new(Ty::IO(BTreeSet::from([IoEffect::Random]), Box::new(Ty::Bytes))),
+                )),
             )),
         );
 

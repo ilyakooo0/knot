@@ -1140,7 +1140,12 @@ impl Parser {
                 "PUT" => Some(HttpMethod::Put),
                 "DELETE" => Some(HttpMethod::Delete),
                 "PATCH" => Some(HttpMethod::Patch),
-                _ => None,
+                _ => {
+                    self.error(format!(
+                        "expected HTTP method (GET, POST, PUT, DELETE, PATCH), found '{}'", m
+                    ));
+                    None
+                }
             },
             _ => None,
         };

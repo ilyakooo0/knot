@@ -671,7 +671,15 @@ fn infer_col_type(v: *mut Value) -> Option<ColType> {
         Value::Bool(_) => Some(ColType::Bool),
         Value::Bytes(_) => Some(ColType::Bytes),
         Value::Unit => None,
-        Value::Constructor(_, _) => Some(ColType::Tag),
+        Value::Constructor(_, payload) => {
+            // Only treat as Tag when the payload is Unit (nullary constructor).
+            // Constructors with fields would lose their payload data if stored as Tag.
+            if matches!(unsafe { as_ref(*payload) }, Value::Unit) {
+                Some(ColType::Tag)
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -1010,12 +1018,15 @@ fn sql_dedup(conn: &Connection, rows: &[*mut Value]) -> Option<Vec<*mut Value>> 
 
 /// Check if two relations are equal using SQL EXCEPT (symmetric difference).
 fn sql_relations_equal(conn: &Connection, a: &[*mut Value], b: &[*mut Value]) -> Option<bool> {
-    if a.len() != b.len() {
-        return Some(false);
-    }
-    if a.is_empty() {
+    if a.is_empty() && b.is_empty() {
         return Some(true);
     }
+    if a.is_empty() || b.is_empty() {
+        return Some(false);
+    }
+    // Don't short-circuit on a.len() != b.len() — in-memory vectors may contain
+    // duplicates, so different lengths don't imply different logical sets.
+    // Let the SQL EXCEPT (symmetric difference) handle deduplication correctly.
     let schema = infer_temp_schema(a)?;
 
     let t1 = materialize_relation(conn, a, &schema);
@@ -2195,6 +2206,8 @@ pub extern "C" fn knot_stm_check_and_clear() -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_stm_snapshot() -> i64 {
     let (lock, _) = &RELATION_CHANGED;
+    // Use wrapping cast to avoid issues if counter ever exceeds i64::MAX.
+    // The wait comparison uses wrapping subtraction for correct overflow handling.
     *lock.lock().unwrap() as i64
 }
 
@@ -2206,7 +2219,9 @@ pub extern "C" fn knot_stm_wait(snapshot: i64) {
     let guard = lock.lock().unwrap();
     let _ = cvar
         .wait_timeout_while(guard, Duration::from_millis(100), |c| {
-            (*c as i64) <= snapshot
+            // Use wrapping subtraction to handle u64->i64 overflow correctly.
+            // If current counter has advanced past snapshot, the wrapping difference > 0.
+            ((*c as i64).wrapping_sub(snapshot)) <= 0
         })
         .unwrap();
 }
@@ -4738,6 +4753,22 @@ fn write_child_rows(
     );
     debug_sql(&insert_sql);
 
+    // Prepare a SELECT to look up existing _id when INSERT OR IGNORE skips a duplicate
+    let select_id_sql = if has_children && !nf.columns.is_empty() {
+        let where_conds: Vec<String> = col_names
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{} IS ?{}", c, i + 1))
+            .collect();
+        Some(format!(
+            "SELECT _id FROM {} WHERE {} LIMIT 1;",
+            table,
+            where_conds.join(" AND ")
+        ))
+    } else {
+        None
+    };
+
     let mut stmt = conn.prepare_cached(&insert_sql).expect("knot runtime: failed to prepare child insert");
 
     for row_ptr in rows {
@@ -4766,7 +4797,19 @@ fn write_child_rows(
 
         // Recurse for deeper nesting
         if has_children {
-            let child_id = conn.last_insert_rowid();
+            let child_id = if conn.changes() == 0 {
+                // INSERT OR IGNORE skipped this row (duplicate) — look up existing _id
+                if let Some(ref sql) = select_id_sql {
+                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                        params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+                    conn.query_row(sql, param_refs.as_slice(), |row| row.get::<_, i64>(0))
+                        .expect("knot runtime: failed to look up existing child _id")
+                } else {
+                    conn.last_insert_rowid()
+                }
+            } else {
+                conn.last_insert_rowid()
+            };
             for grandchild in &nf.nested {
                 let gc_table = format!("{}__{}", table_name, grandchild.name);
                 let gc_val = field_map.get(grandchild.name.as_str())
@@ -6369,6 +6412,7 @@ enum PathPart {
     Param(String, String), // (name, type)
 }
 
+#[derive(Clone)]
 struct RouteTableEntry {
     method: String,
     path_parts: Vec<PathPart>,
@@ -6380,6 +6424,7 @@ struct RouteTableEntry {
     response_headers: Vec<(String, String)>,
 }
 
+#[derive(Clone)]
 struct RouteTable {
     entries: Vec<RouteTableEntry>,
 }
@@ -7341,7 +7386,11 @@ pub extern "C" fn knot_api_register(
     table: *mut c_void,
 ) {
     let name = unsafe { str_from_raw(name_ptr, name_len) }.to_string();
-    API_REGISTRY.lock().unwrap().push((name, SendPtr(table)));
+    // Clone the table so the registry has its own independent copy,
+    // allowing knot_http_listen to consume the original without use-after-free.
+    let table_ref = unsafe { &*(table as *const RouteTable) };
+    let cloned = Box::into_raw(Box::new(table_ref.clone())) as *mut c_void;
+    API_REGISTRY.lock().unwrap().push((name, SendPtr(cloned)));
 }
 
 #[unsafe(no_mangle)]

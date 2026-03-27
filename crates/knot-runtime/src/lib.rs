@@ -6934,7 +6934,7 @@ pub extern "C" fn knot_http_listen(
                                         ])),
                                     ))
                                 }
-                                None => std::ptr::null_mut(),
+                                None => alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit))),
                             }
                         } else {
                             let v = raw_val.unwrap_or_default();
@@ -7272,13 +7272,31 @@ pub extern "C" fn knot_http_fetch_io(
                     for field_desc in resp_hdrs_str.split(',') {
                         if field_desc.is_empty() { continue; }
                         let (name, ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
+                        let is_maybe = ty.starts_with('?');
+                        let inner_ty = if is_maybe { &ty[1..] } else { ty };
                         let http_name = camel_to_header_case(name);
-                        let raw = response.header(&http_name)
-                            .map(|s| s.to_string())
-                            .unwrap_or_default();
+                        let raw_val = response.header(&http_name)
+                            .map(|s| s.to_string());
+                        let value = if is_maybe {
+                            match raw_val {
+                                Some(v) => {
+                                    let inner = string_to_value(&v, inner_ty);
+                                    alloc(Value::Constructor(
+                                        "Just".into(),
+                                        alloc(Value::Record(vec![
+                                            RecordField { name: "value".into(), value: inner },
+                                        ])),
+                                    ))
+                                }
+                                None => alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit))),
+                            }
+                        } else {
+                            let v = raw_val.unwrap_or_default();
+                            string_to_value(&v, inner_ty)
+                        };
                         hdr_fields.push(RecordField {
                             name: name.to_string(),
-                            value: string_to_value(&raw, ty),
+                            value,
                         });
                     }
                     Some(alloc(Value::Record(hdr_fields)))

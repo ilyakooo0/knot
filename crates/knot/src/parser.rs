@@ -2087,6 +2087,8 @@ impl Parser {
 
             let mut params = Vec::new();
             while !this.at(&TokenKind::Arrow) && !this.at_eof() {
+                this.skip_newlines();
+                if this.at(&TokenKind::Arrow) { break; }
                 let p = this.parse_pat()?;
                 params.push(p);
             }

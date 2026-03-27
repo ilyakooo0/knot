@@ -611,7 +611,12 @@ impl<'src> Lexer<'src> {
                                     );
                                 }
                             } else {
-                                let span = Span::new(self.pos - 2, self.pos);
+                                let bad_end = if self.pos < self.source.len() {
+                                    self.pos + self.source[self.pos..].chars().next().map_or(1, |c| c.len_utf8())
+                                } else {
+                                    self.pos
+                                };
+                                let span = Span::new(self.pos - 2, bad_end);
                                 self.diagnostics.push(
                                     Diagnostic::error("invalid hex escape in byte string")
                                         .label(span, "expected two hex digits after \\x"),

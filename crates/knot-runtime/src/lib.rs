@@ -3180,7 +3180,7 @@ pub extern "C" fn knot_db_open(path_ptr: *const u8, path_len: usize) -> *mut c_v
         pa.cmp(&pb)
     })
     .expect("knot runtime: failed to create KNOT_INT collation");
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000; PRAGMA foreign_keys=ON;")
         .expect("knot runtime: failed to set pragmas");
     let db = Box::new(KnotDb {
         conn,
@@ -4631,6 +4631,22 @@ fn adt_row_to_params(
     }
 }
 
+/// Execute SQL with retries on SQLITE_BUSY.
+fn execute_with_busy_retry(conn: &rusqlite::Connection, sql: &str) {
+    for attempt in 0..20 {
+        match conn.execute_batch(sql) {
+            Ok(()) => return,
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1)));
+            }
+            Err(e) => panic!("knot runtime: SQL error: {e}"),
+        }
+    }
+    panic!("knot runtime: database busy after retries: {sql}");
+}
+
 /// Delete all rows from a record table and its child tables (children first).
 fn delete_record_table(conn: &rusqlite::Connection, table_name: &str, schema: &RecordSchema) {
     // Delete children first
@@ -4639,7 +4655,7 @@ fn delete_record_table(conn: &rusqlite::Connection, table_name: &str, schema: &R
     }
     let sql = format!("DELETE FROM {};", quote_ident(table_name));
     debug_sql(&sql);
-    conn.execute_batch(&sql).expect("knot runtime: failed to delete rows");
+    execute_with_busy_retry(conn, &sql);
 }
 
 fn delete_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &NestedField) {
@@ -4650,7 +4666,7 @@ fn delete_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &Nest
     }
     let sql = format!("DELETE FROM {};", quote_ident(&child_table));
     debug_sql(&sql);
-    conn.execute_batch(&sql).expect("knot runtime: failed to delete child rows");
+    execute_with_busy_retry(conn, &sql);
 }
 
 /// Insert rows into a record table and its child tables.
@@ -4905,8 +4921,7 @@ pub extern "C" fn knot_source_write(
         let table = quote_ident(&table_name);
         let delete_sql = format!("DELETE FROM {};", table);
         debug_sql(&delete_sql);
-        db_ref.conn.execute_batch(&delete_sql)
-            .expect("knot runtime: failed to delete rows");
+        execute_with_busy_retry(&db_ref.conn, &delete_sql);
 
         let adt = parse_adt_schema(schema);
         if !rows.is_empty() {

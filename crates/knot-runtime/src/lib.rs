@@ -269,6 +269,9 @@ pub extern "C" fn knot_arena_reset_to(mark: usize) {
 }
 
 unsafe fn as_ref<'a>(v: *mut Value) -> &'a Value {
+    if v.is_null() {
+        panic!("knot runtime: null pointer dereference (value is null)");
+    }
     unsafe { &*v }
 }
 
@@ -1066,6 +1069,31 @@ pub extern "C" fn knot_relation_singleton(v: *mut Value) -> *mut Value {
     alloc(Value::Relation(vec![v]))
 }
 
+/// Unwrap a scalar source relation: extract the `_value` field from the first row.
+/// Returns a default (Int 0) if the relation is empty.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_scalar_source_unwrap(rel: *mut Value) -> *mut Value {
+    match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => {
+            if rows.is_empty() {
+                alloc_int(BigInt::ZERO)
+            } else {
+                knot_record_field(rows[0], "_value".as_ptr(), 6)
+            }
+        }
+        _ => rel,
+    }
+}
+
+/// Wrap a scalar value as a singleton relation with a `_value` field: [{_value: val}]
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_scalar_source_wrap(val: *mut Value) -> *mut Value {
+    let record = alloc(Value::Record(vec![
+        RecordField { name: "_value".into(), value: val },
+    ]));
+    alloc(Value::Relation(vec![record]))
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_relation_push(rel: *mut Value, row: *mut Value) {
     let r = unsafe { &mut *rel };
@@ -1608,6 +1636,12 @@ pub extern "C" fn knot_value_neq_i32(a: *mut Value, b: *mut Value) -> i32 {
 }
 
 fn compare_lt(a: *mut Value, b: *mut Value) -> bool {
+    if a.is_null() || b.is_null() {
+        eprintln!("knot runtime: comparison with null value (a={}, b={})",
+            if a.is_null() { "null".to_string() } else { brief_value(a) },
+            if b.is_null() { "null".to_string() } else { brief_value(b) });
+        return false;
+    }
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Int(x), Value::Int(y)) => x < y,
         (Value::Float(x), Value::Float(y)) => x < y,
@@ -1619,6 +1653,12 @@ fn compare_lt(a: *mut Value, b: *mut Value) -> bool {
 }
 
 fn compare_gt(a: *mut Value, b: *mut Value) -> bool {
+    if a.is_null() || b.is_null() {
+        eprintln!("knot runtime: comparison with null value (a={}, b={})",
+            if a.is_null() { "null".to_string() } else { brief_value(a) },
+            if b.is_null() { "null".to_string() } else { brief_value(b) });
+        return false;
+    }
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Int(x), Value::Int(y)) => x > y,
         (Value::Float(x), Value::Float(y)) => x > y,
@@ -1631,41 +1671,49 @@ fn compare_gt(a: *mut Value, b: *mut Value) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_lt(a: *mut Value, b: *mut Value) -> *mut Value {
+    if a.is_null() || b.is_null() { return alloc_bool(false); }
     alloc_bool(compare_lt(a, b))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_gt(a: *mut Value, b: *mut Value) -> *mut Value {
+    if a.is_null() || b.is_null() { return alloc_bool(false); }
     alloc_bool(compare_gt(a, b))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_le(a: *mut Value, b: *mut Value) -> *mut Value {
+    if a.is_null() || b.is_null() { return alloc_bool(false); }
     alloc_bool(!compare_gt(a, b))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_ge(a: *mut Value, b: *mut Value) -> *mut Value {
+    if a.is_null() || b.is_null() { return alloc_bool(false); }
     alloc_bool(!compare_lt(a, b))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_lt_i32(a: *mut Value, b: *mut Value) -> i32 {
+    if a.is_null() || b.is_null() { return 0; }
     compare_lt(a, b) as i32
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_gt_i32(a: *mut Value, b: *mut Value) -> i32 {
+    if a.is_null() || b.is_null() { return 0; }
     compare_gt(a, b) as i32
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_le_i32(a: *mut Value, b: *mut Value) -> i32 {
+    if a.is_null() || b.is_null() { return 0; }
     !compare_gt(a, b) as i32
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_ge_i32(a: *mut Value, b: *mut Value) -> i32 {
+    if a.is_null() || b.is_null() { return 0; }
     !compare_lt(a, b) as i32
 }
 

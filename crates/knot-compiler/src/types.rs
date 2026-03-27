@@ -289,7 +289,12 @@ fn schema_for_source(
             let resolved = resolve_type(inner, aliases, assoc_types);
             schema_descriptor(&resolved)
         }
-        _ => String::new(),
+        _ => {
+            // Non-relation source type (e.g. `*counter : Int`):
+            // wrap as a single-column `_value` schema.
+            let resolved = resolve_type(ty, aliases, assoc_types);
+            format!("_value:{}", col_type_str(&resolved))
+        }
     }
 }
 

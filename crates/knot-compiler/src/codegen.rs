@@ -116,6 +116,10 @@ pub struct Codegen {
 
     // User-defined functions whose bodies (transitively) produce IO values
     io_functions: HashSet<String>,
+
+    // Scalar sources: source names whose type is a bare primitive (e.g. `*counter : Int`)
+    // rather than a relation of records. These get automatic wrap/unwrap of `_value` field.
+    scalar_sources: HashSet<String>,
 }
 
 /// Role of a constructor in a nullable-encoded ADT.
@@ -237,6 +241,11 @@ pub fn compile(
         .unwrap_or("knot");
     cg.db_path = format!("{}.db", stem);
     cg.source_schemas = type_env.source_schemas.clone();
+    for (name, schema) in &type_env.source_schemas {
+        if schema.starts_with("_value:") {
+            cg.scalar_sources.insert(name.clone());
+        }
+    }
     cg.migrate_schemas = type_env.migrate_schemas.clone();
     cg.type_aliases = type_env.aliases.clone();
     cg.history_sources = type_env.history_sources.clone();
@@ -330,6 +339,7 @@ impl Codegen {
             registered_builtin_impls: HashSet::new(),
             nullable_ctors: HashMap::new(),
             io_functions: HashSet::new(),
+            scalar_sources: HashSet::new(),
         }
     }
 
@@ -367,6 +377,8 @@ impl Codegen {
         self.declare_rt("knot_relation_empty", &[], &[p]);
         self.declare_rt("knot_relation_with_capacity", &[p], &[p]);
         self.declare_rt("knot_relation_singleton", &[p], &[p]);
+        self.declare_rt("knot_scalar_source_unwrap", &[p], &[p]);
+        self.declare_rt("knot_scalar_source_wrap", &[p], &[p]);
         self.declare_rt("knot_relation_push", &[p, p], &[]);
         self.declare_rt("knot_relation_len", &[p], &[p]);
         self.declare_rt("knot_relation_get", &[p, p], &[p]);
@@ -2746,11 +2758,18 @@ impl Codegen {
                         .unwrap_or_default();
                     let (name_ptr, name_len) = self.string_ptr(builder, name);
                     let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
-                    self.call_rt(
+                    let rel = self.call_rt(
                         builder,
                         "knot_source_read",
                         &[db, name_ptr, name_len, schema_ptr, schema_len],
-                    )
+                    );
+                    if self.scalar_sources.contains(name) {
+                        // Scalar source: unwrap first row's _value field,
+                        // or return a default if the relation is empty.
+                        self.call_rt(builder, "knot_scalar_source_unwrap", &[rel])
+                    } else {
+                        rel
+                    }
                 }
             }
 
@@ -3045,6 +3064,20 @@ impl Codegen {
 
                     // Snapshot history before writing (if history-enabled)
                     self.emit_history_snapshot(builder, db, name, &schema);
+
+                    // Scalar source: wrap value as [{_value: val}] and do a full write
+                    if self.scalar_sources.contains(name) {
+                        let val = self.compile_expr(builder, value, env, db);
+                        let wrapped = self.call_rt(builder, "knot_scalar_source_wrap", &[val]);
+                        let (name_ptr, name_len) = self.string_ptr(builder, name);
+                        let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
+                        self.call_rt_void(
+                            builder,
+                            "knot_source_write",
+                            &[db, name_ptr, name_len, schema_ptr, schema_len, wrapped],
+                        );
+                        return self.call_rt(builder, "knot_value_unit", &[]);
+                    }
 
                     if let Some(new_rows_expr) = self.match_union_append(name, value) {
                         // 1. Append: union *rel <new> → INSERT only
@@ -4418,7 +4451,7 @@ impl Codegen {
             }
             ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
             ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
-            ast::ExprKind::At { .. } => true,
+            ast::ExprKind::At { .. } | ast::ExprKind::Atomic(_) => true,
             _ => false,
         }
     }

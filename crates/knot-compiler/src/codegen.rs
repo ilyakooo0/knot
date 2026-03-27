@@ -7952,6 +7952,13 @@ fn ast_type_to_descriptor_type(ty: &ast::Type) -> String {
             "Text" => "text".to_string(),
             _ => "text".to_string(),
         },
+        ast::TypeKind::App { func, arg } => {
+            if matches!(&func.node, ast::TypeKind::Named(n) if n == "Maybe") {
+                format!("?{}", ast_type_to_descriptor_type(arg))
+            } else {
+                "text".to_string()
+            }
+        }
         _ => "text".to_string(),
     }
 }

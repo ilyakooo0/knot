@@ -6871,13 +6871,28 @@ pub extern "C" fn knot_http_listen(
                     // Query params
                     let qs = parse_query_string(&query_string);
                     for (qname, qty) in &entry_query_fields {
-                        let val = qs
-                            .get(qname)
-                            .map(|v| v.as_str())
-                            .unwrap_or("");
+                        let is_maybe = qty.starts_with('?');
+                        let inner_ty = if is_maybe { &qty[1..] } else { qty.as_str() };
+                        let raw_val = qs.get(qname).map(|v| v.as_str());
+                        let value = if is_maybe {
+                            match raw_val {
+                                Some(v) => {
+                                    let inner = string_to_value(v, inner_ty);
+                                    alloc(Value::Constructor(
+                                        "Just".into(),
+                                        alloc(Value::Record(vec![
+                                            RecordField { name: "value".into(), value: inner },
+                                        ])),
+                                    ))
+                                }
+                                None => alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit))),
+                            }
+                        } else {
+                            string_to_value(raw_val.unwrap_or(""), inner_ty)
+                        };
                         fields.push(RecordField {
                             name: qname.clone(),
-                            value: string_to_value(val, qty),
+                            value,
                         });
                     }
 
@@ -6893,22 +6908,43 @@ pub extern "C" fn knot_http_listen(
                         };
                         match unsafe { as_ref(body_val) } {
                             Value::Record(body_fields) => {
-                                for (bname, _bty) in &entry_body_fields {
-                                    let val = body_fields.iter()
+                                for (bname, bty) in &entry_body_fields {
+                                    let is_maybe = bty.starts_with('?');
+                                    let raw_val = body_fields.iter()
                                         .find(|f| f.name == *bname)
-                                        .map(|f| f.value)
-                                        .unwrap_or_else(|| alloc(Value::Text(String::new())));
+                                        .map(|f| f.value);
+                                    let value = if is_maybe {
+                                        match raw_val {
+                                            Some(v) => {
+                                                alloc(Value::Constructor(
+                                                    "Just".into(),
+                                                    alloc(Value::Record(vec![
+                                                        RecordField { name: "value".into(), value: v },
+                                                    ])),
+                                                ))
+                                            }
+                                            None => alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit))),
+                                        }
+                                    } else {
+                                        raw_val.unwrap_or_else(|| alloc(Value::Text(String::new())))
+                                    };
                                     fields.push(RecordField {
                                         name: bname.clone(),
-                                        value: val,
+                                        value,
                                     });
                                 }
                             }
                             _ => {
                                 for (bname, bty) in &entry_body_fields {
+                                    let is_maybe = bty.starts_with('?');
+                                    let value = if is_maybe {
+                                        alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit)))
+                                    } else {
+                                        string_to_value("", bty)
+                                    };
                                     fields.push(RecordField {
                                         name: bname.clone(),
-                                        value: string_to_value("", bty),
+                                        value,
                                     });
                                 }
                             }
@@ -7351,6 +7387,32 @@ pub extern "C" fn knot_http_fetch_io(
     alloc(Value::IO(fetch_thunk as *const u8, env))
 }
 
+/// Percent-encode a string for use in URL path segments or query values.
+fn percent_encode(s: &str) -> String {
+    s.bytes()
+        .flat_map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![b as char]
+            }
+            _ => format!("%{:02X}", b).chars().collect(),
+        })
+        .collect()
+}
+
+/// Unwrap a Maybe-typed value: returns Some(inner) for Just, None for Nothing.
+fn unwrap_maybe(v: *mut Value) -> Option<*mut Value> {
+    if v.is_null() {
+        return None;
+    }
+    match unsafe { as_ref(v) } {
+        Value::Constructor(tag, inner) if tag == "Just" => {
+            Some(knot_record_field(*inner, "value".as_ptr(), 5))
+        }
+        Value::Constructor(tag, _) if tag == "Nothing" => None,
+        _ => Some(v),
+    }
+}
+
 /// Build a full URL by substituting `{name:type}` path params from a record.
 fn fetch_build_url(base: &str, path_pattern: &str, payload: *mut Value) -> String {
     let mut url = base.trim_end_matches('/').to_string();
@@ -7361,7 +7423,7 @@ fn fetch_build_url(base: &str, path_pattern: &str, payload: *mut Value) -> Strin
         let param = &remaining[start + 1..end];
         let (name, _ty) = param.split_once(':').unwrap_or((param, "text"));
         let field_val = knot_record_field(payload, name.as_ptr(), name.len());
-        url.push_str(&fetch_value_to_text(field_val));
+        url.push_str(&percent_encode(&fetch_value_to_text(field_val)));
         remaining = &remaining[end + 1..];
     }
     url.push_str(remaining);
@@ -7375,9 +7437,17 @@ fn fetch_build_body(body_desc: &str, payload: *mut Value) -> String {
         if field_desc.is_empty() {
             continue;
         }
-        let (name, _ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
+        let (name, ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
+        let is_maybe = ty.starts_with('?');
         let field_val = knot_record_field(payload, name.as_ptr(), name.len());
-        map.insert(name.to_string(), value_to_serde_json(field_val));
+        if is_maybe {
+            match unwrap_maybe(field_val) {
+                Some(inner) => { map.insert(name.to_string(), value_to_serde_json(inner)); }
+                None => { map.insert(name.to_string(), serde_json::Value::Null); }
+            }
+        } else {
+            map.insert(name.to_string(), value_to_serde_json(field_val));
+        }
     }
     serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
 }
@@ -7389,20 +7459,19 @@ fn fetch_build_query(query_desc: &str, payload: *mut Value) -> String {
         if field_desc.is_empty() {
             continue;
         }
-        let (name, _ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
+        let (name, ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
+        let is_maybe = ty.starts_with('?');
         let field_val = knot_record_field(payload, name.as_ptr(), name.len());
-        let val_str = fetch_value_to_text(field_val);
-        // Percent-encode the value
-        let encoded: String = val_str
-            .bytes()
-            .flat_map(|b| match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                    vec![b as char]
-                }
-                _ => format!("%{:02X}", b).chars().collect(),
-            })
-            .collect();
-        parts.push(format!("{}={}", name, encoded));
+        let val = if is_maybe {
+            match unwrap_maybe(field_val) {
+                Some(inner) => inner,
+                None => continue, // Skip Nothing query params
+            }
+        } else {
+            field_val
+        };
+        let val_str = fetch_value_to_text(val);
+        parts.push(format!("{}={}", name, percent_encode(&val_str)));
     }
     parts.join("&")
 }

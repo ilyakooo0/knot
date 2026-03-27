@@ -74,6 +74,63 @@ static DB_PATH: Mutex<String> = Mutex::new(String::new());
 /// Join handles for spawned threads — drained in knot_threads_join.
 static THREAD_HANDLES: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
 
+// ── Process-level write serialization ────────────────────────────
+//
+// SQLite WAL allows only one writer at a time. We serialize writes in Rust
+// so threads never contend at the SQLite level.  The lock is reentrant:
+// `atomic` blocks acquire it for their full duration, and individual write
+// functions (full set, set, etc.) inside the block increment the depth
+// without re-acquiring.
+
+static WRITE_LOCKED: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    static WRITE_LOCK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard returned by `write_lock_guard()`.
+struct WriteLockGuard;
+
+impl Drop for WriteLockGuard {
+    fn drop(&mut self) {
+        write_lock_release();
+    }
+}
+
+fn write_lock_acquire() {
+    let reentrant = WRITE_LOCK_DEPTH.with(|d| {
+        let depth = d.get();
+        d.set(depth + 1);
+        depth > 0
+    });
+    if !reentrant {
+        while WRITE_LOCKED
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::thread::yield_now();
+        }
+    }
+}
+
+fn write_lock_release() {
+    let release = WRITE_LOCK_DEPTH.with(|d| {
+        let depth = d.get();
+        assert!(depth > 0, "write_lock_release without matching acquire");
+        d.set(depth - 1);
+        depth == 1
+    });
+    if release {
+        WRITE_LOCKED.store(false, Ordering::Release);
+    }
+}
+
+/// Acquire the write lock, returning an RAII guard that releases on drop.
+fn write_lock_guard() -> WriteLockGuard {
+    write_lock_acquire();
+    WriteLockGuard
+}
+
 // ── STM retry support ────────────────────────────────────────────
 
 /// Change counter + condvar for relation write notifications.
@@ -3409,6 +3466,8 @@ enum ColType {
     Bytes,
     /// Stored as TEXT, reconstructed as Constructor on read
     Tag,
+    /// Nested relation stored as JSON text in SQLite
+    Json,
 }
 
 /// A nested relation field stored in a child table.
@@ -3457,8 +3516,8 @@ fn parse_adt_schema(spec: &str) -> AdtSpec {
         let mut parts = ctor_part.splitn(2, ':');
         let name = parts.next().unwrap().to_string();
         let fields: Vec<ColumnSpec> = if let Some(field_spec) = parts.next() {
-            field_spec
-                .split(';')
+            split_respecting_brackets(field_spec, ';')
+                .iter()
                 .map(|f| {
                     let mut fp = f.splitn(2, '=');
                     let fname = fp.next().unwrap().to_string();
@@ -3469,6 +3528,7 @@ fn parse_adt_schema(spec: &str) -> AdtSpec {
                         "bool" => ColType::Bool,
                         "bytes" => ColType::Bytes,
                         "tag" => ColType::Tag,
+                        s if s.starts_with('[') => ColType::Json,
                         other => panic!("knot runtime: unknown ADT field type '{}'", other),
                     };
                     ColumnSpec {
@@ -3574,6 +3634,7 @@ fn sql_type(ty: ColType) -> &'static str {
         ColType::Bool => "INTEGER",
         ColType::Bytes => "BLOB",
         ColType::Tag => "TEXT",
+        ColType::Json => "TEXT",
     }
 }
 
@@ -3613,6 +3674,14 @@ fn read_sql_column(row: &rusqlite::Row, i: usize, ty: ColType) -> *mut Value {
             // Read TEXT but reconstruct as a Constructor with Unit payload
             let tag: String = row.get(i).unwrap();
             alloc(Value::Constructor(tag, alloc(Value::Unit)))
+        }
+        ColType::Json => {
+            // Read TEXT and parse as JSON back into a Knot value (typically a relation)
+            let s: String = row.get(i).unwrap();
+            match serde_json::from_str::<serde_json::Value>(&s) {
+                Ok(json) => json_to_value(&json),
+                Err(_) => alloc(Value::Text(s)),
+            }
         }
     }
 }
@@ -4631,22 +4700,6 @@ fn adt_row_to_params(
     }
 }
 
-/// Execute SQL with retries on SQLITE_BUSY.
-fn execute_with_busy_retry(conn: &rusqlite::Connection, sql: &str) {
-    for attempt in 0..20 {
-        match conn.execute_batch(sql) {
-            Ok(()) => return,
-            Err(rusqlite::Error::SqliteFailure(e, _))
-                if e.code == rusqlite::ErrorCode::DatabaseBusy =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1)));
-            }
-            Err(e) => panic!("knot runtime: SQL error: {e}"),
-        }
-    }
-    panic!("knot runtime: database busy after retries: {sql}");
-}
-
 /// Delete all rows from a record table and its child tables (children first).
 fn delete_record_table(conn: &rusqlite::Connection, table_name: &str, schema: &RecordSchema) {
     // Delete children first
@@ -4655,7 +4708,7 @@ fn delete_record_table(conn: &rusqlite::Connection, table_name: &str, schema: &R
     }
     let sql = format!("DELETE FROM {};", quote_ident(table_name));
     debug_sql(&sql);
-    execute_with_busy_retry(conn, &sql);
+    conn.execute_batch(&sql).expect("knot runtime: failed to delete rows");
 }
 
 fn delete_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &NestedField) {
@@ -4666,7 +4719,7 @@ fn delete_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &Nest
     }
     let sql = format!("DELETE FROM {};", quote_ident(&child_table));
     debug_sql(&sql);
-    execute_with_busy_retry(conn, &sql);
+    conn.execute_batch(&sql).expect("knot runtime: failed to delete child rows");
 }
 
 /// Insert rows into a record table and its child tables.
@@ -4900,6 +4953,7 @@ pub extern "C" fn knot_source_write(
     schema_len: usize,
     relation: *mut Value,
 ) {
+    let _wl = write_lock_guard();
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
@@ -4921,7 +4975,8 @@ pub extern "C" fn knot_source_write(
         let table = quote_ident(&table_name);
         let delete_sql = format!("DELETE FROM {};", table);
         debug_sql(&delete_sql);
-        execute_with_busy_retry(&db_ref.conn, &delete_sql);
+        db_ref.conn.execute_batch(&delete_sql)
+            .expect("knot runtime: failed to delete rows");
 
         let adt = parse_adt_schema(schema);
         if !rows.is_empty() {
@@ -4980,6 +5035,7 @@ pub extern "C" fn knot_source_append(
     schema_len: usize,
     relation: *mut Value,
 ) {
+    let _wl = write_lock_guard();
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
@@ -5056,6 +5112,7 @@ pub extern "C" fn knot_source_diff_write(
     schema_len: usize,
     relation: *mut Value,
 ) {
+    let _wl = write_lock_guard();
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
@@ -5338,6 +5395,7 @@ pub extern "C" fn knot_source_delete_where(
     where_len: usize,
     params: *mut Value,
 ) {
+    let _wl = write_lock_guard();
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     let where_clause = unsafe { str_from_raw(where_ptr, where_len) };
@@ -5387,6 +5445,7 @@ pub extern "C" fn knot_source_update_where(
     where_len: usize,
     params: *mut Value,
 ) {
+    let _wl = write_lock_guard();
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     let set_clause = unsafe { str_from_raw(set_clause_ptr, set_clause_len) };
@@ -5459,6 +5518,12 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
             rusqlite::types::Value::Text(tag.clone())
         }
         (Value::Constructor(tag, _), _) => rusqlite::types::Value::Text(tag.clone()),
+        (Value::Relation(_), ColType::Json) => {
+            rusqlite::types::Value::Text(value_to_json(v))
+        }
+        (Value::Record(_), ColType::Json) => {
+            rusqlite::types::Value::Text(value_to_json(v))
+        }
         _ => panic!("knot runtime: cannot convert {} to SQL", brief_value(v)),
     }
 }
@@ -5850,6 +5915,7 @@ pub extern "C" fn knot_constraint_register(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_atomic_begin(db: *mut c_void) {
+    write_lock_acquire();
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let depth = db_ref.atomic_depth.get() + 1;
     db_ref.atomic_depth.set(depth);
@@ -5872,6 +5938,7 @@ pub extern "C" fn knot_atomic_commit(db: *mut c_void) {
     if depth == 1 {
         notify_relation_changed();
     }
+    write_lock_release();
 }
 
 #[unsafe(no_mangle)]
@@ -5888,6 +5955,7 @@ pub extern "C" fn knot_atomic_rollback(db: *mut c_void) {
         ))
         .expect("knot runtime: failed to rollback atomic");
     db_ref.atomic_depth.set(depth - 1);
+    write_lock_release();
 }
 
 // ── Record update ─────────────────────────────────────────────────
@@ -6258,6 +6326,7 @@ pub extern "C" fn knot_view_write(
     filter_params: *mut Value,
     new_relation: *mut Value,
 ) {
+    let _wl = write_lock_guard();
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
@@ -6989,7 +7058,10 @@ pub extern "C" fn knot_http_listen(
                                             None => alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit))),
                                         }
                                     } else {
-                                        raw_val.unwrap_or_else(|| alloc(Value::Text(String::new())))
+                                        raw_val.unwrap_or_else(|| {
+                                            let inner_ty = if bty.starts_with('?') { &bty[1..] } else { bty.as_str() };
+                                            string_to_value("", inner_ty)
+                                        })
                                     };
                                     fields.push(RecordField {
                                         name: bname.clone(),

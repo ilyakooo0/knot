@@ -478,7 +478,7 @@ fn is_pure_comprehension(stmts: &[Stmt]) -> bool {
     // IO do blocks use a dedicated codegen path (compile_io_do) — not eligible
     // for desugaring. Check if any bind or bare expression calls an IO builtin.
     if stmts.iter().any(|s| match &s.node {
-        StmtKind::Bind { expr, .. } | StmtKind::Expr(expr) => expr_is_io(expr),
+        StmtKind::Bind { expr, .. } | StmtKind::Let { expr, .. } | StmtKind::Expr(expr) => expr_is_io(expr),
         _ => false,
     }) {
         return false;

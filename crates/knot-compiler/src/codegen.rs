@@ -4338,7 +4338,7 @@ impl Codegen {
     /// Check if a do-block should be compiled as IO (contains IO-producing builtins).
     fn is_io_do_block(&self, stmts: &[ast::Stmt]) -> bool {
         stmts.iter().any(|stmt| match &stmt.node {
-            ast::StmtKind::Bind { expr, .. } => self.expr_is_io(expr),
+            ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Let { expr, .. } => self.expr_is_io(expr),
             ast::StmtKind::Expr(expr) => self.expr_is_io(expr),
             _ => false,
         })

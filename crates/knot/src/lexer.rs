@@ -720,6 +720,7 @@ impl<'src> Lexer<'src> {
             b':' => TokenKind::Colon,
             b'\\' => TokenKind::Backslash,
             b'@' => TokenKind::At,
+            b';' => TokenKind::Newline,
             b'?' => TokenKind::Question,
             b'(' => TokenKind::LParen,
             b')' => TokenKind::RParen,

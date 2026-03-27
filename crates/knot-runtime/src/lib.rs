@@ -5405,10 +5405,12 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
 /// Return current time as milliseconds since Unix epoch.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_now() -> *mut Value {
-    let ms = std::time::SystemTime::now()
+    let ms: i64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_millis() as i64;
+        .as_millis()
+        .try_into()
+        .expect("knot runtime: system clock milliseconds overflowed i64");
     knot_value_int(ms)
 }
 
@@ -5513,10 +5515,12 @@ pub extern "C" fn knot_history_snapshot(
     let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
     let cols = parse_schema(schema);
 
-    let now_ms = std::time::SystemTime::now()
+    let now_ms: i64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_millis() as i64;
+        .as_millis()
+        .try_into()
+        .expect("knot runtime: system clock milliseconds overflowed i64");
 
     let table = quote_ident(&format!("_knot_{}", name));
     let history_table = quote_ident(&format!("_knot_{}_history", name));
@@ -7801,6 +7805,15 @@ struct HashIndex {
 /// Serialize a Value to compact bytes for use as a hash key.
 fn serialize_value_for_hash(v: *mut Value) -> Vec<u8> {
     let mut buf = Vec::new();
+    serialize_value_for_hash_into(v, &mut buf);
+    buf
+}
+
+fn serialize_value_for_hash_into(v: *mut Value, buf: &mut Vec<u8>) {
+    if v.is_null() {
+        buf.push(0xFF);
+        return;
+    }
     match unsafe { as_ref(v) } {
         Value::Int(n) => {
             buf.push(0);
@@ -7829,17 +7842,48 @@ fn serialize_value_for_hash(v: *mut Value) -> Vec<u8> {
             let tag_bytes = tag.as_bytes();
             buf.extend_from_slice(&(tag_bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(tag_bytes);
-            buf.extend_from_slice(&serialize_value_for_hash(*payload));
+            serialize_value_for_hash_into(*payload, buf);
         }
-        _ => {
-            // Fallback: use the show representation
+        Value::Bytes(b) => {
             buf.push(6);
-            let fallback = brief_value(v);
-            buf.extend_from_slice(&(fallback.len() as u32).to_le_bytes());
-            buf.extend_from_slice(fallback.as_bytes());
+            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(b);
+        }
+        Value::Record(fields) => {
+            buf.push(7);
+            buf.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+            for field in fields {
+                buf.extend_from_slice(&(field.name.len() as u32).to_le_bytes());
+                buf.extend_from_slice(field.name.as_bytes());
+                serialize_value_for_hash_into(field.value, buf);
+            }
+        }
+        Value::Relation(rows) => {
+            buf.push(8);
+            buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+            let mut row_bytes: Vec<Vec<u8>> = rows
+                .iter()
+                .map(|r| {
+                    let mut rb = Vec::new();
+                    serialize_value_for_hash_into(*r, &mut rb);
+                    rb
+                })
+                .collect();
+            row_bytes.sort_unstable();
+            for rb in &row_bytes {
+                buf.extend_from_slice(&(rb.len() as u32).to_le_bytes());
+                buf.extend_from_slice(rb);
+            }
+        }
+        Value::Function(_, _, src) => {
+            buf.push(9);
+            buf.extend_from_slice(&(src.len() as u32).to_le_bytes());
+            buf.extend_from_slice(src.as_bytes());
+        }
+        Value::IO(_, _) => {
+            buf.push(10);
         }
     }
-    buf
 }
 
 /// Build a hash index over a relation on a given field.

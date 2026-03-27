@@ -4318,7 +4318,7 @@ impl Codegen {
             "println", "putLine", "print", "readLine", "readFile",
             "writeFile", "appendFile", "fileExists", "removeFile",
             "listDir", "now", "randomInt", "randomFloat", "fetch", "fetchWith",
-            "fork",
+            "fork", "listen", "generateKeyPair", "generateSigningKeyPair", "encrypt",
         ].into_iter().collect();
 
         // Collect function bodies for analysis

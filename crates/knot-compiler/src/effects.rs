@@ -285,20 +285,11 @@ impl EffectChecker {
             ast::ExprKind::Lit(_) | ast::ExprKind::Constructor(_) => EffectSet::empty(),
 
             ast::ExprKind::Var(name) => {
-                if name == "now" {
-                    let mut e = EffectSet::empty();
-                    e.clock = true;
-                    return e;
+                if let Some(effects) = self.builtin_effects.get(name) {
+                    return effects.clone();
                 }
-                if name == "randomFloat" {
-                    let mut e = EffectSet::empty();
-                    e.random = true;
-                    return e;
-                }
-                if name == "readLine" {
-                    let mut e = EffectSet::empty();
-                    e.console = true;
-                    return e;
+                if let Some(effects) = self.decl_effects.get(name) {
+                    return effects.clone();
                 }
                 EffectSet::empty()
             }

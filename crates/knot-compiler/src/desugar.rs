@@ -93,6 +93,7 @@ fn expr_contains_io(expr: &Expr, builtins: &HashSet<&str>, io_fns: &HashSet<Stri
                 StmtKind::Bind { expr, .. } => expr_contains_io(expr, builtins, io_fns),
                 StmtKind::Expr(expr) => expr_contains_io(expr, builtins, io_fns),
                 StmtKind::Let { expr, .. } => expr_contains_io(expr, builtins, io_fns),
+                StmtKind::Where { cond } => expr_contains_io(cond, builtins, io_fns),
                 _ => false,
             })
         }

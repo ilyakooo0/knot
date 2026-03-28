@@ -444,7 +444,17 @@ fn apply_type_subst(ty: &Type, subst: &HashMap<String, Type>) -> Type {
                     value: apply_type_subst(&f.value, subst),
                 })
                 .collect(),
-            rest: rest.clone(),
+            rest: rest.as_ref().map(|r| {
+                if let Some(replacement) = subst.get(r) {
+                    if let TypeKind::Var(new_name) = &replacement.node {
+                        new_name.clone()
+                    } else {
+                        r.clone()
+                    }
+                } else {
+                    r.clone()
+                }
+            }),
         },
         TypeKind::App { func, arg } => TypeKind::App {
             func: Box::new(apply_type_subst(func, subst)),
@@ -472,7 +482,17 @@ fn apply_type_subst(ty: &Type, subst: &HashMap<String, Type>) -> Type {
                         .collect(),
                 })
                 .collect(),
-            rest: rest.clone(),
+            rest: rest.as_ref().map(|r| {
+                if let Some(replacement) = subst.get(r) {
+                    if let TypeKind::Var(new_name) = &replacement.node {
+                        new_name.clone()
+                    } else {
+                        r.clone()
+                    }
+                } else {
+                    r.clone()
+                }
+            }),
         },
         TypeKind::Effectful { effects, ty: inner } => TypeKind::Effectful {
             effects: effects.clone(),

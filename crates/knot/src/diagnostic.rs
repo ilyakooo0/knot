@@ -58,15 +58,16 @@ impl Diagnostic {
 
 // ── Source helpers (still used by LSP and other consumers) ───────────
 
-/// Returns `(line, col)` for a byte offset. Line is 1-based, column is 0-based.
+/// Returns `(line, col)` for a byte offset. Line is 1-based, column is 0-based (in characters, not bytes).
 pub fn line_col(source: &str, byte_offset: usize) -> (usize, usize) {
     let offset = byte_offset.min(source.len());
     let before = source[..offset].as_bytes();
     let line = before.iter().filter(|&&b| b == b'\n').count() + 1;
-    let col = match memrchr(b'\n', before) {
-        Some(nl) => offset - nl - 1,
-        None => offset,
+    let line_start = match memrchr(b'\n', before) {
+        Some(nl) => nl + 1,
+        None => 0,
     };
+    let col = source[line_start..offset].chars().count();
     (line, col)
 }
 

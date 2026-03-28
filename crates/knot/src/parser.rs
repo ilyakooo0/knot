@@ -621,7 +621,6 @@ impl Parser {
                         history = true;
                     } else {
                         this.error("expected 'history' after 'with'");
-                        this.advance(); // consume the bad token to avoid cascade errors
                     }
                 }
                 let end = this.prev_span();
@@ -740,20 +739,27 @@ impl Parser {
                 // Now check if the next line is the definition body.
                 if matches!(this.peek(), TokenKind::Lower(n) if *n == name) {
                     let saved = this.save();
+                    let diag_len = this.diagnostics.len();
                     this.advance(); // consume name again
 
                     if this.eat(&TokenKind::Eq) {
-                        let body = this.parse_expr()?;
-                        let end = this.prev_span();
-                        return Some(Decl {
-                            node: DeclKind::Fun {
-                                name,
-                                ty: ts,
-                                body: Some(body),
-                            },
-                            span: Span::new(start.start, end.end),
-                            exported: false,
-                        });
+                        if let Some(body) = this.parse_expr() {
+                            let end = this.prev_span();
+                            return Some(Decl {
+                                node: DeclKind::Fun {
+                                    name,
+                                    ty: ts,
+                                    body: Some(body),
+                                },
+                                span: Span::new(start.start, end.end),
+                                exported: false,
+                            });
+                        } else {
+                            // parse_expr failed — restore to before the name
+                            // so the tokens can be re-parsed as a separate decl.
+                            this.restore(saved);
+                            this.diagnostics.truncate(diag_len);
+                        }
                     } else {
                         // Not a definition after the signature — restore.
                         this.restore(saved);
@@ -917,12 +923,12 @@ impl Parser {
 
             if self.eat(&TokenKind::Eq) {
                 let body = self.parse_expr()?;
-                // We need a type for the trait item — use a placeholder.
+                // We need a type for the trait item — use a hole for inference.
                 return Some(TraitItem::Method {
                     name,
                     ty: TypeScheme {
                         constraints: vec![],
-                        ty: Spanned::new(TypeKind::Named("_".into()), self.span()),
+                        ty: Spanned::new(TypeKind::Hole, self.span()),
                     },
                     default_params: params,
                     default_body: Some(body),

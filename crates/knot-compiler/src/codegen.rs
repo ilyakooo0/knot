@@ -1547,7 +1547,7 @@ impl Codegen {
             });
         });
 
-        // Semigroup_Relation_append(db, a, b) → knot_value_concat(a, b)
+        // Semigroup_Relation_append(db, a, b) → knot_relation_union(db, a, b)
         define_if_registered!("Semigroup_Relation_append", |cg: &mut Self, func_id: FuncId| {
             let mut sig = cg.module.make_signature();
             sig.params.push(AbiParam::new(cg.ptr_type)); // db
@@ -1555,9 +1555,10 @@ impl Codegen {
             sig.params.push(AbiParam::new(cg.ptr_type)); // b
             sig.returns.push(AbiParam::new(cg.ptr_type));
             cg.build_function(func_id, sig, |cg, builder, entry| {
+                let db = builder.block_params(entry)[0];
                 let a = builder.block_params(entry)[1];
                 let b = builder.block_params(entry)[2];
-                let result = cg.call_rt(builder, "knot_value_concat", &[a, b]);
+                let result = cg.call_rt(builder, "knot_relation_union", &[db, a, b]);
                 builder.ins().return_(&[result]);
             });
         });
@@ -2164,6 +2165,7 @@ impl Codegen {
                     "mul" => Some("knot_value_mul"),
                     "div" => Some("knot_value_div"),
                     "negate" => Some("knot_value_negate"),
+                    "append" => Some("knot_value_concat"),
                     _ => None,
                 };
                 if let Some(rt_fn) = fallback_rt {

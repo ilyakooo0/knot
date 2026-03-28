@@ -610,74 +610,78 @@ pub fn run_db_explorer(db_path: &str) -> io::Result<()> {
     stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
-    loop {
-        terminal.draw(|f| ui(f, &mut app))?;
+    let result = (|| -> io::Result<()> {
+        loop {
+            terminal.draw(|f| ui(f, &mut app))?;
 
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
 
-            // Detail view dismissal
-            if app.detail_view.is_some() {
+                // Detail view dismissal
+                if app.detail_view.is_some() {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+                            app.detail_view = None;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
-                        app.detail_view = None;
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Tab | KeyCode::Right | KeyCode::Left => {
+                        app.focus = match app.focus {
+                            Focus::Relations => Focus::Data,
+                            Focus::Data => Focus::Relations,
+                        };
+                    }
+                    KeyCode::Up => match app.focus {
+                        Focus::Relations => {
+                            let i = app.relation_state.selected().unwrap_or(0);
+                            if i > 0 {
+                                app.relation_state.select(Some(i - 1));
+                                app.load_data(&conn);
+                            }
+                        }
+                        Focus::Data => {
+                            let i = app.data_state.selected().unwrap_or(0);
+                            if i > 0 {
+                                app.data_state.select(Some(i - 1));
+                            }
+                        }
+                    },
+                    KeyCode::Down => match app.focus {
+                        Focus::Relations => {
+                            let i = app.relation_state.selected().unwrap_or(0);
+                            if i + 1 < app.relations.len() {
+                                app.relation_state.select(Some(i + 1));
+                                app.load_data(&conn);
+                            }
+                        }
+                        Focus::Data => {
+                            let i = app.data_state.selected().unwrap_or(0);
+                            if i + 1 < app.data_rows.len() {
+                                app.data_state.select(Some(i + 1));
+                            }
+                        }
+                    },
+                    KeyCode::Enter => {
+                        if matches!(app.focus, Focus::Data) {
+                            app.expand_selected_row();
+                        }
                     }
                     _ => {}
                 }
-                continue;
-            }
-
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => break,
-                KeyCode::Tab | KeyCode::Right | KeyCode::Left => {
-                    app.focus = match app.focus {
-                        Focus::Relations => Focus::Data,
-                        Focus::Data => Focus::Relations,
-                    };
-                }
-                KeyCode::Up => match app.focus {
-                    Focus::Relations => {
-                        let i = app.relation_state.selected().unwrap_or(0);
-                        if i > 0 {
-                            app.relation_state.select(Some(i - 1));
-                            app.load_data(&conn);
-                        }
-                    }
-                    Focus::Data => {
-                        let i = app.data_state.selected().unwrap_or(0);
-                        if i > 0 {
-                            app.data_state.select(Some(i - 1));
-                        }
-                    }
-                },
-                KeyCode::Down => match app.focus {
-                    Focus::Relations => {
-                        let i = app.relation_state.selected().unwrap_or(0);
-                        if i + 1 < app.relations.len() {
-                            app.relation_state.select(Some(i + 1));
-                            app.load_data(&conn);
-                        }
-                    }
-                    Focus::Data => {
-                        let i = app.data_state.selected().unwrap_or(0);
-                        if i + 1 < app.data_rows.len() {
-                            app.data_state.select(Some(i + 1));
-                        }
-                    }
-                },
-                KeyCode::Enter => {
-                    if matches!(app.focus, Focus::Data) {
-                        app.expand_selected_row();
-                    }
-                }
-                _ => {}
             }
         }
-    }
+        Ok(())
+    })();
 
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
-    Ok(())
+    // Always restore terminal, even if the loop returned an error
+    let _ = disable_raw_mode();
+    let _ = stdout().execute(LeaveAlternateScreen);
+    result
 }

@@ -624,7 +624,12 @@ impl Infer {
                         span,
                     );
                 }
-                self.subst.insert(rv, Ty::Record(only2, None));
+                let target = Ty::Record(only2, None);
+                if self.occurs_in(rv, &target) {
+                    self.error("infinite type (record row variable)".into(), span);
+                } else {
+                    self.subst.insert(rv, target);
+                }
             }
             (None, Some(rv)) => {
                 if !only2.is_empty() {
@@ -637,7 +642,12 @@ impl Infer {
                         span,
                     );
                 }
-                self.subst.insert(rv, Ty::Record(only1, None));
+                let target = Ty::Record(only1, None);
+                if self.occurs_in(rv, &target) {
+                    self.error("infinite type (record row variable)".into(), span);
+                } else {
+                    self.subst.insert(rv, target);
+                }
             }
             (Some(rv1), Some(rv2)) => {
                 if rv1 == rv2 {
@@ -649,10 +659,14 @@ impl Infer {
                     }
                 } else {
                     let fresh = self.fresh_var();
-                    self.subst
-                        .insert(rv1, Ty::Record(only2, Some(fresh)));
-                    self.subst
-                        .insert(rv2, Ty::Record(only1, Some(fresh)));
+                    let t1 = Ty::Record(only2, Some(fresh));
+                    let t2 = Ty::Record(only1, Some(fresh));
+                    if self.occurs_in(rv1, &t1) || self.occurs_in(rv2, &t2) {
+                        self.error("infinite type (record row variable)".into(), span);
+                    } else {
+                        self.subst.insert(rv1, t1);
+                        self.subst.insert(rv2, t2);
+                    }
                 }
             }
         }
@@ -709,7 +723,12 @@ impl Infer {
                         span,
                     );
                 }
-                self.subst.insert(rv, Ty::Variant(only2, None));
+                let target = Ty::Variant(only2, None);
+                if self.occurs_in(rv, &target) {
+                    self.error("infinite type (variant row variable)".into(), span);
+                } else {
+                    self.subst.insert(rv, target);
+                }
             }
             (None, Some(rv)) => {
                 if !only2.is_empty() {
@@ -722,7 +741,12 @@ impl Infer {
                         span,
                     );
                 }
-                self.subst.insert(rv, Ty::Variant(only1, None));
+                let target = Ty::Variant(only1, None);
+                if self.occurs_in(rv, &target) {
+                    self.error("infinite type (variant row variable)".into(), span);
+                } else {
+                    self.subst.insert(rv, target);
+                }
             }
             (Some(rv1), Some(rv2)) => {
                 if rv1 == rv2 {
@@ -734,10 +758,14 @@ impl Infer {
                     }
                 } else {
                     let fresh = self.fresh_var();
-                    self.subst
-                        .insert(rv1, Ty::Variant(only2, Some(fresh)));
-                    self.subst
-                        .insert(rv2, Ty::Variant(only1, Some(fresh)));
+                    let t1 = Ty::Variant(only2, Some(fresh));
+                    let t2 = Ty::Variant(only1, Some(fresh));
+                    if self.occurs_in(rv1, &t1) || self.occurs_in(rv2, &t2) {
+                        self.error("infinite type (variant row variable)".into(), span);
+                    } else {
+                        self.subst.insert(rv1, t1);
+                        self.subst.insert(rv2, t2);
+                    }
                 }
             }
         }
@@ -2212,7 +2240,9 @@ impl Infer {
                     // Infer the key expression type (must be a record)
                     let _ = self.infer_expr(key);
                     // After groupBy, rebind all preceding Bind variables
-                    // from T to [T] (they now represent groups)
+                    // from T to [T] (they now represent groups).
+                    // Unwrap any existing Relation wrapping first to avoid
+                    // double-wrapping from multiple groupBy statements.
                     for prev_stmt in stmts {
                         if std::ptr::eq(prev_stmt, stmt) {
                             break;
@@ -2221,7 +2251,11 @@ impl Infer {
                             if let ast::PatKind::Var(name) = &pat.node {
                                 if let Some(scheme) = self.lookup(name).cloned() {
                                     let ty = self.instantiate(&scheme);
-                                    self.bind(name, Scheme::mono(Ty::Relation(Box::new(ty))));
+                                    let elem_ty = match ty {
+                                        Ty::Relation(inner) => *inner,
+                                        other => other,
+                                    };
+                                    self.bind(name, Scheme::mono(Ty::Relation(Box::new(elem_ty))));
                                 }
                             }
                         }

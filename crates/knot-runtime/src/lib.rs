@@ -1205,8 +1205,36 @@ pub extern "C" fn knot_relation_union(
         _ => panic!("knot runtime: expected Relation in union, got {}", type_name(b)),
     };
 
-    if rows_a.is_empty() { return b; }
-    if rows_b.is_empty() { return a; }
+    if rows_a.is_empty() && rows_b.is_empty() {
+        return alloc(Value::Relation(Vec::new()));
+    }
+    // When one side is empty, still dedup the non-empty side for set semantics
+    if rows_a.is_empty() {
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+        let mut buf = Vec::new();
+        for &row in rows_b.iter() {
+            buf.clear();
+            value_to_hash_bytes(row, &mut buf);
+            if seen.insert(buf.clone()) {
+                result.push(row);
+            }
+        }
+        return alloc(Value::Relation(result));
+    }
+    if rows_b.is_empty() {
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+        let mut buf = Vec::new();
+        for &row in rows_a.iter() {
+            buf.clear();
+            value_to_hash_bytes(row, &mut buf);
+            if seen.insert(buf.clone()) {
+                result.push(row);
+            }
+        }
+        return alloc(Value::Relation(result));
+    }
 
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     if let Some(result) = sql_set_op(&db_ref.conn, rows_a, rows_b, "UNION") {
@@ -2666,7 +2694,21 @@ pub extern "C" fn knot_relation_diff(
         _ => panic!("knot runtime: diff expected Relation, got {}", type_name(b)),
     };
 
-    if rows_a.is_empty() || rows_b.is_empty() { return a; }
+    if rows_a.is_empty() { return a; }
+    if rows_b.is_empty() {
+        // Dedup a for set semantics (SQL EXCEPT would dedup)
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+        let mut buf = Vec::new();
+        for &row in rows_a.iter() {
+            buf.clear();
+            value_to_hash_bytes(row, &mut buf);
+            if seen.insert(buf.clone()) {
+                result.push(row);
+            }
+        }
+        return alloc(Value::Relation(result));
+    }
 
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     if let Some(result) = sql_set_op(&db_ref.conn, rows_a, rows_b, "EXCEPT") {
@@ -2894,10 +2936,14 @@ pub extern "C" fn knot_text_reverse(v: *mut Value) -> *mut Value {
 pub extern "C" fn knot_text_chars(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Text(s) => {
-            let rows: Vec<*mut Value> = s
-                .chars()
-                .map(|c| alloc(Value::Text(c.to_string())))
-                .collect();
+            let mut seen = HashSet::new();
+            let mut rows = Vec::new();
+            for c in s.chars() {
+                let cs = c.to_string();
+                if seen.insert(cs.clone()) {
+                    rows.push(alloc(Value::Text(cs)));
+                }
+            }
             alloc(Value::Relation(rows))
         }
         _ => panic!("knot runtime: chars expected Text, got {}", type_name(v)),
@@ -3001,6 +3047,9 @@ pub extern "C" fn knot_bytes_from_hex(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Text(s) => {
             let s = s.trim();
+            if !s.is_ascii() {
+                panic!("knot runtime: bytesFromHex: input contains non-ASCII characters");
+            }
             if s.len() % 2 != 0 {
                 panic!("knot runtime: bytesFromHex: odd-length hex string");
             }
@@ -3088,7 +3137,7 @@ fn json_to_value(json: &serde_json::Value) -> *mut Value {
         }
         serde_json::Value::Object(obj) => {
             if obj.is_empty() {
-                return alloc(Value::Unit);
+                return alloc(Value::Record(Vec::new()));
             }
             let mut fields: Vec<RecordField> = obj
                 .iter()
@@ -5937,6 +5986,9 @@ pub extern "C" fn knot_atomic_begin(db: *mut c_void) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_atomic_commit(db: *mut c_void) {
+    // RAII guard: the lock was acquired in knot_atomic_begin; this guard
+    // ensures it is released even if code below panics during unwinding.
+    let _guard = WriteLockGuard;
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let depth = db_ref.atomic_depth.get();
     assert!(depth > 0, "knot runtime: atomic commit without matching begin");
@@ -5948,14 +6000,13 @@ pub extern "C" fn knot_atomic_commit(db: *mut c_void) {
     if depth == 1 {
         notify_relation_changed();
     }
-    // Use a guard so the lock is released even if code above panics.
-    // The lock was acquired in knot_atomic_begin; create a guard and
-    // let it drop normally to release.
-    drop(WriteLockGuard);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_atomic_rollback(db: *mut c_void) {
+    // RAII guard: the lock was acquired in knot_atomic_begin; this guard
+    // ensures it is released even if code below panics during unwinding.
+    let _guard = WriteLockGuard;
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let depth = db_ref.atomic_depth.get();
     assert!(depth > 0, "knot runtime: atomic rollback without matching begin");
@@ -5968,7 +6019,6 @@ pub extern "C" fn knot_atomic_rollback(db: *mut c_void) {
         ))
         .expect("knot runtime: failed to rollback atomic");
     db_ref.atomic_depth.set(depth - 1);
-    drop(WriteLockGuard);
 }
 
 // ── Record update ─────────────────────────────────────────────────
@@ -6828,7 +6878,11 @@ fn value_to_serde_json(v: *mut Value) -> serde_json::Value {
             }
         }
         Value::Float(n) => {
-            serde_json::json!(*n)
+            if n.is_finite() {
+                serde_json::json!(*n)
+            } else {
+                panic!("knot runtime: toJson: cannot serialize non-finite float ({}) to JSON", n)
+            }
         }
         Value::Text(s) => serde_json::Value::String(s.clone()),
         Value::Bool(b) => serde_json::Value::Bool(*b),
@@ -7215,7 +7269,7 @@ pub extern "C" fn knot_http_listen(
                                 "internal server error".to_string()
                             };
                             eprintln!("[HTTP] handler panicked: {}", msg);
-                            let body = format!("{{\"error\":\"{}\"}}", msg.replace('"', "\\\""));
+                            let body = format!("{{\"error\":\"{}\"}}", json_escape(&msg));
                             let response = tiny_http::Response::from_string(&body)
                                 .with_status_code(500)
                                 .with_header(
@@ -7228,11 +7282,13 @@ pub extern "C" fn knot_http_listen(
                     }
 
                     knot_db_close(db);
-                    // Note: we intentionally do NOT call deep_drop_value(handler) here.
-                    // The handler execution may have stored pointers from the
-                    // deep-cloned tree into arena-allocated values. Freeing the
-                    // tree could cause use-after-free. The bounded leak (just the
-                    // closure environment) is reclaimed when the thread exits.
+                    // Free the deep-cloned handler tree. This is safe because:
+                    // 1. All handler execution is complete and the response is sent
+                    // 2. The DB connection is closed
+                    // 3. No other thread has access (this was deep-cloned for us)
+                    // 4. Any arena values referencing into this tree are thread-local
+                    //    and will be abandoned when this thread exits
+                    unsafe { deep_drop_value(handler); }
                 });
                 // Don't push HTTP request handles into THREAD_HANDLES — the
                 // server loop runs forever so they would accumulate without

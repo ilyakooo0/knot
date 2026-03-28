@@ -2113,7 +2113,7 @@ impl Infer {
     fn stmt_has_io(&self, stmts: &[ast::Stmt]) -> bool {
         for stmt in stmts {
             match &stmt.node {
-                ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Expr(expr) => {
+                ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Let { expr, .. } | ast::StmtKind::Expr(expr) => {
                     if self.expr_is_io_prescan(expr) {
                         return true;
                     }
@@ -2150,7 +2150,7 @@ impl Infer {
             }
             ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
             ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
-            ast::ExprKind::At { .. } => true,
+            ast::ExprKind::At { .. } | ast::ExprKind::Atomic(_) => true,
             _ => false,
         }
     }

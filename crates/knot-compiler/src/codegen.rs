@@ -49,6 +49,12 @@ pub struct Codegen {
     // Pending lambda definitions: (func_id, params, body, free_vars)
     pending_lambdas: Vec<PendingLambda>,
 
+    // Pending IO do-block thunks: deferred compilation of IO do-block bodies
+    pending_io_thunks: Vec<PendingIoThunk>,
+
+    // Counter for generating unique IO thunk names
+    io_thunk_counter: usize,
+
     // Database path baked into the compiled binary
     db_path: String,
 
@@ -151,6 +157,14 @@ struct PendingLambda {
     /// The original parameter pattern (for destructuring bind in the lambda body).
     param_pat: Option<ast::Pat>,
     body: ast::Expr,
+    free_vars: Vec<String>,
+}
+
+/// A deferred IO do-block body compiled as a thunk function.
+/// The thunk has signature `(db, env) -> result` matching the IO convention.
+struct PendingIoThunk {
+    func_id: FuncId,
+    stmts: Vec<ast::Stmt>,
     free_vars: Vec<String>,
 }
 
@@ -270,11 +284,15 @@ pub fn compile(
     cg.collect_declarations(module);
     cg.define_functions(module, type_env);
     cg.generate_main(module);
-    // Drain lambdas created by generate_main (e.g., migration functions)
-    while !cg.pending_lambdas.is_empty() {
+    // Drain lambdas and IO thunks created by generate_main (e.g., migration functions)
+    while !cg.pending_lambdas.is_empty() || !cg.pending_io_thunks.is_empty() {
         let lambdas: Vec<PendingLambda> = std::mem::take(&mut cg.pending_lambdas);
         for lambda in lambdas {
             cg.define_lambda_function(&lambda);
+        }
+        let thunks: Vec<PendingIoThunk> = std::mem::take(&mut cg.pending_io_thunks);
+        for thunk in thunks {
+            cg.define_io_thunk_function(&thunk);
         }
     }
     if !cg.diagnostics.is_empty() {
@@ -317,6 +335,8 @@ impl Codegen {
             constructors: HashMap::new(),
             lambda_counter: 0,
             pending_lambdas: Vec::new(),
+            pending_io_thunks: Vec::new(),
+            io_thunk_counter: 0,
             db_path: String::new(),
             migrate_schemas: HashMap::new(),
             views: HashMap::new(),
@@ -566,6 +586,7 @@ impl Codegen {
 
         // IO monad
         self.declare_rt("knot_io_wrap", &[p, p], &[p]);
+        self.declare_rt("knot_io_new", &[p, p], &[p]);
         self.declare_rt("knot_io_pure", &[p], &[p]);
         self.declare_rt("knot_io_run", &[p, p], &[p]);
         self.declare_rt("knot_io_bind", &[p, p], &[p]);
@@ -1828,24 +1849,34 @@ impl Codegen {
             self.define_user_function(&dm.mangled, &dm.default.params, &dm.default.body);
         }
 
-        // Compile any pending lambdas (may generate more lambdas)
-        while !self.pending_lambdas.is_empty() {
+        // Compile any pending lambdas and IO thunks (may generate more)
+        while !self.pending_lambdas.is_empty() || !self.pending_io_thunks.is_empty() {
             let lambdas: Vec<PendingLambda> =
                 std::mem::take(&mut self.pending_lambdas);
             for lambda in lambdas {
                 self.define_lambda_function(&lambda);
+            }
+            let thunks: Vec<PendingIoThunk> =
+                std::mem::take(&mut self.pending_io_thunks);
+            for thunk in thunks {
+                self.define_io_thunk_function(&thunk);
             }
         }
 
         // Define trait dispatcher function bodies
         self.define_trait_dispatchers();
 
-        // Compile any pending lambdas from dispatchers
-        while !self.pending_lambdas.is_empty() {
+        // Compile any pending lambdas/thunks from dispatchers
+        while !self.pending_lambdas.is_empty() || !self.pending_io_thunks.is_empty() {
             let lambdas: Vec<PendingLambda> =
                 std::mem::take(&mut self.pending_lambdas);
             for lambda in lambdas {
                 self.define_lambda_function(&lambda);
+            }
+            let thunks: Vec<PendingIoThunk> =
+                std::mem::take(&mut self.pending_io_thunks);
+            for thunk in thunks {
+                self.define_io_thunk_function(&thunk);
             }
         }
     }
@@ -2317,6 +2348,43 @@ impl Codegen {
             }
 
             let result = cg.compile_expr(builder, &body, &mut env, db);
+            builder.ins().return_(&[result]);
+        });
+    }
+
+    /// Compile a pending IO do-block thunk function.
+    /// Signature: (db, env) -> result. Runs IO actions eagerly inside the thunk.
+    fn define_io_thunk_function(&mut self, thunk: &PendingIoThunk) {
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(self.ptr_type)); // db
+        sig.params.push(AbiParam::new(self.ptr_type)); // env
+        sig.returns.push(AbiParam::new(self.ptr_type));
+
+        let func_id = thunk.func_id;
+        let stmts = thunk.stmts.clone();
+        let free_vars = thunk.free_vars.clone();
+
+        self.build_function(func_id, sig, |cg, builder, entry| {
+            let mut env = Env::new();
+            let db = builder.block_params(entry)[0];
+            let closure_env = builder.block_params(entry)[1];
+
+            // Unpack free variables from closure env (same pattern as lambdas)
+            if free_vars.len() == 1 {
+                env.set(&free_vars[0], closure_env);
+            } else if free_vars.len() > 1 {
+                let mut sorted_vars: Vec<&str> = free_vars.iter().map(|s| s.as_str()).collect();
+                sorted_vars.sort();
+                for (i, var_name) in sorted_vars.iter().enumerate() {
+                    let idx = builder.ins().iconst(cg.ptr_type, i as i64);
+                    let field_val =
+                        cg.call_rt(builder, "knot_record_field_by_index", &[closure_env, idx]);
+                    env.set(var_name, field_val);
+                }
+            }
+
+            // Run IO do-block eagerly inside the thunk
+            let result = cg.compile_io_do_eager(builder, &stmts, &mut env, db);
             builder.ins().return_(&[result]);
         });
     }
@@ -2951,15 +3019,8 @@ impl Codegen {
                         // Equality: dispatch through Eq trait
                         ast::BinOp::Eq => self.compile_trait_binop(builder, "eq", l, r, db, "knot_value_eq"),
                         ast::BinOp::Neq => {
-                            let eq_result = self.compile_trait_binop(builder, "eq", l, r, db, "knot_value_neq");
-                            // When ADT eq impls exist, compile_trait_binop used the dispatcher
-                            // which returns equality — negate for neq. Otherwise it used the
-                            // fallback knot_value_neq which already returns inequality.
-                            if self.has_adt_impls("eq") {
-                                self.call_rt(builder, "knot_value_not", &[eq_result])
-                            } else {
-                                eq_result
-                            }
+                            let eq_result = self.compile_trait_binop(builder, "eq", l, r, db, "knot_value_eq");
+                            self.call_rt(builder, "knot_value_not", &[eq_result])
                         },
                         // Comparison: dispatch through Ord trait (compare → Ordering)
                         ast::BinOp::Lt => self.compile_comparison(builder, l, r, db, "LT", false),
@@ -3267,6 +3328,20 @@ impl Codegen {
 
                     // Snapshot history before writing (if history-enabled)
                     self.emit_history_snapshot(builder, db, name, &schema);
+
+                    // Scalar source: wrap value as [{_value: val}] and do a full write
+                    if self.scalar_sources.contains(name) {
+                        let val = self.compile_expr(builder, value, env, db);
+                        let wrapped = self.call_rt(builder, "knot_scalar_source_wrap", &[val]);
+                        let (name_ptr, name_len) = self.string_ptr(builder, name);
+                        let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
+                        self.call_rt_void(
+                            builder,
+                            "knot_source_write",
+                            &[db, name_ptr, name_len, schema_ptr, schema_len, wrapped],
+                        );
+                        return self.call_rt(builder, "knot_value_unit", &[]);
+                    }
 
                     let val = self.compile_expr(builder, value, env, db);
                     let (name_ptr, name_len) = self.string_ptr(builder, name);
@@ -4470,25 +4545,92 @@ impl Codegen {
         self.compile_io_do_as_thunk(builder, stmts, env, db)
     }
 
-    /// Compile IO do-block as a thunk that runs IO actions sequentially.
+    /// Compile IO do-block as a deferred thunk.
+    /// Creates a separate Cranelift function for the do-block body and returns
+    /// an IO value `IO(fn_ptr, env)` that, when run via `knot_io_run`, executes
+    /// the IO actions. This ensures side effects are deferred until the IO value
+    /// is actually executed (important for `fork`, storing IO values, etc.).
     fn compile_io_do_as_thunk(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        stmts: &[ast::Stmt],
+        env: &mut Env,
+        _db: Value,
+    ) -> Value {
+        let thunk_name = format!("knot_io_thunk_{}", self.io_thunk_counter);
+        self.io_thunk_counter += 1;
+
+        // Find free variables in the do-block statements
+        let dummy_span = ast::Span::new(0, 0);
+        let do_expr = ast::Spanned::new(ast::ExprKind::Do(stmts.to_vec()), dummy_span);
+        let free_vars: Vec<String> = find_free_vars(&do_expr, &[])
+            .into_iter()
+            .filter(|v| !self.user_fns.contains_key(v))
+            .filter(|v| env.bindings.contains_key(v))
+            .collect();
+
+        // Declare the thunk function: (db, env) -> result
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(self.ptr_type)); // db
+        sig.params.push(AbiParam::new(self.ptr_type)); // env (captured vars)
+        sig.returns.push(AbiParam::new(self.ptr_type));
+        let func_id = self
+            .module
+            .declare_function(&thunk_name, Linkage::Local, &sig)
+            .unwrap();
+
+        // Queue for later compilation
+        self.pending_io_thunks.push(PendingIoThunk {
+            func_id,
+            stmts: stmts.to_vec(),
+            free_vars: free_vars.clone(),
+        });
+
+        // Build the closure env: capture free variables (same pattern as lambdas)
+        let func_ref = self.module.declare_func_in_func(func_id, builder.func);
+        let fn_addr = builder.ins().func_addr(self.ptr_type, func_ref);
+
+        let env_val = if free_vars.is_empty() {
+            builder.ins().iconst(self.ptr_type, 0) // null env
+        } else if free_vars.len() == 1 {
+            env.get(&free_vars[0])
+        } else {
+            let n = free_vars.len();
+            let mut sorted_vars: Vec<&str> = free_vars.iter().map(|s| s.as_str()).collect();
+            sorted_vars.sort();
+
+            let ptr_bytes = self.ptr_type.bytes() as i32;
+            let slot_size = (3 * n as u32) * ptr_bytes as u32;
+            let slot = builder.create_sized_stack_slot(
+                StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 0),
+            );
+            for (i, var_name) in sorted_vars.iter().enumerate() {
+                let val = env.get(var_name);
+                let (key_ptr, key_len) = self.string_ptr(builder, var_name);
+                let base = (i as i32) * (3 * ptr_bytes);
+                builder.ins().stack_store(key_ptr, slot, base);
+                builder.ins().stack_store(key_len, slot, base + ptr_bytes);
+                builder.ins().stack_store(val, slot, base + 2 * ptr_bytes);
+            }
+            let data_ptr = builder.ins().stack_addr(self.ptr_type, slot, 0);
+            let count = builder.ins().iconst(self.ptr_type, n as i64);
+            self.call_rt(builder, "knot_record_from_pairs", &[data_ptr, count])
+        };
+
+        // Create IO value: IO(fn_ptr, env)
+        self.call_rt(builder, "knot_io_new", &[fn_addr, env_val])
+    }
+
+    /// Compile IO do-block body eagerly (runs IO actions inline).
+    /// Used inside IO thunk bodies where laziness is already provided by the
+    /// thunk wrapper. Returns the raw result value (not wrapped in IO).
+    fn compile_io_do_eager(
         &mut self,
         builder: &mut FunctionBuilder,
         stmts: &[ast::Stmt],
         env: &mut Env,
         db: Value,
     ) -> Value {
-        // Strategy: compile the do-block body inline but wrap each IO expression
-        // with knot_io_run to execute it. The overall result is then wrapped in
-        // knot_io_pure to create an IO value.
-        //
-        // This is correct because: the entire block produces an IO value. When
-        // someone runs this IO (via knot_io_run in main or a bind), it executes
-        // all the inner IO actions.
-        //
-        // For now, compile eagerly (run IO inline) and wrap result in IO.
-        // This is semantically equivalent for top-level main execution.
-
         let mut last_val = self.call_rt(builder, "knot_value_unit", &[]);
 
         for stmt in stmts {
@@ -4521,7 +4663,7 @@ impl Codegen {
                     builder.switch_to_block(fail_block);
                     builder.seal_block(fail_block);
                     self.call_rt_void(builder, "knot_guard_failed", &[]);
-                    builder.ins().trap(cranelift_codegen::ir::TrapCode::user(0).unwrap());
+                    builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
                     builder.switch_to_block(pass_block);
                     builder.seal_block(pass_block);
                 }
@@ -4542,8 +4684,7 @@ impl Codegen {
             }
         }
 
-        // Wrap the final value in IO
-        self.call_rt(builder, "knot_io_pure", &[last_val])
+        last_val
     }
 
     /// Bind a pattern in an IO do-block context (no skip/filter blocks — just destructure).
@@ -4961,7 +5102,7 @@ impl Codegen {
                         builder.switch_to_block(skip_block);
                         builder.seal_block(skip_block);
                         self.call_rt_void(builder, "knot_guard_failed", &[]);
-                        builder.ins().trap(cranelift_codegen::ir::TrapCode::user(0).unwrap());
+                        builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
                         builder.switch_to_block(then_block);
                     }
                 }

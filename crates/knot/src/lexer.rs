@@ -526,6 +526,9 @@ impl<'src> Lexer<'src> {
                                 Diagnostic::error("unknown escape sequence")
                                     .label(span, "unknown escape"),
                             );
+                            // Error recovery: emit the escaped character so the
+                            // string value isn't silently shortened.
+                            value.push(ch);
                         }
                         None => {
                             // Backslash at EOF — caught as unterminated
@@ -609,6 +612,9 @@ impl<'src> Lexer<'src> {
                                         Diagnostic::error("invalid hex escape in byte string")
                                             .label(span, "expected two hex digits after \\x"),
                                     );
+                                    // Error recovery: emit the partial hex digit
+                                    // so the byte string isn't silently shortened.
+                                    value.push(d1 as u8);
                                 }
                             } else {
                                 let bad_end = if self.pos < self.source.len() {

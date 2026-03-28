@@ -2098,6 +2098,13 @@ pub extern "C" fn knot_io_wrap(fn_ptr: *const u8, env: *mut Value) -> *mut Value
     alloc(Value::IO(fn_ptr, env))
 }
 
+/// Create an IO thunk from a function pointer and captured environment.
+/// Used by codegen to defer IO do-block execution until knot_io_run.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_io_new(fn_ptr: *const u8, env: *mut Value) -> *mut Value {
+    alloc(Value::IO(fn_ptr, env))
+}
+
 /// Wrap a pure value in an IO thunk (IO.pure / return).
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_io_pure(val: *mut Value) -> *mut Value {
@@ -5915,7 +5922,7 @@ pub extern "C" fn knot_constraint_register(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_atomic_begin(db: *mut c_void) {
-    write_lock_acquire();
+    let _guard = write_lock_guard();
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let depth = db_ref.atomic_depth.get() + 1;
     db_ref.atomic_depth.set(depth);
@@ -5923,6 +5930,9 @@ pub extern "C" fn knot_atomic_begin(db: *mut c_void) {
         .conn
         .execute_batch(&format!("SAVEPOINT knot_atomic_{depth};"))
         .expect("knot runtime: failed to begin atomic");
+    // Lock stays held across begin/commit/rollback — forget the guard
+    // so it doesn't release on drop. Commit/rollback will release.
+    std::mem::forget(_guard);
 }
 
 #[unsafe(no_mangle)]
@@ -5938,7 +5948,10 @@ pub extern "C" fn knot_atomic_commit(db: *mut c_void) {
     if depth == 1 {
         notify_relation_changed();
     }
-    write_lock_release();
+    // Use a guard so the lock is released even if code above panics.
+    // The lock was acquired in knot_atomic_begin; create a guard and
+    // let it drop normally to release.
+    drop(WriteLockGuard);
 }
 
 #[unsafe(no_mangle)]
@@ -5955,7 +5968,7 @@ pub extern "C" fn knot_atomic_rollback(db: *mut c_void) {
         ))
         .expect("knot runtime: failed to rollback atomic");
     db_ref.atomic_depth.set(depth - 1);
-    write_lock_release();
+    drop(WriteLockGuard);
 }
 
 // ── Record update ─────────────────────────────────────────────────
@@ -7470,6 +7483,7 @@ pub extern "C" fn knot_http_fetch_io(
                             value,
                         });
                     }
+                    hdr_fields.sort_by(|a, b| a.name.cmp(&b.name));
                     Some(alloc(Value::Record(hdr_fields)))
                 } else {
                     None
@@ -8159,6 +8173,9 @@ pub extern "C" fn knot_relation_index_lookup(
 /// Free a hash index.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_relation_index_free(index: *mut c_void) {
+    if index.is_null() {
+        return;
+    }
     unsafe {
         drop(Box::from_raw(index as *mut HashIndex));
     }

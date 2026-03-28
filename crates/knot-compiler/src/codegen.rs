@@ -4615,6 +4615,7 @@ impl Codegen {
             result
         };
         let mut primary_var: Option<String> = None;
+        let mut primary_row_val: Option<Value> = None;
         let mut primary_source: Option<String> = None;
 
         // ── Pre-scan for hash join patterns ──────────────────────────
@@ -4754,9 +4755,10 @@ impl Codegen {
                         bind_do_pattern(builder, self, pat, row, env, &mut pattern_skips);
 
                         if group_by_pos.is_some() {
-                            if let ast::PatKind::Var(name) = &pat.node {
-                                primary_var = Some(name.clone());
+                            if let Some(name) = pat_primary_var(&pat.node) {
+                                primary_var = Some(name);
                             }
+                            primary_row_val = Some(row);
                         }
 
                         loop_stack.push(LoopInfo {
@@ -4910,12 +4912,13 @@ impl Codegen {
                     let mut pattern_skips = Vec::new();
                     bind_do_pattern(builder, self, pat, row, env, &mut pattern_skips);
 
-                    // Track the primary bind variable (most recent Var pattern)
-                    // and source name for groupBy
+                    // Track the primary bind variable (most recent Var or
+                    // constructor-payload pattern) and source name for groupBy
                     if group_by_pos.is_some() {
-                        if let ast::PatKind::Var(name) = &pat.node {
-                            primary_var = Some(name.clone());
+                        if let Some(name) = pat_primary_var(&pat.node) {
+                            primary_var = Some(name);
                         }
+                        primary_row_val = Some(row);
                         if let ast::ExprKind::SourceRef(name) = &expr.node {
                             primary_source = Some(name.clone());
                         }
@@ -4973,10 +4976,9 @@ impl Codegen {
                     //
                     // 1. Push the primary bind variable's value into temp
                     //    (we're inside the pre-group loops)
-                    let var_name = primary_var.as_ref().expect(
-                        "groupBy requires a preceding bind statement with a variable pattern"
+                    let var_val = primary_row_val.expect(
+                        "groupBy requires a preceding bind statement"
                     );
-                    let var_val = env.get(var_name);
                     self.call_rt_void(
                         builder,
                         "knot_relation_push",
@@ -5080,7 +5082,9 @@ impl Codegen {
                         "knot_relation_get",
                         &[groups, g_i],
                     );
-                    env.set(var_name, group);
+                    if let Some(var_name) = primary_var.as_ref() {
+                        env.set(var_name, group);
+                    }
 
                     loop_stack.push(LoopInfo {
                         header: g_header,
@@ -7307,6 +7311,17 @@ fn merge_block_param(
     ty: types::Type,
 ) {
     builder.append_block_param(block, ty);
+}
+
+/// Extract the primary variable name from a pattern for groupBy tracking.
+/// For `Var(name)` returns the name; for `Constructor { payload, .. }` recurses
+/// into the payload; for other patterns returns None.
+fn pat_primary_var(pat: &ast::PatKind) -> Option<String> {
+    match pat {
+        ast::PatKind::Var(name) => Some(name.clone()),
+        ast::PatKind::Constructor { payload, .. } => pat_primary_var(&payload.node),
+        _ => None,
+    }
 }
 
 fn bind_do_pattern(

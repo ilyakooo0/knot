@@ -22,13 +22,105 @@
 //! (to preserve SQL optimization patterns in codegen).
 
 use knot::ast::*;
+use std::collections::HashSet;
 
 /// Desugar a module in place. Transforms pure-comprehension do blocks
 /// into nested bind/yield/empty expressions, and routes into data declarations.
 pub fn desugar(module: &mut Module) {
     desugar_routes(module);
+    let io_fns = detect_io_functions(&module.decls);
     for decl in &mut module.decls {
-        desugar_decl(&mut decl.node);
+        desugar_decl(&mut decl.node, &io_fns);
+    }
+}
+
+/// Detect user functions whose bodies (transitively) produce IO values.
+/// Uses fixed-point iteration to handle transitive IO (e.g., genToken calls randomInt).
+fn detect_io_functions(decls: &[Decl]) -> HashSet<String> {
+    let io_builtins: HashSet<&str> = [
+        "println", "putLine", "print", "readLine", "readFile",
+        "writeFile", "appendFile", "fileExists", "removeFile",
+        "listDir", "now", "randomInt", "randomFloat", "fetch", "fetchWith",
+        "fork", "listen", "generateKeyPair", "generateSigningKeyPair", "encrypt",
+    ].into_iter().collect();
+
+    let mut fun_bodies: Vec<(&str, &Expr)> = Vec::new();
+    for decl in decls {
+        if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
+            fun_bodies.push((name, body));
+        }
+    }
+
+    let mut io_fns = HashSet::new();
+    loop {
+        let mut changed = false;
+        for (name, body) in &fun_bodies {
+            if io_fns.contains(*name) {
+                continue;
+            }
+            if expr_contains_io(body, &io_builtins, &io_fns) {
+                io_fns.insert(name.to_string());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    io_fns
+}
+
+/// Check if an expression contains IO calls (builtins or known IO user functions).
+fn expr_contains_io(expr: &Expr, builtins: &HashSet<&str>, io_fns: &HashSet<String>) -> bool {
+    match &expr.node {
+        ExprKind::Var(name) => builtins.contains(name.as_str()) || io_fns.contains(name.as_str()),
+        ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) => true,
+        ExprKind::Set { .. } | ExprKind::FullSet { .. } => true,
+        ExprKind::At { .. } | ExprKind::Atomic(_) => true,
+        ExprKind::App { func, arg } => {
+            expr_contains_io(func, builtins, io_fns)
+                || expr_contains_io(arg, builtins, io_fns)
+        }
+        ExprKind::BinOp { lhs, rhs, .. } => {
+            expr_contains_io(lhs, builtins, io_fns)
+                || expr_contains_io(rhs, builtins, io_fns)
+        }
+        ExprKind::UnaryOp { operand, .. } => {
+            expr_contains_io(operand, builtins, io_fns)
+        }
+        ExprKind::Do(stmts) => {
+            stmts.iter().any(|s| match &s.node {
+                StmtKind::Bind { expr, .. } => expr_contains_io(expr, builtins, io_fns),
+                StmtKind::Expr(expr) => expr_contains_io(expr, builtins, io_fns),
+                StmtKind::Let { expr, .. } => expr_contains_io(expr, builtins, io_fns),
+                _ => false,
+            })
+        }
+        ExprKind::Lambda { body, .. } => expr_contains_io(body, builtins, io_fns),
+        ExprKind::If { cond, then_branch, else_branch, .. } => {
+            expr_contains_io(cond, builtins, io_fns)
+                || expr_contains_io(then_branch, builtins, io_fns)
+                || expr_contains_io(else_branch, builtins, io_fns)
+        }
+        ExprKind::Case { scrutinee, arms, .. } => {
+            expr_contains_io(scrutinee, builtins, io_fns)
+                || arms.iter().any(|arm| expr_contains_io(&arm.body, builtins, io_fns))
+        }
+        ExprKind::Record(fields) => {
+            fields.iter().any(|f| expr_contains_io(&f.value, builtins, io_fns))
+        }
+        ExprKind::RecordUpdate { base, fields, .. } => {
+            expr_contains_io(base, builtins, io_fns)
+                || fields.iter().any(|f| expr_contains_io(&f.value, builtins, io_fns))
+        }
+        ExprKind::FieldAccess { expr, .. } => {
+            expr_contains_io(expr, builtins, io_fns)
+        }
+        ExprKind::List(elems) => {
+            elems.iter().any(|e| expr_contains_io(e, builtins, io_fns))
+        }
+        ExprKind::Yield(inner) => expr_contains_io(inner, builtins, io_fns),
+        _ => false,
     }
 }
 
@@ -185,27 +277,27 @@ fn route_entries_to_constructors(entries: &[RouteEntry]) -> Vec<ConstructorDef> 
         .collect()
 }
 
-fn desugar_decl(decl: &mut DeclKind) {
+fn desugar_decl(decl: &mut DeclKind, io_fns: &HashSet<String>) {
     match decl {
-        DeclKind::Fun { body: Some(body), .. } => desugar_expr(body),
+        DeclKind::Fun { body: Some(body), .. } => desugar_expr(body, io_fns),
         DeclKind::Fun { body: None, .. } => {},
         DeclKind::View { body, .. } => {
             // Don't desugar the top-level do block of a view body
             // (preserve structure for analyze_view), but recurse into sub-exprs.
             if let ExprKind::Do(stmts) = &mut body.node {
                 for stmt in stmts.iter_mut() {
-                    desugar_stmt(stmt);
+                    desugar_stmt(stmt, io_fns);
                 }
             } else {
-                desugar_expr(body);
+                desugar_expr(body, io_fns);
             }
         }
-        DeclKind::Derived { body, .. } => desugar_expr(body),
-        DeclKind::Migrate { using_fn, .. } => desugar_expr(using_fn),
+        DeclKind::Derived { body, .. } => desugar_expr(body, io_fns),
+        DeclKind::Migrate { using_fn, .. } => desugar_expr(using_fn, io_fns),
         DeclKind::Impl { items, .. } => {
             for item in items {
                 if let ImplItem::Method { body, .. } = item {
-                    desugar_expr(body);
+                    desugar_expr(body, io_fns);
                 }
             }
         }
@@ -216,7 +308,7 @@ fn desugar_decl(decl: &mut DeclKind) {
                     ..
                 } = item
                 {
-                    desugar_expr(body);
+                    desugar_expr(body, io_fns);
                 }
             }
         }
@@ -226,30 +318,30 @@ fn desugar_decl(decl: &mut DeclKind) {
 
 /// Recursively desugar expressions. The `Do` nodes that qualify as
 /// pure comprehensions are replaced with nested App/Lambda/Yield nodes.
-fn desugar_expr(expr: &mut Expr) {
+fn desugar_expr(expr: &mut Expr, io_fns: &HashSet<String>) {
     // First, recurse into sub-expressions (bottom-up).
     // We handle Set/FullSet specially to avoid desugaring their value do blocks.
     match &mut expr.node {
         ExprKind::Set { target, value } | ExprKind::FullSet { target, value } => {
-            desugar_expr(target);
+            desugar_expr(target, io_fns);
             // Don't desugar the top-level do block of a set value,
             // but DO recurse into its sub-expressions.
             if let ExprKind::Do(stmts) = &mut value.node {
                 for stmt in stmts.iter_mut() {
-                    desugar_stmt(stmt);
+                    desugar_stmt(stmt, io_fns);
                 }
             } else {
-                desugar_expr(value);
+                desugar_expr(value, io_fns);
             }
             return; // Don't fall through to the Do check below
         }
-        _ => recurse_into_children(expr),
+        _ => recurse_into_children(expr, io_fns),
     }
 
     // Now check if this expression is a desugaring-eligible Do block.
     // Check eligibility with immutable borrows first to avoid borrow conflicts.
     let (sql_compilable, pure_comp) = if let ExprKind::Do(stmts) = &expr.node {
-        (is_sql_compilable(stmts), is_pure_comprehension(stmts))
+        (is_sql_compilable(stmts), is_pure_comprehension(stmts, io_fns))
     } else {
         (false, false)
     };
@@ -259,7 +351,7 @@ fn desugar_expr(expr: &mut Expr) {
         // to a single SQL query. Still recurse into sub-expressions.
         if let ExprKind::Do(stmts) = &mut expr.node {
             for stmt in stmts.iter_mut() {
-                desugar_stmt(stmt);
+                desugar_stmt(stmt, io_fns);
             }
         }
         return;
@@ -275,78 +367,78 @@ fn desugar_expr(expr: &mut Expr) {
 
 /// Recurse into all child expressions of a node (except Do blocks handled
 /// by the caller).
-fn recurse_into_children(expr: &mut Expr) {
+fn recurse_into_children(expr: &mut Expr, io_fns: &HashSet<String>) {
     match &mut expr.node {
         ExprKind::Lit(_) | ExprKind::Var(_) | ExprKind::Constructor(_)
         | ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) => {}
 
         ExprKind::Record(fields) => {
             for f in fields {
-                desugar_expr(&mut f.value);
+                desugar_expr(&mut f.value, io_fns);
             }
         }
         ExprKind::RecordUpdate { base, fields } => {
-            desugar_expr(base);
+            desugar_expr(base, io_fns);
             for f in fields {
-                desugar_expr(&mut f.value);
+                desugar_expr(&mut f.value, io_fns);
             }
         }
-        ExprKind::FieldAccess { expr: e, .. } => desugar_expr(e),
+        ExprKind::FieldAccess { expr: e, .. } => desugar_expr(e, io_fns),
         ExprKind::List(elems) => {
             for e in elems {
-                desugar_expr(e);
+                desugar_expr(e, io_fns);
             }
         }
-        ExprKind::Lambda { body, .. } => desugar_expr(body),
+        ExprKind::Lambda { body, .. } => desugar_expr(body, io_fns),
         ExprKind::App { func, arg } => {
-            desugar_expr(func);
-            desugar_expr(arg);
+            desugar_expr(func, io_fns);
+            desugar_expr(arg, io_fns);
         }
         ExprKind::BinOp { lhs, rhs, .. } => {
-            desugar_expr(lhs);
-            desugar_expr(rhs);
+            desugar_expr(lhs, io_fns);
+            desugar_expr(rhs, io_fns);
         }
-        ExprKind::UnaryOp { operand, .. } => desugar_expr(operand),
+        ExprKind::UnaryOp { operand, .. } => desugar_expr(operand, io_fns),
         ExprKind::If {
             cond,
             then_branch,
             else_branch,
         } => {
-            desugar_expr(cond);
-            desugar_expr(then_branch);
-            desugar_expr(else_branch);
+            desugar_expr(cond, io_fns);
+            desugar_expr(then_branch, io_fns);
+            desugar_expr(else_branch, io_fns);
         }
         ExprKind::Case { scrutinee, arms } => {
-            desugar_expr(scrutinee);
+            desugar_expr(scrutinee, io_fns);
             for arm in arms {
-                desugar_expr(&mut arm.body);
+                desugar_expr(&mut arm.body, io_fns);
             }
         }
         ExprKind::Do(stmts) => {
             for stmt in stmts {
-                desugar_stmt(stmt);
+                desugar_stmt(stmt, io_fns);
             }
         }
-        ExprKind::Yield(inner) => desugar_expr(inner),
+        ExprKind::Yield(inner) => desugar_expr(inner, io_fns),
         ExprKind::Set { target, value } | ExprKind::FullSet { target, value } => {
-            desugar_expr(target);
-            desugar_expr(value);
+            desugar_expr(target, io_fns);
+            desugar_expr(value, io_fns);
         }
-        ExprKind::Atomic(inner) => desugar_expr(inner),
+        ExprKind::Atomic(inner) => desugar_expr(inner, io_fns),
         ExprKind::At { relation, time } => {
-            desugar_expr(relation);
-            desugar_expr(time);
+            desugar_expr(relation, io_fns);
+            desugar_expr(time, io_fns);
         }
     }
 }
 
-fn desugar_stmt(stmt: &mut Stmt) {
+fn desugar_stmt(stmt: &mut Stmt, io_fns: &HashSet<String>) {
     match &mut stmt.node {
-        StmtKind::Bind { expr, .. } => desugar_expr(expr),
-        StmtKind::Let { expr, .. } => desugar_expr(expr),
-        StmtKind::Where { cond } => desugar_expr(cond),
-        StmtKind::GroupBy { key } => desugar_expr(key),
-        StmtKind::Expr(e) => desugar_expr(e),
+        StmtKind::Bind { expr, .. } => desugar_expr(expr, io_fns),
+        StmtKind::Let { expr, .. } => desugar_expr(expr, io_fns),
+        StmtKind::Where { cond } => desugar_expr(cond, io_fns),
+        StmtKind::GroupBy { key } => desugar_expr(key, io_fns),
+        StmtKind::Expr(e) => desugar_expr(e, io_fns),
     }
 }
 
@@ -455,7 +547,7 @@ fn is_bound_field_access(expr: &Expr, bind_vars: &std::collections::HashSet<&str
 /// 1. It contains at least one Bind or Where statement
 /// 2. All non-final statements are Bind, Where, or Let
 /// 3. The final statement is Expr(Yield(..))
-fn is_pure_comprehension(stmts: &[Stmt]) -> bool {
+fn is_pure_comprehension(stmts: &[Stmt], io_fns: &HashSet<String>) -> bool {
     if stmts.is_empty() {
         return false;
     }
@@ -476,9 +568,10 @@ fn is_pure_comprehension(stmts: &[Stmt]) -> bool {
     }
 
     // IO do blocks use a dedicated codegen path (compile_io_do) — not eligible
-    // for desugaring. Check if any bind or bare expression calls an IO builtin.
+    // for desugaring. Check if any bind or bare expression calls an IO builtin
+    // or a user-defined IO function.
     if stmts.iter().any(|s| match &s.node {
-        StmtKind::Bind { expr, .. } | StmtKind::Let { expr, .. } | StmtKind::Expr(expr) => expr_is_io(expr),
+        StmtKind::Bind { expr, .. } | StmtKind::Let { expr, .. } | StmtKind::Expr(expr) => expr_is_io(expr, io_fns),
         _ => false,
     }) {
         return false;
@@ -510,21 +603,24 @@ fn is_pure_comprehension(stmts: &[Stmt]) -> bool {
     }
 }
 
-/// Check if an expression syntactically calls an IO-returning builtin.
-fn expr_is_io(expr: &Expr) -> bool {
+/// Check if an expression syntactically calls an IO-returning builtin
+/// or a user-defined IO function.
+fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
     match &expr.node {
-        ExprKind::App { func, .. } => expr_is_io(func),
-        ExprKind::Var(name) => matches!(
-            name.as_str(),
-            "println" | "putLine" | "print" | "readLine" | "readFile"
-                | "writeFile" | "appendFile" | "fileExists" | "removeFile"
-                | "listDir" | "now" | "randomInt" | "randomFloat"
-                | "fetch" | "fetchWith" | "fork" | "listen"
-                | "generateKeyPair" | "generateSigningKeyPair" | "encrypt"
-        ),
+        ExprKind::App { func, .. } => expr_is_io(func, io_fns),
+        ExprKind::Var(name) => {
+            matches!(
+                name.as_str(),
+                "println" | "putLine" | "print" | "readLine" | "readFile"
+                    | "writeFile" | "appendFile" | "fileExists" | "removeFile"
+                    | "listDir" | "now" | "randomInt" | "randomFloat"
+                    | "fetch" | "fetchWith" | "fork" | "listen"
+                    | "generateKeyPair" | "generateSigningKeyPair" | "encrypt"
+            ) || io_fns.contains(name.as_str())
+        }
         ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) => true,
         ExprKind::Set { .. } | ExprKind::FullSet { .. } => true,
-        ExprKind::At { .. } => true,
+        ExprKind::At { .. } | ExprKind::Atomic(_) => true,
         _ => false,
     }
 }

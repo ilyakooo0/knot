@@ -5437,19 +5437,13 @@ pub extern "C" fn knot_source_diff_write(
             }
         }
 
-        // 3. DELETE rows from main not in temp (use COALESCE for NULL comparison)
-        // Use type-aware sentinel values to avoid conflating NULL with real values
+        // 3. DELETE rows from main not in temp (use IS for NULL-safe comparison)
         let match_conds: Vec<String> = std::iter::once(
             // _tag is NOT NULL TEXT, simple equality
             format!("{t}.{c} = {m}.{c}", t = temp, m = table, c = quote_ident("_tag"))
         ).chain(adt.all_fields.iter().map(|f| {
             let c = quote_ident(&f.name);
-            let coalesce = |tbl: &str| match f.ty {
-                ColType::Int | ColType::Bool => format!("COALESCE({}.{}, -9223372036854775808)", tbl, c),
-                ColType::Float => format!("COALESCE({}.{}, -1.7976931348623157e+308)", tbl, c),
-                _ => format!("COALESCE({}.{}, X'00')", tbl, c),
-            };
-            format!("{} = {}", coalesce(&temp), coalesce(&table))
+            format!("{}.{} IS {}.{}", temp, c, table, c)
         })).collect();
         let delete_sql = format!(
             "DELETE FROM {} WHERE NOT EXISTS (SELECT 1 FROM {} WHERE {});",
@@ -7162,23 +7156,26 @@ fn base64_encode(data: &[u8]) -> String {
 }
 
 fn base64_decode(s: &str) -> Vec<u8> {
-    fn char_to_val(c: u8) -> u8 {
+    fn char_to_val(c: u8) -> Option<u8> {
         match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => 0,
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
         }
     }
-    let bytes: Vec<u8> = s.bytes().filter(|&b| b != b'=').collect();
+    let bytes: Vec<u8> = s.bytes()
+        .filter(|&b| b != b'=' && b != b'\n' && b != b'\r' && b != b' ' && b != b'\t')
+        .filter_map(|b| char_to_val(b))
+        .collect();
     let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
     for chunk in bytes.chunks(4) {
-        let b0 = char_to_val(chunk[0]) as u32;
-        let b1 = if chunk.len() > 1 { char_to_val(chunk[1]) as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { char_to_val(chunk[2]) as u32 } else { 0 };
-        let b3 = if chunk.len() > 3 { char_to_val(chunk[3]) as u32 } else { 0 };
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let b3 = if chunk.len() > 3 { chunk[3] as u32 } else { 0 };
         let triple = (b0 << 18) | (b1 << 12) | (b2 << 6) | b3;
         out.push(((triple >> 16) & 0xFF) as u8);
         if chunk.len() > 2 { out.push(((triple >> 8) & 0xFF) as u8); }

@@ -803,6 +803,10 @@ impl Infer {
         let saved_annotation_vars = self.annotation_vars.clone();
         self.annotation_vars.clear();
         // Build param → arg mapping
+        if args.len() != info.params.len() {
+            self.annotation_vars = saved_annotation_vars;
+            return None;
+        }
         let mapping: HashMap<TyVar, Ty> = info
             .params
             .iter()
@@ -2033,6 +2037,8 @@ impl Infer {
                         ast::PatKind::Constructor { name, .. } => {
                             Some(name.as_str())
                         }
+                        ast::PatKind::Lit(ast::Literal::Bool(true)) => Some("True"),
+                        ast::PatKind::Lit(ast::Literal::Bool(false)) => Some("False"),
                         _ => None,
                     })
                     .collect();
@@ -2061,6 +2067,8 @@ impl Infer {
                         ast::PatKind::Constructor { name, .. } => {
                             Some(name.as_str())
                         }
+                        ast::PatKind::Lit(ast::Literal::Bool(true)) => Some("True"),
+                        ast::PatKind::Lit(ast::Literal::Bool(false)) => Some("False"),
                         _ => None,
                     })
                     .collect();
@@ -2284,6 +2292,7 @@ impl Infer {
     fn infer_do(&mut self, stmts: &[ast::Stmt], _span: Span) -> Ty {
         self.push_scope();
         let mut yield_ty: Option<Ty> = None;
+        let mut last_expr_ty: Option<Ty> = None;
         let mut is_io = false;
         let mut has_relation_bind = false;
         let mut io_effects: BTreeSet<IoEffect> = BTreeSet::new();
@@ -2376,9 +2385,12 @@ impl Infer {
                     } else {
                         let expr_ty = self.infer_expr(expr);
                         let resolved = self.apply(&expr_ty);
-                        if let Ty::IO(ref effects, _) = resolved {
+                        if let Ty::IO(ref effects, ref inner) = resolved {
                             is_io = true;
                             io_effects.extend(effects.iter().cloned());
+                            last_expr_ty = Some(*inner.clone());
+                        } else {
+                            last_expr_ty = Some(expr_ty);
                         }
                     }
                 }
@@ -2398,7 +2410,7 @@ impl Infer {
         // as the result (like Rust's implicit return), falling back to unit.
         let promote_to_io = is_io || (self.in_io_do && !has_relation_bind);
         if promote_to_io {
-            let inner = yield_ty.unwrap_or_else(Ty::unit);
+            let inner = yield_ty.or(last_expr_ty).unwrap_or_else(Ty::unit);
             Ty::IO(io_effects, Box::new(inner))
         } else {
             match yield_ty {

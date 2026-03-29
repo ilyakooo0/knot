@@ -4199,7 +4199,7 @@ impl Codegen {
             // provide).
             let is_unconditional = matches!(
                 &arm.pat.node,
-                ast::PatKind::Wildcard | ast::PatKind::Var(_)
+                ast::PatKind::Wildcard | ast::PatKind::Var(_) | ast::PatKind::Record(_)
             );
             let next_block = if is_last && is_unconditional {
                 merge_block
@@ -4371,8 +4371,12 @@ impl Codegen {
             ast::PatKind::Var(name) => env.set(name, val),
             ast::PatKind::Wildcard => {}
             ast::PatKind::Constructor { name, payload } => {
-                if self.nullable_ctors.contains_key(name) {
-                    // Nullable: val is the bare payload (or null for none)
+                if matches!(self.nullable_ctors.get(name), Some(NullableRole::None)) {
+                    // Nullable none: payload is conceptually unit
+                    let unit = self.call_rt(builder, "knot_value_unit", &[]);
+                    self.bind_case_pattern(builder, payload, unit, env);
+                } else if matches!(self.nullable_ctors.get(name), Some(NullableRole::Some)) {
+                    // Nullable some: val is the bare payload
                     self.bind_case_pattern(builder, payload, val, env);
                 } else {
                     let inner = self.call_rt(builder, "knot_constructor_payload", &[val]);
@@ -4542,19 +4546,14 @@ impl Codegen {
                 Self::expr_contains_io(scrutinee, builtins, io_fns)
                     || arms.iter().any(|arm| Self::expr_contains_io(&arm.body, builtins, io_fns))
             }
-            ast::ExprKind::Record(fields) => {
-                fields.iter().any(|f| Self::expr_contains_io(&f.value, builtins, io_fns))
-            }
-            ast::ExprKind::RecordUpdate { base, fields, .. } => {
-                Self::expr_contains_io(base, builtins, io_fns)
-                    || fields.iter().any(|f| Self::expr_contains_io(&f.value, builtins, io_fns))
-            }
-            ast::ExprKind::FieldAccess { expr, .. } => {
-                Self::expr_contains_io(expr, builtins, io_fns)
-            }
-            ast::ExprKind::List(elems) => {
-                elems.iter().any(|e| Self::expr_contains_io(e, builtins, io_fns))
-            }
+            // Records, lists, field access are data constructors/accessors —
+            // they don't produce IO even if they contain IO values as
+            // subexpressions. A function like `f x = {result: println x}`
+            // returns a record, not IO.
+            ast::ExprKind::Record(_)
+            | ast::ExprKind::RecordUpdate { .. }
+            | ast::ExprKind::FieldAccess { .. }
+            | ast::ExprKind::List(_) => false,
             ast::ExprKind::Yield(inner) => Self::expr_contains_io(inner, builtins, io_fns),
             _ => false,
         }
@@ -4829,8 +4828,11 @@ impl Codegen {
                 builder.seal_block(then_block);
 
                 // Extract the constructor payload and bind the inner pattern
-                let inner = if self.nullable_ctors.contains_key(name) {
-                    // Nullable encoding: val is the bare payload
+                let inner = if matches!(self.nullable_ctors.get(name), Some(NullableRole::None)) {
+                    // Nullable none: payload is conceptually unit
+                    self.call_rt(builder, "knot_value_unit", &[])
+                } else if matches!(self.nullable_ctors.get(name), Some(NullableRole::Some)) {
+                    // Nullable some: val is the bare payload
                     val
                 } else {
                     self.call_rt(builder, "knot_constructor_payload", &[val])
@@ -4971,22 +4973,30 @@ impl Codegen {
             }
         }
 
+        // ── Pre-build hash join indices before any loops ──────────────
+        let mut prebuilt_indices: HashMap<usize, Value> = HashMap::new();
+        for (&stmt_idx, plan) in &hash_join_plans {
+            if let ast::StmtKind::Bind { expr, .. } = &stmts[stmt_idx].node {
+                let inner_rel = self.compile_expr(builder, expr, env, db);
+                let (field_ptr, field_len) =
+                    self.string_ptr(builder, &plan.inner_field);
+                let idx_val = self.call_rt(
+                    builder,
+                    "knot_relation_build_index",
+                    &[inner_rel, field_ptr, field_len],
+                );
+                prebuilt_indices.insert(stmt_idx, idx_val);
+            }
+        }
+
         for (stmt_idx, stmt) in stmts.iter().enumerate() {
             match &stmt.node {
                 ast::StmtKind::Bind { pat, expr } => {
-                    // ── Hash join path: build index inline and lookup ──
+                    // ── Hash join path: use pre-built index for lookup ──
                     if let Some(plan) = hash_join_plans.get(&stmt_idx) {
-                        // Build the hash index from the inner relation right here
-                        let inner_rel = self.compile_expr(builder, expr, env, db);
-                        let (field_ptr, field_len) =
-                            self.string_ptr(builder, &plan.inner_field);
-                        let idx_val = self.call_rt(
-                            builder,
-                            "knot_relation_build_index",
-                            &[inner_rel, field_ptr, field_len],
-                        );
+                        let idx_val = prebuilt_indices[&stmt_idx];
 
-                        // Look up matching rows via the hash index
+                        // Look up matching rows via the pre-built hash index
                         let outer_val = env.get(&plan.outer_var);
                         let (fptr, flen) =
                             self.string_ptr(builder, &plan.outer_field);
@@ -4994,9 +5004,6 @@ impl Codegen {
                             self.call_rt(builder, "knot_record_field", &[outer_val, fptr, flen]);
                         let rel =
                             self.call_rt(builder, "knot_relation_index_lookup", &[idx_val, key]);
-
-                        // Free the index immediately — we have the result relation
-                        self.call_rt_void(builder, "knot_relation_index_free", &[idx_val]);
 
                         let len = self.call_rt(builder, "knot_relation_len", &[rel]);
                         let header = builder.create_block();
@@ -5436,6 +5443,11 @@ impl Codegen {
             // Switch to exit block for the next outer loop
             builder.switch_to_block(info.exit);
             builder.seal_block(info.exit);
+        }
+
+        // Free all pre-built hash join indices
+        for idx_val in prebuilt_indices.values() {
+            self.call_rt_void(builder, "knot_relation_index_free", &[*idx_val]);
         }
 
         result
@@ -5888,7 +5900,7 @@ impl Codegen {
                 let sql = format!("SELECT {}({}) FROM {}", func, col_sql, table);
                 let params_rel = self.compile_sql_params(builder, &[], env);
                 let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                let rt_fn = if fn_name == "avg" { "knot_source_query_float" } else { "knot_source_query_count" };
+                let rt_fn = if fn_name == "avg" || fn_name == "sum" { "knot_source_query_float" } else { "knot_source_query_count" };
                 Some(self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]))
             }
             _ => None,
@@ -6002,7 +6014,7 @@ impl Codegen {
             };
             let params_rel = self.compile_sql_params(builder, &params, env);
             let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-            let rt_fn = if func == "AVG" { "knot_source_query_float" } else { "knot_source_query_count" };
+            let rt_fn = if func == "AVG" || func == "SUM" { "knot_source_query_float" } else { "knot_source_query_count" };
             Some(self.call_rt(
                 builder,
                 rt_fn,
@@ -7663,8 +7675,12 @@ fn bind_do_pattern(
             skips.push(skip_block);
 
             // Extract payload and bind inner pattern
-            if cg.nullable_ctors.contains_key(name) {
-                // Nullable: val is the bare payload (or null for none)
+            if matches!(cg.nullable_ctors.get(name), Some(NullableRole::None)) {
+                // Nullable none: payload is conceptually unit
+                let unit = cg.call_rt(builder, "knot_value_unit", &[]);
+                bind_do_pattern(builder, cg, payload, unit, env, skips);
+            } else if matches!(cg.nullable_ctors.get(name), Some(NullableRole::Some)) {
+                // Nullable some: val is the bare payload
                 bind_do_pattern(builder, cg, payload, val, env, skips);
             } else {
                 let inner = cg.call_rt(builder, "knot_constructor_payload", &[val]);

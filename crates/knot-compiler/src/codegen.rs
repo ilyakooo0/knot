@@ -1953,7 +1953,26 @@ impl Codegen {
                     }
                 }
 
-                let dispatch_arg = all_params[dispatch_index.unwrap_or(0)];
+                let dispatch_arg = match dispatch_index {
+                    Some(idx) => all_params[idx],
+                    None => {
+                        // No parameter carries the HKT variable — call first impl directly
+                        if let Some((_, impl_func_id)) = impls.first() {
+                            let impl_ref = cg
+                                .module
+                                .declare_func_in_func(*impl_func_id, builder.func);
+                            let mut args = vec![db];
+                            args.extend_from_slice(&all_params);
+                            let call = builder.ins().call(impl_ref, &args);
+                            let result = builder.inst_results(call)[0];
+                            builder.ins().return_(&[result]);
+                            return;
+                        }
+                        // No impls at all — unreachable in valid programs
+                        builder.ins().trap(cranelift_codegen::ir::TrapCode::user(0).unwrap());
+                        return;
+                    }
+                };
 
                 let merge_block = builder.create_block();
                 merge_block_param(builder, merge_block, cg.ptr_type);

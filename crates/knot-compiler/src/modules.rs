@@ -143,10 +143,24 @@ fn resolve_recursive(
         // Filter declarations based on selective import list
         let decls: Vec<ast::Decl> = if let Some(items) = &imp.items {
             let names: HashSet<&str> = items.iter().map(|i| i.name.as_str()).collect();
-            visible_decls
+            let decls: Vec<ast::Decl> = visible_decls
                 .into_iter()
                 .filter(|d| should_include_decl(d, &names))
-                .collect()
+                .collect();
+            // Check for requested names that don't match any declaration
+            let found_names: HashSet<String> = decls
+                .iter()
+                .filter_map(|d| decl_name(&d.node))
+                .collect();
+            for item in items {
+                if !found_names.contains(&item.name) {
+                    errors.push(format!(
+                        "import '{}': '{}' not found in module",
+                        imp.path, item.name
+                    ));
+                }
+            }
+            decls
         } else {
             visible_decls
         };

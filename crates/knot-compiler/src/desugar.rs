@@ -638,7 +638,7 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
             expr_is_io(scrutinee, io_fns)
                 || arms.iter().any(|arm| expr_is_io(&arm.body, io_fns))
         }
-        ExprKind::Lambda { body, .. } => expr_is_io(body, io_fns),
+        ExprKind::Lambda { .. } => false,
         ExprKind::Do(stmts) => {
             stmts.iter().any(|s| match &s.node {
                 StmtKind::Bind { expr, .. } => expr_is_io(expr, io_fns),

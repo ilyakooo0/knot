@@ -90,7 +90,7 @@ fn split_respecting_brackets(s: &str, sep: char) -> Vec<&str> {
             ']' => depth = depth.saturating_sub(1),
             c if c == sep && depth == 0 => {
                 parts.push(&s[start..i]);
-                start = i + 1;
+                start = i + c.len_utf8();
             }
             _ => {}
         }

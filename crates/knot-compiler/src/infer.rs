@@ -2175,7 +2175,9 @@ impl Infer {
     /// functions whose already-inferred type returns IO.
     fn expr_is_io_prescan(&self, expr: &ast::Expr) -> bool {
         match &expr.node {
-            ast::ExprKind::App { func, .. } => self.expr_is_io_prescan(func),
+            ast::ExprKind::App { func, arg } => {
+                self.expr_is_io_prescan(func) || self.expr_is_io_prescan(arg)
+            }
             ast::ExprKind::Var(name) => {
                 matches!(
                     name.as_str(),
@@ -2198,6 +2200,16 @@ impl Infer {
             ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
             ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
             ast::ExprKind::At { .. } | ast::ExprKind::Atomic(_) => true,
+            ast::ExprKind::BinOp { lhs, rhs, .. } => {
+                self.expr_is_io_prescan(lhs) || self.expr_is_io_prescan(rhs)
+            }
+            ast::ExprKind::Yield(inner) => self.expr_is_io_prescan(inner),
+            ast::ExprKind::If { then_branch, else_branch, .. } => {
+                self.expr_is_io_prescan(then_branch) || self.expr_is_io_prescan(else_branch)
+            }
+            ast::ExprKind::Case { arms, .. } => {
+                arms.iter().any(|arm| self.expr_is_io_prescan(&arm.body))
+            }
             _ => false,
         }
     }

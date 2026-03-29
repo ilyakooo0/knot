@@ -161,12 +161,13 @@ impl Parser {
         Span::new(self.source.len(), self.source.len())
     }
 
-    fn save(&self) -> usize {
-        self.pos
+    fn save(&self) -> (usize, usize) {
+        (self.pos, self.delimiter_depth)
     }
 
-    fn restore(&mut self, pos: usize) {
-        self.pos = pos;
+    fn restore(&mut self, saved: (usize, usize)) {
+        self.pos = saved.0;
+        self.delimiter_depth = saved.1;
     }
 
     fn column_of(&self, span: &Span) -> usize {
@@ -2749,6 +2750,12 @@ impl Parser {
                             }
                             _ => {
                                 self.error("expected effect name or '}'");
+                                while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
+                                    self.advance();
+                                }
+                                if matches!(self.peek(), TokenKind::RBrace) {
+                                    self.advance();
+                                }
                                 break;
                             }
                         }

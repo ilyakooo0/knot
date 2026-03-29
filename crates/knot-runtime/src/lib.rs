@@ -308,7 +308,7 @@ fn alloc(v: Value) -> *mut Value {
 fn alloc_int(n: BigInt) -> *mut Value {
     if let Some(small) = n.to_i64() {
         if small >= SMALL_INT_MIN && small <= SMALL_INT_MAX {
-            return SMALL_INT_CACHE.with(|cache| cache[(small - SMALL_INT_MIN) as usize]);
+            return SINGLETONS.with(|s| s.small_ints[(small - SMALL_INT_MIN) as usize]);
         }
     }
     alloc(Value::Int(n))
@@ -316,19 +316,15 @@ fn alloc_int(n: BigInt) -> *mut Value {
 
 /// Return the cached Bool singleton.
 fn alloc_bool(b: bool) -> *mut Value {
-    if b {
-        BOOL_TRUE.with(|p| *p)
-    } else {
-        BOOL_FALSE.with(|p| *p)
-    }
+    SINGLETONS.with(|s| if b { s.bool_true } else { s.bool_false })
 }
 
 /// Allocate a float, returning a cached pointer for +0.0 and 1.0.
 fn alloc_float(n: f64) -> *mut Value {
     if n.to_bits() == 0.0_f64.to_bits() {
-        FLOAT_ZERO.with(|p| *p)
+        SINGLETONS.with(|s| s.float_zero)
     } else if n == 1.0 {
-        FLOAT_ONE.with(|p| *p)
+        SINGLETONS.with(|s| s.float_one)
     } else {
         alloc(Value::Float(n))
     }
@@ -446,26 +442,71 @@ pub(crate) fn quote_ident(name: &str) -> String {
 const SMALL_INT_MIN: i64 = -128;
 const SMALL_INT_MAX: i64 = 127;
 
+/// Grouped thread-local singletons with Drop so spawned threads reclaim memory.
+struct ValueSingletons {
+    small_ints: Vec<*mut Value>,
+    unit: *mut Value,
+    bool_true: *mut Value,
+    bool_false: *mut Value,
+    float_zero: *mut Value,
+    float_one: *mut Value,
+}
+
+impl Drop for ValueSingletons {
+    fn drop(&mut self) {
+        for &ptr in &self.small_ints {
+            unsafe { let _ = Box::from_raw(ptr); }
+        }
+        unsafe {
+            let _ = Box::from_raw(self.unit);
+            let _ = Box::from_raw(self.bool_true);
+            let _ = Box::from_raw(self.bool_false);
+            let _ = Box::from_raw(self.float_zero);
+            let _ = Box::from_raw(self.float_one);
+        }
+    }
+}
+
+/// Wrapper around the text literal cache that frees cached values on drop.
+struct TextLiteralCache(HashMap<*const u8, *mut Value>);
+
+impl Drop for TextLiteralCache {
+    fn drop(&mut self) {
+        for &ptr in self.0.values() {
+            unsafe { let _ = Box::from_raw(ptr); }
+        }
+    }
+}
+
+impl std::ops::Deref for TextLiteralCache {
+    type Target = HashMap<*const u8, *mut Value>;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl std::ops::DerefMut for TextLiteralCache {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+}
+
 thread_local! {
-    static SMALL_INT_CACHE: Vec<*mut Value> = {
-        (SMALL_INT_MIN..=SMALL_INT_MAX)
+    static SINGLETONS: ValueSingletons = ValueSingletons {
+        small_ints: (SMALL_INT_MIN..=SMALL_INT_MAX)
             .map(|n| Box::into_raw(Box::new(Value::Int(BigInt::from(n)))))
-            .collect()
+            .collect(),
+        unit: Box::into_raw(Box::new(Value::Unit)),
+        bool_true: Box::into_raw(Box::new(Value::Bool(true))),
+        bool_false: Box::into_raw(Box::new(Value::Bool(false))),
+        float_zero: Box::into_raw(Box::new(Value::Float(0.0))),
+        float_one: Box::into_raw(Box::new(Value::Float(1.0))),
     };
-    static UNIT_SINGLETON: *mut Value = Box::into_raw(Box::new(Value::Unit));
-    static BOOL_TRUE: *mut Value = Box::into_raw(Box::new(Value::Bool(true)));
-    static BOOL_FALSE: *mut Value = Box::into_raw(Box::new(Value::Bool(false)));
-    static FLOAT_ZERO: *mut Value = Box::into_raw(Box::new(Value::Float(0.0)));
-    static FLOAT_ONE: *mut Value = Box::into_raw(Box::new(Value::Float(1.0)));
     /// Cache for text literals keyed by static data pointer.
     /// Values are allocated outside the arena so they survive arena resets.
-    static TEXT_LITERAL_CACHE: RefCell<HashMap<*const u8, *mut Value>> = RefCell::new(HashMap::new());
+    static TEXT_LITERAL_CACHE: RefCell<TextLiteralCache> = RefCell::new(TextLiteralCache(HashMap::new()));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_int(n: i64) -> *mut Value {
     if n >= SMALL_INT_MIN && n <= SMALL_INT_MAX {
-        SMALL_INT_CACHE.with(|cache| cache[(n - SMALL_INT_MIN) as usize])
+        SINGLETONS.with(|s| s.small_ints[(n - SMALL_INT_MIN) as usize])
     } else {
         alloc(Value::Int(BigInt::from(n)))
     }
@@ -481,9 +522,9 @@ pub extern "C" fn knot_value_int_from_str(ptr: *const u8, len: usize) -> *mut Va
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_float(n: f64) -> *mut Value {
     if n.to_bits() == 0.0_f64.to_bits() {
-        FLOAT_ZERO.with(|p| *p)
+        SINGLETONS.with(|s| s.float_zero)
     } else if n == 1.0 {
-        FLOAT_ONE.with(|p| *p)
+        SINGLETONS.with(|s| s.float_one)
     } else {
         alloc(Value::Float(n))
     }
@@ -516,15 +557,15 @@ pub extern "C" fn knot_value_text_cached(ptr: *const u8, len: usize) -> *mut Val
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_bool(b: i32) -> *mut Value {
     if b != 0 {
-        BOOL_TRUE.with(|p| *p)
+        SINGLETONS.with(|s| s.bool_true)
     } else {
-        BOOL_FALSE.with(|p| *p)
+        SINGLETONS.with(|s| s.bool_false)
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_unit() -> *mut Value {
-    UNIT_SINGLETON.with(|p| *p)
+    SINGLETONS.with(|s| s.unit)
 }
 
 #[unsafe(no_mangle)]
@@ -708,7 +749,7 @@ pub extern "C" fn knot_record_field_by_index(record: *mut Value, index: usize) -
             if index < fields.len() {
                 fields[index].value
             } else {
-                alloc(Value::Unit)
+                panic!("knot runtime: field_by_index out of bounds (index {} >= len {})", index, fields.len())
             }
         }
         _ => panic!("knot runtime: expected Record in field_by_index, got {}", type_name(record)),
@@ -759,7 +800,7 @@ fn infer_col_type(v: *mut Value) -> Option<ColType> {
         Value::Constructor(_, payload) => {
             // Only treat as Tag when the payload is Unit (nullary constructor).
             // Constructors with fields would lose their payload data if stored as Tag.
-            if matches!(unsafe { as_ref(*payload) }, Value::Unit) {
+            if (*payload).is_null() || matches!(unsafe { as_ref(*payload) }, Value::Unit) {
                 Some(ColType::Tag)
             } else {
                 None
@@ -2002,7 +2043,7 @@ fn format_value(v: *mut Value) -> String {
         Value::Float(n) => {
             if n.is_nan() || n.is_infinite() {
                 format!("{}", n)
-            } else if *n == (*n as i64) as f64 {
+            } else if n.fract() == 0.0 {
                 format!("{:.1}", n)
             } else {
                 n.to_string()
@@ -2097,7 +2138,7 @@ pub extern "C" fn knot_value_show(v: *mut Value) -> *mut Value {
             Value::Float(n) => {
                 if n.is_nan() || n.is_infinite() {
                     format!("{}", n)
-                } else if *n == (*n as i64) as f64 {
+                } else if n.fract() == 0.0 {
                     format!("{:.1}", n)
                 } else {
                     n.to_string()
@@ -5930,7 +5971,6 @@ pub extern "C" fn knot_source_read_at(
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
-    let cols = parse_schema(schema);
 
     let ts = match unsafe { as_ref(timestamp) } {
         Value::Int(n) => n.to_i64().expect("knot runtime: timestamp too large for i64"),
@@ -5941,43 +5981,103 @@ pub extern "C" fn knot_source_read_at(
     };
 
     let history_table = quote_ident(&format!("_knot_{}_history", name));
-    let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
 
-    let sql = format!(
-        "SELECT {} FROM {} WHERE \"_knot_valid_from\" <= ?1 AND (\"_knot_valid_to\" IS NULL OR \"_knot_valid_to\" > ?1)",
-        if col_names.is_empty() {
-            "1".to_string()
-        } else {
-            col_names.join(", ")
-        },
-        history_table
-    );
-
-    debug_sql(&sql);
-    let mut stmt = db_ref
-        .conn
-        .prepare_cached(&sql)
-        .unwrap_or_else(|e| panic!("knot runtime: temporal query error: {}", e));
-
-    let mut rows: Vec<*mut Value> = Vec::new();
-    let mut result_rows = stmt
-        .query(rusqlite::params![ts])
-        .unwrap_or_else(|e| panic!("knot runtime: temporal query exec error: {}", e));
-
-    while let Some(row) = result_rows
-        .next()
-        .unwrap_or_else(|e| panic!("knot runtime: temporal row fetch error: {}", e))
-    {
-        let record = knot_record_empty(cols.len());
-        for (i, col) in cols.iter().enumerate() {
-            let val = read_sql_column(row, i, col.ty);
-            let field_name = col.name.as_bytes();
-            knot_record_set_field(record, field_name.as_ptr(), field_name.len(), val);
+    if is_adt_schema(schema) {
+        let adt = parse_adt_schema(schema);
+        let field_idx: HashMap<&str, usize> = adt.all_fields.iter().enumerate()
+            .map(|(i, f)| (f.name.as_str(), i)).collect();
+        let mut select_cols = vec![quote_ident("_tag")];
+        for f in &adt.all_fields {
+            select_cols.push(quote_ident(&f.name));
         }
-        rows.push(record);
-    }
+        let sql = format!(
+            "SELECT {} FROM {} WHERE \"_knot_valid_from\" <= ?1 AND (\"_knot_valid_to\" IS NULL OR \"_knot_valid_to\" > ?1)",
+            select_cols.join(", "),
+            history_table
+        );
+        debug_sql(&sql);
+        let mut stmt = db_ref
+            .conn
+            .prepare_cached(&sql)
+            .unwrap_or_else(|e| panic!("knot runtime: temporal query error: {}", e));
+        let mut rows: Vec<*mut Value> = Vec::new();
+        let mut result_rows = stmt
+            .query(rusqlite::params![ts])
+            .unwrap_or_else(|e| panic!("knot runtime: temporal query exec error: {}", e));
 
-    alloc(Value::Relation(rows))
+        while let Some(row) = result_rows
+            .next()
+            .unwrap_or_else(|e| panic!("knot runtime: temporal row fetch error: {}", e))
+        {
+            let tag: String = row.get(0).unwrap();
+            let ctor = adt.constructors.iter().find(|c| c.name == tag);
+            let payload = if let Some(ctor) = ctor {
+                if ctor.fields.is_empty() {
+                    alloc(Value::Unit)
+                } else {
+                    let record = knot_record_empty(ctor.fields.len());
+                    for field in &ctor.fields {
+                        let col_idx = field_idx[field.name.as_str()];
+                        let val = read_sql_column(row, col_idx + 1, field.ty);
+                        let fname = field.name.as_bytes();
+                        knot_record_set_field(record, fname.as_ptr(), fname.len(), val);
+                    }
+                    record
+                }
+            } else {
+                let record = knot_record_empty(adt.all_fields.len());
+                let mut has_fields = false;
+                for (i, field) in adt.all_fields.iter().enumerate() {
+                    if !matches!(row.get_ref(i + 1).unwrap(), ValueRef::Null) {
+                        let val = read_sql_column(row, i + 1, field.ty);
+                        let fname = field.name.as_bytes();
+                        knot_record_set_field(record, fname.as_ptr(), fname.len(), val);
+                        has_fields = true;
+                    }
+                }
+                if has_fields { record } else { alloc(Value::Unit) }
+            };
+            rows.push(alloc(Value::Constructor(tag, payload)));
+        }
+        alloc(Value::Relation(rows))
+    } else {
+        let cols = parse_schema(schema);
+        let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
+
+        let sql = format!(
+            "SELECT {} FROM {} WHERE \"_knot_valid_from\" <= ?1 AND (\"_knot_valid_to\" IS NULL OR \"_knot_valid_to\" > ?1)",
+            if col_names.is_empty() {
+                "1".to_string()
+            } else {
+                col_names.join(", ")
+            },
+            history_table
+        );
+        debug_sql(&sql);
+        let mut stmt = db_ref
+            .conn
+            .prepare_cached(&sql)
+            .unwrap_or_else(|e| panic!("knot runtime: temporal query error: {}", e));
+
+        let mut rows: Vec<*mut Value> = Vec::new();
+        let mut result_rows = stmt
+            .query(rusqlite::params![ts])
+            .unwrap_or_else(|e| panic!("knot runtime: temporal query exec error: {}", e));
+
+        while let Some(row) = result_rows
+            .next()
+            .unwrap_or_else(|e| panic!("knot runtime: temporal row fetch error: {}", e))
+        {
+            let record = knot_record_empty(cols.len());
+            for (i, col) in cols.iter().enumerate() {
+                let val = read_sql_column(row, i, col.ty);
+                let field_name = col.name.as_bytes();
+                knot_record_set_field(record, field_name.as_ptr(), field_name.len(), val);
+            }
+            rows.push(record);
+        }
+        alloc(Value::Relation(rows))
+    }
 }
 
 // ── Subset constraints ────────────────────────────────────────────

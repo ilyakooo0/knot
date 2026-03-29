@@ -59,14 +59,20 @@ fn classify_schema_change(old: &str, new: &str) -> SchemaChange {
 
 /// Parse an ADT schema into a map of constructor_name -> Vec<(field_name, field_type)>.
 fn parse_adt_constructors(spec: &str) -> Vec<(String, Vec<(String, String)>)> {
+    if spec.len() < 2 || !spec.starts_with('#') {
+        return Vec::new();
+    }
     let body = &spec[1..]; // strip '#'
     let mut ctors = Vec::new();
-    for ctor_part in body.split('|') {
+    for ctor_part in split_respecting_brackets(body, '|') {
+        if ctor_part.is_empty() {
+            continue;
+        }
         let mut parts = ctor_part.splitn(2, ':');
         let name = parts.next().unwrap().to_string();
         let fields: Vec<(String, String)> = if let Some(field_spec) = parts.next() {
-            field_spec
-                .split(';')
+            split_respecting_brackets(field_spec, ';')
+                .into_iter()
                 .map(|f| {
                     let mut fp = f.splitn(2, '=');
                     let fname = fp.next().unwrap().to_string();
@@ -111,10 +117,13 @@ fn parse_record_fields(spec: &str) -> Vec<(String, String)> {
         .into_iter()
         .filter(|part| !part.is_empty())
         .map(|part| {
-            let colon = part.find(':').unwrap_or(0);
-            let name = part[..colon].to_string();
-            let ty = if colon < part.len() { part[colon + 1..].to_string() } else { String::new() };
-            (name, ty)
+            if let Some(colon) = part.find(':') {
+                let name = part[..colon].to_string();
+                let ty = part[colon + 1..].to_string();
+                (name, ty)
+            } else {
+                (part.to_string(), String::new())
+            }
         })
         .collect()
 }
@@ -130,7 +139,7 @@ fn split_respecting_brackets(s: &str, sep: char) -> Vec<&str> {
             ']' => depth = depth.saturating_sub(1),
             c if c == sep && depth == 0 => {
                 parts.push(&s[start..i]);
-                start = i + 1;
+                start = i + c.len_utf8();
             }
             _ => {}
         }

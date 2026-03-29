@@ -225,7 +225,7 @@ fn find_runtime() -> PathBuf {
 
     // 3. Extract embedded runtime to a temp file
     if let Some(bytes) = EMBEDDED_RUNTIME {
-        let tmp = std::env::temp_dir().join("libknot_runtime.a");
+        let tmp = std::env::temp_dir().join(format!("libknot_runtime_{}.a", std::process::id()));
         if std::fs::write(&tmp, bytes).is_ok() {
             return tmp;
         }

@@ -4541,7 +4541,9 @@ impl Codegen {
     /// or a user-defined IO function).
     fn expr_is_io(&self, expr: &ast::Expr) -> bool {
         match &expr.node {
-            ast::ExprKind::App { func, .. } => self.expr_is_io(func),
+            ast::ExprKind::App { func, arg } => {
+                self.expr_is_io(func) || self.expr_is_io(arg)
+            }
             ast::ExprKind::Var(name) => {
                 matches!(
                     name.as_str(),
@@ -4555,6 +4557,9 @@ impl Codegen {
             ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
             ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
             ast::ExprKind::At { .. } | ast::ExprKind::Atomic(_) => true,
+            ast::ExprKind::BinOp { lhs, rhs, .. } => {
+                self.expr_is_io(lhs) || self.expr_is_io(rhs)
+            }
             ast::ExprKind::Yield(inner) => self.expr_is_io(inner),
             ast::ExprKind::If { then_branch, else_branch, .. } => {
                 self.expr_is_io(then_branch) || self.expr_is_io(else_branch)

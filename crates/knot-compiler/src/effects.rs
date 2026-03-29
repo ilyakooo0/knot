@@ -358,7 +358,10 @@ impl EffectChecker {
                             ),
                     );
                 }
-                if inner_effects.reads.is_empty() && inner_effects.writes.is_empty() {
+                if !inner_effects.has_io()
+                    && inner_effects.reads.is_empty()
+                    && inner_effects.writes.is_empty()
+                {
                     self.diagnostics.push(
                         Diagnostic::error("atomic block must interact with relations")
                             .label(expr.span, "this atomic block has no relation reads or writes"),
@@ -817,9 +820,8 @@ mod tests {
             arg: Box::new(spanned(ExprKind::Lit(Literal::Text("hello".into())))),
         }))));
         let (diags, _effects) = check_module(vec![make_fun("f", body)]);
-        assert_eq!(diags.len(), 2);
+        assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("IO effects"));
-        assert!(diags[1].message.contains("must interact with relations"));
     }
 
     #[test]
@@ -842,9 +844,8 @@ mod tests {
             "now".into(),
         )))));
         let (diags, _effects) = check_module(vec![make_fun("f", body)]);
-        assert_eq!(diags.len(), 2);
+        assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("IO effects are not allowed inside atomic"));
-        assert!(diags[1].message.contains("must interact with relations"));
     }
 
     #[test]

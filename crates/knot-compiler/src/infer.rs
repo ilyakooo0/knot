@@ -853,7 +853,7 @@ impl Infer {
                 Box::new(self.subst_ty(r, mapping)),
             ),
             Ty::Record(fields, row) => {
-                let new_fields: BTreeMap<_, _> = fields
+                let mut new_fields: BTreeMap<_, _> = fields
                     .iter()
                     .map(|(k, v)| (k.clone(), self.subst_ty(v, mapping)))
                     .collect();
@@ -861,6 +861,13 @@ impl Infer {
                     if let Some(replacement) = mapping.get(&rv) {
                         match replacement {
                             Ty::Var(new_rv) => Some(*new_rv),
+                            Ty::Record(extra_fields, extra_row) => {
+                                // Merge fields from the replacement record
+                                for (k, v) in extra_fields {
+                                    new_fields.entry(k.clone()).or_insert_with(|| v.clone());
+                                }
+                                *extra_row
+                            }
                             _ => None,
                         }
                     } else {
@@ -870,7 +877,7 @@ impl Infer {
                 Ty::Record(new_fields, new_row)
             }
             Ty::Variant(ctors, row) => {
-                let new_ctors: BTreeMap<_, _> = ctors
+                let mut new_ctors: BTreeMap<_, _> = ctors
                     .iter()
                     .map(|(k, v)| (k.clone(), self.subst_ty(v, mapping)))
                     .collect();
@@ -878,6 +885,13 @@ impl Infer {
                     if let Some(replacement) = mapping.get(&rv) {
                         match replacement {
                             Ty::Var(new_rv) => Some(*new_rv),
+                            Ty::Variant(extra_ctors, extra_row) => {
+                                // Merge constructors from the replacement variant
+                                for (k, v) in extra_ctors {
+                                    new_ctors.entry(k.clone()).or_insert_with(|| v.clone());
+                                }
+                                *extra_row
+                            }
                             _ => None,
                         }
                     } else {

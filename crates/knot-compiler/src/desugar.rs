@@ -605,11 +605,13 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &HashSet<String>) -> bool {
     }
 }
 
-/// Check if an expression syntactically calls an IO-returning builtin
-/// or a user-defined IO function.
+/// Check if an expression contains an IO-returning builtin or user-defined IO function.
+/// Recurses into nested expressions to catch IO buried inside if/case/lambda/etc.
 fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
     match &expr.node {
-        ExprKind::App { func, .. } => expr_is_io(func, io_fns),
+        ExprKind::App { func, arg } => {
+            expr_is_io(func, io_fns) || expr_is_io(arg, io_fns)
+        }
         ExprKind::Var(name) => {
             matches!(
                 name.as_str(),
@@ -623,6 +625,39 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
         ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) => true,
         ExprKind::Set { .. } | ExprKind::FullSet { .. } => true,
         ExprKind::At { .. } | ExprKind::Atomic(_) => true,
+        ExprKind::BinOp { lhs, rhs, .. } => {
+            expr_is_io(lhs, io_fns) || expr_is_io(rhs, io_fns)
+        }
+        ExprKind::UnaryOp { operand, .. } => expr_is_io(operand, io_fns),
+        ExprKind::If { cond, then_branch, else_branch, .. } => {
+            expr_is_io(cond, io_fns)
+                || expr_is_io(then_branch, io_fns)
+                || expr_is_io(else_branch, io_fns)
+        }
+        ExprKind::Case { scrutinee, arms, .. } => {
+            expr_is_io(scrutinee, io_fns)
+                || arms.iter().any(|arm| expr_is_io(&arm.body, io_fns))
+        }
+        ExprKind::Lambda { body, .. } => expr_is_io(body, io_fns),
+        ExprKind::Do(stmts) => {
+            stmts.iter().any(|s| match &s.node {
+                StmtKind::Bind { expr, .. } => expr_is_io(expr, io_fns),
+                StmtKind::Expr(expr) => expr_is_io(expr, io_fns),
+                StmtKind::Let { expr, .. } => expr_is_io(expr, io_fns),
+                StmtKind::Where { cond } => expr_is_io(cond, io_fns),
+                _ => false,
+            })
+        }
+        ExprKind::Record(fields) => {
+            fields.iter().any(|f| expr_is_io(&f.value, io_fns))
+        }
+        ExprKind::RecordUpdate { base, fields, .. } => {
+            expr_is_io(base, io_fns)
+                || fields.iter().any(|f| expr_is_io(&f.value, io_fns))
+        }
+        ExprKind::FieldAccess { expr, .. } => expr_is_io(expr, io_fns),
+        ExprKind::List(elems) => elems.iter().any(|e| expr_is_io(e, io_fns)),
+        ExprKind::Yield(inner) => expr_is_io(inner, io_fns),
         _ => false,
     }
 }

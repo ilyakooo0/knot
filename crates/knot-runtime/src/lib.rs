@@ -3135,6 +3135,15 @@ fn json_to_value(json: &serde_json::Value) -> *mut Value {
             if obj.is_empty() {
                 return alloc(Value::Record(Vec::new()));
             }
+            // Reconstruct Constructor from {"tag": "...", "value": ...} format
+            // (round-trip with value_to_serde_json's Constructor encoding)
+            if obj.len() == 2 {
+                if let (Some(serde_json::Value::String(tag)), Some(val)) =
+                    (obj.get("tag"), obj.get("value"))
+                {
+                    return alloc(Value::Constructor(tag.clone(), json_to_value(val)));
+                }
+            }
             let mut fields: Vec<RecordField> = obj
                 .iter()
                 .map(|(k, v)| RecordField { name: k.clone(), value: json_to_value(v) })

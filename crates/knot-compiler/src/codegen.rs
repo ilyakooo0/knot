@@ -3479,8 +3479,7 @@ impl Codegen {
                         )
                     }
                 } else {
-                    // For non-source At expressions, compile the relation normally
-                    self.compile_expr(builder, relation, env, db)
+                    panic!("codegen: temporal query @(...) is only supported on source relations")
                 }
             }
         }

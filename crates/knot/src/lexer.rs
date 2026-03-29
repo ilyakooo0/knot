@@ -461,7 +461,17 @@ impl<'src> Lexer<'src> {
             }
             let slice = self.slice(start, self.pos);
             let raw = if slice.contains('_') { slice.replace('_', "") } else { slice.to_string() };
-            let value = raw.parse::<f64>().unwrap_or(0.0);
+            let value = match raw.parse::<f64>() {
+                Ok(v) => v,
+                Err(_) => {
+                    let span = self.span_from(start);
+                    self.diagnostics.push(
+                        Diagnostic::error("invalid float literal")
+                            .label(span, "could not parse as a floating-point number"),
+                    );
+                    0.0
+                }
+            };
             TokenKind::Float(value)
         } else {
             let slice = self.slice(start, self.pos);

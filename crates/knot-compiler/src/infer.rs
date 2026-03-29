@@ -562,6 +562,26 @@ impl Infer {
                     );
                 }
             }
+            // Bool is Ty::Bool (not Ty::Con), so handle Bool/Variant
+            // unification explicitly to support True {}/False {} patterns.
+            (Ty::Bool, Ty::Variant(c2, r2)) => {
+                if let Some(expanded) = self.con_to_variant("Bool", &[]) {
+                    let (ec, er) = match expanded {
+                        Ty::Variant(c, r) => (c, r),
+                        _ => unreachable!(),
+                    };
+                    self.unify_variants(&ec, er, c2, *r2, span);
+                }
+            }
+            (Ty::Variant(c1, r1), Ty::Bool) => {
+                if let Some(expanded) = self.con_to_variant("Bool", &[]) {
+                    let (ec, er) = match expanded {
+                        Ty::Variant(c, r) => (c, r),
+                        _ => unreachable!(),
+                    };
+                    self.unify_variants(c1, *r1, &ec, er, span);
+                }
+            }
             _ => {
                 let d1 = self.display_ty(&t1);
                 let d2 = self.display_ty(&t2);
@@ -2143,6 +2163,37 @@ impl Infer {
                     }
                 }
             }
+            // Bool is Ty::Bool (not Ty::Con), so handle it explicitly.
+            Ty::Bool => {
+                if let Some(data_info) = self.data_types.get("Bool").cloned() {
+                    let covered: HashSet<&str> = arms
+                        .iter()
+                        .filter_map(|arm| match &arm.pat.node {
+                            ast::PatKind::Constructor { name, .. } => {
+                                Some(name.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+
+                    let missing: Vec<&str> = data_info
+                        .ctors
+                        .iter()
+                        .map(|(n, _)| n.as_str())
+                        .filter(|c| !covered.contains(c))
+                        .collect();
+
+                    if !missing.is_empty() {
+                        self.error(
+                            format!(
+                                "non-exhaustive pattern match — missing: {}",
+                                missing.join(", "),
+                            ),
+                            span,
+                        );
+                    }
+                }
+            }
             // Primitives (Int, Text, etc.) have infinite domains.
             _ => {}
         }
@@ -2194,7 +2245,8 @@ impl Infer {
                             _ => false,
                         }
                     }
-                    returns_io(&scheme.ty)
+                    let resolved = self.apply(&scheme.ty);
+                    returns_io(&resolved)
                 })
             }
             ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
@@ -2204,11 +2256,24 @@ impl Infer {
                 self.expr_is_io_prescan(lhs) || self.expr_is_io_prescan(rhs)
             }
             ast::ExprKind::Yield(inner) => self.expr_is_io_prescan(inner),
-            ast::ExprKind::If { then_branch, else_branch, .. } => {
-                self.expr_is_io_prescan(then_branch) || self.expr_is_io_prescan(else_branch)
+            ast::ExprKind::UnaryOp { operand, .. } => self.expr_is_io_prescan(operand),
+            ast::ExprKind::If { cond, then_branch, else_branch, .. } => {
+                self.expr_is_io_prescan(cond)
+                    || self.expr_is_io_prescan(then_branch)
+                    || self.expr_is_io_prescan(else_branch)
             }
-            ast::ExprKind::Case { arms, .. } => {
-                arms.iter().any(|arm| self.expr_is_io_prescan(&arm.body))
+            ast::ExprKind::Case { scrutinee, arms, .. } => {
+                self.expr_is_io_prescan(scrutinee)
+                    || arms.iter().any(|arm| self.expr_is_io_prescan(&arm.body))
+            }
+            ast::ExprKind::Do(stmts) => {
+                stmts.iter().any(|s| match &s.node {
+                    ast::StmtKind::Bind { expr, .. } => self.expr_is_io_prescan(expr),
+                    ast::StmtKind::Expr(expr) => self.expr_is_io_prescan(expr),
+                    ast::StmtKind::Let { expr, .. } => self.expr_is_io_prescan(expr),
+                    ast::StmtKind::Where { cond } => self.expr_is_io_prescan(cond),
+                    _ => false,
+                })
             }
             _ => false,
         }

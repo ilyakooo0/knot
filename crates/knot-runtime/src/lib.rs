@@ -824,9 +824,11 @@ fn infer_temp_schema(rows: &[*mut Value]) -> Option<TempSchema> {
         Value::Record(fields) => {
             let mut cols = Vec::with_capacity(fields.len());
             for f in fields {
-                match unsafe { as_ref(f.value) } {
-                    Value::Relation(_) | Value::Function(_, _, _) => return None,
-                    _ => {}
+                if !f.value.is_null() {
+                    match unsafe { as_ref(f.value) } {
+                        Value::Relation(_) | Value::Function(_, _, _) => return None,
+                        _ => {}
+                    }
                 }
                 let ty = infer_col_type(f.value)?;
                 cols.push((f.name.clone(), ty));
@@ -3207,6 +3209,12 @@ fn json_to_value(json: &serde_json::Value) -> *mut Value {
         serde_json::Value::Object(obj) => {
             if obj.is_empty() {
                 return alloc(Value::Record(Vec::new()));
+            }
+            // Reconstruct Bytes from {"__knot_bytes": "base64..."} format
+            if obj.len() == 1 {
+                if let Some(serde_json::Value::String(b64)) = obj.get("__knot_bytes") {
+                    return alloc(Value::Bytes(base64_decode(b64)));
+                }
             }
             // Reconstruct Constructor from {"__knot_tag": "...", "__knot_value": ...} format
             // (round-trip with value_to_serde_json's Constructor encoding)
@@ -7153,6 +7161,32 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
+fn base64_decode(s: &str) -> Vec<u8> {
+    fn char_to_val(c: u8) -> u8 {
+        match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => 0,
+        }
+    }
+    let bytes: Vec<u8> = s.bytes().filter(|&b| b != b'=').collect();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        let b0 = char_to_val(chunk[0]) as u32;
+        let b1 = if chunk.len() > 1 { char_to_val(chunk[1]) as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { char_to_val(chunk[2]) as u32 } else { 0 };
+        let b3 = if chunk.len() > 3 { char_to_val(chunk[3]) as u32 } else { 0 };
+        let triple = (b0 << 18) | (b1 << 12) | (b2 << 6) | b3;
+        out.push(((triple >> 16) & 0xFF) as u8);
+        if chunk.len() > 2 { out.push(((triple >> 8) & 0xFF) as u8); }
+        if chunk.len() > 3 { out.push((triple & 0xFF) as u8); }
+    }
+    out
+}
+
 fn value_to_json(v: *mut Value) -> String {
     serde_json::to_string(&value_to_serde_json(v)).unwrap_or_else(|_| "null".to_string())
 }
@@ -7180,7 +7214,11 @@ fn value_to_serde_json(v: *mut Value) -> serde_json::Value {
         }
         Value::Text(s) => serde_json::Value::String(s.clone()),
         Value::Bool(b) => serde_json::Value::Bool(*b),
-        Value::Bytes(b) => serde_json::Value::String(base64_encode(b)),
+        Value::Bytes(b) => {
+            let mut map = serde_json::Map::with_capacity(1);
+            map.insert("__knot_bytes".into(), serde_json::Value::String(base64_encode(b)));
+            serde_json::Value::Object(map)
+        }
         Value::Unit => serde_json::Value::Object(serde_json::Map::new()),
         Value::Record(fields) => {
             let mut map = serde_json::Map::with_capacity(fields.len());

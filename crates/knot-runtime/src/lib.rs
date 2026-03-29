@@ -8001,6 +8001,9 @@ fn fetch_value_to_text(v: *mut Value) -> String {
 /// Extract a Text field from a record by name.
 fn fetch_record_text_field(record: *mut Value, field: &str) -> String {
     let val = knot_record_field(record, field.as_ptr(), field.len());
+    if val.is_null() {
+        return String::new();
+    }
     match unsafe { as_ref(val) } {
         Value::Text(s) => s.clone(),
         _ => String::new(),

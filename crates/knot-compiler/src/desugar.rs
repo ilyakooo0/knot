@@ -639,6 +639,7 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
                 || arms.iter().any(|arm| expr_is_io(&arm.body, io_fns))
         }
         ExprKind::Lambda { .. } => false,
+        ExprKind::Yield(inner) => expr_is_io(inner, io_fns),
         ExprKind::Do(stmts) => {
             stmts.iter().any(|s| match &s.node {
                 StmtKind::Bind { expr, .. } => expr_is_io(expr, io_fns),
@@ -648,9 +649,9 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
                 _ => false,
             })
         }
-        // Records, lists, field access, and yield are data constructors/
-        // accessors — they don't produce IO even if they contain IO values
-        // as subexpressions. Only direct IO-producing expressions (calls to
+        // Records, lists, field access are data constructors/accessors —
+        // they don't produce IO even if they contain IO values as
+        // subexpressions. Only direct IO-producing expressions (calls to
         // IO functions, relation ops, etc.) should flag a do-block as IO.
         _ => false,
     }

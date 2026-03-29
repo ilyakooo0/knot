@@ -6117,6 +6117,9 @@ impl Codegen {
         stmts: &[ast::Stmt],
         env: &Env,
     ) -> Option<SqlQueryPlan> {
+        if stmts.is_empty() {
+            return None;
+        }
         let mut tables: Vec<SqlTable> = Vec::new();
         let mut bind_to_alias: HashMap<String, String> = HashMap::new();
         let mut bind_to_schema: HashMap<String, String> = HashMap::new();

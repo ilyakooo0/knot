@@ -1604,26 +1604,18 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
             ta == tb && values_equal(*pa, *pb)
         }
         (Value::Relation(ra), Value::Relation(rb)) => {
-            if ra.len() != rb.len() {
-                return false;
-            }
-            // Use a multiset (count occurrences) to correctly handle duplicates
-            let mut counts: HashMap<Vec<u8>, usize> = HashMap::new();
-            for r in ra.iter() {
+            // Set semantics: compare unique elements (consistent with SQL paths)
+            let set_a: HashSet<Vec<u8>> = ra.iter().map(|r| {
                 let mut buf = Vec::new();
                 value_to_hash_bytes(*r, &mut buf);
-                *counts.entry(buf).or_insert(0) += 1;
-            }
-            let mut buf = Vec::new();
-            for r in rb.iter() {
-                buf.clear();
+                buf
+            }).collect();
+            let set_b: HashSet<Vec<u8>> = rb.iter().map(|r| {
+                let mut buf = Vec::new();
                 value_to_hash_bytes(*r, &mut buf);
-                match counts.get_mut(buf.as_slice()) {
-                    Some(c) if *c > 0 => *c -= 1,
-                    _ => return false,
-                }
-            }
-            true
+                buf
+            }).collect();
+            set_a == set_b
         }
         _ => false,
     }
@@ -2297,13 +2289,15 @@ pub extern "C" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
 
             // Run the IO action
             knot_io_run(db, io);
-
-            // Note: we intentionally do NOT call deep_drop_value(io) here.
-            // The IO thunk execution may have stored pointers from the
-            // deep-cloned tree into arena-allocated values. Freeing the
-            // tree could cause use-after-free. The bounded leak (just the
-            // closure environment) is reclaimed when the thread exits.
             knot_db_close(db);
+
+            // Free the deep-cloned value tree. This is safe because:
+            // 1. knot_io_run has finished — no more access to these values
+            // 2. knot_db_close doesn't traverse values
+            // 3. Arena drop only frees its tracked pointers (via Box::from_raw)
+            //    without following child *mut Value pointers, so dangling
+            //    references from arena values into this tree are harmless
+            unsafe { deep_drop_value(io); }
         });
 
         THREAD_HANDLES.lock().unwrap().push(handle);
@@ -2715,12 +2709,13 @@ pub extern "C" fn knot_relation_diff(
         return alloc(Value::Relation(result));
     }
 
-    // Fallback: in-memory — hash-based O(n)
+    // Fallback: in-memory — hash-based O(n), with dedup for set semantics
     let set_b: HashSet<Vec<u8>> = rows_b.iter().map(|r| {
         let mut buf = Vec::new();
         value_to_hash_bytes(*r, &mut buf);
         buf
     }).collect();
+    let mut seen = HashSet::new();
     let mut buf = Vec::new();
     let result: Vec<*mut Value> = rows_a
         .iter()
@@ -2728,7 +2723,7 @@ pub extern "C" fn knot_relation_diff(
         .filter(|r| {
             buf.clear();
             value_to_hash_bytes(*r, &mut buf);
-            !set_b.contains(buf.as_slice())
+            !set_b.contains(buf.as_slice()) && seen.insert(buf.clone())
         })
         .collect();
     alloc(Value::Relation(result))
@@ -2765,12 +2760,13 @@ pub extern "C" fn knot_relation_inter(
         return alloc(Value::Relation(result));
     }
 
-    // Fallback: in-memory — hash-based O(n)
+    // Fallback: in-memory — hash-based O(n), with dedup for set semantics
     let set_b: HashSet<Vec<u8>> = rows_b.iter().map(|r| {
         let mut buf = Vec::new();
         value_to_hash_bytes(*r, &mut buf);
         buf
     }).collect();
+    let mut seen = HashSet::new();
     let mut buf = Vec::new();
     let result: Vec<*mut Value> = rows_a
         .iter()
@@ -2778,7 +2774,7 @@ pub extern "C" fn knot_relation_inter(
         .filter(|r| {
             buf.clear();
             value_to_hash_bytes(*r, &mut buf);
-            set_b.contains(buf.as_slice())
+            set_b.contains(buf.as_slice()) && seen.insert(buf.clone())
         })
         .collect();
     alloc(Value::Relation(result))
@@ -3288,9 +3284,12 @@ pub extern "C" fn knot_db_open(path_ptr: *const u8, path_len: usize) -> *mut c_v
     *DB_PATH.lock().unwrap() = path.to_string();
     let conn = Connection::open(path).expect("knot runtime: failed to open database");
     conn.create_collation("KNOT_INT", |a: &str, b: &str| {
-        let pa: BigInt = a.parse().unwrap_or_default();
-        let pb: BigInt = b.parse().unwrap_or_default();
-        pa.cmp(&pb)
+        match (a.parse::<BigInt>(), b.parse::<BigInt>()) {
+            (Ok(pa), Ok(pb)) => pa.cmp(&pb),
+            (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+            (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+            (Err(_), Err(_)) => a.cmp(b),
+        }
     })
     .expect("knot runtime: failed to create KNOT_INT collation");
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000; PRAGMA foreign_keys=ON;")
@@ -4795,6 +4794,13 @@ fn write_record_rows(
     // Build INSERT for scalar columns only
     let col_names: Vec<String> = schema.columns.iter().map(|c| quote_ident(&c.name)).collect();
     if col_names.is_empty() && !has_children {
+        // Unit-type relation: insert rows via the _dummy column
+        let sql = format!("INSERT INTO {} (\"_dummy\") VALUES (0);", table);
+        let mut stmt = conn.prepare_cached(&sql)
+            .expect("knot runtime: prepare unit insert failed");
+        for _ in rows.iter() {
+            stmt.execute([]).expect("knot runtime: failed to insert unit row");
+        }
         return;
     }
 

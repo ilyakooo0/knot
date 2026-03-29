@@ -621,6 +621,7 @@ impl Parser {
                         history = true;
                     } else {
                         this.error("expected 'history' after 'with'");
+                        return None;
                     }
                 }
                 let end = this.prev_span();

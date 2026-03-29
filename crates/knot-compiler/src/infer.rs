@@ -2146,6 +2146,11 @@ impl Infer {
                         return true;
                     }
                 }
+                ast::StmtKind::Where { cond } => {
+                    if self.expr_is_io_prescan(cond) {
+                        return true;
+                    }
+                }
                 _ => {}
             }
         }

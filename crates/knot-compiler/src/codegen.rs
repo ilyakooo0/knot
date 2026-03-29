@@ -4417,6 +4417,7 @@ impl Codegen {
         stmts.iter().any(|stmt| match &stmt.node {
             ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Let { expr, .. } => self.expr_is_io(expr),
             ast::StmtKind::Expr(expr) => self.expr_is_io(expr),
+            ast::StmtKind::Where { cond } => self.expr_is_io(cond),
             _ => false,
         })
     }
@@ -4480,6 +4481,7 @@ impl Codegen {
                     ast::StmtKind::Bind { expr, .. } => Self::expr_contains_io(expr, builtins, io_fns),
                     ast::StmtKind::Expr(expr) => Self::expr_contains_io(expr, builtins, io_fns),
                     ast::StmtKind::Let { expr, .. } => Self::expr_contains_io(expr, builtins, io_fns),
+                    ast::StmtKind::Where { cond } => Self::expr_contains_io(cond, builtins, io_fns),
                     _ => false,
                 })
             }

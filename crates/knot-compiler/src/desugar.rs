@@ -573,6 +573,7 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &HashSet<String>) -> bool {
     // or a user-defined IO function.
     if stmts.iter().any(|s| match &s.node {
         StmtKind::Bind { expr, .. } | StmtKind::Let { expr, .. } | StmtKind::Expr(expr) => expr_is_io(expr, io_fns),
+        StmtKind::Where { cond } => expr_is_io(cond, io_fns),
         _ => false,
     }) {
         return false;

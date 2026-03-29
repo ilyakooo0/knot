@@ -67,7 +67,12 @@ pub fn line_col(source: &str, byte_offset: usize) -> (usize, usize) {
         Some(nl) => nl + 1,
         None => 0,
     };
-    let col = source[line_start..offset].chars().count();
+    // Clamp to a valid char boundary in case offset lands mid-character.
+    let mut safe_offset = offset;
+    while safe_offset > line_start && !source.is_char_boundary(safe_offset) {
+        safe_offset -= 1;
+    }
+    let col = source[line_start..safe_offset].chars().count();
     (line, col)
 }
 

@@ -637,6 +637,15 @@ impl<'src> Lexer<'src> {
                                     Diagnostic::error("invalid hex escape in byte string")
                                         .label(span, "expected two hex digits after \\x"),
                                 );
+                                // Error recovery: advance past the bad character
+                                // and emit it as a literal byte so the byte string
+                                // isn't silently shortened (consistent with other
+                                // escape error recovery paths).
+                                if self.pos < self.source.len() {
+                                    let b = self.source.as_bytes()[self.pos];
+                                    self.advance();
+                                    value.push(b);
+                                }
                             }
                         }
                         Some(_) => {

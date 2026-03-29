@@ -2249,6 +2249,11 @@ impl Infer {
                 }
                 ast::StmtKind::Let { pat, expr } => {
                     let expr_ty = self.infer_expr(expr);
+                    let resolved = self.apply(&expr_ty);
+                    if let Ty::IO(ref effects, _) = resolved {
+                        is_io = true;
+                        io_effects.extend(effects.iter().cloned());
+                    }
                     self.check_pattern(pat, &expr_ty);
                 }
                 ast::StmtKind::Where { cond } => {

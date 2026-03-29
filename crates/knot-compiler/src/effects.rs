@@ -339,6 +339,7 @@ impl EffectChecker {
                     let view_effects =
                         self.decl_effects.get(name).cloned().unwrap_or_else(EffectSet::empty);
                     effects = effects.union(&view_effects);
+                    effects.writes.insert(name.clone());
                 }
                 effects
             }
@@ -354,7 +355,7 @@ impl EffectChecker {
                                 inner_effects
                             ))
                             .note(
-                                "console, network, and fs effects cannot be rolled back",
+                                "console, network, fs, clock, and random effects cannot be rolled back",
                             ),
                     );
                 }

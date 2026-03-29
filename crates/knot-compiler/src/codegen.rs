@@ -1004,6 +1004,10 @@ impl Codegen {
                                 );
                                 self.trait_methods
                                     .entry(method_name.clone())
+                                    .and_modify(|info| {
+                                        info.param_count = param_count;
+                                        info.dispatch_index = dispatch_index;
+                                    })
                                     .or_insert(TraitMethodInfo {
                                         param_count,
                                         dispatch_index,

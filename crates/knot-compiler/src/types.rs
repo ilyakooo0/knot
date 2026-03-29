@@ -444,15 +444,15 @@ fn apply_type_subst(ty: &Type, subst: &HashMap<String, Type>) -> Type {
                     value: apply_type_subst(&f.value, subst),
                 })
                 .collect(),
-            rest: rest.as_ref().map(|r| {
+            rest: rest.as_ref().and_then(|r| {
                 if let Some(replacement) = subst.get(r) {
                     if let TypeKind::Var(new_name) = &replacement.node {
-                        new_name.clone()
+                        Some(new_name.clone())
                     } else {
-                        r.clone()
+                        None // row resolved to concrete type — close the row
                     }
                 } else {
-                    r.clone()
+                    Some(r.clone())
                 }
             }),
         },
@@ -482,15 +482,15 @@ fn apply_type_subst(ty: &Type, subst: &HashMap<String, Type>) -> Type {
                         .collect(),
                 })
                 .collect(),
-            rest: rest.as_ref().map(|r| {
+            rest: rest.as_ref().and_then(|r| {
                 if let Some(replacement) = subst.get(r) {
                     if let TypeKind::Var(new_name) = &replacement.node {
-                        new_name.clone()
+                        Some(new_name.clone())
                     } else {
-                        r.clone()
+                        None // row resolved to concrete type — close the row
                     }
                 } else {
-                    r.clone()
+                    Some(r.clone())
                 }
             }),
         },

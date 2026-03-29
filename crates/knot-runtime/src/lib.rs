@@ -7597,6 +7597,14 @@ pub extern "C" fn knot_http_listen(
                             // atomic block to prevent permanent deadlock.
                             write_lock_force_release();
                             let db_ref = unsafe { &*(db as *mut KnotDb) };
+                            // Roll back any open savepoints before resetting depth.
+                            let depth = db_ref.atomic_depth.get();
+                            for d in (1..=depth).rev() {
+                                let sp = format!("knot_atomic_{}", d);
+                                let _ = db_ref.conn.execute_batch(
+                                    &format!("ROLLBACK TO SAVEPOINT {}; RELEASE SAVEPOINT {};", sp, sp),
+                                );
+                            }
                             db_ref.atomic_depth.set(0);
 
                             let msg = if let Some(s) = panic_err.downcast_ref::<&str>() {

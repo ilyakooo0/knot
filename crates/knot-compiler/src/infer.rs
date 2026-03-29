@@ -2172,6 +2172,8 @@ impl Infer {
                             ast::PatKind::Constructor { name, .. } => {
                                 Some(name.as_str())
                             }
+                            ast::PatKind::Lit(ast::Literal::Bool(true)) => Some("True"),
+                            ast::PatKind::Lit(ast::Literal::Bool(false)) => Some("False"),
                             _ => None,
                         })
                         .collect();

@@ -892,7 +892,10 @@ impl Parser {
                 self.advance();
                 Some("yield".to_string())
             }
-            _ => None,
+            _ => {
+                self.error("expected method name or 'type' in trait definition");
+                return None;
+            }
         };
         if let Some(name) = method_name {
 
@@ -1031,7 +1034,10 @@ impl Parser {
                 self.advance();
                 Some("yield".to_string())
             }
-            _ => None,
+            _ => {
+                self.error("expected method name or 'type' in impl definition");
+                return None;
+            }
         };
         if let Some(name) = method_name {
             let mut params = Vec::new();
@@ -1466,7 +1472,12 @@ impl Parser {
             TokenKind::Do => self.parse_do_expr(),
             TokenKind::Set => self.parse_set(false),
             TokenKind::Full => {
-                if self.peek_ahead(1) == &TokenKind::Set {
+                // Skip newlines when checking for `set` after `full`
+                let mut offset = 1;
+                while self.peek_ahead(offset) == &TokenKind::Newline {
+                    offset += 1;
+                }
+                if self.peek_ahead(offset) == &TokenKind::Set {
                     let full_start = self.span();
                     self.advance(); // consume `full`
                     self.parse_set_with_start(true, full_start)

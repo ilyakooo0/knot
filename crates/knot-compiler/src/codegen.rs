@@ -4761,7 +4761,17 @@ impl Codegen {
                 };
                 self.bind_io_pattern(builder, payload, inner, env);
             }
-            _ => {}
+            ast::PatKind::Lit(_) => {
+                // Literal patterns don't bind anything
+            }
+            ast::PatKind::List(pats) => {
+                for (idx, elem_pat) in pats.iter().enumerate() {
+                    let index = builder.ins().iconst(self.ptr_type, idx as i64);
+                    let elem =
+                        self.call_rt(builder, "knot_relation_get", &[val, index]);
+                    self.bind_io_pattern(builder, elem_pat, elem, env);
+                }
+            }
         }
     }
 
@@ -7582,7 +7592,16 @@ fn bind_do_pattern(
                 bind_do_pattern(builder, cg, payload, inner, env, skips);
             }
         }
-        _ => {}
+        ast::PatKind::Lit(_) => {
+            // Literal patterns don't bind anything
+        }
+        ast::PatKind::List(pats) => {
+            for (idx, elem_pat) in pats.iter().enumerate() {
+                let index = builder.ins().iconst(cg.ptr_type, idx as i64);
+                let elem = cg.call_rt(builder, "knot_relation_get", &[val, index]);
+                bind_do_pattern(builder, cg, elem_pat, elem, env, skips);
+            }
+        }
     }
 }
 

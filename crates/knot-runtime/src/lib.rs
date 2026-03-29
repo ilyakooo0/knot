@@ -704,7 +704,13 @@ pub extern "C" fn knot_record_field(
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_record_field_by_index(record: *mut Value, index: usize) -> *mut Value {
     match unsafe { as_ref(record) } {
-        Value::Record(fields) => fields[index].value,
+        Value::Record(fields) => {
+            if index < fields.len() {
+                fields[index].value
+            } else {
+                alloc(Value::Unit)
+            }
+        }
         _ => panic!("knot runtime: expected Record in field_by_index, got {}", type_name(record)),
     }
 }
@@ -1204,7 +1210,13 @@ pub extern "C" fn knot_relation_len(rel: *mut Value) -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_relation_get(rel: *mut Value, index: usize) -> *mut Value {
     match unsafe { as_ref(rel) } {
-        Value::Relation(rows) => rows[index],
+        Value::Relation(rows) => {
+            if index < rows.len() {
+                rows[index]
+            } else {
+                alloc(Value::Unit)
+            }
+        }
         _ => panic!("knot runtime: expected Relation in get, got {}", type_name(rel)),
     }
 }

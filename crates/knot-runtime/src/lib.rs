@@ -3208,7 +3208,7 @@ fn json_to_value(json: &serde_json::Value) -> *mut Value {
         }
         serde_json::Value::Object(obj) => {
             if obj.is_empty() {
-                return alloc(Value::Record(Vec::new()));
+                return alloc(Value::Unit);
             }
             // Reconstruct Bytes from {"__knot_bytes": "base64..."} format
             if obj.len() == 1 {
@@ -3548,7 +3548,9 @@ pub extern "C" fn knot_source_migrate(
             coalesced.join(", ")
         );
         debug_sql(&idx_sql);
-        let _ = db_ref.conn.execute_batch(&idx_sql);
+        if let Err(e) = db_ref.conn.execute_batch(&idx_sql) {
+            eprintln!("knot runtime: warning: failed to create unique index during migration for {}: {}", name, e);
+        }
 
         // Insert transformed rows (ADT: constructor values)
         if !new_rows.is_empty() {
@@ -3619,7 +3621,9 @@ pub extern "C" fn knot_source_migrate(
                 col_names.join(", ")
             );
             debug_sql(&idx_sql);
-            let _ = db_ref.conn.execute_batch(&idx_sql);
+            if let Err(e) = db_ref.conn.execute_batch(&idx_sql) {
+                eprintln!("knot runtime: warning: failed to create unique index during migration for {}: {}", name, e);
+            }
         }
 
         // Initialize child tables for nested relations in new schema
@@ -7216,7 +7220,7 @@ fn value_to_serde_json(v: *mut Value) -> serde_json::Value {
             map.insert("__knot_bytes".into(), serde_json::Value::String(base64_encode(b)));
             serde_json::Value::Object(map)
         }
-        Value::Unit => serde_json::Value::Object(serde_json::Map::new()),
+        Value::Unit => serde_json::Value::Null,
         Value::Record(fields) => {
             let mut map = serde_json::Map::with_capacity(fields.len());
             for f in fields {

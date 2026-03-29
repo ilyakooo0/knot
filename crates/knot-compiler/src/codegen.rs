@@ -126,6 +126,10 @@ pub struct Codegen {
     // Scalar sources: source names whose type is a bare primitive (e.g. `*counter : Int`)
     // rather than a relation of records. These get automatic wrap/unwrap of `_value` field.
     scalar_sources: HashSet<String>,
+
+    // Whether we are inside compile_io_do_eager — when true, Yield compiles to
+    // the raw inner value rather than wrapping in knot_relation_singleton.
+    in_io_eager: bool,
 }
 
 /// Role of a constructor in a nullable-encoded ADT.
@@ -360,6 +364,7 @@ impl Codegen {
             nullable_ctors: HashMap::new(),
             io_functions: HashSet::new(),
             scalar_sources: HashSet::new(),
+            in_io_eager: false,
         }
     }
 
@@ -3107,7 +3112,12 @@ impl Codegen {
 
             ast::ExprKind::Yield(inner) => {
                 let val = self.compile_expr(builder, inner, env, db);
-                self.call_rt(builder, "knot_relation_singleton", &[val])
+                if self.in_io_eager {
+                    // In IO do-block eager context, yield returns the raw value
+                    val
+                } else {
+                    self.call_rt(builder, "knot_relation_singleton", &[val])
+                }
             }
 
             ast::ExprKind::Set { target, value } => {
@@ -4545,6 +4555,13 @@ impl Codegen {
             ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
             ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
             ast::ExprKind::At { .. } | ast::ExprKind::Atomic(_) => true,
+            ast::ExprKind::Yield(inner) => self.expr_is_io(inner),
+            ast::ExprKind::If { then_branch, else_branch, .. } => {
+                self.expr_is_io(then_branch) || self.expr_is_io(else_branch)
+            }
+            ast::ExprKind::Case { arms, .. } => {
+                arms.iter().any(|arm| self.expr_is_io(&arm.body))
+            }
             _ => false,
         }
     }
@@ -4649,6 +4666,8 @@ impl Codegen {
         env: &mut Env,
         db: Value,
     ) -> Value {
+        let prev_io_eager = self.in_io_eager;
+        self.in_io_eager = true;
         let mut last_val = self.call_rt(builder, "knot_value_unit", &[]);
 
         for stmt in stmts {
@@ -4702,6 +4721,7 @@ impl Codegen {
             }
         }
 
+        self.in_io_eager = prev_io_eager;
         last_val
     }
 
@@ -7698,6 +7718,7 @@ fn pat_bound_names(pat: &ast::Pat) -> Vec<String> {
             })
             .collect(),
         ast::PatKind::Constructor { payload, .. } => pat_bound_names(payload),
+        ast::PatKind::List(pats) => pats.iter().flat_map(pat_bound_names).collect(),
         _ => vec![],
     }
 }

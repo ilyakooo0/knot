@@ -1065,11 +1065,12 @@ fn sql_set_op(
     b: &[*mut Value],
     op: &str,
 ) -> Option<Vec<*mut Value>> {
-    let sample = if !a.is_empty() { a } else { b };
-    if sample.is_empty() {
+    if a.is_empty() && b.is_empty() {
         return Some(Vec::new());
     }
-    let schema = infer_temp_schema(sample)?;
+    // Infer schema from both sides combined so ADT unions see all constructors
+    let combined: Vec<*mut Value> = a.iter().chain(b.iter()).copied().collect();
+    let schema = infer_temp_schema(&combined)?;
 
     let t1 = materialize_relation(conn, a, &schema);
     let t2 = materialize_relation(conn, b, &schema);
@@ -6129,6 +6130,28 @@ pub extern "C" fn knot_constraint_register(
             debug_sql(&update_trigger);
             db_ref.conn.execute_batch(&update_trigger)
                 .expect("knot runtime: failed to create update trigger");
+
+            // Trigger: reject DELETE from sup if sub still references the value
+            let delete_msg = format!(
+                "subset constraint violated: cannot delete from *{}.{} while referenced by *{}.{}",
+                sup_rel, spf, sub_rel, sf
+            ).replace('\'', "''");
+            let delete_trigger = format!(
+                "CREATE TRIGGER IF NOT EXISTS {trg} \
+                 BEFORE DELETE ON {sup_table} \
+                 FOR EACH ROW \
+                 WHEN EXISTS (SELECT 1 FROM {sub_table} WHERE {sub_col} = OLD.{sup_col}) \
+                 BEGIN SELECT RAISE(ABORT, '{msg}'); END;",
+                trg = quote_ident(&format!("_knot_fk_{}_{}_del", sup_rel, spf)),
+                sup_table = sup_table,
+                sub_table = sub_table,
+                sub_col = sub_col,
+                sup_col = sup_col,
+                msg = delete_msg,
+            );
+            debug_sql(&delete_trigger);
+            db_ref.conn.execute_batch(&delete_trigger)
+                .expect("knot runtime: failed to create delete trigger");
         }
         _ => {}
     }

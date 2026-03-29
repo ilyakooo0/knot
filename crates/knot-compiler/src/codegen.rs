@@ -3374,7 +3374,22 @@ impl Codegen {
                 // Snapshot change counter before executing the body
                 let snapshot = self.call_rt(builder, "knot_stm_snapshot", &[]);
                 self.call_rt_void(builder, "knot_atomic_begin", &[db]);
-                let val = self.compile_expr(builder, inner, env, db);
+
+                // Compile inner IO eagerly so side effects run inside the transaction.
+                // If the inner is an IO do-block, we must run it inline rather than
+                // creating a deferred thunk (which would execute after commit).
+                let val = if let ast::ExprKind::Do(stmts) = &inner.node {
+                    if self.is_io_do_block(stmts) {
+                        self.compile_io_do_eager(builder, stmts, env, db)
+                    } else {
+                        self.compile_expr(builder, inner, env, db)
+                    }
+                } else {
+                    // Non-do inner (e.g. function call returning IO): compile it,
+                    // then run the resulting IO thunk eagerly inside the transaction
+                    let io_val = self.compile_expr(builder, inner, env, db);
+                    self.call_rt(builder, "knot_io_run", &[db, io_val])
+                };
 
                 // Check if retry was requested
                 let retry_flag = self.call_rt(builder, "knot_stm_check_and_clear", &[]);

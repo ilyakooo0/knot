@@ -7181,7 +7181,7 @@ fn base64_decode(s: &str) -> Vec<u8> {
         let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
         let b3 = if chunk.len() > 3 { chunk[3] as u32 } else { 0 };
         let triple = (b0 << 18) | (b1 << 12) | (b2 << 6) | b3;
-        out.push(((triple >> 16) & 0xFF) as u8);
+        if chunk.len() > 1 { out.push(((triple >> 16) & 0xFF) as u8); }
         if chunk.len() > 2 { out.push(((triple >> 8) & 0xFF) as u8); }
         if chunk.len() > 3 { out.push((triple & 0xFF) as u8); }
     }

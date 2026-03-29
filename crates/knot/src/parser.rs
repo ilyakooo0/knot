@@ -1480,6 +1480,7 @@ impl Parser {
                 if self.peek_ahead(offset) == &TokenKind::Set {
                     let full_start = self.span();
                     self.advance(); // consume `full`
+                    self.skip_newlines();
                     self.parse_set_with_start(true, full_start)
                 } else {
                     // `full` used as a regular identifier — fall through to

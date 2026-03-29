@@ -658,6 +658,11 @@ impl<'src> Lexer<'src> {
                                 Diagnostic::error("unknown escape sequence in byte string")
                                     .label(span, "unknown escape"),
                             );
+                            // Error recovery: emit the escaped character's bytes
+                            // so the byte string isn't silently shortened.
+                            let mut buf = [0u8; 4];
+                            let encoded = ch.encode_utf8(&mut buf);
+                            value.extend_from_slice(encoded.as_bytes());
                         }
                         None => {}
                     }

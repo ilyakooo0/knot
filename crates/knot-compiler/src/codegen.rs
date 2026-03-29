@@ -4719,6 +4719,39 @@ impl Codegen {
                 }
             }
             ast::PatKind::Constructor { name, payload } => {
+                // Check if the constructor tag matches; panic on mismatch
+                // (IO do-blocks have no loop to skip to).
+                let is_match = match self.nullable_ctors.get(name).cloned() {
+                    Some(NullableRole::None) => {
+                        builder.ins().icmp_imm(IntCC::Equal, val, 0)
+                    }
+                    Some(NullableRole::Some) => {
+                        builder.ins().icmp_imm(IntCC::NotEqual, val, 0)
+                    }
+                    None => {
+                        let (tag_ptr, tag_len) = self.string_ptr(builder, name);
+                        let matches = self.call_rt_typed(
+                            builder,
+                            "knot_constructor_matches",
+                            &[val, tag_ptr, tag_len],
+                            types::I32,
+                        );
+                        builder.ins().icmp_imm(IntCC::NotEqual, matches, 0)
+                    }
+                };
+
+                let then_block = builder.create_block();
+                let fail_block = builder.create_block();
+                builder.ins().brif(is_match, then_block, &[], fail_block, &[]);
+
+                builder.switch_to_block(fail_block);
+                builder.seal_block(fail_block);
+                self.call_rt_void(builder, "knot_guard_failed", &[]);
+                builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+
+                builder.switch_to_block(then_block);
+                builder.seal_block(then_block);
+
                 // Extract the constructor payload and bind the inner pattern
                 let inner = if self.nullable_ctors.contains_key(name) {
                     // Nullable encoding: val is the bare payload
@@ -5112,7 +5145,26 @@ impl Codegen {
 
                 ast::StmtKind::Let { pat, expr } => {
                     let val = self.compile_expr(builder, expr, env, db);
-                    self.bind_io_pattern(builder, pat, val, env);
+                    if matches!(&pat.node, ast::PatKind::Constructor { .. }) {
+                        // Constructor patterns need filter branches
+                        let mut pattern_skips = Vec::new();
+                        bind_do_pattern(builder, self, pat, val, env, &mut pattern_skips);
+                        if let Some(loop_info) = loop_stack.last_mut() {
+                            loop_info.where_skips.extend(pattern_skips);
+                        } else {
+                            // No loop context — seal skip blocks with guard failure
+                            let current_block = builder.current_block().unwrap();
+                            for skip in pattern_skips {
+                                builder.switch_to_block(skip);
+                                builder.seal_block(skip);
+                                self.call_rt_void(builder, "knot_guard_failed", &[]);
+                                builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+                            }
+                            builder.switch_to_block(current_block);
+                        }
+                    } else {
+                        self.bind_io_pattern(builder, pat, val, env);
+                    }
                 }
 
                 ast::StmtKind::GroupBy { key } => {

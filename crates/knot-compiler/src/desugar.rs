@@ -648,16 +648,10 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
                 _ => false,
             })
         }
-        ExprKind::Record(fields) => {
-            fields.iter().any(|f| expr_is_io(&f.value, io_fns))
-        }
-        ExprKind::RecordUpdate { base, fields, .. } => {
-            expr_is_io(base, io_fns)
-                || fields.iter().any(|f| expr_is_io(&f.value, io_fns))
-        }
-        ExprKind::FieldAccess { expr, .. } => expr_is_io(expr, io_fns),
-        ExprKind::List(elems) => elems.iter().any(|e| expr_is_io(e, io_fns)),
-        ExprKind::Yield(inner) => expr_is_io(inner, io_fns),
+        // Records, lists, field access, and yield are data constructors/
+        // accessors — they don't produce IO even if they contain IO values
+        // as subexpressions. Only direct IO-producing expressions (calls to
+        // IO functions, relation ops, etc.) should flag a do-block as IO.
         _ => false,
     }
 }

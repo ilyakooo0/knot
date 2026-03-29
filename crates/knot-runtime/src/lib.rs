@@ -125,6 +125,25 @@ fn write_lock_release() {
     }
 }
 
+/// Release any write locks held by the current thread.
+/// Used for panic recovery (e.g. in the HTTP handler's catch_unwind)
+/// to prevent permanent deadlocks when a panic occurs inside an
+/// atomic block.
+fn write_lock_force_release() {
+    let had_lock = WRITE_LOCK_DEPTH.with(|d| {
+        let depth = d.get();
+        if depth > 0 {
+            d.set(0);
+            true
+        } else {
+            false
+        }
+    });
+    if had_lock {
+        WRITE_LOCKED.store(false, Ordering::Release);
+    }
+}
+
 /// Acquire the write lock, returning an RAII guard that releases on drop.
 fn write_lock_guard() -> WriteLockGuard {
     write_lock_acquire();
@@ -6007,11 +6026,14 @@ pub extern "C" fn knot_atomic_commit(db: *mut c_void) {
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let depth = db_ref.atomic_depth.get();
     assert!(depth > 0, "knot runtime: atomic commit without matching begin");
+    // Decrement depth before SQL so the two counters stay in sync even
+    // if the SQL operation panics (the WriteLockGuard will release the
+    // lock on unwind, and depth must already reflect the release).
+    db_ref.atomic_depth.set(depth - 1);
     db_ref
         .conn
         .execute_batch(&format!("RELEASE SAVEPOINT knot_atomic_{depth};"))
         .expect("knot runtime: failed to commit atomic");
-    db_ref.atomic_depth.set(depth - 1);
     if depth == 1 {
         notify_relation_changed();
     }
@@ -6025,6 +6047,8 @@ pub extern "C" fn knot_atomic_rollback(db: *mut c_void) {
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let depth = db_ref.atomic_depth.get();
     assert!(depth > 0, "knot runtime: atomic rollback without matching begin");
+    // Decrement depth before SQL (same rationale as knot_atomic_commit).
+    db_ref.atomic_depth.set(depth - 1);
     // ROLLBACK TO undoes changes but keeps the savepoint alive.
     // RELEASE then removes it so the next begin creates a clean one.
     db_ref
@@ -6033,7 +6057,6 @@ pub extern "C" fn knot_atomic_rollback(db: *mut c_void) {
             "ROLLBACK TO SAVEPOINT knot_atomic_{depth}; RELEASE SAVEPOINT knot_atomic_{depth};"
         ))
         .expect("knot runtime: failed to rollback atomic");
-    db_ref.atomic_depth.set(depth - 1);
 }
 
 // ── Record update ─────────────────────────────────────────────────
@@ -7276,6 +7299,12 @@ pub extern "C" fn knot_http_listen(
                     }
                         }
                         Err(panic_err) => {
+                            // Release any write locks held by the panicked
+                            // atomic block to prevent permanent deadlock.
+                            write_lock_force_release();
+                            let db_ref = unsafe { &*(db as *mut KnotDb) };
+                            db_ref.atomic_depth.set(0);
+
                             let msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
                                 s.to_string()
                             } else if let Some(s) = panic_err.downcast_ref::<String>() {

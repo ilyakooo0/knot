@@ -3753,7 +3753,7 @@ fn parse_adt_schema(spec: &str) -> AdtSpec {
     let mut all_field_names: HashSet<String> = HashSet::new();
     let mut all_fields: Vec<ColumnSpec> = Vec::new();
 
-    for ctor_part in body.split('|') {
+    for ctor_part in split_respecting_brackets(body, '|') {
         let mut parts = ctor_part.splitn(2, ':');
         let name = parts.next().unwrap().to_string();
         let fields: Vec<ColumnSpec> = if let Some(field_spec) = parts.next() {

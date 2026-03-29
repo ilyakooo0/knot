@@ -4584,11 +4584,24 @@ impl Codegen {
                 self.expr_is_io(lhs) || self.expr_is_io(rhs)
             }
             ast::ExprKind::Yield(inner) => self.expr_is_io(inner),
-            ast::ExprKind::If { then_branch, else_branch, .. } => {
-                self.expr_is_io(then_branch) || self.expr_is_io(else_branch)
+            ast::ExprKind::UnaryOp { operand, .. } => self.expr_is_io(operand),
+            ast::ExprKind::If { cond, then_branch, else_branch, .. } => {
+                self.expr_is_io(cond)
+                    || self.expr_is_io(then_branch)
+                    || self.expr_is_io(else_branch)
             }
-            ast::ExprKind::Case { arms, .. } => {
-                arms.iter().any(|arm| self.expr_is_io(&arm.body))
+            ast::ExprKind::Case { scrutinee, arms, .. } => {
+                self.expr_is_io(scrutinee)
+                    || arms.iter().any(|arm| self.expr_is_io(&arm.body))
+            }
+            ast::ExprKind::Do(stmts) => {
+                stmts.iter().any(|s| match &s.node {
+                    ast::StmtKind::Bind { expr, .. } => self.expr_is_io(expr),
+                    ast::StmtKind::Expr(expr) => self.expr_is_io(expr),
+                    ast::StmtKind::Let { expr, .. } => self.expr_is_io(expr),
+                    ast::StmtKind::Where { cond } => self.expr_is_io(cond),
+                    _ => false,
+                })
             }
             _ => false,
         }

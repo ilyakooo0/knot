@@ -47,12 +47,12 @@ fn parse_schema_kind(schema: &str) -> SchemaKind {
     if schema.starts_with('#') {
         let body = &schema[1..];
         let mut ctors = Vec::new();
-        for ctor_part in body.split('|') {
+        for ctor_part in split_respecting_brackets(body, '|') {
             let mut parts = ctor_part.splitn(2, ':');
             let name = parts.next().unwrap().to_string();
             let fields = if let Some(field_spec) = parts.next() {
-                field_spec
-                    .split(';')
+                split_respecting_brackets(field_spec, ';')
+                    .into_iter()
                     .map(|f| {
                         let mut fp = f.splitn(2, '=');
                         let fname = fp.next().unwrap().to_string();

@@ -1283,7 +1283,10 @@ impl Parser {
                     }
                 }
                 let _ = self.expect(&TokenKind::RBrace, "expected '}' to close path parameter");
-            } else if matches!(self.peek(), TokenKind::Lower(s) if s != "headers") {
+            } else if matches!(self.peek(), TokenKind::Lower(s) if s != "headers")
+                || (matches!(self.peek(), TokenKind::Lower(s) if s == "headers")
+                    && !matches!(self.peek_ahead(1), TokenKind::LBrace))
+            {
                 let tok = self.advance();
                 let TokenKind::Lower(s) = tok.kind else { unreachable!() };
                 segments.push(PathSegment::Literal(s));

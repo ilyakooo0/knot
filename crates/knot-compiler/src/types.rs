@@ -394,9 +394,11 @@ fn col_type_str(ty: &ResolvedType) -> &'static str {
             if ctors.iter().all(|(_, fields)| fields.is_empty()) {
                 "tag"
             } else {
-                "text" // payload-bearing ADTs fall back to text for now
+                "json" // payload-bearing ADTs round-trip through JSON
             }
         }
+        // Nested records round-trip through JSON to preserve structure
+        ResolvedType::Record(_) => "json",
         _ => "text",
     }
 }

@@ -3772,6 +3772,7 @@ fn parse_col_type(s: &str) -> ColType {
         "bool" => ColType::Bool,
         "bytes" => ColType::Bytes,
         "tag" => ColType::Tag,
+        "json" => ColType::Json,
         other => panic!("knot runtime: unknown column type '{}'", other),
     }
 }
@@ -7865,6 +7866,12 @@ pub extern "C" fn knot_http_fetch_io(
             }
         }
 
+        // Set default Content-Type for JSON bodies before ad-hoc headers,
+        // so fetchWith options can override it.
+        if body_json.is_some() {
+            request = request.set("Content-Type", "application/json");
+        }
+
         // Set ad-hoc headers from fetchWith options (override route-declared headers)
         if !headers.is_null() {
             if let Value::Relation(rows) = unsafe { as_ref(headers) } {
@@ -7886,9 +7893,7 @@ pub extern "C" fn knot_http_fetch_io(
 
         // Send request
         let result = match body_json {
-            Some(ref json) => request
-                .set("Content-Type", "application/json")
-                .send_string(json),
+            Some(ref json) => request.send_string(json),
             None => request.call(),
         };
 

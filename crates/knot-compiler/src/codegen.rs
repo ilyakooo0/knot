@@ -2150,8 +2150,10 @@ impl Codegen {
                 }
 
                 // Nullable ADT "Some" dispatch: non-null bare payload
-                // (value didn't match any Constructor-based ADT)
-                for impl_func_id in &nullable_adt_impls {
+                // (value didn't match any Constructor-based ADT).
+                // Use the first nullable impl — at runtime, null vs non-null
+                // is the only distinction we can make for nullable ADTs.
+                if let Some(impl_func_id) = nullable_adt_impls.first() {
                     let impl_block = builder.create_block();
                     let next_block = builder.create_block();
 

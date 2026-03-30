@@ -1231,16 +1231,24 @@ impl Infer {
                 Ty::Variant(ctor_tys, row_var)
             }
             ast::TypeKind::Effectful { ty, .. } => self.ast_type_to_ty(ty),
-            ast::TypeKind::IO { effects, ty } => {
-                let io_effects: BTreeSet<IoEffect> = effects.iter().filter_map(|e| match e.as_str() {
-                    "console" => Some(IoEffect::Console),
-                    "fs" => Some(IoEffect::Fs),
-                    "network" => Some(IoEffect::Network),
-                    "clock" => Some(IoEffect::Clock),
-                    "random" => Some(IoEffect::Random),
-                    _ => None,
-                }).collect();
-                Ty::IO(io_effects, Box::new(self.ast_type_to_ty(ty)))
+            ast::TypeKind::IO { effects, ty: inner_ty } => {
+                let mut io_effects = BTreeSet::new();
+                for e in effects {
+                    match e.as_str() {
+                        "console" => { io_effects.insert(IoEffect::Console); }
+                        "fs" => { io_effects.insert(IoEffect::Fs); }
+                        "network" => { io_effects.insert(IoEffect::Network); }
+                        "clock" => { io_effects.insert(IoEffect::Clock); }
+                        "random" => { io_effects.insert(IoEffect::Random); }
+                        unknown => {
+                            self.error(
+                                format!("unknown IO effect '{}' (expected one of: console, fs, network, clock, random)", unknown),
+                                ty.span,
+                            );
+                        }
+                    }
+                }
+                Ty::IO(io_effects, Box::new(self.ast_type_to_ty(inner_ty)))
             }
         }
     }
@@ -2620,6 +2628,11 @@ impl Infer {
             Ty::Relation(_) => Some("[]".into()),
             Ty::TyCon(name) => Some(name.clone()),
             Ty::Con(name, _) => Some(name.clone()),
+            Ty::IO(_, _) => Some("IO".into()),
+            Ty::Fun(_, _) => Some("Fun".into()),
+            Ty::Record(_, _) => Some("Record".into()),
+            Ty::Variant(_, _) => Some("Variant".into()),
+            Ty::App(_, _) => Some("App".into()),
             _ => None,
         }
     }

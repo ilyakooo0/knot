@@ -1410,7 +1410,11 @@ pub extern "C" fn knot_relation_group_by(
     let schema_str = unsafe { str_from_raw(schema_ptr, schema_len) };
     let key_cols_str = unsafe { str_from_raw(key_cols_ptr, key_cols_len) };
     let schema = parse_record_schema(schema_str);
-    let key_col_names: Vec<&str> = key_cols_str.split(',').collect();
+    let key_col_names: Vec<&str> = if key_cols_str.is_empty() {
+        Vec::new()
+    } else {
+        key_cols_str.split(',').collect()
+    };
 
     // Find key column specs in the schema via HashMap lookup
     let col_map: HashMap<&str, &ColumnSpec> = schema.columns.iter().map(|c| (c.name.as_str(), c)).collect();
@@ -3217,9 +3221,15 @@ fn json_to_value(json: &serde_json::Value) -> *mut Value {
                 return alloc(Value::Record(Vec::new()));
             }
             // Reconstruct Bytes from {"__knot_bytes": "base64..."} format
+            // Reconstruct BigInt from {"__knot_bigint": "12345..."} format
             if obj.len() == 1 {
                 if let Some(serde_json::Value::String(b64)) = obj.get("__knot_bytes") {
                     return alloc(Value::Bytes(base64_decode(b64)));
+                }
+                if let Some(serde_json::Value::String(s)) = obj.get("__knot_bigint") {
+                    if let Ok(n) = s.parse::<BigInt>() {
+                        return alloc_int(n);
+                    }
                 }
             }
             // Reconstruct Constructor from {"__knot_tag": "...", "__knot_value": ...} format
@@ -7241,8 +7251,10 @@ fn value_to_serde_json(v: *mut Value) -> serde_json::Value {
             if let Some(i) = n.to_i64() {
                 serde_json::Value::Number(i.into())
             } else {
-                // BigInt too large for i64 — encode as string
-                serde_json::Value::String(n.to_string())
+                // BigInt too large for i64 — encode as tagged object for lossless round-trip
+                let mut map = serde_json::Map::with_capacity(1);
+                map.insert("__knot_bigint".into(), serde_json::Value::String(n.to_string()));
+                serde_json::Value::Object(map)
             }
         }
         Value::Float(n) => {

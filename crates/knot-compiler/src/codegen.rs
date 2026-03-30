@@ -3551,8 +3551,8 @@ impl Codegen {
             .iter()
             .map(|(_, src_col)| src_col.as_str())
             .collect();
-        source_schema
-            .split(',')
+        split_schema_fields(&source_schema)
+            .into_iter()
             .filter(|part| {
                 let name = part.split(':').next().unwrap_or("");
                 view_col_names.contains(&name)
@@ -7352,7 +7352,7 @@ impl SqlQueryPlan {
 }
 
 fn lookup_col_type_from_schema(schema: &str, col_name: &str) -> Option<String> {
-    for part in schema.split(',') {
+    for part in split_schema_fields(schema) {
         let colon = part.find(':')?;
         let name = &part[..colon];
         let ty = &part[colon + 1..];
@@ -7364,8 +7364,8 @@ fn lookup_col_type_from_schema(schema: &str, col_name: &str) -> Option<String> {
 }
 
 fn parse_schema_columns(schema: &str) -> Vec<(String, String)> {
-    schema
-        .split(',')
+    split_schema_fields(schema)
+        .into_iter()
         .filter_map(|part| {
             let colon = part.find(':')?;
             let name = part[..colon].to_string();
@@ -7373,6 +7373,27 @@ fn parse_schema_columns(schema: &str) -> Vec<(String, String)> {
             Some((name, ty))
         })
         .collect()
+}
+
+/// Split a schema descriptor by commas while respecting `[...]` bracket nesting
+/// for nested relation fields (e.g. `name:text,items:[price:int,qty:int]`).
+fn split_schema_fields(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
 }
 
 // ── Pipe chain analysis ───────────────────────────────────────────

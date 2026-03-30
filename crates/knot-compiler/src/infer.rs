@@ -968,12 +968,12 @@ impl Infer {
         }
     }
 
-    fn generalize(&self, ty: &Ty) -> Scheme {
+    fn generalize(&mut self, ty: &Ty) -> Scheme {
         self.generalize_with_constraints(ty, vec![])
     }
 
     fn generalize_with_constraints(
-        &self,
+        &mut self,
         ty: &Ty,
         all_constraints: Vec<TyConstraint>,
     ) -> Scheme {
@@ -983,20 +983,34 @@ impl Infer {
         let gen_vars: Vec<TyVar> =
             ty_fv.difference(&env_fv).copied().collect();
         let gen_set: HashSet<TyVar> = gen_vars.iter().copied().collect();
-        // Only keep constraints on generalized variables
-        let constraints: Vec<TyConstraint> = all_constraints
-            .into_iter()
-            .filter(|c| {
-                let resolved = self.apply(&Ty::Var(c.type_var));
-                match resolved {
-                    Ty::Var(v) => gen_set.contains(&v),
-                    _ => false, // concrete type — will be checked immediately
+        // Only keep constraints on generalized variables; immediately
+        // validate constraints that resolved to concrete types.
+        let mut kept = Vec::new();
+        for c in all_constraints {
+            let resolved = self.apply(&Ty::Var(c.type_var));
+            match resolved {
+                Ty::Var(v) if gen_set.contains(&v) => kept.push(c),
+                Ty::Var(_) => {} // env-bound var, not generalized
+                concrete => {
+                    // Constraint resolved to a concrete type — check now
+                    if let Some(type_name) = self.type_name_of(&concrete) {
+                        let key = (c.trait_name.clone(), type_name.clone());
+                        if !self.known_impls.contains(&key) {
+                            self.error(
+                                format!(
+                                    "no implementation of trait '{}' for type '{}'",
+                                    c.trait_name, type_name
+                                ),
+                                Span::new(0, 0),
+                            );
+                        }
+                    }
                 }
-            })
-            .collect();
+            }
+        }
         Scheme {
             vars: gen_vars,
-            constraints,
+            constraints: kept,
             ty: applied,
         }
     }
@@ -3523,7 +3537,7 @@ impl Infer {
 
     fn check_impl_items(
         &mut self,
-        _trait_name: &str,
+        trait_name: &str,
         impl_args: &[ast::Type],
         items: &[ast::ImplItem],
     ) {
@@ -3575,6 +3589,22 @@ impl Infer {
                     }
                     let expected = self.subst_ty(&scheme.ty, &mapping);
                     self.unify(&expected, &inferred_method_ty, body.span);
+                } else {
+                    // Method not found in scope — check if it belongs to a
+                    // different trait or is simply unknown.  Default-body
+                    // methods registered with placeholder types won't have
+                    // a lookup entry, so only error when the method isn't
+                    // associated with this trait at all.
+                    let belongs_to = self.trait_method_traits.get(name);
+                    if belongs_to != Some(&trait_name.to_string()) {
+                        self.error(
+                            format!(
+                                "method '{}' is not declared in trait '{}'",
+                                name, trait_name
+                            ),
+                            body.span,
+                        );
+                    }
                 }
             }
         }

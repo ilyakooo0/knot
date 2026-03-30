@@ -633,7 +633,7 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
             expr_is_io(scrutinee, io_fns)
                 || arms.iter().any(|arm| expr_is_io(&arm.body, io_fns))
         }
-        ExprKind::Lambda { .. } => false,
+        ExprKind::Lambda { body, .. } => expr_is_io(body, io_fns),
         ExprKind::Yield(inner) => expr_is_io(inner, io_fns),
         ExprKind::Do(stmts) => {
             stmts.iter().any(|s| match &s.node {
@@ -641,7 +641,7 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
                 StmtKind::Expr(expr) => expr_is_io(expr, io_fns),
                 StmtKind::Let { expr, .. } => expr_is_io(expr, io_fns),
                 StmtKind::Where { cond } => expr_is_io(cond, io_fns),
-                _ => false,
+                StmtKind::GroupBy { key } => expr_is_io(key, io_fns),
             })
         }
         // Records, lists, field access are data constructors/accessors —

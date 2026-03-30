@@ -196,6 +196,13 @@ impl TypeEnv {
                         .or_default()
                         .push((old_schema, new_schema));
                 }
+                DeclKind::Derived { name, ty: Some(scheme), .. } => {
+                    // Compute schema for derived relations with type annotations
+                    // so groupBy can use them
+                    let schema =
+                        schema_for_source(&scheme.ty, &aliases, &associated_types);
+                    source_schemas.insert(name.clone(), schema);
+                }
                 DeclKind::SubsetConstraint { sub, sup } => {
                     subset_constraints.push((sub.clone(), sup.clone()));
                 }

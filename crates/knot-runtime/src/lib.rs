@@ -5732,21 +5732,67 @@ pub extern "C" fn knot_source_delete_where(
         ),
     };
 
-    let sql = format!(
-        "DELETE FROM {} WHERE NOT ({});",
-        quote_ident(&table),
-        where_clause
-    );
-
     let sql_params: Vec<rusqlite::types::Value> =
         param_values.iter().map(|v| value_to_sql_param(*v)).collect();
-    debug_sql_params(&sql, &sql_params);
     let param_refs: Vec<&dyn rusqlite::types::ToSql> =
         sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
 
+    // Cascade delete to child tables (nested relation fields) before
+    // deleting parent rows.  Discover child tables by querying SQLite
+    // metadata for tables matching the `{parent}__{field}` pattern.
+    let qt = quote_ident(&table);
+    let child_tables: Vec<String> = {
+        let prefix = format!("{}__", table);
+        let mut stmt = db_ref.conn.prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?1"
+        ).unwrap();
+        stmt.query_map([format!("{}%", prefix)], |row| row.get::<_, String>(0))
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r.ok())
+            .filter(|n| n.starts_with(&prefix) && n[prefix.len()..].find("__").is_none())
+            .collect()
+    };
+    if !child_tables.is_empty() {
+        // Collect _ids of parent rows that will be deleted
+        let id_sql = format!(
+            "SELECT _id FROM {} WHERE NOT ({});",
+            qt, where_clause
+        );
+        debug_sql(&id_sql);
+        if let Ok(mut stmt) = db_ref.conn.prepare(&id_sql) {
+            let ids: Vec<i64> = stmt
+                .query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r.ok())
+                .collect();
+            if !ids.is_empty() {
+                for ct in &child_tables {
+                    let del = format!(
+                        "DELETE FROM {} WHERE _parent_id IN ({})",
+                        quote_ident(ct),
+                        ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",")
+                    );
+                    debug_sql(&del);
+                    let _ = db_ref.conn.execute_batch(&del);
+                }
+            }
+        }
+    }
+
+    let sql = format!(
+        "DELETE FROM {} WHERE NOT ({});",
+        qt,
+        where_clause
+    );
+    debug_sql_params(&sql, &sql_params);
+    // Rebuild param_refs (moved above)
+    let param_refs2: Vec<&dyn rusqlite::types::ToSql> =
+        sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
     db_ref
         .conn
-        .execute(&sql, param_refs.as_slice())
+        .execute(&sql, param_refs2.as_slice())
         .unwrap_or_else(|e| panic!("knot runtime: delete_where error: {}\n  SQL: {}", e, sql));
     notify_relation_changed();
 }

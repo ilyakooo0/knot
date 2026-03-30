@@ -4618,6 +4618,7 @@ impl Codegen {
                     ast::StmtKind::GroupBy { key } => self.expr_is_io(key),
                 })
             }
+            ast::ExprKind::Lambda { body, .. } => self.expr_is_io(body),
             _ => false,
         }
     }
@@ -5208,8 +5209,12 @@ impl Codegen {
                             primary_var = Some(name);
                         }
                         primary_row_val = Some(row);
-                        if let ast::ExprKind::SourceRef(name) = &expr.node {
-                            primary_source = Some(name.clone());
+                        match &expr.node {
+                            ast::ExprKind::SourceRef(name)
+                            | ast::ExprKind::DerivedRef(name) => {
+                                primary_source = Some(name.clone());
+                            }
+                            _ => {}
                         }
                     }
 
@@ -5319,7 +5324,10 @@ impl Codegen {
                         .source_schemas
                         .get(source_name)
                         .cloned()
-                        .unwrap_or_default();
+                        .unwrap_or_else(|| panic!(
+                            "groupBy: no schema found for relation '{}' (add a type annotation to the declaration)",
+                            source_name
+                        ));
 
                     // Extract key column names from the key record expression
                     let key_cols: Vec<String> = match &key.node {

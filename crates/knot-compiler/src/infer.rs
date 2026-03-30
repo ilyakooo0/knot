@@ -46,7 +46,7 @@ pub type LocalTypeInfo = HashMap<Span, String>;
 type TyVar = u32;
 
 /// Internal type representation for unification-based inference.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum Ty {
     /// Unification variable.
     Var(TyVar),
@@ -2447,16 +2447,28 @@ impl Infer {
     // ── Declaration collection (phase 1) ─────────────────────────
 
     fn collect_types(&mut self, module: &ast::Module) {
-        // First pass: type aliases
-        for decl in &module.decls {
-            if let ast::DeclKind::TypeAlias { name, params, ty } =
-                &decl.node
-            {
+        // First pass: type aliases (multi-pass to handle forward references)
+        let alias_decls: Vec<_> = module.decls.iter().filter_map(|decl| {
+            if let ast::DeclKind::TypeAlias { name, params, ty } = &decl.node {
                 if params.is_empty() {
-                    self.annotation_vars.clear();
-                    let resolved = self.ast_type_to_ty(ty);
-                    self.aliases.insert(name.clone(), resolved);
+                    return Some((name.clone(), ty.clone()));
                 }
+            }
+            None
+        }).collect();
+        // Iterate until alias resolutions stabilize (fixpoint)
+        loop {
+            let mut changed = false;
+            for (name, ty) in &alias_decls {
+                self.annotation_vars.clear();
+                let resolved = self.ast_type_to_ty(ty);
+                if self.aliases.get(name) != Some(&resolved) {
+                    self.aliases.insert(name.clone(), resolved);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
             }
         }
 

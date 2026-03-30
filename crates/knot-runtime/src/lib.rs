@@ -1692,6 +1692,12 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
             }).collect();
             set_a == set_b
         }
+        (Value::Function(fn_a, env_a, src_a), Value::Function(fn_b, env_b, src_b)) => {
+            fn_a == fn_b && src_a == src_b && values_equal(*env_a, *env_b)
+        }
+        (Value::IO(fn_a, env_a), Value::IO(fn_b, env_b)) => {
+            fn_a == fn_b && values_equal(*env_a, *env_b)
+        }
         _ => false,
     }
 }
@@ -4999,6 +5005,31 @@ fn delete_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &Nest
     conn.execute_batch(&sql).expect("knot runtime: failed to delete child rows");
 }
 
+/// Delete child rows for a specific parent _id, recursing for deeper nesting.
+fn delete_child_rows_for_parent(conn: &rusqlite::Connection, child_table: &str, parent_id: i64, nf: &NestedField) {
+    // If this child has its own children, collect its _ids first and recurse
+    if !nf.nested.is_empty() {
+        let select_sql = format!("SELECT _id FROM {} WHERE _parent_id = ?1;", quote_ident(child_table));
+        if let Ok(mut stmt) = conn.prepare(&select_sql) {
+            let ids: Vec<i64> = stmt
+                .query_map([parent_id], |row| row.get::<_, i64>(0))
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r.ok())
+                .collect();
+            for grandchild in &nf.nested {
+                let gc_table = format!("{}__{}", child_table, grandchild.name);
+                for &child_id in &ids {
+                    delete_child_rows_for_parent(conn, &gc_table, child_id, grandchild);
+                }
+            }
+        }
+    }
+    let sql = format!("DELETE FROM {} WHERE _parent_id = ?1;", quote_ident(child_table));
+    debug_sql(&sql);
+    conn.execute(&sql, [parent_id]).expect("knot runtime: failed to delete child rows for parent");
+}
+
 /// Insert rows into a record table and its child tables.
 fn write_record_rows(
     conn: &rusqlite::Connection,
@@ -6718,7 +6749,7 @@ pub extern "C" fn knot_view_write(
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
     let filter_where = unsafe { str_from_raw(filter_ptr, filter_len) };
-    let cols = parse_schema(schema);
+    let rec_schema = parse_record_schema(schema);
 
     let filter_values = match unsafe { as_ref(filter_params) } {
         Value::Relation(rows) => rows,
@@ -6736,14 +6767,48 @@ pub extern "C" fn knot_view_write(
         ),
     };
 
-    let table = quote_ident(&format!("_knot_{}", name));
+    let table_name = format!("_knot_{}", name);
+    let table = quote_ident(&table_name);
 
     db_ref
         .conn
         .execute_batch("SAVEPOINT knot_view_write;")
         .expect("knot runtime: view_write begin failed");
 
-    // 1. Delete rows matching the view's constant filter
+    // 1. Delete rows matching the view's constant filter.
+    //    For sources with nested relations, delete child rows first to avoid orphans.
+    if !rec_schema.nested.is_empty() {
+        // Collect _ids of parent rows about to be deleted
+        let select_sql = if filter_where.is_empty() {
+            format!("SELECT _id FROM {};", table)
+        } else {
+            format!("SELECT _id FROM {} WHERE {};", table, filter_where)
+        };
+        let sql_params: Vec<rusqlite::types::Value> = filter_values
+            .iter()
+            .map(|v| value_to_sql_param(*v))
+            .collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = sql_params
+            .iter()
+            .map(|p| p as &dyn rusqlite::types::ToSql)
+            .collect();
+        let mut stmt = db_ref.conn.prepare(&select_sql).expect("knot runtime: view_write select _id failed");
+        let ids: Vec<i64> = stmt
+            .query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))
+            .expect("knot runtime: view_write query _id failed")
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
+        // Delete child rows for each parent _id
+        for nf in &rec_schema.nested {
+            let child_table = format!("{}__{}", table_name, nf.name);
+            for &parent_id in &ids {
+                delete_child_rows_for_parent(&db_ref.conn, &child_table, parent_id, nf);
+            }
+        }
+    }
+
     let delete_sql = if filter_where.is_empty() {
         format!("DELETE FROM {};", table)
     } else {
@@ -6768,60 +6833,9 @@ pub extern "C" fn knot_view_write(
             )
         });
 
-    // 2. Insert new rows
-    if !cols.is_empty() && !rows.is_empty() {
-        let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
-        let placeholders: Vec<String> = cols
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 1))
-            .collect();
-        let insert_sql = format!(
-            "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
-            table,
-            col_names.join(", "),
-            placeholders.join(", ")
-        );
-        debug_sql(&insert_sql);
-
-        let mut stmt = db_ref
-            .conn
-            .prepare_cached(&insert_sql)
-            .expect("knot runtime: view_write prepare insert failed");
-
-        for row_ptr in rows {
-            let row = unsafe { as_ref(*row_ptr) };
-            match row {
-                Value::Record(fields) => {
-                    let params: Vec<rusqlite::types::Value> = cols
-                        .iter()
-                        .map(|col| {
-                            let field = fields
-                                .iter()
-                                .find(|f| f.name == col.name)
-                                .unwrap_or_else(|| {
-                                    panic!(
-                                        "knot runtime: missing field '{}' in record",
-                                        col.name
-                                    )
-                                });
-                            value_to_sqlite(field.value, col.ty)
-                        })
-                        .collect();
-                    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
-                        .iter()
-                        .map(|p| p as &dyn rusqlite::types::ToSql)
-                        .collect();
-                    stmt.execute(param_refs.as_slice()).unwrap_or_else(|e| {
-                        panic!("knot runtime: view_write insert error: {}", e)
-                    });
-                }
-                _ => panic!(
-                    "knot runtime: rows must be Records, got {}",
-                    type_name(*row_ptr)
-                ),
-            }
-        }
+    // 2. Insert new rows (including child tables for nested relations)
+    if !rows.is_empty() {
+        write_record_rows(&db_ref.conn, &table_name, &rec_schema, rows);
     }
 
     db_ref
@@ -7460,7 +7474,13 @@ pub extern "C" fn knot_http_listen(
                         }
                         let body_val = match serde_json::from_str::<serde_json::Value>(&body_str) {
                             Ok(json) => json_to_value(&json),
-                            Err(_) => alloc(Value::Unit),
+                            Err(e) => {
+                                let msg = format!("invalid JSON body: {}", e);
+                                if debug_enabled() {
+                                    eprintln!("[HTTP] --> 400 {}", msg);
+                                }
+                                panic!("400:{}", msg);
+                            }
                         };
                         match unsafe { as_ref(body_val) } {
                             Value::Record(body_fields) => {
@@ -7639,10 +7659,18 @@ pub extern "C" fn knot_http_listen(
                             } else {
                                 "internal server error".to_string()
                             };
+
+                            // Panics with "400:..." prefix indicate bad requests
+                            let (status_code, error_msg) = if let Some(rest) = msg.strip_prefix("400:") {
+                                (400, rest.to_string())
+                            } else {
+                                (500, msg.clone())
+                            };
+
                             eprintln!("[HTTP] handler panicked: {}", msg);
-                            let body = format!("{{\"error\":\"{}\"}}", json_escape(&msg));
+                            let body = format!("{{\"error\":\"{}\"}}", json_escape(&error_msg));
                             let response = tiny_http::Response::from_string(&body)
-                                .with_status_code(500)
+                                .with_status_code(status_code)
                                 .with_header(
                                     "Content-Type: application/json"
                                         .parse::<tiny_http::Header>()

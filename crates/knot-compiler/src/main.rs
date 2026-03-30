@@ -176,6 +176,10 @@ fn cmd_build(source_file: &str) {
     if let Err(e) = linker::link(&obj_path, &runtime_path, &output_path) {
         eprintln!("Link error: {}", e);
         let _ = std::fs::remove_file(&obj_path);
+        let temp_runtime = std::env::temp_dir().join(format!("libknot_runtime_{}.a", std::process::id()));
+        if runtime_path == temp_runtime {
+            let _ = std::fs::remove_file(&runtime_path);
+        }
         process::exit(1);
     }
 

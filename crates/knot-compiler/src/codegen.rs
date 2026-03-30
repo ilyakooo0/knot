@@ -3197,11 +3197,12 @@ impl Codegen {
                             "knot_source_write",
                             &[db, name_ptr, name_len, schema_ptr, schema_len, val],
                         );
-                    } else if let Some((bind_var, cond, update_fields)) =
-                        Self::match_conditional_update(name, value)
+                    } else if !schema.contains('[')
+                        && let Some((bind_var, cond, update_fields)) =
+                            Self::match_conditional_update(name, value)
                     {
                         // 3. Conditional update: do { t <- *rel; yield (if cond then {t | ...} else t) }
-                        //    Try SQL UPDATE WHERE
+                        //    Try SQL UPDATE WHERE (skip for nested relations — child tables need full rewrite)
                         let where_frag = Self::try_compile_sql_expr(&bind_var, cond);
                         let set_frag = where_frag.as_ref().and_then(|_| {
                             let mut parts = Vec::new();
@@ -3258,11 +3259,12 @@ impl Codegen {
                                 &[db, name_ptr, name_len, schema_ptr, schema_len, val],
                             );
                         }
-                    } else if let Some((bind_var, conditions)) =
-                        Self::match_filter_only(name, value)
+                    } else if !schema.contains('[')
+                        && let Some((bind_var, conditions)) =
+                            Self::match_filter_only(name, value)
                     {
                         // 4. Filter only: do { t <- *rel; where cond; yield t }
-                        //    Try SQL DELETE WHERE
+                        //    Try SQL DELETE WHERE (skip for nested relations — child tables need full rewrite)
                         let combined_sql: Option<SqlFragment> = {
                             let mut frags = Vec::new();
                             let mut all_ok = true;

@@ -4129,6 +4129,96 @@ fn auto_apply_adt_change(
     true
 }
 
+/// Recursively migrate a child table when its inner schema changes.
+/// Handles added columns (ALTER TABLE ADD COLUMN), removed columns (breaking),
+/// type changes (breaking), and nested-within-nested fields.
+fn auto_apply_child_change(
+    conn: &Connection,
+    parent_table: &str,
+    old_nf: &NestedField,
+    new_nf: &NestedField,
+) -> bool {
+    let child_table = format!("{}__{}", parent_table, new_nf.name);
+
+    // Check that all old columns still exist with same type
+    for old_col in &old_nf.columns {
+        match new_nf.columns.iter().find(|c| c.name == old_col.name) {
+            Some(new_col) => {
+                if std::mem::discriminant(&old_col.ty) != std::mem::discriminant(&new_col.ty) {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    }
+
+    // Any removed nested sub-fields → breaking
+    for old_sub in &old_nf.nested {
+        if !new_nf.nested.iter().any(|n| n.name == old_sub.name) {
+            return false;
+        }
+    }
+
+    // Add new columns to the child table
+    let old_col_names: HashSet<&str> = old_nf.columns.iter().map(|c| c.name.as_str()).collect();
+    for c in &new_nf.columns {
+        if !old_col_names.contains(c.name.as_str()) {
+            let sql = format!(
+                "ALTER TABLE {} ADD COLUMN {} {};",
+                quote_ident(&child_table),
+                quote_ident(&c.name),
+                sql_type(c.ty)
+            );
+            debug_sql(&sql);
+            if conn.execute_batch(&sql).is_err() {
+                return false;
+            }
+        }
+    }
+
+    // Drop and recreate unique index with full column set
+    let drop_idx = format!(
+        "DROP INDEX IF EXISTS {};",
+        quote_ident(&format!("{}_unique", child_table))
+    );
+    debug_sql(&drop_idx);
+    let _ = conn.execute_batch(&drop_idx);
+
+    let mut unique_cols = vec![quote_ident("_parent_id")];
+    for c in &new_nf.columns {
+        unique_cols.push(quote_ident(&c.name));
+    }
+    if unique_cols.len() > 1 {
+        let idx_sql = format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({});",
+            quote_ident(&format!("{}_unique", child_table)),
+            quote_ident(&child_table),
+            unique_cols.join(", ")
+        );
+        debug_sql(&idx_sql);
+        let _ = conn.execute_batch(&idx_sql);
+    }
+
+    // Recurse into nested-within-nested fields
+    for new_sub in &new_nf.nested {
+        if let Some(old_sub) = old_nf.nested.iter().find(|n| n.name == new_sub.name) {
+            if !auto_apply_child_change(conn, &child_table, old_sub, new_sub) {
+                return false;
+            }
+        }
+    }
+
+    // Initialize any brand-new nested sub-tables
+    let old_sub_names: HashSet<&str> = old_nf.nested.iter().map(|n| n.name.as_str()).collect();
+    for sub in &new_nf.nested {
+        if !old_sub_names.contains(sub.name.as_str()) {
+            init_child_table(conn, &child_table, sub);
+        }
+    }
+
+    true
+}
+
 fn auto_apply_record_change(
     conn: &Connection,
     table: &str,
@@ -4195,8 +4285,17 @@ fn auto_apply_record_change(
         let _ = conn.execute_batch(&idx_sql);
     }
 
-    // Initialize any new child tables for nested relations
+    // Migrate existing child tables whose inner schema changed
     let old_nested_names: HashSet<&str> = old_rec.nested.iter().map(|n| n.name.as_str()).collect();
+    for new_nf in &new_rec.nested {
+        if let Some(old_nf) = old_rec.nested.iter().find(|n| n.name == new_nf.name) {
+            if !auto_apply_child_change(conn, table, old_nf, new_nf) {
+                return false;
+            }
+        }
+    }
+
+    // Initialize any new child tables for nested relations
     for nf in &new_rec.nested {
         if !old_nested_names.contains(nf.name.as_str()) {
             init_child_table(conn, table, nf);
@@ -7055,7 +7154,7 @@ fn match_route<'a>(
                     }
                 }
                 PathPart::Param(name, _ty) => {
-                    params.push((name.clone(), seg.to_string()));
+                    params.push((name.clone(), url_decode(seg)));
                 }
             }
         }

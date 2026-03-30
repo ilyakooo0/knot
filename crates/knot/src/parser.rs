@@ -62,6 +62,7 @@ impl Parser {
                 break;
             }
             let exported = self.eat(&TokenKind::Export);
+            self.skip_newlines();
             match self.parse_decl() {
                 Some(mut d) => {
                     d.exported = exported;
@@ -2112,6 +2113,12 @@ impl Parser {
             while !this.at(&TokenKind::Arrow) && !this.at_eof() {
                 this.skip_newlines();
                 if this.at(&TokenKind::Arrow) { break; }
+                // Stop consuming params if we've crossed back to column 0 outside
+                // any delimiter — this prevents eating into the next declaration
+                // when `->` is missing.
+                if this.delimiter_depth == 0 && this.column_of(&this.span()) == 0 {
+                    break;
+                }
                 let p = this.parse_pat()?;
                 params.push(p);
             }

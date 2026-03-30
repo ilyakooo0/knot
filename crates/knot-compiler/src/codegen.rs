@@ -6005,7 +6005,7 @@ impl Codegen {
         if let Some((func, col_sql)) = aggregate {
             let table = quote_sql_ident(&format!("_knot_{}", source_name));
             let sql = if conditions.is_empty() {
-                format!("SELECT {}({}) FROM {}", func, col_sql, table)
+                format!("SELECT {}({}) FROM {} AS {}", func, col_sql, table, alias)
             } else {
                 format!(
                     "SELECT {}({}) FROM {} AS {} WHERE {}",

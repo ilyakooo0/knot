@@ -902,10 +902,7 @@ impl Parser {
 
             if self.at(&TokenKind::Colon) {
                 self.advance();
-                let ts = self.parse_type_scheme().unwrap_or(TypeScheme {
-                    constraints: vec![],
-                    ty: Spanned::new(TypeKind::Named("Error".into()), self.span()),
-                });
+                let ts = self.parse_type_scheme()?;
 
                 // Check for default body on next line.
                 // For simplicity, don't handle default bodies in this pass.
@@ -1664,7 +1661,6 @@ impl Parser {
             | TokenKind::LParen
             | TokenKind::LBrace
             | TokenKind::LBracket
-            | TokenKind::Underscore
             | TokenKind::Full
             | TokenKind::Do => true,
             TokenKind::Star => {
@@ -1733,7 +1729,12 @@ impl Parser {
                 self.advance(); // consume `@`
                 self.advance(); // consume `(`
                 self.delimiter_depth += 1;
-                let time = self.parse_expr()?;
+                let time = self.parse_expr();
+                if time.is_none() {
+                    self.delimiter_depth -= 1;
+                    return None;
+                }
+                let time = time.unwrap();
                 self.delimiter_depth -= 1;
                 let end_tok = self
                     .expect(&TokenKind::RParen, "expected ')' to close temporal query '@(...)'")

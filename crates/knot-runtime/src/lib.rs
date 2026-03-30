@@ -1589,7 +1589,9 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
         }
         Value::Float(f) => {
             buf.push(1);
-            buf.extend_from_slice(&f.to_bits().to_le_bytes());
+            // Normalize -0.0 to +0.0 for consistent hashing (matches total_cmp equality)
+            let normalized = if *f == 0.0 { 0.0_f64 } else { *f };
+            buf.extend_from_slice(&normalized.to_bits().to_le_bytes());
         }
         Value::Text(s) => {
             buf.push(2);
@@ -1665,7 +1667,7 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
     }
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Int(x), Value::Int(y)) => x == y,
-        (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+        (Value::Float(x), Value::Float(y)) => x.total_cmp(y) == std::cmp::Ordering::Equal,
         (Value::Text(x), Value::Text(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Bytes(x), Value::Bytes(y)) => x == y,
@@ -1806,9 +1808,9 @@ fn compare_lt(a: *mut Value, b: *mut Value) -> bool {
     }
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Int(x), Value::Int(y)) => x < y,
-        (Value::Float(x), Value::Float(y)) => x < y,
-        (Value::Int(x), Value::Float(y)) => bigint_to_f64(x) < *y,
-        (Value::Float(x), Value::Int(y)) => *x < bigint_to_f64(y),
+        (Value::Float(x), Value::Float(y)) => x.total_cmp(y) == std::cmp::Ordering::Less,
+        (Value::Int(x), Value::Float(y)) => bigint_to_f64(x).total_cmp(y) == std::cmp::Ordering::Less,
+        (Value::Float(x), Value::Int(y)) => x.total_cmp(&bigint_to_f64(y)) == std::cmp::Ordering::Less,
         (Value::Text(x), Value::Text(y)) => x < y,
         _ => panic!("knot runtime: cannot compare {} < {}", type_name(a), type_name(b)),
     }
@@ -1823,9 +1825,9 @@ fn compare_gt(a: *mut Value, b: *mut Value) -> bool {
     }
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Int(x), Value::Int(y)) => x > y,
-        (Value::Float(x), Value::Float(y)) => x > y,
-        (Value::Int(x), Value::Float(y)) => bigint_to_f64(x) > *y,
-        (Value::Float(x), Value::Int(y)) => *x > bigint_to_f64(y),
+        (Value::Float(x), Value::Float(y)) => x.total_cmp(y) == std::cmp::Ordering::Greater,
+        (Value::Int(x), Value::Float(y)) => bigint_to_f64(x).total_cmp(y) == std::cmp::Ordering::Greater,
+        (Value::Float(x), Value::Int(y)) => x.total_cmp(&bigint_to_f64(y)) == std::cmp::Ordering::Greater,
         (Value::Text(x), Value::Text(y)) => x > y,
         _ => panic!("knot runtime: cannot compare {} > {}", type_name(a), type_name(b)),
     }
@@ -5738,10 +5740,12 @@ pub extern "C" fn knot_source_delete_where(
         sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
 
     // Cascade delete to child tables (nested relation fields) before
-    // deleting parent rows.  Discover child tables by querying SQLite
-    // metadata for tables matching the `{parent}__{field}` pattern.
+    // deleting parent rows.  Discover ALL descendant tables by querying
+    // SQLite metadata for tables matching the `{parent}__{...}` pattern
+    // (including grandchildren like `{parent}__{field}__{subfield}`).
+    // Delete deepest tables first so FK ordering is respected.
     let qt = quote_ident(&table);
-    let child_tables: Vec<String> = {
+    let mut descendant_tables: Vec<String> = {
         let prefix = format!("{}__", table);
         let mut stmt = db_ref.conn.prepare(
             "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?1"
@@ -5750,10 +5754,16 @@ pub extern "C" fn knot_source_delete_where(
             .into_iter()
             .flatten()
             .filter_map(|r| r.ok())
-            .filter(|n| n.starts_with(&prefix) && n[prefix.len()..].find("__").is_none())
+            .filter(|n| n.starts_with(&prefix))
             .collect()
     };
-    if !child_tables.is_empty() {
+    // Sort by depth (number of `__` segments) descending so deepest children are deleted first
+    descendant_tables.sort_by(|a, b| {
+        let depth_a = a.matches("__").count();
+        let depth_b = b.matches("__").count();
+        depth_b.cmp(&depth_a)
+    });
+    if !descendant_tables.is_empty() {
         // Collect _ids of parent rows that will be deleted
         let id_sql = format!(
             "SELECT _id FROM {} WHERE NOT ({});",
@@ -5768,14 +5778,32 @@ pub extern "C" fn knot_source_delete_where(
                 .filter_map(|r| r.ok())
                 .collect();
             if !ids.is_empty() {
-                for ct in &child_tables {
-                    let del = format!(
-                        "DELETE FROM {} WHERE _parent_id IN ({})",
-                        quote_ident(ct),
-                        ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",")
-                    );
-                    debug_sql(&del);
-                    let _ = db_ref.conn.execute_batch(&del);
+                // For direct children, delete by _parent_id matching the deleted parent rows.
+                // For grandchildren+, we need to find their parent IDs transitively.
+                let direct_prefix = format!("{}__", table);
+                for ct in &descendant_tables {
+                    let suffix = &ct[direct_prefix.len()..];
+                    if !suffix.contains("__") {
+                        // Direct child: delete by parent _id
+                        let del = format!(
+                            "DELETE FROM {} WHERE _parent_id IN ({})",
+                            quote_ident(ct),
+                            ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",")
+                        );
+                        debug_sql(&del);
+                        let _ = db_ref.conn.execute_batch(&del);
+                    } else {
+                        // Grandchild+: find its immediate parent table and delete rows
+                        // whose _parent_id no longer exists in the parent table.
+                        let parent_table = &ct[..ct.rfind("__").unwrap()];
+                        let del = format!(
+                            "DELETE FROM {} WHERE _parent_id NOT IN (SELECT _id FROM {})",
+                            quote_ident(ct),
+                            quote_ident(parent_table)
+                        );
+                        debug_sql(&del);
+                        let _ = db_ref.conn.execute_batch(&del);
+                    }
                 }
             }
         }
@@ -8581,7 +8609,9 @@ fn serialize_value_for_hash_into(v: *mut Value, buf: &mut Vec<u8>) {
         }
         Value::Float(f) => {
             buf.push(1);
-            buf.extend_from_slice(&f.to_bits().to_le_bytes());
+            // Normalize -0.0 to +0.0 for consistent hashing (matches total_cmp equality)
+            let normalized = if *f == 0.0 { 0.0_f64 } else { *f };
+            buf.extend_from_slice(&normalized.to_bits().to_le_bytes());
         }
         Value::Text(s) => {
             buf.push(2);

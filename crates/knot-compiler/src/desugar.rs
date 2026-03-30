@@ -107,19 +107,14 @@ fn expr_contains_io(expr: &Expr, builtins: &HashSet<&str>, io_fns: &HashSet<Stri
             expr_contains_io(scrutinee, builtins, io_fns)
                 || arms.iter().any(|arm| expr_contains_io(&arm.body, builtins, io_fns))
         }
-        ExprKind::Record(fields) => {
-            fields.iter().any(|f| expr_contains_io(&f.value, builtins, io_fns))
-        }
-        ExprKind::RecordUpdate { base, fields, .. } => {
-            expr_contains_io(base, builtins, io_fns)
-                || fields.iter().any(|f| expr_contains_io(&f.value, builtins, io_fns))
-        }
-        ExprKind::FieldAccess { expr, .. } => {
-            expr_contains_io(expr, builtins, io_fns)
-        }
-        ExprKind::List(elems) => {
-            elems.iter().any(|e| expr_contains_io(e, builtins, io_fns))
-        }
+        // Records, lists, field access are data constructors/accessors —
+        // they don't produce IO even if they contain IO values as
+        // subexpressions. Must match codegen's expr_contains_io to avoid
+        // incorrectly preventing desugaring of pure comprehension do-blocks.
+        ExprKind::Record(_)
+        | ExprKind::RecordUpdate { .. }
+        | ExprKind::FieldAccess { .. }
+        | ExprKind::List(_) => false,
         ExprKind::Yield(inner) => expr_contains_io(inner, builtins, io_fns),
         _ => false,
     }

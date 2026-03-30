@@ -442,7 +442,7 @@ fn schema_descriptor(ty: &ResolvedType) -> String {
                 .collect();
             format!("#{}", parts.join("|"))
         }
-        _ => String::new(),
+        other => col_type_str(other).to_string(),
     }
 }
 

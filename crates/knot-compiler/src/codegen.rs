@@ -4483,7 +4483,7 @@ impl Codegen {
             ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Let { expr, .. } => self.expr_is_io(expr),
             ast::StmtKind::Expr(expr) => self.expr_is_io(expr),
             ast::StmtKind::Where { cond } => self.expr_is_io(cond),
-            _ => false,
+            ast::StmtKind::GroupBy { key } => self.expr_is_io(key),
         })
     }
 
@@ -4613,7 +4613,7 @@ impl Codegen {
                     ast::StmtKind::Expr(expr) => self.expr_is_io(expr),
                     ast::StmtKind::Let { expr, .. } => self.expr_is_io(expr),
                     ast::StmtKind::Where { cond } => self.expr_is_io(cond),
-                    _ => false,
+                    ast::StmtKind::GroupBy { key } => self.expr_is_io(key),
                 })
             }
             _ => false,

@@ -2797,7 +2797,7 @@ impl Codegen {
                 // Check if this is a view reference
                 let view_info = self.views.get(name).cloned();
                 if let Some(view) = view_info {
-                    if view.constant_columns.is_empty() {
+                    if view.constant_columns.is_empty() && view.source_columns.is_empty() {
                         // Simple alias: read the underlying source directly
                         let schema = self
                             .source_schemas
@@ -2814,7 +2814,7 @@ impl Codegen {
                             &[db, name_ptr, name_len, schema_ptr, schema_len],
                         )
                     } else {
-                        // Filtered view: SELECT source columns WHERE constants match
+                        // Filtered/projected view: SELECT source columns WHERE constants match
                         let view_schema = self.compute_view_schema(&view);
                         let (filter_where, constant_cols) =
                             self.compute_view_filter(&view);
@@ -3464,7 +3464,7 @@ impl Codegen {
                         let (name_ptr, name_len) =
                             self.string_ptr(builder, source_name);
 
-                        if view.constant_columns.is_empty() {
+                        if view.constant_columns.is_empty() && view.source_columns.is_empty() {
                             // Simple alias view: read all columns from source history
                             let schema = self
                                 .source_schemas
@@ -3614,7 +3614,9 @@ impl Codegen {
                 &[db, name_ptr, name_len, schema_ptr, schema_len, augmented],
             );
         } else if view.constant_columns.is_empty() {
-            // No constant columns — simple alias, use diff-write on underlying source
+            // No constant columns — use diff-write on underlying source
+            // view_schema adapts: full source_schema for simple aliases,
+            // filtered schema for projected views (source_columns non-empty)
             let val = self.compile_expr(builder, value, env, db);
             let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
             let (schema_ptr, schema_len) = self.string_ptr(builder, &view_schema);
@@ -5041,6 +5043,9 @@ impl Codegen {
                                 primary_var = Some(name);
                             }
                             primary_row_val = Some(row);
+                            if let ast::ExprKind::SourceRef(name) = &expr.node {
+                                primary_source = Some(name.clone());
+                            }
                         }
 
                         loop_stack.push(LoopInfo {

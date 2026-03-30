@@ -7697,8 +7697,24 @@ fn bind_do_pattern(
                 bind_do_pattern(builder, cg, payload, inner, env, skips);
             }
         }
-        ast::PatKind::Lit(_) => {
-            // Literal patterns don't bind anything
+        ast::PatKind::Lit(lit) => {
+            // Filter: only rows matching the literal value continue
+            let lit_val = cg.compile_lit(builder, lit);
+            let eq_i32 = cg.call_rt_typed(
+                builder,
+                "knot_value_eq_i32",
+                &[val, lit_val],
+                types::I32,
+            );
+            let is_match = builder.ins().icmp_imm(IntCC::NotEqual, eq_i32, 0);
+
+            let then_block = builder.create_block();
+            let skip_block = builder.create_block();
+            builder.ins().brif(is_match, then_block, &[], skip_block, &[]);
+
+            builder.switch_to_block(then_block);
+            builder.seal_block(then_block);
+            skips.push(skip_block);
         }
         ast::PatKind::List(pats) => {
             for (idx, elem_pat) in pats.iter().enumerate() {

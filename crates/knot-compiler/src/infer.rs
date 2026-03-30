@@ -198,6 +198,10 @@ struct Infer {
     /// Trait method → trait name mapping (e.g. "display" → "Display").
     trait_method_traits: HashMap<String, String>,
 
+    /// Trait method → list of trait param TyVars in the method's scheme.
+    /// Used to map trait params to impl types during impl validation.
+    trait_method_param_vars: HashMap<String, Vec<TyVar>>,
+
     /// Known trait implementations: (trait_name, type_name).
     known_impls: HashSet<(String, String)>,
 
@@ -244,6 +248,7 @@ impl Infer {
             errors: Vec::new(),
             monad_vars: Vec::new(),
             trait_method_traits: HashMap::new(),
+            trait_method_param_vars: HashMap::new(),
             known_impls: HashSet::new(),
             deferred_constraints: Vec::new(),
             binding_types: Vec::new(),
@@ -425,6 +430,10 @@ impl Infer {
     // ── Unification ──────────────────────────────────────────────
 
     fn unify(&mut self, t1: &Ty, t2: &Ty, span: Span) {
+        // Capture root vars before apply shadows them — needed to propagate
+        // merged IO effects back into the substitution.
+        let var1 = if let Ty::Var(v) = t1 { Some(*v) } else { None };
+        let var2 = if let Ty::Var(v) = t2 { Some(*v) } else { None };
         let t1 = self.apply(t1);
         let t2 = self.apply(t2);
 
@@ -512,8 +521,19 @@ impl Infer {
             // ── IO monad ──────────────────────────────────────
             (Ty::IO(e1, a), Ty::IO(e2, b)) => {
                 self.unify(a, b, span);
-                // Effects are merged (union) — not unified
-                let _ = (e1, e2);
+                // Merge IO effect sets (union) and propagate into substitution
+                if e1 != e2 {
+                    let mut merged = e1.clone();
+                    merged.extend(e2.iter().cloned());
+                    let unified_inner = self.apply(a);
+                    let merged_io = Ty::IO(merged, Box::new(unified_inner));
+                    if let Some(v) = var1 {
+                        self.subst.insert(v, merged_io.clone());
+                    }
+                    if let Some(v) = var2 {
+                        self.subst.insert(v, merged_io);
+                    }
+                }
             }
             // In IO do blocks, allow Relation types to unify with IO or
             // Unit types. Route handlers mix relational operations and
@@ -1705,14 +1725,9 @@ impl Infer {
             ast::ExprKind::Set { target, value } => {
                 let is_view = matches!(&target.node,
                     ast::ExprKind::SourceRef(n) if self.view_names.contains(n));
-                if is_view {
-                    // View writes have constant columns auto-filled by
-                    // codegen — skip type-checking the value expression
-                    // since its type intentionally differs from the view's
-                    // read type.
-                } else {
-                    let target_ty = self.infer_expr(target);
-                    let value_ty = self.infer_expr(value);
+                let target_ty = self.infer_expr(target);
+                let value_ty = self.infer_expr(value);
+                if !is_view {
                     // Unwrap IO from both sides for unification —
                     // target is IO (source ref), value may also be IO
                     // (do-block reading from relations).
@@ -1732,11 +1747,9 @@ impl Infer {
             ast::ExprKind::FullSet { target, value } => {
                 let is_view = matches!(&target.node,
                     ast::ExprKind::SourceRef(n) if self.view_names.contains(n));
-                if is_view {
-                    // Same as Set: skip view write checking.
-                } else {
-                    let target_ty = self.infer_expr(target);
-                    let value_ty = self.infer_expr(value);
+                let target_ty = self.infer_expr(target);
+                let value_ty = self.infer_expr(value);
+                if !is_view {
                     let target_applied = self.apply(&target_ty);
                     let value_applied = self.apply(&value_ty);
                     let unwrap_io = |ty: &Ty| match ty {
@@ -3377,6 +3390,13 @@ impl Infer {
                 self.trait_method_traits
                     .insert(name.clone(), trait_name.to_string());
 
+                // Record which scheme vars are trait params (for impl validation)
+                let param_vars: Vec<TyVar> = params.iter()
+                    .filter_map(|p| self.annotation_vars.get(&p.name).copied())
+                    .collect();
+                self.trait_method_param_vars
+                    .insert(name.clone(), param_vars);
+
                 self.bind_top(
                     name,
                     Scheme::constrained(vars, constraints, method_ty),
@@ -3465,10 +3485,11 @@ impl Infer {
                 }
                 ast::DeclKind::Impl {
                     trait_name,
+                    args,
                     items,
                     ..
                 } => {
-                    self.check_impl_items(trait_name, items);
+                    self.check_impl_items(trait_name, args, items);
                 }
                 _ => {}
             }
@@ -3478,8 +3499,13 @@ impl Infer {
     fn check_impl_items(
         &mut self,
         _trait_name: &str,
+        impl_args: &[ast::Type],
         items: &[ast::ImplItem],
     ) {
+        // Build mapping from trait type params to the impl's concrete types.
+        // e.g. `trait Display a` + `impl Display Int` → { a_var => Int }
+        let impl_types: Vec<Ty> = impl_args.iter().map(|a| self.ast_type_to_ty(&a)).collect();
+
         for item in items {
             if let ast::ImplItem::Method {
                 name, params, body, ..
@@ -3493,12 +3519,38 @@ impl Infer {
                     self.check_pattern(param, &t);
                     param_types.push(t);
                 }
-                let _ = self.infer_expr(body);
+                let body_ty = self.infer_expr(body);
+
+                // Build the inferred method type: params -> body_ty
+                let mut inferred_method_ty = body_ty;
+                for pt in param_types.iter().rev() {
+                    inferred_method_ty = Ty::Fun(
+                        Box::new(pt.clone()),
+                        Box::new(inferred_method_ty),
+                    );
+                }
+
                 self.pop_scope();
 
-                // If there's a known trait method type, we could unify
-                // but for now just check the body is well-typed
-                let _ = name;
+                // Validate against the trait's declared method type
+                if let Some(scheme) = self.lookup(name).cloned() {
+                    // Map only trait param vars to impl types; other vars
+                    // (local type vars like `a`) get fresh variables.
+                    let param_vars = self.trait_method_param_vars
+                        .get(name.as_str())
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut mapping: HashMap<TyVar, Ty> = HashMap::new();
+                    for (pv, impl_ty) in param_vars.iter().zip(impl_types.iter()) {
+                        mapping.insert(*pv, impl_ty.clone());
+                    }
+                    // Give remaining scheme vars fresh variables
+                    for v in &scheme.vars {
+                        mapping.entry(*v).or_insert_with(|| self.fresh());
+                    }
+                    let expected = self.subst_ty(&scheme.ty, &mapping);
+                    self.unify(&expected, &inferred_method_ty, body.span);
+                }
             }
         }
     }
@@ -4188,7 +4240,7 @@ mod tests {
         assert!(check_src(
             "trait Container (f : Type -> Type) where\n\
              \x20 wrap : a -> f a\n\
-             \x20 unwrap : f a -> a\n\
+             \x20 unwrap : f a -> f a\n\
              impl Container [] where\n\
              \x20 wrap x = [x]\n\
              \x20 unwrap rel = do\n\

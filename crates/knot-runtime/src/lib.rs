@@ -3598,88 +3598,13 @@ pub extern "C" fn knot_source_migrate(
             }
         }
     } else {
-        // Record schema
-        let new_cols = parse_schema(new_schema);
-        let col_defs: Vec<String> = new_cols
-            .iter()
-            .map(|c| format!("{} {}", quote_ident(&c.name), sql_type(c.ty)))
-            .collect();
-        let col_names: Vec<String> = new_cols.iter().map(|c| quote_ident(&c.name)).collect();
-
-        let create_sql = format!("CREATE TABLE {} ({});", table, col_defs.join(", "));
-        debug_sql(&create_sql);
-        db_ref
-            .conn
-            .execute_batch(&create_sql)
-            .expect("knot runtime: failed to create table during migration");
-
-        if !new_cols.is_empty() {
-            let idx_sql = format!(
-                "CREATE UNIQUE INDEX {} ON {} ({});",
-                quote_ident(&format!("_knot_{}_unique", name)),
-                table,
-                col_names.join(", ")
-            );
-            debug_sql(&idx_sql);
-            if let Err(e) = db_ref.conn.execute_batch(&idx_sql) {
-                eprintln!("knot runtime: warning: failed to create unique index during migration for {}: {}", name, e);
-            }
-        }
-
-        // Initialize child tables for nested relations in new schema
+        // Record schema — use init_record_table + write_record_rows so that
+        // nested relation fields (child tables) and _id AUTOINCREMENT are
+        // handled correctly, and value_to_sqlite is used for type-aware
+        // serialization.
         let new_rec = parse_record_schema(new_schema);
-        for nf in &new_rec.nested {
-            init_child_table(&db_ref.conn, &table_name, nf);
-        }
-
-        // 4. Insert transformed rows
-        if !new_cols.is_empty() && !new_rows.is_empty() {
-            let placeholders: Vec<String> = new_cols
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("?{}", i + 1))
-                .collect();
-            let insert_sql = format!(
-                "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
-                table,
-                col_names.join(", "),
-                placeholders.join(", ")
-            );
-            debug_sql(&insert_sql);
-
-            let mut stmt = db_ref
-                .conn
-                .prepare_cached(&insert_sql)
-                .expect("knot runtime: failed to prepare insert during migration");
-
-            for row_ptr in &new_rows {
-                let row_ref = unsafe { as_ref(*row_ptr) };
-                let fields = match row_ref {
-                    Value::Record(f) => f,
-                    _ => panic!("knot runtime: migration function must return a record"),
-                };
-                let params: Vec<rusqlite::types::Value> = new_cols
-                    .iter()
-                    .map(|c| {
-                        let val = fields
-                            .iter()
-                            .find(|f| f.name == c.name)
-                            .map(|f| f.value)
-                            .unwrap_or_else(|| {
-                                panic!(
-                                    "knot runtime: migration result missing field '{}'",
-                                    c.name
-                                )
-                            });
-                        value_to_sql_param(val)
-                    })
-                    .collect();
-                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-                stmt.execute(param_refs.as_slice())
-                    .expect("knot runtime: failed to insert row during migration");
-            }
-        }
+        init_record_table(&db_ref.conn, &table_name, &new_rec);
+        write_record_rows(&db_ref.conn, &table_name, &new_rec, &new_rows);
     }
 
     // 5. Update stored schema
@@ -8555,6 +8480,7 @@ fn serialize_value_for_hash_into(v: *mut Value, buf: &mut Vec<u8>) {
         buf.push(0xFF);
         return;
     }
+    // Tag bytes must match value_to_hash_bytes for cross-path consistency.
     match unsafe { as_ref(v) } {
         Value::Int(n) => {
             buf.push(0);
@@ -8575,29 +8501,29 @@ fn serialize_value_for_hash_into(v: *mut Value, buf: &mut Vec<u8>) {
             buf.push(3);
             buf.push(*b as u8);
         }
-        Value::Unit => {
-            buf.push(4);
-        }
-        Value::Constructor(tag, payload) => {
-            buf.push(5);
-            let tag_bytes = tag.as_bytes();
-            buf.extend_from_slice(&(tag_bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(tag_bytes);
-            serialize_value_for_hash_into(*payload, buf);
-        }
         Value::Bytes(b) => {
-            buf.push(6);
+            buf.push(4);
             buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
             buf.extend_from_slice(b);
         }
+        Value::Unit => {
+            buf.push(5);
+        }
         Value::Record(fields) => {
-            buf.push(7);
+            buf.push(6);
             buf.extend_from_slice(&(fields.len() as u32).to_le_bytes());
             for field in fields {
                 buf.extend_from_slice(&(field.name.len() as u32).to_le_bytes());
                 buf.extend_from_slice(field.name.as_bytes());
                 serialize_value_for_hash_into(field.value, buf);
             }
+        }
+        Value::Constructor(tag, payload) => {
+            buf.push(7);
+            let tag_bytes = tag.as_bytes();
+            buf.extend_from_slice(&(tag_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(tag_bytes);
+            serialize_value_for_hash_into(*payload, buf);
         }
         Value::Relation(rows) => {
             buf.push(8);
@@ -8616,13 +8542,14 @@ fn serialize_value_for_hash_into(v: *mut Value, buf: &mut Vec<u8>) {
                 buf.extend_from_slice(rb);
             }
         }
-        Value::Function(_, _, src) => {
+        Value::Function(_, env, src) => {
             buf.push(9);
             buf.extend_from_slice(&(src.len() as u32).to_le_bytes());
             buf.extend_from_slice(src.as_bytes());
+            serialize_value_for_hash_into(*env, buf);
         }
         Value::IO(_, _) => {
-            buf.push(10);
+            buf.push(11);
         }
     }
 }

@@ -1732,7 +1732,9 @@ impl Parser {
             } else if self.at(&TokenKind::At) && matches!(self.peek_ahead(1), TokenKind::LParen) {
                 self.advance(); // consume `@`
                 self.advance(); // consume `(`
+                self.delimiter_depth += 1;
                 let time = self.parse_expr()?;
+                self.delimiter_depth -= 1;
                 let end_tok = self
                     .expect(&TokenKind::RParen, "expected ')' to close temporal query '@(...)'")
                     .ok()?;
@@ -2641,6 +2643,7 @@ impl Parser {
                 self.skip_newlines();
                 let (fname, _) = self.expect_lower("expected field name in record pattern").ok()?;
                 let pattern = if self.eat(&TokenKind::Colon) {
+                    self.skip_newlines();
                     Some(self.parse_pat()?)
                 } else {
                     None // punned: {name} means {name: name}
@@ -2701,6 +2704,7 @@ impl Parser {
     fn parse_type_function(&mut self) -> Option<Type> {
         let lhs = self.parse_type_app()?;
         if self.eat(&TokenKind::Arrow) {
+            self.skip_newlines();
             let rhs = self.parse_type_function()?; // right-associative
             let span = Span::new(lhs.span.start, rhs.span.end);
             Some(Spanned::new(
@@ -2905,6 +2909,7 @@ impl Parser {
             let (fname, _) = self.expect_lower("expected field name in record type").ok()?;
             self.expect(&TokenKind::Colon, "expected ':' after field name in record type")
                 .ok()?;
+            self.skip_newlines();
             let ty = self.parse_type()?;
             fields.push(Field {
                 name: fname,

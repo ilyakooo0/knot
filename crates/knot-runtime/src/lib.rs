@@ -3208,7 +3208,7 @@ fn json_to_value(json: &serde_json::Value) -> *mut Value {
         }
         serde_json::Value::Object(obj) => {
             if obj.is_empty() {
-                return alloc(Value::Unit);
+                return alloc(Value::Record(Vec::new()));
             }
             // Reconstruct Bytes from {"__knot_bytes": "base64..."} format
             if obj.len() == 1 {

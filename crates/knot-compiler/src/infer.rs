@@ -515,10 +515,14 @@ impl Infer {
                 // Effects are merged (union) — not unified
                 let _ = (e1, e2);
             }
-            // In IO do blocks, silently allow Relation types to unify
-            // with other types. Route handlers freely mix relational
-            // operations and `respond` calls in if/case branches.
-            (Ty::Relation(_), _) | (_, Ty::Relation(_)) if self.in_io_do => {}
+            // In IO do blocks, allow Relation types to unify with IO or
+            // Unit types. Route handlers mix relational operations and
+            // `respond` calls in if/case branches.
+            (Ty::Relation(a), Ty::IO(_, b)) | (Ty::IO(_, b), Ty::Relation(a)) if self.in_io_do => {
+                self.unify(a, b, span);
+            }
+            (Ty::Relation(_), Ty::Record(fields, None)) | (Ty::Record(fields, None), Ty::Relation(_))
+                if self.in_io_do && fields.is_empty() => {}
 
             // ── Row-polymorphic variants ────────────────────────
             (Ty::Variant(c1, r1), Ty::Variant(c2, r2)) => {
@@ -1551,7 +1555,7 @@ impl Infer {
                 let base_ty = if let Ty::Relation(elem) = resolved {
                     *elem
                 } else {
-                    expr_ty
+                    resolved
                 };
                 let field_ty = self.fresh();
                 let rv = self.fresh_var();
@@ -1712,11 +1716,15 @@ impl Infer {
                     // Unwrap IO from both sides for unification —
                     // target is IO (source ref), value may also be IO
                     // (do-block reading from relations).
+                    // Apply substitution first so type variables resolved
+                    // to IO are properly unwrapped.
+                    let target_applied = self.apply(&target_ty);
+                    let value_applied = self.apply(&value_ty);
                     let unwrap_io = |ty: &Ty| match ty {
                         Ty::IO(_, inner) => (**inner).clone(),
                         other => other.clone(),
                     };
-                    self.unify(&unwrap_io(&target_ty), &unwrap_io(&value_ty), expr.span);
+                    self.unify(&unwrap_io(&target_applied), &unwrap_io(&value_applied), expr.span);
                 }
                 Ty::IO(BTreeSet::new(), Box::new(Ty::unit()))
             }
@@ -1729,11 +1737,13 @@ impl Infer {
                 } else {
                     let target_ty = self.infer_expr(target);
                     let value_ty = self.infer_expr(value);
+                    let target_applied = self.apply(&target_ty);
+                    let value_applied = self.apply(&value_ty);
                     let unwrap_io = |ty: &Ty| match ty {
                         Ty::IO(_, inner) => (**inner).clone(),
                         other => other.clone(),
                     };
-                    self.unify(&unwrap_io(&target_ty), &unwrap_io(&value_ty), expr.span);
+                    self.unify(&unwrap_io(&target_applied), &unwrap_io(&value_applied), expr.span);
                 }
                 Ty::IO(BTreeSet::new(), Box::new(Ty::unit()))
             }
@@ -1744,8 +1754,9 @@ impl Infer {
                 let inner_ty = self.infer_expr(inner);
                 self.in_atomic = prev;
                 // atomic : IO {} a -> IO {} a
-                match &inner_ty {
-                    Ty::IO(_, _) => inner_ty,
+                let inner_applied = self.apply(&inner_ty);
+                match &inner_applied {
+                    Ty::IO(_, _) => inner_applied,
                     _ => {
                         self.error(
                             "atomic body must be an IO expression".to_string(),
@@ -2236,8 +2247,8 @@ impl Infer {
     /// functions whose already-inferred type returns IO.
     fn expr_is_io_prescan(&self, expr: &ast::Expr) -> bool {
         match &expr.node {
-            ast::ExprKind::App { func, arg } => {
-                self.expr_is_io_prescan(func) || self.expr_is_io_prescan(arg)
+            ast::ExprKind::App { func, .. } => {
+                self.expr_is_io_prescan(func)
             }
             ast::ExprKind::Var(name) => {
                 matches!(

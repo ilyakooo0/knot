@@ -210,7 +210,8 @@ impl EffectChecker {
 
         // Pure builtins
         insert_many(&["show", "union", "count", "filter", "match", "map",
-                       "fold", "single", "toUpper", "toLower", "take", "drop",
+                       "fold", "single", "diff", "inter", "sum", "avg",
+                       "toUpper", "toLower", "take", "drop",
                        "length", "trim", "contains", "reverse", "chars",
                        "id", "not", "toJson", "parseJson"], EffectSet::empty());
 

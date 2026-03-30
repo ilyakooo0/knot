@@ -181,6 +181,11 @@ fn cmd_build(source_file: &str) {
 
     // Clean up
     let _ = std::fs::remove_file(&obj_path);
+    // Remove temp runtime if it was extracted from embedded bytes
+    let temp_runtime = std::env::temp_dir().join(format!("libknot_runtime_{}.a", std::process::id()));
+    if runtime_path == temp_runtime {
+        let _ = std::fs::remove_file(&runtime_path);
+    }
 
     // Update schema lockfile (use original decls — the mutated module contains
     // prelude/import decls whose spans don't correspond to this source text).

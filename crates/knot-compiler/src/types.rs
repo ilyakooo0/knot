@@ -6,7 +6,7 @@
 use knot::ast::*;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum ResolvedType {
     Int,
@@ -136,6 +136,35 @@ impl TypeEnv {
                 }
                 _ => {}
             }
+        }
+
+        // Re-resolve pass: fix forward references in type aliases.
+        // After the first pass, some aliases may contain Named("X") where X
+        // was defined later. Re-resolve those now that all aliases are known.
+        // Run until stable so chained forward refs (A→B→C) all resolve
+        // regardless of HashMap iteration order.
+        loop {
+            let mut changed = false;
+            let alias_keys: Vec<String> = aliases.keys().cloned().collect();
+            for name in &alias_keys {
+                let resolved = aliases[name].clone();
+                let fixed = re_resolve_type(&resolved, &aliases);
+                if fixed != resolved {
+                    aliases.insert(name.clone(), fixed);
+                    changed = true;
+                }
+            }
+            if !changed { break; }
+        }
+        // Also re-resolve constructor fields
+        let ctor_keys: Vec<String> = constructors.keys().cloned().collect();
+        for name in &ctor_keys {
+            let fields = constructors[name].clone();
+            let fixed: Vec<(String, ResolvedType)> = fields
+                .into_iter()
+                .map(|(n, t)| (n, re_resolve_type(&t, &aliases)))
+                .collect();
+            constructors.insert(name.clone(), fixed);
         }
 
         // Second pass: compute source schemas, migration schemas, and subset constraints
@@ -276,6 +305,60 @@ fn resolve_type(
             // IO values aren't persisted — resolve inner type for diagnostics
             resolve_type(ty, aliases, assoc_types)
         }
+    }
+}
+
+/// Re-resolve a `ResolvedType`, replacing `Named(x)` with the alias if now known.
+/// Recurses into the replacement so nested `Named` refs are also resolved.
+/// Uses `seen` to break cycles from mutually recursive types.
+fn re_resolve_type(ty: &ResolvedType, aliases: &HashMap<String, ResolvedType>) -> ResolvedType {
+    re_resolve_inner(ty, aliases, &mut HashSet::new())
+}
+
+fn re_resolve_inner(ty: &ResolvedType, aliases: &HashMap<String, ResolvedType>, seen: &mut HashSet<String>) -> ResolvedType {
+    match ty {
+        ResolvedType::Named(name) => {
+            if seen.contains(name) {
+                return ty.clone(); // break cycle
+            }
+            match aliases.get(name) {
+                Some(resolved) => {
+                    seen.insert(name.clone());
+                    let result = re_resolve_inner(resolved, aliases, seen);
+                    seen.remove(name);
+                    result
+                }
+                None => ty.clone(),
+            }
+        }
+        ResolvedType::Record(fields) => ResolvedType::Record(
+            fields
+                .iter()
+                .map(|(n, t)| (n.clone(), re_resolve_inner(t, aliases, seen)))
+                .collect(),
+        ),
+        ResolvedType::Relation(inner) => {
+            ResolvedType::Relation(Box::new(re_resolve_inner(inner, aliases, seen)))
+        }
+        ResolvedType::Function(a, b) => ResolvedType::Function(
+            Box::new(re_resolve_inner(a, aliases, seen)),
+            Box::new(re_resolve_inner(b, aliases, seen)),
+        ),
+        ResolvedType::Adt(ctors) => ResolvedType::Adt(
+            ctors
+                .iter()
+                .map(|(name, fields)| {
+                    (
+                        name.clone(),
+                        fields
+                            .iter()
+                            .map(|(n, t)| (n.clone(), re_resolve_inner(t, aliases, seen)))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        ),
+        _ => ty.clone(),
     }
 }
 

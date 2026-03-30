@@ -3588,6 +3588,14 @@ impl Codegen {
         // Snapshot history before writing (if underlying source has history)
         self.emit_history_snapshot(builder, db, &source_name, &source_schema);
 
+        // Compute the view-filtered schema (only columns the view selects).
+        // When the view selects all source columns, this equals source_schema.
+        let view_schema = if view.source_columns.is_empty() {
+            source_schema.clone()
+        } else {
+            self.compute_view_schema(view)
+        };
+
         // Check for append optimization: set *view = union *view newRows
         if let Some(new_rows_expr) = self.match_union_append(view_name, value) {
             let new_rows_expr = new_rows_expr.clone();
@@ -3595,6 +3603,8 @@ impl Codegen {
             let augmented =
                 self.compile_view_augment(builder, new_rows, &view.constant_columns, env, db);
             let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
+            // Augmented rows have all source columns (view columns + constants),
+            // so we must pass the full source_schema, not the filtered view_schema.
             let (schema_ptr, schema_len) = self.string_ptr(builder, &source_schema);
             self.call_rt_void(
                 builder,
@@ -3605,7 +3615,7 @@ impl Codegen {
             // No constant columns — simple alias, use diff-write on underlying source
             let val = self.compile_expr(builder, value, env, db);
             let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
-            let (schema_ptr, schema_len) = self.string_ptr(builder, &source_schema);
+            let (schema_ptr, schema_len) = self.string_ptr(builder, &view_schema);
             self.call_rt_void(
                 builder,
                 "knot_source_diff_write",

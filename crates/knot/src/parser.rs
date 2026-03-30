@@ -172,11 +172,13 @@ impl Parser {
     }
 
     fn column_of(&self, span: &Span) -> usize {
-        let before = &self.source.as_bytes()[..span.start.min(self.source.len())];
-        match before.iter().rposition(|&b| b == b'\n') {
-            Some(nl) => span.start - nl - 1,
-            None => span.start,
-        }
+        let offset = span.start.min(self.source.len());
+        let before = &self.source[..offset];
+        let line_start = match before.rfind('\n') {
+            Some(nl) => nl + 1,
+            None => 0,
+        };
+        before[line_start..].chars().count()
     }
 }
 

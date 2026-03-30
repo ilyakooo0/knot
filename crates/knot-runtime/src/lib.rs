@@ -515,7 +515,7 @@ pub extern "C" fn knot_value_int(n: i64) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_int_from_str(ptr: *const u8, len: usize) -> *mut Value {
     let s = unsafe { str_from_raw(ptr, len) };
-    let n = s.parse::<BigInt>().unwrap_or_else(|_| BigInt::ZERO);
+    let n = s.parse::<BigInt>().unwrap_or_else(|e| panic!("knot runtime: invalid integer literal '{}': {}", s, e));
     alloc(Value::Int(n))
 }
 
@@ -849,7 +849,7 @@ fn infer_temp_schema(rows: &[*mut Value]) -> Option<TempSchema> {
                         if !seen_tags.insert(tag.as_str()) {
                             continue;
                         }
-                        let ctor_fields = match unsafe { as_ref(*payload) } {
+                        let ctor_fields = match if (*payload).is_null() { &Value::Unit } else { unsafe { as_ref(*payload) } } {
                             Value::Unit => Vec::new(),
                             Value::Record(fields) => {
                                 let mut cf = Vec::new();
@@ -2374,17 +2374,21 @@ pub extern "C" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
             let db_path = DB_PATH.lock().unwrap().clone();
             let db = knot_db_open(db_path.as_ptr(), db_path.len());
 
+            // Use a drop guard to ensure cleanup even if knot_io_run panics
+            struct CleanupGuard {
+                db: *mut c_void,
+                io: *mut Value,
+            }
+            impl Drop for CleanupGuard {
+                fn drop(&mut self) {
+                    knot_db_close(self.db);
+                    unsafe { deep_drop_value(self.io); }
+                }
+            }
+            let _guard = CleanupGuard { db, io };
+
             // Run the IO action
             knot_io_run(db, io);
-            knot_db_close(db);
-
-            // Free the deep-cloned value tree. This is safe because:
-            // 1. knot_io_run has finished — no more access to these values
-            // 2. knot_db_close doesn't traverse values
-            // 3. Arena drop only frees its tracked pointers (via Box::from_raw)
-            //    without following child *mut Value pointers, so dangling
-            //    references from arena values into this tree are harmless
-            unsafe { deep_drop_value(io); }
         });
 
         THREAD_HANDLES.lock().unwrap().push(handle);

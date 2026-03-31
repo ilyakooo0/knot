@@ -4899,6 +4899,11 @@ impl Codegen {
         let mut primary_var: Option<String> = None;
         let mut primary_row_val: Option<Value> = None;
         let mut primary_source: Option<String> = None;
+        // Direct schema tracking for groupBy — covers source, derived, and
+        // nested-field binds so we don't rely solely on source_schemas lookup.
+        let mut primary_schema: Option<String> = None;
+        // Track per-variable schemas so FieldAccess binds can derive child schemas.
+        let mut var_schemas: HashMap<String, String> = HashMap::new();
 
         // ── Pre-scan for hash join patterns ──────────────────────────
         // Look for: Bind(a, expr1) ... Bind(b, expr2) ... Where(a.f == b.g)
@@ -5206,15 +5211,32 @@ impl Codegen {
                     // constructor-payload pattern) and source name for groupBy
                     if group_by_pos.is_some() {
                         if let Some(name) = pat_primary_var(&pat.node) {
-                            primary_var = Some(name);
+                            primary_var = Some(name.clone());
                         }
                         primary_row_val = Some(row);
                         match &expr.node {
                             ast::ExprKind::SourceRef(name)
                             | ast::ExprKind::DerivedRef(name) => {
                                 primary_source = Some(name.clone());
+                                primary_schema = self.source_schemas.get(name).cloned();
+                            }
+                            ast::ExprKind::FieldAccess { expr: target, field } => {
+                                // Nested relation bind (e.g. `item <- t.children`):
+                                // extract the child field schema from the parent's schema.
+                                if let ast::ExprKind::Var(parent_var) = &target.node {
+                                    if let Some(parent_schema) = var_schemas.get(parent_var) {
+                                        primary_schema = extract_child_schema(parent_schema, field);
+                                    }
+                                }
+                                primary_source = None;
                             }
                             _ => {}
+                        }
+                        // Record the bound variable's schema for downstream FieldAccess lookups.
+                        if let Some(ref schema) = primary_schema {
+                            if let Some(ref var_name) = primary_var {
+                                var_schemas.insert(var_name.clone(), schema.clone());
+                            }
                         }
                     }
 
@@ -5317,17 +5339,26 @@ impl Codegen {
                     }
 
                     // 3. Extract schema and key column names for SQLite grouping
-                    let source_name = primary_source.as_ref().expect(
-                        "groupBy requires a preceding bind from a source relation (*name)"
-                    );
-                    let schema = self
-                        .source_schemas
-                        .get(source_name)
-                        .cloned()
-                        .unwrap_or_else(|| panic!(
-                            "groupBy: no schema found for relation '{}' (add a type annotation to the declaration)",
-                            source_name
-                        ));
+                    let schema = primary_schema.clone()
+                        .or_else(|| {
+                            primary_source.as_ref()
+                                .and_then(|name| self.source_schemas.get(name).cloned())
+                        })
+                        .unwrap_or_else(|| {
+                            let hint = if primary_source.is_some() {
+                                format!(
+                                    "groupBy: no schema found for relation '{}' \
+                                     (add a type annotation to the declaration)",
+                                    primary_source.as_ref().unwrap()
+                                )
+                            } else {
+                                "groupBy requires a preceding bind from a relation \
+                                 with a known schema (*source, &derived with type annotation, \
+                                 or nested field of such a relation)"
+                                    .to_string()
+                            };
+                            panic!("{}", hint)
+                        });
 
                     // Extract key column names from the key record expression
                     let key_cols: Vec<String> = match &key.node {
@@ -7661,6 +7692,48 @@ fn merge_block_param(
 /// Extract the primary variable name from a pattern for groupBy tracking.
 /// For `Var(name)` returns the name; for `Constructor { payload, .. }` recurses
 /// into the payload; for other patterns returns None.
+/// Extract a nested-field schema from a parent schema descriptor.
+/// Given `"name:text,items:[qty:int,price:float]"` and field `"items"`,
+/// returns `Some("qty:int,price:float")`.
+fn extract_child_schema(parent_schema: &str, field: &str) -> Option<String> {
+    // Split schema by commas while respecting brackets (nested schemas).
+    let mut depth = 0usize;
+    let mut start = 0;
+    let bytes = parent_schema.as_bytes();
+    let mut parts = Vec::new();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'[' => depth += 1,
+            b']' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                parts.push(&parent_schema[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < parent_schema.len() {
+        parts.push(&parent_schema[start..]);
+    }
+
+    for part in parts {
+        // Each part is "field_name:type" or "field_name:[child_schema]"
+        if let Some(colon) = part.find(':') {
+            let name = &part[..colon];
+            if name == field {
+                let type_part = &part[colon + 1..];
+                // Nested relation: "[child_schema]" — strip brackets
+                if type_part.starts_with('[') && type_part.ends_with(']') {
+                    return Some(type_part[1..type_part.len() - 1].to_string());
+                }
+                // Not a nested relation field
+                return None;
+            }
+        }
+    }
+    None
+}
+
 fn pat_primary_var(pat: &ast::PatKind) -> Option<String> {
     match pat {
         ast::PatKind::Var(name) => Some(name.clone()),

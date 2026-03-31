@@ -2286,8 +2286,8 @@ impl Infer {
     /// functions whose already-inferred type returns IO.
     fn expr_is_io_prescan(&self, expr: &ast::Expr) -> bool {
         match &expr.node {
-            ast::ExprKind::App { func, .. } => {
-                self.expr_is_io_prescan(func)
+            ast::ExprKind::App { func, arg } => {
+                self.expr_is_io_prescan(func) || self.expr_is_io_prescan(arg)
             }
             ast::ExprKind::Var(name) => {
                 matches!(
@@ -2335,6 +2335,7 @@ impl Infer {
                     ast::StmtKind::GroupBy { key } => self.expr_is_io_prescan(key),
                 })
             }
+            ast::ExprKind::Lambda { body, .. } => self.expr_is_io_prescan(body),
             _ => false,
         }
     }

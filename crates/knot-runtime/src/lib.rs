@@ -1668,6 +1668,8 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Float(x), Value::Float(y)) => x.total_cmp(y) == std::cmp::Ordering::Equal,
+        (Value::Int(x), Value::Float(y)) => bigint_to_f64(x).total_cmp(y) == std::cmp::Ordering::Equal,
+        (Value::Float(x), Value::Int(y)) => x.total_cmp(&bigint_to_f64(y)) == std::cmp::Ordering::Equal,
         (Value::Text(x), Value::Text(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Bytes(x), Value::Bytes(y)) => x == y,

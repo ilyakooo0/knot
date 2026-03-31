@@ -4549,7 +4549,7 @@ impl Codegen {
                     ast::StmtKind::Expr(expr) => Self::expr_contains_io(expr, builtins, io_fns),
                     ast::StmtKind::Let { expr, .. } => Self::expr_contains_io(expr, builtins, io_fns),
                     ast::StmtKind::Where { cond } => Self::expr_contains_io(cond, builtins, io_fns),
-                    _ => false,
+                    ast::StmtKind::GroupBy { key } => Self::expr_contains_io(key, builtins, io_fns),
                 })
             }
             ast::ExprKind::Lambda { body, .. } => Self::expr_contains_io(body, builtins, io_fns),

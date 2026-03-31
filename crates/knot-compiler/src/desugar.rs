@@ -94,7 +94,7 @@ fn expr_contains_io(expr: &Expr, builtins: &HashSet<&str>, io_fns: &HashSet<Stri
                 StmtKind::Expr(expr) => expr_contains_io(expr, builtins, io_fns),
                 StmtKind::Let { expr, .. } => expr_contains_io(expr, builtins, io_fns),
                 StmtKind::Where { cond } => expr_contains_io(cond, builtins, io_fns),
-                _ => false,
+                StmtKind::GroupBy { key } => expr_contains_io(key, builtins, io_fns),
             })
         }
         ExprKind::Lambda { body, .. } => expr_contains_io(body, builtins, io_fns),

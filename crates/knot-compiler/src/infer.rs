@@ -2272,7 +2272,11 @@ impl Infer {
                         return true;
                     }
                 }
-                _ => {}
+                ast::StmtKind::GroupBy { key } => {
+                    if self.expr_is_io_prescan(key) {
+                        return true;
+                    }
+                }
             }
         }
         false
@@ -2328,7 +2332,7 @@ impl Infer {
                     ast::StmtKind::Expr(expr) => self.expr_is_io_prescan(expr),
                     ast::StmtKind::Let { expr, .. } => self.expr_is_io_prescan(expr),
                     ast::StmtKind::Where { cond } => self.expr_is_io_prescan(cond),
-                    _ => false,
+                    ast::StmtKind::GroupBy { key } => self.expr_is_io_prescan(key),
                 })
             }
             _ => false,

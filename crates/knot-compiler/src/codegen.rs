@@ -5058,6 +5058,7 @@ impl Codegen {
                                     primary_schema = self.source_schemas.get(name).cloned();
                                 }
                                 ast::ExprKind::FieldAccess { expr: target, field } => {
+                                    primary_schema = None;
                                     if let ast::ExprKind::Var(parent_var) = &target.node {
                                         if let Some(parent_schema) = var_schemas.get(parent_var) {
                                             primary_schema = extract_child_schema(parent_schema, field);
@@ -5065,7 +5066,10 @@ impl Codegen {
                                     }
                                     primary_source = None;
                                 }
-                                _ => {}
+                                _ => {
+                                    primary_source = None;
+                                    primary_schema = None;
+                                }
                             }
                             if let Some(ref schema) = primary_schema {
                                 if let Some(ref var_name) = primary_var {
@@ -5241,6 +5245,7 @@ impl Codegen {
                             ast::ExprKind::FieldAccess { expr: target, field } => {
                                 // Nested relation bind (e.g. `item <- t.children`):
                                 // extract the child field schema from the parent's schema.
+                                primary_schema = None;
                                 if let ast::ExprKind::Var(parent_var) = &target.node {
                                     if let Some(parent_schema) = var_schemas.get(parent_var) {
                                         primary_schema = extract_child_schema(parent_schema, field);
@@ -5248,7 +5253,10 @@ impl Codegen {
                                 }
                                 primary_source = None;
                             }
-                            _ => {}
+                            _ => {
+                                primary_source = None;
+                                primary_schema = None;
+                            }
                         }
                         // Record the bound variable's schema for downstream FieldAccess lookups.
                         if let Some(ref schema) = primary_schema {

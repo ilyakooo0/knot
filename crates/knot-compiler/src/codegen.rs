@@ -4809,11 +4809,14 @@ impl Codegen {
                     if let ast::ExprKind::Yield(inner) = &expr.node {
                         let val = self.compile_expr(builder, inner, env, db);
                         last_val = val;
-                    } else {
+                    } else if self.expr_is_io(expr) {
                         let val = self.compile_expr(builder, expr, env, db);
-                        // If it's an IO action, run it
+                        // Run the IO action to get its result
                         let result = self.call_rt(builder, "knot_io_run", &[db, val]);
                         last_val = result;
+                    } else {
+                        let val = self.compile_expr(builder, expr, env, db);
+                        last_val = val;
                     }
                 }
                 ast::StmtKind::GroupBy { .. } => {
@@ -5110,6 +5113,12 @@ impl Codegen {
                                     }
                                     primary_source = None;
                                 }
+                                ast::ExprKind::Var(name) => {
+                                    // Let-bound or previously-bound variable —
+                                    // look up its schema from earlier binds.
+                                    primary_source = None;
+                                    primary_schema = var_schemas.get(name).cloned();
+                                }
                                 _ => {
                                     primary_source = None;
                                     primary_schema = None;
@@ -5296,6 +5305,12 @@ impl Codegen {
                                     }
                                 }
                                 primary_source = None;
+                            }
+                            ast::ExprKind::Var(name) => {
+                                // Let-bound or previously-bound variable —
+                                // look up its schema from earlier binds.
+                                primary_source = None;
+                                primary_schema = var_schemas.get(name).cloned();
                             }
                             _ => {
                                 primary_source = None;

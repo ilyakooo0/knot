@@ -348,7 +348,11 @@ unsafe fn as_ref<'a>(v: *mut Value) -> &'a Value {
 }
 
 unsafe fn str_from_raw(ptr: *const u8, len: usize) -> &'static str {
-    unsafe { std::str::from_utf8_unchecked(slice::from_raw_parts(ptr, len)) }
+    let bytes = unsafe { slice::from_raw_parts(ptr, len) };
+    match std::str::from_utf8(bytes) {
+        Ok(s) => unsafe { &*(s as *const str) },
+        Err(e) => panic!("knot runtime: invalid UTF-8 from compiled code at byte {}", e.valid_up_to()),
+    }
 }
 
 /// Runtime error for missing trait implementations.
@@ -2445,11 +2449,12 @@ pub extern "C" fn knot_stm_snapshot() -> i64 {
 pub extern "C" fn knot_stm_wait(snapshot: i64) {
     let (lock, cvar) = &RELATION_CHANGED;
     let guard = lock.lock().unwrap();
+    let snapshot_u64 = snapshot as u64;
     let _ = cvar
         .wait_timeout_while(guard, Duration::from_millis(100), |c| {
-            // Use wrapping subtraction to handle u64->i64 overflow correctly.
-            // If current counter has advanced past snapshot, the wrapping difference > 0.
-            ((*c as i64).wrapping_sub(snapshot)) <= 0
+            // Compare as u64 directly to avoid incorrect results when
+            // the counter exceeds i64::MAX.
+            *c <= snapshot_u64
         })
         .unwrap();
 }

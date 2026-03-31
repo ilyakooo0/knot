@@ -2368,6 +2368,17 @@ impl Infer {
                         is_io = true;
                         io_effects.extend(effects.iter().cloned());
                         self.check_pattern(pat, inner);
+                    } else if self.in_io_do && matches!(&resolved, Ty::Var(_)) {
+                        // In an IO do-block with an unresolved type variable —
+                        // assume IO so we don't incorrectly unify with Relation.
+                        is_io = true;
+                        let inner_ty = self.fresh();
+                        self.unify(
+                            &expr_ty,
+                            &Ty::IO(BTreeSet::new(), Box::new(inner_ty.clone())),
+                            expr.span,
+                        );
+                        self.check_pattern(pat, &inner_ty);
                     } else if is_ctor_pat
                         && !matches!(&resolved, Ty::Relation(_) | Ty::Var(_))
                     {

@@ -327,9 +327,13 @@ impl Parser {
         path.push('.');
 
         // Could be `..` (parent directory)
-        while self.at(&TokenKind::Dot) {
+        if self.at(&TokenKind::Dot) {
             self.advance();
             path.push('.');
+            if self.at(&TokenKind::Dot) {
+                self.error("invalid import path: too many leading dots (use '.' or '..')");
+                return None;
+            }
         }
 
         // Consume `/segment` pairs (segment can be an identifier or `..`)

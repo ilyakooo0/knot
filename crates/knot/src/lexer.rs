@@ -933,7 +933,7 @@ mod tests {
     }
 
     #[test]
-    fn leading_trailing_newlines_suppressed() {
+    fn leading_newlines_suppressed() {
         assert_eq!(
             kinds("\n\na\n\n"),
             vec![

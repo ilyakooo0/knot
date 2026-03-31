@@ -5763,11 +5763,13 @@ pub extern "C" fn knot_source_delete_where(
             .filter(|n| n.starts_with(&prefix))
             .collect()
     };
-    // Sort by depth (number of `__` segments) descending so deepest children are deleted first
+    // Sort by depth (number of `__` segments) ascending so direct children are deleted first.
+    // Grandchild+ deletion uses `NOT IN (SELECT _id FROM parent_table)` to find orphans,
+    // which requires the intermediate parent rows to already be gone.
     descendant_tables.sort_by(|a, b| {
         let depth_a = a.matches("__").count();
         let depth_b = b.matches("__").count();
-        depth_b.cmp(&depth_a)
+        depth_a.cmp(&depth_b)
     });
     if !descendant_tables.is_empty() {
         // Collect _ids of parent rows that will be deleted

@@ -3607,9 +3607,30 @@ impl Codegen {
             let augmented =
                 self.compile_view_augment(builder, new_rows, &view.constant_columns, env, db);
             let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
-            // Augmented rows have all source columns (view columns + constants),
-            // so we must pass the full source_schema, not the filtered view_schema.
-            let (schema_ptr, schema_len) = self.string_ptr(builder, &source_schema);
+            // Augmented rows have view columns + constants, which may be a
+            // subset of the full source schema for projected views.  Pass a
+            // schema that covers exactly the columns present in the rows.
+            let append_schema = if view.source_columns.is_empty() {
+                source_schema.clone()
+            } else {
+                let mut present: std::collections::HashSet<&str> =
+                    std::collections::HashSet::new();
+                for (_, src_col) in &view.source_columns {
+                    present.insert(src_col.as_str());
+                }
+                for (col_name, _) in &view.constant_columns {
+                    present.insert(col_name.as_str());
+                }
+                split_schema_fields(&source_schema)
+                    .into_iter()
+                    .filter(|part| {
+                        let name = part.split(':').next().unwrap_or("");
+                        present.contains(name)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            let (schema_ptr, schema_len) = self.string_ptr(builder, &append_schema);
             self.call_rt_void(
                 builder,
                 "knot_source_append",

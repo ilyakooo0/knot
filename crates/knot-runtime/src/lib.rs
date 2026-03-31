@@ -5679,13 +5679,18 @@ pub extern "C" fn knot_source_diff_write(
                 .execute_batch(&delete_sql)
                 .expect("knot runtime: failed to delete removed rows");
 
-            // 4. INSERT rows from temp that are not in main
+            // 4. INSERT rows from temp that are not in main.
+            // Use NOT EXISTS on the available columns to avoid inserting
+            // duplicate rows when writing through a projected view (where
+            // the schema covers only a subset of the table's columns).
             let insert_new_sql = format!(
-                "INSERT OR IGNORE INTO {} ({}) SELECT {} FROM {};",
+                "INSERT OR IGNORE INTO {} ({}) SELECT {} FROM {} WHERE NOT EXISTS (SELECT 1 FROM {} WHERE {});",
                 table,
                 col_names.join(", "),
                 col_names.join(", "),
-                temp
+                temp,
+                table,
+                match_conds.join(" AND ")
             );
             debug_sql(&insert_new_sql);
             db_ref

@@ -5048,11 +5048,29 @@ impl Codegen {
 
                         if group_by_pos.is_some() {
                             if let Some(name) = pat_primary_var(&pat.node) {
-                                primary_var = Some(name);
+                                primary_var = Some(name.clone());
                             }
                             primary_row_val = Some(row);
-                            if let ast::ExprKind::SourceRef(name) = &expr.node {
-                                primary_source = Some(name.clone());
+                            match &expr.node {
+                                ast::ExprKind::SourceRef(name)
+                                | ast::ExprKind::DerivedRef(name) => {
+                                    primary_source = Some(name.clone());
+                                    primary_schema = self.source_schemas.get(name).cloned();
+                                }
+                                ast::ExprKind::FieldAccess { expr: target, field } => {
+                                    if let ast::ExprKind::Var(parent_var) = &target.node {
+                                        if let Some(parent_schema) = var_schemas.get(parent_var) {
+                                            primary_schema = extract_child_schema(parent_schema, field);
+                                        }
+                                    }
+                                    primary_source = None;
+                                }
+                                _ => {}
+                            }
+                            if let Some(ref schema) = primary_schema {
+                                if let Some(ref var_name) = primary_var {
+                                    var_schemas.insert(var_name.clone(), schema.clone());
+                                }
                             }
                         }
 

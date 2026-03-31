@@ -2486,11 +2486,15 @@ impl Infer {
             }
             None
         }).collect();
-        // Iterate until alias resolutions stabilize (fixpoint)
+        // Iterate until alias resolutions stabilize (fixpoint).
+        // Clear annotation_vars once before the loop so that type variable
+        // names (e.g. `a` in `type T = a`) map to stable TyVars across
+        // iterations — clearing inside would allocate fresh vars each time,
+        // preventing convergence.
+        self.annotation_vars.clear();
         loop {
             let mut changed = false;
             for (name, ty) in &alias_decls {
-                self.annotation_vars.clear();
                 let resolved = self.ast_type_to_ty(ty);
                 if self.aliases.get(name) != Some(&resolved) {
                     self.aliases.insert(name.clone(), resolved);

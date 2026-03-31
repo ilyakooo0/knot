@@ -1512,12 +1512,20 @@ pub extern "C" fn knot_relation_group_by(
         .iter()
         .map(|ks| quote_ident(&ks.name))
         .collect();
-    let select_sql = format!(
-        "SELECT {} FROM {} ORDER BY {}",
-        insert_col_names.join(", "),
-        temp,
-        order_cols.join(", ")
-    );
+    let select_sql = if order_cols.is_empty() {
+        format!(
+            "SELECT {} FROM {}",
+            insert_col_names.join(", "),
+            temp,
+        )
+    } else {
+        format!(
+            "SELECT {} FROM {} ORDER BY {}",
+            insert_col_names.join(", "),
+            temp,
+            order_cols.join(", ")
+        )
+    };
     debug_sql(&select_sql);
 
     let groups = {
@@ -6840,6 +6848,60 @@ pub extern "C" fn knot_relation_add_fields(
     alloc(Value::Relation(new_rows))
 }
 
+/// Rename fields in every record of a relation.
+/// `mapping` is a comma-separated string of `old_name>new_name` pairs.
+/// Fields not mentioned in the mapping are kept unchanged.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_rename_columns(
+    relation: *mut Value,
+    mapping_ptr: *const u8,
+    mapping_len: usize,
+) -> *mut Value {
+    let rows = match unsafe { as_ref(relation) } {
+        Value::Relation(rows) => rows,
+        _ => return relation,
+    };
+    let mapping_str = unsafe { str_from_raw(mapping_ptr, mapping_len) };
+    if mapping_str.is_empty() {
+        return relation;
+    }
+    let renames: Vec<(&str, &str)> = mapping_str
+        .split(',')
+        .filter_map(|pair| pair.split_once('>'))
+        .collect();
+    if renames.is_empty() {
+        return relation;
+    }
+
+    let new_rows: Vec<*mut Value> = rows
+        .iter()
+        .map(|row_ptr| {
+            let fields = match unsafe { as_ref(*row_ptr) } {
+                Value::Record(fields) => fields,
+                _ => return *row_ptr,
+            };
+            let new_rec = knot_record_empty(fields.len());
+            for field in fields {
+                let new_name = renames
+                    .iter()
+                    .find(|(old, _)| *old == field.name)
+                    .map(|(_, new)| *new)
+                    .unwrap_or(&field.name);
+                let name_bytes = new_name.as_bytes();
+                knot_record_set_field(
+                    new_rec,
+                    name_bytes.as_ptr(),
+                    name_bytes.len(),
+                    field.value,
+                );
+            }
+            new_rec
+        })
+        .collect();
+
+    alloc(Value::Relation(new_rows))
+}
+
 /// Write through a view: delete rows matching filter, insert new rows.
 /// `filter_params` is a flat relation of values for the WHERE clause placeholders.
 /// `new_relation` has ALL columns (including constants that were added back).
@@ -7397,12 +7459,22 @@ fn value_to_serde_json(v: *mut Value) -> serde_json::Value {
 /// e.g. "authorization" → "Authorization", "contentType" → "Content-Type",
 ///      "xRequestId" → "X-Request-Id"
 fn camel_to_header_case(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
     let mut result = String::new();
-    for (i, c) in s.chars().enumerate() {
+    let len = chars.len();
+    for (i, &c) in chars.iter().enumerate() {
         if i == 0 {
             result.extend(c.to_uppercase());
         } else if c.is_uppercase() {
-            result.push('-');
+            let prev_upper = chars[i - 1].is_uppercase();
+            let next_lower = i + 1 < len && chars[i + 1].is_lowercase();
+            // Insert hyphen before an uppercase letter when:
+            //   - previous char was lowercase (new word: "contentType" → "Content-Type")
+            //   - OR this is the last uppercase in a run followed by lowercase
+            //     (acronym end: "xHTTPStatus" → "X-HTTP-Status")
+            if !prev_upper || next_lower {
+                result.push('-');
+            }
             result.push(c);
         } else {
             result.push(c);
@@ -7955,12 +8027,16 @@ pub extern "C" fn knot_http_fetch_io(
             Value::Text(s) => s.clone(),
             _ => String::new(),
         };
+        let mut has_content_type = false;
         if !req_hdrs_str.is_empty() {
             for field_desc in req_hdrs_str.split(',') {
                 if field_desc.is_empty() { continue; }
                 let (name, ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
                 let is_maybe = ty.starts_with('?');
                 let http_name = camel_to_header_case(name);
+                if http_name.eq_ignore_ascii_case("Content-Type") {
+                    has_content_type = true;
+                }
                 let field_val = knot_record_field(payload, name.as_ptr(), name.len());
                 if is_maybe {
                     // Maybe type: skip Nothing, extract Just value
@@ -7978,9 +8054,9 @@ pub extern "C" fn knot_http_fetch_io(
             }
         }
 
-        // Set default Content-Type for JSON bodies before ad-hoc headers,
-        // so fetchWith options can override it.
-        if body_json.is_some() {
+        // Set default Content-Type for JSON bodies, unless already set by
+        // route-declared headers.  Ad-hoc fetchWith headers can still override.
+        if body_json.is_some() && !has_content_type {
             request = request.set("Content-Type", "application/json");
         }
 

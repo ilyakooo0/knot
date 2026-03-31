@@ -483,6 +483,7 @@ impl Codegen {
         // View operations
         self.declare_rt("knot_view_read", &[p, p, p, p, p, p, p, p], &[p]);
         self.declare_rt("knot_relation_add_fields", &[p, p], &[p]);
+        self.declare_rt("knot_relation_rename_columns", &[p, p, p], &[p]);
         self.declare_rt("knot_view_write", &[p, p, p, p, p, p, p, p, p], &[]);
 
         // Constructor matching
@@ -2818,6 +2819,7 @@ impl Codegen {
                     } else {
                         // Filtered/projected view: SELECT source columns WHERE constants match
                         let view_schema = self.compute_view_schema(&view);
+                        let (src_to_view, _) = Self::compute_view_renames(&view);
                         let (filter_where, constant_cols) =
                             self.compute_view_filter(&view);
 
@@ -2835,7 +2837,7 @@ impl Codegen {
                         let (filter_ptr, filter_len) =
                             self.string_ptr(builder, &filter_where);
 
-                        self.call_rt(
+                        let result = self.call_rt(
                             builder,
                             "knot_view_read",
                             &[
@@ -2848,7 +2850,14 @@ impl Codegen {
                                 filter_len,
                                 filter_params,
                             ],
-                        )
+                        );
+                        // Rename source columns → view columns if any differ
+                        if src_to_view.is_empty() {
+                            result
+                        } else {
+                            let (map_ptr, map_len) = self.string_ptr(builder, &src_to_view);
+                            self.call_rt(builder, "knot_relation_rename_columns", &[result, map_ptr, map_len])
+                        }
                     }
                 } else {
                     let schema = self
@@ -3483,6 +3492,7 @@ impl Codegen {
                         } else {
                             // Filtered view: read view columns with constant filter
                             let view_schema = self.compute_view_schema(&view);
+                            let (src_to_view, _) = Self::compute_view_renames(&view);
                             let (filter_where, constant_cols) =
                                 self.compute_view_filter(&view);
                             let filter_params = self.compile_view_filter_params(
@@ -3497,7 +3507,7 @@ impl Codegen {
                             let (filter_ptr, filter_len) =
                                 self.string_ptr(builder, &filter_where);
 
-                            self.call_rt(
+                            let result = self.call_rt(
                                 builder,
                                 "knot_view_read_at",
                                 &[
@@ -3511,7 +3521,13 @@ impl Codegen {
                                     filter_params,
                                     timestamp,
                                 ],
-                            )
+                            );
+                            if src_to_view.is_empty() {
+                                result
+                            } else {
+                                let (map_ptr, map_len) = self.string_ptr(builder, &src_to_view);
+                                self.call_rt(builder, "knot_relation_rename_columns", &[result, map_ptr, map_len])
+                            }
                         }
                     } else {
                         // Direct source temporal query
@@ -3540,30 +3556,51 @@ impl Codegen {
     // ── View compilation ─────────────────────────────────────────
 
     /// Compute the view schema: subset of source schema for source columns only.
+    /// Uses SOURCE column names (for correct SQL against the source table).
     fn compute_view_schema(&self, view: &ViewInfo) -> String {
         let source_schema = self
             .source_schemas
             .get(&view.source_name)
             .cloned()
             .unwrap_or_default();
-        // Build mapping: source_col_name -> view_col_name (for renaming)
-        let col_map: Vec<(&str, &str)> = view
+        let src_col_set: std::collections::HashSet<&str> = view
             .source_columns
             .iter()
-            .map(|(view_col, src_col)| (src_col.as_str(), view_col.as_str()))
+            .map(|(_, src_col)| src_col.as_str())
             .collect();
         split_schema_fields(&source_schema)
             .into_iter()
-            .filter_map(|part| {
-                let colon = part.find(':')?;
-                let src_name = &part[..colon];
-                let type_suffix = &part[colon..];
-                col_map.iter()
-                    .find(|(sc, _)| *sc == src_name)
-                    .map(|(_, vc)| format!("{}{}", vc, type_suffix))
+            .filter(|part| {
+                let src_name = part.split(':').next().unwrap_or("");
+                src_col_set.contains(src_name)
             })
             .collect::<Vec<_>>()
             .join(",")
+    }
+
+    /// Compute rename mapping strings for views that rename columns.
+    /// Returns `(src_to_view, view_to_src)` — empty strings when no renames.
+    fn compute_view_renames(view: &ViewInfo) -> (String, String) {
+        let renames: Vec<(&str, &str)> = view
+            .source_columns
+            .iter()
+            .filter(|(view_col, src_col)| view_col != src_col)
+            .map(|(view_col, src_col)| (src_col.as_str(), view_col.as_str()))
+            .collect();
+        if renames.is_empty() {
+            return (String::new(), String::new());
+        }
+        let src_to_view = renames
+            .iter()
+            .map(|(s, v)| format!("{}>{}",s, v))
+            .collect::<Vec<_>>()
+            .join(",");
+        let view_to_src = renames
+            .iter()
+            .map(|(s, v)| format!("{}>{}",v, s))
+            .collect::<Vec<_>>()
+            .join(",");
+        (src_to_view, view_to_src)
     }
 
     /// Compute the WHERE clause and constant column expressions for a view.
@@ -3598,17 +3635,25 @@ impl Codegen {
         self.emit_history_snapshot(builder, db, &source_name, &source_schema);
 
         // Compute the view-filtered schema (only columns the view selects).
-        // When the view selects all source columns, this equals source_schema.
+        // Uses source column names for correct SQL against the source table.
         let view_schema = if view.source_columns.is_empty() {
             source_schema.clone()
         } else {
             self.compute_view_schema(view)
         };
 
+        // Compute rename mapping: view→source for writing (records have view names)
+        let (_, view_to_src) = Self::compute_view_renames(view);
+
         // Check for append optimization: set *view = union *view newRows
         if let Some(new_rows_expr) = self.match_union_append(view_name, value) {
             let new_rows_expr = new_rows_expr.clone();
-            let new_rows = self.compile_expr(builder, &new_rows_expr, env, db);
+            let mut new_rows = self.compile_expr(builder, &new_rows_expr, env, db);
+            // Rename view columns → source columns before writing
+            if !view_to_src.is_empty() {
+                let (map_ptr, map_len) = self.string_ptr(builder, &view_to_src);
+                new_rows = self.call_rt(builder, "knot_relation_rename_columns", &[new_rows, map_ptr, map_len]);
+            }
             let augmented =
                 self.compile_view_augment(builder, new_rows, &view.constant_columns, env, db);
             let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
@@ -3643,9 +3688,13 @@ impl Codegen {
             );
         } else if view.constant_columns.is_empty() {
             // No constant columns — use diff-write on underlying source
-            // view_schema adapts: full source_schema for simple aliases,
-            // filtered schema for projected views (source_columns non-empty)
-            let val = self.compile_expr(builder, value, env, db);
+            // view_schema uses source column names for correct SQL.
+            let mut val = self.compile_set_value_expr(builder, value, env, db);
+            // Rename view columns → source columns before writing
+            if !view_to_src.is_empty() {
+                let (map_ptr, map_len) = self.string_ptr(builder, &view_to_src);
+                val = self.call_rt(builder, "knot_relation_rename_columns", &[val, map_ptr, map_len]);
+            }
             let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
             let (schema_ptr, schema_len) = self.string_ptr(builder, &view_schema);
             self.call_rt_void(
@@ -3655,7 +3704,12 @@ impl Codegen {
             );
         } else {
             // General case: delete matching rows, insert new rows with constants
-            let new_val = self.compile_expr(builder, value, env, db);
+            let mut new_val = self.compile_set_value_expr(builder, value, env, db);
+            // Rename view columns → source columns before writing
+            if !view_to_src.is_empty() {
+                let (map_ptr, map_len) = self.string_ptr(builder, &view_to_src);
+                new_val = self.call_rt(builder, "knot_relation_rename_columns", &[new_val, map_ptr, map_len]);
+            }
             let augmented =
                 self.compile_view_augment(builder, new_val, &view.constant_columns, env, db);
 

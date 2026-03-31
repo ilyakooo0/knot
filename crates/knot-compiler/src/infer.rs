@@ -1745,41 +1745,33 @@ impl Infer {
             }
 
             ast::ExprKind::Set { target, value } => {
-                let is_view = matches!(&target.node,
-                    ast::ExprKind::SourceRef(n) if self.view_names.contains(n));
                 let target_ty = self.infer_expr(target);
                 let value_ty = self.infer_expr(value);
-                if !is_view {
-                    // Unwrap IO from both sides for unification —
-                    // target is IO (source ref), value may also be IO
-                    // (do-block reading from relations).
-                    // Apply substitution first so type variables resolved
-                    // to IO are properly unwrapped.
-                    let target_applied = self.apply(&target_ty);
-                    let value_applied = self.apply(&value_ty);
-                    let unwrap_io = |ty: &Ty| match ty {
-                        Ty::IO(_, inner) => (**inner).clone(),
-                        other => other.clone(),
-                    };
-                    self.unify(&unwrap_io(&target_applied), &unwrap_io(&value_applied), expr.span);
-                }
+                // Unwrap IO from both sides for unification —
+                // target is IO (source ref), value may also be IO
+                // (do-block reading from relations).
+                // Apply substitution first so type variables resolved
+                // to IO are properly unwrapped.
+                let target_applied = self.apply(&target_ty);
+                let value_applied = self.apply(&value_ty);
+                let unwrap_io = |ty: &Ty| match ty {
+                    Ty::IO(_, inner) => (**inner).clone(),
+                    other => other.clone(),
+                };
+                self.unify(&unwrap_io(&target_applied), &unwrap_io(&value_applied), expr.span);
                 Ty::IO(BTreeSet::new(), Box::new(Ty::unit()))
             }
 
             ast::ExprKind::FullSet { target, value } => {
-                let is_view = matches!(&target.node,
-                    ast::ExprKind::SourceRef(n) if self.view_names.contains(n));
                 let target_ty = self.infer_expr(target);
                 let value_ty = self.infer_expr(value);
-                if !is_view {
-                    let target_applied = self.apply(&target_ty);
-                    let value_applied = self.apply(&value_ty);
-                    let unwrap_io = |ty: &Ty| match ty {
-                        Ty::IO(_, inner) => (**inner).clone(),
-                        other => other.clone(),
-                    };
-                    self.unify(&unwrap_io(&target_applied), &unwrap_io(&value_applied), expr.span);
-                }
+                let target_applied = self.apply(&target_ty);
+                let value_applied = self.apply(&value_ty);
+                let unwrap_io = |ty: &Ty| match ty {
+                    Ty::IO(_, inner) => (**inner).clone(),
+                    other => other.clone(),
+                };
+                self.unify(&unwrap_io(&target_applied), &unwrap_io(&value_applied), expr.span);
                 Ty::IO(BTreeSet::new(), Box::new(Ty::unit()))
             }
 

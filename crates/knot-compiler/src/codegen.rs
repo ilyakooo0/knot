@@ -3190,7 +3190,7 @@ impl Codegen {
                         );
                     } else if !Self::references_source(value, name) {
                         // 2. Full replace: value doesn't read the source
-                        let val = self.compile_expr(builder, value, env, db);
+                        let val = self.compile_set_value_expr(builder, value, env, db);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
                         let (schema_ptr, schema_len) =
                             self.string_ptr(builder, &schema);
@@ -3251,7 +3251,7 @@ impl Codegen {
                             );
                         } else {
                             // SQL compilation failed → map with no filter → full write
-                            let val = self.compile_expr(builder, value, env, db);
+                            let val = self.compile_set_value_expr(builder, value, env, db);
                             let (name_ptr, name_len) = self.string_ptr(builder, name);
                             let (schema_ptr, schema_len) =
                                 self.string_ptr(builder, &schema);
@@ -3311,7 +3311,7 @@ impl Codegen {
                             );
                         } else {
                             // SQL compilation failed → fall back to diff-write
-                            let val = self.compile_expr(builder, value, env, db);
+                            let val = self.compile_set_value_expr(builder, value, env, db);
                             let (name_ptr, name_len) = self.string_ptr(builder, name);
                             let (schema_ptr, schema_len) =
                                 self.string_ptr(builder, &schema);
@@ -3324,7 +3324,7 @@ impl Codegen {
                     } else if Self::match_map_no_filter(name, value) {
                         // 5. Map without filter: every row transformed, no filtering
                         //    Full write is safe and avoids diff overhead.
-                        let val = self.compile_expr(builder, value, env, db);
+                        let val = self.compile_set_value_expr(builder, value, env, db);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
                         let (schema_ptr, schema_len) =
                             self.string_ptr(builder, &schema);
@@ -3335,7 +3335,7 @@ impl Codegen {
                         );
                     } else {
                         // 6. Fallback: diff-based write
-                        let val = self.compile_expr(builder, value, env, db);
+                        let val = self.compile_set_value_expr(builder, value, env, db);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
                         let (schema_ptr, schema_len) =
                             self.string_ptr(builder, &schema);
@@ -3382,7 +3382,7 @@ impl Codegen {
                         return self.call_rt(builder, "knot_value_unit", &[]);
                     }
 
-                    let val = self.compile_expr(builder, value, env, db);
+                    let val = self.compile_set_value_expr(builder, value, env, db);
                     let (name_ptr, name_len) = self.string_ptr(builder, name);
                     let (schema_ptr, schema_len) =
                         self.string_ptr(builder, &schema);
@@ -3546,16 +3546,21 @@ impl Codegen {
             .get(&view.source_name)
             .cloned()
             .unwrap_or_default();
-        let view_col_names: Vec<&str> = view
+        // Build mapping: source_col_name -> view_col_name (for renaming)
+        let col_map: Vec<(&str, &str)> = view
             .source_columns
             .iter()
-            .map(|(_, src_col)| src_col.as_str())
+            .map(|(view_col, src_col)| (src_col.as_str(), view_col.as_str()))
             .collect();
         split_schema_fields(&source_schema)
             .into_iter()
-            .filter(|part| {
-                let name = part.split(':').next().unwrap_or("");
-                view_col_names.contains(&name)
+            .filter_map(|part| {
+                let colon = part.find(':')?;
+                let src_name = &part[..colon];
+                let type_suffix = &part[colon..];
+                col_map.iter()
+                    .find(|(sc, _)| *sc == src_name)
+                    .map(|(_, vc)| format!("{}{}", vc, type_suffix))
             })
             .collect::<Vec<_>>()
             .join(",")
@@ -4524,6 +4529,24 @@ impl Codegen {
     // ── Do-block compilation ──────────────────────────────────────
 
     /// Check if a do-block should be compiled as IO (contains IO-producing builtins).
+    /// Compile an expression that will be used as the value of a `set`/`full set`.
+    /// Do-blocks in set-value position are always relational comprehensions,
+    /// even when they contain SourceRef/DerivedRef binds (which would normally
+    /// cause `is_io_do_block` to classify them as IO).
+    fn compile_set_value_expr(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        value: &ast::Expr,
+        env: &mut Env,
+        db: Value,
+    ) -> Value {
+        if let ast::ExprKind::Do(stmts) = &value.node {
+            self.compile_do(builder, stmts, env, db)
+        } else {
+            self.compile_expr(builder, value, env, db)
+        }
+    }
+
     fn is_io_do_block(&self, stmts: &[ast::Stmt]) -> bool {
         stmts.iter().any(|stmt| match &stmt.node {
             ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Let { expr, .. } => self.expr_is_io(expr),

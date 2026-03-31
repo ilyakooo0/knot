@@ -3524,15 +3524,21 @@ pub extern "C" fn knot_source_migrate(
         .execute_batch("SAVEPOINT knot_migrate;")
         .expect("knot runtime: failed to begin migration transaction");
 
-    // Drop old child tables (for nested relation fields) before dropping parent
-    if !is_adt_schema(old_schema) {
-        let old_rec = parse_record_schema(old_schema);
-        for nf in &old_rec.nested {
-            let child = format!("{}__{}", table_name, nf.name);
+    // Drop old child tables (for nested relation fields) before dropping parent.
+    // Recurse to handle grandchild+ tables (deepest first).
+    fn drop_nested_tables(conn: &rusqlite::Connection, parent_table: &str, nested: &[NestedField]) {
+        for nf in nested {
+            let child = format!("{}__{}", parent_table, nf.name);
+            // Drop grandchildren first (depth-first)
+            drop_nested_tables(conn, &child, &nf.nested);
             let drop_child = format!("DROP TABLE IF EXISTS {};", quote_ident(&child));
             debug_sql(&drop_child);
-            let _ = db_ref.conn.execute_batch(&drop_child);
+            let _ = conn.execute_batch(&drop_child);
         }
+    }
+    if !is_adt_schema(old_schema) {
+        let old_rec = parse_record_schema(old_schema);
+        drop_nested_tables(&db_ref.conn, &table_name, &old_rec.nested);
     }
 
     let drop_sql = format!("DROP TABLE IF EXISTS {};", table);
@@ -6428,11 +6434,13 @@ pub extern "C" fn knot_atomic_begin(db: *mut c_void) {
     let _guard = write_lock_guard();
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let depth = db_ref.atomic_depth.get() + 1;
-    db_ref.atomic_depth.set(depth);
     db_ref
         .conn
         .execute_batch(&format!("SAVEPOINT knot_atomic_{depth};"))
         .expect("knot runtime: failed to begin atomic");
+    // Only update depth after SAVEPOINT succeeds, so rollback/commit
+    // never targets a non-existent savepoint on SQL failure.
+    db_ref.atomic_depth.set(depth);
     // Lock stays held across begin/commit/rollback — forget the guard
     // so it doesn't release on drop. Commit/rollback will release.
     std::mem::forget(_guard);

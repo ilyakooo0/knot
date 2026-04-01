@@ -4497,7 +4497,8 @@ pub extern "C" fn knot_source_query_count(
 }
 
 /// Execute a SQL aggregate query returning a float (e.g. AVG).
-/// Returns a boxed Float value.
+/// Returns a boxed Float value. Returns 0.0 when the result is NULL
+/// (e.g. AVG on an empty table).
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_source_query_float(
     db: *mut c_void,
@@ -4522,11 +4523,62 @@ pub extern "C" fn knot_source_query_float(
 
     debug_sql_params(sql, &sql_params);
 
-    let result: f64 = db_ref
+    let result: Option<f64> = db_ref
         .conn
         .query_row(sql, param_refs.as_slice(), |row| row.get(0))
         .unwrap_or_else(|e| panic!("knot runtime: query_float error: {}\n  SQL: {}", e, sql));
-    alloc_float(result)
+    alloc_float(result.unwrap_or(0.0))
+}
+
+/// Execute a SQL SUM() query, preserving the numeric type.
+/// Returns Int when SQLite produces an integer result (SUM on integer columns),
+/// Float when it produces a real result (SUM on float columns).
+/// Returns Int 0 when the result is NULL (SUM on an empty table).
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_source_query_sum(
+    db: *mut c_void,
+    sql_ptr: *const u8,
+    sql_len: usize,
+    params: *mut Value,
+) -> *mut Value {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let sql = unsafe { str_from_raw(sql_ptr, sql_len) };
+
+    let param_values = match unsafe { as_ref(params) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: query_sum params must be a Relation, got {}",
+            type_name(params)
+        ),
+    };
+    let sql_params: Vec<rusqlite::types::Value> =
+        param_values.iter().map(|v| value_to_sql_param(*v)).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+
+    debug_sql_params(sql, &sql_params);
+
+    db_ref
+        .conn
+        .query_row(sql, param_refs.as_slice(), |row| {
+            match row.get_ref(0).unwrap() {
+                ValueRef::Null => Ok(alloc_int(BigInt::ZERO)),
+                ValueRef::Integer(n) => Ok(alloc_int(BigInt::from(n))),
+                ValueRef::Real(f) => Ok(alloc_float(f)),
+                ValueRef::Text(s) => {
+                    let s = std::str::from_utf8(s).expect("knot runtime: invalid UTF-8 in sum result");
+                    if let Ok(n) = s.parse::<BigInt>() {
+                        Ok(alloc_int(n))
+                    } else if let Ok(f) = s.parse::<f64>() {
+                        Ok(alloc_float(f))
+                    } else {
+                        Ok(alloc_int(BigInt::ZERO))
+                    }
+                }
+                _ => Ok(alloc_int(BigInt::ZERO)),
+            }
+        })
+        .unwrap_or_else(|e| panic!("knot runtime: query_sum error: {}\n  SQL: {}", e, sql))
 }
 
 /// Count rows in a source relation via SQL COUNT(*).

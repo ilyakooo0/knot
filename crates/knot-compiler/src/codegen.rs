@@ -462,6 +462,7 @@ impl Codegen {
         self.declare_rt("knot_source_read_where", &[p, p, p, p, p, p, p, p], &[p]);
         self.declare_rt("knot_source_query", &[p, p, p, p, p, p], &[p]);
         self.declare_rt("knot_source_query_float", &[p, p, p, p], &[p]);
+        self.declare_rt("knot_source_query_sum", &[p, p, p, p], &[p]);
         self.declare_rt("knot_source_write", &[p, p, p, p, p, p], &[]);
         self.declare_rt("knot_source_append", &[p, p, p, p, p, p], &[]);
         self.declare_rt("knot_source_diff_write", &[p, p, p, p, p, p], &[]);
@@ -6234,7 +6235,11 @@ impl Codegen {
             };
             let params_rel = self.compile_sql_params(builder, &params, env);
             let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-            let rt_fn = if func == "AVG" || func == "SUM" { "knot_source_query_float" } else { "knot_source_query_count" };
+            let rt_fn = match func {
+                "SUM" => "knot_source_query_sum",
+                "AVG" => "knot_source_query_float",
+                _ => "knot_source_query_count",
+            };
             Some(self.call_rt(
                 builder,
                 rt_fn,

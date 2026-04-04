@@ -3848,6 +3848,26 @@ fn parse_schema(spec: &str) -> Vec<ColumnSpec> {
     parse_record_schema(spec).columns
 }
 
+/// Build a COALESCE expression that maps NULL to a sentinel value for use in
+/// UNIQUE indexes (SQLite treats NULLs as distinct, so we need a non-NULL stand-in).
+///
+/// The sentinel MUST have a different SQLite storage class than real column values
+/// so it can never collide with actual data.  Storage class order:
+///   NULL < INTEGER < REAL < TEXT < BLOB
+/// Values of different storage classes are never considered equal by SQLite.
+fn null_safe_coalesce(col: &str, ty: ColType) -> String {
+    match ty {
+        // Int stored as TEXT, Bool stored as INTEGER — INTEGER sentinel can't match either
+        ColType::Int | ColType::Bool => format!("COALESCE({}, -9223372036854775808)", col),
+        // Float stored as REAL — TEXT sentinel can't match REAL
+        ColType::Float => format!("COALESCE({}, '')", col),
+        // Bytes stored as BLOB — TEXT sentinel can't match BLOB
+        ColType::Bytes => format!("COALESCE({}, '')", col),
+        // Text/Tag/Json stored as TEXT — BLOB sentinel can't match TEXT
+        _ => format!("COALESCE({}, X'00')", col),
+    }
+}
+
 fn sql_type(ty: ColType) -> &'static str {
     match ty {
         ColType::Int => "TEXT COLLATE KNOT_INT",
@@ -4072,12 +4092,7 @@ fn auto_apply_adt_change(
 
     let coalesced: Vec<String> = std::iter::once(quote_ident("_tag"))
         .chain(new_adt.all_fields.iter().map(|f| {
-            let col = quote_ident(&f.name);
-            match f.ty {
-                ColType::Int | ColType::Bool => format!("COALESCE({}, -9223372036854775808)", col),
-                ColType::Float => format!("COALESCE({}, -1.7976931348623157e+308)", col),
-                _ => format!("COALESCE({}, X'00')", col),
-            }
+            null_safe_coalesce(&quote_ident(&f.name), f.ty)
         }))
         .collect();
     let idx_sql = format!(
@@ -4326,13 +4341,7 @@ pub extern "C" fn knot_source_init(
         // Unique index using COALESCE to treat NULLs as equal
         let coalesced: Vec<String> = std::iter::once(quote_ident("_tag"))
             .chain(adt.all_fields.iter().map(|f| {
-                let col = quote_ident(&f.name);
-                let default = match f.ty {
-                    ColType::Int | ColType::Bool => "COALESCE(".to_string() + &col + ", -9223372036854775808)",
-                    ColType::Float => "COALESCE(".to_string() + &col + ", -1.7976931348623157e+308)",
-                    _ => "COALESCE(".to_string() + &col + ", X'00')",
-                };
-                default
+                null_safe_coalesce(&quote_ident(&f.name), f.ty)
             }))
             .collect();
         let idx_sql = format!(

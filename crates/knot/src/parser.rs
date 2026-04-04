@@ -25,6 +25,10 @@ pub struct Parser {
     /// operators at column 0 inside grouped expressions are not mistaken for
     /// new top-level declarations.
     delimiter_depth: usize,
+    /// Tracks recursion depth for unbounded recursive-descent paths
+    /// (unary operators, constructor chaining, type arrows) to prevent
+    /// stack overflow on pathological input.
+    recursion_depth: usize,
 }
 
 // ── Public API ──────────────────────────────────────────────────────
@@ -40,6 +44,7 @@ impl Parser {
             stop_type_at_headers: false,
             block_indent: usize::MAX,
             delimiter_depth: 0,
+            recursion_depth: 0,
         }
     }
 
@@ -83,6 +88,29 @@ impl Parser {
         }
 
         (Module { imports, decls }, self.diagnostics)
+    }
+}
+
+// ── Recursion depth guard ────────────────────────────────────────────
+
+const MAX_RECURSION_DEPTH: usize = 256;
+
+impl Parser {
+    /// Increment recursion depth and return `true`, or emit an error and
+    /// return `false` if the limit is exceeded.  Callers must decrement
+    /// `self.recursion_depth` when the recursive call returns.
+    fn enter_recursion(&mut self) -> bool {
+        self.recursion_depth += 1;
+        if self.recursion_depth > MAX_RECURSION_DEPTH {
+            self.recursion_depth -= 1;
+            let span = self.span();
+            self.diagnostics.push(
+                Diagnostic::error("nesting depth limit exceeded")
+                    .label(span, "expression is too deeply nested"),
+            );
+            return false;
+        }
+        true
     }
 }
 
@@ -1581,9 +1609,12 @@ impl Parser {
     fn parse_unary(&mut self) -> Option<Expr> {
         match self.peek() {
             TokenKind::Minus => {
+                if !self.enter_recursion() { return None; }
                 let start = self.span();
                 self.advance();
-                let operand = self.parse_unary()?;
+                let operand = self.parse_unary();
+                self.recursion_depth -= 1;
+                let operand = operand?;
                 let span = Span::new(start.start, operand.span.end);
                 Some(Spanned::new(
                     ExprKind::UnaryOp {
@@ -1594,9 +1625,12 @@ impl Parser {
                 ))
             }
             TokenKind::Not => {
+                if !self.enter_recursion() { return None; }
                 let start = self.span();
                 self.advance();
-                let operand = self.parse_unary()?;
+                let operand = self.parse_unary();
+                self.recursion_depth -= 1;
+                let operand = operand?;
                 let span = Span::new(start.start, operand.span.end);
                 Some(Spanned::new(
                     ExprKind::UnaryOp {
@@ -1701,7 +1735,10 @@ impl Parser {
     fn parse_constructor_or_atom(&mut self) -> Option<Expr> {
         let expr = self.parse_atom()?;
         if matches!(expr.node, ExprKind::Constructor(_)) && self.can_start_atom() {
-            let arg = self.parse_constructor_or_atom()?;
+            if !self.enter_recursion() { return None; }
+            let arg = self.parse_constructor_or_atom();
+            self.recursion_depth -= 1;
+            let arg = arg?;
             let span = Span::new(expr.span.start, arg.span.end);
             Some(Spanned::new(
                 ExprKind::App {
@@ -2711,8 +2748,11 @@ impl Parser {
     fn parse_type_function(&mut self) -> Option<Type> {
         let lhs = self.parse_type_app()?;
         if self.eat(&TokenKind::Arrow) {
+            if !self.enter_recursion() { return None; }
             self.skip_newlines();
-            let rhs = self.parse_type_function()?; // right-associative
+            let rhs = self.parse_type_function(); // right-associative
+            self.recursion_depth -= 1;
+            let rhs = rhs?;
             let span = Span::new(lhs.span.start, rhs.span.end);
             Some(Spanned::new(
                 TypeKind::Function {

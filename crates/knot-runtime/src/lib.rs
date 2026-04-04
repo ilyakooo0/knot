@@ -4210,6 +4210,14 @@ fn auto_apply_record_change(
         }
     }
 
+    // Adding nested fields to a table that had none → breaking.
+    // The parent table needs `_id INTEGER PRIMARY KEY AUTOINCREMENT` for
+    // child table FK references, and SQLite cannot add a PRIMARY KEY via
+    // ALTER TABLE.
+    if old_rec.nested.is_empty() && !new_rec.nested.is_empty() {
+        return false;
+    }
+
     // Any removed nested fields → breaking
     for old_nf in &old_rec.nested {
         if !new_rec.nested.iter().any(|n| n.name == old_nf.name) {

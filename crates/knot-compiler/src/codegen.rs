@@ -133,7 +133,10 @@ pub struct Codegen {
 }
 
 /// Role of a constructor in a nullable-encoded ADT.
+/// Currently unused — nullable encoding is disabled to avoid representation
+/// mismatch with SQLite-read values (see collect_declarations).
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 enum NullableRole {
     /// The nullary constructor (e.g. Nothing) — encoded as null pointer
     None,
@@ -946,22 +949,12 @@ impl Codegen {
                         ctors.iter().map(|c| c.name.clone()).collect();
                     self.data_constructors.insert(name.clone(), ctor_names);
 
-                    // Detect Maybe-isomorphic types: exactly 2 constructors,
-                    // one nullary (0 fields) and one with fields.
-                    if ctors.len() == 2 {
-                        let (nullary, non_nullary): (Vec<_>, Vec<_>) =
-                            ctors.iter().partition(|c| c.fields.is_empty());
-                        if nullary.len() == 1 && non_nullary.len() == 1 {
-                            self.nullable_ctors.insert(
-                                nullary[0].name.clone(),
-                                NullableRole::None,
-                            );
-                            self.nullable_ctors.insert(
-                                non_nullary[0].name.clone(),
-                                NullableRole::Some,
-                            );
-                        }
-                    }
+                    // NOTE: nullable pointer encoding for Maybe-isomorphic types
+                    // (2 constructors, one nullary, one with fields) is disabled.
+                    // The runtime reconstructs ADT values from SQLite as
+                    // Constructor(tag, payload) which is always non-null, creating
+                    // a representation mismatch with null-encoded in-memory values
+                    // that breaks equality and pattern matching.
                 }
                 ast::DeclKind::Trait {
                     name: trait_name,
@@ -6121,7 +6114,7 @@ impl Codegen {
                 let sql = format!("SELECT {}({}) FROM {}", func, col_sql, table);
                 let params_rel = self.compile_sql_params(builder, &[], env);
                 let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                let rt_fn = if fn_name == "avg" || fn_name == "sum" { "knot_source_query_float" } else { "knot_source_query_count" };
+                let rt_fn = if fn_name == "sum" { "knot_source_query_sum" } else { "knot_source_query_float" };
                 Some(self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]))
             }
             _ => None,

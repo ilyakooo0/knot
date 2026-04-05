@@ -1,0 +1,43 @@
+name: Release VS Code Extension
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Compute version from commit date
+        id: version
+        run: |
+          read YEAR MONTH DAY HOUR MINUTE <<< \
+            "$(TZ=UTC git log -1 --format=%cd --date=format-local:'%Y %-m %-d %-H %-M')"
+          TIME=$((HOUR * 100 + MINUTE))
+          # VSIX requires valid semver (3 segments): encode month+day into minor
+          VSIX_MINOR=$((MONTH * 100 + DAY))
+          echo "vsix=${YEAR}.${VSIX_MINOR}.${TIME}" >> "$GITHUB_OUTPUT"
+          echo "tag=${YEAR}.${MONTH}.${DAY}.${TIME}" >> "$GITHUB_OUTPUT"
+
+      - name: Package extension
+        working-directory: editors/vscode
+        run: |
+          npm ci
+          npm version "${{ steps.version.outputs.vsix }}" --no-git-tag-version --allow-same-version
+          npx @vscode/vsce package
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Knot VS Code ${{ steps.version.outputs.tag }}
+          files: editors/vscode/*.vsix
+          make_latest: true

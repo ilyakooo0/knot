@@ -1,0 +1,303 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Knot",
+  "scopeName": "source.knot",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#string" },
+    { "include": "#byte-string" },
+    { "include": "#number" },
+    { "include": "#declaration" },
+    { "include": "#keyword" },
+    { "include": "#operator" },
+    { "include": "#type-name" },
+    { "include": "#relation" },
+    { "include": "#derived" },
+    { "include": "#identifier" },
+    { "include": "#punctuation" }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.line.double-dash.knot",
+      "match": "--.*$"
+    },
+    "string": {
+      "name": "string.quoted.double.knot",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.knot",
+          "match": "\\\\[\\\\\"ntr]"
+        }
+      ]
+    },
+    "byte-string": {
+      "name": "string.quoted.double.byte.knot",
+      "begin": "b\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.knot",
+          "match": "\\\\[\\\\\"ntr0]|\\\\x[0-9a-fA-F]{2}"
+        }
+      ]
+    },
+    "number": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.knot",
+          "match": "\\b[0-9][0-9_]*\\.[0-9][0-9_]*\\b"
+        },
+        {
+          "name": "constant.numeric.integer.knot",
+          "match": "\\b[0-9][0-9_]*\\b"
+        }
+      ]
+    },
+    "declaration": {
+      "patterns": [
+        {
+          "comment": "Source relation declaration: *name : [Type]",
+          "match": "^(\\*)(\\w+)\\s*(:)",
+          "captures": {
+            "1": { "name": "keyword.operator.relation.knot" },
+            "2": { "name": "entity.name.variable.source.knot" },
+            "3": { "name": "punctuation.separator.type.knot" }
+          }
+        },
+        {
+          "comment": "Derived relation declaration: &name = expr",
+          "match": "^(&)(\\w+)\\s*(=)",
+          "captures": {
+            "1": { "name": "keyword.operator.derived.knot" },
+            "2": { "name": "entity.name.variable.derived.knot" },
+            "3": { "name": "keyword.operator.assignment.knot" }
+          }
+        },
+        {
+          "comment": "View declaration: *view = do",
+          "match": "^(\\*)(\\w+)\\s*(=)",
+          "captures": {
+            "1": { "name": "keyword.operator.relation.knot" },
+            "2": { "name": "entity.name.variable.view.knot" },
+            "3": { "name": "keyword.operator.assignment.knot" }
+          }
+        },
+        {
+          "comment": "Data declaration",
+          "match": "\\b(data)\\s+([A-Z][a-zA-Z0-9_']*)",
+          "captures": {
+            "1": { "name": "keyword.declaration.data.knot" },
+            "2": { "name": "entity.name.type.knot" }
+          }
+        },
+        {
+          "comment": "Type alias declaration",
+          "match": "\\b(type)\\s+([A-Z][a-zA-Z0-9_']*)",
+          "captures": {
+            "1": { "name": "keyword.declaration.type.knot" },
+            "2": { "name": "entity.name.type.knot" }
+          }
+        },
+        {
+          "comment": "Trait declaration",
+          "match": "\\b(trait)\\s+([A-Z][a-zA-Z0-9_']*)",
+          "captures": {
+            "1": { "name": "keyword.declaration.trait.knot" },
+            "2": { "name": "entity.name.type.trait.knot" }
+          }
+        },
+        {
+          "comment": "Impl declaration",
+          "match": "\\b(impl)\\s+([A-Z][a-zA-Z0-9_']*)",
+          "captures": {
+            "1": { "name": "keyword.declaration.impl.knot" },
+            "2": { "name": "entity.name.type.trait.knot" }
+          }
+        },
+        {
+          "comment": "Route declaration",
+          "match": "\\b(route)\\s+([A-Z][a-zA-Z0-9_']*)",
+          "captures": {
+            "1": { "name": "keyword.declaration.route.knot" },
+            "2": { "name": "entity.name.type.route.knot" }
+          }
+        },
+        {
+          "comment": "Migrate block",
+          "match": "\\b(migrate)\\s+([A-Z][a-zA-Z0-9_']*)",
+          "captures": {
+            "1": { "name": "keyword.declaration.migrate.knot" },
+            "2": { "name": "entity.name.type.knot" }
+          }
+        },
+        {
+          "comment": "Top-level function definition",
+          "match": "^([a-z_][a-zA-Z0-9_']*)\\s*(=)",
+          "captures": {
+            "1": { "name": "entity.name.function.knot" },
+            "2": { "name": "keyword.operator.assignment.knot" }
+          }
+        },
+        {
+          "comment": "Top-level function type signature",
+          "match": "^([a-z_][a-zA-Z0-9_']*)\\s*(:)",
+          "captures": {
+            "1": { "name": "entity.name.function.knot" },
+            "2": { "name": "punctuation.separator.type.knot" }
+          }
+        },
+        {
+          "comment": "Import declaration",
+          "match": "\\b(import)\\s+(\"[^\"]*\")",
+          "captures": {
+            "1": { "name": "keyword.control.import.knot" },
+            "2": { "name": "string.quoted.double.knot" }
+          }
+        }
+      ]
+    },
+    "keyword": {
+      "patterns": [
+        {
+          "name": "keyword.control.knot",
+          "match": "\\b(do|if|then|else|case|of|let|in|where|yield|atomic)\\b"
+        },
+        {
+          "name": "keyword.other.knot",
+          "match": "\\b(set|full|import|export|deriving|with|migrate)\\b"
+        },
+        {
+          "name": "keyword.declaration.knot",
+          "match": "\\b(data|type|trait|impl|route)\\b"
+        },
+        {
+          "name": "constant.language.boolean.knot",
+          "match": "\\b(true|false|True|False)\\b"
+        },
+        {
+          "name": "keyword.operator.logical.knot",
+          "match": "\\b(not)\\b"
+        },
+        {
+          "comment": "Built-in types",
+          "name": "support.type.knot",
+          "match": "\\b(Int|Float|Text|Bool|Bytes|IO)\\b"
+        },
+        {
+          "comment": "Built-in functions",
+          "name": "support.function.knot",
+          "match": "\\b(println|print|show|count|union|diff|inter|sum|avg|filter|match|map|fold|single|now|toUpper|toLower|take|drop|length|trim|contains|reverse|chars|id|toJson|parseJson|readFile|writeFile|appendFile|fileExists|removeFile|listDir|readLine|randomInt|randomFloat|fork|retry|listen|fetch|fetchWith)\\b"
+        }
+      ]
+    },
+    "operator": {
+      "patterns": [
+        {
+          "name": "keyword.operator.arrow.knot",
+          "match": "->|<-|=>"
+        },
+        {
+          "name": "keyword.operator.comparison.knot",
+          "match": "==|!=|<=|>="
+        },
+        {
+          "name": "keyword.operator.comparison.knot",
+          "match": "[<>]"
+        },
+        {
+          "name": "keyword.operator.logical.knot",
+          "match": "&&|\\|\\|"
+        },
+        {
+          "name": "keyword.operator.pipe.knot",
+          "match": "\\|>"
+        },
+        {
+          "name": "keyword.operator.concat.knot",
+          "match": "\\+\\+"
+        },
+        {
+          "name": "keyword.operator.arithmetic.knot",
+          "match": "[+\\-*/]"
+        },
+        {
+          "name": "keyword.operator.assignment.knot",
+          "match": "="
+        },
+        {
+          "name": "keyword.operator.lambda.knot",
+          "match": "\\\\"
+        },
+        {
+          "name": "keyword.operator.temporal.knot",
+          "match": "@"
+        }
+      ]
+    },
+    "relation": {
+      "comment": "Source relation reference: *name",
+      "match": "(\\*)[a-z_][a-zA-Z0-9_']*",
+      "name": "variable.other.relation.source.knot"
+    },
+    "derived": {
+      "comment": "Derived relation reference: &name",
+      "match": "(&)[a-z_][a-zA-Z0-9_']*",
+      "name": "variable.other.relation.derived.knot"
+    },
+    "type-name": {
+      "comment": "Type/constructor names starting with uppercase",
+      "name": "entity.name.type.knot",
+      "match": "\\b[A-Z][a-zA-Z0-9_']*\\b"
+    },
+    "identifier": {
+      "name": "variable.other.knot",
+      "match": "\\b[a-z_][a-zA-Z0-9_']*\\b"
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.separator.comma.knot",
+          "match": ","
+        },
+        {
+          "name": "punctuation.separator.colon.knot",
+          "match": ":"
+        },
+        {
+          "name": "punctuation.accessor.dot.knot",
+          "match": "\\."
+        },
+        {
+          "name": "punctuation.separator.pipe.knot",
+          "match": "\\|"
+        },
+        {
+          "name": "punctuation.section.braces.begin.knot",
+          "match": "\\{"
+        },
+        {
+          "name": "punctuation.section.braces.end.knot",
+          "match": "\\}"
+        },
+        {
+          "name": "punctuation.section.brackets.begin.knot",
+          "match": "\\["
+        },
+        {
+          "name": "punctuation.section.brackets.end.knot",
+          "match": "\\]"
+        },
+        {
+          "name": "punctuation.section.parens.begin.knot",
+          "match": "\\("
+        },
+        {
+          "name": "punctuation.section.parens.end.knot",
+          "match": "\\)"
+        }
+      ]
+    }
+  }
+}

@@ -18,6 +18,7 @@
   "activationEvents": [
     "onLanguage:knot"
   ],
+  "icon": "icon.png",
   "main": "./out/extension.js",
   "contributes": {
     "languages": [
@@ -34,7 +35,10 @@
         "icon": {
           "light": "./icon.png",
           "dark": "./icon.png"
-        }
+        },
+        "filenames": [
+          "*.knot"
+        ]
       }
     ],
     "grammars": [

@@ -1,5 +1,9 @@
 # Knot
 
+<center>
+<img src="logo.png" width="300px">
+</center>
+
 Knot is a functional relational programming language. Relations are the primary data structure, computation is pure and functional, and state is automatically persisted to SQLite.
 
 ## Quick Start

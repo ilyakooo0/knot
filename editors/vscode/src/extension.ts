@@ -1,5 +1,6 @@
 import * as path from "path";
 import * as fs from "fs";
+import { execFileSync } from "child_process";
 import {
   workspace,
   ExtensionContext,
@@ -18,8 +19,13 @@ function findServer(context: ExtensionContext): string | undefined {
   const configPath = workspace
     .getConfiguration("knot")
     .get<string>("server.path");
-  if (configPath && fs.existsSync(configPath)) {
-    return configPath;
+  if (configPath) {
+    if (fs.existsSync(configPath)) {
+      return configPath;
+    }
+    window.showWarningMessage(
+      `knot.server.path "${configPath}" does not exist, searching elsewhere...`
+    );
   }
 
   // 2. Workspace cargo target directories (debug then release)
@@ -46,18 +52,34 @@ function findServer(context: ExtensionContext): string | undefined {
     return bundled;
   }
 
-  // 4. Fall back to PATH
-  return "knot-lsp";
+  // 4. Check if knot-lsp is on PATH
+  try {
+    const resolved = execFileSync("which", ["knot-lsp"], {
+      encoding: "utf-8",
+      timeout: 3000,
+    }).trim();
+    if (resolved) {
+      return resolved;
+    }
+  } catch {
+    // not on PATH
+  }
+
+  return undefined;
 }
 
 export function activate(context: ExtensionContext) {
+  const outputChannel = window.createOutputChannel("Knot Language Server");
+
   const serverPath = findServer(context);
   if (!serverPath) {
     window.showErrorMessage(
-      "Could not find knot-lsp. Set knot.server.path or build with `cargo build -p knot-lsp`."
+      "Could not find knot-lsp. Build it with `cargo build -p knot-lsp` or set `knot.server.path`."
     );
     return;
   }
+
+  outputChannel.appendLine(`Using knot-lsp: ${serverPath}`);
 
   const extraArgs = workspace
     .getConfiguration("knot")
@@ -73,6 +95,8 @@ export function activate(context: ExtensionContext) {
     synchronize: {
       fileEvents: workspace.createFileSystemWatcher("**/*.knot"),
     },
+    outputChannel,
+    traceOutputChannel: outputChannel,
   };
 
   client = new LanguageClient(
@@ -82,7 +106,12 @@ export function activate(context: ExtensionContext) {
     clientOptions
   );
 
-  client.start();
+  client.start().catch((err) => {
+    window.showErrorMessage(
+      `Failed to start knot-lsp: ${err.message}`
+    );
+    outputChannel.appendLine(`Error: ${err.message}`);
+  });
 }
 
 export function deactivate(): Thenable<void> | undefined {

@@ -4457,11 +4457,11 @@ impl Codegen {
             builder.ins().jump(merge_block, &[arm_val]);
 
             if is_last && !is_unconditional {
-                // Last arm was conditional — fallback block for non-exhaustive match
+                // Last arm was conditional — no arm matched at runtime; panic.
                 builder.switch_to_block(next_block);
                 builder.seal_block(next_block);
-                let unit = self.call_rt(builder, "knot_value_unit", &[]);
-                builder.ins().jump(merge_block, &[unit]);
+                self.call_rt_void(builder, "knot_guard_failed", &[]);
+                builder.ins().trap(cranelift_codegen::ir::TrapCode::user(0).unwrap());
             } else if !is_last {
                 builder.switch_to_block(next_block);
                 builder.seal_block(next_block);

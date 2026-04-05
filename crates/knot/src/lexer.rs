@@ -274,9 +274,11 @@ impl<'src> Lexer<'src> {
             if let Some(kind) = kind {
                 last_was_newline = matches!(kind, TokenKind::Newline);
                 tokens.push(Token { kind, span });
+            } else {
+                // Unknown character was skipped — reset newline flag so
+                // a subsequent newline is not incorrectly suppressed.
+                last_was_newline = false;
             }
-            // `None` means the character was unknown; a diagnostic was
-            // already emitted, so we just skip it and keep going.
         }
 
         (tokens, self.diagnostics)

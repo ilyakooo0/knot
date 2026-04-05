@@ -1601,9 +1601,11 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
         }
         Value::Float(f) => {
             buf.push(1);
-            // Normalize -0.0 to +0.0 for consistent hashing (matches total_cmp equality)
-            let normalized = if *f == 0.0 { 0.0_f64 } else { *f };
-            buf.extend_from_slice(&normalized.to_bits().to_le_bytes());
+            // Use raw bits for hashing to match total_cmp equality semantics
+            // (total_cmp distinguishes -0.0 from +0.0). Canonicalize NaN so
+            // all NaN bit patterns hash the same (total_cmp treats them equal).
+            let bits = if f.is_nan() { f64::NAN.to_bits() } else { f.to_bits() };
+            buf.extend_from_slice(&bits.to_le_bytes());
         }
         Value::Text(s) => {
             buf.push(2);
@@ -3576,12 +3578,7 @@ pub extern "C" fn knot_source_migrate(
         // Unique index with COALESCE for NULLs (same as knot_source_init)
         let coalesced: Vec<String> = std::iter::once(quote_ident("_tag"))
             .chain(adt.all_fields.iter().map(|f| {
-                let col = quote_ident(&f.name);
-                match f.ty {
-                    ColType::Int | ColType::Bool => format!("COALESCE({}, -9223372036854775808)", col),
-                    ColType::Float => format!("COALESCE({}, -1.7976931348623157e+308)", col),
-                    _ => format!("COALESCE({}, X'00')", col),
-                }
+                null_safe_coalesce(&quote_ident(&f.name), f.ty)
             }))
             .collect();
         let idx_sql = format!(
@@ -6531,14 +6528,14 @@ pub extern "C" fn knot_atomic_commit(db: *mut c_void) {
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let depth = db_ref.atomic_depth.get();
     assert!(depth > 0, "knot runtime: atomic commit without matching begin");
-    // Decrement depth before SQL so the two counters stay in sync even
-    // if the SQL operation panics (the WriteLockGuard will release the
-    // lock on unwind, and depth must already reflect the release).
-    db_ref.atomic_depth.set(depth - 1);
+    // Execute SQL first, then decrement depth. If SQL panics, depth is
+    // still > 0, so WriteLockGuard's drop can safely call write_lock_release
+    // without hitting the depth > 0 assertion.
     db_ref
         .conn
         .execute_batch(&format!("RELEASE SAVEPOINT knot_atomic_{depth};"))
         .expect("knot runtime: failed to commit atomic");
+    db_ref.atomic_depth.set(depth - 1);
     if depth == 1 {
         notify_relation_changed();
     }
@@ -6552,16 +6549,16 @@ pub extern "C" fn knot_atomic_rollback(db: *mut c_void) {
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let depth = db_ref.atomic_depth.get();
     assert!(depth > 0, "knot runtime: atomic rollback without matching begin");
-    // Decrement depth before SQL (same rationale as knot_atomic_commit).
-    db_ref.atomic_depth.set(depth - 1);
     // ROLLBACK TO undoes changes but keeps the savepoint alive.
     // RELEASE then removes it so the next begin creates a clean one.
+    // Execute SQL first, then decrement depth (same rationale as commit).
     db_ref
         .conn
         .execute_batch(&format!(
             "ROLLBACK TO SAVEPOINT knot_atomic_{depth}; RELEASE SAVEPOINT knot_atomic_{depth};"
         ))
         .expect("knot runtime: failed to rollback atomic");
+    db_ref.atomic_depth.set(depth - 1);
 }
 
 // ── Record update ─────────────────────────────────────────────────
@@ -7456,12 +7453,17 @@ fn base64_decode(s: &str) -> Vec<u8> {
         .collect();
     let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
     for chunk in bytes.chunks(4) {
+        if chunk.len() < 2 {
+            // A single base64 character is malformed (encodes only 6 bits,
+            // not enough for a full byte). Skip rather than silently losing data.
+            break;
+        }
         let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b1 = chunk[1] as u32;
         let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
         let b3 = if chunk.len() > 3 { chunk[3] as u32 } else { 0 };
         let triple = (b0 << 18) | (b1 << 12) | (b2 << 6) | b3;
-        if chunk.len() > 1 { out.push(((triple >> 16) & 0xFF) as u8); }
+        out.push(((triple >> 16) & 0xFF) as u8);
         if chunk.len() > 2 { out.push(((triple >> 8) & 0xFF) as u8); }
         if chunk.len() > 3 { out.push((triple & 0xFF) as u8); }
     }
@@ -8780,9 +8782,11 @@ fn serialize_value_for_hash_into(v: *mut Value, buf: &mut Vec<u8>) {
         }
         Value::Float(f) => {
             buf.push(1);
-            // Normalize -0.0 to +0.0 for consistent hashing (matches total_cmp equality)
-            let normalized = if *f == 0.0 { 0.0_f64 } else { *f };
-            buf.extend_from_slice(&normalized.to_bits().to_le_bytes());
+            // Use raw bits for hashing to match total_cmp equality semantics
+            // (total_cmp distinguishes -0.0 from +0.0). Canonicalize NaN so
+            // all NaN bit patterns hash the same (total_cmp treats them equal).
+            let bits = if f.is_nan() { f64::NAN.to_bits() } else { f.to_bits() };
+            buf.extend_from_slice(&bits.to_le_bytes());
         }
         Value::Text(s) => {
             buf.push(2);

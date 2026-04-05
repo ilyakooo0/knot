@@ -190,13 +190,14 @@ impl Parser {
         Span::new(self.source.len(), self.source.len())
     }
 
-    fn save(&self) -> (usize, usize) {
-        (self.pos, self.delimiter_depth)
+    fn save(&self) -> (usize, usize, usize) {
+        (self.pos, self.delimiter_depth, self.recursion_depth)
     }
 
-    fn restore(&mut self, saved: (usize, usize)) {
+    fn restore(&mut self, saved: (usize, usize, usize)) {
         self.pos = saved.0;
         self.delimiter_depth = saved.1;
+        self.recursion_depth = saved.2;
     }
 
     fn column_of(&self, span: &Span) -> usize {
@@ -1271,7 +1272,8 @@ impl Parser {
             self.stop_type_at_headers = true;
             let ty = self.parse_type();
             self.stop_type_at_headers = false;
-            Some(ty?)
+            let ty = ty?;
+            Some(ty)
         } else {
             None
         };

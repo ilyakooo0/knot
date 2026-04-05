@@ -2396,7 +2396,17 @@ impl Infer {
                         is_io = true;
                         io_effects.extend(effects.iter().cloned());
                     }
-                    self.check_pattern(pat, &expr_ty);
+                    // Let-generalization: for simple variable patterns,
+                    // generalize the binding so it can be used polymorphically
+                    // (e.g., `let id = \x -> x` should be usable at multiple types).
+                    if let ast::PatKind::Var(name) = &pat.node {
+                        let applied = self.apply(&expr_ty);
+                        let scheme = self.generalize(&applied);
+                        self.bind(name, scheme);
+                        self.binding_types.push((pat.span, applied));
+                    } else {
+                        self.check_pattern(pat, &expr_ty);
+                    }
                 }
                 ast::StmtKind::Where { cond } => {
                     let cond_ty = self.infer_expr(cond);

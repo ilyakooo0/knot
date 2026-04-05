@@ -142,7 +142,36 @@ fn resolve_recursive(
 
         // Filter declarations based on selective import list
         let decls: Vec<ast::Decl> = if let Some(items) = &imp.items {
-            let names: HashSet<&str> = items.iter().map(|i| i.name.as_str()).collect();
+            let mut names: HashSet<&str> = items.iter().map(|i| i.name.as_str()).collect();
+            // When a trait is selected, also include data types defined in
+            // the same module that the trait or its impls may depend on
+            // (e.g., `Ordering` for `Ord`). This prevents compilation
+            // failures when imported impls reference data types.
+            let data_names: Vec<String> = visible_decls.iter().filter_map(|d| {
+                if let ast::DeclKind::Data { name, .. } = &d.node {
+                    Some(name.clone())
+                } else { None }
+            }).collect();
+            // Collect additional data type names to include (owned, to avoid borrow conflict)
+            let mut extra_data: Vec<String> = Vec::new();
+            for d in &visible_decls {
+                if let ast::DeclKind::Trait { name: trait_name, items: trait_items, .. } = &d.node {
+                    if names.contains(trait_name.as_str()) {
+                        for item in trait_items {
+                            if let ast::TraitItem::Method { ty, .. } = item {
+                                for data_name in &data_names {
+                                    if type_references_name(&ty.ty, data_name) {
+                                        extra_data.push(data_name.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for name in &extra_data {
+                names.insert(name.as_str());
+            }
             let decls: Vec<ast::Decl> = visible_decls
                 .into_iter()
                 .filter(|d| should_include_decl(d, &names))
@@ -194,6 +223,30 @@ fn decl_name(decl: &ast::DeclKind) -> Option<String> {
         ast::DeclKind::Impl { .. }
         | ast::DeclKind::Migrate { .. }
         | ast::DeclKind::SubsetConstraint { .. } => None,
+    }
+}
+
+/// Check if a type AST references a given named type (e.g., data type name).
+fn type_references_name(ty: &ast::Type, name: &str) -> bool {
+    match &ty.node {
+        ast::TypeKind::Named(n) => n == name,
+        ast::TypeKind::App { func, arg } => {
+            type_references_name(func, name) || type_references_name(arg, name)
+        }
+        ast::TypeKind::Record { fields, .. } => {
+            fields.iter().any(|f| type_references_name(&f.value, name))
+        }
+        ast::TypeKind::Relation(inner) => type_references_name(inner, name),
+        ast::TypeKind::Function { param, result } => {
+            type_references_name(param, name) || type_references_name(result, name)
+        }
+        ast::TypeKind::Variant { constructors, .. } => constructors
+            .iter()
+            .any(|c| c.fields.iter().any(|f| type_references_name(&f.value, name))),
+        ast::TypeKind::Effectful { ty, .. } | ast::TypeKind::IO { ty, .. } => {
+            type_references_name(ty, name)
+        }
+        ast::TypeKind::Var(_) | ast::TypeKind::Hole => false,
     }
 }
 

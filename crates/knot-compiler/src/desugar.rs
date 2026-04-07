@@ -612,7 +612,7 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
                 name.as_str(),
                 "println" | "putLine" | "print" | "readLine" | "readFile"
                     | "writeFile" | "appendFile" | "fileExists" | "removeFile"
-                    | "listDir" | "now" | "randomInt" | "randomFloat"
+                    | "listDir" | "now" | "sleep" | "randomInt" | "randomFloat"
                     | "fetch" | "fetchWith" | "fork" | "listen"
                     | "generateKeyPair" | "generateSigningKeyPair" | "encrypt"
             ) || io_fns.contains(name.as_str())

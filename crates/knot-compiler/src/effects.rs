@@ -191,7 +191,7 @@ impl EffectChecker {
 
         let mut clock_effect = EffectSet::empty();
         clock_effect.clock = true;
-        insert_many(&["now"], clock_effect);
+        insert_many(&["now", "sleep"], clock_effect);
 
         let mut random_effect = EffectSet::empty();
         random_effect.random = true;

@@ -613,6 +613,7 @@ impl Codegen {
         self.declare_rt("knot_fs_remove_file_io", &[p], &[p]);
         self.declare_rt("knot_fs_list_dir_io", &[p], &[p]);
         self.declare_rt("knot_now_io", &[], &[p]);
+        self.declare_rt("knot_sleep_io", &[p], &[p]);
         self.declare_rt("knot_random_int_io", &[p], &[p]);
         self.declare_rt("knot_random_float_io", &[], &[p]);
 
@@ -881,7 +882,7 @@ impl Codegen {
             "bytesGet",
             "readFile", "writeFile", "appendFile",
             "fileExists", "removeFile", "listDir",
-            "randomInt", "fork",
+            "randomInt", "sleep", "fork",
             "encrypt", "decrypt", "sign", "verify",
         ];
         for name in &stdlib_names {
@@ -1743,6 +1744,9 @@ impl Codegen {
 
         // Random: 1-param (IO-returning)
         self.define_stdlib_fn_1("randomInt", "knot_random_int_io");
+
+        // Sleep: 1-param (IO-returning)
+        self.define_stdlib_fn_1("sleep", "knot_sleep_io");
 
         // Spawn (IO-returning)
         self.define_stdlib_fn_1("fork", "knot_fork_io");
@@ -4618,7 +4622,7 @@ impl Codegen {
         let io_builtins: HashSet<&str> = [
             "println", "putLine", "print", "readLine", "readFile",
             "writeFile", "appendFile", "fileExists", "removeFile",
-            "listDir", "now", "randomInt", "randomFloat", "fetch", "fetchWith",
+            "listDir", "now", "sleep", "randomInt", "randomFloat", "fetch", "fetchWith",
             "fork", "listen", "generateKeyPair", "generateSigningKeyPair", "encrypt",
         ].into_iter().collect();
 
@@ -4710,7 +4714,7 @@ impl Codegen {
                     name.as_str(),
                     "println" | "putLine" | "print" | "readLine" | "readFile"
                         | "writeFile" | "appendFile" | "fileExists" | "removeFile"
-                        | "listDir" | "now" | "randomInt" | "randomFloat"
+                        | "listDir" | "now" | "sleep" | "randomInt" | "randomFloat"
                         | "fetch" | "fetchWith" | "fork" | "listen"
                         | "generateKeyPair" | "generateSigningKeyPair" | "encrypt"
                 ) || self.io_functions.contains(name)
@@ -8288,6 +8292,7 @@ fn is_builtin_name(name: &str) -> bool {
             | "verify"
             | "randomInt"
             | "randomFloat"
+            | "sleep"
             | "readLine"
             | "retry"
             | "fork"

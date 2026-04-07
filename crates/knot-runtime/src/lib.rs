@@ -2580,6 +2580,16 @@ pub extern "C" fn knot_now_io() -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn knot_sleep_io(ms_val: *mut Value) -> *mut Value {
+    let env = ms_val;
+    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let _ = db;
+        knot_sleep(env)
+    }
+    alloc(Value::IO(thunk as *const u8, env))
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn knot_random_int_io(bound: *mut Value) -> *mut Value {
     let env = bound;
     extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
@@ -6032,6 +6042,19 @@ pub extern "C" fn knot_now() -> *mut Value {
         .try_into()
         .expect("knot runtime: system clock milliseconds overflowed i64");
     knot_value_int(ms)
+}
+
+/// Sleep for the given number of milliseconds.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_sleep(ms_val: *mut Value) -> *mut Value {
+    let ms = match unsafe { as_ref(ms_val) } {
+        Value::Int(i) => i
+            .to_u64()
+            .expect("knot runtime: sleep duration must be non-negative"),
+        _ => panic!("knot runtime: sleep expects Int argument"),
+    };
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+    alloc(Value::Unit)
 }
 
 // ── Random number generation ─────────────────────────────────────

@@ -2303,7 +2303,7 @@ impl Infer {
                     name.as_str(),
                     "println" | "putLine" | "print" | "readLine" | "readFile"
                         | "writeFile" | "appendFile" | "fileExists" | "removeFile"
-                        | "listDir" | "now" | "randomInt" | "randomFloat"
+                        | "listDir" | "now" | "sleep" | "randomInt" | "randomFloat"
                         | "fetch" | "fetchWith" | "fork" | "listen"
                         | "generateKeyPair" | "generateSigningKeyPair" | "encrypt"
                 ) || self.lookup(name).map_or(false, |scheme| {
@@ -2921,6 +2921,15 @@ impl Infer {
         self.bind_top("now", Scheme::mono(
             Ty::IO(BTreeSet::from([IoEffect::Clock]), Box::new(Ty::Int)),
         ));
+
+        // sleep : Int -> IO {clock} {}
+        self.bind_top(
+            "sleep",
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Int),
+                Box::new(Ty::IO(BTreeSet::from([IoEffect::Clock]), Box::new(Ty::unit()))),
+            )),
+        );
 
         // randomInt : Int -> IO {random} Int
         self.bind_top(

@@ -2769,6 +2769,156 @@ pub extern "C" fn knot_relation_fold(
     acc
 }
 
+/// traverse(f, rel) — apply an applicative function to each element of a relation
+/// and sequence the results. Determines the applicative type (IO, Maybe, Result, [])
+/// by inspecting the first result.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_traverse(
+    db: *mut c_void,
+    func: *mut Value,
+    rel: *mut Value,
+) -> *mut Value {
+    let rows = match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => rows.clone(),
+        _ => panic!(
+            "knot runtime: traverse expected Relation, got {}",
+            type_name(rel)
+        ),
+    };
+
+    if rows.is_empty() {
+        // Cannot determine applicative from empty input; default to Relation applicative: [[]]
+        return alloc(Value::Relation(vec![alloc(Value::Relation(vec![]))]));
+    }
+
+    // Apply func to each element
+    let mut mapped: Vec<*mut Value> = Vec::with_capacity(rows.len());
+    for &row in &rows {
+        mapped.push(knot_value_call(db, func, row));
+    }
+
+    // Determine applicative type from first result and sequence accordingly
+    match unsafe { as_ref(mapped[0]) } {
+        Value::IO(..) => traverse_sequence_io(db, mapped),
+        Value::Relation(..) => traverse_sequence_relation(mapped),
+        Value::Constructor(tag, ..) => match tag.as_str() {
+            "Just" | "Nothing" => traverse_sequence_maybe(mapped),
+            "Ok" | "Err" => traverse_sequence_result(mapped),
+            _ => panic!(
+                "knot runtime: traverse unsupported applicative (constructor: {})",
+                tag
+            ),
+        },
+        _ => panic!(
+            "knot runtime: traverse unsupported applicative ({})",
+            type_name(mapped[0])
+        ),
+    }
+}
+
+/// Sequence [IO a] into IO [a] — creates a single IO thunk that runs each action in order.
+fn traverse_sequence_io(db: *mut c_void, ios: Vec<*mut Value>) -> *mut Value {
+    let _ = db;
+    let actions_rel = alloc(Value::Relation(ios));
+
+    extern "C" fn run_sequence(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let actions = match unsafe { as_ref(env) } {
+            Value::Relation(rows) => rows,
+            _ => unreachable!(),
+        };
+        let mut results = Vec::with_capacity(actions.len());
+        for &action in actions {
+            results.push(knot_io_run(db, action));
+        }
+        alloc(Value::Relation(results))
+    }
+
+    alloc(Value::IO(run_sequence as *const u8, actions_rel))
+}
+
+/// Sequence [Maybe a] into Maybe [a] — Nothing if any element is Nothing.
+fn traverse_sequence_maybe(maybes: Vec<*mut Value>) -> *mut Value {
+    let mut values = Vec::with_capacity(maybes.len());
+    for &m in &maybes {
+        match unsafe { as_ref(m) } {
+            Value::Constructor(tag, _) if tag == "Nothing" => {
+                return alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit)));
+            }
+            Value::Constructor(tag, inner) if tag == "Just" => {
+                values.push(extract_value_field(*inner));
+            }
+            _ => panic!("knot runtime: traverse expected Maybe, got {}", type_name(m)),
+        }
+    }
+    wrap_ok_or_just("Just", values)
+}
+
+/// Sequence [Result e a] into Result e [a] — first Err short-circuits.
+fn traverse_sequence_result(results: Vec<*mut Value>) -> *mut Value {
+    let mut values = Vec::with_capacity(results.len());
+    for &r in &results {
+        match unsafe { as_ref(r) } {
+            Value::Constructor(tag, _) if tag == "Err" => return r,
+            Value::Constructor(tag, inner) if tag == "Ok" => {
+                values.push(extract_value_field(*inner));
+            }
+            _ => panic!("knot runtime: traverse expected Result, got {}", type_name(r)),
+        }
+    }
+    wrap_ok_or_just("Ok", values)
+}
+
+/// Sequence [[a]] into [[a]] — cartesian product of all sub-relations.
+fn traverse_sequence_relation(rels: Vec<*mut Value>) -> *mut Value {
+    let mut current: Vec<Vec<*mut Value>> = vec![vec![]];
+    for &rel in &rels {
+        let rows = match unsafe { as_ref(rel) } {
+            Value::Relation(rows) => rows,
+            _ => panic!("knot runtime: traverse expected Relation, got {}", type_name(rel)),
+        };
+        let mut next = Vec::new();
+        for prefix in &current {
+            for &row in rows {
+                let mut extended = prefix.clone();
+                extended.push(row);
+                next.push(extended);
+            }
+        }
+        current = next;
+    }
+    alloc(Value::Relation(
+        current
+            .into_iter()
+            .map(|row| alloc(Value::Relation(row)))
+            .collect(),
+    ))
+}
+
+/// Extract the `value` field from a record (used for Just/Ok payloads).
+fn extract_value_field(payload: *mut Value) -> *mut Value {
+    match unsafe { as_ref(payload) } {
+        Value::Record(fields) => {
+            for f in fields {
+                if f.name == "value" {
+                    return f.value;
+                }
+            }
+            panic!("knot runtime: constructor payload missing 'value' field");
+        }
+        _ => panic!("knot runtime: constructor payload not a record"),
+    }
+}
+
+/// Wrap a list of values in Constructor { value: [values] } (for Just/Ok).
+fn wrap_ok_or_just(tag: &str, values: Vec<*mut Value>) -> *mut Value {
+    let rel = alloc(Value::Relation(values));
+    let rec = alloc(Value::Record(vec![RecordField {
+        name: "value".into(),
+        value: rel,
+    }]));
+    alloc(Value::Constructor(tag.into(), rec))
+}
+
 /// single(rel) — extract the single element from a one-element relation.
 /// Returns `Just {value: x}` for a singleton, `Nothing {}` otherwise.
 #[unsafe(no_mangle)]

@@ -1,9 +1,10 @@
 //! Built-in trait declarations and standard implementations.
 //!
 //! Defines the core trait hierarchy (Eq, Ord, Num, Semigroup, Display, Functor,
-//! Applicative, Monad, Alternative, Foldable) and primitive/[] implementations. Trait
-//! declarations and simple impls are parsed from Knot source; complex [] impls
-//! for HKT traits (Functor, Applicative, Monad, Foldable) are registered
+//! Applicative, Monad, Alternative, Foldable, Traversable) and primitive/[]
+//! implementations. Trait declarations and simple impls are parsed from Knot source;
+//! complex [] impls for HKT traits (Functor, Applicative, Monad, Foldable, Traversable)
+//! are registered
 //! directly in codegen to avoid span collision issues.
 
 use knot::ast;
@@ -36,6 +37,9 @@ trait Applicative f => Alternative (f : Type -> Type) where
 
 trait Foldable (t : Type -> Type) where
   fold : (b -> a -> b) -> b -> t a -> b
+
+trait Foldable t => Traversable (t : Type -> Type) where
+  traverse : (a -> f b) -> t a -> f (t b)
 
 trait Eq a => Num a where
   add : a -> a -> a

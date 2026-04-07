@@ -3476,7 +3476,7 @@ impl Infer {
                     self.annotation_vars.values().copied().collect();
 
                 // Build constraints: each trait param must implement this trait
-                let constraints: Vec<TyConstraint> = params
+                let mut constraints: Vec<TyConstraint> = params
                     .iter()
                     .filter_map(|p| {
                         self.annotation_vars.get(&p.name).map(|&v| TyConstraint {
@@ -3486,6 +3486,22 @@ impl Infer {
                         })
                     })
                     .collect();
+
+                // Also include per-method constraints from the type scheme
+                // (e.g., `Applicative f =>` on Traversable.traverse)
+                for c in &ty.constraints {
+                    if c.args.len() == 1 {
+                        if let ast::TypeKind::Named(var_name) = &c.args[0].node {
+                            if let Some(&v) = self.annotation_vars.get(var_name) {
+                                constraints.push(TyConstraint {
+                                    trait_name: c.trait_name.clone(),
+                                    type_var: v,
+                                    span: Span::new(0, 0),
+                                });
+                            }
+                        }
+                    }
+                }
 
                 // Record method → trait mapping
                 self.trait_method_traits
@@ -3947,7 +3963,7 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
     infer.collect_impls(module);
 
     // Phase 2c: Register builtin [] impls for HKT traits
-    for trait_name in &["Functor", "Applicative", "Monad", "Alternative", "Foldable"] {
+    for trait_name in &["Functor", "Applicative", "Monad", "Alternative", "Foldable", "Traversable"] {
         infer
             .known_impls
             .insert((trait_name.to_string(), "[]".to_string()));

@@ -542,6 +542,7 @@ impl Codegen {
         self.declare_rt("knot_relation_map", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_ap", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_fold", &[p, p, p, p], &[p]);
+        self.declare_rt("knot_relation_traverse", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_single", &[p], &[p]);
         self.declare_rt("knot_relation_diff", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_inter", &[p, p, p], &[p]);
@@ -1293,6 +1294,7 @@ impl Codegen {
             ("Alternative_Relation_empty", "empty", 0),
             ("Alternative_Relation_alt", "alt", 2),
             ("Foldable_Relation_fold", "fold", 3),
+            ("Traversable_Relation_traverse", "traverse", 2),
             ("Semigroup_Relation_append", "append", 2),
         ];
         for (mangled, method_name, n_params) in &impls {
@@ -1345,6 +1347,7 @@ impl Codegen {
                     "bind" => "Monad".to_string(),
                     "empty" | "alt" => "Alternative".to_string(),
                     "fold" => "Foldable".to_string(),
+                    "traverse" => "Traversable".to_string(),
                     "append" => "Semigroup".to_string(),
                     _ => continue,
                 })
@@ -1548,6 +1551,22 @@ impl Codegen {
                 let init = builder.block_params(entry)[2];
                 let rel = builder.block_params(entry)[3];
                 let result = cg.call_rt(builder, "knot_relation_fold", &[db, f, init, rel]);
+                builder.ins().return_(&[result]);
+            });
+        });
+
+        // Traversable_Relation_traverse(db, f, rel) → knot_relation_traverse(db, f, rel)
+        define_if_registered!("Traversable_Relation_traverse", |cg: &mut Self, func_id: FuncId| {
+            let mut sig = cg.module.make_signature();
+            sig.params.push(AbiParam::new(cg.ptr_type)); // db
+            sig.params.push(AbiParam::new(cg.ptr_type)); // f
+            sig.params.push(AbiParam::new(cg.ptr_type)); // rel
+            sig.returns.push(AbiParam::new(cg.ptr_type));
+            cg.build_function(func_id, sig, |cg, builder, entry| {
+                let db = builder.block_params(entry)[0];
+                let f = builder.block_params(entry)[1];
+                let rel = builder.block_params(entry)[2];
+                let result = cg.call_rt(builder, "knot_relation_traverse", &[db, f, rel]);
                 builder.ins().return_(&[result]);
             });
         });

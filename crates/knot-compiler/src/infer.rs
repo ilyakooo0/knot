@@ -363,6 +363,9 @@ impl Infer {
     fn normalize_app(f: Ty, a: Ty) -> Ty {
         match f {
             Ty::TyCon(ref name) if name == "[]" => Ty::Relation(Box::new(a)),
+            Ty::TyCon(ref name) if name == "IO" => {
+                Ty::IO(BTreeSet::new(), Box::new(a))
+            }
             Ty::TyCon(name) => Ty::Con(name, vec![a]),
             Ty::Con(name, mut args) => {
                 args.push(a);
@@ -490,6 +493,12 @@ impl Infer {
             (Ty::App(f, a), Ty::Relation(b))
             | (Ty::Relation(b), Ty::App(f, a)) => {
                 self.unify(f, &Ty::TyCon("[]".into()), span);
+                self.unify(a, b, span);
+            }
+            // App(f, a) vs IO(effects, b) → f = IO, a = b
+            (Ty::App(f, a), Ty::IO(_effects, b))
+            | (Ty::IO(_effects, b), Ty::App(f, a)) => {
+                self.unify(f, &Ty::TyCon("IO".into()), span);
                 self.unify(a, b, span);
             }
             // App(f, a) vs Con(name, args) — decompose the constructor
@@ -1738,9 +1747,17 @@ impl Infer {
             ast::ExprKind::Yield(inner) => {
                 let inner_ty = self.infer_expr(inner);
                 if self.in_io_do {
+                    // Inside an IO do-block, produce IO directly to preserve
+                    // compatibility with infer_do's IO detection logic.
                     Ty::IO(BTreeSet::new(), Box::new(inner_ty))
                 } else {
-                    Ty::Relation(Box::new(inner_ty))
+                    // Outside IO do-blocks, produce a polymorphic type App(m, inner)
+                    // where m is a fresh monad variable. This allows yield to work
+                    // for any Applicative — unification with the context determines
+                    // whether m resolves to [] (Relation), IO, Maybe, etc.
+                    let m = self.fresh_var();
+                    self.monad_vars.push((expr.span, m));
+                    Ty::App(Box::new(Ty::Var(m)), Box::new(inner_ty))
                 }
             }
 
@@ -3929,6 +3946,7 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
         let resolved = infer.apply(&Ty::Var(*m_var));
         let kind = match &resolved {
             Ty::TyCon(name) if name == "[]" => MonadKind::Relation,
+            Ty::TyCon(name) if name == "IO" => MonadKind::IO,
             Ty::TyCon(name) => MonadKind::Adt(name.clone()),
             Ty::Relation(_) => MonadKind::Relation,
             Ty::IO(_, _) => MonadKind::IO,

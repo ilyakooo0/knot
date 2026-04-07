@@ -3144,7 +3144,8 @@ impl Codegen {
                     // In IO do-block eager context, yield returns the raw value
                     val
                 } else {
-                    self.call_rt(builder, "knot_relation_singleton", &[val])
+                    // Dispatch through monad_info for polymorphic yield
+                    self.compile_monadic_yield(builder, val, expr.span, db)
                 }
             }
 
@@ -4525,7 +4526,8 @@ impl Codegen {
 
     // ── Monadic operation compilation ─────────────────────────────
 
-    /// Compile `__yield(val)` — dispatches through Applicative trait impl.
+    /// Compile `__yield(val)` / bare `yield val` — dispatches through
+    /// Applicative trait impl based on monad_info.
     fn compile_monadic_yield(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -4533,9 +4535,15 @@ impl Codegen {
         span: ast::Span,
         db: Value,
     ) -> Value {
+        match self.monad_info.get(&span) {
+            Some(MonadKind::IO) => {
+                // IO yield: wrap value in IO thunk via knot_io_pure
+                return self.call_rt(builder, "knot_io_pure", &[val]);
+            }
+            _ => {}
+        }
         let type_name = match self.monad_info.get(&span) {
             Some(MonadKind::Adt(name)) => name.clone(),
-            Some(MonadKind::IO) => "IO".to_string(),
             _ => "Relation".to_string(),
         };
         let yield_fn = format!("Applicative_{}_yield", type_name);

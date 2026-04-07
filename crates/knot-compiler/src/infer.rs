@@ -2508,6 +2508,13 @@ impl Infer {
         } else {
             match yield_ty {
                 Some(ty) => Ty::Relation(Box::new(ty)),
+                None if !has_relation_bind && last_expr_ty.is_some() => {
+                    // No yield, no relation bind, but has bare expressions:
+                    // use the last expression's type directly. This preserves
+                    // polymorphism for do-blocks that sequence operations
+                    // through a polymorphic monad parameter (e.g. `a {}`).
+                    last_expr_ty.unwrap()
+                }
                 None => Ty::Relation(Box::new(Ty::unit())),
             }
         }

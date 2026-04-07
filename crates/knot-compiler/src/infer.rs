@@ -89,6 +89,7 @@ impl Ty {
 struct TyConstraint {
     trait_name: String,
     type_var: TyVar,
+    span: Span,
 }
 
 /// Polymorphic type scheme: ∀ vars. constraints => ty
@@ -1010,7 +1011,7 @@ impl Infer {
                                     "no implementation of trait '{}' for type '{}'",
                                     c.trait_name, type_name
                                 ),
-                                Span::new(0, 0),
+                                c.span,
                             );
                         }
                     }
@@ -1671,7 +1672,20 @@ impl Infer {
                 let operand_ty = self.infer_expr(operand);
                 match op {
                     ast::UnaryOp::Neg => {
-                        // numeric negation — result same type as operand
+                        // numeric negation — reject known non-numeric types
+                        let resolved = self.apply(&operand_ty);
+                        match &resolved {
+                            Ty::Int | Ty::Float | Ty::Var(_) | Ty::Error => {}
+                            _ => {
+                                self.error(
+                                    format!(
+                                        "cannot negate value of type {}",
+                                        self.display_ty(&resolved)
+                                    ),
+                                    operand.span,
+                                );
+                            }
+                        }
                         operand_ty
                     }
                     ast::UnaryOp::Not => {
@@ -2360,9 +2374,7 @@ impl Infer {
         // Pre-scan: if any statement uses IO builtins, set in_io_do so that
         // `yield` expressions inside case/if branches produce IO types.
         let prev_in_io_do = self.in_io_do;
-        if self.stmt_has_io(stmts) {
-            self.in_io_do = true;
-        }
+        self.in_io_do = self.stmt_has_io(stmts);
 
         for stmt in stmts {
             match &stmt.node {
@@ -2710,6 +2722,7 @@ impl Infer {
                                     constraints.push(TyConstraint {
                                         trait_name: c.trait_name.clone(),
                                         type_var: v,
+                                        span: arg.span,
                                     });
                                 }
                             }
@@ -3469,6 +3482,7 @@ impl Infer {
                         self.annotation_vars.get(&p.name).map(|&v| TyConstraint {
                             trait_name: trait_name.to_string(),
                             type_var: v,
+                            span: Span::new(0, 0),
                         })
                     })
                     .collect();
@@ -3532,6 +3546,7 @@ impl Infer {
                                         constraints.push(TyConstraint {
                                             trait_name: c.trait_name.clone(),
                                             type_var: v,
+                                            span: arg.span,
                                         });
                                     }
                                 }
@@ -3591,6 +3606,7 @@ impl Infer {
     ) {
         // Build mapping from trait type params to the impl's concrete types.
         // e.g. `trait Display a` + `impl Display Int` → { a_var => Int }
+        self.annotation_vars.clear();
         let impl_types: Vec<Ty> = impl_args.iter().map(|a| self.ast_type_to_ty(&a)).collect();
 
         for item in items {

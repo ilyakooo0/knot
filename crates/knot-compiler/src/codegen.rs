@@ -1987,7 +1987,7 @@ impl Codegen {
                             return;
                         }
                         // No impls at all — unreachable in valid programs
-                        builder.ins().trap(cranelift_codegen::ir::TrapCode::user(0).unwrap());
+                        builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
                         return;
                     }
                 };
@@ -4485,7 +4485,7 @@ impl Codegen {
                 builder.switch_to_block(next_block);
                 builder.seal_block(next_block);
                 self.call_rt_void(builder, "knot_guard_failed", &[]);
-                builder.ins().trap(cranelift_codegen::ir::TrapCode::user(0).unwrap());
+                builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
             } else if !is_last {
                 builder.switch_to_block(next_block);
                 builder.seal_block(next_block);

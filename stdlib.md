@@ -97,22 +97,25 @@ numPeople = count *people
 ### `sum`
 
 ```
-sum : (a -> Int) -> [a] -> Int
+sum : (a -> b) -> [a] -> b
 ```
 
-Sum of a projected integer field over a relation.
+Sum of a projected numeric field over a relation. Works with `Int`, `Float`, and unit-annotated types — units are preserved through the projection.
 
 ```knot
 totalAge = sum (\p -> p.age) *people
+
+-- Unit-preserving:
+totalDistance = sum (\t -> t.distance) *trips   -- Float<m> if distance : Float<m>
 ```
 
 ### `avg`
 
 ```
-avg : (a -> Int | Float) -> [a] -> Float
+avg : (a -> Float<u>) -> [a] -> Float<u>
 ```
 
-Average of a projected numeric field over a relation.
+Average of a projected numeric field over a relation. Returns `Float`. Preserves units from the projection function — if the projection returns `Float<m>`, the average is `Float<m>`.
 
 ### `union`
 
@@ -696,12 +699,71 @@ Higher-kinded foldable. Built-in implementation for `[]`.
 |------|-------------|
 | `Int` | Unbounded integer (arbitrary precision) |
 | `Float` | 64-bit floating point |
+| `Int<u>` | Integer with compile-time unit (e.g. `Int<usd>`) |
+| `Float<u>` | Float with compile-time unit (e.g. `Float<m>`, `Float<m/s^2>`) |
 | `Text` | Unicode string |
 | `Bool` | `True {}` or `False {}` |
 | `Bytes` | Byte string |
 | `[a]` | Relation (set of values of type `a`) |
 | `IO {effects} a` | IO action with tracked effects |
 | `Ordering` | `LT {}`, `EQ {}`, or `GT {}` |
+
+### Units of Measure
+
+Optional compile-time units on `Int` and `Float`. Fully erased at runtime — no performance cost, no runtime representation. Plain `Float` is unit-agnostic and unifies with any `Float<u>`.
+
+#### Declaration
+
+```knot
+unit m
+unit s
+unit kg
+unit N = kg * m / s^2    -- derived unit alias
+unit Hz = 1 / s
+```
+
+#### Literals and Type Annotations
+
+```knot
+distance = 42.0<m>            -- Float<m>
+speed : Float<m / s>
+force : Float<N>
+cents : Int<usd>
+```
+
+#### Arithmetic Rules
+
+- `+`/`-` require matching units
+- `*`/`/` compose units algebraically
+- Unary negation preserves units
+- Scalar (dimensionless) multiplication preserves the other operand's unit
+
+```knot
+10.0<m> + 5.0<m>              -- Float<m>
+10.0<m> + 5.0<s>              -- type error
+10.0<m> * 5.0<m>              -- Float<m^2>
+100.0<m> / 10.0<s>            -- Float<m/s>
+2.0 * 5.0<m>                  -- Float<m>
+-(5.0<m>)                     -- Float<m>
+```
+
+#### Unit Polymorphism
+
+Lowercase names inside `<...>` are unit variables:
+
+```knot
+double : Float<u> -> Float<u>
+double = \x -> x + x
+```
+
+#### Unit-Preserving Functions
+
+`sum` and `avg` preserve units from their projection function:
+
+```knot
+avg (\t -> t.distance) *trips   -- Float<m> if distance : Float<m>
+sum (\t -> t.distance) *trips   -- Float<m> if distance : Float<m>
+```
 
 ---
 

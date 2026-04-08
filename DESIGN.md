@@ -1299,6 +1299,7 @@ Functions like `abs`, `min`, `max`, `sum`, `avg` preserve units:
 abs : Float<u> -> Float<u>
 min : Float<u> -> Float<u> -> Float<u>
 sum : (a -> Float<u>) -> [a] -> Float<u>
+avg : (a -> Float<u>) -> [a] -> Float<u>
 ```
 
 #### `show` and Units

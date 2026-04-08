@@ -140,22 +140,24 @@ inter *users *admins
 ```knot
 sum : (a -> b) -> [a] -> b
 ```
-Sum a numeric projection over a relation. The projection function extracts the value to sum from each row. Works with both `Int` and `Float`.
+Sum a numeric projection over a relation. The projection function extracts the value to sum from each row. Works with `Int`, `Float`, and unit-annotated types — units are preserved.
 
 ```knot
 sum (\x -> x) [10, 20, 30]              -- 60
 sum (\o -> o.amount) *orders             -- total of all order amounts
 *orders |> sum (\o -> o.amount)          -- same with pipe
+sum (\t -> t.distance) *trips            -- Float<m> if distance : Float<m>
 ```
 
 ```knot
-avg : (a -> Float) -> [a] -> Float
+avg : (a -> Float<u>) -> [a] -> Float<u>
 ```
-Average a numeric projection over a relation. Always returns `Float`. Returns `0.0` for an empty relation.
+Average a numeric projection over a relation. Returns `Float`. Returns `0.0` for an empty relation. Preserves units — if the projection returns `Float<m>`, the average is `Float<m>`.
 
 ```knot
 avg (\x -> x) [10.0, 20.0, 30.0]        -- 20.0
 avg (\e -> e.salary) *employees          -- mean salary
+avg (\t -> t.distance) *trips            -- Float<m> if distance : Float<m>
 ```
 
 ## Text

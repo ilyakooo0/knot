@@ -42,6 +42,41 @@ cargo run -p knot-compiler -- build file.knot
 | `Bytes` | Byte string | `b"hello"` |
 | `{}` | Unit / empty record | `{}` |
 
+### Units of Measure
+
+Optional compile-time units on `Int` and `Float`. Units are fully erased at runtime — no performance cost.
+
+```knot
+unit m
+unit s
+unit kg
+unit N = kg * m / s^2    -- derived unit alias
+
+distance = 42.0<m>        -- Float<m>
+speed : Float<m / s>
+force : Float<N>
+cents : Int<usd>
+```
+
+Arithmetic rules: `+`/`-` require matching units, `*`/`/` compose units, negation preserves units.
+
+```knot
+10.0<m> + 5.0<m>              -- Float<m>
+10.0<m> * 5.0<m>              -- Float<m^2>
+100.0<m> / 10.0<s>            -- Float<m/s>
+2.0 * 5.0<m>                  -- Float<m> (scalar mul)
+-(5.0<m>)                     -- Float<m>
+```
+
+Unit polymorphism — lowercase names in `<...>` are unit variables:
+
+```knot
+double : Float<u> -> Float<u>
+double = \x -> x + x
+```
+
+Unit-preserving stdlib: `sum`, `avg` propagate units from their projection function.
+
 ### Records
 
 ```knot
@@ -611,8 +646,8 @@ The compiler enforces that `retry` is only used inside `atomic`.
 | `match` | `Constructor -> [ADT] -> [Payload]` | Filter by variant |
 | `fold` | `(b -> a -> b) -> b -> [a] -> b` | Left fold |
 | `count` | `[a] -> Int` | Number of rows |
-| `sum` | `(a -> Int) -> [a] -> Int` | Sum projected field |
-| `avg` | `(a -> Num) -> [a] -> Float` | Average projected field |
+| `sum` | `(a -> b) -> [a] -> b` | Sum projected field (preserves units) |
+| `avg` | `(a -> Float<u>) -> [a] -> Float<u>` | Average projected field (preserves units) |
 | `single` | `[a] -> Maybe a` | Extract singleton |
 | `union` | `[a] -> [a] -> [a]` | Set union |
 | `diff` | `[a] -> [a] -> [a]` | Set difference |

@@ -222,7 +222,8 @@ fn decl_name(decl: &ast::DeclKind) -> Option<String> {
         | ast::DeclKind::RouteComposite { name, .. } => Some(name.clone()),
         ast::DeclKind::Impl { .. }
         | ast::DeclKind::Migrate { .. }
-        | ast::DeclKind::SubsetConstraint { .. } => None,
+        | ast::DeclKind::SubsetConstraint { .. }
+        | ast::DeclKind::UnitDecl { .. } => None,
     }
 }
 
@@ -246,6 +247,7 @@ fn type_references_name(ty: &ast::Type, name: &str) -> bool {
         ast::TypeKind::Effectful { ty, .. } | ast::TypeKind::IO { ty, .. } => {
             type_references_name(ty, name)
         }
+        ast::TypeKind::UnitAnnotated { base, .. } => type_references_name(base, name),
         ast::TypeKind::Var(_) | ast::TypeKind::Hole => false,
     }
 }
@@ -265,8 +267,9 @@ fn should_include_decl(decl: &ast::Decl, names: &HashSet<&str>) -> bool {
         // Routes
         ast::DeclKind::Route { name, .. } => names.contains(name.as_str()),
         ast::DeclKind::RouteComposite { name, .. } => names.contains(name.as_str()),
-        // Migrations and constraints are always included
+        // Migrations, constraints, and unit declarations are always included
         ast::DeclKind::Migrate { .. } => true,
         ast::DeclKind::SubsetConstraint { .. } => true,
+        ast::DeclKind::UnitDecl { .. } => true,
     }
 }

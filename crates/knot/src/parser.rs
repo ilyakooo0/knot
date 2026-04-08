@@ -263,6 +263,7 @@ impl Parser {
                     | TokenKind::Impl
                     | TokenKind::Route
                     | TokenKind::Migrate
+                    | TokenKind::Unit
                     | TokenKind::Star
                     | TokenKind::Ampersand
                     | TokenKind::Lower(_)
@@ -502,11 +503,130 @@ impl Parser {
             TokenKind::Impl => self.parse_impl_decl(),
             TokenKind::Route => self.parse_route_decl(),
             TokenKind::Migrate => self.parse_migrate(),
+            TokenKind::Unit => self.parse_unit_decl(),
             _ => {
                 self.error_at(start, "expected declaration");
                 None
             }
         }
+    }
+
+    // ── unit ─────────────────────────────────────────────────────────
+
+    fn parse_unit_decl(&mut self) -> Option<Decl> {
+        let start = self.span();
+        self.advance(); // consume `unit`
+
+        let (name, _) = self.expect_lower("expected unit name after 'unit'").ok()?;
+
+        let definition = if self.eat(&TokenKind::Eq) {
+            Some(self.parse_unit_expr()?)
+        } else {
+            None
+        };
+
+        let span = Span::new(start.start, self.prev_span().end);
+        Some(Decl {
+            node: DeclKind::UnitDecl { name, definition },
+            span,
+            exported: false,
+        })
+    }
+
+    /// Parse a unit expression: products, quotients, powers of named units.
+    /// Grammar:
+    ///   unit_expr    = unit_mul_div
+    ///   unit_mul_div = unit_power (('*' | '/') unit_power)*
+    ///   unit_power   = unit_atom ('^' integer)?
+    ///   unit_atom    = lower_ident | '1' | '(' unit_expr ')'
+    fn parse_unit_expr(&mut self) -> Option<UnitExpr> {
+        let mut lhs = self.parse_unit_power()?;
+        loop {
+            if self.eat(&TokenKind::Star) {
+                let rhs = self.parse_unit_power()?;
+                lhs = UnitExpr::Mul(Box::new(lhs), Box::new(rhs));
+            } else if self.eat(&TokenKind::Slash) {
+                let rhs = self.parse_unit_power()?;
+                lhs = UnitExpr::Div(Box::new(lhs), Box::new(rhs));
+            } else {
+                break;
+            }
+        }
+        Some(lhs)
+    }
+
+    fn parse_unit_power(&mut self) -> Option<UnitExpr> {
+        let base = self.parse_unit_atom()?;
+        if self.eat(&TokenKind::Caret) {
+            // Parse integer exponent (possibly negative)
+            let neg = self.eat(&TokenKind::Minus);
+            match self.peek() {
+                TokenKind::Int(_) => {
+                    let tok = self.advance();
+                    let TokenKind::Int(n) = tok.kind else { unreachable!() };
+                    let exp: i32 = n.parse().unwrap_or(1);
+                    Some(UnitExpr::Pow(Box::new(base), if neg { -exp } else { exp }))
+                }
+                _ => {
+                    self.error("expected integer exponent after '^'");
+                    None
+                }
+            }
+        } else {
+            Some(base)
+        }
+    }
+
+    fn parse_unit_atom(&mut self) -> Option<UnitExpr> {
+        match self.peek() {
+            TokenKind::Lower(_) => {
+                let tok = self.advance();
+                let TokenKind::Lower(name) = tok.kind else { unreachable!() };
+                Some(UnitExpr::Named(name))
+            }
+            TokenKind::Int(n) if n == "1" => {
+                self.advance();
+                Some(UnitExpr::Dimensionless)
+            }
+            TokenKind::LParen => {
+                self.advance();
+                let inner = self.parse_unit_expr()?;
+                self.expect(&TokenKind::RParen, "expected ')' in unit expression").ok()?;
+                Some(inner)
+            }
+            _ => {
+                self.error("expected unit name, '1', or '(' in unit expression");
+                None
+            }
+        }
+    }
+
+    /// Try to parse `<unit_expr>` after a numeric literal or type name.
+    /// Returns `None` if the `<` doesn't start a unit annotation (falls through to comparison).
+    fn try_parse_unit_annotation(&mut self) -> Option<UnitExpr> {
+        if !matches!(self.peek(), TokenKind::Lt) {
+            return None;
+        }
+        // Check adjacency: no whitespace between previous token and `<`
+        let lt_span = self.span();
+        let prev_end = self.prev_span().end;
+        if lt_span.start != prev_end {
+            return None;
+        }
+
+        let saved = self.save();
+        let diag_count = self.diagnostics.len();
+        self.advance(); // consume `<`
+        if let Some(unit) = self.parse_unit_expr() {
+            if matches!(self.peek(), TokenKind::Gt) {
+                self.advance(); // consume `>`
+                return Some(unit);
+            }
+        }
+        // Not a unit annotation — restore
+        self.diagnostics.truncate(diag_count);
+        self.restore(saved);
+        None
     }
 
     // ── data ─────────────────────────────────────────────────────────
@@ -1677,13 +1797,16 @@ impl Parser {
             | TokenKind::Text(_)
             | TokenKind::Bytes(_)
             | TokenKind::Bool(_)
-            | TokenKind::Lower(_)
             | TokenKind::Upper(_)
             | TokenKind::LParen
             | TokenKind::LBrace
             | TokenKind::LBracket
             | TokenKind::Full
             | TokenKind::Do => true,
+            // `yield` is not a keyword but should not start application atoms
+            // (like keywords), to prevent `f; yield x` from parsing as `f yield x`
+            // in inline do-blocks where `;` is lexed as Newline.
+            TokenKind::Lower(n) => n != "yield",
             TokenKind::Star => {
                 // Source ref `*name` only when `*` is immediately adjacent to a Lower token
                 // (no whitespace). This avoids ambiguity with the `*` multiplication operator.
@@ -1811,7 +1934,21 @@ impl Parser {
                     span,
                 ))
             }
-            None => Some(lit),
+            None => {
+                // Try unit annotation: `42.0<m>`, `999<usd>`
+                if let Some(unit) = self.try_parse_unit_annotation() {
+                    let span = Span::new(lit.span.start, self.prev_span().end);
+                    Some(Spanned::new(
+                        ExprKind::UnitLit {
+                            value: Box::new(lit),
+                            unit,
+                        },
+                        span,
+                    ))
+                } else {
+                    Some(lit)
+                }
+            }
         }
     }
 
@@ -1912,6 +2049,25 @@ impl Parser {
                     return None;
                 }
                 let inner = inner.unwrap();
+                // Check for type annotation: `(expr : Type)`
+                if self.eat(&TokenKind::Colon) {
+                    let ty = self.parse_type()?;
+                    let end_tok = self
+                        .expect(
+                            &TokenKind::RParen,
+                            "unclosed '(' — expected matching ')' after type annotation",
+                        );
+                    self.delimiter_depth -= 1;
+                    let end_tok = end_tok.ok()?;
+                    let span = Span::new(start.start, end_tok.span.end);
+                    return Some(Spanned::new(
+                        ExprKind::Annot {
+                            expr: Box::new(inner),
+                            ty,
+                        },
+                        span,
+                    ));
+                }
                 let end_tok = self
                     .expect(
                         &TokenKind::RParen,
@@ -2817,6 +2973,22 @@ impl Parser {
                     let inner = self.parse_type_atom()?;
                     let span = Span::new(tok.span.start, inner.span.end);
                     Some(Spanned::new(TypeKind::IO { effects, ty: Box::new(inner) }, span))
+                } else if (name == "Float" || name == "Int") && matches!(self.peek(), TokenKind::Lt) {
+                    // Try Float<unit> or Int<unit> — no adjacency check in type context
+                    let saved = self.save();
+                    let diag_count = self.diagnostics.len();
+                    self.advance(); // consume `<`
+                    if let Some(unit) = self.parse_unit_expr() {
+                        if matches!(self.peek(), TokenKind::Gt) {
+                            self.advance(); // consume `>`
+                            let span = Span::new(tok.span.start, self.prev_span().end);
+                            let base = Box::new(Spanned::new(TypeKind::Named(name), tok.span));
+                            return Some(Spanned::new(TypeKind::UnitAnnotated { base, unit }, span));
+                        }
+                    }
+                    self.diagnostics.truncate(diag_count);
+                    self.restore(saved);
+                    Some(Spanned::new(TypeKind::Named(name), tok.span))
                 } else {
                     Some(Spanned::new(TypeKind::Named(name), tok.span))
                 }

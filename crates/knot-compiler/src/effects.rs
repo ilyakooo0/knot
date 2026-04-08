@@ -436,6 +436,9 @@ impl EffectChecker {
                 effects = effects.union(&time_effects);
                 effects
             }
+
+            ast::ExprKind::UnitLit { value, .. } => self.infer_effects(value),
+            ast::ExprKind::Annot { expr: inner, .. } => self.infer_effects(inner),
         }
     }
 

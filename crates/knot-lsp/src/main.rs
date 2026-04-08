@@ -696,6 +696,7 @@ fn build_symbols(module: &Module, source: &str) -> Vec<DocumentSymbol> {
                 });
             }
             DeclKind::SubsetConstraint { .. } => {}
+            DeclKind::UnitDecl { .. } => {}
         }
     }
 
@@ -2971,6 +2972,8 @@ impl DefResolver {
                 };
                 self.literals.push((expr.span, ty.to_string()));
             }
+            ast::ExprKind::UnitLit { value, .. } => self.resolve_expr(value),
+            ast::ExprKind::Annot { expr: inner, .. } => self.resolve_expr(inner),
         }
     }
 }
@@ -3155,6 +3158,19 @@ fn format_type_kind(ty: &TypeKind) -> String {
             }
         }
         TypeKind::Hole => "_".into(),
+        TypeKind::UnitAnnotated { base, unit } => {
+            format!("{}<{}>", format_type_kind(&base.node), format_unit_expr(unit))
+        }
+    }
+}
+
+fn format_unit_expr(u: &ast::UnitExpr) -> String {
+    match u {
+        ast::UnitExpr::Dimensionless => "1".into(),
+        ast::UnitExpr::Named(n) => n.clone(),
+        ast::UnitExpr::Mul(a, b) => format!("{}*{}", format_unit_expr(a), format_unit_expr(b)),
+        ast::UnitExpr::Div(a, b) => format!("{}/{}", format_unit_expr(a), format_unit_expr(b)),
+        ast::UnitExpr::Pow(base, exp) => format!("{}^{}", format_unit_expr(base), exp),
     }
 }
 

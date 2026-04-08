@@ -45,6 +45,7 @@ pub enum TokenKind {
     Deriving,
     With,
     Export,
+    Unit,
 
     // Delimiters
     LParen,
@@ -70,6 +71,7 @@ pub enum TokenKind {
     AndAnd,
     OrOr,
     PipeGt,
+    Caret,
 
     // Arrows
     Arrow,
@@ -128,6 +130,7 @@ impl TokenKind {
             TokenKind::Deriving => "'deriving'",
             TokenKind::With => "'with'",
             TokenKind::Export => "'export'",
+            TokenKind::Unit => "'unit'",
             TokenKind::LParen => "'('",
             TokenKind::RParen => "')'",
             TokenKind::LBrace => "'{'",
@@ -149,6 +152,7 @@ impl TokenKind {
             TokenKind::AndAnd => "'&&'",
             TokenKind::OrOr => "'||'",
             TokenKind::PipeGt => "'|>'",
+            TokenKind::Caret => "'^'",
             TokenKind::Arrow => "'->'",
             TokenKind::FatArrow => "'=>'",
             TokenKind::LArrow => "'<-'",
@@ -192,6 +196,7 @@ impl TokenKind {
             TokenKind::Deriving => Some("deriving"),
             TokenKind::With => Some("with"),
             TokenKind::Export => Some("export"),
+            TokenKind::Unit => Some("unit"),
             _ => None,
         }
     }
@@ -419,6 +424,7 @@ impl<'src> Lexer<'src> {
                 "deriving" => return TokenKind::Deriving,
                 "with" => return TokenKind::With,
                 "export" => return TokenKind::Export,
+                "unit" => return TokenKind::Unit,
                 "true" => return TokenKind::Bool(true),
                 "false" => return TokenKind::Bool(false),
                 _ => {}
@@ -755,6 +761,7 @@ impl<'src> Lexer<'src> {
             b'@' => TokenKind::At,
             b';' => TokenKind::Newline,
             b'?' => TokenKind::Question,
+            b'^' => TokenKind::Caret,
             b'(' => TokenKind::LParen,
             b')' => TokenKind::RParen,
             b'{' => TokenKind::LBrace,

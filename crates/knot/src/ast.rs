@@ -70,6 +70,23 @@ pub struct ImportItem {
     pub span: Span,
 }
 
+// ── Units of Measure ──────────────────────────────────────────────
+
+/// A unit-of-measure expression (compile-time only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnitExpr {
+    /// Dimensionless: `1`
+    Dimensionless,
+    /// A named unit or unit variable: `m`, `s`, `u`
+    Named(Name),
+    /// Product: `u1 * u2`
+    Mul(Box<UnitExpr>, Box<UnitExpr>),
+    /// Quotient: `u1 / u2`
+    Div(Box<UnitExpr>, Box<UnitExpr>),
+    /// Power: `u ^ n` (integer exponent)
+    Pow(Box<UnitExpr>, i32),
+}
+
 // ── Declarations ───────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -159,6 +176,12 @@ pub enum DeclKind {
         sub: RelationPath,
         sup: RelationPath,
     },
+
+    /// `unit m` or `unit N = kg * m / s^2`
+    UnitDecl {
+        name: Name,
+        definition: Option<UnitExpr>,
+    },
 }
 
 // ── Expressions ────────────────────────────────────────────────────
@@ -243,6 +266,18 @@ pub enum ExprKind {
     At {
         relation: Box<Expr>,
         time: Box<Expr>,
+    },
+
+    /// `42.0<m>`, `999<usd>` — numeric literal with unit annotation.
+    UnitLit {
+        value: Box<Expr>,
+        unit: UnitExpr,
+    },
+
+    /// `(expr : Type)` — type annotation on expression.
+    Annot {
+        expr: Box<Expr>,
+        ty: Type,
     },
 }
 
@@ -404,6 +439,12 @@ pub enum TypeKind {
 
     /// `_` — type hole, inferred by the type checker.
     Hole,
+
+    /// `Float<m>`, `Int<usd>`, `Float<m / s^2>` — numeric type with unit.
+    UnitAnnotated {
+        base: Box<Type>,
+        unit: UnitExpr,
+    },
 }
 
 /// A type with optional trait constraints: `Display a => [a] -> [Text]`.

@@ -158,6 +158,12 @@ fn collect_edges(
             collect_edges(relation, polarity, derived_names, out);
             collect_edges(time, polarity, derived_names, out);
         }
+        ast::ExprKind::UnitLit { value, .. } => {
+            collect_edges(value, polarity, derived_names, out);
+        }
+        ast::ExprKind::Annot { expr: inner, .. } => {
+            collect_edges(inner, polarity, derived_names, out);
+        }
     }
 }
 

@@ -3474,6 +3474,14 @@ impl Codegen {
                 arms,
             } => self.compile_case(builder, scrutinee, arms, env, db),
 
+            ast::ExprKind::UnitLit { value, .. } => {
+                self.compile_expr(builder, value, env, db)
+            }
+
+            ast::ExprKind::Annot { expr, .. } => {
+                self.compile_expr(builder, expr, env, db)
+            }
+
             ast::ExprKind::At { relation, time } => {
                 // Temporal query: *source @(timestamp) or *view @(timestamp)
                 if let ast::ExprKind::SourceRef(name) = &relation.node {
@@ -4704,6 +4712,8 @@ impl Codegen {
             // they don't produce IO even if they contain IO values as
             // subexpressions. A function like `f x = {result: println x}`
             // returns a record, not IO.
+            ast::ExprKind::UnitLit { value, .. } => Self::expr_contains_io(value, builtins, io_fns),
+            ast::ExprKind::Annot { expr, .. } => Self::expr_contains_io(expr, builtins, io_fns),
             ast::ExprKind::Record(_)
             | ast::ExprKind::RecordUpdate { .. }
             | ast::ExprKind::FieldAccess { .. }
@@ -4755,6 +4765,8 @@ impl Codegen {
                 })
             }
             ast::ExprKind::Lambda { body, .. } => self.expr_is_io(body),
+            ast::ExprKind::UnitLit { value, .. } => self.expr_is_io(value),
+            ast::ExprKind::Annot { expr, .. } => self.expr_is_io(expr),
             _ => false,
         }
     }
@@ -6030,6 +6042,8 @@ impl Codegen {
                 Self::references_source(relation, source_name)
                     || Self::references_source(time, source_name)
             }
+            ast::ExprKind::UnitLit { value, .. } => Self::references_source(value, source_name),
+            ast::ExprKind::Annot { expr, .. } => Self::references_source(expr, source_name),
         }
     }
 
@@ -7462,6 +7476,8 @@ fn expr_references_var(expr: &ast::Expr, var_name: &str) -> bool {
                     .iter()
                     .any(|f| expr_references_var(&f.value, var_name))
         }
+        ast::ExprKind::UnitLit { value, .. } => expr_references_var(value, var_name),
+        ast::ExprKind::Annot { expr, .. } => expr_references_var(expr, var_name),
         // Conservatively return true for complex expressions
         _ => true,
     }
@@ -8073,6 +8089,8 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
         ast::ExprKind::At { relation, time } => {
             expr_contains_derived_ref(relation, name) || expr_contains_derived_ref(time, name)
         }
+        ast::ExprKind::UnitLit { value, .. } => expr_contains_derived_ref(value, name),
+        ast::ExprKind::Annot { expr, .. } => expr_contains_derived_ref(expr, name),
     }
 }
 
@@ -8204,6 +8222,12 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
         ast::ExprKind::At { relation, time } => {
             collect_free_vars(relation, bound, free);
             collect_free_vars(time, bound, free);
+        }
+        ast::ExprKind::UnitLit { value, .. } => {
+            collect_free_vars(value, bound, free);
+        }
+        ast::ExprKind::Annot { expr, .. } => {
+            collect_free_vars(expr, bound, free);
         }
     }
 }
@@ -8419,6 +8443,8 @@ fn pretty_expr(expr: &ast::Expr) -> String {
         ast::ExprKind::At { relation, time } => {
             format!("{} @({})", pretty_expr(relation), pretty_expr(time))
         }
+        ast::ExprKind::UnitLit { value, .. } => pretty_expr(value),
+        ast::ExprKind::Annot { expr, .. } => pretty_expr(expr),
     }
 }
 
@@ -8568,6 +8594,10 @@ fn impl_type_name(args: &[ast::Type]) -> Option<String> {
             ast::TypeKind::Named(name) => Some(name.clone()),
             _ => None,
         },
+        ast::TypeKind::UnitAnnotated { base, .. } => {
+            // Units are erased; resolve the base type
+            impl_type_name(&[*base.clone()])
+        }
         _ => None,
     }
 }
@@ -8628,6 +8658,7 @@ fn ast_type_to_descriptor_type(ty: &ast::Type) -> String {
                 "text".to_string()
             }
         }
+        ast::TypeKind::UnitAnnotated { base, .. } => ast_type_to_descriptor_type(base),
         _ => "text".to_string(),
     }
 }
@@ -8679,6 +8710,7 @@ fn resolve_type_for_descriptor(
                 resolve_type_for_descriptor(inner, aliases),
             ))
         }
+        ast::TypeKind::UnitAnnotated { base, .. } => resolve_type_for_descriptor(base, aliases),
         _ => ResolvedType::Text,
     }
 }

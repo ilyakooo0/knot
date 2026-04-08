@@ -312,6 +312,10 @@ fn resolve_type(
             // IO values aren't persisted — resolve inner type for diagnostics
             resolve_type(ty, aliases, assoc_types)
         }
+        TypeKind::UnitAnnotated { base, .. } => {
+            // Units are phantom — erase for schema resolution
+            resolve_type(base, aliases, assoc_types)
+        }
     }
 }
 
@@ -595,6 +599,10 @@ fn apply_type_subst(ty: &Type, subst: &HashMap<String, Type>) -> Type {
             ty: Box::new(apply_type_subst(inner, subst)),
         },
         TypeKind::Hole => TypeKind::Hole,
+        TypeKind::UnitAnnotated { base, unit } => TypeKind::UnitAnnotated {
+            base: Box::new(apply_type_subst(base, subst)),
+            unit: unit.clone(),
+        },
     };
     Spanned::new(new_node, ty.span)
 }

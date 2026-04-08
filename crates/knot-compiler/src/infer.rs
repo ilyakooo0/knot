@@ -41,6 +41,125 @@ pub type TypeInfo = HashMap<String, String>;
 /// Maps binding spans (local variables, params, patterns) to their inferred type strings.
 pub type LocalTypeInfo = HashMap<Span, String>;
 
+// ── Units of measure ──────────────────────────────────────────────
+
+type UnitVar = u32;
+
+/// Normalized unit: a product of base-unit powers, e.g. m^1 * s^-2.
+/// Dimensionless = empty map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnitTy {
+    /// base_unit_name -> exponent
+    bases: BTreeMap<String, i32>,
+    /// Unit variable for polymorphism
+    var: Option<UnitVar>,
+}
+
+#[allow(dead_code)]
+impl UnitTy {
+    fn dimensionless() -> Self {
+        UnitTy { bases: BTreeMap::new(), var: None }
+    }
+
+    fn named(name: &str) -> Self {
+        let mut bases = BTreeMap::new();
+        bases.insert(name.to_string(), 1);
+        UnitTy { bases, var: None }
+    }
+
+    fn var(v: UnitVar) -> Self {
+        UnitTy { bases: BTreeMap::new(), var: Some(v) }
+    }
+
+    fn is_dimensionless(&self) -> bool {
+        self.bases.is_empty() && self.var.is_none()
+    }
+
+    fn normalize(&mut self) {
+        self.bases.retain(|_, exp| *exp != 0);
+    }
+
+    fn mul(&self, other: &UnitTy) -> UnitTy {
+        let mut result = self.clone();
+        for (name, exp) in &other.bases {
+            *result.bases.entry(name.clone()).or_insert(0) += exp;
+        }
+        // If both have variables, we can't compose them simply — this would
+        // be caught as an error during unification.
+        if result.var.is_none() {
+            result.var = other.var;
+        }
+        result.normalize();
+        result
+    }
+
+    fn div(&self, other: &UnitTy) -> UnitTy {
+        let mut result = self.clone();
+        for (name, exp) in &other.bases {
+            *result.bases.entry(name.clone()).or_insert(0) -= exp;
+        }
+        if result.var.is_none() {
+            result.var = other.var.map(|_| {
+                // Dividing by a unit variable requires negation — not representable
+                // in our simple model. We'll leave var as None and let unification
+                // handle the error if needed.
+                0 // placeholder
+            });
+            // Actually, just leave var as None for division by variable
+            result.var = None;
+        }
+        result.normalize();
+        result
+    }
+
+    fn pow(&self, n: i32) -> UnitTy {
+        let mut result = self.clone();
+        for exp in result.bases.values_mut() {
+            *exp *= n;
+        }
+        result.normalize();
+        result
+    }
+
+    /// Canonical display string for unit, e.g. "kg*m/s^2"
+    fn display(&self) -> String {
+        if self.is_dimensionless() {
+            return "1".to_string();
+        }
+        let mut num_parts = Vec::new();
+        let mut den_parts = Vec::new();
+        for (name, exp) in &self.bases {
+            if *exp > 0 {
+                if *exp == 1 {
+                    num_parts.push(name.clone());
+                } else {
+                    num_parts.push(format!("{}^{}", name, exp));
+                }
+            } else if *exp < 0 {
+                if *exp == -1 {
+                    den_parts.push(name.clone());
+                } else {
+                    den_parts.push(format!("{}^{}", name, -exp));
+                }
+            }
+        }
+        if let Some(v) = self.var {
+            num_parts.push(format!("?u{}", v));
+        }
+        if den_parts.is_empty() {
+            if num_parts.is_empty() {
+                "1".to_string()
+            } else {
+                num_parts.join("*")
+            }
+        } else if num_parts.is_empty() {
+            format!("1/{}", den_parts.join("*"))
+        } else {
+            format!("{}/{}", num_parts.join("*"), den_parts.join("*"))
+        }
+    }
+}
+
 // ── Internal type representation ──────────────────────────────────
 
 type TyVar = u32;
@@ -74,6 +193,10 @@ enum Ty {
     App(Box<Ty>, Box<Ty>),
     /// IO monad with tracked effects: IO {console, fs} a
     IO(BTreeSet<IoEffect>, Box<Ty>),
+    /// Int with unit of measure (compile-time only).
+    IntUnit(UnitTy),
+    /// Float with unit of measure (compile-time only).
+    FloatUnit(UnitTy),
     /// Error sentinel — suppresses cascading errors.
     Error,
 }
@@ -228,6 +351,18 @@ struct Infer {
 
     /// Whether we are currently inside an `atomic` block.
     in_atomic: bool,
+
+    // ── Units of measure ──────────────────────────────────────────
+    /// Next unit variable ID.
+    #[allow(dead_code)]
+    next_unit_var: UnitVar,
+    /// Unit variable substitution.
+    unit_subst: HashMap<UnitVar, UnitTy>,
+    /// Declared units: name → definition (None for base units).
+    declared_units: HashMap<String, Option<UnitTy>>,
+    /// Maps show call-site spans to their unit display strings (for codegen).
+    #[allow(dead_code)]
+    pub show_unit_strings: HashMap<Span, String>,
 }
 
 // ── Core operations ───────────────────────────────────────────────
@@ -258,6 +393,10 @@ impl Infer {
             fetch_response_headers: HashMap::new(),
             in_io_do: false,
             in_atomic: false,
+            next_unit_var: 0,
+            unit_subst: HashMap::new(),
+            declared_units: HashMap::new(),
+            show_unit_strings: HashMap::new(),
         }
     }
 
@@ -269,6 +408,111 @@ impl Infer {
         let v = self.next_var;
         self.next_var += 1;
         v
+    }
+
+    #[allow(dead_code)]
+    fn fresh_unit_var(&mut self) -> UnitVar {
+        let v = self.next_unit_var;
+        self.next_unit_var += 1;
+        v
+    }
+
+    fn apply_unit(&self, u: &UnitTy) -> UnitTy {
+        match u.var {
+            Some(v) => {
+                if let Some(resolved) = self.unit_subst.get(&v) {
+                    let mut result = u.clone();
+                    result.var = resolved.var;
+                    for (name, exp) in &resolved.bases {
+                        *result.bases.entry(name.clone()).or_insert(0) += exp;
+                    }
+                    result.normalize();
+                    self.apply_unit(&result)
+                } else {
+                    u.clone()
+                }
+            }
+            None => u.clone(),
+        }
+    }
+
+    fn unify_units(&mut self, a: &UnitTy, b: &UnitTy, span: Span) {
+        let a = self.apply_unit(a);
+        let b = self.apply_unit(b);
+
+        match (a.var, b.var) {
+            (Some(va), Some(vb)) if va == vb => {
+                // Same variable — just check concrete parts
+                if a.bases != b.bases {
+                    self.error(
+                        format!("unit mismatch: {} vs {}", a.display(), b.display()),
+                        span,
+                    );
+                }
+            }
+            (Some(va), _) => {
+                // Solve va: need a + va = b, so va = b - a(concrete)
+                let mut solution = b.clone();
+                for (name, exp) in &a.bases {
+                    *solution.bases.entry(name.clone()).or_insert(0) -= exp;
+                }
+                solution.normalize();
+                self.unit_subst.insert(va, solution);
+            }
+            (_, Some(vb)) => {
+                let mut solution = a.clone();
+                for (name, exp) in &b.bases {
+                    *solution.bases.entry(name.clone()).or_insert(0) -= exp;
+                }
+                solution.normalize();
+                self.unit_subst.insert(vb, solution);
+            }
+            (None, None) => {
+                if a.bases != b.bases {
+                    self.error(
+                        format!("unit mismatch: {} vs {}", a.display(), b.display()),
+                        span,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Convert an AST UnitExpr to our internal UnitTy, expanding aliases.
+    fn ast_unit_to_unit_ty(&self, u: &ast::UnitExpr) -> UnitTy {
+        match u {
+            ast::UnitExpr::Dimensionless => UnitTy::dimensionless(),
+            ast::UnitExpr::Named(name) => {
+                // Check if it's a derived unit alias
+                if let Some(Some(def)) = self.declared_units.get(name) {
+                    def.clone()
+                } else {
+                    UnitTy::named(name)
+                }
+            }
+            ast::UnitExpr::Mul(a, b) => {
+                self.ast_unit_to_unit_ty(a).mul(&self.ast_unit_to_unit_ty(b))
+            }
+            ast::UnitExpr::Div(a, b) => {
+                self.ast_unit_to_unit_ty(a).div(&self.ast_unit_to_unit_ty(b))
+            }
+            ast::UnitExpr::Pow(base, exp) => self.ast_unit_to_unit_ty(base).pow(*exp),
+        }
+    }
+
+    /// Get the unit from a type, if it has one. Returns None for dimensionless.
+    #[allow(dead_code)]
+    fn type_unit(&self, ty: &Ty) -> Option<UnitTy> {
+        match ty {
+            Ty::IntUnit(u) | Ty::FloatUnit(u) => Some(self.apply_unit(u)),
+            _ => None,
+        }
+    }
+
+    /// Check if a type is numeric (Int, Float, IntUnit, FloatUnit).
+    #[allow(dead_code)]
+    fn is_numeric(&self, ty: &Ty) -> bool {
+        matches!(ty, Ty::Int | Ty::Float | Ty::IntUnit(_) | Ty::FloatUnit(_))
     }
 
     fn error(&mut self, msg: String, span: Span) {
@@ -353,6 +597,14 @@ impl Infer {
             }
             Ty::IO(effects, inner) => {
                 Ty::IO(effects.clone(), Box::new(self.apply(inner)))
+            }
+            Ty::IntUnit(u) => {
+                let u = self.apply_unit(u);
+                if u.is_dimensionless() { Ty::Int } else { Ty::IntUnit(u) }
+            }
+            Ty::FloatUnit(u) => {
+                let u = self.apply_unit(u);
+                if u.is_dimensionless() { Ty::Float } else { Ty::FloatUnit(u) }
             }
             _ => ty.clone(),
         }
@@ -596,6 +848,20 @@ impl Infer {
                     );
                 }
             }
+            // ── Units of measure ──────────────────────────────
+            (Ty::IntUnit(u1), Ty::IntUnit(u2)) => {
+                self.unify_units(u1, u2, span);
+            }
+            (Ty::FloatUnit(u1), Ty::FloatUnit(u2)) => {
+                self.unify_units(u1, u2, span);
+            }
+            // Plain Int/Float unifies with any IntUnit/FloatUnit — plain
+            // numeric types are unit-agnostic (not "dimensionless").
+            // To express dimensionless explicitly, use Int<1>/Float<1>.
+            (Ty::Int, Ty::IntUnit(_))
+            | (Ty::IntUnit(_), Ty::Int)
+            | (Ty::Float, Ty::FloatUnit(_))
+            | (Ty::FloatUnit(_), Ty::Float) => {}
             // Bool is Ty::Bool (not Ty::Con), so handle Bool/Variant
             // unification explicitly to support True {}/False {} patterns.
             (Ty::Bool, Ty::Variant(c2, r2)) => {
@@ -1274,6 +1540,21 @@ impl Infer {
                 }
                 Ty::IO(io_effects, Box::new(self.ast_type_to_ty(inner_ty)))
             }
+            ast::TypeKind::UnitAnnotated { base, unit } => {
+                let base_ty = self.ast_type_to_ty(base);
+                let unit_ty = self.ast_unit_to_unit_ty(unit);
+                match base_ty {
+                    Ty::Int => Ty::IntUnit(unit_ty),
+                    Ty::Float => Ty::FloatUnit(unit_ty),
+                    _ => {
+                        self.error(
+                            "unit annotations are only allowed on Int and Float types".into(),
+                            ty.span,
+                        );
+                        Ty::Error
+                    }
+                }
+            }
         }
     }
 
@@ -1308,6 +1589,22 @@ impl Infer {
             },
             Ty::Int => "Int".into(),
             Ty::Float => "Float".into(),
+            Ty::IntUnit(u) => {
+                let u = self.apply_unit(u);
+                if u.is_dimensionless() {
+                    "Int".into()
+                } else {
+                    format!("Int<{}>", u.display())
+                }
+            }
+            Ty::FloatUnit(u) => {
+                let u = self.apply_unit(u);
+                if u.is_dimensionless() {
+                    "Float".into()
+                } else {
+                    format!("Float<{}>", u.display())
+                }
+            }
             Ty::Text => "Text".into(),
             Ty::Bool => "Bool".into(),
             Ty::Bytes => "Bytes".into(),
@@ -1468,17 +1765,25 @@ impl Infer {
             ast::ExprKind::Lit(lit) => self.literal_type(lit),
 
             ast::ExprKind::Var(name) if name == "__yield" || name == "yield" => {
-                // ∀m a. a -> App(m, a)  — monadic yield (from do-desugaring)
-                let m = self.fresh_var();
                 let a = self.fresh_var();
-                self.monad_vars.push((expr.span, m));
-                Ty::Fun(
-                    Box::new(Ty::Var(a)),
-                    Box::new(Ty::App(
-                        Box::new(Ty::Var(m)),
+                if self.in_io_do {
+                    // In IO do-blocks, yield produces IO directly
+                    Ty::Fun(
                         Box::new(Ty::Var(a)),
-                    )),
-                )
+                        Box::new(Ty::IO(BTreeSet::new(), Box::new(Ty::Var(a)))),
+                    )
+                } else {
+                    // ∀m a. a -> App(m, a)  — monadic yield (from do-desugaring)
+                    let m = self.fresh_var();
+                    self.monad_vars.push((expr.span, m));
+                    Ty::Fun(
+                        Box::new(Ty::Var(a)),
+                        Box::new(Ty::App(
+                            Box::new(Ty::Var(m)),
+                            Box::new(Ty::Var(a)),
+                        )),
+                    )
+                }
             }
 
             ast::ExprKind::Var(name) if name == "__empty" => {
@@ -1815,6 +2120,29 @@ impl Infer {
                 // Temporal query is a DB read — preserve IO wrapping
                 rel_ty
             }
+
+            ast::ExprKind::UnitLit { value, unit } => {
+                let val_ty = self.infer_expr(value);
+                let unit_ty = self.ast_unit_to_unit_ty(unit);
+                match &val_ty {
+                    Ty::Int | Ty::IntUnit(_) => Ty::IntUnit(unit_ty),
+                    Ty::Float | Ty::FloatUnit(_) => Ty::FloatUnit(unit_ty),
+                    _ => {
+                        self.error(
+                            "unit annotations are only allowed on numeric literals".into(),
+                            expr.span,
+                        );
+                        val_ty
+                    }
+                }
+            }
+
+            ast::ExprKind::Annot { expr: inner, ty } => {
+                let inner_ty = self.infer_expr(inner);
+                let annot_ty = self.ast_type_to_ty(ty);
+                self.unify(&inner_ty, &annot_ty, expr.span);
+                annot_ty
+            }
         }
     }
 
@@ -1932,13 +2260,65 @@ impl Infer {
         let rhs_ty = self.infer_expr(rhs);
 
         match op {
-            // Arithmetic: both same type, result same type
-            ast::BinOp::Add
-            | ast::BinOp::Sub
-            | ast::BinOp::Mul
-            | ast::BinOp::Div => {
-                self.unify(&lhs_ty, &rhs_ty, span);
-                lhs_ty
+            // Add/Sub: units must match, result has same unit
+            ast::BinOp::Add | ast::BinOp::Sub => {
+                let lhs_applied = self.apply(&lhs_ty);
+                let rhs_applied = self.apply(&rhs_ty);
+                // For unit-bearing types, unify normally (which checks unit equality)
+                self.unify(&lhs_applied, &rhs_applied, span);
+                lhs_applied
+            }
+            // Mul/Div: units compose
+            ast::BinOp::Mul | ast::BinOp::Div => {
+                let lhs_applied = self.apply(&lhs_ty);
+                let rhs_applied = self.apply(&rhs_ty);
+                match (&lhs_applied, &rhs_applied) {
+                    // Both have units → compose
+                    (Ty::IntUnit(u1), Ty::IntUnit(u2)) => {
+                        let result_unit = if op == ast::BinOp::Mul {
+                            u1.mul(u2)
+                        } else {
+                            u1.div(u2)
+                        };
+                        if result_unit.is_dimensionless() { Ty::Int } else { Ty::IntUnit(result_unit) }
+                    }
+                    (Ty::FloatUnit(u1), Ty::FloatUnit(u2)) => {
+                        let result_unit = if op == ast::BinOp::Mul {
+                            u1.mul(u2)
+                        } else {
+                            u1.div(u2)
+                        };
+                        if result_unit.is_dimensionless() { Ty::Float } else { Ty::FloatUnit(result_unit) }
+                    }
+                    // One unit, one dimensionless → preserve unit
+                    (Ty::IntUnit(u), Ty::Int) | (Ty::Int, Ty::IntUnit(u)) => {
+                        if op == ast::BinOp::Div && matches!(&rhs_applied, Ty::IntUnit(_)) {
+                            // x / y<u> → x<1/u>
+                            let inv = u.pow(-1);
+                            if inv.is_dimensionless() { Ty::Int } else { Ty::IntUnit(inv) }
+                        } else if op == ast::BinOp::Div && matches!(&lhs_applied, Ty::IntUnit(_)) {
+                            // x<u> / y → x<u>
+                            Ty::IntUnit(u.clone())
+                        } else {
+                            Ty::IntUnit(u.clone())
+                        }
+                    }
+                    (Ty::FloatUnit(u), Ty::Float) | (Ty::Float, Ty::FloatUnit(u)) => {
+                        if op == ast::BinOp::Div && matches!(&rhs_applied, Ty::FloatUnit(_)) {
+                            let inv = u.pow(-1);
+                            if inv.is_dimensionless() { Ty::Float } else { Ty::FloatUnit(inv) }
+                        } else if op == ast::BinOp::Div && matches!(&lhs_applied, Ty::FloatUnit(_)) {
+                            Ty::FloatUnit(u.clone())
+                        } else {
+                            Ty::FloatUnit(u.clone())
+                        }
+                    }
+                    // No units involved → default behavior
+                    _ => {
+                        self.unify(&lhs_applied, &rhs_applied, span);
+                        lhs_applied
+                    }
+                }
             }
             // Comparison: both same type, result Bool
             ast::BinOp::Eq
@@ -2531,6 +2911,14 @@ impl Infer {
             }
             if !changed {
                 break;
+            }
+        }
+
+        // Collect unit declarations
+        for decl in &module.decls {
+            if let ast::DeclKind::UnitDecl { name, definition } = &decl.node {
+                let def = definition.as_ref().map(|u| self.ast_unit_to_unit_ty(u));
+                self.declared_units.insert(name.clone(), def);
             }
         }
 
@@ -3858,6 +4246,12 @@ fn display_ty_clean_inner(ty: &Ty, names: &HashMap<TyVar, usize>, in_fun: bool) 
         Ty::Var(v) => var_letter(names.get(v).copied().unwrap_or(*v as usize)),
         Ty::Int => "Int".into(),
         Ty::Float => "Float".into(),
+        Ty::IntUnit(u) => {
+            if u.is_dimensionless() { "Int".into() } else { format!("Int<{}>", u.display()) }
+        }
+        Ty::FloatUnit(u) => {
+            if u.is_dimensionless() { "Float".into() } else { format!("Float<{}>", u.display()) }
+        }
         Ty::Text => "Text".into(),
         Ty::Bool => "Bool".into(),
         Ty::Bytes => "Bytes".into(),
@@ -4671,6 +5065,77 @@ mod tests {
              main = hasA (A {})",
         );
         assert!(diags.is_empty(), "unexpected errors: {:?}", diags);
+    }
+
+    // ── Units of measure ─────────────────────────────────────────
+
+    #[test]
+    fn unit_literal_typechecks() {
+        assert!(check_src("unit m\nmain = 42.0<m>").is_empty());
+    }
+
+    #[test]
+    fn unit_addition_same_unit() {
+        assert!(check_src("unit m\nmain = 10.0<m> + 5.0<m>").is_empty());
+    }
+
+    #[test]
+    fn unit_addition_mismatch() {
+        let diags = check_src("unit m\nunit s\nmain = 10.0<m> + 5.0<s>");
+        assert!(has_error(&diags, "unit mismatch"));
+    }
+
+    #[test]
+    fn unit_multiplication_composes() {
+        // m * m should not error (produces m^2)
+        assert!(check_src("unit m\nmain = 10.0<m> * 5.0<m>").is_empty());
+    }
+
+    #[test]
+    fn unit_division_composes() {
+        // m / s should not error (produces m/s)
+        assert!(check_src("unit m\nunit s\nmain = 100.0<m> / 10.0<s>").is_empty());
+    }
+
+    #[test]
+    fn unit_dimensionless_scalar_mul() {
+        // Float * Float<m> should produce Float<m>
+        assert!(check_src("unit m\nmain = 2.0 * 5.0<m>").is_empty());
+    }
+
+    #[test]
+    fn unit_in_type_annotation() {
+        assert!(check_src("unit m\nf : Float<m> -> Float<m>\nf = \\x -> x").is_empty());
+    }
+
+    #[test]
+    fn unit_derived_alias() {
+        assert!(check_src("unit m\nunit s\nunit mps = m / s\nmain = 10.0<mps>").is_empty());
+    }
+
+    #[test]
+    fn unit_int_literal() {
+        assert!(check_src("unit usd\nmain = 999<usd>").is_empty());
+    }
+
+    #[test]
+    fn unit_int_addition_mismatch() {
+        let diags = check_src("unit usd\nunit eur\nmain = 100<usd> + 50<eur>");
+        assert!(has_error(&diags, "unit mismatch"));
+    }
+
+    #[test]
+    fn unit_in_record() {
+        assert!(check_src(
+            "unit m\nunit s\nmain = {distance: 100.0<m>, time: 10.0<s>}"
+        ).is_empty());
+    }
+
+    #[test]
+    fn unit_expr_annotation() {
+        // (expr : Type) syntax
+        let diags = check_src("unit m\nmain = (42.0 : Float<m>)");
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
 }
 

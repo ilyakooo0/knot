@@ -1197,6 +1197,146 @@ countOpen = \rel ->
 -- Works on tickets, issues, orders — anything with an Open status variant
 ```
 
+### Units of Measure
+
+Optional compile-time units on `Int` and `Float`. Units are fully erased at runtime — no performance cost, no runtime representation. Plain `Float` is dimensionless (`Float<1>`).
+
+#### Declaration
+
+```knot
+unit m
+unit s
+unit kg
+unit usd
+
+-- Derived unit aliases (expand at use site)
+unit N = kg * m / s^2
+unit Hz = 1 / s
+```
+
+#### Type Syntax
+
+Angle brackets on numeric types only:
+
+```knot
+height : Float<m>
+mass : Float<kg>
+speed : Float<m / s>
+force : Float<N>
+acceleration : Float<m / s^2>
+cents : Int<usd>
+```
+
+#### Literal Syntax
+
+```knot
+distance = 42.0<m>
+duration = 3.5<s>
+price = 999<usd>
+pi = 3.14159              -- dimensionless (Float<1>)
+```
+
+#### Arithmetic
+
+`+`/`-` require matching units. `*`/`/` compose units. The compiler normalizes unit expressions algebraically (`m * s / s` → `m`, `m / m` → `1`).
+
+```knot
+-- Same-unit addition/subtraction
+10.0<m> + 5.0<m>                -- Float<m>
+10.0<m> + 5.0<s>                -- type error
+
+-- Unit composition
+10.0<m> * 5.0<m>                -- Float<m^2>
+100.0<m> / 10.0<s>              -- Float<m/s>
+2.0<kg> * 9.8<m / s^2>          -- Float<kg * m / s^2> = Float<N>
+
+-- Dimensionless scalars
+2.0 * 5.0<m>                    -- Float<m>
+5.0<m> / 2.0                    -- Float<m>
+
+-- Negation preserves units
+-(5.0<m>)                        -- Float<m>
+```
+
+Arbitrary integer powers arise naturally from multiplication: `m * m` = `m^2`, `s * s * s` = `s^3`. Powers can also be written directly in type annotations: `Float<m^2>`, `Float<s^-1>`.
+
+#### Unit Polymorphism
+
+Lowercase names inside `<...>` are unit variables — no extra syntax needed:
+
+```knot
+double : Float<u> -> Float<u>
+double = \x -> x + x
+
+computeSpeed : Float<d> -> Float<t> -> Float<d / t>
+computeSpeed = \distance time -> distance / time
+```
+
+Unit variables are inferred like type variables:
+
+```knot
+double = \x -> x + x
+-- inferred: Float<u> -> Float<u>  (or Int<u> -> Int<u> via Num)
+```
+
+#### Conversion
+
+`withUnit` and `stripUnit` are identity functions that exist only for the type checker. Both require explicit type annotations:
+
+```knot
+withUnit : Float -> Float<u>    -- attach a unit (caller must annotate)
+stripUnit : Float<u> -> Float   -- remove a unit
+
+toMiles : Float<km> -> Float<mi>
+toMiles = \d -> (withUnit (stripUnit d * 0.621371) : Float<mi>)
+```
+
+#### Unit-Preserving Stdlib
+
+Functions like `abs`, `min`, `max`, `sum`, `avg` preserve units:
+
+```knot
+abs : Float<u> -> Float<u>
+min : Float<u> -> Float<u> -> Float<u>
+sum : (a -> Float<u>) -> [a] -> Float<u>
+```
+
+#### `show` and Units
+
+`show` on a value with a concrete unit appends the unit string. The compiler knows the unit statically and emits the string as a constant:
+
+```knot
+show 9.8<m / s^2>       -- "9.8 m/s^2"
+show 42.0<m>             -- "42.0 m"
+show 3.14                -- "3.14"
+```
+
+When the unit is polymorphic (inside a unit-generic function), `show` prints just the number.
+
+The compiler uses a canonical form for unit strings: alphabetical numerator, alphabetical denominator, powers collapsed. This same canonical form determines type equality (`m * s` = `s * m`).
+
+#### Records, Relations, and SQLite
+
+Units are phantom — SQLite stores raw numbers. Schema descriptors ignore units.
+
+```knot
+type Measurement = {distance: Float<m>, time: Float<s>}
+
+*measurements : [Measurement]
+
+-- Units flow through queries
+&speeds = do
+  measurements <- *measurements
+  let result = do
+    m <- measurements
+    yield {speed: m.distance / m.time}   -- Float<m/s>
+  yield result
+```
+
+#### Interaction with Traits
+
+Units live outside the trait system as a compile-time overlay. The `Num` trait handles runtime dispatch for arithmetic; the compiler applies unit algebra rules as an additional layer. No changes to trait definitions are needed — `+` on `Float<m>` dispatches through `Num.add` at runtime while the compiler separately verifies that both operands share the unit `m` and propagates `m` to the result.
+
 ### Traits
 
 Traits define shared behavior that types can implement. Syntax follows Rust: `trait` for definition, `impl` for implementation.

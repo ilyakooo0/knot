@@ -34,6 +34,7 @@ struct DocumentState {
 
 struct ServerState {
     documents: HashMap<Uri, DocumentState>,
+    workspace_root: Option<PathBuf>,
 }
 
 // ── Semantic token legend ───────────────────────────────────────────
@@ -88,10 +89,11 @@ fn main() {
 
     let server_capabilities = serde_json::to_value(ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(
-            TextDocumentSyncKind::FULL,
+            TextDocumentSyncKind::INCREMENTAL,
         )),
         document_symbol_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
+        type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         completion_provider: Some(CompletionOptions {
             trigger_characters: Some(vec![".".into(), "*".into(), "&".into()]),
@@ -121,13 +123,15 @@ fn main() {
         ),
         folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
         selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+        call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
         code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+        document_formatting_provider: Some(OneOf::Left(true)),
         workspace_symbol_provider: Some(OneOf::Left(true)),
         ..Default::default()
     })
     .unwrap();
 
-    let _init_params = match connection.initialize(server_capabilities) {
+    let init_params = match connection.initialize(server_capabilities) {
         Ok(params) => params,
         Err(e) => {
             eprintln!("Initialize error: {e}");
@@ -137,8 +141,17 @@ fn main() {
 
     eprintln!("knot-lsp initialized");
 
+    let workspace_root = serde_json::from_value::<lsp_types::InitializeParams>(init_params)
+        .ok()
+        .and_then(|p| {
+            p.workspace_folders
+                .and_then(|folders| folders.into_iter().next().map(|f| f.uri))
+        })
+        .and_then(|u| uri_to_path(&u));
+
     let mut state = ServerState {
         documents: HashMap::new(),
+        workspace_root,
     };
 
     for msg in &connection.receiver {
@@ -169,6 +182,9 @@ fn handle_request(state: &mut ServerState, conn: &Connection, req: Request) {
         send_response(conn, id, result);
     } else if let Some(params) = cast_request::<request::GotoDefinition>(&req) {
         let result = handle_goto_definition(state, &params);
+        send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::GotoTypeDefinition>(&req) {
+        let result = handle_goto_type_definition(state, &params);
         send_response(conn, id, result);
     } else if let Some(params) = cast_request::<request::HoverRequest>(&req) {
         let result = handle_hover(state, &params);
@@ -203,11 +219,23 @@ fn handle_request(state: &mut ServerState, conn: &Connection, req: Request) {
     } else if let Some(params) = cast_request::<request::SelectionRangeRequest>(&req) {
         let result = handle_selection_range(state, &params);
         send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::Formatting>(&req) {
+        let result = handle_formatting(state, &params);
+        send_response(conn, id, result);
     } else if let Some(params) = cast_request::<request::CodeActionRequest>(&req) {
         let result = handle_code_action(state, &params);
         send_response(conn, id, result);
     } else if let Some(params) = cast_request::<request::WorkspaceSymbolRequest>(&req) {
         let result = handle_workspace_symbol(state, &params);
+        send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::CallHierarchyPrepare>(&req) {
+        let result = handle_call_hierarchy_prepare(state, &params);
+        send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::CallHierarchyIncomingCalls>(&req) {
+        let result = handle_call_hierarchy_incoming(state, &params);
+        send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::CallHierarchyOutgoingCalls>(&req) {
+        let result = handle_call_hierarchy_outgoing(state, &params);
         send_response(conn, id, result);
     }
 }
@@ -237,11 +265,26 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
     } else if not.method == notification::DidChangeTextDocument::METHOD {
         let params: DidChangeTextDocumentParams = serde_json::from_value(not.params).unwrap();
         let uri = params.text_document.uri.clone();
-        if let Some(change) = params.content_changes.into_iter().last() {
-            let doc = analyze_document(&uri, &change.text);
-            publish_diagnostics(conn, &uri, &doc);
-            state.documents.insert(uri, doc);
+        // Get current source or start empty
+        let mut source = state
+            .documents
+            .get(&uri)
+            .map(|d| d.source.clone())
+            .unwrap_or_default();
+        // Apply incremental edits (or full replacement if range is None)
+        for change in params.content_changes {
+            if let Some(range) = change.range {
+                let start = position_to_offset(&source, range.start);
+                let end = position_to_offset(&source, range.end);
+                source.replace_range(start..end, &change.text);
+            } else {
+                // Full document replacement (fallback)
+                source = change.text;
+            }
         }
+        let doc = analyze_document(&uri, &source);
+        publish_diagnostics(conn, &uri, &doc);
+        state.documents.insert(uri, doc);
     } else if not.method == notification::DidCloseTextDocument::METHOD {
         let params: DidCloseTextDocumentParams = serde_json::from_value(not.params).unwrap();
         state.documents.remove(&params.text_document.uri);
@@ -747,6 +790,108 @@ fn handle_goto_definition(
     }))
 }
 
+// ── Go to type definition ────────────────────────────────────────────
+
+fn handle_goto_type_definition(
+    state: &ServerState,
+    params: &GotoDefinitionParams,
+) -> Option<GotoDefinitionResponse> {
+    let uri = &params.text_document_position_params.text_document.uri;
+    let pos = params.text_document_position_params.position;
+    let doc = state.documents.get(uri)?;
+    let offset = position_to_offset(&doc.source, pos);
+    let word = word_at_position(&doc.source, pos)?;
+
+    // Get the type string for the symbol at cursor
+    let type_str = doc
+        .local_type_info
+        .iter()
+        .find(|(span, _)| span.start <= offset && offset < span.end)
+        .map(|(_, ty)| ty.clone())
+        .or_else(|| {
+            doc.references
+                .iter()
+                .find(|(usage, _)| usage.start <= offset && offset < usage.end)
+                .and_then(|(_, def_span)| doc.local_type_info.get(def_span).cloned())
+        })
+        .or_else(|| doc.type_info.get(word).cloned())?;
+
+    // Extract the principal named type from the type string
+    let type_name = extract_principal_type_name(&type_str)?;
+
+    // Look up the definition of that type in the current document
+    if let Some(def_span) = doc.definitions.get(&type_name) {
+        let range = span_to_range(*def_span, &doc.source);
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri: uri.clone(),
+            range,
+        }));
+    }
+
+    // Check imported definitions
+    if let Some((path, span)) = doc.import_defs.get(&type_name) {
+        let imported_source = doc.imported_files.get(path)?;
+        let range = span_to_range(*span, imported_source);
+        let import_uri = path_to_uri(path)?;
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri: import_uri,
+            range,
+        }));
+    }
+
+    None
+}
+
+/// Extract the principal named type from a type string.
+/// E.g., "[Person]" -> "Person", "Maybe Text" -> "Maybe",
+/// "Int -> Text" -> None (functions have no single type def),
+/// "{name: Text}" -> None (anonymous records).
+fn extract_principal_type_name(type_str: &str) -> Option<String> {
+    let s = type_str.trim();
+
+    // Strip relation brackets: [T] -> T
+    if s.starts_with('[') && s.ends_with(']') {
+        return extract_principal_type_name(&s[1..s.len() - 1]);
+    }
+
+    // Strip IO wrapper: IO {effects} T -> T
+    if s.starts_with("IO ") {
+        let rest = &s[3..];
+        if rest.starts_with('{') {
+            if let Some(close) = rest.find('}') {
+                return extract_principal_type_name(rest[close + 1..].trim());
+            }
+        }
+        return extract_principal_type_name(rest);
+    }
+
+    // Anonymous record — no named type
+    if s.starts_with('{') {
+        return None;
+    }
+
+    // Variant type — no single named type
+    if s.starts_with('<') {
+        return None;
+    }
+
+    // Function type — no single named type
+    if s.contains(" -> ") {
+        return None;
+    }
+
+    // Named type (possibly with params): "Person", "Maybe Text", "Result Text Int"
+    // Take the first word as the type name
+    let name = s.split_whitespace().next()?;
+
+    // Must start with uppercase to be a concrete type name
+    if name.chars().next()?.is_uppercase() {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
 // ── Hover ───────────────────────────────────────────────────────────
 
 fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<Hover> {
@@ -1090,7 +1235,7 @@ fn extract_fields_from_type_str(type_str: &str, module: &Module) -> Vec<String> 
         return extract_record_fields(type_str);
     }
 
-    // Relation type: `[{name: Text}]` — extract inner type
+    // Relation type: `[{name: Text}]` or `[Person]` — extract inner type
     if type_str.starts_with('[') && type_str.ends_with(']') {
         let inner = &type_str[1..type_str.len() - 1];
         return extract_fields_from_type_str(inner, module);
@@ -1108,17 +1253,36 @@ fn extract_fields_from_type_str(type_str: &str, module: &Module) -> Vec<String> 
         }
     }
 
-    // Named type: look up in the module's type aliases and source declarations
+    // Maybe type: `Maybe T` — unwrap to inner type
+    if type_str.starts_with("Maybe ") {
+        let inner = type_str[6..].trim();
+        return extract_fields_from_type_str(inner, module);
+    }
+
+    // Named type: look up in the module's declarations
     for decl in &module.decls {
         match &decl.node {
             DeclKind::TypeAlias { name, ty, .. } if name == type_str => {
-                if let TypeKind::Record { fields, .. } = &ty.node {
-                    return fields.iter().map(|f| f.name.clone()).collect();
+                match &ty.node {
+                    TypeKind::Record { fields, .. } => {
+                        return fields.iter().map(|f| f.name.clone()).collect();
+                    }
+                    // Follow alias to another named type
+                    TypeKind::Named(target) => {
+                        return extract_fields_from_type_str(target, module);
+                    }
+                    _ => {}
                 }
             }
             DeclKind::Source { name, ty, .. } if name == type_str => {
                 if let TypeKind::Record { fields, .. } = &ty.node {
                     return fields.iter().map(|f| f.name.clone()).collect();
+                }
+            }
+            // Data type with a single constructor — expose its fields
+            DeclKind::Data { name, constructors, .. } if name == type_str => {
+                if constructors.len() == 1 {
+                    return constructors[0].fields.iter().map(|f| f.name.clone()).collect();
                 }
             }
             _ => {}
@@ -1186,22 +1350,19 @@ fn handle_references(
     let doc = state.documents.get(uri)?;
     let offset = position_to_offset(&doc.source, pos);
 
-    // Find the definition span for the symbol at cursor
+    // Find the symbol name and definition span in current document
+    let word = word_at_position(&doc.source, pos)?;
     let def_span = doc
         .references
         .iter()
         .find(|(usage, _)| usage.start <= offset && offset < usage.end)
         .map(|(_, def)| *def)
-        .or_else(|| {
-            // Cursor might be on a definition site itself
-            let word = word_at_position(&doc.source, pos)?;
-            doc.definitions.get(word).copied()
-        })
-        // Also check: cursor might be directly on a definition span
+        .or_else(|| doc.definitions.get(word).copied())
         .or_else(|| {
             doc.definitions.values().find(|span| span.start <= offset && offset < span.end).copied()
         })?;
 
+    let symbol_name = word.to_string();
     let mut locations = Vec::new();
 
     // Include declaration if requested
@@ -1212,13 +1373,45 @@ fn handle_references(
         });
     }
 
-    // Find all usages that point to this definition
+    // Find all usages in current document
     for (usage_span, target_span) in &doc.references {
         if *target_span == def_span {
             locations.push(Location {
                 uri: uri.clone(),
                 range: span_to_range(*usage_span, &doc.source),
             });
+        }
+    }
+
+    // Cross-file: search all other open documents for references to the same name
+    for (other_uri, other_doc) in &state.documents {
+        if other_uri == uri {
+            continue;
+        }
+        // Check if this document imports/references the same symbol name
+        for (usage_span, target_span) in &other_doc.references {
+            let target_name = &other_doc.source[target_span.start..target_span.end.min(other_doc.source.len())];
+            // Match by name if the target resolves to a definition with the same name
+            if other_doc.definitions.get(&symbol_name) == Some(target_span) {
+                locations.push(Location {
+                    uri: other_uri.clone(),
+                    range: span_to_range(*usage_span, &other_doc.source),
+                });
+            } else if target_name == symbol_name {
+                locations.push(Location {
+                    uri: other_uri.clone(),
+                    range: span_to_range(*usage_span, &other_doc.source),
+                });
+            }
+        }
+        // Also check if the other doc has a definition of this name (for include_declaration)
+        if params.context.include_declaration {
+            if let Some(other_def) = other_doc.definitions.get(&symbol_name) {
+                locations.push(Location {
+                    uri: other_uri.clone(),
+                    range: span_to_range(*other_def, &other_doc.source),
+                });
+            }
         }
     }
 
@@ -1293,38 +1486,63 @@ fn handle_rename(
             doc.definitions.values().find(|span| span.start <= offset && offset < span.end).copied()
         })?;
 
-    let mut edits = Vec::new();
-
-    // Rename at definition site
-    let def_range = span_to_range(def_span, &doc.source);
-    // Find the word within the definition span to rename precisely
     let old_name = word_at_position(&doc.source, pos)?;
+    let symbol_name = old_name.to_string();
+
+    let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
+
+    // Rename at definition site in current doc
     let def_text = &doc.source[def_span.start..def_span.end];
     if let Some(name_start) = def_text.find(old_name) {
         let name_span = Span::new(def_span.start + name_start, def_span.start + name_start + old_name.len());
-        edits.push(TextEdit {
+        changes.entry(uri.clone()).or_default().push(TextEdit {
             range: span_to_range(name_span, &doc.source),
             new_text: new_name.clone(),
         });
     } else {
-        edits.push(TextEdit {
-            range: def_range,
+        changes.entry(uri.clone()).or_default().push(TextEdit {
+            range: span_to_range(def_span, &doc.source),
             new_text: new_name.clone(),
         });
     }
 
-    // Rename all usage sites
+    // Rename all usage sites in current doc
     for (usage_span, target_span) in &doc.references {
         if *target_span == def_span {
-            edits.push(TextEdit {
+            changes.entry(uri.clone()).or_default().push(TextEdit {
                 range: span_to_range(*usage_span, &doc.source),
                 new_text: new_name.clone(),
             });
         }
     }
 
-    let mut changes = HashMap::new();
-    changes.insert(uri.clone(), edits);
+    // Cross-file: rename in all other open documents
+    for (other_uri, other_doc) in &state.documents {
+        if other_uri == uri {
+            continue;
+        }
+        // Rename definition if it exists in this doc
+        if let Some(other_def) = other_doc.definitions.get(&symbol_name) {
+            let def_text = &other_doc.source[other_def.start..other_def.end.min(other_doc.source.len())];
+            if let Some(name_start) = def_text.find(old_name) {
+                let name_span = Span::new(other_def.start + name_start, other_def.start + name_start + old_name.len());
+                changes.entry(other_uri.clone()).or_default().push(TextEdit {
+                    range: span_to_range(name_span, &other_doc.source),
+                    new_text: new_name.clone(),
+                });
+            }
+        }
+        // Rename usages
+        for (usage_span, target_span) in &other_doc.references {
+            let target_name = &other_doc.source[target_span.start..target_span.end.min(other_doc.source.len())];
+            if other_doc.definitions.get(&symbol_name) == Some(target_span) || target_name == symbol_name {
+                changes.entry(other_uri.clone()).or_default().push(TextEdit {
+                    range: span_to_range(*usage_span, &other_doc.source),
+                    new_text: new_name.clone(),
+                });
+            }
+        }
+    }
 
     Some(WorkspaceEdit {
         changes: Some(changes),
@@ -1425,76 +1643,9 @@ fn handle_signature_help(
     let doc = state.documents.get(uri)?;
     let offset = position_to_offset(&doc.source, pos);
 
-    let bytes = doc.source.as_bytes();
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-
-    // Check if cursor is on an identifier (user is typing a word)
-    let on_word = offset > 0 && offset <= bytes.len() && is_ident(bytes[offset - 1]);
-
-    // Collect argument tokens going backwards from cursor.
-    // Each "token" is either a bare identifier or a balanced paren/bracket group.
-    let mut i = offset;
-    let mut tokens: Vec<String> = Vec::new();
-
-    loop {
-        // Skip whitespace/newlines
-        while i > 0 && matches!(bytes[i - 1], b' ' | b'\t' | b'\r' | b'\n') {
-            i -= 1;
-        }
-        if i == 0 {
-            break;
-        }
-
-        if is_ident(bytes[i - 1]) {
-            let end = i;
-            while i > 0 && is_ident(bytes[i - 1]) {
-                i -= 1;
-            }
-            let word = doc.source[i..end].to_string();
-            // Stop at keywords that can't be arguments
-            if matches!(
-                word.as_str(),
-                "let" | "in" | "if" | "then" | "else" | "do" | "where" | "case" | "of"
-                    | "yield" | "set" | "import" | "type" | "data" | "trait" | "impl"
-                    | "route" | "migrate" | "atomic" | "full" | "export"
-            ) {
-                break;
-            }
-            tokens.push(word);
-        } else if matches!(bytes[i - 1], b')' | b']' | b'}') {
-            let close = bytes[i - 1];
-            let open = match close {
-                b')' => b'(',
-                b']' => b'[',
-                _ => b'{',
-            };
-            i -= 1;
-            let mut depth = 1i32;
-            while i > 0 && depth > 0 {
-                i -= 1;
-                if bytes[i] == close {
-                    depth += 1;
-                } else if bytes[i] == open {
-                    depth -= 1;
-                }
-            }
-            tokens.push("<group>".to_string());
-        } else {
-            break; // Operator, `=`, `<-`, etc. — stop
-        }
-    }
-
-    if tokens.is_empty() {
-        return None;
-    }
-
-    let func_name = tokens.last()?;
-    let num_args = tokens.len() - 1; // excluding function name
-    let active_param = if on_word {
-        num_args.saturating_sub(1) as u32
-    } else {
-        num_args as u32
-    };
+    // Strategy: find the innermost App chain in the AST that contains the cursor,
+    // then determine which argument position the cursor is in.
+    let (func_name, active_param) = find_enclosing_application(&doc.module, &doc.source, offset)?;
 
     // Look up the function type
     let type_str = doc.type_info.get(func_name.as_str())?;
@@ -1513,18 +1664,180 @@ fn handle_signature_help(
         })
         .collect();
 
+    let active = (active_param as u32).min(param_infos.len().saturating_sub(1) as u32);
+
     let signature = SignatureInformation {
         label: format!("{func_name} : {type_str}"),
         documentation: None,
         parameters: Some(param_infos),
-        active_parameter: Some(active_param),
+        active_parameter: Some(active),
     };
 
     Some(SignatureHelp {
         signatures: vec![signature],
         active_signature: Some(0),
-        active_parameter: Some(active_param),
+        active_parameter: Some(active),
     })
+}
+
+/// Walk the AST to find the innermost function application chain containing the cursor.
+/// Returns (function_name, active_parameter_index).
+fn find_enclosing_application(module: &Module, source: &str, offset: usize) -> Option<(String, usize)> {
+    let mut best: Option<(String, usize, usize)> = None; // (name, param_idx, span_size)
+
+    for decl in &module.decls {
+        if decl.span.start > offset || offset > decl.span.end {
+            continue;
+        }
+        match &decl.node {
+            DeclKind::Fun { body: Some(body), .. }
+            | DeclKind::View { body, .. }
+            | DeclKind::Derived { body, .. } => {
+                find_app_in_expr(body, source, offset, &mut best);
+            }
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { body, .. } = item {
+                        find_app_in_expr(body, source, offset, &mut best);
+                    }
+                }
+            }
+            DeclKind::Trait { items, .. } => {
+                for item in items {
+                    if let ast::TraitItem::Method { default_body: Some(body), .. } = item {
+                        find_app_in_expr(body, source, offset, &mut best);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    best.map(|(name, idx, _)| (name, idx))
+}
+
+fn find_app_in_expr(
+    expr: &ast::Expr,
+    source: &str,
+    offset: usize,
+    best: &mut Option<(String, usize, usize)>,
+) {
+    if expr.span.start > offset || offset > expr.span.end {
+        return;
+    }
+
+    // Check if this is an App chain
+    if let ast::ExprKind::App { .. } = &expr.node {
+        // Flatten the App spine: f a b c is App(App(App(f, a), b), c)
+        let mut args = Vec::new();
+        let mut cur = expr;
+        while let ast::ExprKind::App { func, arg } = &cur.node {
+            args.push(arg.as_ref());
+            cur = func.as_ref();
+        }
+        args.reverse();
+
+        // cur is now the function at the head
+        let func_name = match &cur.node {
+            ast::ExprKind::Var(name) => Some(name.clone()),
+            ast::ExprKind::Constructor(name) => Some(name.clone()),
+            _ => None,
+        };
+
+        if let Some(name) = func_name {
+            // Determine which argument the cursor is in
+            let mut param_idx = args.len(); // default: past the last arg (next param)
+            for (i, arg) in args.iter().enumerate() {
+                if offset <= arg.span.start {
+                    param_idx = i;
+                    break;
+                }
+                if offset >= arg.span.start && offset <= arg.span.end {
+                    param_idx = i;
+                    break;
+                }
+            }
+
+            let span_size = expr.span.end - expr.span.start;
+            // Prefer the smallest (innermost) enclosing application
+            if best.as_ref().map_or(true, |b| span_size <= b.2) {
+                *best = Some((name, param_idx, span_size));
+            }
+        }
+    }
+
+    // Recurse into sub-expressions
+    match &expr.node {
+        ast::ExprKind::App { func, arg } => {
+            find_app_in_expr(func, source, offset, best);
+            find_app_in_expr(arg, source, offset, best);
+        }
+        ast::ExprKind::Lambda { body, .. } => {
+            find_app_in_expr(body, source, offset, best);
+        }
+        ast::ExprKind::BinOp { lhs, rhs, .. } => {
+            find_app_in_expr(lhs, source, offset, best);
+            find_app_in_expr(rhs, source, offset, best);
+        }
+        ast::ExprKind::UnaryOp { operand, .. } => {
+            find_app_in_expr(operand, source, offset, best);
+        }
+        ast::ExprKind::If { cond, then_branch, else_branch } => {
+            find_app_in_expr(cond, source, offset, best);
+            find_app_in_expr(then_branch, source, offset, best);
+            find_app_in_expr(else_branch, source, offset, best);
+        }
+        ast::ExprKind::Case { scrutinee, arms } => {
+            find_app_in_expr(scrutinee, source, offset, best);
+            for arm in arms {
+                find_app_in_expr(&arm.body, source, offset, best);
+            }
+        }
+        ast::ExprKind::Do(stmts) => {
+            for stmt in stmts {
+                match &stmt.node {
+                    ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Let { expr, .. } => {
+                        find_app_in_expr(expr, source, offset, best);
+                    }
+                    ast::StmtKind::Expr(e) | ast::StmtKind::Where { cond: e } => {
+                        find_app_in_expr(e, source, offset, best);
+                    }
+                    ast::StmtKind::GroupBy { key } => {
+                        find_app_in_expr(key, source, offset, best);
+                    }
+                }
+            }
+        }
+        ast::ExprKind::Atomic(e) => find_app_in_expr(e, source, offset, best),
+        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+            find_app_in_expr(target, source, offset, best);
+            find_app_in_expr(value, source, offset, best);
+        }
+        ast::ExprKind::Record(fields) => {
+            for f in fields {
+                find_app_in_expr(&f.value, source, offset, best);
+            }
+        }
+        ast::ExprKind::RecordUpdate { base, fields } => {
+            find_app_in_expr(base, source, offset, best);
+            for f in fields {
+                find_app_in_expr(&f.value, source, offset, best);
+            }
+        }
+        ast::ExprKind::List(elems) => {
+            for e in elems {
+                find_app_in_expr(e, source, offset, best);
+            }
+        }
+        ast::ExprKind::FieldAccess { expr, .. } => {
+            find_app_in_expr(expr, source, offset, best);
+        }
+        ast::ExprKind::At { relation, time } => {
+            find_app_in_expr(relation, source, offset, best);
+            find_app_in_expr(time, source, offset, best);
+        }
+        _ => {}
+    }
 }
 
 /// Parse a Knot type string like "Int -> Text -> Bool" into parameter types.
@@ -1576,7 +1889,8 @@ fn handle_code_lens(
     state: &ServerState,
     params: &CodeLensParams,
 ) -> Option<Vec<CodeLens>> {
-    let doc = state.documents.get(&params.text_document.uri)?;
+    let uri = &params.text_document.uri;
+    let doc = state.documents.get(uri)?;
     let mut lenses = Vec::new();
 
     for decl in &doc.module.decls {
@@ -1590,12 +1904,17 @@ fn handle_code_lens(
             _ => continue,
         }
 
-        // Count references to this declaration
-        let ref_count = doc
+        // Collect reference locations for this declaration
+        let ref_locations: Vec<Location> = doc
             .references
             .iter()
             .filter(|(_, def)| *def == decl.span)
-            .count();
+            .map(|(usage, _)| Location {
+                uri: uri.clone(),
+                range: span_to_range(*usage, &doc.source),
+            })
+            .collect();
+        let ref_count = ref_locations.len();
 
         let range = span_to_range(decl.span, &doc.source);
         let title = if ref_count == 1 {
@@ -1607,24 +1926,33 @@ fn handle_code_lens(
         lenses.push(CodeLens {
             range: Range {
                 start: range.start,
-                end: range.start, // code lens goes on a single line
+                end: range.start,
             },
             command: Some(Command {
                 title,
-                command: String::new(),
-                arguments: None,
+                command: "editor.action.showReferences".to_string(),
+                arguments: Some(vec![
+                    serde_json::to_value(uri.as_str()).unwrap(),
+                    serde_json::to_value(range.start).unwrap(),
+                    serde_json::to_value(&ref_locations).unwrap(),
+                ]),
             }),
             data: None,
         });
 
-        // For traits: show number of implementations
+        // For traits: show implementations with clickable lens
         if let DeclKind::Trait { name, .. } = &decl.node {
-            let impl_count = doc
+            let impl_locations: Vec<Location> = doc
                 .module
                 .decls
                 .iter()
                 .filter(|d| matches!(&d.node, DeclKind::Impl { trait_name, .. } if trait_name == name))
-                .count();
+                .map(|d| Location {
+                    uri: uri.clone(),
+                    range: span_to_range(d.span, &doc.source),
+                })
+                .collect();
+            let impl_count = impl_locations.len();
             if impl_count > 0 {
                 let title = if impl_count == 1 {
                     "1 implementation".to_string()
@@ -1638,8 +1966,12 @@ fn handle_code_lens(
                     },
                     command: Some(Command {
                         title,
-                        command: String::new(),
-                        arguments: None,
+                        command: "editor.action.showReferences".to_string(),
+                        arguments: Some(vec![
+                            serde_json::to_value(uri.as_str()).unwrap(),
+                            serde_json::to_value(range.start).unwrap(),
+                            serde_json::to_value(&impl_locations).unwrap(),
+                        ]),
                     }),
                     data: None,
                 });
@@ -2271,6 +2603,114 @@ fn collect_containing_spans(expr: &ast::Expr, offset: usize, spans: &mut Vec<Spa
     }
 }
 
+// ── Document Formatting ─────────────────────────────────────────────
+
+fn handle_formatting(
+    state: &ServerState,
+    params: &DocumentFormattingParams,
+) -> Option<Vec<TextEdit>> {
+    let doc = state.documents.get(&params.text_document.uri)?;
+    let source = &doc.source;
+
+    // Conservative formatter:
+    // 1. Trim trailing whitespace from all lines
+    // 2. Normalize blank lines between top-level declarations (exactly one blank line)
+    // 3. Ensure trailing newline
+    // 4. Normalize imports (single blank line after import block)
+
+    let lines: Vec<&str> = source.split('\n').collect();
+    let mut result_lines: Vec<String> = Vec::with_capacity(lines.len());
+
+    // Compute line ranges for each top-level declaration
+    let mut decl_line_ranges: Vec<(u32, u32)> = Vec::new();
+    for decl in &doc.module.decls {
+        let start = offset_to_position(source, decl.span.start);
+        let end = offset_to_position(source, decl.span.end);
+        decl_line_ranges.push((start.line, end.line));
+    }
+    // Also track import line ranges
+    let mut import_line_ranges: Vec<(u32, u32)> = Vec::new();
+    for imp in &doc.module.imports {
+        let start = offset_to_position(source, imp.span.start);
+        let end = offset_to_position(source, imp.span.end);
+        import_line_ranges.push((start.line, end.line));
+    }
+
+    // Merge all block ranges (imports + declarations) sorted by start line
+    let mut block_ranges: Vec<(u32, u32)> = Vec::new();
+    block_ranges.extend_from_slice(&import_line_ranges);
+    block_ranges.extend_from_slice(&decl_line_ranges);
+    block_ranges.sort_by_key(|r| r.0);
+
+    let mut i = 0;
+    while i < lines.len() {
+        let line_num = i as u32;
+
+        // Check if this line is between two top-level blocks (a gap line)
+        let in_block = block_ranges
+            .iter()
+            .any(|(start, end)| line_num >= *start && line_num <= *end);
+        let prev_block_end = block_ranges
+            .iter()
+            .filter(|(_, end)| *end < line_num)
+            .max_by_key(|(_, end)| *end);
+        let next_block_start = block_ranges
+            .iter()
+            .filter(|(start, _)| *start > line_num)
+            .min_by_key(|(start, _)| *start);
+
+        if !in_block && lines[i].trim().is_empty() {
+            // We're in a gap between blocks — check if this is part of
+            // a run of blank lines that should be collapsed to exactly one
+            let gap_start = i;
+            while i < lines.len() && lines[i].trim().is_empty() {
+                i += 1;
+            }
+            // Only emit a blank line if there are blocks on both sides
+            if prev_block_end.is_some() && next_block_start.is_some() {
+                result_lines.push(String::new());
+            } else if prev_block_end.is_some() {
+                // Trailing blank lines at end — skip (trailing newline added later)
+            } else {
+                // Leading blank lines — preserve one at most
+                if gap_start == 0 {
+                    // skip leading blank lines
+                } else {
+                    result_lines.push(String::new());
+                }
+            }
+            continue;
+        }
+
+        // Trim trailing whitespace
+        result_lines.push(lines[i].trim_end().to_string());
+        i += 1;
+    }
+
+    // Ensure trailing newline
+    if result_lines.last().map_or(true, |l| !l.is_empty()) {
+        result_lines.push(String::new());
+    }
+
+    let formatted = result_lines.join("\n");
+
+    // Only return edits if something changed
+    if formatted == *source {
+        return None;
+    }
+
+    // Replace entire document
+    let last_line = lines.len().saturating_sub(1) as u32;
+    let last_col = lines.last().map_or(0, |l| l.len()) as u32;
+    Some(vec![TextEdit {
+        range: Range {
+            start: Position::new(0, 0),
+            end: Position::new(last_line, last_col),
+        },
+        new_text: formatted,
+    }])
+}
+
 // ── Code Actions ────────────────────────────────────────────────────
 
 fn handle_code_action(
@@ -2617,6 +3057,218 @@ fn find_case_actions(
     }
 }
 
+// ── Call Hierarchy ───────────────────────────────────────────────────
+
+fn handle_call_hierarchy_prepare(
+    state: &ServerState,
+    params: &CallHierarchyPrepareParams,
+) -> Option<Vec<CallHierarchyItem>> {
+    let uri = &params.text_document_position_params.text_document.uri;
+    let pos = params.text_document_position_params.position;
+    let doc = state.documents.get(uri)?;
+    let offset = position_to_offset(&doc.source, pos);
+    let word = word_at_position(&doc.source, pos)?;
+
+    // Find the declaration containing this name
+    for decl in &doc.module.decls {
+        let name = match &decl.node {
+            DeclKind::Fun { name, .. } => name,
+            DeclKind::Source { name, .. }
+            | DeclKind::View { name, .. }
+            | DeclKind::Derived { name, .. } => name,
+            DeclKind::Data { name, .. } | DeclKind::Trait { name, .. } => name,
+            _ => continue,
+        };
+        if name != word {
+            continue;
+        }
+        // Check if cursor is on or references this declaration
+        let on_def = decl.span.start <= offset && offset < decl.span.end;
+        let on_ref = doc.references.iter().any(|(usage, def)| {
+            usage.start <= offset && offset < usage.end && *def == decl.span
+        });
+        if !on_def && !on_ref {
+            continue;
+        }
+
+        let range = span_to_range(decl.span, &doc.source);
+        let selection_range = find_word_in_source(&doc.source, name, decl.span.start, decl.span.end)
+            .map(|s| span_to_range(s, &doc.source))
+            .unwrap_or(range);
+
+        let kind = match &decl.node {
+            DeclKind::Fun { .. } => SymbolKind::FUNCTION,
+            DeclKind::Data { .. } => SymbolKind::STRUCT,
+            DeclKind::Trait { .. } => SymbolKind::INTERFACE,
+            _ => SymbolKind::VARIABLE,
+        };
+
+        return Some(vec![CallHierarchyItem {
+            name: name.clone(),
+            kind,
+            tags: None,
+            detail: doc.type_info.get(name).cloned(),
+            uri: uri.clone(),
+            range,
+            selection_range,
+            data: None,
+        }]);
+    }
+
+    None
+}
+
+fn handle_call_hierarchy_incoming(
+    state: &ServerState,
+    params: &CallHierarchyIncomingCallsParams,
+) -> Option<Vec<CallHierarchyIncomingCall>> {
+    let target_name = &params.item.name;
+    let target_uri = &params.item.uri;
+    let doc = state.documents.get(target_uri)?;
+
+    // Find all declarations that reference the target name
+    let target_def = doc.definitions.get(target_name)?;
+    let mut calls: HashMap<String, (ast::Span, Vec<Span>)> = HashMap::new(); // caller_name -> (decl_span, [call_site_spans])
+
+    for decl in &doc.module.decls {
+        let caller_name = match &decl.node {
+            DeclKind::Fun { name, .. } => name.clone(),
+            DeclKind::View { name, .. } => name.clone(),
+            DeclKind::Derived { name, .. } => name.clone(),
+            _ => continue,
+        };
+        // Collect call sites within this declaration that point to target_def
+        let call_sites: Vec<Span> = doc
+            .references
+            .iter()
+            .filter(|(usage, def)| {
+                *def == *target_def
+                    && usage.start >= decl.span.start
+                    && usage.end <= decl.span.end
+            })
+            .map(|(usage, _)| *usage)
+            .collect();
+
+        if !call_sites.is_empty() {
+            calls.insert(caller_name, (decl.span, call_sites));
+        }
+    }
+
+    let mut result = Vec::new();
+    for (name, (decl_span, sites)) in &calls {
+        let range = span_to_range(*decl_span, &doc.source);
+        let selection_range = find_word_in_source(&doc.source, name, decl_span.start, decl_span.end)
+            .map(|s| span_to_range(s, &doc.source))
+            .unwrap_or(range);
+
+        let kind = doc
+            .module
+            .decls
+            .iter()
+            .find(|d| d.span == *decl_span)
+            .map(|d| match &d.node {
+                DeclKind::Fun { .. } => SymbolKind::FUNCTION,
+                DeclKind::Data { .. } => SymbolKind::STRUCT,
+                _ => SymbolKind::VARIABLE,
+            })
+            .unwrap_or(SymbolKind::FUNCTION);
+
+        result.push(CallHierarchyIncomingCall {
+            from: CallHierarchyItem {
+                name: name.clone(),
+                kind,
+                tags: None,
+                detail: doc.type_info.get(name).cloned(),
+                uri: target_uri.clone(),
+                range,
+                selection_range,
+                data: None,
+            },
+            from_ranges: sites.iter().map(|s| span_to_range(*s, &doc.source)).collect(),
+        });
+    }
+
+    if result.is_empty() { None } else { Some(result) }
+}
+
+fn handle_call_hierarchy_outgoing(
+    state: &ServerState,
+    params: &CallHierarchyOutgoingCallsParams,
+) -> Option<Vec<CallHierarchyOutgoingCall>> {
+    let source_name = &params.item.name;
+    let source_uri = &params.item.uri;
+    let doc = state.documents.get(source_uri)?;
+
+    // Find the declaration for the source item
+    let source_decl = doc
+        .module
+        .decls
+        .iter()
+        .find(|d| match &d.node {
+            DeclKind::Fun { name, .. }
+            | DeclKind::View { name, .. }
+            | DeclKind::Derived { name, .. } => name == source_name,
+            _ => false,
+        })?;
+
+    // Collect all references within this declaration that point to other declarations
+    let mut outgoing: HashMap<String, (Span, Vec<Span>)> = HashMap::new(); // callee_name -> (def_span, [call_site_spans])
+
+    for (usage_span, def_span) in &doc.references {
+        if usage_span.start < source_decl.span.start || usage_span.end > source_decl.span.end {
+            continue;
+        }
+        // Find the callee name from the definition
+        if let Some((name, _)) = doc.definitions.iter().find(|(_, s)| *s == def_span) {
+            if name == source_name {
+                continue; // Skip self-references
+            }
+            outgoing
+                .entry(name.clone())
+                .or_insert_with(|| (*def_span, Vec::new()))
+                .1
+                .push(*usage_span);
+        }
+    }
+
+    let mut result = Vec::new();
+    for (name, (def_span, sites)) in &outgoing {
+        let range = span_to_range(*def_span, &doc.source);
+        let selection_range = find_word_in_source(&doc.source, name, def_span.start, def_span.end)
+            .map(|s| span_to_range(s, &doc.source))
+            .unwrap_or(range);
+
+        let kind = doc
+            .module
+            .decls
+            .iter()
+            .find(|d| d.span == *def_span)
+            .map(|d| match &d.node {
+                DeclKind::Fun { .. } => SymbolKind::FUNCTION,
+                DeclKind::Data { .. } => SymbolKind::STRUCT,
+                DeclKind::Trait { .. } => SymbolKind::INTERFACE,
+                _ => SymbolKind::VARIABLE,
+            })
+            .unwrap_or(SymbolKind::FUNCTION);
+
+        result.push(CallHierarchyOutgoingCall {
+            to: CallHierarchyItem {
+                name: name.clone(),
+                kind,
+                tags: None,
+                detail: doc.type_info.get(name).cloned(),
+                uri: source_uri.clone(),
+                range,
+                selection_range,
+                data: None,
+            },
+            from_ranges: sites.iter().map(|s| span_to_range(*s, &doc.source)).collect(),
+        });
+    }
+
+    if result.is_empty() { None } else { Some(result) }
+}
+
 // ── Workspace Symbols ───────────────────────────────────────────────
 
 #[allow(deprecated)]
@@ -2626,54 +3278,93 @@ fn handle_workspace_symbol(
 ) -> Option<Vec<SymbolInformation>> {
     let query = params.query.to_lowercase();
     let mut symbols = Vec::new();
+    let mut seen_paths: HashSet<PathBuf> = HashSet::new();
 
-    for (uri, doc) in &state.documents {
-        for decl in &doc.module.decls {
-            let (name, kind) = match &decl.node {
-                DeclKind::Data { name, .. } => (name.clone(), SymbolKind::STRUCT),
-                DeclKind::TypeAlias { name, .. } => (name.clone(), SymbolKind::TYPE_PARAMETER),
-                DeclKind::Source { name, .. } => (format!("*{name}"), SymbolKind::VARIABLE),
-                DeclKind::View { name, .. } => (format!("*{name}"), SymbolKind::VARIABLE),
-                DeclKind::Derived { name, .. } => (format!("&{name}"), SymbolKind::VARIABLE),
-                DeclKind::Fun { name, .. } => (name.clone(), SymbolKind::FUNCTION),
-                DeclKind::Trait { name, .. } => (name.clone(), SymbolKind::INTERFACE),
-                DeclKind::Impl {
-                    trait_name, args, ..
-                } => {
-                    let args_str = args
-                        .iter()
-                        .map(|a| format_type_kind(&a.node))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    (
-                        format!("impl {trait_name} {args_str}"),
-                        SymbolKind::OBJECT,
-                    )
-                }
-                DeclKind::Route { name, .. } | DeclKind::RouteComposite { name, .. } => {
-                    (format!("route {name}"), SymbolKind::MODULE)
-                }
-                _ => continue,
-            };
+    // Helper closure to extract symbols from a module
+    let collect_symbols =
+        |module: &Module, source: &str, uri: &Uri, query: &str, symbols: &mut Vec<SymbolInformation>| {
+            for decl in &module.decls {
+                let (name, kind) = match &decl.node {
+                    DeclKind::Data { name, .. } => (name.clone(), SymbolKind::STRUCT),
+                    DeclKind::TypeAlias { name, .. } => (name.clone(), SymbolKind::TYPE_PARAMETER),
+                    DeclKind::Source { name, .. } => (format!("*{name}"), SymbolKind::VARIABLE),
+                    DeclKind::View { name, .. } => (format!("*{name}"), SymbolKind::VARIABLE),
+                    DeclKind::Derived { name, .. } => (format!("&{name}"), SymbolKind::VARIABLE),
+                    DeclKind::Fun { name, .. } => (name.clone(), SymbolKind::FUNCTION),
+                    DeclKind::Trait { name, .. } => (name.clone(), SymbolKind::INTERFACE),
+                    DeclKind::Impl {
+                        trait_name, args, ..
+                    } => {
+                        let args_str = args
+                            .iter()
+                            .map(|a| format_type_kind(&a.node))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        (
+                            format!("impl {trait_name} {args_str}"),
+                            SymbolKind::OBJECT,
+                        )
+                    }
+                    DeclKind::Route { name, .. } | DeclKind::RouteComposite { name, .. } => {
+                        (format!("route {name}"), SymbolKind::MODULE)
+                    }
+                    _ => continue,
+                };
 
-            // Filter by query
-            if !query.is_empty() && !name.to_lowercase().contains(&query) {
-                continue;
+                if !query.is_empty() && !name.to_lowercase().contains(query) {
+                    continue;
+                }
+
+                let range = span_to_range(decl.span, source);
+                symbols.push(SymbolInformation {
+                    name,
+                    kind,
+                    tags: None,
+                    deprecated: None,
+                    location: Location {
+                        uri: uri.clone(),
+                        range,
+                    },
+                    container_name: None,
+                });
             }
+        };
 
-            let range = span_to_range(decl.span, &doc.source);
+    // Phase 1: collect from open documents
+    for (uri, doc) in &state.documents {
+        if let Some(path) = uri_to_path(uri) {
+            if let Ok(canonical) = path.canonicalize() {
+                seen_paths.insert(canonical);
+            }
+        }
+        collect_symbols(&doc.module, &doc.source, uri, &query, &mut symbols);
+    }
 
-            symbols.push(SymbolInformation {
-                name,
-                kind,
-                tags: None,
-                deprecated: None,
-                location: Location {
-                    uri: uri.clone(),
-                    range,
-                },
-                container_name: None,
-            });
+    // Phase 2: scan workspace for .knot files not already open
+    if let Some(root) = &state.workspace_root {
+        if let Ok(entries) = scan_knot_files(root) {
+            for path in entries {
+                let canonical = match path.canonicalize() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                if seen_paths.contains(&canonical) {
+                    continue;
+                }
+                let source = match std::fs::read_to_string(&canonical) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let uri = match path_to_uri(&canonical) {
+                    Some(u) => u,
+                    None => continue,
+                };
+                let lexer = knot::lexer::Lexer::new(&source);
+                let (tokens, _) = lexer.tokenize();
+                let parser = knot::parser::Parser::new(source.clone(), tokens);
+                let (module, _) = parser.parse_module();
+                collect_symbols(&module, &source, &uri, &query, &mut symbols);
+            }
         }
     }
 
@@ -2682,6 +3373,30 @@ fn handle_workspace_symbol(
     } else {
         Some(symbols)
     }
+}
+
+/// Recursively find all .knot files under a directory.
+fn scan_knot_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    scan_knot_files_recursive(dir, &mut files)?;
+    Ok(files)
+}
+
+fn scan_knot_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            // Skip hidden dirs and common non-source dirs
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.starts_with('.') && name != "target" && name != "node_modules" {
+                scan_knot_files_recursive(&path, files)?;
+            }
+        } else if path.extension().and_then(|e| e.to_str()) == Some("knot") {
+            files.push(path);
+        }
+    }
+    Ok(())
 }
 
 // ── Constants ───────────────────────────────────────────────────────

@@ -7983,7 +7983,11 @@ pub extern "C" fn knot_http_listen(
         match matched {
             Some((entry, path_params)) => {
                 // Read the body on the main thread before moving the request
-                let body_bytes = if !entry.body_fields.is_empty() {
+                // GET and DELETE requests don't have bodies — skip reading even
+                // if the route entry happens to declare body_fields.
+                let has_body = !entry.body_fields.is_empty()
+                    && entry.method != "GET" && entry.method != "HEAD";
+                let body_bytes = if has_body {
                     let mut buf = Vec::new();
                     request.as_reader().read_to_end(&mut buf).unwrap_or(0);
                     buf
@@ -7997,6 +8001,7 @@ pub extern "C" fn knot_http_listen(
                     .collect();
 
                 // Clone route entry data we need
+                let entry_method = entry.method.clone();
                 let entry_body_fields = entry.body_fields.clone();
                 let entry_query_fields = entry.query_fields.clone();
                 let entry_path_parts = entry.path_parts.clone();
@@ -8014,7 +8019,7 @@ pub extern "C" fn knot_http_listen(
                     let db_path = DB_PATH.lock().unwrap().clone();
                     let db = knot_db_open(db_path.as_ptr(), db_path.len());
 
-                    let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<*mut Value, (u16, String)> {
                     // Build record from path params, query params, and body
                     let mut fields: Vec<RecordField> = Vec::new();
 
@@ -8061,8 +8066,10 @@ pub extern "C" fn knot_http_listen(
                         });
                     }
 
-                    // Body fields (JSON)
-                    if !entry_body_fields.is_empty() {
+                    // Body fields (JSON) — only parse for methods that carry a body
+                    let has_body = !entry_body_fields.is_empty()
+                        && entry_method != "GET" && entry_method != "HEAD";
+                    if has_body {
                         let body_str = String::from_utf8_lossy(&body_bytes);
                         if debug_enabled() {
                             eprintln!("[HTTP]     body: {}", body_str);
@@ -8074,7 +8081,7 @@ pub extern "C" fn knot_http_listen(
                                 if debug_enabled() {
                                     eprintln!("[HTTP] --> 400 {}", msg);
                                 }
-                                panic!("400:{}", msg);
+                                return Err((400, msg));
                             }
                         };
                         match unsafe { as_ref(body_val) } {
@@ -8187,11 +8194,11 @@ pub extern "C" fn knot_http_listen(
                     while matches!(unsafe { as_ref(result) }, Value::IO(..)) {
                         result = knot_io_run(db, result);
                     }
-                    result
+                    Ok(result)
                     }));
 
                     match panic_result {
-                        Ok(result) => {
+                        Ok(Ok(result)) => {
                     let has_resp_headers = !entry_response_headers.is_empty();
                     if has_resp_headers {
                         let body_val = knot_record_field(result, "body".as_ptr(), 4);
@@ -8231,6 +8238,18 @@ pub extern "C" fn knot_http_listen(
                             );
                         let _ = request.respond(response);
                     }
+                        }
+                        Ok(Err((status_code, error_msg))) => {
+                            eprintln!("[HTTP] --> {} {}", status_code, error_msg);
+                            let body = format!("{{\"error\":\"{}\"}}", json_escape(&error_msg));
+                            let response = tiny_http::Response::from_string(&body)
+                                .with_status_code(status_code)
+                                .with_header(
+                                    "Content-Type: application/json"
+                                        .parse::<tiny_http::Header>()
+                                        .unwrap(),
+                                );
+                            let _ = request.respond(response);
                         }
                         Err(panic_err) => {
                             // Release any write locks held by the panicked
@@ -8405,9 +8424,13 @@ pub extern "C" fn knot_http_fetch_io(
         // Build URL with path param substitution
         let url = fetch_build_url(&base, &path_pattern, payload);
 
-        // Build body JSON from body field descriptor
+        // Build body JSON from body field descriptor (skip for GET/HEAD)
         let body_json = match unsafe { as_ref(body_desc) } {
-            Value::Text(s) if !s.is_empty() => Some(fetch_build_body(s, payload)),
+            Value::Text(s) if !s.is_empty()
+                && method_str != "GET" && method_str != "HEAD" =>
+            {
+                Some(fetch_build_body(s, payload))
+            }
             _ => None,
         };
 

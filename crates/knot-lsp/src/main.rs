@@ -5095,41 +5095,43 @@ fn resolve_definitions(
 
     // Phase 1: register all top-level declarations
     for decl in &module.decls {
+        // Use just the name span (not the whole declaration) so document
+        // highlights only cover the identifier, not the entire body.
+        let name_span = |name: &str| {
+            find_word_in_source(source, name, decl.span.start, decl.span.end)
+                .unwrap_or(decl.span)
+        };
         match &decl.node {
             DeclKind::Data {
                 name, constructors, ..
             } => {
-                resolver.define(name, decl.span);
+                resolver.define(name, name_span(name));
                 for ctor in constructors {
-                    // Point constructor to its own span within the data declaration
-                    let ctor_span =
-                        find_word_in_source(source, &ctor.name, decl.span.start, decl.span.end)
-                            .unwrap_or(decl.span);
-                    resolver.define(&ctor.name, ctor_span);
+                    resolver.define(&ctor.name, name_span(&ctor.name));
                 }
             }
             DeclKind::TypeAlias { name, .. } => {
-                resolver.define(name, decl.span);
+                resolver.define(name, name_span(name));
             }
             DeclKind::Source { name, .. } | DeclKind::View { name, .. } => {
-                resolver.define(name, decl.span);
+                resolver.define(name, name_span(name));
             }
             DeclKind::Derived { name, .. } => {
-                resolver.define(name, decl.span);
+                resolver.define(name, name_span(name));
             }
             DeclKind::Fun { name, .. } => {
-                resolver.define(name, decl.span);
+                resolver.define(name, name_span(name));
             }
             DeclKind::Trait { name, items, .. } => {
-                resolver.define(name, decl.span);
+                resolver.define(name, name_span(name));
                 for item in items {
                     if let ast::TraitItem::Method { name, .. } = item {
-                        resolver.define(name, decl.span);
+                        resolver.define(name, name_span(name));
                     }
                 }
             }
             DeclKind::Route { name, .. } | DeclKind::RouteComposite { name, .. } => {
-                resolver.define(name, decl.span);
+                resolver.define(name, name_span(name));
             }
             _ => {}
         }

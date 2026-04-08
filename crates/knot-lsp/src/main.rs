@@ -30,6 +30,8 @@ struct DocumentState {
     imported_files: HashMap<PathBuf, String>,
     /// Definitions from imported files: name → (canonical path, span in that file)
     import_defs: HashMap<String, (PathBuf, Span)>,
+    /// Which import path each name originated from (for scoped cross-file matching).
+    import_origins: HashMap<String, String>,
 }
 
 struct ServerState {
@@ -126,6 +128,16 @@ fn main() {
         call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
         code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         document_formatting_provider: Some(OneOf::Left(true)),
+        document_range_formatting_provider: Some(OneOf::Left(true)),
+        document_highlight_provider: Some(OneOf::Left(true)),
+        document_link_provider: Some(DocumentLinkOptions {
+            resolve_provider: Some(false),
+            work_done_progress_options: Default::default(),
+        }),
+        document_on_type_formatting_provider: Some(DocumentOnTypeFormattingOptions {
+            first_trigger_character: "\n".into(),
+            more_trigger_character: None,
+        }),
         workspace_symbol_provider: Some(OneOf::Left(true)),
         ..Default::default()
     })
@@ -153,6 +165,29 @@ fn main() {
         documents: HashMap::new(),
         workspace_root,
     };
+
+    // Register for file watcher notifications (.knot files)
+    let registration = Registration {
+        id: "knot-file-watcher".into(),
+        method: "workspace/didChangeWatchedFiles".into(),
+        register_options: Some(
+            serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                watchers: vec![FileSystemWatcher {
+                    glob_pattern: GlobPattern::String("**/*.knot".into()),
+                    kind: Some(WatchKind::Create | WatchKind::Delete | WatchKind::Change),
+                }],
+            })
+            .unwrap(),
+        ),
+    };
+    let _ = connection.sender.send(Message::Request(Request::new(
+        RequestId::from("register-file-watcher".to_string()),
+        "client/registerCapability".into(),
+        serde_json::to_value(RegistrationParams {
+            registrations: vec![registration],
+        })
+        .unwrap(),
+    )));
 
     for msg in &connection.receiver {
         match msg {
@@ -222,6 +257,18 @@ fn handle_request(state: &mut ServerState, conn: &Connection, req: Request) {
     } else if let Some(params) = cast_request::<request::Formatting>(&req) {
         let result = handle_formatting(state, &params);
         send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::RangeFormatting>(&req) {
+        let result = handle_range_formatting(state, &params);
+        send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::OnTypeFormatting>(&req) {
+        let result = handle_on_type_formatting(state, &params);
+        send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::DocumentHighlightRequest>(&req) {
+        let result = handle_document_highlight(state, &params);
+        send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::DocumentLinkRequest>(&req) {
+        let result = handle_document_link(state, &params);
+        send_response(conn, id, result);
     } else if let Some(params) = cast_request::<request::CodeActionRequest>(&req) {
         let result = handle_code_action(state, &params);
         send_response(conn, id, result);
@@ -285,6 +332,36 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
         let doc = analyze_document(&uri, &source);
         publish_diagnostics(conn, &uri, &doc);
         state.documents.insert(uri, doc);
+    } else if not.method == notification::DidChangeWatchedFiles::METHOD {
+        let params: DidChangeWatchedFilesParams = serde_json::from_value(not.params).unwrap();
+        // When .knot files change on disk, re-analyze open documents that might
+        // import them (their cross-file navigation data may be stale)
+        let changed_paths: HashSet<PathBuf> = params
+            .changes
+            .iter()
+            .filter_map(|c| uri_to_path(&c.uri))
+            .filter_map(|p| p.canonicalize().ok())
+            .collect();
+
+        if !changed_paths.is_empty() {
+            // Re-analyze all open documents whose imports overlap with changed files
+            let uris_to_refresh: Vec<(Uri, String)> = state
+                .documents
+                .iter()
+                .filter(|(_, doc)| {
+                    doc.imported_files
+                        .keys()
+                        .any(|p| changed_paths.contains(p))
+                })
+                .map(|(uri, doc)| (uri.clone(), doc.source.clone()))
+                .collect();
+
+            for (uri, source) in uris_to_refresh {
+                let doc = analyze_document(&uri, &source);
+                publish_diagnostics(conn, &uri, &doc);
+                state.documents.insert(uri, doc);
+            }
+        }
     } else if not.method == notification::DidCloseTextDocument::METHOD {
         let params: DidCloseTextDocumentParams = serde_json::from_value(not.params).unwrap();
         state.documents.remove(&params.text_document.uri);
@@ -318,10 +395,10 @@ fn analyze_document(uri: &Uri, source: &str) -> DocumentState {
     let details = build_details(&module);
 
     // Resolve import navigation (cross-file definitions)
-    let (imported_files, import_defs) = if let Some(path) = uri_to_path(uri) {
+    let (imported_files, import_defs, import_origins) = if let Some(path) = uri_to_path(uri) {
         resolve_import_navigation(&module.imports, &path)
     } else {
-        (HashMap::new(), HashMap::new())
+        (HashMap::new(), HashMap::new(), HashMap::new())
     };
 
     // Run deeper analysis if no parse errors
@@ -375,6 +452,7 @@ fn analyze_document(uri: &Uri, source: &str) -> DocumentState {
         knot_diagnostics: all_diags,
         imported_files,
         import_defs,
+        import_origins,
     }
 }
 
@@ -382,9 +460,10 @@ fn analyze_document(uri: &Uri, source: &str) -> DocumentState {
 fn resolve_import_navigation(
     imports: &[ast::Import],
     source_path: &Path,
-) -> (HashMap<PathBuf, String>, HashMap<String, (PathBuf, Span)>) {
+) -> (HashMap<PathBuf, String>, HashMap<String, (PathBuf, Span)>, HashMap<String, String>) {
     let mut imported_files = HashMap::new();
     let mut import_defs = HashMap::new();
+    let mut import_origins = HashMap::new();
 
     let base_dir = source_path.parent().unwrap_or(Path::new("."));
 
@@ -414,12 +493,14 @@ fn resolve_import_navigation(
                     name, constructors, ..
                 } => {
                     import_defs.insert(name.clone(), (canonical.clone(), decl.span));
+                    import_origins.insert(name.clone(), imp.path.clone());
                     for ctor in constructors {
                         // Find constructor span within the data decl
                         let ctor_span =
                             find_word_in_source(&source, &ctor.name, decl.span.start, decl.span.end)
                                 .unwrap_or(decl.span);
                         import_defs.insert(ctor.name.clone(), (canonical.clone(), ctor_span));
+                        import_origins.insert(ctor.name.clone(), imp.path.clone());
                     }
                 }
                 DeclKind::TypeAlias { name, .. }
@@ -431,11 +512,13 @@ fn resolve_import_navigation(
                 | DeclKind::Route { name, .. }
                 | DeclKind::RouteComposite { name, .. } => {
                     import_defs.insert(name.clone(), (canonical.clone(), decl.span));
+                    import_origins.insert(name.clone(), imp.path.clone());
                 }
                 DeclKind::Impl { items, .. } => {
                     for item in items {
                         if let ast::ImplItem::Method { name, .. } = item {
                             import_defs.insert(name.clone(), (canonical.clone(), decl.span));
+                            import_origins.insert(name.clone(), imp.path.clone());
                         }
                     }
                 }
@@ -446,7 +529,7 @@ fn resolve_import_navigation(
         imported_files.insert(canonical, source);
     }
 
-    (imported_files, import_defs)
+    (imported_files, import_defs, import_origins)
 }
 
 fn publish_diagnostics(conn: &Connection, uri: &Uri, doc: &DocumentState) {
@@ -1083,13 +1166,25 @@ fn handle_completion(
         return Some(CompletionResponse::Array(items));
     }
 
-    // General completion: keywords + declarations + builtins
+    // General completion: keywords + snippets + declarations + builtins
 
     // Keywords
     for kw in KEYWORDS {
         items.push(CompletionItem {
             label: kw.to_string(),
             kind: Some(CompletionItemKind::KEYWORD),
+            ..Default::default()
+        });
+    }
+
+    // Snippet completions for common patterns
+    for (label, detail, snippet) in SNIPPETS {
+        items.push(CompletionItem {
+            label: label.to_string(),
+            kind: Some(CompletionItemKind::SNIPPET),
+            detail: Some(detail.to_string()),
+            insert_text: Some(snippet.to_string()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
             ..Default::default()
         });
     }
@@ -1171,6 +1266,93 @@ fn handle_completion(
         });
     }
 
+    // Auto-import completions: scan workspace for symbols not in current document
+    if let Some(root) = &state.workspace_root {
+        let source_path = uri_to_path(uri);
+        let existing_imports: HashSet<String> = doc.module.imports.iter().map(|i| i.path.clone()).collect();
+        let local_names: HashSet<&str> = doc.definitions.keys().map(|s| s.as_str()).collect();
+
+        if let Ok(files) = scan_knot_files(root) {
+            for file_path in files {
+                let canonical = match file_path.canonicalize() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                // Skip current file
+                if source_path.as_ref().and_then(|p| p.canonicalize().ok()) == Some(canonical.clone()) {
+                    continue;
+                }
+                // Compute the import path relative to the current file
+                let import_path = match source_path.as_ref().and_then(|p| p.parent()) {
+                    Some(base) => {
+                        match canonical.strip_prefix(base) {
+                            Ok(rel) => rel.with_extension("").to_string_lossy().to_string(),
+                            Err(_) => continue,
+                        }
+                    }
+                    None => continue,
+                };
+                // Skip already imported files
+                if existing_imports.contains(&import_path) {
+                    continue;
+                }
+
+                let source_text = match std::fs::read_to_string(&canonical) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let lexer = knot::lexer::Lexer::new(&source_text);
+                let (tokens, _) = lexer.tokenize();
+                let parser = knot::parser::Parser::new(source_text, tokens);
+                let (module, _) = parser.parse_module();
+
+                for decl in &module.decls {
+                    let (name, kind) = match &decl.node {
+                        DeclKind::Fun { name, .. } => (name.clone(), CompletionItemKind::FUNCTION),
+                        DeclKind::Data { name, .. } => (name.clone(), CompletionItemKind::STRUCT),
+                        DeclKind::TypeAlias { name, .. } => (name.clone(), CompletionItemKind::STRUCT),
+                        DeclKind::Trait { name, .. } => (name.clone(), CompletionItemKind::INTERFACE),
+                        _ => continue,
+                    };
+                    // Skip names already defined locally
+                    if local_names.contains(name.as_str()) {
+                        continue;
+                    }
+
+                    // Compute where to insert the import line
+                    let import_insert_pos = if let Some(last_import) = doc.module.imports.last() {
+                        let end = offset_to_position(&doc.source, last_import.span.end);
+                        Position::new(end.line + 1, 0)
+                    } else {
+                        Position::new(0, 0)
+                    };
+                    let import_line = if doc.module.imports.is_empty() {
+                        format!("import {import_path}\n\n")
+                    } else {
+                        format!("import {import_path}\n")
+                    };
+
+                    let additional_edits = vec![TextEdit {
+                        range: Range {
+                            start: import_insert_pos,
+                            end: import_insert_pos,
+                        },
+                        new_text: import_line,
+                    }];
+
+                    items.push(CompletionItem {
+                        label: name.clone(),
+                        kind: Some(kind),
+                        detail: Some(format!("auto-import from {import_path}")),
+                        additional_text_edits: Some(additional_edits),
+                        sort_text: Some(format!("zz_{name}")), // sort after local items
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+    }
+
     Some(CompletionResponse::Array(items))
 }
 
@@ -1208,9 +1390,11 @@ fn resolve_dot_fields(doc: &DocumentState, dot_pos: usize) -> Vec<String> {
 
 /// Find the type string for a name, checking local bindings first, then globals.
 fn find_type_for_name(doc: &DocumentState, name: &str, offset: usize) -> Option<String> {
-    // Check local type info (span-based: find a binding whose span matches this name)
+    // Check local type info: find a binding whose span covers this identifier
+    // Use the full identifier range [offset..ident_end) for more precise matching
+    let ident_end = offset + name.len();
     for (span, ty) in &doc.local_type_info {
-        if span.start <= offset && offset < span.end {
+        if span.start <= offset && ident_end <= span.end {
             return Some(ty.clone());
         }
     }
@@ -1383,15 +1567,34 @@ fn handle_references(
         }
     }
 
+    // Determine the canonical file that defines this symbol (for scoped matching)
+    let defining_file = doc.import_origins.get(&symbol_name);
+    let _current_file = uri_to_path(uri).and_then(|p| p.canonicalize().ok());
+
     // Cross-file: search all other open documents for references to the same name
     for (other_uri, other_doc) in &state.documents {
         if other_uri == uri {
             continue;
         }
-        // Check if this document imports/references the same symbol name
+        // Scope check: if the symbol is imported, only match in documents that import
+        // from the same origin, or that define the symbol themselves
+        let _other_file = uri_to_path(other_uri).and_then(|p| p.canonicalize().ok());
+        let is_defining_file = defining_file.is_some()
+            && other_doc.import_defs.get(&symbol_name)
+                .map(|(path, _)| Some(path.clone()) == doc.import_defs.get(&symbol_name).map(|(p, _)| p.clone()))
+                .unwrap_or(false);
+        let is_local_def = other_doc.definitions.contains_key(&symbol_name);
+        let shares_origin = defining_file.is_none() // locally defined — match by name
+            || is_defining_file
+            || is_local_def
+            || other_doc.import_origins.get(&symbol_name) == defining_file;
+
+        if !shares_origin {
+            continue;
+        }
+
         for (usage_span, target_span) in &other_doc.references {
             let target_name = &other_doc.source[target_span.start..target_span.end.min(other_doc.source.len())];
-            // Match by name if the target resolves to a definition with the same name
             if other_doc.definitions.get(&symbol_name) == Some(target_span) {
                 locations.push(Location {
                     uri: other_uri.clone(),
@@ -2025,7 +2228,6 @@ struct TokenCollector<'a> {
 impl<'a> TokenCollector<'a> {
     fn add(&mut self, span: Span, token_type: u32, modifiers: u32) {
         if span.start < span.end && span.end <= self.source.len() {
-            // Skip multi-line tokens for now (semantic tokens should be single-line)
             let text = &self.source[span.start..span.end];
             if !text.contains('\n') {
                 self.tokens.push(RawToken {
@@ -2034,6 +2236,20 @@ impl<'a> TokenCollector<'a> {
                     token_type,
                     modifiers,
                 });
+            } else {
+                // Split multi-line tokens into per-line tokens
+                let mut offset = span.start;
+                for line in text.split('\n') {
+                    if !line.is_empty() {
+                        self.tokens.push(RawToken {
+                            start: offset,
+                            length: line.len(),
+                            token_type,
+                            modifiers,
+                        });
+                    }
+                    offset += line.len() + 1; // +1 for the '\n'
+                }
             }
         }
     }
@@ -2883,6 +3099,60 @@ fn handle_code_action(
         }
     }
 
+    // Diagnostic-attached quick fixes: suggest similar names for unknown identifiers
+    let lsp_diags = &params.context.diagnostics;
+    for diag in lsp_diags {
+        let _diag_offset = position_to_offset(&doc.source, diag.range.start);
+
+        // Pattern: "Unknown variable/type/constructor" → suggest similar names
+        let msg = &diag.message;
+        if msg.contains("nknown") || msg.contains("ndefined") || msg.contains("not found") || msg.contains("unresolved") {
+            // Extract the unknown name from the diagnostic range
+            let unknown_name = word_at_position(&doc.source, diag.range.start)
+                .unwrap_or("");
+            if !unknown_name.is_empty() {
+                // Find similar names using edit distance
+                let mut candidates: Vec<(&str, usize)> = Vec::new();
+                for name in doc.definitions.keys() {
+                    let dist = edit_distance(unknown_name, name);
+                    if dist <= 2 && dist > 0 {
+                        candidates.push((name, dist));
+                    }
+                }
+                // Also check builtins
+                for name in BUILTINS {
+                    let dist = edit_distance(unknown_name, name);
+                    if dist <= 2 && dist > 0 {
+                        candidates.push((name, dist));
+                    }
+                }
+                candidates.sort_by_key(|(_, d)| *d);
+
+                for (suggestion, _) in candidates.iter().take(3) {
+                    let mut changes = HashMap::new();
+                    changes.insert(
+                        uri.clone(),
+                        vec![TextEdit {
+                            range: diag.range,
+                            new_text: suggestion.to_string(),
+                        }],
+                    );
+                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                        title: format!("Did you mean `{suggestion}`?"),
+                        kind: Some(CodeActionKind::QUICKFIX),
+                        diagnostics: Some(vec![diag.clone()]),
+                        edit: Some(WorkspaceEdit {
+                            changes: Some(changes),
+                            ..Default::default()
+                        }),
+                        is_preferred: Some(candidates.first().map_or(false, |(s, _)| *s == *suggestion)),
+                        ..Default::default()
+                    }));
+                }
+            }
+        }
+    }
+
     // Action: Fill case arms — check if cursor is inside a case expression
     for decl in &doc.module.decls {
         match &decl.node {
@@ -3399,12 +3669,220 @@ fn scan_knot_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::R
     Ok(())
 }
 
+// ── Document Highlights ─────────────────────────────────────────────
+
+fn handle_document_highlight(
+    state: &ServerState,
+    params: &DocumentHighlightParams,
+) -> Option<Vec<DocumentHighlight>> {
+    let uri = &params.text_document_position_params.text_document.uri;
+    let pos = params.text_document_position_params.position;
+    let doc = state.documents.get(uri)?;
+    let offset = position_to_offset(&doc.source, pos);
+
+    // Find the definition span for the symbol at cursor
+    let def_span = doc
+        .references
+        .iter()
+        .find(|(usage, _)| usage.start <= offset && offset < usage.end)
+        .map(|(_, def)| *def)
+        .or_else(|| {
+            doc.definitions
+                .values()
+                .find(|span| span.start <= offset && offset < span.end)
+                .copied()
+        })?;
+
+    let mut highlights = Vec::new();
+
+    // Highlight the definition itself
+    highlights.push(DocumentHighlight {
+        range: span_to_range(def_span, &doc.source),
+        kind: Some(DocumentHighlightKind::WRITE),
+    });
+
+    // Highlight all usages
+    for (usage_span, target_span) in &doc.references {
+        if *target_span == def_span {
+            highlights.push(DocumentHighlight {
+                range: span_to_range(*usage_span, &doc.source),
+                kind: Some(DocumentHighlightKind::READ),
+            });
+        }
+    }
+
+    if highlights.is_empty() {
+        None
+    } else {
+        Some(highlights)
+    }
+}
+
+// ── Document Links ──────────────────────────────────────────────────
+
+fn handle_document_link(
+    state: &ServerState,
+    params: &DocumentLinkParams,
+) -> Option<Vec<DocumentLink>> {
+    let uri = &params.text_document.uri;
+    let doc = state.documents.get(uri)?;
+    let source_path = uri_to_path(uri)?;
+    let base_dir = source_path.parent().unwrap_or(Path::new("."));
+
+    let mut links = Vec::new();
+
+    for imp in &doc.module.imports {
+        let rel_path = PathBuf::from(&imp.path).with_extension("knot");
+        let full_path = base_dir.join(&rel_path);
+        let canonical = match full_path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let target_uri = match path_to_uri(&canonical) {
+            Some(u) => u,
+            None => continue,
+        };
+
+        // The link range covers the import path string within the import span.
+        // Find the path string in the source text of this import.
+        let import_text = &doc.source[imp.span.start..imp.span.end.min(doc.source.len())];
+        if let Some(path_start) = import_text.find(&imp.path) {
+            let abs_start = imp.span.start + path_start;
+            let abs_end = abs_start + imp.path.len();
+            links.push(DocumentLink {
+                range: span_to_range(Span::new(abs_start, abs_end), &doc.source),
+                target: Some(target_uri),
+                tooltip: Some(format!("{}", canonical.display())),
+                data: None,
+            });
+        }
+    }
+
+    if links.is_empty() {
+        None
+    } else {
+        Some(links)
+    }
+}
+
+// ── Range Formatting ────────────────────────────────────────────────
+
+fn handle_range_formatting(
+    state: &ServerState,
+    params: &DocumentRangeFormattingParams,
+) -> Option<Vec<TextEdit>> {
+    let doc = state.documents.get(&params.text_document.uri)?;
+    let source = &doc.source;
+
+    let start_line = params.range.start.line as usize;
+    let end_line = params.range.end.line as usize;
+
+    let lines: Vec<&str> = source.split('\n').collect();
+    let mut edits = Vec::new();
+
+    for i in start_line..=end_line.min(lines.len().saturating_sub(1)) {
+        let line = lines[i];
+        let trimmed = line.trim_end();
+        if trimmed.len() != line.len() {
+            edits.push(TextEdit {
+                range: Range {
+                    start: Position::new(i as u32, trimmed.len() as u32),
+                    end: Position::new(i as u32, line.len() as u32),
+                },
+                new_text: String::new(),
+            });
+        }
+    }
+
+    if edits.is_empty() {
+        None
+    } else {
+        Some(edits)
+    }
+}
+
+// ── On-Type Formatting ──────────────────────────────────────────────
+
+fn handle_on_type_formatting(
+    state: &ServerState,
+    params: &DocumentOnTypeFormattingParams,
+) -> Option<Vec<TextEdit>> {
+    let doc = state.documents.get(&params.text_document_position.text_document.uri)?;
+    let source = &doc.source;
+    let pos = params.text_document_position.position;
+
+    // We triggered on '\n' — look at the previous line to decide indentation
+    if pos.line == 0 {
+        return None;
+    }
+
+    let prev_line_idx = (pos.line - 1) as usize;
+    let lines: Vec<&str> = source.split('\n').collect();
+    if prev_line_idx >= lines.len() {
+        return None;
+    }
+
+    let prev_line = lines[prev_line_idx];
+    let prev_trimmed = prev_line.trim();
+
+    // Measure the previous line's indentation
+    let prev_indent = prev_line.len() - prev_line.trim_start().len();
+
+    // Keywords that should increase indent on the next line
+    let should_indent = prev_trimmed == "do"
+        || prev_trimmed.ends_with(" do")
+        || prev_trimmed.ends_with(" of")
+        || prev_trimmed == "where"
+        || prev_trimmed.ends_with(" where")
+        || prev_trimmed.ends_with(" then")
+        || prev_trimmed.ends_with(" else")
+        || prev_trimmed.ends_with("->")
+        || prev_trimmed.ends_with('=')
+        || (prev_trimmed.starts_with("impl ") && !prev_trimmed.contains('='));
+
+    if !should_indent {
+        return None;
+    }
+
+    let new_indent = prev_indent + 2;
+    let current_line_idx = pos.line as usize;
+
+    // Only add indent if the current line is empty or has less indentation
+    if current_line_idx < lines.len() {
+        let current_line = lines[current_line_idx];
+        let current_indent = current_line.len() - current_line.trim_start().len();
+        if current_indent >= new_indent && !current_line.trim().is_empty() {
+            return None;
+        }
+    }
+
+    let indent_str = " ".repeat(new_indent);
+    Some(vec![TextEdit {
+        range: Range {
+            start: Position::new(pos.line, 0),
+            end: Position::new(pos.line, pos.character),
+        },
+        new_text: indent_str,
+    }])
+}
+
 // ── Constants ───────────────────────────────────────────────────────
 
 const KEYWORDS: &[&str] = &[
     "import", "data", "type", "trait", "impl", "route", "migrate", "where", "do", "yield", "set",
     "if", "then", "else", "case", "of", "let", "in", "not", "full", "atomic", "deriving", "with",
     "export",
+];
+
+const SNIPPETS: &[(&str, &str, &str)] = &[
+    ("do", "do block", "do\n  ${1:x} <- ${2:expr}\n  yield {$3}"),
+    ("case", "case expression", "case ${1:expr} of\n  ${2:pattern} -> ${3:body}"),
+    ("lambda", "lambda expression", "\\\\${1:x} -> ${2:body}"),
+    ("if", "if expression", "if ${1:cond}\n  then ${2:a}\n  else ${3:b}"),
+    ("data", "data declaration", "data ${1:Name} = ${2:Ctor} {${3:field}: ${4:Type}}"),
+    ("source", "source declaration", "*${1:name} : [${2:Type}]"),
+    ("trait", "trait declaration", "trait ${1:Name} ${2:a} where\n  ${3:method} : ${4:Type}"),
+    ("impl", "impl block", "impl ${1:Trait} ${2:Type} where\n  ${3:method} ${4:x} = ${5:body}"),
 ];
 
 const BUILTINS: &[&str] = &[
@@ -4016,6 +4494,28 @@ fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
 fn path_to_uri(path: &Path) -> Option<Uri> {
     let s = format!("file://{}", path.display());
     s.parse::<Uri>().ok()
+}
+
+/// Compute Levenshtein edit distance between two strings.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut dp = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for i in 0..=a.len() {
+        dp[i][0] = i;
+    }
+    for j in 0..=b.len() {
+        dp[0][j] = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            dp[i][j] = (dp[i - 1][j] + 1)
+                .min(dp[i][j - 1] + 1)
+                .min(dp[i - 1][j - 1] + cost);
+        }
+    }
+    dp[a.len()][b.len()]
 }
 
 /// Find a whole-word occurrence of `name` in `source[start..end]`.

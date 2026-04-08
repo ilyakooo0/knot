@@ -103,7 +103,8 @@ fn main() {
         type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         completion_provider: Some(CompletionOptions {
-            trigger_characters: Some(vec![".".into(), "*".into(), "&".into()]),
+            trigger_characters: Some(vec![".".into(), "*".into(), "&".into(), "/".into()]),
+            resolve_provider: Some(true),
             ..Default::default()
         }),
         references_provider: Some(OneOf::Left(true)),
@@ -113,7 +114,7 @@ fn main() {
         })),
         inlay_hint_provider: Some(OneOf::Left(true)),
         signature_help_provider: Some(SignatureHelpOptions {
-            trigger_characters: Some(vec![" ".into()]),
+            trigger_characters: Some(vec![" ".into(), "(".into()]),
             retrigger_characters: None,
             work_done_progress_options: Default::default(),
         }),
@@ -144,6 +145,15 @@ fn main() {
             more_trigger_character: None,
         }),
         workspace_symbol_provider: Some(OneOf::Left(true)),
+        linked_editing_range_provider: Some(
+            LinkedEditingRangeServerCapabilities::Simple(true),
+        ),
+        diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
+            identifier: Some("knot".into()),
+            inter_file_dependencies: true,
+            workspace_diagnostics: true,
+            work_done_progress_options: Default::default(),
+        })),
         ..Default::default()
     })
     .unwrap();
@@ -289,6 +299,15 @@ fn handle_request(state: &mut ServerState, conn: &Connection, req: Request) {
         send_response(conn, id, result);
     } else if let Some(params) = cast_request::<request::CallHierarchyOutgoingCalls>(&req) {
         let result = handle_call_hierarchy_outgoing(state, &params);
+        send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::ResolveCompletionItem>(&req) {
+        let result = handle_resolve_completion_item(state, params);
+        send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::LinkedEditingRange>(&req) {
+        let result = handle_linked_editing_range(state, &params);
+        send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::WorkspaceDiagnosticRequest>(&req) {
+        let result = handle_workspace_diagnostics(state, &params);
         send_response(conn, id, result);
     }
 }
@@ -1131,8 +1150,71 @@ fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<Hover> {
         return None;
     };
 
-    // Include doc comments if available
     let mut value = format!("```knot\n{detail}\n```");
+
+    // At a call site, show the full signature with the active argument highlighted
+    if let Some((func_name, active_param)) =
+        find_enclosing_application(&doc.module, &doc.source, offset)
+    {
+        if func_name == word {
+            if let Some(type_str) = doc.type_info.get(func_name.as_str()) {
+                let params_list = parse_function_params(type_str);
+                if params_list.len() > 1 {
+                    let highlighted: Vec<String> = params_list
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| {
+                            if i == active_param && i < params_list.len() - 1 {
+                                format!("**{p}**")
+                            } else {
+                                p.clone()
+                            }
+                        })
+                        .collect();
+                    value.push_str(&format!(
+                        "\n\n*Signature:* `{} : {}`",
+                        func_name,
+                        highlighted.join(" → ")
+                    ));
+                }
+            }
+        }
+    }
+
+    // For source/view/derived refs, show the relation schema
+    for decl in &doc.module.decls {
+        match &decl.node {
+            DeclKind::Source { name, ty, history } if name == word => {
+                let hist = if *history { " (with history)" } else { "" };
+                let schema = format_schema_from_type(&ty.node);
+                if !schema.is_empty() {
+                    value.push_str(&format!("\n\n**Schema:**{hist}\n{schema}"));
+                }
+                break;
+            }
+            DeclKind::View { name, .. } if name == word => {
+                if let Some(inferred) = doc.type_info.get(word) {
+                    let schema = format_schema_from_type_str(inferred);
+                    if !schema.is_empty() {
+                        value.push_str(&format!("\n\n**View schema:**\n{schema}"));
+                    }
+                }
+                break;
+            }
+            DeclKind::Derived { name, .. } if name == word => {
+                if let Some(inferred) = doc.type_info.get(word) {
+                    let schema = format_schema_from_type_str(inferred);
+                    if !schema.is_empty() {
+                        value.push_str(&format!("\n\n**Derived schema:**\n{schema}"));
+                    }
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // Include doc comments if available
     if let Some(doc_comment) = doc.doc_comments.get(word) {
         value.push_str("\n\n---\n\n");
         value.push_str(doc_comment);
@@ -1145,6 +1227,92 @@ fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<Hover> {
         }),
         range: None,
     })
+}
+
+/// Format a TypeKind as a markdown schema table for hover display.
+fn format_schema_from_type(ty: &TypeKind) -> String {
+    match ty {
+        TypeKind::Record { fields, .. } => {
+            let mut lines = Vec::new();
+            lines.push("| Field | Type |".to_string());
+            lines.push("|-------|------|".to_string());
+            for f in fields {
+                lines.push(format!(
+                    "| `{}` | `{}` |",
+                    f.name,
+                    format_type_kind(&f.value.node)
+                ));
+            }
+            lines.join("\n")
+        }
+        _ => String::new(),
+    }
+}
+
+/// Format a type string like `[{name: Text, age: Int}]` as a schema table.
+fn format_schema_from_type_str(type_str: &str) -> String {
+    let s = type_str.trim();
+    // Unwrap IO wrapper
+    let s = if s.starts_with("IO ") {
+        let rest = &s[3..];
+        if rest.starts_with('{') {
+            if let Some(close) = rest.find('}') {
+                rest[close + 1..].trim()
+            } else {
+                rest
+            }
+        } else {
+            rest
+        }
+    } else {
+        s
+    };
+    // Unwrap relation brackets
+    let s = if s.starts_with('[') && s.ends_with(']') {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    };
+    // Parse record fields
+    if s.starts_with('{') && s.ends_with('}') {
+        let fields = extract_record_fields(s);
+        let inner = &s[1..s.len() - 1];
+        if fields.is_empty() {
+            return String::new();
+        }
+        let mut lines = Vec::new();
+        lines.push("| Field | Type |".to_string());
+        lines.push("|-------|------|".to_string());
+        // Parse field:type pairs from inner
+        let mut depth = 0i32;
+        let mut current = String::new();
+        for ch in inner.chars() {
+            match ch {
+                '{' | '[' | '(' | '<' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                '}' | ']' | ')' | '>' => {
+                    depth -= 1;
+                    current.push(ch);
+                }
+                ',' if depth == 0 => {
+                    if let Some((name, ty)) = current.trim().split_once(':') {
+                        lines.push(format!("| `{}` | `{}` |", name.trim(), ty.trim()));
+                    }
+                    current.clear();
+                }
+                '|' if depth == 0 => break,
+                _ => current.push(ch),
+            }
+        }
+        if let Some((name, ty)) = current.trim().split_once(':') {
+            lines.push(format!("| `{}` | `{}` |", name.trim(), ty.trim()));
+        }
+        lines.join("\n")
+    } else {
+        String::new()
+    }
 }
 
 // ── Completion ──────────────────────────────────────────────────────
@@ -1197,6 +1365,21 @@ fn handle_completion(
             }
         }
         return Some(CompletionResponse::Array(items));
+    }
+
+    // Context-aware: after `/` in an import line, suggest file paths
+    if trigger_char == Some(b'/') {
+        let line_start = doc.source[..offset].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let line_text = &doc.source[line_start..offset];
+        if line_text.trim_start().starts_with("import ") {
+            if let Some(source_path) = uri_to_path(uri) {
+                if let Some(base_dir) = source_path.parent() {
+                    let partial = line_text.trim_start().strip_prefix("import ").unwrap_or("");
+                    items.extend(complete_import_path(base_dir, partial));
+                }
+            }
+            return Some(CompletionResponse::Array(items));
+        }
     }
 
     // Context-aware: after `.` suggest record field names from known types
@@ -1254,6 +1437,47 @@ fn handle_completion(
     }
 
     // General completion: keywords + snippets + declarations + builtins
+
+    // Context detection: if cursor is in a type annotation position (after `:` or `[`),
+    // only suggest types and type constructors
+    let in_type_context = {
+        let before = &doc.source[..offset];
+        let trimmed = before.trim_end();
+        trimmed.ends_with(':') || trimmed.ends_with('[')
+            || trimmed.ends_with("->")
+    };
+
+    if in_type_context {
+        // Only suggest types: data types, type aliases, built-in types
+        for decl in &doc.module.decls {
+            match &decl.node {
+                DeclKind::Data { name, .. } | DeclKind::TypeAlias { name, .. } => {
+                    items.push(CompletionItem {
+                        label: name.clone(),
+                        kind: Some(CompletionItemKind::STRUCT),
+                        detail: doc.details.get(name).cloned(),
+                        ..Default::default()
+                    });
+                }
+                DeclKind::Trait { name, .. } => {
+                    items.push(CompletionItem {
+                        label: name.clone(),
+                        kind: Some(CompletionItemKind::INTERFACE),
+                        ..Default::default()
+                    });
+                }
+                _ => {}
+            }
+        }
+        for ty in &["Int", "Float", "Text", "Bool", "IO", "Maybe", "Result"] {
+            items.push(CompletionItem {
+                label: ty.to_string(),
+                kind: Some(CompletionItemKind::STRUCT),
+                ..Default::default()
+            });
+        }
+        return Some(CompletionResponse::Array(items));
+    }
 
     // Keywords
     for kw in KEYWORDS {
@@ -3408,6 +3632,159 @@ fn handle_code_action(
                 }),
                 ..Default::default()
             }));
+
+            // Extract function: wrap selected expression in a named function
+            let mut fn_changes = HashMap::new();
+            // Find free variables in the selected text that are bound in scope
+            let free_vars = find_free_vars_in_selection(doc, range_start, range_end);
+            let params_str = if free_vars.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", free_vars.join(" "))
+            };
+            let call_args = if free_vars.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", free_vars.join(" "))
+            };
+
+            // Find the enclosing top-level declaration to place the function before it
+            let fn_insert_offset = doc
+                .module
+                .decls
+                .iter()
+                .find(|d| d.span.start <= range_start && range_end <= d.span.end)
+                .map(|d| d.span.start)
+                .unwrap_or(0);
+            let fn_insert_pos = offset_to_position(&doc.source, fn_insert_offset);
+
+            fn_changes.insert(
+                uri.clone(),
+                vec![
+                    // Insert new function before the enclosing declaration
+                    TextEdit {
+                        range: Range {
+                            start: fn_insert_pos,
+                            end: fn_insert_pos,
+                        },
+                        new_text: format!(
+                            "extracted{params_str} = {trimmed}\n\n"
+                        ),
+                    },
+                    // Replace the selected expression with a call
+                    TextEdit {
+                        range: params.range,
+                        new_text: format!("extracted{call_args}"),
+                    },
+                ],
+            );
+
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: "Extract to function".to_string(),
+                kind: Some(CodeActionKind::REFACTOR_EXTRACT),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(fn_changes),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }));
+        }
+    }
+
+    // Action: Inline variable — if cursor is on a let binding's name, offer to inline it
+    for decl in &doc.module.decls {
+        if decl.span.end < range_start || decl.span.start > range_end {
+            continue;
+        }
+        match &decl.node {
+            DeclKind::Fun { body: Some(body), .. }
+            | DeclKind::View { body, .. }
+            | DeclKind::Derived { body, .. } => {
+                find_inline_actions(body, doc, uri, range_start, &mut actions);
+            }
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { body, .. } = item {
+                        find_inline_actions(body, doc, uri, range_start, &mut actions);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Action: Convert lambda to named function
+    for decl in &doc.module.decls {
+        if decl.span.end < range_start || decl.span.start > range_end {
+            continue;
+        }
+        if let DeclKind::Fun { name, body: Some(body), ty: None, .. } = &decl.node {
+            // Check if the body is a lambda — offer to convert to direct function params
+            if let ast::ExprKind::Lambda { params: lam_params, body: lam_body } = &body.node {
+                let param_names: Vec<String> = lam_params
+                    .iter()
+                    .map(|p| pat_to_string(p, &doc.source))
+                    .collect();
+                let body_text = &doc.source[lam_body.span.start..lam_body.span.end.min(doc.source.len())];
+
+                let mut changes = HashMap::new();
+                changes.insert(
+                    uri.clone(),
+                    vec![TextEdit {
+                        range: span_to_range(decl.span, &doc.source),
+                        new_text: format!(
+                            "{name} {} = {body_text}",
+                            param_names.join(" ")
+                        ),
+                    }],
+                );
+
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: "Convert lambda to function parameters".to_string(),
+                    kind: Some(CodeActionKind::REFACTOR_REWRITE),
+                    edit: Some(WorkspaceEdit {
+                        changes: Some(changes),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }));
+            }
+        }
+    }
+
+    // Action: Organize imports — sort and deduplicate
+    if !doc.module.imports.is_empty() {
+        let mut import_paths: Vec<&str> = doc.module.imports.iter().map(|i| i.path.as_str()).collect();
+        let original = import_paths.clone();
+        import_paths.sort();
+        import_paths.dedup();
+
+        if import_paths != original {
+            let first_import = &doc.module.imports[0];
+            let last_import = doc.module.imports.last().unwrap();
+            let import_range = Range {
+                start: offset_to_position(&doc.source, first_import.span.start),
+                end: offset_to_position(&doc.source, last_import.span.end),
+            };
+
+            let new_text = import_paths
+                .iter()
+                .map(|p| format!("import {p}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let mut changes = HashMap::new();
+            changes.insert(uri.clone(), vec![TextEdit { range: import_range, new_text }]);
+
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: "Organize imports".to_string(),
+                kind: Some(CodeActionKind::SOURCE_ORGANIZE_IMPORTS),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }));
         }
     }
 
@@ -3563,6 +3940,182 @@ fn find_case_actions(
         }
         _ => {}
     }
+}
+
+/// Find free variables in a selection that are bound in surrounding scope.
+fn find_free_vars_in_selection(
+    doc: &DocumentState,
+    start: usize,
+    end: usize,
+) -> Vec<String> {
+    let mut free_vars = Vec::new();
+    let mut seen = HashSet::new();
+
+    // Check all references that start within the selection range
+    for (usage_span, _def_span) in &doc.references {
+        if usage_span.start >= start && usage_span.end <= end {
+            let name = &doc.source[usage_span.start..usage_span.end.min(doc.source.len())];
+            // Only include if it looks like a lowercase variable (not a constructor/type)
+            if !name.is_empty()
+                && name.chars().next().map_or(false, |c| c.is_lowercase())
+                && !seen.contains(name)
+            {
+                // Check it's a local binding, not a top-level definition
+                if doc.local_type_info.keys().any(|span| {
+                    span.start < start
+                        && doc.source.get(span.start..span.end.min(doc.source.len())) == Some(name)
+                }) {
+                    seen.insert(name.to_string());
+                    free_vars.push(name.to_string());
+                }
+            }
+        }
+    }
+
+    free_vars
+}
+
+/// Find inline variable opportunities in do-block let bindings.
+fn find_inline_actions(
+    expr: &ast::Expr,
+    doc: &DocumentState,
+    uri: &Uri,
+    cursor_offset: usize,
+    actions: &mut Vec<CodeActionOrCommand>,
+) {
+    if expr.span.end < cursor_offset || expr.span.start > cursor_offset {
+        return;
+    }
+
+    if let ast::ExprKind::Do(stmts) = &expr.node {
+        for stmt in stmts {
+            if let ast::StmtKind::Let { pat, expr: value_expr } = &stmt.node {
+                // Check if cursor is on the let binding
+                if stmt.span.start <= cursor_offset && cursor_offset <= stmt.span.end {
+                    if let ast::PatKind::Var(var_name) = &pat.node {
+                        let value_text = &doc.source
+                            [value_expr.span.start..value_expr.span.end.min(doc.source.len())];
+
+                        // Count usages of this variable in subsequent statements
+                        let use_count = doc
+                            .references
+                            .iter()
+                            .filter(|(usage, def)| {
+                                *def == pat.span
+                                    && usage.start > stmt.span.end
+                                    && usage.start < expr.span.end
+                            })
+                            .count();
+
+                        if use_count > 0 {
+                            // Build edits: remove the let line, replace all usages with the value
+                            let mut edits = Vec::new();
+
+                            // Remove the let statement (including the newline)
+                            let let_line_start = doc.source[..stmt.span.start]
+                                .rfind('\n')
+                                .map(|p| p + 1)
+                                .unwrap_or(stmt.span.start);
+                            let let_line_end = doc.source[stmt.span.end..]
+                                .find('\n')
+                                .map(|p| stmt.span.end + p + 1)
+                                .unwrap_or(stmt.span.end);
+
+                            edits.push(TextEdit {
+                                range: Range {
+                                    start: offset_to_position(&doc.source, let_line_start),
+                                    end: offset_to_position(&doc.source, let_line_end),
+                                },
+                                new_text: String::new(),
+                            });
+
+                            // Replace each usage with the value (parenthesized if complex)
+                            let replacement = if value_text.contains(' ') && use_count > 0 {
+                                format!("({value_text})")
+                            } else {
+                                value_text.to_string()
+                            };
+
+                            for (usage_span, def_span) in &doc.references {
+                                if *def_span == pat.span
+                                    && usage_span.start > stmt.span.end
+                                    && usage_span.start < expr.span.end
+                                {
+                                    edits.push(TextEdit {
+                                        range: span_to_range(*usage_span, &doc.source),
+                                        new_text: replacement.clone(),
+                                    });
+                                }
+                            }
+
+                            let mut changes = HashMap::new();
+                            changes.insert(uri.clone(), edits);
+
+                            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                                title: format!("Inline `{var_name}`"),
+                                kind: Some(CodeActionKind::REFACTOR_INLINE),
+                                edit: Some(WorkspaceEdit {
+                                    changes: Some(changes),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Recurse into statements
+        for stmt in stmts {
+            match &stmt.node {
+                ast::StmtKind::Bind { expr: e, .. }
+                | ast::StmtKind::Let { expr: e, .. }
+                | ast::StmtKind::Expr(e)
+                | ast::StmtKind::Where { cond: e } => {
+                    find_inline_actions(e, doc, uri, cursor_offset, actions);
+                }
+                ast::StmtKind::GroupBy { key } => {
+                    find_inline_actions(key, doc, uri, cursor_offset, actions);
+                }
+            }
+        }
+    }
+
+    // Recurse into other expression types
+    match &expr.node {
+        ast::ExprKind::App { func, arg } => {
+            find_inline_actions(func, doc, uri, cursor_offset, actions);
+            find_inline_actions(arg, doc, uri, cursor_offset, actions);
+        }
+        ast::ExprKind::Lambda { body, .. } => {
+            find_inline_actions(body, doc, uri, cursor_offset, actions);
+        }
+        ast::ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            find_inline_actions(cond, doc, uri, cursor_offset, actions);
+            find_inline_actions(then_branch, doc, uri, cursor_offset, actions);
+            find_inline_actions(else_branch, doc, uri, cursor_offset, actions);
+        }
+        ast::ExprKind::Case { scrutinee, arms } => {
+            find_inline_actions(scrutinee, doc, uri, cursor_offset, actions);
+            for arm in arms {
+                find_inline_actions(&arm.body, doc, uri, cursor_offset, actions);
+            }
+        }
+        ast::ExprKind::Atomic(e) => {
+            find_inline_actions(e, doc, uri, cursor_offset, actions);
+        }
+        _ => {}
+    }
+}
+
+/// Convert a pattern AST node to a source string representation.
+fn pat_to_string(pat: &ast::Pat, source: &str) -> String {
+    source[pat.span.start..pat.span.end.min(source.len())].to_string()
 }
 
 // ── Call Hierarchy ───────────────────────────────────────────────────
@@ -4011,6 +4564,8 @@ fn handle_range_formatting(
 ) -> Option<Vec<TextEdit>> {
     let doc = state.documents.get(&params.text_document.uri)?;
     let source = &doc.source;
+    let tab_size = params.options.tab_size as usize;
+    let use_spaces = params.options.insert_spaces;
 
     let start_line = params.range.start.line as usize;
     let end_line = params.range.end.line as usize;
@@ -4018,8 +4573,44 @@ fn handle_range_formatting(
     let lines: Vec<&str> = source.split('\n').collect();
     let mut edits = Vec::new();
 
+    let mut prev_was_blank = false;
     for i in start_line..=end_line.min(lines.len().saturating_sub(1)) {
         let line = lines[i];
+
+        // Convert tabs to spaces
+        if use_spaces && line.contains('\t') {
+            let indent_str = " ".repeat(tab_size);
+            let new_line = line.replace('\t', &indent_str);
+            let trimmed = new_line.trim_end();
+            edits.push(TextEdit {
+                range: Range {
+                    start: Position::new(i as u32, 0),
+                    end: Position::new(i as u32, line.len() as u32),
+                },
+                new_text: trimmed.to_string(),
+            });
+            prev_was_blank = trimmed.is_empty();
+            continue;
+        }
+
+        // Collapse consecutive blank lines to at most one
+        if line.trim().is_empty() {
+            if prev_was_blank {
+                edits.push(TextEdit {
+                    range: Range {
+                        start: Position::new(i as u32, 0),
+                        end: Position::new((i + 1).min(lines.len()) as u32, 0),
+                    },
+                    new_text: String::new(),
+                });
+                continue;
+            }
+            prev_was_blank = true;
+        } else {
+            prev_was_blank = false;
+        }
+
+        // Trim trailing whitespace
         let trimmed = line.trim_end();
         if trimmed.len() != line.len() {
             edits.push(TextEdit {
@@ -4102,6 +4693,354 @@ fn handle_on_type_formatting(
         },
         new_text: indent_str,
     }])
+}
+
+// ── Completion Resolve ───────────────────────────────────────────────
+
+fn handle_resolve_completion_item(
+    state: &ServerState,
+    mut item: CompletionItem,
+) -> CompletionItem {
+    // Enrich the completion item with documentation and type details
+    let label = &item.label;
+
+    // Search all open documents for matching definitions
+    for doc in state.documents.values() {
+        // Check doc comments
+        if let Some(doc_comment) = doc.doc_comments.get(label.as_str()) {
+            item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: doc_comment.clone(),
+            }));
+        }
+        // Enrich detail with type info if not already present
+        if item.detail.is_none() {
+            if let Some(ty) = doc.type_info.get(label.as_str()) {
+                item.detail = Some(ty.clone());
+            }
+        }
+        // Add effect info as part of documentation
+        if let Some(effects) = doc.effect_info.get(label.as_str()) {
+            let existing = item
+                .documentation
+                .as_ref()
+                .map(|d| match d {
+                    Documentation::String(s) => s.clone(),
+                    Documentation::MarkupContent(m) => m.value.clone(),
+                })
+                .unwrap_or_default();
+            let combined = if existing.is_empty() {
+                format!("*Effects:* `{effects}`")
+            } else {
+                format!("{existing}\n\n---\n\n*Effects:* `{effects}`")
+            };
+            item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: combined,
+            }));
+        }
+
+        if item.documentation.is_some() || item.detail.is_some() {
+            break;
+        }
+    }
+
+    item
+}
+
+// ── Import Path Completion ──────────────────────────────────────────
+
+fn complete_import_path(base_dir: &Path, partial: &str) -> Vec<CompletionItem> {
+    let mut items = Vec::new();
+
+    // Resolve the directory from the partial path
+    let (search_dir, prefix) = if let Some(last_slash) = partial.rfind('/') {
+        let dir_part = &partial[..last_slash];
+        let file_part = &partial[last_slash + 1..];
+        (base_dir.join(dir_part), file_part)
+    } else {
+        (base_dir.to_path_buf(), partial)
+    };
+
+    let entries = match std::fs::read_dir(&search_dir) {
+        Ok(e) => e,
+        Err(_) => return items,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        // Skip hidden files/dirs
+        if name.starts_with('.') || name == "target" || name == "node_modules" {
+            continue;
+        }
+
+        if path.is_dir() {
+            if name.to_lowercase().starts_with(&prefix.to_lowercase()) {
+                items.push(CompletionItem {
+                    label: format!("{name}/"),
+                    kind: Some(CompletionItemKind::FOLDER),
+                    insert_text: Some(format!("{name}/")),
+                    command: Some(Command {
+                        title: "Trigger completion".into(),
+                        command: "editor.action.triggerSuggest".into(),
+                        arguments: None,
+                    }),
+                    ..Default::default()
+                });
+            }
+        } else if path.extension().and_then(|e| e.to_str()) == Some("knot") {
+            let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            if stem.to_lowercase().starts_with(&prefix.to_lowercase()) {
+                items.push(CompletionItem {
+                    label: stem.clone(),
+                    kind: Some(CompletionItemKind::MODULE),
+                    detail: Some("module".into()),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    items
+}
+
+// ── Linked Editing Range ────────────────────────────────────────────
+
+fn handle_linked_editing_range(
+    state: &ServerState,
+    params: &LinkedEditingRangeParams,
+) -> Option<LinkedEditingRanges> {
+    let uri = &params.text_document_position_params.text_document.uri;
+    let pos = params.text_document_position_params.position;
+    let doc = state.documents.get(uri)?;
+    let offset = position_to_offset(&doc.source, pos);
+    let word = word_at_position(&doc.source, pos)?;
+
+    // Check if cursor is on a record field name (either in a record expression,
+    // pattern, or type declaration) — link all occurrences of the same field
+    // within the same declaration scope
+    let mut linked_ranges = Vec::new();
+
+    // Find the enclosing declaration
+    for decl in &doc.module.decls {
+        if decl.span.start > offset || offset > decl.span.end {
+            continue;
+        }
+
+        // Collect all field name positions within this declaration
+        match &decl.node {
+            DeclKind::Fun { body: Some(body), .. }
+            | DeclKind::View { body, .. }
+            | DeclKind::Derived { body, .. } => {
+                collect_field_name_spans(body, word, &doc.source, &mut linked_ranges);
+            }
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { body, .. } = item {
+                        collect_field_name_spans(body, word, &doc.source, &mut linked_ranges);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if linked_ranges.len() <= 1 {
+        return None;
+    }
+
+    Some(LinkedEditingRanges {
+        ranges: linked_ranges,
+        word_pattern: None,
+    })
+}
+
+fn collect_field_name_spans(
+    expr: &ast::Expr,
+    field_name: &str,
+    source: &str,
+    ranges: &mut Vec<Range>,
+) {
+    match &expr.node {
+        ast::ExprKind::Record(fields) => {
+            for f in fields {
+                if f.name == field_name {
+                    // Find the field name span within the record expression
+                    if let Some(span) =
+                        find_word_in_source(source, field_name, expr.span.start, expr.span.end)
+                    {
+                        ranges.push(span_to_range(span, source));
+                    }
+                }
+                collect_field_name_spans(&f.value, field_name, source, ranges);
+            }
+        }
+        ast::ExprKind::RecordUpdate { base, fields } => {
+            collect_field_name_spans(base, field_name, source, ranges);
+            for f in fields {
+                if f.name == field_name {
+                    if let Some(span) =
+                        find_word_in_source(source, field_name, expr.span.start, expr.span.end)
+                    {
+                        ranges.push(span_to_range(span, source));
+                    }
+                }
+                collect_field_name_spans(&f.value, field_name, source, ranges);
+            }
+        }
+        ast::ExprKind::FieldAccess {
+            expr: inner, field, ..
+        } => {
+            if field == field_name {
+                let field_start = expr.span.end - field.len();
+                ranges.push(span_to_range(
+                    Span::new(field_start, expr.span.end),
+                    source,
+                ));
+            }
+            collect_field_name_spans(inner, field_name, source, ranges);
+        }
+        ast::ExprKind::App { func, arg } => {
+            collect_field_name_spans(func, field_name, source, ranges);
+            collect_field_name_spans(arg, field_name, source, ranges);
+        }
+        ast::ExprKind::Lambda { body, .. } => {
+            collect_field_name_spans(body, field_name, source, ranges);
+        }
+        ast::ExprKind::BinOp { lhs, rhs, .. } => {
+            collect_field_name_spans(lhs, field_name, source, ranges);
+            collect_field_name_spans(rhs, field_name, source, ranges);
+        }
+        ast::ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            collect_field_name_spans(cond, field_name, source, ranges);
+            collect_field_name_spans(then_branch, field_name, source, ranges);
+            collect_field_name_spans(else_branch, field_name, source, ranges);
+        }
+        ast::ExprKind::Case { scrutinee, arms } => {
+            collect_field_name_spans(scrutinee, field_name, source, ranges);
+            for arm in arms {
+                collect_field_name_spans(&arm.body, field_name, source, ranges);
+            }
+        }
+        ast::ExprKind::Do(stmts) => {
+            for stmt in stmts {
+                match &stmt.node {
+                    ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Let { expr, .. } => {
+                        collect_field_name_spans(expr, field_name, source, ranges);
+                    }
+                    ast::StmtKind::Expr(e) | ast::StmtKind::Where { cond: e } => {
+                        collect_field_name_spans(e, field_name, source, ranges);
+                    }
+                    ast::StmtKind::GroupBy { key } => {
+                        collect_field_name_spans(key, field_name, source, ranges);
+                    }
+                }
+            }
+        }
+        ast::ExprKind::Atomic(e) => collect_field_name_spans(e, field_name, source, ranges),
+        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+            collect_field_name_spans(target, field_name, source, ranges);
+            collect_field_name_spans(value, field_name, source, ranges);
+        }
+        ast::ExprKind::List(elems) => {
+            for e in elems {
+                collect_field_name_spans(e, field_name, source, ranges);
+            }
+        }
+        _ => {}
+    }
+}
+
+// ── Workspace Diagnostics (Pull Model) ──────────────────────────────
+
+fn handle_workspace_diagnostics(
+    state: &ServerState,
+    _params: &WorkspaceDiagnosticParams,
+) -> WorkspaceDiagnosticReportResult {
+    let mut items = Vec::new();
+
+    for (uri, doc) in &state.documents {
+        let lsp_diags: Vec<Diagnostic> = doc
+            .knot_diagnostics
+            .iter()
+            .filter_map(|d| to_lsp_diagnostic(d, &doc.source, uri))
+            .collect();
+
+        items.push(WorkspaceDocumentDiagnosticReport::Full(
+            WorkspaceFullDocumentDiagnosticReport {
+                uri: uri.clone(),
+                version: None,
+                full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                    result_id: None,
+                    items: lsp_diags,
+                },
+            },
+        ));
+    }
+
+    // Also scan workspace files not currently open
+    if let Some(root) = &state.workspace_root {
+        let open_paths: HashSet<PathBuf> = state
+            .documents
+            .keys()
+            .filter_map(|u| uri_to_path(u))
+            .filter_map(|p| p.canonicalize().ok())
+            .collect();
+
+        if let Ok(files) = scan_knot_files(root) {
+            for file_path in files {
+                let canonical = match file_path.canonicalize() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                if open_paths.contains(&canonical) {
+                    continue;
+                }
+                let source = match std::fs::read_to_string(&canonical) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let file_uri = match path_to_uri(&canonical) {
+                    Some(u) => u,
+                    None => continue,
+                };
+
+                let lexer = knot::lexer::Lexer::new(&source);
+                let (tokens, lex_diags) = lexer.tokenize();
+                let parser = knot::parser::Parser::new(source.clone(), tokens);
+                let (_, parse_diags) = parser.parse_module();
+
+                let mut all_diags = lex_diags;
+                all_diags.extend(parse_diags);
+
+                let lsp_diags: Vec<Diagnostic> = all_diags
+                    .iter()
+                    .filter_map(|d| to_lsp_diagnostic(d, &source, &file_uri))
+                    .collect();
+
+                if !lsp_diags.is_empty() {
+                    items.push(WorkspaceDocumentDiagnosticReport::Full(
+                        WorkspaceFullDocumentDiagnosticReport {
+                            uri: file_uri,
+                            version: None,
+                            full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                                result_id: None,
+                                items: lsp_diags,
+                            },
+                        },
+                    ));
+                }
+            }
+        }
+    }
+
+    WorkspaceDiagnosticReportResult::Report(WorkspaceDiagnosticReport { items })
 }
 
 // ── Constants ───────────────────────────────────────────────────────
@@ -4661,6 +5600,16 @@ fn to_lsp_diagnostic(diag: &diagnostic::Diagnostic, source: &str, uri: &Uri) -> 
     // Assign structured error codes based on diagnostic message patterns
     let code = error_code_for_diagnostic(&diag.message);
 
+    // Assign diagnostic tags: Unnecessary for unused warnings, Deprecated for deprecation
+    let msg_lower = diag.message.to_lowercase();
+    let mut tags = Vec::new();
+    if msg_lower.contains("unused") || msg_lower.contains("never used") {
+        tags.push(DiagnosticTag::UNNECESSARY);
+    }
+    if msg_lower.contains("deprecated") {
+        tags.push(DiagnosticTag::DEPRECATED);
+    }
+
     Some(Diagnostic {
         range,
         severity: Some(severity),
@@ -4672,6 +5621,7 @@ fn to_lsp_diagnostic(diag: &diagnostic::Diagnostic, source: &str, uri: &Uri) -> 
         } else {
             Some(related)
         },
+        tags: if tags.is_empty() { None } else { Some(tags) },
         ..Default::default()
     })
 }

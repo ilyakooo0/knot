@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::notification::Notification as _;
@@ -32,11 +33,17 @@ struct DocumentState {
     import_defs: HashMap<String, (PathBuf, Span)>,
     /// Which import path each name originated from (for scoped cross-file matching).
     import_origins: HashMap<String, String>,
+    /// Doc comments for declarations: name → comment text.
+    doc_comments: HashMap<String, String>,
+    /// Keyword/operator token positions for semantic highlighting.
+    keyword_tokens: Vec<(Span, u32)>,
 }
 
 struct ServerState {
     documents: HashMap<Uri, DocumentState>,
     workspace_root: Option<PathBuf>,
+    /// Cached parsed imports: canonical path → (mtime, module, source text).
+    import_cache: HashMap<PathBuf, (SystemTime, Module, String)>,
 }
 
 // ── Semantic token legend ───────────────────────────────────────────
@@ -49,11 +56,9 @@ const TOK_PARAMETER: u32 = 4;
 const TOK_VARIABLE: u32 = 5;
 const TOK_PROPERTY: u32 = 6;
 const TOK_FUNCTION: u32 = 7;
-#[allow(dead_code)]
 const TOK_KEYWORD: u32 = 8;
 const TOK_STRING: u32 = 9;
 const TOK_NUMBER: u32 = 10;
-#[allow(dead_code)]
 const TOK_OPERATOR: u32 = 11;
 
 const MOD_DECLARATION: u32 = 0b01;
@@ -164,6 +169,7 @@ fn main() {
     let mut state = ServerState {
         documents: HashMap::new(),
         workspace_root,
+        import_cache: HashMap::new(),
     };
 
     // Register for file watcher notifications (.knot files)
@@ -306,7 +312,7 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
     if not.method == notification::DidOpenTextDocument::METHOD {
         let params: DidOpenTextDocumentParams = serde_json::from_value(not.params).unwrap();
         let uri = params.text_document.uri.clone();
-        let doc = analyze_document(&uri, &params.text_document.text);
+        let doc = analyze_document(&uri, &params.text_document.text, &mut state.import_cache);
         publish_diagnostics(conn, &uri, &doc);
         state.documents.insert(uri, doc);
     } else if not.method == notification::DidChangeTextDocument::METHOD {
@@ -329,9 +335,31 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
                 source = change.text;
             }
         }
-        let doc = analyze_document(&uri, &source);
+        let doc = analyze_document(&uri, &source, &mut state.import_cache);
         publish_diagnostics(conn, &uri, &doc);
-        state.documents.insert(uri, doc);
+        state.documents.insert(uri.clone(), doc);
+
+        // Re-analyze open documents that import from the changed file
+        if let Some(changed_path) = uri_to_path(&uri).and_then(|p| p.canonicalize().ok()) {
+            let uris_to_refresh: Vec<(Uri, String)> = state
+                .documents
+                .iter()
+                .filter(|(other_uri, other_doc)| {
+                    **other_uri != uri
+                        && other_doc
+                            .imported_files
+                            .keys()
+                            .any(|p| *p == changed_path)
+                })
+                .map(|(u, d)| (u.clone(), d.source.clone()))
+                .collect();
+            for (refresh_uri, refresh_source) in uris_to_refresh {
+                let doc =
+                    analyze_document(&refresh_uri, &refresh_source, &mut state.import_cache);
+                publish_diagnostics(conn, &refresh_uri, &doc);
+                state.documents.insert(refresh_uri, doc);
+            }
+        }
     } else if not.method == notification::DidChangeWatchedFiles::METHOD {
         let params: DidChangeWatchedFilesParams = serde_json::from_value(not.params).unwrap();
         // When .knot files change on disk, re-analyze open documents that might
@@ -357,7 +385,7 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
                 .collect();
 
             for (uri, source) in uris_to_refresh {
-                let doc = analyze_document(&uri, &source);
+                let doc = analyze_document(&uri, &source, &mut state.import_cache);
                 publish_diagnostics(conn, &uri, &doc);
                 state.documents.insert(uri, doc);
             }
@@ -374,7 +402,11 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
 
 // ── Document analysis ───────────────────────────────────────────────
 
-fn analyze_document(uri: &Uri, source: &str) -> DocumentState {
+fn analyze_document(
+    uri: &Uri,
+    source: &str,
+    import_cache: &mut HashMap<PathBuf, (SystemTime, Module, String)>,
+) -> DocumentState {
     let mut all_diags = Vec::new();
     let mut type_info = HashMap::new();
     let mut local_type_info = HashMap::new();
@@ -385,6 +417,9 @@ fn analyze_document(uri: &Uri, source: &str) -> DocumentState {
     let (tokens, lex_diags) = lexer.tokenize();
     all_diags.extend(lex_diags);
 
+    // Collect keyword/operator positions for semantic tokens before parser consumes them
+    let keyword_tokens = collect_keyword_operator_positions(&tokens);
+
     // Parse
     let parser = knot::parser::Parser::new(source.to_string(), tokens);
     let (module, parse_diags) = parser.parse_module();
@@ -394,9 +429,12 @@ fn analyze_document(uri: &Uri, source: &str) -> DocumentState {
     let (definitions, references, literal_types) = resolve_definitions(&module, source);
     let details = build_details(&module);
 
+    // Extract doc comments from source
+    let doc_comments = extract_doc_comments(source, &module);
+
     // Resolve import navigation (cross-file definitions)
     let (imported_files, import_defs, import_origins) = if let Some(path) = uri_to_path(uri) {
-        resolve_import_navigation(&module.imports, &path)
+        resolve_import_navigation(&module.imports, &path, import_cache)
     } else {
         (HashMap::new(), HashMap::new(), HashMap::new())
     };
@@ -453,6 +491,8 @@ fn analyze_document(uri: &Uri, source: &str) -> DocumentState {
         imported_files,
         import_defs,
         import_origins,
+        doc_comments,
+        keyword_tokens,
     }
 }
 
@@ -460,6 +500,7 @@ fn analyze_document(uri: &Uri, source: &str) -> DocumentState {
 fn resolve_import_navigation(
     imports: &[ast::Import],
     source_path: &Path,
+    import_cache: &mut HashMap<PathBuf, (SystemTime, Module, String)>,
 ) -> (HashMap<PathBuf, String>, HashMap<String, (PathBuf, Span)>, HashMap<String, String>) {
     let mut imported_files = HashMap::new();
     let mut import_defs = HashMap::new();
@@ -476,15 +517,54 @@ fn resolve_import_navigation(
             Err(_) => continue,
         };
 
-        let source = match std::fs::read_to_string(&canonical) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+        // Check import cache: reuse if mtime hasn't changed
+        let current_mtime = std::fs::metadata(&canonical)
+            .and_then(|m| m.modified())
+            .ok();
 
-        let lexer = knot::lexer::Lexer::new(&source);
-        let (tokens, _) = lexer.tokenize();
-        let parser = knot::parser::Parser::new(source.clone(), tokens);
-        let (module, _) = parser.parse_module();
+        let (module, source) = if let Some(mtime) = current_mtime {
+            if let Some((cached_mtime, cached_module, cached_source)) =
+                import_cache.get(&canonical)
+            {
+                if *cached_mtime == mtime {
+                    (cached_module.clone(), cached_source.clone())
+                } else {
+                    let source = match std::fs::read_to_string(&canonical) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let lexer = knot::lexer::Lexer::new(&source);
+                    let (tokens, _) = lexer.tokenize();
+                    let parser = knot::parser::Parser::new(source.clone(), tokens);
+                    let (module, _) = parser.parse_module();
+                    import_cache
+                        .insert(canonical.clone(), (mtime, module.clone(), source.clone()));
+                    (module, source)
+                }
+            } else {
+                let source = match std::fs::read_to_string(&canonical) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let lexer = knot::lexer::Lexer::new(&source);
+                let (tokens, _) = lexer.tokenize();
+                let parser = knot::parser::Parser::new(source.clone(), tokens);
+                let (module, _) = parser.parse_module();
+                import_cache
+                    .insert(canonical.clone(), (mtime, module.clone(), source.clone()));
+                (module, source)
+            }
+        } else {
+            let source = match std::fs::read_to_string(&canonical) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let lexer = knot::lexer::Lexer::new(&source);
+            let (tokens, _) = lexer.tokenize();
+            let parser = knot::parser::Parser::new(source.clone(), tokens);
+            let (module, _) = parser.parse_module();
+            (module, source)
+        };
 
         // Register definitions from this file
         for decl in &module.decls {
@@ -1051,10 +1131,17 @@ fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<Hover> {
         return None;
     };
 
+    // Include doc comments if available
+    let mut value = format!("```knot\n{detail}\n```");
+    if let Some(doc_comment) = doc.doc_comments.get(word) {
+        value.push_str("\n\n---\n\n");
+        value.push_str(doc_comment);
+    }
+
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
-            value: format!("```knot\n{detail}\n```"),
+            value,
         }),
         range: None,
     })
@@ -1747,6 +1834,76 @@ fn handle_rename(
         }
     }
 
+    // Workspace-wide: scan .knot files not currently open that may import this symbol
+    if let Some(root) = &state.workspace_root {
+        let open_paths: HashSet<PathBuf> = state
+            .documents
+            .keys()
+            .filter_map(|u| uri_to_path(u))
+            .filter_map(|p| p.canonicalize().ok())
+            .collect();
+
+        if let Ok(files) = scan_knot_files(root) {
+            for file_path in files {
+                let canonical = match file_path.canonicalize() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                if open_paths.contains(&canonical) {
+                    continue;
+                }
+                let file_source = match std::fs::read_to_string(&canonical) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                // Quick check: does the file contain the symbol name at all?
+                if !file_source.contains(old_name) {
+                    continue;
+                }
+                let file_uri = match path_to_uri(&canonical) {
+                    Some(u) => u,
+                    None => continue,
+                };
+                let lexer = knot::lexer::Lexer::new(&file_source);
+                let (tokens, _) = lexer.tokenize();
+                let parser = knot::parser::Parser::new(file_source.clone(), tokens);
+                let (module, _) = parser.parse_module();
+                let (defs, refs, _) = resolve_definitions(&module, &file_source);
+
+                // Rename at definition sites
+                if let Some(def_span) = defs.get(&symbol_name) {
+                    let def_text =
+                        &file_source[def_span.start..def_span.end.min(file_source.len())];
+                    if let Some(name_start) = def_text.find(old_name) {
+                        let name_span = Span::new(
+                            def_span.start + name_start,
+                            def_span.start + name_start + old_name.len(),
+                        );
+                        changes
+                            .entry(file_uri.clone())
+                            .or_default()
+                            .push(TextEdit {
+                                range: span_to_range(name_span, &file_source),
+                                new_text: new_name.clone(),
+                            });
+                    }
+                }
+                // Rename at usage sites
+                for (usage_span, target_span) in &refs {
+                    if defs.get(&symbol_name) == Some(target_span) {
+                        changes
+                            .entry(file_uri.clone())
+                            .or_default()
+                            .push(TextEdit {
+                                range: span_to_range(*usage_span, &file_source),
+                                new_text: new_name.clone(),
+                            });
+                    }
+                }
+            }
+        }
+    }
+
     Some(WorkspaceEdit {
         changes: Some(changes),
         ..Default::default()
@@ -2200,6 +2357,20 @@ fn handle_semantic_tokens_full(
 
     for decl in &doc.module.decls {
         collector.visit_decl(decl);
+    }
+
+    // Add keyword and operator tokens from lexer
+    let ast_token_starts: HashSet<usize> = raw_tokens.iter().map(|t| t.start).collect();
+    for (span, tok_type) in &doc.keyword_tokens {
+        // Only add if no AST-based token already covers this position
+        if !ast_token_starts.contains(&span.start) {
+            raw_tokens.push(RawToken {
+                start: span.start,
+                length: span.end - span.start,
+                token_type: *tok_type,
+                modifiers: 0,
+            });
+        }
     }
 
     raw_tokens.sort_by_key(|t| (t.start, t.length));
@@ -2828,12 +2999,16 @@ fn handle_formatting(
     let doc = state.documents.get(&params.text_document.uri)?;
     let source = &doc.source;
 
-    // Conservative formatter:
-    // 1. Trim trailing whitespace from all lines
-    // 2. Normalize blank lines between top-level declarations (exactly one blank line)
-    // 3. Ensure trailing newline
-    // 4. Normalize imports (single blank line after import block)
+    // Formatter:
+    // 1. Convert tabs to spaces (2 spaces per tab)
+    // 2. Trim trailing whitespace from all lines
+    // 3. Normalize blank lines between top-level declarations (exactly one blank line)
+    // 4. Collapse consecutive blank lines inside blocks to at most one
+    // 5. Ensure trailing newline
+    // 6. Normalize imports (single blank line after import block)
 
+    // Convert tabs to spaces first
+    let source = &source.replace('\t', "  ");
     let lines: Vec<&str> = source.split('\n').collect();
     let mut result_lines: Vec<String> = Vec::with_capacity(lines.len());
 
@@ -2894,6 +3069,19 @@ fn handle_formatting(
                 } else {
                     result_lines.push(String::new());
                 }
+            }
+            continue;
+        }
+
+        // Collapse consecutive blank lines inside blocks to at most one
+        if lines[i].trim().is_empty() && in_block {
+            let mut blank_count = 0;
+            while i < lines.len() && lines[i].trim().is_empty() {
+                blank_count += 1;
+                i += 1;
+            }
+            if blank_count > 0 {
+                result_lines.push(String::new());
             }
             continue;
         }
@@ -3170,6 +3358,56 @@ fn handle_code_action(
                 }
             }
             _ => {}
+        }
+    }
+
+    // Action: Extract variable — if a non-trivial expression is selected, offer to extract it
+    if range_start != range_end {
+        let selected_text = &doc.source[range_start..range_end.min(doc.source.len())];
+        let trimmed = selected_text.trim();
+        // Only offer for non-trivial selections (not just a name or empty)
+        if !trimmed.is_empty()
+            && trimmed.len() > 1
+            && !trimmed.chars().all(|c| c.is_alphanumeric() || c == '_')
+        {
+            // Find the line where the selection starts to determine indentation
+            let line_start = doc.source[..range_start]
+                .rfind('\n')
+                .map(|p| p + 1)
+                .unwrap_or(0);
+            let current_line = &doc.source[line_start..];
+            let indent = current_line.len() - current_line.trim_start().len();
+            let indent_str = " ".repeat(indent);
+
+            let mut changes = HashMap::new();
+            changes.insert(
+                uri.clone(),
+                vec![
+                    // Insert let binding before the current line
+                    TextEdit {
+                        range: Range {
+                            start: offset_to_position(&doc.source, line_start),
+                            end: offset_to_position(&doc.source, line_start),
+                        },
+                        new_text: format!("{indent_str}let extracted = {trimmed}\n"),
+                    },
+                    // Replace the selected expression with the variable name
+                    TextEdit {
+                        range: params.range,
+                        new_text: "extracted".to_string(),
+                    },
+                ],
+            );
+
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: "Extract to let binding".to_string(),
+                kind: Some(CodeActionKind::REFACTOR_EXTRACT),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }));
         }
     }
 
@@ -4420,9 +4658,13 @@ fn to_lsp_diagnostic(diag: &diagnostic::Diagnostic, source: &str, uri: &Uri) -> 
         })
         .collect();
 
+    // Assign structured error codes based on diagnostic message patterns
+    let code = error_code_for_diagnostic(&diag.message);
+
     Some(Diagnostic {
         range,
         severity: Some(severity),
+        code: code.map(NumberOrString::String),
         source: Some("knot".into()),
         message,
         related_information: if related.is_empty() {
@@ -4540,4 +4782,149 @@ fn find_word_in_source(source: &str, name: &str, start: usize, end: usize) -> Op
         search_start += pos + 1;
     }
     None
+}
+
+// ── Doc comment extraction ──────────────────────────────────────────
+
+/// Extract doc comments (lines starting with `-- `) above each declaration.
+fn extract_doc_comments(source: &str, module: &Module) -> HashMap<String, String> {
+    let mut comments = HashMap::new();
+    let lines: Vec<&str> = source.split('\n').collect();
+
+    for decl in &module.decls {
+        let name = match &decl.node {
+            DeclKind::Fun { name, .. }
+            | DeclKind::Data { name, .. }
+            | DeclKind::TypeAlias { name, .. }
+            | DeclKind::Source { name, .. }
+            | DeclKind::View { name, .. }
+            | DeclKind::Derived { name, .. }
+            | DeclKind::Trait { name, .. }
+            | DeclKind::Route { name, .. }
+            | DeclKind::RouteComposite { name, .. } => name.clone(),
+            _ => continue,
+        };
+
+        let decl_line = offset_to_position(source, decl.span.start).line as usize;
+        if decl_line == 0 {
+            continue;
+        }
+
+        // Collect consecutive comment lines above the declaration
+        let mut comment_lines = Vec::new();
+        let mut line_idx = decl_line;
+        while line_idx > 0 {
+            line_idx -= 1;
+            let line = lines.get(line_idx).map(|l| l.trim()).unwrap_or("");
+            if let Some(text) = line.strip_prefix("-- ") {
+                comment_lines.push(text.to_string());
+            } else if line == "--" {
+                comment_lines.push(String::new());
+            } else {
+                break;
+            }
+        }
+
+        if !comment_lines.is_empty() {
+            comment_lines.reverse();
+            comments.insert(name, comment_lines.join("\n"));
+        }
+    }
+
+    comments
+}
+
+// ── Keyword/operator semantic token collection ──────────────────────
+
+/// Collect keyword and operator token positions from the lexer token stream.
+fn collect_keyword_operator_positions(tokens: &[knot::lexer::Token]) -> Vec<(Span, u32)> {
+    use knot::lexer::TokenKind;
+    let mut positions = Vec::new();
+    for token in tokens {
+        let tok_type = match &token.kind {
+            // Keywords
+            TokenKind::Import
+            | TokenKind::Data
+            | TokenKind::Type
+            | TokenKind::Trait
+            | TokenKind::Impl
+            | TokenKind::Route
+            | TokenKind::Migrate
+            | TokenKind::Where
+            | TokenKind::Do
+            | TokenKind::Set
+            | TokenKind::If
+            | TokenKind::Then
+            | TokenKind::Else
+            | TokenKind::Case
+            | TokenKind::Of
+            | TokenKind::Let
+            | TokenKind::In
+            | TokenKind::Not
+            | TokenKind::Full
+            | TokenKind::Atomic
+            | TokenKind::Deriving
+            | TokenKind::With
+            | TokenKind::Export
+            | TokenKind::Unit => Some(TOK_KEYWORD),
+            // Operators
+            TokenKind::Plus
+            | TokenKind::Minus
+            | TokenKind::Star
+            | TokenKind::Slash
+            | TokenKind::EqEq
+            | TokenKind::BangEq
+            | TokenKind::Lt
+            | TokenKind::Gt
+            | TokenKind::Le
+            | TokenKind::Ge
+            | TokenKind::PlusPlus
+            | TokenKind::AndAnd
+            | TokenKind::OrOr
+            | TokenKind::PipeGt
+            | TokenKind::Caret
+            | TokenKind::Arrow
+            | TokenKind::FatArrow
+            | TokenKind::LArrow => Some(TOK_OPERATOR),
+            _ => None,
+        };
+        if let Some(tt) = tok_type {
+            positions.push((token.span, tt));
+        }
+    }
+    positions
+}
+
+// ── Diagnostic error codes ──────────────────────────────────────────
+
+/// Map diagnostic messages to structured error codes.
+fn error_code_for_diagnostic(message: &str) -> Option<String> {
+    let msg = message.to_lowercase();
+    if msg.contains("type mismatch") || msg.contains("cannot unify") {
+        Some("E001".into())
+    } else if msg.contains("undefined") || msg.contains("unknown") || msg.contains("not found") {
+        Some("E002".into())
+    } else if msg.contains("missing") && msg.contains("field") {
+        Some("E003".into())
+    } else if msg.contains("exhaustive") || msg.contains("missing case") {
+        Some("E004".into())
+    } else if msg.contains("occurs check") || msg.contains("infinite type") {
+        Some("E005".into())
+    } else if msg.contains("duplicate") {
+        Some("E006".into())
+    } else if msg.contains("import") {
+        Some("E007".into())
+    } else if msg.contains("effect") || msg.contains("purity") {
+        Some("E008".into())
+    } else if msg.contains("stratif") {
+        Some("E009".into())
+    } else if msg.contains("trait") && (msg.contains("impl") || msg.contains("instance")) {
+        Some("E010".into())
+    } else if msg.contains("unused") {
+        Some("W001".into())
+    } else if msg.contains("shadow") {
+        Some("W002".into())
+    } else {
+        None
+    }
 }

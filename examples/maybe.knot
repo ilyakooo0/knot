@@ -54,13 +54,13 @@ result3 = do
   a <- Just {value: 10}
   b <- Just {value: 3}
   where b > 2
-  yield a + b
+  yield (a + b)
 
 result4 = do
   a <- Just {value: 10}
   b <- Just {value: 1}
   where b > 2
-  yield a + b
+  yield (a + b)
 
 main = do
   println (show result1)

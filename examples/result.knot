@@ -47,7 +47,7 @@ result2 = do
 result3 = do
   a <- Err {error: "no input"}
   b <- Ok {value: 42}
-  yield a + b
+  yield (a + b)
 
 main = do
   println (show result1)

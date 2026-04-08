@@ -1467,7 +1467,7 @@ impl Infer {
         match &expr.node {
             ast::ExprKind::Lit(lit) => self.literal_type(lit),
 
-            ast::ExprKind::Var(name) if name == "__yield" => {
+            ast::ExprKind::Var(name) if name == "__yield" || name == "yield" => {
                 // ∀m a. a -> App(m, a)  — monadic yield (from do-desugaring)
                 let m = self.fresh_var();
                 let a = self.fresh_var();
@@ -1757,23 +1757,6 @@ impl Infer {
             }
 
             ast::ExprKind::Do(stmts) => self.infer_do(stmts, expr.span),
-
-            ast::ExprKind::Yield(inner) => {
-                let inner_ty = self.infer_expr(inner);
-                if self.in_io_do {
-                    // Inside an IO do-block, produce IO directly to preserve
-                    // compatibility with infer_do's IO detection logic.
-                    Ty::IO(BTreeSet::new(), Box::new(inner_ty))
-                } else {
-                    // Outside IO do-blocks, produce a polymorphic type App(m, inner)
-                    // where m is a fresh monad variable. This allows yield to work
-                    // for any Applicative — unification with the context determines
-                    // whether m resolves to [] (Relation), IO, Maybe, etc.
-                    let m = self.fresh_var();
-                    self.monad_vars.push((expr.span, m));
-                    Ty::App(Box::new(Ty::Var(m)), Box::new(inner_ty))
-                }
-            }
 
             ast::ExprKind::Set { target, value } => {
                 let target_ty = self.infer_expr(target);
@@ -2338,7 +2321,6 @@ impl Infer {
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
                 self.expr_is_io_prescan(lhs) || self.expr_is_io_prescan(rhs)
             }
-            ast::ExprKind::Yield(inner) => self.expr_is_io_prescan(inner),
             ast::ExprKind::UnaryOp { operand, .. } => self.expr_is_io_prescan(operand),
             ast::ExprKind::If { cond, then_branch, else_branch, .. } => {
                 self.expr_is_io_prescan(cond)
@@ -2467,7 +2449,7 @@ impl Infer {
                     }
                 }
                 ast::StmtKind::Expr(expr) => {
-                    if let ast::ExprKind::Yield(inner) = &expr.node {
+                    if let Some(inner) = expr.node.as_yield_arg() {
                         let inner_ty = self.infer_expr(inner);
                         if let Some(ref yt) = yield_ty {
                             let yt = yt.clone();

@@ -3143,10 +3143,13 @@ impl Codegen {
             }
 
             ast::ExprKind::App { func, arg } => {
-                // Check for monadic yield: __yield(e)
+                // Check for monadic yield: __yield(e) or yield(e)
                 if let ast::ExprKind::Var(name) = &func.node {
-                    if name == "__yield" {
+                    if name == "__yield" || name == "yield" {
                         let val = self.compile_expr(builder, arg, env, db);
+                        if self.in_io_eager {
+                            return val;
+                        }
                         return self.compile_monadic_yield(builder, val, func.span, db);
                     }
                 }
@@ -3158,17 +3161,6 @@ impl Codegen {
                     self.compile_io_do(builder, stmts, env, db)
                 } else {
                     self.compile_do(builder, stmts, env, db)
-                }
-            }
-
-            ast::ExprKind::Yield(inner) => {
-                let val = self.compile_expr(builder, inner, env, db);
-                if self.in_io_eager {
-                    // In IO do-block eager context, yield returns the raw value
-                    val
-                } else {
-                    // Dispatch through monad_info for polymorphic yield
-                    self.compile_monadic_yield(builder, val, expr.span, db)
                 }
             }
 
@@ -4716,7 +4708,6 @@ impl Codegen {
             | ast::ExprKind::RecordUpdate { .. }
             | ast::ExprKind::FieldAccess { .. }
             | ast::ExprKind::List(_) => false,
-            ast::ExprKind::Yield(inner) => Self::expr_contains_io(inner, builtins, io_fns),
             _ => false,
         }
     }
@@ -4744,7 +4735,6 @@ impl Codegen {
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
                 self.expr_is_io(lhs) || self.expr_is_io(rhs)
             }
-            ast::ExprKind::Yield(inner) => self.expr_is_io(inner),
             ast::ExprKind::UnaryOp { operand, .. } => self.expr_is_io(operand),
             ast::ExprKind::If { cond, then_branch, else_branch, .. } => {
                 self.expr_is_io(cond)
@@ -4908,7 +4898,7 @@ impl Codegen {
                     builder.seal_block(pass_block);
                 }
                 ast::StmtKind::Expr(expr) => {
-                    if let ast::ExprKind::Yield(inner) = &expr.node {
+                    if let Some(inner) = expr.node.as_yield_arg() {
                         let val = self.compile_expr(builder, inner, env, db);
                         last_val = val;
                     } else if self.expr_is_io(expr) {
@@ -5631,32 +5621,28 @@ impl Codegen {
 
                 ast::StmtKind::Expr(expr) => {
                     let is_last = stmt_idx == stmts.len() - 1;
-                    match &expr.node {
-                        ast::ExprKind::Yield(inner) => {
-                            let val =
-                                self.compile_expr(builder, inner, env, db);
+                    if let Some(inner) = expr.node.as_yield_arg() {
+                        let val =
+                            self.compile_expr(builder, inner, env, db);
+                        self.call_rt_void(
+                            builder,
+                            "knot_relation_push",
+                            &[result, val],
+                        );
+                    } else if matches!(&expr.node, ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. }) {
+                        // Compile set inside do block
+                        let _ = self.compile_expr(builder, expr, env, db);
+                    } else {
+                        let val =
+                            self.compile_expr(builder, expr, env, db);
+                        if is_last && loop_stack.is_empty() {
+                            // Last expression in a non-looping do block
+                            // — push as result
                             self.call_rt_void(
                                 builder,
                                 "knot_relation_push",
                                 &[result, val],
                             );
-                        }
-                        ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => {
-                            // Compile set inside do block
-                            let _ = self.compile_expr(builder, expr, env, db);
-                        }
-                        _ => {
-                            let val =
-                                self.compile_expr(builder, expr, env, db);
-                            if is_last && loop_stack.is_empty() {
-                                // Last expression in a non-looping do block
-                                // — push as result
-                                self.call_rt_void(
-                                    builder,
-                                    "knot_relation_push",
-                                    &[result, val],
-                                );
-                            }
                         }
                     }
                 }
@@ -6034,7 +6020,6 @@ impl Codegen {
                 ast::StmtKind::GroupBy { key } => Self::references_source(key, source_name),
                 ast::StmtKind::Expr(e) => Self::references_source(e, source_name),
             }),
-            ast::ExprKind::Yield(inner) => Self::references_source(inner, source_name),
             ast::ExprKind::Set { target, value }
             | ast::ExprKind::FullSet { target, value } => {
                 Self::references_source(target, source_name)
@@ -6435,7 +6420,7 @@ impl Codegen {
         // Parse the yield statement
         let yield_expr = match &stmts.last()?.node {
             ast::StmtKind::Expr(e) => {
-                if let ast::ExprKind::Yield(inner) = &e.node {
+                if let Some(inner) = e.node.as_yield_arg() {
                     inner
                 } else {
                     return None;
@@ -6835,7 +6820,7 @@ impl Codegen {
                     if let ast::ExprKind::SourceRef(name) = &expr.node {
                         if name == source_name {
                             if let ast::StmtKind::Expr(e) = &stmts[1].node {
-                                return matches!(&e.node, ast::ExprKind::Yield(_));
+                                return e.node.as_yield_arg().is_some();
                             }
                         }
                     }
@@ -6881,7 +6866,7 @@ impl Codegen {
 
         // Last: yield t
         if let ast::StmtKind::Expr(e) = &stmts.last()?.node {
-            if let ast::ExprKind::Yield(inner) = &e.node {
+            if let Some(inner) = e.node.as_yield_arg() {
                 if let ast::ExprKind::Var(v) = &inner.node {
                     if v != &bind_var {
                         return None;
@@ -6948,7 +6933,7 @@ impl Codegen {
 
         // Second: yield (if cond then {t | ...} else t)
         if let ast::StmtKind::Expr(e) = &stmts[1].node {
-            if let ast::ExprKind::Yield(yield_inner) = &e.node {
+            if let Some(yield_inner) = e.node.as_yield_arg() {
                 if let ast::ExprKind::If {
                     cond,
                     then_branch,
@@ -7400,7 +7385,7 @@ fn analyze_view(body: &ast::Expr) -> Option<ViewInfo> {
         // Find the yield expression with a record
         let yield_record = stmts.iter().rev().find_map(|s| {
             if let ast::StmtKind::Expr(expr) = &s.node {
-                if let ast::ExprKind::Yield(inner) = &expr.node {
+                if let Some(inner) = expr.node.as_yield_arg() {
                     if let ast::ExprKind::Record(fields) = &inner.node {
                         return Some(fields.clone());
                     }
@@ -8079,7 +8064,7 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
             ast::StmtKind::GroupBy { key } => expr_contains_derived_ref(key, name),
             ast::StmtKind::Expr(e) => expr_contains_derived_ref(e, name),
         }),
-        ast::ExprKind::Yield(inner) | ast::ExprKind::Atomic(inner) => {
+        ast::ExprKind::Atomic(inner) => {
             expr_contains_derived_ref(inner, name)
         }
         ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
@@ -8207,9 +8192,6 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
                     }
                 }
             }
-        }
-        ast::ExprKind::Yield(inner) => {
-            collect_free_vars(inner, bound, free);
         }
         ast::ExprKind::Set { target, value }
         | ast::ExprKind::FullSet { target, value } => {
@@ -8423,7 +8405,6 @@ fn pretty_expr(expr: &ast::Expr) -> String {
             let ss: Vec<String> = stmts.iter().map(pretty_stmt).collect();
             format!("do {{ {} }}", ss.join("; "))
         }
-        ast::ExprKind::Yield(e) => format!("yield {}", pretty_expr(e)),
         ast::ExprKind::Set { target, value } => {
             format!("set {} = {}", pretty_expr(target), pretty_expr(value))
         }

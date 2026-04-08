@@ -645,9 +645,9 @@ fn do_with_bind_and_yield() {
             assert!(matches!(&stmts[0].node, StmtKind::Bind { .. }));
             match &stmts[1].node {
                 StmtKind::Expr(e) => {
-                    assert!(matches!(&e.node, ExprKind::Yield(_)));
+                    assert!(e.node.as_yield_arg().is_some());
                 }
-                other => panic!("expected Expr(Yield), got {:?}", other),
+                other => panic!("expected Expr(yield app), got {:?}", other),
             }
         }
         other => panic!("expected Do, got {:?}", other),
@@ -663,8 +663,8 @@ fn do_with_where() {
             assert!(matches!(&stmts[0].node, StmtKind::Bind { .. }));
             assert!(matches!(&stmts[1].node, StmtKind::Where { .. }));
             match &stmts[2].node {
-                StmtKind::Expr(e) => assert!(matches!(&e.node, ExprKind::Yield(_))),
-                other => panic!("expected Expr(Yield), got {:?}", other),
+                StmtKind::Expr(e) => assert!(e.node.as_yield_arg().is_some()),
+                other => panic!("expected Expr(yield app), got {:?}", other),
             }
         }
         other => panic!("expected Do, got {:?}", other),
@@ -751,11 +751,13 @@ fn set_with_union() {
 
 #[test]
 fn standalone_yield() {
-    match fun_body("x = yield 42") {
-        ExprKind::Yield(inner) => {
-            assert!(matches!(&inner.node, ExprKind::Lit(Literal::Int(n)) if n == "42"));
-        }
-        other => panic!("expected Yield, got {:?}", other),
+    let body = fun_body("x = yield 42");
+    // yield is now a regular function: App(Var("yield"), Lit(42))
+    if let ExprKind::App { func, arg } = &body {
+        assert!(matches!(&func.node, ExprKind::Var(n) if n == "yield"));
+        assert!(matches!(&arg.node, ExprKind::Lit(Literal::Int(n)) if n == "42"));
+    } else {
+        panic!("expected App(yield, 42), got {:?}", body);
     }
 }
 
@@ -1582,9 +1584,9 @@ pendingFor = \\user -> do
                     // Fourth: yield {...}
                     match &stmts[3].node {
                         StmtKind::Expr(e) => {
-                            assert!(matches!(&e.node, ExprKind::Yield(_)));
+                            assert!(e.node.as_yield_arg().is_some());
                         }
-                        other => panic!("expected Expr(Yield), got {:?}", other),
+                        other => panic!("expected Expr(yield app), got {:?}", other),
                     }
                 }
                 other => panic!("expected Do, got {:?}", other),
@@ -1692,12 +1694,10 @@ f = do
         ExprKind::Do(stmts) => {
             assert_eq!(stmts.len(), 2);
             match &stmts[1].node {
-                StmtKind::Expr(e) => match &e.node {
-                    ExprKind::Yield(inner) => {
-                        assert!(matches!(&inner.node, ExprKind::If { .. }));
-                    }
-                    other => panic!("expected Yield(If), got {:?}", other),
-                },
+                StmtKind::Expr(e) => {
+                    let inner = e.node.as_yield_arg().expect("expected yield app");
+                    assert!(matches!(&inner.node, ExprKind::If { .. }));
+                }
                 other => panic!("expected Expr, got {:?}", other),
             }
         }
@@ -3424,8 +3424,8 @@ fn do_with_group_by() {
                 other => panic!("expected GroupBy, got {:?}", other),
             }
             match &stmts[2].node {
-                StmtKind::Expr(e) => assert!(matches!(&e.node, ExprKind::Yield(_))),
-                other => panic!("expected Expr(Yield), got {:?}", other),
+                StmtKind::Expr(e) => assert!(e.node.as_yield_arg().is_some()),
+                other => panic!("expected Expr(yield app), got {:?}", other),
             }
         }
         other => panic!("expected Do, got {:?}", other),

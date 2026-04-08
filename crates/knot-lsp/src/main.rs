@@ -1855,7 +1855,7 @@ impl<'a> TokenCollector<'a> {
                     }
                 }
             }
-            ast::ExprKind::Yield(e) | ast::ExprKind::Atomic(e) => self.visit_expr(e),
+            ast::ExprKind::Atomic(e) => self.visit_expr(e),
             ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
                 self.visit_expr(target);
                 self.visit_expr(value);
@@ -2236,7 +2236,7 @@ fn collect_containing_spans(expr: &ast::Expr, offset: usize, spans: &mut Vec<Spa
                 }
             }
         }
-        ast::ExprKind::Yield(e) | ast::ExprKind::Atomic(e) => {
+        ast::ExprKind::Atomic(e) => {
             collect_containing_spans(e, offset, spans);
         }
         ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
@@ -2610,7 +2610,7 @@ fn find_case_actions(
                 find_case_actions(&arm.body, doc, uri, range_start, range_end, actions);
             }
         }
-        ast::ExprKind::Yield(e) | ast::ExprKind::Atomic(e) => {
+        ast::ExprKind::Atomic(e) => {
             find_case_actions(e, doc, uri, range_start, range_end, actions);
         }
         ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
@@ -2935,7 +2935,7 @@ impl DefResolver {
                 self.resolve_expr(then_branch);
                 self.resolve_expr(else_branch);
             }
-            ast::ExprKind::Yield(e) | ast::ExprKind::Atomic(e) => self.resolve_expr(e),
+            ast::ExprKind::Atomic(e) => self.resolve_expr(e),
             ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
                 self.resolve_expr(target);
                 self.resolve_expr(value);

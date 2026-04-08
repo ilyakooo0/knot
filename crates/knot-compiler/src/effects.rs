@@ -430,8 +430,6 @@ impl EffectChecker {
                 effects
             }
 
-            ast::ExprKind::Yield(inner) => self.infer_effects(inner),
-
             ast::ExprKind::At { relation, time } => {
                 let mut effects = self.infer_effects(relation);
                 let time_effects = self.infer_effects(time);
@@ -803,9 +801,10 @@ mod tests {
                 func: Box::new(spanned(ExprKind::Var("println".into()))),
                 arg: Box::new(spanned(ExprKind::Var("p".into()))),
             }))),
-            spanned(StmtKind::Expr(spanned(ExprKind::Yield(Box::new(spanned(
-                ExprKind::Var("p".into()),
-            )))))),
+            spanned(StmtKind::Expr(spanned(ExprKind::App {
+                func: Box::new(spanned(ExprKind::Var("yield".into()))),
+                arg: Box::new(spanned(ExprKind::Var("p".into()))),
+            }))),
         ]));
         let (diags, effects) =
             check_module(vec![make_source("people"), make_fun("f", body)]);
@@ -874,9 +873,10 @@ mod tests {
                 pat: spanned(PatKind::Var("p".into())),
                 expr: spanned(ExprKind::SourceRef("people".into())),
             }),
-            spanned(StmtKind::Expr(spanned(ExprKind::Yield(Box::new(spanned(
-                ExprKind::Var("p".into()),
-            )))))),
+            spanned(StmtKind::Expr(spanned(ExprKind::App {
+                func: Box::new(spanned(ExprKind::Var("yield".into()))),
+                arg: Box::new(spanned(ExprKind::Var("p".into()))),
+            }))),
         ]));
         let derived = make_decl(DeclKind::Derived {
             name: "seniors".into(),
@@ -903,9 +903,10 @@ mod tests {
                     func: Box::new(spanned(ExprKind::Var("println".into()))),
                     arg: Box::new(spanned(ExprKind::SourceRef("people".into()))),
                 }))),
-                spanned(StmtKind::Expr(spanned(ExprKind::Yield(Box::new(spanned(
-                    ExprKind::Var("x".into()),
-                )))))),
+                spanned(StmtKind::Expr(spanned(ExprKind::App {
+                    func: Box::new(spanned(ExprKind::Var("yield".into()))),
+                    arg: Box::new(spanned(ExprKind::Var("x".into()))),
+                }))),
             ]))),
         });
         let ty = TypeScheme {

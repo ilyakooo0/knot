@@ -284,7 +284,6 @@ impl Parser {
             }
             TokenKind::Where
             | TokenKind::Do
-            | TokenKind::Yield
             | TokenKind::Set
             | TokenKind::If
             | TokenKind::Then
@@ -921,13 +920,8 @@ impl Parser {
         }
 
         // Method: name : type_scheme  (or name params = expr for default)
-        // Allow `yield` keyword as a method name in trait definitions
         let method_name = match self.peek() {
             TokenKind::Lower(_) => Some(self.expect_lower("expected method name").ok()?.0),
-            TokenKind::Yield => {
-                self.advance();
-                Some("yield".to_string())
-            }
             _ => {
                 self.error("expected method name or 'type' in trait definition");
                 return None;
@@ -1060,13 +1054,8 @@ impl Parser {
         }
 
         // Method: name params* = expr
-        // Allow `yield` keyword as a method name in impl definitions
         let method_name = match self.peek() {
             TokenKind::Lower(_) => Some(self.expect_lower("expected method name in impl").ok()?.0),
-            TokenKind::Yield => {
-                self.advance();
-                Some("yield".to_string())
-            }
             _ => {
                 self.error("expected method name or 'type' in impl definition");
                 return None;
@@ -1521,16 +1510,6 @@ impl Parser {
                     // Pratt parsing so binary operators and application work.
                     self.parse_expr_bp(0)
                 }
-            }
-            TokenKind::Yield => {
-                let start = self.span();
-                self.advance();
-                let e = self.parse_expr()?;
-                let end_sp = e.span;
-                Some(Spanned::new(
-                    ExprKind::Yield(Box::new(e)),
-                    Span::new(start.start, end_sp.end),
-                ))
             }
             TokenKind::Atomic => {
                 let start = self.span();

@@ -147,7 +147,7 @@ fn collect_edges(
                 }
             }
         }
-        ast::ExprKind::Yield(inner) | ast::ExprKind::Atomic(inner) => {
+        ast::ExprKind::Atomic(inner) => {
             collect_edges(inner, polarity, derived_names, out);
         }
         ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {

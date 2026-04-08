@@ -230,9 +230,6 @@ pub enum ExprKind {
     /// `do { stmts }`
     Do(Vec<Stmt>),
 
-    /// `yield expr` — `Applicative.yield`.
-    Yield(Box<Expr>),
-
     /// `set *rel = expr` — update a source relation (must match an optimized pattern).
     Set { target: Box<Expr>, value: Box<Expr> },
 
@@ -247,6 +244,20 @@ pub enum ExprKind {
         relation: Box<Expr>,
         time: Box<Expr>,
     },
+}
+
+impl ExprKind {
+    /// If this is `yield arg` (i.e. `App(Var("yield"), arg)`), return the argument.
+    pub fn as_yield_arg(&self) -> Option<&Expr> {
+        if let ExprKind::App { func, arg } = self {
+            if let ExprKind::Var(name) = &func.node {
+                if name == "yield" {
+                    return Some(arg);
+                }
+            }
+        }
+        None
+    }
 }
 
 // ── Literals ───────────────────────────────────────────────────────

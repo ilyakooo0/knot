@@ -115,8 +115,13 @@ fn expr_contains_io(expr: &Expr, builtins: &HashSet<&str>, io_fns: &HashSet<Stri
         | ExprKind::RecordUpdate { .. }
         | ExprKind::FieldAccess { .. }
         | ExprKind::List(_) => false,
-        ExprKind::Yield(inner) => expr_contains_io(inner, builtins, io_fns),
-        _ => false,
+        _ => {
+            if let Some(inner) = expr.node.as_yield_arg() {
+                expr_contains_io(inner, builtins, io_fns)
+            } else {
+                false
+            }
+        }
     }
 }
 
@@ -415,7 +420,6 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &HashSet<String>) {
                 desugar_stmt(stmt, io_fns);
             }
         }
-        ExprKind::Yield(inner) => desugar_expr(inner, io_fns),
         ExprKind::Set { target, value } | ExprKind::FullSet { target, value } => {
             desugar_expr(target, io_fns);
             desugar_expr(value, io_fns);
@@ -483,7 +487,7 @@ fn is_sql_compilable(stmts: &[Stmt]) -> bool {
     // Final statement must be yield of a record of field accesses or a bound var
     match &stmts.last().unwrap().node {
         StmtKind::Expr(e) => {
-            if let ExprKind::Yield(inner) = &e.node {
+            if let Some(inner) = e.node.as_yield_arg() {
                 match &inner.node {
                     ExprKind::Record(fields) => {
                         !fields.is_empty()
@@ -595,7 +599,7 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &HashSet<String>) -> bool {
 
     // Final statement must be yield
     match &stmts.last().unwrap().node {
-        StmtKind::Expr(e) => matches!(&e.node, ExprKind::Yield(_)),
+        StmtKind::Expr(e) => e.node.as_yield_arg().is_some(),
         _ => false,
     }
 }
@@ -634,7 +638,6 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
                 || arms.iter().any(|arm| expr_is_io(&arm.body, io_fns))
         }
         ExprKind::Lambda { body, .. } => expr_is_io(body, io_fns),
-        ExprKind::Yield(inner) => expr_is_io(inner, io_fns),
         ExprKind::Do(stmts) => {
             stmts.iter().any(|s| match &s.node {
                 StmtKind::Bind { expr, .. } => expr_is_io(expr, io_fns),
@@ -676,8 +679,8 @@ fn desugar_stmts(stmts: &[Stmt], span: Span) -> Expr {
         return match &stmts[0].node {
             StmtKind::Expr(e) => {
                 // Transform yield e -> __yield(e) for generic monad support
-                if let ExprKind::Yield(inner) = &e.node {
-                    mk_yield((**inner).clone(), span)
+                if let Some(inner) = e.node.as_yield_arg() {
+                    mk_yield(inner.clone(), span)
                 } else {
                     e.clone()
                 }
@@ -855,7 +858,6 @@ mod tests {
             ExprKind::Case { scrutinee, arms } => {
                 has_bind_var(scrutinee) || arms.iter().any(|a| has_bind_var(&a.body))
             }
-            ExprKind::Yield(inner) => has_bind_var(inner),
             _ => false,
         }
     }
@@ -871,7 +873,6 @@ mod tests {
             ExprKind::Case { scrutinee, arms } => {
                 has_do_block(scrutinee) || arms.iter().any(|a| has_do_block(&a.body))
             }
-            ExprKind::Yield(inner) => has_do_block(inner),
             ExprKind::Set { target, value } | ExprKind::FullSet { target, value } => {
                 has_do_block(target) || has_do_block(value)
             }

@@ -1765,25 +1765,17 @@ impl Infer {
             ast::ExprKind::Lit(lit) => self.literal_type(lit),
 
             ast::ExprKind::Var(name) if name == "__yield" || name == "yield" => {
+                // ∀m a. a -> App(m, a)  — monadic yield (from do-desugaring)
+                let m = self.fresh_var();
                 let a = self.fresh_var();
-                if self.in_io_do {
-                    // In IO do-blocks, yield produces IO directly
-                    Ty::Fun(
+                self.monad_vars.push((expr.span, m));
+                Ty::Fun(
+                    Box::new(Ty::Var(a)),
+                    Box::new(Ty::App(
+                        Box::new(Ty::Var(m)),
                         Box::new(Ty::Var(a)),
-                        Box::new(Ty::IO(BTreeSet::new(), Box::new(Ty::Var(a)))),
-                    )
-                } else {
-                    // ∀m a. a -> App(m, a)  — monadic yield (from do-desugaring)
-                    let m = self.fresh_var();
-                    self.monad_vars.push((expr.span, m));
-                    Ty::Fun(
-                        Box::new(Ty::Var(a)),
-                        Box::new(Ty::App(
-                            Box::new(Ty::Var(m)),
-                            Box::new(Ty::Var(a)),
-                        )),
-                    )
-                }
+                    )),
+                )
             }
 
             ast::ExprKind::Var(name) if name == "__empty" => {
@@ -2844,6 +2836,16 @@ impl Infer {
                             is_io = true;
                             io_effects.extend(effects.iter().cloned());
                             last_expr_ty = Some(*inner.clone());
+                        } else if self.in_io_do {
+                            if let Ty::App(ref f, ref inner) = resolved {
+                                // In IO do-blocks, App(m, a) from yield in
+                                // case/if branches — resolve m to IO.
+                                self.unify(f, &Ty::TyCon("IO".into()), expr.span);
+                                is_io = true;
+                                last_expr_ty = Some(*inner.clone());
+                            } else {
+                                last_expr_ty = Some(expr_ty);
+                            }
                         } else {
                             last_expr_ty = Some(expr_ty);
                         }

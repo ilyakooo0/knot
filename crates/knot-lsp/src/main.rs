@@ -2293,12 +2293,7 @@ fn handle_code_action(
         // Action: Add type annotation to unannotated functions
         if let DeclKind::Fun { name, ty: None, .. } = &decl.node {
             if let Some(inferred) = doc.type_info.get(name) {
-                let decl_text = &doc.source[decl.span.start..decl.span.end.min(doc.source.len())];
-                let name_end = decl_text
-                    .find(|c: char| !c.is_alphanumeric() && c != '_')
-                    .unwrap_or(name.len());
-                let insert_offset = decl.span.start + name_end;
-                let insert_pos = offset_to_position(&doc.source, insert_offset);
+                let insert_pos = offset_to_position(&doc.source, decl.span.start);
 
                 let mut changes = HashMap::new();
                 changes.insert(
@@ -2308,7 +2303,7 @@ fn handle_code_action(
                             start: insert_pos,
                             end: insert_pos,
                         },
-                        new_text: format!(" : {inferred}"),
+                        new_text: format!("{name} : {inferred}\n"),
                     }],
                 );
 

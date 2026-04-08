@@ -1068,6 +1068,97 @@ fn drop_temp_table(conn: &Connection, name: &str) {
     let _ = conn.execute_batch(&sql);
 }
 
+/// Maximum number of SQL parameters for a VALUES clause.
+/// SQLite's SQLITE_MAX_VARIABLE_NUMBER is 32766 in 3.32.0+.
+const MAX_VALUES_PARAMS: usize = 10_000;
+
+/// Number of SQL columns in a TempSchema.
+fn schema_col_count(schema: &TempSchema) -> usize {
+    match schema {
+        TempSchema::Record(cols) => if cols.is_empty() { 1 } else { cols.len() },
+        TempSchema::Scalar(_) => 1,
+        TempSchema::Adt { all_fields, .. } => 1 + all_fields.len(),
+        TempSchema::Unit => 1,
+    }
+}
+
+/// Quoted column names for a TempSchema.
+fn schema_col_names(schema: &TempSchema) -> Vec<String> {
+    match schema {
+        TempSchema::Record(cols) => {
+            if cols.is_empty() {
+                vec![quote_ident("_dummy")]
+            } else {
+                cols.iter().map(|(n, _)| quote_ident(n)).collect()
+            }
+        }
+        TempSchema::Scalar(_) => vec![quote_ident("_val")],
+        TempSchema::Adt { all_fields, .. } => {
+            let mut names = vec![quote_ident("_tag")];
+            for (n, _) in all_fields {
+                names.push(quote_ident(n));
+            }
+            names
+        }
+        TempSchema::Unit => vec![quote_ident("_dummy")],
+    }
+}
+
+/// Build a `VALUES (?1, ?2), (?3, ?4), ...` clause with flattened parameters.
+/// `param_offset` is the number of params already bound (for numbering continuity).
+fn build_values_clause(
+    rows: &[*mut Value],
+    schema: &TempSchema,
+    param_offset: usize,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let mut params = Vec::new();
+    let mut row_clauses = Vec::with_capacity(rows.len());
+    let mut idx = param_offset + 1;
+
+    for row in rows {
+        let row_params = temp_row_to_params(*row, schema);
+        let placeholders: Vec<String> = row_params
+            .iter()
+            .map(|_| {
+                let p = format!("?{}", idx);
+                idx += 1;
+                p
+            })
+            .collect();
+        row_clauses.push(format!("({})", placeholders.join(", ")));
+        params.extend(row_params);
+    }
+
+    (format!("VALUES {}", row_clauses.join(", ")), params)
+}
+
+/// Execute a parameterized SQL query and read rows using a TempSchema.
+fn read_query_rows_params(
+    conn: &Connection,
+    sql: &str,
+    params: &[rusqlite::types::Value],
+    schema: &TempSchema,
+) -> Vec<*mut Value> {
+    debug_sql(sql);
+    let mut stmt = conn
+        .prepare(sql)
+        .unwrap_or_else(|e| panic!("knot runtime: query error: {}\n  SQL: {}", e, sql));
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+    let mut result_rows = stmt
+        .query(param_refs.as_slice())
+        .unwrap_or_else(|e| panic!("knot runtime: query exec error: {}\n  SQL: {}", e, sql));
+
+    let mut rows: Vec<*mut Value> = Vec::new();
+    while let Some(row) = result_rows
+        .next()
+        .unwrap_or_else(|e| panic!("knot runtime: query fetch error: {}", e))
+    {
+        rows.push(read_temp_row(row, schema));
+    }
+    rows
+}
+
 /// Materialize a relation into a temp table and return the table name.
 fn materialize_relation(conn: &Connection, rows: &[*mut Value], schema: &TempSchema) -> String {
     let name = next_temp_name();
@@ -1106,6 +1197,7 @@ fn in_memory_dedup(rows: Vec<*mut Value>) -> Vec<*mut Value> {
 }
 
 /// Perform a set operation (UNION/EXCEPT/INTERSECT) using SQLite.
+/// Uses VALUES CTEs for small datasets, falls back to temp tables for large ones.
 fn sql_set_op(
     conn: &Connection,
     a: &[*mut Value],
@@ -1118,6 +1210,22 @@ fn sql_set_op(
     // Infer schema from both sides combined so ADT unions see all constructors
     let combined: Vec<*mut Value> = a.iter().chain(b.iter()).copied().collect();
     let schema = infer_temp_schema(&combined)?;
+    let n_cols = schema_col_count(&schema);
+
+    if !a.is_empty() && !b.is_empty() && (a.len() + b.len()) * n_cols <= MAX_VALUES_PARAMS {
+        let col_names = schema_col_names(&schema);
+        let col_str = col_names.join(", ");
+        let (values_a, params_a) = build_values_clause(a, &schema, 0);
+        let (values_b, params_b) = build_values_clause(b, &schema, params_a.len());
+        let mut all_params = params_a;
+        all_params.extend(params_b);
+        let sql = format!(
+            "WITH _t1({c}) AS ({v1}), _t2({c}) AS ({v2}) \
+             SELECT * FROM _t1 {op} SELECT * FROM _t2",
+            c = col_str, v1 = values_a, v2 = values_b, op = op
+        );
+        return Some(read_query_rows_params(conn, &sql, &all_params, &schema));
+    }
 
     let t1 = materialize_relation(conn, a, &schema);
     let t2 = materialize_relation(conn, b, &schema);
@@ -1136,12 +1244,25 @@ fn sql_set_op(
     Some(result)
 }
 
-/// Dedup a list of values using a SQL temp table with SELECT DISTINCT.
+/// Dedup a list of values using SQL SELECT DISTINCT.
+/// Uses a VALUES CTE for small datasets, falls back to a temp table for large ones.
 fn sql_dedup(conn: &Connection, rows: &[*mut Value]) -> Option<Vec<*mut Value>> {
     if rows.is_empty() {
         return Some(Vec::new());
     }
     let schema = infer_temp_schema(rows)?;
+
+    if rows.len() * schema_col_count(&schema) <= MAX_VALUES_PARAMS {
+        let col_names = schema_col_names(&schema);
+        let (values_sql, params) = build_values_clause(rows, &schema, 0);
+        let sql = format!(
+            "WITH _t({}) AS ({}) SELECT DISTINCT * FROM _t",
+            col_names.join(", "),
+            values_sql
+        );
+        return Some(read_query_rows_params(conn, &sql, &params, &schema));
+    }
+
     let tmp = materialize_relation(conn, rows, &schema);
     let sql = format!("SELECT DISTINCT * FROM {}", quote_ident(&tmp));
     let result = read_query_rows(conn, &sql, &schema);
@@ -1150,6 +1271,7 @@ fn sql_dedup(conn: &Connection, rows: &[*mut Value]) -> Option<Vec<*mut Value>> 
 }
 
 /// Check if two relations are equal using SQL EXCEPT (symmetric difference).
+/// Uses VALUES CTEs for small datasets, falls back to temp tables for large ones.
 fn sql_relations_equal(conn: &Connection, a: &[*mut Value], b: &[*mut Value]) -> Option<bool> {
     if a.is_empty() && b.is_empty() {
         return Some(true);
@@ -1161,6 +1283,33 @@ fn sql_relations_equal(conn: &Connection, a: &[*mut Value], b: &[*mut Value]) ->
     // duplicates, so different lengths don't imply different logical sets.
     // Let the SQL EXCEPT (symmetric difference) handle deduplication correctly.
     let schema = infer_temp_schema(a)?;
+    let n_cols = schema_col_count(&schema);
+
+    if (a.len() + b.len()) * n_cols <= MAX_VALUES_PARAMS {
+        let col_names = schema_col_names(&schema);
+        let col_str = col_names.join(", ");
+        let (values_a, params_a) = build_values_clause(a, &schema, 0);
+        let (values_b, params_b) = build_values_clause(b, &schema, params_a.len());
+        let mut all_params = params_a;
+        all_params.extend(params_b);
+        let sql = format!(
+            "WITH _t1({c}) AS ({v1}), _t2({c}) AS ({v2}) \
+             SELECT 1 FROM (\
+               (SELECT * FROM _t1 EXCEPT SELECT * FROM _t2) \
+               UNION ALL \
+               (SELECT * FROM _t2 EXCEPT SELECT * FROM _t1)\
+             ) LIMIT 1",
+            c = col_str, v1 = values_a, v2 = values_b
+        );
+        debug_sql(&sql);
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            all_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+        let has_diff = conn
+            .prepare(&sql)
+            .and_then(|mut s| s.query_row(param_refs.as_slice(), |_| Ok(true)))
+            .unwrap_or(false);
+        return Some(!has_diff);
+    }
 
     let t1 = materialize_relation(conn, a, &schema);
     let t2 = materialize_relation(conn, b, &schema);
@@ -1434,107 +1583,113 @@ pub extern "C" fn knot_relation_group_by(
         })
         .collect();
 
-    let temp_name = next_temp_name();
-    let temp = quote_ident(&temp_name);
-
-    // Drop any leftover temp table
-    let _ = db_ref
-        .conn
-        .execute_batch(&format!("DROP TABLE IF EXISTS {};", temp));
-
-    // Create temp table: _idx INTEGER + key columns only
-    let mut col_defs = vec!["_idx INTEGER".to_string()];
+    // Build column name list: _idx + key columns
+    let mut col_names = vec!["\"_idx\"".to_string()];
     for ks in &key_specs {
-        col_defs.push(format!("{} {}", quote_ident(&ks.name), sql_type(ks.ty)));
+        col_names.push(quote_ident(&ks.name));
     }
-    let create_sql = format!(
-        "CREATE TEMP TABLE {} ({});",
-        temp,
-        col_defs.join(", ")
-    );
-    debug_sql(&create_sql);
-    db_ref
-        .conn
-        .execute_batch(&create_sql)
-        .expect("knot runtime: failed to create groupby temp table");
-
-    // Insert row indices + key column values
-    let mut insert_col_names = vec!["\"_idx\"".to_string()];
-    for ks in &key_specs {
-        insert_col_names.push(quote_ident(&ks.name));
-    }
-    let placeholders: Vec<String> = (1..=insert_col_names.len())
-        .map(|i| format!("?{}", i))
-        .collect();
-    let insert_sql = format!(
-        "INSERT INTO {} ({}) VALUES ({});",
-        temp,
-        insert_col_names.join(", "),
-        placeholders.join(", ")
-    );
-    debug_sql(&insert_sql);
-
-    {
-        let mut insert_stmt = db_ref
-            .conn
-            .prepare_cached(&insert_sql)
-            .expect("knot runtime: failed to prepare groupby insert");
-
-        for (idx, row_ptr) in rows.iter().enumerate() {
-            let fields = match unsafe { as_ref(*row_ptr) } {
-                Value::Record(fields) => fields,
-                _ => panic!("knot runtime: groupby rows must be Records"),
-            };
-
-            let mut params: Vec<rusqlite::types::Value> =
-                vec![rusqlite::types::Value::Integer(idx as i64)];
-            for ks in &key_specs {
-                let value = fields.iter().find(|f| f.name == ks.name)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "knot runtime: missing field '{}' in record",
-                            ks.name
-                        )
-                    });
-                params.push(value_to_sqlite(value.value, ks.ty));
-            }
-
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-            insert_stmt
-                .execute(param_refs.as_slice())
-                .expect("knot runtime: groupby insert error");
-        }
-    } // insert_stmt dropped here
-
-    // SELECT with ORDER BY key columns; group consecutive rows
+    let col_str = col_names.join(", ");
     let order_cols: Vec<String> = key_specs
         .iter()
         .map(|ks| quote_ident(&ks.name))
         .collect();
-    let select_sql = if order_cols.is_empty() {
-        format!(
-            "SELECT {} FROM {}",
-            insert_col_names.join(", "),
-            temp,
-        )
-    } else {
-        format!(
-            "SELECT {} FROM {} ORDER BY {}",
-            insert_col_names.join(", "),
-            temp,
-            order_cols.join(", ")
-        )
+
+    // Extract key params from each row (shared by both paths)
+    let extract_key_params = |row_ptr: &*mut Value, key_specs: &[&ColumnSpec]| -> Vec<rusqlite::types::Value> {
+        let fields = match unsafe { as_ref(*row_ptr) } {
+            Value::Record(fields) => fields,
+            _ => panic!("knot runtime: groupby rows must be Records"),
+        };
+        key_specs.iter().map(|ks| {
+            let value = fields.iter().find(|f| f.name == ks.name)
+                .unwrap_or_else(|| panic!("knot runtime: missing field '{}' in record", ks.name));
+            value_to_sqlite(value.value, ks.ty)
+        }).collect()
     };
+
+    // Only key columns are params (_idx is a literal); check if VALUES is feasible
+    let n_key_params = rows.len() * key_specs.len();
+    let (select_sql, sql_params, temp_to_drop) = if n_key_params <= MAX_VALUES_PARAMS && !key_specs.is_empty() {
+        // VALUES CTE path: _idx is a literal integer, key columns are params
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(n_key_params);
+        let mut row_clauses = Vec::with_capacity(rows.len());
+        let mut pidx = 1usize;
+
+        for (i, row_ptr) in rows.iter().enumerate() {
+            let key_params = extract_key_params(row_ptr, &key_specs);
+            let mut placeholders = vec![format!("{}", i)]; // _idx literal
+            for _ in &key_params {
+                placeholders.push(format!("?{}", pidx));
+                pidx += 1;
+            }
+            row_clauses.push(format!("({})", placeholders.join(", ")));
+            params.extend(key_params);
+        }
+
+        let values_sql = format!("VALUES {}", row_clauses.join(", "));
+        let sql = if order_cols.is_empty() {
+            format!("WITH _t({}) AS ({}) SELECT {} FROM _t", col_str, values_sql, col_str)
+        } else {
+            format!(
+                "WITH _t({}) AS ({}) SELECT {} FROM _t ORDER BY {}",
+                col_str, values_sql, col_str, order_cols.join(", ")
+            )
+        };
+        (sql, params, None)
+    } else {
+        // Temp table fallback for large datasets or no key columns
+        let temp_name = next_temp_name();
+        let temp = quote_ident(&temp_name);
+
+        let _ = db_ref.conn.execute_batch(&format!("DROP TABLE IF EXISTS {};", temp));
+
+        let mut col_defs = vec!["_idx INTEGER".to_string()];
+        for ks in &key_specs {
+            col_defs.push(format!("{} {}", quote_ident(&ks.name), sql_type(ks.ty)));
+        }
+        let create_sql = format!("CREATE TEMP TABLE {} ({});", temp, col_defs.join(", "));
+        debug_sql(&create_sql);
+        db_ref.conn.execute_batch(&create_sql)
+            .expect("knot runtime: failed to create groupby temp table");
+
+        let placeholders: Vec<String> = (1..=col_names.len()).map(|i| format!("?{}", i)).collect();
+        let insert_sql = format!(
+            "INSERT INTO {} ({}) VALUES ({});",
+            temp, col_str, placeholders.join(", ")
+        );
+        debug_sql(&insert_sql);
+
+        {
+            let mut insert_stmt = db_ref.conn.prepare_cached(&insert_sql)
+                .expect("knot runtime: failed to prepare groupby insert");
+            for (idx, row_ptr) in rows.iter().enumerate() {
+                let mut params: Vec<rusqlite::types::Value> =
+                    vec![rusqlite::types::Value::Integer(idx as i64)];
+                params.extend(extract_key_params(row_ptr, &key_specs));
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+                insert_stmt.execute(param_refs.as_slice())
+                    .expect("knot runtime: groupby insert error");
+            }
+        }
+
+        let sql = if order_cols.is_empty() {
+            format!("SELECT {} FROM {}", col_str, temp)
+        } else {
+            format!("SELECT {} FROM {} ORDER BY {}", col_str, temp, order_cols.join(", "))
+        };
+        (sql, Vec::new(), Some(temp_name))
+    };
+
     debug_sql(&select_sql);
 
+    // Execute query and group consecutive rows by key values
     let groups = {
-        let mut select_stmt = db_ref
-            .conn
-            .prepare_cached(&select_sql)
+        let mut stmt = db_ref.conn.prepare(&select_sql)
             .expect("knot runtime: failed to prepare groupby select");
-        let mut result_rows = select_stmt
-            .query([])
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+        let mut result_rows = stmt.query(param_refs.as_slice())
             .expect("knot runtime: groupby select error");
 
         let mut groups: Vec<Vec<*mut Value>> = Vec::new();
@@ -1546,13 +1701,10 @@ pub extern "C" fn knot_relation_group_by(
             .unwrap_or_else(|e| panic!("knot runtime: groupby fetch error: {}", e))
         {
             let idx: i64 = row.get(0).unwrap();
-
-            // Extract key values for comparison
             let keys: Vec<rusqlite::types::Value> = (1..=key_specs.len())
                 .map(|i| row.get(i).unwrap())
                 .collect();
 
-            // Detect group boundary
             if let Some(ref prev) = prev_keys {
                 if keys != *prev {
                     groups.push(std::mem::take(&mut current_group));
@@ -1568,12 +1720,14 @@ pub extern "C" fn knot_relation_group_by(
         }
 
         groups
-    }; // select_stmt + result_rows dropped here
+    };
 
-    // Clean up temp table
-    let _ = db_ref
-        .conn
-        .execute_batch(&format!("DROP TABLE IF EXISTS {};", temp));
+    // Clean up temp table if used
+    if let Some(ref temp_name) = temp_to_drop {
+        let _ = db_ref.conn.execute_batch(
+            &format!("DROP TABLE IF EXISTS {};", quote_ident(temp_name))
+        );
+    }
 
     // Convert to a relation of relations
     let result: Vec<*mut Value> = groups
@@ -5714,85 +5868,111 @@ pub extern "C" fn knot_source_diff_write(
 
     if is_adt_schema(schema) {
         let adt = parse_adt_schema(schema);
-
-        // 1. Create temp table with ADT columns
-        let mut col_defs = vec![format!("{} TEXT NOT NULL", quote_ident("_tag"))];
         let mut col_names = vec![quote_ident("_tag")];
         for f in &adt.all_fields {
-            col_defs.push(format!("{} {}", quote_ident(&f.name), sql_type(f.ty)));
             col_names.push(quote_ident(&f.name));
         }
-        let create_temp = format!(
-            "CREATE TEMP TABLE {} ({});",
-            temp,
-            col_defs.join(", ")
-        );
-        debug_sql(&create_temp);
-        db_ref
-            .conn
-            .execute_batch(&create_temp)
-            .expect("knot runtime: failed to create temp table");
+        let col_str = col_names.join(", ");
+        let n_cols = col_names.len();
 
-        // 2. Insert new rows into temp
-        if !rows.is_empty() {
-            let placeholders: Vec<String> = (1..=col_names.len())
-                .map(|i| format!("?{}", i))
-                .collect();
+        // Build match conditions: _tag equality + IS for NULL-safe field comparison
+        let build_adt_match = |src: &str| -> Vec<String> {
+            std::iter::once(
+                format!("{s}.{c} = {t}.{c}", s = src, t = table, c = quote_ident("_tag"))
+            ).chain(adt.all_fields.iter().map(|f| {
+                let c = quote_ident(&f.name);
+                format!("{}.{} IS {}.{}", src, c, table, c)
+            })).collect()
+        };
+
+        if !rows.is_empty() && rows.len() * n_cols <= MAX_VALUES_PARAMS {
+            // VALUES CTE path
+            let mut all_params = Vec::with_capacity(rows.len() * n_cols);
+            let mut row_clauses = Vec::with_capacity(rows.len());
+            let mut pidx = 1usize;
+            for row_ptr in rows {
+                let rp = adt_row_to_params(*row_ptr, &adt);
+                let ph: Vec<String> = rp.iter()
+                    .map(|_| { let p = format!("?{}", pidx); pidx += 1; p })
+                    .collect();
+                row_clauses.push(format!("({})", ph.join(", ")));
+                all_params.extend(rp);
+            }
+            let values_sql = format!("VALUES {}", row_clauses.join(", "));
+            let match_conds = build_adt_match("_new");
+
+            let delete_sql = format!(
+                "WITH _new({c}) AS ({v}) \
+                 DELETE FROM {t} WHERE NOT EXISTS (SELECT 1 FROM _new WHERE {m});",
+                c = col_str, v = values_sql, t = table, m = match_conds.join(" AND ")
+            );
+            debug_sql(&delete_sql);
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                all_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+            db_ref.conn.prepare(&delete_sql)
+                .and_then(|mut s| s.execute(param_refs.as_slice()))
+                .expect("knot runtime: failed to delete removed rows");
+
             let insert_sql = format!(
-                "INSERT INTO {} ({}) VALUES ({});",
-                temp,
-                col_names.join(", "),
-                placeholders.join(", ")
+                "WITH _new({c}) AS ({v}) \
+                 INSERT OR IGNORE INTO {t} ({c}) SELECT * FROM _new;",
+                c = col_str, v = values_sql, t = table
             );
             debug_sql(&insert_sql);
-            let mut stmt = db_ref
-                .conn
-                .prepare_cached(&insert_sql)
-                .expect("knot runtime: failed to prepare temp insert");
+            db_ref.conn.prepare(&insert_sql)
+                .and_then(|mut s| s.execute(param_refs.as_slice()))
+                .expect("knot runtime: failed to insert new rows");
+        } else {
+            // Temp table fallback (handles empty rows and large datasets)
+            let match_conds = build_adt_match(&temp);
 
-            for row_ptr in rows {
-                let params = adt_row_to_params(*row_ptr, &adt);
-                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-                stmt.execute(param_refs.as_slice()).unwrap_or_else(|e| {
-                    panic!("knot runtime: temp insert error: {}", e)
-                });
+            let mut col_defs = vec![format!("{} TEXT NOT NULL", quote_ident("_tag"))];
+            for f in &adt.all_fields {
+                col_defs.push(format!("{} {}", quote_ident(&f.name), sql_type(f.ty)));
             }
+            let create_temp = format!("CREATE TEMP TABLE {} ({});", temp, col_defs.join(", "));
+            debug_sql(&create_temp);
+            db_ref.conn.execute_batch(&create_temp)
+                .expect("knot runtime: failed to create temp table");
+
+            if !rows.is_empty() {
+                let placeholders: Vec<String> = (1..=n_cols).map(|i| format!("?{}", i)).collect();
+                let insert_sql = format!(
+                    "INSERT INTO {} ({}) VALUES ({});", temp, col_str, placeholders.join(", ")
+                );
+                debug_sql(&insert_sql);
+                let mut stmt = db_ref.conn.prepare_cached(&insert_sql)
+                    .expect("knot runtime: failed to prepare temp insert");
+                for row_ptr in rows {
+                    let params = adt_row_to_params(*row_ptr, &adt);
+                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                        params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+                    stmt.execute(param_refs.as_slice())
+                        .unwrap_or_else(|e| panic!("knot runtime: temp insert error: {}", e));
+                }
+            }
+
+            let delete_sql = format!(
+                "DELETE FROM {} WHERE NOT EXISTS (SELECT 1 FROM {} WHERE {});",
+                table, temp, match_conds.join(" AND ")
+            );
+            debug_sql(&delete_sql);
+            db_ref.conn.execute_batch(&delete_sql)
+                .expect("knot runtime: failed to delete removed rows");
+
+            let insert_new_sql = format!(
+                "INSERT OR IGNORE INTO {} ({}) SELECT {} FROM {};",
+                table, col_str, col_str, temp
+            );
+            debug_sql(&insert_new_sql);
+            db_ref.conn.execute_batch(&insert_new_sql)
+                .expect("knot runtime: failed to insert new rows");
+
+            let drop_sql = format!("DROP TABLE IF EXISTS {};", temp);
+            debug_sql(&drop_sql);
+            db_ref.conn.execute_batch(&drop_sql)
+                .expect("knot runtime: failed to drop temp table");
         }
-
-        // 3. DELETE rows from main not in temp (use IS for NULL-safe comparison)
-        let match_conds: Vec<String> = std::iter::once(
-            // _tag is NOT NULL TEXT, simple equality
-            format!("{t}.{c} = {m}.{c}", t = temp, m = table, c = quote_ident("_tag"))
-        ).chain(adt.all_fields.iter().map(|f| {
-            let c = quote_ident(&f.name);
-            format!("{}.{} IS {}.{}", temp, c, table, c)
-        })).collect();
-        let delete_sql = format!(
-            "DELETE FROM {} WHERE NOT EXISTS (SELECT 1 FROM {} WHERE {});",
-            table,
-            temp,
-            match_conds.join(" AND ")
-        );
-        debug_sql(&delete_sql);
-        db_ref
-            .conn
-            .execute_batch(&delete_sql)
-            .expect("knot runtime: failed to delete removed rows");
-
-        // 4. INSERT rows from temp not in main
-        let insert_new_sql = format!(
-            "INSERT OR IGNORE INTO {} ({}) SELECT {} FROM {};",
-            table,
-            col_names.join(", "),
-            col_names.join(", "),
-            temp
-        );
-        debug_sql(&insert_new_sql);
-        db_ref
-            .conn
-            .execute_batch(&insert_new_sql)
-            .expect("knot runtime: failed to insert new rows");
     } else {
         let rec_schema = parse_record_schema(schema);
 
@@ -5803,9 +5983,7 @@ pub extern "C" fn knot_source_diff_write(
             delete_record_table(&db_ref.conn, &table_name, &rec_schema);
             write_record_rows(&db_ref.conn, &table_name, &rec_schema, rows);
 
-            db_ref
-                .conn
-                .execute_batch("RELEASE SAVEPOINT knot_diff_write;")
+            db_ref.conn.execute_batch("RELEASE SAVEPOINT knot_diff_write;")
                 .expect("knot runtime: failed to commit transaction");
             notify_relation_changed();
             return;
@@ -5817,146 +5995,134 @@ pub extern "C" fn knot_source_diff_write(
             delete_record_table(&db_ref.conn, &table_name, &rec_schema);
             write_record_rows(&db_ref.conn, &table_name, &rec_schema, rows);
 
-            db_ref
-                .conn
-                .execute_batch("RELEASE SAVEPOINT knot_diff_write;")
+            db_ref.conn.execute_batch("RELEASE SAVEPOINT knot_diff_write;")
                 .expect("knot runtime: failed to commit transaction");
             notify_relation_changed();
             return;
         }
 
         let cols = rec_schema.columns;
+        let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
+        let col_str = col_names.join(", ");
+        let n_cols = cols.len();
 
-        // 1. Create temp table with same schema
-        let col_defs: Vec<String> = cols
-            .iter()
-            .map(|c| format!("{} {}", quote_ident(&c.name), sql_type(c.ty)))
-            .collect();
-        let create_temp = format!(
-            "CREATE TEMP TABLE {} ({});",
-            temp,
-            col_defs.join(", ")
-        );
-        debug_sql(&create_temp);
-        db_ref
-            .conn
-            .execute_batch(&create_temp)
-            .expect("knot runtime: failed to create temp table");
+        // Build NULL-safe match conditions
+        let build_rec_match = |src: &str| -> Vec<String> {
+            cols.iter().map(|c| {
+                let cq = quote_ident(&c.name);
+                format!(
+                    "({s}.{c} = {t}.{c} OR ({s}.{c} IS NULL AND {t}.{c} IS NULL))",
+                    s = src, t = table, c = cq
+                )
+            }).collect()
+        };
 
-        // 2. Insert all new rows into temp
-        if !rows.is_empty() {
-            let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
-            let placeholders: Vec<String> = cols
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("?{}", i + 1))
-                .collect();
-            let insert_sql = format!(
-                "INSERT INTO {} ({}) VALUES ({});",
-                temp,
-                col_names.join(", "),
-                placeholders.join(", ")
-            );
-            debug_sql(&insert_sql);
-
-            let mut stmt = db_ref
-                .conn
-                .prepare_cached(&insert_sql)
-                .expect("knot runtime: failed to prepare temp insert");
-
-            for row_ptr in rows {
-                let row = unsafe { as_ref(*row_ptr) };
-                match row {
-                    Value::Record(fields) => {
-                        let params: Vec<rusqlite::types::Value> = cols
-                            .iter()
-                            .map(|col| {
-                                let field = fields
-                                    .iter()
-                                    .find(|f| f.name == col.name)
-                                    .unwrap_or_else(|| {
-                                        panic!(
-                                            "knot runtime: missing field '{}' in record",
-                                            col.name
-                                        )
-                                    });
-                                value_to_sqlite(field.value, col.ty)
-                            })
-                            .collect();
-                        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                            params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-                        stmt.execute(param_refs.as_slice()).unwrap_or_else(|e| {
-                            panic!("knot runtime: temp insert error: {}", e)
-                        });
-                    }
-                    _ => panic!(
-                        "knot runtime: relation rows must be Records, got {}",
-                        type_name(*row_ptr)
-                    ),
-                }
+        // Extract record row to SQL params
+        let rec_row_to_params = |row_ptr: *mut Value| -> Vec<rusqlite::types::Value> {
+            match unsafe { as_ref(row_ptr) } {
+                Value::Record(fields) => cols.iter().map(|col| {
+                    let field = fields.iter().find(|f| f.name == col.name)
+                        .unwrap_or_else(|| panic!("knot runtime: missing field '{}' in record", col.name));
+                    value_to_sqlite(field.value, col.ty)
+                }).collect(),
+                _ => panic!("knot runtime: relation rows must be Records, got {}", type_name(row_ptr)),
             }
-        }
+        };
 
-        // 3. DELETE rows from main that are not in temp
-        if !cols.is_empty() {
-            let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
-            let match_conds: Vec<String> = cols
-                .iter()
-                .map(|c| {
-                    let c_quoted = quote_ident(&c.name);
-                    format!(
-                        "({t}.{c} = {m}.{c} OR ({t}.{c} IS NULL AND {m}.{c} IS NULL))",
-                        t = temp,
-                        m = table,
-                        c = c_quoted
-                    )
-                })
-                .collect();
+        if !rows.is_empty() && rows.len() * n_cols <= MAX_VALUES_PARAMS {
+            // VALUES CTE path
+            let mut all_params = Vec::with_capacity(rows.len() * n_cols);
+            let mut row_clauses = Vec::with_capacity(rows.len());
+            let mut pidx = 1usize;
+            for row_ptr in rows {
+                let rp = rec_row_to_params(*row_ptr);
+                let ph: Vec<String> = rp.iter()
+                    .map(|_| { let p = format!("?{}", pidx); pidx += 1; p })
+                    .collect();
+                row_clauses.push(format!("({})", ph.join(", ")));
+                all_params.extend(rp);
+            }
+            let values_sql = format!("VALUES {}", row_clauses.join(", "));
+            let match_conds = build_rec_match("_new");
+
             let delete_sql = format!(
-                "DELETE FROM {} WHERE NOT EXISTS (SELECT 1 FROM {} WHERE {});",
-                table,
-                temp,
-                match_conds.join(" AND ")
+                "WITH _new({c}) AS ({v}) \
+                 DELETE FROM {t} WHERE NOT EXISTS (SELECT 1 FROM _new WHERE {m});",
+                c = col_str, v = values_sql, t = table, m = match_conds.join(" AND ")
             );
             debug_sql(&delete_sql);
-            db_ref
-                .conn
-                .execute_batch(&delete_sql)
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                all_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+            db_ref.conn.prepare(&delete_sql)
+                .and_then(|mut s| s.execute(param_refs.as_slice()))
                 .expect("knot runtime: failed to delete removed rows");
 
-            // 4. INSERT rows from temp that are not in main.
-            // Use NOT EXISTS on the available columns to avoid inserting
-            // duplicate rows when writing through a projected view (where
-            // the schema covers only a subset of the table's columns).
+            // INSERT rows not in main. Use NOT EXISTS to avoid duplicates
+            // when writing through a projected view.
+            let insert_sql = format!(
+                "WITH _new({c}) AS ({v}) \
+                 INSERT OR IGNORE INTO {t} ({c}) SELECT * FROM _new \
+                 WHERE NOT EXISTS (SELECT 1 FROM {t} WHERE {m});",
+                c = col_str, v = values_sql, t = table, m = match_conds.join(" AND ")
+            );
+            debug_sql(&insert_sql);
+            db_ref.conn.prepare(&insert_sql)
+                .and_then(|mut s| s.execute(param_refs.as_slice()))
+                .expect("knot runtime: failed to insert new rows");
+        } else {
+            // Temp table fallback (handles empty rows and large datasets)
+            let match_conds = build_rec_match(&temp);
+
+            let col_defs: Vec<String> = cols.iter()
+                .map(|c| format!("{} {}", quote_ident(&c.name), sql_type(c.ty)))
+                .collect();
+            let create_temp = format!("CREATE TEMP TABLE {} ({});", temp, col_defs.join(", "));
+            debug_sql(&create_temp);
+            db_ref.conn.execute_batch(&create_temp)
+                .expect("knot runtime: failed to create temp table");
+
+            if !rows.is_empty() {
+                let placeholders: Vec<String> = (1..=n_cols).map(|i| format!("?{}", i)).collect();
+                let insert_sql = format!(
+                    "INSERT INTO {} ({}) VALUES ({});", temp, col_str, placeholders.join(", ")
+                );
+                debug_sql(&insert_sql);
+                let mut stmt = db_ref.conn.prepare_cached(&insert_sql)
+                    .expect("knot runtime: failed to prepare temp insert");
+                for row_ptr in rows {
+                    let params = rec_row_to_params(*row_ptr);
+                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                        params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+                    stmt.execute(param_refs.as_slice())
+                        .unwrap_or_else(|e| panic!("knot runtime: temp insert error: {}", e));
+                }
+            }
+
+            let delete_sql = format!(
+                "DELETE FROM {} WHERE NOT EXISTS (SELECT 1 FROM {} WHERE {});",
+                table, temp, match_conds.join(" AND ")
+            );
+            debug_sql(&delete_sql);
+            db_ref.conn.execute_batch(&delete_sql)
+                .expect("knot runtime: failed to delete removed rows");
+
             let insert_new_sql = format!(
-                "INSERT OR IGNORE INTO {} ({}) SELECT {} FROM {} WHERE NOT EXISTS (SELECT 1 FROM {} WHERE {});",
-                table,
-                col_names.join(", "),
-                col_names.join(", "),
-                temp,
-                table,
-                match_conds.join(" AND ")
+                "INSERT OR IGNORE INTO {} ({}) SELECT {} FROM {} \
+                 WHERE NOT EXISTS (SELECT 1 FROM {} WHERE {});",
+                table, col_str, col_str, temp, table, match_conds.join(" AND ")
             );
             debug_sql(&insert_new_sql);
-            db_ref
-                .conn
-                .execute_batch(&insert_new_sql)
+            db_ref.conn.execute_batch(&insert_new_sql)
                 .expect("knot runtime: failed to insert new rows");
+
+            let drop_sql = format!("DROP TABLE IF EXISTS {};", temp);
+            debug_sql(&drop_sql);
+            db_ref.conn.execute_batch(&drop_sql)
+                .expect("knot runtime: failed to drop temp table");
         }
     }
 
-    // 5. Drop temp table
-    let drop_temp = format!("DROP TABLE IF EXISTS {};", temp);
-    debug_sql(&drop_temp);
-    db_ref
-        .conn
-        .execute_batch(&drop_temp)
-        .expect("knot runtime: failed to drop temp table");
-
-
-    db_ref
-        .conn
-        .execute_batch("RELEASE SAVEPOINT knot_diff_write;")
+    db_ref.conn.execute_batch("RELEASE SAVEPOINT knot_diff_write;")
         .expect("knot runtime: failed to commit transaction");
     notify_relation_changed();
 }

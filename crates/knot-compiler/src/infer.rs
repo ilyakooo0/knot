@@ -219,6 +219,7 @@ struct TyConstraint {
 #[derive(Debug, Clone)]
 struct Scheme {
     vars: Vec<TyVar>,
+    unit_vars: Vec<UnitVar>,
     constraints: Vec<TyConstraint>,
     ty: Ty,
 }
@@ -227,6 +228,7 @@ impl Scheme {
     fn mono(ty: Ty) -> Self {
         Scheme {
             vars: vec![],
+            unit_vars: vec![],
             constraints: vec![],
             ty,
         }
@@ -235,6 +237,7 @@ impl Scheme {
     fn poly(vars: Vec<TyVar>, ty: Ty) -> Self {
         Scheme {
             vars,
+            unit_vars: vec![],
             constraints: vec![],
             ty,
         }
@@ -247,6 +250,7 @@ impl Scheme {
     ) -> Self {
         Scheme {
             vars,
+            unit_vars: vec![],
             constraints,
             ty,
         }
@@ -1139,7 +1143,7 @@ impl Infer {
     }
 
     fn instantiate_at(&mut self, scheme: &Scheme, span: Span) -> Ty {
-        if scheme.vars.is_empty() {
+        if scheme.vars.is_empty() && scheme.unit_vars.is_empty() {
             return scheme.ty.clone();
         }
         let mapping: HashMap<TyVar, Ty> = scheme
@@ -1157,7 +1161,18 @@ impl Infer {
                 });
             }
         }
-        self.subst_ty(&scheme.ty, &mapping)
+        let ty = self.subst_ty(&scheme.ty, &mapping);
+        // Freshen unit variables so each instantiation gets independent units
+        if scheme.unit_vars.is_empty() {
+            ty
+        } else {
+            let unit_mapping: HashMap<UnitVar, UnitVar> = scheme
+                .unit_vars
+                .iter()
+                .map(|v| (*v, self.fresh_unit_var()))
+                .collect();
+            self.subst_unit_vars_in_ty(&ty, &unit_mapping)
+        }
     }
 
     /// Substitute type variables according to a mapping (for instantiation).
@@ -1244,6 +1259,101 @@ impl Infer {
         }
     }
 
+    /// Replace unit variables in a type according to a freshening mapping.
+    fn subst_unit_vars_in_ty(&self, ty: &Ty, mapping: &HashMap<UnitVar, UnitVar>) -> Ty {
+        match ty {
+            Ty::IntUnit(u) => Ty::IntUnit(Self::subst_unit_var(u, mapping)),
+            Ty::FloatUnit(u) => Ty::FloatUnit(Self::subst_unit_var(u, mapping)),
+            Ty::Fun(p, r) => Ty::Fun(
+                Box::new(self.subst_unit_vars_in_ty(p, mapping)),
+                Box::new(self.subst_unit_vars_in_ty(r, mapping)),
+            ),
+            Ty::Relation(inner) => Ty::Relation(Box::new(self.subst_unit_vars_in_ty(inner, mapping))),
+            Ty::Record(fields, row) => {
+                let new_fields = fields.iter()
+                    .map(|(k, v)| (k.clone(), self.subst_unit_vars_in_ty(v, mapping)))
+                    .collect();
+                Ty::Record(new_fields, *row)
+            }
+            Ty::Variant(ctors, row) => {
+                let new_ctors = ctors.iter()
+                    .map(|(k, v)| (k.clone(), self.subst_unit_vars_in_ty(v, mapping)))
+                    .collect();
+                Ty::Variant(new_ctors, *row)
+            }
+            Ty::Con(name, args) => Ty::Con(
+                name.clone(),
+                args.iter().map(|a| self.subst_unit_vars_in_ty(a, mapping)).collect(),
+            ),
+            Ty::App(f, a) => Ty::App(
+                Box::new(self.subst_unit_vars_in_ty(f, mapping)),
+                Box::new(self.subst_unit_vars_in_ty(a, mapping)),
+            ),
+            Ty::IO(effects, inner) => Ty::IO(
+                effects.clone(),
+                Box::new(self.subst_unit_vars_in_ty(inner, mapping)),
+            ),
+            _ => ty.clone(),
+        }
+    }
+
+    fn subst_unit_var(u: &UnitTy, mapping: &HashMap<UnitVar, UnitVar>) -> UnitTy {
+        match u.var {
+            Some(v) => {
+                if let Some(&new_v) = mapping.get(&v) {
+                    UnitTy { bases: u.bases.clone(), var: Some(new_v) }
+                } else {
+                    u.clone()
+                }
+            }
+            None => u.clone(),
+        }
+    }
+
+    /// Collect all free (unsolved) unit variables in a type.
+    fn free_unit_vars_in_ty(&self, ty: &Ty) -> Vec<UnitVar> {
+        let mut vars = HashSet::new();
+        self.collect_free_unit_vars(ty, &mut vars);
+        vars.into_iter().collect()
+    }
+
+    fn collect_free_unit_vars(&self, ty: &Ty, out: &mut HashSet<UnitVar>) {
+        match ty {
+            Ty::IntUnit(u) | Ty::FloatUnit(u) => {
+                let applied = self.apply_unit(u);
+                if let Some(v) = applied.var {
+                    out.insert(v);
+                }
+            }
+            Ty::Fun(p, r) => {
+                self.collect_free_unit_vars(p, out);
+                self.collect_free_unit_vars(r, out);
+            }
+            Ty::Relation(inner) => self.collect_free_unit_vars(inner, out),
+            Ty::Record(fields, _) => {
+                for v in fields.values() {
+                    self.collect_free_unit_vars(v, out);
+                }
+            }
+            Ty::Variant(ctors, _) => {
+                for v in ctors.values() {
+                    self.collect_free_unit_vars(v, out);
+                }
+            }
+            Ty::Con(_, args) => {
+                for a in args {
+                    self.collect_free_unit_vars(a, out);
+                }
+            }
+            Ty::App(f, a) => {
+                self.collect_free_unit_vars(f, out);
+                self.collect_free_unit_vars(a, out);
+            }
+            Ty::IO(_, inner) => self.collect_free_unit_vars(inner, out),
+            _ => {}
+        }
+    }
+
     fn generalize(&mut self, ty: &Ty) -> Scheme {
         self.generalize_with_constraints(ty, vec![])
     }
@@ -1284,8 +1394,10 @@ impl Infer {
                 }
             }
         }
+        let unit_vars = self.free_unit_vars_in_ty(&applied);
         Scheme {
             vars: gen_vars,
+            unit_vars,
             constraints: kept,
             ty: applied,
         }
@@ -1972,7 +2084,7 @@ impl Infer {
                         // numeric negation — reject known non-numeric types
                         let resolved = self.apply(&operand_ty);
                         match &resolved {
-                            Ty::Int | Ty::Float | Ty::Var(_) | Ty::Error => {}
+                            Ty::Int | Ty::Float | Ty::IntUnit(_) | Ty::FloatUnit(_) | Ty::Var(_) | Ty::Error => {}
                             _ => {
                                 self.error(
                                     format!(
@@ -3494,21 +3606,27 @@ impl Infer {
             ),
         );
 
-        // avg : ∀a. (a -> Float) -> [a] -> Float
-        let a = self.fresh_var();
-        self.bind_top(
-            "avg",
-            Scheme::poly(
-                vec![a],
-                Ty::Fun(
-                    Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Float))),
-                    Box::new(Ty::Fun(
-                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                        Box::new(Ty::Float),
-                    )),
-                ),
-            ),
-        );
+        // avg : ∀a u. (a -> Float<u>) -> [a] -> Float<u>
+        {
+            let a = self.fresh_var();
+            let u = self.fresh_unit_var();
+            let float_u = Ty::FloatUnit(UnitTy::var(u));
+            self.bind_top(
+                "avg",
+                Scheme {
+                    vars: vec![a],
+                    unit_vars: vec![u],
+                    constraints: vec![],
+                    ty: Ty::Fun(
+                        Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(float_u.clone()))),
+                        Box::new(Ty::Fun(
+                            Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                            Box::new(float_u),
+                        )),
+                    ),
+                },
+            );
+        }
 
         // match : ∀a b. (a -> b) -> [b] -> [a]
         let a = self.fresh_var();
@@ -5137,6 +5255,35 @@ mod tests {
     fn unit_expr_annotation() {
         // (expr : Type) syntax
         let diags = check_src("unit m\nmain = (42.0 : Float<m>)");
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn unit_avg_preserves_unit() {
+        // avg should preserve the unit from the projection function
+        let diags = check_src(
+            "unit m\n\
+             main = avg (\\p -> p.x) [{x: 1.0<m>}, {x: 2.0<m>}] + 1.0<m>"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn unit_avg_mismatch() {
+        // avg result has unit from projection — adding mismatched unit should fail
+        let diags = check_src(
+            "unit m\nunit s\n\
+             main = avg (\\p -> p.x) [{x: 1.0<m>}] + 1.0<s>"
+        );
+        assert!(!diags.is_empty(), "should reject adding Float<m> avg result to Float<s>");
+    }
+
+    #[test]
+    fn unit_negation_preserves() {
+        // Unary negation should preserve units
+        let diags = check_src(
+            "unit m\nmain = -(5.0<m>) + 3.0<m>"
+        );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
 }

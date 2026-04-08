@@ -37,6 +37,9 @@ pub struct Codegen {
     // User function declarations: name -> (func_id, param_count)
     user_fns: HashMap<String, (FuncId, usize)>,
 
+    // Names registered as stdlib builtins (skip user redefinitions)
+    stdlib_fns: HashSet<String>,
+
     // Source relation schemas: name -> schema descriptor
     source_schemas: HashMap<String, String>,
 
@@ -338,6 +341,7 @@ impl Codegen {
             string_counter: 0,
             runtime_fns: HashMap::new(),
             user_fns: HashMap::new(),
+            stdlib_fns: HashSet::new(),
             source_schemas: HashMap::new(),
             constructors: HashMap::new(),
             lambda_counter: 0,
@@ -686,6 +690,7 @@ impl Codegen {
             .declare_function(&func_name, Linkage::Local, &sig)
             .unwrap();
         self.user_fns.insert(name.into(), (func_id, 1));
+        self.stdlib_fns.insert(name.into());
     }
 
     /// Declare a helper closure function with the standard (db, env, arg) -> result signature.
@@ -894,6 +899,11 @@ impl Codegen {
             match &decl.node {
                 ast::DeclKind::Fun { name, body, .. } => {
                     if let Some(body) = body {
+                        // Skip user functions that shadow stdlib builtins —
+                        // the stdlib version is already registered.
+                        if self.user_fns.contains_key(name.as_str()) {
+                            continue;
+                        }
                         // If the body is a lambda, extract its params for direct-call optimization.
                         let n_params = match &body.node {
                             ast::ExprKind::Lambda { params, .. } => params.len(),
@@ -1798,6 +1808,11 @@ impl Codegen {
             match &decl.node {
                 ast::DeclKind::Fun { name, body, .. } => {
                     if let Some(body) = body {
+                        // Skip user functions that shadow stdlib builtins —
+                        // the stdlib version is already defined above.
+                        if self.stdlib_fns.contains(name.as_str()) {
+                            continue;
+                        }
                         // If body is a lambda, extract its params for direct compilation.
                         match &body.node {
                             ast::ExprKind::Lambda { params, body: lambda_body } => {

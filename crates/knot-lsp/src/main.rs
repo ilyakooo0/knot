@@ -2719,6 +2719,11 @@ impl<'a> TokenCollector<'a> {
             DeclKind::Migrate { using_fn, .. } => {
                 self.visit_expr(using_fn);
             }
+            DeclKind::UnitDecl { name, .. } => {
+                if let Some(s) = find_word_in_source(self.source, name, decl.span.start, decl.span.end) {
+                    self.add(s, TOK_TYPE, MOD_DECLARATION);
+                }
+            }
             _ => {}
         }
     }
@@ -2823,6 +2828,12 @@ impl<'a> TokenCollector<'a> {
                 for e in elems {
                     self.visit_expr(e);
                 }
+            }
+            ast::ExprKind::UnitLit { value, .. } => {
+                self.visit_expr(value);
+            }
+            ast::ExprKind::Annot { expr: inner, .. } => {
+                self.visit_expr(inner);
             }
             _ => {}
         }

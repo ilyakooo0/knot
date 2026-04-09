@@ -3347,6 +3347,9 @@ impl Infer {
     }
 
     fn register_builtins(&mut self) {
+        // Built-in unit: Ms (milliseconds) — used by now/sleep
+        self.declared_units.insert("Ms".into(), None);
+
         // Built-in ADT: data Maybe a = Nothing {} | Just {value: a}
         let dummy_span = Span::new(0, 0);
         self.constructors.insert(
@@ -3508,18 +3511,24 @@ impl Infer {
             ),
         );
 
-        // count : ∀a. [a] -> Int
-        let a = self.fresh_var();
-        self.bind_top(
-            "count",
-            Scheme::poly(
-                vec![a],
-                Ty::Fun(
-                    Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                    Box::new(Ty::Int),
-                ),
-            ),
-        );
+        // count : ∀a u. [a] -> Int<u>
+        {
+            let a = self.fresh_var();
+            let u = self.fresh_unit_var();
+            let int_u = Ty::IntUnit(UnitTy::var(u));
+            self.bind_top(
+                "count",
+                Scheme {
+                    vars: vec![a],
+                    unit_vars: vec![u],
+                    constraints: vec![],
+                    ty: Ty::Fun(
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        Box::new(int_u),
+                    ),
+                },
+            );
+        }
 
         // putLine : ∀a. a -> IO {console} {} (alias for println)
         let a = self.fresh_var();
@@ -3531,33 +3540,55 @@ impl Infer {
             )),
         );
 
-        // now : IO {clock} Int
-        self.bind_top("now", Scheme::mono(
-            Ty::IO(BTreeSet::from([IoEffect::Clock]), Box::new(Ty::Int)),
-        ));
+        // now : IO {clock} Int<Ms>
+        {
+            let int_ms = Ty::IntUnit(UnitTy::named("Ms"));
+            self.bind_top("now", Scheme::mono(
+                Ty::IO(BTreeSet::from([IoEffect::Clock]), Box::new(int_ms)),
+            ));
+        }
 
-        // sleep : Int -> IO {clock} {}
-        self.bind_top(
-            "sleep",
-            Scheme::mono(Ty::Fun(
-                Box::new(Ty::Int),
-                Box::new(Ty::IO(BTreeSet::from([IoEffect::Clock]), Box::new(Ty::unit()))),
-            )),
-        );
+        // sleep : Int<Ms> -> IO {clock} {}
+        {
+            let int_ms = Ty::IntUnit(UnitTy::named("Ms"));
+            self.bind_top(
+                "sleep",
+                Scheme::mono(Ty::Fun(
+                    Box::new(int_ms),
+                    Box::new(Ty::IO(BTreeSet::from([IoEffect::Clock]), Box::new(Ty::unit()))),
+                )),
+            );
+        }
 
-        // randomInt : Int -> IO {random} Int
-        self.bind_top(
-            "randomInt",
-            Scheme::mono(Ty::Fun(
-                Box::new(Ty::Int),
-                Box::new(Ty::IO(BTreeSet::from([IoEffect::Random]), Box::new(Ty::Int))),
-            )),
-        );
+        // randomInt : ∀u. Int<u> -> IO {random} Int<u>
+        {
+            let u = self.fresh_unit_var();
+            let int_u = Ty::IntUnit(UnitTy::var(u));
+            self.bind_top(
+                "randomInt",
+                Scheme {
+                    vars: vec![],
+                    unit_vars: vec![u],
+                    constraints: vec![],
+                    ty: Ty::Fun(
+                        Box::new(int_u.clone()),
+                        Box::new(Ty::IO(BTreeSet::from([IoEffect::Random]), Box::new(int_u))),
+                    ),
+                },
+            );
+        }
 
-        // randomFloat : IO {random} Float
-        self.bind_top("randomFloat", Scheme::mono(
-            Ty::IO(BTreeSet::from([IoEffect::Random]), Box::new(Ty::Float)),
-        ));
+        // randomFloat : ∀u. IO {random} Float<u>
+        {
+            let u = self.fresh_unit_var();
+            let float_u = Ty::FloatUnit(UnitTy::var(u));
+            self.bind_top("randomFloat", Scheme {
+                vars: vec![],
+                unit_vars: vec![u],
+                constraints: vec![],
+                ty: Ty::IO(BTreeSet::from([IoEffect::Random]), Box::new(float_u)),
+            });
+        }
 
         // fork : IO {} {} -> IO {} {}
         // Argument must be an IO action. Empty effect set unifies with any
@@ -3578,25 +3609,31 @@ impl Infer {
         // with polymorphic HKT types: ∀m a b. (a -> m b) -> m a -> m b, etc.
         // This allows do-block desugaring to work with any monad, not just [].
 
-        // listen : ∀a b. Int -> (a -> b) -> IO {network} {}
-        let a = self.fresh_var();
-        let b = self.fresh_var();
-        self.bind_top(
-            "listen",
-            Scheme::poly(
-                vec![a, b],
-                Ty::Fun(
-                    Box::new(Ty::Int),
-                    Box::new(Ty::Fun(
-                        Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
-                        Box::new(Ty::IO(
-                            BTreeSet::from([IoEffect::Network]),
-                            Box::new(Ty::unit()),
+        // listen : ∀a b u. Int<u> -> (a -> b) -> IO {network} {}
+        {
+            let a = self.fresh_var();
+            let b = self.fresh_var();
+            let u = self.fresh_unit_var();
+            let int_u = Ty::IntUnit(UnitTy::var(u));
+            self.bind_top(
+                "listen",
+                Scheme {
+                    vars: vec![a, b],
+                    unit_vars: vec![u],
+                    constraints: vec![],
+                    ty: Ty::Fun(
+                        Box::new(int_u),
+                        Box::new(Ty::Fun(
+                            Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
+                            Box::new(Ty::IO(
+                                BTreeSet::from([IoEffect::Network]),
+                                Box::new(Ty::unit()),
+                            )),
                         )),
-                    )),
-                ),
-            ),
-        );
+                    ),
+                },
+            );
+        }
 
         // fetch : ∀a b. Text -> a -> IO {network} (Result {status: Int, message: Text} b)
         // (also accepts 3-arg form with options record in the middle)
@@ -3780,29 +3817,56 @@ impl Infer {
             Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Text))),
         );
 
-        // take : Int -> Text -> Text
-        self.bind_top(
-            "take",
-            Scheme::mono(Ty::Fun(
-                Box::new(Ty::Int),
-                Box::new(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Text))),
-            )),
-        );
+        // take : ∀u. Int<u> -> Text -> Text
+        {
+            let u = self.fresh_unit_var();
+            let int_u = Ty::IntUnit(UnitTy::var(u));
+            self.bind_top(
+                "take",
+                Scheme {
+                    vars: vec![],
+                    unit_vars: vec![u],
+                    constraints: vec![],
+                    ty: Ty::Fun(
+                        Box::new(int_u),
+                        Box::new(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Text))),
+                    ),
+                },
+            );
+        }
 
-        // drop : Int -> Text -> Text
-        self.bind_top(
-            "drop",
-            Scheme::mono(Ty::Fun(
-                Box::new(Ty::Int),
-                Box::new(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Text))),
-            )),
-        );
+        // drop : ∀u. Int<u> -> Text -> Text
+        {
+            let u = self.fresh_unit_var();
+            let int_u = Ty::IntUnit(UnitTy::var(u));
+            self.bind_top(
+                "drop",
+                Scheme {
+                    vars: vec![],
+                    unit_vars: vec![u],
+                    constraints: vec![],
+                    ty: Ty::Fun(
+                        Box::new(int_u),
+                        Box::new(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Text))),
+                    ),
+                },
+            );
+        }
 
-        // length : Text -> Int
-        self.bind_top(
-            "length",
-            Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Int))),
-        );
+        // length : ∀u. Text -> Int<u>
+        {
+            let u = self.fresh_unit_var();
+            let int_u = Ty::IntUnit(UnitTy::var(u));
+            self.bind_top(
+                "length",
+                Scheme {
+                    vars: vec![],
+                    unit_vars: vec![u],
+                    constraints: vec![],
+                    ty: Ty::Fun(Box::new(Ty::Text), Box::new(int_u)),
+                },
+            );
+        }
 
         // trim : Text -> Text
         self.bind_top(
@@ -3927,23 +3991,43 @@ impl Infer {
 
         // ── Bytes standard library ────────────────────────────────
 
-        // bytesLength : Bytes -> Int
-        self.bind_top(
-            "bytesLength",
-            Scheme::mono(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Int))),
-        );
+        // bytesLength : ∀u. Bytes -> Int<u>
+        {
+            let u = self.fresh_unit_var();
+            let int_u = Ty::IntUnit(UnitTy::var(u));
+            self.bind_top(
+                "bytesLength",
+                Scheme {
+                    vars: vec![],
+                    unit_vars: vec![u],
+                    constraints: vec![],
+                    ty: Ty::Fun(Box::new(Ty::Bytes), Box::new(int_u)),
+                },
+            );
+        }
 
-        // bytesSlice : Int -> Int -> Bytes -> Bytes
-        self.bind_top(
-            "bytesSlice",
-            Scheme::mono(Ty::Fun(
-                Box::new(Ty::Int),
-                Box::new(Ty::Fun(
-                    Box::new(Ty::Int),
-                    Box::new(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Bytes))),
-                )),
-            )),
-        );
+        // bytesSlice : ∀u1 u2. Int<u1> -> Int<u2> -> Bytes -> Bytes
+        {
+            let u1 = self.fresh_unit_var();
+            let u2 = self.fresh_unit_var();
+            let int_u1 = Ty::IntUnit(UnitTy::var(u1));
+            let int_u2 = Ty::IntUnit(UnitTy::var(u2));
+            self.bind_top(
+                "bytesSlice",
+                Scheme {
+                    vars: vec![],
+                    unit_vars: vec![u1, u2],
+                    constraints: vec![],
+                    ty: Ty::Fun(
+                        Box::new(int_u1),
+                        Box::new(Ty::Fun(
+                            Box::new(int_u2),
+                            Box::new(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Bytes))),
+                        )),
+                    ),
+                },
+            );
+        }
 
         // bytesConcat : Bytes -> Bytes -> Bytes
         self.bind_top(
@@ -3982,14 +4066,25 @@ impl Infer {
             Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Bytes))),
         );
 
-        // bytesGet : Int -> Bytes -> Int
-        self.bind_top(
-            "bytesGet",
-            Scheme::mono(Ty::Fun(
-                Box::new(Ty::Int),
-                Box::new(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Int))),
-            )),
-        );
+        // bytesGet : ∀u1 u2. Int<u1> -> Bytes -> Int<u2>
+        {
+            let u1 = self.fresh_unit_var();
+            let u2 = self.fresh_unit_var();
+            let int_u1 = Ty::IntUnit(UnitTy::var(u1));
+            let int_u2 = Ty::IntUnit(UnitTy::var(u2));
+            self.bind_top(
+                "bytesGet",
+                Scheme {
+                    vars: vec![],
+                    unit_vars: vec![u1, u2],
+                    constraints: vec![],
+                    ty: Ty::Fun(
+                        Box::new(int_u1),
+                        Box::new(Ty::Fun(Box::new(Ty::Bytes), Box::new(int_u2))),
+                    ),
+                },
+            );
+        }
 
         // Elliptic curve cryptography
 
@@ -5599,6 +5694,94 @@ mod tests {
             "type Range = {lo: Int, hi: Int} where \\r -> r.lo <= r.hi\nmain = 1"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    // ── Unit annotations on stdlib functions ─────────────────────
+
+    #[test]
+    fn unit_randomint_preserves_unit() {
+        // randomInt should preserve the unit from the bound argument
+        let diags = check_src(
+            "unit Usd\n\
+             f : IO {random} Int<Usd>\n\
+             f = randomInt 100<Usd>\n\
+             main = 1"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn unit_randomint_mismatch() {
+        // randomInt result has unit from bound — annotating with wrong unit should fail
+        let diags = check_src(
+            "unit Usd\nunit Eur\n\
+             f : IO {random} Int<Eur>\n\
+             f = randomInt 100<Usd>\n\
+             main = 1"
+        );
+        assert!(has_error(&diags, "unit mismatch"));
+    }
+
+    #[test]
+    fn unit_count_accepts_unit_context() {
+        // count result can unify with a unit context
+        let diags = check_src(
+            "unit N\n\
+             main = count [1, 2, 3] + 0<N>"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn unit_length_accepts_unit_context() {
+        // length result can unify with a unit context
+        let diags = check_src(
+            "unit N\n\
+             main = length \"hello\" + 0<N>"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn unit_sleep_accepts_ms() {
+        // sleep accepts Int<Ms> (built-in unit)
+        let diags = check_src(
+            "main = sleep 1000<Ms>"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn unit_sleep_rejects_wrong_unit() {
+        // sleep requires Ms — passing a different unit should fail
+        let diags = check_src(
+            "unit Kg\n\
+             main = sleep 1000<Kg>"
+        );
+        assert!(has_error(&diags, "unit mismatch"));
+    }
+
+    #[test]
+    fn unit_now_returns_ms() {
+        // now returns IO {clock} Int<Ms>
+        let diags = check_src(
+            "f : IO {clock} Int<Ms>\n\
+             f = now\n\
+             main = 1"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn unit_now_rejects_wrong_unit() {
+        // now returns Int<Ms> — annotating with wrong unit should fail
+        let diags = check_src(
+            "unit Kg\n\
+             f : IO {clock} Int<Kg>\n\
+             f = now\n\
+             main = 1"
+        );
+        assert!(has_error(&diags, "unit mismatch"));
     }
 }
 

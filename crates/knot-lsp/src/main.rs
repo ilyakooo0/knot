@@ -2392,7 +2392,7 @@ fn find_app_in_expr(
                 }
             }
         }
-        ast::ExprKind::Atomic(e) => find_app_in_expr(e, source, offset, best),
+        ast::ExprKind::Atomic(e) | ast::ExprKind::Refine(e) => find_app_in_expr(e, source, offset, best),
         ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
             find_app_in_expr(target, source, offset, best);
             find_app_in_expr(value, source, offset, best);
@@ -2804,7 +2804,7 @@ impl<'a> TokenCollector<'a> {
                     }
                 }
             }
-            ast::ExprKind::Atomic(e) => self.visit_expr(e),
+            ast::ExprKind::Atomic(e) | ast::ExprKind::Refine(e) => self.visit_expr(e),
             ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
                 self.visit_expr(target);
                 self.visit_expr(value);
@@ -3191,7 +3191,7 @@ fn collect_containing_spans(expr: &ast::Expr, offset: usize, spans: &mut Vec<Spa
                 }
             }
         }
-        ast::ExprKind::Atomic(e) => {
+        ast::ExprKind::Atomic(e) | ast::ExprKind::Refine(e) => {
             collect_containing_spans(e, offset, spans);
         }
         ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
@@ -3942,7 +3942,7 @@ fn find_case_actions(
                 find_case_actions(&arm.body, doc, uri, range_start, range_end, actions);
             }
         }
-        ast::ExprKind::Atomic(e) => {
+        ast::ExprKind::Atomic(e) | ast::ExprKind::Refine(e) => {
             find_case_actions(e, doc, uri, range_start, range_end, actions);
         }
         ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
@@ -4117,7 +4117,7 @@ fn find_inline_actions(
                 find_inline_actions(&arm.body, doc, uri, cursor_offset, actions);
             }
         }
-        ast::ExprKind::Atomic(e) => {
+        ast::ExprKind::Atomic(e) | ast::ExprKind::Refine(e) => {
             find_inline_actions(e, doc, uri, cursor_offset, actions);
         }
         _ => {}
@@ -4954,7 +4954,7 @@ fn collect_field_name_spans(
                 }
             }
         }
-        ast::ExprKind::Atomic(e) => collect_field_name_spans(e, field_name, source, ranges),
+        ast::ExprKind::Atomic(e) | ast::ExprKind::Refine(e) => collect_field_name_spans(e, field_name, source, ranges),
         ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
             collect_field_name_spans(target, field_name, source, ranges);
             collect_field_name_spans(value, field_name, source, ranges);
@@ -5540,9 +5540,64 @@ fn format_type_kind(ty: &TypeKind) -> String {
         TypeKind::UnitAnnotated { base, unit } => {
             format!("{}<{}>", format_type_kind(&base.node), format_unit_expr(unit))
         }
-        TypeKind::Refined { base, .. } => {
-            format!("{} where ...", format_type_kind(&base.node))
+        TypeKind::Refined { base, predicate } => {
+            format!("{} where {}", format_type_kind(&base.node), format_expr_brief(&predicate.node))
         }
+    }
+}
+
+/// Brief structural rendering of an expression for display in type hovers.
+fn format_expr_brief(expr: &ast::ExprKind) -> String {
+    match expr {
+        ast::ExprKind::Var(name) => name.clone(),
+        ast::ExprKind::Lit(ast::Literal::Int(n)) => n.to_string(),
+        ast::ExprKind::Lit(ast::Literal::Float(f)) => f.to_string(),
+        ast::ExprKind::Lit(ast::Literal::Text(s)) => format!("\"{}\"", s),
+        ast::ExprKind::Lit(ast::Literal::Bool(b)) => if *b { "true" } else { "false" }.into(),
+        ast::ExprKind::Lambda { params, body } => {
+            let ps: Vec<String> = params.iter().map(|p| format_pat_brief(&p.node)).collect();
+            format!("\\{} -> {}", ps.join(" "), format_expr_brief(&body.node))
+        }
+        ast::ExprKind::App { func, arg } => {
+            let f = format_expr_brief(&func.node);
+            let a = format_expr_brief(&arg.node);
+            if matches!(arg.node, ast::ExprKind::App { .. } | ast::ExprKind::BinOp { .. }) {
+                format!("{f} ({a})")
+            } else {
+                format!("{f} {a}")
+            }
+        }
+        ast::ExprKind::BinOp { op, lhs, rhs } => {
+            let op_str = match op {
+                ast::BinOp::Add => "+", ast::BinOp::Sub => "-",
+                ast::BinOp::Mul => "*", ast::BinOp::Div => "/",
+                ast::BinOp::Eq => "==", ast::BinOp::Neq => "!=",
+                ast::BinOp::Lt => "<", ast::BinOp::Gt => ">",
+                ast::BinOp::Le => "<=", ast::BinOp::Ge => ">=",
+                ast::BinOp::And => "&&", ast::BinOp::Or => "||",
+                ast::BinOp::Concat => "++", ast::BinOp::Pipe => "|>",
+            };
+            format!("{} {} {}", format_expr_brief(&lhs.node), op_str, format_expr_brief(&rhs.node))
+        }
+        ast::ExprKind::UnaryOp { op, operand } => {
+            let op_str = match op {
+                ast::UnaryOp::Neg => "-",
+                ast::UnaryOp::Not => "not ",
+            };
+            format!("{}{}", op_str, format_expr_brief(&operand.node))
+        }
+        ast::ExprKind::FieldAccess { expr, field } => {
+            format!("{}.{}", format_expr_brief(&expr.node), field)
+        }
+        _ => "...".into(),
+    }
+}
+
+fn format_pat_brief(pat: &ast::PatKind) -> String {
+    match pat {
+        ast::PatKind::Var(name) => name.clone(),
+        ast::PatKind::Wildcard => "_".into(),
+        _ => "...".into(),
     }
 }
 
@@ -5833,7 +5888,8 @@ fn collect_keyword_operator_positions(tokens: &[knot::lexer::Token]) -> Vec<(Spa
             | TokenKind::Deriving
             | TokenKind::With
             | TokenKind::Export
-            | TokenKind::Unit => Some(TOK_KEYWORD),
+            | TokenKind::Unit
+            | TokenKind::Refine => Some(TOK_KEYWORD),
             // Operators
             TokenKind::Plus
             | TokenKind::Minus

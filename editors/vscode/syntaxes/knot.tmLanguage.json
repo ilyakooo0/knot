@@ -162,7 +162,7 @@
       "patterns": [
         {
           "name": "keyword.control.knot",
-          "match": "\\b(do|if|then|else|case|of|let|in|where|yield|atomic)\\b"
+          "match": "\\b(do|if|then|else|case|of|let|in|where|yield|atomic|refine)\\b"
         },
         {
           "name": "keyword.other.knot",

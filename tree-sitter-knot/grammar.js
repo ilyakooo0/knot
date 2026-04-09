@@ -333,11 +333,17 @@ module.exports = grammar({
 
     constraint: ($) => seq($.upper_identifier, repeat1($._type_atom)),
 
-    _type: ($) => choice($.function_type, $._type_app),
+    _type: ($) => choice($.function_type, $.refined_type, $._type_app),
 
     function_type: ($) =>
       prec.right(
-        seq(field("param", $._type_app), "->", field("result", $._type)),
+        seq(field("param", $.refined_type), "->", field("result", $._type)),
+      ),
+
+    refined_type: ($) =>
+      choice(
+        seq(field("base", $._type_app), "where", field("predicate", $._expression)),
+        $._type_app,
       ),
 
     _type_app: ($) => choice($.type_application, $._type_atom),
@@ -429,6 +435,7 @@ module.exports = grammar({
         $.full_set_expression,
         $.yield_expression,
         $.atomic_expression,
+        $.refine_expression,
         $.let_in_expression,
         $._binary_expression,
       ),
@@ -544,6 +551,9 @@ module.exports = grammar({
 
     atomic_expression: ($) =>
       prec.right(seq("atomic", field("body", $._expression))),
+
+    refine_expression: ($) =>
+      prec.right(seq("refine", field("value", $._expression))),
 
     let_in_expression: ($) =>
       prec.right(

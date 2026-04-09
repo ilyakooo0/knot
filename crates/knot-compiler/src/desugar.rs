@@ -573,9 +573,10 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &HashSet<String>) -> bool {
         return false;
     }
 
-    // IO do blocks use a dedicated codegen path (compile_io_do) — not eligible
-    // for desugaring. Check if any bind or bare expression calls an IO builtin
-    // or a user-defined IO function.
+    // IO do blocks use a dedicated codegen path (compile_io_do) that handles
+    // running IO actions and iterating over resulting relations. Desugaring
+    // would use IO's monadic bind (sequencing) instead, which is wrong when
+    // the intent is to iterate over relation elements.
     if stmts.iter().any(|s| match &s.node {
         StmtKind::Bind { expr, .. } | StmtKind::Let { expr, .. } | StmtKind::Expr(expr) => expr_is_io(expr, io_fns),
         StmtKind::Where { cond } => expr_is_io(cond, io_fns),

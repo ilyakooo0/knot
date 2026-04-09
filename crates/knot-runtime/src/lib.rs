@@ -2455,6 +2455,24 @@ pub extern "C" fn knot_io_then(io1: *mut Value, io2: *mut Value) -> *mut Value {
     alloc(Value::IO(then_thunk as *const u8, env))
 }
 
+/// map(f, io) — apply f to the result of an IO action
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_io_map(f: *mut Value, io: *mut Value) -> *mut Value {
+    let env = alloc(Value::Record(vec![
+        RecordField { name: "_f".to_string(), value: f },
+        RecordField { name: "_io".to_string(), value: io },
+    ]));
+
+    extern "C" fn map_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let io = knot_record_field(env, "_io\0".as_ptr(), 3);
+        let f = knot_record_field(env, "_f\0".as_ptr(), 2);
+        let a = knot_io_run(db, io);
+        knot_value_call(db, f, a)
+    }
+
+    alloc(Value::IO(map_thunk as *const u8, env))
+}
+
 // ── Spawn / threading ────────────────────────────────────────────
 
 /// Deep-clone a Value tree so it can be sent to another thread.

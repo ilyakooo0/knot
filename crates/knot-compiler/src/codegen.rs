@@ -631,6 +631,7 @@ impl Codegen {
         self.declare_rt("knot_io_run", &[p, p], &[p]);
         self.declare_rt("knot_io_bind", &[p, p], &[p]);
         self.declare_rt("knot_io_then", &[p, p], &[p]);
+        self.declare_rt("knot_io_map", &[p, p], &[p]);
 
         // IO wrappers for effectful builtins
         self.declare_rt("knot_println_io", &[p], &[p]);
@@ -1278,6 +1279,9 @@ impl Codegen {
         // with base-parsed source.
         self.register_builtin_relation_impls();
 
+        // Register built-in IO impls for Functor, Applicative, Monad
+        self.register_builtin_io_impls();
+
         // Register built-in primitive impls for Eq, Ord, Num traits.
         // These delegate to runtime functions to avoid circular dependencies
         // (e.g. `impl Eq Int where eq a b = a == b` would loop if == dispatches through eq).
@@ -1388,6 +1392,68 @@ impl Codegen {
                 })
                 .or_default()
                 .push(("Relation".to_string(), ast::Span { start: 0, end: 0 }));
+        }
+    }
+
+    // ── Built-in IO impls for HKT traits ─────────────────────────
+
+    /// Register mangled functions for Functor/Applicative/Monad IO impls.
+    fn register_builtin_io_impls(&mut self) {
+        let impls = [
+            ("Functor_IO_map", "map", 2),
+            ("Applicative_IO_yield", "yield", 1),
+            ("Monad_IO_bind", "bind", 2),
+        ];
+        for (mangled, method_name, n_params) in &impls {
+            if self.user_fns.contains_key(*mangled) {
+                continue;
+            }
+            let already_has_io_impl = self
+                .trait_methods
+                .get(*method_name)
+                .map(|info| info.impls.iter().any(|e| e.type_name == "IO"))
+                .unwrap_or(false);
+            if already_has_io_impl {
+                continue;
+            }
+
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(self.ptr_type)); // db
+            for _ in 0..*n_params {
+                sig.params.push(AbiParam::new(self.ptr_type));
+            }
+            sig.returns.push(AbiParam::new(self.ptr_type));
+            let func_name = format!("knot_user_{}", mangled);
+            let func_id = self
+                .module
+                .declare_function(&func_name, Linkage::Local, &sig)
+                .unwrap();
+            self.user_fns
+                .insert(mangled.to_string(), (func_id, *n_params));
+            self.registered_builtin_impls.insert(mangled.to_string());
+
+            self.trait_methods
+                .entry(method_name.to_string())
+                .or_insert(TraitMethodInfo {
+                    param_count: *n_params,
+                    dispatch_index: None,
+                    impls: Vec::new(),
+                })
+                .impls
+                .push(ImplEntry {
+                    type_name: "IO".to_string(),
+                    func_id,
+                });
+
+            self.trait_impl_types
+                .entry(match *method_name {
+                    "map" => "Functor".to_string(),
+                    "yield" | "ap" => "Applicative".to_string(),
+                    "bind" => "Monad".to_string(),
+                    _ => continue,
+                })
+                .or_default()
+                .push(("IO".to_string(), ast::Span { start: 0, end: 0 }));
         }
     }
 
@@ -1623,6 +1689,62 @@ impl Codegen {
         });
     }
 
+    /// Define Cranelift IR bodies for built-in IO impls of HKT traits.
+    fn define_builtin_io_impls(&mut self) {
+        macro_rules! define_if_registered {
+            ($name:expr, $body:expr) => {
+                if self.registered_builtin_impls.contains($name) {
+                    if let Some(&(func_id, _)) = self.user_fns.get($name) {
+                        $body(self, func_id);
+                    }
+                }
+            };
+        }
+
+        // Functor_IO_map(db, f, io) → knot_io_map(f, io)
+        define_if_registered!("Functor_IO_map", |cg: &mut Self, func_id: FuncId| {
+            let mut sig = cg.module.make_signature();
+            sig.params.push(AbiParam::new(cg.ptr_type)); // db
+            sig.params.push(AbiParam::new(cg.ptr_type)); // f
+            sig.params.push(AbiParam::new(cg.ptr_type)); // io
+            sig.returns.push(AbiParam::new(cg.ptr_type));
+            cg.build_function(func_id, sig, |cg, builder, entry| {
+                let f = builder.block_params(entry)[1];
+                let io = builder.block_params(entry)[2];
+                let result = cg.call_rt(builder, "knot_io_map", &[f, io]);
+                builder.ins().return_(&[result]);
+            });
+        });
+
+        // Applicative_IO_yield(db, x) → knot_io_pure(x)
+        define_if_registered!("Applicative_IO_yield", |cg: &mut Self, func_id: FuncId| {
+            let mut sig = cg.module.make_signature();
+            sig.params.push(AbiParam::new(cg.ptr_type)); // db
+            sig.params.push(AbiParam::new(cg.ptr_type)); // x
+            sig.returns.push(AbiParam::new(cg.ptr_type));
+            cg.build_function(func_id, sig, |cg, builder, entry| {
+                let x = builder.block_params(entry)[1];
+                let result = cg.call_rt(builder, "knot_io_pure", &[x]);
+                builder.ins().return_(&[result]);
+            });
+        });
+
+        // Monad_IO_bind(db, f, io) → knot_io_bind(io, f)
+        define_if_registered!("Monad_IO_bind", |cg: &mut Self, func_id: FuncId| {
+            let mut sig = cg.module.make_signature();
+            sig.params.push(AbiParam::new(cg.ptr_type)); // db
+            sig.params.push(AbiParam::new(cg.ptr_type)); // f
+            sig.params.push(AbiParam::new(cg.ptr_type)); // io
+            sig.returns.push(AbiParam::new(cg.ptr_type));
+            cg.build_function(func_id, sig, |cg, builder, entry| {
+                let f = builder.block_params(entry)[1];
+                let io = builder.block_params(entry)[2];
+                let result = cg.call_rt(builder, "knot_io_bind", &[io, f]);
+                builder.ins().return_(&[result]);
+            });
+        });
+    }
+
     /// Define Cranelift IR bodies for built-in primitive impls (Eq, Ord, Num).
     /// Each impl delegates to the corresponding runtime function.
     fn define_builtin_primitive_impls(&mut self) {
@@ -1825,6 +1947,9 @@ impl Codegen {
 
         // Define built-in [] impls for HKT traits
         self.define_builtin_relation_impls();
+
+        // Define built-in IO impls for HKT traits
+        self.define_builtin_io_impls();
 
         // Define built-in primitive impls for Eq, Ord, Num traits
         self.define_builtin_primitive_impls();
@@ -8851,6 +8976,7 @@ fn type_name_to_tag(name: &str) -> Option<i64> {
         "Bool" => Some(3),
         "Unit" => Some(4),
         "Relation" => Some(6),
+        "IO" => Some(11),
         _ => None,
     }
 }

@@ -4694,6 +4694,11 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
             .known_impls
             .insert((trait_name.to_string(), "Result".to_string()));
     }
+    for trait_name in &["Functor", "Applicative", "Monad"] {
+        infer
+            .known_impls
+            .insert((trait_name.to_string(), "IO".to_string()));
+    }
 
     // Phase 3: Pre-register top-level names (builtins, functions, trait methods)
     infer.pre_register(module);

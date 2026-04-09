@@ -248,6 +248,7 @@ fn type_references_name(ty: &ast::Type, name: &str) -> bool {
             type_references_name(ty, name)
         }
         ast::TypeKind::UnitAnnotated { base, .. } => type_references_name(base, name),
+        ast::TypeKind::Refined { base, .. } => type_references_name(base, name),
         ast::TypeKind::Var(_) | ast::TypeKind::Hole => false,
     }
 }

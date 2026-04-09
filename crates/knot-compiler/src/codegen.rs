@@ -133,6 +133,15 @@ pub struct Codegen {
     // Whether we are inside compile_io_do_eager — when true, Yield compiles to
     // the raw inner value rather than wrapping in knot_relation_singleton.
     in_io_eager: bool,
+
+    // Refined type predicates: type_name -> predicate AST expression
+    refined_types: HashMap<String, knot::ast::Expr>,
+    // Source refinements: source_name -> [(field_name_or_none, type_name, predicate_expr)]
+    source_refinements: HashMap<String, Vec<(Option<String>, String, knot::ast::Expr)>>,
+    // Refine expression targets: expr_span -> refined type name
+    refine_targets: HashMap<knot::ast::Span, String>,
+    // Compiled predicate function values: type_name -> func_id
+    refined_predicate_fns: HashMap<String, FuncId>,
 }
 
 /// Role of a constructor in a nullable-encoded ADT.
@@ -256,6 +265,8 @@ pub fn compile(
     type_env: &TypeEnv,
     source_file: &str,
     monad_info: &MonadInfo,
+    refine_targets: &crate::infer::RefineTargets,
+    refined_types: &crate::infer::RefinedTypeInfoMap,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     let mut cg = Codegen::new();
     // Derive database path from source filename: "foo.knot" → "foo.db"
@@ -275,6 +286,9 @@ pub fn compile(
     cg.history_sources = type_env.history_sources.clone();
     cg.subset_constraints = type_env.subset_constraints.clone();
     cg.monad_info = monad_info.clone();
+    cg.refine_targets = refine_targets.clone();
+    cg.refined_types = refined_types.clone();
+    cg.source_refinements = type_env.source_refinements.clone();
     for (name, fields) in &type_env.constructors {
         let field_strs: Vec<(String, String)> = fields
             .iter()
@@ -372,6 +386,10 @@ impl Codegen {
             io_functions: HashSet::new(),
             scalar_sources: HashSet::new(),
             in_io_eager: false,
+            refined_types: HashMap::new(),
+            refine_targets: HashMap::new(),
+            refined_predicate_fns: HashMap::new(),
+            source_refinements: HashMap::new(),
         }
     }
 
@@ -532,6 +550,13 @@ impl Codegen {
 
         // Subset constraints
         self.declare_rt("knot_constraint_register", &[p, p, p, p, p, p, p, p, p], &[]);
+        // Refinement validation
+        // Result monad
+        self.declare_rt("knot_result_bind", &[p, p, p], &[p]);
+        self.declare_rt("knot_result_yield", &[p], &[p]);
+        self.declare_rt("knot_result_empty", &[], &[p]);
+        self.declare_rt("knot_refinement_validate_relation", &[p, p, p, p, p, p, p], &[]);
+        self.declare_rt("knot_route_set_field_refinement", &[p, p, p, p, p, p, p, p], &[]);
 
         // Monadic bind for relations (do-desugaring)
         self.declare_rt("knot_relation_bind", &[p, p, p], &[p]);
@@ -2525,6 +2550,7 @@ impl Codegen {
             let argv = builder.block_params(entry)[1];
 
             // Register route tables for the api command
+            let mut route_tables: Vec<(Value, Vec<ast::RouteEntry>)> = Vec::new();
             for (route_name, entries) in &all_routes {
                 let table = cg.call_rt(builder, "knot_route_table_new", &[]);
                 for route_entry in entries {
@@ -2562,6 +2588,7 @@ impl Codegen {
                 }
                 let (name_ptr, name_len) = cg.string_ptr(builder, route_name);
                 cg.call_rt_void(builder, "knot_api_register", &[name_ptr, name_len, table]);
+                route_tables.push((table, entries.clone()));
             }
 
             // Check if this is an "api" command
@@ -2704,6 +2731,36 @@ impl Codegen {
                         sup_rel_ptr, sup_rel_len, sup_field_ptr, sup_field_len,
                     ],
                 );
+            }
+
+            // Register refinement predicates for route body fields
+            for (table, entries) in &route_tables {
+                for route_entry in entries {
+                    let (ctor_ptr, ctor_len) = cg.string_ptr(builder, &route_entry.constructor);
+                    for field in &route_entry.body_fields {
+                        let refined_type_name = match &field.value.node {
+                            ast::TypeKind::Refined { predicate, .. } => {
+                                // Inline refinement — use field name as type name
+                                Some((field.name.clone(), (**predicate).clone()))
+                            }
+                            ast::TypeKind::Named(name) => {
+                                cg.refined_types.get(name).map(|pred| (name.clone(), pred.clone()))
+                            }
+                            _ => None,
+                        };
+                        if let Some((type_name, pred_expr)) = refined_type_name {
+                            let mut pred_env = Env::new();
+                            let pred_fn = cg.compile_expr(builder, &pred_expr, &mut pred_env, db);
+                            let (fn_ptr, fn_len) = cg.string_ptr(builder, &field.name);
+                            let (tn_ptr, tn_len) = cg.string_ptr(builder, &type_name);
+                            cg.call_rt_void(
+                                builder,
+                                "knot_route_set_field_refinement",
+                                &[*table, ctor_ptr, ctor_len, fn_ptr, fn_len, pred_fn, tn_ptr, tn_len],
+                            );
+                        }
+                    }
+                }
             }
 
             // Call user's main function if it exists
@@ -3214,6 +3271,7 @@ impl Codegen {
                     if let Some(new_rows_expr) = self.match_union_append(name, value) {
                         // 1. Append: union *rel <new> → INSERT only
                         let new_rows = self.compile_expr(builder, new_rows_expr, env, db);
+                        self.emit_refinement_checks(builder, name, new_rows, env, db);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
                         let (schema_ptr, schema_len) =
                             self.string_ptr(builder, &schema);
@@ -3225,6 +3283,7 @@ impl Codegen {
                     } else if !Self::references_source(value, name) {
                         // 2. Full replace: value doesn't read the source
                         let val = self.compile_set_value_expr(builder, value, env, db);
+                        self.emit_refinement_checks(builder, name, val, env, db);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
                         let (schema_ptr, schema_len) =
                             self.string_ptr(builder, &schema);
@@ -3495,6 +3554,10 @@ impl Codegen {
 
             ast::ExprKind::Annot { expr, .. } => {
                 self.compile_expr(builder, expr, env, db)
+            }
+
+            ast::ExprKind::Refine(inner) => {
+                self.compile_refine(builder, inner, expr.span, env, db)
             }
 
             ast::ExprKind::At { relation, time } => {
@@ -3985,6 +4048,14 @@ impl Codegen {
                         Some(MonadKind::IO) => "IO".to_string(),
                         _ => "Relation".to_string(),
                     };
+                    // Built-in Result monad bind
+                    if type_name == "Result" {
+                        return self.call_rt(
+                            builder,
+                            "knot_result_bind",
+                            &[db, compiled_args[0], compiled_args[1]],
+                        );
+                    }
                     let bind_fn = format!("Monad_{}_bind", type_name);
                     if let Some(&(func_id, _)) = self.user_fns.get(&bind_fn) {
                         let func_ref = self
@@ -4299,6 +4370,143 @@ impl Codegen {
         )
     }
 
+    // ── Refine expression compilation ─────────────────────────────
+
+    fn compile_refine(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        inner: &ast::Expr,
+        span: knot::ast::Span,
+        env: &mut Env,
+        db: Value,
+    ) -> Value {
+        let val = self.compile_expr(builder, inner, env, db);
+
+        // Look up which refined type this refine targets
+        let type_name = match self.refine_targets.get(&span) {
+            Some(name) => name.clone(),
+            None => {
+                // No target resolved — wrap in Ok {value: val} as pass-through
+                return self.build_ok_result(builder, val);
+            }
+        };
+
+        // Compile the predicate expression (a lambda) in the current env
+        let predicate_expr = match self.refined_types.get(&type_name) {
+            Some(pred) => pred.clone(),
+            None => return self.build_ok_result(builder, val),
+        };
+        let pred_fn = self.compile_expr(builder, &predicate_expr, env, db);
+
+        // Call the predicate: pred(val) -> Bool
+        let pred_result = self.call_rt(builder, "knot_value_call", &[db, pred_fn, val]);
+        let is_true = self.call_rt_typed(
+            builder,
+            "knot_value_get_bool",
+            &[pred_result],
+            cranelift_codegen::ir::types::I32,
+        );
+
+        // Branch: if true -> Ok {value: val}, else -> Err {error: RefinementError{...}}
+        let ok_block = builder.create_block();
+        let err_block = builder.create_block();
+        let merge_block = builder.create_block();
+        builder.append_block_param(merge_block, self.ptr_type);
+
+        builder.ins().brif(is_true, ok_block, &[], err_block, &[]);
+
+        // Ok path
+        builder.switch_to_block(ok_block);
+        builder.seal_block(ok_block);
+        let ok_val = self.build_ok_result(builder, val);
+        builder.ins().jump(merge_block, &[ok_val]);
+
+        // Err path
+        builder.switch_to_block(err_block);
+        builder.seal_block(err_block);
+        let err_val = self.build_refinement_err(builder, &type_name);
+        builder.ins().jump(merge_block, &[err_val]);
+
+        builder.switch_to_block(merge_block);
+        builder.seal_block(merge_block);
+        builder.block_params(merge_block)[0]
+    }
+
+    /// Build Ok {value: val} constructor value
+    fn build_ok_result(&mut self, builder: &mut FunctionBuilder, val: Value) -> Value {
+        let cap = builder.ins().iconst(self.ptr_type, 1);
+        let rec = self.call_rt(builder, "knot_record_empty", &[cap]);
+        let (key_ptr, key_len) = self.string_ptr(builder, "value");
+        self.call_rt_void(builder, "knot_record_set_field", &[rec, key_ptr, key_len, val]);
+        let (tag_ptr, tag_len) = self.string_ptr(builder, "Ok");
+        self.call_rt(builder, "knot_value_constructor", &[tag_ptr, tag_len, rec])
+    }
+
+    /// Emit refinement validation calls for a source relation before writing.
+    fn emit_refinement_checks(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        source_name: &str,
+        relation_val: Value,
+        env: &mut Env,
+        db: Value,
+    ) {
+        let refinements = match self.source_refinements.get(source_name) {
+            Some(r) => r.clone(),
+            None => return,
+        };
+        for (field_name, type_name, predicate_expr) in &refinements {
+            let pred_fn = self.compile_expr(builder, predicate_expr, env, db);
+            let (tn_ptr, tn_len) = self.string_ptr(builder, type_name);
+            let field_str = field_name.as_deref().unwrap_or("");
+            let (fn_ptr, fn_len) = self.string_ptr(builder, field_str);
+            self.call_rt_void(
+                builder,
+                "knot_refinement_validate_relation",
+                &[db, relation_val, pred_fn, tn_ptr, tn_len, fn_ptr, fn_len],
+            );
+        }
+    }
+
+    /// Build Err {error: {typeName: ..., violations: [...]}} constructor value
+    fn build_refinement_err(&mut self, builder: &mut FunctionBuilder, type_name: &str) -> Value {
+        // Build {typeName: type_name, violations: [{field: Nothing {}, message: "..."}]}
+        let cap2 = builder.ins().iconst(self.ptr_type, 2);
+        let error_rec = self.call_rt(builder, "knot_record_empty", &[cap2]);
+
+        let (tn_key_ptr, tn_key_len) = self.string_ptr(builder, "typeName");
+        let (tn_val_ptr, tn_val_len) = self.string_ptr(builder, type_name);
+        let type_name_val = self.call_rt(builder, "knot_value_text", &[tn_val_ptr, tn_val_len]);
+        self.call_rt_void(builder, "knot_record_set_field", &[error_rec, tn_key_ptr, tn_key_len, type_name_val]);
+
+        // Build violation record
+        let violation_rec = self.call_rt(builder, "knot_record_empty", &[cap2]);
+
+        let (f_key_ptr, f_key_len) = self.string_ptr(builder, "field");
+        let (nothing_tag_ptr, nothing_tag_len) = self.string_ptr(builder, "Nothing");
+        let nothing_unit = self.call_rt(builder, "knot_value_unit", &[]);
+        let nothing_val = self.call_rt(builder, "knot_value_constructor", &[nothing_tag_ptr, nothing_tag_len, nothing_unit]);
+        self.call_rt_void(builder, "knot_record_set_field", &[violation_rec, f_key_ptr, f_key_len, nothing_val]);
+
+        let (m_key_ptr, m_key_len) = self.string_ptr(builder, "message");
+        let msg_str = format!("value does not satisfy '{}' predicate", type_name);
+        let (msg_ptr, msg_len) = self.string_ptr(builder, &msg_str);
+        let msg_val = self.call_rt(builder, "knot_value_text", &[msg_ptr, msg_len]);
+        self.call_rt_void(builder, "knot_record_set_field", &[violation_rec, m_key_ptr, m_key_len, msg_val]);
+
+        let violations = self.call_rt(builder, "knot_relation_singleton", &[violation_rec]);
+        let (v_key_ptr, v_key_len) = self.string_ptr(builder, "violations");
+        self.call_rt_void(builder, "knot_record_set_field", &[error_rec, v_key_ptr, v_key_len, violations]);
+
+        // Wrap in Err {error: error_rec}
+        let cap1 = builder.ins().iconst(self.ptr_type, 1);
+        let err_wrapper = self.call_rt(builder, "knot_record_empty", &[cap1]);
+        let (err_key_ptr, err_key_len) = self.string_ptr(builder, "error");
+        self.call_rt_void(builder, "knot_record_set_field", &[err_wrapper, err_key_ptr, err_key_len, error_rec]);
+        let (err_tag_ptr, err_tag_len) = self.string_ptr(builder, "Err");
+        self.call_rt(builder, "knot_value_constructor", &[err_tag_ptr, err_tag_len, err_wrapper])
+    }
+
     // ── Case expression compilation ───────────────────────────────
 
     fn compile_case(
@@ -4584,6 +4792,10 @@ impl Codegen {
             Some(MonadKind::Adt(name)) => name.clone(),
             _ => "Relation".to_string(),
         };
+        // Built-in Result yield (pure/return)
+        if type_name == "Result" {
+            return self.call_rt(builder, "knot_result_yield", &[val]);
+        }
         let yield_fn = format!("Applicative_{}_yield", type_name);
         if let Some(&(func_id, _)) = self.user_fns.get(&yield_fn) {
             let func_ref = self
@@ -4608,6 +4820,10 @@ impl Codegen {
             Some(MonadKind::IO) => "IO".to_string(),
             _ => "Relation".to_string(),
         };
+        // Built-in Result empty
+        if type_name == "Result" {
+            return self.call_rt(builder, "knot_result_empty", &[]);
+        }
         let empty_fn = format!("Alternative_{}_empty", type_name);
         if let Some(&(func_id, _)) = self.user_fns.get(&empty_fn) {
             let func_ref = self
@@ -4729,6 +4945,7 @@ impl Codegen {
             // returns a record, not IO.
             ast::ExprKind::UnitLit { value, .. } => Self::expr_contains_io(value, builtins, io_fns),
             ast::ExprKind::Annot { expr, .. } => Self::expr_contains_io(expr, builtins, io_fns),
+            ast::ExprKind::Refine(inner) => Self::expr_contains_io(inner, builtins, io_fns),
             ast::ExprKind::Record(_)
             | ast::ExprKind::RecordUpdate { .. }
             | ast::ExprKind::FieldAccess { .. }
@@ -4782,6 +4999,7 @@ impl Codegen {
             ast::ExprKind::Lambda { body, .. } => self.expr_is_io(body),
             ast::ExprKind::UnitLit { value, .. } => self.expr_is_io(value),
             ast::ExprKind::Annot { expr, .. } => self.expr_is_io(expr),
+            ast::ExprKind::Refine(_) => false,
             _ => false,
         }
     }
@@ -6059,6 +6277,7 @@ impl Codegen {
             }
             ast::ExprKind::UnitLit { value, .. } => Self::references_source(value, source_name),
             ast::ExprKind::Annot { expr, .. } => Self::references_source(expr, source_name),
+            ast::ExprKind::Refine(inner) => Self::references_source(inner, source_name),
         }
     }
 
@@ -7493,6 +7712,7 @@ fn expr_references_var(expr: &ast::Expr, var_name: &str) -> bool {
         }
         ast::ExprKind::UnitLit { value, .. } => expr_references_var(value, var_name),
         ast::ExprKind::Annot { expr, .. } => expr_references_var(expr, var_name),
+        ast::ExprKind::Refine(inner) => expr_references_var(inner, var_name),
         // Conservatively return true for complex expressions
         _ => true,
     }
@@ -8106,6 +8326,7 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
         }
         ast::ExprKind::UnitLit { value, .. } => expr_contains_derived_ref(value, name),
         ast::ExprKind::Annot { expr, .. } => expr_contains_derived_ref(expr, name),
+        ast::ExprKind::Refine(inner) => expr_contains_derived_ref(inner, name),
     }
 }
 
@@ -8243,6 +8464,9 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
         }
         ast::ExprKind::Annot { expr, .. } => {
             collect_free_vars(expr, bound, free);
+        }
+        ast::ExprKind::Refine(inner) => {
+            collect_free_vars(inner, bound, free);
         }
     }
 }
@@ -8460,6 +8684,7 @@ fn pretty_expr(expr: &ast::Expr) -> String {
         }
         ast::ExprKind::UnitLit { value, .. } => pretty_expr(value),
         ast::ExprKind::Annot { expr, .. } => pretty_expr(expr),
+        ast::ExprKind::Refine(inner) => format!("refine {}", pretty_expr(inner)),
     }
 }
 

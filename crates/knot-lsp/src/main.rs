@@ -476,7 +476,7 @@ fn analyze_document(
         knot_compiler::desugar::desugar(&mut analysis_module);
 
         // Type inference
-        let (infer_diags, _monad_info, inferred_types, local_types) =
+        let (infer_diags, _monad_info, inferred_types, local_types, _refine_targets, _refined_types) =
             knot_compiler::infer::check(&analysis_module);
         all_diags.extend(infer_diags);
         type_info = inferred_types;
@@ -5352,6 +5352,7 @@ impl DefResolver {
             }
             ast::ExprKind::UnitLit { value, .. } => self.resolve_expr(value),
             ast::ExprKind::Annot { expr: inner, .. } => self.resolve_expr(inner),
+            ast::ExprKind::Refine(inner) => self.resolve_expr(inner),
         }
     }
 }
@@ -5538,6 +5539,9 @@ fn format_type_kind(ty: &TypeKind) -> String {
         TypeKind::Hole => "_".into(),
         TypeKind::UnitAnnotated { base, unit } => {
             format!("{}<{}>", format_type_kind(&base.node), format_unit_expr(unit))
+        }
+        TypeKind::Refined { base, .. } => {
+            format!("{} where ...", format_type_kind(&base.node))
         }
     }
 }

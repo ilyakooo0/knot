@@ -439,6 +439,7 @@ impl EffectChecker {
 
             ast::ExprKind::UnitLit { value, .. } => self.infer_effects(value),
             ast::ExprKind::Annot { expr: inner, .. } => self.infer_effects(inner),
+            ast::ExprKind::Refine(inner) => self.infer_effects(inner),
         }
     }
 

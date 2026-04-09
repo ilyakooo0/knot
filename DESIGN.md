@@ -971,21 +971,6 @@ set *people = union *people [{name: "Alice", age: 30}]  -- no change
 
 No surrogate IDs, no key declarations. Data identifies itself.
 
-### Subset Constraints (Optional)
-
-For referential integrity and uniqueness, express value relationships:
-
-```knot
-*orders : [{customer: Text, amount: Int}]
-*users : [{email: Text, name: Text}]
-
--- Referential integrity: every order's customer must appear in people's names
-*orders.customer <= *people.name
-
--- Uniqueness: email determines the full row (each email maps to at most one row)
-*users <= *users.email
-```
-
 ### Indexing
 
 Automatic. The runtime observes query patterns and indexes accordingly. No `CREATE INDEX`, no key declarations.
@@ -1337,6 +1322,258 @@ type Measurement = {distance: Float<m>, time: Float<s>}
 #### Interaction with Traits
 
 Units live outside the trait system as a compile-time overlay. The `Num` trait handles runtime dispatch for arithmetic; the compiler applies unit algebra rules as an additional layer. No changes to trait definitions are needed — `+` on `Float<m>` dispatches through `Num.add` at runtime while the compiler separately verifies that both operands share the unit `m` and propagates `m` to the result.
+
+### Refined Types
+
+A refined type is a base type restricted by a predicate. The predicate is an ordinary Knot function (`T -> Bool`) — any pure function works, no restrictions.
+
+#### Declaration
+
+```knot
+-- Standalone refined type
+type Nat = Int where \x -> x >= 0
+type Percentage = Float where \x -> x >= 0.0 && x <= 100.0
+type NonEmptyText = Text where \s -> length s > 0
+type Email = Text where \s -> contains "@" s && length s >= 3
+
+-- Stacking: inner refinement inherited, predicates conjoin
+type Age = Nat where \x -> x <= 150
+-- equivalent to: Int where \x -> x >= 0 && x <= 150
+```
+
+#### Per-Field Refinements
+
+Refinements attach to individual record fields:
+
+```knot
+type Person = {
+  name: Text where \s -> length s > 0,
+  age: Int where \x -> x >= 0 && x <= 150,
+  email: Text
+}
+```
+
+#### Cross-Field Refinements
+
+A `where` after the closing `}` constrains the whole record. Multiple `where` clauses are conjunctive:
+
+```knot
+type DateRange = {
+  start: Int,
+  end: Int
+} where \r -> r.start <= r.end
+
+type Discount = {
+  percent: Float where \x -> x >= 0.0 && x <= 1.0,
+  minQty: Int where \x -> x >= 0
+} where \d -> d.percent < 0.5 || d.minQty >= 10
+```
+
+#### ADT Constructor Refinements
+
+Refinements can appear on constructor fields:
+
+```knot
+data Shape
+  = Circle {radius: Float where \r -> r > 0.0}
+  | Rect {width: Float where \w -> w > 0.0, height: Float where \h -> h > 0.0}
+```
+
+#### Relation Constraints
+
+Source declarations support both value predicates and relational predicates:
+
+```knot
+*people : [{
+  name: Text where \s -> length s > 0,
+  age: Int where \x -> x >= 0
+}]
+  where \p -> p.age >= 13 || p.email == ""     -- cross-field value predicate
+
+*orders : [{customer: Text, amount: Int where \x -> x > 0}]
+  where .customer in *people.email              -- relational membership
+  where unique .email                           -- uniqueness
+  where \o -> o.amount <= 1000000               -- value predicate
+```
+
+Two relational constraint forms:
+
+- `.field in *rel.field` — every value of `.field` must appear in the referenced relation's field (referential integrity)
+- `unique .field` — field values must be unique across all rows
+
+These replace the old subset constraint syntax:
+
+```knot
+-- Old (removed):
+*orders.customer <= *people.name
+*users <= *users.email
+
+-- New:
+*orders : [...] where .customer in *people.name
+*users : [...] where unique .email
+```
+
+All constraints — field, cross-field, relational — are enforced by the Knot runtime at `set` boundaries. Nothing is pushed to SQLite. The runtime mediates all writes, so there is no escape hatch.
+
+#### Subtyping
+
+`Refined(T, p) <: T`. A refined type is a subtype of its base.
+
+```
+Nat <: Int
+Age <: Nat <: Int
+```
+
+Upcasting (refined → base) is implicit, no check:
+
+```knot
+f : Int -> Int
+f (x : Nat)         -- fine: Nat <: Int
+```
+
+Downcasting (base → refined) requires `refine`. `refine expr` has type `Result RefinementError T` where `T` is the target refined type, inferred from context. If context doesn't determine `T`, it's a type error.
+
+```knot
+f : Nat -> Text
+
+-- In a Result do-block (bind unwraps the Result):
+do
+  n <- refine someInt        -- n : Nat (inferred from f's parameter type)
+  yield (f n)
+-- : Result RefinementError Text
+
+-- With case:
+case refine someInt of
+  Ok {value: n} -> f n       -- Nat inferred from f's parameter
+  Err {error}   -> "invalid"
+```
+
+Two refined types with the same base but different predicates are unrelated — no subtyping between `Nat` and `Percentage`. Stacked refinements are the exception: `Age <: Nat` because `Age` was defined as `Nat where ...`.
+
+Arithmetic on refined types returns the base type:
+
+```knot
+x : Nat = ...
+y : Nat = ...
+x + y    -- Int, not Nat (no attempt to prove result satisfies predicate)
+```
+
+#### The `refine` Expression
+
+`refine expr` checks the refinement predicate at runtime. It returns `Result RefinementError T` where `T` is the target refined type, inferred from context:
+
+```knot
+-- Target type Nat inferred from binding annotation
+let r : Result RefinementError Nat = refine 42
+-- r = Ok {value: 42}
+
+let r : Result RefinementError Nat = refine (-1)
+-- r = Err {error: {typeName: "Nat", violations: [{field: Nothing {}, message: "expected x >= 0, got -1"}]}}
+```
+
+The error type:
+
+```knot
+type RefinementError = {
+  typeName: Text,
+  violations: [{
+    field: Maybe Text,   -- Nothing for whole-value, Just "age" for field-level
+    message: Text
+  }]
+}
+```
+
+`refine` checks all predicates and reports all violations, not just the first.
+
+In do-blocks over `Result`, `<-` unwraps on `Ok` and short-circuits on `Err`:
+
+```knot
+validateOrder : {customer: Text, amount: Int} -> Result RefinementError {customer: NonEmptyText, amount: Nat}
+validateOrder = \raw -> do
+  customer <- refine raw.customer    -- NonEmptyText inferred from return type
+  amount   <- refine raw.amount      -- Nat inferred from return type
+  yield {customer, amount}
+```
+
+#### Boundary Checking
+
+Checks happen at two boundaries:
+
+| Boundary | Mechanism | On failure |
+|----------|-----------|------------|
+| `refine expr` | Explicit coercion | Returns `Result RefinementError T` |
+| `set *rel = value` | Implicit per-row check | Panics with `RefinementError` |
+
+`set` panics because constraint violations at the persistence boundary are programming errors — input should be validated with `refine` first. For explicit error handling at the `set` boundary, use `trySet`:
+
+```knot
+trySet : *[a] -> [a] -> IO {} (Result RefinementError {})
+```
+
+#### Predicates
+
+Predicates in type-level refinements must be **pure** — no IO, no relation references. They are ordinary Knot functions with no restrictions on what pure operations they use (recursion, pattern matching, higher-order functions, etc.).
+
+Predicates in relation `where` clauses follow the same rule — they are pure functions over individual rows. Relational constraints (`.field in`, `unique`) are separate syntactic forms, not predicates.
+
+#### Interaction with Units
+
+Units and refinements are orthogonal — units are compile-time phantom, refinements are runtime-checked:
+
+```knot
+type PositiveDistance = Float<m> where \x -> x > 0.0
+type Speed = Float<m/s> where \x -> x >= 0.0
+```
+
+#### Schema Evolution
+
+Refinements are part of the schema, tracked in the lockfile:
+
+| Change | Compiler action |
+|--------|-----------------|
+| Add refinement to existing field | Warning: tightening — existing data may violate |
+| Remove refinement | Auto-update lockfile (loosening) |
+| Change predicate | Error: require `migrate` |
+
+Adding a refinement to an existing relation requires a validation migration to ensure existing data satisfies the new predicate.
+
+#### Full Example
+
+```knot
+type Nat = Int where \x -> x >= 0
+type NonEmptyText = Text where \s -> length s > 0
+type Email = Text where \s -> contains "@" s && length s >= 3
+
+type Person = {
+  name: NonEmptyText,
+  age: Nat where \x -> x <= 150,
+  email: Email
+} where \p -> p.age >= 13
+
+*people : [Person]
+
+*orders : [{
+  customer: Email,
+  amount: Nat where \x -> x <= 1000000,
+  items: [{name: NonEmptyText, qty: Nat where \q -> q > 0}]
+}]
+  where .customer in *people.email
+
+route Api where
+  POST {name: Text, age: Int, email: Text}  /users -> {ok: Bool, error: Maybe Text}  = CreateUser
+
+serve = \req -> case req of
+  CreateUser {name, age, email, respond} -> do
+    case refine {name, age, email} of    -- Person inferred from set *people
+      Ok {value: person} -> do
+        atomic do
+          people <- *people
+          set *people = union people [person]
+        respond {ok: true, error: Nothing {}}
+      Err {error} -> do
+        let msg = fold (\acc v -> acc ++ v.message ++ "; ") "" error.violations
+        respond {ok: false, error: Just {value: msg}}
+```
 
 ### Traits
 

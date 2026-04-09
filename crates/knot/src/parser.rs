@@ -1641,6 +1641,16 @@ impl Parser {
                     Span::new(start.start, end_sp.end),
                 ))
             }
+            TokenKind::Refine => {
+                let start = self.span();
+                self.advance();
+                let e = self.parse_expr()?;
+                let end_sp = e.span;
+                Some(Spanned::new(
+                    ExprKind::Refine(Box::new(e)),
+                    Span::new(start.start, end_sp.end),
+                ))
+            }
             TokenKind::Let => self.parse_let_in_expr(),
             _ => self.parse_expr_bp(0),
         }
@@ -2883,7 +2893,7 @@ impl Parser {
     }
 
     fn parse_type_function(&mut self) -> Option<Type> {
-        let lhs = self.parse_type_app()?;
+        let lhs = self.parse_type_refined()?;
         if self.eat(&TokenKind::Arrow) {
             if !self.enter_recursion() { return None; }
             self.skip_newlines();
@@ -2900,6 +2910,23 @@ impl Parser {
             ))
         } else {
             Some(lhs)
+        }
+    }
+
+    fn parse_type_refined(&mut self) -> Option<Type> {
+        let base = self.parse_type_app()?;
+        if self.eat(&TokenKind::Where) {
+            let predicate = self.parse_expr()?;
+            let span = Span::new(base.span.start, predicate.span.end);
+            Some(Spanned::new(
+                TypeKind::Refined {
+                    base: Box::new(base),
+                    predicate: Box::new(predicate),
+                },
+                span,
+            ))
+        } else {
+            Some(base)
         }
     }
 

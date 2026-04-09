@@ -35,6 +35,12 @@ pub enum IoEffect {
 /// Maps desugared do-block spans to their resolved monad type.
 pub type MonadInfo = HashMap<Span, MonadKind>;
 
+/// Maps `refine` expression spans to their resolved refined type name.
+pub type RefineTargets = HashMap<Span, String>;
+
+/// Refined type info exported for codegen: type_name → predicate expression.
+pub type RefinedTypeInfoMap = HashMap<String, knot::ast::Expr>;
+
 /// Maps declaration names to their inferred type display strings.
 pub type TypeInfo = HashMap<String, String>;
 
@@ -367,6 +373,12 @@ struct Infer {
     /// Maps show call-site spans to their unit display strings (for codegen).
     #[allow(dead_code)]
     pub show_unit_strings: HashMap<Span, String>,
+
+    // ── Refined types ─────────────────────────────────────────────
+    /// Refined type metadata: type_name → (base Ty, predicate Expr).
+    refined_types: HashMap<String, (Ty, knot::ast::Expr)>,
+    /// Refine expression type vars: (span, alpha_var, inner_ty) for post-inference resolution.
+    refine_vars: Vec<(Span, TyVar, Ty)>,
 }
 
 // ── Core operations ───────────────────────────────────────────────
@@ -401,6 +413,8 @@ impl Infer {
             unit_subst: HashMap::new(),
             declared_units: HashMap::new(),
             show_unit_strings: HashMap::new(),
+            refined_types: HashMap::new(),
+            refine_vars: Vec::new(),
         }
     }
 
@@ -885,6 +899,21 @@ impl Infer {
                     };
                     self.unify_variants(c1, *r1, &ec, er, span);
                 }
+            }
+            // Refined type subsumption: Con("Nat", []) ↔ Int, etc.
+            (Ty::Con(name, args), other)
+                if args.is_empty() && self.refined_types.contains_key(name) =>
+            {
+                let base_ty = self.refined_types[name].0.clone();
+                let other = other.clone();
+                self.unify(&base_ty, &other, span);
+            }
+            (other, Ty::Con(name, args))
+                if args.is_empty() && self.refined_types.contains_key(name) =>
+            {
+                let base_ty = self.refined_types[name].0.clone();
+                let other = other.clone();
+                self.unify(&other, &base_ty, span);
             }
             _ => {
                 let d1 = self.display_ty(&t1);
@@ -1667,6 +1696,12 @@ impl Infer {
                     }
                 }
             }
+
+            ast::TypeKind::Refined { base, .. } => {
+                // Inline refined types resolve to their base type.
+                // Named refined type aliases are kept nominal (handled in Named arm).
+                self.ast_type_to_ty(base)
+            }
         }
     }
 
@@ -2246,6 +2281,28 @@ impl Infer {
                 let annot_ty = self.ast_type_to_ty(ty);
                 self.unify(&inner_ty, &annot_ty, expr.span);
                 annot_ty
+            }
+
+            ast::ExprKind::Refine(inner) => {
+                let inner_ty = self.infer_expr(inner);
+                let alpha = self.fresh();
+                // Unify alpha with inner_ty so the Result type is fully determined.
+                // Context may further constrain alpha to a refined type via subsumption.
+                self.unify(&inner_ty, &alpha, expr.span);
+                let alpha_var = match &alpha {
+                    Ty::Var(v) => *v,
+                    _ => unreachable!(),
+                };
+                self.refine_vars.push((expr.span, alpha_var, inner_ty));
+                // Return Result RefinementError alpha
+                // Use the actual record type for RefinementError (not Con) so field access works
+                let refinement_error_ty = self.aliases.get("RefinementError")
+                    .cloned()
+                    .unwrap_or_else(|| Ty::Con("RefinementError".into(), vec![]));
+                Ty::Con(
+                    "Result".into(),
+                    vec![refinement_error_ty, alpha],
+                )
             }
         }
     }
@@ -3000,14 +3057,24 @@ impl Infer {
 
     fn collect_types(&mut self, module: &ast::Module) {
         // First pass: type aliases (multi-pass to handle forward references)
-        let alias_decls: Vec<_> = module.decls.iter().filter_map(|decl| {
+        // Separate refined type aliases from regular ones.
+        let mut alias_decls: Vec<(String, ast::Type)> = Vec::new();
+        let mut refined_alias_decls: Vec<(String, ast::Type, ast::Expr)> = Vec::new();
+        for decl in &module.decls {
             if let ast::DeclKind::TypeAlias { name, params, ty } = &decl.node {
                 if params.is_empty() {
-                    return Some((name.clone(), ty.clone()));
+                    if let ast::TypeKind::Refined { base, predicate } = &ty.node {
+                        refined_alias_decls.push((
+                            name.clone(),
+                            (**base).clone(),
+                            (**predicate).clone(),
+                        ));
+                    } else {
+                        alias_decls.push((name.clone(), ty.clone()));
+                    }
                 }
             }
-            None
-        }).collect();
+        }
         // Iterate until alias resolutions stabilize (fixpoint).
         // Clear annotation_vars once before the loop so that type variable
         // names (e.g. `a` in `type T = a`) map to stable TyVars across
@@ -3026,6 +3093,13 @@ impl Infer {
             if !changed {
                 break;
             }
+        }
+
+        // Populate refined types (after alias fixpoint so bases can reference aliases)
+        for (name, base_ty_ast, predicate) in &refined_alias_decls {
+            let base_ty = self.ast_type_to_ty(base_ty_ast);
+            self.refined_types
+                .insert(name.clone(), (base_ty, predicate.clone()));
         }
 
         // Collect unit declarations
@@ -3348,6 +3422,25 @@ impl Infer {
                     ("Ok".into(), vec![("value".into(), ast::Type::new(ast::TypeKind::Var("a".into()), dummy_span))]),
                 ],
             },
+        );
+
+        // Built-in type: RefinementError = {typeName: Text, violations: [{field: Maybe Text, message: Text}]}
+        // Register as a type alias so field access (e.typeName) works.
+        self.aliases.insert(
+            "RefinementError".into(),
+            Ty::Record(
+                BTreeMap::from([
+                    ("typeName".into(), Ty::Text),
+                    ("violations".into(), Ty::Relation(Box::new(Ty::Record(
+                        BTreeMap::from([
+                            ("field".into(), Ty::Con("Maybe".into(), vec![Ty::Text])),
+                            ("message".into(), Ty::Text),
+                        ]),
+                        None,
+                    )))),
+                ]),
+                None,
+            ),
         );
 
         // println : ∀a. a -> IO {console} {}
@@ -4453,7 +4546,7 @@ fn display_ty_clean_inner(ty: &Ty, names: &HashMap<TyVar, usize>, in_fun: bool) 
 /// Run type inference on a parsed module. Returns diagnostics,
 /// resolved monad info for desugared do-blocks, and inferred type info
 /// mapping declaration names to their display type strings.
-pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, LocalTypeInfo) {
+pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, LocalTypeInfo, RefineTargets, RefinedTypeInfoMap) {
     let mut infer = Infer::new();
 
     // Phase 1: Collect type aliases, data types, constructors
@@ -4465,11 +4558,16 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
     // Phase 2b: Collect known trait implementations
     infer.collect_impls(module);
 
-    // Phase 2c: Register builtin [] impls for HKT traits
+    // Phase 2c: Register builtin [] and Result impls for HKT traits
     for trait_name in &["Functor", "Applicative", "Monad", "Alternative", "Foldable", "Traversable"] {
         infer
             .known_impls
             .insert((trait_name.to_string(), "[]".to_string()));
+    }
+    for trait_name in &["Functor", "Applicative", "Monad", "Alternative"] {
+        infer
+            .known_impls
+            .insert((trait_name.to_string(), "Result".to_string()));
     }
 
     // Phase 3: Pre-register top-level names (builtins, functions, trait methods)
@@ -4506,10 +4604,50 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
         monad_info.insert(*span, kind);
     }
 
+    // Phase 6: Resolve refine expression targets
+    let mut refine_targets = RefineTargets::new();
+    for (span, var, _inner_ty) in &infer.refine_vars {
+        let resolved = infer.apply(&Ty::Var(*var));
+        if let Ty::Con(name, args) = &resolved {
+            if args.is_empty() && infer.refined_types.contains_key(name) {
+                refine_targets.insert(*span, name.clone());
+                continue;
+            }
+        }
+        // Alpha resolved to a base type (e.g. Int). Search for a refined type
+        // whose base matches — this handles the do-block case where subsumption
+        // unified alpha with the base type rather than the refined type.
+        let mut found = None;
+        for (name, (base_ty, _)) in &infer.refined_types {
+            if *base_ty == resolved {
+                found = Some(name.clone());
+                break;
+            }
+        }
+        if let Some(name) = found {
+            refine_targets.insert(*span, name);
+        } else {
+            infer.errors.push((
+                format!(
+                    "cannot infer refined type target for refine expression (got {}); use a context that constrains the type (e.g., pass to a function expecting a refined type)",
+                    infer.display_ty(&resolved)
+                ),
+                *span,
+            ));
+        }
+    }
+
+    // Export refined type predicates for codegen
+    let refined_type_info: RefinedTypeInfoMap = infer
+        .refined_types
+        .iter()
+        .map(|(name, (_, pred))| (name.clone(), pred.clone()))
+        .collect();
+
     let type_info = infer.extract_type_info();
     let local_type_info = infer.extract_local_type_info();
 
-    (infer.to_diagnostics(), monad_info, type_info, local_type_info)
+    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
@@ -4527,7 +4665,9 @@ mod tests {
     }
 
     fn check_src(src: &str) -> Vec<Diagnostic> {
-        let (diags, _monad_info, _type_info, _local_types) = check(&parse(src));
+        let mut module = parse(src);
+        crate::desugar::desugar(&mut module);
+        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types) = check(&module);
         diags
     }
 
@@ -5283,6 +5423,87 @@ mod tests {
         // Unary negation should preserve units
         let diags = check_src(
             "unit m\nmain = -(5.0<m>) + 3.0<m>"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    // ── Refined types ─────────────────────────────────────────────
+
+    #[test]
+    fn refined_type_alias_definition() {
+        // Defining a refined type should not produce errors
+        let diags = check_src("type Nat = Int where \\x -> x >= 0\nmain = 42");
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn refined_type_subsumption() {
+        // A function accepting Nat should accept Int via subsumption
+        let diags = check_src(
+            "type Nat = Int where \\x -> x >= 0\nf : Nat -> Int\nf = \\x -> x\nmain = f 42"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn refined_type_in_record() {
+        // Inline refined type in a record should parse and type-check
+        let diags = check_src(
+            "type Person = {name: Text, age: Int where \\x -> x >= 0}\nmain = 1"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn refine_expr_with_case() {
+        // refine should return Result RefinementError T, usable with case
+        let diags = check_src(
+            "type Nat = Int where \\x -> x >= 0\nf : Nat -> Int\nf = \\x -> x\nmain = case refine 42 of\n  Ok {value: n} -> f n\n  Err {error: _} -> 0"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn refine_expr_in_result_do_block() {
+        // refine in a do-block should use Result monad (bind short-circuits on Err)
+        let diags = check_src(
+            "type Nat = Int where \\x -> x >= 0\nf : Nat -> Int\nf = \\x -> x\nmain = do\n  n <- refine 42\n  yield (f n)"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn refined_type_stacking() {
+        // Stacked refinements: Age = Nat where <= 150, Nat = Int where >= 0
+        let diags = check_src(
+            "type Nat = Int where \\x -> x >= 0\ntype Age = Nat where \\x -> x <= 150\nf : Age -> Int\nf = \\x -> x\nmain = f 25"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn refined_type_with_units() {
+        // Refinement and units are orthogonal
+        let diags = check_src(
+            "unit m\ntype PosFloat = Float where \\x -> x > 0.0\nmain = 1"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn refine_target_must_be_refined_type() {
+        // refine with a non-refined target should error
+        let diags = check_src(
+            "main = case refine 42 of\n  Ok {value: n} -> n\n  Err {error: _} -> 0"
+        );
+        assert!(has_error(&diags, "cannot infer refined type target"));
+    }
+
+    #[test]
+    fn refined_cross_field() {
+        // Cross-field refinement on a record type
+        let diags = check_src(
+            "type Range = {lo: Int, hi: Int} where \\r -> r.lo <= r.hi\nmain = 1"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }

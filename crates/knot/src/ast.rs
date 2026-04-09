@@ -279,6 +279,9 @@ pub enum ExprKind {
         expr: Box<Expr>,
         ty: Type,
     },
+
+    /// `refine expr` — runtime refinement check, returns Result.
+    Refine(Box<Expr>),
 }
 
 impl ExprKind {
@@ -444,6 +447,12 @@ pub enum TypeKind {
     UnitAnnotated {
         base: Box<Type>,
         unit: UnitExpr,
+    },
+
+    /// `T where \x -> predicate` — refined type.
+    Refined {
+        base: Box<Type>,
+        predicate: Box<Expr>,
     },
 }
 

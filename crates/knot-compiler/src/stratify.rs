@@ -164,6 +164,9 @@ fn collect_edges(
         ast::ExprKind::Annot { expr: inner, .. } => {
             collect_edges(inner, polarity, derived_names, out);
         }
+        ast::ExprKind::Refine(inner) => {
+            collect_edges(inner, polarity, derived_names, out);
+        }
     }
 }
 

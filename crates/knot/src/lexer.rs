@@ -46,6 +46,7 @@ pub enum TokenKind {
     With,
     Export,
     Unit,
+    Refine,
 
     // Delimiters
     LParen,
@@ -131,6 +132,7 @@ impl TokenKind {
             TokenKind::With => "'with'",
             TokenKind::Export => "'export'",
             TokenKind::Unit => "'unit'",
+            TokenKind::Refine => "'refine'",
             TokenKind::LParen => "'('",
             TokenKind::RParen => "')'",
             TokenKind::LBrace => "'{'",
@@ -197,6 +199,7 @@ impl TokenKind {
             TokenKind::With => Some("with"),
             TokenKind::Export => Some("export"),
             TokenKind::Unit => Some("unit"),
+            TokenKind::Refine => Some("refine"),
             _ => None,
         }
     }
@@ -425,6 +428,7 @@ impl<'src> Lexer<'src> {
                 "with" => return TokenKind::With,
                 "export" => return TokenKind::Export,
                 "unit" => return TokenKind::Unit,
+                "refine" => return TokenKind::Refine,
                 "true" => return TokenKind::Bool(true),
                 "false" => return TokenKind::Bool(false),
                 _ => {}

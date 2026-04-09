@@ -6665,6 +6665,155 @@ pub extern "C" fn knot_source_read_at(
 
 // ── Subset constraints ────────────────────────────────────────────
 
+// ── Result monad operations ──────────────────────────────────────
+
+/// Result.bind: (a -> Result e b) -> Result e a -> Result e b
+/// If Ok, apply function to value. If Err, propagate.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_result_bind(
+    db: *mut c_void,
+    func: *mut Value,
+    result: *mut Value,
+) -> *mut Value {
+    match unsafe { as_ref(result) } {
+        Value::Constructor(tag, payload) if tag == "Ok" => {
+            // Extract value from Ok {value: v}
+            let v = knot_record_field(*payload, "value".as_ptr(), "value".len());
+            knot_value_call(db, func, v)
+        }
+        Value::Constructor(tag, _) if tag == "Err" => {
+            // Propagate error
+            result
+        }
+        _ => result,
+    }
+}
+
+/// Result.yield (pure/return): a -> Result e a
+/// Wraps value in Ok {value: a}
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_result_yield(value: *mut Value) -> *mut Value {
+    let rec = alloc(Value::Record(vec![
+        RecordField { name: "value".to_string(), value },
+    ]));
+    alloc(Value::Constructor("Ok".to_string(), rec))
+}
+
+/// Result.empty: Result e a (always Err)
+/// Returns Err {error: {typeName: "", violations: []}}
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_result_empty() -> *mut Value {
+    let violations = alloc(Value::Relation(Vec::new()));
+    let error_rec = alloc(Value::Record(vec![
+        RecordField { name: "typeName".to_string(), value: alloc(Value::Text(String::new())) },
+        RecordField { name: "violations".to_string(), value: violations },
+    ]));
+    let err_rec = alloc(Value::Record(vec![
+        RecordField { name: "error".to_string(), value: error_rec },
+    ]));
+    alloc(Value::Constructor("Err".to_string(), err_rec))
+}
+
+// ── Refinement validation ─────────────────────────────────────────
+
+/// Validate that all rows in a relation satisfy a predicate.
+/// Panics with a descriptive error if any row fails.
+/// `field_ptr`/`field_len` = field name (empty string if whole-element check).
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_refinement_validate_relation(
+    db: *mut c_void,
+    relation: *mut Value,
+    predicate: *mut Value,
+    type_name_ptr: *const u8,
+    type_name_len: usize,
+    field_ptr: *const u8,
+    field_len: usize,
+) {
+    let type_name = unsafe { str_from_raw(type_name_ptr, type_name_len) };
+    let field_name = unsafe { str_from_raw(field_ptr, field_len) };
+    let rows = match unsafe { as_ref(relation) } {
+        Value::Relation(rows) => rows,
+        _ => {
+            // Single value — check directly
+            let result = knot_value_call(db, predicate, relation);
+            match unsafe { as_ref(result) } {
+                Value::Bool(true) => return,
+                _ => panic!(
+                    "refinement violation: value does not satisfy '{}' predicate",
+                    type_name
+                ),
+            }
+        }
+    };
+    for (i, row) in rows.iter().enumerate() {
+        let check_val = if field_name.is_empty() {
+            *row
+        } else {
+            // Extract the field from the record
+            let field_ptr_inner = field_name.as_ptr();
+            let field_len_inner = field_name.len();
+            knot_record_field(*row, field_ptr_inner, field_len_inner)
+        };
+        let result = knot_value_call(db, predicate, check_val);
+        match unsafe { as_ref(result) } {
+            Value::Bool(true) => {}
+            _ => {
+                if field_name.is_empty() {
+                    panic!(
+                        "refinement violation: row {} does not satisfy '{}' predicate",
+                        i, type_name
+                    );
+                } else {
+                    panic!(
+                        "refinement violation: row {} field '{}' does not satisfy '{}' predicate",
+                        i, field_name, type_name
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Validate that a single value (from JSON decode) satisfies a predicate.
+/// Returns 1 if valid, 0 if not.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_refinement_check_value(
+    db: *mut c_void,
+    value: *mut Value,
+    predicate: *mut Value,
+) -> i32 {
+    let result = knot_value_call(db, predicate, value);
+    match unsafe { as_ref(result) } {
+        Value::Bool(true) => 1,
+        _ => 0,
+    }
+}
+
+/// Register a refinement predicate for a route body field.
+/// Called during program initialization after route table is set up.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_route_set_field_refinement(
+    table: *mut c_void,
+    ctor_ptr: *const u8,
+    ctor_len: usize,
+    field_ptr: *const u8,
+    field_len: usize,
+    predicate: *mut Value,
+    type_name_ptr: *const u8,
+    type_name_len: usize,
+) {
+    let ctor = unsafe { str_from_raw(ctor_ptr, ctor_len) };
+    let field = unsafe { str_from_raw(field_ptr, field_len) };
+    let type_name = unsafe { str_from_raw(type_name_ptr, type_name_len) };
+    let table = unsafe { &mut *(table as *mut RouteTable) };
+    table.field_refinements.push(FieldRefinement {
+        constructor: ctor.to_string(),
+        field_name: field.to_string(),
+        predicate,
+        type_name: type_name.to_string(),
+    });
+}
+
 /// Register a subset constraint. Called at program startup.
 /// Empty field strings mean "no field" (whole relation).
 #[unsafe(no_mangle)]
@@ -7558,9 +7707,32 @@ struct RouteTableEntry {
     response_headers: Vec<(String, String)>,
 }
 
+struct FieldRefinement {
+    constructor: String,
+    field_name: String,
+    predicate: *mut Value,
+    type_name: String,
+}
+
+// Safety: predicate is a Knot function value that lives for the program's lifetime
+unsafe impl Send for FieldRefinement {}
+unsafe impl Sync for FieldRefinement {}
+
+impl Clone for FieldRefinement {
+    fn clone(&self) -> Self {
+        Self {
+            constructor: self.constructor.clone(),
+            field_name: self.field_name.clone(),
+            predicate: self.predicate,
+            type_name: self.type_name.clone(),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct RouteTable {
     entries: Vec<RouteTableEntry>,
+    field_refinements: Vec<FieldRefinement>,
 }
 
 fn parse_descriptor(desc: &str) -> Vec<(String, String)> {
@@ -7598,6 +7770,7 @@ fn parse_path_pattern(path: &str) -> Vec<PathPart> {
 pub extern "C" fn knot_route_table_new() -> *mut c_void {
     let table = Box::new(RouteTable {
         entries: Vec::new(),
+        field_refinements: Vec::new(),
     });
     Box::into_raw(table) as *mut c_void
 }
@@ -8008,6 +8181,11 @@ pub extern "C" fn knot_http_listen(
                 let entry_request_headers = entry.request_headers.clone();
                 let entry_response_headers = entry.response_headers.clone();
                 let entry_constructor = entry.constructor.clone();
+                let entry_refinements: Vec<FieldRefinement> = table.field_refinements
+                    .iter()
+                    .filter(|r| r.constructor == entry_constructor)
+                    .cloned()
+                    .collect();
 
                 // Deep-clone handler for the worker thread
                 let handler_cloned = deep_clone_value(handler) as usize;
@@ -8161,6 +8339,19 @@ pub extern "C" fn knot_http_listen(
                             name: hname.clone(),
                             value,
                         });
+                    }
+
+                    // Validate refined body fields
+                    for refinement in &entry_refinements {
+                        if let Some(field) = fields.iter().find(|f| f.name == refinement.field_name) {
+                            let check = knot_refinement_check_value(db, field.value, refinement.predicate);
+                            if check == 0 {
+                                return Err((400, format!(
+                                    "validation error: field '{}' does not satisfy '{}' constraint",
+                                    refinement.field_name, refinement.type_name
+                                )));
+                            }
+                        }
                     }
 
                     // Add `respond` field

@@ -47,6 +47,11 @@ pub struct TypeEnv {
     pub history_sources: HashSet<String>,
     /// Subset constraints: (sub, sup)
     pub subset_constraints: Vec<(RelationPath, RelationPath)>,
+    /// Source refined field info: source_name -> [(field_name_or_none, refined_type_name, predicate_expr)]
+    /// None field_name means the whole element type is refined.
+    pub source_refinements: HashMap<String, Vec<(Option<String>, String, Expr)>>,
+    /// Refined type aliases: type_name -> predicate expr
+    pub refined_types: HashMap<String, Expr>,
 }
 
 impl TypeEnv {
@@ -58,14 +63,24 @@ impl TypeEnv {
         let mut associated_types: HashMap<String, Vec<AssocTypeDef>> = HashMap::new();
         let mut history_sources = HashSet::new();
 
+        let mut refined_types: HashMap<String, Expr> = HashMap::new();
+
         // First pass: collect type aliases and data types
         for decl in &module.decls {
             match &decl.node {
                 DeclKind::TypeAlias { name, params, ty } => {
                     if params.is_empty() {
-                        let resolved =
-                            resolve_type(ty, &aliases, &associated_types);
-                        aliases.insert(name.clone(), resolved);
+                        // Track refined type aliases separately
+                        if let TypeKind::Refined { base, predicate } = &ty.node {
+                            refined_types.insert(name.clone(), (**predicate).clone());
+                            let resolved =
+                                resolve_type(base, &aliases, &associated_types);
+                            aliases.insert(name.clone(), resolved);
+                        } else {
+                            let resolved =
+                                resolve_type(ty, &aliases, &associated_types);
+                            aliases.insert(name.clone(), resolved);
+                        }
                     }
                 }
                 DeclKind::Data {
@@ -169,6 +184,7 @@ impl TypeEnv {
 
         // Second pass: compute source schemas, migration schemas, and subset constraints
         let mut subset_constraints = Vec::new();
+        let mut source_refinements: HashMap<String, Vec<(Option<String>, String, Expr)>> = HashMap::new();
         for decl in &module.decls {
             match &decl.node {
                 DeclKind::Source { name, ty, history } => {
@@ -177,6 +193,11 @@ impl TypeEnv {
                     source_schemas.insert(name.clone(), schema);
                     if *history {
                         history_sources.insert(name.clone());
+                    }
+                    // Collect refined field info from the source type
+                    let refinements = collect_source_refinements(ty, &refined_types, &aliases);
+                    if !refinements.is_empty() {
+                        source_refinements.insert(name.clone(), refinements);
                     }
                 }
                 DeclKind::Migrate {
@@ -218,8 +239,65 @@ impl TypeEnv {
             associated_types,
             history_sources,
             subset_constraints,
+            source_refinements,
+            refined_types,
         }
     }
+}
+
+/// Walk a source's type (e.g., `[{name: NonEmptyText, age: Nat}]`) and collect
+/// refinement info: (field_name_or_none, refined_type_name, predicate_expr).
+fn collect_source_refinements(
+    ty: &Type,
+    refined_types: &HashMap<String, Expr>,
+    aliases: &HashMap<String, ResolvedType>,
+) -> Vec<(Option<String>, String, Expr)> {
+    let mut result = Vec::new();
+    // Unwrap [T] to get to the element type
+    let elem_ty = match &ty.node {
+        TypeKind::Relation(inner) => inner.as_ref(),
+        _ => ty,
+    };
+    match &elem_ty.node {
+        // Element type is a refined type alias: *scores : [Nat]
+        TypeKind::Named(name) if refined_types.contains_key(name) => {
+            result.push((None, name.clone(), refined_types[name].clone()));
+        }
+        // Element type is a record: check each field
+        TypeKind::Record { fields, .. } => {
+            for field in fields {
+                match &field.value.node {
+                    // Field has inline refinement: age: Int where \x -> x >= 0
+                    TypeKind::Refined { predicate, .. } => {
+                        result.push((
+                            Some(field.name.clone()),
+                            field.name.clone(),
+                            (**predicate).clone(),
+                        ));
+                    }
+                    // Field references a refined type alias: age: Nat
+                    TypeKind::Named(name) if refined_types.contains_key(name) => {
+                        result.push((
+                            Some(field.name.clone()),
+                            name.clone(),
+                            refined_types[name].clone(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Element type is a refined record: {..} where \p -> ...
+        TypeKind::Refined { base, predicate } => {
+            // Collect the cross-field predicate
+            result.push((None, "record".into(), (**predicate).clone()));
+            // Recurse into the base to collect field-level refinements
+            let inner_ty = Spanned::new(TypeKind::Relation(base.clone()), ty.span);
+            result.extend(collect_source_refinements(&inner_ty, refined_types, aliases));
+        }
+        _ => {}
+    }
+    result
 }
 
 fn resolve_type(
@@ -314,6 +392,10 @@ fn resolve_type(
         }
         TypeKind::UnitAnnotated { base, .. } => {
             // Units are phantom — erase for schema resolution
+            resolve_type(base, aliases, assoc_types)
+        }
+        TypeKind::Refined { base, .. } => {
+            // Refinements are phantom for schema — base type determines storage
             resolve_type(base, aliases, assoc_types)
         }
     }
@@ -602,6 +684,10 @@ fn apply_type_subst(ty: &Type, subst: &HashMap<String, Type>) -> Type {
         TypeKind::UnitAnnotated { base, unit } => TypeKind::UnitAnnotated {
             base: Box::new(apply_type_subst(base, subst)),
             unit: unit.clone(),
+        },
+        TypeKind::Refined { base, predicate } => TypeKind::Refined {
+            base: Box::new(apply_type_subst(base, subst)),
+            predicate: predicate.clone(),
         },
     };
     Spanned::new(new_node, ty.span)

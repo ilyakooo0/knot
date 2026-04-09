@@ -476,7 +476,7 @@ fn analyze_document(
         knot_compiler::desugar::desugar(&mut analysis_module);
 
         // Type inference
-        let (infer_diags, _monad_info, inferred_types, local_types, _refine_targets, _refined_types) =
+        let (infer_diags, _monad_info, inferred_types, local_types, _refine_targets, _refined_types, _from_json) =
             knot_compiler::infer::check(&analysis_module);
         all_diags.extend(infer_diags);
         type_info = inferred_types;

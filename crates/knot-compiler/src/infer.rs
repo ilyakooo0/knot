@@ -47,6 +47,9 @@ pub type TypeInfo = HashMap<String, String>;
 /// Maps binding spans (local variables, params, patterns) to their inferred type strings.
 pub type LocalTypeInfo = HashMap<Span, String>;
 
+/// Maps parseJson call-site spans to the resolved target type name for compile-time FromJSON dispatch.
+pub type FromJsonTargets = HashMap<Span, String>;
+
 // ── Units of measure ──────────────────────────────────────────────
 
 type UnitVar = u32;
@@ -316,6 +319,10 @@ struct Infer {
     /// concrete monad after inference completes.
     monad_vars: Vec<(Span, TyVar)>,
 
+    /// Tracks `parseJson` application sites for compile-time FromJSON dispatch.
+    /// Each entry records (app_span, return_type_var).
+    from_json_calls: Vec<(Span, TyVar)>,
+
     /// Trait method → trait name mapping (e.g. "display" → "Display").
     trait_method_traits: HashMap<String, String>,
 
@@ -390,6 +397,7 @@ impl Infer {
             annotation_vars: HashMap::new(),
             errors: Vec::new(),
             monad_vars: Vec::new(),
+            from_json_calls: Vec::new(),
             trait_method_traits: HashMap::new(),
             trait_method_param_vars: HashMap::new(),
             known_impls: HashSet::new(),
@@ -2117,6 +2125,16 @@ impl Infer {
                     Box::new(result_ty.clone()),
                 );
                 self.unify(&func_ty, &expected, expr.span);
+
+                // Track parseJson calls for compile-time FromJSON dispatch
+                if let ast::ExprKind::Var(name) = &func.node {
+                    if name == "parseJson" {
+                        if let Ty::Var(v) = &result_ty {
+                            self.from_json_calls.push((expr.span, *v));
+                        }
+                    }
+                }
+
                 result_ty
             }
 
@@ -3344,6 +3362,21 @@ impl Infer {
                 _ => {}
             }
         }
+
+        // Re-bind toJson/parseJson as unconstrained after trait processing.
+        // The ToJSON/FromJSON traits register these methods with constraints,
+        // but we want calling them to work on all types without explicit impls
+        // (the runtime provides generic JSON encoding/decoding for all types).
+        let a = self.fresh_var();
+        self.bind_top(
+            "toJson",
+            Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Text))),
+        );
+        let a = self.fresh_var();
+        self.bind_top(
+            "parseJson",
+            Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Var(a)))),
+        );
     }
 
     fn register_builtins(&mut self) {
@@ -3911,21 +3944,9 @@ impl Infer {
             Scheme::mono(Ty::Fun(Box::new(Ty::Bool), Box::new(Ty::Bool))),
         );
 
-        // ── JSON standard library ─────────────────────────────────
-
-        // toJson : ∀a. a -> Text
-        let a = self.fresh_var();
-        self.bind_top(
-            "toJson",
-            Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Text))),
-        );
-
-        // parseJson : ∀a. Text -> a
-        let a = self.fresh_var();
-        self.bind_top(
-            "parseJson",
-            Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Var(a)))),
-        );
+        // toJson and parseJson are now trait methods (ToJSON/FromJSON)
+        // registered via register_trait_methods from the prelude.
+        // They are re-bound as unconstrained after trait processing in pre_register().
 
         // ── File system standard library ─────────────────────────
 
@@ -4671,7 +4692,7 @@ fn display_ty_clean_inner(ty: &Ty, names: &HashMap<TyVar, usize>, in_fun: bool) 
 /// Run type inference on a parsed module. Returns diagnostics,
 /// resolved monad info for desugared do-blocks, and inferred type info
 /// mapping declaration names to their display type strings.
-pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, LocalTypeInfo, RefineTargets, RefinedTypeInfoMap) {
+pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, LocalTypeInfo, RefineTargets, RefinedTypeInfoMap, FromJsonTargets) {
     let mut infer = Infer::new();
 
     // Phase 1: Collect type aliases, data types, constructors
@@ -4774,10 +4795,34 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
         .map(|(name, (_, pred))| (name.clone(), pred.clone()))
         .collect();
 
+    // Phase 7: Resolve parseJson call targets for compile-time FromJSON dispatch
+    let mut from_json_targets = FromJsonTargets::new();
+    for (span, var) in &infer.from_json_calls {
+        let resolved = infer.apply(&Ty::Var(*var));
+        if let Some(name) = ty_to_type_name(&resolved) {
+            from_json_targets.insert(*span, name);
+        }
+    }
+
     let type_info = infer.extract_type_info();
     let local_type_info = infer.extract_local_type_info();
 
-    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info)
+    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets)
+}
+
+/// Extract a simple type name from a resolved type for trait dispatch purposes.
+fn ty_to_type_name(ty: &Ty) -> Option<String> {
+    match ty {
+        Ty::Int | Ty::IntUnit(_) => Some("Int".to_string()),
+        Ty::Float | Ty::FloatUnit(_) => Some("Float".to_string()),
+        Ty::Text => Some("Text".to_string()),
+        Ty::Bool => Some("Bool".to_string()),
+        Ty::Bytes => Some("Bytes".to_string()),
+        Ty::Con(name, _) => Some(name.clone()),
+        Ty::Relation(_) => Some("Relation".to_string()),
+        Ty::Record(_, _) => Some("Record".to_string()),
+        _ => None,
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
@@ -4797,7 +4842,7 @@ mod tests {
     fn check_src(src: &str) -> Vec<Diagnostic> {
         let mut module = parse(src);
         crate::desugar::desugar(&mut module);
-        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types) = check(&module);
+        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json) = check(&module);
         diags
     }
 

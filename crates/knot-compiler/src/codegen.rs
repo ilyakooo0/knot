@@ -142,6 +142,8 @@ pub struct Codegen {
     refine_targets: HashMap<knot::ast::Span, String>,
     // Compiled predicate function values: type_name -> func_id
     refined_predicate_fns: HashMap<String, FuncId>,
+    // parseJson call targets: app_span -> resolved return type name (for compile-time FromJSON dispatch)
+    from_json_targets: HashMap<knot::ast::Span, String>,
 }
 
 /// Role of a constructor in a nullable-encoded ADT.
@@ -267,6 +269,7 @@ pub fn compile(
     monad_info: &MonadInfo,
     refine_targets: &crate::infer::RefineTargets,
     refined_types: &crate::infer::RefinedTypeInfoMap,
+    from_json_targets: &crate::infer::FromJsonTargets,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     let mut cg = Codegen::new();
     // Derive database path from source filename: "foo.knot" → "foo.db"
@@ -288,6 +291,7 @@ pub fn compile(
     cg.monad_info = monad_info.clone();
     cg.refine_targets = refine_targets.clone();
     cg.refined_types = refined_types.clone();
+    cg.from_json_targets = from_json_targets.clone();
     cg.source_refinements = type_env.source_refinements.clone();
     for (name, fields) in &type_env.constructors {
         let field_strs: Vec<(String, String)> = fields
@@ -390,6 +394,7 @@ impl Codegen {
             refine_targets: HashMap::new(),
             refined_predicate_fns: HashMap::new(),
             source_refinements: HashMap::new(),
+            from_json_targets: HashMap::new(),
         }
     }
 
@@ -908,7 +913,6 @@ impl Codegen {
             "toUpper", "toLower", "take", "drop",
             "length", "trim", "contains", "reverse",
             "chars", "id", "not",
-            "toJson", "parseJson",
             "bytesLength", "bytesSlice", "bytesConcat",
             "textToBytes", "bytesToText", "bytesToHex", "bytesFromHex", "hexDecode",
             "bytesGet",
@@ -1008,6 +1012,14 @@ impl Codegen {
                             None
                         }
                     });
+                    // Extract regular type param name (e.g., "a" from `Eq a`)
+                    let type_param_name: Option<String> = params.iter().find_map(|p| {
+                        if p.kind.is_none() {
+                            Some(p.name.clone())
+                        } else {
+                            None
+                        }
+                    });
                     // Store supertrait relationships
                     let supertrait_names: Vec<String> = supertraits
                         .iter()
@@ -1033,6 +1045,7 @@ impl Codegen {
                                 };
                                 let dispatch_index = find_dispatch_index(
                                     hkt_param_name.as_deref(),
+                                    type_param_name.as_deref(),
                                     &ty.ty,
                                 );
                                 self.trait_methods
@@ -1296,7 +1309,8 @@ impl Codegen {
             .trait_methods
             .iter()
             .filter(|(name, info)| {
-                !info.impls.is_empty() && !self.user_fns.contains_key(name.as_str())
+                let has_fallback = has_trait_fallback(name);
+                (!info.impls.is_empty() || has_fallback) && !self.user_fns.contains_key(name.as_str())
             })
             .map(|(name, info)| (name.clone(), info.param_count))
             .collect();
@@ -1899,10 +1913,6 @@ impl Codegen {
         self.define_stdlib_fn_2("sum", "knot_relation_sum", true);
         self.define_stdlib_fn_2("avg", "knot_relation_avg", true);
 
-        // JSON: 1-param
-        self.define_stdlib_fn_1("toJson", "knot_json_encode");
-        self.define_stdlib_fn_1("parseJson", "knot_json_decode");
-
         // Bytes: 1-param
         self.define_stdlib_fn_1("bytesLength", "knot_bytes_length");
         self.define_stdlib_fn_1("textToBytes", "knot_text_to_bytes");
@@ -2139,7 +2149,14 @@ impl Codegen {
                 let dispatch_arg = match dispatch_index {
                     Some(idx) => all_params[idx],
                     None => {
-                        // No parameter carries the HKT variable — call first impl directly
+                        // No parameter carries the type variable — can't dispatch
+                        // at runtime. Use fallback if available, else first impl.
+                        let fallback_rt = trait_method_fallback(&method_name);
+                        if let Some(rt_fn) = fallback_rt {
+                            let result = cg.call_rt(builder, rt_fn, &all_params);
+                            builder.ins().return_(&[result]);
+                            return;
+                        }
                         if let Some((_, impl_func_id)) = impls.first() {
                             let impl_ref = cg
                                 .module
@@ -2370,17 +2387,7 @@ impl Codegen {
                 // Fallback: for operator-mapped trait methods, delegate to the
                 // runtime function (handles types without explicit impls like
                 // Record == Record). For other traits, panic with no-impl error.
-                let fallback_rt = match method_name.as_str() {
-                    "eq" => Some("knot_value_eq"),
-                    "compare" => Some("knot_value_compare"),
-                    "add" => Some("knot_value_add"),
-                    "sub" => Some("knot_value_sub"),
-                    "mul" => Some("knot_value_mul"),
-                    "div" => Some("knot_value_div"),
-                    "negate" => Some("knot_value_negate"),
-                    "append" => Some("knot_value_concat"),
-                    _ => None,
-                };
+                let fallback_rt = trait_method_fallback(&method_name);
                 if let Some(rt_fn) = fallback_rt {
                     let result = cg.call_rt(builder, rt_fn, &all_params);
                     builder.ins().jump(merge_block, &[result]);
@@ -4199,6 +4206,35 @@ impl Codegen {
                     "knot_relation_bind",
                     &[db, compiled_args[0], compiled_args[1]],
                 )
+            }
+
+            // Compile-time FromJSON dispatch: parseJson(text) → FromJSON_Type_parseJson
+            // when the return type is known and a FromJSON impl exists for that type
+            ast::ExprKind::Var(name) if name == "parseJson" && compiled_args.len() == 1 => {
+                if let Some(type_name) = self.from_json_targets.get(&expr.span) {
+                    let impl_fn = format!("FromJSON_{}_parseJson", type_name);
+                    if let Some(&(func_id, _)) = self.user_fns.get(&impl_fn) {
+                        let func_ref = self
+                            .module
+                            .declare_func_in_func(func_id, builder.func);
+                        let call = builder.ins().call(
+                            func_ref,
+                            &[db, compiled_args[0]],
+                        );
+                        return builder.inst_results(call)[0];
+                    }
+                }
+                // Fall through to generic parseJson (dispatcher or runtime)
+                if let Some(&(func_id, expected_params)) = self.user_fns.get("parseJson") {
+                    if compiled_args.len() == expected_params {
+                        let func_ref = self
+                            .module
+                            .declare_func_in_func(func_id, builder.func);
+                        let call = builder.ins().call(func_ref, &[db, compiled_args[0]]);
+                        return builder.inst_results(call)[0];
+                    }
+                }
+                self.call_rt(builder, "knot_json_decode", &[compiled_args[0]])
             }
 
             // Direct call to a known user function
@@ -8899,22 +8935,71 @@ fn pretty_stmt(stmt: &ast::Stmt) -> String {
 /// Returns `Some(index)` if the method has a parameter whose outermost type
 /// constructor is the trait's HKT variable (e.g., `f a` where `f` is the trait param).
 /// Returns `None` if no parameter uses the HKT variable (e.g., `yield : a -> f a`).
-fn find_dispatch_index(hkt_param: Option<&str>, ty: &ast::Type) -> Option<usize> {
-    let param_name = hkt_param?;
-    let mut current = ty;
-    let mut index = 0;
-    loop {
-        match &current.node {
-            ast::TypeKind::Function { param, result } => {
-                if type_uses_hkt_var(param, param_name) {
-                    return Some(index);
+fn find_dispatch_index(hkt_param: Option<&str>, type_param: Option<&str>, ty: &ast::Type) -> Option<usize> {
+    // First try HKT param (e.g., `f` in `Functor (f : Type -> Type)`)
+    if let Some(param_name) = hkt_param {
+        let mut current = ty;
+        let mut index = 0;
+        loop {
+            match &current.node {
+                ast::TypeKind::Function { param, result } => {
+                    if type_uses_hkt_var(param, param_name) {
+                        return Some(index);
+                    }
+                    index += 1;
+                    current = result;
                 }
-                index += 1;
-                current = result;
+                _ => break,
             }
-            _ => return None,
         }
     }
+    // Then try regular type param (e.g., `a` in `Eq a` or `ToJSON a`)
+    // Find the first function parameter that IS the type variable
+    if let Some(param_name) = type_param {
+        let mut current = ty;
+        let mut index = 0;
+        loop {
+            match &current.node {
+                ast::TypeKind::Function { param, result } => {
+                    if type_is_plain_var(param, param_name) {
+                        return Some(index);
+                    }
+                    index += 1;
+                    current = result;
+                }
+                _ => break,
+            }
+        }
+    }
+    None
+}
+
+/// Check if a type is exactly a named type variable (e.g., `a` matches param_name `a`).
+fn type_is_plain_var(ty: &ast::Type, param_name: &str) -> bool {
+    matches!(&ty.node, ast::TypeKind::Var(name) if name == param_name)
+}
+
+/// Runtime fallback function for a trait method, if any.
+/// Methods with fallbacks use the generic runtime function for types without explicit impls.
+fn trait_method_fallback(method_name: &str) -> Option<&'static str> {
+    match method_name {
+        "eq" => Some("knot_value_eq"),
+        "compare" => Some("knot_value_compare"),
+        "add" => Some("knot_value_add"),
+        "sub" => Some("knot_value_sub"),
+        "mul" => Some("knot_value_mul"),
+        "div" => Some("knot_value_div"),
+        "negate" => Some("knot_value_negate"),
+        "append" => Some("knot_value_concat"),
+        "toJson" => Some("knot_json_encode"),
+        "parseJson" => Some("knot_json_decode"),
+        _ => None,
+    }
+}
+
+/// Whether a trait method has a runtime fallback (used for dispatcher creation).
+fn has_trait_fallback(method_name: &str) -> bool {
+    trait_method_fallback(method_name).is_some()
 }
 
 /// Check if a type's outermost constructor is the given HKT variable.

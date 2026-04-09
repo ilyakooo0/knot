@@ -69,6 +69,12 @@ impl Display Bool where
 impl Alternative [] where
   empty = []
   alt a b = union a b
+
+trait ToJSON a where
+  toJson : a -> Text
+
+trait FromJSON a where
+  parseJson : Text -> a
 "#;
 
 /// Parse the prelude source and prepend its declarations to the user's module.

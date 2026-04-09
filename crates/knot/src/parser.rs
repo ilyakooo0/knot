@@ -517,7 +517,7 @@ impl Parser {
         let start = self.span();
         self.advance(); // consume `unit`
 
-        let (name, _) = self.expect_lower("expected unit name after 'unit'").ok()?;
+        let (name, _) = self.expect_upper("expected unit name after 'unit' (units must start with uppercase)").ok()?;
 
         let definition = if self.eat(&TokenKind::Eq) {
             Some(self.parse_unit_expr()?)
@@ -579,6 +579,11 @@ impl Parser {
 
     fn parse_unit_atom(&mut self) -> Option<UnitExpr> {
         match self.peek() {
+            TokenKind::Upper(_) => {
+                let tok = self.advance();
+                let TokenKind::Upper(name) = tok.kind else { unreachable!() };
+                Some(UnitExpr::Named(name))
+            }
             TokenKind::Lower(_) => {
                 let tok = self.advance();
                 let TokenKind::Lower(name) = tok.kind else { unreachable!() };

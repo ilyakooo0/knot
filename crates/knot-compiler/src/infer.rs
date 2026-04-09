@@ -248,19 +248,6 @@ impl Scheme {
             ty,
         }
     }
-
-    fn constrained(
-        vars: Vec<TyVar>,
-        constraints: Vec<TyConstraint>,
-        ty: Ty,
-    ) -> Self {
-        Scheme {
-            vars,
-            unit_vars: vec![],
-            constraints,
-            ty,
-        }
-    }
 }
 
 /// A deferred constraint check: after inference resolves type variables,
@@ -364,12 +351,16 @@ struct Infer {
 
     // ── Units of measure ──────────────────────────────────────────
     /// Next unit variable ID.
-    #[allow(dead_code)]
     next_unit_var: UnitVar,
     /// Unit variable substitution.
     unit_subst: HashMap<UnitVar, UnitTy>,
     /// Declared units: name → definition (None for base units).
     declared_units: HashMap<String, Option<UnitTy>>,
+    /// Unit variable names from type annotations: name → UnitVar.
+    annotation_unit_vars: HashMap<String, UnitVar>,
+    /// Whether we are currently processing a type annotation (so undeclared
+    /// unit names are treated as polymorphic unit variables).
+    in_type_annotation: bool,
     /// Maps show call-site spans to their unit display strings (for codegen).
     #[allow(dead_code)]
     pub show_unit_strings: HashMap<Span, String>,
@@ -412,6 +403,8 @@ impl Infer {
             next_unit_var: 0,
             unit_subst: HashMap::new(),
             declared_units: HashMap::new(),
+            annotation_unit_vars: HashMap::new(),
+            in_type_annotation: false,
             show_unit_strings: HashMap::new(),
             refined_types: HashMap::new(),
             refine_vars: Vec::new(),
@@ -428,7 +421,6 @@ impl Infer {
         v
     }
 
-    #[allow(dead_code)]
     fn fresh_unit_var(&mut self) -> UnitVar {
         let v = self.next_unit_var;
         self.next_unit_var += 1;
@@ -497,22 +489,32 @@ impl Infer {
     }
 
     /// Convert an AST UnitExpr to our internal UnitTy, expanding aliases.
-    fn ast_unit_to_unit_ty(&self, u: &ast::UnitExpr) -> UnitTy {
+    /// When `in_type_annotation` is true, undeclared unit names are treated
+    /// as polymorphic unit variables (analogous to type variables).
+    fn ast_unit_to_unit_ty(&mut self, u: &ast::UnitExpr) -> UnitTy {
         match u {
             ast::UnitExpr::Dimensionless => UnitTy::dimensionless(),
             ast::UnitExpr::Named(name) => {
                 // Check if it's a derived unit alias
                 if let Some(Some(def)) = self.declared_units.get(name) {
                     def.clone()
+                } else if self.in_type_annotation && name.starts_with(|c: char| c.is_lowercase()) {
+                    // In annotation context, lowercase unit names are variables
+                    let var = self.annotation_unit_var(name);
+                    UnitTy::var(var)
                 } else {
                     UnitTy::named(name)
                 }
             }
             ast::UnitExpr::Mul(a, b) => {
-                self.ast_unit_to_unit_ty(a).mul(&self.ast_unit_to_unit_ty(b))
+                let a_ty = self.ast_unit_to_unit_ty(a);
+                let b_ty = self.ast_unit_to_unit_ty(b);
+                a_ty.mul(&b_ty)
             }
             ast::UnitExpr::Div(a, b) => {
-                self.ast_unit_to_unit_ty(a).div(&self.ast_unit_to_unit_ty(b))
+                let a_ty = self.ast_unit_to_unit_ty(a);
+                let b_ty = self.ast_unit_to_unit_ty(b);
+                a_ty.div(&b_ty)
             }
             ast::UnitExpr::Pow(base, exp) => self.ast_unit_to_unit_ty(base).pow(*exp),
         }
@@ -1711,6 +1713,16 @@ impl Infer {
         } else {
             let var = self.fresh_var();
             self.annotation_vars.insert(name.to_string(), var);
+            var
+        }
+    }
+
+    fn annotation_unit_var(&mut self, name: &str) -> UnitVar {
+        if let Some(&var) = self.annotation_unit_vars.get(name) {
+            var
+        } else {
+            let var = self.fresh_unit_var();
+            self.annotation_unit_vars.insert(name.to_string(), var);
             var
         }
     }
@@ -3278,6 +3290,8 @@ impl Infer {
                 ast::DeclKind::Fun { name, ty, .. } => {
                     if let Some(scheme) = ty {
                         self.annotation_vars.clear();
+                        self.annotation_unit_vars.clear();
+                        self.in_type_annotation = true;
                         // Convert AST constraints to internal constraints
                         let mut constraints = Vec::new();
                         for c in &scheme.constraints {
@@ -3293,11 +3307,14 @@ impl Infer {
                             }
                         }
                         let ty = self.ast_type_to_ty(&scheme.ty);
+                        self.in_type_annotation = false;
                         let vars: Vec<TyVar> =
                             self.annotation_vars.values().copied().collect();
+                        let unit_vars: Vec<UnitVar> =
+                            self.annotation_unit_vars.values().copied().collect();
                         self.bind_top(
                             name,
-                            Scheme::constrained(vars, constraints, ty),
+                            Scheme { vars, unit_vars, constraints, ty },
                         );
                     } else {
                         let var = self.fresh();
@@ -4057,13 +4074,18 @@ impl Infer {
                     }
                 }
                 self.annotation_vars.clear();
+                self.annotation_unit_vars.clear();
+                self.in_type_annotation = true;
                 // Register trait params as annotation vars
                 for p in params {
                     self.annotation_var(&p.name);
                 }
                 let method_ty = self.ast_type_to_ty(&ty.ty);
+                self.in_type_annotation = false;
                 let vars: Vec<TyVar> =
                     self.annotation_vars.values().copied().collect();
+                let unit_vars: Vec<UnitVar> =
+                    self.annotation_unit_vars.values().copied().collect();
 
                 // Build constraints: each trait param must implement this trait
                 let mut constraints: Vec<TyConstraint> = params
@@ -4106,7 +4128,7 @@ impl Infer {
 
                 self.bind_top(
                     name,
-                    Scheme::constrained(vars, constraints, method_ty),
+                    Scheme { vars, unit_vars, constraints, ty: method_ty },
                 );
             }
         }
@@ -4142,6 +4164,8 @@ impl Infer {
                         if has_constraints {
                             let ts = ty.as_ref().unwrap();
                             self.annotation_vars.clear();
+                            self.annotation_unit_vars.clear();
+                            self.in_type_annotation = true;
                             let mut constraints = Vec::new();
                             for c in &ts.constraints {
                                 for arg in &c.args {
@@ -4158,14 +4182,20 @@ impl Infer {
                                 }
                             }
                             let ann_ty = self.ast_type_to_ty(&ts.ty);
+                            self.in_type_annotation = false;
                             let vars: Vec<TyVar> = self
                                 .annotation_vars
                                 .values()
                                 .copied()
                                 .collect();
+                            let unit_vars: Vec<UnitVar> = self
+                                .annotation_unit_vars
+                                .values()
+                                .copied()
+                                .collect();
                             self.bind_top(
                                 name,
-                                Scheme::constrained(vars, constraints, ann_ty),
+                                Scheme { vars, unit_vars, constraints, ty: ann_ty },
                             );
                         } else {
                             let applied = self.apply(&inferred);
@@ -5331,70 +5361,70 @@ mod tests {
 
     #[test]
     fn unit_literal_typechecks() {
-        assert!(check_src("unit m\nmain = 42.0<m>").is_empty());
+        assert!(check_src("unit M\nmain = 42.0<M>").is_empty());
     }
 
     #[test]
     fn unit_addition_same_unit() {
-        assert!(check_src("unit m\nmain = 10.0<m> + 5.0<m>").is_empty());
+        assert!(check_src("unit M\nmain = 10.0<M> + 5.0<M>").is_empty());
     }
 
     #[test]
     fn unit_addition_mismatch() {
-        let diags = check_src("unit m\nunit s\nmain = 10.0<m> + 5.0<s>");
+        let diags = check_src("unit M\nunit S\nmain = 10.0<M> + 5.0<S>");
         assert!(has_error(&diags, "unit mismatch"));
     }
 
     #[test]
     fn unit_multiplication_composes() {
-        // m * m should not error (produces m^2)
-        assert!(check_src("unit m\nmain = 10.0<m> * 5.0<m>").is_empty());
+        // M * M should not error (produces M^2)
+        assert!(check_src("unit M\nmain = 10.0<M> * 5.0<M>").is_empty());
     }
 
     #[test]
     fn unit_division_composes() {
-        // m / s should not error (produces m/s)
-        assert!(check_src("unit m\nunit s\nmain = 100.0<m> / 10.0<s>").is_empty());
+        // M / S should not error (produces M/S)
+        assert!(check_src("unit M\nunit S\nmain = 100.0<M> / 10.0<S>").is_empty());
     }
 
     #[test]
     fn unit_dimensionless_scalar_mul() {
-        // Float * Float<m> should produce Float<m>
-        assert!(check_src("unit m\nmain = 2.0 * 5.0<m>").is_empty());
+        // Float * Float<M> should produce Float<M>
+        assert!(check_src("unit M\nmain = 2.0 * 5.0<M>").is_empty());
     }
 
     #[test]
     fn unit_in_type_annotation() {
-        assert!(check_src("unit m\nf : Float<m> -> Float<m>\nf = \\x -> x").is_empty());
+        assert!(check_src("unit M\nf : Float<M> -> Float<M>\nf = \\x -> x").is_empty());
     }
 
     #[test]
     fn unit_derived_alias() {
-        assert!(check_src("unit m\nunit s\nunit mps = m / s\nmain = 10.0<mps>").is_empty());
+        assert!(check_src("unit M\nunit S\nunit Mps = M / S\nmain = 10.0<Mps>").is_empty());
     }
 
     #[test]
     fn unit_int_literal() {
-        assert!(check_src("unit usd\nmain = 999<usd>").is_empty());
+        assert!(check_src("unit Usd\nmain = 999<Usd>").is_empty());
     }
 
     #[test]
     fn unit_int_addition_mismatch() {
-        let diags = check_src("unit usd\nunit eur\nmain = 100<usd> + 50<eur>");
+        let diags = check_src("unit Usd\nunit Eur\nmain = 100<Usd> + 50<Eur>");
         assert!(has_error(&diags, "unit mismatch"));
     }
 
     #[test]
     fn unit_in_record() {
         assert!(check_src(
-            "unit m\nunit s\nmain = {distance: 100.0<m>, time: 10.0<s>}"
+            "unit M\nunit S\nmain = {distance: 100.0<M>, time: 10.0<S>}"
         ).is_empty());
     }
 
     #[test]
     fn unit_expr_annotation() {
         // (expr : Type) syntax
-        let diags = check_src("unit m\nmain = (42.0 : Float<m>)");
+        let diags = check_src("unit M\nmain = (42.0 : Float<M>)");
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
 
@@ -5402,8 +5432,8 @@ mod tests {
     fn unit_avg_preserves_unit() {
         // avg should preserve the unit from the projection function
         let diags = check_src(
-            "unit m\n\
-             main = avg (\\p -> p.x) [{x: 1.0<m>}, {x: 2.0<m>}] + 1.0<m>"
+            "unit M\n\
+             main = avg (\\p -> p.x) [{x: 1.0<M>}, {x: 2.0<M>}] + 1.0<M>"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -5412,17 +5442,80 @@ mod tests {
     fn unit_avg_mismatch() {
         // avg result has unit from projection — adding mismatched unit should fail
         let diags = check_src(
-            "unit m\nunit s\n\
-             main = avg (\\p -> p.x) [{x: 1.0<m>}] + 1.0<s>"
+            "unit M\nunit S\n\
+             main = avg (\\p -> p.x) [{x: 1.0<M>}] + 1.0<S>"
         );
-        assert!(!diags.is_empty(), "should reject adding Float<m> avg result to Float<s>");
+        assert!(!diags.is_empty(), "should reject adding Float<M> avg result to Float<S>");
     }
 
     #[test]
     fn unit_negation_preserves() {
         // Unary negation should preserve units
         let diags = check_src(
-            "unit m\nmain = -(5.0<m>) + 3.0<m>"
+            "unit M\nmain = -(5.0<M>) + 3.0<M>"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn unit_annotation_on_function_concrete() {
+        // Function with concrete unit annotation (identity-style)
+        let diags = check_src(
+            "unit M\n\
+             wrap : Float<M> -> Float<M>\n\
+             wrap = \\x -> x\n\
+             main = wrap 5.0<M>"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn unit_annotation_concrete_rejects_wrong_unit() {
+        // Calling a concrete-annotated function with wrong unit should fail
+        let diags = check_src(
+            "unit M\nunit S\n\
+             wrap : Float<M> -> Float<M>\n\
+             wrap = \\x -> x\n\
+             main = wrap 5.0<S>"
+        );
+        assert!(!diags.is_empty(), "should reject Float<S> for Float<M> param");
+    }
+
+    #[test]
+    fn unit_annotation_on_function_polymorphic() {
+        // Function with polymorphic unit variable should type-check
+        let diags = check_src(
+            "unit M\n\
+             double : Float<u> -> Float<u>\n\
+             double = \\x -> x + x\n\
+             main = double 5.0<M>"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn unit_annotation_polymorphic_mismatch() {
+        // Polymorphic unit annotation should reject unit mismatches
+        let diags = check_src(
+            "unit M\nunit S\n\
+             double : Float<u> -> Float<u>\n\
+             double = \\x -> x + x\n\
+             main = double 5.0<M> + 1.0<S>"
+        );
+        assert!(!diags.is_empty(), "should reject Float<M> + Float<S>");
+    }
+
+    #[test]
+    fn unit_annotation_polymorphic_reuse() {
+        // Polymorphic unit function can be called with different units at different sites
+        let diags = check_src(
+            "unit M\nunit S\n\
+             double : Float<u> -> Float<u>\n\
+             double = \\x -> x + x\n\
+             main = do\n\
+               let a = double 5.0<M>\n\
+               let b = double 3.0<S>\n\
+               yield {}"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -5485,7 +5578,7 @@ mod tests {
     fn refined_type_with_units() {
         // Refinement and units are orthogonal
         let diags = check_src(
-            "unit m\ntype PosFloat = Float where \\x -> x > 0.0\nmain = 1"
+            "unit M\ntype PosFloat = Float where \\x -> x > 0.0\nmain = 1"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }

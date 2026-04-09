@@ -1189,65 +1189,65 @@ Optional compile-time units on `Int` and `Float`. Units are fully erased at runt
 #### Declaration
 
 ```knot
-unit m
-unit s
-unit kg
-unit usd
+unit M
+unit S
+unit Kg
+unit Usd
 
 -- Derived unit aliases (expand at use site)
-unit N = kg * m / s^2
-unit Hz = 1 / s
+unit N = Kg * M / S^2
+unit Hz = 1 / S
 ```
 
 #### Type Syntax
 
-Angle brackets on numeric types only:
+Angle brackets on numeric types only. Concrete units are uppercase; lowercase names are unit variables (see [Unit Polymorphism](#unit-polymorphism)).
 
 ```knot
-height : Float<m>
-mass : Float<kg>
-speed : Float<m / s>
+height : Float<M>
+mass : Float<Kg>
+speed : Float<M / S>
 force : Float<N>
-acceleration : Float<m / s^2>
-cents : Int<usd>
+acceleration : Float<M / S^2>
+cents : Int<Usd>
 ```
 
 #### Literal Syntax
 
 ```knot
-distance = 42.0<m>
-duration = 3.5<s>
-price = 999<usd>
+distance = 42.0<M>
+duration = 3.5<S>
+price = 999<Usd>
 pi = 3.14159              -- dimensionless (Float<1>)
 ```
 
 #### Arithmetic
 
-`+`/`-` require matching units. `*`/`/` compose units. The compiler normalizes unit expressions algebraically (`m * s / s` → `m`, `m / m` → `1`).
+`+`/`-` require matching units. `*`/`/` compose units. The compiler normalizes unit expressions algebraically (`M * S / S` → `M`, `M / M` → `1`).
 
 ```knot
 -- Same-unit addition/subtraction
-10.0<m> + 5.0<m>                -- Float<m>
-10.0<m> + 5.0<s>                -- type error
+10.0<M> + 5.0<M>                -- Float<M>
+10.0<M> + 5.0<S>                -- type error
 
 -- Unit composition
-10.0<m> * 5.0<m>                -- Float<m^2>
-100.0<m> / 10.0<s>              -- Float<m/s>
-2.0<kg> * 9.8<m / s^2>          -- Float<kg * m / s^2> = Float<N>
+10.0<M> * 5.0<M>                -- Float<M^2>
+100.0<M> / 10.0<S>              -- Float<M/S>
+2.0<Kg> * 9.8<M / S^2>          -- Float<Kg * M / S^2> = Float<N>
 
 -- Dimensionless scalars
-2.0 * 5.0<m>                    -- Float<m>
-5.0<m> / 2.0                    -- Float<m>
+2.0 * 5.0<M>                    -- Float<M>
+5.0<M> / 2.0                    -- Float<M>
 
 -- Negation preserves units
--(5.0<m>)                        -- Float<m>
+-(5.0<M>)                        -- Float<M>
 ```
 
-Arbitrary integer powers arise naturally from multiplication: `m * m` = `m^2`, `s * s * s` = `s^3`. Powers can also be written directly in type annotations: `Float<m^2>`, `Float<s^-1>`.
+Arbitrary integer powers arise naturally from multiplication: `M * M` = `M^2`, `S * S * S` = `S^3`. Powers can also be written directly in type annotations: `Float<M^2>`, `Float<S^-1>`.
 
 #### Unit Polymorphism
 
-Lowercase names inside `<...>` are unit variables — no extra syntax needed:
+Concrete units are uppercase; lowercase names inside `<...>` are unit variables — no extra syntax needed:
 
 ```knot
 double : Float<u> -> Float<u>
@@ -1272,8 +1272,8 @@ double = \x -> x + x
 withUnit : Float -> Float<u>    -- attach a unit (caller must annotate)
 stripUnit : Float<u> -> Float   -- remove a unit
 
-toMiles : Float<km> -> Float<mi>
-toMiles = \d -> (withUnit (stripUnit d * 0.621371) : Float<mi>)
+toMiles : Float<Km> -> Float<Mi>
+toMiles = \d -> (withUnit (stripUnit d * 0.621371) : Float<Mi>)
 ```
 
 #### Unit-Preserving Stdlib
@@ -1292,8 +1292,8 @@ avg : (a -> Float<u>) -> [a] -> Float<u>
 `show` on a value with a concrete unit appends the unit string. The compiler knows the unit statically and emits the string as a constant:
 
 ```knot
-show 9.8<m / s^2>       -- "9.8 m/s^2"
-show 42.0<m>             -- "42.0 m"
+show 9.8<M / S^2>       -- "9.8 M/S^2"
+show 42.0<M>             -- "42.0 M"
 show 3.14                -- "3.14"
 ```
 
@@ -1306,7 +1306,7 @@ The compiler uses a canonical form for unit strings: alphabetical numerator, alp
 Units are phantom — SQLite stores raw numbers. Schema descriptors ignore units.
 
 ```knot
-type Measurement = {distance: Float<m>, time: Float<s>}
+type Measurement = {distance: Float<M>, time: Float<S>}
 
 *measurements : [Measurement]
 
@@ -1315,13 +1315,13 @@ type Measurement = {distance: Float<m>, time: Float<s>}
   measurements <- *measurements
   let result = do
     m <- measurements
-    yield {speed: m.distance / m.time}   -- Float<m/s>
+    yield {speed: m.distance / m.time}   -- Float<M/S>
   yield result
 ```
 
 #### Interaction with Traits
 
-Units live outside the trait system as a compile-time overlay. The `Num` trait handles runtime dispatch for arithmetic; the compiler applies unit algebra rules as an additional layer. No changes to trait definitions are needed — `+` on `Float<m>` dispatches through `Num.add` at runtime while the compiler separately verifies that both operands share the unit `m` and propagates `m` to the result.
+Units live outside the trait system as a compile-time overlay. The `Num` trait handles runtime dispatch for arithmetic; the compiler applies unit algebra rules as an additional layer. No changes to trait definitions are needed — `+` on `Float<M>` dispatches through `Num.add` at runtime while the compiler separately verifies that both operands share the unit `M` and propagates `M` to the result.
 
 ### Refined Types
 
@@ -1521,8 +1521,8 @@ Predicates in relation `where` clauses follow the same rule — they are pure fu
 Units and refinements are orthogonal — units are compile-time phantom, refinements are runtime-checked:
 
 ```knot
-type PositiveDistance = Float<m> where \x -> x > 0.0
-type Speed = Float<m/s> where \x -> x >= 0.0
+type PositiveDistance = Float<M> where \x -> x > 0.0
+type Speed = Float<M/S> where \x -> x >= 0.0
 ```
 
 #### Schema Evolution

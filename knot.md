@@ -47,28 +47,28 @@ cargo run -p knot-compiler -- build file.knot
 Optional compile-time units on `Int` and `Float`. Units are fully erased at runtime — no performance cost.
 
 ```knot
-unit m
-unit s
-unit kg
-unit N = kg * m / s^2    -- derived unit alias
+unit M
+unit S
+unit Kg
+unit N = Kg * M / S^2    -- derived unit alias
 
-distance = 42.0<m>        -- Float<m>
-speed : Float<m / s>
+distance = 42.0<M>        -- Float<M>
+speed : Float<M / S>
 force : Float<N>
-cents : Int<usd>
+cents : Int<Usd>
 ```
 
 Arithmetic rules: `+`/`-` require matching units, `*`/`/` compose units, negation preserves units.
 
 ```knot
-10.0<m> + 5.0<m>              -- Float<m>
-10.0<m> * 5.0<m>              -- Float<m^2>
-100.0<m> / 10.0<s>            -- Float<m/s>
-2.0 * 5.0<m>                  -- Float<m> (scalar mul)
--(5.0<m>)                     -- Float<m>
+10.0<M> + 5.0<M>              -- Float<M>
+10.0<M> * 5.0<M>              -- Float<M^2>
+100.0<M> / 10.0<S>            -- Float<M/S>
+2.0 * 5.0<M>                  -- Float<M> (scalar mul)
+-(5.0<M>)                     -- Float<M>
 ```
 
-Unit polymorphism — lowercase names in `<...>` are unit variables:
+Unit polymorphism — concrete units are uppercase, lowercase names in `<...>` are unit variables:
 
 ```knot
 double : Float<u> -> Float<u>

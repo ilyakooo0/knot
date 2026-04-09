@@ -3587,11 +3587,11 @@ fn json_to_value(json: &serde_json::Value) -> *mut Value {
                     }
                 }
             }
-            // Reconstruct Constructor from {"__knot_tag": "...", "__knot_value": ...} format
+            // Reconstruct Constructor from {"tag": "...", "value": ...} format
             // (round-trip with value_to_serde_json's Constructor encoding)
             if obj.len() == 2 {
                 if let (Some(serde_json::Value::String(tag)), Some(val)) =
-                    (obj.get("__knot_tag"), obj.get("__knot_value"))
+                    (obj.get("tag"), obj.get("value"))
                 {
                     return alloc(Value::Constructor(tag.clone(), json_to_value(val)));
                 }
@@ -8047,8 +8047,8 @@ fn value_to_serde_json(v: *mut Value) -> serde_json::Value {
         }
         Value::Constructor(tag, payload) => {
             let mut map = serde_json::Map::with_capacity(2);
-            map.insert("__knot_tag".into(), serde_json::Value::String(tag.clone()));
-            map.insert("__knot_value".into(), value_to_serde_json(*payload));
+            map.insert("tag".into(), serde_json::Value::String(tag.clone()));
+            map.insert("value".into(), value_to_serde_json(*payload));
             serde_json::Value::Object(map)
         }
         Value::Function(_, _, src) => serde_json::Value::String(format!("<function: {}>", src)),

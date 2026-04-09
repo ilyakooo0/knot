@@ -841,6 +841,74 @@ salaryLastYear = \name -> do
 
 ---
 
+## Refined Types
+
+Types restricted by predicate functions, checked at runtime boundaries.
+
+### Declaration
+
+```knot
+-- Simple refined type alias
+type Nat = Int where \x -> x >= 0
+
+-- Per-field refinements
+type ValidPerson = {name: Text, age: Int where \x -> x >= 0 && x <= 150}
+
+-- Cross-field refinements
+type Range = {lo: Int, hi: Int} where \r -> r.lo <= r.hi
+
+-- ADT constructor refinements
+data Shape
+  = Circle {radius: Float where \r -> r > 0.0}
+  | Rect {width: Float where \w -> w > 0.0, height: Float where \h -> h > 0.0}
+```
+
+### Checking with `refine`
+
+`refine expr` validates a value against a refined type inferred from context. Returns `Result RefinementError T`:
+
+```knot
+-- Use with case
+result = case refine someInt of
+  Ok {value: n} -> println ("Valid: " ++ show n)
+  Err {error: e} -> println ("Invalid: " ++ show e)
+
+-- Use in Result do-block
+validated = do
+  n <- refine someInt        -- binds n : Nat on success, short-circuits on failure
+  m <- refine otherInt
+  yield (n + m)
+-- validated : Result RefinementError Int
+```
+
+`RefinementError = {typeName: Text, violations: [{field: Maybe Text, message: Text}]}`
+
+### Automatic Validation
+
+**`set` validation**: refined fields on source relations are checked before writes. Panics on violation.
+
+```knot
+*people : [{name: Text, age: Nat}]
+
+-- This panics if any age is negative:
+set *people = [{name: "Alice", age: -1}]
+```
+
+**Route handlers**: refined body fields are auto-validated after JSON decoding. Returns HTTP 400 on failure.
+
+```knot
+route Api where
+  POST {age: Nat} /users -> User = CreateUser
+
+-- POST with {"age": -1} returns 400 automatically
+```
+
+### Subtyping
+
+Refined types are subtypes of their base type. `Nat` is compatible with `Int` in both directions — passing a `Nat` where `Int` is expected works, and vice versa (but the latter is unchecked unless you use `refine`).
+
+---
+
 ## Custom Monads
 
 Any type implementing `Monad` gets `do`/`<-`/`yield` syntax:

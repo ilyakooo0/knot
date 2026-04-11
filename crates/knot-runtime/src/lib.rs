@@ -195,6 +195,16 @@ fn stm_track_write(name: &str) {
 
 static DEBUG: AtomicBool = AtomicBool::new(false);
 
+// ── ToJSON dispatcher ────────────────────────────────────────────
+//
+// Stores the compiled toJson trait dispatcher function pointer so the
+// runtime (e.g. HTTP response serialization) can use custom ToJSON impls.
+// Written once during program init, read by listen handler threads.
+
+use std::sync::atomic::AtomicUsize;
+
+static TO_JSON_FN: AtomicUsize = AtomicUsize::new(0);
+
 fn debug_enabled() -> bool {
     DEBUG.load(Ordering::Relaxed)
 }
@@ -3551,6 +3561,23 @@ pub extern "C" fn knot_bytes_get(index: *mut Value, bytes: *mut Value) -> *mut V
 }
 
 // ── Standard library: JSON operations ─────────────────────────
+
+/// Register the compiled toJson trait dispatcher so the runtime can use
+/// custom ToJSON impls for JSON encoding (e.g. HTTP responses).
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_register_to_json(fn_ptr: *const u8) {
+    TO_JSON_FN.store(fn_ptr as usize, Ordering::Release);
+}
+
+/// Encode a value to JSON, using the registered ToJSON dispatcher if available.
+fn json_encode_value(db: *mut c_void, v: *mut Value) -> String {
+    let fn_ptr = TO_JSON_FN.load(Ordering::Acquire);
+    if fn_ptr != 0 {
+        call_to_json_dispatcher(db, v, fn_ptr as *const u8)
+    } else {
+        value_to_json(v)
+    }
+}
 
 /// toJson(value) — convert any Knot value to its JSON text representation
 #[unsafe(no_mangle)]
@@ -8556,7 +8583,7 @@ pub extern "C" fn knot_http_listen(
                     if has_resp_headers {
                         let body_val = knot_record_field(result, "body".as_ptr(), 4);
                         let hdrs_val = knot_record_field(result, "headers".as_ptr(), 7);
-                        let json = value_to_json(body_val);
+                        let json = json_encode_value(db, body_val);
                         let mut response = tiny_http::Response::from_string(&json)
                             .with_header(
                                 "Content-Type: application/json"
@@ -8579,7 +8606,7 @@ pub extern "C" fn knot_http_listen(
                         }
                         let _ = request.respond(response);
                     } else {
-                        let json = value_to_json(result);
+                        let json = json_encode_value(db, result);
                         if debug_enabled() {
                             eprintln!("[HTTP] --> 200 {}", json);
                         }

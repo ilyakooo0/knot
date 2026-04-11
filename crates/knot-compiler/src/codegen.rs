@@ -620,6 +620,7 @@ impl Codegen {
         self.declare_rt("knot_json_encode", &[p], &[p]);
         self.declare_rt("knot_json_encode_with", &[p, p, p], &[p]);
         self.declare_rt("knot_json_decode", &[p], &[p]);
+        self.declare_rt("knot_register_to_json", &[p], &[]);
 
         // Bytes value constructor and standard library
         self.declare_rt("knot_value_bytes", &[p, p], &[p]);
@@ -2884,6 +2885,7 @@ impl Codegen {
         let user_main = self.user_fns.get("main").copied();
         let all_routes: Vec<(String, Vec<ast::RouteEntry>)> =
             self.route_entries.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let to_json_dispatcher_id = self.trait_dispatcher_fns.get("toJson").copied();
 
         self.build_function(main_id, sig, |cg, builder, entry| {
             let argc = builder.block_params(entry)[0];
@@ -2987,6 +2989,13 @@ impl Codegen {
 
             // Initialize schema tracking
             cg.call_rt_void(builder, "knot_schema_init", &[db]);
+
+            // Register toJson dispatcher so the runtime can use custom ToJSON impls
+            if let Some(dispatcher_id) = to_json_dispatcher_id {
+                let func_ref = cg.module.declare_func_in_func(dispatcher_id, builder.func);
+                let func_addr = builder.ins().func_addr(cg.ptr_type, func_ref);
+                cg.call_rt_void(builder, "knot_register_to_json", &[func_addr]);
+            }
 
             // Apply pending migrations (before source init)
             let migrate_schemas = cg.migrate_schemas.clone();

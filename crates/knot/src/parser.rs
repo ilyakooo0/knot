@@ -477,6 +477,18 @@ impl Parser {
                 self.advance();
                 continue;
             }
+            // When inside delimiters (parens, brackets, braces), a closing
+            // delimiter ends the block — it belongs to an outer scope.
+            // Without this, `(case x of A -> 1; B -> 2)` would try to
+            // parse `)` as a case arm pattern.
+            if self.delimiter_depth > 0
+                && matches!(
+                    self.peek(),
+                    TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace
+                )
+            {
+                break;
+            }
             // Peek past newlines to check if the next item is still in
             // this block. If not, DON'T consume the newlines — they act
             // as separators for the outer parser (e.g. parse_application
@@ -484,7 +496,14 @@ impl Parser {
             // continuation).
             let saved = self.save();
             self.skip_newlines();
-            if self.at_eof() || self.column_of(&self.span()) < indent {
+            if self.at_eof()
+                || self.column_of(&self.span()) < indent
+                || (self.delimiter_depth > 0
+                    && matches!(
+                        self.peek(),
+                        TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace
+                    ))
+            {
                 self.restore(saved);
                 break;
             }

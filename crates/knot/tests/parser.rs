@@ -3560,3 +3560,63 @@ fn export_with_imports() {
     assert!(m.decls[0].exported);
     assert!(!m.decls[1].exported);
 }
+
+// ── Case expressions inside delimiters ─────────────────────────────
+
+#[test]
+fn case_inside_parens() {
+    let src = "f = g (case x of\n  A {} -> 1\n  B {} -> 2)";
+    match fun_body(src) {
+        ExprKind::App { func, arg } => {
+            assert!(matches!(func.node, ExprKind::Var(_)));
+            assert!(matches!(arg.node, ExprKind::Case { ref arms, .. } if arms.len() == 2));
+        }
+        other => panic!("expected App, got {:?}", other),
+    }
+}
+
+#[test]
+fn case_inside_parens_single_line() {
+    let src = "f = g (case x of A {} -> 1; B {} -> 2)";
+    match fun_body(src) {
+        ExprKind::App { func, arg } => {
+            assert!(matches!(func.node, ExprKind::Var(_)));
+            assert!(matches!(arg.node, ExprKind::Case { ref arms, .. } if arms.len() == 2));
+        }
+        other => panic!("expected App, got {:?}", other),
+    }
+}
+
+#[test]
+fn case_inside_lambda_in_parens() {
+    // Pattern from fold: (\acc x -> case acc of ... ) init items
+    let src = "\
+f = fold (\\acc x -> case acc of
+  Nothing {} -> Just {value: x}
+  _ -> acc) Nothing {} items";
+    // Should parse without errors — the ) closes the paren, not a case arm
+    parse_ok(src);
+}
+
+#[test]
+fn case_inside_braces() {
+    let src = "f = {x: case v of A {} -> 1; B {} -> 2}";
+    match fun_body(src) {
+        ExprKind::Record(fields) => {
+            assert_eq!(fields.len(), 1);
+            assert!(matches!(fields[0].value.node, ExprKind::Case { ref arms, .. } if arms.len() == 2));
+        }
+        other => panic!("expected Record, got {:?}", other),
+    }
+}
+
+#[test]
+fn do_block_inside_parens() {
+    let src = "f = g (do\n  x <- xs\n  yield x)";
+    match fun_body(src) {
+        ExprKind::App { arg, .. } => {
+            assert!(matches!(arg.node, ExprKind::Do(_)));
+        }
+        other => panic!("expected App, got {:?}", other),
+    }
+}

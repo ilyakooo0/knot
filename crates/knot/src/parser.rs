@@ -60,6 +60,9 @@ impl Parser {
             self.skip_newlines();
         }
 
+        // Set block_indent so that multiline expressions inside declarations
+        // can continue across newlines (parse_application checks column > block_indent).
+        self.block_indent = 0;
         let mut decls = Vec::new();
         while !self.at_eof() {
             self.skip_newlines();
@@ -487,6 +490,12 @@ impl Parser {
                     TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace
                 )
             {
+                break;
+            }
+            // Keywords that cannot start a new block item terminate the block.
+            // For example, `in` after `let active = do ...; yield x in ...`
+            // belongs to the enclosing `let...in`, not to the do block.
+            if matches!(self.peek(), TokenKind::In | TokenKind::Then | TokenKind::Else | TokenKind::Of) {
                 break;
             }
             // Peek past newlines to check if the next item is still in
@@ -1731,7 +1740,25 @@ impl Parser {
 
             self.advance(); // consume operator
             self.skip_newlines();
-            let rhs = self.parse_expr_bp(r_bp)?;
+            // Allow let/if/case/do/lambda/set/atomic/refine on the RHS of
+            // binary operators.  These are handled by `parse_expr` but not by
+            // the Pratt sub-parser, so we delegate to `parse_expr` when we see
+            // one of these keyword tokens.
+            let rhs = if matches!(
+                self.peek(),
+                TokenKind::Let
+                    | TokenKind::If
+                    | TokenKind::Case
+                    | TokenKind::Do
+                    | TokenKind::Backslash
+                    | TokenKind::Set
+                    | TokenKind::Atomic
+                    | TokenKind::Refine
+            ) {
+                self.parse_expr()?
+            } else {
+                self.parse_expr_bp(r_bp)?
+            };
 
             let span = Span::new(lhs.span.start, rhs.span.end);
             lhs = Spanned::new(
@@ -2485,11 +2512,33 @@ impl Parser {
             this.advance(); // consume `let`
 
             let pat = this.parse_pat()?;
+
+            // Optional type annotation: `let x : Type = ...`
+            let annot_ty = if this.at(&TokenKind::Colon) {
+                this.advance();
+                Some(this.parse_type()?)
+            } else {
+                None
+            };
+
             this.expect(&TokenKind::Eq, "expected '=' in let binding").ok()?;
-            let value = this.parse_expr()?;
+            let mut value = this.parse_expr()?;
             this.skip_newlines();
             this.expect(&TokenKind::In, "expected 'in' after let binding").ok()?;
             let body = this.parse_expr()?;
+
+            // If there is a type annotation, wrap the value as `(value : Type)`
+            // so that inference sees the constraint.
+            if let Some(ty) = annot_ty {
+                let sp = value.span;
+                value = Spanned::new(
+                    ExprKind::Annot {
+                        expr: Box::new(value),
+                        ty,
+                    },
+                    sp,
+                );
+            }
 
             // Desugar `let pat = value in body` as a lambda application.
             // `(\pat -> body) value`
@@ -2530,6 +2579,19 @@ impl Parser {
             return None;
         }
 
+        // `_` followed by `->` is a case arm wildcard, not a do statement.
+        // Return None so the enclosing case block can claim it.
+        // `_` followed by `<-` is a valid bind (`_ <- expr`), so allow that.
+        if self.at(&TokenKind::Underscore) {
+            let saved = self.save();
+            self.advance(); // consume `_`
+            let is_bind = self.at(&TokenKind::LArrow);
+            self.restore(saved);
+            if !is_bind {
+                return None;
+            }
+        }
+
         let start = self.span();
 
         // `where cond`
@@ -2553,12 +2615,34 @@ impl Parser {
             ));
         }
 
-        // `let pat = expr`
+        // `let pat = expr` or `let pat : Type = expr`
         if self.at(&TokenKind::Let) {
             self.advance();
             let pat = self.parse_pat()?;
+
+            // Optional type annotation: `let x : Type = ...`
+            let annot_ty = if self.at(&TokenKind::Colon) {
+                self.advance();
+                Some(self.parse_type()?)
+            } else {
+                None
+            };
+
             self.expect(&TokenKind::Eq, "expected '=' in let statement").ok()?;
-            let expr = self.parse_expr()?;
+            let mut expr = self.parse_expr()?;
+
+            // Wrap value with annotation so inference sees the constraint.
+            if let Some(ty) = annot_ty {
+                let sp = expr.span;
+                expr = Spanned::new(
+                    ExprKind::Annot {
+                        expr: Box::new(expr),
+                        ty,
+                    },
+                    sp,
+                );
+            }
+
             let end_sp = expr.span;
             return Some(Spanned::new(
                 StmtKind::Let { pat, expr },

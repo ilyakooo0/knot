@@ -92,6 +92,7 @@ pub enum TokenKind {
 
     // Layout
     Newline,
+    Semicolon,
 
     // End
     Eof,
@@ -168,6 +169,7 @@ impl TokenKind {
             TokenKind::Underscore => "'_'",
             TokenKind::Question => "'?'",
             TokenKind::Newline => "newline",
+            TokenKind::Semicolon => "';'",
             TokenKind::Eof => "end of file",
         }
     }
@@ -763,7 +765,7 @@ impl<'src> Lexer<'src> {
             b':' => TokenKind::Colon,
             b'\\' => TokenKind::Backslash,
             b'@' => TokenKind::At,
-            b';' => TokenKind::Newline,
+            b';' => TokenKind::Semicolon,
             b'?' => TokenKind::Question,
             b'^' => TokenKind::Caret,
             b'(' => TokenKind::LParen,

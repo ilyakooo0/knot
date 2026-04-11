@@ -471,6 +471,12 @@ impl Parser {
                 Some(item) => items.push(item),
                 None => break,
             }
+            // Semicolons act as explicit item separators within a block,
+            // allowing e.g. `case x of A {} -> 1; B {} -> 2` on one line.
+            if self.at(&TokenKind::Semicolon) {
+                self.advance();
+                continue;
+            }
             // Peek past newlines to check if the next item is still in
             // this block. If not, DON'T consume the newlines — they act
             // as separators for the outer parser (e.g. parse_application

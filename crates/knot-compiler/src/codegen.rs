@@ -144,6 +144,7 @@ pub struct Codegen {
     // Refine expression targets: expr_span -> refined type name
     refine_targets: HashMap<knot::ast::Span, String>,
     // Compiled predicate function values: type_name -> func_id
+    #[allow(dead_code)]
     refined_predicate_fns: HashMap<String, FuncId>,
     // parseJson call targets: app_span -> resolved return type name (for compile-time FromJSON dispatch)
     from_json_targets: HashMap<knot::ast::Span, String>,
@@ -2766,7 +2767,7 @@ impl Codegen {
             sig.returns.push(AbiParam::new(self.ptr_type));
 
             let total_args = stage_idx + 2; // args accumulated after this stage
-            let n_params = n_params;
+            let _n_params = n_params;
 
             self.build_function(stage_fn_id, sig, |cg, builder, entry| {
                 let db = builder.block_params(entry)[0];

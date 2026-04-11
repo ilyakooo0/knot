@@ -2193,6 +2193,13 @@ impl Infer {
                         merged.extend(e2.iter().cloned());
                         Ty::IO(merged, inner.clone())
                     }
+                    // When one branch is IO and the other Relation, prefer IO.
+                    // This handles functions whose IO nature wasn't detected
+                    // due to declaration ordering (callee inferred after caller).
+                    (Ty::IO(e, inner), Ty::Relation(_))
+                    | (Ty::Relation(_), Ty::IO(e, inner)) => {
+                        Ty::IO(e.clone(), inner.clone())
+                    }
                     _ => then_ty,
                 }
             }
@@ -3071,12 +3078,32 @@ impl Infer {
         } else {
             match yield_ty {
                 Some(ty) => Ty::Relation(Box::new(ty)),
-                None if !has_relation_bind && last_expr_ty.is_some() => {
-                    // No yield, no relation bind, but has bare expressions:
-                    // use the last expression's type directly. This preserves
-                    // polymorphism for do-blocks that sequence operations
-                    // through a polymorphic monad parameter (e.g. `a {}`).
-                    last_expr_ty.unwrap()
+                None if last_expr_ty.is_some() => {
+                    let last = last_expr_ty.unwrap();
+                    if has_relation_bind {
+                        // Flat-map / concatMap semantics: the last bare expression
+                        // should itself be a list (e.g. from a case with yield/[]
+                        // arms). Use it as the do-block type directly.
+                        let applied = self.apply(&last);
+                        match &applied {
+                            Ty::Relation(_) => applied,
+                            Ty::App(f, _) => {
+                                let f_applied = self.apply(f);
+                                if matches!(&f_applied, Ty::TyCon(n) if n == "[]") {
+                                    applied
+                                } else {
+                                    Ty::Relation(Box::new(Ty::unit()))
+                                }
+                            }
+                            _ => Ty::Relation(Box::new(Ty::unit())),
+                        }
+                    } else {
+                        // No yield, no relation bind, but has bare expressions:
+                        // use the last expression's type directly. This preserves
+                        // polymorphism for do-blocks that sequence operations
+                        // through a polymorphic monad parameter (e.g. `a {}`).
+                        last
+                    }
                 }
                 None => Ty::Relation(Box::new(Ty::unit())),
             }

@@ -55,6 +55,9 @@ pub struct Codegen {
     // Pending IO do-block thunks: deferred compilation of IO do-block bodies
     pending_io_thunks: Vec<PendingIoThunk>,
 
+    // Pending trampolines for multi-param user functions (curry chains)
+    pending_trampolines: Vec<PendingTrampoline>,
+
     // Counter for generating unique IO thunk names
     io_thunk_counter: usize,
 
@@ -189,6 +192,16 @@ struct PendingIoThunk {
     free_vars: Vec<String>,
 }
 
+/// A deferred trampoline for a multi-param user function.
+/// Generates a curry chain that directly calls the user function,
+/// avoiding the infinite recursion that occurs when trampolines
+/// resolve back through user_fns.
+struct PendingTrampoline {
+    trampoline_id: FuncId,
+    user_fn_name: String,
+    n_params: usize,
+}
+
 /// Information about a trait method for runtime dispatch.
 struct TraitMethodInfo {
     param_count: usize,
@@ -313,7 +326,7 @@ pub fn compile(
     cg.define_functions(module, type_env);
     cg.generate_main(module);
     // Drain lambdas and IO thunks created by generate_main (e.g., migration functions)
-    while !cg.pending_lambdas.is_empty() || !cg.pending_io_thunks.is_empty() {
+    while !cg.pending_lambdas.is_empty() || !cg.pending_io_thunks.is_empty() || !cg.pending_trampolines.is_empty() {
         let lambdas: Vec<PendingLambda> = std::mem::take(&mut cg.pending_lambdas);
         for lambda in lambdas {
             cg.define_lambda_function(&lambda);
@@ -321,6 +334,10 @@ pub fn compile(
         let thunks: Vec<PendingIoThunk> = std::mem::take(&mut cg.pending_io_thunks);
         for thunk in thunks {
             cg.define_io_thunk_function(&thunk);
+        }
+        let trampolines: Vec<PendingTrampoline> = std::mem::take(&mut cg.pending_trampolines);
+        for tramp in &trampolines {
+            cg.define_trampoline(tramp);
         }
     }
     if !cg.diagnostics.is_empty() {
@@ -365,6 +382,7 @@ impl Codegen {
             lambda_counter: 0,
             pending_lambdas: Vec::new(),
             pending_io_thunks: Vec::new(),
+            pending_trampolines: Vec::new(),
             io_thunk_counter: 0,
             db_path: String::new(),
             migrate_schemas: HashMap::new(),
@@ -2053,7 +2071,7 @@ impl Codegen {
         }
 
         // Compile any pending lambdas and IO thunks (may generate more)
-        while !self.pending_lambdas.is_empty() || !self.pending_io_thunks.is_empty() {
+        while !self.pending_lambdas.is_empty() || !self.pending_io_thunks.is_empty() || !self.pending_trampolines.is_empty() {
             let lambdas: Vec<PendingLambda> =
                 std::mem::take(&mut self.pending_lambdas);
             for lambda in lambdas {
@@ -2063,6 +2081,11 @@ impl Codegen {
                 std::mem::take(&mut self.pending_io_thunks);
             for thunk in thunks {
                 self.define_io_thunk_function(&thunk);
+            }
+            let trampolines: Vec<PendingTrampoline> =
+                std::mem::take(&mut self.pending_trampolines);
+            for tramp in &trampolines {
+                self.define_trampoline(tramp);
             }
         }
 
@@ -2070,7 +2093,7 @@ impl Codegen {
         self.define_trait_dispatchers();
 
         // Compile any pending lambdas/thunks from dispatchers
-        while !self.pending_lambdas.is_empty() || !self.pending_io_thunks.is_empty() {
+        while !self.pending_lambdas.is_empty() || !self.pending_io_thunks.is_empty() || !self.pending_trampolines.is_empty() {
             let lambdas: Vec<PendingLambda> =
                 std::mem::take(&mut self.pending_lambdas);
             for lambda in lambdas {
@@ -2080,6 +2103,11 @@ impl Codegen {
                 std::mem::take(&mut self.pending_io_thunks);
             for thunk in thunks {
                 self.define_io_thunk_function(&thunk);
+            }
+            let trampolines: Vec<PendingTrampoline> =
+                std::mem::take(&mut self.pending_trampolines);
+            for tramp in &trampolines {
+                self.define_trampoline(tramp);
             }
         }
     }
@@ -2614,8 +2642,10 @@ impl Codegen {
     /// Get or create a trampoline function that wraps a user function with the
     /// standard lambda calling convention (db, env, arg) -> result.
     /// For 1-param user functions: trampoline(db, env, arg) calls user_fn(db, arg).
-    /// For n-param: trampoline(db, env, arg) partially applies (curries remaining args).
-    fn get_or_create_trampoline(&mut self, name: &str, _n_params: usize) -> FuncId {
+    /// For n-param: generates a curry chain that directly calls the user function,
+    /// avoiding the infinite recursion that would occur if the trampoline tried
+    /// to partially apply itself through compile_app.
+    fn get_or_create_trampoline(&mut self, name: &str, n_params: usize) -> FuncId {
         if let Some(&id) = self.user_fn_trampolines.get(name) {
             return id;
         }
@@ -2630,34 +2660,201 @@ impl Codegen {
             .declare_function(&trampoline_name, Linkage::Local, &sig)
             .unwrap();
 
-        // For 1-param functions: body is App(Var(name), Var(param))
-        // For multi-param: body is App(Var(name), Var(param)) which creates a partial application
-        // (compile_app handles partial application by wrapping in dynamic calls)
-        let dummy_span = ast::Span::new(0, 0);
-        let body = ast::Spanned::new(
-            ast::ExprKind::App {
-                func: Box::new(ast::Spanned::new(
-                    ast::ExprKind::Var(name.to_string()),
-                    dummy_span,
-                )),
-                arg: Box::new(ast::Spanned::new(
-                    ast::ExprKind::Var("__trampoline_arg".into()),
-                    dummy_span,
-                )),
-            },
-            dummy_span,
-        );
+        if n_params <= 1 {
+            // For 1-param functions: body is App(Var(name), Var(param)) — direct call
+            let dummy_span = ast::Span::new(0, 0);
+            let body = ast::Spanned::new(
+                ast::ExprKind::App {
+                    func: Box::new(ast::Spanned::new(
+                        ast::ExprKind::Var(name.to_string()),
+                        dummy_span,
+                    )),
+                    arg: Box::new(ast::Spanned::new(
+                        ast::ExprKind::Var("__trampoline_arg".into()),
+                        dummy_span,
+                    )),
+                },
+                dummy_span,
+            );
 
-        self.pending_lambdas.push(PendingLambda {
-            func_id: trampoline_id,
-            params: vec!["__trampoline_arg".to_string()],
-            param_pat: None,
-            body,
-            free_vars: vec![],
-        });
+            self.pending_lambdas.push(PendingLambda {
+                func_id: trampoline_id,
+                params: vec!["__trampoline_arg".to_string()],
+                param_pat: None,
+                body,
+                free_vars: vec![],
+            });
+        } else {
+            // For multi-param functions: generate curry chain via build_function
+            self.pending_trampolines.push(PendingTrampoline {
+                trampoline_id,
+                user_fn_name: name.to_string(),
+                n_params,
+            });
+        }
 
         self.user_fn_trampolines.insert(name.to_string(), trampoline_id);
         trampoline_id
+    }
+
+    /// Define a multi-param trampoline as a curry chain.
+    /// For n_params=2: trampoline(db,env,arg1) → Function(inner,arg1)
+    ///                  inner(db,arg1,arg2)     → user_fn(db,arg1,arg2)
+    /// For n_params=3: trampoline(db,env,arg1) → Function(mid,arg1)
+    ///                  mid(db,arg1,arg2)       → Function(inner,{arg1,arg2})
+    ///                  inner(db,env,arg3)      → user_fn(db,arg1,arg2,arg3)
+    /// General pattern builds n_params-1 curry stages.
+    fn define_trampoline(&mut self, tramp: &PendingTrampoline) {
+        let (user_fn_id, _) = self.user_fns[&tramp.user_fn_name];
+        let n_params = tramp.n_params;
+        let fn_name = tramp.user_fn_name.clone();
+
+        // Declare all inner curry stage functions upfront
+        // Stage i (0-indexed) takes (db, env, arg_{i+1}) and either:
+        //   - returns the final user_fn call (if i == n_params-2, i.e. last stage)
+        //   - returns a Function wrapping the next stage
+        let mut stage_ids: Vec<FuncId> = Vec::new();
+        for i in 0..n_params - 1 {
+            let stage_name = format!("__tramp_{}_{}", fn_name, i + 1);
+            stage_ids.push(self.declare_closure_fn(&stage_name));
+        }
+
+        // Stage 0: the trampoline itself — captures arg1, returns Function(stage1, arg1)
+        {
+            let next_stage_id = stage_ids[0];
+            let trampoline_id = tramp.trampoline_id;
+            let fn_name = fn_name.clone();
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(self.ptr_type)); // db
+            sig.params.push(AbiParam::new(self.ptr_type)); // env (unused)
+            sig.params.push(AbiParam::new(self.ptr_type)); // arg1
+            sig.returns.push(AbiParam::new(self.ptr_type));
+            self.build_function(trampoline_id, sig, |cg, builder, entry| {
+                let arg1 = builder.block_params(entry)[2];
+                let next_ref = cg.module.declare_func_in_func(next_stage_id, builder.func);
+                let fn_addr = builder.ins().func_addr(cg.ptr_type, next_ref);
+                let (src_ptr, src_len) = cg.string_ptr(builder, &fn_name);
+                let result =
+                    cg.call_rt(builder, "knot_value_function", &[fn_addr, arg1, src_ptr, src_len]);
+                builder.ins().return_(&[result]);
+            });
+        }
+
+        // Intermediate + final stages
+        for stage_idx in 0..stage_ids.len() {
+            let stage_fn_id = stage_ids[stage_idx];
+            let is_last = stage_idx == stage_ids.len() - 1;
+            let next_stage_id = if !is_last { Some(stage_ids[stage_idx + 1]) } else { None };
+            let fn_name = fn_name.clone();
+
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(self.ptr_type)); // db
+            sig.params.push(AbiParam::new(self.ptr_type)); // env (captured args)
+            sig.params.push(AbiParam::new(self.ptr_type)); // new arg
+            sig.returns.push(AbiParam::new(self.ptr_type));
+
+            let total_args = stage_idx + 2; // args accumulated after this stage
+            let n_params = n_params;
+
+            self.build_function(stage_fn_id, sig, |cg, builder, entry| {
+                let db = builder.block_params(entry)[0];
+                let env = builder.block_params(entry)[1]; // captured args
+                let new_arg = builder.block_params(entry)[2];
+
+                if is_last {
+                    // Final stage: extract all captured args, call user function directly
+                    let mut call_args = vec![db];
+                    if total_args == 2 {
+                        // env is arg1 directly (single capture)
+                        call_args.push(env);
+                    } else {
+                        // env is a record of previous args
+                        for i in 0..total_args - 1 {
+                            let idx = builder.ins().iconst(cg.ptr_type, i as i64);
+                            let arg_val = cg.call_rt(
+                                builder,
+                                "knot_record_field_by_index",
+                                &[env, idx],
+                            );
+                            call_args.push(arg_val);
+                        }
+                    }
+                    call_args.push(new_arg);
+
+                    let func_ref =
+                        cg.module.declare_func_in_func(user_fn_id, builder.func);
+                    let call = builder.ins().call(func_ref, &call_args);
+                    let result = builder.inst_results(call)[0];
+                    builder.ins().return_(&[result]);
+                } else {
+                    // Intermediate stage: pack args into record, return Function(next_stage, record)
+                    let next_id = next_stage_id.unwrap();
+
+                    let new_env = if total_args == 2 {
+                        // Going from 1 captured arg (env=arg1) + new_arg to record of 2
+                        let ptr_bytes = cg.ptr_type.bytes() as i32;
+                        let slot = builder.create_sized_stack_slot(
+                            StackSlotData::new(StackSlotKind::ExplicitSlot, (6 * ptr_bytes) as u32, 0),
+                        );
+                        let (k0_ptr, k0_len) = cg.string_ptr(builder, "0");
+                        builder.ins().stack_store(k0_ptr, slot, 0);
+                        builder.ins().stack_store(k0_len, slot, ptr_bytes);
+                        builder.ins().stack_store(env, slot, 2 * ptr_bytes);
+                        let (k1_ptr, k1_len) = cg.string_ptr(builder, "1");
+                        builder.ins().stack_store(k1_ptr, slot, 3 * ptr_bytes);
+                        builder.ins().stack_store(k1_len, slot, 4 * ptr_bytes);
+                        builder.ins().stack_store(new_arg, slot, 5 * ptr_bytes);
+                        let data_ptr = builder.ins().stack_addr(cg.ptr_type, slot, 0);
+                        let count = builder.ins().iconst(cg.ptr_type, 2i64);
+                        cg.call_rt(builder, "knot_record_from_pairs", &[data_ptr, count])
+                    } else {
+                        // env is already a record, append new_arg
+                        let prev_count = (total_args - 1) as usize;
+                        let new_count = total_args;
+                        let ptr_bytes = cg.ptr_type.bytes() as i32;
+                        let slot_size = (3 * new_count as u32) * ptr_bytes as u32;
+                        let slot = builder.create_sized_stack_slot(
+                            StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 0),
+                        );
+                        // Copy existing fields
+                        for i in 0..prev_count {
+                            let idx = builder.ins().iconst(cg.ptr_type, i as i64);
+                            let val = cg.call_rt(
+                                builder,
+                                "knot_record_field_by_index",
+                                &[env, idx],
+                            );
+                            let key_str = i.to_string();
+                            let (kp, kl) = cg.string_ptr(builder, &key_str);
+                            let base = (i as i32) * (3 * ptr_bytes);
+                            builder.ins().stack_store(kp, slot, base);
+                            builder.ins().stack_store(kl, slot, base + ptr_bytes);
+                            builder.ins().stack_store(val, slot, base + 2 * ptr_bytes);
+                        }
+                        // Add new arg
+                        let key_str = prev_count.to_string();
+                        let (kp, kl) = cg.string_ptr(builder, &key_str);
+                        let base = (prev_count as i32) * (3 * ptr_bytes);
+                        builder.ins().stack_store(kp, slot, base);
+                        builder.ins().stack_store(kl, slot, base + ptr_bytes);
+                        builder.ins().stack_store(new_arg, slot, base + 2 * ptr_bytes);
+                        let data_ptr = builder.ins().stack_addr(cg.ptr_type, slot, 0);
+                        let count = builder.ins().iconst(cg.ptr_type, new_count as i64);
+                        cg.call_rt(builder, "knot_record_from_pairs", &[data_ptr, count])
+                    };
+
+                    let next_ref = cg.module.declare_func_in_func(next_id, builder.func);
+                    let fn_addr = builder.ins().func_addr(cg.ptr_type, next_ref);
+                    let (src_ptr, src_len) = cg.string_ptr(builder, &fn_name);
+                    let result = cg.call_rt(
+                        builder,
+                        "knot_value_function",
+                        &[fn_addr, new_env, src_ptr, src_len],
+                    );
+                    builder.ins().return_(&[result]);
+                }
+            });
+        }
     }
 
     // ── Main function generation ──────────────────────────────────

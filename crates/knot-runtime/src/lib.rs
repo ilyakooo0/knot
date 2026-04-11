@@ -3528,6 +3528,18 @@ pub extern "C" fn knot_json_encode(v: *mut Value) -> *mut Value {
     alloc(Value::Text(value_to_json(v)))
 }
 
+/// toJson fallback with dispatcher — encodes compound types by calling back
+/// through the trait dispatcher for nested values, so custom ToJSON impls
+/// are respected for elements inside records, relations, and constructors.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_json_encode_with(
+    db: *mut c_void,
+    v: *mut Value,
+    to_json_fn: *const u8,
+) -> *mut Value {
+    alloc(Value::Text(value_to_json_with(db, v, to_json_fn)))
+}
+
 /// parseJson(text) — parse a JSON string into a Knot value
 ///
 /// Mapping:
@@ -8053,6 +8065,58 @@ fn value_to_serde_json(v: *mut Value) -> serde_json::Value {
         }
         Value::Function(_, _, src) => serde_json::Value::String(format!("<function: {}>", src)),
         Value::IO(_, _) => serde_json::Value::String("<<IO>>".into()),
+    }
+}
+
+/// Call the compiled toJson dispatcher for a sub-value, returning the JSON string.
+fn call_to_json_dispatcher(db: *mut c_void, v: *mut Value, to_json_fn: *const u8) -> String {
+    let f: extern "C" fn(*mut c_void, *mut Value) -> *mut Value =
+        unsafe { std::mem::transmute(to_json_fn) };
+    let result = f(db, v);
+    match unsafe { as_ref(result) } {
+        Value::Text(s) => s.clone(),
+        _ => value_to_json(v),
+    }
+}
+
+/// Like value_to_json but calls back through the trait dispatcher for nested values.
+fn value_to_json_with(db: *mut c_void, v: *mut Value, to_json_fn: *const u8) -> String {
+    if v.is_null() {
+        return "null".to_string();
+    }
+    match unsafe { as_ref(v) } {
+        // Compound types: recurse through the dispatcher for sub-values
+        Value::Record(fields) => {
+            let mut json = String::from("{");
+            for (i, f) in fields.iter().enumerate() {
+                if i > 0 { json.push(','); }
+                // Use serde to properly escape the field name
+                json.push_str(&serde_json::to_string(&f.name).unwrap());
+                json.push(':');
+                json.push_str(&call_to_json_dispatcher(db, f.value, to_json_fn));
+            }
+            json.push('}');
+            json
+        }
+        Value::Relation(rows) => {
+            let mut json = String::from("[");
+            for (i, r) in rows.iter().enumerate() {
+                if i > 0 { json.push(','); }
+                json.push_str(&call_to_json_dispatcher(db, *r, to_json_fn));
+            }
+            json.push(']');
+            json
+        }
+        Value::Constructor(tag, payload) => {
+            let mut json = String::from("{\"tag\":");
+            json.push_str(&serde_json::to_string(tag).unwrap());
+            json.push_str(",\"value\":");
+            json.push_str(&call_to_json_dispatcher(db, *payload, to_json_fn));
+            json.push('}');
+            json
+        }
+        // Leaf types: encode directly (no sub-values to dispatch on)
+        _ => value_to_json(v),
     }
 }
 

@@ -618,6 +618,7 @@ impl Codegen {
 
         // Standard library: JSON
         self.declare_rt("knot_json_encode", &[p], &[p]);
+        self.declare_rt("knot_json_encode_with", &[p, p, p], &[p]);
         self.declare_rt("knot_json_decode", &[p], &[p]);
 
         // Bytes value constructor and standard library
@@ -2417,8 +2418,18 @@ impl Codegen {
                 // Record == Record). For other traits, panic with no-impl error.
                 let fallback_rt = trait_method_fallback(&method_name);
                 if let Some(rt_fn) = fallback_rt {
-                    let result = cg.call_rt(builder, rt_fn, &all_params);
-                    builder.ins().jump(merge_block, &[result]);
+                    if method_name == "toJson" {
+                        // Special case: toJson fallback passes the dispatcher function
+                        // pointer so the runtime can call back for nested values,
+                        // respecting custom ToJSON impls inside compound types.
+                        let self_ref = cg.module.declare_func_in_func(dispatcher_id, builder.func);
+                        let self_addr = builder.ins().func_addr(cg.ptr_type, self_ref);
+                        let result = cg.call_rt(builder, "knot_json_encode_with", &[db, all_params[0], self_addr]);
+                        builder.ins().jump(merge_block, &[result]);
+                    } else {
+                        let result = cg.call_rt(builder, rt_fn, &all_params);
+                        builder.ins().jump(merge_block, &[result]);
+                    }
                 } else {
                     let (name_ptr, name_len) =
                         cg.string_ptr(builder, &method_name);

@@ -152,21 +152,43 @@ fn write_lock_guard() -> WriteLockGuard {
 
 // ── STM retry support ────────────────────────────────────────────
 
-/// Change counter + condvar for relation write notifications.
-/// `retry` waits here until a relation write increments the counter.
-static RELATION_CHANGED: (Mutex<u64>, Condvar) = (Mutex::new(0), Condvar::new());
+/// Per-table version counters for fine-grained retry notifications.
+/// A retrying `atomic` block only wakes when a table it actually read changes.
+static TABLE_VERSIONS: std::sync::LazyLock<Mutex<HashMap<String, u64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static TABLE_CVAR: Condvar = Condvar::new();
 
 thread_local! {
     /// Set by `knot_stm_retry`, checked by `knot_stm_check_and_clear` after atomic body.
     static STM_RETRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tables read during current atomic block, with version at read time.
+    static STM_READ_VERSIONS: RefCell<HashMap<String, u64>> = RefCell::new(HashMap::new());
+    /// Tables written during current atomic block (notification deferred to commit).
+    static STM_WRITTEN_TABLES: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 }
 
-/// Notify waiting `retry` callers that a relation has changed.
-fn notify_relation_changed() {
-    let (lock, cvar) = &RELATION_CHANGED;
-    let mut counter = lock.lock().unwrap();
-    *counter += 1;
-    cvar.notify_all();
+/// Notify waiting `retry` callers that a specific relation has changed.
+fn notify_relation_changed(name: &str) {
+    let mut versions = TABLE_VERSIONS.lock().unwrap();
+    *versions.entry(name.to_string()).or_insert(0) += 1;
+    TABLE_CVAR.notify_all();
+}
+
+/// Record that a table was read inside an atomic block.
+/// Captures the version at first-read time as the baseline for retry.
+fn stm_track_read(name: &str) {
+    let ver = TABLE_VERSIONS.lock().unwrap().get(name).copied().unwrap_or(0);
+    STM_READ_VERSIONS.with(|rv| {
+        rv.borrow_mut().entry(name.to_string()).or_insert(ver);
+    });
+}
+
+/// Record that a table was written inside an atomic block.
+/// The actual notification is deferred to commit.
+fn stm_track_write(name: &str) {
+    STM_WRITTEN_TABLES.with(|wt| {
+        wt.borrow_mut().insert(name.to_string());
+    });
 }
 
 // ── Debug mode ───────────────────────────────────────────────────
@@ -2616,27 +2638,35 @@ pub extern "C" fn knot_stm_check_and_clear() -> i32 {
     })
 }
 
-/// Snapshot the current relation change counter (for `knot_stm_wait`).
+/// Clear per-table read/write tracking to prepare for a new atomic body iteration.
+/// Return value is unused but kept for ABI compatibility with codegen.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_stm_snapshot() -> i64 {
-    let (lock, _) = &RELATION_CHANGED;
-    // Use wrapping cast to avoid issues if counter ever exceeds i64::MAX.
-    // The wait comparison uses wrapping subtraction for correct overflow handling.
-    *lock.lock().unwrap() as i64
+    STM_READ_VERSIONS.with(|rv| rv.borrow_mut().clear());
+    STM_WRITTEN_TABLES.with(|wt| wt.borrow_mut().clear());
+    0
 }
 
-/// Wait until the change counter exceeds the given snapshot.
-/// Used after rollback in a retry loop.
+/// Wait until a table in the read set has been modified since we read it.
+/// Only wakes for changes to tables the atomic block actually accessed.
+/// The `_snapshot` parameter is unused but kept for ABI compatibility.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_stm_wait(snapshot: i64) {
-    let (lock, cvar) = &RELATION_CHANGED;
-    let guard = lock.lock().unwrap();
-    let snapshot_u64 = snapshot as u64;
-    let _ = cvar
-        .wait_timeout_while(guard, Duration::from_millis(100), |c| {
-            // Compare as u64 directly to avoid incorrect results when
-            // the counter exceeds i64::MAX.
-            *c <= snapshot_u64
+pub extern "C" fn knot_stm_wait(_snapshot: i64) {
+    let read_versions = STM_READ_VERSIONS.with(|rv| rv.borrow().clone());
+    let guard = TABLE_VERSIONS.lock().unwrap();
+    if read_versions.is_empty() {
+        // Fallback: no tracked reads, wait for any change
+        let _ = TABLE_CVAR
+            .wait_timeout(guard, Duration::from_millis(100))
+            .unwrap();
+        return;
+    }
+    let _ = TABLE_CVAR
+        .wait_timeout_while(guard, Duration::from_millis(100), |versions| {
+            // Stay waiting while no tracked table has changed
+            read_versions.iter().all(|(table, ver)| {
+                versions.get(table).copied().unwrap_or(0) <= *ver
+            })
         })
         .unwrap();
 }
@@ -4749,6 +4779,10 @@ pub extern "C" fn knot_source_read(
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
 
+    if db_ref.atomic_depth.get() > 0 {
+        stm_track_read(name);
+    }
+
     let table = quote_ident(&format!("_knot_{}", name));
 
     if is_adt_schema(schema) {
@@ -4976,6 +5010,10 @@ pub extern "C" fn knot_source_read_where(
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
     let where_clause = unsafe { str_from_raw(where_ptr, where_len) };
+
+    if db_ref.atomic_depth.get() > 0 {
+        stm_track_read(name);
+    }
 
     let table_name = format!("_knot_{}", name);
     let table = quote_ident(&table_name);
@@ -5784,7 +5822,11 @@ pub extern "C" fn knot_source_write(
         .conn
         .execute_batch("RELEASE SAVEPOINT knot_full_set;")
         .expect("knot runtime: failed to commit transaction");
-    notify_relation_changed();
+    if db_ref.atomic_depth.get() > 0 {
+        stm_track_write(name);
+    } else {
+        notify_relation_changed(name);
+    }
 }
 
 /// Append rows to a source relation (INSERT only, no DELETE).
@@ -5861,7 +5903,11 @@ pub extern "C" fn knot_source_append(
         .conn
         .execute_batch("RELEASE SAVEPOINT knot_set;")
         .expect("knot runtime: failed to commit transaction");
-    notify_relation_changed();
+    if db_ref.atomic_depth.get() > 0 {
+        stm_track_write(name);
+    } else {
+        notify_relation_changed(name);
+    }
 }
 
 /// Diff-based write: compute minimal INSERT/DELETE against the existing table.
@@ -6015,7 +6061,11 @@ pub extern "C" fn knot_source_diff_write(
 
             db_ref.conn.execute_batch("RELEASE SAVEPOINT knot_diff_write;")
                 .expect("knot runtime: failed to commit transaction");
-            notify_relation_changed();
+            if db_ref.atomic_depth.get() > 0 {
+                stm_track_write(name);
+            } else {
+                notify_relation_changed(name);
+            }
             return;
         }
 
@@ -6027,7 +6077,11 @@ pub extern "C" fn knot_source_diff_write(
 
             db_ref.conn.execute_batch("RELEASE SAVEPOINT knot_diff_write;")
                 .expect("knot runtime: failed to commit transaction");
-            notify_relation_changed();
+            if db_ref.atomic_depth.get() > 0 {
+                stm_track_write(name);
+            } else {
+                notify_relation_changed(name);
+            }
             return;
         }
 
@@ -6154,7 +6208,11 @@ pub extern "C" fn knot_source_diff_write(
 
     db_ref.conn.execute_batch("RELEASE SAVEPOINT knot_diff_write;")
         .expect("knot runtime: failed to commit transaction");
-    notify_relation_changed();
+    if db_ref.atomic_depth.get() > 0 {
+        stm_track_write(name);
+    } else {
+        notify_relation_changed(name);
+    }
 }
 
 /// DELETE rows that don't match a WHERE condition.
@@ -6276,7 +6334,11 @@ pub extern "C" fn knot_source_delete_where(
         .conn
         .execute(&sql, param_refs2.as_slice())
         .unwrap_or_else(|e| panic!("knot runtime: delete_where error: {}\n  SQL: {}", e, sql));
-    notify_relation_changed();
+    if db_ref.atomic_depth.get() > 0 {
+        stm_track_write(name);
+    } else {
+        notify_relation_changed(name);
+    }
 }
 
 /// UPDATE rows matching a WHERE condition with new field values.
@@ -6328,7 +6390,11 @@ pub extern "C" fn knot_source_update_where(
         .conn
         .execute(&sql, param_refs.as_slice())
         .unwrap_or_else(|e| panic!("knot runtime: update_where error: {}\n  SQL: {}", e, sql));
-    notify_relation_changed();
+    if db_ref.atomic_depth.get() > 0 {
+        stm_track_write(name);
+    } else {
+        notify_relation_changed(name);
+    }
 }
 
 fn value_to_sql_param(v: *mut Value) -> rusqlite::types::Value {
@@ -6584,6 +6650,10 @@ pub extern "C" fn knot_source_read_at(
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
+
+    if db_ref.atomic_depth.get() > 0 {
+        stm_track_read(name);
+    }
 
     let ts = match unsafe { as_ref(timestamp) } {
         Value::Int(n) => n.to_i64().expect("knot runtime: timestamp too large for i64"),
@@ -7055,7 +7125,10 @@ pub extern "C" fn knot_atomic_commit(db: *mut c_void) {
         .expect("knot runtime: failed to commit atomic");
     db_ref.atomic_depth.set(depth - 1);
     if depth == 1 {
-        notify_relation_changed();
+        let written = STM_WRITTEN_TABLES.with(|wt| std::mem::take(&mut *wt.borrow_mut()));
+        for table in written {
+            notify_relation_changed(&table);
+        }
     }
 }
 
@@ -7077,6 +7150,9 @@ pub extern "C" fn knot_atomic_rollback(db: *mut c_void) {
         ))
         .expect("knot runtime: failed to rollback atomic");
     db_ref.atomic_depth.set(depth - 1);
+    if depth == 1 {
+        STM_WRITTEN_TABLES.with(|wt| wt.borrow_mut().clear());
+    }
 }
 
 // ── Record update ─────────────────────────────────────────────────
@@ -7599,7 +7675,11 @@ pub extern "C" fn knot_view_write(
         .conn
         .execute_batch("RELEASE SAVEPOINT knot_view_write;")
         .expect("knot runtime: view_write commit failed");
-    notify_relation_changed();
+    if db_ref.atomic_depth.get() > 0 {
+        stm_track_write(name);
+    } else {
+        notify_relation_changed(name);
+    }
 }
 
 // ── Pipe (|>) support ─────────────────────────────────────────────

@@ -272,6 +272,8 @@ struct LoopInfo {
     exit: cranelift_codegen::ir::Block,
     index_var: Value,
     where_skips: Vec<cranelift_codegen::ir::Block>,
+    /// Arena mark set at loop body entry — used for per-iteration reset.
+    arena_mark: Value,
 }
 
 // ── Public API ────────────────────────────────────────────────────
@@ -712,6 +714,14 @@ impl Codegen {
 
         // DB explorer TUI
         self.declare_rt("knot_db_handle", &[types::I32, p, p, p], &[types::I32]);
+
+        // Arena GC — per-iteration reset and frame-based isolation
+        self.declare_rt("knot_arena_mark", &[], &[p]);
+        self.declare_rt("knot_arena_reset_to", &[p], &[]);
+        self.declare_rt("knot_arena_promote", &[p], &[p]);
+        self.declare_rt("knot_arena_push_frame", &[], &[]);
+        self.declare_rt("knot_arena_pop_frame", &[], &[]);
+        self.declare_rt("knot_arena_pop_frame_promote", &[p], &[p]);
     }
 
     fn declare_rt(&mut self, name: &str, params: &[types::Type], returns: &[types::Type]) {
@@ -5805,6 +5815,9 @@ impl Codegen {
                         builder.switch_to_block(body);
                         builder.seal_block(body);
 
+                        // Arena GC: mark at hash join loop body entry
+                        let hj_arena_mark = self.call_rt(builder, "knot_arena_mark", &[]);
+
                         let row = self.call_rt(builder, "knot_relation_get", &[rel, i]);
                         let mut pattern_skips = Vec::new();
                         bind_do_pattern(builder, self, pat, row, env, &mut pattern_skips);
@@ -5853,6 +5866,7 @@ impl Codegen {
                             exit,
                             index_var: i,
                             where_skips: pattern_skips,
+                            arena_mark: hj_arena_mark,
                         });
                         continue;
                     }
@@ -5944,10 +5958,28 @@ impl Codegen {
                         None
                     };
 
+                    // Arena GC: frame isolation for bind expressions with user calls.
+                    // This reduces peak memory by freeing the callee's intermediate
+                    // allocations immediately, keeping only the return value.
+                    let needs_frame = !loop_stack.is_empty()
+                        && use_filter_pushdown.is_none()
+                        && expr_has_user_calls(expr, &self.user_fns);
+
+                    if needs_frame {
+                        self.call_rt_void(builder, "knot_arena_push_frame", &[]);
+                    }
+
                     let val = if let Some(pushed_val) = use_filter_pushdown {
                         pushed_val
                     } else {
                         self.compile_expr(builder, expr, env, db)
+                    };
+
+                    // Promote return value to parent frame, freeing callee temporaries
+                    let val = if needs_frame {
+                        self.call_rt(builder, "knot_arena_pop_frame_promote", &[val])
+                    } else {
+                        val
                     };
 
                     // For constructor patterns, the RHS might be a single value
@@ -5991,6 +6023,9 @@ impl Codegen {
 
                     builder.switch_to_block(body);
                     builder.seal_block(body);
+
+                    // Arena GC: mark at loop body entry for per-iteration reset
+                    let arena_mark = self.call_rt(builder, "knot_arena_mark", &[]);
 
                     let row = self.call_rt(builder, "knot_relation_get", &[rel, i]);
 
@@ -6047,6 +6082,7 @@ impl Codegen {
                         exit,
                         index_var: i,
                         where_skips: pattern_skips,
+                        arena_mark,
                     });
                 }
 
@@ -6224,6 +6260,9 @@ impl Codegen {
                     builder.switch_to_block(g_body);
                     builder.seal_block(g_body);
 
+                    // Arena GC: mark at groupBy loop body entry
+                    let g_arena_mark = self.call_rt(builder, "knot_arena_mark", &[]);
+
                     // 6. Rebind the primary variable to the current group
                     let group = self.call_rt(
                         builder,
@@ -6240,6 +6279,7 @@ impl Codegen {
                         exit: g_exit,
                         index_var: g_i,
                         where_skips: Vec::new(),
+                        arena_mark: g_arena_mark,
                     });
                 }
 
@@ -6248,6 +6288,13 @@ impl Codegen {
                     if let Some(inner) = expr.node.as_yield_arg() {
                         let val =
                             self.compile_expr(builder, inner, env, db);
+                        // Arena GC: promote yielded value so it survives
+                        // per-iteration reset in the continue block
+                        let val = if !loop_stack.is_empty() {
+                            self.call_rt(builder, "knot_arena_promote", &[val])
+                        } else {
+                            val
+                        };
                         self.call_rt_void(
                             builder,
                             "knot_relation_push",
@@ -6285,9 +6332,11 @@ impl Codegen {
                 builder.ins().jump(info.continue_blk, &[]);
             }
 
-            // Continue block: increment and loop back
+            // Continue block: reset arena and increment
             builder.switch_to_block(info.continue_blk);
             builder.seal_block(info.continue_blk);
+            // Arena GC: free per-iteration temporaries (promoted values survive in pinned set)
+            self.call_rt_void(builder, "knot_arena_reset_to", &[info.arena_mark]);
             let one = builder.ins().iconst(self.ptr_type, 1);
             let next_i = builder.ins().iadd(info.index_var, one);
             builder.ins().jump(info.header, &[next_i]);
@@ -8058,6 +8107,67 @@ fn analyze_view(body: &ast::Expr) -> Option<ViewInfo> {
 }
 
 /// Check if an expression references a specific variable name.
+/// Check if an expression contains function applications to user-defined
+/// functions (not builtins/runtime). Such calls may produce significant
+/// intermediate arena allocations that benefit from frame isolation.
+fn expr_has_user_calls(expr: &ast::Expr, user_fns: &HashMap<String, (FuncId, usize)>) -> bool {
+    match &expr.node {
+        ast::ExprKind::App { func, arg } => {
+            // Check if the function head is a user-defined function
+            let head_is_user_fn = match &func.node {
+                ast::ExprKind::Var(name) => user_fns.contains_key(name.as_str()),
+                // Curried application: f x y → App(App(Var("f"), x), y)
+                ast::ExprKind::App { .. } => expr_has_user_calls(func, user_fns),
+                _ => false,
+            };
+            head_is_user_fn
+                || expr_has_user_calls(func, user_fns)
+                || expr_has_user_calls(arg, user_fns)
+        }
+        ast::ExprKind::BinOp { lhs, rhs, .. } => {
+            expr_has_user_calls(lhs, user_fns) || expr_has_user_calls(rhs, user_fns)
+        }
+        ast::ExprKind::UnaryOp { operand, .. } => expr_has_user_calls(operand, user_fns),
+        ast::ExprKind::If { cond, then_branch, else_branch } => {
+            expr_has_user_calls(cond, user_fns)
+                || expr_has_user_calls(then_branch, user_fns)
+                || expr_has_user_calls(else_branch, user_fns)
+        }
+        ast::ExprKind::Case { scrutinee, arms } => {
+            expr_has_user_calls(scrutinee, user_fns)
+                || arms.iter().any(|a| expr_has_user_calls(&a.body, user_fns))
+        }
+        ast::ExprKind::Record(fields) => {
+            fields.iter().any(|f| expr_has_user_calls(&f.value, user_fns))
+        }
+        ast::ExprKind::RecordUpdate { base, fields } => {
+            expr_has_user_calls(base, user_fns)
+                || fields.iter().any(|f| expr_has_user_calls(&f.value, user_fns))
+        }
+        ast::ExprKind::FieldAccess { expr, .. } => expr_has_user_calls(expr, user_fns),
+        ast::ExprKind::Lambda { body, .. } => expr_has_user_calls(body, user_fns),
+        ast::ExprKind::Annot { expr, .. } => expr_has_user_calls(expr, user_fns),
+        ast::ExprKind::UnitLit { value, .. } => expr_has_user_calls(value, user_fns),
+        ast::ExprKind::Refine(inner) => expr_has_user_calls(inner, user_fns),
+        ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
+            ast::StmtKind::Bind { expr, .. } => expr_has_user_calls(expr, user_fns),
+            ast::StmtKind::Let { expr, .. } => expr_has_user_calls(expr, user_fns),
+            ast::StmtKind::Where { cond } => expr_has_user_calls(cond, user_fns),
+            ast::StmtKind::GroupBy { key } => expr_has_user_calls(key, user_fns),
+            ast::StmtKind::Expr(e) => expr_has_user_calls(e, user_fns),
+        }),
+        // Leaves: no function calls
+        ast::ExprKind::Lit(_)
+        | ast::ExprKind::Var(_)
+        | ast::ExprKind::Constructor(_)
+        | ast::ExprKind::SourceRef(_)
+        | ast::ExprKind::DerivedRef(_)
+        | ast::ExprKind::List(_) => false,
+        // Conservative: treat complex nodes as potentially having user calls
+        _ => true,
+    }
+}
+
 fn expr_references_var(expr: &ast::Expr, var_name: &str) -> bool {
     match &expr.node {
         ast::ExprKind::Var(name) => name == var_name,

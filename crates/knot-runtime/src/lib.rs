@@ -21,20 +21,19 @@ use std::time::Duration;
 
 // ── Arena allocator ──────────────────────────────────────────────
 
-/// A mark-and-reset arena for `Value` allocations.
+/// A single frame in the arena's frame stack.
 ///
-/// All `*mut Value` pointers are heap-allocated via `Box` and tracked here.
-/// `mark()` snapshots the current position; `reset_to(mark)` drops and frees
-/// every allocation made after that mark. Dropping a `Value` frees its owned
-/// data (String, Vec, BigInt) but does NOT recurse into child `*mut Value`
-/// pointers — those are independently tracked in the arena.
-struct Arena {
+/// `ptrs` tracks normal allocations that are freed by `reset_to` or frame drop.
+/// `pinned` tracks promoted values that survive `reset_to` within the frame
+/// (e.g., yielded values in do-block loops) but are freed when the frame drops.
+struct Frame {
     ptrs: Vec<*mut Value>,
+    pinned: Vec<*mut Value>,
 }
 
-impl Arena {
+impl Frame {
     fn new() -> Self {
-        Arena { ptrs: Vec::new() }
+        Frame { ptrs: Vec::new(), pinned: Vec::new() }
     }
 
     fn alloc(&mut self, v: Value) -> *mut Value {
@@ -51,14 +50,181 @@ impl Arena {
         for ptr in self.ptrs.drain(mark..) {
             unsafe { drop(Box::from_raw(ptr)); }
         }
+        // pinned values survive resets within the frame
+    }
+}
+
+impl Drop for Frame {
+    fn drop(&mut self) {
+        for ptr in self.ptrs.drain(..) {
+            unsafe { drop(Box::from_raw(ptr)); }
+        }
+        for ptr in self.pinned.drain(..) {
+            unsafe { drop(Box::from_raw(ptr)); }
+        }
+    }
+}
+
+/// A frame-stack arena for `Value` allocations.
+///
+/// All `*mut Value` pointers are heap-allocated via `Box` and tracked in frames.
+/// The frame stack enables isolation across function call boundaries:
+/// - `push_frame()` / `pop_frame()` for call-site isolation
+/// - `mark()` / `reset_to()` for per-iteration cleanup within a frame
+/// - `promote()` moves values to the pinned set (survives reset_to)
+/// - `pop_frame_promote()` deep-clones a value to the parent frame
+///
+/// Dropping a `Value` frees its owned data (String, Vec, BigInt) but does NOT
+/// recurse into child `*mut Value` pointers — those are independently tracked.
+struct Arena {
+    frames: Vec<Frame>,
+}
+
+impl Arena {
+    fn new() -> Self {
+        Arena { frames: vec![Frame::new()] }
+    }
+
+    fn current_frame(&mut self) -> &mut Frame {
+        self.frames.last_mut().expect("arena: no frames")
+    }
+
+    fn alloc(&mut self, v: Value) -> *mut Value {
+        self.current_frame().alloc(v)
+    }
+
+    fn mark(&self) -> usize {
+        self.frames.last().expect("arena: no frames").mark()
+    }
+
+    fn reset_to(&mut self, mark: usize) {
+        self.current_frame().reset_to(mark);
+    }
+
+    fn push_frame(&mut self) {
+        self.frames.push(Frame::new());
+    }
+
+    /// Pop the current frame, freeing all its allocations and pinned values.
+    fn pop_frame(&mut self) {
+        if self.frames.len() > 1 {
+            let _frame = self.frames.pop().unwrap();
+            // frame dropped here, freeing all ptrs and pinned
+        }
+    }
+
+    /// Pop the current frame, deep-clone `val` into the parent frame,
+    /// then free the popped frame. Returns the promoted pointer in the parent.
+    fn pop_frame_promote(&mut self, val: *mut Value) -> *mut Value {
+        if self.frames.len() <= 1 || val.is_null() {
+            return val;
+        }
+        // Pop the child frame — keep it alive while we clone
+        let frame = self.frames.pop().unwrap();
+        // Build a set of pointers owned by the child frame for selective cloning
+        let child_ptrs: HashSet<*mut Value> = frame.ptrs.iter().copied()
+            .chain(frame.pinned.iter().copied())
+            .collect();
+        // Deep-clone val into the parent frame, only copying child-owned values
+        let promoted = self.deep_clone_selective(val, &child_ptrs);
+        // Drop the child frame (frees all its allocations)
+        drop(frame);
+        promoted
+    }
+
+    /// Deep-clone `val` into the current frame's pinned set.
+    /// The original remains in ptrs and will be freed by `reset_to`.
+    fn promote(&mut self, val: *mut Value) -> *mut Value {
+        if val.is_null() { return val; }
+        // Collect which pointers are in the "danger zone" (at or after current mark
+        // position — though promote is called before reset_to, we conservatively
+        // clone the full tree into pinned).
+        self.deep_clone_into_pinned(val)
+    }
+
+    /// Deep-clone a value tree into the current frame's pinned set.
+    fn deep_clone_into_pinned(&mut self, val: *mut Value) -> *mut Value {
+        if val.is_null() { return val; }
+        let cloned = match unsafe { &*val } {
+            Value::Int(n) => Value::Int(n.clone()),
+            Value::Float(f) => Value::Float(*f),
+            Value::Text(s) => Value::Text(s.clone()),
+            Value::Bool(b) => Value::Bool(*b),
+            Value::Bytes(b) => Value::Bytes(b.clone()),
+            Value::Unit => Value::Unit,
+            Value::Record(fields) => Value::Record(
+                fields.iter().map(|f| RecordField {
+                    name: f.name.clone(),
+                    value: self.deep_clone_into_pinned(f.value),
+                }).collect(),
+            ),
+            Value::Relation(rows) => Value::Relation(
+                rows.iter().map(|r| self.deep_clone_into_pinned(*r)).collect(),
+            ),
+            Value::Constructor(tag, inner) => {
+                let inner_c = self.deep_clone_into_pinned(*inner);
+                Value::Constructor(tag.clone(), inner_c)
+            }
+            Value::Function(fn_ptr, env, source) => {
+                let env_c = self.deep_clone_into_pinned(*env);
+                Value::Function(*fn_ptr, env_c, source.clone())
+            }
+            Value::IO(fn_ptr, env) => {
+                let env_c = self.deep_clone_into_pinned(*env);
+                Value::IO(*fn_ptr, env_c)
+            }
+        };
+        let ptr = Box::into_raw(Box::new(cloned));
+        self.current_frame().pinned.push(ptr);
+        ptr
+    }
+
+    /// Deep-clone a value tree into the current frame's `ptrs`, but only clone
+    /// values that are owned by `child_ptrs`. Values not in the set are
+    /// referenced directly (they belong to an ancestor frame and are still live).
+    fn deep_clone_selective(&mut self, val: *mut Value, child_ptrs: &HashSet<*mut Value>) -> *mut Value {
+        if val.is_null() { return val; }
+        if !child_ptrs.contains(&val) {
+            // Value belongs to an ancestor frame — still live, no clone needed
+            return val;
+        }
+        let cloned = match unsafe { &*val } {
+            Value::Int(n) => Value::Int(n.clone()),
+            Value::Float(f) => Value::Float(*f),
+            Value::Text(s) => Value::Text(s.clone()),
+            Value::Bool(b) => Value::Bool(*b),
+            Value::Bytes(b) => Value::Bytes(b.clone()),
+            Value::Unit => Value::Unit,
+            Value::Record(fields) => Value::Record(
+                fields.iter().map(|f| RecordField {
+                    name: f.name.clone(),
+                    value: self.deep_clone_selective(f.value, child_ptrs),
+                }).collect(),
+            ),
+            Value::Relation(rows) => Value::Relation(
+                rows.iter().map(|r| self.deep_clone_selective(*r, child_ptrs)).collect(),
+            ),
+            Value::Constructor(tag, inner) => {
+                let inner_c = self.deep_clone_selective(*inner, child_ptrs);
+                Value::Constructor(tag.clone(), inner_c)
+            }
+            Value::Function(fn_ptr, env, source) => {
+                let env_c = self.deep_clone_selective(*env, child_ptrs);
+                Value::Function(*fn_ptr, env_c, source.clone())
+            }
+            Value::IO(fn_ptr, env) => {
+                let env_c = self.deep_clone_selective(*env, child_ptrs);
+                Value::IO(*fn_ptr, env_c)
+            }
+        };
+        self.alloc(cloned)
     }
 }
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        for ptr in self.ptrs.drain(..) {
-            unsafe { drop(Box::from_raw(ptr)); }
-        }
+        // Drop all frames (each frame frees its ptrs and pinned)
+        self.frames.clear();
     }
 }
 
@@ -370,6 +536,34 @@ pub extern "C" fn knot_arena_mark() -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_arena_reset_to(mark: usize) {
     ARENA.with(|a| a.borrow_mut().reset_to(mark));
+}
+
+/// Push a new arena frame for call-site isolation.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_arena_push_frame() {
+    ARENA.with(|a| a.borrow_mut().push_frame());
+}
+
+/// Pop the current arena frame, freeing all its allocations.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_arena_pop_frame() {
+    ARENA.with(|a| a.borrow_mut().pop_frame());
+}
+
+/// Pop the current arena frame, deep-cloning `val` into the parent frame.
+/// Returns the promoted pointer. Used at function return boundaries
+/// to preserve the return value while freeing the callee's temporaries.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_arena_pop_frame_promote(val: *mut Value) -> *mut Value {
+    ARENA.with(|a| a.borrow_mut().pop_frame_promote(val))
+}
+
+/// Deep-clone `val` into the current frame's pinned set so it survives
+/// `knot_arena_reset_to`. Used before `knot_relation_push` in do-block
+/// loops to preserve yielded values across per-iteration resets.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_arena_promote(val: *mut Value) -> *mut Value {
+    ARENA.with(|a| a.borrow_mut().promote(val))
 }
 
 unsafe fn as_ref<'a>(v: *mut Value) -> &'a Value {
@@ -8314,10 +8508,15 @@ pub extern "C" fn knot_http_listen(
     eprintln!("Knot HTTP server listening on http://0.0.0.0:{}", port);
 
     loop {
+        // Mark the arena so we can free main-thread allocations after dispatching
+        // each request. Handler threads have their own arenas (thread-local).
+        let arena_mark = ARENA.with(|a| a.borrow().mark());
+
         let mut request = match server.recv() {
             Ok(req) => req,
             Err(e) => {
                 eprintln!("knot runtime: error receiving request: {}", e);
+                ARENA.with(|a| a.borrow_mut().reset_to(arena_mark));
                 continue;
             }
         };
@@ -8713,6 +8912,10 @@ pub extern "C" fn knot_http_listen(
                 let _ = request.respond(response);
             }
         }
+
+        // Free main-thread arena allocations from this request cycle.
+        // Handler threads have their own thread-local arenas.
+        ARENA.with(|a| a.borrow_mut().reset_to(arena_mark));
     }
 }
 

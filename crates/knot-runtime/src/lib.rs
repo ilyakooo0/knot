@@ -8076,6 +8076,8 @@ pub extern "C" fn knot_constructor_matches(
     let tag = unsafe { str_from_raw(tag_ptr, tag_len) };
     match unsafe { as_ref(v) } {
         Value::Constructor(t, _) => (t == tag) as i32,
+        // Text values can appear as implicit nullary constructors (e.g. from JSON deserialization)
+        Value::Text(s) => (s.as_str() == tag) as i32,
         _ => 0,
     }
 }
@@ -8086,6 +8088,8 @@ pub extern "C" fn knot_constructor_matches(
 pub extern "C" fn knot_constructor_tag_ptr(v: *mut Value) -> *const u8 {
     match unsafe { as_ref(v) } {
         Value::Constructor(t, _) => t.as_ptr(),
+        // Text values can appear as implicit nullary constructors (e.g. from JSON deserialization)
+        Value::Text(s) => s.as_ptr(),
         _ => panic!("knot runtime: expected Constructor in tag_ptr, got {} = {}", type_name(v), brief_value(v)),
     }
 }
@@ -8095,6 +8099,8 @@ pub extern "C" fn knot_constructor_tag_ptr(v: *mut Value) -> *const u8 {
 pub extern "C" fn knot_constructor_tag_len(v: *mut Value) -> usize {
     match unsafe { as_ref(v) } {
         Value::Constructor(t, _) => t.len(),
+        // Text values can appear as implicit nullary constructors (e.g. from JSON deserialization)
+        Value::Text(s) => s.len(),
         _ => panic!("knot runtime: expected Constructor in tag_len, got {}", type_name(v)),
     }
 }
@@ -8125,6 +8131,8 @@ pub extern "C" fn knot_constructor_payload(v: *mut Value) -> *mut Value {
     }
     match unsafe { as_ref(v) } {
         Value::Constructor(_, payload) => *payload,
+        // Text values can appear as implicit nullary constructors (e.g. from JSON deserialization)
+        Value::Text(_) => alloc(Value::Unit),
         _ => panic!("knot runtime: expected Constructor, got {}", type_name(v)),
     }
 }

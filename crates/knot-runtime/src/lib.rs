@@ -20,46 +20,139 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 // ── Arena allocator ──────────────────────────────────────────────
+//
+// Three-tier GC with bump allocation:
+//
+//  1. **Bump chunks** — values are allocated by bumping a pointer in fixed-size
+//     chunks (no per-value malloc). Chunks are stable; pointers never move.
+//  2. **Mark / reset** — `mark()` snapshots the position; `reset_to()` runs
+//     destructors on values allocated since the mark and rewinds the bump
+//     pointer.  Used for per-iteration cleanup in do-block loops.
+//  3. **Promote (selective)** — before `reset_to`, yielded values are
+//     deep-cloned into a Box-allocated `pinned` list.  Only chunk-resident
+//     values are cloned; singletons, text-cache, and parent-frame values are
+//     reused by pointer (zero-copy for safe values).
+//  4. **Frame stack** — `push_frame` / `pop_frame` isolate function calls.
+//     `pop_frame_promote` deep-clones the return value into the parent,
+//     using chunk-range checks instead of a HashSet.
+
+use std::mem::MaybeUninit;
+
+/// Number of `Alloc` slots per chunk.  512 × ~80-120 bytes ≈ 40-60 KB.
+const CHUNK_CAP: usize = 512;
+
+/// A contiguous block of bump-allocated `Value` slots.
+struct Chunk {
+    data: Box<[MaybeUninit<Value>]>,
+    len: usize,
+}
+
+impl Chunk {
+    fn new() -> Self {
+        let mut v: Vec<MaybeUninit<Value>> = Vec::with_capacity(CHUNK_CAP);
+        // SAFETY: MaybeUninit<T> is valid for any bit pattern.
+        unsafe { v.set_len(CHUNK_CAP); }
+        Chunk { data: v.into_boxed_slice(), len: 0 }
+    }
+
+    #[inline]
+    fn is_full(&self) -> bool { self.len >= CHUNK_CAP }
+
+    /// Bump-allocate a value, returning a stable pointer.
+    #[inline]
+    fn alloc(&mut self, v: Value) -> *mut Value {
+        debug_assert!(!self.is_full());
+        let slot = &mut self.data[self.len];
+        let ptr = slot.as_mut_ptr();
+        unsafe { ptr.write(v); }
+        self.len += 1;
+        ptr
+    }
+
+    /// Check whether `val` points into this chunk's live region.
+    #[inline]
+    fn contains(&self, val: *mut Value) -> bool {
+        if self.len == 0 { return false; }
+        let base = self.data.as_ptr() as usize;
+        let end = unsafe { self.data.as_ptr().add(self.len) as usize };
+        let addr = val as usize;
+        addr >= base && addr < end
+    }
+}
 
 /// A single frame in the arena's frame stack.
 ///
-/// `ptrs` tracks normal allocations that are freed by `reset_to` or frame drop.
-/// `pinned` tracks promoted values that survive `reset_to` within the frame
-/// (e.g., yielded values in do-block loops) but are freed when the frame drops.
+/// `chunks` holds bump-allocated values freed by `reset_to` or frame drop.
+/// `pinned` holds values promoted out of chunks (Box-allocated) that survive
+/// `reset_to` but are freed when the frame drops.
 struct Frame {
-    ptrs: Vec<*mut Value>,
+    chunks: Vec<Chunk>,
+    /// Promoted values that survive `reset_to` within this frame.
+    /// Each entry is a `Box::into_raw(Box::new(Value))`.
     pinned: Vec<*mut Value>,
 }
 
 impl Frame {
     fn new() -> Self {
-        Frame { ptrs: Vec::new(), pinned: Vec::new() }
+        Frame { chunks: vec![Chunk::new()], pinned: Vec::new() }
     }
 
+    #[inline]
     fn alloc(&mut self, v: Value) -> *mut Value {
-        let ptr = Box::into_raw(Box::new(v));
-        self.ptrs.push(ptr);
-        ptr
+        if self.chunks.last().map_or(true, Chunk::is_full) {
+            self.chunks.push(Chunk::new());
+        }
+        self.chunks.last_mut().unwrap().alloc(v)
     }
 
     fn mark(&self) -> usize {
-        self.ptrs.len()
+        if self.chunks.is_empty() { return 0; }
+        (self.chunks.len() - 1) * CHUNK_CAP + self.chunks.last().unwrap().len
     }
 
     fn reset_to(&mut self, mark: usize) {
-        for ptr in self.ptrs.drain(mark..) {
-            unsafe { drop(Box::from_raw(ptr)); }
+        let mark_chunk = mark / CHUNK_CAP;
+        let mark_slot = mark % CHUNK_CAP;
+
+        // Drop values from current end back to mark position.
+        for ci in (mark_chunk..self.chunks.len()).rev() {
+            let chunk = &mut self.chunks[ci];
+            let start = if ci == mark_chunk { mark_slot } else { 0 };
+            for si in (start..chunk.len).rev() {
+                unsafe { std::ptr::drop_in_place(chunk.data[si].as_mut_ptr()); }
+            }
+            chunk.len = start;
         }
-        // pinned values survive resets within the frame
+        // Free fully-cleared chunks (keep mark chunk for reuse).
+        self.chunks.truncate(mark_chunk + 1);
+    }
+
+    /// Check whether `val` lives in one of this frame's chunks.
+    fn owns_in_chunks(&self, val: *mut Value) -> bool {
+        self.chunks.iter().any(|c| c.contains(val))
+    }
+
+    /// Check whether `val` is owned by this frame (chunks or pinned).
+    fn owns(&self, val: *mut Value) -> bool {
+        if self.owns_in_chunks(val) { return true; }
+        self.pinned.contains(&val)
+    }
+
+    /// Drop all live values in chunks (called from Frame::drop).
+    fn drop_chunks(&mut self) {
+        for chunk in &mut self.chunks {
+            for si in 0..chunk.len {
+                unsafe { std::ptr::drop_in_place(chunk.data[si].as_mut_ptr()); }
+            }
+            chunk.len = 0;
+        }
     }
 }
 
 impl Drop for Frame {
     fn drop(&mut self) {
-        for ptr in self.ptrs.drain(..) {
-            unsafe { drop(Box::from_raw(ptr)); }
-        }
-        for ptr in self.pinned.drain(..) {
+        self.drop_chunks();
+        for &ptr in &self.pinned {
             unsafe { drop(Box::from_raw(ptr)); }
         }
     }
@@ -67,15 +160,12 @@ impl Drop for Frame {
 
 /// A frame-stack arena for `Value` allocations.
 ///
-/// All `*mut Value` pointers are heap-allocated via `Box` and tracked in frames.
+/// Values are bump-allocated in per-frame chunks (no per-value malloc).
 /// The frame stack enables isolation across function call boundaries:
 /// - `push_frame()` / `pop_frame()` for call-site isolation
 /// - `mark()` / `reset_to()` for per-iteration cleanup within a frame
-/// - `promote()` moves values to the pinned set (survives reset_to)
+/// - `promote()` selectively clones values into the pinned set
 /// - `pop_frame_promote()` deep-clones a value to the parent frame
-///
-/// Dropping a `Value` frees its owned data (String, Vec, BigInt) but does NOT
-/// recurse into child `*mut Value` pointers — those are independently tracked.
 struct Arena {
     frames: Vec<Frame>,
 }
@@ -85,10 +175,12 @@ impl Arena {
         Arena { frames: vec![Frame::new()] }
     }
 
+    #[inline]
     fn current_frame(&mut self) -> &mut Frame {
         self.frames.last_mut().expect("arena: no frames")
     }
 
+    #[inline]
     fn alloc(&mut self, v: Value) -> *mut Value {
         self.current_frame().alloc(v)
     }
@@ -109,41 +201,97 @@ impl Arena {
     fn pop_frame(&mut self) {
         if self.frames.len() > 1 {
             let _frame = self.frames.pop().unwrap();
-            // frame dropped here, freeing all ptrs and pinned
         }
     }
 
     /// Pop the current frame, deep-clone `val` into the parent frame,
-    /// then free the popped frame. Returns the promoted pointer in the parent.
+    /// then free the popped frame.  Uses chunk-range ownership checks
+    /// instead of building a HashSet.
     fn pop_frame_promote(&mut self, val: *mut Value) -> *mut Value {
         if self.frames.len() <= 1 || val.is_null() {
             return val;
         }
-        // Pop the child frame — keep it alive while we clone
-        let frame = self.frames.pop().unwrap();
-        // Build a set of pointers owned by the child frame for selective cloning
-        let child_ptrs: HashSet<*mut Value> = frame.ptrs.iter().copied()
-            .chain(frame.pinned.iter().copied())
-            .collect();
-        // Deep-clone val into the parent frame, only copying child-owned values
-        let promoted = self.deep_clone_selective(val, &child_ptrs);
-        // Drop the child frame (frees all its allocations)
-        drop(frame);
+        let child = self.frames.pop().unwrap();
+        let promoted = self.clone_from_child(val, &child);
+        drop(child);
         promoted
     }
 
-    /// Deep-clone `val` into the current frame's pinned set.
-    /// The original remains in ptrs and will be freed by `reset_to`.
+    // ── Promote (selective clone into pinned) ────────────────────
+
+    /// Selectively clone `val` so it survives the upcoming `reset_to`.
+    /// Values already safe (singletons, parent-frame, text-cache) are
+    /// returned as-is; only chunk-resident values are deep-cloned.
     fn promote(&mut self, val: *mut Value) -> *mut Value {
         if val.is_null() { return val; }
-        // Collect which pointers are in the "danger zone" (at or after current mark
-        // position — though promote is called before reset_to, we conservatively
-        // clone the full tree into pinned).
-        self.deep_clone_into_pinned(val)
+        let in_chunk = self.current_frame().owns_in_chunks(val);
+        if in_chunk {
+            self.clone_into_pinned(val)
+        } else {
+            self.promote_children(val)
+        }
     }
 
-    /// Deep-clone a value tree into the current frame's pinned set.
-    fn deep_clone_into_pinned(&mut self, val: *mut Value) -> *mut Value {
+    /// `val` is NOT in the current frame's chunks (safe from reset),
+    /// but its children might be.  Recurse and copy-on-write if needed.
+    fn promote_children(&mut self, val: *mut Value) -> *mut Value {
+        if val.is_null() { return val; }
+        match unsafe { &*val } {
+            Value::Int(_) | Value::Float(_) | Value::Text(_)
+            | Value::Bool(_) | Value::Bytes(_) | Value::Unit => val,
+
+            Value::Record(fields) => {
+                let mut changed = false;
+                let new_fields: Vec<RecordField> = fields.iter().map(|f| {
+                    let nv = self.promote_value(f.value);
+                    if nv != f.value { changed = true; }
+                    RecordField { name: f.name.clone(), value: nv }
+                }).collect();
+                if changed { self.alloc_pinned(Value::Record(new_fields)) } else { val }
+            }
+            Value::Relation(rows) => {
+                let mut changed = false;
+                let new_rows: Vec<*mut Value> = rows.iter().map(|&r| {
+                    let nr = self.promote_value(r);
+                    if nr != r { changed = true; }
+                    nr
+                }).collect();
+                if changed { self.alloc_pinned(Value::Relation(new_rows)) } else { val }
+            }
+            Value::Constructor(tag, inner) => {
+                let ni = self.promote_value(*inner);
+                if ni != *inner {
+                    self.alloc_pinned(Value::Constructor(tag.clone(), ni))
+                } else { val }
+            }
+            Value::Function(fp, env, src) => {
+                let ne = self.promote_value(*env);
+                if ne != *env {
+                    self.alloc_pinned(Value::Function(*fp, ne, src.clone()))
+                } else { val }
+            }
+            Value::IO(fp, env) => {
+                let ne = self.promote_value(*env);
+                if ne != *env {
+                    self.alloc_pinned(Value::IO(*fp, ne))
+                } else { val }
+            }
+        }
+    }
+
+    /// Top-level recursive promote: dispatch chunk-resident vs safe.
+    fn promote_value(&mut self, val: *mut Value) -> *mut Value {
+        if val.is_null() { return val; }
+        if self.current_frame().owns_in_chunks(val) {
+            self.clone_into_pinned(val)
+        } else {
+            self.promote_children(val)
+        }
+    }
+
+    /// Deep-clone a chunk-resident value into the pinned set.
+    /// Children are processed with `promote_value` (selective).
+    fn clone_into_pinned(&mut self, val: *mut Value) -> *mut Value {
         if val.is_null() { return val; }
         let cloned = match unsafe { &*val } {
             Value::Int(n) => Value::Int(n.clone()),
@@ -155,37 +303,39 @@ impl Arena {
             Value::Record(fields) => Value::Record(
                 fields.iter().map(|f| RecordField {
                     name: f.name.clone(),
-                    value: self.deep_clone_into_pinned(f.value),
+                    value: self.promote_value(f.value),
                 }).collect(),
             ),
             Value::Relation(rows) => Value::Relation(
-                rows.iter().map(|r| self.deep_clone_into_pinned(*r)).collect(),
+                rows.iter().map(|&r| self.promote_value(r)).collect(),
             ),
             Value::Constructor(tag, inner) => {
-                let inner_c = self.deep_clone_into_pinned(*inner);
-                Value::Constructor(tag.clone(), inner_c)
+                Value::Constructor(tag.clone(), self.promote_value(*inner))
             }
-            Value::Function(fn_ptr, env, source) => {
-                let env_c = self.deep_clone_into_pinned(*env);
-                Value::Function(*fn_ptr, env_c, source.clone())
+            Value::Function(fp, env, src) => {
+                Value::Function(*fp, self.promote_value(*env), src.clone())
             }
-            Value::IO(fn_ptr, env) => {
-                let env_c = self.deep_clone_into_pinned(*env);
-                Value::IO(*fn_ptr, env_c)
+            Value::IO(fp, env) => {
+                Value::IO(*fp, self.promote_value(*env))
             }
         };
-        let ptr = Box::into_raw(Box::new(cloned));
+        self.alloc_pinned(cloned)
+    }
+
+    /// Box-allocate a value into the current frame's pinned set.
+    fn alloc_pinned(&mut self, v: Value) -> *mut Value {
+        let ptr = Box::into_raw(Box::new(v));
         self.current_frame().pinned.push(ptr);
         ptr
     }
 
-    /// Deep-clone a value tree into the current frame's `ptrs`, but only clone
-    /// values that are owned by `child_ptrs`. Values not in the set are
-    /// referenced directly (they belong to an ancestor frame and are still live).
-    fn deep_clone_selective(&mut self, val: *mut Value, child_ptrs: &HashSet<*mut Value>) -> *mut Value {
+    // ── Pop-frame selective clone ────────────────────────────────
+
+    /// Deep-clone `val` into the parent frame, only cloning values owned
+    /// by `child`.  Uses chunk-range + pinned checks (no HashSet).
+    fn clone_from_child(&mut self, val: *mut Value, child: &Frame) -> *mut Value {
         if val.is_null() { return val; }
-        if !child_ptrs.contains(&val) {
-            // Value belongs to an ancestor frame — still live, no clone needed
+        if !child.owns(val) {
             return val;
         }
         let cloned = match unsafe { &*val } {
@@ -198,23 +348,20 @@ impl Arena {
             Value::Record(fields) => Value::Record(
                 fields.iter().map(|f| RecordField {
                     name: f.name.clone(),
-                    value: self.deep_clone_selective(f.value, child_ptrs),
+                    value: self.clone_from_child(f.value, child),
                 }).collect(),
             ),
             Value::Relation(rows) => Value::Relation(
-                rows.iter().map(|r| self.deep_clone_selective(*r, child_ptrs)).collect(),
+                rows.iter().map(|&r| self.clone_from_child(r, child)).collect(),
             ),
             Value::Constructor(tag, inner) => {
-                let inner_c = self.deep_clone_selective(*inner, child_ptrs);
-                Value::Constructor(tag.clone(), inner_c)
+                Value::Constructor(tag.clone(), self.clone_from_child(*inner, child))
             }
-            Value::Function(fn_ptr, env, source) => {
-                let env_c = self.deep_clone_selective(*env, child_ptrs);
-                Value::Function(*fn_ptr, env_c, source.clone())
+            Value::Function(fp, env, src) => {
+                Value::Function(*fp, self.clone_from_child(*env, child), src.clone())
             }
-            Value::IO(fn_ptr, env) => {
-                let env_c = self.deep_clone_selective(*env, child_ptrs);
-                Value::IO(*fn_ptr, env_c)
+            Value::IO(fp, env) => {
+                Value::IO(*fp, self.clone_from_child(*env, child))
             }
         };
         self.alloc(cloned)
@@ -223,7 +370,6 @@ impl Arena {
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        // Drop all frames (each frame frees its ptrs and pinned)
         self.frames.clear();
     }
 }

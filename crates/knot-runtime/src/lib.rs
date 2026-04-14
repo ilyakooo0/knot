@@ -8396,8 +8396,22 @@ fn string_to_value(s: &str, ty: &str) -> *mut Value {
             let b = s == "true" || s == "True";
             alloc_bool(b)
         }
+        "tag" => {
+            alloc(Value::Constructor(s.to_string(), alloc(Value::Unit)))
+        }
         _ => alloc(Value::Text(s.to_string())),
     }
+}
+
+/// Coerce a JSON-parsed value to match the expected field type.
+/// JSON strings become Constructors for "tag"-typed fields (all-nullary ADTs).
+fn coerce_json_field(v: *mut Value, ty: &str) -> *mut Value {
+    if ty == "tag" {
+        if let Value::Text(s) = unsafe { as_ref(v) } {
+            return alloc(Value::Constructor(s.clone(), alloc(Value::Unit)));
+        }
+    }
+    v
 }
 
 const BASE64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -8800,26 +8814,28 @@ pub extern "C" fn knot_http_listen(
                             Value::Record(body_fields) => {
                                 for (bname, bty) in &entry_body_fields {
                                     let is_maybe = bty.starts_with('?');
+                                    let inner_ty = if is_maybe { &bty[1..] } else { bty.as_str() };
                                     let raw_val = body_fields.iter()
                                         .find(|f| f.name == *bname)
                                         .map(|f| f.value);
                                     let value = if is_maybe {
                                         match raw_val {
                                             Some(v) => {
+                                                let coerced = coerce_json_field(v, inner_ty);
                                                 alloc(Value::Constructor(
                                                     "Just".into(),
                                                     alloc(Value::Record(vec![
-                                                        RecordField { name: "value".into(), value: v },
+                                                        RecordField { name: "value".into(), value: coerced },
                                                     ])),
                                                 ))
                                             }
                                             None => alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit))),
                                         }
                                     } else {
-                                        raw_val.unwrap_or_else(|| {
-                                            let inner_ty = if bty.starts_with('?') { &bty[1..] } else { bty.as_str() };
-                                            string_to_value("", inner_ty)
-                                        })
+                                        match raw_val {
+                                            Some(v) => coerce_json_field(v, inner_ty),
+                                            None => string_to_value("", inner_ty),
+                                        }
                                     };
                                     fields.push(RecordField {
                                         name: bname.clone(),

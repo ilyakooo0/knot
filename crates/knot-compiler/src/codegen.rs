@@ -2915,18 +2915,18 @@ impl Codegen {
                         ast::HttpMethod::Patch => "PATCH",
                     };
                     let (method_ptr, method_len) = cg.string_ptr(builder, method_str);
-                    let path_pattern = path_segments_to_pattern(&route_entry.path);
+                    let path_pattern = path_segments_to_pattern(&route_entry.path, &cg.type_aliases);
                     let (path_ptr, path_len) = cg.string_ptr(builder, &path_pattern);
                     let (ctor_ptr, ctor_len) = cg.string_ptr(builder, &route_entry.constructor);
-                    let body_desc = fields_to_descriptor(&route_entry.body_fields);
+                    let body_desc = fields_to_descriptor(&route_entry.body_fields, &cg.type_aliases);
                     let (body_ptr, body_len) = cg.string_ptr(builder, &body_desc);
-                    let query_desc = fields_to_descriptor(&route_entry.query_params);
+                    let query_desc = fields_to_descriptor(&route_entry.query_params, &cg.type_aliases);
                     let (query_ptr, query_len) = cg.string_ptr(builder, &query_desc);
                     let resp_desc = response_type_descriptor(&route_entry.response_ty, &cg.type_aliases);
                     let (resp_ptr, resp_len) = cg.string_ptr(builder, &resp_desc);
-                    let req_hdrs_desc = fields_to_descriptor(&route_entry.request_headers);
+                    let req_hdrs_desc = fields_to_descriptor(&route_entry.request_headers, &cg.type_aliases);
                     let (req_hdrs_ptr, req_hdrs_len) = cg.string_ptr(builder, &req_hdrs_desc);
-                    let resp_hdrs_desc = fields_to_descriptor(&route_entry.response_headers);
+                    let resp_hdrs_desc = fields_to_descriptor(&route_entry.response_headers, &cg.type_aliases);
                     let (resp_hdrs_ptr, resp_hdrs_len) = cg.string_ptr(builder, &resp_hdrs_desc);
                     cg.call_rt_void(
                         builder,
@@ -4567,18 +4567,18 @@ impl Codegen {
                         let (method_ptr, method_len) =
                             self.string_ptr(builder, method_str);
 
-                        let path_pattern = path_segments_to_pattern(&entry.path);
+                        let path_pattern = path_segments_to_pattern(&entry.path, &self.type_aliases);
                         let (path_ptr, path_len) =
                             self.string_ptr(builder, &path_pattern);
 
                         let (ctor_ptr, ctor_len) =
                             self.string_ptr(builder, &entry.constructor);
 
-                        let body_desc = fields_to_descriptor(&entry.body_fields);
+                        let body_desc = fields_to_descriptor(&entry.body_fields, &self.type_aliases);
                         let (body_ptr, body_len) =
                             self.string_ptr(builder, &body_desc);
 
-                        let query_desc = fields_to_descriptor(&entry.query_params);
+                        let query_desc = fields_to_descriptor(&entry.query_params, &self.type_aliases);
                         let (query_ptr, query_len) =
                             self.string_ptr(builder, &query_desc);
 
@@ -4586,11 +4586,11 @@ impl Codegen {
                         let (resp_ptr, resp_len) =
                             self.string_ptr(builder, &resp_desc);
 
-                        let req_hdrs_desc = fields_to_descriptor(&entry.request_headers);
+                        let req_hdrs_desc = fields_to_descriptor(&entry.request_headers, &self.type_aliases);
                         let (req_hdrs_ptr, req_hdrs_len) =
                             self.string_ptr(builder, &req_hdrs_desc);
 
-                        let resp_hdrs_desc = fields_to_descriptor(&entry.response_headers);
+                        let resp_hdrs_desc = fields_to_descriptor(&entry.response_headers, &self.type_aliases);
                         let (resp_hdrs_ptr, resp_hdrs_len) =
                             self.string_ptr(builder, &resp_hdrs_desc);
 
@@ -4732,13 +4732,13 @@ impl Codegen {
             ast::HttpMethod::Delete => "DELETE",
             ast::HttpMethod::Patch => "PATCH",
         };
-        let path_pattern = path_segments_to_pattern(&entry.path);
-        let body_desc = fields_to_descriptor(&entry.body_fields);
-        let query_desc = fields_to_descriptor(&entry.query_params);
+        let path_pattern = path_segments_to_pattern(&entry.path, &self.type_aliases);
+        let body_desc = fields_to_descriptor(&entry.body_fields, &self.type_aliases);
+        let query_desc = fields_to_descriptor(&entry.query_params, &self.type_aliases);
         let resp_desc =
             response_type_descriptor(&entry.response_ty, &self.type_aliases);
-        let req_hdrs_desc = fields_to_descriptor(&entry.request_headers);
-        let resp_hdrs_desc = fields_to_descriptor(&entry.response_headers);
+        let req_hdrs_desc = fields_to_descriptor(&entry.request_headers, &self.type_aliases);
+        let resp_hdrs_desc = fields_to_descriptor(&entry.response_headers, &self.type_aliases);
 
         let (method_ptr, method_len) = self.string_ptr(builder, method_str);
         let (path_ptr, path_len) = self.string_ptr(builder, &path_pattern);
@@ -9395,13 +9395,16 @@ fn type_name_to_tag(name: &str) -> Option<i64> {
 }
 
 /// Convert route path segments to a pattern string like "/todos/{owner:text}".
-fn path_segments_to_pattern(segments: &[ast::PathSegment]) -> String {
+fn path_segments_to_pattern(
+    segments: &[ast::PathSegment],
+    aliases: &std::collections::HashMap<String, ResolvedType>,
+) -> String {
     let mut parts = Vec::new();
     for seg in segments {
         match seg {
             ast::PathSegment::Literal(s) => parts.push(s.clone()),
             ast::PathSegment::Param { name, ty } => {
-                let ty_str = ast_type_to_descriptor_type(ty);
+                let ty_str = ast_type_to_descriptor_type(ty, aliases);
                 parts.push(format!("{{{name}:{ty_str}}}"));
             }
         }
@@ -9410,34 +9413,47 @@ fn path_segments_to_pattern(segments: &[ast::PathSegment]) -> String {
 }
 
 /// Convert typed fields to a descriptor string like "name:text,age:int".
-fn fields_to_descriptor(fields: &[ast::Field<ast::Type>]) -> String {
+fn fields_to_descriptor(
+    fields: &[ast::Field<ast::Type>],
+    aliases: &std::collections::HashMap<String, ResolvedType>,
+) -> String {
     fields
         .iter()
         .map(|f| {
-            let ty_str = ast_type_to_descriptor_type(&f.value);
+            let ty_str = ast_type_to_descriptor_type(&f.value, aliases);
             format!("{}:{}", f.name, ty_str)
         })
         .collect::<Vec<_>>()
         .join(",")
 }
 
-fn ast_type_to_descriptor_type(ty: &ast::Type) -> String {
+fn ast_type_to_descriptor_type(
+    ty: &ast::Type,
+    aliases: &std::collections::HashMap<String, ResolvedType>,
+) -> String {
     match &ty.node {
         ast::TypeKind::Named(n) => match n.as_str() {
             "Int" => "int".to_string(),
             "Float" => "float".to_string(),
             "Bool" => "bool".to_string(),
             "Text" => "text".to_string(),
-            _ => "text".to_string(),
+            _ => {
+                if let Some(ResolvedType::Adt(ctors)) = aliases.get(n) {
+                    if ctors.iter().all(|(_, fields)| fields.is_empty()) {
+                        return "tag".to_string();
+                    }
+                }
+                "text".to_string()
+            }
         },
         ast::TypeKind::App { func, arg } => {
             if matches!(&func.node, ast::TypeKind::Named(n) if n == "Maybe") {
-                format!("?{}", ast_type_to_descriptor_type(arg))
+                format!("?{}", ast_type_to_descriptor_type(arg, aliases))
             } else {
                 "text".to_string()
             }
         }
-        ast::TypeKind::UnitAnnotated { base, .. } => ast_type_to_descriptor_type(base),
+        ast::TypeKind::UnitAnnotated { base, .. } => ast_type_to_descriptor_type(base, aliases),
         _ => "text".to_string(),
     }
 }

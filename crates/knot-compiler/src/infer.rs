@@ -3049,6 +3049,19 @@ impl Infer {
                                 self.unify(f, &Ty::TyCon("IO".into()), expr.span);
                                 is_io = true;
                                 last_expr_ty = Some(*inner.clone());
+                            } else if matches!(&resolved, Ty::Var(_)) {
+                                // In IO do-block with unresolved type var:
+                                // constrain to IO to prevent double-wrapping
+                                // when the var later resolves to IO (e.g.
+                                // polymorphic callbacks in withSessionAuth).
+                                is_io = true;
+                                let inner_ty = self.fresh();
+                                self.unify(
+                                    &expr_ty,
+                                    &Ty::IO(BTreeSet::new(), Box::new(inner_ty.clone())),
+                                    expr.span,
+                                );
+                                last_expr_ty = Some(inner_ty);
                             } else {
                                 last_expr_ty = Some(expr_ty);
                             }

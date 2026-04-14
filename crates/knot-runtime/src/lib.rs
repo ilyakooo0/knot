@@ -7940,7 +7940,7 @@ pub extern "C" fn knot_constructor_matches(
 pub extern "C" fn knot_constructor_tag_ptr(v: *mut Value) -> *const u8 {
     match unsafe { as_ref(v) } {
         Value::Constructor(t, _) => t.as_ptr(),
-        _ => panic!("knot runtime: expected Constructor in tag_ptr, got {}", type_name(v)),
+        _ => panic!("knot runtime: expected Constructor in tag_ptr, got {} = {}", type_name(v), brief_value(v)),
     }
 }
 

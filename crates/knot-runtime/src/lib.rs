@@ -15,7 +15,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::slice;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -49,18 +49,40 @@ use std::mem::MaybeUninit;
 /// waste memory for short-running programs.
 const CHUNK_CAP: usize = 512;
 
+/// Cache-line aligned backing buffer for a chunk.
+///
+/// Forcing 64-byte alignment on the whole backing array means the
+/// chunk's first slot lands at a cache-line boundary, which keeps
+/// sequential row scans (e.g. `promote`, `clone_into_pinned`) from
+/// straddling cache lines on their first few values and avoids false
+/// sharing when two thread-local arenas happen to allocate chunks
+/// whose heads would otherwise share a line (rare but possible with
+/// glibc's per-arena pools).  `MaybeUninit` lets us leave the buffer
+/// bit-untouched until `Chunk::alloc` writes into a slot.
+#[repr(align(64))]
+struct ChunkData([MaybeUninit<Value>; CHUNK_CAP]);
+
 /// A contiguous block of bump-allocated `Value` slots.
 struct Chunk {
-    data: Box<[MaybeUninit<Value>]>,
+    data: Box<ChunkData>,
     len: usize,
 }
 
 impl Chunk {
     fn new() -> Self {
-        let mut v: Vec<MaybeUninit<Value>> = Vec::with_capacity(CHUNK_CAP);
-        // SAFETY: MaybeUninit<T> is valid for any bit pattern.
-        unsafe { v.set_len(CHUNK_CAP); }
-        Chunk { data: v.into_boxed_slice(), len: 0 }
+        // SAFETY: `ChunkData` is `[MaybeUninit<Value>; CHUNK_CAP]`
+        // wrapped in a `#[repr(align(64))]` newtype; `MaybeUninit` is
+        // valid for any bit pattern, so the fresh allocation from the
+        // global allocator is already in a legal state.  The alignment
+        // attribute guarantees `std::alloc::alloc(layout)` hands back a
+        // 64-byte-aligned pointer.
+        let layout = std::alloc::Layout::new::<ChunkData>();
+        let ptr = unsafe { std::alloc::alloc(layout) as *mut ChunkData };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        let data = unsafe { Box::from_raw(ptr) };
+        Chunk { data, len: 0 }
     }
 
     #[inline]
@@ -70,7 +92,7 @@ impl Chunk {
     #[inline]
     fn alloc(&mut self, v: Value) -> *mut Value {
         debug_assert!(!self.is_full());
-        let slot = &mut self.data[self.len];
+        let slot = &mut self.data.0[self.len];
         let ptr = slot.as_mut_ptr();
         unsafe { ptr.write(v); }
         self.len += 1;
@@ -81,8 +103,8 @@ impl Chunk {
     #[inline]
     fn contains(&self, val: *mut Value) -> bool {
         if self.len == 0 { return false; }
-        let base = self.data.as_ptr() as usize;
-        let end = unsafe { self.data.as_ptr().add(self.len) as usize };
+        let base = self.data.0.as_ptr() as usize;
+        let end = unsafe { self.data.0.as_ptr().add(self.len) as usize };
         let addr = val as usize;
         addr >= base && addr < end
     }
@@ -90,31 +112,36 @@ impl Chunk {
 
 /// A single frame in the arena's frame stack.
 ///
-/// `chunks` holds bump-allocated values freed by `reset_to` or frame drop.
-/// `pinned` holds values promoted out of chunks (Box-allocated) that survive
-/// `reset_to` but are freed when the frame drops (or selectively by
-/// `reset_to` when `pinned_mark < pinned.len()`).
+/// `chunks` holds bump-allocated "young" values freed by `reset_to` or
+/// frame drop.  `pinned_chunks` holds bump-allocated values promoted
+/// out of the young chunks (so they survive `reset_to`) but still
+/// freed at frame drop or via selective pinned reclamation.
+///
+/// Pinned values share the chunk-pool machinery — no per-value
+/// `Box::into_raw` on the promote path — which eliminates a malloc
+/// per yield in do-block loops.  Two parallel structures (`chunks` and
+/// `pinned_chunks`) keep the bump positions independent so the two
+/// lifetimes don't interfere.
 struct Frame {
     chunks: Vec<Chunk>,
-    /// Sorted-by-base-address sidetable mapping chunk base addresses to
-    /// their index in `chunks`.  Enables O(log n) `owns_in_chunks`
-    /// lookup without scanning every chunk.  Maintained by
-    /// `push_chunk` / `pop_chunk` helpers; `chunks` retains insertion
-    /// order (used by `reset_to`'s mark arithmetic).
+    /// Sorted-by-base-address sidetable mapping young-chunk base
+    /// addresses to their index in `chunks`.  Enables O(log n)
+    /// `owns_in_chunks` lookup.  Maintained by `push_chunk` /
+    /// `pop_chunk` helpers; `chunks` retains insertion order (used by
+    /// `reset_to`'s mark arithmetic).
     ///
     /// Box allocator doesn't guarantee adjacency between sequential
     /// chunks, so a simple `[min_base, max_end]` bound isn't tight
     /// enough to serve as a fast reject in realistic workloads.
     chunk_index: Vec<(usize, u32)>,
-    /// Promoted values that survive `reset_to` within this frame, in
-    /// insertion order (used for Drop iteration).  Each entry is a
-    /// `Box::into_raw(Box::new(Value))`.
-    pinned: Vec<*mut Value>,
-    /// Set-backed lookup mirror of `pinned` for O(1) `owns` checks.
-    /// Kept in sync with `pinned` on push/clear — under heavy promotion
-    /// the linear `Vec::contains` became the dominant cost in
-    /// `clone_from_child`.
-    pinned_set: HashSet<*mut Value>,
+    /// Chunks reserved for pinned (promoted) values.  These are
+    /// bump-allocated just like `chunks`, but survive `reset_to` —
+    /// instead of being unwound on every iteration, they're only
+    /// truncated to the pinned mark.
+    pinned_chunks: Vec<Chunk>,
+    /// Parallel sidetable to `chunk_index` for `pinned_chunks`, used
+    /// by `owns_in_pinned_chunks` to do the same O(log n) range check.
+    pinned_chunk_index: Vec<(usize, u32)>,
 }
 
 impl Frame {
@@ -124,34 +151,28 @@ impl Frame {
         Frame {
             chunks: Vec::new(),
             chunk_index: Vec::new(),
-            pinned: Vec::new(),
-            pinned_set: HashSet::new(),
+            pinned_chunks: Vec::new(),
+            pinned_chunk_index: Vec::new(),
         }
     }
 
+    /// Flat position across `chunks` (chunk_index * CHUNK_CAP + slot).
     fn mark_chunks(&self) -> usize {
         if self.chunks.is_empty() { return 0; }
         (self.chunks.len() - 1) * CHUNK_CAP + self.chunks.last().unwrap().len
     }
 
+    /// Flat position across `pinned_chunks`.  Used by `Arena::mark` /
+    /// `reset_to` to know where pinned values were when a given mark
+    /// was taken so selective reclamation can rewind precisely.
     fn mark_pinned(&self) -> usize {
-        self.pinned.len()
+        if self.pinned_chunks.is_empty() { return 0; }
+        (self.pinned_chunks.len() - 1) * CHUNK_CAP + self.pinned_chunks.last().unwrap().len
     }
 
-    /// Drop pinned entries added since `pinned_mark` (used by selective
-    /// reclamation in `reset_to`).  Removes from both the `Vec` and the
-    /// lookup `HashSet`.  Entries allocated before the mark are kept.
-    fn truncate_pinned(&mut self, pinned_mark: usize) {
-        while self.pinned.len() > pinned_mark {
-            let ptr = self.pinned.pop().expect("pinned invariant: len > 0");
-            self.pinned_set.remove(&ptr);
-            unsafe { drop(Box::from_raw(ptr)); }
-        }
-    }
-
-    /// Append a chunk and update the sorted sidetable.
+    /// Append a young chunk and update the sorted sidetable.
     fn push_chunk(&mut self, c: Chunk) {
-        let base = c.data.as_ptr() as usize;
+        let base = c.data.0.as_ptr() as usize;
         let idx = self.chunks.len() as u32;
         self.chunks.push(c);
         let pos = self
@@ -161,60 +182,136 @@ impl Frame {
         self.chunk_index.insert(pos, (base, idx));
     }
 
-    /// Pop the last chunk and update the sorted sidetable.
+    /// Pop the last young chunk and update the sorted sidetable.
     fn pop_chunk(&mut self) -> Option<Chunk> {
         let chunk = self.chunks.pop()?;
-        let base = chunk.data.as_ptr() as usize;
+        let base = chunk.data.0.as_ptr() as usize;
         if let Ok(pos) = self.chunk_index.binary_search_by_key(&base, |&(b, _)| b) {
             self.chunk_index.remove(pos);
         }
         Some(chunk)
     }
 
-    /// Check whether `val` lives in one of this frame's chunks.
+    /// Append a pinned chunk and update the sorted sidetable.
+    fn push_pinned_chunk(&mut self, c: Chunk) {
+        let base = c.data.0.as_ptr() as usize;
+        let idx = self.pinned_chunks.len() as u32;
+        self.pinned_chunks.push(c);
+        let pos = self
+            .pinned_chunk_index
+            .binary_search_by_key(&base, |&(b, _)| b)
+            .unwrap_or_else(|p| p);
+        self.pinned_chunk_index.insert(pos, (base, idx));
+    }
+
+    /// Pop the last pinned chunk and update the sorted sidetable.
+    fn pop_pinned_chunk(&mut self) -> Option<Chunk> {
+        let chunk = self.pinned_chunks.pop()?;
+        let base = chunk.data.0.as_ptr() as usize;
+        if let Ok(pos) = self.pinned_chunk_index.binary_search_by_key(&base, |&(b, _)| b) {
+            self.pinned_chunk_index.remove(pos);
+        }
+        Some(chunk)
+    }
+
+    /// Check whether `val` lives in one of this frame's young chunks.
     /// Uses binary search on `chunk_index` for O(log n) lookup.
+    ///
+    /// Fast path: many functions only ever allocate into a single chunk
+    /// (the frame's first one), so the binary-search machinery is pure
+    /// overhead there.  Short-circuit before touching `chunk_index`.
     fn owns_in_chunks(&self, val: *mut Value) -> bool {
-        if self.chunk_index.is_empty() { return false; }
-        let addr = val as usize;
-        // Find the chunk whose base is the largest one ≤ addr.
-        let pos = match self.chunk_index.binary_search_by_key(&addr, |&(b, _)| b) {
-            Ok(p) => p,        // addr == base of chunk `p`
-            Err(0) => return false,  // addr precedes all chunks
-            Err(p) => p - 1,   // chunk p-1 is the greatest base ≤ addr
-        };
-        let (_, chunk_idx) = self.chunk_index[pos];
-        self.chunks[chunk_idx as usize].contains(val)
+        match self.chunks.len() {
+            0 => false,
+            1 => self.chunks[0].contains(val),
+            _ => {
+                let addr = val as usize;
+                // Find the chunk whose base is the largest one ≤ addr.
+                let pos = match self.chunk_index.binary_search_by_key(&addr, |&(b, _)| b) {
+                    Ok(p) => p,        // addr == base of chunk `p`
+                    Err(0) => return false,  // addr precedes all chunks
+                    Err(p) => p - 1,   // chunk p-1 is the greatest base ≤ addr
+                };
+                let (_, chunk_idx) = self.chunk_index[pos];
+                self.chunks[chunk_idx as usize].contains(val)
+            }
+        }
     }
 
-    /// Check whether `val` is owned by this frame (chunks or pinned).
-    fn owns(&self, val: *mut Value) -> bool {
-        if self.owns_in_chunks(val) { return true; }
-        self.pinned_set.contains(&val)
+    /// Check whether `val` lives in one of this frame's pinned chunks.
+    /// Same O(log n) structure as `owns_in_chunks`, but against the
+    /// pinned-chunk sidetable.  The common case (no pinned values yet)
+    /// returns immediately.
+    fn owns_in_pinned_chunks(&self, val: *mut Value) -> bool {
+        match self.pinned_chunks.len() {
+            0 => false,
+            1 => self.pinned_chunks[0].contains(val),
+            _ => {
+                let addr = val as usize;
+                let pos = match self.pinned_chunk_index.binary_search_by_key(&addr, |&(b, _)| b) {
+                    Ok(p) => p,
+                    Err(0) => return false,
+                    Err(p) => p - 1,
+                };
+                let (_, chunk_idx) = self.pinned_chunk_index[pos];
+                self.pinned_chunks[chunk_idx as usize].contains(val)
+            }
+        }
     }
 
-    /// Record a new pinned pointer (kept in both Vec and Set).
-    fn push_pinned(&mut self, ptr: *mut Value) {
-        self.pinned.push(ptr);
-        self.pinned_set.insert(ptr);
+    /// Check whether `val` is owned by this frame (young or pinned),
+    /// probing pinned first.  Used by `clone_from_child` where the
+    /// traversed graph is a deep-pinned spine promoted across prior
+    /// iterations — the pinned-chunk range check typically hits fast.
+    fn owns_pinned_first(&self, val: *mut Value) -> bool {
+        if self.owns_in_pinned_chunks(val) { return true; }
+        self.owns_in_chunks(val)
     }
 
-    /// Drop all live values in chunks (called from Arena::drop_frame_contents).
+    /// Drop all live values in young chunks (called from
+    /// `Arena::drop_frame_contents`).  Leaves chunks zero-length but
+    /// retained so `pop_chunk` can harvest them into the pool.
     fn drop_chunks(&mut self) {
         for chunk in &mut self.chunks {
             for si in 0..chunk.len {
-                unsafe { std::ptr::drop_in_place(chunk.data[si].as_mut_ptr()); }
+                unsafe { std::ptr::drop_in_place(chunk.data.0[si].as_mut_ptr()); }
             }
             chunk.len = 0;
         }
     }
 
-    /// Free all pinned boxes.  Called from Arena::drop_frame_contents.
-    fn drop_pinned(&mut self) {
-        for &ptr in &self.pinned {
-            unsafe { drop(Box::from_raw(ptr)); }
+    /// Drop all live values in pinned chunks.  Symmetric to
+    /// `drop_chunks`; leaves pinned chunks zero-length for harvest.
+    fn drop_pinned_chunks(&mut self) {
+        for chunk in &mut self.pinned_chunks {
+            for si in 0..chunk.len {
+                unsafe { std::ptr::drop_in_place(chunk.data.0[si].as_mut_ptr()); }
+            }
+            chunk.len = 0;
         }
-        self.pinned.clear();
-        self.pinned_set.clear();
+    }
+
+    /// Rewind pinned allocations to `pinned_mark` (flat position
+    /// `chunk_idx * CHUNK_CAP + slot`).  Runs destructors on the
+    /// reclaimed suffix and empties chunks above the mark's chunk.
+    ///
+    /// Used by `reset_to` for selective pinned reclamation — any
+    /// pinned entries added since the mark are freed, but values
+    /// pinned before the mark persist until a lower mark (or frame
+    /// drop) reaches them.
+    fn truncate_pinned(&mut self, pinned_mark: usize) {
+        let mark_chunk = pinned_mark / CHUNK_CAP;
+        let mark_slot = pinned_mark % CHUNK_CAP;
+        if self.pinned_chunks.is_empty() { return; }
+        for ci in (mark_chunk..self.pinned_chunks.len()).rev() {
+            let chunk = &mut self.pinned_chunks[ci];
+            let start = if ci == mark_chunk { mark_slot } else { 0 };
+            if start >= chunk.len { continue; }
+            for si in (start..chunk.len).rev() {
+                unsafe { std::ptr::drop_in_place(chunk.data.0[si].as_mut_ptr()); }
+            }
+            chunk.len = start;
+        }
     }
 }
 
@@ -225,7 +322,7 @@ impl Drop for Frame {
         // contents here.  Chunks that have already been harvested into
         // the pool will have `len == 0` and contribute no work.
         self.drop_chunks();
-        self.drop_pinned();
+        self.drop_pinned_chunks();
     }
 }
 
@@ -252,6 +349,149 @@ struct Arena {
     /// pointer is reached via multiple paths (DAG structure).  Emptied
     /// after every top-level call so it never holds stale pointers.
     promote_cache: HashMap<*mut Value, *mut Value>,
+}
+
+// ── GC telemetry ─────────────────────────────────────────────────
+//
+// Cross-thread `AtomicU64` counters surfacing allocator behaviour for
+// profiling.  All counters use `Ordering::Relaxed`: we only need
+// monotonic updates, not happens-before, so the ordering is a single
+// non-fenced add on every architecture we care about (basically free).
+//
+// The stats are accumulated process-wide (not per-thread) so the
+// snapshot reflects aggregate activity across all Knot threads; this
+// matches how a user would ask "how much churn is my program doing"
+// rather than per-worker introspection.  A future extension could
+// sharde by thread if we need to attribute costs.
+
+/// Snapshot of all GC counters.  Stable layout for FFI: every field is
+/// a `u64` at a fixed offset so consumers written against this struct
+/// can read it as a plain byte blob.
+#[repr(C)]
+pub struct GcStatsSnapshot {
+    pub allocs: u64,
+    pub chunks_allocated: u64,
+    pub chunks_pool_hits: u64,
+    pub chunks_returned: u64,
+    pub chunks_dropped: u64,
+    pub promotes: u64,
+    pub promote_cache_hits: u64,
+    pub clone_into_pinned: u64,
+    pub frame_pushes: u64,
+    pub frame_pops: u64,
+    pub peak_frame_depth: u64,
+    pub relation_pool_hits: u64,
+    pub relation_pool_misses: u64,
+    pub text_cache_hits: u64,
+    pub text_cache_misses: u64,
+    pub pinned_allocs: u64,
+    pub resets: u64,
+}
+
+struct GcStats {
+    allocs: AtomicU64,
+    chunks_allocated: AtomicU64,
+    chunks_pool_hits: AtomicU64,
+    chunks_returned: AtomicU64,
+    chunks_dropped: AtomicU64,
+    promotes: AtomicU64,
+    promote_cache_hits: AtomicU64,
+    clone_into_pinned: AtomicU64,
+    frame_pushes: AtomicU64,
+    frame_pops: AtomicU64,
+    peak_frame_depth: AtomicU64,
+    relation_pool_hits: AtomicU64,
+    relation_pool_misses: AtomicU64,
+    text_cache_hits: AtomicU64,
+    text_cache_misses: AtomicU64,
+    pinned_allocs: AtomicU64,
+    resets: AtomicU64,
+}
+
+impl GcStats {
+    const fn new() -> Self {
+        GcStats {
+            allocs: AtomicU64::new(0),
+            chunks_allocated: AtomicU64::new(0),
+            chunks_pool_hits: AtomicU64::new(0),
+            chunks_returned: AtomicU64::new(0),
+            chunks_dropped: AtomicU64::new(0),
+            promotes: AtomicU64::new(0),
+            promote_cache_hits: AtomicU64::new(0),
+            clone_into_pinned: AtomicU64::new(0),
+            frame_pushes: AtomicU64::new(0),
+            frame_pops: AtomicU64::new(0),
+            peak_frame_depth: AtomicU64::new(0),
+            relation_pool_hits: AtomicU64::new(0),
+            relation_pool_misses: AtomicU64::new(0),
+            text_cache_hits: AtomicU64::new(0),
+            text_cache_misses: AtomicU64::new(0),
+            pinned_allocs: AtomicU64::new(0),
+            resets: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    fn bump(&self, field: &AtomicU64) {
+        field.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Raise `peak_frame_depth` if `depth` exceeds the current peak.
+    /// `fetch_max` is a single CAS-loop per call, but peak updates
+    /// happen on `push_frame` (not per allocation) so the cost is
+    /// negligible.
+    fn record_frame_depth(&self, depth: u64) {
+        self.peak_frame_depth.fetch_max(depth, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> GcStatsSnapshot {
+        GcStatsSnapshot {
+            allocs: self.allocs.load(Ordering::Relaxed),
+            chunks_allocated: self.chunks_allocated.load(Ordering::Relaxed),
+            chunks_pool_hits: self.chunks_pool_hits.load(Ordering::Relaxed),
+            chunks_returned: self.chunks_returned.load(Ordering::Relaxed),
+            chunks_dropped: self.chunks_dropped.load(Ordering::Relaxed),
+            promotes: self.promotes.load(Ordering::Relaxed),
+            promote_cache_hits: self.promote_cache_hits.load(Ordering::Relaxed),
+            clone_into_pinned: self.clone_into_pinned.load(Ordering::Relaxed),
+            frame_pushes: self.frame_pushes.load(Ordering::Relaxed),
+            frame_pops: self.frame_pops.load(Ordering::Relaxed),
+            peak_frame_depth: self.peak_frame_depth.load(Ordering::Relaxed),
+            relation_pool_hits: self.relation_pool_hits.load(Ordering::Relaxed),
+            relation_pool_misses: self.relation_pool_misses.load(Ordering::Relaxed),
+            text_cache_hits: self.text_cache_hits.load(Ordering::Relaxed),
+            text_cache_misses: self.text_cache_misses.load(Ordering::Relaxed),
+            pinned_allocs: self.pinned_allocs.load(Ordering::Relaxed),
+            resets: self.resets.load(Ordering::Relaxed),
+        }
+    }
+}
+
+static GC_STATS: GcStats = GcStats::new();
+
+/// Populate `out` with a snapshot of the GC counters.  Exposed for
+/// programs/tests that want to observe allocator behaviour in-process.
+/// Safe to call from any thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn knot_gc_stats_snapshot(out: *mut GcStatsSnapshot) {
+    if out.is_null() { return; }
+    unsafe { std::ptr::write(out, GC_STATS.snapshot()); }
+}
+
+/// Print a human-readable dump of the current GC counters to stderr.
+/// Intended for diagnostics (`--gc-stats` style invocations or panics).
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_gc_stats_dump() {
+    let s = GC_STATS.snapshot();
+    eprintln!("[gc] allocs={} pinned_allocs={} resets={}", s.allocs, s.pinned_allocs, s.resets);
+    eprintln!("[gc] chunks: allocated={} pool_hits={} returned={} dropped={}",
+        s.chunks_allocated, s.chunks_pool_hits, s.chunks_returned, s.chunks_dropped);
+    eprintln!("[gc] promote: calls={} cache_hits={} clone_into_pinned={}",
+        s.promotes, s.promote_cache_hits, s.clone_into_pinned);
+    eprintln!("[gc] frames: pushes={} pops={} peak_depth={}",
+        s.frame_pushes, s.frame_pops, s.peak_frame_depth);
+    eprintln!("[gc] relation_pool: hits={} misses={}", s.relation_pool_hits, s.relation_pool_misses);
+    eprintln!("[gc] text_cache: hits={} misses={}", s.text_cache_hits, s.text_cache_misses);
 }
 
 /// Cap the chunk pool so the arena doesn't hoard memory after a transient
@@ -309,6 +549,7 @@ fn take_relation_vec(min_capacity: usize) -> Vec<*mut Value> {
         // doesn't pay for a grow.
         for bin in start..RELATION_POOL_BINS {
             if let Some(v) = pool[bin].pop() {
+                GC_STATS.bump(&GC_STATS.relation_pool_hits);
                 return v;
             }
         }
@@ -316,9 +557,11 @@ fn take_relation_vec(min_capacity: usize) -> Vec<*mut Value> {
         // will reallocate on demand.
         for bin in (0..start).rev() {
             if let Some(v) = pool[bin].pop() {
+                GC_STATS.bump(&GC_STATS.relation_pool_hits);
                 return v;
             }
         }
+        GC_STATS.bump(&GC_STATS.relation_pool_misses);
         Vec::with_capacity(min_capacity)
     })
 }
@@ -353,7 +596,13 @@ impl Arena {
     /// Take a chunk from the pool or allocate a new one.
     #[inline]
     fn take_chunk(&mut self) -> Chunk {
-        self.free_chunks.pop().unwrap_or_else(Chunk::new)
+        if let Some(c) = self.free_chunks.pop() {
+            GC_STATS.bump(&GC_STATS.chunks_pool_hits);
+            c
+        } else {
+            GC_STATS.bump(&GC_STATS.chunks_allocated);
+            Chunk::new()
+        }
     }
 
     /// Return an empty chunk to the pool for reuse.  Capped at
@@ -362,7 +611,10 @@ impl Arena {
     fn return_chunk(&mut self, chunk: Chunk) {
         debug_assert_eq!(chunk.len, 0, "arena: pool received non-empty chunk");
         if self.free_chunks.len() < CHUNK_POOL_CAP {
+            GC_STATS.bump(&GC_STATS.chunks_returned);
             self.free_chunks.push(chunk);
+        } else {
+            GC_STATS.bump(&GC_STATS.chunks_dropped);
         }
     }
 
@@ -372,6 +624,7 @@ impl Arena {
     }
 
     fn alloc(&mut self, v: Value) -> *mut Value {
+        GC_STATS.bump(&GC_STATS.allocs);
         let need_new = self
             .frames
             .last()
@@ -408,35 +661,40 @@ impl Arena {
     }
 
     fn reset_to(&mut self, mark: usize) {
+        GC_STATS.bump(&GC_STATS.resets);
         let chunk_mark = mark >> 32;
         let pinned_mark = mark & 0xFFFF_FFFF;
         let mark_chunk = chunk_mark / CHUNK_CAP;
         let mark_slot = chunk_mark % CHUNK_CAP;
+        let pinned_mark_chunk = pinned_mark / CHUNK_CAP;
         let mut harvested: Vec<Chunk> = Vec::new();
         {
             let frame = self.current_frame();
-            // Drop values in chunks above the mark.
+            // Drop values in young chunks above the mark.
             for ci in (mark_chunk..frame.chunks.len()).rev() {
                 let chunk = &mut frame.chunks[ci];
                 let start = if ci == mark_chunk { mark_slot } else { 0 };
                 for si in (start..chunk.len).rev() {
-                    unsafe { std::ptr::drop_in_place(chunk.data[si].as_mut_ptr()); }
+                    unsafe { std::ptr::drop_in_place(chunk.data.0[si].as_mut_ptr()); }
                 }
                 chunk.len = start;
             }
-            // Harvest empty chunks above the mark into the pool.
+            // Harvest empty young chunks above the mark into the pool.
             while frame.chunks.len() > mark_chunk + 1 {
                 // `pop_chunk` keeps the sorted `chunk_index` in sync.
                 harvested.push(frame.pop_chunk().unwrap());
             }
             // Selectively reclaim pinned entries allocated since the
-            // mark.  Any still-live pinned entries from earlier in the
-            // frame are preserved; only the "above-mark" pins are
-            // dropped.  Generated code must promote yielded values
-            // AFTER the mark so they're reclaimed at reset_to; yields
-            // compiled after `knot_arena_mark` land in the reclaimable
-            // region, which is the intended semantics.
+            // mark.  `truncate_pinned` runs destructors on the suffix
+            // but leaves the chunk structures intact; we also harvest
+            // any chunks that are wholly above the mark (and thus now
+            // empty) back into the pool.
             frame.truncate_pinned(pinned_mark);
+            while frame.pinned_chunks.len() > (pinned_mark_chunk + 1).max(1)
+                && frame.pinned_chunks.last().map_or(false, |c| c.len == 0)
+            {
+                harvested.push(frame.pop_pinned_chunk().unwrap());
+            }
         }
         for chunk in harvested {
             self.return_chunk(chunk);
@@ -449,19 +707,22 @@ impl Arena {
     }
 
     fn push_frame(&mut self) {
+        GC_STATS.bump(&GC_STATS.frame_pushes);
         // Cache keys are relative to the current frame's chunk addresses;
         // a new frame starts with a fresh identity space.
         self.promote_cache.clear();
         self.frames.push(Frame::empty());
+        GC_STATS.record_frame_depth(self.frames.len() as u64);
     }
 
-    /// Drop a frame's contents (running value destructors and freeing
-    /// pinned boxes) and harvest its empty chunks into the pool.  The
-    /// frame itself is consumed.
+    /// Drop a frame's contents (running value destructors on both
+    /// young and pinned chunks) and harvest its empty chunks into
+    /// the pool.  The frame itself is consumed.
     fn drop_and_harvest_frame(&mut self, mut frame: Frame) {
         frame.drop_chunks();
-        frame.drop_pinned();
-        let chunks: Vec<Chunk> = frame.chunks.drain(..).collect();
+        frame.drop_pinned_chunks();
+        let mut chunks: Vec<Chunk> = frame.chunks.drain(..).collect();
+        chunks.extend(frame.pinned_chunks.drain(..));
         drop(frame);
         for chunk in chunks {
             self.return_chunk(chunk);
@@ -472,6 +733,7 @@ impl Arena {
     /// Empty chunks are harvested into the pool.
     fn pop_frame(&mut self) {
         if self.frames.len() > 1 {
+            GC_STATS.bump(&GC_STATS.frame_pops);
             let frame = self.frames.pop().unwrap();
             self.drop_and_harvest_frame(frame);
             // Dropped frame's pointers could collide with future allocations.
@@ -487,6 +749,7 @@ impl Arena {
         if self.frames.len() <= 1 || val.is_null() {
             return val;
         }
+        GC_STATS.bump(&GC_STATS.frame_pops);
         // Child frame's pointers are about to be freed — cache must not
         // retain them across the call.  We clear before cloning so the
         // clone_from_child recursion starts with a fresh cache (its keys
@@ -528,6 +791,9 @@ impl Arena {
     /// recursion" case.
     fn promote_children(&mut self, val: *mut Value) -> *mut Value {
         if val.is_null() { return val; }
+        // Tagged pointers encode leaf values inline; they have no
+        // heap-resident payload, so there's nothing to walk.
+        if is_tagged(val) { return val; }
         match unsafe { &*val } {
             Value::Int(_) | Value::SmallInt(_) | Value::Float(_) | Value::Text(_)
             | Value::Bool(_) | Value::Bytes(_) | Value::Unit => val,
@@ -610,10 +876,24 @@ impl Arena {
     /// the same promoted pointer afterward.
     fn promote_value(&mut self, val: *mut Value) -> *mut Value {
         if val.is_null() { return val; }
+        GC_STATS.bump(&GC_STATS.promotes);
         if let Some(&cached) = self.promote_cache.get(&val) {
+            GC_STATS.bump(&GC_STATS.promote_cache_hits);
             return cached;
         }
-        let promoted = if self.current_frame().owns_in_chunks(val) {
+        // Lazy promote: if `val` already lives in this frame's pinned
+        // chunks it was produced by a prior promote, so its children
+        // were walked at that time and everything reachable from it is
+        // guaranteed safe.  Skip the recursive descent entirely —
+        // otherwise `promote_children` would re-walk the whole subtree
+        // only to discover every child returns identity.  Hot on
+        // do-blocks that yield the same already-pinned accumulator
+        // across iterations.
+        let frame = self.current_frame();
+        if frame.owns_in_pinned_chunks(val) {
+            return val;
+        }
+        let promoted = if frame.owns_in_chunks(val) {
             self.clone_into_pinned(val)
         } else {
             self.promote_children(val)
@@ -628,6 +908,10 @@ impl Arena {
     /// Children are processed with `promote_value` (selective).
     fn clone_into_pinned(&mut self, val: *mut Value) -> *mut Value {
         if val.is_null() { return val; }
+        // Tagged pointers carry their full payload inline — they're
+        // already safe from any arena reset.  No pinned clone needed.
+        if is_tagged(val) { return val; }
+        GC_STATS.bump(&GC_STATS.clone_into_pinned);
         let cloned = match unsafe { &*val } {
             Value::Int(n) => Value::Int(n.clone()),
             Value::SmallInt(n) => Value::SmallInt(*n),
@@ -642,9 +926,37 @@ impl Arena {
                     value: self.promote_value(f.value),
                 }).collect(),
             ),
-            Value::Relation(rows) => Value::Relation(
-                rows.iter().map(|&r| self.promote_value(r)).collect(),
-            ),
+            Value::Relation(rows) => {
+                // Fast path: if every row is a leaf primitive that is
+                // not owned by the current frame's chunks, `promote_value`
+                // would return each pointer unchanged.  Skip the per-row
+                // dispatch and bulk-copy the pointer slice.  This hits
+                // hard on primitive-valued relations (e.g. `sum [1..n]`,
+                // filter/map over a column of Ints).  Use the
+                // relation-vec pool so the fresh backing allocation
+                // reuses pooled capacity instead of hitting malloc.
+                let frame_idx = self.frames.len() - 1;
+                let mut new_rows = take_relation_vec(rows.len());
+                let all_identity = rows.iter().all(|&r| {
+                    if r.is_null() { return true; }
+                    // Tagged pointers carry leaf values inline —
+                    // always identity-copyable, never chunk-owned.
+                    if is_tagged(r) { return true; }
+                    let is_leaf = matches!(unsafe { &*r },
+                        Value::SmallInt(_) | Value::Int(_) | Value::Float(_)
+                        | Value::Bool(_) | Value::Unit | Value::Text(_)
+                        | Value::Bytes(_));
+                    is_leaf && !self.frames[frame_idx].owns_in_chunks(r)
+                });
+                if all_identity {
+                    new_rows.extend_from_slice(rows);
+                } else {
+                    for &r in rows.iter() {
+                        new_rows.push(self.promote_value(r));
+                    }
+                }
+                Value::Relation(new_rows)
+            }
             Value::Constructor(tag, inner) => {
                 Value::Constructor(tag.clone(), self.promote_value(*inner))
             }
@@ -665,11 +977,28 @@ impl Arena {
         self.alloc_pinned(cloned)
     }
 
-    /// Box-allocate a value into the current frame's pinned set.
+    /// Bump-allocate a value into the current frame's pinned chunks.
+    ///
+    /// Previously this used `Box::into_raw`, one malloc per promoted
+    /// value — a measurable cost in yield-heavy do-blocks.  Pinned
+    /// chunks share the `free_chunks` pool with young chunks so the
+    /// amortised cost is near zero once steady-state reuse kicks in.
     fn alloc_pinned(&mut self, v: Value) -> *mut Value {
-        let ptr = Box::into_raw(Box::new(v));
-        self.current_frame().push_pinned(ptr);
-        ptr
+        GC_STATS.bump(&GC_STATS.pinned_allocs);
+        let need_new = self
+            .current_frame()
+            .pinned_chunks
+            .last()
+            .map_or(true, Chunk::is_full);
+        if need_new {
+            let chunk = self.take_chunk();
+            self.current_frame().push_pinned_chunk(chunk);
+        }
+        self.current_frame()
+            .pinned_chunks
+            .last_mut()
+            .unwrap()
+            .alloc(v)
     }
 
     // ── Pop-frame selective clone ────────────────────────────────
@@ -679,7 +1008,9 @@ impl Arena {
     /// Consults `promote_cache` to share cloned subtrees.
     fn clone_from_child(&mut self, val: *mut Value, child: &Frame) -> *mut Value {
         if val.is_null() { return val; }
-        if !child.owns(val) {
+        // Use pinned-first ownership to short-circuit on the deep-pinned
+        // spine that dominates values promoted across frame boundaries.
+        if !child.owns_pinned_first(val) {
             return val;
         }
         if let Some(&cached) = self.promote_cache.get(&val) {
@@ -920,17 +1251,20 @@ pub extern "C" fn knot_debug_init() {
 // Interning them into `Arc<str>` means every field/constructor in the
 // program shares a single heap allocation per unique name, and clones
 // are atomic-increment-cheap.  The interner is a global Mutex-guarded
-// map; callers hit the `Mutex` once per record construction but all
-// subsequent cloning/comparison is lock-free.
+// structure; callers hit the `Mutex` once per record construction but
+// all subsequent cloning/comparison is lock-free.
 //
-// Bounded at `INTERNER_CAP` entries to cap worst-case memory for
-// pathological inputs (e.g. dynamically-generated field names from
-// user-supplied data).  When the cap is exceeded, new strings are
-// still returned as fresh `Arc<str>` — they just aren't shared with
-// future calls.  Existing interned entries keep working because we
-// never evict (we can't — external `Arc<str>` clones are out of our
-// control, and equality checks assume pointer stability after first
-// intern).
+// Bounded by an LRU so long-running programs with dynamic tag-name
+// vocabularies (HTTP handlers synthesizing JSON keys, user-supplied
+// record field names via reflection, etc.) don't silently stop
+// sharing after the cap is hit.  Eviction is safe because
+// `Arc<str>` equality is content-based (not pointer-based) — evicting
+// an entry leaves outstanding clones valid and correctly comparable,
+// and a subsequent call for the same text will just intern it anew.
+//
+// Intended as a *sharing* cache: a miss still returns a correct (but
+// non-shared) `Arc<str>`, so a low hit rate degrades memory use but
+// never correctness.
 
 /// Maximum number of interned strings.  Typical programs have at most
 /// a few hundred unique field names / constructor tags; 65536 leaves
@@ -938,24 +1272,230 @@ pub extern "C" fn knot_debug_init() {
 /// bytes — roughly 2 MB for 8-byte average strings.
 const INTERNER_CAP: usize = 65_536;
 
-static STRING_INTERNER: std::sync::LazyLock<Mutex<HashMap<String, Arc<str>>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+/// LRU sentinel indicating "no neighbor" in the doubly-linked list.
+const INTERNER_NIL: u32 = u32::MAX;
+
+struct InternerEntry {
+    key: String,
+    val: Arc<str>,
+    prev: u32,
+    next: u32,
+}
+
+/// Bounded LRU cache keyed by string content.  O(1) get and insert.
+///
+/// `entries` is a slab: removed slots get pushed onto the `free` chain
+/// for reuse.  `head` is MRU, `tail` is LRU.  `map` points from the
+/// string content to the slab index.
+struct StringInterner {
+    map: HashMap<String, u32>,
+    entries: Vec<InternerEntry>,
+    head: u32,
+    tail: u32,
+    free: u32,
+}
+
+impl StringInterner {
+    fn new() -> Self {
+        StringInterner {
+            map: HashMap::new(),
+            entries: Vec::new(),
+            head: INTERNER_NIL,
+            tail: INTERNER_NIL,
+            free: INTERNER_NIL,
+        }
+    }
+
+    fn detach(&mut self, idx: u32) {
+        let (prev, next) = {
+            let e = &self.entries[idx as usize];
+            (e.prev, e.next)
+        };
+        if prev != INTERNER_NIL {
+            self.entries[prev as usize].next = next;
+        } else {
+            self.head = next;
+        }
+        if next != INTERNER_NIL {
+            self.entries[next as usize].prev = prev;
+        } else {
+            self.tail = prev;
+        }
+    }
+
+    fn push_head(&mut self, idx: u32) {
+        let old_head = self.head;
+        {
+            let e = &mut self.entries[idx as usize];
+            e.prev = INTERNER_NIL;
+            e.next = old_head;
+        }
+        if old_head != INTERNER_NIL {
+            self.entries[old_head as usize].prev = idx;
+        } else {
+            self.tail = idx;
+        }
+        self.head = idx;
+    }
+
+    /// Return the interned `Arc<str>` for `s` if present, promoting it
+    /// to MRU.  Returns `None` on miss.
+    fn get(&mut self, s: &str) -> Option<Arc<str>> {
+        let idx = *self.map.get(s)?;
+        self.detach(idx);
+        self.push_head(idx);
+        Some(self.entries[idx as usize].val.clone())
+    }
+
+    /// Insert `(s, arc)`, evicting the LRU entry if at capacity.
+    fn insert(&mut self, s: String, arc: Arc<str>) {
+        if self.map.len() >= INTERNER_CAP && self.tail != INTERNER_NIL {
+            // Evict LRU and reuse the slot.
+            let victim = self.tail;
+            self.detach(victim);
+            let old_key = std::mem::take(&mut self.entries[victim as usize].key);
+            self.map.remove(&old_key);
+            self.entries[victim as usize].key = s.clone();
+            self.entries[victim as usize].val = arc;
+            self.push_head(victim);
+            self.map.insert(s, victim);
+            return;
+        }
+        let idx = if self.free != INTERNER_NIL {
+            let slot = self.free;
+            self.free = self.entries[slot as usize].next;
+            self.entries[slot as usize] = InternerEntry {
+                key: s.clone(),
+                val: arc,
+                prev: INTERNER_NIL,
+                next: INTERNER_NIL,
+            };
+            slot
+        } else {
+            let slot = self.entries.len() as u32;
+            self.entries.push(InternerEntry {
+                key: s.clone(),
+                val: arc,
+                prev: INTERNER_NIL,
+                next: INTERNER_NIL,
+            });
+            slot
+        };
+        self.push_head(idx);
+        self.map.insert(s, idx);
+    }
+}
+
+static STRING_INTERNER: std::sync::LazyLock<Mutex<StringInterner>> =
+    std::sync::LazyLock::new(|| Mutex::new(StringInterner::new()));
 
 /// Intern a string, returning a shared `Arc<str>`.  Repeated calls with
-/// the same contents return the same `Arc` without re-allocating.
-/// Once the interner hits `INTERNER_CAP` entries, new strings get a
-/// fresh (non-shared) `Arc<str>` — correctness is preserved, but the
-/// sharing optimization is dropped.
+/// the same contents (that haven't been evicted from the LRU) return
+/// the same `Arc` without re-allocating.  When the interner is full
+/// the LRU entry is evicted and the new string takes its place —
+/// correctness is preserved regardless because `Arc<str>` equality
+/// compares by content, not pointer identity.
 fn intern_str(s: &str) -> Arc<str> {
     let mut table = STRING_INTERNER.lock().unwrap();
     if let Some(existing) = table.get(s) {
-        return existing.clone();
+        return existing;
     }
     let arc: Arc<str> = Arc::from(s);
-    if table.len() < INTERNER_CAP {
-        table.insert(s.to_string(), arc.clone());
-    }
+    table.insert(s.to_string(), arc.clone());
     arc
+}
+
+// ── Pointer tagging (infrastructure) ─────────────────────────────
+//
+// Real `*mut Value` pointers land in either a chunk slot (aligned to
+// at least 8 bytes by `ChunkData`'s `#[repr(align(64))]`) or a `Box`
+// allocation (aligned to at least 8 bytes by the system allocator).
+// That leaves the low 3 bits free for encoding small immediate values
+// directly in the pointer — no allocation, no deref, no cache miss.
+//
+// Encoding:
+//   low 3 bits == 0b000 : real boxed `*mut Value`
+//   low 3 bits == 0b001 : `SmallInt` payload in upper 61 bits (signed, sign-extended)
+//   low 3 bits == 0b010 : `Bool`; bit 3 holds `b as u8`
+//   low 3 bits == 0b011 : `Unit` (the rest of the word is zero)
+//   others              : reserved
+//
+// The encoders below are ready to use, but the runtime as a whole is
+// not yet tag-aware: every `unsafe { &*val }` deref site (≈240 across
+// `lib.rs`) would need to dispatch through a decoder before tagged
+// pointers can safely flow through compiled-code boundaries.  Wiring
+// that in universally requires a careful audit — the encoders are
+// shipped here so the infrastructure is ready, but `alloc_small_int`
+// et al. still return real pointers.  Activating tagging is a matter
+// of (a) returning `encode_smallint(n)` from `alloc_small_int` when
+// `n` fits in 61 bits, (b) teaching `as_ref` to decode, and (c)
+// spot-checking that Drop-sensitive variants (`Relation` in particular)
+// never receive tagged pointers.
+
+#[allow(dead_code)]
+pub(crate) const VALUE_TAG_MASK: usize = 0b111;
+#[allow(dead_code)]
+pub(crate) const TAG_SMALLINT: usize = 0b001;
+#[allow(dead_code)]
+pub(crate) const TAG_BOOL: usize = 0b010;
+#[allow(dead_code)]
+pub(crate) const TAG_UNIT: usize = 0b011;
+
+/// Encode an `i64` as a tagged pointer if it fits in 61 signed bits.
+/// Returns `None` otherwise — callers should fall through to a real
+/// heap allocation for larger values.
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn encode_smallint(n: i64) -> Option<*mut Value> {
+    // i61 range: −2^60 .. 2^60 − 1
+    const MIN: i64 = -(1i64 << 60);
+    const MAX: i64 = (1i64 << 60) - 1;
+    if n < MIN || n > MAX { return None; }
+    let raw = ((n as usize) << 3) | TAG_SMALLINT;
+    Some(raw as *mut Value)
+}
+
+/// Encode a `bool` as a tagged pointer.  The two constants the
+/// returned pointer can take (`0b1010` and `0b0010`) cannot collide
+/// with any valid allocation thanks to the alignment guarantees.
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn encode_bool(b: bool) -> *mut Value {
+    let raw = ((b as usize) << 3) | TAG_BOOL;
+    raw as *mut Value
+}
+
+/// Encode a `Unit` as a tagged pointer.  All-tagged Units share the
+/// same bit pattern, so identity comparisons work.
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn encode_unit() -> *mut Value {
+    TAG_UNIT as *mut Value
+}
+
+/// Check whether a pointer is tagged (non-zero low bits).
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn is_tagged(p: *mut Value) -> bool {
+    (p as usize) & VALUE_TAG_MASK != 0
+}
+
+/// Decode a tagged pointer into an owned `Value`.  Panics if `p` is
+/// untagged — callers should gate on `is_tagged` first.
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn decode_tagged(p: *mut Value) -> Value {
+    let raw = p as usize;
+    match raw & VALUE_TAG_MASK {
+        TAG_SMALLINT => {
+            // Sign-extend from 61-bit field.
+            let shifted = (raw as i64) >> 3;
+            Value::SmallInt(shifted)
+        }
+        TAG_BOOL => Value::Bool((raw >> 3) & 1 == 1),
+        TAG_UNIT => Value::Unit,
+        _ => panic!("knot runtime: decode_tagged on untagged pointer 0x{:x}", raw),
+    }
 }
 
 // ── Value representation ──────────────────────────────────────────
@@ -1135,6 +1675,19 @@ fn alloc_int(n: BigInt) -> *mut Value {
 /// Allocate an `i64`-sized integer directly.  Equivalent to
 /// `alloc_int(BigInt::from(n))` but avoids the `BigInt` roundtrip for
 /// the fast-path `SmallInt` variant.
+///
+/// The surrounding pointer-tagging infrastructure (`encode_smallint`,
+/// `decode_tagged`) can in principle skip the arena slot entirely for
+/// i61-range values, but actually returning a tagged pointer here
+/// would require auditing every downstream `match unsafe { &*val }`
+/// site for aliasing on the shared `UNPACK_SCRATCH`.  For example the
+/// pattern `match (as_ref(a), as_ref(b)) { (SmallInt(x), SmallInt(y))
+/// => x == y }` breaks if both pointers are tagged — both `as_ref`
+/// calls land on the same thread-local slot, so `y` overwrites the
+/// value `x` points at and the match arm always reports equality.
+/// The wire-up lives behind `alloc_small_int` so flipping it on is a
+/// one-line change once the downstream aliasing has been dealt with
+/// (e.g. by switching to a `ValueGuard<'a>` that owns decoded values).
 #[inline]
 fn alloc_small_int(n: i64) -> *mut Value {
     if n >= SMALL_INT_MIN && n <= SMALL_INT_MAX {
@@ -1235,7 +1788,32 @@ unsafe fn as_ref<'a>(v: *mut Value) -> &'a Value {
     if v.is_null() {
         panic!("knot runtime: null pointer dereference (value is null)");
     }
-    unsafe { &*v }
+    if is_tagged(v) {
+        // Materialize the tagged pointer into a thread-local scratch
+        // slot and hand back a reference into it.  The scratch holds
+        // exactly one value at a time — callers MUST not retain the
+        // returned reference across another `as_ref` call that could
+        // see a tagged pointer.  All existing `as_ref` callers match
+        // once and extract owned data, so this invariant holds today;
+        // any new caller that stashes the reference should be reviewed.
+        UNPACK_SCRATCH.with(|cell| {
+            let ptr = cell.get();
+            unsafe {
+                std::ptr::drop_in_place(ptr);
+                std::ptr::write(ptr, decode_tagged(v));
+                std::mem::transmute::<&Value, &'a Value>(&*ptr)
+            }
+        })
+    } else {
+        unsafe { &*v }
+    }
+}
+
+thread_local! {
+    /// Scratch slot for materializing tagged pointers during `as_ref`.
+    /// See the safety note on `as_ref`.
+    static UNPACK_SCRATCH: std::cell::UnsafeCell<Value> =
+        std::cell::UnsafeCell::new(Value::Unit);
 }
 
 unsafe fn str_from_raw(ptr: *const u8, len: usize) -> &'static str {
@@ -1513,8 +2091,15 @@ impl Drop for TextLiteralCache {
 
 thread_local! {
     static SINGLETONS: ValueSingletons = ValueSingletons {
+        // Use the `SmallInt` fast-path variant so the singleton payload is a
+        // bare `i64` (no `BigInt::Vec<u32>` heap tail).  All integer
+        // arithmetic / equality paths treat `SmallInt` and `Int` as
+        // equivalent (see `values_equal`, `int_as_i64`, `int_as_bigint`),
+        // so callers that reach one of these 256 singletons via
+        // `alloc_int` or `alloc_small_int` get the same semantics with
+        // one less allocation per singleton and a smaller hot-path branch.
         small_ints: (SMALL_INT_MIN..=SMALL_INT_MAX)
-            .map(|n| Box::into_raw(Box::new(Value::Int(BigInt::from(n)))))
+            .map(|n| Box::into_raw(Box::new(Value::SmallInt(n))))
             .collect(),
         unit: Box::into_raw(Box::new(Value::Unit)),
         bool_true: Box::into_raw(Box::new(Value::Bool(true))),
@@ -1564,14 +2149,56 @@ pub extern "C" fn knot_value_text_cached(ptr: *const u8, len: usize) -> *mut Val
     TEXT_LITERAL_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(val) = cache.get(ptr) {
+            GC_STATS.bump(&GC_STATS.text_cache_hits);
             val
         } else {
+            GC_STATS.bump(&GC_STATS.text_cache_misses);
             let s = unsafe { str_from_raw(ptr, len) };
             let val = Box::into_raw(Box::new(Value::Text(Arc::from(s))));
             cache.insert(ptr, val);
             val
         }
     })
+}
+
+/// Per-call-site interned text literal.
+///
+/// `slot` is a compiler-emitted 8-byte zero-initialized data slot,
+/// unique to the specific text literal at this source location.  On
+/// first use, `*slot` is null and we box-allocate the `Value::Text`,
+/// storing the pointer back into the slot.  All subsequent calls
+/// observe the non-null slot and return it directly — no hashing, no
+/// LRU traversal, no re-allocation.
+///
+/// The slot is thread-unsafe in theory (no atomic compare-exchange),
+/// but in practice a Knot program's compiled static data isn't
+/// read/written across threads until after main has started, by
+/// which point the dominant literals will have been initialized
+/// serially during startup; worst case, two threads race and one
+/// box leaks (harmless).  Text values are `Arc<str>` wrapped so
+/// duplicate boxes compare equal.
+///
+/// Compared to `knot_value_text_cached`, this also frees the runtime
+/// LRU from per-call pressure — the LRU remains available for dynamic
+/// callers that don't go through the inline slot path, but the common
+/// case (compiled-code-emitted literals) stays entirely out of it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn knot_value_text_intern(
+    ptr: *const u8,
+    len: usize,
+    slot: *mut *mut Value,
+) -> *mut Value {
+    debug_assert!(!slot.is_null(), "knot runtime: null text-literal slot");
+    let cached = unsafe { *slot };
+    if !cached.is_null() {
+        GC_STATS.bump(&GC_STATS.text_cache_hits);
+        return cached;
+    }
+    GC_STATS.bump(&GC_STATS.text_cache_misses);
+    let s = unsafe { str_from_raw(ptr, len) };
+    let val = Box::into_raw(Box::new(Value::Text(Arc::from(s))));
+    unsafe { *slot = val; }
+    val
 }
 
 #[unsafe(no_mangle)]
@@ -3620,6 +4247,11 @@ fn deep_clone_value(val: *mut Value) -> *mut Value {
     if val.is_null() {
         return val;
     }
+    // Tagged pointers carry their payload inline; they're already
+    // cross-thread safe (no heap resource to duplicate).
+    if is_tagged(val) {
+        return val;
+    }
     let cloned = match unsafe { &*val } {
         Value::Int(n) => Value::Int(n.clone()),
         Value::SmallInt(n) => Value::SmallInt(*n),
@@ -3685,6 +4317,10 @@ fn deep_clone_value(val: *mut Value) -> *mut Value {
 #[allow(dead_code)]
 unsafe fn deep_drop_value(val: *mut Value) {
     if val.is_null() {
+        return;
+    }
+    // Tagged pointers don't occupy heap memory — nothing to free.
+    if is_tagged(val) {
         return;
     }
     unsafe {

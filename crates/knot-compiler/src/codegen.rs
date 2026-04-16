@@ -31,6 +31,14 @@ pub struct Codegen {
     strings: HashMap<String, DataId>,
     string_counter: usize,
 
+    // Per-text-literal caching slot.  Each unique text literal has an
+    // 8-byte zero-initialized data slot; first use calls
+    // `knot_value_text_intern(ptr, len, slot)` which atomically
+    // populates the slot, subsequent uses load directly.  Replaces the
+    // runtime-side LRU for text literals — no hashing, no eviction,
+    // O(1) load on the hot path.
+    text_literal_slots: HashMap<String, DataId>,
+
     // Runtime function declarations (imported)
     runtime_fns: HashMap<String, FuncId>,
 
@@ -377,6 +385,7 @@ impl Codegen {
             ptr_type,
             strings: HashMap::new(),
             string_counter: 0,
+            text_literal_slots: HashMap::new(),
             runtime_fns: HashMap::new(),
             user_fns: HashMap::new(),
             stdlib_fns: HashSet::new(),
@@ -430,6 +439,7 @@ impl Codegen {
         self.declare_rt("knot_value_float", &[types::F64], &[p]);
         self.declare_rt("knot_value_text", &[p, p], &[p]);
         self.declare_rt("knot_value_text_cached", &[p, p], &[p]);
+        self.declare_rt("knot_value_text_intern", &[p, p, p], &[p]);
         self.declare_rt("knot_value_bool", &[types::I32], &[p]);
         self.declare_rt("knot_value_unit", &[], &[p]);
         self.declare_rt("knot_value_function", &[p, p, p, p], &[p]);
@@ -6531,7 +6541,8 @@ impl Codegen {
             }
             ast::Literal::Text(s) => {
                 let (ptr, len) = self.string_ptr(builder, s);
-                self.call_rt(builder, "knot_value_text_cached", &[ptr, len])
+                let slot = self.text_literal_slot(builder, s);
+                self.call_rt(builder, "knot_value_text_intern", &[ptr, len, slot])
             }
             ast::Literal::Bytes(b) => {
                 let (ptr, len) = self.bytes_ptr(builder, b);
@@ -6663,6 +6674,39 @@ impl Codegen {
         let ptr = builder.ins().global_value(self.ptr_type, gv);
         let len = builder.ins().iconst(self.ptr_type, b.len() as i64);
         (ptr, len)
+    }
+
+    /// Get a Cranelift `Value` holding the address of the 8-byte
+    /// zero-initialized slot dedicated to caching the interned `Value*`
+    /// for `s`.  On first use the slot is null and the runtime's
+    /// `knot_value_text_intern` fills it; subsequent uses load directly.
+    fn text_literal_slot(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        s: &str,
+    ) -> Value {
+        let data_id = if let Some(id) = self.text_literal_slots.get(s) {
+            *id
+        } else {
+            let name = format!(".text.slot.{}", self.string_counter);
+            self.string_counter += 1;
+            // `writable = true` so the first call can write into the
+            // slot without the loader marking the page read-only.
+            let id = self
+                .module
+                .declare_data(&name, Linkage::Local, true, false)
+                .unwrap();
+            let mut desc = DataDescription::new();
+            // Zero-initialized 8-byte slot (holds a `*mut Value`).
+            desc.define_zeroinit(std::mem::size_of::<*mut u8>());
+            self.module.define_data(id, &desc).unwrap();
+            self.text_literal_slots.insert(s.to_string(), id);
+            id
+        };
+        let gv = self
+            .module
+            .declare_data_in_func(data_id, builder.func);
+        builder.ins().global_value(self.ptr_type, gv)
     }
 
     fn ensure_bytes(&mut self, b: &[u8]) -> DataId {

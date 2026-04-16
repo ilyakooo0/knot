@@ -15,7 +15,9 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::slice;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+#[cfg(feature = "gc-stats")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -108,6 +110,33 @@ impl Chunk {
         let addr = val as usize;
         addr >= base && addr < end
     }
+
+    /// Hint to the OS that this chunk's backing pages can be
+    /// reclaimed.  Called when a chunk is about to be dropped because
+    /// the pool is at capacity; the allocator's free list may retain
+    /// the virtual allocation but madvise lets the kernel drop the
+    /// physical pages and keep RSS bounded in long-running processes.
+    ///
+    /// On Linux: `MADV_DONTNEED` releases pages and zeroes them on next
+    /// access.  On macOS/BSD: `MADV_FREE` marks pages as reclaimable
+    /// (kernel may drop them under pressure).  Both are advisory — if
+    /// the syscall fails there's no correctness impact.
+    #[cfg(unix)]
+    fn advise_release(&mut self) {
+        let addr = self.data.0.as_mut_ptr() as *mut libc::c_void;
+        let len = std::mem::size_of::<ChunkData>();
+        // SAFETY: addr/len describe a valid, owned allocation; madvise
+        // is non-destructive — it only affects paging behaviour.
+        #[cfg(target_os = "linux")]
+        unsafe { libc::madvise(addr, len, libc::MADV_DONTNEED); }
+        #[cfg(any(target_os = "macos", target_os = "ios",
+                  target_os = "freebsd", target_os = "openbsd",
+                  target_os = "netbsd", target_os = "dragonfly"))]
+        unsafe { libc::madvise(addr, len, libc::MADV_FREE); }
+    }
+
+    #[cfg(not(unix))]
+    fn advise_release(&mut self) {}
 }
 
 /// A single frame in the arena's frame stack.
@@ -388,6 +417,7 @@ pub struct GcStatsSnapshot {
     pub resets: u64,
 }
 
+#[cfg(feature = "gc-stats")]
 struct GcStats {
     allocs: AtomicU64,
     chunks_allocated: AtomicU64,
@@ -408,6 +438,7 @@ struct GcStats {
     resets: AtomicU64,
 }
 
+#[cfg(feature = "gc-stats")]
 impl GcStats {
     const fn new() -> Self {
         GcStats {
@@ -463,6 +494,77 @@ impl GcStats {
             text_cache_misses: self.text_cache_misses.load(Ordering::Relaxed),
             pinned_allocs: self.pinned_allocs.load(Ordering::Relaxed),
             resets: self.resets.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Zero-cost stub when `gc-stats` feature is disabled.  All counter
+/// field accesses resolve to no-op `StatCounter` handles so hot-path
+/// call sites like `GC_STATS.bump(&GC_STATS.allocs)` compile down to
+/// nothing.  Exposed FFI calls (`knot_gc_stats_snapshot`,
+/// `knot_gc_stats_dump`) still succeed; they just report zeros.
+#[cfg(not(feature = "gc-stats"))]
+struct StatCounter;
+
+#[cfg(not(feature = "gc-stats"))]
+#[allow(dead_code)]
+struct GcStats {
+    allocs: StatCounter,
+    chunks_allocated: StatCounter,
+    chunks_pool_hits: StatCounter,
+    chunks_returned: StatCounter,
+    chunks_dropped: StatCounter,
+    promotes: StatCounter,
+    promote_cache_hits: StatCounter,
+    clone_into_pinned: StatCounter,
+    frame_pushes: StatCounter,
+    frame_pops: StatCounter,
+    peak_frame_depth: StatCounter,
+    relation_pool_hits: StatCounter,
+    relation_pool_misses: StatCounter,
+    text_cache_hits: StatCounter,
+    text_cache_misses: StatCounter,
+    pinned_allocs: StatCounter,
+    resets: StatCounter,
+}
+
+#[cfg(not(feature = "gc-stats"))]
+impl GcStats {
+    const fn new() -> Self {
+        GcStats {
+            allocs: StatCounter,
+            chunks_allocated: StatCounter,
+            chunks_pool_hits: StatCounter,
+            chunks_returned: StatCounter,
+            chunks_dropped: StatCounter,
+            promotes: StatCounter,
+            promote_cache_hits: StatCounter,
+            clone_into_pinned: StatCounter,
+            frame_pushes: StatCounter,
+            frame_pops: StatCounter,
+            peak_frame_depth: StatCounter,
+            relation_pool_hits: StatCounter,
+            relation_pool_misses: StatCounter,
+            text_cache_hits: StatCounter,
+            text_cache_misses: StatCounter,
+            pinned_allocs: StatCounter,
+            resets: StatCounter,
+        }
+    }
+
+    #[inline(always)]
+    fn bump(&self, _field: &StatCounter) {}
+
+    #[inline(always)]
+    fn record_frame_depth(&self, _depth: u64) {}
+
+    fn snapshot(&self) -> GcStatsSnapshot {
+        GcStatsSnapshot {
+            allocs: 0, chunks_allocated: 0, chunks_pool_hits: 0, chunks_returned: 0,
+            chunks_dropped: 0, promotes: 0, promote_cache_hits: 0, clone_into_pinned: 0,
+            frame_pushes: 0, frame_pops: 0, peak_frame_depth: 0, relation_pool_hits: 0,
+            relation_pool_misses: 0, text_cache_hits: 0, text_cache_misses: 0,
+            pinned_allocs: 0, resets: 0,
         }
     }
 }
@@ -584,6 +686,71 @@ fn return_relation_vec(mut v: Vec<*mut Value>) {
     });
 }
 
+// ── Record-field vec pool ───────────────────────────────────────
+//
+// Records are built by `knot_record_empty(cap) + knot_record_set_field`
+// on every row construction: record literals, JSON-deserialised HTTP
+// requests, SELECT-derived relation rows, etc.  Each `with_capacity`
+// hits the allocator.  Mirror the relation-vec pool here to absorb that
+// churn — same binning, same per-bin cap, independent storage.
+//
+// Records are typically small (fewer fields than relations have rows),
+// so a tighter bin count suffices: bin 6 covers caps up to 128, which
+// comfortably holds every record we emit in practice.
+
+const RECORD_POOL_BINS: usize = 7;
+const RECORD_POOL_MAX_CAPACITY: usize = 128;
+const RECORD_POOL_PER_BIN_CAP: usize = 32;
+
+#[inline]
+fn record_pool_bin(cap: usize) -> usize {
+    if cap <= 1 {
+        0
+    } else {
+        ((usize::BITS - 1 - cap.leading_zeros()) as usize).min(RECORD_POOL_BINS - 1)
+    }
+}
+
+thread_local! {
+    static RECORD_VEC_POOL: RefCell<[Vec<Vec<RecordField>>; RECORD_POOL_BINS]> =
+        RefCell::new(std::array::from_fn(|_| Vec::new()));
+}
+
+/// Obtain a `Vec<RecordField>` from the pool or allocate a new one.
+fn take_record_vec(min_capacity: usize) -> Vec<RecordField> {
+    RECORD_VEC_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        let start = record_pool_bin(min_capacity);
+        for bin in start..RECORD_POOL_BINS {
+            if let Some(v) = pool[bin].pop() {
+                return v;
+            }
+        }
+        for bin in (0..start).rev() {
+            if let Some(v) = pool[bin].pop() {
+                return v;
+            }
+        }
+        Vec::with_capacity(min_capacity)
+    })
+}
+
+/// Return a `Vec<RecordField>` to the pool.  Called from `Value::drop`.
+fn return_record_vec(mut v: Vec<RecordField>) {
+    let cap = v.capacity();
+    if cap == 0 || cap > RECORD_POOL_MAX_CAPACITY {
+        return;
+    }
+    v.clear();
+    RECORD_VEC_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        let bin = record_pool_bin(cap);
+        if pool[bin].len() < RECORD_POOL_PER_BIN_CAP {
+            pool[bin].push(v);
+        }
+    });
+}
+
 impl Arena {
     fn new() -> Self {
         Arena {
@@ -607,6 +774,10 @@ impl Arena {
 
     /// Return an empty chunk to the pool for reuse.  Capped at
     /// `CHUNK_POOL_CAP` to avoid hoarding after peak memory usage.
+    /// When the pool is full, the incoming chunk is dropped — before
+    /// dropping, `advise_release` hints to the OS that its physical
+    /// pages can be reclaimed, keeping RSS tight in long-running
+    /// processes (routes, TUIs) whose pools saturate then idle.
     #[inline]
     fn return_chunk(&mut self, chunk: Chunk) {
         debug_assert_eq!(chunk.len, 0, "arena: pool received non-empty chunk");
@@ -615,6 +786,9 @@ impl Arena {
             self.free_chunks.push(chunk);
         } else {
             GC_STATS.bump(&GC_STATS.chunks_dropped);
+            let mut chunk = chunk;
+            chunk.advise_release();
+            drop(chunk);
         }
     }
 
@@ -806,7 +980,7 @@ impl Arena {
                         vec.push(RecordField { name: f.name.clone(), value: nv });
                     } else if nv != f.value {
                         // First divergence: materialize, copy prefix.
-                        let mut vec = Vec::with_capacity(fields.len());
+                        let mut vec = take_record_vec(fields.len());
                         for prev in &fields[..i] {
                             vec.push(RecordField { name: prev.name.clone(), value: prev.value });
                         }
@@ -920,12 +1094,16 @@ impl Arena {
             Value::Bool(b) => Value::Bool(*b),
             Value::Bytes(b) => Value::Bytes(b.clone()),
             Value::Unit => Value::Unit,
-            Value::Record(fields) => Value::Record(
-                fields.iter().map(|f| RecordField {
-                    name: f.name.clone(),
-                    value: self.promote_value(f.value),
-                }).collect(),
-            ),
+            Value::Record(fields) => {
+                let mut new_fields = take_record_vec(fields.len());
+                for f in fields.iter() {
+                    new_fields.push(RecordField {
+                        name: f.name.clone(),
+                        value: self.promote_value(f.value),
+                    });
+                }
+                Value::Record(new_fields)
+            }
             Value::Relation(rows) => {
                 // Fast path: if every row is a leaf primitive that is
                 // not owned by the current frame's chunks, `promote_value`
@@ -1024,15 +1202,23 @@ impl Arena {
             Value::Bool(b) => Value::Bool(*b),
             Value::Bytes(b) => Value::Bytes(b.clone()),
             Value::Unit => Value::Unit,
-            Value::Record(fields) => Value::Record(
-                fields.iter().map(|f| RecordField {
-                    name: f.name.clone(),
-                    value: self.clone_from_child(f.value, child),
-                }).collect(),
-            ),
-            Value::Relation(rows) => Value::Relation(
-                rows.iter().map(|&r| self.clone_from_child(r, child)).collect(),
-            ),
+            Value::Record(fields) => {
+                let mut new_fields = take_record_vec(fields.len());
+                for f in fields.iter() {
+                    new_fields.push(RecordField {
+                        name: f.name.clone(),
+                        value: self.clone_from_child(f.value, child),
+                    });
+                }
+                Value::Record(new_fields)
+            }
+            Value::Relation(rows) => {
+                let mut new_rows = take_relation_vec(rows.len());
+                for &r in rows.iter() {
+                    new_rows.push(self.clone_from_child(r, child));
+                }
+                Value::Relation(new_rows)
+            }
             Value::Constructor(tag, inner) => {
                 Value::Constructor(tag.clone(), self.clone_from_child(*inner, child))
             }
@@ -1389,19 +1575,64 @@ impl StringInterner {
 static STRING_INTERNER: std::sync::LazyLock<Mutex<StringInterner>> =
     std::sync::LazyLock::new(|| Mutex::new(StringInterner::new()));
 
+/// Per-thread L1 cache in front of the Mutex-guarded global interner.
+///
+/// `intern_str` is called every time a record is built (once per field)
+/// and every constructor tag — under fork-parallel workloads the Mutex
+/// becomes a contention hotspot even though most lookups hit a tiny
+/// vocabulary.  The L1 holds recently-seen `Arc<str>`s (themselves
+/// produced by the global interner and therefore still content-shared
+/// across threads) and short-circuits the lock on hit.
+///
+/// Capacity is deliberately small: the live field-name/constructor-tag
+/// vocabulary of a typical program is dozens of entries, and keeping
+/// the L1 small keeps its HashMap in a handful of cache lines.  On
+/// overflow we drop everything and re-seed; this costs one extra
+/// Mutex acquisition per stale entry, but the hot working set rebuilds
+/// in-place so steady-state hit rate returns immediately.
+const INTERN_L1_CAP: usize = 512;
+
+thread_local! {
+    static INTERN_L1: RefCell<HashMap<String, Arc<str>>> =
+        RefCell::new(HashMap::with_capacity(64));
+}
+
 /// Intern a string, returning a shared `Arc<str>`.  Repeated calls with
 /// the same contents (that haven't been evicted from the LRU) return
 /// the same `Arc` without re-allocating.  When the interner is full
 /// the LRU entry is evicted and the new string takes its place —
 /// correctness is preserved regardless because `Arc<str>` equality
 /// compares by content, not pointer identity.
+///
+/// Two-tier: thread-local `INTERN_L1` short-circuits without the global
+/// Mutex when the string is in the thread's recently-seen set; on miss
+/// we consult the global LRU interner, which returns a cross-thread
+/// shared `Arc<str>`, and populate the L1 for next time.
 fn intern_str(s: &str) -> Arc<str> {
-    let mut table = STRING_INTERNER.lock().unwrap();
-    if let Some(existing) = table.get(s) {
-        return existing;
+    if let Some(arc) = INTERN_L1.with(|cell| cell.borrow().get(s).cloned()) {
+        return arc;
     }
-    let arc: Arc<str> = Arc::from(s);
-    table.insert(s.to_string(), arc.clone());
+    let arc = {
+        let mut table = STRING_INTERNER.lock().unwrap();
+        if let Some(existing) = table.get(s) {
+            existing
+        } else {
+            let arc: Arc<str> = Arc::from(s);
+            table.insert(s.to_string(), arc.clone());
+            arc
+        }
+    };
+    INTERN_L1.with(|cell| {
+        let mut m = cell.borrow_mut();
+        if m.len() >= INTERN_L1_CAP {
+            // Overflow: clear and rebuild.  The hot working set re-
+            // populates on next access; stale long-tail entries get
+            // evicted.  Cheaper than per-entry LRU bookkeeping for a
+            // cache this small.
+            m.clear();
+        }
+        m.insert(s.to_string(), arc.clone());
+    });
     arc
 }
 
@@ -1505,14 +1736,16 @@ pub(crate) fn decode_tagged(p: *mut Value) -> Value {
 /// Every Knot expression evaluates to a heap-allocated `Value`.
 /// The Cranelift-generated code works exclusively with `*mut Value` pointers.
 pub enum Value {
-    /// Kept inline (not boxed).  `BigInt` is the largest variant and
-    /// dominates `Value`'s size, but every non-singleton integer hits
-    /// this constructor; boxing would add a heap allocation per int on
-    /// the hot path.  Singletons for small ints absorb most of the
-    /// allocation pressure so the inline footprint is acceptable.
-    /// Big integer (arbitrary precision).  Used for values that don't
-    /// fit in `i64` or are the result of BigInt operations.
-    Int(BigInt),
+    /// Big integer (arbitrary precision), boxed.  Boxing keeps the
+    /// `Value` enum uniformly pointer-sized across variants — `BigInt`
+    /// inline would be 32 B (Sign + `Vec<u32>`), tying with
+    /// `Vec<RecordField>` for largest.  Today `Value` is still 32 B
+    /// because other variants (`Record`, `Relation`, `Constructor`) are
+    /// already 24 B; boxing `BigInt` costs one heap alloc per true
+    /// bignum (rare — `SmallInt` catches every integer that fits in
+    /// `i64`) and lines the enum up for a future shrink once those
+    /// other variants are squeezed into `Arc<[T]>` / similar.
+    Int(Box<BigInt>),
     /// Fast-path integer: `i64`-sized, inline.  Produced by
     /// `knot_value_int` / `alloc_int` for values in `i64` range that
     /// aren't already covered by the small-int singleton cache.
@@ -1575,12 +1808,19 @@ pub struct RecordField {
 
 impl Drop for Value {
     fn drop(&mut self) {
-        // Custom Drop intercepts `Value::Relation` to return its backing
-        // Vec storage to the thread-local pool; all other variants fall
-        // back to the compiler-generated field drop.
-        if let Value::Relation(rows) = self {
-            let owned = std::mem::take(rows);
-            return_relation_vec(owned);
+        // Custom Drop intercepts `Value::Relation` / `Value::Record` to
+        // return their backing Vec storage to the thread-local pool; all
+        // other variants fall back to the compiler-generated field drop.
+        match self {
+            Value::Relation(rows) => {
+                let owned = std::mem::take(rows);
+                return_relation_vec(owned);
+            }
+            Value::Record(fields) => {
+                let owned = std::mem::take(fields);
+                return_record_vec(owned);
+            }
+            _ => {}
         }
     }
 }
@@ -1660,38 +1900,37 @@ fn alloc(v: Value) -> *mut Value {
 }
 
 /// Allocate an integer, returning a cached pointer for small values
-/// in the singleton range, a `SmallInt` for values that fit in `i64`,
-/// or a `BigInt` for larger values.
+/// in the singleton range, a tagged pointer for i61-range values, a
+/// `SmallInt` for values that fit in `i64` but not i61, or a `BigInt`
+/// for larger values.
 fn alloc_int(n: BigInt) -> *mut Value {
     if let Some(small) = n.to_i64() {
         if small >= SMALL_INT_MIN && small <= SMALL_INT_MAX {
             return SINGLETONS.with(|s| s.small_ints[(small - SMALL_INT_MIN) as usize]);
         }
+        if let Some(tagged) = encode_smallint(small) {
+            return tagged;
+        }
         return alloc(Value::SmallInt(small));
     }
-    alloc(Value::Int(n))
+    alloc(Value::Int(Box::new(n)))
 }
 
-/// Allocate an `i64`-sized integer directly.  Equivalent to
-/// `alloc_int(BigInt::from(n))` but avoids the `BigInt` roundtrip for
-/// the fast-path `SmallInt` variant.
-///
-/// The surrounding pointer-tagging infrastructure (`encode_smallint`,
-/// `decode_tagged`) can in principle skip the arena slot entirely for
-/// i61-range values, but actually returning a tagged pointer here
-/// would require auditing every downstream `match unsafe { &*val }`
-/// site for aliasing on the shared `UNPACK_SCRATCH`.  For example the
-/// pattern `match (as_ref(a), as_ref(b)) { (SmallInt(x), SmallInt(y))
-/// => x == y }` breaks if both pointers are tagged — both `as_ref`
-/// calls land on the same thread-local slot, so `y` overwrites the
-/// value `x` points at and the match arm always reports equality.
-/// The wire-up lives behind `alloc_small_int` so flipping it on is a
-/// one-line change once the downstream aliasing has been dealt with
-/// (e.g. by switching to a `ValueGuard<'a>` that owns decoded values).
+/// Allocate an `i64`-sized integer directly.  The singleton cache for
+/// [-128, 127] is tried first, then pointer tagging for i61-range
+/// values (≈ 2.3 × 10^18), falling back to an arena `SmallInt` for the
+/// tails of the i64 range.  Tagged pointers carry the integer inline
+/// in the pointer's upper 61 bits with a `0b001` tag in the low 3
+/// bits; `as_ref` / callers that dereference route through a
+/// tagged-aware scratch ring, so tagged pointers can flow transparently
+/// through all existing runtime functions.
 #[inline]
 fn alloc_small_int(n: i64) -> *mut Value {
     if n >= SMALL_INT_MIN && n <= SMALL_INT_MAX {
         return SINGLETONS.with(|s| s.small_ints[(n - SMALL_INT_MIN) as usize]);
+    }
+    if let Some(tagged) = encode_smallint(n) {
+        return tagged;
     }
     alloc(Value::SmallInt(n))
 }
@@ -1714,7 +1953,7 @@ fn int_as_i64(v: &Value) -> Option<i64> {
 fn int_to_bigint(v: &Value) -> Option<BigInt> {
     match v {
         Value::SmallInt(n) => Some(BigInt::from(*n)),
-        Value::Int(n) => Some(n.clone()),
+        Value::Int(n) => Some((**n).clone()),
         _ => None,
     }
 }
@@ -1730,9 +1969,14 @@ fn int_as_usize(v: &Value) -> Option<usize> {
     }
 }
 
-/// Return the cached Bool singleton.
+/// Return a tagged Bool pointer.  The tag encoding (`0b010` in the
+/// low 3 bits, payload in bit 3) produces two globally-unique bit
+/// patterns for `true` / `false` — no thread-local lookup, no heap
+/// allocation, and identity comparison (`a == b` on the pointers)
+/// correctly implies value equality.
+#[inline]
 fn alloc_bool(b: bool) -> *mut Value {
-    SINGLETONS.with(|s| if b { s.bool_true } else { s.bool_false })
+    encode_bool(b)
 }
 
 /// Allocate a float, returning a cached pointer for +0.0 and 1.0.
@@ -1789,16 +2033,28 @@ unsafe fn as_ref<'a>(v: *mut Value) -> &'a Value {
         panic!("knot runtime: null pointer dereference (value is null)");
     }
     if is_tagged(v) {
-        // Materialize the tagged pointer into a thread-local scratch
-        // slot and hand back a reference into it.  The scratch holds
-        // exactly one value at a time — callers MUST not retain the
-        // returned reference across another `as_ref` call that could
-        // see a tagged pointer.  All existing `as_ref` callers match
-        // once and extract owned data, so this invariant holds today;
-        // any new caller that stashes the reference should be reviewed.
-        UNPACK_SCRATCH.with(|cell| {
-            let ptr = cell.get();
+        // Materialize the tagged pointer into the next slot of a
+        // per-thread scratch ring and hand back a reference into it.
+        // The ring has `UNPACK_SCRATCH_SLOTS` entries; each `as_ref`
+        // call on a tagged pointer advances the cursor, so the common
+        // pattern `match (as_ref(a), as_ref(b)) { ... }` sees two
+        // distinct slots even if both a and b are tagged.
+        //
+        // Invariant: a caller must not keep a reference from this
+        // function alive across more than `UNPACK_SCRATCH_SLOTS - 1`
+        // subsequent `as_ref` calls that could themselves be tagged,
+        // or the cursor will wrap around and overwrite the slot.
+        // In practice, match arms extract owned data (i64, bool) or
+        // refcount-clone (Arc<str>, Arc<[u8]>) immediately, so no
+        // pattern-bound reference outlives its arm; the worst nesting
+        // we see is 2-deep tuple matches, well within a 8-slot ring.
+        UNPACK_SCRATCH.with(|ring| {
+            let cursor_cell = &ring.cursor;
+            let idx = cursor_cell.get();
+            cursor_cell.set((idx + 1) % UNPACK_SCRATCH_SLOTS);
+            let slots = ring.slots.get();
             unsafe {
+                let ptr = (*slots).as_mut_ptr().add(idx);
                 std::ptr::drop_in_place(ptr);
                 std::ptr::write(ptr, decode_tagged(v));
                 std::mem::transmute::<&Value, &'a Value>(&*ptr)
@@ -1809,11 +2065,27 @@ unsafe fn as_ref<'a>(v: *mut Value) -> &'a Value {
     }
 }
 
+/// Number of scratch slots in the tagged-pointer decode ring.  Must be
+/// large enough that no realistic match-chain (including nested
+/// helpers like `type_name`, `brief_value`, and equality recursion)
+/// wraps the cursor around while pattern-bound references are still
+/// live.  8 is generous — the observed maximum concurrent tagged
+/// derefs per call stack is 2 (binary op match patterns).
+const UNPACK_SCRATCH_SLOTS: usize = 8;
+
+struct UnpackScratchRing {
+    slots: std::cell::UnsafeCell<[Value; UNPACK_SCRATCH_SLOTS]>,
+    cursor: std::cell::Cell<usize>,
+}
+
 thread_local! {
-    /// Scratch slot for materializing tagged pointers during `as_ref`.
-    /// See the safety note on `as_ref`.
-    static UNPACK_SCRATCH: std::cell::UnsafeCell<Value> =
-        std::cell::UnsafeCell::new(Value::Unit);
+    static UNPACK_SCRATCH: UnpackScratchRing = UnpackScratchRing {
+        slots: std::cell::UnsafeCell::new([
+            Value::Unit, Value::Unit, Value::Unit, Value::Unit,
+            Value::Unit, Value::Unit, Value::Unit, Value::Unit,
+        ]),
+        cursor: std::cell::Cell::new(0),
+    };
 }
 
 unsafe fn str_from_raw(ptr: *const u8, len: usize) -> &'static str {
@@ -2121,7 +2393,7 @@ pub extern "C" fn knot_value_int(n: i64) -> *mut Value {
 pub extern "C" fn knot_value_int_from_str(ptr: *const u8, len: usize) -> *mut Value {
     let s = unsafe { str_from_raw(ptr, len) };
     let n = s.parse::<BigInt>().unwrap_or_else(|e| panic!("knot runtime: invalid integer literal '{}': {}", s, e));
-    alloc(Value::Int(n))
+    alloc_int(n)
 }
 
 #[unsafe(no_mangle)]
@@ -2203,16 +2475,12 @@ pub unsafe extern "C" fn knot_value_text_intern(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_bool(b: i32) -> *mut Value {
-    if b != 0 {
-        SINGLETONS.with(|s| s.bool_true)
-    } else {
-        SINGLETONS.with(|s| s.bool_false)
-    }
+    encode_bool(b != 0)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_unit() -> *mut Value {
-    SINGLETONS.with(|s| s.unit)
+    encode_unit()
 }
 
 #[unsafe(no_mangle)]
@@ -2299,7 +2567,7 @@ pub extern "C" fn knot_value_get_tag(v: *mut Value) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_record_empty(capacity: usize) -> *mut Value {
-    alloc(Value::Record(Vec::with_capacity(capacity)))
+    alloc(Value::Record(take_record_vec(capacity)))
 }
 
 #[unsafe(no_mangle)]
@@ -2333,7 +2601,7 @@ pub extern "C" fn knot_record_set_field(
 /// development; release builds trust codegen and skip the O(n) scan.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_record_from_pairs(data: *const usize, count: usize) -> *mut Value {
-    let mut fields = Vec::with_capacity(count);
+    let mut fields = take_record_vec(count);
     for i in 0..count {
         let offset = i * 3;
         let key_ptr = unsafe { *data.add(offset) as *const u8 };
@@ -2837,20 +3105,53 @@ fn materialize_relation(conn: &Connection, rows: &[*mut Value], schema: &TempSch
     name
 }
 
-/// In-memory dedup fallback for relations that can't be stored in SQL.
+// In-memory dedup fallback for relations that can't be stored in SQL.
+//
+// Reusable scratch for `in_memory_dedup`: the seen-set, the result
+// vec, and a hash buffer.  `in_memory_dedup` is called on every
+// union / relation-bind / groupBy when the SQL fallback doesn't
+// fire, so allocating a fresh `HashSet` + `Vec<u8>` per call is
+// wasteful in tight loops.  Reusing keeps the hashed-row storage
+// and the capacity-hinted `result` around across calls.
+thread_local! {
+    static DEDUP_SCRATCH: RefCell<DedupScratch> = RefCell::new(DedupScratch {
+        seen: HashSet::new(),
+        result: Vec::new(),
+        buf: Vec::new(),
+    });
+}
+
+struct DedupScratch {
+    seen: HashSet<Vec<u8>>,
+    result: Vec<*mut Value>,
+    buf: Vec<u8>,
+}
+
 fn in_memory_dedup(rows: Vec<*mut Value>) -> Vec<*mut Value> {
-    let mut seen = HashSet::new();
-    let mut result = Vec::new();
-    let mut buf = Vec::new();
-    for row in rows {
-        buf.clear();
-        value_to_hash_bytes(row, &mut buf);
-        if !seen.contains(buf.as_slice()) {
-            seen.insert(std::mem::take(&mut buf));
-            result.push(row);
+    DEDUP_SCRATCH.with(|cell| {
+        let mut s = cell.borrow_mut();
+        s.seen.clear();
+        s.result.clear();
+        s.buf.clear();
+        // Reserve to minimise incremental growth in large-relation paths;
+        // the Vec hangs on to its backing buffer across calls so future
+        // calls don't pay the grow again.
+        s.result.reserve(rows.len());
+        for row in rows {
+            s.buf.clear();
+            value_to_hash_bytes(row, &mut s.buf);
+            if !s.seen.contains(s.buf.as_slice()) {
+                let key = std::mem::take(&mut s.buf);
+                s.seen.insert(key);
+                s.result.push(row);
+            }
         }
-    }
-    result
+        // Hand the result vec to the caller; swap in a fresh empty one
+        // so the scratch's `result` slot keeps its capacity for next
+        // call (the caller owns the big buffer until its Relation is
+        // dropped and the relation-vec pool takes it).
+        std::mem::take(&mut s.result)
+    })
 }
 
 /// Perform a set operation (UNION/EXCEPT/INTERSECT) using SQLite.
@@ -3512,8 +3813,8 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
         // Fast path: both SmallInt — direct i64 compare.
         (Value::SmallInt(x), Value::SmallInt(y)) => x == y,
         (Value::Int(x), Value::Int(y)) => x == y,
-        (Value::SmallInt(x), Value::Int(y)) => &BigInt::from(*x) == y,
-        (Value::Int(x), Value::SmallInt(y)) => x == &BigInt::from(*y),
+        (Value::SmallInt(x), Value::Int(y)) => BigInt::from(*x) == **y,
+        (Value::Int(x), Value::SmallInt(y)) => **x == BigInt::from(*y),
         (Value::Float(x), Value::Float(y)) => x.total_cmp(y) == std::cmp::Ordering::Equal,
         (Value::Int(x), Value::Float(y)) => bigint_to_f64(x).total_cmp(y) == std::cmp::Ordering::Equal,
         (Value::Float(x), Value::Int(y)) => x.total_cmp(&bigint_to_f64(y)) == std::cmp::Ordering::Equal,
@@ -3577,7 +3878,7 @@ enum NumView {
 #[inline]
 fn to_num_view(v: &Value) -> Option<NumView> {
     match v {
-        Value::Int(n) => Some(NumView::Int(n.clone())),
+        Value::Int(n) => Some(NumView::Int((**n).clone())),
         Value::SmallInt(n) => Some(NumView::Int(BigInt::from(*n))),
         Value::Float(f) => Some(NumView::Float(*f)),
         _ => None,
@@ -3933,7 +4234,7 @@ pub extern "C" fn knot_value_negate(v: *mut Value) -> *mut Value {
             Some(r) => alloc_small_int(r),
             None => alloc_int(-BigInt::from(*n)),
         },
-        Value::Int(n) => alloc_int(-n),
+        Value::Int(n) => alloc_int(-&**n),
         Value::Float(n) => alloc_float(-n),
         _ => panic!("knot runtime: cannot negate {}", type_name(v)),
     }
@@ -4243,72 +4544,137 @@ pub extern "C" fn knot_io_map(f: *mut Value, io: *mut Value) -> *mut Value {
 /// across threads without copying.  Records and Relations still require
 /// fresh Vec allocation (their backing is mutable `Vec`, not an Arc).
 /// BigInt is cloned (its internal Vec is deep-copied).
+/// Iterative deep-clone.  Uses an explicit work stack so a deeply
+/// nested structure (a long linked list in an ADT, a record whose
+/// field is another record whose field is another ...) can't blow the
+/// native call stack.
+///
+/// Two-phase: first allocate a shell for each reachable source pointer
+/// (recording src→dst in a per-call map), then patch each shell's
+/// children using the map.  Shared subtrees are cloned exactly once.
 fn deep_clone_value(val: *mut Value) -> *mut Value {
-    if val.is_null() {
-        return val;
-    }
-    // Tagged pointers carry their payload inline; they're already
-    // cross-thread safe (no heap resource to duplicate).
-    if is_tagged(val) {
-        return val;
-    }
-    let cloned = match unsafe { &*val } {
-        Value::Int(n) => Value::Int(n.clone()),
-        Value::SmallInt(n) => Value::SmallInt(*n),
-        Value::Float(f) => Value::Float(*f),
-        // Interned Arc<str>: clone is an atomic increment, no allocation.
-        Value::Text(s) => Value::Text(s.clone()),
-        Value::Bool(b) => Value::Bool(*b),
-        // Arc<[u8]>: clone is an atomic increment, no allocation even
-        // for large blobs.  Forked threads share the byte buffer.
-        Value::Bytes(b) => Value::Bytes(b.clone()),
-        Value::Unit => Value::Unit,
-        Value::Record(fields) => {
-            // Field names are interned Arc<str>: clones are refcount bumps.
-            let mut new_fields = Vec::with_capacity(fields.len());
-            for f in fields {
-                new_fields.push(RecordField {
-                    name: f.name.clone(),
-                    value: deep_clone_value(f.value),
-                });
-            }
-            Value::Record(new_fields)
+    if val.is_null() { return val; }
+    if is_tagged(val) { return val; }
+
+    // src → dst map.  Shared subtrees (DAGs) are cloned exactly once.
+    let mut map: HashMap<*mut Value, *mut Value> = HashMap::new();
+    // Phase 1 stack: values to shell-clone.  We iterate depth-first so
+    // children get allocated before we try to patch them.
+    let mut to_alloc: Vec<*mut Value> = vec![val];
+    // Phase 2 stack: (dst, children) — dst is a freshly-allocated shell,
+    // children are the src pointers whose dsts need patching into dst's
+    // slots.  The patching logic inspects dst's variant to know which
+    // slot each child fills.
+    let mut to_patch: Vec<*mut Value> = Vec::new();
+
+    while let Some(src) = to_alloc.pop() {
+        if src.is_null() || is_tagged(src) || map.contains_key(&src) {
+            continue;
         }
-        Value::Relation(rows) => {
-            // Fast path: empty relation doesn't need a Vec at all.
-            // Fork envs rarely carry populated Relations; if they do, the
-            // per-row recursion is unavoidable — each row is an independent
-            // arena allocation that must be lifted to Box for thread safety.
-            if rows.is_empty() {
-                Value::Relation(Vec::new())
-            } else {
-                let mut new_rows = Vec::with_capacity(rows.len());
-                for &r in rows {
-                    new_rows.push(deep_clone_value(r));
+        // Allocate a shell cloned value.  Leaf variants are complete;
+        // compound variants have placeholder-null children to be filled
+        // in phase 2.
+        let shell = match unsafe { &*src } {
+            Value::Int(n) => Value::Int(n.clone()),
+            Value::SmallInt(n) => Value::SmallInt(*n),
+            Value::Float(f) => Value::Float(*f),
+            Value::Text(s) => Value::Text(s.clone()),
+            Value::Bool(b) => Value::Bool(*b),
+            Value::Bytes(b) => Value::Bytes(b.clone()),
+            Value::Unit => Value::Unit,
+            Value::Record(fields) => {
+                let mut new_fields = Vec::with_capacity(fields.len());
+                for f in fields {
+                    new_fields.push(RecordField {
+                        name: f.name.clone(),
+                        value: std::ptr::null_mut(),
+                    });
+                    to_alloc.push(f.value);
+                }
+                Value::Record(new_fields)
+            }
+            Value::Relation(rows) => {
+                let mut new_rows = vec![std::ptr::null_mut(); rows.len()];
+                for (i, &r) in rows.iter().enumerate() {
+                    new_rows[i] = std::ptr::null_mut();
+                    to_alloc.push(r);
                 }
                 Value::Relation(new_rows)
             }
+            Value::Constructor(tag, inner) => {
+                to_alloc.push(*inner);
+                Value::Constructor(tag.clone(), std::ptr::null_mut())
+            }
+            Value::Function(f) => {
+                to_alloc.push(f.env);
+                Value::Function(Box::new(FunctionInner {
+                    fn_ptr: f.fn_ptr,
+                    env: std::ptr::null_mut(),
+                    source: f.source.clone(),
+                }))
+            }
+            Value::IO(fn_ptr, env) => {
+                to_alloc.push(*env);
+                Value::IO(*fn_ptr, std::ptr::null_mut())
+            }
+            Value::Pair(a, b) => {
+                to_alloc.push(*a);
+                to_alloc.push(*b);
+                Value::Pair(std::ptr::null_mut(), std::ptr::null_mut())
+            }
+        };
+        let dst = Box::into_raw(Box::new(shell));
+        map.insert(src, dst);
+        to_patch.push(src);
+    }
+
+    // Phase 2: patch children.  Walk each src whose dst shell was
+    // allocated; look up each child's dst and write it into the
+    // appropriate slot.  Null / tagged children resolve to themselves.
+    for src in to_patch {
+        let dst = *map.get(&src).unwrap();
+        // SAFETY: we just allocated `dst` in phase 1; `src` is the
+        // original — we're reading src's children and writing dst's.
+        // `dst` is disjoint from `src`.
+        match (unsafe { &*src }, unsafe { &mut *dst }) {
+            (Value::Record(src_fields), Value::Record(dst_fields)) => {
+                for (i, f) in src_fields.iter().enumerate() {
+                    dst_fields[i].value = lookup_or_identity(&map, f.value);
+                }
+            }
+            (Value::Relation(src_rows), Value::Relation(dst_rows)) => {
+                for (i, &r) in src_rows.iter().enumerate() {
+                    dst_rows[i] = lookup_or_identity(&map, r);
+                }
+            }
+            (Value::Constructor(_, src_inner), Value::Constructor(_, dst_inner)) => {
+                *dst_inner = lookup_or_identity(&map, *src_inner);
+            }
+            (Value::Function(src_f), Value::Function(dst_f)) => {
+                dst_f.env = lookup_or_identity(&map, src_f.env);
+            }
+            (Value::IO(_, src_env), Value::IO(_, dst_env)) => {
+                *dst_env = lookup_or_identity(&map, *src_env);
+            }
+            (Value::Pair(src_a, src_b), Value::Pair(dst_a, dst_b)) => {
+                *dst_a = lookup_or_identity(&map, *src_a);
+                *dst_b = lookup_or_identity(&map, *src_b);
+            }
+            _ => {}  // leaf: nothing to patch
         }
-        Value::Constructor(tag, inner) => {
-            // tag is interned Arc<str>: clone is a refcount bump.
-            Value::Constructor(tag.clone(), deep_clone_value(*inner))
-        }
-        Value::Function(f) => {
-            // fn_ptr is a code address (shared), env is data (cloned),
-            // source is interned Arc<str>.
-            Value::Function(Box::new(FunctionInner {
-                fn_ptr: f.fn_ptr,
-                env: deep_clone_value(f.env),
-                source: f.source.clone(),
-            }))
-        }
-        Value::IO(fn_ptr, env) => {
-            // fn_ptr is a code address (shared), env is data (cloned)
-            Value::IO(*fn_ptr, deep_clone_value(*env))
-        }
-        Value::Pair(a, b) => Value::Pair(deep_clone_value(*a), deep_clone_value(*b)),
-    };
-    Box::into_raw(Box::new(cloned))
+    }
+
+    *map.get(&val).unwrap()
+}
+
+/// Resolve a child pointer through the src→dst map, or return it
+/// unchanged if not in the map (null, tagged, or unchanged reference).
+#[inline]
+fn lookup_or_identity(map: &HashMap<*mut Value, *mut Value>, p: *mut Value) -> *mut Value {
+    if p.is_null() || is_tagged(p) {
+        return p;
+    }
+    map.get(&p).copied().unwrap_or(p)
 }
 
 /// Recursively free a value tree allocated by `deep_clone_value`.
@@ -8312,7 +8678,7 @@ pub extern "C" fn knot_random_int(bound: *mut Value) -> *mut Value {
             break raw % n;
         }
     };
-    alloc(Value::Int(BigInt::from(result)))
+    alloc_int(BigInt::from(result))
 }
 
 /// Return a random Float in [0.0, 1.0).
@@ -10959,7 +11325,7 @@ fn fetch_build_err(status: u16, message: &str) -> *mut Value {
         },
         RecordField {
             name: "status".into(),
-            value: alloc(Value::Int(BigInt::from(status))),
+            value: alloc_int(BigInt::from(status)),
         },
     ]));
     alloc(Value::Constructor(

@@ -852,6 +852,7 @@ dependencies = [
  "crossterm",
  "ed25519-dalek",
  "getrandom 0.3.4",
+ "libc",
  "num-bigint",
  "num-integer",
  "num-traits",

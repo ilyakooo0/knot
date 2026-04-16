@@ -8176,6 +8176,31 @@ fn expr_is_promote_safe(expr: &ast::Expr) -> bool {
             // yield-position literals.)
             ast::Literal::Text(_) | ast::Literal::Bytes(_) => false,
         },
+        // Bare `True` and `False` constructors compile to the Bool
+        // singletons (see codegen's special-case for Constructor("True"
+        // | "False", ...)).  Same for `Unit`-producing nullary
+        // constructors via the runtime's shared `Unit` singleton.
+        //
+        // NOTE: we can't easily distinguish "plain Unit constructor"
+        // from a user-defined nullary constructor with the same name
+        // without resolving through the type environment.  Stick to
+        // the bare primitive names which codegen special-cases.
+        ast::ExprKind::Constructor(name) => {
+            matches!(name.as_str(), "True" | "False")
+        }
+        // `if cond then t else e` produces whichever branch ran.  If
+        // both branches are promote-safe, the result is too.  Note we
+        // don't inspect `cond` — it's evaluated but its result doesn't
+        // reach the yield position; only the selected branch does.
+        ast::ExprKind::If { then_branch, else_branch, .. } => {
+            expr_is_promote_safe(then_branch) && expr_is_promote_safe(else_branch)
+        }
+        // Case dispatch: if every arm's body is promote-safe, so is
+        // the result.  An empty arm list shouldn't occur (ill-typed),
+        // but we conservatively return false to avoid false positives.
+        ast::ExprKind::Case { arms, .. } => {
+            !arms.is_empty() && arms.iter().all(|a| expr_is_promote_safe(&a.body))
+        }
         _ => false,
     }
 }

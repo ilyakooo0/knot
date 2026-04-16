@@ -96,6 +96,16 @@ impl Chunk {
 /// `reset_to` when `pinned_mark < pinned.len()`).
 struct Frame {
     chunks: Vec<Chunk>,
+    /// Sorted-by-base-address sidetable mapping chunk base addresses to
+    /// their index in `chunks`.  Enables O(log n) `owns_in_chunks`
+    /// lookup without scanning every chunk.  Maintained by
+    /// `push_chunk` / `pop_chunk` helpers; `chunks` retains insertion
+    /// order (used by `reset_to`'s mark arithmetic).
+    ///
+    /// Box allocator doesn't guarantee adjacency between sequential
+    /// chunks, so a simple `[min_base, max_end]` bound isn't tight
+    /// enough to serve as a fast reject in realistic workloads.
+    chunk_index: Vec<(usize, u32)>,
     /// Promoted values that survive `reset_to` within this frame, in
     /// insertion order (used for Drop iteration).  Each entry is a
     /// `Box::into_raw(Box::new(Value))`.
@@ -113,6 +123,7 @@ impl Frame {
     fn empty() -> Self {
         Frame {
             chunks: Vec::new(),
+            chunk_index: Vec::new(),
             pinned: Vec::new(),
             pinned_set: HashSet::new(),
         }
@@ -123,9 +134,56 @@ impl Frame {
         (self.chunks.len() - 1) * CHUNK_CAP + self.chunks.last().unwrap().len
     }
 
+    fn mark_pinned(&self) -> usize {
+        self.pinned.len()
+    }
+
+    /// Drop pinned entries added since `pinned_mark` (used by selective
+    /// reclamation in `reset_to`).  Removes from both the `Vec` and the
+    /// lookup `HashSet`.  Entries allocated before the mark are kept.
+    fn truncate_pinned(&mut self, pinned_mark: usize) {
+        while self.pinned.len() > pinned_mark {
+            let ptr = self.pinned.pop().expect("pinned invariant: len > 0");
+            self.pinned_set.remove(&ptr);
+            unsafe { drop(Box::from_raw(ptr)); }
+        }
+    }
+
+    /// Append a chunk and update the sorted sidetable.
+    fn push_chunk(&mut self, c: Chunk) {
+        let base = c.data.as_ptr() as usize;
+        let idx = self.chunks.len() as u32;
+        self.chunks.push(c);
+        let pos = self
+            .chunk_index
+            .binary_search_by_key(&base, |&(b, _)| b)
+            .unwrap_or_else(|p| p);
+        self.chunk_index.insert(pos, (base, idx));
+    }
+
+    /// Pop the last chunk and update the sorted sidetable.
+    fn pop_chunk(&mut self) -> Option<Chunk> {
+        let chunk = self.chunks.pop()?;
+        let base = chunk.data.as_ptr() as usize;
+        if let Ok(pos) = self.chunk_index.binary_search_by_key(&base, |&(b, _)| b) {
+            self.chunk_index.remove(pos);
+        }
+        Some(chunk)
+    }
+
     /// Check whether `val` lives in one of this frame's chunks.
+    /// Uses binary search on `chunk_index` for O(log n) lookup.
     fn owns_in_chunks(&self, val: *mut Value) -> bool {
-        self.chunks.iter().any(|c| c.contains(val))
+        if self.chunk_index.is_empty() { return false; }
+        let addr = val as usize;
+        // Find the chunk whose base is the largest one ≤ addr.
+        let pos = match self.chunk_index.binary_search_by_key(&addr, |&(b, _)| b) {
+            Ok(p) => p,        // addr == base of chunk `p`
+            Err(0) => return false,  // addr precedes all chunks
+            Err(p) => p - 1,   // chunk p-1 is the greatest base ≤ addr
+        };
+        let (_, chunk_idx) = self.chunk_index[pos];
+        self.chunks[chunk_idx as usize].contains(val)
     }
 
     /// Check whether `val` is owned by this frame (chunks or pinned).
@@ -201,48 +259,67 @@ struct Arena {
 /// bound for steady-state working set.
 const CHUNK_POOL_CAP: usize = 64;
 
-/// Cap on the number of `Vec<*mut Value>` backing storage buffers held in
-/// the relation pool per thread.  Query pipelines produce many transient
-/// relations; reusing their allocations avoids heap churn.
-const RELATION_POOL_CAP: usize = 256;
-
 /// Drop threshold for returning relation vecs to the pool.  Very large
 /// Vecs (e.g. accidentally-full query results) are freed instead of
 /// pooled to avoid keeping megabytes around after a single large query.
 const RELATION_POOL_MAX_CAPACITY: usize = 4096;
 
+/// Number of size-class bins.  Bin `i` stores vecs with capacity in
+/// `[1 << i, 1 << (i+1))`.  We cap at `log2(RELATION_POOL_MAX_CAPACITY)
+/// + 1 = 13` so bin 12 covers [4096, 8192) but the reject threshold
+/// keeps the tail small.
+const RELATION_POOL_BINS: usize = 13;
+
+/// Per-bin capacity cap.  Keeps total pool memory bounded while still
+/// providing generous reuse for hot size classes.
+const RELATION_POOL_PER_BIN_CAP: usize = 32;
+
+/// Compute the bin index for a given capacity.  Bin `i` holds vecs with
+/// capacity in `[1 << i, 1 << (i+1))`.  Capacity 0 or 1 maps to bin 0.
+#[inline]
+fn relation_pool_bin(cap: usize) -> usize {
+    if cap <= 1 {
+        0
+    } else {
+        // floor(log2(cap))
+        ((usize::BITS - 1 - cap.leading_zeros()) as usize).min(RELATION_POOL_BINS - 1)
+    }
+}
+
 thread_local! {
     /// Recycled `Vec<*mut Value>` buffers reused by `knot_relation_*`
-    /// constructors.  Populated by `Value::drop` when a `Value::Relation`
-    /// is dropped; drained by `take_relation_vec`.
-    static RELATION_VEC_POOL: RefCell<Vec<Vec<*mut Value>>> = const { RefCell::new(Vec::new()) };
+    /// constructors.  Organised into size-class bins keyed by
+    /// `floor(log2(capacity))` for O(1) best-fit lookup.  Populated by
+    /// `Value::drop` when a `Value::Relation` is dropped; drained by
+    /// `take_relation_vec`.
+    static RELATION_VEC_POOL: RefCell<[Vec<Vec<*mut Value>>; RELATION_POOL_BINS]> =
+        RefCell::new(std::array::from_fn(|_| Vec::new()));
 }
 
 /// Obtain a `Vec<*mut Value>` from the pool (if any) or allocate a new
 /// one.  The returned Vec is always empty; callers may reserve further
-/// capacity as needed.
+/// capacity as needed.  First searches the bin matching `min_capacity`
+/// and then larger bins; only falls back to smaller bins (which will
+/// grow on push) if nothing bigger is available.
 fn take_relation_vec(min_capacity: usize) -> Vec<*mut Value> {
     RELATION_VEC_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
-        // Find the first Vec with sufficient capacity.  Linear scan is
-        // fine for a ~256-entry pool and lets us reuse under-sized Vecs
-        // if no larger one is available.
-        let mut best = None;
-        for (i, v) in pool.iter().enumerate() {
-            if v.capacity() >= min_capacity {
-                best = Some(i);
-                break;
+        let start = relation_pool_bin(min_capacity);
+        // Prefer a bin that already satisfies the request so the caller
+        // doesn't pay for a grow.
+        for bin in start..RELATION_POOL_BINS {
+            if let Some(v) = pool[bin].pop() {
+                return v;
             }
         }
-        if let Some(i) = best {
-            pool.swap_remove(i)
-        } else if let Some(v) = pool.pop() {
-            // No perfectly-sized buffer — reuse the smallest we have
-            // and let it grow.
-            v
-        } else {
-            Vec::with_capacity(min_capacity)
+        // Nothing large enough — accept an under-sized buffer; push()
+        // will reallocate on demand.
+        for bin in (0..start).rev() {
+            if let Some(v) = pool[bin].pop() {
+                return v;
+            }
         }
+        Vec::with_capacity(min_capacity)
     })
 }
 
@@ -250,14 +327,16 @@ fn take_relation_vec(min_capacity: usize) -> Vec<*mut Value> {
 /// capacity is reasonable.  Called from `Value::drop` when a Relation
 /// is being destroyed.
 fn return_relation_vec(mut v: Vec<*mut Value>) {
-    if v.capacity() == 0 || v.capacity() > RELATION_POOL_MAX_CAPACITY {
+    let cap = v.capacity();
+    if cap == 0 || cap > RELATION_POOL_MAX_CAPACITY {
         return;
     }
     v.clear();
     RELATION_VEC_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
-        if pool.len() < RELATION_POOL_CAP {
-            pool.push(v);
+        let bin = relation_pool_bin(cap);
+        if pool[bin].len() < RELATION_POOL_PER_BIN_CAP {
+            pool[bin].push(v);
         }
     });
 }
@@ -302,18 +381,37 @@ impl Arena {
             .map_or(true, Chunk::is_full);
         if need_new {
             let chunk = self.take_chunk();
-            self.current_frame().chunks.push(chunk);
+            self.current_frame().push_chunk(chunk);
         }
         self.current_frame().chunks.last_mut().unwrap().alloc(v)
     }
 
+    /// Snapshot the current frame's allocation frontier.
+    ///
+    /// Returns a packed `usize` encoding both the chunk-slot position
+    /// (upper 32 bits) and the pinned-vec length (lower 32 bits).  The
+    /// pinned mark enables selective reclamation of promoted values
+    /// accumulated since the last `mark` — without it, pinned entries
+    /// persisted across `reset_to` and the frame grew unboundedly
+    /// within a single long-running function.
+    ///
+    /// 32 bits each is sufficient: `CHUNK_CAP = 512` so the chunk-slot
+    /// position caps out at ~2B allocations per frame; pinned grows at
+    /// most once per yield per iteration, so 4B is generous.
     fn mark(&self) -> usize {
-        self.frames.last().expect("arena: no frames").mark_chunks()
+        let frame = self.frames.last().expect("arena: no frames");
+        let chunk_mark = frame.mark_chunks();
+        let pinned_mark = frame.mark_pinned();
+        debug_assert!(chunk_mark < (1usize << 32), "arena: chunk mark overflow");
+        debug_assert!(pinned_mark < (1usize << 32), "arena: pinned mark overflow");
+        (chunk_mark << 32) | (pinned_mark & 0xFFFF_FFFF)
     }
 
     fn reset_to(&mut self, mark: usize) {
-        let mark_chunk = mark / CHUNK_CAP;
-        let mark_slot = mark % CHUNK_CAP;
+        let chunk_mark = mark >> 32;
+        let pinned_mark = mark & 0xFFFF_FFFF;
+        let mark_chunk = chunk_mark / CHUNK_CAP;
+        let mark_slot = chunk_mark % CHUNK_CAP;
         let mut harvested: Vec<Chunk> = Vec::new();
         {
             let frame = self.current_frame();
@@ -328,15 +426,32 @@ impl Arena {
             }
             // Harvest empty chunks above the mark into the pool.
             while frame.chunks.len() > mark_chunk + 1 {
-                harvested.push(frame.chunks.pop().unwrap());
+                // `pop_chunk` keeps the sorted `chunk_index` in sync.
+                harvested.push(frame.pop_chunk().unwrap());
             }
+            // Selectively reclaim pinned entries allocated since the
+            // mark.  Any still-live pinned entries from earlier in the
+            // frame are preserved; only the "above-mark" pins are
+            // dropped.  Generated code must promote yielded values
+            // AFTER the mark so they're reclaimed at reset_to; yields
+            // compiled after `knot_arena_mark` land in the reclaimable
+            // region, which is the intended semantics.
+            frame.truncate_pinned(pinned_mark);
         }
         for chunk in harvested {
             self.return_chunk(chunk);
         }
+        // Cache keys are raw pointers into chunks just dropped — they can
+        // be reused for different values on the next allocation, so the
+        // cache must be cleared.  `HashMap::clear` retains capacity, so
+        // repeated cycles reuse the underlying allocation.
+        self.promote_cache.clear();
     }
 
     fn push_frame(&mut self) {
+        // Cache keys are relative to the current frame's chunk addresses;
+        // a new frame starts with a fresh identity space.
+        self.promote_cache.clear();
         self.frames.push(Frame::empty());
     }
 
@@ -359,6 +474,8 @@ impl Arena {
         if self.frames.len() > 1 {
             let frame = self.frames.pop().unwrap();
             self.drop_and_harvest_frame(frame);
+            // Dropped frame's pointers could collide with future allocations.
+            self.promote_cache.clear();
         }
     }
 
@@ -370,6 +487,11 @@ impl Arena {
         if self.frames.len() <= 1 || val.is_null() {
             return val;
         }
+        // Child frame's pointers are about to be freed — cache must not
+        // retain them across the call.  We clear before cloning so the
+        // clone_from_child recursion starts with a fresh cache (its keys
+        // are child pointers, which are invalid after drop).
+        self.promote_cache.clear();
         let child = self.frames.pop().unwrap();
         // Clone into the (now-current) parent frame before dropping the child.
         let promoted = self.clone_from_child(val, &child);
@@ -384,47 +506,70 @@ impl Arena {
     /// Values already safe (singletons, parent-frame, text-cache) are
     /// returned as-is; only chunk-resident values are deep-cloned.
     ///
-    /// `promote_cache` dedups shared subtrees during this call so that if
-    /// the same source pointer is reached via multiple paths (DAG
-    /// structure, e.g., two records referencing the same child record),
-    /// we only clone it once and share the promoted pointer.
+    /// `promote_cache` dedups shared subtrees during this call and
+    /// across subsequent calls within the same frame/mark window — a
+    /// second `promote(val)` on the same pointer returns the already-
+    /// pinned clone without re-cloning.  The cache is invalidated at
+    /// the events that could reuse its keys: `reset_to`, `push_frame`,
+    /// `pop_frame`, and `pop_frame_promote`.
     fn promote(&mut self, val: *mut Value) -> *mut Value {
-        if val.is_null() { return val; }
-        let in_chunk = self.current_frame().owns_in_chunks(val);
-        let result = if in_chunk {
-            self.clone_into_pinned(val)
-        } else {
-            self.promote_children(val)
-        };
-        self.promote_cache.clear();
-        result
+        self.promote_value(val)
     }
 
     /// `val` is NOT in the current frame's chunks (safe from reset),
     /// but its children might be.  Recurse and copy-on-write if needed.
+    ///
+    /// For Records and Relations, uses lazy-materialization: the new
+    /// backing Vec is only allocated on the first child that actually
+    /// changes.  If no child changes, `val` is returned unchanged and
+    /// no allocation occurs.  Previously we always built a fresh Vec
+    /// of the same length and only threw it away if nothing changed —
+    /// pure overhead in the common "already-safe value reached via
+    /// recursion" case.
     fn promote_children(&mut self, val: *mut Value) -> *mut Value {
         if val.is_null() { return val; }
         match unsafe { &*val } {
-            Value::Int(_) | Value::Float(_) | Value::Text(_)
+            Value::Int(_) | Value::SmallInt(_) | Value::Float(_) | Value::Text(_)
             | Value::Bool(_) | Value::Bytes(_) | Value::Unit => val,
 
             Value::Record(fields) => {
-                let mut changed = false;
-                let new_fields: Vec<RecordField> = fields.iter().map(|f| {
+                let mut new_fields: Option<Vec<RecordField>> = None;
+                for (i, f) in fields.iter().enumerate() {
                     let nv = self.promote_value(f.value);
-                    if nv != f.value { changed = true; }
-                    RecordField { name: f.name.clone(), value: nv }
-                }).collect();
-                if changed { self.alloc_pinned(Value::Record(new_fields)) } else { val }
+                    if let Some(vec) = new_fields.as_mut() {
+                        vec.push(RecordField { name: f.name.clone(), value: nv });
+                    } else if nv != f.value {
+                        // First divergence: materialize, copy prefix.
+                        let mut vec = Vec::with_capacity(fields.len());
+                        for prev in &fields[..i] {
+                            vec.push(RecordField { name: prev.name.clone(), value: prev.value });
+                        }
+                        vec.push(RecordField { name: f.name.clone(), value: nv });
+                        new_fields = Some(vec);
+                    }
+                }
+                match new_fields {
+                    Some(v) => self.alloc_pinned(Value::Record(v)),
+                    None => val,
+                }
             }
             Value::Relation(rows) => {
-                let mut changed = false;
-                let new_rows: Vec<*mut Value> = rows.iter().map(|&r| {
+                let mut new_rows: Option<Vec<*mut Value>> = None;
+                for (i, &r) in rows.iter().enumerate() {
                     let nr = self.promote_value(r);
-                    if nr != r { changed = true; }
-                    nr
-                }).collect();
-                if changed { self.alloc_pinned(Value::Relation(new_rows)) } else { val }
+                    if let Some(vec) = new_rows.as_mut() {
+                        vec.push(nr);
+                    } else if nr != r {
+                        let mut vec = Vec::with_capacity(rows.len());
+                        vec.extend_from_slice(&rows[..i]);
+                        vec.push(nr);
+                        new_rows = Some(vec);
+                    }
+                }
+                match new_rows {
+                    Some(v) => self.alloc_pinned(Value::Relation(v)),
+                    None => val,
+                }
             }
             Value::Constructor(tag, inner) => {
                 let ni = self.promote_value(*inner);
@@ -485,6 +630,7 @@ impl Arena {
         if val.is_null() { return val; }
         let cloned = match unsafe { &*val } {
             Value::Int(n) => Value::Int(n.clone()),
+            Value::SmallInt(n) => Value::SmallInt(*n),
             Value::Float(f) => Value::Float(*f),
             Value::Text(s) => Value::Text(s.clone()),
             Value::Bool(b) => Value::Bool(*b),
@@ -541,6 +687,7 @@ impl Arena {
         }
         let cloned = match unsafe { &*val } {
             Value::Int(n) => Value::Int(n.clone()),
+            Value::SmallInt(n) => Value::SmallInt(*n),
             Value::Float(f) => Value::Float(*f),
             Value::Text(s) => Value::Text(s.clone()),
             Value::Bool(b) => Value::Bool(*b),
@@ -775,19 +922,39 @@ pub extern "C" fn knot_debug_init() {
 // are atomic-increment-cheap.  The interner is a global Mutex-guarded
 // map; callers hit the `Mutex` once per record construction but all
 // subsequent cloning/comparison is lock-free.
+//
+// Bounded at `INTERNER_CAP` entries to cap worst-case memory for
+// pathological inputs (e.g. dynamically-generated field names from
+// user-supplied data).  When the cap is exceeded, new strings are
+// still returned as fresh `Arc<str>` — they just aren't shared with
+// future calls.  Existing interned entries keep working because we
+// never evict (we can't — external `Arc<str>` clones are out of our
+// control, and equality checks assume pointer stability after first
+// intern).
+
+/// Maximum number of interned strings.  Typical programs have at most
+/// a few hundred unique field names / constructor tags; 65536 leaves
+/// ample headroom while capping memory at (avg_str_len + 24) * 65536
+/// bytes — roughly 2 MB for 8-byte average strings.
+const INTERNER_CAP: usize = 65_536;
 
 static STRING_INTERNER: std::sync::LazyLock<Mutex<HashMap<String, Arc<str>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Intern a string, returning a shared `Arc<str>`.  Repeated calls with
 /// the same contents return the same `Arc` without re-allocating.
+/// Once the interner hits `INTERNER_CAP` entries, new strings get a
+/// fresh (non-shared) `Arc<str>` — correctness is preserved, but the
+/// sharing optimization is dropped.
 fn intern_str(s: &str) -> Arc<str> {
     let mut table = STRING_INTERNER.lock().unwrap();
     if let Some(existing) = table.get(s) {
         return existing.clone();
     }
     let arc: Arc<str> = Arc::from(s);
-    table.insert(s.to_string(), arc.clone());
+    if table.len() < INTERNER_CAP {
+        table.insert(s.to_string(), arc.clone());
+    }
     arc
 }
 
@@ -803,11 +970,29 @@ pub enum Value {
     /// this constructor; boxing would add a heap allocation per int on
     /// the hot path.  Singletons for small ints absorb most of the
     /// allocation pressure so the inline footprint is acceptable.
+    /// Big integer (arbitrary precision).  Used for values that don't
+    /// fit in `i64` or are the result of BigInt operations.
     Int(BigInt),
+    /// Fast-path integer: `i64`-sized, inline.  Produced by
+    /// `knot_value_int` / `alloc_int` for values in `i64` range that
+    /// aren't already covered by the small-int singleton cache.
+    /// Arithmetic preserves this variant when both operands fit and
+    /// the result doesn't overflow; on overflow, falls back to `Int`.
+    ///
+    /// Saves one heap allocation per non-singleton integer creation:
+    /// `BigInt::from(n)` internally allocates a `Vec<u32>` (currently
+    /// 16-24 bytes + the Vec header), which is the dominant cost for
+    /// integer-heavy workloads like row iteration or numeric reduction.
+    SmallInt(i64),
     Float(f64),
-    Text(String),
+    /// Immutable UTF-8 text.  Stored as `Arc<str>` so `clone()` is a
+    /// refcount bump (not a heap allocation) and large strings shared
+    /// across threads (via `fork`) avoid deep copies.
+    Text(Arc<str>),
     Bool(bool),
-    Bytes(Vec<u8>),
+    /// Immutable byte buffer.  Stored as `Arc<[u8]>` for the same
+    /// reasons as `Text`.
+    Bytes(Arc<[u8]>),
     Unit,
     Record(Vec<RecordField>),
     Relation(Vec<*mut Value>),
@@ -934,14 +1119,62 @@ fn alloc(v: Value) -> *mut Value {
     ARENA.with(|a| a.borrow_mut().alloc(v))
 }
 
-/// Allocate an integer, returning a cached pointer for small values.
+/// Allocate an integer, returning a cached pointer for small values
+/// in the singleton range, a `SmallInt` for values that fit in `i64`,
+/// or a `BigInt` for larger values.
 fn alloc_int(n: BigInt) -> *mut Value {
     if let Some(small) = n.to_i64() {
         if small >= SMALL_INT_MIN && small <= SMALL_INT_MAX {
             return SINGLETONS.with(|s| s.small_ints[(small - SMALL_INT_MIN) as usize]);
         }
+        return alloc(Value::SmallInt(small));
     }
     alloc(Value::Int(n))
+}
+
+/// Allocate an `i64`-sized integer directly.  Equivalent to
+/// `alloc_int(BigInt::from(n))` but avoids the `BigInt` roundtrip for
+/// the fast-path `SmallInt` variant.
+#[inline]
+fn alloc_small_int(n: i64) -> *mut Value {
+    if n >= SMALL_INT_MIN && n <= SMALL_INT_MAX {
+        return SINGLETONS.with(|s| s.small_ints[(n - SMALL_INT_MIN) as usize]);
+    }
+    alloc(Value::SmallInt(n))
+}
+
+/// Extract an `i64` from a `SmallInt` or `Int` value without allocating.
+/// Returns `None` if the integer doesn't fit in `i64`.
+#[inline]
+fn int_as_i64(v: &Value) -> Option<i64> {
+    match v {
+        Value::SmallInt(n) => Some(*n),
+        Value::Int(n) => n.to_i64(),
+        _ => None,
+    }
+}
+
+/// Produce a `BigInt` from either integer variant.  For `Int`, this
+/// clones; for `SmallInt`, this allocates a fresh `BigInt`.
+#[inline]
+#[allow(dead_code)]
+fn int_to_bigint(v: &Value) -> Option<BigInt> {
+    match v {
+        Value::SmallInt(n) => Some(BigInt::from(*n)),
+        Value::Int(n) => Some(n.clone()),
+        _ => None,
+    }
+}
+
+/// Extract a `usize` from either integer variant.  Returns `None` if
+/// the value doesn't fit (e.g., negative or too large).
+#[inline]
+fn int_as_usize(v: &Value) -> Option<usize> {
+    match v {
+        Value::SmallInt(n) => usize::try_from(*n).ok(),
+        Value::Int(n) => n.to_usize(),
+        _ => None,
+    }
 }
 
 /// Return the cached Bool singleton.
@@ -1033,7 +1266,7 @@ fn type_name(v: *mut Value) -> &'static str {
         return "null";
     }
     match unsafe { as_ref(v) } {
-        Value::Int(_) => "Int",
+        Value::Int(_) | Value::SmallInt(_) => "Int",
         Value::Float(_) => "Float",
         Value::Text(_) => "Text",
         Value::Bool(_) => "Bool",
@@ -1054,6 +1287,7 @@ fn brief_value(v: *mut Value) -> String {
     }
     match unsafe { as_ref(v) } {
         Value::Int(n) => format!("Int({})", n),
+        Value::SmallInt(n) => format!("Int({})", n),
         Value::Float(n) => format!("Float({})", n),
         Value::Text(s) => {
             if s.len() > 30 {
@@ -1137,45 +1371,142 @@ impl Drop for ValueSingletons {
 /// pointers (e.g. generated SQL fragments).
 const TEXT_LITERAL_CACHE_CAP: usize = 4096;
 
-/// Wrapper around the text literal cache that frees cached values on drop.
-/// Implements simple FIFO eviction (approximating LRU) once the cap is hit;
-/// `order` tracks insertion order so we can reclaim the oldest entry.
+/// Sentinel index meaning "no neighbor" in the linked list.
+const LRU_NIL: u32 = u32::MAX;
+
+/// One entry in the LRU cache.  Packed representation (u32 indices)
+/// keeps each node at 24 bytes regardless of pointer width.
+struct LruEntry {
+    key: *const u8,
+    val: *mut Value,
+    prev: u32,
+    next: u32,
+}
+
+/// Doubly-linked-list-based LRU cache for text literals.
+///
+/// `map` maps source pointers to their index in `entries`.
+/// `entries` is a slab; a removed entry's slot is pushed onto `free` for
+/// reuse.  `head` is the most-recently-used index, `tail` is the
+/// least-recently-used.  All operations (get, insert, evict) are O(1).
 struct TextLiteralCache {
-    map: HashMap<*const u8, *mut Value>,
-    order: std::collections::VecDeque<*const u8>,
+    map: HashMap<*const u8, u32>,
+    entries: Vec<LruEntry>,
+    head: u32,
+    tail: u32,
+    free: u32,
 }
 
 impl TextLiteralCache {
     fn new() -> Self {
         TextLiteralCache {
             map: HashMap::new(),
-            order: std::collections::VecDeque::new(),
+            entries: Vec::new(),
+            head: LRU_NIL,
+            tail: LRU_NIL,
+            free: LRU_NIL,
         }
     }
 
-    fn get(&self, key: &*const u8) -> Option<&*mut Value> {
-        self.map.get(key)
+    /// Detach `idx` from its current position in the list (if linked).
+    fn detach(&mut self, idx: u32) {
+        let (prev, next) = {
+            let e = &self.entries[idx as usize];
+            (e.prev, e.next)
+        };
+        if prev != LRU_NIL {
+            self.entries[prev as usize].next = next;
+        } else {
+            self.head = next;
+        }
+        if next != LRU_NIL {
+            self.entries[next as usize].prev = prev;
+        } else {
+            self.tail = prev;
+        }
     }
 
+    /// Link `idx` at the head (most-recently-used position).
+    fn push_head(&mut self, idx: u32) {
+        let old_head = self.head;
+        {
+            let e = &mut self.entries[idx as usize];
+            e.prev = LRU_NIL;
+            e.next = old_head;
+        }
+        if old_head != LRU_NIL {
+            self.entries[old_head as usize].prev = idx;
+        } else {
+            // Empty list — new head is also the tail.
+            self.tail = idx;
+        }
+        self.head = idx;
+    }
+
+    /// Look up `key` and, if present, promote it to the head.
+    fn get(&mut self, key: *const u8) -> Option<*mut Value> {
+        let idx = *self.map.get(&key)?;
+        // Promote to head: detach then re-link at front.
+        self.detach(idx);
+        self.push_head(idx);
+        Some(self.entries[idx as usize].val)
+    }
+
+    /// Insert a new (key, val).  Evicts the least-recently-used entry
+    /// if the cache is full.  Returns the index assigned.
     fn insert(&mut self, key: *const u8, val: *mut Value) {
-        while self.map.len() >= TEXT_LITERAL_CACHE_CAP {
-            if let Some(old_key) = self.order.pop_front() {
-                if let Some(old_val) = self.map.remove(&old_key) {
-                    unsafe { let _ = Box::from_raw(old_val); }
-                }
-            } else {
-                break;
-            }
+        // If at capacity, evict the tail (LRU) and reuse its slot.
+        if self.map.len() >= TEXT_LITERAL_CACHE_CAP && self.tail != LRU_NIL {
+            let victim = self.tail;
+            let victim_key = self.entries[victim as usize].key;
+            let victim_val = self.entries[victim as usize].val;
+            self.detach(victim);
+            self.map.remove(&victim_key);
+            unsafe { let _ = Box::from_raw(victim_val); }
+            // Reuse the slot directly.
+            self.entries[victim as usize] = LruEntry {
+                key,
+                val,
+                prev: LRU_NIL,
+                next: LRU_NIL,
+            };
+            self.push_head(victim);
+            self.map.insert(key, victim);
+            return;
         }
-        self.map.insert(key, val);
-        self.order.push_back(key);
+
+        // Grow: reuse a freed slot if available, otherwise append.
+        let idx = if self.free != LRU_NIL {
+            let slot = self.free;
+            self.free = self.entries[slot as usize].next;
+            self.entries[slot as usize] = LruEntry {
+                key,
+                val,
+                prev: LRU_NIL,
+                next: LRU_NIL,
+            };
+            slot
+        } else {
+            let slot = self.entries.len() as u32;
+            self.entries.push(LruEntry {
+                key,
+                val,
+                prev: LRU_NIL,
+                next: LRU_NIL,
+            });
+            slot
+        };
+        self.push_head(idx);
+        self.map.insert(key, idx);
     }
 }
 
 impl Drop for TextLiteralCache {
     fn drop(&mut self) {
-        for &ptr in self.map.values() {
-            unsafe { let _ = Box::from_raw(ptr); }
+        // Iterate the map (not entries) so we skip freed slots.
+        for &idx in self.map.values() {
+            let val = self.entries[idx as usize].val;
+            unsafe { let _ = Box::from_raw(val); }
         }
     }
 }
@@ -1198,11 +1529,7 @@ thread_local! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_int(n: i64) -> *mut Value {
-    if n >= SMALL_INT_MIN && n <= SMALL_INT_MAX {
-        SINGLETONS.with(|s| s.small_ints[(n - SMALL_INT_MIN) as usize])
-    } else {
-        alloc(Value::Int(BigInt::from(n)))
-    }
+    alloc_small_int(n)
 }
 
 #[unsafe(no_mangle)]
@@ -1226,7 +1553,7 @@ pub extern "C" fn knot_value_float(n: f64) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_text(ptr: *const u8, len: usize) -> *mut Value {
     let s = unsafe { str_from_raw(ptr, len) };
-    alloc(Value::Text(s.to_string()))
+    alloc(Value::Text(Arc::from(s)))
 }
 
 /// Like `knot_value_text` but caches by data pointer, avoiding repeated
@@ -1236,11 +1563,11 @@ pub extern "C" fn knot_value_text(ptr: *const u8, len: usize) -> *mut Value {
 pub extern "C" fn knot_value_text_cached(ptr: *const u8, len: usize) -> *mut Value {
     TEXT_LITERAL_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if let Some(&val) = cache.get(&ptr) {
+        if let Some(val) = cache.get(ptr) {
             val
         } else {
             let s = unsafe { str_from_raw(ptr, len) };
-            let val = Box::into_raw(Box::new(Value::Text(s.to_string())));
+            let val = Box::into_raw(Box::new(Value::Text(Arc::from(s))));
             cache.insert(ptr, val);
             val
         }
@@ -1284,10 +1611,11 @@ pub extern "C" fn knot_value_constructor(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_bytes(ptr: *const u8, len: usize) -> *mut Value {
-    let bytes = if ptr.is_null() || len == 0 {
-        Vec::new()
+    let bytes: Arc<[u8]> = if ptr.is_null() || len == 0 {
+        Arc::from(&[][..])
     } else {
-        unsafe { slice::from_raw_parts(ptr, len) }.to_vec()
+        let slice = unsafe { slice::from_raw_parts(ptr, len) };
+        Arc::from(slice)
     };
     alloc(Value::Bytes(bytes))
 }
@@ -1297,6 +1625,7 @@ pub extern "C" fn knot_value_bytes(ptr: *const u8, len: usize) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_get_int(v: *mut Value) -> i64 {
     match unsafe { as_ref(v) } {
+        Value::SmallInt(n) => *n,
         Value::Int(n) => n.to_i64().expect("knot runtime: Int too large for i64"),
         _ => panic!("knot runtime: expected Int, got {}", brief_value(v)),
     }
@@ -1324,7 +1653,7 @@ pub extern "C" fn knot_value_get_tag(v: *mut Value) -> i32 {
         return 9; // Nullable none (null pointer)
     }
     match unsafe { as_ref(v) } {
-        Value::Int(_) => 0,
+        Value::Int(_) | Value::SmallInt(_) => 0,
         Value::Float(_) => 1,
         Value::Text(_) => 2,
         Value::Bool(_) => 3,
@@ -1371,10 +1700,10 @@ pub extern "C" fn knot_record_set_field(
 /// array of triples: [key_ptr, key_len, value, ...] where each element
 /// is pointer-sized.
 ///
-/// Codegen emits pairs in sorted order already, but we unconditionally
-/// sort here to make the invariant robust against buggy or externally-
-/// produced pair lists.  For small records (typical < 20 fields) this
-/// is effectively free.
+/// Codegen guarantees pairs are emitted in sorted order (see the
+/// `compiled.sort_by_key` calls in codegen.rs's Record/Lambda/Do
+/// lowerings).  `debug_assert` catches invariant violations during
+/// development; release builds trust codegen and skip the O(n) scan.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_record_from_pairs(data: *const usize, count: usize) -> *mut Value {
     let mut fields = Vec::with_capacity(count);
@@ -1386,9 +1715,10 @@ pub extern "C" fn knot_record_from_pairs(data: *const usize, count: usize) -> *m
         let name = intern_str(unsafe { str_from_raw(key_ptr, key_len) });
         fields.push(RecordField { name, value });
     }
-    if !fields.windows(2).all(|w| w[0].name <= w[1].name) {
-        fields.sort_by(|a, b| a.name.cmp(&b.name));
-    }
+    debug_assert!(
+        fields.windows(2).all(|w| w[0].name <= w[1].name),
+        "knot_record_from_pairs: codegen emitted unsorted field pairs"
+    );
     alloc(Value::Record(fields))
 }
 
@@ -1489,7 +1819,7 @@ fn infer_col_type(v: *mut Value) -> Option<ColType> {
         return Some(ColType::Text);
     }
     match unsafe { as_ref(v) } {
-        Value::Int(_) => Some(ColType::Int),
+        Value::Int(_) | Value::SmallInt(_) => Some(ColType::Int),
         Value::Float(_) => Some(ColType::Float),
         Value::Text(_) => Some(ColType::Text),
         Value::Bool(_) => Some(ColType::Bool),
@@ -1576,7 +1906,7 @@ fn infer_temp_schema(rows: &[*mut Value]) -> Option<TempSchema> {
             Some(TempSchema::Adt { constructors: ctors, all_fields })
         }
         Value::Unit => Some(TempSchema::Unit),
-        Value::Int(_) => Some(TempSchema::Scalar(ColType::Int)),
+        Value::Int(_) | Value::SmallInt(_) => Some(TempSchema::Scalar(ColType::Int)),
         Value::Float(_) => Some(TempSchema::Scalar(ColType::Float)),
         Value::Text(_) => Some(TempSchema::Scalar(ColType::Text)),
         Value::Bool(_) => Some(TempSchema::Scalar(ColType::Bool)),
@@ -2455,6 +2785,14 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
             buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(&bytes);
         }
+        Value::SmallInt(n) => {
+            // Hash identically to BigInt(n) so SmallInt(5) and Int(5)
+            // produce the same hash (matching `values_equal`).
+            buf.push(0);
+            let bytes = BigInt::from(*n).to_signed_bytes_le();
+            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&bytes);
+        }
         Value::Float(f) => {
             buf.push(1);
             // Use raw bits for hashing to match total_cmp equality semantics
@@ -2544,10 +2882,16 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
         return false; // a == b already handled both-null
     }
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
+        // Fast path: both SmallInt — direct i64 compare.
+        (Value::SmallInt(x), Value::SmallInt(y)) => x == y,
         (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::SmallInt(x), Value::Int(y)) => &BigInt::from(*x) == y,
+        (Value::Int(x), Value::SmallInt(y)) => x == &BigInt::from(*y),
         (Value::Float(x), Value::Float(y)) => x.total_cmp(y) == std::cmp::Ordering::Equal,
         (Value::Int(x), Value::Float(y)) => bigint_to_f64(x).total_cmp(y) == std::cmp::Ordering::Equal,
         (Value::Float(x), Value::Int(y)) => x.total_cmp(&bigint_to_f64(y)) == std::cmp::Ordering::Equal,
+        (Value::SmallInt(x), Value::Float(y)) => (*x as f64).total_cmp(y) == std::cmp::Ordering::Equal,
+        (Value::Float(x), Value::SmallInt(y)) => x.total_cmp(&(*y as f64)) == std::cmp::Ordering::Equal,
         (Value::Text(x), Value::Text(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Bytes(x), Value::Bytes(y)) => x == y,
@@ -2594,65 +2938,117 @@ fn bigint_to_f64(n: &BigInt) -> f64 {
     n.to_f64().unwrap_or(if n.sign() == num_bigint::Sign::Minus { f64::NEG_INFINITY } else { f64::INFINITY })
 }
 
+/// Numeric view used by arithmetic and comparison after the SmallInt
+/// fast path failed.  `Int` and `SmallInt` are unified by widening
+/// SmallInt to BigInt.  Returns `None` for non-numeric values so the
+/// caller can produce a precise type error.
+enum NumView {
+    Int(BigInt),
+    Float(f64),
+}
+
+#[inline]
+fn to_num_view(v: &Value) -> Option<NumView> {
+    match v {
+        Value::Int(n) => Some(NumView::Int(n.clone())),
+        Value::SmallInt(n) => Some(NumView::Int(BigInt::from(*n))),
+        Value::Float(f) => Some(NumView::Float(*f)),
+        _ => None,
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_add(a: *mut Value, b: *mut Value) -> *mut Value {
-    match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
-        (Value::Int(x), Value::Int(y)) => alloc_int(x + y),
-        (Value::Float(x), Value::Float(y)) => alloc_float(x + y),
-        (Value::Int(x), Value::Float(y)) => alloc_float(bigint_to_f64(x) + y),
-        (Value::Float(x), Value::Int(y)) => alloc_float(x + bigint_to_f64(y)),
+    let av = unsafe { as_ref(a) };
+    let bv = unsafe { as_ref(b) };
+    // Fast path: SmallInt + SmallInt with overflow detection.
+    if let (Value::SmallInt(x), Value::SmallInt(y)) = (av, bv) {
+        if let Some(r) = x.checked_add(*y) {
+            return alloc_small_int(r);
+        }
+    }
+    match (to_num_view(av), to_num_view(bv)) {
+        (Some(NumView::Int(x)), Some(NumView::Int(y))) => alloc_int(x + y),
+        (Some(NumView::Float(x)), Some(NumView::Float(y))) => alloc_float(x + y),
+        (Some(NumView::Int(x)), Some(NumView::Float(y))) => alloc_float(bigint_to_f64(&x) + y),
+        (Some(NumView::Float(x)), Some(NumView::Int(y))) => alloc_float(x + bigint_to_f64(&y)),
         _ => panic!("knot runtime: cannot add {} + {}", type_name(a), type_name(b)),
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_sub(a: *mut Value, b: *mut Value) -> *mut Value {
-    match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
-        (Value::Int(x), Value::Int(y)) => alloc_int(x - y),
-        (Value::Float(x), Value::Float(y)) => alloc_float(x - y),
-        (Value::Int(x), Value::Float(y)) => alloc_float(bigint_to_f64(x) - y),
-        (Value::Float(x), Value::Int(y)) => alloc_float(x - bigint_to_f64(y)),
+    let av = unsafe { as_ref(a) };
+    let bv = unsafe { as_ref(b) };
+    if let (Value::SmallInt(x), Value::SmallInt(y)) = (av, bv) {
+        if let Some(r) = x.checked_sub(*y) {
+            return alloc_small_int(r);
+        }
+    }
+    match (to_num_view(av), to_num_view(bv)) {
+        (Some(NumView::Int(x)), Some(NumView::Int(y))) => alloc_int(x - y),
+        (Some(NumView::Float(x)), Some(NumView::Float(y))) => alloc_float(x - y),
+        (Some(NumView::Int(x)), Some(NumView::Float(y))) => alloc_float(bigint_to_f64(&x) - y),
+        (Some(NumView::Float(x)), Some(NumView::Int(y))) => alloc_float(x - bigint_to_f64(&y)),
         _ => panic!("knot runtime: cannot subtract {} - {}", type_name(a), type_name(b)),
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_mul(a: *mut Value, b: *mut Value) -> *mut Value {
-    match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
-        (Value::Int(x), Value::Int(y)) => alloc_int(x * y),
-        (Value::Float(x), Value::Float(y)) => alloc_float(x * y),
-        (Value::Int(x), Value::Float(y)) => alloc_float(bigint_to_f64(x) * y),
-        (Value::Float(x), Value::Int(y)) => alloc_float(x * bigint_to_f64(y)),
+    let av = unsafe { as_ref(a) };
+    let bv = unsafe { as_ref(b) };
+    if let (Value::SmallInt(x), Value::SmallInt(y)) = (av, bv) {
+        if let Some(r) = x.checked_mul(*y) {
+            return alloc_small_int(r);
+        }
+    }
+    match (to_num_view(av), to_num_view(bv)) {
+        (Some(NumView::Int(x)), Some(NumView::Int(y))) => alloc_int(x * y),
+        (Some(NumView::Float(x)), Some(NumView::Float(y))) => alloc_float(x * y),
+        (Some(NumView::Int(x)), Some(NumView::Float(y))) => alloc_float(bigint_to_f64(&x) * y),
+        (Some(NumView::Float(x)), Some(NumView::Int(y))) => alloc_float(x * bigint_to_f64(&y)),
         _ => panic!("knot runtime: cannot multiply {} * {}", type_name(a), type_name(b)),
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_div(a: *mut Value, b: *mut Value) -> *mut Value {
-    match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
-        (Value::Int(x), Value::Int(y)) => {
+    let av = unsafe { as_ref(a) };
+    let bv = unsafe { as_ref(b) };
+    if let (Value::SmallInt(x), Value::SmallInt(y)) = (av, bv) {
+        if *y == 0 {
+            panic!("knot runtime: division by zero");
+        }
+        // Use checked_div to handle i64::MIN / -1 overflow case.
+        if let Some(r) = x.checked_div(*y) {
+            return alloc_small_int(r);
+        }
+    }
+    match (to_num_view(av), to_num_view(bv)) {
+        (Some(NumView::Int(x)), Some(NumView::Int(y))) => {
             if y.is_zero() {
                 panic!("knot runtime: division by zero");
             }
             alloc_int(x / y)
         }
-        (Value::Float(x), Value::Float(y)) => {
-            if *y == 0.0 {
+        (Some(NumView::Float(x)), Some(NumView::Float(y))) => {
+            if y == 0.0 {
                 panic!("knot runtime: division by zero");
             }
             alloc_float(x / y)
         }
-        (Value::Int(x), Value::Float(y)) => {
-            if *y == 0.0 {
+        (Some(NumView::Int(x)), Some(NumView::Float(y))) => {
+            if y == 0.0 {
                 panic!("knot runtime: division by zero");
             }
-            alloc_float(bigint_to_f64(x) / y)
+            alloc_float(bigint_to_f64(&x) / y)
         }
-        (Value::Float(x), Value::Int(y)) => {
+        (Some(NumView::Float(x)), Some(NumView::Int(y))) => {
             if y.is_zero() {
                 panic!("knot runtime: division by zero");
             }
-            alloc_float(x / bigint_to_f64(y))
+            alloc_float(x / bigint_to_f64(&y))
         }
         _ => panic!("knot runtime: cannot divide {} / {}", type_name(a), type_name(b)),
     }
@@ -2686,12 +3082,19 @@ fn compare_lt(a: *mut Value, b: *mut Value) -> bool {
             if b.is_null() { "null".to_string() } else { brief_value(b) });
         return false;
     }
-    match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
-        (Value::Int(x), Value::Int(y)) => x < y,
-        (Value::Float(x), Value::Float(y)) => x.total_cmp(y) == std::cmp::Ordering::Less,
-        (Value::Int(x), Value::Float(y)) => bigint_to_f64(x).total_cmp(y) == std::cmp::Ordering::Less,
-        (Value::Float(x), Value::Int(y)) => x.total_cmp(&bigint_to_f64(y)) == std::cmp::Ordering::Less,
-        (Value::Text(x), Value::Text(y)) => x < y,
+    let av = unsafe { as_ref(a) };
+    let bv = unsafe { as_ref(b) };
+    if let (Value::SmallInt(x), Value::SmallInt(y)) = (av, bv) {
+        return x < y;
+    }
+    if let (Value::Text(x), Value::Text(y)) = (av, bv) {
+        return x < y;
+    }
+    match (to_num_view(av), to_num_view(bv)) {
+        (Some(NumView::Int(x)), Some(NumView::Int(y))) => x < y,
+        (Some(NumView::Float(x)), Some(NumView::Float(y))) => x.total_cmp(&y) == std::cmp::Ordering::Less,
+        (Some(NumView::Int(x)), Some(NumView::Float(y))) => bigint_to_f64(&x).total_cmp(&y) == std::cmp::Ordering::Less,
+        (Some(NumView::Float(x)), Some(NumView::Int(y))) => x.total_cmp(&bigint_to_f64(&y)) == std::cmp::Ordering::Less,
         _ => panic!("knot runtime: cannot compare {} < {}", type_name(a), type_name(b)),
     }
 }
@@ -2703,12 +3106,19 @@ fn compare_gt(a: *mut Value, b: *mut Value) -> bool {
             if b.is_null() { "null".to_string() } else { brief_value(b) });
         return false;
     }
-    match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
-        (Value::Int(x), Value::Int(y)) => x > y,
-        (Value::Float(x), Value::Float(y)) => x.total_cmp(y) == std::cmp::Ordering::Greater,
-        (Value::Int(x), Value::Float(y)) => bigint_to_f64(x).total_cmp(y) == std::cmp::Ordering::Greater,
-        (Value::Float(x), Value::Int(y)) => x.total_cmp(&bigint_to_f64(y)) == std::cmp::Ordering::Greater,
-        (Value::Text(x), Value::Text(y)) => x > y,
+    let av = unsafe { as_ref(a) };
+    let bv = unsafe { as_ref(b) };
+    if let (Value::SmallInt(x), Value::SmallInt(y)) = (av, bv) {
+        return x > y;
+    }
+    if let (Value::Text(x), Value::Text(y)) = (av, bv) {
+        return x > y;
+    }
+    match (to_num_view(av), to_num_view(bv)) {
+        (Some(NumView::Int(x)), Some(NumView::Int(y))) => x > y,
+        (Some(NumView::Float(x)), Some(NumView::Float(y))) => x.total_cmp(&y) == std::cmp::Ordering::Greater,
+        (Some(NumView::Int(x)), Some(NumView::Float(y))) => bigint_to_f64(&x).total_cmp(&y) == std::cmp::Ordering::Greater,
+        (Some(NumView::Float(x)), Some(NumView::Int(y))) => x.total_cmp(&bigint_to_f64(&y)) == std::cmp::Ordering::Greater,
         _ => panic!("knot runtime: cannot compare {} > {}", type_name(a), type_name(b)),
     }
 }
@@ -2801,7 +3211,7 @@ pub extern "C" fn knot_value_concat(a: *mut Value, b: *mut Value) -> *mut Value 
             let mut s = String::with_capacity(x.len() + y.len());
             s.push_str(x);
             s.push_str(y);
-            alloc(Value::Text(s))
+            alloc(Value::Text(Arc::from(s)))
         }
         (Value::Relation(rows_a), Value::Relation(rows_b)) => {
             // ++ on relations is union (in-memory hash-based dedup)
@@ -2827,18 +3237,7 @@ pub extern "C" fn knot_value_concat(a: *mut Value, b: *mut Value) -> *mut Value 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_compare(a: *mut Value, b: *mut Value) -> *mut Value {
-    let ordering = match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
-        (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        (Value::Float(x), Value::Float(y)) => x.total_cmp(y),
-        (Value::Int(x), Value::Float(y)) => bigint_to_f64(x).total_cmp(y),
-        (Value::Float(x), Value::Int(y)) => x.total_cmp(&bigint_to_f64(y)),
-        (Value::Text(x), Value::Text(y)) => x.cmp(y),
-        _ => panic!(
-            "knot runtime: cannot compare {} with {}",
-            type_name(a),
-            type_name(b)
-        ),
-    };
+    let ordering = compare_values(a, b);
     let tag = match ordering {
         std::cmp::Ordering::Less => "LT",
         std::cmp::Ordering::Equal => "EQ",
@@ -2854,22 +3253,32 @@ pub extern "C" fn knot_value_compare(a: *mut Value, b: *mut Value) -> *mut Value
 /// Avoids allocating an Ordering constructor for use in comparison operators.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_compare_ord(a: *mut Value, b: *mut Value) -> i32 {
-    let ordering = match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
-        (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        (Value::Float(x), Value::Float(y)) => x.total_cmp(y),
-        (Value::Int(x), Value::Float(y)) => bigint_to_f64(x).total_cmp(y),
-        (Value::Float(x), Value::Int(y)) => x.total_cmp(&bigint_to_f64(y)),
-        (Value::Text(x), Value::Text(y)) => x.cmp(y),
+    match compare_values(a, b) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+fn compare_values(a: *mut Value, b: *mut Value) -> std::cmp::Ordering {
+    let av = unsafe { as_ref(a) };
+    let bv = unsafe { as_ref(b) };
+    if let (Value::SmallInt(x), Value::SmallInt(y)) = (av, bv) {
+        return x.cmp(y);
+    }
+    if let (Value::Text(x), Value::Text(y)) = (av, bv) {
+        return x.cmp(y);
+    }
+    match (to_num_view(av), to_num_view(bv)) {
+        (Some(NumView::Int(x)), Some(NumView::Int(y))) => x.cmp(&y),
+        (Some(NumView::Float(x)), Some(NumView::Float(y))) => x.total_cmp(&y),
+        (Some(NumView::Int(x)), Some(NumView::Float(y))) => bigint_to_f64(&x).total_cmp(&y),
+        (Some(NumView::Float(x)), Some(NumView::Int(y))) => x.total_cmp(&bigint_to_f64(&y)),
         _ => panic!(
             "knot runtime: cannot compare {} with {}",
             type_name(a),
             type_name(b)
         ),
-    };
-    match ordering {
-        std::cmp::Ordering::Less => -1,
-        std::cmp::Ordering::Equal => 0,
-        std::cmp::Ordering::Greater => 1,
     }
 }
 
@@ -2893,6 +3302,10 @@ pub extern "C" fn knot_ordering_tag_i32(v: *mut Value) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_negate(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
+        Value::SmallInt(n) => match n.checked_neg() {
+            Some(r) => alloc_small_int(r),
+            None => alloc_int(-BigInt::from(*n)),
+        },
         Value::Int(n) => alloc_int(-n),
         Value::Float(n) => alloc_float(-n),
         _ => panic!("knot runtime: cannot negate {}", type_name(v)),
@@ -2934,6 +3347,7 @@ fn format_value(v: *mut Value) -> String {
     }
     match unsafe { as_ref(v) } {
         Value::Int(n) => n.to_string(),
+        Value::SmallInt(n) => n.to_string(),
         Value::Float(n) => {
             if n.is_nan() || n.is_infinite() {
                 format!("{}", n)
@@ -2947,7 +3361,7 @@ fn format_value(v: *mut Value) -> String {
         Value::Bytes(b) => {
             let mut hex = String::with_capacity(b.len() * 2 + 3);
             hex.push_str("b\"");
-            for byte in b {
+            for byte in b.iter() {
                 use std::fmt::Write;
                 let _ = write!(hex, "{:02x}", byte);
             }
@@ -3000,7 +3414,7 @@ pub extern "C" fn knot_read_line() -> *mut Value {
             line.pop();
         }
     }
-    alloc(Value::Text(line))
+    alloc(Value::Text(Arc::from(line)))
 }
 
 #[unsafe(no_mangle)]
@@ -3030,6 +3444,7 @@ pub extern "C" fn knot_value_show(v: *mut Value) -> *mut Value {
         }
         match unsafe { as_ref(v) } {
             Value::Int(n) => n.to_string(),
+            Value::SmallInt(n) => n.to_string(),
             Value::Float(n) => {
                 if n.is_nan() || n.is_infinite() {
                     format!("{}", n)
@@ -3039,10 +3454,10 @@ pub extern "C" fn knot_value_show(v: *mut Value) -> *mut Value {
                     n.to_string()
                 }
             }
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => (**s).to_string(),
             Value::Bytes(b) => {
                 let mut hex = String::with_capacity(b.len() * 2);
-                for byte in b {
+                for byte in b.iter() {
                     use std::fmt::Write;
                     let _ = write!(hex, "{:02x}", byte);
                 }
@@ -3076,7 +3491,7 @@ pub extern "C" fn knot_value_show(v: *mut Value) -> *mut Value {
             Value::Pair(_, _) => "<<Pair>>".to_string(),
         }
     }
-    alloc(Value::Text(show_inner(v)))
+    alloc(Value::Text(Arc::from(show_inner(v))))
 }
 
 // ── IO monad ─────────────────────────────────────────────────────
@@ -3195,16 +3610,25 @@ pub extern "C" fn knot_io_map(f: *mut Value, io: *mut Value) -> *mut Value {
 
 /// Deep-clone a Value tree so it can be sent to another thread.
 /// Uses Box::new (not the thread-local arena) so values survive arena resets.
+///
+/// `Text` and `Bytes` use `Arc<str>` / `Arc<[u8]>`, so their clones are
+/// atomic increments — large strings/blobs in fork envs are shared
+/// across threads without copying.  Records and Relations still require
+/// fresh Vec allocation (their backing is mutable `Vec`, not an Arc).
+/// BigInt is cloned (its internal Vec is deep-copied).
 fn deep_clone_value(val: *mut Value) -> *mut Value {
     if val.is_null() {
         return val;
     }
     let cloned = match unsafe { &*val } {
         Value::Int(n) => Value::Int(n.clone()),
+        Value::SmallInt(n) => Value::SmallInt(*n),
         Value::Float(f) => Value::Float(*f),
         // Interned Arc<str>: clone is an atomic increment, no allocation.
         Value::Text(s) => Value::Text(s.clone()),
         Value::Bool(b) => Value::Bool(*b),
+        // Arc<[u8]>: clone is an atomic increment, no allocation even
+        // for large blobs.  Forked threads share the byte buffer.
         Value::Bytes(b) => Value::Bytes(b.clone()),
         Value::Unit => Value::Unit,
         Value::Record(fields) => {
@@ -4041,6 +4465,7 @@ pub extern "C" fn knot_relation_avg(
         let val = knot_value_call(db, f, row);
         match unsafe { as_ref(val) } {
             Value::Int(n) => total += bigint_to_f64(n),
+            Value::SmallInt(n) => total += *n as f64,
             Value::Float(n) => total += n,
             _ => panic!(
                 "knot runtime: avg projection must return Int or Float, got {}",
@@ -4057,7 +4482,7 @@ pub extern "C" fn knot_relation_avg(
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_text_to_upper(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
-        Value::Text(s) => alloc(Value::Text(s.to_uppercase())),
+        Value::Text(s) => alloc(Value::Text(Arc::from(s.to_uppercase()))),
         _ => panic!("knot runtime: toUpper expected Text, got {}", type_name(v)),
     }
 }
@@ -4066,7 +4491,7 @@ pub extern "C" fn knot_text_to_upper(v: *mut Value) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_text_to_lower(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
-        Value::Text(s) => alloc(Value::Text(s.to_lowercase())),
+        Value::Text(s) => alloc(Value::Text(Arc::from(s.to_lowercase()))),
         _ => panic!("knot runtime: toLower expected Text, got {}", type_name(v)),
     }
 }
@@ -4074,14 +4499,12 @@ pub extern "C" fn knot_text_to_lower(v: *mut Value) -> *mut Value {
 /// take(n, text) — first n characters
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_text_take(n: *mut Value, text: *mut Value) -> *mut Value {
-    let n = match unsafe { as_ref(n) } {
-        Value::Int(n) => n.to_usize().expect("knot runtime: take index out of range"),
-        _ => panic!("knot runtime: take expected Int as first arg, got {}", type_name(n)),
-    };
+    let n_idx = int_as_usize(unsafe { as_ref(n) })
+        .unwrap_or_else(|| panic!("knot runtime: take expected Int as first arg, got {}", type_name(n)));
     match unsafe { as_ref(text) } {
         Value::Text(s) => {
-            let result: String = s.chars().take(n).collect();
-            alloc(Value::Text(result))
+            let result: String = s.chars().take(n_idx).collect();
+            alloc(Value::Text(Arc::from(result)))
         }
         _ => panic!("knot runtime: take expected Text as second arg, got {}", type_name(text)),
     }
@@ -4090,14 +4513,12 @@ pub extern "C" fn knot_text_take(n: *mut Value, text: *mut Value) -> *mut Value 
 /// drop(n, text) — skip first n characters
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_text_drop(n: *mut Value, text: *mut Value) -> *mut Value {
-    let n = match unsafe { as_ref(n) } {
-        Value::Int(n) => n.to_usize().expect("knot runtime: drop index out of range"),
-        _ => panic!("knot runtime: drop expected Int as first arg, got {}", type_name(n)),
-    };
+    let n_idx = int_as_usize(unsafe { as_ref(n) })
+        .unwrap_or_else(|| panic!("knot runtime: drop expected Int as first arg, got {}", type_name(n)));
     match unsafe { as_ref(text) } {
         Value::Text(s) => {
-            let result: String = s.chars().skip(n).collect();
-            alloc(Value::Text(result))
+            let result: String = s.chars().skip(n_idx).collect();
+            alloc(Value::Text(Arc::from(result)))
         }
         _ => panic!("knot runtime: drop expected Text as second arg, got {}", type_name(text)),
     }
@@ -4116,7 +4537,7 @@ pub extern "C" fn knot_text_length(v: *mut Value) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_text_trim(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
-        Value::Text(s) => alloc(Value::Text(s.trim().to_string())),
+        Value::Text(s) => alloc(Value::Text(Arc::from(s.trim()))),
         _ => panic!("knot runtime: trim expected Text, got {}", type_name(v)),
     }
 }
@@ -4124,8 +4545,8 @@ pub extern "C" fn knot_text_trim(v: *mut Value) -> *mut Value {
 /// contains(needle, haystack) — check if text contains a substring
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_text_contains(needle: *mut Value, haystack: *mut Value) -> *mut Value {
-    let needle = match unsafe { as_ref(needle) } {
-        Value::Text(s) => s.as_str(),
+    let needle: &str = match unsafe { as_ref(needle) } {
+        Value::Text(s) => &**s,
         _ => panic!("knot runtime: contains expected Text as first arg"),
     };
     match unsafe { as_ref(haystack) } {
@@ -4138,7 +4559,10 @@ pub extern "C" fn knot_text_contains(needle: *mut Value, haystack: *mut Value) -
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_text_reverse(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
-        Value::Text(s) => alloc(Value::Text(s.chars().rev().collect())),
+        Value::Text(s) => {
+            let result: String = s.chars().rev().collect();
+            alloc(Value::Text(Arc::from(result)))
+        }
         _ => panic!("knot runtime: reverse expected Text, got {}", type_name(v)),
     }
 }
@@ -4153,7 +4577,7 @@ pub extern "C" fn knot_text_chars(v: *mut Value) -> *mut Value {
             for c in s.chars() {
                 let cs = c.to_string();
                 if seen.insert(cs.clone()) {
-                    rows.push(alloc(Value::Text(cs)));
+                    rows.push(alloc(Value::Text(Arc::from(cs))));
                 }
             }
             alloc(Value::Relation(rows))
@@ -4184,9 +4608,10 @@ pub extern "C" fn knot_bytes_concat(a: *mut Value, b: *mut Value) -> *mut Value 
         Value::Bytes(b) => b,
         _ => panic!("knot runtime: bytesConcat expected Bytes as second arg, got {}", type_name(b)),
     };
-    let mut result = a_bytes.clone();
+    let mut result = Vec::with_capacity(a_bytes.len() + b_bytes.len());
+    result.extend_from_slice(a_bytes);
     result.extend_from_slice(b_bytes);
-    alloc(Value::Bytes(result))
+    alloc(Value::Bytes(Arc::from(result)))
 }
 
 /// bytesSlice(start, len, bytes) — extract a sub-range of bytes
@@ -4197,19 +4622,15 @@ pub extern "C" fn knot_bytes_slice(
     len: *mut Value,
     bytes: *mut Value,
 ) -> *mut Value {
-    let start = match unsafe { as_ref(start) } {
-        Value::Int(n) => n.to_usize().expect("knot runtime: bytesSlice start out of range"),
-        _ => panic!("knot runtime: bytesSlice expected Int as first arg"),
-    };
-    let len = match unsafe { as_ref(len) } {
-        Value::Int(n) => n.to_usize().expect("knot runtime: bytesSlice len out of range"),
-        _ => panic!("knot runtime: bytesSlice expected Int as second arg"),
-    };
+    let start = int_as_usize(unsafe { as_ref(start) })
+        .unwrap_or_else(|| panic!("knot runtime: bytesSlice expected Int as first arg"));
+    let len = int_as_usize(unsafe { as_ref(len) })
+        .unwrap_or_else(|| panic!("knot runtime: bytesSlice expected Int as second arg"));
     match unsafe { as_ref(bytes) } {
         Value::Bytes(b) => {
             let end = start.saturating_add(len).min(b.len());
             let s = start.min(b.len());
-            alloc(Value::Bytes(b[s..end].to_vec()))
+            alloc(Value::Bytes(Arc::from(&b[s..end])))
         }
         _ => panic!("knot runtime: bytesSlice expected Bytes as third arg, got {}", type_name(bytes)),
     }
@@ -4219,7 +4640,7 @@ pub extern "C" fn knot_bytes_slice(
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_text_to_bytes(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
-        Value::Text(s) => alloc(Value::Bytes(s.as_bytes().to_vec())),
+        Value::Text(s) => alloc(Value::Bytes(Arc::from(s.as_bytes()))),
         _ => panic!("knot runtime: textToBytes expected Text, got {}", type_name(v)),
     }
 }
@@ -4229,9 +4650,9 @@ pub extern "C" fn knot_text_to_bytes(v: *mut Value) -> *mut Value {
 pub extern "C" fn knot_bytes_to_text(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Bytes(b) => {
-            let s = String::from_utf8(b.clone())
+            let s = std::str::from_utf8(b)
                 .unwrap_or_else(|e| panic!("knot runtime: bytesToText: invalid UTF-8: {}", e));
-            alloc(Value::Text(s))
+            alloc(Value::Text(Arc::from(s)))
         }
         _ => panic!("knot runtime: bytesToText expected Bytes, got {}", type_name(v)),
     }
@@ -4243,11 +4664,11 @@ pub extern "C" fn knot_bytes_to_hex(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Bytes(b) => {
             let mut hex = String::with_capacity(b.len() * 2);
-            for byte in b {
+            for byte in b.iter() {
                 use std::fmt::Write;
                 let _ = write!(hex, "{:02x}", byte);
             }
-            alloc(Value::Text(hex))
+            alloc(Value::Text(Arc::from(hex)))
         }
         _ => panic!("knot runtime: bytesToHex expected Bytes, got {}", type_name(v)),
     }
@@ -4272,7 +4693,7 @@ pub extern "C" fn knot_bytes_from_hex(v: *mut Value) -> *mut Value {
                         .unwrap_or_else(|_| panic!("knot runtime: bytesFromHex: invalid hex at position {}", i))
                 })
                 .collect();
-            alloc(Value::Bytes(bytes))
+            alloc(Value::Bytes(Arc::from(bytes)))
         }
         _ => panic!("knot runtime: bytesFromHex expected Text, got {}", type_name(v)),
     }
@@ -4281,10 +4702,8 @@ pub extern "C" fn knot_bytes_from_hex(v: *mut Value) -> *mut Value {
 /// bytesGet(index, bytes) — get byte at index as Int (0-255)
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_bytes_get(index: *mut Value, bytes: *mut Value) -> *mut Value {
-    let i = match unsafe { as_ref(index) } {
-        Value::Int(n) => n.to_usize().expect("knot runtime: bytesGet index out of range"),
-        _ => panic!("knot runtime: bytesGet expected Int as first arg"),
-    };
+    let i = int_as_usize(unsafe { as_ref(index) })
+        .unwrap_or_else(|| panic!("knot runtime: bytesGet expected Int as first arg"));
     match unsafe { as_ref(bytes) } {
         Value::Bytes(b) => {
             if i >= b.len() {
@@ -4318,7 +4737,7 @@ fn json_encode_value(db: *mut c_void, v: *mut Value) -> String {
 /// toJson(value) — convert any Knot value to its JSON text representation
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_json_encode(v: *mut Value) -> *mut Value {
-    alloc(Value::Text(value_to_json(v)))
+    alloc(Value::Text(Arc::from(value_to_json(v))))
 }
 
 /// toJson fallback with dispatcher — encodes compound types by calling back
@@ -4330,7 +4749,7 @@ pub extern "C" fn knot_json_encode_with(
     v: *mut Value,
     to_json_fn: *const u8,
 ) -> *mut Value {
-    alloc(Value::Text(value_to_json_with(db, v, to_json_fn)))
+    alloc(Value::Text(Arc::from(value_to_json_with(db, v, to_json_fn))))
 }
 
 /// parseJson(text) — parse a JSON string into a Knot value
@@ -4371,7 +4790,7 @@ fn json_to_value(json: &serde_json::Value) -> *mut Value {
                 alloc_int(BigInt::ZERO)
             }
         }
-        serde_json::Value::String(s) => alloc(Value::Text(s.clone())),
+        serde_json::Value::String(s) => alloc(Value::Text(Arc::from(s.as_str()))),
         serde_json::Value::Array(arr) => {
             let items: Vec<*mut Value> = arr.iter().map(json_to_value).collect();
             alloc(Value::Relation(items))
@@ -4384,7 +4803,7 @@ fn json_to_value(json: &serde_json::Value) -> *mut Value {
             // Reconstruct BigInt from {"__knot_bigint": "12345..."} format
             if obj.len() == 1 {
                 if let Some(serde_json::Value::String(b64)) = obj.get("__knot_bytes") {
-                    return alloc(Value::Bytes(base64_decode(b64)));
+                    return alloc(Value::Bytes(Arc::from(base64_decode(b64))));
                 }
                 if let Some(serde_json::Value::String(s)) = obj.get("__knot_bigint") {
                     if let Ok(n) = s.parse::<BigInt>() {
@@ -4431,8 +4850,8 @@ pub extern "C" fn knot_value_not_fn(v: *mut Value) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_fs_read_file(path: *mut Value) -> *mut Value {
     match unsafe { as_ref(path) } {
-        Value::Text(p) => match std::fs::read_to_string(p) {
-            Ok(contents) => alloc(Value::Text(contents)),
+        Value::Text(p) => match std::fs::read_to_string(&**p) {
+            Ok(contents) => alloc(Value::Text(Arc::from(contents))),
             Err(e) => panic!("knot runtime: readFile failed for {:?}: {}", p, e),
         },
         _ => panic!(
@@ -4445,15 +4864,15 @@ pub extern "C" fn knot_fs_read_file(path: *mut Value) -> *mut Value {
 /// writeFile(path, contents) — write Text to a file (creates or overwrites)
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_fs_write_file(path: *mut Value, contents: *mut Value) -> *mut Value {
-    let p = match unsafe { as_ref(path) } {
-        Value::Text(s) => s.as_str(),
+    let p: &str = match unsafe { as_ref(path) } {
+        Value::Text(s) => &**s,
         _ => panic!(
             "knot runtime: writeFile expected Text as first arg, got {}",
             type_name(path)
         ),
     };
-    let c = match unsafe { as_ref(contents) } {
-        Value::Text(s) => s.as_str(),
+    let c: &str = match unsafe { as_ref(contents) } {
+        Value::Text(s) => &**s,
         _ => panic!(
             "knot runtime: writeFile expected Text as second arg, got {}",
             type_name(contents)
@@ -4469,15 +4888,15 @@ pub extern "C" fn knot_fs_write_file(path: *mut Value, contents: *mut Value) -> 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_fs_append_file(path: *mut Value, contents: *mut Value) -> *mut Value {
     use std::io::Write;
-    let p = match unsafe { as_ref(path) } {
-        Value::Text(s) => s.as_str(),
+    let p: &str = match unsafe { as_ref(path) } {
+        Value::Text(s) => &**s,
         _ => panic!(
             "knot runtime: appendFile expected Text as first arg, got {}",
             type_name(path)
         ),
     };
-    let c = match unsafe { as_ref(contents) } {
-        Value::Text(s) => s.as_str(),
+    let c: &str = match unsafe { as_ref(contents) } {
+        Value::Text(s) => &**s,
         _ => panic!(
             "knot runtime: appendFile expected Text as second arg, got {}",
             type_name(contents)
@@ -4497,7 +4916,7 @@ pub extern "C" fn knot_fs_append_file(path: *mut Value, contents: *mut Value) ->
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_fs_file_exists(path: *mut Value) -> *mut Value {
     match unsafe { as_ref(path) } {
-        Value::Text(p) => alloc_bool(std::path::Path::new(p).exists()),
+        Value::Text(p) => alloc_bool(std::path::Path::new(&**p).exists()),
         _ => panic!(
             "knot runtime: fileExists expected Text, got {}",
             type_name(path)
@@ -4509,7 +4928,7 @@ pub extern "C" fn knot_fs_file_exists(path: *mut Value) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_fs_remove_file(path: *mut Value) -> *mut Value {
     match unsafe { as_ref(path) } {
-        Value::Text(p) => match std::fs::remove_file(p) {
+        Value::Text(p) => match std::fs::remove_file(&**p) {
             Ok(()) => alloc(Value::Unit),
             Err(e) => panic!("knot runtime: removeFile failed for {:?}: {}", p, e),
         },
@@ -4525,10 +4944,10 @@ pub extern "C" fn knot_fs_remove_file(path: *mut Value) -> *mut Value {
 pub extern "C" fn knot_fs_list_dir(path: *mut Value) -> *mut Value {
     match unsafe { as_ref(path) } {
         Value::Text(p) => {
-            let entries: Vec<*mut Value> = match std::fs::read_dir(p) {
+            let entries: Vec<*mut Value> = match std::fs::read_dir(&**p) {
                 Ok(rd) => rd
                     .filter_map(|entry| entry.ok())
-                    .map(|entry| alloc(Value::Text(entry.file_name().to_string_lossy().into_owned())))
+                    .map(|entry| alloc(Value::Text(Arc::from(entry.file_name().to_string_lossy().as_ref()))))
                     .collect(),
                 Err(e) => panic!("knot runtime: listDir failed for {:?}: {}", p, e),
             };
@@ -5039,12 +5458,12 @@ fn read_sql_column(row: &rusqlite::Row, i: usize, ty: ColType) -> *mut Value {
         ColType::Float => knot_value_float(row.get::<_, f64>(i).unwrap()),
         ColType::Text => {
             let s: String = row.get(i).unwrap();
-            alloc(Value::Text(s))
+            alloc(Value::Text(Arc::from(s)))
         }
         ColType::Bool => knot_value_bool(row.get::<_, i32>(i).unwrap()),
         ColType::Bytes => {
             let b: Vec<u8> = row.get(i).unwrap();
-            alloc(Value::Bytes(b))
+            alloc(Value::Bytes(Arc::from(b)))
         }
         ColType::Tag => {
             // Read TEXT but reconstruct as a Constructor with Unit payload
@@ -5056,7 +5475,7 @@ fn read_sql_column(row: &rusqlite::Row, i: usize, ty: ColType) -> *mut Value {
             let s: String = row.get(i).unwrap();
             match serde_json::from_str::<serde_json::Value>(&s) {
                 Ok(json) => json_to_value(&json),
-                Err(_) => alloc(Value::Text(s)),
+                Err(_) => alloc(Value::Text(Arc::from(s))),
             }
         }
     }
@@ -7166,10 +7585,11 @@ fn value_to_sql_param(v: *mut Value) -> rusqlite::types::Value {
     }
     match unsafe { as_ref(v) } {
         Value::Int(n) => rusqlite::types::Value::Text(n.to_string()),
+        Value::SmallInt(n) => rusqlite::types::Value::Text(n.to_string()),
         Value::Float(n) => rusqlite::types::Value::Real(*n),
-        Value::Text(s) => rusqlite::types::Value::Text(s.clone()),
+        Value::Text(s) => rusqlite::types::Value::Text((**s).to_string()),
         Value::Bool(b) => rusqlite::types::Value::Integer(*b as i64),
-        Value::Bytes(b) => rusqlite::types::Value::Blob(b.clone()),
+        Value::Bytes(b) => rusqlite::types::Value::Blob((**b).to_vec()),
         Value::Constructor(tag, _) => rusqlite::types::Value::Text(tag.to_string()),
         Value::Relation(_) | Value::Record(_) => {
             rusqlite::types::Value::Text(value_to_json(v))
@@ -7187,10 +7607,11 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
     }
     match (unsafe { as_ref(v) }, ty) {
         (Value::Int(n), _) => rusqlite::types::Value::Text(n.to_string()),
+        (Value::SmallInt(n), _) => rusqlite::types::Value::Text(n.to_string()),
         (Value::Float(n), _) => rusqlite::types::Value::Real(*n),
-        (Value::Text(s), _) => rusqlite::types::Value::Text(s.clone()),
+        (Value::Text(s), _) => rusqlite::types::Value::Text((**s).to_string()),
         (Value::Bool(b), _) => rusqlite::types::Value::Integer(*b as i64),
-        (Value::Bytes(b), _) => rusqlite::types::Value::Blob(b.clone()),
+        (Value::Bytes(b), _) => rusqlite::types::Value::Blob((**b).to_vec()),
         (Value::Constructor(tag, _), ColType::Tag) => {
             rusqlite::types::Value::Text(tag.to_string())
         }
@@ -7222,10 +7643,9 @@ pub extern "C" fn knot_now() -> *mut Value {
 /// Sleep for the given number of milliseconds.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_sleep(ms_val: *mut Value) -> *mut Value {
-    let ms = match unsafe { as_ref(ms_val) } {
-        Value::Int(i) => i
-            .to_u64()
-            .expect("knot runtime: sleep duration must be non-negative"),
+    let ms: u64 = match unsafe { as_ref(ms_val) } {
+        Value::SmallInt(i) => u64::try_from(*i).expect("knot runtime: sleep duration must be non-negative"),
+        Value::Int(i) => i.to_u64().expect("knot runtime: sleep duration must be non-negative"),
         _ => panic!("knot runtime: sleep expects Int argument"),
     };
     std::thread::sleep(std::time::Duration::from_millis(ms));
@@ -7237,7 +7657,8 @@ pub extern "C" fn knot_sleep(ms_val: *mut Value) -> *mut Value {
 /// Return a random integer in [0, bound).
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_random_int(bound: *mut Value) -> *mut Value {
-    let n = match unsafe { as_ref(bound) } {
+    let n: u64 = match unsafe { as_ref(bound) } {
+        Value::SmallInt(i) => u64::try_from(*i).expect("knot runtime: randomInt bound must be positive"),
         Value::Int(i) => i.to_u64().expect("knot runtime: randomInt bound must be positive"),
         _ => panic!(
             "knot runtime: randomInt expected Int, got {}",
@@ -7418,13 +7839,11 @@ pub extern "C" fn knot_source_read_at(
         stm_track_read(name);
     }
 
-    let ts = match unsafe { as_ref(timestamp) } {
-        Value::Int(n) => n.to_i64().expect("knot runtime: timestamp too large for i64"),
-        _ => panic!(
+    let ts = int_as_i64(unsafe { as_ref(timestamp) })
+        .unwrap_or_else(|| panic!(
             "knot runtime: temporal query timestamp must be Int, got {}",
             type_name(timestamp)
-        ),
-    };
+        ));
 
     let history_table = quote_ident(&format!("_knot_{}_history", name));
 
@@ -7568,7 +7987,7 @@ pub extern "C" fn knot_result_yield(value: *mut Value) -> *mut Value {
 pub extern "C" fn knot_result_empty() -> *mut Value {
     let violations = alloc(Value::Relation(Vec::new()));
     let error_rec = alloc(Value::Record(vec![
-        RecordField { name: "typeName".into(), value: alloc(Value::Text(String::new())) },
+        RecordField { name: "typeName".into(), value: alloc(Value::Text(Arc::from(""))) },
         RecordField { name: "violations".into(), value: violations },
     ]));
     let err_rec = alloc(Value::Record(vec![
@@ -8127,13 +8546,11 @@ pub extern "C" fn knot_view_read_at(
     let filter_where = unsafe { str_from_raw(filter_ptr, filter_len) };
     let cols = parse_schema(view_schema);
 
-    let ts = match unsafe { as_ref(timestamp) } {
-        Value::Int(n) => n.to_i64().expect("knot runtime: timestamp too large for i64"),
-        _ => panic!(
+    let ts = int_as_i64(unsafe { as_ref(timestamp) })
+        .unwrap_or_else(|| panic!(
             "knot runtime: temporal query timestamp must be Int, got {}",
             type_name(timestamp)
-        ),
-    };
+        ));
 
     let filter_values = match unsafe { as_ref(filter_params) } {
         Value::Relation(rows) => rows,
@@ -8474,7 +8891,7 @@ pub extern "C" fn knot_constructor_matches(
     match unsafe { as_ref(v) } {
         Value::Constructor(t, _) => (&**t == tag) as i32,
         // Text values can appear as implicit nullary constructors (e.g. from JSON deserialization)
-        Value::Text(s) => (s.as_str() == tag) as i32,
+        Value::Text(s) => (&**s == tag) as i32,
         _ => 0,
     }
 }
@@ -8804,7 +9221,7 @@ fn string_to_value(s: &str, ty: &str) -> *mut Value {
         "tag" => {
             alloc(Value::Constructor(intern_str(s), alloc(Value::Unit)))
         }
-        _ => alloc(Value::Text(s.to_string())),
+        _ => alloc(Value::Text(Arc::from(s))),
     }
 }
 
@@ -8898,6 +9315,7 @@ fn value_to_serde_json(v: *mut Value) -> serde_json::Value {
                 serde_json::Value::Object(map)
             }
         }
+        Value::SmallInt(n) => serde_json::Value::Number((*n).into()),
         Value::Float(n) => {
             if n.is_finite() {
                 serde_json::json!(*n)
@@ -8905,7 +9323,7 @@ fn value_to_serde_json(v: *mut Value) -> serde_json::Value {
                 panic!("knot runtime: toJson: cannot serialize non-finite float ({}) to JSON", n)
             }
         }
-        Value::Text(s) => serde_json::Value::String(s.clone()),
+        Value::Text(s) => serde_json::Value::String((**s).to_string()),
         Value::Bool(b) => serde_json::Value::Bool(*b),
         Value::Bytes(b) => {
             let mut map = serde_json::Map::with_capacity(1);
@@ -8941,7 +9359,7 @@ fn call_to_json_dispatcher(db: *mut c_void, v: *mut Value, to_json_fn: *const u8
         unsafe { std::mem::transmute(to_json_fn) };
     let result = f(db, v);
     match unsafe { as_ref(result) } {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => (**s).to_string(),
         _ => value_to_json(v),
     }
 }
@@ -9063,7 +9481,8 @@ pub extern "C" fn knot_http_listen(
     route_table: *mut c_void,
     handler: *mut Value,
 ) -> *mut Value {
-    let port = match unsafe { as_ref(port_val) } {
+    let port: u16 = match unsafe { as_ref(port_val) } {
+        Value::SmallInt(n) => u16::try_from(*n).expect("knot runtime: port number out of range"),
         Value::Int(n) => n.to_u16().expect("knot runtime: port number out of range"),
         _ => panic!("knot runtime: listen expects Int port, got {}", type_name(port_val)),
     };
@@ -9517,27 +9936,27 @@ pub extern "C" fn knot_http_fetch_io(
     resp_hdrs_ptr: *const u8,
     resp_hdrs_len: usize,
 ) -> *mut Value {
-    let method = alloc(Value::Text(
-        unsafe { str_from_raw(method_ptr, method_len) }.to_string(),
-    ));
-    let path = alloc(Value::Text(
-        unsafe { str_from_raw(path_ptr, path_len) }.to_string(),
-    ));
-    let body_desc = alloc(Value::Text(
-        unsafe { str_from_raw(body_ptr, body_len) }.to_string(),
-    ));
-    let query_desc = alloc(Value::Text(
-        unsafe { str_from_raw(query_ptr, query_len) }.to_string(),
-    ));
-    let resp_desc = alloc(Value::Text(
-        unsafe { str_from_raw(resp_ptr, resp_len) }.to_string(),
-    ));
-    let req_hdrs_desc = alloc(Value::Text(
-        unsafe { str_from_raw(req_hdrs_ptr, req_hdrs_len) }.to_string(),
-    ));
-    let resp_hdrs_desc = alloc(Value::Text(
-        unsafe { str_from_raw(resp_hdrs_ptr, resp_hdrs_len) }.to_string(),
-    ));
+    let method = alloc(Value::Text(Arc::from(
+        unsafe { str_from_raw(method_ptr, method_len) },
+    )));
+    let path = alloc(Value::Text(Arc::from(
+        unsafe { str_from_raw(path_ptr, path_len) },
+    )));
+    let body_desc = alloc(Value::Text(Arc::from(
+        unsafe { str_from_raw(body_ptr, body_len) },
+    )));
+    let query_desc = alloc(Value::Text(Arc::from(
+        unsafe { str_from_raw(query_ptr, query_len) },
+    )));
+    let resp_desc = alloc(Value::Text(Arc::from(
+        unsafe { str_from_raw(resp_ptr, resp_len) },
+    )));
+    let req_hdrs_desc = alloc(Value::Text(Arc::from(
+        unsafe { str_from_raw(req_hdrs_ptr, req_hdrs_len) },
+    )));
+    let resp_hdrs_desc = alloc(Value::Text(Arc::from(
+        unsafe { str_from_raw(resp_hdrs_ptr, resp_hdrs_len) },
+    )));
 
     // Env record — fields sorted alphabetically for index-based access
     // 0: base_url, 1: body_desc, 2: headers, 3: method, 4: path, 5: payload,
@@ -9571,12 +9990,12 @@ pub extern "C" fn knot_http_fetch_io(
             Value::Text(s) => s.clone(),
             _ => panic!("knot runtime: fetch expected Text base URL"),
         };
-        let path_pattern = match unsafe { as_ref(path) } {
-            Value::Text(s) => s.clone(),
+        let path_pattern: String = match unsafe { as_ref(path) } {
+            Value::Text(s) => (**s).to_string(),
             _ => panic!("knot runtime: fetch expected Text path"),
         };
-        let method_str = match unsafe { as_ref(method) } {
-            Value::Text(s) => s.clone(),
+        let method_str: String = match unsafe { as_ref(method) } {
+            Value::Text(s) => (**s).to_string(),
             _ => panic!("knot runtime: fetch expected Text method"),
         };
 
@@ -9586,16 +10005,16 @@ pub extern "C" fn knot_http_fetch_io(
         // Build body JSON from body field descriptor (skip for GET/HEAD)
         let body_json = match unsafe { as_ref(body_desc) } {
             Value::Text(s) if !s.is_empty()
-                && method_str != "GET" && method_str != "HEAD" =>
+                && method_str.as_str() != "GET" && method_str.as_str() != "HEAD" =>
             {
-                Some(fetch_build_body(s, payload))
+                Some(fetch_build_body(&**s, payload))
             }
             _ => None,
         };
 
         // Build query string from query field descriptor
         let query_string = match unsafe { as_ref(query_desc) } {
-            Value::Text(s) if !s.is_empty() => Some(fetch_build_query(s, payload)),
+            Value::Text(s) if !s.is_empty() => Some(fetch_build_query(&**s, payload)),
             _ => None,
         };
 
@@ -9615,8 +10034,8 @@ pub extern "C" fn knot_http_fetch_io(
         };
 
         // Set route-declared request headers from payload fields first
-        let req_hdrs_str = match unsafe { as_ref(req_hdrs_desc) } {
-            Value::Text(s) => s.clone(),
+        let req_hdrs_str: String = match unsafe { as_ref(req_hdrs_desc) } {
+            Value::Text(s) => (**s).to_string(),
             _ => String::new(),
         };
         let mut has_content_type = false;
@@ -9678,8 +10097,8 @@ pub extern "C" fn knot_http_fetch_io(
         };
 
         // Check if we need to parse response headers
-        let resp_hdrs_str = match unsafe { as_ref(resp_hdrs_desc) } {
-            Value::Text(s) => s.clone(),
+        let resp_hdrs_str: String = match unsafe { as_ref(resp_hdrs_desc) } {
+            Value::Text(s) => (**s).to_string(),
             _ => String::new(),
         };
         let has_resp_hdrs = !resp_hdrs_str.is_empty();
@@ -9737,7 +10156,7 @@ pub extern "C" fn knot_http_fetch_io(
                         Err(_) => alloc(Value::Unit),
                     }
                 } else {
-                    alloc(Value::Text(body_text))
+                    alloc(Value::Text(Arc::from(body_text)))
                 };
 
                 // Wrap with headers if response headers declared
@@ -9872,8 +10291,9 @@ fn fetch_value_to_text(v: *mut Value) -> String {
     }
     match unsafe { as_ref(v) } {
         Value::Int(n) => n.to_string(),
+        Value::SmallInt(n) => n.to_string(),
         Value::Float(n) => n.to_string(),
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => (**s).to_string(),
         Value::Bool(b) => b.to_string(),
         _ => panic!(
             "knot runtime: cannot convert {} to text for URL parameter",
@@ -9889,7 +10309,7 @@ fn fetch_record_text_field(record: *mut Value, field: &str) -> String {
         return String::new();
     }
     match unsafe { as_ref(val) } {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => (**s).to_string(),
         _ => String::new(),
     }
 }
@@ -9899,7 +10319,7 @@ fn fetch_build_err(status: u16, message: &str) -> *mut Value {
     let error_record = alloc(Value::Record(vec![
         RecordField {
             name: "message".into(),
-            value: alloc(Value::Text(message.to_string())),
+            value: alloc(Value::Text(Arc::from(message))),
         },
         RecordField {
             name: "status".into(),
@@ -10301,6 +10721,13 @@ fn serialize_value_for_hash_into(v: *mut Value, buf: &mut Vec<u8>) {
             buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(&bytes);
         }
+        Value::SmallInt(n) => {
+            // Match BigInt(n) hash for cross-path consistency.
+            buf.push(0);
+            let bytes = BigInt::from(*n).to_signed_bytes_le();
+            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&bytes);
+        }
         Value::Float(f) => {
             buf.push(1);
             // Use raw bits for hashing to match total_cmp equality semantics
@@ -10448,9 +10875,9 @@ pub extern "C" fn knot_crypto_generate_key_pair() -> *mut Value {
 
     let record = knot_record_empty(2);
     let k = b"privateKey";
-    knot_record_set_field(record, k.as_ptr(), k.len(), alloc(Value::Bytes(secret_bytes.to_vec())));
+    knot_record_set_field(record, k.as_ptr(), k.len(), alloc(Value::Bytes(Arc::from(secret_bytes.to_vec()))));
     let k = b"publicKey";
-    knot_record_set_field(record, k.as_ptr(), k.len(), alloc(Value::Bytes(public.as_bytes().to_vec())));
+    knot_record_set_field(record, k.as_ptr(), k.len(), alloc(Value::Bytes(Arc::from(public.as_bytes().to_vec()))));
     record
 }
 
@@ -10465,9 +10892,9 @@ pub extern "C" fn knot_crypto_generate_signing_key_pair() -> *mut Value {
 
     let record = knot_record_empty(2);
     let k = b"privateKey";
-    knot_record_set_field(record, k.as_ptr(), k.len(), alloc(Value::Bytes(signing_key.to_bytes().to_vec())));
+    knot_record_set_field(record, k.as_ptr(), k.len(), alloc(Value::Bytes(Arc::from(signing_key.to_bytes().to_vec()))));
     let k = b"publicKey";
-    knot_record_set_field(record, k.as_ptr(), k.len(), alloc(Value::Bytes(verifying_key.to_bytes().to_vec())));
+    knot_record_set_field(record, k.as_ptr(), k.len(), alloc(Value::Bytes(Arc::from(verifying_key.to_bytes().to_vec()))));
     record
 }
 
@@ -10488,7 +10915,7 @@ pub extern "C" fn knot_crypto_encrypt(public_key: *mut Value, plaintext: *mut Va
         _ => panic!("knot runtime: encrypt expected Bytes for plaintext, got {}", type_name(plaintext)),
     };
 
-    let recipient_pub: [u8; 32] = pub_bytes.as_slice().try_into()
+    let recipient_pub: [u8; 32] = (**pub_bytes).try_into()
         .expect("knot runtime: encrypt publicKey must be 32 bytes");
     let recipient_public = x25519_dalek::PublicKey::from(recipient_pub);
 
@@ -10508,7 +10935,7 @@ pub extern "C" fn knot_crypto_encrypt(public_key: *mut Value, plaintext: *mut Va
     getrandom::fill(&mut nonce_bytes).expect("knot runtime: failed to generate nonce");
     let nonce = chacha20poly1305::Nonce::from_slice(&nonce_bytes);
 
-    let ciphertext = cipher.encrypt(nonce, plain.as_slice())
+    let ciphertext = cipher.encrypt(nonce, &**plain)
         .expect("knot runtime: encryption failed");
 
     // Pack: ephemeral_public (32) + nonce (12) + ciphertext
@@ -10516,7 +10943,7 @@ pub extern "C" fn knot_crypto_encrypt(public_key: *mut Value, plaintext: *mut Va
     result.extend_from_slice(eph_public.as_bytes());
     result.extend_from_slice(&nonce_bytes);
     result.extend_from_slice(&ciphertext);
-    alloc(Value::Bytes(result))
+    alloc(Value::Bytes(Arc::from(result)))
 }
 
 /// Sealed-box decryption: reverse of encrypt.
@@ -10539,7 +10966,7 @@ pub extern "C" fn knot_crypto_decrypt(private_key: *mut Value, ciphertext: *mut 
         panic!("knot runtime: decrypt ciphertext too short (need at least 60 bytes, got {})", ct.len());
     }
 
-    let secret_bytes: [u8; 32] = priv_bytes.as_slice().try_into()
+    let secret_bytes: [u8; 32] = (**priv_bytes).try_into()
         .expect("knot runtime: decrypt privateKey must be 32 bytes");
     let secret = x25519_dalek::StaticSecret::from(secret_bytes);
 
@@ -10556,7 +10983,7 @@ pub extern "C" fn knot_crypto_decrypt(private_key: *mut Value, ciphertext: *mut 
 
     let plaintext = cipher.decrypt(nonce, encrypted)
         .expect("knot runtime: decryption failed (invalid key or corrupted ciphertext)");
-    alloc(Value::Bytes(plaintext))
+    alloc(Value::Bytes(Arc::from(plaintext)))
 }
 
 /// Ed25519 signing. Takes (privateKey: Bytes, message: Bytes), returns signature Bytes.
@@ -10573,11 +11000,11 @@ pub extern "C" fn knot_crypto_sign(private_key: *mut Value, message: *mut Value)
         _ => panic!("knot runtime: sign expected Bytes for message, got {}", type_name(message)),
     };
 
-    let secret_bytes: [u8; 32] = priv_bytes.as_slice().try_into()
+    let secret_bytes: [u8; 32] = (**priv_bytes).try_into()
         .expect("knot runtime: sign privateKey must be 32 bytes");
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret_bytes);
     let signature = signing_key.sign(msg);
-    alloc(Value::Bytes(signature.to_bytes().to_vec()))
+    alloc(Value::Bytes(Arc::from(signature.to_bytes().to_vec())))
 }
 
 /// Ed25519 verification. Takes (db, publicKey: Bytes, message: Bytes, signature: Bytes), returns Bool.
@@ -10603,9 +11030,9 @@ pub extern "C" fn knot_crypto_verify(
         _ => panic!("knot runtime: verify expected Bytes for signature, got {}", type_name(signature)),
     };
 
-    let pub_arr: [u8; 32] = pub_bytes.as_slice().try_into()
+    let pub_arr: [u8; 32] = (**pub_bytes).try_into()
         .expect("knot runtime: verify publicKey must be 32 bytes");
-    let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into()
+    let sig_arr: [u8; 64] = (**sig_bytes).try_into()
         .expect("knot runtime: verify signature must be 64 bytes");
 
     let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pub_arr)

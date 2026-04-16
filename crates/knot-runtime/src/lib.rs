@@ -191,14 +191,6 @@ impl Frame {
         (self.chunks.len() - 1) * CHUNK_CAP + self.chunks.last().unwrap().len
     }
 
-    /// Flat position across `pinned_chunks`.  Used by `Arena::mark` /
-    /// `reset_to` to know where pinned values were when a given mark
-    /// was taken so selective reclamation can rewind precisely.
-    fn mark_pinned(&self) -> usize {
-        if self.pinned_chunks.is_empty() { return 0; }
-        (self.pinned_chunks.len() - 1) * CHUNK_CAP + self.pinned_chunks.last().unwrap().len
-    }
-
     /// Append a young chunk and update the sorted sidetable.
     fn push_chunk(&mut self, c: Chunk) {
         let base = c.data.0.as_ptr() as usize;
@@ -231,16 +223,6 @@ impl Frame {
             .binary_search_by_key(&base, |&(b, _)| b)
             .unwrap_or_else(|p| p);
         self.pinned_chunk_index.insert(pos, (base, idx));
-    }
-
-    /// Pop the last pinned chunk and update the sorted sidetable.
-    fn pop_pinned_chunk(&mut self) -> Option<Chunk> {
-        let chunk = self.pinned_chunks.pop()?;
-        let base = chunk.data.0.as_ptr() as usize;
-        if let Ok(pos) = self.pinned_chunk_index.binary_search_by_key(&base, |&(b, _)| b) {
-            self.pinned_chunk_index.remove(pos);
-        }
-        Some(chunk)
     }
 
     /// Check whether `val` lives in one of this frame's young chunks.
@@ -320,28 +302,6 @@ impl Frame {
         }
     }
 
-    /// Rewind pinned allocations to `pinned_mark` (flat position
-    /// `chunk_idx * CHUNK_CAP + slot`).  Runs destructors on the
-    /// reclaimed suffix and empties chunks above the mark's chunk.
-    ///
-    /// Used by `reset_to` for selective pinned reclamation — any
-    /// pinned entries added since the mark are freed, but values
-    /// pinned before the mark persist until a lower mark (or frame
-    /// drop) reaches them.
-    fn truncate_pinned(&mut self, pinned_mark: usize) {
-        let mark_chunk = pinned_mark / CHUNK_CAP;
-        let mark_slot = pinned_mark % CHUNK_CAP;
-        if self.pinned_chunks.is_empty() { return; }
-        for ci in (mark_chunk..self.pinned_chunks.len()).rev() {
-            let chunk = &mut self.pinned_chunks[ci];
-            let start = if ci == mark_chunk { mark_slot } else { 0 };
-            if start >= chunk.len { continue; }
-            for si in (start..chunk.len).rev() {
-                unsafe { std::ptr::drop_in_place(chunk.data.0[si].as_mut_ptr()); }
-            }
-            chunk.len = start;
-        }
-    }
 }
 
 impl Drop for Frame {
@@ -671,13 +631,20 @@ fn take_relation_vec(min_capacity: usize) -> Vec<*mut Value> {
 /// Return a `Vec<*mut Value>` to the pool if there's space and the
 /// capacity is reasonable.  Called from `Value::drop` when a Relation
 /// is being destroyed.
-fn return_relation_vec(mut v: Vec<*mut Value>) {
+///
+/// Uses `try_with` because `Value::drop` can be invoked during thread
+/// teardown (when `ARENA`'s TLS destructor walks every chunk, dropping
+/// each live `Value`).  TLS destructor order is unspecified, so the
+/// pool may already be destroyed — if so we fall through and let `v`
+/// drop normally (its allocation is freed by the global allocator).
+fn return_relation_vec(v: Vec<*mut Value>) {
     let cap = v.capacity();
     if cap == 0 || cap > RELATION_POOL_MAX_CAPACITY {
         return;
     }
-    v.clear();
-    RELATION_VEC_POOL.with(|pool| {
+    let _ = RELATION_VEC_POOL.try_with(|pool| {
+        let mut v = v;
+        v.clear();
         let mut pool = pool.borrow_mut();
         let bin = relation_pool_bin(cap);
         if pool[bin].len() < RELATION_POOL_PER_BIN_CAP {
@@ -736,13 +703,19 @@ fn take_record_vec(min_capacity: usize) -> Vec<RecordField> {
 }
 
 /// Return a `Vec<RecordField>` to the pool.  Called from `Value::drop`.
-fn return_record_vec(mut v: Vec<RecordField>) {
+///
+/// Uses `try_with` for the same reason as `return_relation_vec`:
+/// `Value::drop` may fire during thread teardown (via `ARENA`'s TLS
+/// destructor) after `RECORD_VEC_POOL` has itself been destroyed.
+/// On a miss, `v` is dropped normally by the allocator.
+fn return_record_vec(v: Vec<RecordField>) {
     let cap = v.capacity();
     if cap == 0 || cap > RECORD_POOL_MAX_CAPACITY {
         return;
     }
-    v.clear();
-    RECORD_VEC_POOL.with(|pool| {
+    let _ = RECORD_VEC_POOL.try_with(|pool| {
+        let mut v = v;
+        v.clear();
         let mut pool = pool.borrow_mut();
         let bin = record_pool_bin(cap);
         if pool[bin].len() < RECORD_POOL_PER_BIN_CAP {
@@ -813,34 +786,21 @@ impl Arena {
         self.current_frame().chunks.last_mut().unwrap().alloc(v)
     }
 
-    /// Snapshot the current frame's allocation frontier.
+    /// Snapshot the current frame's young-chunk allocation frontier.
     ///
-    /// Returns a packed `usize` encoding both the chunk-slot position
-    /// (upper 32 bits) and the pinned-vec length (lower 32 bits).  The
-    /// pinned mark enables selective reclamation of promoted values
-    /// accumulated since the last `mark` — without it, pinned entries
-    /// persisted across `reset_to` and the frame grew unboundedly
-    /// within a single long-running function.
-    ///
-    /// 32 bits each is sufficient: `CHUNK_CAP = 512` so the chunk-slot
-    /// position caps out at ~2B allocations per frame; pinned grows at
-    /// most once per yield per iteration, so 4B is generous.
+    /// Returns a flat slot position `(chunk_idx * CHUNK_CAP + slot)`;
+    /// pinned entries are intentionally excluded — they must survive
+    /// `reset_to` so yields promoted mid-iteration remain live in the
+    /// result relation (see `reset_to`).
     fn mark(&self) -> usize {
         let frame = self.frames.last().expect("arena: no frames");
-        let chunk_mark = frame.mark_chunks();
-        let pinned_mark = frame.mark_pinned();
-        debug_assert!(chunk_mark < (1usize << 32), "arena: chunk mark overflow");
-        debug_assert!(pinned_mark < (1usize << 32), "arena: pinned mark overflow");
-        (chunk_mark << 32) | (pinned_mark & 0xFFFF_FFFF)
+        frame.mark_chunks()
     }
 
     fn reset_to(&mut self, mark: usize) {
         GC_STATS.bump(&GC_STATS.resets);
-        let chunk_mark = mark >> 32;
-        let pinned_mark = mark & 0xFFFF_FFFF;
-        let mark_chunk = chunk_mark / CHUNK_CAP;
-        let mark_slot = chunk_mark % CHUNK_CAP;
-        let pinned_mark_chunk = pinned_mark / CHUNK_CAP;
+        let mark_chunk = mark / CHUNK_CAP;
+        let mark_slot = mark % CHUNK_CAP;
         let mut harvested: Vec<Chunk> = Vec::new();
         {
             let frame = self.current_frame();
@@ -858,17 +818,12 @@ impl Arena {
                 // `pop_chunk` keeps the sorted `chunk_index` in sync.
                 harvested.push(frame.pop_chunk().unwrap());
             }
-            // Selectively reclaim pinned entries allocated since the
-            // mark.  `truncate_pinned` runs destructors on the suffix
-            // but leaves the chunk structures intact; we also harvest
-            // any chunks that are wholly above the mark (and thus now
-            // empty) back into the pool.
-            frame.truncate_pinned(pinned_mark);
-            while frame.pinned_chunks.len() > (pinned_mark_chunk + 1).max(1)
-                && frame.pinned_chunks.last().map_or(false, |c| c.len == 0)
-            {
-                harvested.push(frame.pop_pinned_chunk().unwrap());
-            }
+            // Pinned values are NOT truncated: compile_do's per-iteration
+            // `knot_arena_reset_to` runs with `arena_mark` taken *before*
+            // the yield's `knot_arena_promote`, so anything pinned during
+            // the iteration (the yielded row pushed into `result`) must
+            // survive the reset.  Pinned entries are reclaimed at frame
+            // drop via `drop_and_harvest_frame`.
         }
         for chunk in harvested {
             self.return_chunk(chunk);
@@ -4677,40 +4632,63 @@ fn lookup_or_identity(map: &HashMap<*mut Value, *mut Value>, p: *mut Value) -> *
     map.get(&p).copied().unwrap_or(p)
 }
 
-/// Recursively free a value tree allocated by `deep_clone_value`.
+/// Free a value tree allocated by `deep_clone_value`.
+///
 /// SAFETY: Every node in the tree must have been allocated by `Box::into_raw`.
 /// Do NOT call this on arena-allocated values.
+///
+/// The cloned tree is a DAG (not a tree): `deep_clone_value` dedupes
+/// shared subtrees via a src→dst `HashMap`, so a single `Box` may be
+/// reachable via multiple paths.  A naive recursive walk would free
+/// the same `Box` more than once (double-free), hence the iterative
+/// two-phase algorithm below:
+///
+///   1. Walk the DAG with an explicit stack + visited set, collecting
+///      every reachable node exactly once.
+///   2. Free each collected node via `Box::from_raw` + drop.
+///
+/// Iteration (instead of recursion) also prevents stack overflow on
+/// deeply nested structures (long linked lists in ADTs, etc.).
 #[allow(dead_code)]
 unsafe fn deep_drop_value(val: *mut Value) {
-    if val.is_null() {
+    if val.is_null() || is_tagged(val) {
         return;
     }
-    // Tagged pointers don't occupy heap memory — nothing to free.
-    if is_tagged(val) {
-        return;
-    }
-    unsafe {
-        match &*val {
-            Value::Record(fields) => {
-                for f in fields {
-                    deep_drop_value(f.value);
-                }
-            }
-            Value::Relation(rows) => {
-                for r in rows {
-                    deep_drop_value(*r);
-                }
-            }
-            Value::Constructor(_, inner) => deep_drop_value(*inner),
-            Value::Function(f) => deep_drop_value(f.env),
-            Value::IO(_, env) => deep_drop_value(*env),
-            Value::Pair(a, b) => {
-                deep_drop_value(*a);
-                deep_drop_value(*b);
-            }
-            _ => {}
+    let mut visited: HashSet<*mut Value> = HashSet::new();
+    let mut stack: Vec<*mut Value> = Vec::new();
+    stack.push(val);
+    while let Some(v) = stack.pop() {
+        if v.is_null() || is_tagged(v) || !visited.insert(v) {
+            continue;
         }
-        drop(Box::from_raw(val));
+        unsafe {
+            match &*v {
+                Value::Record(fields) => {
+                    for f in fields {
+                        stack.push(f.value);
+                    }
+                }
+                Value::Relation(rows) => {
+                    for r in rows {
+                        stack.push(*r);
+                    }
+                }
+                Value::Constructor(_, inner) => stack.push(*inner),
+                Value::Function(f) => stack.push(f.env),
+                Value::IO(_, env) => stack.push(*env),
+                Value::Pair(a, b) => {
+                    stack.push(*a);
+                    stack.push(*b);
+                }
+                _ => {}
+            }
+        }
+    }
+    for v in visited {
+        // SAFETY: each `v` was allocated by `Box::into_raw` in
+        // `deep_clone_value`; `visited` ensures we reconstruct the
+        // Box exactly once per unique pointer.
+        unsafe { drop(Box::from_raw(v)); }
     }
 }
 

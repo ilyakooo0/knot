@@ -3123,9 +3123,18 @@ impl Codegen {
                 }
             }
 
-            // Call user's main function if it exists
+            // Call user's main function if it exists.
+            //
+            // Isolate main's body in a child arena frame so any values it
+            // `knot_arena_promote`s are pinned in the child, not the root.
+            // The root frame is never popped (see Arena::pop_frame), so
+            // any pinned values there would leak for the life of the
+            // process — a real concern for any program whose top-level
+            // do-block promotes values.
             if let Some((main_fn_id, n_params)) = user_main {
                 if n_params == 0 {
+                    cg.call_rt_void(builder, "knot_arena_push_frame", &[]);
+
                     let user_main_ref =
                         cg.module.declare_func_in_func(main_fn_id, builder.func);
                     let call = builder.ins().call(user_main_ref, &[db]);
@@ -3138,6 +3147,11 @@ impl Codegen {
 
                     let println_ref = cg.import_rt(builder, "knot_println");
                     builder.ins().call(println_ref, &[executed]);
+
+                    // Pop main's frame, discarding everything it allocated.
+                    // The printed value has already been written to stdout,
+                    // so we don't need to promote anything up.
+                    cg.call_rt_void(builder, "knot_arena_pop_frame", &[]);
                 } else {
                     cg.diagnostics.push(
                         knot::diagnostic::Diagnostic::error(
@@ -5655,6 +5669,18 @@ impl Codegen {
             return val;
         }
 
+        // Wrap the do-block in a dedicated arena frame.  Every yielded value
+        // is `knot_arena_promote`d into pinned, which survives the
+        // per-iteration `knot_arena_reset_to` but is NOT freed by it.
+        // Without this push/pop-promote, pinned entries accumulate in the
+        // *caller's* frame for the caller's entire lifetime — a leak in
+        // any long-running function with a do-block (e.g. main event loops).
+        //
+        // With this frame: pinned entries live in the child frame, get
+        // deep-cloned into the parent by `pop_frame_promote`, and the
+        // child frame (including its pinned set) is dropped.
+        self.call_rt_void(builder, "knot_arena_push_frame", &[]);
+
         let result = self.call_rt(builder, "knot_relation_empty", &[]);
         let mut loop_stack: Vec<LoopInfo> = Vec::new();
 
@@ -6354,7 +6380,10 @@ impl Codegen {
             self.call_rt_void(builder, "knot_relation_index_free", &[*idx_val]);
         }
 
-        result
+        // Pop the do-block's frame, deep-cloning `result` into the parent.
+        // This frees every per-iteration pinned yield that would otherwise
+        // live until the caller returned.
+        self.call_rt(builder, "knot_arena_pop_frame_promote", &[result])
     }
 
     // ── Lambda compilation ────────────────────────────────────────

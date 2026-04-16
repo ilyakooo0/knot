@@ -15,7 +15,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::slice;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -84,7 +84,8 @@ impl Chunk {
 ///
 /// `chunks` holds bump-allocated values freed by `reset_to` or frame drop.
 /// `pinned` holds values promoted out of chunks (Box-allocated) that survive
-/// `reset_to` but are freed when the frame drops.
+/// `reset_to` but are freed when the frame drops (or selectively by
+/// `reset_to` when `pinned_mark < pinned.len()`).
 struct Frame {
     chunks: Vec<Chunk>,
     /// Promoted values that survive `reset_to` within this frame.
@@ -93,38 +94,15 @@ struct Frame {
 }
 
 impl Frame {
-    fn new() -> Self {
-        Frame { chunks: vec![Chunk::new()], pinned: Vec::new() }
+    /// Build an empty frame.  The arena supplies chunks on first alloc via
+    /// `Arena::take_chunk`, so this doesn't allocate.
+    fn empty() -> Self {
+        Frame { chunks: Vec::new(), pinned: Vec::new() }
     }
 
-    #[inline]
-    fn alloc(&mut self, v: Value) -> *mut Value {
-        if self.chunks.last().map_or(true, Chunk::is_full) {
-            self.chunks.push(Chunk::new());
-        }
-        self.chunks.last_mut().unwrap().alloc(v)
-    }
-
-    fn mark(&self) -> usize {
+    fn mark_chunks(&self) -> usize {
         if self.chunks.is_empty() { return 0; }
         (self.chunks.len() - 1) * CHUNK_CAP + self.chunks.last().unwrap().len
-    }
-
-    fn reset_to(&mut self, mark: usize) {
-        let mark_chunk = mark / CHUNK_CAP;
-        let mark_slot = mark % CHUNK_CAP;
-
-        // Drop values from current end back to mark position.
-        for ci in (mark_chunk..self.chunks.len()).rev() {
-            let chunk = &mut self.chunks[ci];
-            let start = if ci == mark_chunk { mark_slot } else { 0 };
-            for si in (start..chunk.len).rev() {
-                unsafe { std::ptr::drop_in_place(chunk.data[si].as_mut_ptr()); }
-            }
-            chunk.len = start;
-        }
-        // Free fully-cleared chunks (keep mark chunk for reuse).
-        self.chunks.truncate(mark_chunk + 1);
     }
 
     /// Check whether `val` lives in one of this frame's chunks.
@@ -138,7 +116,7 @@ impl Frame {
         self.pinned.contains(&val)
     }
 
-    /// Drop all live values in chunks (called from Frame::drop).
+    /// Drop all live values in chunks (called from Arena::drop_frame_contents).
     fn drop_chunks(&mut self) {
         for chunk in &mut self.chunks {
             for si in 0..chunk.len {
@@ -147,14 +125,24 @@ impl Frame {
             chunk.len = 0;
         }
     }
+
+    /// Free all pinned boxes.  Called from Arena::drop_frame_contents.
+    fn drop_pinned(&mut self) {
+        for &ptr in &self.pinned {
+            unsafe { drop(Box::from_raw(ptr)); }
+        }
+        self.pinned.clear();
+    }
 }
 
 impl Drop for Frame {
     fn drop(&mut self) {
+        // Safety net: if a Frame is dropped without going through
+        // Arena::pop_frame (e.g. Arena::drop on thread exit), free its
+        // contents here.  Chunks that have already been harvested into
+        // the pool will have `len == 0` and contribute no work.
         self.drop_chunks();
-        for &ptr in &self.pinned {
-            unsafe { drop(Box::from_raw(ptr)); }
-        }
+        self.drop_pinned();
     }
 }
 
@@ -164,15 +152,47 @@ impl Drop for Frame {
 /// The frame stack enables isolation across function call boundaries:
 /// - `push_frame()` / `pop_frame()` for call-site isolation
 /// - `mark()` / `reset_to()` for per-iteration cleanup within a frame
-/// - `promote()` selectively clones values into the pinned set
+/// - `promote()` selectively clones values into the pinned set, and those
+///   pinned values survive `reset_to` (they're only freed on frame drop);
+///   do-block codegen wraps each do-block in `push_frame`/`pop_frame_promote`
+///   so that accumulated pinned yields get freed when the block ends
 /// - `pop_frame_promote()` deep-clones a value to the parent frame
+///
+/// `free_chunks` is a process-global-per-thread pool of empty chunks shared
+/// across all frames.  When `reset_to` or `pop_frame` releases chunks they
+/// go here instead of being freed, so hot loops reuse backing memory.
 struct Arena {
     frames: Vec<Frame>,
+    free_chunks: Vec<Chunk>,
 }
+
+/// Cap the chunk pool so the arena doesn't hoard memory after a transient
+/// peak.  64 × CHUNK_CAP × sizeof(Value) ≈ a few MB — a reasonable upper
+/// bound for steady-state working set.
+const CHUNK_POOL_CAP: usize = 64;
 
 impl Arena {
     fn new() -> Self {
-        Arena { frames: vec![Frame::new()] }
+        Arena {
+            frames: vec![Frame::empty()],
+            free_chunks: Vec::new(),
+        }
+    }
+
+    /// Take a chunk from the pool or allocate a new one.
+    #[inline]
+    fn take_chunk(&mut self) -> Chunk {
+        self.free_chunks.pop().unwrap_or_else(Chunk::new)
+    }
+
+    /// Return an empty chunk to the pool for reuse.  Capped at
+    /// `CHUNK_POOL_CAP` to avoid hoarding after peak memory usage.
+    #[inline]
+    fn return_chunk(&mut self, chunk: Chunk) {
+        debug_assert_eq!(chunk.len, 0, "arena: pool received non-empty chunk");
+        if self.free_chunks.len() < CHUNK_POOL_CAP {
+            self.free_chunks.push(chunk);
+        }
     }
 
     #[inline]
@@ -180,27 +200,73 @@ impl Arena {
         self.frames.last_mut().expect("arena: no frames")
     }
 
-    #[inline]
     fn alloc(&mut self, v: Value) -> *mut Value {
-        self.current_frame().alloc(v)
+        let need_new = self
+            .frames
+            .last()
+            .expect("arena: no frames")
+            .chunks
+            .last()
+            .map_or(true, Chunk::is_full);
+        if need_new {
+            let chunk = self.take_chunk();
+            self.current_frame().chunks.push(chunk);
+        }
+        self.current_frame().chunks.last_mut().unwrap().alloc(v)
     }
 
     fn mark(&self) -> usize {
-        self.frames.last().expect("arena: no frames").mark()
+        self.frames.last().expect("arena: no frames").mark_chunks()
     }
 
     fn reset_to(&mut self, mark: usize) {
-        self.current_frame().reset_to(mark);
+        let mark_chunk = mark / CHUNK_CAP;
+        let mark_slot = mark % CHUNK_CAP;
+        let mut harvested: Vec<Chunk> = Vec::new();
+        {
+            let frame = self.current_frame();
+            // Drop values in chunks above the mark.
+            for ci in (mark_chunk..frame.chunks.len()).rev() {
+                let chunk = &mut frame.chunks[ci];
+                let start = if ci == mark_chunk { mark_slot } else { 0 };
+                for si in (start..chunk.len).rev() {
+                    unsafe { std::ptr::drop_in_place(chunk.data[si].as_mut_ptr()); }
+                }
+                chunk.len = start;
+            }
+            // Harvest empty chunks above the mark into the pool.
+            while frame.chunks.len() > mark_chunk + 1 {
+                harvested.push(frame.chunks.pop().unwrap());
+            }
+        }
+        for chunk in harvested {
+            self.return_chunk(chunk);
+        }
     }
 
     fn push_frame(&mut self) {
-        self.frames.push(Frame::new());
+        self.frames.push(Frame::empty());
+    }
+
+    /// Drop a frame's contents (running value destructors and freeing
+    /// pinned boxes) and harvest its empty chunks into the pool.  The
+    /// frame itself is consumed.
+    fn drop_and_harvest_frame(&mut self, mut frame: Frame) {
+        frame.drop_chunks();
+        frame.drop_pinned();
+        let chunks: Vec<Chunk> = frame.chunks.drain(..).collect();
+        drop(frame);
+        for chunk in chunks {
+            self.return_chunk(chunk);
+        }
     }
 
     /// Pop the current frame, freeing all its allocations and pinned values.
+    /// Empty chunks are harvested into the pool.
     fn pop_frame(&mut self) {
         if self.frames.len() > 1 {
-            let _frame = self.frames.pop().unwrap();
+            let frame = self.frames.pop().unwrap();
+            self.drop_and_harvest_frame(frame);
         }
     }
 
@@ -212,8 +278,9 @@ impl Arena {
             return val;
         }
         let child = self.frames.pop().unwrap();
+        // Clone into the (now-current) parent frame before dropping the child.
         let promoted = self.clone_from_child(val, &child);
-        drop(child);
+        self.drop_and_harvest_frame(child);
         promoted
     }
 
@@ -276,6 +343,13 @@ impl Arena {
                     self.alloc_pinned(Value::IO(*fp, ne))
                 } else { val }
             }
+            Value::Pair(a, b) => {
+                let na = self.promote_value(*a);
+                let nb = self.promote_value(*b);
+                if na != *a || nb != *b {
+                    self.alloc_pinned(Value::Pair(na, nb))
+                } else { val }
+            }
         }
     }
 
@@ -317,6 +391,9 @@ impl Arena {
             }
             Value::IO(fp, env) => {
                 Value::IO(*fp, self.promote_value(*env))
+            }
+            Value::Pair(a, b) => {
+                Value::Pair(self.promote_value(*a), self.promote_value(*b))
             }
         };
         self.alloc_pinned(cloned)
@@ -363,6 +440,12 @@ impl Arena {
             Value::IO(fp, env) => {
                 Value::IO(*fp, self.clone_from_child(*env, child))
             }
+            Value::Pair(a, b) => {
+                Value::Pair(
+                    self.clone_from_child(*a, child),
+                    self.clone_from_child(*b, child),
+                )
+            }
         };
         self.alloc(cloned)
     }
@@ -383,8 +466,16 @@ thread_local! {
 /// Database path — set in knot_db_open so spawned threads can open their own connections.
 static DB_PATH: Mutex<String> = Mutex::new(String::new());
 
-/// Join handles for spawned threads — drained in knot_threads_join.
-static THREAD_HANDLES: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+/// Count of live detached `fork`ed threads.  Incremented when a thread is
+/// spawned, decremented when it exits (via a drop guard so panics still
+/// decrement).  `knot_threads_join` waits on `ACTIVE_FORKS_CVAR` until the
+/// count reaches zero.  Using a counter + condvar instead of a `Vec` of
+/// `JoinHandle`s means we never accumulate handles across forks — the
+/// previous `THREAD_HANDLES: Mutex<Vec<_>>` grew unboundedly in programs
+/// that `fork`ed repeatedly.
+static ACTIVE_FORKS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_FORKS_MUTEX: Mutex<()> = Mutex::new(());
+static ACTIVE_FORKS_CVAR: Condvar = Condvar::new();
 
 // ── Process-level write serialization ────────────────────────────
 //
@@ -513,8 +604,6 @@ static DEBUG: AtomicBool = AtomicBool::new(false);
 // runtime (e.g. HTTP response serialization) can use custom ToJSON impls.
 // Written once during program init, read by listen handler threads.
 
-use std::sync::atomic::AtomicUsize;
-
 static TO_JSON_FN: AtomicUsize = AtomicUsize::new(0);
 
 fn debug_enabled() -> bool {
@@ -567,6 +656,14 @@ pub enum Value {
     Function(*const u8, *mut Value, String),
     /// IO thunk — fn_ptr: extern "C" fn(db: *mut KnotDb, env: *mut Value) -> *mut Value
     IO(*const u8, *mut Value),
+    /// Internal two-pointer tuple used to build closure envs without
+    /// allocating a `Record` + `Vec<RecordField>` + two `String`s per
+    /// construction.  Used by `knot_io_bind`, `knot_io_then`, `knot_io_map`,
+    /// etc. — the env doesn't need field names because the thunk knows the
+    /// positions statically.  Must not escape to user code; matches on
+    /// `Value` outside of arena/GC handling should treat this as an
+    /// internal implementation detail.
+    Pair(*mut Value, *mut Value),
 }
 
 pub struct RecordField {
@@ -758,6 +855,7 @@ fn type_name(v: *mut Value) -> &'static str {
         Value::Constructor(_, _) => "Constructor",
         Value::Function(_, _, _) => "Function",
         Value::IO(_, _) => "IO",
+        Value::Pair(_, _) => "Pair",
     }
 }
 
@@ -787,6 +885,7 @@ fn brief_value(v: *mut Value) -> String {
         Value::Constructor(tag, _) => format!("Constructor({})", tag),
         Value::Function(_, _, src) => format!("Function({})", src),
         Value::IO(_, _) => "IO".to_string(),
+        Value::Pair(_, _) => "Pair".to_string(),
     }
 }
 
@@ -1018,6 +1117,7 @@ pub extern "C" fn knot_value_get_tag(v: *mut Value) -> i32 {
         Value::Function(_, _, _) => 8,
         Value::Bytes(_) => 10,
         Value::IO(_, _) => 11,
+        Value::Pair(_, _) => 12,
     }
 }
 
@@ -2192,6 +2292,14 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
         Value::IO(_, _) => {
             buf.push(11);
         }
+        Value::Pair(a, b) => {
+            // Pair is an internal-only variant for IO thunk envs; it should
+            // never reach user-visible hash/compare paths.  Handle it for
+            // exhaustiveness but don't expect it.
+            buf.push(12);
+            value_to_hash_bytes(*a, buf);
+            value_to_hash_bytes(*b, buf);
+        }
     }
 }
 
@@ -2645,6 +2753,7 @@ fn format_value(v: *mut Value) -> String {
         }
         Value::Function(_, _, src) => src.clone(),
         Value::IO(_, _) => "<<IO>>".to_string(),
+        Value::Pair(_, _) => "<<Pair>>".to_string(),
     }
 }
 
@@ -2734,6 +2843,7 @@ pub extern "C" fn knot_value_show(v: *mut Value) -> *mut Value {
             }
             Value::Function(_, _, src) => src.clone(),
             Value::IO(_, _) => "<<IO>>".to_string(),
+            Value::Pair(_, _) => "<<Pair>>".to_string(),
         }
     }
     alloc(Value::Text(show_inner(v)))
@@ -2785,22 +2895,36 @@ pub extern "C" fn knot_io_run(db: *mut c_void, val: *mut Value) -> *mut Value {
     }
 }
 
+/// Unpack a `Value::Pair` env built by `knot_io_bind`/`_then`/`_map`.
+/// Panics if the env isn't a Pair — this is an internal invariant.
+#[inline]
+fn pair_unpack(env: *mut Value) -> (*mut Value, *mut Value) {
+    match unsafe { as_ref(env) } {
+        Value::Pair(a, b) => (*a, *b),
+        _ => panic!(
+            "knot runtime: expected Pair env in IO thunk, got {}",
+            type_name(env)
+        ),
+    }
+}
+
 /// Monadic bind for IO: knot_io_bind(io, f) -> IO
 /// Creates a new IO thunk that, when run:
 ///   1. Runs `io` to get result `a`
 ///   2. Calls `f(a)` to get a new IO action
 ///   3. Runs that IO action
+///
+/// The env is a `Value::Pair(io, f)` — a two-pointer tuple — instead of a
+/// Record with named fields.  This skips one `Vec<RecordField>` allocation
+/// and two `String` allocations (the field names "_io", "_f") per bind.
+/// Over a long-running program with many IO chains that's millions of
+/// avoided allocations.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_io_bind(io: *mut Value, f: *mut Value) -> *mut Value {
-    // Build a closure env holding (io, f) — fields sorted for binary search
-    let env = alloc(Value::Record(vec![
-        RecordField { name: "_f".to_string(), value: f },
-        RecordField { name: "_io".to_string(), value: io },
-    ]));
+    let env = alloc(Value::Pair(io, f));
 
     extern "C" fn bind_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
-        let io = knot_record_field(env, "_io\0".as_ptr(), 3);
-        let f = knot_record_field(env, "_f\0".as_ptr(), 2);
+        let (io, f) = pair_unpack(env);
         let a = knot_io_run(db, io);
         let io2 = knot_value_call(db, f, a);
         knot_io_run(db, io2)
@@ -2812,14 +2936,10 @@ pub extern "C" fn knot_io_bind(io: *mut Value, f: *mut Value) -> *mut Value {
 /// Sequence two IO actions, discarding the first result: knot_io_then(io1, io2) -> IO
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_io_then(io1: *mut Value, io2: *mut Value) -> *mut Value {
-    let env = alloc(Value::Record(vec![
-        RecordField { name: "_io1".to_string(), value: io1 },
-        RecordField { name: "_io2".to_string(), value: io2 },
-    ]));
+    let env = alloc(Value::Pair(io1, io2));
 
     extern "C" fn then_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
-        let io1 = knot_record_field(env, "_io1\0".as_ptr(), 4);
-        let io2 = knot_record_field(env, "_io2\0".as_ptr(), 4);
+        let (io1, io2) = pair_unpack(env);
         knot_io_run(db, io1);
         knot_io_run(db, io2)
     }
@@ -2830,14 +2950,10 @@ pub extern "C" fn knot_io_then(io1: *mut Value, io2: *mut Value) -> *mut Value {
 /// map(f, io) — apply f to the result of an IO action
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_io_map(f: *mut Value, io: *mut Value) -> *mut Value {
-    let env = alloc(Value::Record(vec![
-        RecordField { name: "_f".to_string(), value: f },
-        RecordField { name: "_io".to_string(), value: io },
-    ]));
+    let env = alloc(Value::Pair(io, f));
 
     extern "C" fn map_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
-        let io = knot_record_field(env, "_io\0".as_ptr(), 3);
-        let f = knot_record_field(env, "_f\0".as_ptr(), 2);
+        let (io, f) = pair_unpack(env);
         let a = knot_io_run(db, io);
         knot_value_call(db, f, a)
     }
@@ -2883,6 +2999,7 @@ fn deep_clone_value(val: *mut Value) -> *mut Value {
             // fn_ptr is a code address (shared), env is data (cloned)
             Value::IO(*fn_ptr, deep_clone_value(*env))
         }
+        Value::Pair(a, b) => Value::Pair(deep_clone_value(*a), deep_clone_value(*b)),
     };
     Box::into_raw(Box::new(cloned))
 }
@@ -2910,6 +3027,10 @@ unsafe fn deep_drop_value(val: *mut Value) {
             Value::Constructor(_, inner) => deep_drop_value(*inner),
             Value::Function(_, env, _) => deep_drop_value(*env),
             Value::IO(_, env) => deep_drop_value(*env),
+            Value::Pair(a, b) => {
+                deep_drop_value(*a);
+                deep_drop_value(*b);
+            }
             _ => {}
         }
         drop(Box::from_raw(val));
@@ -2928,7 +3049,28 @@ pub extern "C" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
         // Convert to usize to satisfy Send (deep_clone produces an independent tree).
         let cloned_io = deep_clone_value(env) as *mut u8 as usize;
 
-        let handle = std::thread::spawn(move || {
+        // Increment the live-fork counter *before* spawning so `knot_threads_join`
+        // can't race past zero.  The spawned thread decrements via a drop guard.
+        ACTIVE_FORKS.fetch_add(1, Ordering::SeqCst);
+
+        // Detach: we drop the handle, so the thread runs to completion
+        // independently.  Detached threads are reclaimed by the OS on exit.
+        let _ = std::thread::spawn(move || {
+            // Guards run in reverse declaration order.  `ForkCounter` is
+            // declared first so it drops last: DB/IO cleanup happens before
+            // the counter decrement, which prevents a race where a joiner
+            // proceeds past `wait_while` while the thread is still cleaning up.
+            struct ForkCounter;
+            impl Drop for ForkCounter {
+                fn drop(&mut self) {
+                    ACTIVE_FORKS.fetch_sub(1, Ordering::SeqCst);
+                    // Notify under the mutex so waiters never miss the wakeup.
+                    let _g = ACTIVE_FORKS_MUTEX.lock().unwrap();
+                    ACTIVE_FORKS_CVAR.notify_all();
+                }
+            }
+            let _counter = ForkCounter;
+
             let io = cloned_io as *mut u8 as *mut Value;
             // Open a new DB connection for this thread
             let db_path = DB_PATH.lock().unwrap().clone();
@@ -2951,22 +3093,25 @@ pub extern "C" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
             knot_io_run(db, io);
         });
 
-        THREAD_HANDLES.lock().unwrap().push(handle);
         alloc(Value::Unit)
     }
 
     alloc(Value::IO(spawn_thunk as *const u8, env))
 }
 
-/// Join all spawned threads. Called from generated main before db close.
+/// Wait until all `fork`ed threads have completed.  Called from generated
+/// main before `knot_db_close`.
+///
+/// Uses a condition variable keyed on `ACTIVE_FORKS`.  When the counter
+/// reaches zero the wait returns.  Unlike the previous `JoinHandle` vector,
+/// this keeps constant memory overhead regardless of how many threads have
+/// been forked.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_threads_join() {
-    let handles: Vec<_> = THREAD_HANDLES.lock().unwrap().drain(..).collect();
-    for handle in handles {
-        if let Err(e) = handle.join() {
-            eprintln!("knot runtime: spawned thread panicked: {:?}", e);
-        }
-    }
+    let lock = ACTIVE_FORKS_MUTEX.lock().unwrap();
+    let _guard = ACTIVE_FORKS_CVAR
+        .wait_while(lock, |_| ACTIVE_FORKS.load(Ordering::SeqCst) > 0)
+        .unwrap();
 }
 
 // ── STM retry functions ──────────────────────────────────────────
@@ -8534,6 +8679,7 @@ fn value_to_serde_json(v: *mut Value) -> serde_json::Value {
         }
         Value::Function(_, _, src) => serde_json::Value::String(format!("<function: {}>", src)),
         Value::IO(_, _) => serde_json::Value::String("<<IO>>".into()),
+        Value::Pair(_, _) => serde_json::Value::String("<<Pair>>".into()),
     }
 }
 
@@ -8676,15 +8822,22 @@ pub extern "C" fn knot_http_listen(
     eprintln!("Knot HTTP server listening on http://0.0.0.0:{}", port);
 
     loop {
-        // Mark the arena so we can free main-thread allocations after dispatching
-        // each request. Handler threads have their own arenas (thread-local).
-        let arena_mark = ARENA.with(|a| a.borrow().mark());
+        // Isolate each request's main-thread allocations in a dedicated
+        // arena frame.  Previously we used `mark`/`reset_to` on the caller's
+        // frame — that freed chunk-allocated temporaries but any values
+        // that ended up in the frame's `pinned` set (e.g., intermediate
+        // constructors from request parsing that got promoted) persisted
+        // forever.  A fresh child frame discarded at request-cycle end
+        // makes request handling zero-allocation-overhead across the
+        // program's lifetime.  Handler threads still run on their own
+        // thread-local arenas (spawned below).
+        ARENA.with(|a| a.borrow_mut().push_frame());
 
         let mut request = match server.recv() {
             Ok(req) => req,
             Err(e) => {
                 eprintln!("knot runtime: error receiving request: {}", e);
-                ARENA.with(|a| a.borrow_mut().reset_to(arena_mark));
+                ARENA.with(|a| a.borrow_mut().pop_frame());
                 continue;
             }
         };
@@ -9083,9 +9236,10 @@ pub extern "C" fn knot_http_listen(
             }
         }
 
-        // Free main-thread arena allocations from this request cycle.
-        // Handler threads have their own thread-local arenas.
-        ARENA.with(|a| a.borrow_mut().reset_to(arena_mark));
+        // Free main-thread arena allocations (chunks + pinned) from this
+        // request cycle.  Handler threads have their own thread-local arenas
+        // which are dropped when the handler thread exits.
+        ARENA.with(|a| a.borrow_mut().pop_frame());
     }
 }
 
@@ -9961,6 +10115,11 @@ fn serialize_value_for_hash_into(v: *mut Value, buf: &mut Vec<u8>) {
         }
         Value::IO(_, _) => {
             buf.push(11);
+        }
+        Value::Pair(a, b) => {
+            buf.push(12);
+            serialize_value_for_hash_into(*a, buf);
+            serialize_value_for_hash_into(*b, buf);
         }
     }
 }

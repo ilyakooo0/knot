@@ -6315,8 +6315,13 @@ impl Codegen {
                         let val =
                             self.compile_expr(builder, inner, env, db);
                         // Arena GC: promote yielded value so it survives
-                        // per-iteration reset in the continue block
-                        let val = if !loop_stack.is_empty() {
+                        // per-iteration reset in the continue block.
+                        // Escape-analysis hint: if the yielded value is
+                        // syntactically a singleton (small int / bool /
+                        // `Unit` / Float 0.0 or 1.0), it's already owned
+                        // by the thread-local `SINGLETONS` table and
+                        // needs no promotion — skip the call entirely.
+                        let val = if !loop_stack.is_empty() && !expr_is_promote_safe(inner) {
                             self.call_rt(builder, "knot_arena_promote", &[val])
                         } else {
                             val
@@ -8137,6 +8142,44 @@ fn analyze_view(body: &ast::Expr) -> Option<ViewInfo> {
 
 /// Check if an expression references a specific variable name.
 /// Check if an expression contains function applications to user-defined
+/// Escape-analysis hint: returns true if `expr` trivially evaluates to a
+/// value that does not need `knot_arena_promote` to survive an
+/// enclosing `reset_to`.
+///
+/// The runtime pre-allocates singletons for small ints (`-128..=127`),
+/// `Bool(true)` / `Bool(false)`, `Unit`, and `Float(0.0)` / `Float(1.0)`.
+/// Pointers returned for these values are owned by the thread-local
+/// `SINGLETONS` table, not by the current frame's chunks — so they're
+/// already safe.  Emitting a `knot_arena_promote` call for them just
+/// burns cycles inside the runtime's `owns_in_chunks` check and cache
+/// lookup; skipping the call when the expression is syntactically
+/// guaranteed to produce a singleton avoids that work.
+///
+/// This is a deliberately conservative analysis: false negatives are
+/// fine (we just emit a redundant promote call), false positives are
+/// a memory-safety bug.
+fn expr_is_promote_safe(expr: &ast::Expr) -> bool {
+    match &expr.node {
+        ast::ExprKind::Lit(lit) => match lit {
+            ast::Literal::Int(s) => {
+                // Small-int singletons cover -128..=127; anything outside
+                // allocates a fresh BigInt, which must be promoted.
+                s.parse::<i64>().map_or(false, |n| (-128..=127).contains(&n))
+            }
+            ast::Literal::Bool(_) => true,
+            ast::Literal::Float(f) => {
+                f.to_bits() == 0.0_f64.to_bits() || *f == 1.0
+            }
+            // Text/Bytes are freshly allocated on each evaluation and
+            // need promotion.  (Text literals can be cached, but the
+            // compiler doesn't currently emit the cached path for
+            // yield-position literals.)
+            ast::Literal::Text(_) | ast::Literal::Bytes(_) => false,
+        },
+        _ => false,
+    }
+}
+
 /// functions (not builtins/runtime). Such calls may produce significant
 /// intermediate arena allocations that benefit from frame isolation.
 fn expr_has_user_calls(expr: &ast::Expr, user_fns: &HashMap<String, (FuncId, usize)>) -> bool {

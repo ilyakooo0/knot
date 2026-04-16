@@ -38,7 +38,15 @@ use std::time::Duration;
 
 use std::mem::MaybeUninit;
 
-/// Number of `Alloc` slots per chunk.  512 × ~80-120 bytes ≈ 40-60 KB.
+/// Number of `Value` slots per chunk.
+///
+/// `sizeof(Value) = 40` (verified by `_size_tests::report_value_size`), so
+/// 512 × 40 B = 20 KB per chunk.  This fits comfortably in L1D on every
+/// modern CPU (Intel Skylake: 32 KB, Apple M-series P-core: 128 KB), so
+/// promotion scans stay cache-resident.  Smaller caps (128, 256) trade
+/// worse allocation throughput (more `take_chunk` calls) for marginal
+/// cache wins we don't need.  Larger caps (1024+) exceed Intel L1D and
+/// waste memory for short-running programs.
 const CHUNK_CAP: usize = 512;
 
 /// A contiguous block of bump-allocated `Value` slots.
@@ -88,16 +96,26 @@ impl Chunk {
 /// `reset_to` when `pinned_mark < pinned.len()`).
 struct Frame {
     chunks: Vec<Chunk>,
-    /// Promoted values that survive `reset_to` within this frame.
-    /// Each entry is a `Box::into_raw(Box::new(Value))`.
+    /// Promoted values that survive `reset_to` within this frame, in
+    /// insertion order (used for Drop iteration).  Each entry is a
+    /// `Box::into_raw(Box::new(Value))`.
     pinned: Vec<*mut Value>,
+    /// Set-backed lookup mirror of `pinned` for O(1) `owns` checks.
+    /// Kept in sync with `pinned` on push/clear — under heavy promotion
+    /// the linear `Vec::contains` became the dominant cost in
+    /// `clone_from_child`.
+    pinned_set: HashSet<*mut Value>,
 }
 
 impl Frame {
     /// Build an empty frame.  The arena supplies chunks on first alloc via
     /// `Arena::take_chunk`, so this doesn't allocate.
     fn empty() -> Self {
-        Frame { chunks: Vec::new(), pinned: Vec::new() }
+        Frame {
+            chunks: Vec::new(),
+            pinned: Vec::new(),
+            pinned_set: HashSet::new(),
+        }
     }
 
     fn mark_chunks(&self) -> usize {
@@ -113,7 +131,13 @@ impl Frame {
     /// Check whether `val` is owned by this frame (chunks or pinned).
     fn owns(&self, val: *mut Value) -> bool {
         if self.owns_in_chunks(val) { return true; }
-        self.pinned.contains(&val)
+        self.pinned_set.contains(&val)
+    }
+
+    /// Record a new pinned pointer (kept in both Vec and Set).
+    fn push_pinned(&mut self, ptr: *mut Value) {
+        self.pinned.push(ptr);
+        self.pinned_set.insert(ptr);
     }
 
     /// Drop all live values in chunks (called from Arena::drop_frame_contents).
@@ -132,6 +156,7 @@ impl Frame {
             unsafe { drop(Box::from_raw(ptr)); }
         }
         self.pinned.clear();
+        self.pinned_set.clear();
     }
 }
 
@@ -164,6 +189,11 @@ impl Drop for Frame {
 struct Arena {
     frames: Vec<Frame>,
     free_chunks: Vec<Chunk>,
+    /// Transient per-call deduplication cache used by `promote` and
+    /// `pop_frame_promote` to share cloned subtrees when the same source
+    /// pointer is reached via multiple paths (DAG structure).  Emptied
+    /// after every top-level call so it never holds stale pointers.
+    promote_cache: HashMap<*mut Value, *mut Value>,
 }
 
 /// Cap the chunk pool so the arena doesn't hoard memory after a transient
@@ -171,11 +201,73 @@ struct Arena {
 /// bound for steady-state working set.
 const CHUNK_POOL_CAP: usize = 64;
 
+/// Cap on the number of `Vec<*mut Value>` backing storage buffers held in
+/// the relation pool per thread.  Query pipelines produce many transient
+/// relations; reusing their allocations avoids heap churn.
+const RELATION_POOL_CAP: usize = 256;
+
+/// Drop threshold for returning relation vecs to the pool.  Very large
+/// Vecs (e.g. accidentally-full query results) are freed instead of
+/// pooled to avoid keeping megabytes around after a single large query.
+const RELATION_POOL_MAX_CAPACITY: usize = 4096;
+
+thread_local! {
+    /// Recycled `Vec<*mut Value>` buffers reused by `knot_relation_*`
+    /// constructors.  Populated by `Value::drop` when a `Value::Relation`
+    /// is dropped; drained by `take_relation_vec`.
+    static RELATION_VEC_POOL: RefCell<Vec<Vec<*mut Value>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Obtain a `Vec<*mut Value>` from the pool (if any) or allocate a new
+/// one.  The returned Vec is always empty; callers may reserve further
+/// capacity as needed.
+fn take_relation_vec(min_capacity: usize) -> Vec<*mut Value> {
+    RELATION_VEC_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        // Find the first Vec with sufficient capacity.  Linear scan is
+        // fine for a ~256-entry pool and lets us reuse under-sized Vecs
+        // if no larger one is available.
+        let mut best = None;
+        for (i, v) in pool.iter().enumerate() {
+            if v.capacity() >= min_capacity {
+                best = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = best {
+            pool.swap_remove(i)
+        } else if let Some(v) = pool.pop() {
+            // No perfectly-sized buffer — reuse the smallest we have
+            // and let it grow.
+            v
+        } else {
+            Vec::with_capacity(min_capacity)
+        }
+    })
+}
+
+/// Return a `Vec<*mut Value>` to the pool if there's space and the
+/// capacity is reasonable.  Called from `Value::drop` when a Relation
+/// is being destroyed.
+fn return_relation_vec(mut v: Vec<*mut Value>) {
+    if v.capacity() == 0 || v.capacity() > RELATION_POOL_MAX_CAPACITY {
+        return;
+    }
+    v.clear();
+    RELATION_VEC_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < RELATION_POOL_CAP {
+            pool.push(v);
+        }
+    });
+}
+
 impl Arena {
     fn new() -> Self {
         Arena {
             frames: vec![Frame::empty()],
             free_chunks: Vec::new(),
+            promote_cache: HashMap::new(),
         }
     }
 
@@ -272,7 +364,8 @@ impl Arena {
 
     /// Pop the current frame, deep-clone `val` into the parent frame,
     /// then free the popped frame.  Uses chunk-range ownership checks
-    /// instead of building a HashSet.
+    /// instead of building a HashSet.  `promote_cache` dedups shared
+    /// subtrees in the value being lifted.
     fn pop_frame_promote(&mut self, val: *mut Value) -> *mut Value {
         if self.frames.len() <= 1 || val.is_null() {
             return val;
@@ -281,6 +374,7 @@ impl Arena {
         // Clone into the (now-current) parent frame before dropping the child.
         let promoted = self.clone_from_child(val, &child);
         self.drop_and_harvest_frame(child);
+        self.promote_cache.clear();
         promoted
     }
 
@@ -289,14 +383,21 @@ impl Arena {
     /// Selectively clone `val` so it survives the upcoming `reset_to`.
     /// Values already safe (singletons, parent-frame, text-cache) are
     /// returned as-is; only chunk-resident values are deep-cloned.
+    ///
+    /// `promote_cache` dedups shared subtrees during this call so that if
+    /// the same source pointer is reached via multiple paths (DAG
+    /// structure, e.g., two records referencing the same child record),
+    /// we only clone it once and share the promoted pointer.
     fn promote(&mut self, val: *mut Value) -> *mut Value {
         if val.is_null() { return val; }
         let in_chunk = self.current_frame().owns_in_chunks(val);
-        if in_chunk {
+        let result = if in_chunk {
             self.clone_into_pinned(val)
         } else {
             self.promote_children(val)
-        }
+        };
+        self.promote_cache.clear();
+        result
     }
 
     /// `val` is NOT in the current frame's chunks (safe from reset),
@@ -331,10 +432,14 @@ impl Arena {
                     self.alloc_pinned(Value::Constructor(tag.clone(), ni))
                 } else { val }
             }
-            Value::Function(fp, env, src) => {
-                let ne = self.promote_value(*env);
-                if ne != *env {
-                    self.alloc_pinned(Value::Function(*fp, ne, src.clone()))
+            Value::Function(f) => {
+                let ne = self.promote_value(f.env);
+                if ne != f.env {
+                    self.alloc_pinned(Value::Function(Box::new(FunctionInner {
+                        fn_ptr: f.fn_ptr,
+                        env: ne,
+                        source: f.source.clone(),
+                    })))
                 } else { val }
             }
             Value::IO(fp, env) => {
@@ -354,13 +459,24 @@ impl Arena {
     }
 
     /// Top-level recursive promote: dispatch chunk-resident vs safe.
+    ///
+    /// Uses `promote_cache` to dedup DAG structure — if two parents share
+    /// a child pointer, we clone the child once and both parents reference
+    /// the same promoted pointer afterward.
     fn promote_value(&mut self, val: *mut Value) -> *mut Value {
         if val.is_null() { return val; }
-        if self.current_frame().owns_in_chunks(val) {
+        if let Some(&cached) = self.promote_cache.get(&val) {
+            return cached;
+        }
+        let promoted = if self.current_frame().owns_in_chunks(val) {
             self.clone_into_pinned(val)
         } else {
             self.promote_children(val)
+        };
+        if promoted != val {
+            self.promote_cache.insert(val, promoted);
         }
+        promoted
     }
 
     /// Deep-clone a chunk-resident value into the pinned set.
@@ -386,8 +502,12 @@ impl Arena {
             Value::Constructor(tag, inner) => {
                 Value::Constructor(tag.clone(), self.promote_value(*inner))
             }
-            Value::Function(fp, env, src) => {
-                Value::Function(*fp, self.promote_value(*env), src.clone())
+            Value::Function(f) => {
+                Value::Function(Box::new(FunctionInner {
+                    fn_ptr: f.fn_ptr,
+                    env: self.promote_value(f.env),
+                    source: f.source.clone(),
+                }))
             }
             Value::IO(fp, env) => {
                 Value::IO(*fp, self.promote_value(*env))
@@ -402,7 +522,7 @@ impl Arena {
     /// Box-allocate a value into the current frame's pinned set.
     fn alloc_pinned(&mut self, v: Value) -> *mut Value {
         let ptr = Box::into_raw(Box::new(v));
-        self.current_frame().pinned.push(ptr);
+        self.current_frame().push_pinned(ptr);
         ptr
     }
 
@@ -410,10 +530,14 @@ impl Arena {
 
     /// Deep-clone `val` into the parent frame, only cloning values owned
     /// by `child`.  Uses chunk-range + pinned checks (no HashSet).
+    /// Consults `promote_cache` to share cloned subtrees.
     fn clone_from_child(&mut self, val: *mut Value, child: &Frame) -> *mut Value {
         if val.is_null() { return val; }
         if !child.owns(val) {
             return val;
+        }
+        if let Some(&cached) = self.promote_cache.get(&val) {
+            return cached;
         }
         let cloned = match unsafe { &*val } {
             Value::Int(n) => Value::Int(n.clone()),
@@ -434,8 +558,12 @@ impl Arena {
             Value::Constructor(tag, inner) => {
                 Value::Constructor(tag.clone(), self.clone_from_child(*inner, child))
             }
-            Value::Function(fp, env, src) => {
-                Value::Function(*fp, self.clone_from_child(*env, child), src.clone())
+            Value::Function(f) => {
+                Value::Function(Box::new(FunctionInner {
+                    fn_ptr: f.fn_ptr,
+                    env: self.clone_from_child(f.env, child),
+                    source: f.source.clone(),
+                }))
             }
             Value::IO(fp, env) => {
                 Value::IO(*fp, self.clone_from_child(*env, child))
@@ -447,7 +575,9 @@ impl Arena {
                 )
             }
         };
-        self.alloc(cloned)
+        let out = self.alloc(cloned);
+        self.promote_cache.insert(val, out);
+        out
     }
 }
 
@@ -636,6 +766,31 @@ pub extern "C" fn knot_debug_init() {
     }
 }
 
+// ── String interner ──────────────────────────────────────────────
+//
+// Record field names and constructor tags are drawn from a small,
+// heavily-repeated vocabulary ("name", "id", "value", "Ok", "Err", etc.).
+// Interning them into `Arc<str>` means every field/constructor in the
+// program shares a single heap allocation per unique name, and clones
+// are atomic-increment-cheap.  The interner is a global Mutex-guarded
+// map; callers hit the `Mutex` once per record construction but all
+// subsequent cloning/comparison is lock-free.
+
+static STRING_INTERNER: std::sync::LazyLock<Mutex<HashMap<String, Arc<str>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Intern a string, returning a shared `Arc<str>`.  Repeated calls with
+/// the same contents return the same `Arc` without re-allocating.
+fn intern_str(s: &str) -> Arc<str> {
+    let mut table = STRING_INTERNER.lock().unwrap();
+    if let Some(existing) = table.get(s) {
+        return existing.clone();
+    }
+    let arc: Arc<str> = Arc::from(s);
+    table.insert(s.to_string(), arc.clone());
+    arc
+}
+
 // ── Value representation ──────────────────────────────────────────
 
 /// Runtime representation of all Knot values.
@@ -643,6 +798,11 @@ pub extern "C" fn knot_debug_init() {
 /// Every Knot expression evaluates to a heap-allocated `Value`.
 /// The Cranelift-generated code works exclusively with `*mut Value` pointers.
 pub enum Value {
+    /// Kept inline (not boxed).  `BigInt` is the largest variant and
+    /// dominates `Value`'s size, but every non-singleton integer hits
+    /// this constructor; boxing would add a heap allocation per int on
+    /// the hot path.  Singletons for small ints absorb most of the
+    /// allocation pressure so the inline footprint is acceptable.
     Int(BigInt),
     Float(f64),
     Text(String),
@@ -651,9 +811,16 @@ pub enum Value {
     Unit,
     Record(Vec<RecordField>),
     Relation(Vec<*mut Value>),
-    Constructor(String, *mut Value),
-    /// (fn_ptr, env, source) — fn_ptr has signature: extern "C" fn(db, env, arg) -> *mut Value
-    Function(*const u8, *mut Value, String),
+    /// Constructor tag is interned via `intern_str` so the common vocabulary
+    /// (`Ok`, `Err`, `Just`, ...) shares one allocation per name.
+    Constructor(Arc<str>, *mut Value),
+    /// (fn_ptr, env, source) — fn_ptr has signature: extern "C" fn(db, env, arg) -> *mut Value.
+    /// `source` is the Knot expression that produced the function, used in
+    /// diagnostics; interned because the same lambda site is stringified
+    /// repeatedly.
+    ///
+    /// Boxed so the three-field tuple doesn't bloat every `Value` slot.
+    Function(Box<FunctionInner>),
     /// IO thunk — fn_ptr: extern "C" fn(db: *mut KnotDb, env: *mut Value) -> *mut Value
     IO(*const u8, *mut Value),
     /// Internal two-pointer tuple used to build closure envs without
@@ -666,9 +833,31 @@ pub enum Value {
     Pair(*mut Value, *mut Value),
 }
 
+/// Payload for `Value::Function`: boxed to keep `Value` compact.
+pub struct FunctionInner {
+    pub fn_ptr: *const u8,
+    pub env: *mut Value,
+    pub source: Arc<str>,
+}
+
 pub struct RecordField {
-    pub name: String,
+    /// Field name, interned via `intern_str`.  Cloning an interned name
+    /// is an atomic increment, and comparison is a pointer-equal fast
+    /// path followed by the usual lexical compare.
+    pub name: Arc<str>,
     pub value: *mut Value,
+}
+
+impl Drop for Value {
+    fn drop(&mut self) {
+        // Custom Drop intercepts `Value::Relation` to return its backing
+        // Vec storage to the thread-local pool; all other variants fall
+        // back to the compiler-generated field drop.
+        if let Value::Relation(rows) = self {
+            let owned = std::mem::take(rows);
+            return_relation_vec(owned);
+        }
+    }
 }
 
 /// SQLite database handle.
@@ -853,7 +1042,7 @@ fn type_name(v: *mut Value) -> &'static str {
         Value::Record(_) => "Record",
         Value::Relation(_) => "Relation",
         Value::Constructor(_, _) => "Constructor",
-        Value::Function(_, _, _) => "Function",
+        Value::Function(_) => "Function",
         Value::IO(_, _) => "IO",
         Value::Pair(_, _) => "Pair",
     }
@@ -878,12 +1067,12 @@ fn brief_value(v: *mut Value) -> String {
         Value::Bytes(b) => format!("Bytes({} bytes)", b.len()),
         Value::Unit => "Unit".to_string(),
         Value::Record(fields) => {
-            let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+            let names: Vec<&str> = fields.iter().map(|f| f.name.as_ref()).collect();
             format!("Record({{{}}})", names.join(", "))
         }
         Value::Relation(rows) => format!("Relation({} rows)", rows.len()),
-        Value::Constructor(tag, _) => format!("Constructor({})", tag),
-        Value::Function(_, _, src) => format!("Function({})", src),
+        Value::Constructor(tag, _) => format!("Constructor({})", &**tag),
+        Value::Function(f) => format!("Function({})", &*f.source),
         Value::IO(_, _) => "IO".to_string(),
         Value::Pair(_, _) => "Pair".to_string(),
     }
@@ -942,24 +1131,53 @@ impl Drop for ValueSingletons {
     }
 }
 
-/// Wrapper around the text literal cache that frees cached values on drop.
-struct TextLiteralCache(HashMap<*const u8, *mut Value>);
+/// Upper bound on cached text literals per thread.  Source-pointer-keyed
+/// literals from `.rodata` are typically bounded by program size; this cap
+/// protects against pathological callers that pass dynamically-allocated
+/// pointers (e.g. generated SQL fragments).
+const TEXT_LITERAL_CACHE_CAP: usize = 4096;
 
-impl Drop for TextLiteralCache {
-    fn drop(&mut self) {
-        for &ptr in self.0.values() {
-            unsafe { let _ = Box::from_raw(ptr); }
+/// Wrapper around the text literal cache that frees cached values on drop.
+/// Implements simple FIFO eviction (approximating LRU) once the cap is hit;
+/// `order` tracks insertion order so we can reclaim the oldest entry.
+struct TextLiteralCache {
+    map: HashMap<*const u8, *mut Value>,
+    order: std::collections::VecDeque<*const u8>,
+}
+
+impl TextLiteralCache {
+    fn new() -> Self {
+        TextLiteralCache {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
         }
+    }
+
+    fn get(&self, key: &*const u8) -> Option<&*mut Value> {
+        self.map.get(key)
+    }
+
+    fn insert(&mut self, key: *const u8, val: *mut Value) {
+        while self.map.len() >= TEXT_LITERAL_CACHE_CAP {
+            if let Some(old_key) = self.order.pop_front() {
+                if let Some(old_val) = self.map.remove(&old_key) {
+                    unsafe { let _ = Box::from_raw(old_val); }
+                }
+            } else {
+                break;
+            }
+        }
+        self.map.insert(key, val);
+        self.order.push_back(key);
     }
 }
 
-impl std::ops::Deref for TextLiteralCache {
-    type Target = HashMap<*const u8, *mut Value>;
-    fn deref(&self) -> &Self::Target { &self.0 }
-}
-
-impl std::ops::DerefMut for TextLiteralCache {
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+impl Drop for TextLiteralCache {
+    fn drop(&mut self) {
+        for &ptr in self.map.values() {
+            unsafe { let _ = Box::from_raw(ptr); }
+        }
+    }
 }
 
 thread_local! {
@@ -975,7 +1193,7 @@ thread_local! {
     };
     /// Cache for text literals keyed by static data pointer.
     /// Values are allocated outside the arena so they survive arena resets.
-    static TEXT_LITERAL_CACHE: RefCell<TextLiteralCache> = RefCell::new(TextLiteralCache(HashMap::new()));
+    static TEXT_LITERAL_CACHE: RefCell<TextLiteralCache> = RefCell::new(TextLiteralCache::new());
 }
 
 #[unsafe(no_mangle)]
@@ -1050,8 +1268,8 @@ pub extern "C" fn knot_value_function(
     src_ptr: *const u8,
     src_len: usize,
 ) -> *mut Value {
-    let source = unsafe { str_from_raw(src_ptr, src_len) }.to_string();
-    alloc(Value::Function(fn_ptr, env, source))
+    let source = intern_str(unsafe { str_from_raw(src_ptr, src_len) });
+    alloc(Value::Function(Box::new(FunctionInner { fn_ptr, env, source })))
 }
 
 #[unsafe(no_mangle)]
@@ -1060,7 +1278,7 @@ pub extern "C" fn knot_value_constructor(
     tag_len: usize,
     payload: *mut Value,
 ) -> *mut Value {
-    let tag = unsafe { str_from_raw(tag_ptr, tag_len) }.to_string();
+    let tag = intern_str(unsafe { str_from_raw(tag_ptr, tag_len) });
     alloc(Value::Constructor(tag, payload))
 }
 
@@ -1114,7 +1332,7 @@ pub extern "C" fn knot_value_get_tag(v: *mut Value) -> i32 {
         Value::Record(_) => 5,
         Value::Relation(_) => 6,
         Value::Constructor(_, _) => 7,
-        Value::Function(_, _, _) => 8,
+        Value::Function(_) => 8,
         Value::Bytes(_) => 10,
         Value::IO(_, _) => 11,
         Value::Pair(_, _) => 12,
@@ -1135,23 +1353,28 @@ pub extern "C" fn knot_record_set_field(
     key_len: usize,
     value: *mut Value,
 ) {
-    let name = unsafe { str_from_raw(key_ptr, key_len) }.to_string();
+    let name_str = unsafe { str_from_raw(key_ptr, key_len) };
     let rec = unsafe { &mut *record };
     match rec {
         Value::Record(fields) => {
             // Maintain sorted order by field name for O(log n) lookup
-            match fields.binary_search_by(|f| f.name.as_str().cmp(&name)) {
+            match fields.binary_search_by(|f| (*f.name).cmp(name_str)) {
                 Ok(idx) => fields[idx].value = value,
-                Err(idx) => fields.insert(idx, RecordField { name, value }),
+                Err(idx) => fields.insert(idx, RecordField { name: intern_str(name_str), value }),
             }
         }
         _ => panic!("knot runtime: expected Record in set_field, got {}", type_name(record)),
     }
 }
 
-/// Batch-construct a record from pre-sorted field pairs.
-/// `data` points to a flat array of triples: [key_ptr, key_len, value, ...]
-/// where each element is pointer-sized. Fields MUST be pre-sorted by name.
+/// Batch-construct a record from field pairs.  `data` points to a flat
+/// array of triples: [key_ptr, key_len, value, ...] where each element
+/// is pointer-sized.
+///
+/// Codegen emits pairs in sorted order already, but we unconditionally
+/// sort here to make the invariant robust against buggy or externally-
+/// produced pair lists.  For small records (typical < 20 fields) this
+/// is effectively free.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_record_from_pairs(data: *const usize, count: usize) -> *mut Value {
     let mut fields = Vec::with_capacity(count);
@@ -1160,8 +1383,11 @@ pub extern "C" fn knot_record_from_pairs(data: *const usize, count: usize) -> *m
         let key_ptr = unsafe { *data.add(offset) as *const u8 };
         let key_len = unsafe { *data.add(offset + 1) };
         let value = unsafe { *data.add(offset + 2) as *mut Value };
-        let name = unsafe { str_from_raw(key_ptr, key_len) }.to_string();
+        let name = intern_str(unsafe { str_from_raw(key_ptr, key_len) });
         fields.push(RecordField { name, value });
+    }
+    if !fields.windows(2).all(|w| w[0].name <= w[1].name) {
+        fields.sort_by(|a, b| a.name.cmp(&b.name));
     }
     alloc(Value::Record(fields))
 }
@@ -1179,17 +1405,13 @@ pub extern "C" fn knot_record_field(
     let name = unsafe { str_from_raw(key_ptr, key_len) };
     match unsafe { as_ref(record) } {
         Value::Record(fields) => {
-            // Binary search for O(log n) lookup (fields are kept sorted)
-            if let Ok(idx) = fields.binary_search_by(|f| f.name.as_str().cmp(name)) {
+            // Fields are kept sorted by all constructors
+            // (`knot_record_from_pairs` sorts defensively, `set_field`
+            // uses sorted insert).  Binary search is always correct.
+            if let Ok(idx) = fields.binary_search_by(|f| (*f.name).cmp(name)) {
                 return fields[idx].value;
             }
-            // Fallback: linear scan for records not built via set_field
-            for field in fields {
-                if field.name == name {
-                    return field.value;
-                }
-            }
-            let available: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+            let available: Vec<&str> = fields.iter().map(|f| f.name.as_ref()).collect();
             panic!(
                 "knot runtime: field '{}' not found in record\n  available fields: {}",
                 name,
@@ -1302,19 +1524,19 @@ fn infer_temp_schema(rows: &[*mut Value]) -> Option<TempSchema> {
             for f in fields {
                 if !f.value.is_null() {
                     match unsafe { as_ref(f.value) } {
-                        Value::Relation(_) | Value::Function(_, _, _) => return None,
+                        Value::Relation(_) | Value::Function(_) => return None,
                         _ => {}
                     }
                 }
                 let ty = infer_col_type(f.value)?;
-                cols.push((f.name.clone(), ty));
+                cols.push((f.name.to_string(), ty));
             }
             Some(TempSchema::Record(cols))
         }
         Value::Constructor(_, _) => {
             // Scan all rows to collect all constructor variants
             let mut ctors: Vec<(String, Vec<(String, ColType)>)> = Vec::new();
-            let mut seen_tags: HashSet<&str> = HashSet::new();
+            let mut seen_tags: HashSet<String> = HashSet::new();
             let mut seen_field_names: HashSet<String> = HashSet::new();
             let mut all_fields: Vec<(String, ColType)> = Vec::new();
 
@@ -1322,25 +1544,31 @@ fn infer_temp_schema(rows: &[*mut Value]) -> Option<TempSchema> {
                 if row.is_null() { continue; }
                 match unsafe { as_ref(*row) } {
                     Value::Constructor(tag, payload) => {
-                        if !seen_tags.insert(tag.as_str()) {
+                        if !seen_tags.insert(tag.to_string()) {
                             continue;
                         }
-                        let ctor_fields = match if (*payload).is_null() { &Value::Unit } else { unsafe { as_ref(*payload) } } {
+                        let unit_placeholder = Value::Unit;
+                        let payload_ref = if (*payload).is_null() {
+                            &unit_placeholder
+                        } else {
+                            unsafe { as_ref(*payload) }
+                        };
+                        let ctor_fields = match payload_ref {
                             Value::Unit => Vec::new(),
                             Value::Record(fields) => {
                                 let mut cf = Vec::new();
                                 for f in fields {
                                     let ty = infer_col_type(f.value)?;
-                                    cf.push((f.name.clone(), ty));
-                                    if seen_field_names.insert(f.name.clone()) {
-                                        all_fields.push((f.name.clone(), ty));
+                                    cf.push((f.name.to_string(), ty));
+                                    if seen_field_names.insert(f.name.to_string()) {
+                                        all_fields.push((f.name.to_string(), ty));
                                     }
                                 }
                                 cf
                             }
                             _ => return None,
                         };
-                        ctors.push((tag.clone(), ctor_fields));
+                        ctors.push((tag.to_string(), ctor_fields));
                     }
                     _ => return None,
                 }
@@ -1428,7 +1656,7 @@ fn temp_row_to_params(v: *mut Value, schema: &TempSchema) -> Vec<rusqlite::types
             };
             cols.iter()
                 .map(|(name, ty)| {
-                    let field = fields.iter().find(|f| f.name == *name);
+                    let field = fields.iter().find(|f| &*f.name == name.as_str());
                     match field {
                         Some(f) => value_to_sqlite(f.value, *ty),
                         None => rusqlite::types::Value::Null,
@@ -1440,8 +1668,8 @@ fn temp_row_to_params(v: *mut Value, schema: &TempSchema) -> Vec<rusqlite::types
         TempSchema::Adt { all_fields, constructors } => {
             match unsafe { as_ref(v) } {
                 Value::Constructor(tag, payload) => {
-                    let mut params = vec![rusqlite::types::Value::Text(tag.clone())];
-                    let ctor = constructors.iter().find(|(t, _)| t == tag);
+                    let mut params = vec![rusqlite::types::Value::Text(tag.to_string())];
+                    let ctor = constructors.iter().find(|(t, _)| t.as_str() == &**tag);
                     for (fname, fty) in all_fields {
                         let has_field = ctor.map_or(false, |(_, fields)| {
                             fields.iter().any(|(n, _)| n == fname)
@@ -1449,7 +1677,7 @@ fn temp_row_to_params(v: *mut Value, schema: &TempSchema) -> Vec<rusqlite::types
                         if has_field {
                             match unsafe { as_ref(*payload) } {
                                 Value::Record(fields) => {
-                                    let field = fields.iter().find(|f| f.name == *fname);
+                                    let field = fields.iter().find(|f| &*f.name == fname.as_str());
                                     params.push(match field {
                                         Some(f) => value_to_sqlite(f.value, *fty),
                                         None => rusqlite::types::Value::Null,
@@ -1507,7 +1735,7 @@ fn read_temp_row(row: &rusqlite::Row, schema: &TempSchema) -> *mut Value {
             } else {
                 alloc(Value::Unit)
             };
-            alloc(Value::Constructor(tag, payload))
+            alloc(Value::Constructor(intern_str(&tag), payload))
         }
         TempSchema::Unit => alloc(Value::Unit),
     }
@@ -1807,17 +2035,19 @@ fn sql_relations_equal(conn: &Connection, a: &[*mut Value], b: &[*mut Value]) ->
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_relation_empty() -> *mut Value {
-    alloc(Value::Relation(Vec::new()))
+    alloc(Value::Relation(take_relation_vec(0)))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_relation_with_capacity(cap: usize) -> *mut Value {
-    alloc(Value::Relation(Vec::with_capacity(cap)))
+    alloc(Value::Relation(take_relation_vec(cap)))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_relation_singleton(v: *mut Value) -> *mut Value {
-    alloc(Value::Relation(vec![v]))
+    let mut buf = take_relation_vec(1);
+    buf.push(v);
+    alloc(Value::Relation(buf))
 }
 
 /// Unwrap a scalar source relation: extract the `_value` field from the first row.
@@ -2073,7 +2303,7 @@ pub extern "C" fn knot_relation_group_by(
             _ => panic!("knot runtime: groupby rows must be Records"),
         };
         key_specs.iter().map(|ks| {
-            let value = fields.iter().find(|f| f.name == ks.name)
+            let value = fields.iter().find(|f| &*f.name == ks.name.as_str())
                 .unwrap_or_else(|| panic!("knot runtime: missing field '{}' in record", ks.name));
             value_to_sqlite(value.value, ks.ty)
         }).collect()
@@ -2283,11 +2513,11 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
                 buf.extend_from_slice(rb);
             }
         }
-        Value::Function(_, env, src) => {
+        Value::Function(f) => {
             buf.push(9);
-            buf.extend_from_slice(&(src.len() as u32).to_le_bytes());
-            buf.extend_from_slice(src.as_bytes());
-            value_to_hash_bytes(*env, buf);
+            buf.extend_from_slice(&(f.source.len() as u32).to_le_bytes());
+            buf.extend_from_slice(f.source.as_bytes());
+            value_to_hash_bytes(f.env, buf);
         }
         Value::IO(_, _) => {
             buf.push(11);
@@ -2348,8 +2578,8 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
             }).collect();
             set_a == set_b
         }
-        (Value::Function(fn_a, env_a, src_a), Value::Function(fn_b, env_b, src_b)) => {
-            fn_a == fn_b && src_a == src_b && values_equal(*env_a, *env_b)
+        (Value::Function(a), Value::Function(b)) => {
+            a.fn_ptr == b.fn_ptr && a.source == b.source && values_equal(a.env, b.env)
         }
         (Value::IO(fn_a, env_a), Value::IO(fn_b, env_b)) => {
             fn_a == fn_b && values_equal(*env_a, *env_b)
@@ -2615,7 +2845,7 @@ pub extern "C" fn knot_value_compare(a: *mut Value, b: *mut Value) -> *mut Value
         std::cmp::Ordering::Greater => "GT",
     };
     alloc(Value::Constructor(
-        tag.to_string(),
+        intern_str(tag),
         alloc(Value::Unit),
     ))
 }
@@ -2648,7 +2878,7 @@ pub extern "C" fn knot_value_compare_ord(a: *mut Value, b: *mut Value) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_ordering_tag_i32(v: *mut Value) -> i32 {
     match unsafe { as_ref(v) } {
-        Value::Constructor(tag, _) => match tag.as_str() {
+        Value::Constructor(tag, _) => match &**tag {
             "LT" => 0,
             "EQ" => 1,
             "GT" => 2,
@@ -2687,10 +2917,10 @@ pub extern "C" fn knot_value_call(
     arg: *mut Value,
 ) -> *mut Value {
     match unsafe { as_ref(func) } {
-        Value::Function(fn_ptr, env, _) => {
-            let f: extern "C" fn(*mut c_void, *mut Value, *mut Value) -> *mut Value =
-                unsafe { std::mem::transmute(*fn_ptr) };
-            f(db, *env, arg)
+        Value::Function(f) => {
+            let fun: extern "C" fn(*mut c_void, *mut Value, *mut Value) -> *mut Value =
+                unsafe { std::mem::transmute(f.fn_ptr) };
+            fun(db, f.env, arg)
         }
         _ => panic!("knot runtime: cannot call {}, expected Function", brief_value(func)),
     }
@@ -2751,7 +2981,7 @@ fn format_value(v: *mut Value) -> String {
                 format!("{} {}", tag, p)
             }
         }
-        Value::Function(_, _, src) => src.clone(),
+        Value::Function(f) => f.source.to_string(),
         Value::IO(_, _) => "<<IO>>".to_string(),
         Value::Pair(_, _) => "<<Pair>>".to_string(),
     }
@@ -2841,7 +3071,7 @@ pub extern "C" fn knot_value_show(v: *mut Value) -> *mut Value {
                     format!("{} {}", tag, p)
                 }
             }
-            Value::Function(_, _, src) => src.clone(),
+            Value::Function(f) => f.source.to_string(),
             Value::IO(_, _) => "<<IO>>".to_string(),
             Value::Pair(_, _) => "<<Pair>>".to_string(),
         }
@@ -2972,28 +3202,49 @@ fn deep_clone_value(val: *mut Value) -> *mut Value {
     let cloned = match unsafe { &*val } {
         Value::Int(n) => Value::Int(n.clone()),
         Value::Float(f) => Value::Float(*f),
+        // Interned Arc<str>: clone is an atomic increment, no allocation.
         Value::Text(s) => Value::Text(s.clone()),
         Value::Bool(b) => Value::Bool(*b),
         Value::Bytes(b) => Value::Bytes(b.clone()),
         Value::Unit => Value::Unit,
-        Value::Record(fields) => Value::Record(
-            fields
-                .iter()
-                .map(|f| RecordField {
+        Value::Record(fields) => {
+            // Field names are interned Arc<str>: clones are refcount bumps.
+            let mut new_fields = Vec::with_capacity(fields.len());
+            for f in fields {
+                new_fields.push(RecordField {
                     name: f.name.clone(),
                     value: deep_clone_value(f.value),
-                })
-                .collect(),
-        ),
+                });
+            }
+            Value::Record(new_fields)
+        }
         Value::Relation(rows) => {
-            Value::Relation(rows.iter().map(|r| deep_clone_value(*r)).collect())
+            // Fast path: empty relation doesn't need a Vec at all.
+            // Fork envs rarely carry populated Relations; if they do, the
+            // per-row recursion is unavoidable — each row is an independent
+            // arena allocation that must be lifted to Box for thread safety.
+            if rows.is_empty() {
+                Value::Relation(Vec::new())
+            } else {
+                let mut new_rows = Vec::with_capacity(rows.len());
+                for &r in rows {
+                    new_rows.push(deep_clone_value(r));
+                }
+                Value::Relation(new_rows)
+            }
         }
         Value::Constructor(tag, inner) => {
+            // tag is interned Arc<str>: clone is a refcount bump.
             Value::Constructor(tag.clone(), deep_clone_value(*inner))
         }
-        Value::Function(fn_ptr, env, source) => {
-            // fn_ptr is a code address (shared), env is data (cloned)
-            Value::Function(*fn_ptr, deep_clone_value(*env), source.clone())
+        Value::Function(f) => {
+            // fn_ptr is a code address (shared), env is data (cloned),
+            // source is interned Arc<str>.
+            Value::Function(Box::new(FunctionInner {
+                fn_ptr: f.fn_ptr,
+                env: deep_clone_value(f.env),
+                source: f.source.clone(),
+            }))
         }
         Value::IO(fn_ptr, env) => {
             // fn_ptr is a code address (shared), env is data (cloned)
@@ -3025,7 +3276,7 @@ unsafe fn deep_drop_value(val: *mut Value) {
                 }
             }
             Value::Constructor(_, inner) => deep_drop_value(*inner),
-            Value::Function(_, env, _) => deep_drop_value(*env),
+            Value::Function(f) => deep_drop_value(f.env),
             Value::IO(_, env) => deep_drop_value(*env),
             Value::Pair(a, b) => {
                 deep_drop_value(*a);
@@ -3210,8 +3461,8 @@ pub extern "C" fn knot_fs_read_file_io(path: *mut Value) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_fs_write_file_io(path: *mut Value, contents: *mut Value) -> *mut Value {
     let env = alloc(Value::Record(vec![
-        RecordField { name: "_c".to_string(), value: contents },
-        RecordField { name: "_p".to_string(), value: path },
+        RecordField { name: "_c".into(), value: contents },
+        RecordField { name: "_p".into(), value: path },
     ]));
     extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let _ = db;
@@ -3225,8 +3476,8 @@ pub extern "C" fn knot_fs_write_file_io(path: *mut Value, contents: *mut Value) 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_fs_append_file_io(path: *mut Value, contents: *mut Value) -> *mut Value {
     let env = alloc(Value::Record(vec![
-        RecordField { name: "_c".to_string(), value: contents },
-        RecordField { name: "_p".to_string(), value: path },
+        RecordField { name: "_c".into(), value: contents },
+        RecordField { name: "_p".into(), value: path },
     ]));
     extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let _ = db;
@@ -3341,7 +3592,7 @@ pub extern "C" fn knot_relation_match(
     rel: *mut Value,
 ) -> *mut Value {
     let tag = match unsafe { as_ref(ctor) } {
-        Value::Constructor(t, _) => t.as_str(),
+        Value::Constructor(t, _) => &**t,
         _ => panic!(
             "knot runtime: match expected Constructor, got {}",
             type_name(ctor)
@@ -3357,7 +3608,7 @@ pub extern "C" fn knot_relation_match(
     let mut result: Vec<*mut Value> = Vec::new();
     for &row in rows {
         match unsafe { as_ref(row) } {
-            Value::Constructor(t, payload) if t == tag => {
+            Value::Constructor(t, payload) if &**t == tag => {
                 result.push(*payload);
             }
             _ => {}
@@ -3498,7 +3749,7 @@ pub extern "C" fn knot_relation_traverse(
     match unsafe { as_ref(mapped[0]) } {
         Value::IO(..) => traverse_sequence_io(db, mapped),
         Value::Relation(..) => traverse_sequence_relation(mapped),
-        Value::Constructor(tag, ..) => match tag.as_str() {
+        Value::Constructor(tag, ..) => match &**tag {
             "Just" | "Nothing" => traverse_sequence_maybe(mapped),
             "Ok" | "Err" => traverse_sequence_result(mapped),
             _ => panic!(
@@ -3538,10 +3789,10 @@ fn traverse_sequence_maybe(maybes: Vec<*mut Value>) -> *mut Value {
     let mut values = Vec::with_capacity(maybes.len());
     for &m in &maybes {
         match unsafe { as_ref(m) } {
-            Value::Constructor(tag, _) if tag == "Nothing" => {
+            Value::Constructor(tag, _) if &**tag == "Nothing" => {
                 return alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit)));
             }
-            Value::Constructor(tag, inner) if tag == "Just" => {
+            Value::Constructor(tag, inner) if &**tag == "Just" => {
                 values.push(extract_value_field(*inner));
             }
             _ => panic!("knot runtime: traverse expected Maybe, got {}", type_name(m)),
@@ -3555,8 +3806,8 @@ fn traverse_sequence_result(results: Vec<*mut Value>) -> *mut Value {
     let mut values = Vec::with_capacity(results.len());
     for &r in &results {
         match unsafe { as_ref(r) } {
-            Value::Constructor(tag, _) if tag == "Err" => return r,
-            Value::Constructor(tag, inner) if tag == "Ok" => {
+            Value::Constructor(tag, _) if &**tag == "Err" => return r,
+            Value::Constructor(tag, inner) if &**tag == "Ok" => {
                 values.push(extract_value_field(*inner));
             }
             _ => panic!("knot runtime: traverse expected Result, got {}", type_name(r)),
@@ -3596,7 +3847,7 @@ fn extract_value_field(payload: *mut Value) -> *mut Value {
     match unsafe { as_ref(payload) } {
         Value::Record(fields) => {
             for f in fields {
-                if f.name == "value" {
+                if &*f.name == "value" {
                     return f.value;
                 }
             }
@@ -4147,12 +4398,12 @@ fn json_to_value(json: &serde_json::Value) -> *mut Value {
                 if let (Some(serde_json::Value::String(tag)), Some(val)) =
                     (obj.get("tag"), obj.get("value"))
                 {
-                    return alloc(Value::Constructor(tag.clone(), json_to_value(val)));
+                    return alloc(Value::Constructor(intern_str(tag), json_to_value(val)));
                 }
             }
             let mut fields: Vec<RecordField> = obj
                 .iter()
-                .map(|(k, v)| RecordField { name: k.clone(), value: json_to_value(v) })
+                .map(|(k, v)| RecordField { name: intern_str(k), value: json_to_value(v) })
                 .collect();
             fields.sort_by(|a, b| a.name.cmp(&b.name));
             alloc(Value::Record(fields))
@@ -4502,7 +4753,7 @@ pub extern "C" fn knot_source_migrate(
                 let row_ref = unsafe { as_ref(*row_ptr) };
                 if let Value::Constructor(tag, payload) = row_ref {
                     let mut params: Vec<rusqlite::types::Value> = Vec::new();
-                    params.push(rusqlite::types::Value::Text(tag.clone()));
+                    params.push(rusqlite::types::Value::Text(tag.to_string()));
                     let payload_fields = match unsafe { as_ref(*payload) } {
                         Value::Record(f) => f,
                         Value::Unit => &Vec::new() as &Vec<RecordField>,
@@ -4511,7 +4762,7 @@ pub extern "C" fn knot_source_migrate(
                     for f in &adt.all_fields {
                         let val = payload_fields
                             .iter()
-                            .find(|pf| pf.name == f.name)
+                            .find(|pf| &*pf.name == f.name.as_str())
                             .map(|pf| value_to_sql_param(pf.value))
                             .unwrap_or(rusqlite::types::Value::Null);
                         params.push(val);
@@ -4798,7 +5049,7 @@ fn read_sql_column(row: &rusqlite::Row, i: usize, ty: ColType) -> *mut Value {
         ColType::Tag => {
             // Read TEXT but reconstruct as a Constructor with Unit payload
             let tag: String = row.get(i).unwrap();
-            alloc(Value::Constructor(tag, alloc(Value::Unit)))
+            alloc(Value::Constructor(intern_str(&tag), alloc(Value::Unit)))
         }
         ColType::Json => {
             // Read TEXT and parse as JSON back into a Knot value (typically a relation)
@@ -5358,7 +5609,7 @@ pub extern "C" fn knot_source_read(
                     alloc(Value::Unit)
                 }
             };
-            rows.push(alloc(Value::Constructor(tag, payload)));
+            rows.push(alloc(Value::Constructor(intern_str(&tag), payload)));
         }
         alloc(Value::Relation(rows))
     } else {
@@ -5602,7 +5853,7 @@ pub extern "C" fn knot_source_read_where(
                 }
                 if has_fields { record } else { alloc(Value::Unit) }
             };
-            rows.push(alloc(Value::Constructor(tag, payload)));
+            rows.push(alloc(Value::Constructor(intern_str(&tag), payload)));
         }
         alloc(Value::Relation(rows))
     } else {
@@ -5943,10 +6194,10 @@ fn adt_row_to_params(
         Value::Constructor(tag, payload) => {
             let mut params = Vec::with_capacity(1 + adt.all_fields.len());
             // First column: _tag
-            params.push(rusqlite::types::Value::Text(tag.clone()));
+            params.push(rusqlite::types::Value::Text(tag.to_string()));
 
             // Find which fields belong to this constructor
-            let ctor = adt.constructors.iter().find(|c| c.name == *tag);
+            let ctor = adt.constructors.iter().find(|c| c.name.as_str() == &**tag);
             let ctor_field_names: HashSet<&str> = ctor
                 .map(|c| c.fields.iter().map(|f| f.name.as_str()).collect())
                 .unwrap_or_default();
@@ -5960,7 +6211,7 @@ fn adt_row_to_params(
                         Value::Record(fields) => {
                             let val = fields
                                 .iter()
-                                .find(|f| f.name == field.name)
+                                .find(|f| &*f.name == field.name.as_str())
                                 .map(|f| value_to_sqlite(f.value, field.ty))
                                 .unwrap_or(rusqlite::types::Value::Null);
                             params.push(val);
@@ -6102,7 +6353,7 @@ fn write_record_rows(
         };
 
         // Build field lookup map for O(1) access
-        let field_map: HashMap<&str, *mut Value> = fields.iter().map(|f| (f.name.as_str(), f.value)).collect();
+        let field_map: HashMap<&str, *mut Value> = fields.iter().map(|f| (&*f.name, f.value)).collect();
 
         // Build scalar params
         let params: Vec<rusqlite::types::Value> = schema.columns
@@ -6209,7 +6460,7 @@ fn write_child_rows(
             _ => panic!("knot runtime: child rows must be Records"),
         };
 
-        let field_map: HashMap<&str, *mut Value> = fields.iter().map(|f| (f.name.as_str(), f.value)).collect();
+        let field_map: HashMap<&str, *mut Value> = fields.iter().map(|f| (&*f.name, f.value)).collect();
 
         let mut params: Vec<rusqlite::types::Value> = vec![
             rusqlite::types::Value::Integer(parent_id),
@@ -6617,7 +6868,7 @@ pub extern "C" fn knot_source_diff_write(
         let rec_row_to_params = |row_ptr: *mut Value| -> Vec<rusqlite::types::Value> {
             match unsafe { as_ref(row_ptr) } {
                 Value::Record(fields) => cols.iter().map(|col| {
-                    let field = fields.iter().find(|f| f.name == col.name)
+                    let field = fields.iter().find(|f| &*f.name == col.name.as_str())
                         .unwrap_or_else(|| panic!("knot runtime: missing field '{}' in record", col.name));
                     value_to_sqlite(field.value, col.ty)
                 }).collect(),
@@ -6919,7 +7170,7 @@ fn value_to_sql_param(v: *mut Value) -> rusqlite::types::Value {
         Value::Text(s) => rusqlite::types::Value::Text(s.clone()),
         Value::Bool(b) => rusqlite::types::Value::Integer(*b as i64),
         Value::Bytes(b) => rusqlite::types::Value::Blob(b.clone()),
-        Value::Constructor(tag, _) => rusqlite::types::Value::Text(tag.clone()),
+        Value::Constructor(tag, _) => rusqlite::types::Value::Text(tag.to_string()),
         Value::Relation(_) | Value::Record(_) => {
             rusqlite::types::Value::Text(value_to_json(v))
         }
@@ -6941,9 +7192,9 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
         (Value::Bool(b), _) => rusqlite::types::Value::Integer(*b as i64),
         (Value::Bytes(b), _) => rusqlite::types::Value::Blob(b.clone()),
         (Value::Constructor(tag, _), ColType::Tag) => {
-            rusqlite::types::Value::Text(tag.clone())
+            rusqlite::types::Value::Text(tag.to_string())
         }
-        (Value::Constructor(tag, _), _) => rusqlite::types::Value::Text(tag.clone()),
+        (Value::Constructor(tag, _), _) => rusqlite::types::Value::Text(tag.to_string()),
         (Value::Relation(_), ColType::Json) => {
             rusqlite::types::Value::Text(value_to_json(v))
         }
@@ -7232,7 +7483,7 @@ pub extern "C" fn knot_source_read_at(
                 }
                 if has_fields { record } else { alloc(Value::Unit) }
             };
-            rows.push(alloc(Value::Constructor(tag, payload)));
+            rows.push(alloc(Value::Constructor(intern_str(&tag), payload)));
         }
         alloc(Value::Relation(rows))
     } else {
@@ -7288,12 +7539,12 @@ pub extern "C" fn knot_result_bind(
     result: *mut Value,
 ) -> *mut Value {
     match unsafe { as_ref(result) } {
-        Value::Constructor(tag, payload) if tag == "Ok" => {
+        Value::Constructor(tag, payload) if &**tag == "Ok" => {
             // Extract value from Ok {value: v}
             let v = knot_record_field(*payload, "value".as_ptr(), "value".len());
             knot_value_call(db, func, v)
         }
-        Value::Constructor(tag, _) if tag == "Err" => {
+        Value::Constructor(tag, _) if &**tag == "Err" => {
             // Propagate error
             result
         }
@@ -7306,9 +7557,9 @@ pub extern "C" fn knot_result_bind(
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_result_yield(value: *mut Value) -> *mut Value {
     let rec = alloc(Value::Record(vec![
-        RecordField { name: "value".to_string(), value },
+        RecordField { name: "value".into(), value },
     ]));
-    alloc(Value::Constructor("Ok".to_string(), rec))
+    alloc(Value::Constructor("Ok".into(), rec))
 }
 
 /// Result.empty: Result e a (always Err)
@@ -7317,13 +7568,13 @@ pub extern "C" fn knot_result_yield(value: *mut Value) -> *mut Value {
 pub extern "C" fn knot_result_empty() -> *mut Value {
     let violations = alloc(Value::Relation(Vec::new()));
     let error_rec = alloc(Value::Record(vec![
-        RecordField { name: "typeName".to_string(), value: alloc(Value::Text(String::new())) },
-        RecordField { name: "violations".to_string(), value: violations },
+        RecordField { name: "typeName".into(), value: alloc(Value::Text(String::new())) },
+        RecordField { name: "violations".into(), value: violations },
     ]));
     let err_rec = alloc(Value::Record(vec![
-        RecordField { name: "error".to_string(), value: error_rec },
+        RecordField { name: "error".into(), value: error_rec },
     ]));
-    alloc(Value::Constructor("Err".to_string(), err_rec))
+    alloc(Value::Constructor("Err".into(), err_rec))
 }
 
 // ── Refinement validation ─────────────────────────────────────────
@@ -7720,7 +7971,7 @@ pub extern "C" fn knot_record_update_batch(
     let mut upd_idx = 0;
 
     while base_idx < base_fields.len() && upd_idx < updates.len() {
-        let base_name = base_fields[base_idx].name.as_str();
+        let base_name: &str = &*base_fields[base_idx].name;
         let upd_name = updates[upd_idx].0;
         match base_name.cmp(upd_name) {
             std::cmp::Ordering::Less => {
@@ -7740,7 +7991,7 @@ pub extern "C" fn knot_record_update_batch(
             }
             std::cmp::Ordering::Greater => {
                 result.push(RecordField {
-                    name: updates[upd_idx].0.to_string(),
+                    name: intern_str(updates[upd_idx].0),
                     value: updates[upd_idx].1,
                 });
                 upd_idx += 1;
@@ -7756,7 +8007,7 @@ pub extern "C" fn knot_record_update_batch(
     }
     while upd_idx < updates.len() {
         result.push(RecordField {
-            name: updates[upd_idx].0.to_string(),
+            name: intern_str(updates[upd_idx].0),
             value: updates[upd_idx].1,
         });
         upd_idx += 1;
@@ -8054,11 +8305,12 @@ pub extern "C" fn knot_relation_rename_columns(
             };
             let new_rec = knot_record_empty(fields.len());
             for field in fields {
-                let new_name = renames
+                let field_name_str: &str = &*field.name;
+                let new_name: &str = renames
                     .iter()
-                    .find(|(old, _)| *old == field.name)
+                    .find(|(old, _)| **old == *field_name_str)
                     .map(|(_, new)| *new)
-                    .unwrap_or(&field.name);
+                    .unwrap_or(field_name_str);
                 let name_bytes = new_name.as_bytes();
                 knot_record_set_field(
                     new_rec,
@@ -8220,7 +8472,7 @@ pub extern "C" fn knot_constructor_matches(
     }
     let tag = unsafe { str_from_raw(tag_ptr, tag_len) };
     match unsafe { as_ref(v) } {
-        Value::Constructor(t, _) => (t == tag) as i32,
+        Value::Constructor(t, _) => (&**t == tag) as i32,
         // Text values can appear as implicit nullary constructors (e.g. from JSON deserialization)
         Value::Text(s) => (s.as_str() == tag) as i32,
         _ => 0,
@@ -8550,7 +8802,7 @@ fn string_to_value(s: &str, ty: &str) -> *mut Value {
             alloc_bool(b)
         }
         "tag" => {
-            alloc(Value::Constructor(s.to_string(), alloc(Value::Unit)))
+            alloc(Value::Constructor(intern_str(s), alloc(Value::Unit)))
         }
         _ => alloc(Value::Text(s.to_string())),
     }
@@ -8561,7 +8813,7 @@ fn string_to_value(s: &str, ty: &str) -> *mut Value {
 fn coerce_json_field(v: *mut Value, ty: &str) -> *mut Value {
     if ty == "tag" {
         if let Value::Text(s) = unsafe { as_ref(v) } {
-            return alloc(Value::Constructor(s.clone(), alloc(Value::Unit)));
+            return alloc(Value::Constructor(intern_str(s), alloc(Value::Unit)));
         }
     }
     v
@@ -8664,7 +8916,7 @@ fn value_to_serde_json(v: *mut Value) -> serde_json::Value {
         Value::Record(fields) => {
             let mut map = serde_json::Map::with_capacity(fields.len());
             for f in fields {
-                map.insert(f.name.clone(), value_to_serde_json(f.value));
+                map.insert(f.name.to_string(), value_to_serde_json(f.value));
             }
             serde_json::Value::Object(map)
         }
@@ -8673,11 +8925,11 @@ fn value_to_serde_json(v: *mut Value) -> serde_json::Value {
         }
         Value::Constructor(tag, payload) => {
             let mut map = serde_json::Map::with_capacity(2);
-            map.insert("tag".into(), serde_json::Value::String(tag.clone()));
+            map.insert("tag".into(), serde_json::Value::String(tag.to_string()));
             map.insert("value".into(), value_to_serde_json(*payload));
             serde_json::Value::Object(map)
         }
-        Value::Function(_, _, src) => serde_json::Value::String(format!("<function: {}>", src)),
+        Value::Function(f) => serde_json::Value::String(format!("<function: {}>", &*f.source)),
         Value::IO(_, _) => serde_json::Value::String("<<IO>>".into()),
         Value::Pair(_, _) => serde_json::Value::String("<<Pair>>".into()),
     }
@@ -8706,7 +8958,7 @@ fn value_to_json_with(db: *mut c_void, v: *mut Value, to_json_fn: *const u8) -> 
             for (i, f) in fields.iter().enumerate() {
                 if i > 0 { json.push(','); }
                 // Use serde to properly escape the field name
-                json.push_str(&serde_json::to_string(&f.name).unwrap());
+                json.push_str(&serde_json::to_string(&*f.name).unwrap());
                 json.push(':');
                 json.push_str(&call_to_json_dispatcher(db, f.value, to_json_fn));
             }
@@ -8724,7 +8976,7 @@ fn value_to_json_with(db: *mut c_void, v: *mut Value, to_json_fn: *const u8) -> 
         }
         Value::Constructor(tag, payload) => {
             let mut json = String::from("{\"tag\":");
-            json.push_str(&serde_json::to_string(tag).unwrap());
+            json.push_str(&serde_json::to_string(&**tag).unwrap());
             json.push_str(",\"value\":");
             json.push_str(&call_to_json_dispatcher(db, *payload, to_json_fn));
             json.push('}');
@@ -8785,11 +9037,11 @@ extern "C" fn respond_with_headers(
     let env = alloc(Value::Record(vec![
         RecordField { name: "body".into(), value: body },
     ]));
-    alloc(Value::Function(
-        respond_headers_inner as *const u8,
+    alloc(Value::Function(Box::new(FunctionInner {
+        fn_ptr: respond_headers_inner as *const u8,
         env,
-        "respond".to_string(),
-    ))
+        source: "respond".into(),
+    })))
 }
 
 extern "C" fn respond_headers_inner(
@@ -8920,7 +9172,7 @@ pub extern "C" fn knot_http_listen(
                             })
                             .unwrap_or("text");
                         fields.push(RecordField {
-                            name: name.clone(),
+                            name: intern_str(name),
                             value: string_to_value(val, ty),
                         });
                     }
@@ -8948,7 +9200,7 @@ pub extern "C" fn knot_http_listen(
                             string_to_value(raw_val.unwrap_or(""), inner_ty)
                         };
                         fields.push(RecordField {
-                            name: qname.clone(),
+                            name: intern_str(qname),
                             value,
                         });
                     }
@@ -8977,7 +9229,7 @@ pub extern "C" fn knot_http_listen(
                                     let is_maybe = bty.starts_with('?');
                                     let inner_ty = if is_maybe { &bty[1..] } else { bty.as_str() };
                                     let raw_val = body_fields.iter()
-                                        .find(|f| f.name == *bname)
+                                        .find(|f| &*f.name == bname.as_str())
                                         .map(|f| f.value);
                                     let value = if is_maybe {
                                         match raw_val {
@@ -8999,7 +9251,7 @@ pub extern "C" fn knot_http_listen(
                                         }
                                     };
                                     fields.push(RecordField {
-                                        name: bname.clone(),
+                                        name: intern_str(bname),
                                         value,
                                     });
                                 }
@@ -9013,7 +9265,7 @@ pub extern "C" fn knot_http_listen(
                                         string_to_value("", bty)
                                     };
                                     fields.push(RecordField {
-                                        name: bname.clone(),
+                                        name: intern_str(bname),
                                         value,
                                     });
                                 }
@@ -9047,14 +9299,14 @@ pub extern "C" fn knot_http_listen(
                             string_to_value(&v, inner_ty)
                         };
                         fields.push(RecordField {
-                            name: hname.clone(),
+                            name: intern_str(hname),
                             value,
                         });
                     }
 
                     // Validate refined body fields
                     for refinement in &entry_refinements {
-                        if let Some(field) = fields.iter().find(|f| f.name == refinement.field_name) {
+                        if let Some(field) = fields.iter().find(|f| &*f.name == refinement.field_name.as_str()) {
                             let check = knot_refinement_check_value(db, field.value, refinement.predicate);
                             if check == 0 {
                                 return Err((400, format!(
@@ -9069,27 +9321,27 @@ pub extern "C" fn knot_http_listen(
                     let has_resp_headers = !entry_response_headers.is_empty();
                     if has_resp_headers {
                         fields.push(RecordField {
-                            name: "respond".to_string(),
-                            value: alloc(Value::Function(
-                                respond_with_headers as *const u8,
-                                std::ptr::null_mut(),
-                                "respond".to_string(),
-                            )),
+                            name: "respond".into(),
+                            value: alloc(Value::Function(Box::new(FunctionInner {
+                                fn_ptr: respond_with_headers as *const u8,
+                                env: std::ptr::null_mut(),
+                                source: "respond".into(),
+                            }))),
                         });
                     } else {
                         fields.push(RecordField {
-                            name: "respond".to_string(),
-                            value: alloc(Value::Function(
-                                respond_identity as *const u8,
-                                std::ptr::null_mut(),
-                                "respond".to_string(),
-                            )),
+                            name: "respond".into(),
+                            value: alloc(Value::Function(Box::new(FunctionInner {
+                                fn_ptr: respond_identity as *const u8,
+                                env: std::ptr::null_mut(),
+                                source: "respond".into(),
+                            }))),
                         });
                     }
 
                     fields.sort_by(|a, b| a.name.cmp(&b.name));
                     let record = alloc(Value::Record(fields));
-                    let ctor_val = alloc(Value::Constructor(entry_constructor, record));
+                    let ctor_val = alloc(Value::Constructor(intern_str(&entry_constructor), record));
 
                     // Call handler
                     let mut result = knot_value_call(db, handler, ctor_val);
@@ -9382,7 +9634,7 @@ pub extern "C" fn knot_http_fetch_io(
                     // Maybe type: skip Nothing, extract Just value
                     if !field_val.is_null() {
                         if let Value::Constructor(tag, inner) = unsafe { as_ref(field_val) } {
-                            if tag == "Just" {
+                            if &**tag == "Just" {
                                 let v = knot_record_field(*inner, "value".as_ptr(), 5);
                                 request = request.set(&http_name, &fetch_value_to_text(v));
                             }
@@ -9467,7 +9719,7 @@ pub extern "C" fn knot_http_fetch_io(
                             string_to_value(&v, inner_ty)
                         };
                         hdr_fields.push(RecordField {
-                            name: name.to_string(),
+                            name: intern_str(name),
                             value,
                         });
                     }
@@ -9542,10 +9794,10 @@ fn unwrap_maybe(v: *mut Value) -> Option<*mut Value> {
         return None;
     }
     match unsafe { as_ref(v) } {
-        Value::Constructor(tag, inner) if tag == "Just" => {
+        Value::Constructor(tag, inner) if &**tag == "Just" => {
             Some(knot_record_field(*inner, "value".as_ptr(), 5))
         }
-        Value::Constructor(tag, _) if tag == "Nothing" => None,
+        Value::Constructor(tag, _) if &**tag == "Nothing" => None,
         _ => Some(v),
     }
 }
@@ -10107,11 +10359,11 @@ fn serialize_value_for_hash_into(v: *mut Value, buf: &mut Vec<u8>) {
                 buf.extend_from_slice(rb);
             }
         }
-        Value::Function(_, env, src) => {
+        Value::Function(f) => {
             buf.push(9);
-            buf.extend_from_slice(&(src.len() as u32).to_le_bytes());
-            buf.extend_from_slice(src.as_bytes());
-            serialize_value_for_hash_into(*env, buf);
+            buf.extend_from_slice(&(f.source.len() as u32).to_le_bytes());
+            buf.extend_from_slice(f.source.as_bytes());
+            serialize_value_for_hash_into(f.env, buf);
         }
         Value::IO(_, _) => {
             buf.push(11);
@@ -10397,4 +10649,29 @@ pub extern "C" fn knot_crypto_encrypt_io(public_key: *mut Value, plaintext: *mut
         knot_crypto_encrypt(public_key, plaintext)
     }
     alloc(Value::IO(thunk as *const u8, env))
+}
+
+#[cfg(test)]
+mod _size_tests {
+    use super::*;
+    /// Sanity-check the `Value` size assumption baked into `CHUNK_CAP`.
+    /// If this starts failing, re-evaluate `CHUNK_CAP`'s 20 KB/chunk target.
+    #[test]
+    fn value_size_fits_l1() {
+        let slot = std::mem::size_of::<std::mem::MaybeUninit<Value>>();
+        let chunk_bytes = CHUNK_CAP * slot;
+        assert!(chunk_bytes <= 32 * 1024,
+            "chunk size {} B exceeds 32 KB Intel L1D budget (sizeof(Value) = {})",
+            chunk_bytes, std::mem::size_of::<Value>());
+    }
+
+    /// Report sizes to stdout when run with --nocapture.  Useful for
+    /// tuning CHUNK_CAP or evaluating layout changes.
+    #[test]
+    fn report_sizes() {
+        eprintln!("sizeof(Value) = {}", std::mem::size_of::<Value>());
+        eprintln!("sizeof(RecordField) = {}", std::mem::size_of::<RecordField>());
+        eprintln!("sizeof(FunctionInner) = {}", std::mem::size_of::<FunctionInner>());
+        eprintln!("sizeof(Arc<str>) = {}", std::mem::size_of::<Arc<str>>());
+    }
 }

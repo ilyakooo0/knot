@@ -3615,6 +3615,16 @@ impl Codegen {
             ast::ExprKind::Do(stmts) => {
                 if self.is_io_do_block(stmts) {
                     self.compile_io_do(builder, stmts, env, db)
+                } else if self.in_io_eager
+                    && !stmts.iter().any(|s| matches!(&s.node, ast::StmtKind::Bind { .. }))
+                {
+                    // Pure do-block with no binds (no loops) nested inside
+                    // an IO eager context: compile eagerly so that `yield`
+                    // returns values directly instead of wrapping them in a
+                    // relation.  Bind-free do-blocks are just sequential
+                    // let/yield/where, which compile_io_do_eager handles
+                    // correctly.
+                    self.compile_io_do_eager(builder, stmts, env, db)
                 } else {
                     self.compile_do(builder, stmts, env, db)
                 }

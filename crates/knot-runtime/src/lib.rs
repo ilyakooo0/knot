@@ -8595,6 +8595,9 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
         (Value::Constructor(tag, _), ColType::Tag) => {
             rusqlite::types::Value::Text(tag.to_string())
         }
+        (Value::Constructor(_, _), ColType::Json) => {
+            rusqlite::types::Value::Text(value_to_json(v))
+        }
         (Value::Constructor(tag, _), _) => rusqlite::types::Value::Text(tag.to_string()),
         (Value::Relation(_), ColType::Json) => {
             rusqlite::types::Value::Text(value_to_json(v))

@@ -1430,6 +1430,10 @@ fn notify_relation_changed(name: &str) {
 /// Captures the version at first-read time as the baseline for retry.
 /// Skips the RwLock and allocation if already tracking this table.
 fn stm_track_read(name: &str) {
+    if name == "messages" {
+        eprintln!("[STM] track_read(messages), depth={}, thread: {:?}",
+            WRITE_LOCK_DEPTH.with(|d| d.get()), std::thread::current().id());
+    }
     let already = STM_READ_VERSIONS.with(|rv| rv.borrow().contains_key(name));
     if already {
         return;
@@ -4924,6 +4928,8 @@ pub extern "C" fn knot_stm_snapshot() -> i64 {
 /// can perform writes during the wait. Re-acquires after waking.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_stm_wait(_snapshot: i64) {
+    let tables: Vec<String> = STM_READ_VERSIONS.with(|rv| rv.borrow().keys().cloned().collect());
+    eprintln!("[STM] retry wait — watching tables: {:?}, thread: {:?}", tables, std::thread::current().id());
     // Release the write lock before any potential blocking so nested atomic
     // retries don't prevent other threads from writing.
     let saved_lock_depth = WRITE_LOCK_DEPTH.with(|d| {
@@ -9497,6 +9503,7 @@ pub extern "C" fn knot_atomic_commit(db: *mut c_void) {
     if depth == 1 {
         let written = STM_WRITTEN_TABLES.with(|wt| std::mem::take(&mut *wt.borrow_mut()));
         if !written.is_empty() {
+            eprintln!("[STM] commit — notifying tables: {:?}, thread: {:?}", written, std::thread::current().id());
             // Batch: read lock + atomic increment for existing tables
             let mut new_tables = Vec::new();
             {
@@ -10738,8 +10745,9 @@ pub extern "C" fn knot_http_listen(
         let method = request.method().as_str().to_string();
         let url = request.url().to_string();
 
+        eprintln!("[HTTP] <-- {} {}", method, url);
+
         if debug_enabled() {
-            eprintln!("[HTTP] <-- {} {}", method, url);
             for header in request.headers() {
                 eprintln!("[HTTP]     {}: {}", header.field, header.value);
             }

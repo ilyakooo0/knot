@@ -5623,18 +5623,7 @@ impl Codegen {
                     builder.seal_block(pass_block);
                 }
                 ast::StmtKind::Expr(expr) => {
-                    if let Some(inner) = expr.node.as_yield_arg() {
-                        let val = self.compile_expr(builder, inner, env, db);
-                        last_val = val;
-                    } else if self.expr_is_io(expr) {
-                        let val = self.compile_expr(builder, expr, env, db);
-                        // Run the IO action to get its result
-                        let result = self.call_rt(builder, "knot_io_run", &[db, val]);
-                        last_val = result;
-                    } else {
-                        let val = self.compile_expr(builder, expr, env, db);
-                        last_val = val;
-                    }
+                    last_val = self.compile_io_expr_eager(builder, expr, env, db);
                 }
                 ast::StmtKind::GroupBy { .. } => {
                     // groupBy doesn't make sense in IO do-blocks
@@ -5649,6 +5638,75 @@ impl Codegen {
 
         self.in_io_eager = prev_io_eager;
         done_param
+    }
+
+    /// Compile an expression eagerly in IO do-block context.
+    /// For if/else and case expressions, inlines IO do-block branches
+    /// directly (using compile_io_do_eager) instead of creating deferred
+    /// thunks. This avoids variable capture issues where captured vars
+    /// (from enclosing IO binds) resolve to wrong values at runtime.
+    /// For other expressions, compiles normally and runs knot_io_run.
+    fn compile_io_expr_eager(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        expr: &ast::Expr,
+        env: &mut Env,
+        db: Value,
+    ) -> Value {
+        if let Some(inner) = expr.node.as_yield_arg() {
+            return self.compile_expr(builder, inner, env, db);
+        }
+        if let ast::ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } = &expr.node
+        {
+            let cond_i32 = self.compile_condition(builder, cond, env, db);
+            let is_true =
+                builder.ins().icmp_imm(IntCC::NotEqual, cond_i32, 0);
+            let then_block = builder.create_block();
+            let else_block = builder.create_block();
+            let merge_block = builder.create_block();
+            builder.append_block_param(merge_block, self.ptr_type);
+            builder
+                .ins()
+                .brif(is_true, then_block, &[], else_block, &[]);
+
+            builder.switch_to_block(then_block);
+            builder.seal_block(then_block);
+            let then_val = self.compile_io_expr_eager(
+                builder,
+                then_branch,
+                &mut env.clone(),
+                db,
+            );
+            builder.ins().jump(merge_block, &[then_val]);
+
+            builder.switch_to_block(else_block);
+            builder.seal_block(else_block);
+            let else_val = self.compile_io_expr_eager(
+                builder,
+                else_branch,
+                &mut env.clone(),
+                db,
+            );
+            builder.ins().jump(merge_block, &[else_val]);
+
+            builder.switch_to_block(merge_block);
+            builder.seal_block(merge_block);
+            return builder.block_params(merge_block)[0];
+        }
+        if let ast::ExprKind::Do(stmts) = &expr.node {
+            if self.is_io_do_block(stmts) {
+                return self.compile_io_do_eager(builder, stmts, env, db);
+            }
+        }
+        // General case: compile and run knot_io_run — safe for non-IO
+        // values (returns as-is), necessary for higher-order functions
+        // whose IO callbacks aren't detectable by expr_is_io.
+        let val = self.compile_expr(builder, expr, env, db);
+        self.call_rt(builder, "knot_io_run", &[db, val])
     }
 
     /// Bind a pattern in an IO do-block context.

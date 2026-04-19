@@ -3338,12 +3338,15 @@ pub extern "C" fn knot_relation_union(
     a: *mut Value,
     b: *mut Value,
 ) -> *mut Value {
+    let empty = Vec::new();
     let rows_a = match unsafe { as_ref(a) } {
         Value::Relation(rows) => rows,
+        Value::Unit => &empty,
         _ => panic!("knot runtime: expected Relation in union, got {}", type_name(a)),
     };
     let rows_b = match unsafe { as_ref(b) } {
         Value::Relation(rows) => rows,
+        Value::Unit => &empty,
         _ => panic!("knot runtime: expected Relation in union, got {}", type_name(b)),
     };
 
@@ -3409,6 +3412,7 @@ pub extern "C" fn knot_relation_bind(
 ) -> *mut Value {
     let rows = match unsafe { as_ref(rel) } {
         Value::Relation(rows) => rows,
+        Value::Unit => return alloc(Value::Relation(Vec::new())),
         _ => panic!(
             "knot runtime: expected Relation in bind, got {}",
             type_name(rel)
@@ -4971,6 +4975,7 @@ pub extern "C" fn knot_relation_filter(
 ) -> *mut Value {
     let rows = match unsafe { as_ref(rel) } {
         Value::Relation(rows) => rows,
+        Value::Unit => return alloc(Value::Relation(Vec::new())),
         _ => panic!(
             "knot runtime: filter expected Relation, got {}",
             type_name(rel)
@@ -5029,6 +5034,7 @@ pub extern "C" fn knot_relation_map(
 ) -> *mut Value {
     let rows = match unsafe { as_ref(rel) } {
         Value::Relation(rows) => rows,
+        Value::Unit => return alloc(Value::Relation(Vec::new())),
         _ => panic!(
             "knot runtime: map expected Relation, got {}",
             type_name(rel)
@@ -5106,6 +5112,7 @@ pub extern "C" fn knot_relation_fold(
 ) -> *mut Value {
     let rows = match unsafe { as_ref(rel) } {
         Value::Relation(rows) => rows,
+        Value::Unit => return init,
         _ => panic!(
             "knot runtime: fold expected Relation, got {}",
             type_name(rel)
@@ -5131,6 +5138,7 @@ pub extern "C" fn knot_relation_traverse(
 ) -> *mut Value {
     let rows = match unsafe { as_ref(rel) } {
         Value::Relation(rows) => rows.clone(),
+        Value::Unit => Vec::new(),
         _ => panic!(
             "knot runtime: traverse expected Relation, got {}",
             type_name(rel)

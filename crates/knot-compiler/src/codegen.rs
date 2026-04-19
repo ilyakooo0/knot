@@ -2297,6 +2297,15 @@ impl Codegen {
                         builder.ins().iconst(types::I32, *runtime_tag);
                     let is_match =
                         builder.ins().icmp(IntCC::Equal, tag, tag_const);
+                    // Unit (tag 4) can appear where Relation (tag 6) is expected
+                    // (empty relation operations). Route Unit to Relation impls.
+                    let is_match = if *runtime_tag == 6 {
+                        let unit_tag = builder.ins().iconst(types::I32, 4);
+                        let is_unit = builder.ins().icmp(IntCC::Equal, tag, unit_tag);
+                        builder.ins().bor(is_match, is_unit)
+                    } else {
+                        is_match
+                    };
                     builder.ins().brif(
                         is_match,
                         impl_block,

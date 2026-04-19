@@ -1371,7 +1371,12 @@ fn notify_relation_changed(name: &str) {
 
 /// Record that a table was read inside an atomic block.
 /// Captures the version at first-read time as the baseline for retry.
+/// Skips the RwLock and allocation if already tracking this table.
 fn stm_track_read(name: &str) {
+    let already = STM_READ_VERSIONS.with(|rv| rv.borrow().contains_key(name));
+    if already {
+        return;
+    }
     let ver = TABLE_VERSIONS.read().unwrap().get(name).copied().unwrap_or(0);
     STM_READ_VERSIONS.with(|rv| {
         rv.borrow_mut().entry(name.to_string()).or_insert(ver);
@@ -9366,8 +9371,27 @@ pub extern "C" fn knot_atomic_commit(db: *mut c_void) {
     db_ref.atomic_depth.set(depth - 1);
     if depth == 1 {
         let written = STM_WRITTEN_TABLES.with(|wt| std::mem::take(&mut *wt.borrow_mut()));
-        for table in written {
-            notify_relation_changed(&table);
+        if !written.is_empty() {
+            // Batch: bump all versions under one write lock
+            {
+                let mut versions = TABLE_VERSIONS.write().unwrap();
+                for table in &written {
+                    *versions.entry(table.clone()).or_insert(0) += 1;
+                }
+            }
+            // Batch: wake all relevant watchers under one lock
+            let mut watchers = TABLE_WATCHERS.lock().unwrap();
+            for table in &written {
+                if let Some(slots) = watchers.get_mut(table.as_str()) {
+                    slots.retain(|weak| match weak.upgrade() {
+                        Some(slot) => {
+                            slot.wake();
+                            true
+                        }
+                        None => false,
+                    });
+                }
+            }
         }
     }
 }

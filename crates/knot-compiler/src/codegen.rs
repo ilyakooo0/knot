@@ -2523,7 +2523,7 @@ impl Codegen {
             let db = builder.block_params(entry)[0];
             for (i, pat) in params_owned.iter().enumerate() {
                 let val = builder.block_params(entry)[i + 1];
-                cg.bind_io_pattern(builder, pat, val, &mut env);
+                cg.bind_io_pattern(builder, pat, val, &mut env, None);
             }
 
             let result = cg.compile_expr(builder, &body_owned, &mut env, db);
@@ -2624,7 +2624,7 @@ impl Codegen {
             if let Some(ref pat) = param_pat {
                 match &pat.node {
                     ast::PatKind::Var(name) => env.set(name, arg),
-                    _ => cg.bind_io_pattern(builder, pat, arg, &mut env),
+                    _ => cg.bind_io_pattern(builder, pat, arg, &mut env, None),
                 }
             } else if params.len() == 1 {
                 env.set(&params[0], arg);
@@ -5531,6 +5531,11 @@ impl Codegen {
         self.in_io_eager = true;
         let mut last_val = self.call_rt(builder, "knot_value_unit", &[]);
 
+        // Create a done block for early exit on guard/pattern failures.
+        // Failed guards jump here with unit instead of panicking.
+        let done_block = builder.create_block();
+        let done_param = builder.append_block_param(done_block, self.ptr_type);
+
         for stmt in stmts {
             match &stmt.node {
                 ast::StmtKind::Bind { pat, expr } => {
@@ -5538,17 +5543,18 @@ impl Codegen {
                     // Run the IO action to get the result
                     let result = self.call_rt(builder, "knot_io_run", &[db, io_val]);
                     // Bind the result to the pattern
-                    self.bind_io_pattern(builder, pat, result, env);
+                    self.bind_io_pattern(builder, pat, result, env, Some(done_block));
                     last_val = result;
                 }
                 ast::StmtKind::Let { pat, expr } => {
                     let val = self.compile_expr(builder, expr, env, db);
-                    self.bind_io_pattern(builder, pat, val, env);
+                    self.bind_io_pattern(builder, pat, val, env, Some(done_block));
                     last_val = val;
                 }
                 ast::StmtKind::Where { cond } => {
-                    // In IO do-blocks, where acts as an assertion/guard:
-                    // if the condition is false, panic at runtime.
+                    // In IO do-blocks, where acts as a guard:
+                    // if the condition is false, skip remaining statements
+                    // and return unit.
                     let cond_i32 =
                         self.compile_condition(builder, cond, env, db);
                     let is_true =
@@ -5560,8 +5566,8 @@ impl Codegen {
                         .brif(is_true, pass_block, &[], fail_block, &[]);
                     builder.switch_to_block(fail_block);
                     builder.seal_block(fail_block);
-                    self.call_rt_void(builder, "knot_guard_failed", &[]);
-                    builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+                    let unit = self.call_rt(builder, "knot_value_unit", &[]);
+                    builder.ins().jump(done_block, &[unit]);
                     builder.switch_to_block(pass_block);
                     builder.seal_block(pass_block);
                 }
@@ -5585,17 +5591,25 @@ impl Codegen {
             }
         }
 
+        // Normal flow joins done_block with the final result
+        builder.ins().jump(done_block, &[last_val]);
+        builder.switch_to_block(done_block);
+        builder.seal_block(done_block);
+
         self.in_io_eager = prev_io_eager;
-        last_val
+        done_param
     }
 
-    /// Bind a pattern in an IO do-block context (no skip/filter blocks — just destructure).
+    /// Bind a pattern in an IO do-block context.
+    /// When `done_block` is Some, constructor mismatches jump there with unit
+    /// instead of panicking — the rest of the do-block is skipped.
     fn bind_io_pattern(
         &mut self,
         builder: &mut FunctionBuilder,
         pat: &ast::Pat,
         val: Value,
         env: &mut Env,
+        done_block: Option<cranelift_codegen::ir::Block>,
     ) {
         match &pat.node {
             ast::PatKind::Var(name) => {
@@ -5611,15 +5625,13 @@ impl Codegen {
                         &[val, field_ptr, field_len],
                     );
                     if let Some(ref inner_pat) = f.pattern {
-                        self.bind_io_pattern(builder, inner_pat, field_val, env);
+                        self.bind_io_pattern(builder, inner_pat, field_val, env, done_block);
                     } else {
                         env.bindings.insert(f.name.clone(), field_val);
                     }
                 }
             }
             ast::PatKind::Constructor { name, payload } => {
-                // Check if the constructor tag matches; panic on mismatch
-                // (IO do-blocks have no loop to skip to).
                 let is_match = match self.nullable_ctors.get(name).cloned() {
                     Some(NullableRole::None) => {
                         builder.ins().icmp_imm(IntCC::Equal, val, 0)
@@ -5645,8 +5657,13 @@ impl Codegen {
 
                 builder.switch_to_block(fail_block);
                 builder.seal_block(fail_block);
-                self.call_rt_void(builder, "knot_guard_failed", &[]);
-                builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+                if let Some(done) = done_block {
+                    let unit = self.call_rt(builder, "knot_value_unit", &[]);
+                    builder.ins().jump(done, &[unit]);
+                } else {
+                    self.call_rt_void(builder, "knot_guard_failed", &[]);
+                    builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+                }
 
                 builder.switch_to_block(then_block);
                 builder.seal_block(then_block);
@@ -5661,7 +5678,7 @@ impl Codegen {
                 } else {
                     self.call_rt(builder, "knot_constructor_payload", &[val])
                 };
-                self.bind_io_pattern(builder, payload, inner, env);
+                self.bind_io_pattern(builder, payload, inner, env, done_block);
             }
             ast::PatKind::Lit(_) => {
                 // Literal patterns don't bind anything
@@ -5671,7 +5688,7 @@ impl Codegen {
                     let index = builder.ins().iconst(self.ptr_type, idx as i64);
                     let elem =
                         self.call_rt(builder, "knot_relation_get", &[val, index]);
-                    self.bind_io_pattern(builder, elem_pat, elem, env);
+                    self.bind_io_pattern(builder, elem_pat, elem, env, done_block);
                 }
             }
         }
@@ -6185,7 +6202,7 @@ impl Codegen {
                             builder.switch_to_block(current_block);
                         }
                     } else {
-                        self.bind_io_pattern(builder, pat, val, env);
+                        self.bind_io_pattern(builder, pat, val, env, None);
                     }
                 }
 

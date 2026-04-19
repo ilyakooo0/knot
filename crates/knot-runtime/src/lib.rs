@@ -17,7 +17,7 @@ use std::ffi::c_void;
 use std::slice;
 #[cfg(feature = "gc-stats")]
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::time::Duration;
 
@@ -1304,8 +1304,9 @@ fn write_lock_guard() -> WriteLockGuard {
 
 // ── STM retry support ────────────────────────────────────────────
 
-/// Per-table version counters (RwLock for low-contention concurrent reads).
-static TABLE_VERSIONS: std::sync::LazyLock<RwLock<HashMap<String, u64>>> =
+/// Per-table version counters. RwLock guards the map structure; individual
+/// counters are `AtomicU64` so reads and increments avoid the write lock.
+static TABLE_VERSIONS: std::sync::LazyLock<RwLock<HashMap<String, Arc<AtomicU64>>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Per-thread wake slot for targeted retry notification.
@@ -1352,10 +1353,24 @@ thread_local! {
 
 /// Notify waiting `retry` callers that a specific relation has changed.
 /// Only wakes threads that registered interest in this table.
+/// Uses a read lock + atomic increment for existing tables (common case);
+/// falls back to a write lock only for the first write to a new table.
 fn notify_relation_changed(name: &str) {
-    {
+    let needs_insert = {
+        let versions = TABLE_VERSIONS.read().unwrap();
+        if let Some(v) = versions.get(name) {
+            v.fetch_add(1, Ordering::Release);
+            false
+        } else {
+            true
+        }
+    };
+    if needs_insert {
         let mut versions = TABLE_VERSIONS.write().unwrap();
-        *versions.entry(name.to_string()).or_insert(0) += 1;
+        versions
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .fetch_add(1, Ordering::Release);
     }
     let mut watchers = TABLE_WATCHERS.lock().unwrap();
     if let Some(slots) = watchers.get_mut(name) {
@@ -1377,7 +1392,12 @@ fn stm_track_read(name: &str) {
     if already {
         return;
     }
-    let ver = TABLE_VERSIONS.read().unwrap().get(name).copied().unwrap_or(0);
+    let ver = TABLE_VERSIONS
+        .read()
+        .unwrap()
+        .get(name)
+        .map(|v| v.load(Ordering::Acquire))
+        .unwrap_or(0);
     STM_READ_VERSIONS.with(|rv| {
         rv.borrow_mut().entry(name.to_string()).or_insert(ver);
     });
@@ -1385,7 +1405,12 @@ fn stm_track_read(name: &str) {
 
 /// Record that a table was written inside an atomic block.
 /// The actual notification is deferred to commit.
+/// Skips the allocation if already tracking this table.
 fn stm_track_write(name: &str) {
+    let already = STM_WRITTEN_TABLES.with(|wt| wt.borrow().contains(name));
+    if already {
+        return;
+    }
     STM_WRITTEN_TABLES.with(|wt| {
         wt.borrow_mut().insert(name.to_string());
     });
@@ -4850,31 +4875,42 @@ pub extern "C" fn knot_stm_snapshot() -> i64 {
 
 /// Wait until a table in the read set has been modified since we read it.
 /// Registers a per-thread wake slot so only writes to watched tables cause a wakeup.
+/// Avoids cloning the read-version map on fast paths (empty / already changed).
 /// The `_snapshot` parameter is unused but kept for ABI compatibility.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_stm_wait(_snapshot: i64) {
-    let read_versions = STM_READ_VERSIONS.with(|rv| rv.borrow().clone());
-    if read_versions.is_empty() {
+    let is_empty = STM_READ_VERSIONS.with(|rv| rv.borrow().is_empty());
+    if is_empty {
         std::thread::sleep(Duration::from_millis(100));
         return;
     }
 
-    // Fast path: already changed since we read
-    {
+    // Fast path: check if already changed without cloning the map
+    let already_changed = STM_READ_VERSIONS.with(|rv| {
+        let rv = rv.borrow();
         let versions = TABLE_VERSIONS.read().unwrap();
-        if read_versions
-            .iter()
-            .any(|(table, ver)| versions.get(table).copied().unwrap_or(0) > *ver)
-        {
-            return;
-        }
+        rv.iter().any(|(table, ver)| {
+            versions
+                .get(table)
+                .map(|v| v.load(Ordering::Acquire))
+                .unwrap_or(0)
+                > *ver
+        })
+    });
+    if already_changed {
+        return;
     }
+
+    // Need to register — collect into a Vec (cheaper than HashMap clone)
+    let read_versions: Vec<(String, u64)> = STM_READ_VERSIONS.with(|rv| {
+        rv.borrow().iter().map(|(k, v)| (k.clone(), *v)).collect()
+    });
 
     // Register a wake slot with each watched table
     let slot = Arc::new(WakeSlot::new());
     {
         let mut watchers = TABLE_WATCHERS.lock().unwrap();
-        for table in read_versions.keys() {
+        for (table, _) in &read_versions {
             watchers
                 .entry(table.clone())
                 .or_default()
@@ -4885,10 +4921,13 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
     // Re-check after registration to prevent lost wakeups
     {
         let versions = TABLE_VERSIONS.read().unwrap();
-        if read_versions
-            .iter()
-            .any(|(table, ver)| versions.get(table).copied().unwrap_or(0) > *ver)
-        {
+        if read_versions.iter().any(|(table, ver)| {
+            versions
+                .get(table)
+                .map(|v| v.load(Ordering::Acquire))
+                .unwrap_or(0)
+                > *ver
+        }) {
             return;
         }
     }
@@ -9372,11 +9411,26 @@ pub extern "C" fn knot_atomic_commit(db: *mut c_void) {
     if depth == 1 {
         let written = STM_WRITTEN_TABLES.with(|wt| std::mem::take(&mut *wt.borrow_mut()));
         if !written.is_empty() {
-            // Batch: bump all versions under one write lock
+            // Batch: read lock + atomic increment for existing tables
+            let mut new_tables = Vec::new();
             {
-                let mut versions = TABLE_VERSIONS.write().unwrap();
+                let versions = TABLE_VERSIONS.read().unwrap();
                 for table in &written {
-                    *versions.entry(table.clone()).or_insert(0) += 1;
+                    if let Some(v) = versions.get(table.as_str()) {
+                        v.fetch_add(1, Ordering::Release);
+                    } else {
+                        new_tables.push(table.clone());
+                    }
+                }
+            }
+            // Write lock only for newly seen tables (rare at steady state)
+            if !new_tables.is_empty() {
+                let mut versions = TABLE_VERSIONS.write().unwrap();
+                for table in new_tables {
+                    versions
+                        .entry(table)
+                        .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                        .fetch_add(1, Ordering::Release);
                 }
             }
             // Batch: wake all relevant watchers under one lock

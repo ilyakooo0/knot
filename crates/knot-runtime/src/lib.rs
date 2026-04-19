@@ -1349,6 +1349,48 @@ thread_local! {
     static STM_READ_VERSIONS: RefCell<HashMap<String, u64>> = RefCell::new(HashMap::new());
     /// Tables written during current atomic block (notification deferred to commit).
     static STM_WRITTEN_TABLES: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    /// Stack of saved (read_versions, written_tables) for nested atomic blocks.
+    /// Pushed before inner atomic's loop, popped/merged on inner commit.
+    static STM_TRACKING_STACK: RefCell<Vec<(HashMap<String, u64>, HashSet<String>)>> = RefCell::new(Vec::new());
+}
+
+/// Save current STM read/write tracking onto a stack (for nested atomics).
+/// Called before a nested atomic's retry loop so inner snapshot/retry
+/// doesn't destroy outer tracking state.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_stm_push() {
+    let reads = STM_READ_VERSIONS.with(|rv| rv.borrow().clone());
+    let writes = STM_WRITTEN_TABLES.with(|wt| wt.borrow().clone());
+    STM_TRACKING_STACK.with(|stack| {
+        stack.borrow_mut().push((reads, writes));
+    });
+}
+
+/// Pop saved STM tracking from the stack and merge inner tracking into it.
+/// Called after a nested atomic commits to restore outer read/write sets
+/// combined with inner reads/writes.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_stm_pop_merge() {
+    let (saved_reads, saved_writes) = STM_TRACKING_STACK.with(|stack| {
+        stack
+            .borrow_mut()
+            .pop()
+            .expect("knot runtime: STM tracking stack underflow")
+    });
+    // Merge: outer reads + inner reads (keep earliest version per table)
+    STM_READ_VERSIONS.with(|rv| {
+        let mut rv = rv.borrow_mut();
+        for (table, ver) in saved_reads {
+            rv.entry(table).or_insert(ver);
+        }
+    });
+    // Merge: outer writes + inner writes
+    STM_WRITTEN_TABLES.with(|wt| {
+        let mut wt = wt.borrow_mut();
+        for table in saved_writes {
+            wt.insert(table);
+        }
+    });
 }
 
 /// Notify waiting `retry` callers that a specific relation has changed.
@@ -4877,11 +4919,35 @@ pub extern "C" fn knot_stm_snapshot() -> i64 {
 /// Registers a per-thread wake slot so only writes to watched tables cause a wakeup.
 /// Avoids cloning the read-version map on fast paths (empty / already changed).
 /// The `_snapshot` parameter is unused but kept for ABI compatibility.
+///
+/// Releases the write lock (if held) before blocking so that other threads
+/// can perform writes during the wait. Re-acquires after waking.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_stm_wait(_snapshot: i64) {
+    // Release the write lock before any potential blocking so nested atomic
+    // retries don't prevent other threads from writing.
+    let saved_lock_depth = WRITE_LOCK_DEPTH.with(|d| {
+        let depth = d.get();
+        if depth > 0 {
+            d.set(0);
+            WRITE_LOCKED.store(false, Ordering::Release);
+        }
+        depth
+    });
+
     let is_empty = STM_READ_VERSIONS.with(|rv| rv.borrow().is_empty());
     if is_empty {
         std::thread::sleep(Duration::from_millis(100));
+        // Re-acquire write lock if we held it
+        if saved_lock_depth > 0 {
+            while WRITE_LOCKED
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                std::thread::yield_now();
+            }
+            WRITE_LOCK_DEPTH.with(|d| d.set(saved_lock_depth));
+        }
         return;
     }
 
@@ -4898,6 +4964,15 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
         })
     });
     if already_changed {
+        if saved_lock_depth > 0 {
+            while WRITE_LOCKED
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                std::thread::yield_now();
+            }
+            WRITE_LOCK_DEPTH.with(|d| d.set(saved_lock_depth));
+        }
         return;
     }
 
@@ -4919,21 +4994,32 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
     }
 
     // Re-check after registration to prevent lost wakeups
-    {
+    let changed_after_register = {
         let versions = TABLE_VERSIONS.read().unwrap();
-        if read_versions.iter().any(|(table, ver)| {
+        read_versions.iter().any(|(table, ver)| {
             versions
                 .get(table)
                 .map(|v| v.load(Ordering::Acquire))
                 .unwrap_or(0)
                 > *ver
-        }) {
-            return;
-        }
+        })
+    };
+
+    if !changed_after_register {
+        slot.wait(Duration::from_millis(100));
+        // slot drops → Weak refs become invalid, cleaned up lazily in notify
     }
 
-    slot.wait(Duration::from_millis(100));
-    // slot drops → Weak refs become invalid, cleaned up lazily in notify
+    // Re-acquire write lock if we held it before waiting
+    if saved_lock_depth > 0 {
+        while WRITE_LOCKED
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::thread::yield_now();
+        }
+        WRITE_LOCK_DEPTH.with(|d| d.set(saved_lock_depth));
+    }
 }
 
 // ── IO wrappers for effectful functions ──────────────────────────

@@ -145,6 +145,11 @@ pub struct Codegen {
     // the raw inner value rather than wrapping in knot_relation_singleton.
     in_io_eager: bool,
 
+    // Current atomic retry block — when compiling inside an `atomic` body,
+    // this is the block that `retry` jumps to (rollback + wait + loop).
+    // Used to short-circuit execution on retry instead of flag-based checking.
+    atomic_retry_block: Option<cranelift_codegen::ir::Block>,
+
     // Refined type predicates: type_name -> predicate AST expression
     refined_types: HashMap<String, knot::ast::Expr>,
     // Source refinements: source_name -> [(field_name_or_none, type_name, predicate_expr)]
@@ -420,6 +425,7 @@ impl Codegen {
             io_functions: HashSet::new(),
             scalar_sources: HashSet::new(),
             in_io_eager: false,
+            atomic_retry_block: None,
             refined_types: HashMap::new(),
             refine_targets: HashMap::new(),
             refined_predicate_fns: HashMap::new(),
@@ -695,6 +701,8 @@ impl Codegen {
         self.declare_rt("knot_stm_check_and_clear", &[], &[types::I32]);
         self.declare_rt("knot_stm_snapshot", &[], &[types::I64]);
         self.declare_rt("knot_stm_wait", &[types::I64], &[]);
+        self.declare_rt("knot_stm_push", &[], &[]);
+        self.declare_rt("knot_stm_pop_merge", &[], &[]);
 
         // HTTP server (routes)
         self.declare_rt("knot_route_table_new", &[], &[p]);
@@ -3233,6 +3241,17 @@ impl Codegen {
                     return self.call_rt(builder, "knot_read_line_io", &[]);
                 }
                 if name == "retry" {
+                    if let Some(retry_block) = self.atomic_retry_block {
+                        // Jump directly to the retry path, short-circuiting
+                        // all subsequent code in the atomic body.
+                        builder.ins().jump(retry_block, &[]);
+                        // Create an unreachable block so subsequent codegen
+                        // has somewhere to emit instructions (dead code).
+                        let dead = builder.create_block();
+                        builder.switch_to_block(dead);
+                        builder.seal_block(dead);
+                        return self.call_rt(builder, "knot_value_unit", &[]);
+                    }
                     return self.call_rt(builder, "knot_stm_retry", &[]);
                 }
                 if let Some(&val) = env.bindings.get(name) {
@@ -3894,6 +3913,14 @@ impl Codegen {
             }
 
             ast::ExprKind::Atomic(inner) => {
+                let is_nested = self.atomic_retry_block.is_some();
+
+                // For nested atomics, save outer STM tracking before the loop
+                // so inner snapshot/retry doesn't destroy outer read/write sets.
+                if is_nested {
+                    self.call_rt_void(builder, "knot_stm_push", &[]);
+                }
+
                 // Retry loop: if `retry` is called inside, rollback and wait for changes
                 let loop_block = builder.create_block();
                 let retry_block = builder.create_block();
@@ -3907,6 +3934,11 @@ impl Codegen {
                 // Snapshot change counter before executing the body
                 let snapshot = self.call_rt(builder, "knot_stm_snapshot", &[]);
                 self.call_rt_void(builder, "knot_atomic_begin", &[db]);
+
+                // Set retry block so `retry` keyword can jump directly here,
+                // short-circuiting execution instead of using a flag.
+                let prev_retry_block = self.atomic_retry_block;
+                self.atomic_retry_block = Some(retry_block);
 
                 // Compile inner IO eagerly so side effects run inside the transaction.
                 // If the inner is an IO do-block, we must run it inline rather than
@@ -3924,11 +3956,15 @@ impl Codegen {
                     self.call_rt(builder, "knot_io_run", &[db, io_val])
                 };
 
-                // Check if retry was requested
+                self.atomic_retry_block = prev_retry_block;
+
+                // Check if retry was requested (safety net for edge cases)
                 let retry_flag = self.call_rt(builder, "knot_stm_check_and_clear", &[]);
                 builder.ins().brif(retry_flag, retry_block, &[], done_block, &[val]);
 
-                // Retry: rollback, wait for relation changes, loop back
+                // Retry: rollback, wait for relation changes, loop back.
+                // Seal retry_block here — after all jumps to it (from `retry`
+                // sites inside the body and from the brif above) are emitted.
                 builder.switch_to_block(retry_block);
                 builder.seal_block(retry_block);
                 self.call_rt_void(builder, "knot_atomic_rollback", &[db]);
@@ -3943,6 +3979,12 @@ impl Codegen {
                 builder.seal_block(done_block);
                 let result = builder.block_params(done_block)[0];
                 self.call_rt_void(builder, "knot_atomic_commit", &[db]);
+
+                // For nested atomics, restore outer tracking and merge inner
+                if is_nested {
+                    self.call_rt_void(builder, "knot_stm_pop_merge", &[]);
+                }
+
                 result
             }
 

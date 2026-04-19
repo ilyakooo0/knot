@@ -2606,7 +2606,7 @@ pub extern "C" fn knot_record_field(
             // After groupBy, field access on a group relation delegates to first element.
             // All elements in a group share the key fields, so this is well-defined.
             if rows.is_empty() {
-                return alloc(Value::Unit);
+                return alloc(Value::Relation(vec![]));
             }
             knot_record_field(rows[0], key_ptr, key_len)
         }

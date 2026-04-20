@@ -3730,11 +3730,13 @@ impl Codegen {
                             &[db, name_ptr, name_len, schema_ptr, schema_len, val],
                         );
                     } else if !schema.contains('[')
+                        && !self.source_refinements.contains_key(name)
                         && let Some((bind_var, cond, update_fields)) =
                             Self::match_conditional_update(name, value)
                     {
                         // 3. Conditional update: do { t <- *rel; yield (if cond then {t | ...} else t) }
                         //    Try SQL UPDATE WHERE (skip for nested relations — child tables need full rewrite)
+                        //    Skip when source has refinements — SQL bypasses Knot-level validation
                         let where_frag = Self::try_compile_sql_expr(&bind_var, cond);
                         let set_frag = where_frag.as_ref().and_then(|_| {
                             let mut parts = Vec::new();

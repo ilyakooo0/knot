@@ -40,7 +40,7 @@ fn detect_io_functions(decls: &[Decl]) -> HashSet<String> {
     let io_builtins: HashSet<&str> = [
         "println", "putLine", "print", "readLine", "readFile",
         "writeFile", "appendFile", "fileExists", "removeFile",
-        "listDir", "now", "randomInt", "randomFloat", "fetch", "fetchWith",
+        "listDir", "now", "sleep", "randomInt", "randomFloat", "fetch", "fetchWith",
         "fork", "listen", "generateKeyPair", "generateSigningKeyPair", "encrypt",
     ].into_iter().collect();
 

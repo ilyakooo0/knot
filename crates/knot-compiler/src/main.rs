@@ -58,6 +58,9 @@ fn cmd_build(source_file: &str) {
         for diag in &lex_diags {
             eprintln!("{}", diag.render(&source, &filename));
         }
+        if lex_diags.iter().any(|d| d.severity == knot::diagnostic::Severity::Error) {
+            process::exit(1);
+        }
     }
 
     // Parse

@@ -2647,7 +2647,22 @@ impl Codegen {
                 env.set(&params[0], arg);
             }
 
-            let result = cg.compile_expr(builder, &body, &mut env, db);
+            // If the body is an IO do-block, compile it eagerly inline
+            // instead of creating a deferred thunk. This avoids the
+            // variable capture mechanism: binds within the do-block
+            // create SSA values directly in this function, so later
+            // statements can use them without going through a closure env.
+            // The lambda executes IO when called; the caller's knot_io_run
+            // on the result is a no-op (returns non-IO values as-is).
+            let result = if let ast::ExprKind::Do(stmts) = &body.node {
+                if cg.is_io_do_block(stmts) {
+                    cg.compile_io_do_eager(builder, stmts, &mut env, db)
+                } else {
+                    cg.compile_expr(builder, &body, &mut env, db)
+                }
+            } else {
+                cg.compile_expr(builder, &body, &mut env, db)
+            };
             builder.ins().return_(&[result]);
         });
     }

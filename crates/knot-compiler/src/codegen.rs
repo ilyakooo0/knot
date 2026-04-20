@@ -3694,6 +3694,11 @@ impl Codegen {
                     // Scalar source: wrap value as [{_value: val}] and do a full write
                     if self.scalar_sources.contains(name) {
                         let val = self.compile_set_value_expr(builder, value, env, db);
+                        // Validate refinements on the raw value (wrap as [val] for the check)
+                        if self.source_refinements.contains_key(name) {
+                            let singleton = self.call_rt(builder, "knot_relation_singleton", &[val]);
+                            self.emit_refinement_checks(builder, name, singleton, env, db);
+                        }
                         let wrapped = self.call_rt(builder, "knot_scalar_source_wrap", &[val]);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
                         let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
@@ -3907,6 +3912,11 @@ impl Codegen {
                     // Scalar source: wrap value as [{_value: val}] and do a full write
                     if self.scalar_sources.contains(name) {
                         let val = self.compile_set_value_expr(builder, value, env, db);
+                        // Validate refinements on the raw value (wrap as [val] for the check)
+                        if self.source_refinements.contains_key(name) {
+                            let singleton = self.call_rt(builder, "knot_relation_singleton", &[val]);
+                            self.emit_refinement_checks(builder, name, singleton, env, db);
+                        }
                         let wrapped = self.call_rt(builder, "knot_scalar_source_wrap", &[val]);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
                         let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
@@ -5498,7 +5508,7 @@ impl Codegen {
             ast::ExprKind::Lambda { body, .. } => self.expr_is_io(body),
             ast::ExprKind::UnitLit { value, .. } => self.expr_is_io(value),
             ast::ExprKind::Annot { expr, .. } => self.expr_is_io(expr),
-            ast::ExprKind::Refine(_) => false,
+            ast::ExprKind::Refine(inner) => self.expr_is_io(inner),
             _ => false,
         }
     }

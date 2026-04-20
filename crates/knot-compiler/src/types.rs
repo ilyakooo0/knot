@@ -64,12 +64,15 @@ impl TypeEnv {
         let mut history_sources = HashSet::new();
 
         let mut refined_types: HashMap<String, Expr> = HashMap::new();
+        // Original AST types for aliases — used to resolve refinements through aliases
+        let mut alias_ast_types: HashMap<String, Type> = HashMap::new();
 
         // First pass: collect type aliases and data types
         for decl in &module.decls {
             match &decl.node {
                 DeclKind::TypeAlias { name, params, ty } => {
                     if params.is_empty() {
+                        alias_ast_types.insert(name.clone(), ty.clone());
                         // Track refined type aliases separately
                         if let TypeKind::Refined { base, predicate } = &ty.node {
                             refined_types.insert(name.clone(), (**predicate).clone());
@@ -195,7 +198,7 @@ impl TypeEnv {
                         history_sources.insert(name.clone());
                     }
                     // Collect refined field info from the source type
-                    let refinements = collect_source_refinements(ty, &refined_types, &aliases);
+                    let refinements = collect_source_refinements(ty, &refined_types, &alias_ast_types);
                     if !refinements.is_empty() {
                         source_refinements.insert(name.clone(), refinements);
                     }
@@ -250,7 +253,7 @@ impl TypeEnv {
 fn collect_source_refinements(
     ty: &Type,
     refined_types: &HashMap<String, Expr>,
-    aliases: &HashMap<String, ResolvedType>,
+    alias_ast_types: &HashMap<String, Type>,
 ) -> Vec<(Option<String>, String, Expr)> {
     let mut result = Vec::new();
     // Unwrap [T] to get to the element type
@@ -262,6 +265,13 @@ fn collect_source_refinements(
         // Element type is a refined type alias: *scores : [Nat]
         TypeKind::Named(name) if refined_types.contains_key(name) => {
             result.push((None, name.clone(), refined_types[name].clone()));
+        }
+        // Element type is a type alias: *people : [Person]
+        // Resolve through the alias to find refined fields in the underlying record.
+        TypeKind::Named(name) if alias_ast_types.contains_key(name) => {
+            let alias_ty = &alias_ast_types[name];
+            let inner_ty = Spanned::new(TypeKind::Relation(Box::new(alias_ty.clone())), ty.span);
+            result.extend(collect_source_refinements(&inner_ty, refined_types, alias_ast_types));
         }
         // Element type is a record: check each field
         TypeKind::Record { fields, .. } => {
@@ -293,7 +303,7 @@ fn collect_source_refinements(
             result.push((None, "record".into(), (**predicate).clone()));
             // Recurse into the base to collect field-level refinements
             let inner_ty = Spanned::new(TypeKind::Relation(base.clone()), ty.span);
-            result.extend(collect_source_refinements(&inner_ty, refined_types, aliases));
+            result.extend(collect_source_refinements(&inner_ty, refined_types, alias_ast_types));
         }
         _ => {}
     }
@@ -460,7 +470,12 @@ fn schema_for_source(
     aliases: &HashMap<String, ResolvedType>,
     assoc_types: &HashMap<String, Vec<AssocTypeDef>>,
 ) -> String {
-    match &ty.node {
+    // Unwrap Effectful/Refined wrappers to find the underlying type
+    let unwrapped = match &ty.node {
+        TypeKind::Effectful { ty: inner, .. } | TypeKind::Refined { base: inner, .. } => inner.as_ref(),
+        _ => ty,
+    };
+    match &unwrapped.node {
         TypeKind::Relation(inner) => {
             let resolved = resolve_type(inner, aliases, assoc_types);
             schema_descriptor(&resolved)
@@ -468,7 +483,7 @@ fn schema_for_source(
         _ => {
             // Non-relation source type (e.g. `*counter : Int`):
             // wrap as a single-column `_value` schema.
-            let resolved = resolve_type(ty, aliases, assoc_types);
+            let resolved = resolve_type(unwrapped, aliases, assoc_types);
             format!("_value:{}", col_type_str(&resolved))
         }
     }

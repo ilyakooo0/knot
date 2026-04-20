@@ -55,37 +55,41 @@ pub type FromJsonTargets = HashMap<Span, String>;
 type UnitVar = u32;
 
 /// Normalized unit: a product of base-unit powers, e.g. m^1 * s^-2.
-/// Dimensionless = empty map.
+/// Dimensionless = empty map.  Unit variables track polymorphic units
+/// with arbitrary exponents, e.g. `u^2` or `u^-1`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UnitTy {
     /// base_unit_name -> exponent
     bases: BTreeMap<String, i32>,
-    /// Unit variable for polymorphism
-    var: Option<UnitVar>,
+    /// Unit variables with exponents for polymorphism (e.g. u^1, u^-1, u^2)
+    vars: BTreeMap<UnitVar, i32>,
 }
 
 #[allow(dead_code)]
 impl UnitTy {
     fn dimensionless() -> Self {
-        UnitTy { bases: BTreeMap::new(), var: None }
+        UnitTy { bases: BTreeMap::new(), vars: BTreeMap::new() }
     }
 
     fn named(name: &str) -> Self {
         let mut bases = BTreeMap::new();
         bases.insert(name.to_string(), 1);
-        UnitTy { bases, var: None }
+        UnitTy { bases, vars: BTreeMap::new() }
     }
 
     fn var(v: UnitVar) -> Self {
-        UnitTy { bases: BTreeMap::new(), var: Some(v) }
+        let mut vars = BTreeMap::new();
+        vars.insert(v, 1);
+        UnitTy { bases: BTreeMap::new(), vars }
     }
 
     fn is_dimensionless(&self) -> bool {
-        self.bases.is_empty() && self.var.is_none()
+        self.bases.is_empty() && self.vars.is_empty()
     }
 
     fn normalize(&mut self) {
         self.bases.retain(|_, exp| *exp != 0);
+        self.vars.retain(|_, exp| *exp != 0);
     }
 
     fn mul(&self, other: &UnitTy) -> UnitTy {
@@ -93,10 +97,8 @@ impl UnitTy {
         for (name, exp) in &other.bases {
             *result.bases.entry(name.clone()).or_insert(0) += exp;
         }
-        // If both have variables, we can't compose them simply — this would
-        // be caught as an error during unification.
-        if result.var.is_none() {
-            result.var = other.var;
+        for (&v, &exp) in &other.vars {
+            *result.vars.entry(v).or_insert(0) += exp;
         }
         result.normalize();
         result
@@ -107,15 +109,8 @@ impl UnitTy {
         for (name, exp) in &other.bases {
             *result.bases.entry(name.clone()).or_insert(0) -= exp;
         }
-        if result.var.is_none() {
-            result.var = other.var.map(|_| {
-                // Dividing by a unit variable requires negation — not representable
-                // in our simple model. We'll leave var as None and let unification
-                // handle the error if needed.
-                0 // placeholder
-            });
-            // Actually, just leave var as None for division by variable
-            result.var = None;
+        for (&v, &exp) in &other.vars {
+            *result.vars.entry(v).or_insert(0) -= exp;
         }
         result.normalize();
         result
@@ -124,6 +119,9 @@ impl UnitTy {
     fn pow(&self, n: i32) -> UnitTy {
         let mut result = self.clone();
         for exp in result.bases.values_mut() {
+            *exp *= n;
+        }
+        for exp in result.vars.values_mut() {
             *exp *= n;
         }
         result.normalize();
@@ -152,8 +150,20 @@ impl UnitTy {
                 }
             }
         }
-        if let Some(v) = self.var {
-            num_parts.push(format!("?u{}", v));
+        for (&v, &exp) in &self.vars {
+            if exp > 0 {
+                if exp == 1 {
+                    num_parts.push(format!("?u{}", v));
+                } else {
+                    num_parts.push(format!("?u{}^{}", v, exp));
+                }
+            } else if exp < 0 {
+                if exp == -1 {
+                    den_parts.push(format!("?u{}", v));
+                } else {
+                    den_parts.push(format!("?u{}^{}", v, -exp));
+                }
+            }
         }
         if den_parts.is_empty() {
             if num_parts.is_empty() {
@@ -436,21 +446,29 @@ impl Infer {
     }
 
     fn apply_unit(&self, u: &UnitTy) -> UnitTy {
-        match u.var {
-            Some(v) => {
-                if let Some(resolved) = self.unit_subst.get(&v) {
-                    let mut result = u.clone();
-                    result.var = resolved.var;
-                    for (name, exp) in &resolved.bases {
-                        *result.bases.entry(name.clone()).or_insert(0) += exp;
-                    }
-                    result.normalize();
-                    self.apply_unit(&result)
-                } else {
-                    u.clone()
+        if u.vars.is_empty() {
+            return u.clone();
+        }
+        let mut result = UnitTy { bases: u.bases.clone(), vars: BTreeMap::new() };
+        let mut changed = false;
+        for (&v, &exp) in &u.vars {
+            if let Some(resolved) = self.unit_subst.get(&v) {
+                changed = true;
+                for (name, &base_exp) in &resolved.bases {
+                    *result.bases.entry(name.clone()).or_insert(0) += base_exp * exp;
                 }
+                for (&rv, &rexp) in &resolved.vars {
+                    *result.vars.entry(rv).or_insert(0) += rexp * exp;
+                }
+            } else {
+                *result.vars.entry(v).or_insert(0) += exp;
             }
-            None => u.clone(),
+        }
+        result.normalize();
+        if changed {
+            self.apply_unit(&result)
+        } else {
+            result
         }
     }
 
@@ -458,40 +476,90 @@ impl Infer {
         let a = self.apply_unit(a);
         let b = self.apply_unit(b);
 
-        match (a.var, b.var) {
-            (Some(va), Some(vb)) if va == vb => {
-                // Same variable — just check concrete parts
-                if a.bases != b.bases {
+        if a == b { return; }
+
+        // Find a variable in either side that we can solve.
+        // Prefer solving a variable that appears on only one side.
+        let a_only_vars: Vec<UnitVar> = a.vars.keys()
+            .filter(|v| !b.vars.contains_key(v))
+            .copied().collect();
+        let b_only_vars: Vec<UnitVar> = b.vars.keys()
+            .filter(|v| !a.vars.contains_key(v))
+            .copied().collect();
+
+        if let Some(&va) = a_only_vars.first() {
+            // Solve va: a_bases + va^ea + shared_vars = b_bases + b_vars
+            // => va^ea = (b - a_without_va)
+            let ea = a.vars[&va];
+            let mut solution = b.div(&UnitTy { bases: a.bases.clone(), vars: a.vars.iter()
+                .filter(|(k, _)| **k != va).map(|(&k, &v)| (k, v)).collect() });
+            // Scale by 1/ea if ea != 1
+            if ea != 1 {
+                // Can only solve cleanly if all exponents divide evenly
+                let mut clean = true;
+                for exp in solution.bases.values() {
+                    if exp % ea != 0 { clean = false; break; }
+                }
+                for exp in solution.vars.values() {
+                    if exp % ea != 0 { clean = false; break; }
+                }
+                if clean {
+                    for exp in solution.bases.values_mut() { *exp /= ea; }
+                    for exp in solution.vars.values_mut() { *exp /= ea; }
+                    solution.normalize();
+                } else {
                     self.error(
                         format!("unit mismatch: {} vs {}", a.display(), b.display()),
                         span,
                     );
+                    return;
                 }
             }
-            (Some(va), _) => {
-                // Solve va: need a + va = b, so va = b - a(concrete)
-                let mut solution = b.clone();
-                for (name, exp) in &a.bases {
-                    *solution.bases.entry(name.clone()).or_insert(0) -= exp;
+            solution.normalize();
+            self.unit_subst.insert(va, solution);
+        } else if let Some(&vb) = b_only_vars.first() {
+            // Symmetric: solve vb
+            let eb = b.vars[&vb];
+            let mut solution = a.div(&UnitTy { bases: b.bases.clone(), vars: b.vars.iter()
+                .filter(|(k, _)| **k != vb).map(|(&k, &v)| (k, v)).collect() });
+            if eb != 1 {
+                let mut clean = true;
+                for exp in solution.bases.values() {
+                    if exp % eb != 0 { clean = false; break; }
                 }
-                solution.normalize();
-                self.unit_subst.insert(va, solution);
-            }
-            (_, Some(vb)) => {
-                let mut solution = a.clone();
-                for (name, exp) in &b.bases {
-                    *solution.bases.entry(name.clone()).or_insert(0) -= exp;
+                for exp in solution.vars.values() {
+                    if exp % eb != 0 { clean = false; break; }
                 }
-                solution.normalize();
-                self.unit_subst.insert(vb, solution);
-            }
-            (None, None) => {
-                if a.bases != b.bases {
+                if clean {
+                    for exp in solution.bases.values_mut() { *exp /= eb; }
+                    for exp in solution.vars.values_mut() { *exp /= eb; }
+                    solution.normalize();
+                } else {
                     self.error(
                         format!("unit mismatch: {} vs {}", a.display(), b.display()),
                         span,
                     );
+                    return;
                 }
+            }
+            solution.normalize();
+            self.unit_subst.insert(vb, solution);
+        } else if a.vars.is_empty() && b.vars.is_empty() {
+            // No variables — bases must match exactly
+            if a.bases != b.bases {
+                self.error(
+                    format!("unit mismatch: {} vs {}", a.display(), b.display()),
+                    span,
+                );
+            }
+        } else {
+            // Both sides share all variables — check if difference is concrete
+            let diff = a.div(&b);
+            if !diff.is_dimensionless() {
+                self.error(
+                    format!("unit mismatch: {} vs {}", a.display(), b.display()),
+                    span,
+                );
             }
         }
     }
@@ -1337,16 +1405,14 @@ impl Infer {
     }
 
     fn subst_unit_var(u: &UnitTy, mapping: &HashMap<UnitVar, UnitVar>) -> UnitTy {
-        match u.var {
-            Some(v) => {
-                if let Some(&new_v) = mapping.get(&v) {
-                    UnitTy { bases: u.bases.clone(), var: Some(new_v) }
-                } else {
-                    u.clone()
-                }
-            }
-            None => u.clone(),
+        if u.vars.is_empty() {
+            return u.clone();
         }
+        let new_vars = u.vars.iter().map(|(&v, &exp)| {
+            let new_v = mapping.get(&v).copied().unwrap_or(v);
+            (new_v, exp)
+        }).collect();
+        UnitTy { bases: u.bases.clone(), vars: new_vars }
     }
 
     /// Collect all free (unsolved) unit variables in a type.
@@ -1360,7 +1426,7 @@ impl Infer {
         match ty {
             Ty::IntUnit(u) | Ty::FloatUnit(u) => {
                 let applied = self.apply_unit(u);
-                if let Some(v) = applied.var {
+                for &v in applied.vars.keys() {
                     out.insert(v);
                 }
             }

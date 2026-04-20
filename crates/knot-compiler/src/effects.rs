@@ -252,7 +252,28 @@ impl EffectChecker {
         for decl in views {
             self.process_decl(decl);
         }
-        for decl in funs {
+
+        // Fixpoint loop: forward references and mutual recursion need
+        // multiple passes until effects stabilize.  Suppress diagnostics
+        // during the fixpoint since intermediate states may be incomplete.
+        loop {
+            let mut changed = false;
+            let saved_diags = std::mem::take(&mut self.diagnostics);
+            for decl in &funs {
+                if let ast::DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
+                    let effects = self.fun_body_effects(body);
+                    let old = self.decl_effects.get(name);
+                    if old.map_or(true, |o| *o != effects) {
+                        self.decl_effects.insert(name.clone(), effects);
+                        changed = true;
+                    }
+                }
+            }
+            self.diagnostics = saved_diags;
+            if !changed { break; }
+        }
+        // Final pass: emit diagnostics and check annotations with converged effects
+        for decl in &funs {
             self.process_decl(decl);
         }
     }
@@ -286,6 +307,11 @@ impl EffectChecker {
             ast::ExprKind::Lit(_) | ast::ExprKind::Constructor(_) => EffectSet::empty(),
 
             ast::ExprKind::Var(name) => {
+                // For zero-argument IO builtins (now, randomFloat, readLine),
+                // referencing them IS the IO action — return their effects.
+                // For functions (println, readFile, etc.), this over-approximates
+                // (effects only manifest at call sites), but is necessary for
+                // correct validation in contexts like `atomic(now)`.
                 if let Some(effects) = self.builtin_effects.get(name) {
                     return effects.clone();
                 }
@@ -481,8 +507,25 @@ impl EffectChecker {
                 func_effects.union(&arg_effects)
             }
 
+            ast::ExprKind::If { cond, then_branch, else_branch, .. } => {
+                // Callee is an if/else: effects are the union of branches' callable effects
+                let c = self.infer_effects(cond);
+                let t = self.callee_effects(then_branch);
+                let e = self.callee_effects(else_branch);
+                c.union(&t).union(&e)
+            }
+
+            ast::ExprKind::Case { scrutinee, arms } => {
+                // Callee is a case: effects are the union of each arm's callable effects
+                let mut effects = self.infer_effects(scrutinee);
+                for arm in arms {
+                    effects = effects.union(&self.callee_effects(&arm.body));
+                }
+                effects
+            }
+
             other => {
-                // Field access, case, etc. — fall back to infer_effects
+                // Field access, etc. — fall back to infer_effects
                 let _ = other;
                 self.infer_effects(func_expr)
             }

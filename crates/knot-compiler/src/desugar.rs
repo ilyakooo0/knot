@@ -635,6 +635,9 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
             expr_is_io(lhs, io_fns) || expr_is_io(rhs, io_fns)
         }
         ExprKind::UnaryOp { operand, .. } => expr_is_io(operand, io_fns),
+        ExprKind::UnitLit { value, .. } => expr_is_io(value, io_fns),
+        ExprKind::Annot { expr, .. } => expr_is_io(expr, io_fns),
+        ExprKind::Refine(inner) => expr_is_io(inner, io_fns),
         ExprKind::If { cond, then_branch, else_branch, .. } => {
             expr_is_io(cond, io_fns)
                 || expr_is_io(then_branch, io_fns)

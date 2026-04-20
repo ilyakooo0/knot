@@ -3693,7 +3693,7 @@ impl Codegen {
 
                     // Scalar source: wrap value as [{_value: val}] and do a full write
                     if self.scalar_sources.contains(name) {
-                        let val = self.compile_expr(builder, value, env, db);
+                        let val = self.compile_set_value_expr(builder, value, env, db);
                         let wrapped = self.call_rt(builder, "knot_scalar_source_wrap", &[val]);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
                         let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
@@ -3782,6 +3782,7 @@ impl Codegen {
                         } else {
                             // SQL compilation failed → map with no filter → full write
                             let val = self.compile_set_value_expr(builder, value, env, db);
+                            self.emit_refinement_checks(builder, name, val, env, db);
                             let (name_ptr, name_len) = self.string_ptr(builder, name);
                             let (schema_ptr, schema_len) =
                                 self.string_ptr(builder, &schema);
@@ -3842,6 +3843,7 @@ impl Codegen {
                         } else {
                             // SQL compilation failed → fall back to diff-write
                             let val = self.compile_set_value_expr(builder, value, env, db);
+                            self.emit_refinement_checks(builder, name, val, env, db);
                             let (name_ptr, name_len) = self.string_ptr(builder, name);
                             let (schema_ptr, schema_len) =
                                 self.string_ptr(builder, &schema);
@@ -3855,6 +3857,7 @@ impl Codegen {
                         // 5. Map without filter: every row transformed, no filtering
                         //    Full write is safe and avoids diff overhead.
                         let val = self.compile_set_value_expr(builder, value, env, db);
+                        self.emit_refinement_checks(builder, name, val, env, db);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
                         let (schema_ptr, schema_len) =
                             self.string_ptr(builder, &schema);
@@ -3866,6 +3869,7 @@ impl Codegen {
                     } else {
                         // 6. Fallback: diff-based write
                         let val = self.compile_set_value_expr(builder, value, env, db);
+                        self.emit_refinement_checks(builder, name, val, env, db);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
                         let (schema_ptr, schema_len) =
                             self.string_ptr(builder, &schema);
@@ -3900,7 +3904,7 @@ impl Codegen {
 
                     // Scalar source: wrap value as [{_value: val}] and do a full write
                     if self.scalar_sources.contains(name) {
-                        let val = self.compile_expr(builder, value, env, db);
+                        let val = self.compile_set_value_expr(builder, value, env, db);
                         let wrapped = self.call_rt(builder, "knot_scalar_source_wrap", &[val]);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
                         let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
@@ -3913,6 +3917,7 @@ impl Codegen {
                     }
 
                     let val = self.compile_set_value_expr(builder, value, env, db);
+                    self.emit_refinement_checks(builder, name, val, env, db);
                     let (name_ptr, name_len) = self.string_ptr(builder, name);
                     let (schema_ptr, schema_len) =
                         self.string_ptr(builder, &schema);
@@ -5188,8 +5193,11 @@ impl Codegen {
             let mut arm_env = env.clone();
             self.bind_case_pattern(builder, &arm.pat, scrut, &mut arm_env);
 
-            let arm_val =
-                self.compile_expr(builder, &arm.body, &mut arm_env, db);
+            let arm_val = if self.in_io_eager {
+                self.compile_io_expr_eager(builder, &arm.body, &mut arm_env, db)
+            } else {
+                self.compile_expr(builder, &arm.body, &mut arm_env, db)
+            };
             builder.ins().jump(merge_block, &[arm_val]);
 
             if is_last && !is_unconditional {

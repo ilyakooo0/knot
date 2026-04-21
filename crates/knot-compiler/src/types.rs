@@ -270,8 +270,14 @@ fn collect_source_refinements(
         // Resolve through the alias to find refined fields in the underlying record.
         TypeKind::Named(name) if alias_ast_types.contains_key(name) => {
             let alias_ty = &alias_ast_types[name];
-            let inner_ty = Spanned::new(TypeKind::Relation(Box::new(alias_ty.clone())), ty.span);
-            result.extend(collect_source_refinements(&inner_ty, refined_types, alias_ast_types));
+            // If the alias already resolves to a Relation type (e.g. `type People = [{name: Nat}]`),
+            // recurse directly to avoid double-wrapping Relation(Relation(...)).
+            if matches!(&alias_ty.node, TypeKind::Relation(_)) {
+                result.extend(collect_source_refinements(alias_ty, refined_types, alias_ast_types));
+            } else {
+                let inner_ty = Spanned::new(TypeKind::Relation(Box::new(alias_ty.clone())), ty.span);
+                result.extend(collect_source_refinements(&inner_ty, refined_types, alias_ast_types));
+            }
         }
         // Element type is a record: check each field
         TypeKind::Record { fields, .. } => {
@@ -481,9 +487,15 @@ fn schema_for_source(
             schema_descriptor(&resolved)
         }
         _ => {
+            // The type might be a named alias that resolves to a Relation
+            // (e.g. `type People = [{name: Text}]` and `*people : People`).
+            // Check the resolved type before falling back to scalar schema.
+            let resolved = resolve_type(unwrapped, aliases, assoc_types);
+            if let ResolvedType::Relation(inner) = &resolved {
+                return schema_descriptor(inner);
+            }
             // Non-relation source type (e.g. `*counter : Int`):
             // wrap as a single-column `_value` schema.
-            let resolved = resolve_type(unwrapped, aliases, assoc_types);
             format!("_value:{}", col_type_str(&resolved))
         }
     }

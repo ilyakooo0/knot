@@ -2985,6 +2985,9 @@ impl Infer {
                 })
             }
             ast::ExprKind::Lambda { body, .. } => self.expr_is_io_prescan(body),
+            ast::ExprKind::UnitLit { value, .. } => self.expr_is_io_prescan(value),
+            ast::ExprKind::Annot { expr, .. } => self.expr_is_io_prescan(expr),
+            ast::ExprKind::Refine(inner) => self.expr_is_io_prescan(inner),
             _ => false,
         }
     }

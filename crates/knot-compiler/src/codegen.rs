@@ -6343,6 +6343,39 @@ impl Codegen {
 
                 ast::StmtKind::Let { pat, expr } => {
                     let val = self.compile_expr(builder, expr, env, db);
+
+                    // Track schema of Let-bound relation variables for groupBy support.
+                    // If the expression is a known relation (source, derived, or var),
+                    // extract its schema and store it for later use in groupBy.
+                    if group_by_pos.is_some() {
+                        if let ast::PatKind::Var(var_name) = &pat.node {
+                            match &expr.node {
+                                ast::ExprKind::SourceRef(name)
+                                | ast::ExprKind::DerivedRef(name) => {
+                                    if let Some(schema) = self.source_schemas.get(name).cloned() {
+                                        var_schemas.insert(var_name.clone(), schema);
+                                    }
+                                }
+                                ast::ExprKind::FieldAccess { expr: target, field } => {
+                                    if let ast::ExprKind::Var(parent_var) = &target.node {
+                                        if let Some(parent_schema) = var_schemas.get(parent_var) {
+                                            if let Some(child_schema) = extract_child_schema(parent_schema, field) {
+                                                var_schemas.insert(var_name.clone(), child_schema);
+                                            }
+                                        }
+                                    }
+                                }
+                                ast::ExprKind::Var(source_var) => {
+                                    // Let-bound from another variable — inherit its schema
+                                    if let Some(schema) = var_schemas.get(source_var).cloned() {
+                                        var_schemas.insert(var_name.clone(), schema);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
                     if matches!(&pat.node, ast::PatKind::Constructor { .. }) {
                         // Constructor patterns need filter branches
                         let mut pattern_skips = Vec::new();

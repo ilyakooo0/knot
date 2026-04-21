@@ -5375,11 +5375,18 @@ impl Codegen {
     }
 
     fn is_io_do_block(&self, stmts: &[ast::Stmt]) -> bool {
+        // Do-blocks with groupBy always need relational iteration (compile_do),
+        // even if they contain IO-like expressions, because groupBy requires
+        // the loop-based collection/grouping phase that compile_io_do_eager
+        // cannot provide.
+        if stmts.iter().any(|s| matches!(&s.node, ast::StmtKind::GroupBy { .. })) {
+            return false;
+        }
         stmts.iter().any(|stmt| match &stmt.node {
             ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Let { expr, .. } => self.expr_is_io(expr),
             ast::StmtKind::Expr(expr) => self.expr_is_io(expr),
             ast::StmtKind::Where { cond } => self.expr_is_io(cond),
-            ast::StmtKind::GroupBy { key } => self.expr_is_io(key),
+            ast::StmtKind::GroupBy { .. } => false,
         })
     }
 

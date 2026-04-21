@@ -288,7 +288,9 @@ fn desugar_decl(decl: &mut DeclKind, io_fns: &HashSet<String>) {
         DeclKind::View { body, .. } => {
             // Don't desugar the top-level do block of a view body
             // (preserve structure for analyze_view), but recurse into sub-exprs.
-            if let ExprKind::Do(stmts) = &mut body.node {
+            // Unwrap wrappers in case the body is annotated.
+            let inner = unwrap_wrappers_mut(body);
+            if let ExprKind::Do(stmts) = &mut inner.node {
                 for stmt in stmts.iter_mut() {
                     desugar_stmt(stmt, io_fns);
                 }
@@ -330,7 +332,10 @@ fn desugar_expr(expr: &mut Expr, io_fns: &HashSet<String>) {
             desugar_expr(target, io_fns);
             // Don't desugar the top-level do block of a set value,
             // but DO recurse into its sub-expressions.
-            if let ExprKind::Do(stmts) = &mut value.node {
+            // Unwrap Annot/UnitLit/Refine wrappers to find the Do block
+            // (e.g. `set *rel = (do { ... } : [T])`).
+            let inner = unwrap_wrappers_mut(value);
+            if let ExprKind::Do(stmts) = &mut inner.node {
                 for stmt in stmts.iter_mut() {
                     desugar_stmt(stmt, io_fns);
                 }
@@ -435,6 +440,26 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &HashSet<String>) {
         ExprKind::UnitLit { value, .. } => desugar_expr(value, io_fns),
         ExprKind::Annot { expr, .. } => desugar_expr(expr, io_fns),
         ExprKind::Refine(inner) => desugar_expr(inner, io_fns),
+    }
+}
+
+/// Unwrap Annot/UnitLit/Refine wrappers to find the innermost expression.
+/// Used to protect Do blocks inside Set values and View bodies from
+/// desugaring when they're wrapped in type annotations.
+fn unwrap_wrappers_mut(expr: &mut Expr) -> &mut Expr {
+    if matches!(
+        &expr.node,
+        ExprKind::Annot { .. } | ExprKind::UnitLit { .. } | ExprKind::Refine(_)
+    ) {
+        let inner = match &mut expr.node {
+            ExprKind::Annot { expr: inner, .. }
+            | ExprKind::UnitLit { value: inner, .. } => inner.as_mut(),
+            ExprKind::Refine(inner) => inner.as_mut(),
+            _ => unreachable!(),
+        };
+        unwrap_wrappers_mut(inner)
+    } else {
+        expr
     }
 }
 

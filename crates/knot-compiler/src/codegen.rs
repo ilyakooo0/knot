@@ -5359,10 +5359,18 @@ impl Codegen {
         env: &mut Env,
         db: Value,
     ) -> Value {
-        if let ast::ExprKind::Do(stmts) = &value.node {
-            self.compile_do(builder, stmts, env, db)
-        } else {
-            self.compile_expr(builder, value, env, db)
+        match &value.node {
+            ast::ExprKind::Do(stmts) => self.compile_do(builder, stmts, env, db),
+            // Unwrap wrapper expressions to find the do-block inside.
+            // E.g. `set *rel = (do { ... } : [T])` wraps the Do in Annot.
+            ast::ExprKind::UnitLit { value: inner, .. }
+            | ast::ExprKind::Annot { expr: inner, .. } => {
+                self.compile_set_value_expr(builder, inner, env, db)
+            }
+            ast::ExprKind::Refine(inner) => {
+                self.compile_set_value_expr(builder, inner, env, db)
+            }
+            _ => self.compile_expr(builder, value, env, db),
         }
     }
 

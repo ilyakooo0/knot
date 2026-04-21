@@ -246,6 +246,35 @@ impl EffectChecker {
             }
         }
 
+        // Fixpoint loop for derived relations and views: forward references
+        // between derived relations (e.g. &d2 reads &d1 which reads *source,
+        // but &d2 is declared before &d1) need multiple passes to propagate
+        // transitive effects.
+        loop {
+            let mut changed = false;
+            for decl in &derived {
+                if let ast::DeclKind::Derived { name, body, .. } = &decl.node {
+                    let effects = self.infer_effects(body);
+                    let old = self.decl_effects.get(name);
+                    if old.map_or(true, |o| *o != effects) {
+                        self.decl_effects.insert(name.clone(), effects);
+                        changed = true;
+                    }
+                }
+            }
+            for decl in &views {
+                if let ast::DeclKind::View { name, body, .. } = &decl.node {
+                    let effects = self.infer_effects(body);
+                    let old = self.decl_effects.get(name);
+                    if old.map_or(true, |o| *o != effects) {
+                        self.decl_effects.insert(name.clone(), effects);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed { break; }
+        }
+        // Final pass for derived/views: emit diagnostics with converged effects
         for decl in derived {
             self.process_decl(decl);
         }
@@ -524,6 +553,14 @@ impl EffectChecker {
                 effects
             }
 
+            // Wrapper expressions: unwrap to find the actual callee.
+            // Without this, an annotated lambda like `(\x -> println x : Type) y`
+            // would fall through to infer_effects, which treats Lambda as pure
+            // (creating a lambda IS pure), missing the body's call effects.
+            ast::ExprKind::UnitLit { value, .. } => self.callee_effects(value),
+            ast::ExprKind::Annot { expr, .. } => self.callee_effects(expr),
+            ast::ExprKind::Refine(inner) => self.callee_effects(inner),
+
             other => {
                 // Field access, etc. — fall back to infer_effects
                 let _ = other;
@@ -537,6 +574,10 @@ impl EffectChecker {
     fn fun_body_effects(&mut self, body: &ast::Expr) -> EffectSet {
         match &body.node {
             ast::ExprKind::Lambda { body: inner, .. } => self.fun_body_effects(inner),
+            // Wrapper expressions: unwrap to find the lambda chain inside.
+            ast::ExprKind::UnitLit { value, .. } => self.fun_body_effects(value),
+            ast::ExprKind::Annot { expr, .. } => self.fun_body_effects(expr),
+            ast::ExprKind::Refine(inner) => self.fun_body_effects(inner),
             _ => self.infer_effects(body),
         }
     }

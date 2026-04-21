@@ -4937,7 +4937,7 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
 
     let is_empty = STM_READ_VERSIONS.with(|rv| rv.borrow().is_empty());
     if is_empty {
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_secs(1));
         // Re-acquire write lock if we held it
         if saved_lock_depth > 0 {
             while WRITE_LOCKED
@@ -5006,7 +5006,7 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
     };
 
     if !changed_after_register {
-        slot.wait(Duration::from_millis(100));
+        slot.wait(Duration::from_secs(30));
         // slot drops → Weak refs become invalid, cleaned up lazily in notify
     }
 

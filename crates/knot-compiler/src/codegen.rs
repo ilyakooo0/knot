@@ -7709,12 +7709,15 @@ impl Codegen {
                             params: vec![],
                         });
                     }
-                    if env.bindings.contains_key(name) {
-                        return Some(SqlFragment {
-                            sql: "?".to_string(),
-                            params: vec![SqlParamSource::FieldAccess(name.clone(), field.clone())],
-                        });
-                    }
+                    // Field access on env variable or global — compute at runtime
+                    return Some(SqlFragment {
+                        sql: "?".to_string(),
+                        params: vec![if env.bindings.contains_key(name) {
+                            SqlParamSource::FieldAccess(name.clone(), field.clone())
+                        } else {
+                            SqlParamSource::Expr(expr.clone())
+                        }],
+                    });
                 }
                 None
             }
@@ -7731,7 +7734,11 @@ impl Codegen {
                         params: vec![SqlParamSource::Var(name.clone())],
                     })
                 } else {
-                    None
+                    // Global constant or user function — compile at runtime
+                    Some(SqlFragment {
+                        sql: "?".to_string(),
+                        params: vec![SqlParamSource::Expr(expr.clone())],
+                    })
                 }
             }
             ast::ExprKind::BinOp { op, lhs, rhs } => {

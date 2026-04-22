@@ -4957,6 +4957,14 @@ impl Codegen {
         env: &mut Env,
         db: Value,
     ) {
+        // Skip refinement checks inside atomic blocks: data entering the
+        // system is validated at the boundary (route handlers), so re-running
+        // potentially expensive predicates on every internal `set` is
+        // redundant and can cause hangs for large values (e.g. recursive
+        // hex validation on multi-KB blobs).
+        if self.atomic_retry_block.is_some() {
+            return;
+        }
         let refinements = match self.source_refinements.get(source_name) {
             Some(r) => r.clone(),
             None => return,

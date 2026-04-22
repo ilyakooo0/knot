@@ -5738,6 +5738,9 @@ impl Codegen {
     ) -> Value {
         let prev_io_eager = self.in_io_eager;
         self.in_io_eager = true;
+        // Scope source_var_binds: save and restore around each IO do-block
+        // so entries from one handler don't leak into another.
+        let prev_source_var_binds = std::mem::take(&mut self.source_var_binds);
         let mut last_val = self.call_rt(builder, "knot_value_unit", &[]);
 
         // Create a done block for early exit on guard/pattern failures.
@@ -5816,6 +5819,7 @@ impl Codegen {
         builder.seal_block(done_block);
 
         self.in_io_eager = prev_io_eager;
+        self.source_var_binds = prev_source_var_binds;
         done_param
     }
 

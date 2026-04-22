@@ -5757,19 +5757,6 @@ impl Codegen {
                     if let ast::PatKind::Var(var_name) = &pat.node {
                         if let ast::ExprKind::SourceRef(source_name) = &expr.node {
                             self.source_var_binds.insert(var_name.clone(), source_name.clone());
-                            // Look-ahead: if this variable is ONLY used inside
-                            // SQL-compiled do-blocks (detected by the sortBy/takeRelation
-                            // optimization), skip the full source load and just track
-                            // the STM read.  This avoids loading multi-MB blob data
-                            // when the SQL query handles the actual retrieval.
-                            if self.var_only_used_in_sql_do(var_name, stmts) {
-                                let (name_ptr, name_len) = self.string_ptr(builder, source_name);
-                                self.call_rt_void(builder, "knot_stm_track_read", &[name_ptr, name_len]);
-                                let empty = self.call_rt(builder, "knot_relation_empty", &[]);
-                                env.bindings.insert(var_name.clone(), empty);
-                                last_val = empty;
-                                continue;
-                            }
                         }
                     }
                     let io_val = self.compile_expr(builder, expr, env, db);

@@ -4579,23 +4579,28 @@ pub extern "C" fn knot_io_pure(val: *mut Value) -> *mut Value {
 /// Execute an IO thunk. If the value is not IO, return it as-is.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_io_run(db: *mut c_void, val: *mut Value) -> *mut Value {
-    if val.is_null() {
-        return val;
-    }
-    match unsafe { as_ref(val) } {
-        Value::IO(fn_ptr, env) => {
-            let fn_ptr = *fn_ptr;
-            let env = *env;
-            if fn_ptr.is_null() {
-                // Pure value wrapped in IO — just return the environment (which holds the value)
-                env
-            } else {
+    let mut current = val;
+    loop {
+        if current.is_null() {
+            return current;
+        }
+        match unsafe { as_ref(current) } {
+            Value::IO(fn_ptr, env) => {
+                let fn_ptr = *fn_ptr;
+                let env = *env;
+                if fn_ptr.is_null() {
+                    return env;
+                }
                 let thunk: extern "C" fn(*mut c_void, *mut Value) -> *mut Value =
                     unsafe { std::mem::transmute(fn_ptr) };
-                thunk(db, env)
+                // Trampoline: if the thunk returns another IO value,
+                // loop instead of returning.  This prevents stack overflow
+                // and arena growth in tail-recursive IO loops
+                // (backgroundPrune, pollHeartbeat).
+                current = thunk(db, env);
             }
+            _ => return current,
         }
-        _ => val, // Not IO, return as-is (backwards compat)
     }
 }
 

@@ -55,6 +55,11 @@ pub struct Codegen {
     /// Enables SQL optimization for `do { m <- x; where ...; yield m }`.
     source_var_binds: HashMap<String, String>,
 
+    /// User function bodies: name → AST body.
+    /// Enables cross-function-boundary SQL optimization by resolving named
+    /// predicates and partial applications to their definitions.
+    fun_bodies: HashMap<String, ast::Expr>,
+
     // Constructor info: ctor_name -> [(field_name, field_type_str)]
     constructors: HashMap<String, Vec<(String, String)>>,
 
@@ -400,6 +405,7 @@ impl Codegen {
             stdlib_fns: HashSet::new(),
             source_schemas: HashMap::new(),
             source_var_binds: HashMap::new(),
+            fun_bodies: HashMap::new(),
             constructors: HashMap::new(),
             lambda_counter: 0,
             pending_lambdas: Vec::new(),
@@ -1010,6 +1016,7 @@ impl Codegen {
                             .declare_function(&func_name, Linkage::Local, &sig)
                             .unwrap();
                         self.user_fns.insert(name.clone(), (func_id, n_params));
+                        self.fun_bodies.insert(name.clone(), body.clone());
                     }
                 }
                 ast::DeclKind::Derived { name, body, .. } => {
@@ -4465,7 +4472,7 @@ impl Codegen {
 
                 // count (filter f *source) → SELECT COUNT(*) FROM ... WHERE ...
                 if let Some((source_name, filter_bind, filter_body)) =
-                    extract_filter_on_source(&args[0], &self.source_var_binds)
+                    extract_filter_on_source(&args[0], &self.source_var_binds, &self.fun_bodies)
                 {
                     if !self.views.contains_key(source_name) {
                         if let Some(schema) = self.source_schemas.get(source_name).cloned() {
@@ -4564,12 +4571,12 @@ impl Codegen {
                 // sum/avg lambda (filter f *source) → SQL aggregate with WHERE
                 if matches!(name.as_str(), "sum" | "avg") {
                     if let Some((source_name, filter_bind, filter_body)) =
-                        extract_filter_on_source(&args[1], &self.source_var_binds)
+                        extract_filter_on_source(&args[1], &self.source_var_binds, &self.fun_bodies)
                     {
                         if !self.views.contains_key(source_name) {
                             if let Some(schema) = self.source_schemas.get(source_name).cloned() {
                                 if !schema.starts_with('#') && !schema.contains('[') {
-                                    if let Some((agg_bind, agg_body)) = extract_single_param_lambda(&args[0]) {
+                                    if let Some((agg_bind, agg_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies) {
                                         if let Some(col_sql) = extract_sql_field_access(&agg_bind, agg_body, "", &schema) {
                                             if let Some(frag) = Self::try_compile_sql_expr(&filter_bind, filter_body) {
                                                 let func = if name == "sum" { "SUM" } else { "AVG" };
@@ -4598,7 +4605,7 @@ impl Codegen {
                     if let ast::ExprKind::App { func: sort_name_expr, arg: sort_lambda } = &sort_func.node {
                         if let ast::ExprKind::Var(sort_name) = &sort_name_expr.node {
                             if sort_name == "sortBy" {
-                                if let Some((sort_bind, sort_body)) = extract_single_param_lambda(sort_lambda) {
+                                if let Some((sort_bind, sort_body)) = extract_single_param_lambda(sort_lambda, &self.fun_bodies) {
                                     // Case 1: sortBy f *source → SQL ORDER BY + LIMIT
                                     if let ast::ExprKind::SourceRef(source_name) = &sort_source.node {
                                         if !self.views.contains_key(source_name) {
@@ -4697,7 +4704,7 @@ impl Codegen {
 
                 // takeRelation N (filter f *source) → SQL WHERE + LIMIT
                 if let Some((source_name, filter_bind, filter_body)) =
-                    extract_filter_on_source(&args[1], &self.source_var_binds)
+                    extract_filter_on_source(&args[1], &self.source_var_binds, &self.fun_bodies)
                 {
                     if !self.views.contains_key(source_name) {
                         if let Some(schema) = self.source_schemas.get(source_name).cloned() {
@@ -7345,7 +7352,7 @@ impl Codegen {
         env: &mut Env,
         db: Value,
     ) -> Option<Value> {
-        let (bind_var, body) = extract_single_param_lambda(lambda_arg)?;
+        let (bind_var, body) = extract_single_param_lambda(lambda_arg, &self.fun_bodies)?;
         let table = quote_sql_ident(&format!("_knot_{}", source_name));
 
         match fn_name {
@@ -7401,7 +7408,7 @@ impl Codegen {
         env: &mut Env,
         db: Value,
     ) -> Option<Value> {
-        let (source, ops) = flatten_pipe_chain(expr)?;
+        let (source, ops) = flatten_pipe_chain(expr, &self.fun_bodies)?;
         if ops.is_empty() {
             return None;
         }
@@ -7431,8 +7438,8 @@ impl Codegen {
         let mut order_by_cols: Vec<String> = Vec::new();
         let mut aggregate: Option<(&str, String)> = None; // (func, column_sql)
 
-        for op in &ops {
-            match op {
+        for op in ops {
+            match &op {
                 PipeOp::Filter { bind_var, body } => {
                     if is_count || aggregate.is_some() {
                         return None;
@@ -9221,7 +9228,10 @@ enum PipeOp<'a> {
 
 /// Flatten a nested pipe chain `a |> f |> g |> h` into `(a, [f, g, h])`.
 /// Each operation must be a recognized stdlib function (filter, map, count).
-fn flatten_pipe_chain(expr: &ast::Expr) -> Option<(&ast::Expr, Vec<PipeOp<'_>>)> {
+fn flatten_pipe_chain<'a>(
+    expr: &'a ast::Expr,
+    fun_bodies: &'a HashMap<String, ast::Expr>,
+) -> Option<(&'a ast::Expr, Vec<PipeOp<'a>>)> {
     let mut ops = Vec::new();
     let mut current = expr;
 
@@ -9232,7 +9242,7 @@ fn flatten_pipe_chain(expr: &ast::Expr) -> Option<(&ast::Expr, Vec<PipeOp<'_>>)>
                 lhs,
                 rhs,
             } => {
-                let pipe_op = analyze_pipe_op(rhs)?;
+                let pipe_op = analyze_pipe_op(rhs, fun_bodies)?;
                 ops.push(pipe_op);
                 current = lhs;
             }
@@ -9245,28 +9255,31 @@ fn flatten_pipe_chain(expr: &ast::Expr) -> Option<(&ast::Expr, Vec<PipeOp<'_>>)>
 }
 
 /// Recognize a pipe RHS as a SQL-compilable operation.
-fn analyze_pipe_op(expr: &ast::Expr) -> Option<PipeOp<'_>> {
+fn analyze_pipe_op<'a>(
+    expr: &'a ast::Expr,
+    fun_bodies: &'a HashMap<String, ast::Expr>,
+) -> Option<PipeOp<'a>> {
     match &expr.node {
         ast::ExprKind::Var(name) if name == "count" => Some(PipeOp::Count),
         ast::ExprKind::App { func, arg } => {
             if let ast::ExprKind::Var(name) = &func.node {
                 match name.as_str() {
-                    "filter" => extract_single_param_lambda(arg).map(|(bind_var, body)| {
+                    "filter" => extract_single_param_lambda(arg, fun_bodies).map(|(bind_var, body)| {
                         PipeOp::Filter { bind_var, body }
                     }),
-                    "map" => extract_single_param_lambda(arg).map(|(bind_var, body)| {
+                    "map" => extract_single_param_lambda(arg, fun_bodies).map(|(bind_var, body)| {
                         PipeOp::Map { bind_var, body }
                     }),
                     "take" => Some(PipeOp::Take { n: arg }),
                     "takeRelation" => Some(PipeOp::TakeRelation { n: arg }),
                     "drop" => Some(PipeOp::Drop { n: arg }),
-                    "sortBy" => extract_single_param_lambda(arg).map(|(bind_var, body)| {
+                    "sortBy" => extract_single_param_lambda(arg, fun_bodies).map(|(bind_var, body)| {
                         PipeOp::SortBy { bind_var, body }
                     }),
-                    "sum" => extract_single_param_lambda(arg).map(|(bind_var, body)| {
+                    "sum" => extract_single_param_lambda(arg, fun_bodies).map(|(bind_var, body)| {
                         PipeOp::Sum { bind_var, body }
                     }),
-                    "avg" => extract_single_param_lambda(arg).map(|(bind_var, body)| {
+                    "avg" => extract_single_param_lambda(arg, fun_bodies).map(|(bind_var, body)| {
                         PipeOp::Avg { bind_var, body }
                     }),
                     _ => None,
@@ -9280,7 +9293,18 @@ fn analyze_pipe_op(expr: &ast::Expr) -> Option<PipeOp<'_>> {
 }
 
 /// Extract bind variable name and body from a single-parameter lambda.
-fn extract_single_param_lambda(expr: &ast::Expr) -> Option<(String, &ast::Expr)> {
+fn extract_single_param_lambda<'a>(
+    expr: &'a ast::Expr,
+    fun_bodies: &'a HashMap<String, ast::Expr>,
+) -> Option<(String, &'a ast::Expr)> {
+    extract_single_param_lambda_depth(expr, fun_bodies, 3)
+}
+
+fn extract_single_param_lambda_depth<'a>(
+    expr: &'a ast::Expr,
+    fun_bodies: &'a HashMap<String, ast::Expr>,
+    depth: usize,
+) -> Option<(String, &'a ast::Expr)> {
     if let ast::ExprKind::Lambda { params, body } = &expr.node {
         if params.len() == 1 {
             if let ast::PatKind::Var(name) = &params[0].node {
@@ -9288,29 +9312,60 @@ fn extract_single_param_lambda(expr: &ast::Expr) -> Option<(String, &ast::Expr)>
             }
         }
     }
+    // Resolve named function references: isActive → \x -> x.active == 1
+    if depth > 0 {
+        if let ast::ExprKind::Var(name) = &expr.node {
+            if let Some(body) = fun_bodies.get(name) {
+                return extract_single_param_lambda_depth(body, fun_bodies, depth - 1);
+            }
+        }
+    }
     None
 }
 
 /// Extract `filter (\x -> cond) *source` or `filter (\x -> cond) bound_var` pattern.
+/// Also handles cross-function expansion: `f *source` where `f = filter pred`.
 /// Returns (source_name, bind_var, filter_body).
 fn extract_filter_on_source<'a>(
     expr: &'a ast::Expr,
     source_var_binds: &'a HashMap<String, String>,
+    fun_bodies: &'a HashMap<String, ast::Expr>,
 ) -> Option<(&'a str, String, &'a ast::Expr)> {
     if let ast::ExprKind::App { func, arg: source_expr } = &expr.node {
+        let resolve_source = |se: &'a ast::Expr| -> Option<&'a str> {
+            match &se.node {
+                ast::ExprKind::SourceRef(name) => Some(name.as_str()),
+                ast::ExprKind::Var(name) => {
+                    source_var_binds.get(name).map(|s| s.as_str())
+                }
+                _ => None,
+            }
+        };
+
+        // Direct: filter (\x -> cond) *source
         if let ast::ExprKind::App { func: inner_func, arg: filter_lambda } = &func.node {
             if let ast::ExprKind::Var(fn_name) = &inner_func.node {
                 if fn_name == "filter" {
-                    let source_name = match &source_expr.node {
-                        ast::ExprKind::SourceRef(name) => Some(name.as_str()),
-                        ast::ExprKind::Var(name) => {
-                            source_var_binds.get(name).map(|s| s.as_str())
-                        }
-                        _ => None,
-                    };
-                    if let Some(source_name) = source_name {
-                        if let Some((bind_var, body)) = extract_single_param_lambda(filter_lambda) {
+                    if let Some(source_name) = resolve_source(source_expr) {
+                        if let Some((bind_var, body)) = extract_single_param_lambda(filter_lambda, fun_bodies) {
                             return Some((source_name, bind_var, body));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Expanded: f *source where f = filter pred (partial application)
+        if let ast::ExprKind::Var(fn_name) = &func.node {
+            if let Some(fn_body) = fun_bodies.get(fn_name) {
+                if let ast::ExprKind::App { func: inner_func, arg: filter_lambda } = &fn_body.node {
+                    if let ast::ExprKind::Var(inner_name) = &inner_func.node {
+                        if inner_name == "filter" {
+                            if let Some(source_name) = resolve_source(source_expr) {
+                                if let Some((bind_var, body)) = extract_single_param_lambda(filter_lambda, fun_bodies) {
+                                    return Some((source_name, bind_var, body));
+                                }
+                            }
                         }
                     }
                 }

@@ -609,6 +609,8 @@ impl Codegen {
         // Standard library: relation operations
         self.declare_rt("knot_relation_filter", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_match", &[p, p], &[p]);
+        self.declare_rt("knot_relation_sort_by", &[p, p, p], &[p]);
+        self.declare_rt("knot_relation_take", &[p, p], &[p]);
         self.declare_rt("knot_source_match", &[p, p, p, p, p, p, p], &[p]);
         self.declare_rt("knot_relation_map", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_ap", &[p, p, p], &[p]);
@@ -1956,6 +1958,8 @@ impl Codegen {
         self.define_stdlib_fn_2("match", "knot_relation_match", false);
         self.define_stdlib_fn_2("take", "knot_text_take", false);
         self.define_stdlib_fn_2("drop", "knot_text_drop", false);
+        self.define_stdlib_fn_2("sortBy", "knot_relation_sort_by", true);
+        self.define_stdlib_fn_2("takeRelation", "knot_relation_take", false);
         self.define_stdlib_fn_2("contains", "knot_text_contains", false);
         self.define_stdlib_fn_2("diff", "knot_relation_diff", true);
         self.define_stdlib_fn_2("inter", "knot_relation_inter", true);

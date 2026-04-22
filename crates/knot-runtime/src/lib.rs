@@ -2079,6 +2079,13 @@ pub extern "C" fn knot_arena_push_frame() {
 /// Pop the current arena frame, freeing all its allocations.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_arena_pop_frame() {
+    if debug_enabled() {
+        ARENA.with(|a| {
+            let arena = a.borrow();
+            let depth = arena.frames.len();
+            eprintln!("[ARENA] pop_frame: depth {} → {}", depth, depth.saturating_sub(1));
+        });
+    }
     ARENA.with(|a| a.borrow_mut().pop_frame());
 }
 
@@ -3431,6 +3438,57 @@ pub extern "C" fn knot_relation_len(rel: *mut Value) -> usize {
         Value::Relation(rows) => rows.len(),
         _ => panic!("knot runtime: expected Relation in len, got {}", type_name(rel)),
     }
+}
+
+/// Take the first `n` elements from a relation.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_take(
+    n_val: *mut Value,
+    rel: *mut Value,
+) -> *mut Value {
+    let n = match unsafe { as_ref(n_val) } {
+        Value::SmallInt(i) => *i as usize,
+        Value::Int(i) => i.to_u64().unwrap_or(0) as usize,
+        _ => 0,
+    };
+    match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => {
+            let take_n = n.min(rows.len());
+            alloc(Value::Relation(rows[..take_n].to_vec()))
+        }
+        _ => rel,
+    }
+}
+
+/// Sort a relation by a key function, returning a new relation.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_sort_by(
+    db: *mut c_void,
+    key_fn: *mut Value,
+    rel: *mut Value,
+) -> *mut Value {
+    let rows = match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => rows,
+        _ => return rel,
+    };
+    if rows.len() <= 1 {
+        return rel;
+    }
+    let mut indexed: Vec<(*mut Value, *mut Value)> = rows
+        .iter()
+        .map(|&row| {
+            let key = knot_value_call(db, key_fn, row);
+            (row, key)
+        })
+        .collect();
+    indexed.sort_by(|(_, a), (_, b)| {
+        let ord = knot_value_compare_ord(*a, *b);
+        if ord < 0 { std::cmp::Ordering::Less }
+        else if ord > 0 { std::cmp::Ordering::Greater }
+        else { std::cmp::Ordering::Equal }
+    });
+    let sorted: Vec<*mut Value> = indexed.into_iter().map(|(row, _)| row).collect();
+    alloc(Value::Relation(sorted))
 }
 
 #[unsafe(no_mangle)]

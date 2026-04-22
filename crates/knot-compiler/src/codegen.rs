@@ -7153,16 +7153,12 @@ impl Codegen {
                 if let ast::ExprKind::Var(fn_name) = &inner_func.node {
                     if fn_name == "union" {
                         // union *rel <new_rows>
-                        if let ast::ExprKind::SourceRef(name) = &arg1.node {
-                            if name == source_name {
-                                return Some(arg2);
-                            }
+                        if Self::expr_is_source(&arg1.node, source_name, &self.source_var_binds) {
+                            return Some(arg2);
                         }
                         // union <new_rows> *rel
-                        if let ast::ExprKind::SourceRef(name) = &arg2.node {
-                            if name == source_name {
-                                return Some(arg1);
-                            }
+                        if Self::expr_is_source(&arg2.node, source_name, &self.source_var_binds) {
+                            return Some(arg1);
                         }
                     }
                 }
@@ -7971,6 +7967,15 @@ impl Codegen {
             }
             ast::ExprKind::Lambda { body, .. } => Self::expr_refs_var_outside_sql_do(body, var),
             ast::ExprKind::FieldAccess { expr: e, .. } => Self::expr_refs_var_outside_sql_do(e, var),
+            _ => false,
+        }
+    }
+
+    /// Check if an expression refers to a specific source (directly or via a bound variable).
+    fn expr_is_source(node: &ast::ExprKind, source_name: &str, var_binds: &HashMap<String, String>) -> bool {
+        match node {
+            ast::ExprKind::SourceRef(name) => name == source_name,
+            ast::ExprKind::Var(name) => var_binds.get(name).map_or(false, |s| s == source_name),
             _ => false,
         }
     }

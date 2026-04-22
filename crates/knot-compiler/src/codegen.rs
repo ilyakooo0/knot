@@ -5754,6 +5754,19 @@ impl Codegen {
                     if let ast::PatKind::Var(var_name) = &pat.node {
                         if let ast::ExprKind::SourceRef(source_name) = &expr.node {
                             self.source_var_binds.insert(var_name.clone(), source_name.clone());
+                            // Look-ahead: if this variable is ONLY used inside
+                            // SQL-compiled do-blocks (detected by the sortBy/takeRelation
+                            // optimization), skip the full source load and just track
+                            // the STM read.  This avoids loading multi-MB blob data
+                            // when the SQL query handles the actual retrieval.
+                            if self.var_only_used_in_sql_do(var_name, stmts) {
+                                let (name_ptr, name_len) = self.string_ptr(builder, source_name);
+                                self.call_rt_void(builder, "knot_stm_track_read", &[name_ptr, name_len]);
+                                let empty = self.call_rt(builder, "knot_relation_empty", &[]);
+                                env.bindings.insert(var_name.clone(), empty);
+                                last_val = empty;
+                                continue;
+                            }
                         }
                     }
                     let io_val = self.compile_expr(builder, expr, env, db);
@@ -7897,6 +7910,69 @@ impl Codegen {
             sql: format!("{} {} ?", quote_sql_ident(&col_name), op),
             params: vec![param],
         })
+    }
+
+    /// Check if a source-bound variable is only referenced inside SQL-compilable
+    /// do-blocks (as part of sortBy/takeRelation patterns).  If true, the full
+    /// source read can be replaced with a lightweight STM track.
+    fn var_only_used_in_sql_do(&self, var_name: &str, stmts: &[ast::Stmt]) -> bool {
+        // Check if var is referenced outside of do-blocks
+        for stmt in stmts {
+            match &stmt.node {
+                ast::StmtKind::Bind { pat, expr } => {
+                    if let ast::PatKind::Var(name) = &pat.node {
+                        if name == var_name { continue; } // Skip the definition itself
+                    }
+                    if Self::expr_refs_var(expr, var_name) { return false; }
+                }
+                ast::StmtKind::Let { expr, .. } => {
+                    // The var may appear inside a do-block that's an arg to sortBy.
+                    // Check if the only references are inside Do nodes that are SQL-compilable.
+                    if Self::expr_refs_var_outside_sql_do(expr, var_name) { return false; }
+                }
+                ast::StmtKind::Expr(expr) => {
+                    if Self::expr_refs_var(expr, var_name) { return false; }
+                }
+                ast::StmtKind::Where { cond } => {
+                    if Self::expr_refs_var(cond, var_name) { return false; }
+                }
+                ast::StmtKind::GroupBy { key } => {
+                    if Self::expr_refs_var(key, var_name) { return false; }
+                }
+            }
+        }
+        true
+    }
+
+    /// Check if an expression references a variable outside of Do-block arguments
+    /// (i.e., in positions where the variable's VALUE is needed at runtime).
+    fn expr_refs_var_outside_sql_do(expr: &ast::Expr, var: &str) -> bool {
+        match &expr.node {
+            ast::ExprKind::Var(name) => name == var,
+            ast::ExprKind::Do(_) => false, // Inside a do-block — the SQL plan handles it
+            ast::ExprKind::App { func, arg } => {
+                // Don't recurse into Do-block args (they're SQL-compiled)
+                let func_refs = Self::expr_refs_var_outside_sql_do(func, var);
+                let arg_refs = if matches!(&arg.node, ast::ExprKind::Do(_)) {
+                    false
+                } else {
+                    Self::expr_refs_var_outside_sql_do(arg, var)
+                };
+                func_refs || arg_refs
+            }
+            ast::ExprKind::BinOp { lhs, rhs, .. } => {
+                Self::expr_refs_var_outside_sql_do(lhs, var) || Self::expr_refs_var_outside_sql_do(rhs, var)
+            }
+            ast::ExprKind::UnaryOp { operand, .. } => Self::expr_refs_var_outside_sql_do(operand, var),
+            ast::ExprKind::If { cond, then_branch, else_branch } => {
+                Self::expr_refs_var_outside_sql_do(cond, var) ||
+                Self::expr_refs_var_outside_sql_do(then_branch, var) ||
+                Self::expr_refs_var_outside_sql_do(else_branch, var)
+            }
+            ast::ExprKind::Lambda { body, .. } => Self::expr_refs_var_outside_sql_do(body, var),
+            ast::ExprKind::FieldAccess { expr: e, .. } => Self::expr_refs_var_outside_sql_do(e, var),
+            _ => false,
+        }
     }
 
     /// Check if an expression references a specific variable.

@@ -961,7 +961,7 @@ impl Codegen {
         // with [] impls registered directly in register_builtin_relation_impls.
         let stdlib_names = [
             "filter", "match", "single", "diff", "inter", "sum", "avg",
-            "toUpper", "toLower", "take", "drop",
+            "toUpper", "toLower", "take", "drop", "sortBy", "takeRelation",
             "length", "trim", "contains", "reverse",
             "chars", "id", "not",
             "bytesLength", "bytesSlice", "bytesConcat",
@@ -4502,22 +4502,22 @@ impl Codegen {
                                             if !schema.starts_with('#') && !schema.contains('[') {
                                                 if let Some((bind_var, body)) = extract_single_param_lambda(sort_lambda) {
                                                     if let Some(col_sql) = extract_sql_field_access(&bind_var, body, "", &schema) {
-                                                        if let Some(limit_param) = expr_to_sql_param(&args[0]) {
-                                                            let table = quote_sql_ident(&format!("_knot_{}", source_name));
-                                                            let cols = parse_schema_columns(&schema).iter()
-                                                                .map(|(n, _)| quote_sql_ident(n))
-                                                                .collect::<Vec<_>>()
-                                                                .join(", ");
-                                                            let sql = format!("SELECT {} FROM {} ORDER BY {} LIMIT ?", cols, table, col_sql);
-                                                            let params_rel = self.compile_sql_params(builder, &[limit_param], env);
-                                                            let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                                                            let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
-                                                            return self.call_rt(
-                                                                builder,
-                                                                "knot_source_query",
-                                                                &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
-                                                            );
-                                                        }
+                                                        let table = quote_sql_ident(&format!("_knot_{}", source_name));
+                                                        let cols = parse_schema_columns(&schema).iter()
+                                                            .map(|(n, _)| quote_sql_ident(n))
+                                                            .collect::<Vec<_>>()
+                                                            .join(", ");
+                                                        let sql = format!("SELECT {} FROM {} ORDER BY {} LIMIT ?", cols, table, col_sql);
+                                                        // Compile N as a runtime value and wrap as a singleton relation param
+                                                        let n_val = self.compile_expr(builder, &args[0], env, db);
+                                                        let params_rel = self.call_rt(builder, "knot_relation_singleton", &[n_val]);
+                                                        let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                                                        let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
+                                                        return self.call_rt(
+                                                            builder,
+                                                            "knot_source_query",
+                                                            &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                                                        );
                                                     }
                                                 }
                                             }

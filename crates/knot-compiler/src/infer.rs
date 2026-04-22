@@ -3846,6 +3846,43 @@ impl Infer {
         // map and fold are now trait methods (Functor.map, Foldable.fold)
         // registered via the prelude's trait declarations.
 
+        // sortBy : ∀a b. (a -> b) -> IO {} [a] -> IO {} [a]
+        // Typed as IO-returning so it can be applied directly to *source refs.
+        // Codegen compiles sortBy f *source → SQL ORDER BY.
+        let a = self.fresh_var();
+        let b = self.fresh_var();
+        self.bind_top(
+            "sortBy",
+            Scheme::poly(
+                vec![a, b],
+                Ty::Fun(
+                    Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::IO(BTreeSet::new(), Box::new(Ty::Relation(Box::new(Ty::Var(a)))))),
+                        Box::new(Ty::IO(BTreeSet::new(), Box::new(Ty::Relation(Box::new(Ty::Var(a)))))),
+                    )),
+                ),
+            ),
+        );
+
+        // takeRelation : ∀a. Int -> IO {} [a] -> IO {} [a]
+        // Typed as IO-returning so it can be applied to sortBy results and *source refs.
+        // Codegen compiles takeRelation N (sortBy f *source) → SQL ORDER BY + LIMIT.
+        let a = self.fresh_var();
+        self.bind_top(
+            "takeRelation",
+            Scheme::poly(
+                vec![a],
+                Ty::Fun(
+                    Box::new(Ty::Int),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::IO(BTreeSet::new(), Box::new(Ty::Relation(Box::new(Ty::Var(a)))))),
+                        Box::new(Ty::IO(BTreeSet::new(), Box::new(Ty::Relation(Box::new(Ty::Var(a)))))),
+                    )),
+                ),
+            ),
+        );
+
         // diff : ∀a. [a] -> [a] -> [a]
         let a = self.fresh_var();
         self.bind_top(

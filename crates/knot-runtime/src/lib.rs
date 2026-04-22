@@ -11325,17 +11325,10 @@ pub extern "C" fn knot_http_fetch_io(
             _ => url,
         };
 
-        // Build ureq request
-        let mut request = match method_str.as_str() {
-            "GET" => ureq::get(&full_url),
-            "POST" => ureq::post(&full_url),
-            "PUT" => ureq::put(&full_url),
-            "DELETE" => ureq::delete(&full_url),
-            "PATCH" => ureq::patch(&full_url),
-            _ => panic!("knot runtime: fetch unsupported method: {}", method_str),
-        };
-
-        // Set route-declared request headers from payload fields first
+        // Collect request headers into a vec (ureq 3 uses typed builders
+        // that differ for methods with/without body, so we can't share a
+        // single mutable request across the match arms)
+        let mut req_headers: Vec<(String, String)> = Vec::new();
         let req_hdrs_str: String = match unsafe { as_ref(req_hdrs_desc) } {
             Value::Text(s) => (**s).to_string(),
             _ => String::new(),
@@ -11357,12 +11350,12 @@ pub extern "C" fn knot_http_fetch_io(
                         if let Value::Constructor(tag, inner) = unsafe { as_ref(field_val) } {
                             if &**tag == "Just" {
                                 let v = knot_record_field(*inner, "value".as_ptr(), 5);
-                                request = request.set(&http_name, &fetch_value_to_text(v));
+                                req_headers.push((http_name, fetch_value_to_text(v)));
                             }
                         }
                     }
                 } else {
-                    request = request.set(&http_name, &fetch_value_to_text(field_val));
+                    req_headers.push((http_name, fetch_value_to_text(field_val)));
                 }
             }
         }
@@ -11370,16 +11363,16 @@ pub extern "C" fn knot_http_fetch_io(
         // Set default Content-Type for JSON bodies, unless already set by
         // route-declared headers.  Ad-hoc fetchWith headers can still override.
         if body_json.is_some() && !has_content_type {
-            request = request.set("Content-Type", "application/json");
+            req_headers.push(("Content-Type".to_string(), "application/json".to_string()));
         }
 
-        // Set ad-hoc headers from fetchWith options (override route-declared headers)
+        // Ad-hoc headers from fetchWith options (override route-declared headers)
         if !headers.is_null() {
             if let Value::Relation(rows) = unsafe { as_ref(headers) } {
                 for row in rows {
                     let n = fetch_record_text_field(*row, "name");
                     let v = fetch_record_text_field(*row, "value");
-                    request = request.set(&n, &v);
+                    req_headers.push((n, v));
                 }
             }
         }
@@ -11392,10 +11385,43 @@ pub extern "C" fn knot_http_fetch_io(
             }
         }
 
-        // Send request
-        let result = match body_json {
-            Some(ref json) => request.send_string(json),
-            None => request.call(),
+        // Build agent that returns all HTTP responses as Ok
+        // (ureq 3 default converts 4xx/5xx to Err without the body)
+        let agent = ureq::Agent::new_with_config(
+            ureq::config::Config::builder()
+                .http_status_as_error(false)
+                .build()
+        );
+
+        // Send request — split by method type since ureq 3 uses different
+        // builder types for methods with/without body
+        let result = match method_str.as_str() {
+            "GET" | "HEAD" | "DELETE" => {
+                let mut req = match method_str.as_str() {
+                    "GET" => agent.get(&full_url),
+                    "HEAD" => agent.head(&full_url),
+                    _ => agent.delete(&full_url),
+                };
+                for (k, v) in &req_headers {
+                    req = req.header(k.as_str(), v.as_str());
+                }
+                req.call()
+            }
+            _ => {
+                let mut req = match method_str.as_str() {
+                    "POST" => agent.post(&full_url),
+                    "PUT" => agent.put(&full_url),
+                    "PATCH" => agent.patch(&full_url),
+                    _ => panic!("knot runtime: fetch unsupported method: {}", method_str),
+                };
+                for (k, v) in &req_headers {
+                    req = req.header(k.as_str(), v.as_str());
+                }
+                match &body_json {
+                    Some(json) => req.send(json.as_str()),
+                    None => req.send_empty(),
+                }
+            }
         };
 
         // Check if we need to parse response headers
@@ -11407,85 +11433,86 @@ pub extern "C" fn knot_http_fetch_io(
 
         // Build Result ADT
         match result {
-            Ok(response) => {
+            Ok(mut response) => {
+                let status = response.status().as_u16();
                 if debug_enabled() {
-                    eprintln!("[HTTP] <-- {} {}", response.status(), full_url);
+                    eprintln!("[HTTP] <-- {} {}", status, full_url);
                 }
-                // Parse response headers before consuming the response body
-                let parsed_headers = if has_resp_hdrs {
-                    let mut hdr_fields = Vec::new();
-                    for field_desc in resp_hdrs_str.split(',') {
-                        if field_desc.is_empty() { continue; }
-                        let (name, ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
-                        let is_maybe = ty.starts_with('?');
-                        let inner_ty = if is_maybe { &ty[1..] } else { ty };
-                        let http_name = camel_to_header_case(name);
-                        let raw_val = response.header(&http_name)
-                            .map(|s| s.to_string());
-                        let value = if is_maybe {
-                            match raw_val {
-                                Some(v) => {
-                                    let inner = string_to_value(&v, inner_ty);
-                                    alloc(Value::Constructor(
-                                        "Just".into(),
-                                        alloc(Value::Record(vec![
-                                            RecordField { name: "value".into(), value: inner },
-                                        ])),
-                                    ))
+
+                if status >= 400 {
+                    let body_text = response.body_mut().read_to_string().unwrap_or_default();
+                    fetch_build_err(status, &body_text)
+                } else {
+                    // Parse response headers before consuming the response body
+                    let parsed_headers = if has_resp_hdrs {
+                        let mut hdr_fields = Vec::new();
+                        for field_desc in resp_hdrs_str.split(',') {
+                            if field_desc.is_empty() { continue; }
+                            let (name, ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
+                            let is_maybe = ty.starts_with('?');
+                            let inner_ty = if is_maybe { &ty[1..] } else { ty };
+                            let http_name = camel_to_header_case(name);
+                            let raw_val = response.headers().get(&http_name)
+                                .and_then(|v| v.to_str().ok())
+                                .map(|s| s.to_string());
+                            let value = if is_maybe {
+                                match raw_val {
+                                    Some(v) => {
+                                        let inner = string_to_value(&v, inner_ty);
+                                        alloc(Value::Constructor(
+                                            "Just".into(),
+                                            alloc(Value::Record(vec![
+                                                RecordField { name: "value".into(), value: inner },
+                                            ])),
+                                        ))
+                                    }
+                                    None => alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit))),
                                 }
-                                None => alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit))),
-                            }
-                        } else {
-                            let v = raw_val.unwrap_or_default();
-                            string_to_value(&v, inner_ty)
-                        };
-                        hdr_fields.push(RecordField {
-                            name: intern_str(name),
-                            value,
-                        });
-                    }
-                    hdr_fields.sort_by(|a, b| a.name.cmp(&b.name));
-                    Some(alloc(Value::Record(hdr_fields)))
-                } else {
-                    None
-                };
+                            } else {
+                                let v = raw_val.unwrap_or_default();
+                                string_to_value(&v, inner_ty)
+                            };
+                            hdr_fields.push(RecordField {
+                                name: intern_str(name),
+                                value,
+                            });
+                        }
+                        hdr_fields.sort_by(|a, b| a.name.cmp(&b.name));
+                        Some(alloc(Value::Record(hdr_fields)))
+                    } else {
+                        None
+                    };
 
-                let body_text = response.into_string().unwrap_or_default();
-                let has_resp_schema = matches!(unsafe { as_ref(resp_desc) }, Value::Text(s) if !s.is_empty());
-                let parsed_body = if has_resp_schema {
-                    match serde_json::from_str::<serde_json::Value>(&body_text) {
-                        Ok(json) => json_to_value(&json),
-                        Err(_) => alloc(Value::Unit),
-                    }
-                } else {
-                    alloc(Value::Text(Arc::from(body_text)))
-                };
+                    let body_text = response.body_mut().read_to_string().unwrap_or_default();
+                    let has_resp_schema = matches!(unsafe { as_ref(resp_desc) }, Value::Text(s) if !s.is_empty());
+                    let parsed_body = if has_resp_schema {
+                        match serde_json::from_str::<serde_json::Value>(&body_text) {
+                            Ok(json) => json_to_value(&json),
+                            Err(_) => alloc(Value::Unit),
+                        }
+                    } else {
+                        alloc(Value::Text(Arc::from(body_text)))
+                    };
 
-                // Wrap with headers if response headers declared
-                let ok_value = match parsed_headers {
-                    Some(hdrs) => alloc(Value::Record(vec![
-                        RecordField { name: "body".into(), value: parsed_body },
-                        RecordField { name: "headers".into(), value: hdrs },
-                    ])),
-                    None => parsed_body,
-                };
+                    // Wrap with headers if response headers declared
+                    let ok_value = match parsed_headers {
+                        Some(hdrs) => alloc(Value::Record(vec![
+                            RecordField { name: "body".into(), value: parsed_body },
+                            RecordField { name: "headers".into(), value: hdrs },
+                        ])),
+                        None => parsed_body,
+                    };
 
-                // Ok {value: ok_value}
-                alloc(Value::Constructor(
-                    "Ok".into(),
-                    alloc(Value::Record(vec![
-                        RecordField { name: "value".into(), value: ok_value },
-                    ])),
-                ))
-            }
-            Err(ureq::Error::Status(code, response)) => {
-                if debug_enabled() {
-                    eprintln!("[HTTP] <-- {} {}", code, full_url);
+                    // Ok {value: ok_value}
+                    alloc(Value::Constructor(
+                        "Ok".into(),
+                        alloc(Value::Record(vec![
+                            RecordField { name: "value".into(), value: ok_value },
+                        ])),
+                    ))
                 }
-                let body_text = response.into_string().unwrap_or_default();
-                fetch_build_err(code, &body_text)
             }
-            Err(ureq::Error::Transport(e)) => {
+            Err(e) => {
                 if debug_enabled() {
                     eprintln!("[HTTP] <-- ERR {}", e);
                 }

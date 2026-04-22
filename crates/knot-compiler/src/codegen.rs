@@ -2299,7 +2299,7 @@ impl Codegen {
                     call_args.extend(&all_params);
                     let call = builder.ins().call(impl_ref, &call_args);
                     let result = builder.inst_results(call)[0];
-                    builder.ins().jump(merge_block, &[result]);
+                    builder.ins().jump(merge_block, &[result.into()]);
                 } else {
                     builder.ins().jump(tag_block, &[]);
                 }
@@ -2350,7 +2350,7 @@ impl Codegen {
                     call_args.extend(&all_params);
                     let call = builder.ins().call(impl_ref, &call_args);
                     let result = builder.inst_results(call)[0];
-                    builder.ins().jump(merge_block, &[result]);
+                    builder.ins().jump(merge_block, &[result.into()]);
 
                     builder.switch_to_block(next_block);
                     builder.seal_block(next_block);
@@ -2430,7 +2430,7 @@ impl Codegen {
                     call_args.extend(&all_params);
                     let call = builder.ins().call(impl_ref, &call_args);
                     let result = builder.inst_results(call)[0];
-                    builder.ins().jump(merge_block, &[result]);
+                    builder.ins().jump(merge_block, &[result.into()]);
 
                     builder.switch_to_block(next_adt_block);
                     builder.seal_block(next_adt_block);
@@ -2465,7 +2465,7 @@ impl Codegen {
                     call_args.extend(&all_params);
                     let call = builder.ins().call(impl_ref, &call_args);
                     let result = builder.inst_results(call)[0];
-                    builder.ins().jump(merge_block, &[result]);
+                    builder.ins().jump(merge_block, &[result.into()]);
 
                     builder.switch_to_block(next_block);
                     builder.seal_block(next_block);
@@ -2483,10 +2483,10 @@ impl Codegen {
                         let self_ref = cg.module.declare_func_in_func(dispatcher_id, builder.func);
                         let self_addr = builder.ins().func_addr(cg.ptr_type, self_ref);
                         let result = cg.call_rt(builder, "knot_json_encode_with", &[db, all_params[0], self_addr]);
-                        builder.ins().jump(merge_block, &[result]);
+                        builder.ins().jump(merge_block, &[result.into()]);
                     } else {
                         let result = cg.call_rt(builder, rt_fn, &all_params);
-                        builder.ins().jump(merge_block, &[result]);
+                        builder.ins().jump(merge_block, &[result.into()]);
                     }
                 } else {
                     let (name_ptr, name_len) =
@@ -2496,7 +2496,7 @@ impl Codegen {
                         "knot_trait_no_impl",
                         &[name_ptr, name_len, dispatch_arg],
                     );
-                    builder.ins().jump(merge_block, &[err]);
+                    builder.ins().jump(merge_block, &[err.into()]);
                 }
 
                 builder.switch_to_block(merge_block);
@@ -3569,16 +3569,16 @@ impl Codegen {
 
                     if matches!(op, ast::BinOp::And) {
                         // &&: if l is false, short-circuit with l (false)
-                        builder.ins().brif(l_true, rhs_block, &[], merge_block, &[l]);
+                        builder.ins().brif(l_true, rhs_block, &[], merge_block, &[l.into()]);
                     } else {
                         // ||: if l is true, short-circuit with l (true)
-                        builder.ins().brif(l_true, merge_block, &[l], rhs_block, &[]);
+                        builder.ins().brif(l_true, merge_block, &[l.into()], rhs_block, &[]);
                     }
 
                     builder.switch_to_block(rhs_block);
                     builder.seal_block(rhs_block);
                     let r = self.compile_expr(builder, rhs, env, db);
-                    builder.ins().jump(merge_block, &[r]);
+                    builder.ins().jump(merge_block, &[r.into()]);
 
                     builder.switch_to_block(merge_block);
                     builder.seal_block(merge_block);
@@ -3643,13 +3643,13 @@ impl Codegen {
                 builder.seal_block(then_block);
                 let then_val =
                     self.compile_expr(builder, then_branch, &mut env.clone(), db);
-                builder.ins().jump(merge_block, &[then_val]);
+                builder.ins().jump(merge_block, &[then_val.into()]);
 
                 builder.switch_to_block(else_block);
                 builder.seal_block(else_block);
                 let else_val =
                     self.compile_expr(builder, else_branch, &mut env.clone(), db);
-                builder.ins().jump(merge_block, &[else_val]);
+                builder.ins().jump(merge_block, &[else_val.into()]);
 
                 builder.switch_to_block(merge_block);
                 builder.seal_block(merge_block);
@@ -4028,7 +4028,7 @@ impl Codegen {
 
                 // Check if retry was requested (safety net for edge cases)
                 let retry_flag = self.call_rt(builder, "knot_stm_check_and_clear", &[]);
-                builder.ins().brif(retry_flag, retry_block, &[], done_block, &[val]);
+                builder.ins().brif(retry_flag, retry_block, &[], done_block, &[val.into()]);
 
                 // Retry: rollback, pop arena frame (frees all body allocations
                 // including multi-MB blob reads), wait for changes, loop back.
@@ -5373,13 +5373,13 @@ impl Codegen {
         builder.switch_to_block(ok_block);
         builder.seal_block(ok_block);
         let ok_val = self.build_ok_result(builder, val);
-        builder.ins().jump(merge_block, &[ok_val]);
+        builder.ins().jump(merge_block, &[ok_val.into()]);
 
         // Err path
         builder.switch_to_block(err_block);
         builder.seal_block(err_block);
         let err_val = self.build_refinement_err(builder, &type_name);
-        builder.ins().jump(merge_block, &[err_val]);
+        builder.ins().jump(merge_block, &[err_val.into()]);
 
         builder.switch_to_block(merge_block);
         builder.seal_block(merge_block);
@@ -5666,7 +5666,7 @@ impl Codegen {
             } else {
                 self.compile_expr(builder, &arm.body, &mut arm_env, db)
             };
-            builder.ins().jump(merge_block, &[arm_val]);
+            builder.ins().jump(merge_block, &[arm_val.into()]);
 
             if is_last && !is_unconditional {
                 // Last arm was conditional — no arm matched at runtime; panic.
@@ -6136,7 +6136,7 @@ impl Codegen {
                     builder.switch_to_block(fail_block);
                     builder.seal_block(fail_block);
                     let unit = self.call_rt(builder, "knot_value_unit", &[]);
-                    builder.ins().jump(done_block, &[unit]);
+                    builder.ins().jump(done_block, &[unit.into()]);
                     builder.switch_to_block(pass_block);
                     builder.seal_block(pass_block);
                 }
@@ -6150,7 +6150,7 @@ impl Codegen {
         }
 
         // Normal flow joins done_block with the final result
-        builder.ins().jump(done_block, &[last_val]);
+        builder.ins().jump(done_block, &[last_val.into()]);
         builder.switch_to_block(done_block);
         builder.seal_block(done_block);
 
@@ -6200,7 +6200,7 @@ impl Codegen {
                 &mut env.clone(),
                 db,
             );
-            builder.ins().jump(merge_block, &[then_val]);
+            builder.ins().jump(merge_block, &[then_val.into()]);
 
             builder.switch_to_block(else_block);
             builder.seal_block(else_block);
@@ -6210,7 +6210,7 @@ impl Codegen {
                 &mut env.clone(),
                 db,
             );
-            builder.ins().jump(merge_block, &[else_val]);
+            builder.ins().jump(merge_block, &[else_val.into()]);
 
             builder.switch_to_block(merge_block);
             builder.seal_block(merge_block);
@@ -6287,7 +6287,7 @@ impl Codegen {
                 builder.seal_block(fail_block);
                 if let Some(done) = done_block {
                     let unit = self.call_rt(builder, "knot_value_unit", &[]);
-                    builder.ins().jump(done, &[unit]);
+                    builder.ins().jump(done, &[unit.into()]);
                 } else {
                     self.call_rt_void(builder, "knot_guard_failed", &[]);
                     builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
@@ -6498,7 +6498,7 @@ impl Codegen {
                         let exit = builder.create_block();
 
                         let zero = builder.ins().iconst(self.ptr_type, 0);
-                        builder.ins().jump(header, &[zero]);
+                        builder.ins().jump(header, &[zero.into()]);
                         builder.switch_to_block(header);
                         let i = builder.append_block_param(header, self.ptr_type);
                         let cond = builder.ins().icmp(IntCC::SignedLessThan, i, len);
@@ -6704,7 +6704,7 @@ impl Codegen {
                     let exit = builder.create_block();
 
                     let zero = builder.ins().iconst(self.ptr_type, 0);
-                    builder.ins().jump(header, &[zero]);
+                    builder.ins().jump(header, &[zero.into()]);
 
                     builder.switch_to_block(header);
                     let i = builder.append_block_param(header, self.ptr_type);
@@ -6893,7 +6893,7 @@ impl Codegen {
                         builder.seal_block(info.continue_blk);
                         let one = builder.ins().iconst(self.ptr_type, 1);
                         let next_i = builder.ins().iadd(info.index_var, one);
-                        builder.ins().jump(info.header, &[next_i]);
+                        builder.ins().jump(info.header, &[next_i.into()]);
                         builder.seal_block(info.header);
                         builder.switch_to_block(info.exit);
                         builder.seal_block(info.exit);
@@ -6970,7 +6970,7 @@ impl Codegen {
                     let g_exit = builder.create_block();
 
                     let zero = builder.ins().iconst(self.ptr_type, 0);
-                    builder.ins().jump(g_header, &[zero]);
+                    builder.ins().jump(g_header, &[zero.into()]);
 
                     builder.switch_to_block(g_header);
                     let g_i = builder.append_block_param(g_header, self.ptr_type);
@@ -7068,7 +7068,7 @@ impl Codegen {
             self.call_rt_void(builder, "knot_arena_reset_to", &[info.arena_mark]);
             let one = builder.ins().iconst(self.ptr_type, 1);
             let next_i = builder.ins().iadd(info.index_var, one);
-            builder.ins().jump(info.header, &[next_i]);
+            builder.ins().jump(info.header, &[next_i.into()]);
 
             // Seal header (all predecessors now known)
             builder.seal_block(info.header);
@@ -8979,13 +8979,13 @@ impl Codegen {
                             builder.switch_to_block(fast_block);
                             builder.seal_block(fast_block);
                             let eq_i32 = self.call_rt_typed(builder, "knot_value_eq_i32", &[l, r], types::I32);
-                            builder.ins().jump(merge_block, &[eq_i32]);
+                            builder.ins().jump(merge_block, &[eq_i32.into()]);
 
                             builder.switch_to_block(dispatch_block);
                             builder.seal_block(dispatch_block);
                             let boxed = self.compile_trait_binop(builder, "eq", l, r, db, "knot_value_eq");
                             let unboxed = self.call_rt_typed(builder, "knot_value_get_bool", &[boxed], types::I32);
-                            builder.ins().jump(merge_block, &[unboxed]);
+                            builder.ins().jump(merge_block, &[unboxed.into()]);
 
                             builder.switch_to_block(merge_block);
                             builder.seal_block(merge_block);
@@ -9012,7 +9012,7 @@ impl Codegen {
                             builder.switch_to_block(fast_block);
                             builder.seal_block(fast_block);
                             let neq_i32 = self.call_rt_typed(builder, "knot_value_neq_i32", &[l, r], types::I32);
-                            builder.ins().jump(merge_block, &[neq_i32]);
+                            builder.ins().jump(merge_block, &[neq_i32.into()]);
 
                             builder.switch_to_block(dispatch_block);
                             builder.seal_block(dispatch_block);
@@ -9021,7 +9021,7 @@ impl Codegen {
                             // Negate: eq result → neq result
                             let one = builder.ins().iconst(types::I32, 1);
                             let neq_result = builder.ins().isub(one, eq_i32);
-                            builder.ins().jump(merge_block, &[neq_result]);
+                            builder.ins().jump(merge_block, &[neq_result.into()]);
 
                             builder.switch_to_block(merge_block);
                             builder.seal_block(merge_block);
@@ -9061,12 +9061,12 @@ impl Codegen {
                         merge_block_param(builder, merge_block, types::I32);
 
                         let zero = builder.ins().iconst(types::I32, 0);
-                        builder.ins().brif(l_true, rhs_block, &[], merge_block, &[zero]);
+                        builder.ins().brif(l_true, rhs_block, &[], merge_block, &[zero.into()]);
 
                         builder.switch_to_block(rhs_block);
                         builder.seal_block(rhs_block);
                         let r_i32 = self.compile_condition(builder, rhs, env, db);
-                        builder.ins().jump(merge_block, &[r_i32]);
+                        builder.ins().jump(merge_block, &[r_i32.into()]);
 
                         builder.switch_to_block(merge_block);
                         builder.seal_block(merge_block);
@@ -9082,12 +9082,12 @@ impl Codegen {
                         merge_block_param(builder, merge_block, types::I32);
 
                         let one = builder.ins().iconst(types::I32, 1);
-                        builder.ins().brif(l_true, merge_block, &[one], rhs_block, &[]);
+                        builder.ins().brif(l_true, merge_block, &[one.into()], rhs_block, &[]);
 
                         builder.switch_to_block(rhs_block);
                         builder.seal_block(rhs_block);
                         let r_i32 = self.compile_condition(builder, rhs, env, db);
-                        builder.ins().jump(merge_block, &[r_i32]);
+                        builder.ins().jump(merge_block, &[r_i32.into()]);
 
                         builder.switch_to_block(merge_block);
                         builder.seal_block(merge_block);

@@ -131,7 +131,7 @@ fn load_relations(conn: &Connection) -> Vec<RelationInfo> {
         let (name, schema) = row.unwrap();
         let table_name = format!("_knot_{}", name);
         let quoted_table = crate::quote_ident(&table_name);
-        let count: usize = conn
+        let count: i64 = conn
             .query_row(
                 &format!("SELECT COUNT(*) FROM {}", quoted_table),
                 [],
@@ -141,7 +141,7 @@ fn load_relations(conn: &Connection) -> Vec<RelationInfo> {
         relations.push(RelationInfo {
             name,
             schema,
-            row_count: count,
+            row_count: count as usize,
         });
     }
     relations
@@ -165,14 +165,14 @@ fn load_rows(conn: &Connection, rel: &RelationInfo) -> Vec<Vec<String>> {
 
     match &schema {
         SchemaKind::Unit => {
-            let count: usize = conn
+            let count: i64 = conn
                 .query_row(
                     &format!("SELECT COUNT(*) FROM {}", quoted_table),
                     [],
                     |row| row.get(0),
                 )
                 .unwrap_or(0);
-            (0..count).map(|_| vec!["{}".to_string()]).collect()
+            (0..count as usize).map(|_| vec!["{}".to_string()]).collect()
         }
         SchemaKind::Record(fields) => {
             let col_names: Vec<String> = fields

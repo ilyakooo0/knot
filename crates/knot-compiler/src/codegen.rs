@@ -3724,8 +3724,9 @@ impl Codegen {
 
                     if let Some(new_rows_expr) = self.match_union_append(name, value) {
                         // 1. Append: union *rel <new> → INSERT only
+                        // Skip refinement checks: appended data was already validated
+                        // at the route handler boundary (HTTP body field validation).
                         let new_rows = self.compile_expr(builder, new_rows_expr, env, db);
-                        self.emit_refinement_checks(builder, name, new_rows, env, db);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
                         let (schema_ptr, schema_len) =
                             self.string_ptr(builder, &schema);

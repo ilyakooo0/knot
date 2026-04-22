@@ -4517,6 +4517,93 @@ impl Codegen {
             }
         }
 
+        // Special case: single *rel / single (filter f *rel) / single (do {...}) → LIMIT 2
+        if let ast::ExprKind::Var(name) = &func_expr.node {
+            if name == "single" && args.len() == 1 {
+                // single *source → SELECT ... LIMIT 2 then knot_relation_single
+                if let Some(source_name) = self.resolve_source(&args[0]) {
+                    if !self.views.contains_key(&source_name) {
+                        if let Some(schema) = self.source_schemas.get(&source_name).cloned() {
+                            if !schema.starts_with('#') && !schema.contains('[') {
+                                let table = quote_sql_ident(&format!("_knot_{}", source_name));
+                                let cols = parse_schema_columns(&schema).iter()
+                                    .map(|(name, _)| quote_sql_ident(name))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let sql = format!("SELECT {} FROM {} LIMIT 2", cols, table);
+                                let params_rel = self.compile_sql_params(builder, &[], env, db);
+                                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                                let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
+                                let (tn_ptr, tn_len) = self.string_ptr(builder, &source_name);
+                                self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
+                                let rel = self.call_rt(
+                                    builder,
+                                    "knot_source_query",
+                                    &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                                );
+                                return self.call_rt(builder, "knot_relation_single", &[rel]);
+                            }
+                        }
+                    }
+                }
+
+                // single (filter f *source) → SELECT ... WHERE ... LIMIT 2
+                if let Some((source_name, filter_bind, filter_body)) =
+                    extract_filter_on_source(&args[0], &self.source_var_binds, &self.fun_bodies)
+                {
+                    let source_name = source_name.to_string();
+                    let filter_bind = filter_bind.to_string();
+                    if !self.views.contains_key(&source_name) {
+                        if let Some(schema) = self.source_schemas.get(&source_name).cloned() {
+                            if !schema.starts_with('#') && !schema.contains('[') {
+                                if let Some(frag) = Self::try_compile_sql_expr(&filter_bind, filter_body) {
+                                    let table = quote_sql_ident(&format!("_knot_{}", source_name));
+                                    let cols = parse_schema_columns(&schema).iter()
+                                        .map(|(name, _)| quote_sql_ident(name))
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    let sql = format!("SELECT {} FROM {} WHERE {} LIMIT 2", cols, table, frag.sql);
+                                    let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
+                                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                                    let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
+                                    let (tn_ptr, tn_len) = self.string_ptr(builder, &source_name);
+                                    self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
+                                    let rel = self.call_rt(
+                                        builder,
+                                        "knot_source_query",
+                                        &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                                    );
+                                    return self.call_rt(builder, "knot_relation_single", &[rel]);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // single (do { x <- *source; where ...; yield x }) → SQL plan + LIMIT 2
+                if let ast::ExprKind::Do(stmts) = &args[0].node {
+                    if let Some(plan) = self.analyze_sql_plan(stmts, env) {
+                        let mut sql = plan.build_sql();
+                        sql.push_str(" LIMIT 2");
+                        let result_schema = plan.build_result_schema();
+                        let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
+                        for table in &plan.tables {
+                            let (tn_ptr, tn_len) = self.string_ptr(builder, &table.source_name);
+                            self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
+                        }
+                        let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                        let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
+                        let rel = self.call_rt(
+                            builder,
+                            "knot_source_query",
+                            &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                        );
+                        return self.call_rt(builder, "knot_relation_single", &[rel]);
+                    }
+                }
+            }
+        }
+
         // Special case: match Constructor SourceRef → SQL-level filtered read
         if let ast::ExprKind::Var(name) = &func_expr.node {
             if name == "match" && args.len() == 2 {
@@ -4589,6 +4676,102 @@ impl Codegen {
                                             }
                                         }
                                     }
+                                }
+                            }
+                        }
+                    }
+
+                    // sum/avg lambda (do { ... }) → SQL aggregate from plan
+                    if let ast::ExprKind::Do(stmts) = &args[1].node {
+                        if let Some(plan) = self.analyze_sql_plan(stmts, env) {
+                            if let Some((agg_bind, agg_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies) {
+                                // Use first table's alias and schema for the aggregate column
+                                let alias = if plan.tables.len() == 1 { &plan.tables[0].alias } else { "" };
+                                let schema = plan.tables.first()
+                                    .and_then(|t| self.source_schemas.get(&t.source_name))
+                                    .cloned()
+                                    .unwrap_or_default();
+                                if let Some(col_sql) = extract_sql_field_access(&agg_bind, agg_body, alias, &schema) {
+                                    let func = if name == "sum" { "SUM" } else { "AVG" };
+                                    let tables_sql: Vec<String> = plan.tables.iter().map(|t| {
+                                        format!("{} AS {}", quote_sql_ident(&format!("_knot_{}", t.source_name)), t.alias)
+                                    }).collect();
+                                    let from = tables_sql.join(", ");
+                                    let sql = if plan.conditions.is_empty() {
+                                        format!("SELECT {}({}) FROM {}", func, col_sql, from)
+                                    } else {
+                                        format!("SELECT {}({}) FROM {} WHERE {}", func, col_sql, from, plan.conditions.join(" AND "))
+                                    };
+                                    let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
+                                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                                    let rt_fn = if name == "sum" { "knot_source_query_sum" } else { "knot_source_query_float" };
+                                    return self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // filter/sortBy lambda (do { ... }) → merge into SQL plan
+                if matches!(name.as_str(), "filter" | "sortBy") {
+                    if let ast::ExprKind::Do(stmts) = &args[1].node {
+                        if let Some(mut plan) = self.analyze_sql_plan(stmts, env) {
+                            if let Some((bind_var, body)) = extract_single_param_lambda(&args[0], &self.fun_bodies) {
+                                match name.as_str() {
+                                    "filter" => {
+                                        // Merge WHERE condition into the plan
+                                        let bind_aliases: HashMap<String, String> = plan.tables.iter()
+                                            .enumerate()
+                                            .map(|(i, t)| (format!("__yield_row_{}", i), t.alias.clone()))
+                                            .collect();
+                                        // For single-table plans, the bind var maps to the table alias
+                                        if plan.tables.len() == 1 {
+                                            let mut ba = HashMap::new();
+                                            ba.insert(bind_var.clone(), plan.tables[0].alias.clone());
+                                            if let Some(frag) = Self::try_compile_multi_table_sql_expr(
+                                                &ba, body, env, &HashMap::new(),
+                                            ) {
+                                                plan.conditions.push(frag.sql);
+                                                plan.params.extend(frag.params);
+                                                let sql = plan.build_sql();
+                                                let result_schema = plan.build_result_schema();
+                                                let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
+                                                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                                                let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
+                                                return self.call_rt(
+                                                    builder,
+                                                    "knot_source_query",
+                                                    &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                                                );
+                                            }
+                                        }
+                                        let _ = bind_aliases;
+                                    }
+                                    "sortBy" => {
+                                        if plan.tables.len() == 1 {
+                                            let alias = &plan.tables[0].alias;
+                                            let schema = self.source_schemas
+                                                .get(&plan.tables[0].source_name)
+                                                .cloned()
+                                                .unwrap_or_default();
+                                            if let Some(col_sql) = extract_sql_field_access(
+                                                &bind_var, body, alias, &schema,
+                                            ) {
+                                                plan.order_by.push(col_sql);
+                                                let sql = plan.build_sql();
+                                                let result_schema = plan.build_result_schema();
+                                                let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
+                                                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                                                let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
+                                                return self.call_rt(
+                                                    builder,
+                                                    "knot_source_query",
+                                                    &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                                                );
+                                            }
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -4744,14 +4927,23 @@ impl Codegen {
             };
             if let Some(sql_op) = sql_op {
                 if args.len() == 2 {
-                    if let (ast::ExprKind::SourceRef(a), ast::ExprKind::SourceRef(b)) =
-                        (&args[0].node, &args[1].node)
-                    {
-                        if let Some(result) =
-                            self.try_compile_set_op_sql(builder, sql_op, a, b, env, db)
-                        {
-                            return result;
-                        }
+                    // Try to compile each side to a SQL subquery
+                    if let (Some(sub_a), Some(sub_b)) = (
+                        self.try_set_op_subquery(&args[0], env),
+                        self.try_set_op_subquery(&args[1], env),
+                    ) {
+                        let sql = format!("{} {} {}", sub_a.sql, sql_op, sub_b.sql);
+                        let result_schema = sub_a.schema;
+                        let mut all_params = sub_a.params;
+                        all_params.extend(sub_b.params);
+                        let params_rel = self.compile_sql_params(builder, &all_params, env, db);
+                        let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                        let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
+                        return self.call_rt(
+                            builder,
+                            "knot_source_query",
+                            &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                        );
                     }
                 }
             }
@@ -7446,7 +7638,7 @@ impl Codegen {
                     }
                     bind_aliases.insert(bind_var.clone(), alias.clone());
                     let frag = Self::try_compile_multi_table_sql_expr(
-                        &bind_aliases, body, env,
+                        &bind_aliases, body, env, &HashMap::new(),
                     )?;
                     conditions.push(frag.sql);
                     params.extend(frag.params);
@@ -7594,42 +7786,69 @@ impl Codegen {
         }
     }
 
-    /// Analyze do-block statements and produce a SQL query plan.
-    /// Returns None if the block can't be compiled to a single SQL query.
-    /// Compile `diff *a *b` / `inter *a *b` / `union *a *b` to SQL EXCEPT/INTERSECT/UNION.
-    fn try_compile_set_op_sql(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        sql_op: &str,
-        source_a: &str,
-        source_b: &str,
-        _env: &mut Env,
-        db: Value,
-    ) -> Option<Value> {
-        // Both must be plain source relations (not views, ADTs, or nested)
-        if self.views.contains_key(source_a) || self.views.contains_key(source_b) {
-            return None;
-        }
-        let schema_a = self.source_schemas.get(source_a)?.clone();
-        let schema_b = self.source_schemas.get(source_b)?.clone();
-        if schema_a.starts_with('#') || schema_a.contains('[')
-            || schema_b.starts_with('#') || schema_b.contains('[')
-        {
-            return None;
+    /// Try to compile a set-op argument (one side of diff/inter/union) to a SQL subquery.
+    /// Handles: bare *source, bound variable, filter f *source, and do-block SQL plans.
+    fn try_set_op_subquery(
+        &self,
+        expr: &ast::Expr,
+        env: &Env,
+    ) -> Option<SetOpSubquery> {
+        // Case 1: bare *source or bound variable
+        if let Some(source_name) = self.resolve_source(expr) {
+            if self.views.contains_key(&source_name) {
+                return None;
+            }
+            let schema = self.source_schemas.get(&source_name)?;
+            if schema.starts_with('#') || schema.contains('[') {
+                return None;
+            }
+            let table = quote_sql_ident(&format!("_knot_{}", source_name));
+            let cols = parse_schema_columns(schema).iter()
+                .map(|(name, _)| quote_sql_ident(name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Some(SetOpSubquery {
+                sql: format!("SELECT {} FROM {}", cols, table),
+                schema: schema.clone(),
+                params: vec![],
+            });
         }
 
-        let table_a = quote_sql_ident(&format!("_knot_{}", source_a));
-        let table_b = quote_sql_ident(&format!("_knot_{}", source_b));
-        let sql = format!("SELECT * FROM {} {} SELECT * FROM {}", table_a, sql_op, table_b);
-        let result_schema = schema_a.clone();
-        let empty_params = self.call_rt(builder, "knot_relation_empty", &[]);
-        let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-        let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
-        Some(self.call_rt(
-            builder,
-            "knot_source_query",
-            &[db, sql_ptr, sql_len, schema_ptr, schema_len, empty_params],
-        ))
+        // Case 2: filter f *source
+        if let Some((source_name, filter_bind, filter_body)) =
+            extract_filter_on_source(expr, &self.source_var_binds, &self.fun_bodies)
+        {
+            if self.views.contains_key(source_name) {
+                return None;
+            }
+            let schema = self.source_schemas.get(source_name)?;
+            if schema.starts_with('#') || schema.contains('[') {
+                return None;
+            }
+            let frag = Self::try_compile_sql_expr(&filter_bind, filter_body)?;
+            let table = quote_sql_ident(&format!("_knot_{}", source_name));
+            let cols = parse_schema_columns(schema).iter()
+                .map(|(name, _)| quote_sql_ident(name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Some(SetOpSubquery {
+                sql: format!("SELECT {} FROM {} WHERE {}", cols, table, frag.sql),
+                schema: schema.clone(),
+                params: frag.params,
+            });
+        }
+
+        // Case 3: do-block → full SQL plan
+        if let ast::ExprKind::Do(stmts) = &expr.node {
+            let plan = self.analyze_sql_plan(stmts, env)?;
+            return Some(SetOpSubquery {
+                sql: plan.build_sql(),
+                schema: plan.build_result_schema(),
+                params: plan.params,
+            });
+        }
+
+        None
     }
 
     fn analyze_sql_plan(
@@ -7643,6 +7862,7 @@ impl Codegen {
         let mut tables: Vec<SqlTable> = Vec::new();
         let mut bind_to_alias: HashMap<String, String> = HashMap::new();
         let mut bind_to_schema: HashMap<String, String> = HashMap::new();
+        let mut let_binds: HashMap<String, ast::Expr> = HashMap::new();
         let mut conditions: Vec<String> = Vec::new();
         let mut params: Vec<SqlParamSource> = Vec::new();
 
@@ -7679,9 +7899,23 @@ impl Codegen {
                         alias,
                     });
                 }
+                ast::StmtKind::Let { pat, expr } => {
+                    // Only support simple variable patterns; bail on destructuring.
+                    let var_name = if let ast::PatKind::Var(name) = &pat.node {
+                        name.clone()
+                    } else {
+                        return None;
+                    };
+                    // The let expression must not reference any bind aliases
+                    // (it's a computed parameter, not a column alias).
+                    if bind_to_alias.keys().any(|k| Self::expr_refs_var(expr, k)) {
+                        return None;
+                    }
+                    let_binds.insert(var_name, expr.clone());
+                }
                 ast::StmtKind::Where { cond } => {
                     let frag = Self::try_compile_multi_table_sql_expr(
-                        &bind_to_alias, cond, env,
+                        &bind_to_alias, cond, env, &let_binds,
                     )?;
                     conditions.push(frag.sql);
                     params.extend(frag.params);
@@ -7711,22 +7945,40 @@ impl Codegen {
         match &yield_expr.node {
             ast::ExprKind::Record(fields) => {
                 for field in fields {
+                    // Try simple field access first: var.column
                     if let ast::ExprKind::FieldAccess { expr, field: col_name } = &field.value.node
                     {
                         if let ast::ExprKind::Var(var_name) = &expr.node {
-                            let alias = bind_to_alias.get(var_name)?.clone();
-                            let schema = bind_to_schema.get(var_name)?;
-                            let type_str = lookup_col_type_from_schema(schema, col_name)?;
-                            select_columns.push(SqlSelectColumn {
-                                result_field: field.name.clone(),
-                                alias,
-                                source_col: col_name.clone(),
-                                type_str,
-                                sql_expr: None,
-                            });
-                        } else {
-                            return None;
+                            if let Some(alias) = bind_to_alias.get(var_name) {
+                                if let Some(schema) = bind_to_schema.get(var_name) {
+                                    if let Some(type_str) = lookup_col_type_from_schema(schema, col_name) {
+                                        select_columns.push(SqlSelectColumn {
+                                            result_field: field.name.clone(),
+                                            alias: alias.clone(),
+                                            source_col: col_name.clone(),
+                                            type_str,
+                                            sql_expr: None,
+                                        });
+                                        continue;
+                                    }
+                                }
+                            }
                         }
+                    }
+                    // Fallback: try computed expression (arithmetic, CASE WHEN)
+                    if let Some(sql_expr) = try_multi_table_arithmetic_expr(
+                        &bind_to_alias, &bind_to_schema, &field.value,
+                    ) {
+                        let type_str = infer_multi_table_sql_expr_type(
+                            &bind_to_schema, &field.value,
+                        ).unwrap_or_else(|| "float".to_string());
+                        select_columns.push(SqlSelectColumn {
+                            result_field: field.name.clone(),
+                            alias: String::new(),
+                            source_col: field.name.clone(),
+                            type_str,
+                            sql_expr: Some(sql_expr),
+                        });
                     } else {
                         return None;
                     }
@@ -7764,16 +8016,18 @@ impl Codegen {
 
     /// Compile a multi-table Where condition to a SQL fragment.
     /// Handles both join conditions (field = field) and filter conditions (field op ?).
+    /// `let_binds` maps let-bound variable names to their expressions for SQL parameter compilation.
     fn try_compile_multi_table_sql_expr(
         bind_aliases: &HashMap<String, String>,
         expr: &ast::Expr,
         env: &Env,
+        let_binds: &HashMap<String, ast::Expr>,
     ) -> Option<SqlFragment> {
         match &expr.node {
             ast::ExprKind::BinOp { op, lhs, rhs } => match op {
                 ast::BinOp::And => {
-                    let l = Self::try_compile_multi_table_sql_expr(bind_aliases, lhs, env)?;
-                    let r = Self::try_compile_multi_table_sql_expr(bind_aliases, rhs, env)?;
+                    let l = Self::try_compile_multi_table_sql_expr(bind_aliases, lhs, env, let_binds)?;
+                    let r = Self::try_compile_multi_table_sql_expr(bind_aliases, rhs, env, let_binds)?;
                     let mut params = l.params;
                     params.extend(r.params);
                     Some(SqlFragment {
@@ -7782,8 +8036,8 @@ impl Codegen {
                     })
                 }
                 ast::BinOp::Or => {
-                    let l = Self::try_compile_multi_table_sql_expr(bind_aliases, lhs, env)?;
-                    let r = Self::try_compile_multi_table_sql_expr(bind_aliases, rhs, env)?;
+                    let l = Self::try_compile_multi_table_sql_expr(bind_aliases, lhs, env, let_binds)?;
+                    let r = Self::try_compile_multi_table_sql_expr(bind_aliases, rhs, env, let_binds)?;
                     let mut params = l.params;
                     params.extend(r.params);
                     Some(SqlFragment {
@@ -7802,7 +8056,7 @@ impl Codegen {
                         ast::BinOp::Ge => ">=",
                         _ => unreachable!(),
                     };
-                    Self::try_compile_multi_table_comparison(bind_aliases, lhs, rhs, sql_op, env)
+                    Self::try_compile_multi_table_comparison(bind_aliases, lhs, rhs, sql_op, env, let_binds)
                         .or_else(|| {
                             let rev = match sql_op {
                                 "=" | "!=" => sql_op,
@@ -7813,7 +8067,7 @@ impl Codegen {
                                 _ => return None,
                             };
                             Self::try_compile_multi_table_comparison(
-                                bind_aliases, rhs, lhs, rev, env,
+                                bind_aliases, rhs, lhs, rev, env, let_binds,
                             )
                         })
                 }
@@ -7826,8 +8080,8 @@ impl Codegen {
                         ast::BinOp::Div => "/",
                         _ => unreachable!(),
                     };
-                    let l = Self::try_compile_sql_atom(bind_aliases, lhs, env)?;
-                    let r = Self::try_compile_sql_atom(bind_aliases, rhs, env)?;
+                    let l = Self::try_compile_sql_atom(bind_aliases, lhs, env, let_binds)?;
+                    let r = Self::try_compile_sql_atom(bind_aliases, rhs, env, let_binds)?;
                     let mut params = l.params;
                     params.extend(r.params);
                     Some(SqlFragment {
@@ -7841,7 +8095,7 @@ impl Codegen {
                 op: ast::UnaryOp::Not,
                 operand,
             } => {
-                let inner = Self::try_compile_multi_table_sql_expr(bind_aliases, operand, env)?;
+                let inner = Self::try_compile_multi_table_sql_expr(bind_aliases, operand, env, let_binds)?;
                 Some(SqlFragment {
                     sql: format!("NOT ({})", inner.sql),
                     params: inner.params,
@@ -7853,10 +8107,12 @@ impl Codegen {
 
     /// Try to compile an expression as a SQL atom (field access, literal, var, or arithmetic).
     /// Used as operands in comparisons and arithmetic.
+    /// `let_binds` maps let-bound variable names to their original expressions.
     fn try_compile_sql_atom(
         bind_aliases: &HashMap<String, String>,
         expr: &ast::Expr,
         env: &Env,
+        let_binds: &HashMap<String, ast::Expr>,
     ) -> Option<SqlFragment> {
         match &expr.node {
             ast::ExprKind::FieldAccess { expr: inner, field } => {
@@ -7886,6 +8142,13 @@ impl Codegen {
             ast::ExprKind::Var(name) => {
                 if bind_aliases.contains_key(name.as_str()) {
                     None
+                } else if let Some(let_expr) = let_binds.get(name.as_str()) {
+                    // Let-bound variable from within the do-block — compile
+                    // the original let expression at runtime as a SQL parameter.
+                    Some(SqlFragment {
+                        sql: "?".to_string(),
+                        params: vec![SqlParamSource::Expr(let_expr.clone())],
+                    })
                 } else if env.bindings.contains_key(name) {
                     Some(SqlFragment {
                         sql: "?".to_string(),
@@ -7907,8 +8170,8 @@ impl Codegen {
                     ast::BinOp::Div => "/",
                     _ => return None,
                 };
-                let l = Self::try_compile_sql_atom(bind_aliases, lhs, env)?;
-                let r = Self::try_compile_sql_atom(bind_aliases, rhs, env)?;
+                let l = Self::try_compile_sql_atom(bind_aliases, lhs, env, let_binds)?;
+                let r = Self::try_compile_sql_atom(bind_aliases, rhs, env, let_binds)?;
                 let mut params = l.params;
                 params.extend(r.params);
                 Some(SqlFragment {
@@ -7928,9 +8191,10 @@ impl Codegen {
         rhs: &ast::Expr,
         op: &str,
         env: &Env,
+        let_binds: &HashMap<String, ast::Expr>,
     ) -> Option<SqlFragment> {
-        let l = Self::try_compile_sql_atom(bind_aliases, lhs, env)?;
-        let r = Self::try_compile_sql_atom(bind_aliases, rhs, env)?;
+        let l = Self::try_compile_sql_atom(bind_aliases, lhs, env, let_binds)?;
+        let r = Self::try_compile_sql_atom(bind_aliases, rhs, env, let_binds)?;
         let mut params = l.params;
         params.extend(r.params);
         // Wrap arithmetic atoms in CAST for correct TEXT/INTEGER comparison:
@@ -9072,6 +9336,13 @@ struct SqlFragment {
     params: Vec<SqlParamSource>,
 }
 
+/// A SQL subquery for one side of a set operation (diff/inter/union).
+struct SetOpSubquery {
+    sql: String,
+    schema: String,
+    params: Vec<SqlParamSource>,
+}
+
 #[derive(Clone)]
 enum SqlParamSource {
     Literal(ast::Literal),
@@ -9427,8 +9698,57 @@ fn sql_col_ref(alias: &str, col_name: &str) -> String {
     }
 }
 
+/// Try to compile a condition expression to an inline SQL condition (no params).
+/// Used inside CASE WHEN expressions where everything must be inlined.
+/// Handles: comparisons (==, !=, <, >, <=, >=), AND, OR, NOT.
+fn try_sql_inline_condition(
+    bind_var: &str,
+    expr: &ast::Expr,
+    alias: &str,
+    schema: &str,
+) -> Option<String> {
+    match &expr.node {
+        ast::ExprKind::BinOp { op, lhs, rhs } => match op {
+            ast::BinOp::And => {
+                let l = try_sql_inline_condition(bind_var, lhs, alias, schema)?;
+                let r = try_sql_inline_condition(bind_var, rhs, alias, schema)?;
+                Some(format!("({}) AND ({})", l, r))
+            }
+            ast::BinOp::Or => {
+                let l = try_sql_inline_condition(bind_var, lhs, alias, schema)?;
+                let r = try_sql_inline_condition(bind_var, rhs, alias, schema)?;
+                Some(format!("({}) OR ({})", l, r))
+            }
+            ast::BinOp::Eq | ast::BinOp::Neq | ast::BinOp::Lt
+            | ast::BinOp::Gt | ast::BinOp::Le | ast::BinOp::Ge => {
+                let sql_op = match op {
+                    ast::BinOp::Eq => "=",
+                    ast::BinOp::Neq => "!=",
+                    ast::BinOp::Lt => "<",
+                    ast::BinOp::Gt => ">",
+                    ast::BinOp::Le => "<=",
+                    ast::BinOp::Ge => ">=",
+                    _ => unreachable!(),
+                };
+                let l = try_sql_arithmetic_expr(bind_var, lhs, alias, schema)?;
+                let r = try_sql_arithmetic_expr(bind_var, rhs, alias, schema)?;
+                Some(format!("{} {} {}", l, sql_op, r))
+            }
+            _ => None,
+        },
+        ast::ExprKind::UnaryOp {
+            op: ast::UnaryOp::Not,
+            operand,
+        } => {
+            let inner = try_sql_inline_condition(bind_var, operand, alias, schema)?;
+            Some(format!("NOT ({})", inner))
+        }
+        _ => None,
+    }
+}
+
 /// Try to compile an arithmetic expression to a SQL fragment.
-/// Handles: field access, literals, and +, -, *, / binary ops.
+/// Handles: field access, literals, +, -, *, / binary ops, and if/then/else → CASE WHEN.
 fn try_sql_arithmetic_expr(
     bind_var: &str,
     expr: &ast::Expr,
@@ -9448,6 +9768,8 @@ fn try_sql_arithmetic_expr(
         ast::ExprKind::Lit(lit) => match lit {
             ast::Literal::Int(n) => Some(n.to_string()),
             ast::Literal::Float(f) => Some(f.to_string()),
+            ast::Literal::Text(s) => Some(format!("'{}'", s.replace('\'', "''"))),
+            ast::Literal::Bool(b) => Some(if *b { "1" } else { "0" }.to_string()),
             _ => None,
         },
         ast::ExprKind::BinOp { op, lhs, rhs } => {
@@ -9461,6 +9783,12 @@ fn try_sql_arithmetic_expr(
             let l = try_sql_arithmetic_expr(bind_var, lhs, alias, schema)?;
             let r = try_sql_arithmetic_expr(bind_var, rhs, alias, schema)?;
             Some(format!("({} {} {})", l, sql_op, r))
+        }
+        ast::ExprKind::If { cond, then_branch, else_branch } => {
+            let cond_sql = try_sql_inline_condition(bind_var, cond, alias, schema)?;
+            let then_sql = try_sql_arithmetic_expr(bind_var, then_branch, alias, schema)?;
+            let else_sql = try_sql_arithmetic_expr(bind_var, else_branch, alias, schema)?;
+            Some(format!("CASE WHEN {} THEN {} ELSE {} END", cond_sql, then_sql, else_sql))
         }
         _ => None,
     }
@@ -9533,6 +9861,8 @@ fn infer_sql_expr_type(bind_var: &str, expr: &ast::Expr, schema: &str) -> Option
         ast::ExprKind::Lit(lit) => match lit {
             ast::Literal::Int(_) => Some("int".to_string()),
             ast::Literal::Float(_) => Some("float".to_string()),
+            ast::Literal::Text(_) => Some("text".to_string()),
+            ast::Literal::Bool(_) => Some("int".to_string()),
             _ => None,
         },
         ast::ExprKind::BinOp { op, lhs, rhs } => {
@@ -9547,6 +9877,146 @@ fn infer_sql_expr_type(bind_var: &str, expr: &ast::Expr, schema: &str) -> Option
                 (_, Some(t), _) => Some(t.to_string()),
                 _ => None,
             }
+        }
+        ast::ExprKind::If { then_branch, else_branch, .. } => {
+            infer_sql_expr_type(bind_var, then_branch, schema)
+                .or_else(|| infer_sql_expr_type(bind_var, else_branch, schema))
+        }
+        _ => None,
+    }
+}
+
+// ── Multi-table SQL expression helpers ───────────────────────────
+
+/// Try to compile a condition expression to inline SQL for multi-table contexts.
+/// Used inside CASE WHEN in multi-table yield expressions.
+fn try_multi_table_inline_condition(
+    bind_to_alias: &HashMap<String, String>,
+    bind_to_schema: &HashMap<String, String>,
+    expr: &ast::Expr,
+) -> Option<String> {
+    match &expr.node {
+        ast::ExprKind::BinOp { op, lhs, rhs } => match op {
+            ast::BinOp::And => {
+                let l = try_multi_table_inline_condition(bind_to_alias, bind_to_schema, lhs)?;
+                let r = try_multi_table_inline_condition(bind_to_alias, bind_to_schema, rhs)?;
+                Some(format!("({}) AND ({})", l, r))
+            }
+            ast::BinOp::Or => {
+                let l = try_multi_table_inline_condition(bind_to_alias, bind_to_schema, lhs)?;
+                let r = try_multi_table_inline_condition(bind_to_alias, bind_to_schema, rhs)?;
+                Some(format!("({}) OR ({})", l, r))
+            }
+            ast::BinOp::Eq | ast::BinOp::Neq | ast::BinOp::Lt
+            | ast::BinOp::Gt | ast::BinOp::Le | ast::BinOp::Ge => {
+                let sql_op = match op {
+                    ast::BinOp::Eq => "=",
+                    ast::BinOp::Neq => "!=",
+                    ast::BinOp::Lt => "<",
+                    ast::BinOp::Gt => ">",
+                    ast::BinOp::Le => "<=",
+                    ast::BinOp::Ge => ">=",
+                    _ => unreachable!(),
+                };
+                let l = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, lhs)?;
+                let r = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, rhs)?;
+                Some(format!("{} {} {}", l, sql_op, r))
+            }
+            _ => None,
+        },
+        ast::ExprKind::UnaryOp {
+            op: ast::UnaryOp::Not,
+            operand,
+        } => {
+            let inner = try_multi_table_inline_condition(bind_to_alias, bind_to_schema, operand)?;
+            Some(format!("NOT ({})", inner))
+        }
+        _ => None,
+    }
+}
+
+/// Try to compile an expression to an inline SQL string for multi-table yield contexts.
+/// Handles: field access on any bound table, literals, arithmetic, CASE WHEN.
+fn try_multi_table_arithmetic_expr(
+    bind_to_alias: &HashMap<String, String>,
+    bind_to_schema: &HashMap<String, String>,
+    expr: &ast::Expr,
+) -> Option<String> {
+    match &expr.node {
+        ast::ExprKind::FieldAccess { expr: inner, field: col_name } => {
+            if let ast::ExprKind::Var(name) = &inner.node {
+                if let Some(alias) = bind_to_alias.get(name.as_str()) {
+                    let schema = bind_to_schema.get(name.as_str())?;
+                    lookup_col_type_from_schema(schema, col_name)?;
+                    return Some(format!("{}.{}", alias, quote_sql_ident(col_name)));
+                }
+            }
+            None
+        }
+        ast::ExprKind::Lit(lit) => match lit {
+            ast::Literal::Int(n) => Some(n.to_string()),
+            ast::Literal::Float(f) => Some(f.to_string()),
+            ast::Literal::Text(s) => Some(format!("'{}'", s.replace('\'', "''"))),
+            ast::Literal::Bool(b) => Some(if *b { "1" } else { "0" }.to_string()),
+            _ => None,
+        },
+        ast::ExprKind::BinOp { op, lhs, rhs } => {
+            let sql_op = match op {
+                ast::BinOp::Add => "+",
+                ast::BinOp::Sub => "-",
+                ast::BinOp::Mul => "*",
+                ast::BinOp::Div => "/",
+                _ => return None,
+            };
+            let l = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, lhs)?;
+            let r = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, rhs)?;
+            Some(format!("({} {} {})", l, sql_op, r))
+        }
+        ast::ExprKind::If { cond, then_branch, else_branch } => {
+            let cond_sql = try_multi_table_inline_condition(bind_to_alias, bind_to_schema, cond)?;
+            let then_sql = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, then_branch)?;
+            let else_sql = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, else_branch)?;
+            Some(format!("CASE WHEN {} THEN {} ELSE {} END", cond_sql, then_sql, else_sql))
+        }
+        _ => None,
+    }
+}
+
+/// Infer the SQL type of an expression in a multi-table context.
+fn infer_multi_table_sql_expr_type(
+    bind_to_schema: &HashMap<String, String>,
+    expr: &ast::Expr,
+) -> Option<String> {
+    match &expr.node {
+        ast::ExprKind::FieldAccess { expr: inner, field: col_name } => {
+            if let ast::ExprKind::Var(name) = &inner.node {
+                if let Some(schema) = bind_to_schema.get(name.as_str()) {
+                    return lookup_col_type_from_schema(schema, col_name);
+                }
+            }
+            None
+        }
+        ast::ExprKind::Lit(lit) => match lit {
+            ast::Literal::Int(_) => Some("int".to_string()),
+            ast::Literal::Float(_) => Some("float".to_string()),
+            ast::Literal::Text(_) => Some("text".to_string()),
+            ast::Literal::Bool(_) => Some("int".to_string()),
+            _ => None,
+        },
+        ast::ExprKind::BinOp { op, lhs, rhs } => {
+            let l = infer_multi_table_sql_expr_type(bind_to_schema, lhs);
+            let r = infer_multi_table_sql_expr_type(bind_to_schema, rhs);
+            match (l.as_deref(), r.as_deref(), op) {
+                (_, _, ast::BinOp::Div) => Some("float".to_string()),
+                (Some("float"), _, _) | (_, Some("float"), _) => Some("float".to_string()),
+                (Some(t), _, _) => Some(t.to_string()),
+                (_, Some(t), _) => Some(t.to_string()),
+                _ => None,
+            }
+        }
+        ast::ExprKind::If { then_branch, else_branch, .. } => {
+            infer_multi_table_sql_expr_type(bind_to_schema, then_branch)
+                .or_else(|| infer_multi_table_sql_expr_type(bind_to_schema, else_branch))
         }
         _ => None,
     }

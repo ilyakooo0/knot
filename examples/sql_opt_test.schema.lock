@@ -1,0 +1,11 @@
+-- schema.lock (auto-generated, do not edit)
+-- Commit to source control.
+
+type Employee = {name: Text, dept: Text, salary: Float}
+
+*employees : [Employee]
+
+
+*engineers : [Employee]
+
+

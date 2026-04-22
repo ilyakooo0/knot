@@ -50,6 +50,10 @@ pub struct Codegen {
 
     // Source relation schemas: name -> schema descriptor
     source_schemas: HashMap<String, String>,
+    /// Variables bound from source reads: var_name → source_name.
+    /// Populated by compile_io_do_eager when it processes `x <- *source`.
+    /// Enables SQL optimization for `do { m <- x; where ...; yield m }`.
+    source_var_binds: HashMap<String, String>,
 
     // Constructor info: ctor_name -> [(field_name, field_type_str)]
     constructors: HashMap<String, Vec<(String, String)>>,
@@ -395,6 +399,7 @@ impl Codegen {
             user_fns: HashMap::new(),
             stdlib_fns: HashSet::new(),
             source_schemas: HashMap::new(),
+            source_var_binds: HashMap::new(),
             constructors: HashMap::new(),
             lambda_counter: 0,
             pending_lambdas: Vec::new(),
@@ -4496,19 +4501,19 @@ impl Codegen {
                     if let ast::ExprKind::App { func: sort_name_expr, arg: sort_lambda } = &sort_func.node {
                         if let ast::ExprKind::Var(sort_name) = &sort_name_expr.node {
                             if sort_name == "sortBy" {
-                                if let ast::ExprKind::SourceRef(source_name) = &sort_source.node {
-                                    if !self.views.contains_key(source_name) {
-                                        if let Some(schema) = self.source_schemas.get(source_name).cloned() {
-                                            if !schema.starts_with('#') && !schema.contains('[') {
-                                                if let Some((bind_var, body)) = extract_single_param_lambda(sort_lambda) {
-                                                    if let Some(col_sql) = extract_sql_field_access(&bind_var, body, "", &schema) {
+                                if let Some((sort_bind, sort_body)) = extract_single_param_lambda(sort_lambda) {
+                                    // Case 1: sortBy f *source → SQL ORDER BY + LIMIT
+                                    if let ast::ExprKind::SourceRef(source_name) = &sort_source.node {
+                                        if !self.views.contains_key(source_name) {
+                                            if let Some(schema) = self.source_schemas.get(source_name).cloned() {
+                                                if !schema.starts_with('#') && !schema.contains('[') {
+                                                    if let Some(col_sql) = extract_sql_field_access(&sort_bind, sort_body, "", &schema) {
                                                         let table = quote_sql_ident(&format!("_knot_{}", source_name));
                                                         let cols = parse_schema_columns(&schema).iter()
                                                             .map(|(n, _)| quote_sql_ident(n))
                                                             .collect::<Vec<_>>()
                                                             .join(", ");
                                                         let sql = format!("SELECT {} FROM {} ORDER BY {} LIMIT ?", cols, table, col_sql);
-                                                        // Compile N as a runtime value and wrap as a singleton relation param
                                                         let n_val = self.compile_expr(builder, &args[0], env, db);
                                                         let params_rel = self.call_rt(builder, "knot_relation_singleton", &[n_val]);
                                                         let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
@@ -4519,6 +4524,42 @@ impl Codegen {
                                                             &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
                                                         );
                                                     }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Case 2: sortBy f (do { m <- *source; where ...; yield m })
+                                    // → SQL WHERE + ORDER BY + LIMIT
+                                    if let ast::ExprKind::Do(do_stmts) = &sort_source.node {
+                                        if let Some(mut plan) = self.analyze_sql_plan(do_stmts, env) {
+                                            if plan.tables.len() == 1 {
+                                                let alias = &plan.tables[0].alias;
+                                                let schema = self.source_schemas
+                                                    .get(&plan.tables[0].source_name)
+                                                    .cloned()
+                                                    .unwrap_or_default();
+                                                if let Some(col_sql) = extract_sql_field_access(
+                                                    &sort_bind, sort_body, alias, &schema,
+                                                ) {
+                                                    plan.order_by.push(col_sql);
+                                                    let n_param = SqlParamSource::Var("__limit__".into());
+                                                    plan.limit = Some(n_param);
+                                                    let sql = plan.build_sql();
+                                                    let result_schema = plan.build_result_schema();
+                                                    // Compile SQL params + the limit value
+                                                    let n_val = self.compile_expr(builder, &args[0], env, db);
+                                                    // Build params: plan params + limit
+                                                    let mut all_params = plan.params.clone();
+                                                    let params_rel = self.compile_sql_params(builder, &all_params, env);
+                                                    // Append limit to the params relation
+                                                    self.call_rt_void(builder, "knot_relation_push", &[params_rel, n_val]);
+                                                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                                                    let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
+                                                    return self.call_rt(
+                                                        builder,
+                                                        "knot_source_query",
+                                                        &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                                                    );
                                                 }
                                             }
                                         }
@@ -5701,6 +5742,14 @@ impl Codegen {
         for stmt in stmts {
             match &stmt.node {
                 ast::StmtKind::Bind { pat, expr } => {
+                    // Track source read bindings for SQL optimization:
+                    // `x <- *source` records x → source so inner do-blocks
+                    // like `do { m <- x; where ...; yield m }` can compile to SQL.
+                    if let ast::PatKind::Var(var_name) = &pat.node {
+                        if let ast::ExprKind::SourceRef(source_name) = &expr.node {
+                            self.source_var_binds.insert(var_name.clone(), source_name.clone());
+                        }
+                    }
                     let io_val = self.compile_expr(builder, expr, env, db);
                     // Run the IO action to get the result
                     let result = self.call_rt(builder, "knot_io_run", &[db, io_val]);
@@ -7443,6 +7492,9 @@ impl Codegen {
                     };
                     let source_name = if let ast::ExprKind::SourceRef(name) = &expr.node {
                         name.clone()
+                    } else if let ast::ExprKind::Var(var_name) = &expr.node {
+                        // Variable bound from a source read (e.g. `allMessages <- *messages`)
+                        self.source_var_binds.get(var_name)?.clone()
                     } else {
                         return None;
                     };

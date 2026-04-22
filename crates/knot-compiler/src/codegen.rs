@@ -3782,7 +3782,7 @@ impl Codegen {
                             let mut all_params = sf.params;
                             all_params.extend(wf.params);
                             let params_rel =
-                                self.compile_sql_params(builder, &all_params, env);
+                                self.compile_sql_params(builder, &all_params, env, db);
                             let (name_ptr, name_len) = self.string_ptr(builder, name);
                             let set_sql = sf.sql;
                             let where_sql = wf.sql;
@@ -3849,7 +3849,7 @@ impl Codegen {
                         if let Some(frag) = combined_sql {
                             // SQL compilation succeeded → DELETE WHERE NOT (cond)
                             let params_rel =
-                                self.compile_sql_params(builder, &frag.params, env);
+                                self.compile_sql_params(builder, &frag.params, env, db);
                             let (name_ptr, name_len) = self.string_ptr(builder, name);
                             let where_sql = frag.sql;
                             let (where_ptr, where_len) =
@@ -4556,7 +4556,7 @@ impl Codegen {
                                                     }
                                                     // Compile SQL params + the limit value
                                                     let n_val = self.compile_expr(builder, &args[0], env, db);
-                                                    let params_rel = self.compile_sql_params(builder, &plan.params, env);
+                                                    let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
                                                     // Append limit to the params relation
                                                     self.call_rt_void(builder, "knot_relation_push", &[params_rel, n_val]);
                                                     let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
@@ -6239,7 +6239,7 @@ impl Codegen {
                                             Self::try_compile_sql_expr(bind_var, cond)
                                         {
                                             let params_ok = frag.params.iter().all(|p| match p {
-                                                SqlParamSource::Literal(_) => true,
+                                                SqlParamSource::Literal(_) | SqlParamSource::Expr(_) => true,
                                                 SqlParamSource::Var(v) => {
                                                     v != bind_var && env.bindings.contains_key(v)
                                                 }
@@ -6272,7 +6272,7 @@ impl Codegen {
                                     let (where_ptr, where_len) =
                                         self.string_ptr(builder, &where_sql);
                                     let params_rel =
-                                        self.compile_sql_params(builder, &all_params, env);
+                                        self.compile_sql_params(builder, &all_params, env, db);
                                     let val = self.call_rt(
                                         builder,
                                         "knot_source_read_where",
@@ -7174,7 +7174,7 @@ impl Codegen {
         let sql = plan.build_sql();
         let result_schema = plan.build_result_schema();
 
-        let params_rel = self.compile_sql_params(builder, &plan.params, env);
+        let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
         let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
         let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
         Some(self.call_rt(
@@ -7202,7 +7202,7 @@ impl Codegen {
             "filter" => {
                 // Use unqualified column names for knot_source_read_where
                 let frag = Self::try_compile_sql_expr(&bind_var, body)?;
-                let params_rel = self.compile_sql_params(builder, &frag.params, env);
+                let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
                 let (name_ptr, name_len) = self.string_ptr(builder, source_name);
                 let (schema_ptr, schema_len) = self.string_ptr(builder, schema);
                 let (where_ptr, where_len) = self.string_ptr(builder, &frag.sql);
@@ -7217,7 +7217,7 @@ impl Codegen {
                 let col_sql = extract_sql_field_access(&bind_var, body, "", schema)?;
                 let func = if fn_name == "sum" { "SUM" } else { "AVG" };
                 let sql = format!("SELECT {}({}) FROM {}", func, col_sql, table);
-                let params_rel = self.compile_sql_params(builder, &[], env);
+                let params_rel = self.compile_sql_params(builder, &[], env, db);
                 let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
                 let rt_fn = if fn_name == "sum" { "knot_source_query_sum" } else { "knot_source_query_float" };
                 Some(self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]))
@@ -7232,7 +7232,7 @@ impl Codegen {
                 let sql = format!("SELECT {} FROM {} ORDER BY {}", cols, table, col_sql);
                 let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
                 let (schema_ptr, schema_len) = self.string_ptr(builder, schema);
-                let params_rel = self.compile_sql_params(builder, &[], env);
+                let params_rel = self.compile_sql_params(builder, &[], env, db);
                 Some(self.call_rt(
                     builder,
                     "knot_source_query",
@@ -7357,7 +7357,7 @@ impl Codegen {
                     func, col_sql, table, alias, conditions.join(" AND ")
                 )
             };
-            let params_rel = self.compile_sql_params(builder, &params, env);
+            let params_rel = self.compile_sql_params(builder, &params, env, db);
             let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
             let rt_fn = match func {
                 "SUM" => "knot_source_query_sum",
@@ -7379,7 +7379,7 @@ impl Codegen {
                     table, alias, conditions.join(" AND ")
                 )
             };
-            let params_rel = self.compile_sql_params(builder, &params, env);
+            let params_rel = self.compile_sql_params(builder, &params, env, db);
             let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
             Some(self.call_rt(
                 builder,
@@ -7425,7 +7425,7 @@ impl Codegen {
             if let Some(off) = &plan.offset {
                 all_params.push(off.clone());
             }
-            let params_rel = self.compile_sql_params(builder, &all_params, env);
+            let params_rel = self.compile_sql_params(builder, &all_params, env, db);
             let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
             let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
             Some(self.call_rt(
@@ -7882,13 +7882,37 @@ impl Codegen {
                     return None;
                 }
             }
-            _ => return None,
+            // Computed expression (e.g. `t - messageMaxAge`): compile at runtime
+            // and pass as a SQL parameter.  Only accept if the expression doesn't
+            // reference the bind variable (would need column-level SQL instead).
+            _ => {
+                if Self::expr_refs_var(value_side, bind_var) {
+                    return None;
+                }
+                SqlParamSource::Expr(value_side.clone())
+            }
         };
 
         Some(SqlFragment {
             sql: format!("{} {} ?", quote_sql_ident(&col_name), op),
             params: vec![param],
         })
+    }
+
+    /// Check if an expression references a specific variable.
+    fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
+        match &expr.node {
+            ast::ExprKind::Var(name) => name == var,
+            ast::ExprKind::FieldAccess { expr: e, .. } => Self::expr_refs_var(e, var),
+            ast::ExprKind::App { func, arg } => Self::expr_refs_var(func, var) || Self::expr_refs_var(arg, var),
+            ast::ExprKind::BinOp { lhs, rhs, .. } => Self::expr_refs_var(lhs, var) || Self::expr_refs_var(rhs, var),
+            ast::ExprKind::UnaryOp { operand, .. } => Self::expr_refs_var(operand, var),
+            ast::ExprKind::If { cond, then_branch, else_branch } => {
+                Self::expr_refs_var(cond, var) || Self::expr_refs_var(then_branch, var) || Self::expr_refs_var(else_branch, var)
+            }
+            ast::ExprKind::Lambda { body, .. } => Self::expr_refs_var(body, var),
+            _ => false,
+        }
     }
 
     /// Match an equi-join pattern: `a.f == b.g` where a and b are two different
@@ -8093,6 +8117,7 @@ impl Codegen {
         builder: &mut FunctionBuilder,
         params: &[SqlParamSource],
         env: &mut Env,
+        db: Value,
     ) -> Value {
         let rel = if params.is_empty() {
             self.call_rt(builder, "knot_relation_empty", &[])
@@ -8109,6 +8134,7 @@ impl Codegen {
                     let (fptr, flen) = self.string_ptr(builder, field);
                     self.call_rt(builder, "knot_record_field", &[record, fptr, flen])
                 }
+                SqlParamSource::Expr(expr) => self.compile_expr(builder, expr, env, db),
             };
             self.call_rt_void(builder, "knot_relation_push", &[rel, val]);
         }
@@ -8731,6 +8757,9 @@ enum SqlParamSource {
     Literal(ast::Literal),
     Var(String),
     FieldAccess(String, String), // (var_name, field_name)
+    /// Arbitrary expression compiled at runtime.  Used for computed
+    /// values like `t - messageMaxAge` in WHERE clauses.
+    Expr(ast::Expr),
 }
 
 // ── SQL query plan types ────────────────────────────────────────

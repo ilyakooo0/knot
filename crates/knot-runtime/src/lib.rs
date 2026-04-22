@@ -1429,6 +1429,13 @@ fn notify_relation_changed(name: &str) {
 /// Record that a table was read inside an atomic block.
 /// Captures the version at first-read time as the baseline for retry.
 /// Skips the RwLock and allocation if already tracking this table.
+/// Exported wrapper for codegen-emitted SQL queries that need STM tracking.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_stm_track_read(name_ptr: *const u8, name_len: usize) {
+    let name = unsafe { str_from_raw(name_ptr, name_len) };
+    stm_track_read(name);
+}
+
 fn stm_track_read(name: &str) {
     let already = STM_READ_VERSIONS.with(|rv| rv.borrow().contains_key(name));
     if already {

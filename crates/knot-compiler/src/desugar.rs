@@ -400,8 +400,25 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &HashSet<String>) {
         }
         ExprKind::Lambda { body, .. } => desugar_expr(body, io_fns),
         ExprKind::App { func, arg } => {
+            // Preserve do-block arguments to sortBy/takeRelation so codegen
+            // can compile them to SQL ORDER BY + LIMIT.
+            let protect_do = if let ExprKind::App { func: inner_f, .. } = &func.node {
+                matches!(&inner_f.node, ExprKind::Var(name) if name == "sortBy")
+            } else {
+                false
+            };
             desugar_expr(func, io_fns);
-            desugar_expr(arg, io_fns);
+            if protect_do {
+                if let ExprKind::Do(stmts) = &mut arg.node {
+                    for stmt in stmts.iter_mut() {
+                        desugar_stmt(stmt, io_fns);
+                    }
+                } else {
+                    desugar_expr(arg, io_fns);
+                }
+            } else {
+                desugar_expr(arg, io_fns);
+            }
         }
         ExprKind::BinOp { lhs, rhs, .. } => {
             desugar_expr(lhs, io_fns);
@@ -496,8 +513,14 @@ fn is_sql_compilable(stmts: &[Stmt]) -> bool {
     for stmt in &stmts[..stmts.len() - 1] {
         match &stmt.node {
             StmtKind::Bind { pat, expr } => {
-                if let (PatKind::Var(name), ExprKind::SourceRef(_)) = (&pat.node, &expr.node) {
-                    bind_vars.insert(name.as_str());
+                if let PatKind::Var(name) = &pat.node {
+                    // Accept SourceRef (direct source read) and Var (may be
+                    // a source-bound variable — codegen resolves via source_var_binds).
+                    if matches!(&expr.node, ExprKind::SourceRef(_) | ExprKind::Var(_)) {
+                        bind_vars.insert(name.as_str());
+                    } else {
+                        return false;
+                    }
                 } else {
                     return false;
                 }

@@ -548,6 +548,9 @@ impl Codegen {
         // Debug
         self.declare_rt("knot_debug_init", &[], &[]);
 
+        // STM tracking
+        self.declare_rt("knot_stm_track_read", &[p, p], &[]);
+
         // Transactions
         self.declare_rt("knot_atomic_begin", &[p], &[]);
         self.declare_rt("knot_atomic_commit", &[p], &[]);
@@ -4546,11 +4549,14 @@ impl Codegen {
                                                     plan.limit = Some(n_param);
                                                     let sql = plan.build_sql();
                                                     let result_schema = plan.build_result_schema();
+                                                    // Track reads for STM (so retry wakes on changes)
+                                                    for table in &plan.tables {
+                                                        let (tn_ptr, tn_len) = self.string_ptr(builder, &table.source_name);
+                                                        self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
+                                                    }
                                                     // Compile SQL params + the limit value
                                                     let n_val = self.compile_expr(builder, &args[0], env, db);
-                                                    // Build params: plan params + limit
-                                                    let mut all_params = plan.params.clone();
-                                                    let params_rel = self.compile_sql_params(builder, &all_params, env);
+                                                    let params_rel = self.compile_sql_params(builder, &plan.params, env);
                                                     // Append limit to the params relation
                                                     self.call_rt_void(builder, "knot_relation_push", &[params_rel, n_val]);
                                                     let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);

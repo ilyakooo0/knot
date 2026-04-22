@@ -4488,6 +4488,49 @@ impl Codegen {
             }
         }
 
+        // Special case: takeRelation N (sortBy f *source) → SQL ORDER BY + LIMIT
+        if let ast::ExprKind::Var(name) = &func_expr.node {
+            if (name == "takeRelation" || name == "take") && args.len() == 2 {
+                // args[0] = N, args[1] = sortBy f *source (or just *source)
+                if let ast::ExprKind::App { func: sort_func, arg: sort_source } = &args[1].node {
+                    if let ast::ExprKind::App { func: sort_name_expr, arg: sort_lambda } = &sort_func.node {
+                        if let ast::ExprKind::Var(sort_name) = &sort_name_expr.node {
+                            if sort_name == "sortBy" {
+                                if let ast::ExprKind::SourceRef(source_name) = &sort_source.node {
+                                    if !self.views.contains_key(source_name) {
+                                        if let Some(schema) = self.source_schemas.get(source_name).cloned() {
+                                            if !schema.starts_with('#') && !schema.contains('[') {
+                                                if let Some((bind_var, body)) = extract_single_param_lambda(sort_lambda) {
+                                                    if let Some(col_sql) = extract_sql_field_access(&bind_var, body, "", &schema) {
+                                                        if let Some(limit_param) = expr_to_sql_param(&args[0]) {
+                                                            let table = quote_sql_ident(&format!("_knot_{}", source_name));
+                                                            let cols = parse_schema_columns(&schema).iter()
+                                                                .map(|(n, _)| quote_sql_ident(n))
+                                                                .collect::<Vec<_>>()
+                                                                .join(", ");
+                                                            let sql = format!("SELECT {} FROM {} ORDER BY {} LIMIT ?", cols, table, col_sql);
+                                                            let params_rel = self.compile_sql_params(builder, &[limit_param], env);
+                                                            let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                                                            let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
+                                                            return self.call_rt(
+                                                                builder,
+                                                                "knot_source_query",
+                                                                &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // SQL set operations: diff/inter/union on two source relations
         if let ast::ExprKind::Var(name) = &func_expr.node {
             let sql_op = match name.as_str() {
@@ -7124,6 +7167,23 @@ impl Codegen {
                 let rt_fn = if fn_name == "sum" { "knot_source_query_sum" } else { "knot_source_query_float" };
                 Some(self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]))
             }
+            "sortBy" => {
+                // sortBy (\m -> m.field) *source → SELECT * FROM source ORDER BY field
+                let col_sql = extract_sql_field_access(&bind_var, body, "", schema)?;
+                let cols = parse_schema_columns(schema).iter()
+                    .map(|(name, _)| quote_sql_ident(name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!("SELECT {} FROM {} ORDER BY {}", cols, table, col_sql);
+                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                let (schema_ptr, schema_len) = self.string_ptr(builder, schema);
+                let params_rel = self.compile_sql_params(builder, &[], env);
+                Some(self.call_rt(
+                    builder,
+                    "knot_source_query",
+                    &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                ))
+            }
             _ => None,
         }
     }
@@ -7162,6 +7222,7 @@ impl Codegen {
         let mut is_count = false;
         let mut limit: Option<SqlParamSource> = None;
         let mut offset: Option<SqlParamSource> = None;
+        let mut order_by_cols: Vec<String> = Vec::new();
         let mut aggregate: Option<(&str, String)> = None; // (func, column_sql)
 
         for op in &ops {
@@ -7192,7 +7253,7 @@ impl Codegen {
                     }
                     is_count = true;
                 }
-                PipeOp::Take { n } => {
+                PipeOp::Take { n } | PipeOp::TakeRelation { n } => {
                     if limit.is_some() || is_count || aggregate.is_some() {
                         return None;
                     }
@@ -7203,6 +7264,14 @@ impl Codegen {
                         return None;
                     }
                     offset = Some(expr_to_sql_param(n)?);
+                }
+                PipeOp::SortBy { bind_var, body } => {
+                    if is_count || aggregate.is_some() {
+                        return None;
+                    }
+                    bind_aliases.insert(bind_var.clone(), alias.clone());
+                    let col_sql = extract_sql_field_access(bind_var, body, &alias, &schema)?;
+                    order_by_cols.push(col_sql);
                 }
                 PipeOp::Sum { bind_var, body } => {
                     if is_count || aggregate.is_some() {
@@ -7287,6 +7356,7 @@ impl Codegen {
                 conditions,
                 params,
                 select_columns,
+                order_by: order_by_cols,
                 limit,
                 offset,
             };
@@ -7470,6 +7540,7 @@ impl Codegen {
             conditions,
             params,
             select_columns,
+            order_by: Vec::new(),
             limit: None,
             offset: None,
         })
@@ -8611,6 +8682,7 @@ struct SqlQueryPlan {
     conditions: Vec<String>,
     params: Vec<SqlParamSource>,
     select_columns: Vec<SqlSelectColumn>,
+    order_by: Vec<String>,
     limit: Option<SqlParamSource>,
     offset: Option<SqlParamSource>,
 }
@@ -8664,6 +8736,10 @@ impl SqlQueryPlan {
             let where_clause = self.conditions.join(" AND ");
             format!("SELECT {} FROM {} WHERE {}", select, from, where_clause)
         };
+
+        if !self.order_by.is_empty() {
+            sql.push_str(&format!(" ORDER BY {}", self.order_by.join(", ")));
+        }
 
         if self.limit.is_some() || self.offset.is_some() {
             sql.push_str(&format!(" LIMIT {}", if self.limit.is_some() { "?" } else { "-1" }));
@@ -8739,6 +8815,8 @@ enum PipeOp<'a> {
     Drop { n: &'a ast::Expr },
     Sum { bind_var: String, body: &'a ast::Expr },
     Avg { bind_var: String, body: &'a ast::Expr },
+    SortBy { bind_var: String, body: &'a ast::Expr },
+    TakeRelation { n: &'a ast::Expr },
 }
 
 /// Flatten a nested pipe chain `a |> f |> g |> h` into `(a, [f, g, h])`.
@@ -8780,7 +8858,11 @@ fn analyze_pipe_op(expr: &ast::Expr) -> Option<PipeOp<'_>> {
                         PipeOp::Map { bind_var, body }
                     }),
                     "take" => Some(PipeOp::Take { n: arg }),
+                    "takeRelation" => Some(PipeOp::TakeRelation { n: arg }),
                     "drop" => Some(PipeOp::Drop { n: arg }),
+                    "sortBy" => extract_single_param_lambda(arg).map(|(bind_var, body)| {
+                        PipeOp::SortBy { bind_var, body }
+                    }),
                     "sum" => extract_single_param_lambda(arg).map(|(bind_var, body)| {
                         PipeOp::Sum { bind_var, body }
                     }),

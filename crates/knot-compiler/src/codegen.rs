@@ -3760,17 +3760,28 @@ impl Codegen {
                             let mut parts = Vec::new();
                             let mut params = Vec::new();
                             for (field_name, field_val) in &update_fields {
-                                let param = match &field_val.node {
+                                match &field_val.node {
                                     ast::ExprKind::Lit(lit) => {
-                                        SqlParamSource::Literal(lit.clone())
+                                        parts.push(format!("{} = ?", quote_sql_ident(field_name)));
+                                        params.push(SqlParamSource::Literal(lit.clone()));
                                     }
                                     ast::ExprKind::Var(name) => {
-                                        SqlParamSource::Var(name.clone())
+                                        parts.push(format!("{} = ?", quote_sql_ident(field_name)));
+                                        params.push(SqlParamSource::Var(name.clone()));
                                     }
-                                    _ => return None,
-                                };
-                                parts.push(format!("{} = ?", quote_sql_ident(field_name)));
-                                params.push(param);
+                                    _ => {
+                                        // Try computed expression (e.g., p.price * 0.9)
+                                        let atom = Self::try_compile_single_table_atom(
+                                            &bind_var, field_val,
+                                        )?;
+                                        parts.push(format!(
+                                            "{} = {}",
+                                            quote_sql_ident(field_name),
+                                            atom.sql
+                                        ));
+                                        params.extend(atom.params);
+                                    }
+                                }
                             }
                             Some(SqlFragment {
                                 sql: parts.join(", "),
@@ -4414,6 +4425,16 @@ impl Codegen {
 
     // ── Application compilation ───────────────────────────────────
 
+    /// Resolve an expression to a source relation name.
+    /// Handles both `*source` (SourceRef) and bound variables from `x <- *source`.
+    fn resolve_source(&self, expr: &ast::Expr) -> Option<String> {
+        match &expr.node {
+            ast::ExprKind::SourceRef(name) => Some(name.clone()),
+            ast::ExprKind::Var(name) => self.source_var_binds.get(name).cloned(),
+            _ => None,
+        }
+    }
+
     fn compile_app(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -4427,17 +4448,62 @@ impl Codegen {
         // Special case: count *rel → SQL COUNT(*)
         if let ast::ExprKind::Var(name) = &func_expr.node {
             if name == "count" && args.len() == 1 {
-                if let ast::ExprKind::SourceRef(source_name) = &args[0].node {
+                if let Some(source_name) = self.resolve_source(&args[0]) {
                     // Only for actual sources, not views
-                    if !self.views.contains_key(source_name)
-                        && self.source_schemas.contains_key(source_name)
+                    if !self.views.contains_key(&source_name)
+                        && self.source_schemas.contains_key(&source_name)
                     {
                         let (name_ptr, name_len) =
-                            self.string_ptr(builder, source_name);
+                            self.string_ptr(builder, &source_name);
                         return self.call_rt(
                             builder,
                             "knot_source_count",
                             &[db, name_ptr, name_len],
+                        );
+                    }
+                }
+
+                // count (filter f *source) → SELECT COUNT(*) FROM ... WHERE ...
+                if let Some((source_name, filter_bind, filter_body)) =
+                    extract_filter_on_source(&args[0], &self.source_var_binds)
+                {
+                    if !self.views.contains_key(source_name) {
+                        if let Some(schema) = self.source_schemas.get(source_name).cloned() {
+                            if !schema.starts_with('#') && !schema.contains('[') {
+                                if let Some(frag) = Self::try_compile_sql_expr(&filter_bind, filter_body) {
+                                    let table = quote_sql_ident(&format!("_knot_{}", source_name));
+                                    let sql = format!("SELECT COUNT(*) FROM {} WHERE {}", table, frag.sql);
+                                    let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
+                                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                                    return self.call_rt(
+                                        builder,
+                                        "knot_source_query_count",
+                                        &[db, sql_ptr, sql_len, params_rel],
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // count (do { x <- *source; where ...; yield x }) → SELECT COUNT(*) FROM ... WHERE ...
+                if let ast::ExprKind::Do(stmts) = &args[0].node {
+                    if let Some(plan) = self.analyze_sql_plan(stmts, env) {
+                        let tables_sql: Vec<String> = plan.tables.iter().map(|t| {
+                            format!("{} AS {}", quote_sql_ident(&format!("_knot_{}", t.source_name)), t.alias)
+                        }).collect();
+                        let from = tables_sql.join(", ");
+                        let sql = if plan.conditions.is_empty() {
+                            format!("SELECT COUNT(*) FROM {}", from)
+                        } else {
+                            format!("SELECT COUNT(*) FROM {} WHERE {}", from, plan.conditions.join(" AND "))
+                        };
+                        let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
+                        let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                        return self.call_rt(
+                            builder,
+                            "knot_source_query_count",
+                            &[db, sql_ptr, sql_len, params_rel],
                         );
                     }
                 }
@@ -4481,14 +4547,41 @@ impl Codegen {
         // Special case: filter/sum/avg with lambda on source → SQL
         if let ast::ExprKind::Var(name) = &func_expr.node {
             if args.len() == 2 {
-                if let ast::ExprKind::SourceRef(source_name) = &args[1].node {
-                    if !self.views.contains_key(source_name) {
-                        if let Some(schema) = self.source_schemas.get(source_name).cloned() {
+                if let Some(source_name) = self.resolve_source(&args[1]) {
+                    if !self.views.contains_key(&source_name) {
+                        if let Some(schema) = self.source_schemas.get(&source_name).cloned() {
                             if !schema.starts_with('#') && !schema.contains('[') {
                                 if let Some(result) = self.try_compile_app_sql(
-                                    builder, name, &args[0], source_name, &schema, env, db,
+                                    builder, name, &args[0], &source_name, &schema, env, db,
                                 ) {
                                     return result;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // sum/avg lambda (filter f *source) → SQL aggregate with WHERE
+                if matches!(name.as_str(), "sum" | "avg") {
+                    if let Some((source_name, filter_bind, filter_body)) =
+                        extract_filter_on_source(&args[1], &self.source_var_binds)
+                    {
+                        if !self.views.contains_key(source_name) {
+                            if let Some(schema) = self.source_schemas.get(source_name).cloned() {
+                                if !schema.starts_with('#') && !schema.contains('[') {
+                                    if let Some((agg_bind, agg_body)) = extract_single_param_lambda(&args[0]) {
+                                        if let Some(col_sql) = extract_sql_field_access(&agg_bind, agg_body, "", &schema) {
+                                            if let Some(frag) = Self::try_compile_sql_expr(&filter_bind, filter_body) {
+                                                let func = if name == "sum" { "SUM" } else { "AVG" };
+                                                let table = quote_sql_ident(&format!("_knot_{}", source_name));
+                                                let sql = format!("SELECT {}({}) FROM {} WHERE {}", func, col_sql, table, frag.sql);
+                                                let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
+                                                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                                                let rt_fn = if name == "sum" { "knot_source_query_sum" } else { "knot_source_query_float" };
+                                                return self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -4571,6 +4664,61 @@ impl Codegen {
                                             }
                                         }
                                     }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // takeRelation N *source → SQL LIMIT (no ORDER BY)
+                if let Some(source_name) = self.resolve_source(&args[1]) {
+                    if !self.views.contains_key(&source_name) {
+                        if let Some(schema) = self.source_schemas.get(&source_name).cloned() {
+                            if !schema.starts_with('#') && !schema.contains('[') {
+                                let table = quote_sql_ident(&format!("_knot_{}", source_name));
+                                let cols = parse_schema_columns(&schema).iter()
+                                    .map(|(n, _)| quote_sql_ident(n))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let sql = format!("SELECT {} FROM {} LIMIT ?", cols, table);
+                                let n_val = self.compile_expr(builder, &args[0], env, db);
+                                let params_rel = self.call_rt(builder, "knot_relation_singleton", &[n_val]);
+                                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                                let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
+                                return self.call_rt(
+                                    builder,
+                                    "knot_source_query",
+                                    &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // takeRelation N (filter f *source) → SQL WHERE + LIMIT
+                if let Some((source_name, filter_bind, filter_body)) =
+                    extract_filter_on_source(&args[1], &self.source_var_binds)
+                {
+                    if !self.views.contains_key(source_name) {
+                        if let Some(schema) = self.source_schemas.get(source_name).cloned() {
+                            if !schema.starts_with('#') && !schema.contains('[') {
+                                if let Some(frag) = Self::try_compile_sql_expr(&filter_bind, filter_body) {
+                                    let table = quote_sql_ident(&format!("_knot_{}", source_name));
+                                    let cols = parse_schema_columns(&schema).iter()
+                                        .map(|(n, _)| quote_sql_ident(n))
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    let sql = format!("SELECT {} FROM {} WHERE {} LIMIT ?", cols, table, frag.sql);
+                                    let n_val = self.compile_expr(builder, &args[0], env, db);
+                                    let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
+                                    self.call_rt_void(builder, "knot_relation_push", &[params_rel, n_val]);
+                                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                                    let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
+                                    return self.call_rt(
+                                        builder,
+                                        "knot_source_query",
+                                        &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                                    );
                                 }
                             }
                         }
@@ -7258,9 +7406,10 @@ impl Codegen {
             return None;
         }
 
-        // Source must be a SourceRef to a plain source relation
+        // Source must be a SourceRef or a variable bound from a source read
         let source_name = match &source.node {
             ast::ExprKind::SourceRef(name) => name.clone(),
+            ast::ExprKind::Var(name) => self.source_var_binds.get(name)?.clone(),
             _ => return None,
         };
         if self.views.contains_key(&source_name) {
@@ -7777,8 +7926,13 @@ impl Codegen {
         let r = Self::try_compile_sql_atom(bind_aliases, rhs, env)?;
         let mut params = l.params;
         params.extend(r.params);
+        // Wrap arithmetic atoms in CAST for correct TEXT/INTEGER comparison:
+        // SQLite arithmetic on TEXT columns produces INTEGER, but params are TEXT;
+        // without CAST, INTEGER vs TEXT comparison always puts INTEGER before TEXT.
+        let l_sql = cast_arithmetic_for_where(&l.sql);
+        let r_sql = cast_arithmetic_for_where(&r.sql);
         Some(SqlFragment {
-            sql: format!("{} {} {}", l.sql, op, r.sql),
+            sql: format!("{} {} {}", l_sql, op, r_sql),
             params,
         })
     }
@@ -7826,7 +7980,8 @@ impl Codegen {
                         ast::BinOp::Ge => ">=",
                         _ => unreachable!(),
                     };
-                    // Try field op value, then value op field (reversed)
+                    // Try field op value, then value op field (reversed),
+                    // then atom-based comparison (handles arithmetic like x.a * x.b > 100)
                     Self::try_compile_sql_comparison(bind_var, lhs, rhs, sql_op)
                         .or_else(|| {
                             let rev = match sql_op {
@@ -7838,6 +7993,18 @@ impl Codegen {
                                 _ => return None,
                             };
                             Self::try_compile_sql_comparison(bind_var, rhs, lhs, rev)
+                        })
+                        .or_else(|| {
+                            let l = Self::try_compile_single_table_atom(bind_var, lhs)?;
+                            let r = Self::try_compile_single_table_atom(bind_var, rhs)?;
+                            let mut params = l.params;
+                            params.extend(r.params);
+                            let l_sql = cast_arithmetic_for_where(&l.sql);
+                            let r_sql = cast_arithmetic_for_where(&r.sql);
+                            Some(SqlFragment {
+                                sql: format!("{} {} {}", l_sql, sql_op, r_sql),
+                                params,
+                            })
                         })
                 }
                 _ => None,
@@ -7906,6 +8073,71 @@ impl Codegen {
             sql: format!("{} {} ?", quote_sql_ident(&col_name), op),
             params: vec![param],
         })
+    }
+
+    /// Try to compile a single-table expression as a SQL atom.
+    /// Handles: `bind_var.field` → column ref, literals/vars → `?`, arithmetic combos.
+    fn try_compile_single_table_atom(
+        bind_var: &str,
+        expr: &ast::Expr,
+    ) -> Option<SqlFragment> {
+        match &expr.node {
+            ast::ExprKind::FieldAccess { expr: inner, field } => {
+                if let ast::ExprKind::Var(name) = &inner.node {
+                    if name == bind_var {
+                        return Some(SqlFragment {
+                            sql: quote_sql_ident(field),
+                            params: vec![],
+                        });
+                    }
+                    // Field access on other variable → parameter
+                    return Some(SqlFragment {
+                        sql: "?".to_string(),
+                        params: vec![SqlParamSource::FieldAccess(name.clone(), field.clone())],
+                    });
+                }
+                None
+            }
+            ast::ExprKind::Lit(lit) => Some(SqlFragment {
+                sql: "?".to_string(),
+                params: vec![SqlParamSource::Literal(lit.clone())],
+            }),
+            ast::ExprKind::Var(name) => {
+                if name == bind_var {
+                    return None;
+                }
+                Some(SqlFragment {
+                    sql: "?".to_string(),
+                    params: vec![SqlParamSource::Var(name.clone())],
+                })
+            }
+            ast::ExprKind::BinOp { op, lhs, rhs } => {
+                let sql_op = match op {
+                    ast::BinOp::Add => "+",
+                    ast::BinOp::Sub => "-",
+                    ast::BinOp::Mul => "*",
+                    ast::BinOp::Div => "/",
+                    _ => return None,
+                };
+                let l = Self::try_compile_single_table_atom(bind_var, lhs)?;
+                let r = Self::try_compile_single_table_atom(bind_var, rhs)?;
+                let mut params = l.params;
+                params.extend(r.params);
+                Some(SqlFragment {
+                    sql: format!("({} {} {})", l.sql, sql_op, r.sql),
+                    params,
+                })
+            }
+            _ => {
+                if Self::expr_refs_var(expr, bind_var) {
+                    return None;
+                }
+                Some(SqlFragment {
+                    sql: "?".to_string(),
+                    params: vec![SqlParamSource::Expr(expr.clone())],
+                })
+            }
+        }
     }
 
     /// Check if a source-bound variable is only referenced inside SQL-compilable
@@ -9059,12 +9291,54 @@ fn extract_single_param_lambda(expr: &ast::Expr) -> Option<(String, &ast::Expr)>
     None
 }
 
+/// Extract `filter (\x -> cond) *source` or `filter (\x -> cond) bound_var` pattern.
+/// Returns (source_name, bind_var, filter_body).
+fn extract_filter_on_source<'a>(
+    expr: &'a ast::Expr,
+    source_var_binds: &'a HashMap<String, String>,
+) -> Option<(&'a str, String, &'a ast::Expr)> {
+    if let ast::ExprKind::App { func, arg: source_expr } = &expr.node {
+        if let ast::ExprKind::App { func: inner_func, arg: filter_lambda } = &func.node {
+            if let ast::ExprKind::Var(fn_name) = &inner_func.node {
+                if fn_name == "filter" {
+                    let source_name = match &source_expr.node {
+                        ast::ExprKind::SourceRef(name) => Some(name.as_str()),
+                        ast::ExprKind::Var(name) => {
+                            source_var_binds.get(name).map(|s| s.as_str())
+                        }
+                        _ => None,
+                    };
+                    if let Some(source_name) = source_name {
+                        if let Some((bind_var, body)) = extract_single_param_lambda(filter_lambda) {
+                            return Some((source_name, bind_var, body));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Convert an expression to a SQL parameter source (literal int or variable).
 fn expr_to_sql_param(expr: &ast::Expr) -> Option<SqlParamSource> {
     match &expr.node {
         ast::ExprKind::Lit(lit) => Some(SqlParamSource::Literal(lit.clone())),
         ast::ExprKind::Var(name) => Some(SqlParamSource::Var(name.clone())),
         _ => None,
+    }
+}
+
+/// Wrap arithmetic SQL expressions in CAST for correct WHERE comparison.
+/// SQLite arithmetic on TEXT columns (INT stored as TEXT COLLATE KNOT_INT)
+/// produces INTEGER results, but parameters are TEXT. Without CAST,
+/// SQLite's type affinity puts INTEGER before TEXT, breaking `>` / `<`.
+fn cast_arithmetic_for_where(sql: &str) -> String {
+    // Arithmetic atoms are wrapped in parentheses by try_compile_sql_atom
+    if sql.starts_with('(') && !sql.starts_with("(CAST") {
+        format!("CAST({} AS TEXT) COLLATE KNOT_INT", sql)
+    } else {
+        sql.to_string()
     }
 }
 

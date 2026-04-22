@@ -271,6 +271,7 @@ fn lint_set_expr(
         let set_ok = where_ok
             && update_fields.iter().all(|(_, val)| {
                 matches!(val.node, ExprKind::Lit(_) | ExprKind::Var(_))
+                    || try_sql_atom(&bind_var, val).is_some()
             });
 
         if !where_ok {
@@ -519,8 +520,13 @@ fn try_compile_sql_expr(bind_var: &str, expr: &Expr) -> Option<()> {
                 Some(())
             }
             BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
+                // Try simple field op value, then atom-based (handles arithmetic)
                 try_sql_comparison(bind_var, lhs, rhs)
                     .or_else(|| try_sql_comparison(bind_var, rhs, lhs))
+                    .or_else(|| {
+                        try_sql_atom(bind_var, lhs)?;
+                        try_sql_atom(bind_var, rhs)
+                    })
             }
             _ => None,
         },
@@ -562,7 +568,72 @@ fn try_sql_comparison(bind_var: &str, field_side: &Expr, value_side: &Expr) -> O
                 None
             }
         }
-        _ => None,
+        _ => {
+            if !expr_refs_var(value_side, bind_var) {
+                Some(())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Check if an expression can be compiled as a SQL atom (column ref, literal, var, arithmetic).
+fn try_sql_atom(bind_var: &str, expr: &Expr) -> Option<()> {
+    match &expr.node {
+        ExprKind::FieldAccess { expr: inner, .. } => {
+            // bind_var.field → column ref, other_var.field → parameter
+            if let ExprKind::Var(_) = &inner.node {
+                return Some(());
+            }
+            None
+        }
+        ExprKind::Lit(_) => Some(()),
+        ExprKind::Var(name) => {
+            if name == bind_var { None } else { Some(()) }
+        }
+        ExprKind::BinOp { op, lhs, rhs } => {
+            match op {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                    try_sql_atom(bind_var, lhs)?;
+                    try_sql_atom(bind_var, rhs)
+                }
+                _ => None,
+            }
+        }
+        _ => {
+            if !expr_refs_var(expr, bind_var) {
+                Some(())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Check if an expression references a given variable.
+fn expr_refs_var(expr: &Expr, var: &str) -> bool {
+    match &expr.node {
+        ExprKind::Var(name) => name == var,
+        ExprKind::FieldAccess { expr: inner, .. } => expr_refs_var(inner, var),
+        ExprKind::BinOp { lhs, rhs, .. } => {
+            expr_refs_var(lhs, var) || expr_refs_var(rhs, var)
+        }
+        ExprKind::UnaryOp { operand, .. } => expr_refs_var(operand, var),
+        ExprKind::App { func, arg } => {
+            expr_refs_var(func, var) || expr_refs_var(arg, var)
+        }
+        ExprKind::If { cond, then_branch, else_branch } => {
+            expr_refs_var(cond, var)
+                || expr_refs_var(then_branch, var)
+                || expr_refs_var(else_branch, var)
+        }
+        ExprKind::Lambda { body, .. } => expr_refs_var(body, var),
+        ExprKind::Record(fields) => fields.iter().any(|f| expr_refs_var(&f.value, var)),
+        ExprKind::RecordUpdate { base, fields } => {
+            expr_refs_var(base, var) || fields.iter().any(|f| expr_refs_var(&f.value, var))
+        }
+        _ => false,
     }
 }
 

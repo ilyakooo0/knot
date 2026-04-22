@@ -3963,6 +3963,11 @@ impl Codegen {
                 // loop_block sealed after retry jump is emitted (two predecessors)
                 builder.switch_to_block(loop_block);
 
+                // Arena frame: each retry iteration pushes a fresh frame so
+                // allocations from the body (SQL reads including large blobs)
+                // are freed on retry instead of accumulating unboundedly.
+                self.call_rt_void(builder, "knot_arena_push_frame", &[]);
+
                 // Snapshot change counter before executing the body
                 let snapshot = self.call_rt(builder, "knot_stm_snapshot", &[]);
                 self.call_rt_void(builder, "knot_atomic_begin", &[db]);
@@ -3994,22 +3999,23 @@ impl Codegen {
                 let retry_flag = self.call_rt(builder, "knot_stm_check_and_clear", &[]);
                 builder.ins().brif(retry_flag, retry_block, &[], done_block, &[val]);
 
-                // Retry: rollback, wait for relation changes, loop back.
-                // Seal retry_block here — after all jumps to it (from `retry`
-                // sites inside the body and from the brif above) are emitted.
+                // Retry: rollback, pop arena frame (frees all body allocations
+                // including multi-MB blob reads), wait for changes, loop back.
                 builder.switch_to_block(retry_block);
                 builder.seal_block(retry_block);
                 self.call_rt_void(builder, "knot_atomic_rollback", &[db]);
+                self.call_rt_void(builder, "knot_arena_pop_frame", &[]);
                 self.call_rt_void(builder, "knot_stm_wait", &[snapshot]);
                 builder.ins().jump(loop_block, &[]);
 
                 // Now loop_block has both predecessors, seal it
                 builder.seal_block(loop_block);
 
-                // Done: commit and return value
+                // Done: promote result to parent frame, pop body frame, commit
                 builder.switch_to_block(done_block);
                 builder.seal_block(done_block);
-                let result = builder.block_params(done_block)[0];
+                let raw_result = builder.block_params(done_block)[0];
+                let result = self.call_rt(builder, "knot_arena_pop_frame_promote", &[raw_result]);
                 self.call_rt_void(builder, "knot_atomic_commit", &[db]);
 
                 // For nested atomics, restore outer tracking and merge inner

@@ -370,32 +370,32 @@ fn lint_pipe_chain(
                 }
             }
             LintPipeOp::SortBy { bind_var, body, span } => {
-                if extract_simple_field_access(bind_var, body).is_none() {
+                if try_sql_column_expr(bind_var, body).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "pipe sortBy will be evaluated at runtime instead of SQL ORDER BY",
                         )
-                        .label(*span, "sortBy lambda is not a simple field access"),
+                        .label(*span, "sortBy lambda cannot be compiled to SQL"),
                     );
                 }
             }
             LintPipeOp::Sum { bind_var, body, span } => {
-                if extract_simple_field_access(bind_var, body).is_none() {
+                if try_sql_column_expr(bind_var, body).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "pipe sum will be evaluated at runtime instead of SQL SUM",
                         )
-                        .label(*span, "sum lambda is not a simple field access"),
+                        .label(*span, "sum lambda cannot be compiled to SQL"),
                     );
                 }
             }
             LintPipeOp::Avg { bind_var, body, span } => {
-                if extract_simple_field_access(bind_var, body).is_none() {
+                if try_sql_column_expr(bind_var, body).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "pipe avg will be evaluated at runtime instead of SQL AVG",
                         )
-                        .label(*span, "avg lambda is not a simple field access"),
+                        .label(*span, "avg lambda cannot be compiled to SQL"),
                     );
                 }
             }
@@ -464,40 +464,40 @@ fn lint_app_form(
                 }
             }
             "sortBy" => {
-                if extract_simple_field_access(&bind_var, body).is_none() {
+                if try_sql_column_expr(&bind_var, body).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "sortBy will be evaluated at runtime instead of SQL ORDER BY",
                         )
                         .label(
                             lambda_arg.span,
-                            "sortBy lambda is not a simple field access",
+                            "sortBy lambda cannot be compiled to SQL",
                         ),
                     );
                 }
             }
             "sum" => {
-                if extract_simple_field_access(&bind_var, body).is_none() {
+                if try_sql_column_expr(&bind_var, body).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "sum will be evaluated at runtime instead of SQL SUM",
                         )
                         .label(
                             lambda_arg.span,
-                            "sum lambda is not a simple field access",
+                            "sum lambda cannot be compiled to SQL",
                         ),
                     );
                 }
             }
             "avg" => {
-                if extract_simple_field_access(&bind_var, body).is_none() {
+                if try_sql_column_expr(&bind_var, body).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "avg will be evaluated at runtime instead of SQL AVG",
                         )
                         .label(
                             lambda_arg.span,
-                            "avg lambda is not a simple field access",
+                            "avg lambda cannot be compiled to SQL",
                         ),
                     );
                 }
@@ -534,6 +534,24 @@ fn try_compile_sql_expr(bind_var: &str, expr: &Expr) -> Option<()> {
             op: UnaryOp::Not,
             operand,
         } => try_compile_sql_expr(bind_var, operand),
+        // `not expr` function application → NOT (...)
+        // `contains needle haystack` → INSTR(haystack, needle) > 0
+        ExprKind::App { func, arg } => {
+            if let ExprKind::Var(name) = &func.node {
+                if name == "not" {
+                    return try_compile_sql_expr(bind_var, arg);
+                }
+            }
+            if let ExprKind::App { func: inner_func, arg: first_arg } = &func.node {
+                if let ExprKind::Var(name) = &inner_func.node {
+                    if name == "contains" {
+                        try_sql_atom(bind_var, first_arg)?;
+                        return try_sql_atom(bind_var, arg);
+                    }
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -578,7 +596,7 @@ fn try_sql_comparison(bind_var: &str, field_side: &Expr, value_side: &Expr) -> O
     }
 }
 
-/// Check if an expression can be compiled as a SQL atom (column ref, literal, var, arithmetic).
+/// Check if an expression can be compiled as a SQL atom (column ref, literal, var, arithmetic, concat, functions).
 fn try_sql_atom(bind_var: &str, expr: &Expr) -> Option<()> {
     match &expr.node {
         ExprKind::FieldAccess { expr: inner, .. } => {
@@ -594,11 +612,24 @@ fn try_sql_atom(bind_var: &str, expr: &Expr) -> Option<()> {
         }
         ExprKind::BinOp { op, lhs, rhs } => {
             match op {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Concat => {
                     try_sql_atom(bind_var, lhs)?;
                     try_sql_atom(bind_var, rhs)
                 }
                 _ => None,
+            }
+        }
+        // Built-in functions: length, toUpper, toLower, trim
+        ExprKind::App { func, arg } => {
+            if let ExprKind::Var(name) = &func.node {
+                match name.as_str() {
+                    "length" | "toUpper" | "toLower" | "trim" => {
+                        try_sql_atom(bind_var, arg)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
             }
         }
         _ => {
@@ -924,16 +955,86 @@ fn extract_single_param_lambda(expr: &Expr) -> Option<(String, &Expr)> {
     None
 }
 
-/// Check if a lambda body is a simple `\x -> x.field` access.
-fn extract_simple_field_access<'a>(bind_var: &str, body: &'a Expr) -> Option<&'a str> {
-    if let ExprKind::FieldAccess { expr, field } = &body.node {
-        if let ExprKind::Var(name) = &expr.node {
-            if name == bind_var {
-                return Some(field);
+/// Check if a lambda body can be compiled to a SQL expression.
+/// Mirrors codegen's `extract_sql_field_access` which handles simple field access,
+/// arithmetic expressions (including ++), CASE WHEN, and built-in functions.
+fn try_sql_column_expr(bind_var: &str, body: &Expr) -> Option<()> {
+    match &body.node {
+        ExprKind::FieldAccess { expr, .. } => {
+            if let ExprKind::Var(name) = &expr.node {
+                if name == bind_var { return Some(()); }
+            }
+            None
+        }
+        ExprKind::Lit(lit) => match lit {
+            Literal::Int(_) | Literal::Float(_) | Literal::Text(_) | Literal::Bool(_) => Some(()),
+            _ => None,
+        },
+        ExprKind::BinOp { op, lhs, rhs } => {
+            match op {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Concat => {
+                    try_sql_column_expr(bind_var, lhs)?;
+                    try_sql_column_expr(bind_var, rhs)
+                }
+                _ => None,
             }
         }
+        ExprKind::If { cond, then_branch, else_branch } => {
+            try_sql_inline_cond(bind_var, cond)?;
+            try_sql_column_expr(bind_var, then_branch)?;
+            try_sql_column_expr(bind_var, else_branch)
+        }
+        ExprKind::App { func, arg } => {
+            if let ExprKind::Var(name) = &func.node {
+                match name.as_str() {
+                    "length" | "toUpper" | "toLower" | "trim" => {
+                        try_sql_column_expr(bind_var, arg)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
-    None
+}
+
+/// Check if a condition can be compiled to an inline SQL condition (for CASE WHEN).
+fn try_sql_inline_cond(bind_var: &str, expr: &Expr) -> Option<()> {
+    match &expr.node {
+        ExprKind::BinOp { op, lhs, rhs } => match op {
+            BinOp::And | BinOp::Or => {
+                try_sql_inline_cond(bind_var, lhs)?;
+                try_sql_inline_cond(bind_var, rhs)
+            }
+            BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
+                try_sql_column_expr(bind_var, lhs)?;
+                try_sql_column_expr(bind_var, rhs)
+            }
+            _ => None,
+        },
+        ExprKind::UnaryOp { op: UnaryOp::Not, operand } => {
+            try_sql_inline_cond(bind_var, operand)
+        }
+        ExprKind::App { func, arg } => {
+            if let ExprKind::Var(name) = &func.node {
+                if name == "not" {
+                    return try_sql_inline_cond(bind_var, arg);
+                }
+            }
+            if let ExprKind::App { func: inner_func, arg: first_arg } = &func.node {
+                if let ExprKind::Var(name) = &inner_func.node {
+                    if name == "contains" {
+                        try_sql_column_expr(bind_var, first_arg)?;
+                        return try_sql_column_expr(bind_var, arg);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -970,8 +1071,8 @@ mod tests {
     }
 
     #[test]
-    fn lint_on_function_call_in_where() {
-        // length(p.name) can't be SQL-compiled.
+    fn no_lint_on_length_in_where() {
+        // length(p.name) now compiles to SQL LENGTH().
         let diags = lint(
             "type T = {name: Text, age: Int}\n\
              *people : [T]\n\
@@ -980,14 +1081,12 @@ mod tests {
                where length p.name > 3\n\
                yield p\n",
         );
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].severity, Severity::Info);
-        assert!(diags[0].message.contains("runtime"));
+        assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
     }
 
     #[test]
-    fn lint_on_set_conditional_update_complex_cond() {
-        // Condition uses a function call — can't be SQL UPDATE WHERE.
+    fn no_lint_on_contains_in_update() {
+        // contains now compiles to SQL INSTR().
         let diags = lint(
             "type T = {name: Text, active: Int}\n\
              *items : [T]\n\
@@ -998,9 +1097,24 @@ mod tests {
                    then {i | active: 0}\n\
                    else i)\n",
         );
+        assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
+    }
+
+    #[test]
+    fn lint_on_unknown_function_in_where() {
+        // Custom function calls still can't be SQL-compiled.
+        let diags = lint(
+            "type T = {name: Text, age: Int}\n\
+             *people : [T]\n\
+             isLong = \\t -> length t > 10\n\
+             main = do\n\
+               p <- *people\n\
+               where isLong p.name\n\
+               yield p\n",
+        );
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].severity, Severity::Info);
-        assert!(diags[0].message.contains("UPDATE"));
+        assert!(diags[0].message.contains("runtime"));
     }
 
     #[test]
@@ -1074,6 +1188,75 @@ mod tests {
              *items : [T]\n\
              main = do\n\
                yield (*items |> filter (\\i -> i.score > 50))\n",
+        );
+        assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
+    }
+
+    #[test]
+    fn no_lint_on_contains_in_where() {
+        // contains compiles to SQL INSTR().
+        let diags = lint(
+            "type T = {name: Text, age: Int}\n\
+             *people : [T]\n\
+             main = do\n\
+               p <- *people\n\
+               where contains \"test\" p.name\n\
+               yield p\n",
+        );
+        assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
+    }
+
+    #[test]
+    fn no_lint_on_toupper_in_where() {
+        // toUpper compiles to SQL UPPER().
+        let diags = lint(
+            "type T = {name: Text, age: Int}\n\
+             *people : [T]\n\
+             main = do\n\
+               p <- *people\n\
+               where toUpper p.name == \"ALICE\"\n\
+               yield p\n",
+        );
+        assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
+    }
+
+    #[test]
+    fn no_lint_on_not_function_in_where() {
+        // `not` function compiles to SQL NOT.
+        let diags = lint(
+            "type T = {name: Text, active: Int}\n\
+             *items : [T]\n\
+             main = do\n\
+               i <- *items\n\
+               where not (i.active == 1)\n\
+               yield i\n",
+        );
+        assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
+    }
+
+    #[test]
+    fn no_lint_on_arithmetic_sum() {
+        // sum with arithmetic lambda compiles to SQL SUM(col * col).
+        let diags = lint(
+            "type T = {price: Int, qty: Int}\n\
+             *items : [T]\n\
+             main = do\n\
+               items <- *items\n\
+               yield (sum (\\i -> i.price * i.qty) items)\n",
+        );
+        assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
+    }
+
+    #[test]
+    fn no_lint_on_concat_in_where() {
+        // ++ compiles to SQL ||.
+        let diags = lint(
+            "type T = {first: Text, last: Text}\n\
+             *people : [T]\n\
+             main = do\n\
+               p <- *people\n\
+               where p.first ++ \" \" ++ p.last == \"Alice Smith\"\n\
+               yield p\n",
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
     }

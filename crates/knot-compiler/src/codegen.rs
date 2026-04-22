@@ -8071,13 +8071,15 @@ impl Codegen {
                             )
                         })
                 }
-                ast::BinOp::Add | ast::BinOp::Sub | ast::BinOp::Mul | ast::BinOp::Div => {
-                    // Arithmetic in WHERE: try to compile both sides as SQL atoms
+                ast::BinOp::Add | ast::BinOp::Sub | ast::BinOp::Mul | ast::BinOp::Div
+                | ast::BinOp::Concat => {
+                    // Arithmetic/concat in WHERE: try to compile both sides as SQL atoms
                     let sql_op = match op {
                         ast::BinOp::Add => "+",
                         ast::BinOp::Sub => "-",
                         ast::BinOp::Mul => "*",
                         ast::BinOp::Div => "/",
+                        ast::BinOp::Concat => "||",
                         _ => unreachable!(),
                     };
                     let l = Self::try_compile_sql_atom(bind_aliases, lhs, env, let_binds)?;
@@ -8100,6 +8102,35 @@ impl Codegen {
                     sql: format!("NOT ({})", inner.sql),
                     params: inner.params,
                 })
+            }
+            // `not expr` function application form → NOT (...)
+            ast::ExprKind::App { func, arg } => {
+                if let ast::ExprKind::Var(name) = &func.node {
+                    if name == "not" {
+                        let inner = Self::try_compile_multi_table_sql_expr(bind_aliases, arg, env, let_binds)?;
+                        return Some(SqlFragment {
+                            sql: format!("NOT ({})", inner.sql),
+                            params: inner.params,
+                        });
+                    }
+                }
+                // Two-arg builtins: App(App(Var(name), arg1), arg2)
+                if let ast::ExprKind::App { func: inner_func, arg: first_arg } = &func.node {
+                    if let ast::ExprKind::Var(name) = &inner_func.node {
+                        if name == "contains" {
+                            // contains needle haystack → INSTR(haystack, needle) > 0
+                            let needle = Self::try_compile_sql_atom(bind_aliases, first_arg, env, let_binds)?;
+                            let haystack = Self::try_compile_sql_atom(bind_aliases, arg, env, let_binds)?;
+                            let mut params = haystack.params;
+                            params.extend(needle.params);
+                            return Some(SqlFragment {
+                                sql: format!("INSTR({}, {}) > 0", haystack.sql, needle.sql),
+                                params,
+                            });
+                        }
+                    }
+                }
+                None
             }
             _ => None,
         }
@@ -8168,6 +8199,7 @@ impl Codegen {
                     ast::BinOp::Sub => "-",
                     ast::BinOp::Mul => "*",
                     ast::BinOp::Div => "/",
+                    ast::BinOp::Concat => "||",
                     _ => return None,
                 };
                 let l = Self::try_compile_sql_atom(bind_aliases, lhs, env, let_binds)?;
@@ -8178,6 +8210,25 @@ impl Codegen {
                     sql: format!("({} {} {})", l.sql, sql_op, r.sql),
                     params,
                 })
+            }
+            // Built-in functions: length, toUpper, toLower, trim
+            ast::ExprKind::App { func, arg } => {
+                if let ast::ExprKind::Var(name) = &func.node {
+                    let sql_fn = match name.as_str() {
+                        "length" => "LENGTH",
+                        "toUpper" => "UPPER",
+                        "toLower" => "LOWER",
+                        "trim" => "TRIM",
+                        _ => return None,
+                    };
+                    let inner = Self::try_compile_sql_atom(bind_aliases, arg, env, let_binds)?;
+                    Some(SqlFragment {
+                        sql: format!("{}({})", sql_fn, inner.sql),
+                        params: inner.params,
+                    })
+                } else {
+                    None
+                }
             }
             _ => None,
         }
@@ -8290,6 +8341,35 @@ impl Codegen {
                     params: inner.params,
                 })
             }
+            // `not expr` function application form → NOT (...)
+            // `contains needle haystack` → INSTR(haystack, needle) > 0
+            ast::ExprKind::App { func, arg } => {
+                if let ast::ExprKind::Var(name) = &func.node {
+                    if name == "not" {
+                        let inner = Self::try_compile_sql_expr(bind_var, arg)?;
+                        return Some(SqlFragment {
+                            sql: format!("NOT ({})", inner.sql),
+                            params: inner.params,
+                        });
+                    }
+                }
+                // Two-arg builtins: App(App(Var(name), arg1), arg2)
+                if let ast::ExprKind::App { func: inner_func, arg: first_arg } = &func.node {
+                    if let ast::ExprKind::Var(name) = &inner_func.node {
+                        if name == "contains" {
+                            let needle = Self::try_compile_single_table_atom(bind_var, first_arg)?;
+                            let haystack = Self::try_compile_single_table_atom(bind_var, arg)?;
+                            let mut params = haystack.params;
+                            params.extend(needle.params);
+                            return Some(SqlFragment {
+                                sql: format!("INSTR({}, {}) > 0", haystack.sql, needle.sql),
+                                params,
+                            });
+                        }
+                    }
+                }
+                None
+            }
             _ => None,
         }
     }
@@ -8388,6 +8468,7 @@ impl Codegen {
                     ast::BinOp::Sub => "-",
                     ast::BinOp::Mul => "*",
                     ast::BinOp::Div => "/",
+                    ast::BinOp::Concat => "||",
                     _ => return None,
                 };
                 let l = Self::try_compile_single_table_atom(bind_var, lhs)?;
@@ -8398,6 +8479,25 @@ impl Codegen {
                     sql: format!("({} {} {})", l.sql, sql_op, r.sql),
                     params,
                 })
+            }
+            // Built-in functions: length, toUpper, toLower, trim
+            ast::ExprKind::App { func, arg } => {
+                if let ast::ExprKind::Var(name) = &func.node {
+                    let sql_fn = match name.as_str() {
+                        "length" => "LENGTH",
+                        "toUpper" => "UPPER",
+                        "toLower" => "LOWER",
+                        "trim" => "TRIM",
+                        _ => return None,
+                    };
+                    let inner = Self::try_compile_single_table_atom(bind_var, arg)?;
+                    Some(SqlFragment {
+                        sql: format!("{}({})", sql_fn, inner.sql),
+                        params: inner.params,
+                    })
+                } else {
+                    None
+                }
             }
             _ => {
                 if Self::expr_refs_var(expr, bind_var) {
@@ -9655,13 +9755,16 @@ fn expr_to_sql_param(expr: &ast::Expr) -> Option<SqlParamSource> {
     }
 }
 
-/// Wrap arithmetic SQL expressions in CAST for correct WHERE comparison.
+/// Wrap arithmetic/function SQL expressions in CAST for correct WHERE comparison.
 /// SQLite arithmetic on TEXT columns (INT stored as TEXT COLLATE KNOT_INT)
 /// produces INTEGER results, but parameters are TEXT. Without CAST,
 /// SQLite's type affinity puts INTEGER before TEXT, breaking `>` / `<`.
+/// Also wraps built-in functions like LENGTH() that return INTEGER.
 fn cast_arithmetic_for_where(sql: &str) -> String {
     // Arithmetic atoms are wrapped in parentheses by try_compile_sql_atom
     if sql.starts_with('(') && !sql.starts_with("(CAST") {
+        format!("CAST({} AS TEXT) COLLATE KNOT_INT", sql)
+    } else if sql.starts_with("LENGTH(") {
         format!("CAST({} AS TEXT) COLLATE KNOT_INT", sql)
     } else {
         sql.to_string()
@@ -9743,6 +9846,26 @@ fn try_sql_inline_condition(
             let inner = try_sql_inline_condition(bind_var, operand, alias, schema)?;
             Some(format!("NOT ({})", inner))
         }
+        // `not expr` function application form → NOT (...)
+        // `contains needle haystack` → INSTR(haystack, needle) > 0
+        ast::ExprKind::App { func, arg } => {
+            if let ast::ExprKind::Var(name) = &func.node {
+                if name == "not" {
+                    let inner = try_sql_inline_condition(bind_var, arg, alias, schema)?;
+                    return Some(format!("NOT ({})", inner));
+                }
+            }
+            if let ast::ExprKind::App { func: inner_func, arg: first_arg } = &func.node {
+                if let ast::ExprKind::Var(name) = &inner_func.node {
+                    if name == "contains" {
+                        let needle = try_sql_arithmetic_expr(bind_var, first_arg, alias, schema)?;
+                        let haystack = try_sql_arithmetic_expr(bind_var, arg, alias, schema)?;
+                        return Some(format!("INSTR({}, {}) > 0", haystack, needle));
+                    }
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -9778,6 +9901,7 @@ fn try_sql_arithmetic_expr(
                 ast::BinOp::Sub => "-",
                 ast::BinOp::Mul => "*",
                 ast::BinOp::Div => "/",
+                ast::BinOp::Concat => "||",
                 _ => return None,
             };
             let l = try_sql_arithmetic_expr(bind_var, lhs, alias, schema)?;
@@ -9789,6 +9913,22 @@ fn try_sql_arithmetic_expr(
             let then_sql = try_sql_arithmetic_expr(bind_var, then_branch, alias, schema)?;
             let else_sql = try_sql_arithmetic_expr(bind_var, else_branch, alias, schema)?;
             Some(format!("CASE WHEN {} THEN {} ELSE {} END", cond_sql, then_sql, else_sql))
+        }
+        // Built-in functions: length, toUpper, toLower, trim
+        ast::ExprKind::App { func, arg } => {
+            if let ast::ExprKind::Var(name) = &func.node {
+                let sql_fn = match name.as_str() {
+                    "length" => "LENGTH",
+                    "toUpper" => "UPPER",
+                    "toLower" => "LOWER",
+                    "trim" => "TRIM",
+                    _ => return None,
+                };
+                let inner = try_sql_arithmetic_expr(bind_var, arg, alias, schema)?;
+                Some(format!("{}({})", sql_fn, inner))
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -9866,21 +10006,38 @@ fn infer_sql_expr_type(bind_var: &str, expr: &ast::Expr, schema: &str) -> Option
             _ => None,
         },
         ast::ExprKind::BinOp { op, lhs, rhs } => {
-            let l = infer_sql_expr_type(bind_var, lhs, schema);
-            let r = infer_sql_expr_type(bind_var, rhs, schema);
-            match (l.as_deref(), r.as_deref(), op) {
-                // Division always produces float
-                (_, _, ast::BinOp::Div) => Some("float".to_string()),
-                // Float on either side → float
-                (Some("float"), _, _) | (_, Some("float"), _) => Some("float".to_string()),
-                (Some(t), _, _) => Some(t.to_string()),
-                (_, Some(t), _) => Some(t.to_string()),
-                _ => None,
+            match op {
+                ast::BinOp::Concat => Some("text".to_string()),
+                _ => {
+                    let l = infer_sql_expr_type(bind_var, lhs, schema);
+                    let r = infer_sql_expr_type(bind_var, rhs, schema);
+                    match (l.as_deref(), r.as_deref(), op) {
+                        // Division always produces float
+                        (_, _, ast::BinOp::Div) => Some("float".to_string()),
+                        // Float on either side → float
+                        (Some("float"), _, _) | (_, Some("float"), _) => Some("float".to_string()),
+                        (Some(t), _, _) => Some(t.to_string()),
+                        (_, Some(t), _) => Some(t.to_string()),
+                        _ => None,
+                    }
+                }
             }
         }
         ast::ExprKind::If { then_branch, else_branch, .. } => {
             infer_sql_expr_type(bind_var, then_branch, schema)
                 .or_else(|| infer_sql_expr_type(bind_var, else_branch, schema))
+        }
+        // Built-in functions
+        ast::ExprKind::App { func, .. } => {
+            if let ast::ExprKind::Var(name) = &func.node {
+                match name.as_str() {
+                    "length" => Some("int".to_string()),
+                    "toUpper" | "toLower" | "trim" => Some("text".to_string()),
+                    _ => None,
+                }
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -9931,6 +10088,26 @@ fn try_multi_table_inline_condition(
             let inner = try_multi_table_inline_condition(bind_to_alias, bind_to_schema, operand)?;
             Some(format!("NOT ({})", inner))
         }
+        // `not expr` function application form → NOT (...)
+        // `contains needle haystack` → INSTR(haystack, needle) > 0
+        ast::ExprKind::App { func, arg } => {
+            if let ast::ExprKind::Var(name) = &func.node {
+                if name == "not" {
+                    let inner = try_multi_table_inline_condition(bind_to_alias, bind_to_schema, arg)?;
+                    return Some(format!("NOT ({})", inner));
+                }
+            }
+            if let ast::ExprKind::App { func: inner_func, arg: first_arg } = &func.node {
+                if let ast::ExprKind::Var(name) = &inner_func.node {
+                    if name == "contains" {
+                        let needle = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, first_arg)?;
+                        let haystack = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, arg)?;
+                        return Some(format!("INSTR({}, {}) > 0", haystack, needle));
+                    }
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -9966,6 +10143,7 @@ fn try_multi_table_arithmetic_expr(
                 ast::BinOp::Sub => "-",
                 ast::BinOp::Mul => "*",
                 ast::BinOp::Div => "/",
+                ast::BinOp::Concat => "||",
                 _ => return None,
             };
             let l = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, lhs)?;
@@ -9977,6 +10155,22 @@ fn try_multi_table_arithmetic_expr(
             let then_sql = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, then_branch)?;
             let else_sql = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, else_branch)?;
             Some(format!("CASE WHEN {} THEN {} ELSE {} END", cond_sql, then_sql, else_sql))
+        }
+        // Built-in functions: length, toUpper, toLower, trim
+        ast::ExprKind::App { func, arg } => {
+            if let ast::ExprKind::Var(name) = &func.node {
+                let sql_fn = match name.as_str() {
+                    "length" => "LENGTH",
+                    "toUpper" => "UPPER",
+                    "toLower" => "LOWER",
+                    "trim" => "TRIM",
+                    _ => return None,
+                };
+                let inner = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, arg)?;
+                Some(format!("{}({})", sql_fn, inner))
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -10004,19 +10198,36 @@ fn infer_multi_table_sql_expr_type(
             _ => None,
         },
         ast::ExprKind::BinOp { op, lhs, rhs } => {
-            let l = infer_multi_table_sql_expr_type(bind_to_schema, lhs);
-            let r = infer_multi_table_sql_expr_type(bind_to_schema, rhs);
-            match (l.as_deref(), r.as_deref(), op) {
-                (_, _, ast::BinOp::Div) => Some("float".to_string()),
-                (Some("float"), _, _) | (_, Some("float"), _) => Some("float".to_string()),
-                (Some(t), _, _) => Some(t.to_string()),
-                (_, Some(t), _) => Some(t.to_string()),
-                _ => None,
+            match op {
+                ast::BinOp::Concat => Some("text".to_string()),
+                _ => {
+                    let l = infer_multi_table_sql_expr_type(bind_to_schema, lhs);
+                    let r = infer_multi_table_sql_expr_type(bind_to_schema, rhs);
+                    match (l.as_deref(), r.as_deref(), op) {
+                        (_, _, ast::BinOp::Div) => Some("float".to_string()),
+                        (Some("float"), _, _) | (_, Some("float"), _) => Some("float".to_string()),
+                        (Some(t), _, _) => Some(t.to_string()),
+                        (_, Some(t), _) => Some(t.to_string()),
+                        _ => None,
+                    }
+                }
             }
         }
         ast::ExprKind::If { then_branch, else_branch, .. } => {
             infer_multi_table_sql_expr_type(bind_to_schema, then_branch)
                 .or_else(|| infer_multi_table_sql_expr_type(bind_to_schema, else_branch))
+        }
+        // Built-in functions
+        ast::ExprKind::App { func, .. } => {
+            if let ast::ExprKind::Var(name) = &func.node {
+                match name.as_str() {
+                    "length" => Some("int".to_string()),
+                    "toUpper" | "toLower" | "trim" => Some("text".to_string()),
+                    _ => None,
+                }
+            } else {
+                None
+            }
         }
         _ => None,
     }

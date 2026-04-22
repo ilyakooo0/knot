@@ -4964,6 +4964,12 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
         })
     });
     if already_changed {
+        // Yield before returning so other threads (e.g. pollHeartbeat)
+        // get a chance to acquire the write lock.  Without this, the
+        // atomic retry loop re-acquires the lock immediately and can
+        // spin-starve writers that would satisfy the retry condition,
+        // causing unbounded memory growth from repeated SQL reads.
+        std::thread::yield_now();
         if saved_lock_depth > 0 {
             while WRITE_LOCKED
                 .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -5008,6 +5014,10 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
     if !changed_after_register {
         slot.wait(Duration::from_secs(30));
         // slot drops → Weak refs become invalid, cleaned up lazily in notify
+    } else {
+        // Changed between registration and re-check — yield to prevent
+        // spin-starvation (same rationale as the already_changed path).
+        std::thread::yield_now();
     }
 
     // Re-acquire write lock if we held it before waiting

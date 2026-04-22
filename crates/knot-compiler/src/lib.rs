@@ -6,5 +6,6 @@ pub mod infer;
 pub mod linker;
 pub mod lockfile;
 pub mod modules;
+pub mod sql_lint;
 pub mod stratify;
 pub mod types;

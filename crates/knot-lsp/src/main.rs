@@ -494,6 +494,10 @@ fn analyze_document(
 
         // Stratification
         all_diags.extend(knot_compiler::stratify::check(&analysis_module));
+
+        // SQL optimization lint
+        let type_env = knot_compiler::types::TypeEnv::from_module(&analysis_module);
+        all_diags.extend(knot_compiler::sql_lint::check(&analysis_module, &type_env));
     }
 
     DocumentState {
@@ -5629,6 +5633,7 @@ fn to_lsp_diagnostic(diag: &diagnostic::Diagnostic, source: &str, uri: &Uri) -> 
     let severity = match diag.severity {
         diagnostic::Severity::Error => DiagnosticSeverity::ERROR,
         diagnostic::Severity::Warning => DiagnosticSeverity::WARNING,
+        diagnostic::Severity::Info => DiagnosticSeverity::INFORMATION,
     };
 
     // Use the first valid label's span for the diagnostic range,
@@ -5947,6 +5952,8 @@ fn error_code_for_diagnostic(message: &str) -> Option<String> {
         Some("W001".into())
     } else if msg.contains("shadow") {
         Some("W002".into())
+    } else if msg.contains("runtime") && msg.contains("sql") {
+        Some("I001".into())
     } else {
         None
     }

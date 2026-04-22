@@ -8,6 +8,7 @@ use crate::ast::Span;
 pub enum Severity {
     Error,
     Warning,
+    Info,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +40,15 @@ impl Diagnostic {
     pub fn warning(msg: impl Into<String>) -> Self {
         Self {
             severity: Severity::Warning,
+            message: msg.into(),
+            labels: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    pub fn info(msg: impl Into<String>) -> Self {
+        Self {
+            severity: Severity::Info,
             message: msg.into(),
             labels: Vec::new(),
             notes: Vec::new(),
@@ -112,6 +122,7 @@ impl Diagnostic {
         let kind = match self.severity {
             Severity::Error => ReportKind::Error,
             Severity::Warning => ReportKind::Warning,
+            Severity::Info => ReportKind::Advice,
         };
 
         // Pick the offset for the report header from the first label, or 0.

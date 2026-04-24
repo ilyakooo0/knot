@@ -1507,6 +1507,145 @@ pub extern "C" fn knot_debug_init() {
     }
 }
 
+// ── CLI constant overrides ───────────────────────────────────────
+
+/// Look up a command-line override for a top-level constant.
+///
+/// Scans `std::env::args()` for `--{name}=value` or `--{name} value`.
+/// `type_tag`: 0=Int, 1=Float, 2=Text, 3=Bool.
+/// Returns a boxed `Value` if found, or null if absent.
+/// On parse error, prints a message and exits.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_override_lookup(
+    name_ptr: *const u8,
+    name_len: usize,
+    type_tag: i32,
+) -> *mut Value {
+    let name = unsafe { str_from_raw(name_ptr, name_len) };
+    let flag = format!("--{}", name);
+
+    let args: Vec<String> = std::env::args().collect();
+    let mut value: Option<String> = None;
+
+    let mut i = 1; // skip argv[0]
+    while i < args.len() {
+        if let Some(v) = args[i].strip_prefix(&flag) {
+            if let Some(v) = v.strip_prefix('=') {
+                value = Some(v.to_string());
+                break;
+            } else if v.is_empty() {
+                // --name value (two-arg form)
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    value = Some(args[i + 1].clone());
+                    break;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let val_str = match value {
+        Some(v) => v,
+        None => return std::ptr::null_mut(),
+    };
+
+    let type_name = match type_tag {
+        0 => "Int",
+        1 => "Float",
+        2 => "Text",
+        3 => "Bool",
+        _ => "unknown",
+    };
+
+    match type_tag {
+        0 => {
+            // Int
+            match val_str.parse::<i64>() {
+                Ok(n) => alloc_small_int(n),
+                Err(_) => {
+                    eprintln!(
+                        "Error: invalid value '{}' for --{} (expected {})",
+                        val_str, name, type_name
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+        1 => {
+            // Float
+            match val_str.parse::<f64>() {
+                Ok(n) => alloc(Value::Float(n)),
+                Err(_) => {
+                    eprintln!(
+                        "Error: invalid value '{}' for --{} (expected {})",
+                        val_str, name, type_name
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+        2 => {
+            // Text
+            alloc(Value::Text(Arc::from(val_str.as_str())))
+        }
+        3 => {
+            // Bool
+            match val_str.as_str() {
+                "true" | "1" => encode_bool(true),
+                "false" | "0" => encode_bool(false),
+                _ => {
+                    eprintln!(
+                        "Error: invalid value '{}' for --{} (expected true or false)",
+                        val_str, name
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
+/// Check for `--help` and print available constant overrides.
+///
+/// `desc` is a compile-time string like `"port:Int,name:Text"`.
+/// If `--help` is found, prints usage and exits.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_override_check_help(desc_ptr: *const u8, desc_len: usize) {
+    let has_help = std::env::args().any(|a| a == "--help");
+    if !has_help {
+        return;
+    }
+
+    let desc = unsafe { str_from_raw(desc_ptr, desc_len) };
+    let exe = std::env::args().next().unwrap_or_else(|| "program".to_string());
+
+    // Collect overridable constants
+    let mut overrides: Vec<(&str, &str)> = Vec::new();
+    if !desc.is_empty() {
+        for entry in desc.split(',') {
+            if let Some((name, ty)) = entry.split_once(':') {
+                overrides.push((name, ty));
+            }
+        }
+    }
+    let has_debug_override = overrides.iter().any(|(n, _)| *n == "debug");
+
+    eprintln!("Usage: {} [OPTIONS]", exe);
+    eprintln!();
+    eprintln!("Options:");
+    if !has_debug_override {
+        eprintln!("  --debug          Enable debug output");
+    }
+    eprintln!("  --help           Show this help message");
+
+    for (name, ty) in &overrides {
+        eprintln!("  --{:<14} {} (default from source)", name, ty);
+    }
+
+    std::process::exit(0);
+}
+
 // ── String interner ──────────────────────────────────────────────
 //
 // Record field names and constructor tags are drawn from a small,

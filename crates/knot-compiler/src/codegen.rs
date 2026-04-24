@@ -150,6 +150,9 @@ pub struct Codegen {
     // rather than a relation of records. These get automatic wrap/unwrap of `_value` field.
     scalar_sources: HashSet<String>,
 
+    // Overridable constants: name -> type string ("Int", "Float", "Text", "Bool")
+    overridable_constants: HashMap<String, String>,
+
     // Whether we are inside compile_io_do_eager — when true, Yield compiles to
     // the raw inner value rather than wrapping in knot_relation_singleton.
     in_io_eager: bool,
@@ -308,6 +311,7 @@ pub fn compile(
     refine_targets: &crate::infer::RefineTargets,
     refined_types: &crate::infer::RefinedTypeInfoMap,
     from_json_targets: &crate::infer::FromJsonTargets,
+    type_info: &crate::infer::TypeInfo,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     let mut cg = Codegen::new();
     // Derive database path from source filename: "foo.knot" → "foo.db"
@@ -348,6 +352,24 @@ pub fn compile(
         }
     }
     cg.collect_declarations(module);
+    // Compute overridable constants: 0-param Fun declarations with scalar types
+    for decl in &module.decls {
+        if let ast::DeclKind::Fun { name, body: Some(_), .. } = &decl.node {
+            if name == "main" {
+                continue;
+            }
+            if let Some((_, 0)) = cg.user_fns.get(name.as_str()) {
+                if let Some(ty_str) = type_info.get(name.as_str()) {
+                    match ty_str.as_str() {
+                        "Int" | "Float" | "Text" | "Bool" => {
+                            cg.overridable_constants.insert(name.clone(), ty_str.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
     cg.define_functions(module, type_env);
     cg.generate_main(module);
     // Drain lambdas and IO thunks created by generate_main (e.g., migration functions)
@@ -435,6 +457,7 @@ impl Codegen {
             nullable_ctors: HashMap::new(),
             io_functions: HashSet::new(),
             scalar_sources: HashSet::new(),
+            overridable_constants: HashMap::new(),
             in_io_eager: false,
             atomic_retry_block: None,
             refined_types: HashMap::new(),
@@ -553,6 +576,10 @@ impl Codegen {
 
         // Debug
         self.declare_rt("knot_debug_init", &[], &[]);
+
+        // CLI constant overrides
+        self.declare_rt("knot_override_lookup", &[p, p, types::I32], &[p]);
+        self.declare_rt("knot_override_check_help", &[p, p], &[]);
 
         // STM tracking
         self.declare_rt("knot_stm_track_read", &[p, p], &[]);
@@ -2553,6 +2580,12 @@ impl Codegen {
 
         let params_owned: Vec<ast::Pat> = params.to_vec();
         let body_owned = body.clone();
+        let override_type = if params.is_empty() {
+            self.overridable_constants.get(name).cloned()
+        } else {
+            None
+        };
+        let name_owned = name.to_string();
 
         self.build_function(func_id, sig, |cg, builder, entry| {
             let mut env = Env::new();
@@ -2560,6 +2593,32 @@ impl Codegen {
             for (i, pat) in params_owned.iter().enumerate() {
                 let val = builder.block_params(entry)[i + 1];
                 cg.bind_io_pattern(builder, pat, val, &mut env, None);
+            }
+
+            // For overridable constants, check CLI override before evaluating body
+            if let Some(type_str) = &override_type {
+                let type_tag: i64 = match type_str.as_str() {
+                    "Int" => 0,
+                    "Float" => 1,
+                    "Text" => 2,
+                    "Bool" => 3,
+                    _ => unreachable!(),
+                };
+                let (name_ptr, name_len) = cg.string_ptr(builder, &name_owned);
+                let tag = builder.ins().iconst(types::I32, type_tag);
+                let override_val = cg.call_rt(builder, "knot_override_lookup", &[name_ptr, name_len, tag]);
+
+                let default_block = builder.create_block();
+                let override_block = builder.create_block();
+                let is_null = builder.ins().icmp_imm(IntCC::Equal, override_val, 0);
+                builder.ins().brif(is_null, default_block, &[], override_block, &[]);
+
+                builder.switch_to_block(override_block);
+                builder.seal_block(override_block);
+                builder.ins().return_(&[override_val]);
+
+                builder.switch_to_block(default_block);
+                builder.seal_block(default_block);
             }
 
             let result = cg.compile_expr(builder, &body_owned, &mut env, db);
@@ -3050,6 +3109,19 @@ impl Codegen {
             // Check --debug flag
             let debug_init_ref = cg.import_rt(builder, "knot_debug_init");
             builder.ins().call(debug_init_ref, &[]);
+
+            // Check --help for overridable constants
+            if !cg.overridable_constants.is_empty() {
+                let descriptor = {
+                    let mut entries: Vec<String> = cg.overridable_constants.iter()
+                        .map(|(name, ty)| format!("{}:{}", name, ty))
+                        .collect();
+                    entries.sort();
+                    entries.join(",")
+                };
+                let (desc_ptr, desc_len) = cg.string_ptr(builder, &descriptor);
+                cg.call_rt_void(builder, "knot_override_check_help", &[desc_ptr, desc_len]);
+            }
 
             // Open database
             let db_path = cg.db_path.clone();

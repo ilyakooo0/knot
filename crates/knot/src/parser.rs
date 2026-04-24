@@ -2116,6 +2116,7 @@ impl Parser {
                     return None;
                 }
                 let inner = inner.unwrap();
+                self.skip_newlines();
                 // Check for type annotation: `(expr : Type)`
                 if self.eat(&TokenKind::Colon) {
                     let ty = self.parse_type()?;

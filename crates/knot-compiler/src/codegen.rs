@@ -361,7 +361,8 @@ pub fn compile(
             if let Some((_, 0)) = cg.user_fns.get(name.as_str()) {
                 if let Some(ty_str) = type_info.get(name.as_str()) {
                     match ty_str.as_str() {
-                        "Int" | "Float" | "Text" | "Bool" => {
+                        "Int" | "Float" | "Text" | "Bool"
+                        | "Maybe Int" | "Maybe Float" | "Maybe Text" | "Maybe Bool" => {
                             cg.overridable_constants.insert(name.clone(), ty_str.clone());
                         }
                         _ => {}
@@ -2602,6 +2603,10 @@ impl Codegen {
                     "Float" => 1,
                     "Text" => 2,
                     "Bool" => 3,
+                    "Maybe Int" => 4,
+                    "Maybe Float" => 5,
+                    "Maybe Text" => 6,
+                    "Maybe Bool" => 7,
                     _ => unreachable!(),
                 };
                 let (name_ptr, name_len) = cg.string_ptr(builder, &name_owned);

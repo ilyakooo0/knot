@@ -1512,7 +1512,8 @@ pub extern "C" fn knot_debug_init() {
 /// Look up a command-line override for a top-level constant.
 ///
 /// Scans `std::env::args()` for `--{name}=value` or `--{name} value`.
-/// `type_tag`: 0=Int, 1=Float, 2=Text, 3=Bool.
+/// `type_tag`: 0=Int, 1=Float, 2=Text, 3=Bool, 4=Maybe Int, 5=Maybe Float, 6=Maybe Text, 7=Maybe Bool.
+/// Maybe tags automatically wrap the parsed value in `Just`.
 /// Returns a boxed `Value` if found, or null if absent.
 /// On parse error, prints a message and exits.
 #[unsafe(no_mangle)]
@@ -1549,7 +1550,11 @@ pub extern "C" fn knot_override_lookup(
         None => return std::ptr::null_mut(),
     };
 
-    let type_name = match type_tag {
+    // Tags 4-7 are Maybe variants of 0-3
+    let base_tag = if type_tag >= 4 { type_tag - 4 } else { type_tag };
+    let wrap_maybe = type_tag >= 4;
+
+    let type_name = match base_tag {
         0 => "Int",
         1 => "Float",
         2 => "Text",
@@ -1557,7 +1562,7 @@ pub extern "C" fn knot_override_lookup(
         _ => "unknown",
     };
 
-    match type_tag {
+    let inner = match base_tag {
         0 => {
             // Int
             match val_str.parse::<i64>() {
@@ -1602,7 +1607,14 @@ pub extern "C" fn knot_override_lookup(
                 }
             }
         }
-        _ => std::ptr::null_mut(),
+        _ => return std::ptr::null_mut(),
+    };
+
+    if wrap_maybe {
+        let tag = intern_str("Just");
+        alloc(Value::Constructor(tag, inner))
+    } else {
+        inner
     }
 }
 

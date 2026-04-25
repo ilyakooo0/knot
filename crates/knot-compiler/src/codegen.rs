@@ -3116,17 +3116,15 @@ impl Codegen {
             builder.ins().call(debug_init_ref, &[]);
 
             // Check --help for overridable constants
-            if !cg.overridable_constants.is_empty() {
-                let descriptor = {
-                    let mut entries: Vec<String> = cg.overridable_constants.iter()
-                        .map(|(name, ty)| format!("{}:{}", name, ty))
-                        .collect();
-                    entries.sort();
-                    entries.join(",")
-                };
-                let (desc_ptr, desc_len) = cg.string_ptr(builder, &descriptor);
-                cg.call_rt_void(builder, "knot_override_check_help", &[desc_ptr, desc_len]);
-            }
+            let descriptor = {
+                let mut entries: Vec<String> = cg.overridable_constants.iter()
+                    .map(|(name, ty)| format!("{}:{}", name, ty))
+                    .collect();
+                entries.sort();
+                entries.join(",")
+            };
+            let (desc_ptr, desc_len) = cg.string_ptr(builder, &descriptor);
+            cg.call_rt_void(builder, "knot_override_check_help", &[desc_ptr, desc_len]);
 
             // Open database
             let db_path = cg.db_path.clone();

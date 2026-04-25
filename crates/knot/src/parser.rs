@@ -1477,15 +1477,51 @@ impl Parser {
             {
                 let tok = self.advance();
                 let TokenKind::Lower(s) = tok.kind else { unreachable!() };
-                segments.push(PathSegment::Literal(s));
+                let mut seg = s;
+                while self.at(&TokenKind::Minus) && matches!(self.peek_ahead(1), TokenKind::Lower(_) | TokenKind::Upper(_)) {
+                    self.advance(); // consume `-`
+                    let next = self.advance();
+                    match next.kind {
+                        TokenKind::Lower(s) | TokenKind::Upper(s) => {
+                            seg.push('-');
+                            seg.push_str(&s);
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                segments.push(PathSegment::Literal(seg));
             } else if matches!(self.peek(), TokenKind::Upper(_)) {
                 // uppercase segment like /api/v1 — unlikely but handle
                 let tok = self.advance();
                 let TokenKind::Upper(s) = tok.kind else { unreachable!() };
-                segments.push(PathSegment::Literal(s));
+                let mut seg = s;
+                while self.at(&TokenKind::Minus) && matches!(self.peek_ahead(1), TokenKind::Lower(_) | TokenKind::Upper(_)) {
+                    self.advance(); // consume `-`
+                    let next = self.advance();
+                    match next.kind {
+                        TokenKind::Lower(s) | TokenKind::Upper(s) => {
+                            seg.push('-');
+                            seg.push_str(&s);
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                segments.push(PathSegment::Literal(seg));
             } else if self.peek().keyword_str().is_some() {
                 let tok = self.advance();
-                segments.push(PathSegment::Literal(tok.kind.keyword_str().unwrap().to_string()));
+                let mut seg = tok.kind.keyword_str().unwrap().to_string();
+                while self.at(&TokenKind::Minus) && matches!(self.peek_ahead(1), TokenKind::Lower(_) | TokenKind::Upper(_)) {
+                    self.advance(); // consume `-`
+                    let next = self.advance();
+                    match next.kind {
+                        TokenKind::Lower(s) | TokenKind::Upper(s) => {
+                            seg.push('-');
+                            seg.push_str(&s);
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                segments.push(PathSegment::Literal(seg));
             } else {
                 // Just a trailing `/`
             }

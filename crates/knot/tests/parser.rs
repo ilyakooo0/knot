@@ -2530,6 +2530,21 @@ fn route_multiple_path_segments() {
 }
 
 #[test]
+fn route_dashes_in_path() {
+    let src = "route Api where\n  GET /user-orders/{id: Int}/line-items = GetLineItems";
+    match first_decl(src) {
+        DeclKind::Route { entries, .. } => {
+            let path = &entries[0].path;
+            assert_eq!(path.len(), 3);
+            assert!(matches!(&path[0], PathSegment::Literal(s) if s == "user-orders"));
+            assert!(matches!(&path[1], PathSegment::Param { name, .. } if name == "id"));
+            assert!(matches!(&path[2], PathSegment::Literal(s) if s == "line-items"));
+        }
+        other => panic!("expected Route, got {:?}", other),
+    }
+}
+
+#[test]
 fn route_body_and_query_and_response() {
     let src =
         "route Api where\n  POST {title: Text} /todos?{notify: Bool} -> {id: Int} = CreateTodo";

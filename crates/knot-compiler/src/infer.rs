@@ -3685,6 +3685,28 @@ impl Infer {
             );
         }
 
+        // countWhere : ∀a u. (a -> Bool) -> [a] -> Int<u>
+        {
+            let a = self.fresh_var();
+            let u = self.fresh_unit_var();
+            let int_u = Ty::IntUnit(UnitTy::var(u));
+            self.bind_top(
+                "countWhere",
+                Scheme {
+                    vars: vec![a],
+                    unit_vars: vec![u],
+                    constraints: vec![],
+                    ty: Ty::Fun(
+                        Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Bool))),
+                        Box::new(Ty::Fun(
+                            Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                            Box::new(int_u),
+                        )),
+                    ),
+                },
+            );
+        }
+
         // putLine : ∀a. a -> IO {console} {} (alias for println)
         let a = self.fresh_var();
         self.bind_top(
@@ -3962,6 +3984,40 @@ impl Infer {
                 },
             );
         }
+
+        // min : ∀a b. (a -> b) -> [a] -> b
+        let a = self.fresh_var();
+        let b = self.fresh_var();
+        self.bind_top(
+            "min",
+            Scheme::poly(
+                vec![a, b],
+                Ty::Fun(
+                    Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        Box::new(Ty::Var(b)),
+                    )),
+                ),
+            ),
+        );
+
+        // max : ∀a b. (a -> b) -> [a] -> b
+        let a = self.fresh_var();
+        let b = self.fresh_var();
+        self.bind_top(
+            "max",
+            Scheme::poly(
+                vec![a, b],
+                Ty::Fun(
+                    Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        Box::new(Ty::Var(b)),
+                    )),
+                ),
+            ),
+        );
 
         // match : ∀a b. (a -> b) -> [b] -> [a]
         let a = self.fresh_var();
@@ -5157,6 +5213,38 @@ mod tests {
     #[test]
     fn count_builtin() {
         assert!(check_src("main = count [1, 2, 3]").is_empty());
+    }
+
+    #[test]
+    fn min_builtin_int() {
+        // min : (a -> b) -> [a] -> b ; numeric projection
+        assert!(check_src(
+            "type T = {x: Int}\n*ts : [T]\nmain = do\n  ts <- *ts\n  yield (min (\\t -> t.x) ts)"
+        ).is_empty());
+    }
+
+    #[test]
+    fn max_builtin_text() {
+        // max works with Text projections (lexicographic ordering)
+        assert!(check_src(
+            "type T = {name: Text}\n*ts : [T]\nmain = do\n  ts <- *ts\n  yield (max (\\t -> t.name) ts)"
+        ).is_empty());
+    }
+
+    #[test]
+    fn count_where_builtin() {
+        assert!(check_src(
+            "type T = {x: Int}\n*ts : [T]\nmain = do\n  ts <- *ts\n  yield (countWhere (\\t -> t.x > 5) ts)"
+        ).is_empty());
+    }
+
+    #[test]
+    fn count_where_rejects_non_bool() {
+        // countWhere predicate must return Bool
+        let diags = check_src(
+            "type T = {x: Int}\n*ts : [T]\nmain = do\n  ts <- *ts\n  yield (countWhere (\\t -> t.x) ts)"
+        );
+        assert!(has_error(&diags, "type mismatch"));
     }
 
     #[test]

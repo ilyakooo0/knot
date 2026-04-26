@@ -94,6 +94,22 @@ Return the number of rows in a relation.
 numPeople = count *people
 ```
 
+When the argument is a source relation (or its bound alias), the compiler emits a single `SELECT COUNT(*)` query. Pipe forms like `*people |> filter (\p -> p.age > 30) |> count` collapse into one `SELECT COUNT(*) FROM ... WHERE ...`.
+
+### `countWhere`
+
+```
+countWhere : (a -> Bool) -> [a] -> Int
+```
+
+Count rows that satisfy a predicate. Equivalent to `count . filter`, but pushes down to a single `SELECT COUNT(*) FROM ... WHERE pred` when the predicate is SQL-compilable.
+
+```knot
+engHeadcount = do
+  employees <- *employees
+  yield (countWhere (\e -> e.dept == "Eng") employees)
+```
+
 ### `sum`
 
 ```
@@ -116,6 +132,40 @@ avg : (a -> Float<u>) -> [a] -> Float<u>
 ```
 
 Average of a projected numeric field over a relation. Returns `Float`. Preserves units from the projection function — if the projection returns `Float<M>`, the average is `Float<M>`.
+
+### `min`
+
+```
+min : (a -> b) -> [a] -> b
+```
+
+Minimum of a projected field over a relation. The projection can return any orderable type — `Int`, `Float`, or `Text` (lexicographic ordering). Panics if the relation is empty.
+
+```knot
+lowestSalary = do
+  employees <- *employees
+  yield (min (\e -> e.salary) employees)
+
+firstName = do
+  employees <- *employees
+  yield (min (\e -> e.name) employees)
+```
+
+When applied to a source (or bound source variable), it pushes down to `SELECT MIN(col) FROM ...`. Combined with `filter` it becomes `SELECT MIN(col) FROM ... WHERE ...`.
+
+### `max`
+
+```
+max : (a -> b) -> [a] -> b
+```
+
+Maximum of a projected field over a relation. Like `min`, works with any orderable type. Panics if the relation is empty. Pushes down to `SELECT MAX(col) FROM ...`.
+
+```knot
+highestSalary = do
+  employees <- *employees
+  yield (max (\e -> e.salary) employees)
+```
 
 ### `union`
 
@@ -758,11 +808,13 @@ double = \x -> x + x
 
 #### Unit-Preserving Functions
 
-`sum` and `avg` preserve units from their projection function:
+`sum`, `avg`, `min`, and `max` preserve units from their projection function:
 
 ```knot
 avg (\t -> t.distance) *trips   -- Float<M> if distance : Float<M>
 sum (\t -> t.distance) *trips   -- Float<M> if distance : Float<M>
+min (\t -> t.distance) *trips   -- Float<M> if distance : Float<M>
+max (\t -> t.distance) *trips   -- Float<M> if distance : Float<M>
 ```
 
 ---

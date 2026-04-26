@@ -614,6 +614,7 @@ impl Codegen {
         self.declare_rt("knot_source_query", &[p, p, p, p, p, p], &[p]);
         self.declare_rt("knot_source_query_float", &[p, p, p, p], &[p]);
         self.declare_rt("knot_source_query_sum", &[p, p, p, p], &[p]);
+        self.declare_rt("knot_source_query_value", &[p, p, p, p], &[p]);
         self.declare_rt("knot_source_write", &[p, p, p, p, p, p], &[]);
         self.declare_rt("knot_source_append", &[p, p, p, p, p, p], &[]);
         self.declare_rt("knot_source_diff_write", &[p, p, p, p, p, p], &[]);
@@ -712,6 +713,9 @@ impl Codegen {
         self.declare_rt("knot_relation_inter", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_sum", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_avg", &[p, p, p], &[p]);
+        self.declare_rt("knot_relation_min", &[p, p, p], &[p]);
+        self.declare_rt("knot_relation_max", &[p, p, p], &[p]);
+        self.declare_rt("knot_relation_count_where", &[p, p, p], &[p]);
 
         // Standard library: text operations
         self.declare_rt("knot_text_to_upper", &[p], &[p]);
@@ -1056,6 +1060,7 @@ impl Codegen {
         // with [] impls registered directly in register_builtin_relation_impls.
         let stdlib_names = [
             "filter", "match", "single", "diff", "inter", "sum", "avg",
+            "min", "max", "countWhere",
             "toUpper", "toLower", "take", "drop", "sortBy", "takeRelation",
             "length", "trim", "contains", "reverse",
             "chars", "id", "not",
@@ -2061,6 +2066,9 @@ impl Codegen {
         self.define_stdlib_fn_2("inter", "knot_relation_inter", true);
         self.define_stdlib_fn_2("sum", "knot_relation_sum", true);
         self.define_stdlib_fn_2("avg", "knot_relation_avg", true);
+        self.define_stdlib_fn_2("min", "knot_relation_min", true);
+        self.define_stdlib_fn_2("max", "knot_relation_max", true);
+        self.define_stdlib_fn_2("countWhere", "knot_relation_count_where", true);
 
         // Bytes: 1-param
         self.define_stdlib_fn_1("bytesLength", "knot_bytes_length");
@@ -4792,8 +4800,8 @@ impl Codegen {
                     }
                 }
 
-                // sum/avg lambda (filter f *source) → SQL aggregate with WHERE
-                if matches!(name.as_str(), "sum" | "avg") {
+                // sum/avg/min/max lambda (filter f *source) → SQL aggregate with WHERE
+                if let Some((sql_func, rt_fn)) = aggregate_sql_func_runtime(name) {
                     if let Some((source_name, filter_bind, filter_body)) =
                         extract_filter_on_source(&args[1], &self.source_var_binds, &self.fun_bodies)
                     {
@@ -4803,12 +4811,15 @@ impl Codegen {
                                     if let Some((agg_bind, agg_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies) {
                                         if let Some(col_sql) = extract_sql_field_access(&agg_bind, agg_body, "", &schema) {
                                             if let Some(frag) = Self::try_compile_sql_expr(&filter_bind, filter_body) {
-                                                let func = if name == "sum" { "SUM" } else { "AVG" };
+                                                let arg_sql = if matches!(name.as_str(), "min" | "max") {
+                                                    col_sql_for_minmax(&col_sql, &agg_bind, agg_body, &schema)
+                                                } else {
+                                                    col_sql
+                                                };
                                                 let table = quote_sql_ident(&format!("_knot_{}", source_name));
-                                                let sql = format!("SELECT {}({}) FROM {} WHERE {}", func, col_sql, table, frag.sql);
+                                                let sql = format!("SELECT {}({}) FROM {} WHERE {}", sql_func, arg_sql, table, frag.sql);
                                                 let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
                                                 let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                                                let rt_fn = if name == "sum" { "knot_source_query_sum" } else { "knot_source_query_float" };
                                                 return self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]);
                                             }
                                         }
@@ -4818,7 +4829,7 @@ impl Codegen {
                         }
                     }
 
-                    // sum/avg lambda (do { ... }) → SQL aggregate from plan
+                    // sum/avg/min/max lambda (do { ... }) → SQL aggregate from plan
                     if let ast::ExprKind::Do(stmts) = &args[1].node {
                         if let Some(plan) = self.analyze_sql_plan(stmts, env) {
                             if let Some((agg_bind, agg_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies) {
@@ -4829,20 +4840,93 @@ impl Codegen {
                                     .cloned()
                                     .unwrap_or_default();
                                 if let Some(col_sql) = extract_sql_field_access(&agg_bind, agg_body, alias, &schema) {
-                                    let func = if name == "sum" { "SUM" } else { "AVG" };
+                                    let arg_sql = if matches!(name.as_str(), "min" | "max") {
+                                        col_sql_for_minmax(&col_sql, &agg_bind, agg_body, &schema)
+                                    } else {
+                                        col_sql
+                                    };
                                     let tables_sql: Vec<String> = plan.tables.iter().map(|t| {
                                         format!("{} AS {}", quote_sql_ident(&format!("_knot_{}", t.source_name)), t.alias)
                                     }).collect();
                                     let from = tables_sql.join(", ");
                                     let sql = if plan.conditions.is_empty() {
-                                        format!("SELECT {}({}) FROM {}", func, col_sql, from)
+                                        format!("SELECT {}({}) FROM {}", sql_func, arg_sql, from)
                                     } else {
-                                        format!("SELECT {}({}) FROM {} WHERE {}", func, col_sql, from, plan.conditions.join(" AND "))
+                                        format!("SELECT {}({}) FROM {} WHERE {}", sql_func, arg_sql, from, plan.conditions.join(" AND "))
                                     };
                                     let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
                                     let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                                    let rt_fn = if name == "sum" { "knot_source_query_sum" } else { "knot_source_query_float" };
                                     return self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // countWhere predicate (filter f *source) → SELECT COUNT(*) FROM ... WHERE pred AND filter
+                if name == "countWhere" {
+                    if let Some((source_name, filter_bind, filter_body)) =
+                        extract_filter_on_source(&args[1], &self.source_var_binds, &self.fun_bodies)
+                    {
+                        if !self.views.contains_key(source_name) {
+                            if let Some(schema) = self.source_schemas.get(source_name).cloned() {
+                                if !schema.starts_with('#') && !schema.contains('[') {
+                                    if let Some((pred_bind, pred_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies) {
+                                        if let Some(pred_frag) = Self::try_compile_sql_expr(&pred_bind, pred_body) {
+                                            if let Some(filter_frag) = Self::try_compile_sql_expr(&filter_bind, filter_body) {
+                                                let table = quote_sql_ident(&format!("_knot_{}", source_name));
+                                                let sql = format!(
+                                                    "SELECT COUNT(*) FROM {} WHERE {} AND {}",
+                                                    table, filter_frag.sql, pred_frag.sql,
+                                                );
+                                                let mut all_params = filter_frag.params;
+                                                all_params.extend(pred_frag.params);
+                                                let params_rel = self.compile_sql_params(builder, &all_params, env, db);
+                                                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                                                return self.call_rt(
+                                                    builder,
+                                                    "knot_source_query_count",
+                                                    &[db, sql_ptr, sql_len, params_rel],
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // countWhere predicate (do { ... }) → SELECT COUNT(*) FROM plan WHERE pred
+                    if let ast::ExprKind::Do(stmts) = &args[1].node {
+                        if let Some(plan) = self.analyze_sql_plan(stmts, env) {
+                            if let Some((pred_bind, pred_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies) {
+                                let mut bind_aliases: HashMap<String, String> = HashMap::new();
+                                if plan.tables.len() == 1 {
+                                    bind_aliases.insert(pred_bind.clone(), plan.tables[0].alias.clone());
+                                }
+                                if let Some(pred_frag) = Self::try_compile_multi_table_sql_expr(
+                                    &bind_aliases, pred_body, env, &HashMap::new(),
+                                ) {
+                                    let tables_sql: Vec<String> = plan.tables.iter().map(|t| {
+                                        format!("{} AS {}", quote_sql_ident(&format!("_knot_{}", t.source_name)), t.alias)
+                                    }).collect();
+                                    let from = tables_sql.join(", ");
+                                    let mut all_conditions = plan.conditions.clone();
+                                    all_conditions.push(pred_frag.sql);
+                                    let sql = format!(
+                                        "SELECT COUNT(*) FROM {} WHERE {}",
+                                        from,
+                                        all_conditions.join(" AND "),
+                                    );
+                                    let mut all_params = plan.params.clone();
+                                    all_params.extend(pred_frag.params);
+                                    let params_rel = self.compile_sql_params(builder, &all_params, env, db);
+                                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                                    return self.call_rt(
+                                        builder,
+                                        "knot_source_query_count",
+                                        &[db, sql_ptr, sql_len, params_rel],
+                                    );
                                 }
                             }
                         }
@@ -7756,15 +7840,30 @@ impl Codegen {
                     &[db, name_ptr, name_len, schema_ptr, schema_len, where_ptr, where_len, params_rel],
                 ))
             }
-            "sum" | "avg" => {
+            "sum" | "avg" | "min" | "max" => {
                 // Use unqualified column names for direct SQL aggregate
                 let col_sql = extract_sql_field_access(&bind_var, body, "", schema)?;
-                let func = if fn_name == "sum" { "SUM" } else { "AVG" };
-                let sql = format!("SELECT {}({}) FROM {}", func, col_sql, table);
+                let (func, rt_fn) = aggregate_sql_func_runtime(fn_name)?;
+                let arg_sql = if matches!(fn_name, "min" | "max") {
+                    col_sql_for_minmax(&col_sql, &bind_var, body, schema)
+                } else {
+                    col_sql
+                };
+                let sql = format!("SELECT {}({}) FROM {}", func, arg_sql, table);
                 let params_rel = self.compile_sql_params(builder, &[], env, db);
                 let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                let rt_fn = if fn_name == "sum" { "knot_source_query_sum" } else { "knot_source_query_float" };
                 Some(self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]))
+            }
+            "countWhere" => {
+                let frag = Self::try_compile_sql_expr(&bind_var, body)?;
+                let sql = format!("SELECT COUNT(*) FROM {} WHERE {}", table, frag.sql);
+                let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
+                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                Some(self.call_rt(
+                    builder,
+                    "knot_source_query_count",
+                    &[db, sql_ptr, sql_len, params_rel],
+                ))
             }
             "sortBy" => {
                 // sortBy (\m -> m.field) *source → SELECT * FROM source ORDER BY field
@@ -7889,6 +7988,36 @@ impl Codegen {
                     let col_sql = extract_sql_field_access(bind_var, body, &alias, &schema)?;
                     aggregate = Some(("AVG", col_sql));
                 }
+                PipeOp::Min { bind_var, body } => {
+                    if is_count || aggregate.is_some() {
+                        return None;
+                    }
+                    bind_aliases.insert(bind_var.clone(), alias.clone());
+                    let col_sql = extract_sql_field_access(bind_var, body, &alias, &schema)?;
+                    let arg_sql = col_sql_for_minmax(&col_sql, bind_var, body, &schema);
+                    aggregate = Some(("MIN", arg_sql));
+                }
+                PipeOp::Max { bind_var, body } => {
+                    if is_count || aggregate.is_some() {
+                        return None;
+                    }
+                    bind_aliases.insert(bind_var.clone(), alias.clone());
+                    let col_sql = extract_sql_field_access(bind_var, body, &alias, &schema)?;
+                    let arg_sql = col_sql_for_minmax(&col_sql, bind_var, body, &schema);
+                    aggregate = Some(("MAX", arg_sql));
+                }
+                PipeOp::CountWhere { bind_var, body } => {
+                    if is_count || aggregate.is_some() {
+                        return None;
+                    }
+                    bind_aliases.insert(bind_var.clone(), alias.clone());
+                    let frag = Self::try_compile_multi_table_sql_expr(
+                        &bind_aliases, body, env, &HashMap::new(),
+                    )?;
+                    conditions.push(frag.sql);
+                    params.extend(frag.params);
+                    is_count = true;
+                }
             }
         }
 
@@ -7907,6 +8036,7 @@ impl Codegen {
             let rt_fn = match func {
                 "SUM" => "knot_source_query_sum",
                 "AVG" => "knot_source_query_float",
+                "MIN" | "MAX" => "knot_source_query_value",
                 _ => "knot_source_query_count",
             };
             Some(self.call_rt(
@@ -9558,6 +9688,45 @@ fn expr_references_var(expr: &ast::Expr, var_name: &str) -> bool {
 
 // ── SQL compilation types ─────────────────────────────────────────
 
+/// Map a 2-arg projection-based aggregate name (`sum`/`avg`/`min`/`max`) to its
+/// SQL aggregate function and the runtime function used to read the result.
+fn aggregate_sql_func_runtime(name: &str) -> Option<(&'static str, &'static str)> {
+    match name {
+        "sum" => Some(("SUM", "knot_source_query_sum")),
+        "avg" => Some(("AVG", "knot_source_query_float")),
+        "min" => Some(("MIN", "knot_source_query_value")),
+        "max" => Some(("MAX", "knot_source_query_value")),
+        _ => None,
+    }
+}
+
+/// Wrap a column SQL expression for use inside MIN/MAX so integer-typed
+/// columns sort numerically rather than lexicographically. Knot stores
+/// `Int` columns as `TEXT COLLATE KNOT_INT` (to support arbitrary BigInts),
+/// but SQLite does not propagate column collation through MIN/MAX, so we
+/// add `COLLATE KNOT_INT` explicitly when the projection is a simple Int
+/// field access. For Float/Text columns and arithmetic expressions, the
+/// expression is returned unchanged.
+fn col_sql_for_minmax(
+    col_sql: &str,
+    bind_var: &str,
+    body: &ast::Expr,
+    schema: &str,
+) -> String {
+    if let ast::ExprKind::FieldAccess { expr, field } = &body.node {
+        if let ast::ExprKind::Var(name) = &expr.node {
+            if name == bind_var {
+                if let Some(ty) = lookup_col_type_from_schema(schema, field) {
+                    if ty == "int" {
+                        return format!("{} COLLATE KNOT_INT", col_sql);
+                    }
+                }
+            }
+        }
+    }
+    col_sql.to_string()
+}
+
 /// Escape a SQL identifier by wrapping in double quotes, doubling internal `"`.
 fn quote_sql_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -9721,10 +9890,13 @@ enum PipeOp<'a> {
     Filter { bind_var: String, body: &'a ast::Expr },
     Map { bind_var: String, body: &'a ast::Expr },
     Count,
+    CountWhere { bind_var: String, body: &'a ast::Expr },
     Take { n: &'a ast::Expr },
     Drop { n: &'a ast::Expr },
     Sum { bind_var: String, body: &'a ast::Expr },
     Avg { bind_var: String, body: &'a ast::Expr },
+    Min { bind_var: String, body: &'a ast::Expr },
+    Max { bind_var: String, body: &'a ast::Expr },
     SortBy { bind_var: String, body: &'a ast::Expr },
     TakeRelation { n: &'a ast::Expr },
 }
@@ -9784,6 +9956,15 @@ fn analyze_pipe_op<'a>(
                     }),
                     "avg" => extract_single_param_lambda(arg, fun_bodies).map(|(bind_var, body)| {
                         PipeOp::Avg { bind_var, body }
+                    }),
+                    "min" => extract_single_param_lambda(arg, fun_bodies).map(|(bind_var, body)| {
+                        PipeOp::Min { bind_var, body }
+                    }),
+                    "max" => extract_single_param_lambda(arg, fun_bodies).map(|(bind_var, body)| {
+                        PipeOp::Max { bind_var, body }
+                    }),
+                    "countWhere" => extract_single_param_lambda(arg, fun_bodies).map(|(bind_var, body)| {
+                        PipeOp::CountWhere { bind_var, body }
                     }),
                     _ => None,
                 }

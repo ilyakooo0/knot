@@ -399,6 +399,36 @@ fn lint_pipe_chain(
                     );
                 }
             }
+            LintPipeOp::Min { bind_var, body, span } => {
+                if try_sql_column_expr(bind_var, body).is_none() {
+                    diags.push(
+                        Diagnostic::info(
+                            "pipe min will be evaluated at runtime instead of SQL MIN",
+                        )
+                        .label(*span, "min lambda cannot be compiled to SQL"),
+                    );
+                }
+            }
+            LintPipeOp::Max { bind_var, body, span } => {
+                if try_sql_column_expr(bind_var, body).is_none() {
+                    diags.push(
+                        Diagnostic::info(
+                            "pipe max will be evaluated at runtime instead of SQL MAX",
+                        )
+                        .label(*span, "max lambda cannot be compiled to SQL"),
+                    );
+                }
+            }
+            LintPipeOp::CountWhere { bind_var, body, span } => {
+                if try_compile_sql_expr(bind_var, body).is_none() {
+                    diags.push(
+                        Diagnostic::info(
+                            "pipe countWhere will be evaluated at runtime instead of SQL COUNT",
+                        )
+                        .label(*span, "countWhere predicate cannot be compiled to SQL"),
+                    );
+                }
+            }
             LintPipeOp::Map { .. }
             | LintPipeOp::Count { .. }
             | LintPipeOp::Take { .. }
@@ -498,6 +528,45 @@ fn lint_app_form(
                         .label(
                             lambda_arg.span,
                             "avg lambda cannot be compiled to SQL",
+                        ),
+                    );
+                }
+            }
+            "min" => {
+                if try_sql_column_expr(&bind_var, body).is_none() {
+                    diags.push(
+                        Diagnostic::info(
+                            "min will be evaluated at runtime instead of SQL MIN",
+                        )
+                        .label(
+                            lambda_arg.span,
+                            "min lambda cannot be compiled to SQL",
+                        ),
+                    );
+                }
+            }
+            "max" => {
+                if try_sql_column_expr(&bind_var, body).is_none() {
+                    diags.push(
+                        Diagnostic::info(
+                            "max will be evaluated at runtime instead of SQL MAX",
+                        )
+                        .label(
+                            lambda_arg.span,
+                            "max lambda cannot be compiled to SQL",
+                        ),
+                    );
+                }
+            }
+            "countWhere" => {
+                if try_compile_sql_expr(&bind_var, body).is_none() {
+                    diags.push(
+                        Diagnostic::info(
+                            "countWhere will be evaluated at runtime instead of SQL COUNT",
+                        )
+                        .label(
+                            lambda_arg.span,
+                            "countWhere predicate cannot be compiled to SQL",
                         ),
                     );
                 }
@@ -846,6 +915,11 @@ enum LintPipeOp<'a> {
         #[allow(dead_code)]
         span: Span,
     },
+    CountWhere {
+        bind_var: String,
+        body: &'a Expr,
+        span: Span,
+    },
     Take {
         #[allow(dead_code)]
         span: Span,
@@ -865,6 +939,16 @@ enum LintPipeOp<'a> {
         span: Span,
     },
     Avg {
+        bind_var: String,
+        body: &'a Expr,
+        span: Span,
+    },
+    Min {
+        bind_var: String,
+        body: &'a Expr,
+        span: Span,
+    },
+    Max {
         bind_var: String,
         body: &'a Expr,
         span: Span,
@@ -929,6 +1013,27 @@ fn analyze_pipe_op(expr: &Expr) -> Option<LintPipeOp<'_>> {
                     }),
                     "avg" => extract_single_param_lambda(arg).map(|(bind_var, body)| {
                         LintPipeOp::Avg {
+                            bind_var,
+                            body,
+                            span: arg.span,
+                        }
+                    }),
+                    "min" => extract_single_param_lambda(arg).map(|(bind_var, body)| {
+                        LintPipeOp::Min {
+                            bind_var,
+                            body,
+                            span: arg.span,
+                        }
+                    }),
+                    "max" => extract_single_param_lambda(arg).map(|(bind_var, body)| {
+                        LintPipeOp::Max {
+                            bind_var,
+                            body,
+                            span: arg.span,
+                        }
+                    }),
+                    "countWhere" => extract_single_param_lambda(arg).map(|(bind_var, body)| {
+                        LintPipeOp::CountWhere {
                             bind_var,
                             body,
                             span: arg.span,
@@ -1243,6 +1348,84 @@ mod tests {
              main = do\n\
                items <- *items\n\
                yield (sum (\\i -> i.price * i.qty) items)\n",
+        );
+        assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
+    }
+
+    #[test]
+    fn no_lint_on_arithmetic_min_max() {
+        // min/max with field access compile to SQL MIN/MAX.
+        let diags = lint(
+            "type T = {salary: Int}\n\
+             *items : [T]\n\
+             main = do\n\
+               items <- *items\n\
+               yield (min (\\i -> i.salary) items)\n",
+        );
+        assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
+    }
+
+    #[test]
+    fn lint_on_complex_min_lambda() {
+        // min with non-SQL-compilable lambda body — falls back to runtime.
+        let diags = lint(
+            "type T = {salary: Int}\n\
+             classify = \\x -> x + 100\n\
+             *items : [T]\n\
+             main = do\n\
+               yield (*items |> min (\\i -> classify i.salary))\n",
+        );
+        assert!(!diags.is_empty(), "expected diagnostic for non-SQL min");
+        assert!(diags.iter().any(|d| d.message.contains("MIN")));
+    }
+
+    #[test]
+    fn no_lint_on_count_where_simple() {
+        // countWhere with simple predicate compiles to SQL COUNT(*) WHERE.
+        let diags = lint(
+            "type T = {salary: Int, dept: Text}\n\
+             *items : [T]\n\
+             main = do\n\
+               items <- *items\n\
+               yield (countWhere (\\i -> i.salary > 75) items)\n",
+        );
+        assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
+    }
+
+    #[test]
+    fn lint_on_count_where_complex() {
+        // countWhere with non-SQL-compilable predicate — falls back to runtime.
+        let diags = lint(
+            "type T = {salary: Int}\n\
+             isHigh = \\x -> x.salary > 50\n\
+             *items : [T]\n\
+             main = do\n\
+               yield (*items |> countWhere (\\i -> isHigh i))\n",
+        );
+        assert!(!diags.is_empty(), "expected diagnostic for non-SQL countWhere");
+        assert!(diags.iter().any(|d| d.message.contains("COUNT")));
+    }
+
+    #[test]
+    fn no_lint_on_pipe_min_max() {
+        // Pipe forms `*items |> min ...` compile to SQL MIN/MAX.
+        let diags = lint(
+            "type T = {salary: Int}\n\
+             *items : [T]\n\
+             main = do\n\
+               yield (*items |> max (\\i -> i.salary))\n",
+        );
+        assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
+    }
+
+    #[test]
+    fn no_lint_on_pipe_count_where() {
+        // Pipe form `*items |> countWhere pred` compiles to SQL COUNT(*) WHERE.
+        let diags = lint(
+            "type T = {salary: Int}\n\
+             *items : [T]\n\
+             main = do\n\
+               yield (*items |> countWhere (\\i -> i.salary > 75))\n",
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
     }

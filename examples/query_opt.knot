@@ -95,6 +95,32 @@ pipeMap = do
   employees <- *employees
   yield (employees |> map (\e -> {name: e.name, dept: e.dept}))
 
+-- 11. min/max projection → SQL MIN/MAX
+minMaxDemo = do
+  employees <- *employees
+  let lo = min (\e -> e.salary) employees
+  let hi = max (\e -> e.salary) employees
+  println ("min salary: " ++ show lo ++ ", max salary: " ++ show hi)
+
+-- 12. countWhere predicate → SQL COUNT(*) WHERE
+countWhereDemo = do
+  employees <- *employees
+  let n = countWhere (\e -> e.dept == "Eng") employees
+  println ("eng headcount: " ++ show n)
+
+-- 13. Pipe: filter + min/max → SQL aggregate with WHERE
+pipeFilterMin = do
+  employees <- *employees
+  yield (employees |> filter (\e -> e.dept == "Eng") |> min (\e -> e.salary))
+
+pipeFilterMax = do
+  employees <- *employees
+  yield (employees |> filter (\e -> e.dept == "Eng") |> max (\e -> e.salary))
+
+pipeCountWhere = do
+  employees <- *employees
+  yield (employees |> countWhere (\e -> e.dept == "Sales"))
+
 main = do
   set *employees = [
     {name: "Alice", dept: "Eng", salary: 90},
@@ -124,4 +150,12 @@ main = do
   println ("Pipe filter+count (salary > 75): " ++ show pfc)
   pm <- pipeMap
   printQuery "Pipe map (name, dept)" pm
+  minMaxDemo
+  countWhereDemo
+  pmin <- pipeFilterMin
+  println ("Pipe Eng min salary: " ++ show pmin)
+  pmax <- pipeFilterMax
+  println ("Pipe Eng max salary: " ++ show pmax)
+  pcw <- pipeCountWhere
+  println ("Pipe count dept=Sales: " ++ show pcw)
   yield {}

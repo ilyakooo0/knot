@@ -5935,6 +5935,91 @@ pub extern "C" fn knot_relation_avg(
     alloc_float(total / count as f64)
 }
 
+/// countWhere(pred, rel) — count rows where pred(row) is True.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_count_where(
+    db: *mut c_void,
+    pred: *mut Value,
+    rel: *mut Value,
+) -> *mut Value {
+    let rows = match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: countWhere expected Relation, got {}",
+            type_name(rel)
+        ),
+    };
+    let mut n: i64 = 0;
+    for &row in rows {
+        let result = knot_value_call(db, pred, row);
+        match unsafe { as_ref(result) } {
+            Value::Bool(true) => n += 1,
+            Value::Bool(false) => {}
+            _ => panic!(
+                "knot runtime: countWhere predicate must return Bool, got {}",
+                type_name(result)
+            ),
+        }
+    }
+    alloc_int(BigInt::from(n))
+}
+
+/// min(f, rel) — minimum of f(x) for each x in rel.
+/// Panics on empty relation.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_min(
+    db: *mut c_void,
+    f: *mut Value,
+    rel: *mut Value,
+) -> *mut Value {
+    let rows = match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: min expected Relation, got {}",
+            type_name(rel)
+        ),
+    };
+    if rows.is_empty() {
+        panic!("knot runtime: min on empty relation");
+    }
+    let mut best = knot_value_call(db, f, rows[0]);
+    for &row in &rows[1..] {
+        let val = knot_value_call(db, f, row);
+        if compare_values(val, best) == std::cmp::Ordering::Less {
+            best = val;
+        }
+    }
+    best
+}
+
+/// max(f, rel) — maximum of f(x) for each x in rel.
+/// Panics on empty relation.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_max(
+    db: *mut c_void,
+    f: *mut Value,
+    rel: *mut Value,
+) -> *mut Value {
+    let rows = match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: max expected Relation, got {}",
+            type_name(rel)
+        ),
+    };
+    if rows.is_empty() {
+        panic!("knot runtime: max on empty relation");
+    }
+    let mut best = knot_value_call(db, f, rows[0]);
+    for &row in &rows[1..] {
+        let val = knot_value_call(db, f, row);
+        if compare_values(val, best) == std::cmp::Ordering::Greater {
+            best = val;
+        }
+    }
+    best
+}
+
 // ── Standard library: text operations ─────────────────────────────
 
 /// toUpper(text) — convert text to uppercase
@@ -7612,6 +7697,54 @@ pub extern "C" fn knot_source_query_sum(
             }
         })
         .unwrap_or_else(|e| panic!("knot runtime: query_sum error: {}\n  SQL: {}", e, sql))
+}
+
+/// Execute a SQL aggregate query (e.g. MIN, MAX) and return the result
+/// as an Int, Float, or Text Value matching the SQLite column type.
+/// Panics if the result is NULL (e.g. min/max on an empty table).
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_source_query_value(
+    db: *mut c_void,
+    sql_ptr: *const u8,
+    sql_len: usize,
+    params: *mut Value,
+) -> *mut Value {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let sql = unsafe { str_from_raw(sql_ptr, sql_len) };
+
+    let param_values = match unsafe { as_ref(params) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: query_value params must be a Relation, got {}",
+            type_name(params)
+        ),
+    };
+    let sql_params: Vec<rusqlite::types::Value> =
+        param_values.iter().map(|v| value_to_sql_param(*v)).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+
+    debug_sql_params(sql, &sql_params);
+
+    db_ref
+        .conn
+        .query_row(sql, param_refs.as_slice(), |row| {
+            match row.get_ref(0).unwrap() {
+                ValueRef::Null => panic!("knot runtime: aggregate on empty relation\n  SQL: {}", sql),
+                ValueRef::Integer(n) => Ok(alloc_int(BigInt::from(n))),
+                ValueRef::Real(f) => Ok(alloc_float(f)),
+                ValueRef::Text(s) => {
+                    let s = std::str::from_utf8(s)
+                        .expect("knot runtime: invalid UTF-8 in aggregate result");
+                    Ok(alloc(Value::Text(Arc::from(s))))
+                }
+                ValueRef::Blob(_) => panic!(
+                    "knot runtime: aggregate result is BLOB, expected Int/Float/Text\n  SQL: {}",
+                    sql
+                ),
+            }
+        })
+        .unwrap_or_else(|e| panic!("knot runtime: query_value error: {}\n  SQL: {}", e, sql))
 }
 
 /// Count rows in a source relation via SQL COUNT(*).

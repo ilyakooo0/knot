@@ -187,7 +187,8 @@ impl EffectChecker {
 
         let mut console_effect = EffectSet::empty();
         console_effect.console = true;
-        insert_many(&["println", "putLine", "print", "readLine"], console_effect);
+        insert_many(&["println", "putLine", "print", "readLine",
+                       "logInfo", "logWarn", "logError", "logDebug"], console_effect);
 
         let mut clock_effect = EffectSet::empty();
         clock_effect.clock = true;

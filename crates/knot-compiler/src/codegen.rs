@@ -773,6 +773,10 @@ impl Codegen {
         // IO wrappers for effectful builtins
         self.declare_rt("knot_println_io", &[p], &[p]);
         self.declare_rt("knot_print_io", &[p], &[p]);
+        self.declare_rt("knot_log_info_io", &[p], &[p]);
+        self.declare_rt("knot_log_warn_io", &[p], &[p]);
+        self.declare_rt("knot_log_error_io", &[p], &[p]);
+        self.declare_rt("knot_log_debug_io", &[p], &[p]);
         self.declare_rt("knot_read_line_io", &[], &[p]);
         self.declare_rt("knot_fs_read_file_io", &[p], &[p]);
         self.declare_rt("knot_fs_write_file_io", &[p, p], &[p]);
@@ -5204,6 +5208,23 @@ impl Codegen {
             ast::ExprKind::Var(name) if name == "print" => {
                 if compiled_args.len() == 1 {
                     self.call_rt(builder, "knot_print_io", &[compiled_args[0]])
+                } else {
+                    self.call_rt(builder, "knot_value_unit", &[])
+                }
+            }
+            ast::ExprKind::Var(name)
+                if name == "logInfo" || name == "logWarn"
+                    || name == "logError" || name == "logDebug" =>
+            {
+                let rt = match name.as_str() {
+                    "logInfo" => "knot_log_info_io",
+                    "logWarn" => "knot_log_warn_io",
+                    "logError" => "knot_log_error_io",
+                    "logDebug" => "knot_log_debug_io",
+                    _ => unreachable!(),
+                };
+                if compiled_args.len() == 1 {
+                    self.call_rt(builder, rt, &[compiled_args[0]])
                 } else {
                     self.call_rt(builder, "knot_value_unit", &[])
                 }

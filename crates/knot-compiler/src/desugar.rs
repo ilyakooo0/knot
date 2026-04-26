@@ -42,6 +42,7 @@ fn detect_io_functions(decls: &[Decl]) -> HashSet<String> {
         "writeFile", "appendFile", "fileExists", "removeFile",
         "listDir", "now", "sleep", "randomInt", "randomFloat", "fetch", "fetchWith",
         "fork", "listen", "generateKeyPair", "generateSigningKeyPair", "encrypt",
+        "logInfo", "logWarn", "logError", "logDebug",
     ].into_iter().collect();
 
     let mut fun_bodies: Vec<(&str, &Expr)> = Vec::new();
@@ -674,6 +675,7 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
                     | "listDir" | "now" | "sleep" | "randomInt" | "randomFloat"
                     | "fetch" | "fetchWith" | "fork" | "listen"
                     | "generateKeyPair" | "generateSigningKeyPair" | "encrypt"
+                    | "logInfo" | "logWarn" | "logError" | "logDebug"
             ) || io_fns.contains(name.as_str())
         }
         ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) => true,

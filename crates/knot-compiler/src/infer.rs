@@ -2947,6 +2947,7 @@ impl Infer {
                         | "listDir" | "now" | "sleep" | "randomInt" | "randomFloat"
                         | "fetch" | "fetchWith" | "fork" | "listen"
                         | "generateKeyPair" | "generateSigningKeyPair" | "encrypt"
+                        | "logInfo" | "logWarn" | "logError" | "logDebug"
                 ) || self.lookup(name).map_or(false, |scheme| {
                     fn returns_io(ty: &Ty) -> bool {
                         match ty {
@@ -3624,6 +3625,18 @@ impl Infer {
                 Box::new(Ty::IO(BTreeSet::from([IoEffect::Console]), Box::new(Ty::unit()))),
             )),
         );
+
+        // logInfo / logWarn / logError / logDebug : ∀a. a -> IO {console} {}
+        for log_name in ["logInfo", "logWarn", "logError", "logDebug"] {
+            let a = self.fresh_var();
+            self.bind_top(
+                log_name,
+                Scheme::poly(vec![a], Ty::Fun(
+                    Box::new(Ty::Var(a)),
+                    Box::new(Ty::IO(BTreeSet::from([IoEffect::Console]), Box::new(Ty::unit()))),
+                )),
+            );
+        }
 
         // readLine : IO {console} Text
         self.bind_top("readLine", Scheme::mono(

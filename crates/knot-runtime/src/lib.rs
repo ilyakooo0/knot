@@ -4629,6 +4629,30 @@ pub extern "C" fn knot_println(v: *mut Value) -> *mut Value {
     alloc(Value::Unit)
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_log_info(v: *mut Value) -> *mut Value {
+    log::log_info(&format_value(v));
+    alloc(Value::Unit)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_log_warn(v: *mut Value) -> *mut Value {
+    log::log_warn(&format_value(v));
+    alloc(Value::Unit)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_log_error(v: *mut Value) -> *mut Value {
+    log::log_error(&format_value(v));
+    alloc(Value::Unit)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_log_debug(v: *mut Value) -> *mut Value {
+    log::log_debug(&format_value(v));
+    alloc(Value::Unit)
+}
+
 /// Convert a value to its text representation (returned as a Value::Text).
 /// Panic when a `where` guard fails inside an IO do-block.
 #[unsafe(no_mangle)]
@@ -5256,6 +5280,42 @@ pub extern "C" fn knot_print_io(v: *mut Value) -> *mut Value {
         knot_print(env)
     }
     alloc(Value::IO(thunk as *const u8, env))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_log_info_io(v: *mut Value) -> *mut Value {
+    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let _ = db;
+        knot_log_info(env)
+    }
+    alloc(Value::IO(thunk as *const u8, v))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_log_warn_io(v: *mut Value) -> *mut Value {
+    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let _ = db;
+        knot_log_warn(env)
+    }
+    alloc(Value::IO(thunk as *const u8, v))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_log_error_io(v: *mut Value) -> *mut Value {
+    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let _ = db;
+        knot_log_error(env)
+    }
+    alloc(Value::IO(thunk as *const u8, v))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_log_debug_io(v: *mut Value) -> *mut Value {
+    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let _ = db;
+        knot_log_debug(env)
+    }
+    alloc(Value::IO(thunk as *const u8, v))
 }
 
 #[unsafe(no_mangle)]

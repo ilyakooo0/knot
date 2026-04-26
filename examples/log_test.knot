@@ -1,0 +1,6 @@
+main = do
+  logInfo "starting up"
+  logWarn "something looks fishy"
+  logError "something is broken"
+  logDebug "verbose details (only with --debug)"
+  println "done"

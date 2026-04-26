@@ -4,6 +4,7 @@
 //! and SQLite-backed persistence. This crate is compiled as a static
 //! library and linked into every compiled Knot program.
 
+pub mod log;
 mod tui;
 
 use num_bigint::BigInt;
@@ -1467,8 +1468,6 @@ fn stm_track_write(name: &str) {
 
 // ── Debug mode ───────────────────────────────────────────────────
 
-static DEBUG: AtomicBool = AtomicBool::new(false);
-
 // ── ToJSON dispatcher ────────────────────────────────────────────
 //
 // Stores the compiled toJson trait dispatcher function pointer so the
@@ -1477,32 +1476,16 @@ static DEBUG: AtomicBool = AtomicBool::new(false);
 
 static TO_JSON_FN: AtomicUsize = AtomicUsize::new(0);
 
-fn debug_enabled() -> bool {
-    DEBUG.load(Ordering::Relaxed)
-}
-
 fn debug_sql(sql: &str) {
-    if debug_enabled() {
-        eprintln!("[SQL] {}", sql);
-    }
+    log_debug!("[SQL] {}", sql);
 }
 
 fn debug_sql_params(sql: &str, params: &[rusqlite::types::Value]) {
-    if debug_enabled() {
+    if log::debug_enabled() {
         if params.is_empty() {
-            eprintln!("[SQL] {}", sql);
+            log_debug!("[SQL] {}", sql);
         } else {
-            eprintln!("[SQL] {} -- params: {:?}", sql, params);
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn knot_debug_init() {
-    for arg in std::env::args() {
-        if arg == "--debug" {
-            DEBUG.store(true, Ordering::Relaxed);
-            return;
+            log_debug!("[SQL] {} -- params: {:?}", sql, params);
         }
     }
 }
@@ -2237,11 +2220,11 @@ pub extern "C" fn knot_arena_push_frame() {
 /// Pop the current arena frame, freeing all its allocations.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_arena_pop_frame() {
-    if debug_enabled() {
+    if log::debug_enabled() {
         ARENA.with(|a| {
             let arena = a.borrow();
             let depth = arena.frames.len();
-            eprintln!("[ARENA] pop_frame: depth {} → {}", depth, depth.saturating_sub(1));
+            log_debug!("[ARENA] pop_frame: depth {} → {}", depth, depth.saturating_sub(1));
         });
     }
     ARENA.with(|a| a.borrow_mut().pop_frame());
@@ -10557,9 +10540,7 @@ pub extern "C" fn knot_route_table_add(
     let req_hdrs = unsafe { str_from_raw(req_hdrs_ptr, req_hdrs_len) };
     let resp_hdrs = unsafe { str_from_raw(resp_hdrs_ptr, resp_hdrs_len) };
 
-    if debug_enabled() {
-        eprintln!("[ROUTE] {} {} -> {}", method, path, ctor);
-    }
+    log_debug!("[ROUTE] {} {} -> {}", method, path, ctor);
 
     table.entries.push(RouteTableEntry {
         method,
@@ -10969,10 +10950,10 @@ pub extern "C" fn knot_http_listen(
         let method = request.method().as_str().to_string();
         let url = request.url().to_string();
 
-        if debug_enabled() {
-            eprintln!("[HTTP] <-- {} {}", method, url);
+        if log::debug_enabled() {
+            log_debug!("[HTTP] <-- {} {}", method, url);
             for header in request.headers() {
-                eprintln!("[HTTP]     {}: {}", header.field, header.value);
+                log_debug!("[HTTP]     {}: {}", header.field, header.value);
             }
         }
 
@@ -11082,16 +11063,12 @@ pub extern "C" fn knot_http_listen(
                         && entry_method != "GET" && entry_method != "HEAD";
                     if has_body {
                         let body_str = String::from_utf8_lossy(&body_bytes);
-                        if debug_enabled() {
-                            eprintln!("[HTTP]     body: {}", body_str);
-                        }
+                        log_debug!("[HTTP]     body: {}", body_str);
                         let body_val = match serde_json::from_str::<serde_json::Value>(&body_str) {
                             Ok(json) => json_to_value(&json),
                             Err(e) => {
                                 let msg = format!("invalid JSON body: {}", e);
-                                if debug_enabled() {
-                                    eprintln!("[HTTP] --> 400 {}", msg);
-                                }
+                                log_debug!("[HTTP] --> 400 {}", msg);
                                 return Err((400, msg));
                             }
                         };
@@ -11247,15 +11224,11 @@ pub extern "C" fn knot_http_listen(
                                 }
                             }
                         }
-                        if debug_enabled() {
-                            eprintln!("[HTTP] --> 200 {}", json);
-                        }
+                        log_debug!("[HTTP] --> 200 {}", json);
                         let _ = request.respond(response);
                     } else {
                         let json = json_encode_value(db, result);
-                        if debug_enabled() {
-                            eprintln!("[HTTP] --> 200 {}", json);
-                        }
+                        log_debug!("[HTTP] --> 200 {}", json);
                         let response = tiny_http::Response::from_string(&json)
                             .with_header(
                                 "Content-Type: application/json"
@@ -11266,7 +11239,7 @@ pub extern "C" fn knot_http_listen(
                     }
                         }
                         Ok(Err((status_code, error_msg))) => {
-                            eprintln!("[HTTP] --> {} {}", status_code, error_msg);
+                            log_warn!("[HTTP] --> {} {}", status_code, error_msg);
                             let body = format!("{{\"error\":\"{}\"}}", json_escape(&error_msg));
                             let response = tiny_http::Response::from_string(&body)
                                 .with_status_code(status_code)
@@ -11341,14 +11314,12 @@ pub extern "C" fn knot_http_listen(
                         } else {
                             "unknown panic".to_string()
                         };
-                        eprintln!("[HTTP] handler thread panicked: {}", msg);
+                        log_error!("[HTTP] handler thread panicked: {}", msg);
                     }
                 });
             }
             None => {
-                if debug_enabled() {
-                    eprintln!("[HTTP] --> 404 not found");
-                }
+                log_debug!("[HTTP] --> 404 not found");
                 let response = tiny_http::Response::from_string("{\"error\":\"not found\"}")
                     .with_status_code(404)
                     .with_header(
@@ -11529,10 +11500,10 @@ pub extern "C" fn knot_http_fetch_io(
         }
 
         // Debug log outgoing fetch
-        if debug_enabled() {
-            eprintln!("[HTTP] --> {} {}", method_str, full_url);
+        if log::debug_enabled() {
+            log_debug!("[HTTP] --> {} {}", method_str, full_url);
             if let Some(ref json) = body_json {
-                eprintln!("[HTTP]     body: {}", json);
+                log_debug!("[HTTP]     body: {}", json);
             }
         }
 
@@ -11586,9 +11557,7 @@ pub extern "C" fn knot_http_fetch_io(
         match result {
             Ok(mut response) => {
                 let status = response.status().as_u16();
-                if debug_enabled() {
-                    eprintln!("[HTTP] <-- {} {}", status, full_url);
-                }
+                log_debug!("[HTTP] <-- {} {}", status, full_url);
 
                 if status >= 400 {
                     let body_text = response.body_mut().read_to_string().unwrap_or_default();
@@ -11664,9 +11633,7 @@ pub extern "C" fn knot_http_fetch_io(
                 }
             }
             Err(e) => {
-                if debug_enabled() {
-                    eprintln!("[HTTP] <-- ERR {}", e);
-                }
+                log_debug!("[HTTP] <-- ERR {}", e);
                 fetch_build_err(0, &format!("Network error: {}", e))
             }
         }
@@ -12304,14 +12271,12 @@ pub extern "C" fn knot_relation_build_index(
         map.entry(key).or_default().push(row);
     }
 
-    if debug_enabled() {
-        eprintln!(
-            "[OPT] hash index on .{}: {} keys from {} rows",
-            field_name,
-            map.len(),
-            rows.len()
-        );
-    }
+    log_debug!(
+        "[OPT] hash index on .{}: {} keys from {} rows",
+        field_name,
+        map.len(),
+        rows.len()
+    );
 
     Box::into_raw(Box::new(HashIndex { map })) as *mut c_void
 }

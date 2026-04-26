@@ -4,6 +4,7 @@
 
 use knot_compiler::{base, codegen, desugar, effects, infer, linker, lockfile, modules, stratify, types};
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process;
 
@@ -19,10 +20,30 @@ fn main() {
         "build" => {
             if args.len() < 3 {
                 eprintln!("Error: missing source file");
-                eprintln!("Usage: knotc build <file.knot>");
+                eprintln!("Usage: knotc build <file.knot> [--name=value ...]");
                 process::exit(1);
             }
-            cmd_build(&args[2]);
+            // Parse compile-time overrides from remaining args (--name=value or --name value)
+            let mut overrides = HashMap::new();
+            let mut i = 3;
+            while i < args.len() {
+                if let Some(rest) = args[i].strip_prefix("--") {
+                    if let Some((name, val)) = rest.split_once('=') {
+                        overrides.insert(name.to_string(), val.to_string());
+                    } else if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                        overrides.insert(rest.to_string(), args[i + 1].clone());
+                        i += 1;
+                    } else {
+                        eprintln!("Error: missing value for --{}", rest);
+                        process::exit(1);
+                    }
+                } else {
+                    eprintln!("Error: unexpected argument '{}'", args[i]);
+                    process::exit(1);
+                }
+                i += 1;
+            }
+            cmd_build(&args[2], &overrides);
         }
         "--help" | "-h" | "help" => print_usage(),
         other => {
@@ -37,11 +58,11 @@ fn print_usage() {
     eprintln!("Knot compiler");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  knotc build <file.knot>   Compile a Knot source file to an executable");
-    eprintln!("  knotc help                Show this help message");
+    eprintln!("  knotc build <file.knot> [--name=value ...]   Compile with optional constant overrides");
+    eprintln!("  knotc help                                   Show this help message");
 }
 
-fn cmd_build(source_file: &str) {
+fn cmd_build(source_file: &str, overrides: &HashMap<String, String>) {
     let source_path = PathBuf::from(source_file);
 
     // Read source
@@ -154,7 +175,7 @@ fn cmd_build(source_file: &str) {
     }
 
     // Code generation
-    let obj_bytes = match codegen::compile(&module, &type_env, source_file, &monad_info, &refine_targets, &refined_types, &from_json_targets, &type_info) {
+    let obj_bytes = match codegen::compile(&module, &type_env, source_file, &monad_info, &refine_targets, &refined_types, &from_json_targets, &type_info, overrides) {
         Ok(bytes) => bytes,
         Err(diags) => {
             for diag in &diags {

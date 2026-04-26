@@ -153,6 +153,9 @@ pub struct Codegen {
     // Overridable constants: name -> type string ("Int", "Float", "Text", "Bool")
     overridable_constants: HashMap<String, String>,
 
+    // Compile-time constant overrides: name -> raw string value (parsed during codegen)
+    compile_time_overrides: HashMap<String, String>,
+
     // Whether we are inside compile_io_do_eager — when true, Yield compiles to
     // the raw inner value rather than wrapping in knot_relation_singleton.
     in_io_eager: bool,
@@ -312,6 +315,7 @@ pub fn compile(
     refined_types: &crate::infer::RefinedTypeInfoMap,
     from_json_targets: &crate::infer::FromJsonTargets,
     type_info: &crate::infer::TypeInfo,
+    compile_time_overrides: &HashMap<String, String>,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     let mut cg = Codegen::new();
     // Derive database path from source filename: "foo.knot" → "foo.db"
@@ -369,6 +373,50 @@ pub fn compile(
                     }
                 }
             }
+        }
+    }
+    // Validate and store compile-time overrides
+    for (name, val) in compile_time_overrides {
+        if let Some(ty_str) = cg.overridable_constants.get(name) {
+            let base_type = match ty_str.as_str() {
+                "Int" | "Maybe Int" => "Int",
+                "Float" | "Maybe Float" => "Float",
+                "Text" | "Maybe Text" => "Text",
+                "Bool" | "Maybe Bool" => "Bool",
+                _ => continue,
+            };
+            match base_type {
+                "Int" => {
+                    if val.parse::<i64>().is_err() {
+                        cg.diagnostics.push(knot::diagnostic::Diagnostic::error(
+                            format!("invalid compile-time override '{}' for --{} (expected Int)", val, name),
+                        ));
+                        continue;
+                    }
+                }
+                "Float" => {
+                    if val.parse::<f64>().is_err() {
+                        cg.diagnostics.push(knot::diagnostic::Diagnostic::error(
+                            format!("invalid compile-time override '{}' for --{} (expected Float)", val, name),
+                        ));
+                        continue;
+                    }
+                }
+                "Bool" => {
+                    if !matches!(val.as_str(), "true" | "false" | "0" | "1") {
+                        cg.diagnostics.push(knot::diagnostic::Diagnostic::error(
+                            format!("invalid compile-time override '{}' for --{} (expected true or false)", val, name),
+                        ));
+                        continue;
+                    }
+                }
+                _ => {} // Text always valid
+            }
+            cg.compile_time_overrides.insert(name.clone(), val.clone());
+        } else {
+            cg.diagnostics.push(knot::diagnostic::Diagnostic::error(
+                format!("unknown constant '{}' for compile-time override", name),
+            ));
         }
     }
     cg.define_functions(module, type_env);
@@ -459,6 +507,7 @@ impl Codegen {
             io_functions: HashSet::new(),
             scalar_sources: HashSet::new(),
             overridable_constants: HashMap::new(),
+            compile_time_overrides: HashMap::new(),
             in_io_eager: false,
             atomic_retry_block: None,
             refined_types: HashMap::new(),
@@ -2586,6 +2635,7 @@ impl Codegen {
         } else {
             None
         };
+        let compile_time_val = self.compile_time_overrides.get(name).cloned();
         let name_owned = name.to_string();
 
         self.build_function(func_id, sig, |cg, builder, entry| {
@@ -2594,6 +2644,13 @@ impl Codegen {
             for (i, pat) in params_owned.iter().enumerate() {
                 let val = builder.block_params(entry)[i + 1];
                 cg.bind_io_pattern(builder, pat, val, &mut env, None);
+            }
+
+            // Compile-time override: emit the value directly, skip body entirely
+            if let (Some(val_str), Some(type_str)) = (&compile_time_val, &override_type) {
+                let val = cg.emit_override_literal(builder, val_str, type_str);
+                builder.ins().return_(&[val]);
+                return;
             }
 
             // For overridable constants, check CLI override before evaluating body
@@ -3115,9 +3172,10 @@ impl Codegen {
             let debug_init_ref = cg.import_rt(builder, "knot_debug_init");
             builder.ins().call(debug_init_ref, &[]);
 
-            // Check --help for overridable constants
+            // Check --help for overridable constants (exclude compile-time overrides)
             let descriptor = {
                 let mut entries: Vec<String> = cg.overridable_constants.iter()
+                    .filter(|(name, _)| !cg.compile_time_overrides.contains_key(*name))
                     .map(|(name, ty)| format!("{}:{}", name, ty))
                     .collect();
                 entries.sort();
@@ -7315,6 +7373,47 @@ impl Codegen {
                 let val = builder.ins().iconst(types::I32, *b as i64);
                 self.call_rt(builder, "knot_value_bool", &[val])
             }
+        }
+    }
+
+    /// Emit a literal value for a compile-time constant override.
+    /// Parses `val_str` according to `type_str` and emits the appropriate
+    /// Cranelift IR, wrapping in `Just` for Maybe types.
+    fn emit_override_literal(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        val_str: &str,
+        type_str: &str,
+    ) -> Value {
+        let is_maybe = type_str.starts_with("Maybe ");
+        let inner = match type_str {
+            "Int" | "Maybe Int" => {
+                let n: i64 = val_str.parse().unwrap();
+                let n_val = builder.ins().iconst(types::I64, n);
+                self.call_rt(builder, "knot_value_int", &[n_val])
+            }
+            "Float" | "Maybe Float" => {
+                let n: f64 = val_str.parse().unwrap();
+                let n_val = builder.ins().f64const(n);
+                self.call_rt(builder, "knot_value_float", &[n_val])
+            }
+            "Text" | "Maybe Text" => {
+                let (ptr, len) = self.string_ptr(builder, val_str);
+                let slot = self.text_literal_slot(builder, val_str);
+                self.call_rt(builder, "knot_value_text_intern", &[ptr, len, slot])
+            }
+            "Bool" | "Maybe Bool" => {
+                let b = matches!(val_str, "true" | "1");
+                let val = builder.ins().iconst(types::I32, b as i64);
+                self.call_rt(builder, "knot_value_bool", &[val])
+            }
+            _ => unreachable!(),
+        };
+        if is_maybe {
+            let (tag_ptr, tag_len) = self.string_ptr(builder, "Just");
+            self.call_rt(builder, "knot_value_constructor", &[tag_ptr, tag_len, inner])
+        } else {
+            inner
         }
     }
 

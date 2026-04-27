@@ -3601,6 +3601,26 @@ pub extern "C" fn knot_relation_take(
     }
 }
 
+/// Drop the first `n` elements from a relation.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_drop(
+    n_val: *mut Value,
+    rel: *mut Value,
+) -> *mut Value {
+    let n = match unsafe { as_ref(n_val) } {
+        Value::SmallInt(i) => *i as usize,
+        Value::Int(i) => i.to_u64().unwrap_or(0) as usize,
+        _ => 0,
+    };
+    match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => {
+            let drop_n = n.min(rows.len());
+            alloc(Value::Relation(rows[drop_n..].to_vec()))
+        }
+        _ => rel,
+    }
+}
+
 /// Sort a relation by a key function, returning a new relation.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_relation_sort_by(

@@ -3914,6 +3914,22 @@ impl Infer {
             ),
         );
 
+        // dropRelation : ∀a. Int -> [a] -> [a]
+        let a = self.fresh_var();
+        self.bind_top(
+            "dropRelation",
+            Scheme::poly(
+                vec![a],
+                Ty::Fun(
+                    Box::new(Ty::Int),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                    )),
+                ),
+            ),
+        );
+
         // diff : ∀a. [a] -> [a] -> [a]
         let a = self.fresh_var();
         self.bind_top(

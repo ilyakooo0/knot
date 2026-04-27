@@ -705,6 +705,7 @@ impl Codegen {
         self.declare_rt("knot_relation_match", &[p, p], &[p]);
         self.declare_rt("knot_relation_sort_by", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_take", &[p, p], &[p]);
+        self.declare_rt("knot_relation_drop", &[p, p], &[p]);
         self.declare_rt("knot_source_match", &[p, p, p, p, p, p, p], &[p]);
         self.declare_rt("knot_relation_map", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_ap", &[p, p, p], &[p]);
@@ -1063,7 +1064,7 @@ impl Codegen {
         let stdlib_names = [
             "filter", "match", "single", "diff", "inter", "sum", "avg",
             "min", "max", "countWhere",
-            "toUpper", "toLower", "take", "drop", "sortBy", "takeRelation",
+            "toUpper", "toLower", "take", "drop", "sortBy", "takeRelation", "dropRelation",
             "length", "trim", "contains", "reverse",
             "chars", "id", "not",
             "bytesLength", "bytesSlice", "bytesConcat",
@@ -2063,6 +2064,7 @@ impl Codegen {
         self.define_stdlib_fn_2("drop", "knot_text_drop", false);
         self.define_stdlib_fn_2("sortBy", "knot_relation_sort_by", true);
         self.define_stdlib_fn_2("takeRelation", "knot_relation_take", false);
+        self.define_stdlib_fn_2("dropRelation", "knot_relation_drop", false);
         self.define_stdlib_fn_2("contains", "knot_text_contains", false);
         self.define_stdlib_fn_2("diff", "knot_relation_diff", true);
         self.define_stdlib_fn_2("inter", "knot_relation_inter", true);

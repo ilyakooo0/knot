@@ -454,6 +454,9 @@ pub enum TypeKind {
         base: Box<Type>,
         predicate: Box<Expr>,
     },
+
+    /// `forall a b. T` — explicit higher-rank quantifier.
+    Forall { vars: Vec<Name>, ty: Box<Type> },
 }
 
 /// A type with optional trait constraints: `Display a => [a] -> [Text]`.

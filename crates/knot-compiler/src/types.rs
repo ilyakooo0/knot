@@ -414,6 +414,10 @@ fn resolve_type(
             // Refinements are phantom for schema — base type determines storage
             resolve_type(base, aliases, assoc_types)
         }
+        TypeKind::Forall { ty, .. } => {
+            // Quantifiers are phantom for schema resolution.
+            resolve_type(ty, aliases, assoc_types)
+        }
     }
 }
 
@@ -716,6 +720,18 @@ fn apply_type_subst(ty: &Type, subst: &HashMap<String, Type>) -> Type {
             base: Box::new(apply_type_subst(base, subst)),
             predicate: predicate.clone(),
         },
+        TypeKind::Forall { vars, ty: inner } => {
+            // Avoid capturing bound vars: shadow them in the substitution
+            // by removing entries with matching names.
+            let mut inner_subst = subst.clone();
+            for v in vars {
+                inner_subst.remove(v);
+            }
+            TypeKind::Forall {
+                vars: vars.clone(),
+                ty: Box::new(apply_type_subst(inner, &inner_subst)),
+            }
+        }
     };
     Spanned::new(new_node, ty.span)
 }

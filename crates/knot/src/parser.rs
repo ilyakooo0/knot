@@ -3040,6 +3040,32 @@ impl Parser {
 
 impl Parser {
     fn parse_type(&mut self) -> Option<Type> {
+        if self.at(&TokenKind::Forall) {
+            let start = self.span();
+            self.advance(); // consume 'forall'
+            let mut vars = Vec::new();
+            loop {
+                match self.peek().clone() {
+                    TokenKind::Lower(name) => {
+                        self.advance();
+                        vars.push(name);
+                    }
+                    _ => break,
+                }
+            }
+            if vars.is_empty() {
+                self.error("expected one or more type variables after 'forall'");
+                return None;
+            }
+            self.expect(&TokenKind::Dot, "expected '.' after forall variables").ok()?;
+            self.skip_newlines();
+            let body = self.parse_type()?;
+            let span = Span::new(start.start, body.span.end);
+            return Some(Spanned::new(
+                TypeKind::Forall { vars, ty: Box::new(body) },
+                span,
+            ));
+        }
         self.parse_type_function()
     }
 

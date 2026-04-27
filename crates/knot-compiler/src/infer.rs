@@ -216,6 +216,11 @@ enum Ty {
     IntUnit(UnitTy),
     /// Float with unit of measure (compile-time only).
     FloatUnit(UnitTy),
+    /// Higher-rank universal quantifier (predicative). The bound vars are
+    /// rigid skolems for the body of `ty`; users introduce them via
+    /// explicit `forall a. T` syntax. Only legal in function arg/result
+    /// positions; never inside Record/Variant/Con/App.
+    Forall(Vec<TyVar>, Box<Ty>),
     /// Error sentinel — suppresses cascading errors.
     Error,
 }
@@ -293,6 +298,13 @@ struct DataInfo {
 struct Infer {
     next_var: TyVar,
     subst: HashMap<TyVar, Ty>,
+
+    /// TyVars allocated as rigid skolems by `check_expr` against a
+    /// `Ty::Forall`. Skolems represent universally-quantified variables
+    /// inside a higher-rank check. Unification refuses to bind a skolem
+    /// to anything other than itself, ensuring the body is generic in
+    /// those vars rather than monomorphic to a leaked unification var.
+    skolems: HashSet<TyVar>,
 
     /// Scoped variable environment (functions, let-bindings, params).
     scopes: Vec<HashMap<String, Scheme>>,
@@ -396,6 +408,7 @@ impl Infer {
         Self {
             next_var: 0,
             subst: HashMap::new(),
+            skolems: HashSet::new(),
             scopes: vec![HashMap::new()],
             constructors: HashMap::new(),
             data_types: HashMap::new(),
@@ -702,6 +715,9 @@ impl Infer {
                 let u = self.apply_unit(u);
                 if u.is_dimensionless() { Ty::Float } else { Ty::FloatUnit(u) }
             }
+            Ty::Forall(vars, inner) => {
+                Ty::Forall(vars.clone(), Box::new(self.apply(inner)))
+            }
             _ => ty.clone(),
         }
     }
@@ -775,8 +791,43 @@ impl Infer {
                 self.occurs_in(var, f) || self.occurs_in(var, a)
             }
             Ty::IO(_, inner) => self.occurs_in(var, inner),
+            Ty::Forall(bound, inner) => {
+                if bound.contains(&var) {
+                    false
+                } else {
+                    self.occurs_in(var, inner)
+                }
+            }
             _ => false,
         }
+    }
+
+    /// Bind a unification variable to a type. Refuses to bind skolems
+    /// (rigid variables introduced by higher-rank checking) and emits a
+    /// diagnostic instead — keeping universally-quantified parameters
+    /// from collapsing into their concrete usage.
+    fn bind_var(&mut self, v: TyVar, ty: Ty, span: Span) {
+        if self.skolems.contains(&v) {
+            // Allow self-binding (already handled by Var(a)==Var(b)).
+            if let Ty::Var(other) = &ty {
+                if *other == v {
+                    return;
+                }
+            }
+            self.error(
+                format!(
+                    "rigid type variable would escape: cannot unify with {}",
+                    self.display_ty(&ty)
+                ),
+                span,
+            );
+            return;
+        }
+        if self.occurs_in(v, &ty) {
+            self.error("infinite type".into(), span);
+            return;
+        }
+        self.subst.insert(v, ty);
     }
 
     // ── Unification ──────────────────────────────────────────────
@@ -792,21 +843,34 @@ impl Infer {
         match (&t1, &t2) {
             (Ty::Error, _) | (_, Ty::Error) => {}
             (Ty::Var(a), Ty::Var(b)) if a == b => {}
+            (Ty::Var(a), Ty::Var(b)) => {
+                // When unifying two variables, bind the non-skolem one
+                // toward the other. If both are skolems, neither can be
+                // bound — error.
+                let a = *a;
+                let b = *b;
+                if !self.skolems.contains(&a) {
+                    self.bind_var(a, Ty::Var(b), span);
+                } else if !self.skolems.contains(&b) {
+                    self.bind_var(b, Ty::Var(a), span);
+                } else {
+                    self.error(
+                        format!(
+                            "cannot unify rigid type variables {} and {}",
+                            self.display_ty(&Ty::Var(a)),
+                            self.display_ty(&Ty::Var(b))
+                        ),
+                        span,
+                    );
+                }
+            }
             (Ty::Var(v), _) => {
                 let v = *v;
-                if self.occurs_in(v, &t2) {
-                    self.error("infinite type".into(), span);
-                } else {
-                    self.subst.insert(v, t2);
-                }
+                self.bind_var(v, t2.clone(), span);
             }
             (_, Ty::Var(v)) => {
                 let v = *v;
-                if self.occurs_in(v, &t1) {
-                    self.error("infinite type".into(), span);
-                } else {
-                    self.subst.insert(v, t1);
-                }
+                self.bind_var(v, t1.clone(), span);
             }
             (Ty::Int, Ty::Int)
             | (Ty::Float, Ty::Float)
@@ -1056,11 +1120,7 @@ impl Infer {
                     );
                 }
                 let target = Ty::Record(only2, None);
-                if self.occurs_in(rv, &target) {
-                    self.error("infinite type (record row variable)".into(), span);
-                } else {
-                    self.subst.insert(rv, target);
-                }
+                self.bind_var(rv, target, span);
             }
             (None, Some(rv)) => {
                 if !only2.is_empty() {
@@ -1074,11 +1134,7 @@ impl Infer {
                     );
                 }
                 let target = Ty::Record(only1, None);
-                if self.occurs_in(rv, &target) {
-                    self.error("infinite type (record row variable)".into(), span);
-                } else {
-                    self.subst.insert(rv, target);
-                }
+                self.bind_var(rv, target, span);
             }
             (Some(rv1), Some(rv2)) => {
                 if rv1 == rv2 {
@@ -1088,16 +1144,17 @@ impl Infer {
                             span,
                         );
                     }
+                } else if only1.is_empty() && only2.is_empty() {
+                    // Both rows match exactly — link them via `unify` so
+                    // skolem-vs-unification-var binding is directed
+                    // toward the non-skolem.
+                    self.unify(&Ty::Var(rv1), &Ty::Var(rv2), span);
                 } else {
                     let fresh = self.fresh_var();
                     let t1 = Ty::Record(only2, Some(fresh));
                     let t2 = Ty::Record(only1, Some(fresh));
-                    if self.occurs_in(rv1, &t1) || self.occurs_in(rv2, &t2) {
-                        self.error("infinite type (record row variable)".into(), span);
-                    } else {
-                        self.subst.insert(rv1, t1);
-                        self.subst.insert(rv2, t2);
-                    }
+                    self.bind_var(rv1, t1, span);
+                    self.bind_var(rv2, t2, span);
                 }
             }
         }
@@ -1155,11 +1212,7 @@ impl Infer {
                     );
                 }
                 let target = Ty::Variant(only2, None);
-                if self.occurs_in(rv, &target) {
-                    self.error("infinite type (variant row variable)".into(), span);
-                } else {
-                    self.subst.insert(rv, target);
-                }
+                self.bind_var(rv, target, span);
             }
             (None, Some(rv)) => {
                 if !only2.is_empty() {
@@ -1173,11 +1226,7 @@ impl Infer {
                     );
                 }
                 let target = Ty::Variant(only1, None);
-                if self.occurs_in(rv, &target) {
-                    self.error("infinite type (variant row variable)".into(), span);
-                } else {
-                    self.subst.insert(rv, target);
-                }
+                self.bind_var(rv, target, span);
             }
             (Some(rv1), Some(rv2)) => {
                 if rv1 == rv2 {
@@ -1187,16 +1236,14 @@ impl Infer {
                             span,
                         );
                     }
+                } else if only1.is_empty() && only2.is_empty() {
+                    self.unify(&Ty::Var(rv1), &Ty::Var(rv2), span);
                 } else {
                     let fresh = self.fresh_var();
                     let t1 = Ty::Variant(only2, Some(fresh));
                     let t2 = Ty::Variant(only1, Some(fresh));
-                    if self.occurs_in(rv1, &t1) || self.occurs_in(rv2, &t2) {
-                        self.error("infinite type (variant row variable)".into(), span);
-                    } else {
-                        self.subst.insert(rv1, t1);
-                        self.subst.insert(rv2, t2);
-                    }
+                    self.bind_var(rv1, t1, span);
+                    self.bind_var(rv2, t2, span);
                 }
             }
         }
@@ -1362,6 +1409,17 @@ impl Infer {
                 effects.clone(),
                 Box::new(self.subst_ty(inner, mapping)),
             ),
+            Ty::Forall(bound, inner) => {
+                // Avoid capturing bound vars: shadow them in the mapping.
+                let mut shadowed = mapping.clone();
+                for b in bound {
+                    shadowed.remove(b);
+                }
+                Ty::Forall(
+                    bound.clone(),
+                    Box::new(self.subst_ty(inner, &shadowed)),
+                )
+            }
             _ => ty.clone(),
         }
     }
@@ -1398,6 +1456,10 @@ impl Infer {
             ),
             Ty::IO(effects, inner) => Ty::IO(
                 effects.clone(),
+                Box::new(self.subst_unit_vars_in_ty(inner, mapping)),
+            ),
+            Ty::Forall(bound, inner) => Ty::Forall(
+                bound.clone(),
                 Box::new(self.subst_unit_vars_in_ty(inner, mapping)),
             ),
             _ => ty.clone(),
@@ -1455,6 +1517,7 @@ impl Infer {
                 self.collect_free_unit_vars(a, out);
             }
             Ty::IO(_, inner) => self.collect_free_unit_vars(inner, out),
+            Ty::Forall(_, inner) => self.collect_free_unit_vars(inner, out),
             _ => {}
         }
     }
@@ -1569,6 +1632,14 @@ impl Infer {
             }
             Ty::IO(_, inner) => {
                 self.collect_free_vars(inner, out);
+            }
+            Ty::Forall(bound, inner) => {
+                let mut inner_set = HashSet::new();
+                self.collect_free_vars(inner, &mut inner_set);
+                for v in bound {
+                    inner_set.remove(v);
+                }
+                out.extend(inner_set);
             }
             _ => {}
         }
@@ -1778,6 +1849,37 @@ impl Infer {
                 // Named refined type aliases are kept nominal (handled in Named arm).
                 self.ast_type_to_ty(base)
             }
+
+            ast::TypeKind::Forall { vars, ty: inner } => {
+                // Allocate fresh TyVars for the bound names and shadow any
+                // existing annotation_vars binding for the duration of the
+                // body, then restore. This keeps inner-quantified vars
+                // separate from outer-scope annotation vars.
+                let saved: Vec<(String, Option<TyVar>)> = vars
+                    .iter()
+                    .map(|v| (v.clone(), self.annotation_vars.get(v).copied()))
+                    .collect();
+                let bound: Vec<TyVar> = vars
+                    .iter()
+                    .map(|v| {
+                        let fv = self.fresh_var();
+                        self.annotation_vars.insert(v.clone(), fv);
+                        fv
+                    })
+                    .collect();
+                let inner_ty = self.ast_type_to_ty(inner);
+                for (name, prev) in saved {
+                    match prev {
+                        Some(v) => {
+                            self.annotation_vars.insert(name, v);
+                        }
+                        None => {
+                            self.annotation_vars.remove(&name);
+                        }
+                    }
+                }
+                Ty::Forall(bound, Box::new(inner_ty))
+            }
         }
     }
 
@@ -1945,6 +2047,33 @@ impl Infer {
                     format!(" {{{}}}", names.join(", "))
                 };
                 format!("IO{} {}", effects_str, self.display_ty(inner))
+            }
+            Ty::Forall(vars, inner) => {
+                if vars.is_empty() {
+                    self.display_ty_inner(inner, in_fun)
+                } else {
+                    let names: Vec<String> = vars
+                        .iter()
+                        .map(|v| {
+                            let idx = *v as usize;
+                            if idx < 26 {
+                                format!("{}", (b'a' + idx as u8) as char)
+                            } else {
+                                format!("t{}", v)
+                            }
+                        })
+                        .collect();
+                    let s = format!(
+                        "forall {}. {}",
+                        names.join(" "),
+                        self.display_ty_inner(inner, false)
+                    );
+                    if in_fun {
+                        format!("({})", s)
+                    } else {
+                        s
+                    }
+                }
             }
             Ty::Error => "<error>".into(),
         }
@@ -2184,6 +2313,28 @@ impl Infer {
                 }
 
                 let func_ty = self.infer_expr(func);
+
+                // Higher-rank arg slot: when the function's parameter is
+                // a `Ty::Forall`, check the argument against the Forall's
+                // body so the arg can be used polymorphically inside the
+                // callee. Predicative — relies on later escape checks.
+                let func_applied = self.apply(&func_ty);
+                if let Ty::Fun(arg_slot, ret_ty) = &func_applied {
+                    let arg_slot_resolved = self.apply(arg_slot);
+                    if matches!(arg_slot_resolved, Ty::Forall(..)) {
+                        self.check_expr(arg, &arg_slot_resolved);
+                        let result_ty = (**ret_ty).clone();
+                        if let ast::ExprKind::Var(name) = &func.node {
+                            if name == "parseJson" {
+                                if let Ty::Var(v) = &result_ty {
+                                    self.from_json_calls.push((expr.span, *v));
+                                }
+                            }
+                        }
+                        return result_ty;
+                    }
+                }
+
                 let arg_ty = self.infer_expr(arg);
                 let result_ty = self.fresh();
                 let expected = Ty::Fun(
@@ -2412,15 +2563,69 @@ impl Infer {
 
     /// Bidirectional checking entry point. Infers `expr` and unifies the
     /// result against `expected`. Specialised cases push `expected` down
-    /// instead of synthesising — the foundation for higher-rank types.
-    /// Today every case delegates; specialised rules will land in later
-    /// phases. Behaviour is identical to `infer_expr` + `unify`.
+    /// to enable higher-rank types — when a lambda parameter's expected
+    /// type is `forall vs. body`, the param is bound polymorphically.
     fn check_expr(&mut self, expr: &ast::Expr, expected: &Ty) {
+        // Higher-rank: when the expected type is `forall vs. body`,
+        // skolemise the bound vars (mark them rigid in `self.skolems`)
+        // and recurse with the skolemised body. After the check, drop
+        // the skolems. Unification refuses to bind a skolem, so leaks
+        // surface as type errors at the offending site.
+        let resolved = self.apply(expected);
+        if let Ty::Forall(vars, body) = resolved {
+            let mut fresh_skolems: Vec<TyVar> = Vec::with_capacity(vars.len());
+            let mut mapping: HashMap<TyVar, Ty> = HashMap::new();
+            for v in &vars {
+                let s = self.fresh_var();
+                self.skolems.insert(s);
+                fresh_skolems.push(s);
+                mapping.insert(*v, Ty::Var(s));
+            }
+            let body_skolemised = self.subst_ty(&body, &mapping);
+            self.check_expr(expr, &body_skolemised);
+            for s in fresh_skolems {
+                self.skolems.remove(&s);
+            }
+            return;
+        }
         match &expr.node {
             ast::ExprKind::Annot { expr: inner, ty } => {
                 let annot_ty = self.ast_type_to_ty(ty);
                 self.check_expr(inner, &annot_ty);
                 self.unify(&annot_ty, expected, expr.span);
+            }
+            ast::ExprKind::Lambda { params, body } => {
+                // Peel `Fun(p, r)` off `expected` for each lambda param,
+                // resolving substitutions as we go. If the expected type
+                // turns out to have fewer arrows than the lambda has
+                // params, fall back to synthesise + unify (mono).
+                let resolved = self.apply(expected);
+                let mut current = resolved;
+                let mut peeled: Vec<Ty> = Vec::new();
+                for _ in params {
+                    match current {
+                        Ty::Fun(p, r) => {
+                            peeled.push(*p);
+                            current = self.apply(&r);
+                        }
+                        other => {
+                            // Not enough arrows — fall back to inference.
+                            current = other;
+                            break;
+                        }
+                    }
+                }
+                if peeled.len() == params.len() {
+                    self.push_scope();
+                    for (param, p_ty) in params.iter().zip(peeled.iter()) {
+                        self.check_pattern(param, p_ty);
+                    }
+                    self.check_expr(body, &current);
+                    self.pop_scope();
+                } else {
+                    let inferred = self.infer_expr(expr);
+                    self.unify(&inferred, expected, expr.span);
+                }
             }
             _ => {
                 let inferred = self.infer_expr(expr);
@@ -2652,7 +2857,20 @@ impl Infer {
     fn check_pattern(&mut self, pat: &ast::Pat, expected: &Ty) {
         match &pat.node {
             ast::PatKind::Var(name) => {
-                self.bind(name, Scheme::mono(expected.clone()));
+                // If the expected type is `forall vs. body`, bind the var
+                // with a polymorphic Scheme so each use freshly instantiates
+                // the quantified variables. This is what makes higher-rank
+                // arguments usable at multiple types inside the body.
+                let scheme = match self.apply(expected) {
+                    Ty::Forall(vars, body) => Scheme {
+                        vars,
+                        unit_vars: vec![],
+                        constraints: vec![],
+                        ty: *body,
+                    },
+                    _ => Scheme::mono(expected.clone()),
+                };
+                self.bind(name, scheme);
                 self.binding_types.push((pat.span, expected.clone()));
             }
             ast::PatKind::Wildcard => {}
@@ -3453,12 +3671,23 @@ impl Infer {
                                 }
                             }
                         }
-                        let ty = self.ast_type_to_ty(&scheme.ty);
+                        let raw_ty = self.ast_type_to_ty(&scheme.ty);
                         self.in_type_annotation = false;
-                        let vars: Vec<TyVar> =
+                        let mut vars: Vec<TyVar> =
                             self.annotation_vars.values().copied().collect();
                         let unit_vars: Vec<UnitVar> =
                             self.annotation_unit_vars.values().copied().collect();
+                        // Lift any outermost `Ty::Forall` into the Scheme so
+                        // standard instantiation handles its quantified vars.
+                        // Inner `Ty::Forall` (in arg positions) stays as-is
+                        // for higher-rank handling.
+                        let ty = match raw_ty {
+                            Ty::Forall(forall_vars, body) => {
+                                vars.extend(forall_vars);
+                                *body
+                            }
+                            other => other,
+                        };
                         self.bind_top(
                             name,
                             Scheme { vars, unit_vars, constraints, ty },
@@ -4830,6 +5059,16 @@ fn collect_vars_ordered(ty: &Ty, out: &mut Vec<TyVar>) {
             collect_vars_ordered(a, out);
         }
         Ty::IO(_, inner) => collect_vars_ordered(inner, out),
+        Ty::Forall(bound, inner) => {
+            // Collect free vars from the body, then drop the bound ones.
+            let mut inner_vars = Vec::new();
+            collect_vars_ordered(inner, &mut inner_vars);
+            for v in inner_vars {
+                if !bound.contains(&v) && !out.contains(&v) {
+                    out.push(v);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -4928,6 +5167,26 @@ fn display_ty_clean_inner(ty: &Ty, names: &HashMap<TyVar, usize>, in_fun: bool) 
                 format!(" {{{}}}", eff_names.join(", "))
             };
             format!("IO{} {}", effects_str, display_ty_clean(inner, names))
+        }
+        Ty::Forall(vars, inner) => {
+            if vars.is_empty() {
+                display_ty_clean_inner(inner, names, in_fun)
+            } else {
+                let bound: Vec<String> = vars
+                    .iter()
+                    .map(|v| var_letter(names.get(v).copied().unwrap_or(*v as usize)))
+                    .collect();
+                let s = format!(
+                    "forall {}. {}",
+                    bound.join(" "),
+                    display_ty_clean_inner(inner, names, false)
+                );
+                if in_fun {
+                    format!("({})", s)
+                } else {
+                    s
+                }
+            }
         }
         Ty::Error => "<error>".into(),
     }

@@ -5547,6 +5547,9 @@ fn format_type_kind(ty: &TypeKind) -> String {
         TypeKind::Refined { base, predicate } => {
             format!("{} where {}", format_type_kind(&base.node), format_expr_brief(&predicate.node))
         }
+        TypeKind::Forall { vars, ty } => {
+            format!("forall {}. {}", vars.join(" "), format_type_kind(&ty.node))
+        }
     }
 }
 

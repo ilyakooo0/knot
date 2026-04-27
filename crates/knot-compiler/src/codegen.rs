@@ -615,6 +615,8 @@ impl Codegen {
         self.declare_rt("knot_source_query_float", &[p, p, p, p], &[p]);
         self.declare_rt("knot_source_query_sum", &[p, p, p, p], &[p]);
         self.declare_rt("knot_source_query_value", &[p, p, p, p], &[p]);
+        self.declare_rt("knot_source_fold", &[p, p, p, p, p, p, p], &[p]);
+        self.declare_rt("knot_source_query_fold", &[p, p, p, p, p, p, p, p], &[p]);
         self.declare_rt("knot_source_write", &[p, p, p, p, p, p], &[]);
         self.declare_rt("knot_source_append", &[p, p, p, p, p, p], &[]);
         self.declare_rt("knot_source_diff_write", &[p, p, p, p, p, p], &[]);
@@ -4744,6 +4746,94 @@ impl Codegen {
                             &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
                         );
                         return self.call_rt(builder, "knot_relation_single", &[rel]);
+                    }
+                }
+            }
+        }
+
+        // Special case: fold f init <relation expression> → stream rows from SQLite
+        // one-by-one through the fold function instead of materializing the whole
+        // relation in memory.  Restricted to flat record sources (no ADTs, no
+        // nested relation fields); other shapes fall back to knot_relation_fold.
+        // We deliberately skip the bound-variable case (`fold f init sales` after
+        // `sales <- *sales`) — the bind already materialised the rows, so
+        // streaming would do a redundant SQL pass.  The wins are in the filter
+        // and do-block paths, which would otherwise build an intermediate Vec.
+        if let ast::ExprKind::Var(name) = &func_expr.node {
+            if name == "fold" && args.len() == 3 {
+                // fold f init *source → SELECT cols FROM table; stream
+                if let ast::ExprKind::SourceRef(source_name) = &args[2].node {
+                    if !self.views.contains_key(source_name) {
+                        if let Some(schema) = self.source_schemas.get(source_name).cloned() {
+                            if !schema.starts_with('#') && !schema.contains('[') {
+                                let source_name = source_name.clone();
+                                let f = self.compile_expr(builder, &args[0], env, db);
+                                let init = self.compile_expr(builder, &args[1], env, db);
+                                let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
+                                let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
+                                return self.call_rt(
+                                    builder,
+                                    "knot_source_fold",
+                                    &[db, f, init, name_ptr, name_len, schema_ptr, schema_len],
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // fold f init (filter g *source) → SELECT cols FROM table WHERE ...; stream
+                if let Some((source_name, filter_bind, filter_body)) =
+                    extract_filter_on_source(&args[2], &self.source_var_binds, &self.fun_bodies)
+                {
+                    let source_name = source_name.to_string();
+                    let filter_bind = filter_bind.to_string();
+                    if !self.views.contains_key(&source_name) {
+                        if let Some(schema) = self.source_schemas.get(&source_name).cloned() {
+                            if !schema.starts_with('#') && !schema.contains('[') {
+                                if let Some(frag) = Self::try_compile_sql_expr(&filter_bind, filter_body) {
+                                    let f = self.compile_expr(builder, &args[0], env, db);
+                                    let init = self.compile_expr(builder, &args[1], env, db);
+                                    let table = quote_sql_ident(&format!("_knot_{}", source_name));
+                                    let cols = parse_schema_columns(&schema).iter()
+                                        .map(|(name, _)| quote_sql_ident(name))
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    let sql = format!("SELECT {} FROM {} WHERE {}", cols, table, frag.sql);
+                                    let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
+                                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                                    let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
+                                    let (tn_ptr, tn_len) = self.string_ptr(builder, &source_name);
+                                    self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
+                                    return self.call_rt(
+                                        builder,
+                                        "knot_source_query_fold",
+                                        &[db, f, init, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // fold f init (do { ... }) → SQL plan; stream
+                if let ast::ExprKind::Do(stmts) = &args[2].node {
+                    if let Some(plan) = self.analyze_sql_plan(stmts, env) {
+                        let f = self.compile_expr(builder, &args[0], env, db);
+                        let init = self.compile_expr(builder, &args[1], env, db);
+                        let sql = plan.build_sql();
+                        let result_schema = plan.build_result_schema();
+                        let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
+                        for table in &plan.tables {
+                            let (tn_ptr, tn_len) = self.string_ptr(builder, &table.source_name);
+                            self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
+                        }
+                        let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                        let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
+                        return self.call_rt(
+                            builder,
+                            "knot_source_query_fold",
+                            &[db, f, init, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                        );
                     }
                 }
             }

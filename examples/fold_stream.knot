@@ -1,0 +1,32 @@
+type Sale = {item: Text, qty: Int, price: Int}
+
+*sales : [Sale]
+
+main = do
+  set *sales = [
+    {item: "apple",  qty: 3, price: 50},
+    {item: "banana", qty: 7, price: 20},
+    {item: "cherry", qty: 2, price: 120},
+    {item: "date",   qty: 5, price: 80},
+    {item: "fig",    qty: 4, price: 30}
+  ]
+
+  -- Bind once so the source name resolves through source_var_binds
+  sales <- *sales
+
+  -- 1. fold over a bare source binding: total revenue across every row
+  let total = fold (\acc s -> acc + s.qty * s.price) 0 sales
+  println ("total revenue: " ++ show total)
+
+  -- 2. fold over a filter expression: revenue for high-qty items only
+  let bulk = fold (\acc s -> acc + s.qty * s.price) 0 (filter (\s -> s.qty > 3) sales)
+  println ("bulk-only revenue: " ++ show bulk)
+
+  -- 3. fold over a do-block (SQL plan): count rows priced > 25
+  let pricey = fold (\acc _ -> acc + 1) 0 do
+    s <- sales
+    where s.price > 25
+    yield s
+  println ("rows priced > 25: " ++ show pricey)
+
+  yield {}

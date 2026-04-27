@@ -5599,6 +5599,128 @@ pub extern "C" fn knot_relation_fold(
     acc
 }
 
+/// Streaming fold over a source relation table.
+/// Reads rows one-at-a-time from SQLite and applies the curried fold
+/// function, never materialising the relation in memory.
+/// Caller must guarantee the schema is a flat record schema (no nested
+/// relations, no ADT) — those are excluded by the compiler so they fall
+/// back to `knot_relation_fold`.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_source_fold(
+    db: *mut c_void,
+    func: *mut Value,
+    init: *mut Value,
+    name_ptr: *const u8,
+    name_len: usize,
+    schema_ptr: *const u8,
+    schema_len: usize,
+) -> *mut Value {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let name = unsafe { str_from_raw(name_ptr, name_len) };
+    let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
+
+    if db_ref.atomic_depth.get() > 0 {
+        stm_track_read(name);
+    }
+
+    let table_name = format!("_knot_{}", name);
+    let table = quote_ident(&table_name);
+    let rec = parse_record_schema(schema);
+
+    let cols: Vec<String> = rec.columns.iter().map(|c| quote_ident(&c.name)).collect();
+    let sql = format!(
+        "SELECT {} FROM {}",
+        if cols.is_empty() { "1".to_string() } else { cols.join(", ") },
+        table
+    );
+    debug_sql(&sql);
+
+    let mut stmt = db_ref
+        .conn
+        .prepare_cached(&sql)
+        .unwrap_or_else(|e| panic!("knot runtime: source_fold error: {}\n  SQL: {}", e, sql));
+    let mut result_rows = stmt
+        .query([])
+        .unwrap_or_else(|e| panic!("knot runtime: source_fold exec error: {}\n  SQL: {}", e, sql));
+
+    let mut acc = init;
+    while let Some(row) = result_rows
+        .next()
+        .unwrap_or_else(|e| panic!("knot runtime: source_fold row fetch error: {}", e))
+    {
+        let record = knot_record_empty(rec.columns.len());
+        for (i, col) in rec.columns.iter().enumerate() {
+            let val = read_sql_column(row, i, col.ty);
+            let cname = col.name.as_bytes();
+            knot_record_set_field(record, cname.as_ptr(), cname.len(), val);
+        }
+        let partial = knot_value_call(db, func, acc);
+        acc = knot_value_call(db, partial, record);
+    }
+    acc
+}
+
+/// Streaming fold over an arbitrary record-producing SELECT.
+/// Used by the compiler when fold is applied to `filter f *src` or to a
+/// `do { ... }` block that maps to a flat SQL plan.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_source_query_fold(
+    db: *mut c_void,
+    func: *mut Value,
+    init: *mut Value,
+    sql_ptr: *const u8,
+    sql_len: usize,
+    result_schema_ptr: *const u8,
+    result_schema_len: usize,
+    params: *mut Value,
+) -> *mut Value {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let sql = unsafe { str_from_raw(sql_ptr, sql_len) };
+    let result_schema = unsafe { str_from_raw(result_schema_ptr, result_schema_len) };
+
+    let param_values = match unsafe { as_ref(params) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: source_query_fold params must be a Relation, got {}",
+            type_name(params)
+        ),
+    };
+    let sql_params: Vec<rusqlite::types::Value> =
+        param_values.iter().map(|v| value_to_sql_param(*v)).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = sql_params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
+
+    debug_sql_params(sql, &sql_params);
+
+    let rec = parse_record_schema(result_schema);
+
+    let mut stmt = db_ref
+        .conn
+        .prepare_cached(sql)
+        .unwrap_or_else(|e| panic!("knot runtime: source_query_fold error: {}\n  SQL: {}", e, sql));
+    let mut result_rows = stmt
+        .query(param_refs.as_slice())
+        .unwrap_or_else(|e| panic!("knot runtime: source_query_fold exec error: {}\n  SQL: {}", e, sql));
+
+    let mut acc = init;
+    while let Some(row) = result_rows
+        .next()
+        .unwrap_or_else(|e| panic!("knot runtime: source_query_fold row fetch error: {}", e))
+    {
+        let record = knot_record_empty(rec.columns.len());
+        for (i, col) in rec.columns.iter().enumerate() {
+            let val = read_sql_column(row, i, col.ty);
+            let cname = col.name.as_bytes();
+            knot_record_set_field(record, cname.as_ptr(), cname.len(), val);
+        }
+        let partial = knot_value_call(db, func, acc);
+        acc = knot_value_call(db, partial, record);
+    }
+    acc
+}
+
 /// traverse(f, rel) — apply an applicative function to each element of a relation
 /// and sequence the results. Determines the applicative type (IO, Maybe, Result, [])
 /// by inspecting the first result.

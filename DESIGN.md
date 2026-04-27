@@ -1266,15 +1266,22 @@ double = \x -> x + x
 
 #### Conversion
 
-`withUnit` and `stripUnit` are identity functions that exist only for the type checker. Both require explicit type annotations:
+`stripUnit` / `withUnit` (Int) and `stripFloatUnit` / `withFloatUnit` (Float) are identity functions that exist only for the type checker. Use them to drop a unit tag and re-attach a different one. The result of `withUnit`/`withFloatUnit` carries a free unit variable, so the caller pins the target unit via the surrounding type context (e.g. the function's return signature) or an explicit annotation:
 
 ```knot
-withUnit : Float -> Float<u>    -- attach a unit (caller must annotate)
-stripUnit : Float<u> -> Float   -- remove a unit
+stripUnit       : Int<u> -> Int           -- drop unit from Int
+withUnit        : Int -> Int<u>           -- attach unit to Int
+stripFloatUnit  : Float<u> -> Float
+withFloatUnit   : Float -> Float<u>
+
+toS : Int<Ms> -> Int<S>
+toS = \ms -> withUnit (stripUnit ms / 1000)
 
 toMiles : Float<Km> -> Float<Mi>
-toMiles = \d -> (withUnit (stripUnit d * 0.621371) : Float<Mi>)
+toMiles = \d -> withFloatUnit (stripFloatUnit d * 0.621371)
 ```
+
+Plain `Int`/`Float` are unit-agnostic and unify with any `Int<u>`/`Float<u>`, so passing a unit-tagged value where plain numeric is expected (or vice versa) needs no conversion. These helpers are only needed when you must rebrand a value with a *different* concrete unit.
 
 #### Unit-Preserving Stdlib
 

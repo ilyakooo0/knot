@@ -1067,6 +1067,7 @@ impl Codegen {
             "toUpper", "toLower", "take", "drop", "sortBy", "takeRelation", "dropRelation",
             "length", "trim", "contains", "reverse",
             "chars", "id", "not",
+            "stripUnit", "withUnit", "stripFloatUnit", "withFloatUnit",
             "bytesLength", "bytesSlice", "bytesConcat",
             "textToBytes", "bytesToText", "bytesToHex", "bytesFromHex", "hexDecode",
             "bytesGet",
@@ -2056,6 +2057,10 @@ impl Codegen {
         self.define_stdlib_fn_1("chars", "knot_text_chars");
         self.define_stdlib_fn_1("id", "knot_value_id");
         self.define_stdlib_fn_1("not", "knot_value_not_fn");
+        self.define_stdlib_fn_1("stripUnit", "knot_value_id");
+        self.define_stdlib_fn_1("withUnit", "knot_value_id");
+        self.define_stdlib_fn_1("stripFloatUnit", "knot_value_id");
+        self.define_stdlib_fn_1("withFloatUnit", "knot_value_id");
 
         // 2-param: curried (outer captures arg1, inner calls runtime)
         self.define_stdlib_fn_2("filter", "knot_relation_filter", true);

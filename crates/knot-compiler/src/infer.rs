@@ -4413,6 +4413,74 @@ impl Infer {
             Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(a)))),
         );
 
+        // stripUnit : ∀u. Int<u> -> Int — drop the unit tag from an Int
+        {
+            let u = self.fresh_unit_var();
+            self.bind_top(
+                "stripUnit",
+                Scheme {
+                    vars: vec![],
+                    unit_vars: vec![u],
+                    constraints: vec![],
+                    ty: Ty::Fun(
+                        Box::new(Ty::IntUnit(UnitTy::var(u))),
+                        Box::new(Ty::Int),
+                    ),
+                },
+            );
+        }
+
+        // withUnit : ∀u. Int -> Int<u> — attach a unit (caller must annotate result)
+        {
+            let u = self.fresh_unit_var();
+            self.bind_top(
+                "withUnit",
+                Scheme {
+                    vars: vec![],
+                    unit_vars: vec![u],
+                    constraints: vec![],
+                    ty: Ty::Fun(
+                        Box::new(Ty::Int),
+                        Box::new(Ty::IntUnit(UnitTy::var(u))),
+                    ),
+                },
+            );
+        }
+
+        // stripFloatUnit : ∀u. Float<u> -> Float
+        {
+            let u = self.fresh_unit_var();
+            self.bind_top(
+                "stripFloatUnit",
+                Scheme {
+                    vars: vec![],
+                    unit_vars: vec![u],
+                    constraints: vec![],
+                    ty: Ty::Fun(
+                        Box::new(Ty::FloatUnit(UnitTy::var(u))),
+                        Box::new(Ty::Float),
+                    ),
+                },
+            );
+        }
+
+        // withFloatUnit : ∀u. Float -> Float<u>
+        {
+            let u = self.fresh_unit_var();
+            self.bind_top(
+                "withFloatUnit",
+                Scheme {
+                    vars: vec![],
+                    unit_vars: vec![u],
+                    constraints: vec![],
+                    ty: Ty::Fun(
+                        Box::new(Ty::Float),
+                        Box::new(Ty::FloatUnit(UnitTy::var(u))),
+                    ),
+                },
+            );
+        }
+
         // not : Bool -> Bool
         self.bind_top(
             "not",
@@ -6369,6 +6437,50 @@ mod tests {
              main = 1"
         );
         assert!(has_error(&diags, "unit mismatch"));
+    }
+
+    #[test]
+    fn strip_with_unit_int_round_trip() {
+        let diags = check_src(
+            "unit Ms\nunit S\n\
+             toS : Int<Ms> -> Int<S>\n\
+             toS = \\ms -> withUnit (stripUnit ms / 1000)\n\
+             main = 1"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn strip_unit_float() {
+        let diags = check_src(
+            "unit M\n\
+             f : Float<M> -> Float\n\
+             f = \\x -> stripFloatUnit x\n\
+             main = 1"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn with_unit_float() {
+        let diags = check_src(
+            "unit M\n\
+             f : Float -> Float<M>\n\
+             f = \\x -> withFloatUnit x\n\
+             main = 1"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn strip_unit_rejects_float_arg() {
+        // stripUnit is Int-only — passing a Float should fail
+        let diags = check_src(
+            "unit M\n\
+             f = stripUnit 1.0<M>\n\
+             main = 1"
+        );
+        assert!(!diags.is_empty());
     }
 }
 

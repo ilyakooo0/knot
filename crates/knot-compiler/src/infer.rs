@@ -2410,6 +2410,25 @@ impl Infer {
         }
     }
 
+    /// Bidirectional checking entry point. Infers `expr` and unifies the
+    /// result against `expected`. Specialised cases push `expected` down
+    /// instead of synthesising — the foundation for higher-rank types.
+    /// Today every case delegates; specialised rules will land in later
+    /// phases. Behaviour is identical to `infer_expr` + `unify`.
+    fn check_expr(&mut self, expr: &ast::Expr, expected: &Ty) {
+        match &expr.node {
+            ast::ExprKind::Annot { expr: inner, ty } => {
+                let annot_ty = self.ast_type_to_ty(ty);
+                self.check_expr(inner, &annot_ty);
+                self.unify(&annot_ty, expected, expr.span);
+            }
+            _ => {
+                let inferred = self.infer_expr(expr);
+                self.unify(&inferred, expected, expr.span);
+            }
+        }
+    }
+
     /// Try to infer a `fetch` call. Returns `Some(ty)` if the expression
     /// is `fetch url (Ctor {..})` or `fetch url opts (Ctor {..})`.
     /// This skips the constructor's `respond` field and resolves the
@@ -4488,8 +4507,8 @@ impl Infer {
                             self.lookup_instantiate(name).unwrap_or_else(|| {
                                 self.fresh()
                             });
-                        let inferred = self.infer_expr(body);
-                        self.unify(&expected, &inferred, body.span);
+                        self.check_expr(body, &expected);
+                        let inferred = self.apply(&expected);
 
                         // Remove the old monomorphic binding before
                         // generalizing, so its free variables don't block

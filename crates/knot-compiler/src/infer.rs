@@ -2658,6 +2658,22 @@ impl Infer {
                     self.unify(&inferred, expected, expr.span);
                 }
             }
+            ast::ExprKind::Do(stmts) => {
+                // Bidirectional hint: if the expected type is `IO _ _`, set
+                // `in_io_do` so a do-block with only `yield x` (no IO stmts,
+                // no relation binds) is inferred as IO instead of defaulting
+                // to Relation. `infer_do` ORs this with `stmt_has_io`, so the
+                // hint propagates while still letting genuinely IO statements
+                // turn it on bottom-up.
+                let resolved_expected = self.apply(expected);
+                let prev_in_io_do = self.in_io_do;
+                if matches!(resolved_expected, Ty::IO(_, _)) {
+                    self.in_io_do = true;
+                }
+                let inferred = self.infer_do(stmts, expr.span);
+                self.in_io_do = prev_in_io_do;
+                self.unify(&inferred, expected, expr.span);
+            }
             _ => {
                 let inferred = self.infer_expr(expr);
                 self.unify(&inferred, expected, expr.span);
@@ -3271,8 +3287,10 @@ impl Infer {
 
         // Pre-scan: if any statement uses IO builtins, set in_io_do so that
         // `yield` expressions inside case/if branches produce IO types.
+        // Preserve any outer hint (from `check_expr` against an `IO _ _`
+        // expected type) — yield-only blocks rely on the hint to promote.
         let prev_in_io_do = self.in_io_do;
-        self.in_io_do = self.stmt_has_io(stmts);
+        self.in_io_do = self.in_io_do || self.stmt_has_io(stmts);
 
         for stmt in stmts {
             match &stmt.node {

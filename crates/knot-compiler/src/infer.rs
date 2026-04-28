@@ -1150,11 +1150,28 @@ impl Infer {
                     // toward the non-skolem.
                     self.unify(&Ty::Var(rv1), &Ty::Var(rv2), span);
                 } else {
-                    let fresh = self.fresh_var();
-                    let t1 = Ty::Record(only2, Some(fresh));
-                    let t2 = Ty::Record(only1, Some(fresh));
-                    self.bind_var(rv1, t1, span);
-                    self.bind_var(rv2, t2, span);
+                    let rv1_skolem = self.skolems.contains(&rv1);
+                    let rv2_skolem = self.skolems.contains(&rv2);
+                    match (rv1_skolem, rv2_skolem) {
+                        // Skolem on one side with no extras to absorb:
+                        // keep the rigid tail intact and bind the free row
+                        // var to a record using the skolem as its tail.
+                        (true, false) if only2.is_empty() => {
+                            let target = Ty::Record(only1, Some(rv1));
+                            self.bind_var(rv2, target, span);
+                        }
+                        (false, true) if only1.is_empty() => {
+                            let target = Ty::Record(only2, Some(rv2));
+                            self.bind_var(rv1, target, span);
+                        }
+                        _ => {
+                            let fresh = self.fresh_var();
+                            let t1 = Ty::Record(only2, Some(fresh));
+                            let t2 = Ty::Record(only1, Some(fresh));
+                            self.bind_var(rv1, t1, span);
+                            self.bind_var(rv2, t2, span);
+                        }
+                    }
                 }
             }
         }
@@ -1239,11 +1256,25 @@ impl Infer {
                 } else if only1.is_empty() && only2.is_empty() {
                     self.unify(&Ty::Var(rv1), &Ty::Var(rv2), span);
                 } else {
-                    let fresh = self.fresh_var();
-                    let t1 = Ty::Variant(only2, Some(fresh));
-                    let t2 = Ty::Variant(only1, Some(fresh));
-                    self.bind_var(rv1, t1, span);
-                    self.bind_var(rv2, t2, span);
+                    let rv1_skolem = self.skolems.contains(&rv1);
+                    let rv2_skolem = self.skolems.contains(&rv2);
+                    match (rv1_skolem, rv2_skolem) {
+                        (true, false) if only2.is_empty() => {
+                            let target = Ty::Variant(only1, Some(rv1));
+                            self.bind_var(rv2, target, span);
+                        }
+                        (false, true) if only1.is_empty() => {
+                            let target = Ty::Variant(only2, Some(rv2));
+                            self.bind_var(rv1, target, span);
+                        }
+                        _ => {
+                            let fresh = self.fresh_var();
+                            let t1 = Ty::Variant(only2, Some(fresh));
+                            let t2 = Ty::Variant(only1, Some(fresh));
+                            self.bind_var(rv1, t1, span);
+                            self.bind_var(rv2, t2, span);
+                        }
+                    }
                 }
             }
         }
@@ -5505,6 +5536,20 @@ mod tests {
         assert!(check_src(
             "getName = \\r -> r.name\nmain = do\n  let x = getName {name: \"A\", age: 1}\n  let y = getName {name: \"B\", email: \"b\"}\n  yield {}"
         ).is_empty());
+    }
+
+    #[test]
+    fn rank2_row_polymorphic_field_access() {
+        // A rank-2 predicate may access any field listed in the row
+        // pattern. The skolemised row variable must stay rigid even when
+        // field-access constraints introduce extra fresh row variables.
+        let src = "\
+applyPred : (forall a. {x: Int, y: Int | a} -> Bool) -> Int\n\
+applyPred = \\pred -> if pred {x: 1, y: 2} then 1 else 0\n\
+main = applyPred (\\r -> r.x == r.y)\
+";
+        let diags = check_src(src);
+        assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
     }
 
     #[test]

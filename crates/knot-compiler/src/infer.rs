@@ -3575,17 +3575,24 @@ impl Infer {
                     let resolved = self.ast_type_to_ty(ty);
                     self.source_types.insert(name.clone(), resolved);
                 }
-                ast::DeclKind::View { name, .. } => {
-                    let elem = self.fresh();
-                    self.source_types.insert(
-                        name.clone(),
-                        Ty::Relation(Box::new(elem)),
-                    );
+                ast::DeclKind::View { name, ty, .. } => {
+                    let resolved = if let Some(scheme) = ty {
+                        self.annotation_vars.clear();
+                        self.ast_type_to_ty(&scheme.ty)
+                    } else {
+                        Ty::Relation(Box::new(self.fresh()))
+                    };
+                    self.source_types.insert(name.clone(), resolved);
                     self.view_names.insert(name.clone());
                 }
-                ast::DeclKind::Derived { name, .. } => {
-                    let ty = self.fresh();
-                    self.derived_types.insert(name.clone(), ty);
+                ast::DeclKind::Derived { name, ty, .. } => {
+                    let resolved = if let Some(scheme) = ty {
+                        self.annotation_vars.clear();
+                        self.ast_type_to_ty(&scheme.ty)
+                    } else {
+                        self.fresh()
+                    };
+                    self.derived_types.insert(name.clone(), resolved);
                 }
                 _ => {}
             }

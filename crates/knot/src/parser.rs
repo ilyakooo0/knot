@@ -806,7 +806,29 @@ impl Parser {
             // Peek: if `:` → source declaration, if `=` → view declaration.
             if this.eat(&TokenKind::Colon) {
                 // Source declaration: *name : type
+                // Or annotated view: *name : type = body
                 let ty = this.parse_type()?;
+
+                // Inline annotated view: *name : Type = body
+                if this.at(&TokenKind::Eq) {
+                    this.advance();
+                    let body = this.parse_expr()?;
+                    let end = this.prev_span();
+                    let scheme = TypeScheme {
+                        constraints: vec![],
+                        ty,
+                    };
+                    return Some(Decl {
+                        node: DeclKind::View {
+                            name,
+                            ty: Some(scheme),
+                            body,
+                        },
+                        span: Span::new(start.start, end.end),
+                        exported: false,
+                    });
+                }
+
                 // Optional `with history` (may be on the next line)
                 let mut history = false;
                 this.skip_newlines();
@@ -901,17 +923,21 @@ impl Parser {
 
             let (name, _) = this.expect_lower("expected name after '&'").ok()?;
 
+            // Optional inline type annotation: `&name : Type = body`
+            let ty = if this.eat(&TokenKind::Colon) {
+                let scheme = this.parse_type_scheme()?;
+                Some(scheme)
+            } else {
+                None
+            };
+
             this.expect(&TokenKind::Eq, "expected '=' in derived declaration")
                 .ok()?;
             let body = this.parse_expr()?;
 
             let end = this.prev_span();
             Some(Decl {
-                node: DeclKind::Derived {
-                    name,
-                    ty: None,
-                    body,
-                },
+                node: DeclKind::Derived { name, ty, body },
                 span: Span::new(start.start, end.end),
                 exported: false,
             })
@@ -930,6 +956,24 @@ impl Parser {
                 // Type signature — parse it and try to attach to next definition.
                 this.advance(); // consume `:`
                 let ts = this.parse_type_scheme();
+
+                // Inline form: `name : Type = body` (no newline, no name repeat).
+                if this.at(&TokenKind::Eq) {
+                    this.advance(); // consume `=`
+                    if let Some(body) = this.parse_expr() {
+                        let end = this.prev_span();
+                        return Some(Decl {
+                            node: DeclKind::Fun {
+                                name,
+                                ty: ts,
+                                body: Some(body),
+                            },
+                            span: Span::new(start.start, end.end),
+                            exported: false,
+                        });
+                    }
+                }
+
                 this.skip_newlines();
 
                 // Now check if the next line is the definition body.

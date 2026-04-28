@@ -2301,6 +2301,49 @@ fn function_with_type_signature_and_body() {
 }
 
 #[test]
+fn function_with_inline_type_signature() {
+    let src = r"add : Int -> Int -> Int = \x y -> x + y";
+    let m = parse_ok(src);
+    assert_eq!(m.decls.len(), 1);
+    match &m.decls[0].node {
+        DeclKind::Fun { name, ty, body: Some(body), .. } => {
+            assert_eq!(name, "add");
+            assert!(ty.is_some());
+            assert!(matches!(&body.node, ExprKind::Lambda { .. }));
+        }
+        other => panic!("expected Fun, got {:?}", other),
+    }
+}
+
+#[test]
+fn view_with_inline_type_annotation() {
+    let src = r"*active : [Int] = []";
+    let m = parse_ok(src);
+    assert_eq!(m.decls.len(), 1);
+    match &m.decls[0].node {
+        DeclKind::View { name, ty, .. } => {
+            assert_eq!(name, "active");
+            assert!(ty.is_some());
+        }
+        other => panic!("expected View, got {:?}", other),
+    }
+}
+
+#[test]
+fn derived_with_inline_type_annotation() {
+    let src = r"&seniors : [Int] = []";
+    let m = parse_ok(src);
+    assert_eq!(m.decls.len(), 1);
+    match &m.decls[0].node {
+        DeclKind::Derived { name, ty, .. } => {
+            assert_eq!(name, "seniors");
+            assert!(ty.is_some());
+        }
+        other => panic!("expected Derived, got {:?}", other),
+    }
+}
+
+#[test]
 fn trait_method_with_constraint() {
     let src = "trait Collection c where\n  toList : Eq a => c a -> [a]";
     match first_decl(src) {

@@ -595,35 +595,106 @@ impl EffectChecker {
             None => return,
         };
 
-        // Walk the type to find an Effectful wrapper
-        if let Some(declared) = extract_effects(&scheme.ty) {
-            if !inferred.is_subset_of(&declared) {
-                let extra = inferred.difference(&declared);
-                self.diagnostics.push(
-                    Diagnostic::error("inferred effects exceed declared effects")
-                        .label(decl_span, "this declaration")
-                        .note(format!("declared effects: {}", declared))
-                        .note(format!("inferred effects: {}", inferred))
-                        .note(format!("undeclared effects: {}", extra)),
-                );
+        match extract_declared_effects(&scheme.ty) {
+            Some(DeclaredEffects::Effectful(declared)) => {
+                if !inferred.is_subset_of(&declared) {
+                    let extra = inferred.difference(&declared);
+                    self.diagnostics.push(
+                        Diagnostic::error("inferred effects exceed declared effects")
+                            .label(decl_span, "this declaration")
+                            .note(format!("declared effects: {}", declared))
+                            .note(format!("inferred effects: {}", inferred))
+                            .note(format!("undeclared effects: {}", extra)),
+                    );
+                }
             }
+            // `IO {effects} a` syntax constrains only IO-level effects
+            // (console/fs/network/clock/random). Relation reads/writes are
+            // not expressible in IO-type syntax and remain unconstrained.
+            Some(DeclaredEffects::Io(declared)) => {
+                let inferred_io = io_only(inferred);
+                if !inferred_io.is_subset_of(&declared) {
+                    let extra = inferred_io.difference(&declared);
+                    self.diagnostics.push(
+                        Diagnostic::error("inferred effects exceed declared effects")
+                            .label(decl_span, "this declaration")
+                            .note(format!("declared effects: {}", declared))
+                            .note(format!("inferred effects: {}", inferred_io))
+                            .note(format!("undeclared effects: {}", extra)),
+                    );
+                }
+            }
+            None => {}
         }
     }
 }
 
-/// Extract effect set from a type, if it has an Effectful wrapper.
-fn extract_effects(ty: &ast::Type) -> Option<EffectSet> {
+enum DeclaredEffects {
+    /// Old-style `{reads *r, console} ty -> ty` — checked against all effects.
+    Effectful(EffectSet),
+    /// New-style `IO {effects} a` — checked only against IO-level effects.
+    Io(EffectSet),
+}
+
+/// IO effect strings that may appear inside `IO {…} a`.
+fn io_effect_set_from_strings(strs: &[String]) -> EffectSet {
+    let mut set = EffectSet::empty();
+    for s in strs {
+        match s.as_str() {
+            "console" => set.console = true,
+            "network" => set.network = true,
+            "fs" => set.fs = true,
+            "clock" => set.clock = true,
+            "random" => set.random = true,
+            _ => {} // unknown effect names are reported by infer.rs
+        }
+    }
+    set
+}
+
+/// Project out only the IO-level effects from a full effect set.
+fn io_only(set: &EffectSet) -> EffectSet {
+    let mut out = EffectSet::empty();
+    out.console = set.console;
+    out.network = set.network;
+    out.fs = set.fs;
+    out.clock = set.clock;
+    out.random = set.random;
+    out
+}
+
+/// Extract declared effects from a type, if any.
+fn extract_declared_effects(ty: &ast::Type) -> Option<DeclaredEffects> {
     match &ty.node {
-        ast::TypeKind::Effectful { effects, .. } => Some(EffectSet::from_ast_effects(effects)),
+        ast::TypeKind::Effectful { effects, .. } => {
+            Some(DeclaredEffects::Effectful(EffectSet::from_ast_effects(effects)))
+        }
+        ast::TypeKind::IO { effects, .. } => {
+            Some(DeclaredEffects::Io(io_effect_set_from_strings(effects)))
+        }
         ast::TypeKind::Function { param, result } => {
-            // Effects could be on either side of the function arrow — union both
-            match (extract_effects(param), extract_effects(result)) {
-                (Some(a), Some(b)) => Some(a.union(&b)),
-                (a @ Some(_), None) => a,
+            // Effects can appear on either side of the arrow.
+            match (extract_declared_effects(param), extract_declared_effects(result)) {
+                (Some(a), Some(b)) => Some(merge_declared(a, b)),
+                (Some(a), None) => Some(a),
                 (None, b) => b,
             }
         }
         _ => None,
+    }
+}
+
+fn merge_declared(a: DeclaredEffects, b: DeclaredEffects) -> DeclaredEffects {
+    match (a, b) {
+        (DeclaredEffects::Effectful(x), DeclaredEffects::Effectful(y)) => {
+            DeclaredEffects::Effectful(x.union(&y))
+        }
+        (DeclaredEffects::Io(x), DeclaredEffects::Io(y)) => DeclaredEffects::Io(x.union(&y)),
+        // Mixed annotations: prefer the looser Effectful check (it covers more).
+        (DeclaredEffects::Effectful(x), DeclaredEffects::Io(y))
+        | (DeclaredEffects::Io(y), DeclaredEffects::Effectful(x)) => {
+            DeclaredEffects::Effectful(x.union(&y))
+        }
     }
 }
 
@@ -1060,6 +1131,71 @@ mod tests {
         assert!(diags.is_empty());
         assert!(effects["f"].reads.contains("a"));
         assert!(effects["f"].reads.contains("b"));
+    }
+
+    #[test]
+    fn io_annotation_empty_rejects_console() {
+        // f : IO {} {}
+        // f = \_ -> println "hello"
+        let body = spanned(ExprKind::Lambda {
+            params: vec![spanned(PatKind::Var("x".into()))],
+            body: Box::new(spanned(ExprKind::App {
+                func: Box::new(spanned(ExprKind::Var("println".into()))),
+                arg: Box::new(spanned(ExprKind::Lit(Literal::Text("hi".into())))),
+            })),
+        });
+        let ty = TypeScheme {
+            constraints: vec![],
+            ty: spanned(TypeKind::IO {
+                effects: vec![],
+                ty: Box::new(spanned(TypeKind::Record { fields: vec![], rest: None })),
+            }),
+        };
+        let (diags, _) = check_module(vec![make_fun_with_type("f", body, ty)]);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("exceed"));
+    }
+
+    #[test]
+    fn io_annotation_with_console_accepts_println() {
+        // f : IO {console} {}
+        let body = spanned(ExprKind::Lambda {
+            params: vec![spanned(PatKind::Var("x".into()))],
+            body: Box::new(spanned(ExprKind::App {
+                func: Box::new(spanned(ExprKind::Var("println".into()))),
+                arg: Box::new(spanned(ExprKind::Lit(Literal::Text("hi".into())))),
+            })),
+        });
+        let ty = TypeScheme {
+            constraints: vec![],
+            ty: spanned(TypeKind::IO {
+                effects: vec!["console".into()],
+                ty: Box::new(spanned(TypeKind::Record { fields: vec![], rest: None })),
+            }),
+        };
+        let (diags, _) = check_module(vec![make_fun_with_type("f", body, ty)]);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn io_annotation_does_not_constrain_reads_writes() {
+        // f : IO {} [T] — reading a relation is fine, IO syntax doesn't
+        // express reads/writes
+        let body = spanned(ExprKind::SourceRef("people".into()));
+        let ty = TypeScheme {
+            constraints: vec![],
+            ty: spanned(TypeKind::IO {
+                effects: vec![],
+                ty: Box::new(spanned(TypeKind::Relation(Box::new(spanned(
+                    TypeKind::Named("T".into()),
+                ))))),
+            }),
+        };
+        let (diags, _) = check_module(vec![
+            make_source("people"),
+            make_fun_with_type("f", body, ty),
+        ]);
+        assert!(diags.is_empty());
     }
 
     #[test]

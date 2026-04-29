@@ -3194,30 +3194,14 @@ impl Parser {
                 if name == "IO" && matches!(self.peek(), TokenKind::LBrace) {
                     // Parse IO {effects} Type
                     self.advance(); // consume '{'
-                    let mut effects = Vec::new();
-                    loop {
-                        match self.peek() {
-                            TokenKind::RBrace => { self.advance(); break; }
-                            TokenKind::Lower(eff) => {
-                                let eff_name = eff.clone();
-                                self.advance();
-                                effects.push(eff_name);
-                                if matches!(self.peek(), TokenKind::Comma) {
-                                    self.advance();
-                                }
-                            }
-                            _ => {
-                                self.error("expected effect name or '}'");
-                                while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
-                                    self.advance();
-                                }
-                                if matches!(self.peek(), TokenKind::RBrace) {
-                                    self.advance();
-                                }
-                                break;
-                            }
-                        }
-                    }
+                    self.skip_newlines();
+                    let effects = if matches!(self.peek(), TokenKind::RBrace) {
+                        Vec::new()
+                    } else {
+                        self.try_parse_effects().unwrap_or_default()
+                    };
+                    self.expect(&TokenKind::RBrace, "expected '}' to close IO effect set")
+                        .ok()?;
                     let inner = self.parse_type_atom()?;
                     let span = Span::new(tok.span.start, inner.span.end);
                     Some(Spanned::new(TypeKind::IO { effects, ty: Box::new(inner) }, span))

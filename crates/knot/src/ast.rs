@@ -436,7 +436,7 @@ pub enum TypeKind {
 
     /// `IO {effects} a` — IO monad type with effect set.
     IO {
-        effects: Vec<String>,
+        effects: Vec<Effect>,
         ty: Box<Type>,
     },
 

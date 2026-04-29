@@ -1841,20 +1841,18 @@ impl Infer {
             }
             ast::TypeKind::Effectful { ty, .. } => self.ast_type_to_ty(ty),
             ast::TypeKind::IO { effects, ty: inner_ty } => {
+                // The type-system layer only tracks IO-level effects
+                // (console/fs/network/clock/random). Reads/writes are tracked
+                // separately by the effect-checker pass and are erased here.
                 let mut io_effects = BTreeSet::new();
                 for e in effects {
-                    match e.as_str() {
-                        "console" => { io_effects.insert(IoEffect::Console); }
-                        "fs" => { io_effects.insert(IoEffect::Fs); }
-                        "network" => { io_effects.insert(IoEffect::Network); }
-                        "clock" => { io_effects.insert(IoEffect::Clock); }
-                        "random" => { io_effects.insert(IoEffect::Random); }
-                        unknown => {
-                            self.error(
-                                format!("unknown IO effect '{}' (expected one of: console, fs, network, clock, random)", unknown),
-                                ty.span,
-                            );
-                        }
+                    match e {
+                        ast::Effect::Console => { io_effects.insert(IoEffect::Console); }
+                        ast::Effect::Fs => { io_effects.insert(IoEffect::Fs); }
+                        ast::Effect::Network => { io_effects.insert(IoEffect::Network); }
+                        ast::Effect::Clock => { io_effects.insert(IoEffect::Clock); }
+                        ast::Effect::Random => { io_effects.insert(IoEffect::Random); }
+                        ast::Effect::Reads(_) | ast::Effect::Writes(_) => {}
                     }
                 }
                 Ty::IO(io_effects, Box::new(self.ast_type_to_ty(inner_ty)))

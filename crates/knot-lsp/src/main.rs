@@ -5537,7 +5537,8 @@ fn format_type_kind(ty: &TypeKind) -> String {
             if effects.is_empty() {
                 format!("IO {}", format_type_kind(&ty.node))
             } else {
-                format!("IO {{{}}} {}", effects.join(", "), format_type_kind(&ty.node))
+                let effs: Vec<String> = effects.iter().map(format_effect).collect();
+                format!("IO {{{}}} {}", effs.join(", "), format_type_kind(&ty.node))
             }
         }
         TypeKind::Hole => "_".into(),

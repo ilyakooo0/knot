@@ -595,106 +595,40 @@ impl EffectChecker {
             None => return,
         };
 
-        match extract_declared_effects(&scheme.ty) {
-            Some(DeclaredEffects::Effectful(declared)) => {
-                if !inferred.is_subset_of(&declared) {
-                    let extra = inferred.difference(&declared);
-                    self.diagnostics.push(
-                        Diagnostic::error("inferred effects exceed declared effects")
-                            .label(decl_span, "this declaration")
-                            .note(format!("declared effects: {}", declared))
-                            .note(format!("inferred effects: {}", inferred))
-                            .note(format!("undeclared effects: {}", extra)),
-                    );
-                }
+        if let Some(declared) = extract_effects(&scheme.ty) {
+            if !inferred.is_subset_of(&declared) {
+                let extra = inferred.difference(&declared);
+                self.diagnostics.push(
+                    Diagnostic::error("inferred effects exceed declared effects")
+                        .label(decl_span, "this declaration")
+                        .note(format!("declared effects: {}", declared))
+                        .note(format!("inferred effects: {}", inferred))
+                        .note(format!("undeclared effects: {}", extra)),
+                );
             }
-            // `IO {effects} a` syntax constrains only IO-level effects
-            // (console/fs/network/clock/random). Relation reads/writes are
-            // not expressible in IO-type syntax and remain unconstrained.
-            Some(DeclaredEffects::Io(declared)) => {
-                let inferred_io = io_only(inferred);
-                if !inferred_io.is_subset_of(&declared) {
-                    let extra = inferred_io.difference(&declared);
-                    self.diagnostics.push(
-                        Diagnostic::error("inferred effects exceed declared effects")
-                            .label(decl_span, "this declaration")
-                            .note(format!("declared effects: {}", declared))
-                            .note(format!("inferred effects: {}", inferred_io))
-                            .note(format!("undeclared effects: {}", extra)),
-                    );
-                }
-            }
-            None => {}
         }
     }
 }
 
-enum DeclaredEffects {
-    /// Old-style `{reads *r, console} ty -> ty` — checked against all effects.
-    Effectful(EffectSet),
-    /// New-style `IO {effects} a` — checked only against IO-level effects.
-    Io(EffectSet),
-}
-
-/// IO effect strings that may appear inside `IO {…} a`.
-fn io_effect_set_from_strings(strs: &[String]) -> EffectSet {
-    let mut set = EffectSet::empty();
-    for s in strs {
-        match s.as_str() {
-            "console" => set.console = true,
-            "network" => set.network = true,
-            "fs" => set.fs = true,
-            "clock" => set.clock = true,
-            "random" => set.random = true,
-            _ => {} // unknown effect names are reported by infer.rs
-        }
-    }
-    set
-}
-
-/// Project out only the IO-level effects from a full effect set.
-fn io_only(set: &EffectSet) -> EffectSet {
-    let mut out = EffectSet::empty();
-    out.console = set.console;
-    out.network = set.network;
-    out.fs = set.fs;
-    out.clock = set.clock;
-    out.random = set.random;
-    out
-}
-
-/// Extract declared effects from a type, if any.
-fn extract_declared_effects(ty: &ast::Type) -> Option<DeclaredEffects> {
+/// Extract the declared effect set from a type, if any.
+///
+/// Both `{effects} a -> b` (old syntax) and `IO {effects} a` (new syntax)
+/// declare effect sets, including reads/writes. The two syntaxes share the
+/// same `Effect` AST representation, so the same conversion applies.
+fn extract_effects(ty: &ast::Type) -> Option<EffectSet> {
     match &ty.node {
-        ast::TypeKind::Effectful { effects, .. } => {
-            Some(DeclaredEffects::Effectful(EffectSet::from_ast_effects(effects)))
-        }
-        ast::TypeKind::IO { effects, .. } => {
-            Some(DeclaredEffects::Io(io_effect_set_from_strings(effects)))
+        ast::TypeKind::Effectful { effects, .. } | ast::TypeKind::IO { effects, .. } => {
+            Some(EffectSet::from_ast_effects(effects))
         }
         ast::TypeKind::Function { param, result } => {
             // Effects can appear on either side of the arrow.
-            match (extract_declared_effects(param), extract_declared_effects(result)) {
-                (Some(a), Some(b)) => Some(merge_declared(a, b)),
-                (Some(a), None) => Some(a),
+            match (extract_effects(param), extract_effects(result)) {
+                (Some(a), Some(b)) => Some(a.union(&b)),
+                (a @ Some(_), None) => a,
                 (None, b) => b,
             }
         }
         _ => None,
-    }
-}
-
-fn merge_declared(a: DeclaredEffects, b: DeclaredEffects) -> DeclaredEffects {
-    match (a, b) {
-        (DeclaredEffects::Effectful(x), DeclaredEffects::Effectful(y)) => {
-            DeclaredEffects::Effectful(x.union(&y))
-        }
-        (DeclaredEffects::Io(x), DeclaredEffects::Io(y)) => DeclaredEffects::Io(x.union(&y)),
-        // Mixed annotations: prefer the looser Effectful check (it covers more).
-        (DeclaredEffects::Effectful(x), DeclaredEffects::Io(y))
-        | (DeclaredEffects::Io(y), DeclaredEffects::Effectful(x)) => {
-            DeclaredEffects::Effectful(x.union(&y))
-        }
     }
 }
 
@@ -1169,7 +1103,7 @@ mod tests {
         let ty = TypeScheme {
             constraints: vec![],
             ty: spanned(TypeKind::IO {
-                effects: vec!["console".into()],
+                effects: vec![Effect::Console],
                 ty: Box::new(spanned(TypeKind::Record { fields: vec![], rest: None })),
             }),
         };
@@ -1178,14 +1112,34 @@ mod tests {
     }
 
     #[test]
-    fn io_annotation_does_not_constrain_reads_writes() {
-        // f : IO {} [T] — reading a relation is fine, IO syntax doesn't
-        // express reads/writes
+    fn io_annotation_empty_rejects_reads() {
+        // f : IO {} [T] — reading from a source should be rejected
         let body = spanned(ExprKind::SourceRef("people".into()));
         let ty = TypeScheme {
             constraints: vec![],
             ty: spanned(TypeKind::IO {
                 effects: vec![],
+                ty: Box::new(spanned(TypeKind::Relation(Box::new(spanned(
+                    TypeKind::Named("T".into()),
+                ))))),
+            }),
+        };
+        let (diags, _) = check_module(vec![
+            make_source("people"),
+            make_fun_with_type("f", body, ty),
+        ]);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("exceed"));
+    }
+
+    #[test]
+    fn io_annotation_with_reads_accepts_source_ref() {
+        // f : IO {reads *people} [T] — reads declared, source ref allowed
+        let body = spanned(ExprKind::SourceRef("people".into()));
+        let ty = TypeScheme {
+            constraints: vec![],
+            ty: spanned(TypeKind::IO {
+                effects: vec![Effect::Reads("people".into())],
                 ty: Box::new(spanned(TypeKind::Relation(Box::new(spanned(
                     TypeKind::Named("T".into()),
                 ))))),

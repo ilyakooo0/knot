@@ -2439,6 +2439,118 @@ fn multiple_constraints() {
     }
 }
 
+#[test]
+fn multiline_type_signature_break_before_arrow() {
+    // Newline before each `->`
+    let src = "add : Int\n   -> Int\n   -> Int\nadd = \\x y -> x + y";
+    let m = parse_ok(src);
+    let fun = m
+        .decls
+        .iter()
+        .find(|d| matches!(&d.node, DeclKind::Fun { name, .. } if name == "add"))
+        .expect("should find 'add'");
+    match &fun.node {
+        DeclKind::Fun { ty: Some(ts), body: Some(_), .. } => {
+            // Int -> (Int -> Int)
+            match &ts.ty.node {
+                TypeKind::Function { result, .. } => {
+                    assert!(matches!(&result.node, TypeKind::Function { .. }));
+                }
+                other => panic!("expected nested Function type, got {:?}", other),
+            }
+        }
+        other => panic!("expected Fun with type and body, got {:?}", other),
+    }
+}
+
+#[test]
+fn multiline_type_signature_break_after_arrow() {
+    // Newline after each `->` (already supported, regression check).
+    let src = "add : Int ->\n      Int ->\n      Int\nadd = \\x y -> x + y";
+    let m = parse_ok(src);
+    let fun = m
+        .decls
+        .iter()
+        .find(|d| matches!(&d.node, DeclKind::Fun { name, .. } if name == "add"))
+        .expect("should find 'add'");
+    match &fun.node {
+        DeclKind::Fun { ty: Some(ts), .. } => match &ts.ty.node {
+            TypeKind::Function { result, .. } => {
+                assert!(matches!(&result.node, TypeKind::Function { .. }));
+            }
+            other => panic!("expected nested Function type, got {:?}", other),
+        },
+        other => panic!("expected Fun with type signature, got {:?}", other),
+    }
+}
+
+#[test]
+fn multiline_type_signature_break_before_fat_arrow() {
+    // Newline before each `=>`
+    let src = "trait C c where\n  m : Ord a\n   => Eq a\n   => c a -> c a";
+    match first_decl(src) {
+        DeclKind::Trait { items, .. } => match &items[0] {
+            TraitItem::Method { ty, .. } => {
+                assert_eq!(ty.constraints.len(), 2);
+                assert_eq!(ty.constraints[0].trait_name, "Ord");
+                assert_eq!(ty.constraints[1].trait_name, "Eq");
+            }
+            other => panic!("expected Method, got {:?}", other),
+        },
+        other => panic!("expected Trait, got {:?}", other),
+    }
+}
+
+#[test]
+fn multiline_type_signature_break_after_fat_arrow() {
+    // Newline after each `=>`
+    let src = "trait C c where\n  m : Ord a =>\n      Eq a =>\n      c a -> c a";
+    match first_decl(src) {
+        DeclKind::Trait { items, .. } => match &items[0] {
+            TraitItem::Method { ty, .. } => {
+                assert_eq!(ty.constraints.len(), 2);
+                assert_eq!(ty.constraints[0].trait_name, "Ord");
+                assert_eq!(ty.constraints[1].trait_name, "Eq");
+            }
+            other => panic!("expected Method, got {:?}", other),
+        },
+        other => panic!("expected Trait, got {:?}", other),
+    }
+}
+
+#[test]
+fn multiline_type_signature_constraints_and_arrows() {
+    // Constraints split across lines, then function type also split.
+    let src = "trait C c where\n  m : Ord a\n   => Eq a\n   => c a\n   -> c a\n   -> [a]";
+    match first_decl(src) {
+        DeclKind::Trait { items, .. } => match &items[0] {
+            TraitItem::Method { ty, .. } => {
+                assert_eq!(ty.constraints.len(), 2);
+                // c a -> (c a -> [a])
+                match &ty.ty.node {
+                    TypeKind::Function { result, .. } => {
+                        assert!(matches!(&result.node, TypeKind::Function { .. }));
+                    }
+                    other => panic!("expected nested Function type, got {:?}", other),
+                }
+            }
+            other => panic!("expected Method, got {:?}", other),
+        },
+        other => panic!("expected Trait, got {:?}", other),
+    }
+}
+
+#[test]
+fn multiline_type_signature_does_not_consume_next_decl() {
+    // Bare type signature followed by another decl on the next line —
+    // the parser must not treat the next decl's tokens as part of the type.
+    let src = "foo : Int\nbar : Int";
+    let m = parse_ok(src);
+    assert_eq!(m.decls.len(), 2);
+    assert!(matches!(&m.decls[0].node, DeclKind::Fun { name, body: None, .. } if name == "foo"));
+    assert!(matches!(&m.decls[1].node, DeclKind::Fun { name, body: None, .. } if name == "bar"));
+}
+
 // ── Trait/Impl Advanced ─────────────────────────────────────────────
 
 #[test]

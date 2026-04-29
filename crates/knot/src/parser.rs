@@ -1679,6 +1679,8 @@ impl Parser {
         let mut constraints = Vec::new();
         loop {
             let saved = self.save();
+            // Allow newlines between constraints (e.g. after a previous `=>`).
+            self.skip_newlines();
             if matches!(self.peek(), TokenKind::Upper(_)) {
                 let tok = self.advance();
                 let TokenKind::Upper(trait_name) = tok.kind else { unreachable!() };
@@ -1695,6 +1697,9 @@ impl Parser {
                         break;
                     }
                 }
+                // Allow `=>` on the next line.
+                let pre_arrow = self.save();
+                self.skip_newlines();
                 if self.eat(&TokenKind::FatArrow) {
                     constraints.push(Constraint {
                         trait_name,
@@ -1702,6 +1707,7 @@ impl Parser {
                     });
                     continue;
                 }
+                self.restore(pre_arrow);
             }
             self.restore(saved);
             break;
@@ -3115,6 +3121,9 @@ impl Parser {
 
     fn parse_type_function(&mut self) -> Option<Type> {
         let lhs = self.parse_type_refined()?;
+        // Allow `->` on the next line by peeking past newlines.
+        let saved = self.save();
+        self.skip_newlines();
         if self.eat(&TokenKind::Arrow) {
             if !self.enter_recursion() { return None; }
             self.skip_newlines();
@@ -3130,6 +3139,7 @@ impl Parser {
                 span,
             ))
         } else {
+            self.restore(saved);
             Some(lhs)
         }
     }
@@ -3544,6 +3554,8 @@ impl Parser {
             self.diagnostics.truncate(diag_count);
             vec![]
         };
+        // Allow the type body to begin on a new line (after `:` or after `=>`).
+        self.skip_newlines();
         let ty = self.parse_type()?;
         Some(TypeScheme { constraints, ty })
     }

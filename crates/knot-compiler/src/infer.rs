@@ -234,6 +234,11 @@ enum Ty {
     /// explicit `forall a. T` syntax. Only legal in function arg/result
     /// positions; never inside Record/Variant/Con/App.
     Forall(Vec<TyVar>, Box<Ty>),
+    /// Named type alias preserved through inference. The wrapped type is
+    /// the fully-resolved expansion. Unification and structural matching
+    /// look through the alias; display preserves the name so type hints
+    /// reference the alias instead of the expanded form.
+    Alias(String, Box<Ty>),
     /// Error sentinel — suppresses cascading errors.
     Error,
 }
@@ -241,6 +246,19 @@ enum Ty {
 impl Ty {
     fn unit() -> Ty {
         Ty::Record(BTreeMap::new(), None)
+    }
+
+    /// Strip outer `Ty::Alias` wrappers to expose the underlying type.
+    /// Used at structural-inspection sites (case exhaustiveness, unary
+    /// ops, monad detection, etc.) so callers don't have to handle the
+    /// wrapper case explicitly. Unification peels at the entry point, so
+    /// most other call sites don't need this helper.
+    fn peel_alias(&self) -> &Ty {
+        let mut t = self;
+        while let Ty::Alias(_, inner) = t {
+            t = inner;
+        }
+        t
     }
 }
 
@@ -739,6 +757,9 @@ impl Infer {
             Ty::Forall(vars, inner) => {
                 Ty::Forall(vars.clone(), Box::new(self.apply(inner)))
             }
+            Ty::Alias(name, inner) => {
+                Ty::Alias(name.clone(), Box::new(self.apply(inner)))
+            }
             _ => ty.clone(),
         }
     }
@@ -873,6 +894,7 @@ impl Infer {
                     self.occurs_in(var, inner)
                 }
             }
+            Ty::Alias(_, inner) => self.occurs_in(var, inner),
             _ => false,
         }
     }
@@ -917,6 +939,17 @@ impl Infer {
 
         match (&t1, &t2) {
             (Ty::Error, _) | (_, Ty::Error) => {}
+            // Peel alias wrappers — they're transparent to unification.
+            (Ty::Alias(_, inner), _) => {
+                let inner = (**inner).clone();
+                self.unify(&inner, &t2, span);
+                return;
+            }
+            (_, Ty::Alias(_, inner)) => {
+                let inner = (**inner).clone();
+                self.unify(&t1, &inner, span);
+                return;
+            }
             (Ty::Var(a), Ty::Var(b)) if a == b => {}
             (Ty::Var(a), Ty::Var(b)) => {
                 // When unifying two variables, bind the non-skolem one
@@ -1947,6 +1980,7 @@ impl Infer {
                 }
                 out.extend(inner_set);
             }
+            Ty::Alias(_, inner) => self.collect_free_vars(inner, out),
             _ => {}
         }
     }
@@ -2029,7 +2063,15 @@ impl Infer {
                 "[]" => Ty::TyCon("[]".into()),
                 _ => {
                     if let Some(aliased) = self.aliases.get(name).cloned() {
-                        aliased
+                        // Wrap nullary alias references so the name flows
+                        // through inference into LSP type hints. Skip the
+                        // wrapper when the alias already names itself
+                        // (e.g. data-as-alias for single-variant ADTs).
+                        match &aliased {
+                            Ty::Con(n, args) if n == name && args.is_empty() => aliased,
+                            Ty::Alias(n, _) if n == name => aliased,
+                            _ => Ty::Alias(name.clone(), Box::new(aliased)),
+                        }
                     } else if self
                         .data_types
                         .get(name)
@@ -2400,6 +2442,7 @@ impl Infer {
                     }
                 }
             }
+            Ty::Alias(name, _) => name.clone(),
             Ty::Error => "<error>".into(),
         }
     }
@@ -2695,7 +2738,7 @@ impl Infer {
                     ast::UnaryOp::Neg => {
                         // numeric negation — reject known non-numeric types
                         let resolved = self.apply(&operand_ty);
-                        match &resolved {
+                        match resolved.peel_alias() {
                             Ty::Int | Ty::Float | Ty::IntUnit(_) | Ty::FloatUnit(_) | Ty::Var(_) | Ty::Error => {}
                             _ => {
                                 self.error(
@@ -3294,7 +3337,8 @@ impl Infer {
         arms: &[ast::CaseArm],
         span: Span,
     ) {
-        // Resolve the scrutinee type through substitution.
+        // Resolve the scrutinee type through substitution and peel any
+        // alias wrappers so exhaustiveness sees the underlying ADT shape.
         let resolved = self.apply(scrut_ty);
 
         // If any arm has an unconditional catch-all pattern (wildcard or
@@ -3309,7 +3353,7 @@ impl Infer {
             return;
         }
 
-        match &resolved {
+        match resolved.peel_alias() {
             Ty::Con(name, _) => {
                 let data_info = match self.data_types.get(name) {
                     Some(info) => info.clone(),
@@ -3802,11 +3846,11 @@ impl Infer {
                         // should itself be a list (e.g. from a case with yield/[]
                         // arms). Use it as the do-block type directly.
                         let applied = self.apply(&last);
-                        match &applied {
+                        match applied.peel_alias() {
                             Ty::Relation(_) => applied,
                             Ty::App(f, _) => {
                                 let f_applied = self.apply(f);
-                                if matches!(&f_applied, Ty::TyCon(n) if n == "[]") {
+                                if matches!(f_applied.peel_alias(), Ty::TyCon(n) if n == "[]") {
                                     applied
                                 } else {
                                     Ty::Relation(Box::new(Ty::unit()))
@@ -4030,7 +4074,7 @@ impl Infer {
     /// Get the type name of a resolved Ty for impl lookup.
     fn type_name_of(&self, ty: &Ty) -> Option<String> {
         let resolved = self.apply(ty);
-        match &resolved {
+        match resolved.peel_alias() {
             Ty::Int => Some("Int".into()),
             Ty::Float => Some("Float".into()),
             Ty::Text => Some("Text".into()),
@@ -5556,6 +5600,7 @@ fn collect_vars_ordered(ty: &Ty, out: &mut Vec<TyVar>) {
                 }
             }
         }
+        Ty::Alias(_, inner) => collect_vars_ordered(inner, out),
         _ => {}
     }
 }
@@ -5714,6 +5759,7 @@ fn display_ty_clean_inner(ty: &Ty, names: &HashMap<TyVar, usize>, in_fun: bool) 
                 }
             }
         }
+        Ty::Alias(name, _) => name.clone(),
         Ty::Error => "<error>".into(),
     }
 }
@@ -5768,7 +5814,7 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
     let mut monad_info = MonadInfo::new();
     for (span, m_var) in &infer.monad_vars {
         let resolved = infer.apply(&Ty::Var(*m_var));
-        let kind = match &resolved {
+        let kind = match resolved.peel_alias() {
             Ty::TyCon(name) if name == "[]" => MonadKind::Relation,
             Ty::TyCon(name) if name == "IO" => MonadKind::IO,
             Ty::TyCon(name) => MonadKind::Adt(name.clone()),
@@ -5875,6 +5921,13 @@ mod tests {
         crate::desugar::desugar(&mut module);
         let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json) = check(&module);
         diags
+    }
+
+    fn type_info_for(src: &str) -> TypeInfo {
+        let mut module = parse(src);
+        crate::desugar::desugar(&mut module);
+        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json) = check(&module);
+        type_info
     }
 
     fn has_error(diags: &[Diagnostic], needle: &str) -> bool {
@@ -6953,6 +7006,135 @@ main = applyPred (\\r -> r.x == r.y)\
              main = 1"
         );
         assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn alias_preserved_in_record_type_hint() {
+        // type Person = {...} should appear as "Person" in the inferred
+        // type of any function that mentions it, not as the expanded form.
+        let info = type_info_for(
+            "type Person = {name: Text, age: Int}\n\
+             greet : Person -> Text\n\
+             greet = \\p -> p.name\n\
+             main = 1"
+        );
+        let ty = info.get("greet").expect("missing greet type");
+        assert!(
+            ty.contains("Person") && !ty.contains("name: Text"),
+            "expected alias preserved, got {}",
+            ty
+        );
+    }
+
+    #[test]
+    fn alias_preserved_in_text_synonym() {
+        let info = type_info_for(
+            "type UserId = Text\n\
+             format : UserId -> Text\n\
+             format = \\u -> u\n\
+             main = 1"
+        );
+        let ty = info.get("format").expect("missing format type");
+        assert!(
+            ty.contains("UserId"),
+            "expected UserId in type, got {}",
+            ty
+        );
+    }
+
+    #[test]
+    fn alias_record_field_access_works() {
+        // Field access through an alias must still type-check — the
+        // structural inspection has to peel the alias to find the field.
+        let diags = check_src(
+            "type Person = {name: Text, age: Int}\n\
+             greet : Person -> Text\n\
+             greet = \\p -> p.name\n\
+             main = greet {name: \"Alice\", age: 30}"
+        );
+        assert!(diags.is_empty(), "diagnostics: {:?}", diags);
+    }
+
+    #[test]
+    fn alias_relation_bind_typechecks() {
+        // *people : [Person]; reading from it must still typecheck.
+        let diags = check_src(
+            "type Person = {name: Text, age: Int}\n\
+             *people : [Person]\n\
+             main = do\n\
+               set *people = [{name: \"A\", age: 1}]\n\
+               p <- *people\n\
+               yield p.name"
+        );
+        assert!(diags.is_empty(), "diagnostics: {:?}", diags);
+    }
+
+    #[test]
+    fn alias_for_function_type() {
+        // type Handler = Int -> Text; calling a Handler must work.
+        let diags = check_src(
+            "type Handler = Int -> Text\n\
+             apply : Handler -> Int -> Text\n\
+             apply = \\h x -> h x\n\
+             main = apply (\\n -> show n) 42"
+        );
+        assert!(diags.is_empty(), "diagnostics: {:?}", diags);
+    }
+
+    #[test]
+    fn alias_subsumes_base_type() {
+        // Bidirectional compatibility: alias and base should interoperate.
+        let diags = check_src(
+            "type UserId = Text\n\
+             toText : UserId -> Text\n\
+             toText = \\u -> u\n\
+             main = toText \"hello\""
+        );
+        assert!(diags.is_empty(), "diagnostics: {:?}", diags);
+    }
+
+    #[test]
+    fn alias_unary_negation() {
+        // Negation on an aliased numeric type must work — the unary op
+        // path inspects the resolved type structurally.
+        let diags = check_src(
+            "type Cents = Int\n\
+             flip : Cents -> Cents\n\
+             flip = \\x -> -x\n\
+             main = flip 100"
+        );
+        assert!(diags.is_empty(), "diagnostics: {:?}", diags);
+    }
+
+    #[test]
+    fn alias_case_on_data_type() {
+        // Pattern matching on an aliased data type must pass exhaustiveness.
+        let diags = check_src(
+            "data Color = Red {} | Green {} | Blue {}\n\
+             type Hue = Color\n\
+             name : Hue -> Text\n\
+             name = \\h -> case h of\n  Red {} -> \"red\"\n  Green {} -> \"green\"\n  Blue {} -> \"blue\"\n\
+             main = name (Red {})"
+        );
+        assert!(diags.is_empty(), "diagnostics: {:?}", diags);
+    }
+
+    #[test]
+    fn alias_case_non_exhaustive_detected() {
+        // Exhaustiveness must still flag missing constructors when the
+        // scrutinee is an alias of a data type — the check has to peel.
+        let diags = check_src(
+            "data Color = Red {} | Green {} | Blue {}\n\
+             type Hue = Color\n\
+             name : Hue -> Text\n\
+             name = \\h -> case h of\n  Red {} -> \"red\"\n  Green {} -> \"green\"\n\
+             main = name (Red {})"
+        );
+        assert!(
+            has_error(&diags, "non-exhaustive"),
+            "expected non-exhaustive error, got: {:?}",
+            diags
+        );
     }
 }
 

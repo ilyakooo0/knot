@@ -1082,6 +1082,7 @@ mod tests {
             constraints: vec![],
             ty: spanned(TypeKind::IO {
                 effects: vec![],
+                rest: None,
                 ty: Box::new(spanned(TypeKind::Record { fields: vec![], rest: None })),
             }),
         };
@@ -1104,6 +1105,7 @@ mod tests {
             constraints: vec![],
             ty: spanned(TypeKind::IO {
                 effects: vec![Effect::Console],
+                rest: None,
                 ty: Box::new(spanned(TypeKind::Record { fields: vec![], rest: None })),
             }),
         };
@@ -1119,6 +1121,7 @@ mod tests {
             constraints: vec![],
             ty: spanned(TypeKind::IO {
                 effects: vec![],
+                rest: None,
                 ty: Box::new(spanned(TypeKind::Relation(Box::new(spanned(
                     TypeKind::Named("T".into()),
                 ))))),
@@ -1140,6 +1143,7 @@ mod tests {
             constraints: vec![],
             ty: spanned(TypeKind::IO {
                 effects: vec![Effect::Reads("people".into())],
+                rest: None,
                 ty: Box::new(spanned(TypeKind::Relation(Box::new(spanned(
                     TypeKind::Named("T".into()),
                 ))))),

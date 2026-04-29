@@ -707,8 +707,9 @@ fn apply_type_subst(ty: &Type, subst: &HashMap<String, Type>) -> Type {
             effects: effects.clone(),
             ty: Box::new(apply_type_subst(inner, subst)),
         },
-        TypeKind::IO { effects, ty: inner } => TypeKind::IO {
+        TypeKind::IO { effects, rest, ty: inner } => TypeKind::IO {
             effects: effects.clone(),
+            rest: rest.clone(),
             ty: Box::new(apply_type_subst(inner, subst)),
         },
         TypeKind::Hole => TypeKind::Hole,

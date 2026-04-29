@@ -2241,6 +2241,51 @@ fn effectful_type_all_io_effects() {
     }
 }
 
+#[test]
+fn io_type_with_effect_row_var() {
+    match first_decl("type X = IO {console | e} Int") {
+        DeclKind::TypeAlias { ty, .. } => match &ty.node {
+            TypeKind::IO { effects, rest, .. } => {
+                assert_eq!(effects.len(), 1);
+                assert!(matches!(&effects[0], Effect::Console));
+                assert_eq!(rest.as_deref(), Some("e"));
+            }
+            other => panic!("expected IO with rest, got {:?}", other),
+        },
+        other => panic!("expected TypeAlias, got {:?}", other),
+    }
+}
+
+#[test]
+fn io_type_with_only_effect_row() {
+    match first_decl("type X = IO {| e} Int") {
+        DeclKind::TypeAlias { ty, .. } => match &ty.node {
+            TypeKind::IO { effects, rest, .. } => {
+                assert!(effects.is_empty());
+                assert_eq!(rest.as_deref(), Some("e"));
+            }
+            other => panic!("expected IO with rest, got {:?}", other),
+        },
+        other => panic!("expected TypeAlias, got {:?}", other),
+    }
+}
+
+#[test]
+fn io_type_with_reads_and_row_var() {
+    match first_decl("type X = IO {reads *people, console | e} Int") {
+        DeclKind::TypeAlias { ty, .. } => match &ty.node {
+            TypeKind::IO { effects, rest, .. } => {
+                assert_eq!(effects.len(), 2);
+                assert!(matches!(&effects[0], Effect::Reads(n) if n == "people"));
+                assert!(matches!(&effects[1], Effect::Console));
+                assert_eq!(rest.as_deref(), Some("e"));
+            }
+            other => panic!("expected IO with rest, got {:?}", other),
+        },
+        other => panic!("expected TypeAlias, got {:?}", other),
+    }
+}
+
 // ── Variant Types ───────────────────────────────────────────────────
 
 #[test]

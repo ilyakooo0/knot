@@ -434,9 +434,11 @@ pub enum TypeKind {
         ty: Box<Type>,
     },
 
-    /// `IO {effects} a` — IO monad type with effect set.
+    /// `IO {effects} a` or `IO {effects | r} a` — IO monad type with effect set.
+    /// The optional `rest` is a row variable name for effect polymorphism.
     IO {
         effects: Vec<Effect>,
+        rest: Option<Name>,
         ty: Box<Type>,
     },
 

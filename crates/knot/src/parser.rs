@@ -3192,19 +3192,37 @@ impl Parser {
                 let tok = self.advance();
                 let TokenKind::Upper(name) = tok.kind else { unreachable!() };
                 if name == "IO" && matches!(self.peek(), TokenKind::LBrace) {
-                    // Parse IO {effects} Type
+                    // Parse IO {effects} Type or IO {effects | r} Type or IO {| r} Type
                     self.advance(); // consume '{'
                     self.skip_newlines();
-                    let effects = if matches!(self.peek(), TokenKind::RBrace) {
+                    let effects = if matches!(self.peek(), TokenKind::RBrace | TokenKind::Pipe) {
                         Vec::new()
                     } else {
                         self.try_parse_effects().unwrap_or_default()
                     };
+                    self.skip_newlines();
+                    let rest = if self.eat(&TokenKind::Pipe) {
+                        self.skip_newlines();
+                        match self.peek() {
+                            TokenKind::Lower(_) => {
+                                let tok = self.advance();
+                                let TokenKind::Lower(n) = tok.kind else { unreachable!() };
+                                Some(n)
+                            }
+                            _ => {
+                                self.error("expected effect row variable name after '|'");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    self.skip_newlines();
                     self.expect(&TokenKind::RBrace, "expected '}' to close IO effect set")
                         .ok()?;
                     let inner = self.parse_type_atom()?;
                     let span = Span::new(tok.span.start, inner.span.end);
-                    Some(Spanned::new(TypeKind::IO { effects, ty: Box::new(inner) }, span))
+                    Some(Spanned::new(TypeKind::IO { effects, rest, ty: Box::new(inner) }, span))
                 } else if (name == "Float" || name == "Int") && matches!(self.peek(), TokenKind::Lt) {
                     // Try Float<unit> or Int<unit> — no adjacency check in type context
                     let saved = self.save();

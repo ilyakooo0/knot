@@ -1,0 +1,12 @@
+-- schema.lock (auto-generated, do not edit)
+-- Commit to source control.
+
+data Priority = Low {} | Medium {} | High {} | Critical {}
+
+
+
+type Todo = {title: Text, owner: Text, priority: Priority}
+
+*todos : [Todo]
+
+

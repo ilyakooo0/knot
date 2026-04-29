@@ -23,8 +23,12 @@ pub enum MonadKind {
 }
 
 /// IO effect kinds tracked in the IO type.
+///
+/// Reads/Writes carry the source-relation name. Other effects are nullary tags.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum IoEffect {
+    Reads(String),
+    Writes(String),
     Console,
     Fs,
     Network,
@@ -210,8 +214,17 @@ enum Ty {
     TyCon(String),
     /// Type-level application (e.g. `f a` where `f` is a HK variable).
     App(Box<Ty>, Box<Ty>),
-    /// IO monad with tracked effects: IO {console, fs} a
-    IO(BTreeSet<IoEffect>, Box<Ty>),
+    /// IO monad with tracked effects and an optional row variable for
+    /// effect polymorphism: `IO {console, fs} a` or `IO {console | r} a`.
+    /// The row tail unifies with whatever extra effects the caller's
+    /// context introduces.
+    IO(BTreeSet<IoEffect>, Option<TyVar>, Box<Ty>),
+    /// Tail of an effect row — the binding form for an effect row variable.
+    /// `Ty::EffectRow(extras, tail)` says: "the original row variable now
+    /// stands for `extras`, possibly followed by another row variable
+    /// `tail`". Only legal as the right-hand side of a substitution for a
+    /// row variable that appeared in `Ty::IO`'s tail position.
+    EffectRow(BTreeSet<IoEffect>, Option<TyVar>),
     /// Int with unit of measure (compile-time only).
     IntUnit(UnitTy),
     /// Float with unit of measure (compile-time only).
@@ -704,8 +717,16 @@ impl Infer {
                 let a = self.apply(a);
                 Self::normalize_app(f, a)
             }
-            Ty::IO(effects, inner) => {
-                Ty::IO(effects.clone(), Box::new(self.apply(inner)))
+            Ty::IO(effects, row, inner) => {
+                let inner = self.apply(inner);
+                let (effects, row) =
+                    self.resolve_effect_row(effects.clone(), *row);
+                Ty::IO(effects, row, Box::new(inner))
+            }
+            Ty::EffectRow(effects, row) => {
+                let (effects, row) =
+                    self.resolve_effect_row(effects.clone(), *row);
+                Ty::EffectRow(effects, row)
             }
             Ty::IntUnit(u) => {
                 let u = self.apply_unit(u);
@@ -729,7 +750,7 @@ impl Infer {
         match f {
             Ty::TyCon(ref name) if name == "[]" => Ty::Relation(Box::new(a)),
             Ty::TyCon(ref name) if name == "IO" => {
-                Ty::IO(BTreeSet::new(), Box::new(a))
+                Ty::IO(BTreeSet::new(), None, Box::new(a))
             }
             Ty::TyCon(name) => Ty::Con(name, vec![a]),
             Ty::Con(name, mut args) => {
@@ -738,6 +759,37 @@ impl Infer {
             }
             _ => Ty::App(Box::new(f), Box::new(a)),
         }
+    }
+
+    // ── Effect-row helpers ───────────────────────────────────────
+
+    /// Walk an effect-row tail through the substitution, merging any
+    /// effects that have been bound to the chain. Returns the fully
+    /// resolved (effects, tail) pair.
+    fn resolve_effect_row(
+        &self,
+        mut effects: BTreeSet<IoEffect>,
+        mut row: Option<TyVar>,
+    ) -> (BTreeSet<IoEffect>, Option<TyVar>) {
+        while let Some(rv) = row {
+            match self.subst.get(&rv) {
+                Some(Ty::EffectRow(extras, tail)) => {
+                    for e in extras {
+                        effects.insert(e.clone());
+                    }
+                    row = *tail;
+                }
+                Some(Ty::Var(other)) => {
+                    if *other == rv {
+                        break;
+                    }
+                    row = Some(*other);
+                }
+                Some(_) => break,
+                None => break,
+            }
+        }
+        (effects, row)
     }
 
     // ── Occurs check ─────────────────────────────────────────────
@@ -790,7 +842,30 @@ impl Infer {
             Ty::App(f, a) => {
                 self.occurs_in(var, f) || self.occurs_in(var, a)
             }
-            Ty::IO(_, inner) => self.occurs_in(var, inner),
+            Ty::IO(_, row, inner) => {
+                if let Some(rv) = row {
+                    if *rv == var {
+                        return true;
+                    }
+                    if let Some(resolved) = self.subst.get(rv) {
+                        if self.occurs_in(var, resolved) {
+                            return true;
+                        }
+                    }
+                }
+                self.occurs_in(var, inner)
+            }
+            Ty::EffectRow(_, row) => {
+                if let Some(rv) = row {
+                    if *rv == var {
+                        return true;
+                    }
+                    if let Some(resolved) = self.subst.get(rv) {
+                        return self.occurs_in(var, resolved);
+                    }
+                }
+                false
+            }
             Ty::Forall(bound, inner) => {
                 if bound.contains(&var) {
                     false
@@ -908,9 +983,9 @@ impl Infer {
                 self.unify(f, &Ty::TyCon("[]".into()), span);
                 self.unify(a, b, span);
             }
-            // App(f, a) vs IO(effects, b) → f = IO, a = b
-            (Ty::App(f, a), Ty::IO(_effects, b))
-            | (Ty::IO(_effects, b), Ty::App(f, a)) => {
+            // App(f, a) vs IO(effects, row, b) → f = IO, a = b
+            (Ty::App(f, a), Ty::IO(_effects, _row, b))
+            | (Ty::IO(_effects, _row, b), Ty::App(f, a)) => {
                 self.unify(f, &Ty::TyCon("IO".into()), span);
                 self.unify(a, b, span);
             }
@@ -940,27 +1015,52 @@ impl Infer {
                     self.unify(&a, &last, span);
                 }
             }
-            // ── IO monad ──────────────────────────────────────
-            (Ty::IO(e1, a), Ty::IO(e2, b)) => {
-                self.unify(a, b, span);
-                // Merge IO effect sets (union) and propagate into substitution
-                if e1 != e2 {
+            // ── IO monad with effect-row unification ──────────
+            (Ty::IO(e1, r1, a), Ty::IO(e2, r2, b)) => {
+                let e1 = e1.clone();
+                let r1 = *r1;
+                let e2 = e2.clone();
+                let r2 = *r2;
+                let a = a.clone();
+                let b = b.clone();
+                self.unify(&a, &b, span);
+                // If at least one side started as a `Ty::Var` (an inferred
+                // IO from a case-arm or if-branch), widen its effect set to
+                // the union instead of running strict row unification —
+                // mirrors the pre-row-polymorphism behavior so case/if
+                // arms with different effects merge cleanly.
+                if (var1.is_some() || var2.is_some())
+                    && r1.is_none()
+                    && r2.is_none()
+                    && e1 != e2
+                {
                     let mut merged = e1.clone();
                     merged.extend(e2.iter().cloned());
-                    let unified_inner = self.apply(a);
-                    let merged_io = Ty::IO(merged, Box::new(unified_inner));
+                    let unified_inner = self.apply(&a);
+                    let merged_io =
+                        Ty::IO(merged, None, Box::new(unified_inner));
                     if let Some(v) = var1 {
                         self.subst.insert(v, merged_io.clone());
                     }
                     if let Some(v) = var2 {
                         self.subst.insert(v, merged_io);
                     }
+                } else {
+                    self.unify_io_effects(&e1, r1, &e2, r2, span);
                 }
+            }
+            (Ty::EffectRow(e1, r1), Ty::EffectRow(e2, r2)) => {
+                let e1 = e1.clone();
+                let r1 = *r1;
+                let e2 = e2.clone();
+                let r2 = *r2;
+                self.unify_io_effects(&e1, r1, &e2, r2, span);
             }
             // In IO do blocks, allow Relation types to unify with IO or
             // Unit types. Route handlers mix relational operations and
             // `respond` calls in if/case branches.
-            (Ty::Relation(a), Ty::IO(_, b)) | (Ty::IO(_, b), Ty::Relation(a)) if self.in_io_do => {
+            (Ty::Relation(a), Ty::IO(_, _, b))
+            | (Ty::IO(_, _, b), Ty::Relation(a)) if self.in_io_do => {
                 self.unify(a, b, span);
             }
             (Ty::Relation(_), Ty::Record(fields, None)) | (Ty::Record(fields, None), Ty::Relation(_))
@@ -1280,6 +1380,116 @@ impl Infer {
         }
     }
 
+    /// Unify two effect rows. Mirrors `unify_records`/`unify_variants` but
+    /// over `BTreeSet<IoEffect>` instead of fielded maps. Effects are
+    /// equality-keyed (no inner type to unify on shared elements), so we
+    /// only need to ensure each closed side covers the other's extras.
+    fn unify_io_effects(
+        &mut self,
+        e1: &BTreeSet<IoEffect>,
+        r1: Option<TyVar>,
+        e2: &BTreeSet<IoEffect>,
+        r2: Option<TyVar>,
+        span: Span,
+    ) {
+        let (e1, r1) = self.resolve_effect_row(e1.clone(), r1);
+        let (e2, r2) = self.resolve_effect_row(e2.clone(), r2);
+
+        let only1: BTreeSet<IoEffect> = e1.difference(&e2).cloned().collect();
+        let only2: BTreeSet<IoEffect> = e2.difference(&e1).cloned().collect();
+
+        match (r1, r2) {
+            (None, None) => {
+                if !only1.is_empty() || !only2.is_empty() {
+                    let extras: Vec<String> = only1
+                        .iter()
+                        .chain(only2.iter())
+                        .map(format_io_effect)
+                        .collect();
+                    self.error(
+                        format!(
+                            "IO effects don't match: extra effects {{{}}}",
+                            extras.join(", ")
+                        ),
+                        span,
+                    );
+                }
+            }
+            (Some(rv), None) => {
+                if !only1.is_empty() {
+                    let names: Vec<String> =
+                        only1.iter().map(format_io_effect).collect();
+                    self.error(
+                        format!(
+                            "IO has unexpected effects: {{{}}}",
+                            names.join(", ")
+                        ),
+                        span,
+                    );
+                }
+                self.bind_var(rv, Ty::EffectRow(only2, None), span);
+            }
+            (None, Some(rv)) => {
+                if !only2.is_empty() {
+                    let names: Vec<String> =
+                        only2.iter().map(format_io_effect).collect();
+                    self.error(
+                        format!(
+                            "IO has unexpected effects: {{{}}}",
+                            names.join(", ")
+                        ),
+                        span,
+                    );
+                }
+                self.bind_var(rv, Ty::EffectRow(only1, None), span);
+            }
+            (Some(rv1), Some(rv2)) => {
+                if rv1 == rv2 {
+                    if !only1.is_empty() || !only2.is_empty() {
+                        self.error(
+                            "IO effects don't match".into(),
+                            span,
+                        );
+                    }
+                } else if only1.is_empty() && only2.is_empty() {
+                    self.unify(&Ty::Var(rv1), &Ty::Var(rv2), span);
+                } else {
+                    let rv1_skolem = self.skolems.contains(&rv1);
+                    let rv2_skolem = self.skolems.contains(&rv2);
+                    match (rv1_skolem, rv2_skolem) {
+                        (true, false) if only2.is_empty() => {
+                            self.bind_var(
+                                rv2,
+                                Ty::EffectRow(only1, Some(rv1)),
+                                span,
+                            );
+                        }
+                        (false, true) if only1.is_empty() => {
+                            self.bind_var(
+                                rv1,
+                                Ty::EffectRow(only2, Some(rv2)),
+                                span,
+                            );
+                        }
+                        _ => {
+                            let fresh = self.fresh_var();
+                            self.bind_var(
+                                rv1,
+                                Ty::EffectRow(only2, Some(fresh)),
+                                span,
+                            );
+                            self.bind_var(
+                                rv2,
+                                Ty::EffectRow(only1, Some(fresh)),
+                                span,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Expand a nominal ADT (`Con(name, args)`) to a structural `Variant`.
     fn con_to_variant(
         &mut self,
@@ -1436,10 +1646,50 @@ impl Infer {
                 Box::new(self.subst_ty(f, mapping)),
                 Box::new(self.subst_ty(a, mapping)),
             ),
-            Ty::IO(effects, inner) => Ty::IO(
-                effects.clone(),
-                Box::new(self.subst_ty(inner, mapping)),
-            ),
+            Ty::IO(effects, row, inner) => {
+                let mut new_effects = effects.clone();
+                let new_row = row.and_then(|rv| {
+                    if let Some(replacement) = mapping.get(&rv) {
+                        match replacement {
+                            Ty::Var(new_rv) => Some(*new_rv),
+                            Ty::EffectRow(extra, extra_row) => {
+                                for e in extra {
+                                    new_effects.insert(e.clone());
+                                }
+                                *extra_row
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        Some(rv)
+                    }
+                });
+                Ty::IO(
+                    new_effects,
+                    new_row,
+                    Box::new(self.subst_ty(inner, mapping)),
+                )
+            }
+            Ty::EffectRow(effects, row) => {
+                let mut new_effects = effects.clone();
+                let new_row = row.and_then(|rv| {
+                    if let Some(replacement) = mapping.get(&rv) {
+                        match replacement {
+                            Ty::Var(new_rv) => Some(*new_rv),
+                            Ty::EffectRow(extra, extra_row) => {
+                                for e in extra {
+                                    new_effects.insert(e.clone());
+                                }
+                                *extra_row
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        Some(rv)
+                    }
+                });
+                Ty::EffectRow(new_effects, new_row)
+            }
             Ty::Forall(bound, inner) => {
                 // Avoid capturing bound vars: shadow them in the mapping.
                 let mut shadowed = mapping.clone();
@@ -1485,10 +1735,12 @@ impl Infer {
                 Box::new(self.subst_unit_vars_in_ty(f, mapping)),
                 Box::new(self.subst_unit_vars_in_ty(a, mapping)),
             ),
-            Ty::IO(effects, inner) => Ty::IO(
+            Ty::IO(effects, row, inner) => Ty::IO(
                 effects.clone(),
+                *row,
                 Box::new(self.subst_unit_vars_in_ty(inner, mapping)),
             ),
+            Ty::EffectRow(effects, row) => Ty::EffectRow(effects.clone(), *row),
             Ty::Forall(bound, inner) => Ty::Forall(
                 bound.clone(),
                 Box::new(self.subst_unit_vars_in_ty(inner, mapping)),
@@ -1547,7 +1799,8 @@ impl Infer {
                 self.collect_free_unit_vars(f, out);
                 self.collect_free_unit_vars(a, out);
             }
-            Ty::IO(_, inner) => self.collect_free_unit_vars(inner, out),
+            Ty::IO(_, _, inner) => self.collect_free_unit_vars(inner, out),
+            Ty::EffectRow(_, _) => {}
             Ty::Forall(_, inner) => self.collect_free_unit_vars(inner, out),
             _ => {}
         }
@@ -1661,8 +1914,30 @@ impl Infer {
                 self.collect_free_vars(f, out);
                 self.collect_free_vars(a, out);
             }
-            Ty::IO(_, inner) => {
+            Ty::IO(_, row, inner) => {
+                if let Some(rv) = row {
+                    match self.subst.get(rv) {
+                        Some(resolved) => {
+                            self.collect_free_vars(resolved, out)
+                        }
+                        None => {
+                            out.insert(*rv);
+                        }
+                    }
+                }
                 self.collect_free_vars(inner, out);
+            }
+            Ty::EffectRow(_, row) => {
+                if let Some(rv) = row {
+                    match self.subst.get(rv) {
+                        Some(resolved) => {
+                            self.collect_free_vars(resolved, out)
+                        }
+                        None => {
+                            out.insert(*rv);
+                        }
+                    }
+                }
             }
             Ty::Forall(bound, inner) => {
                 let mut inner_set = HashSet::new();
@@ -1840,22 +2115,14 @@ impl Infer {
                 Ty::Variant(ctor_tys, row_var)
             }
             ast::TypeKind::Effectful { ty, .. } => self.ast_type_to_ty(ty),
-            ast::TypeKind::IO { effects, ty: inner_ty } => {
-                // The type-system layer only tracks IO-level effects
-                // (console/fs/network/clock/random). Reads/writes are tracked
-                // separately by the effect-checker pass and are erased here.
-                let mut io_effects = BTreeSet::new();
-                for e in effects {
-                    match e {
-                        ast::Effect::Console => { io_effects.insert(IoEffect::Console); }
-                        ast::Effect::Fs => { io_effects.insert(IoEffect::Fs); }
-                        ast::Effect::Network => { io_effects.insert(IoEffect::Network); }
-                        ast::Effect::Clock => { io_effects.insert(IoEffect::Clock); }
-                        ast::Effect::Random => { io_effects.insert(IoEffect::Random); }
-                        ast::Effect::Reads(_) | ast::Effect::Writes(_) => {}
-                    }
-                }
-                Ty::IO(io_effects, Box::new(self.ast_type_to_ty(inner_ty)))
+            ast::TypeKind::IO { effects, rest, ty: inner_ty } => {
+                let io_effects = ast_effects_to_io_effects(effects);
+                let row_var = rest.as_ref().map(|name| self.annotation_var(name));
+                Ty::IO(
+                    io_effects,
+                    row_var,
+                    Box::new(self.ast_type_to_ty(inner_ty)),
+                )
             }
             ast::TypeKind::UnitAnnotated { base, unit } => {
                 let base_ty = self.ast_type_to_ty(base);
@@ -1933,6 +2200,36 @@ impl Infer {
     }
 
     // ── Type display ─────────────────────────────────────────────
+
+    /// Render `{e1, e2 | r}` for an effect set with optional row tail. An
+    /// empty closed set renders as `""` (so callers can omit the braces),
+    /// while a nonempty or open set renders with surrounding braces.
+    fn display_effect_set(
+        &self,
+        effects: &BTreeSet<IoEffect>,
+        row: Option<TyVar>,
+    ) -> String {
+        if effects.is_empty() && row.is_none() {
+            return String::new();
+        }
+        let mut parts: Vec<String> =
+            effects.iter().map(format_io_effect).collect();
+        if let Some(rv) = row {
+            let name = match self.subst.get(&rv) {
+                Some(resolved) => self.display_ty(resolved),
+                None => {
+                    let idx = rv as usize;
+                    if idx < 26 {
+                        format!("{}", (b'a' + idx as u8) as char)
+                    } else {
+                        format!("e{}", rv)
+                    }
+                }
+            };
+            parts.push(format!("| {}", name));
+        }
+        format!(" {{{}}}", parts.join(", "))
+    }
 
     fn display_ty(&self, ty: &Ty) -> String {
         self.display_ty_inner(ty, false)
@@ -2062,20 +2359,19 @@ impl Infer {
                     self.display_ty(a)
                 )
             }
-            Ty::IO(effects, inner) => {
-                let effects_str = if effects.is_empty() {
-                    String::new()
-                } else {
-                    let names: Vec<&str> = effects.iter().map(|e| match e {
-                        IoEffect::Console => "console",
-                        IoEffect::Fs => "fs",
-                        IoEffect::Network => "network",
-                        IoEffect::Clock => "clock",
-                        IoEffect::Random => "random",
-                    }).collect();
-                    format!(" {{{}}}", names.join(", "))
-                };
-                format!("IO{} {}", effects_str, self.display_ty(inner))
+            Ty::IO(effects, row, inner) => {
+                let (effects, row) =
+                    self.resolve_effect_row(effects.clone(), *row);
+                format!(
+                    "IO{} {}",
+                    self.display_effect_set(&effects, row),
+                    self.display_ty(inner),
+                )
+            }
+            Ty::EffectRow(effects, row) => {
+                let (effects, row) =
+                    self.resolve_effect_row(effects.clone(), *row);
+                format!("Effects{}", self.display_effect_set(&effects, row))
             }
             Ty::Forall(vars, inner) => {
                 if vars.is_empty() {
@@ -2238,7 +2534,9 @@ impl Infer {
 
             ast::ExprKind::SourceRef(name) => {
                 if let Some(ty) = self.source_types.get(name).cloned() {
-                    Ty::IO(BTreeSet::new(), Box::new(ty))
+                    let mut effects = BTreeSet::new();
+                    effects.insert(IoEffect::Reads(name.clone()));
+                    Ty::IO(effects, None, Box::new(ty))
                 } else {
                     self.error(
                         format!("unknown source relation '*{}'", name),
@@ -2250,7 +2548,10 @@ impl Infer {
 
             ast::ExprKind::DerivedRef(name) => {
                 if let Some(ty) = self.derived_types.get(name).cloned() {
-                    Ty::IO(BTreeSet::new(), Box::new(ty))
+                    // A derived relation's reads aren't known at this site;
+                    // the effect-checker pass tracks them. Type-system effects
+                    // start empty here and grow via unification.
+                    Ty::IO(BTreeSet::new(), None, Box::new(ty))
                 } else {
                     self.error(
                         format!("unknown derived relation '&{}'", name),
@@ -2434,17 +2735,17 @@ impl Infer {
                 let applied_then = self.apply(&then_ty);
                 let applied_else = self.apply(&else_ty);
                 match (&applied_then, &applied_else) {
-                    (Ty::IO(e1, inner), Ty::IO(e2, _)) => {
+                    (Ty::IO(e1, r1, inner), Ty::IO(e2, r2, _)) => {
                         let mut merged = e1.clone();
                         merged.extend(e2.iter().cloned());
-                        Ty::IO(merged, inner.clone())
+                        Ty::IO(merged, r1.or(*r2), inner.clone())
                     }
                     // When one branch is IO and the other Relation, prefer IO.
                     // This handles functions whose IO nature wasn't detected
                     // due to declaration ordering (callee inferred after caller).
-                    (Ty::IO(e, inner), Ty::Relation(_))
-                    | (Ty::Relation(_), Ty::IO(e, inner)) => {
-                        Ty::IO(e.clone(), inner.clone())
+                    (Ty::IO(e, r, inner), Ty::Relation(_))
+                    | (Ty::Relation(_), Ty::IO(e, r, inner)) => {
+                        Ty::IO(e.clone(), *r, inner.clone())
                     }
                     _ => then_ty,
                 }
@@ -2462,7 +2763,7 @@ impl Infer {
                     self.unify(&result_ty, &body_ty, arm.body.span);
                     // Collect IO effects from each arm
                     let applied = self.apply(&body_ty);
-                    if let Ty::IO(ref effects, _) = applied {
+                    if let Ty::IO(ref effects, _, _) = applied {
                         case_io_effects.extend(effects.iter().cloned());
                     }
                     self.pop_scope();
@@ -2473,8 +2774,8 @@ impl Infer {
                 // Merge IO effects from all arms into the result type
                 if !case_io_effects.is_empty() {
                     let applied_result = self.apply(&result_ty);
-                    if let Ty::IO(_, inner) = applied_result {
-                        Ty::IO(case_io_effects, inner)
+                    if let Ty::IO(_, row, inner) = applied_result {
+                        Ty::IO(case_io_effects, row, inner)
                     } else {
                         result_ty
                     }
@@ -2488,19 +2789,19 @@ impl Infer {
             ast::ExprKind::Set { target, value } => {
                 let target_ty = self.infer_expr(target);
                 let value_ty = self.infer_expr(value);
-                // Unwrap IO from both sides for unification —
-                // target is IO (source ref), value may also be IO
-                // (do-block reading from relations).
-                // Apply substitution first so type variables resolved
-                // to IO are properly unwrapped.
                 let target_applied = self.apply(&target_ty);
                 let value_applied = self.apply(&value_ty);
                 let unwrap_io = |ty: &Ty| match ty {
-                    Ty::IO(_, inner) => (**inner).clone(),
+                    Ty::IO(_, _, inner) => (**inner).clone(),
                     other => other.clone(),
                 };
                 self.unify(&unwrap_io(&target_applied), &unwrap_io(&value_applied), expr.span);
-                Ty::IO(BTreeSet::new(), Box::new(Ty::unit()))
+                let mut effects = BTreeSet::new();
+                if let ast::ExprKind::SourceRef(name) = &target.node {
+                    effects.insert(IoEffect::Writes(name.clone()));
+                    effects.insert(IoEffect::Reads(name.clone()));
+                }
+                Ty::IO(effects, None, Box::new(Ty::unit()))
             }
 
             ast::ExprKind::FullSet { target, value } => {
@@ -2509,11 +2810,16 @@ impl Infer {
                 let target_applied = self.apply(&target_ty);
                 let value_applied = self.apply(&value_ty);
                 let unwrap_io = |ty: &Ty| match ty {
-                    Ty::IO(_, inner) => (**inner).clone(),
+                    Ty::IO(_, _, inner) => (**inner).clone(),
                     other => other.clone(),
                 };
                 self.unify(&unwrap_io(&target_applied), &unwrap_io(&value_applied), expr.span);
-                Ty::IO(BTreeSet::new(), Box::new(Ty::unit()))
+                let mut effects = BTreeSet::new();
+                if let ast::ExprKind::SourceRef(name) = &target.node {
+                    effects.insert(IoEffect::Writes(name.clone()));
+                    effects.insert(IoEffect::Reads(name.clone()));
+                }
+                Ty::IO(effects, None, Box::new(Ty::unit()))
             }
 
             ast::ExprKind::Atomic(inner) => {
@@ -2524,7 +2830,7 @@ impl Infer {
                 // atomic : IO {} a -> IO {} a
                 let inner_applied = self.apply(&inner_ty);
                 match &inner_applied {
-                    Ty::IO(_, _) => inner_applied,
+                    Ty::IO(_, _, _) => inner_applied,
                     _ => {
                         self.error(
                             "atomic body must be an IO expression".to_string(),
@@ -2665,7 +2971,7 @@ impl Infer {
                 // turn it on bottom-up.
                 let resolved_expected = self.apply(expected);
                 let prev_in_io_do = self.in_io_do;
-                if matches!(resolved_expected, Ty::IO(_, _)) {
+                if matches!(resolved_expected, Ty::IO(_, _, _)) {
                     self.in_io_do = true;
                 }
                 let inferred = self.infer_do(stmts, expr.span);
@@ -2778,6 +3084,7 @@ impl Infer {
         self.annotation_vars = saved_annotation_vars;
         Some(Ty::IO(
             BTreeSet::from([IoEffect::Network]),
+            None,
             Box::new(result_adt),
         ))
     }
@@ -3233,7 +3540,7 @@ impl Infer {
                 ) || self.lookup(name).map_or(false, |scheme| {
                     fn returns_io(ty: &Ty) -> bool {
                         match ty {
-                            Ty::IO(_, _) => true,
+                            Ty::IO(_, _, _) => true,
                             Ty::Fun(_, ret) => returns_io(ret),
                             _ => false,
                         }
@@ -3282,6 +3589,10 @@ impl Infer {
         let mut is_io = false;
         let mut has_relation_bind = false;
         let mut io_effects: BTreeSet<IoEffect> = BTreeSet::new();
+        // Effect row tail accumulated from IO statements. Multiple row vars
+        // are unified so the do-block's result has a single polymorphic
+        // tail. None means the block's effects are fully closed.
+        let mut io_row: Option<TyVar> = None;
 
         // Pre-scan: if any statement uses IO builtins, set in_io_do so that
         // `yield` expressions inside case/if branches produce IO types.
@@ -3298,10 +3609,23 @@ impl Infer {
                     let is_ctor_pat =
                         matches!(&pat.node, ast::PatKind::Constructor { .. });
 
-                    if let Ty::IO(ref effects, ref inner) = resolved {
+                    if let Ty::IO(ref effects, ref row, ref inner) = resolved {
                         // IO bind: x <- ioAction
                         is_io = true;
                         io_effects.extend(effects.iter().cloned());
+                        if let Some(rv) = row {
+                            match io_row {
+                                None => io_row = Some(*rv),
+                                Some(existing) if existing != *rv => {
+                                    self.unify(
+                                        &Ty::Var(existing),
+                                        &Ty::Var(*rv),
+                                        expr.span,
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
                         self.check_pattern(pat, inner);
                     } else if self.in_io_do && matches!(&resolved, Ty::Var(_)) {
                         // In an IO do-block with an unresolved type variable —
@@ -3310,7 +3634,7 @@ impl Infer {
                         let inner_ty = self.fresh();
                         self.unify(
                             &expr_ty,
-                            &Ty::IO(BTreeSet::new(), Box::new(inner_ty.clone())),
+                            &Ty::IO(BTreeSet::new(), None, Box::new(inner_ty.clone())),
                             expr.span,
                         );
                         self.check_pattern(pat, &inner_ty);
@@ -3335,9 +3659,22 @@ impl Infer {
                 ast::StmtKind::Let { pat, expr } => {
                     let expr_ty = self.infer_expr(expr);
                     let resolved = self.apply(&expr_ty);
-                    if let Ty::IO(ref effects, _) = resolved {
+                    if let Ty::IO(ref effects, ref row, _) = resolved {
                         is_io = true;
                         io_effects.extend(effects.iter().cloned());
+                        if let Some(rv) = row {
+                            match io_row {
+                                None => io_row = Some(*rv),
+                                Some(existing) if existing != *rv => {
+                                    self.unify(
+                                        &Ty::Var(existing),
+                                        &Ty::Var(*rv),
+                                        expr.span,
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                     // Let-generalization: for simple variable patterns,
                     // generalize the binding so it can be used polymorphically
@@ -3392,9 +3729,22 @@ impl Infer {
                     } else {
                         let expr_ty = self.infer_expr(expr);
                         let resolved = self.apply(&expr_ty);
-                        if let Ty::IO(ref effects, ref inner) = resolved {
+                        if let Ty::IO(ref effects, ref row, ref inner) = resolved {
                             is_io = true;
                             io_effects.extend(effects.iter().cloned());
+                            if let Some(rv) = row {
+                                match io_row {
+                                    None => io_row = Some(*rv),
+                                    Some(existing) if existing != *rv => {
+                                        self.unify(
+                                            &Ty::Var(existing),
+                                            &Ty::Var(*rv),
+                                            expr.span,
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
                             last_expr_ty = Some(*inner.clone());
                         } else if self.in_io_do {
                             if let Ty::App(ref f, ref inner) = resolved {
@@ -3412,7 +3762,7 @@ impl Infer {
                                 let inner_ty = self.fresh();
                                 self.unify(
                                     &expr_ty,
-                                    &Ty::IO(BTreeSet::new(), Box::new(inner_ty.clone())),
+                                    &Ty::IO(BTreeSet::new(), None, Box::new(inner_ty.clone())),
                                     expr.span,
                                 );
                                 last_expr_ty = Some(inner_ty);
@@ -3441,7 +3791,7 @@ impl Infer {
         let promote_to_io = is_io || (self.in_io_do && !has_relation_bind);
         if promote_to_io {
             let inner = yield_ty.or(last_expr_ty).unwrap_or_else(Ty::unit);
-            Ty::IO(io_effects, Box::new(inner))
+            Ty::IO(io_effects, io_row, Box::new(inner))
         } else {
             match yield_ty {
                 Some(ty) => Ty::Relation(Box::new(ty)),
@@ -3689,7 +4039,7 @@ impl Infer {
             Ty::Relation(_) => Some("[]".into()),
             Ty::TyCon(name) => Some(name.clone()),
             Ty::Con(name, _) => Some(name.clone()),
-            Ty::IO(_, _) => Some("IO".into()),
+            Ty::IO(_, _, _) => Some("IO".into()),
             Ty::Fun(_, _) => Some("Fun".into()),
             Ty::Record(_, _) => Some("Record".into()),
             Ty::Variant(_, _) => Some("Variant".into()),
@@ -3914,7 +4264,7 @@ impl Infer {
             "println",
             Scheme::poly(vec![a], Ty::Fun(
                 Box::new(Ty::Var(a)),
-                Box::new(Ty::IO(BTreeSet::from([IoEffect::Console]), Box::new(Ty::unit()))),
+                Box::new(Ty::IO(BTreeSet::from([IoEffect::Console]), None, Box::new(Ty::unit()))),
             )),
         );
 
@@ -3924,7 +4274,7 @@ impl Infer {
             "print",
             Scheme::poly(vec![a], Ty::Fun(
                 Box::new(Ty::Var(a)),
-                Box::new(Ty::IO(BTreeSet::from([IoEffect::Console]), Box::new(Ty::unit()))),
+                Box::new(Ty::IO(BTreeSet::from([IoEffect::Console]), None, Box::new(Ty::unit()))),
             )),
         );
 
@@ -3935,14 +4285,14 @@ impl Infer {
                 log_name,
                 Scheme::poly(vec![a], Ty::Fun(
                     Box::new(Ty::Var(a)),
-                    Box::new(Ty::IO(BTreeSet::from([IoEffect::Console]), Box::new(Ty::unit()))),
+                    Box::new(Ty::IO(BTreeSet::from([IoEffect::Console]), None, Box::new(Ty::unit()))),
                 )),
             );
         }
 
         // readLine : IO {console} Text
         self.bind_top("readLine", Scheme::mono(
-            Ty::IO(BTreeSet::from([IoEffect::Console]), Box::new(Ty::Text)),
+            Ty::IO(BTreeSet::from([IoEffect::Console]), None, Box::new(Ty::Text)),
         ));
 
         // show : ∀a. a -> Text
@@ -4015,7 +4365,7 @@ impl Infer {
             "putLine",
             Scheme::poly(vec![a], Ty::Fun(
                 Box::new(Ty::Var(a)),
-                Box::new(Ty::IO(BTreeSet::from([IoEffect::Console]), Box::new(Ty::unit()))),
+                Box::new(Ty::IO(BTreeSet::from([IoEffect::Console]), None, Box::new(Ty::unit()))),
             )),
         );
 
@@ -4023,7 +4373,7 @@ impl Infer {
         {
             let int_ms = Ty::IntUnit(UnitTy::named("Ms"));
             self.bind_top("now", Scheme::mono(
-                Ty::IO(BTreeSet::from([IoEffect::Clock]), Box::new(int_ms)),
+                Ty::IO(BTreeSet::from([IoEffect::Clock]), None, Box::new(int_ms)),
             ));
         }
 
@@ -4034,7 +4384,7 @@ impl Infer {
                 "sleep",
                 Scheme::mono(Ty::Fun(
                     Box::new(int_ms),
-                    Box::new(Ty::IO(BTreeSet::from([IoEffect::Clock]), Box::new(Ty::unit()))),
+                    Box::new(Ty::IO(BTreeSet::from([IoEffect::Clock]), None, Box::new(Ty::unit()))),
                 )),
             );
         }
@@ -4051,7 +4401,7 @@ impl Infer {
                     constraints: vec![],
                     ty: Ty::Fun(
                         Box::new(int_u.clone()),
-                        Box::new(Ty::IO(BTreeSet::from([IoEffect::Random]), Box::new(int_u))),
+                        Box::new(Ty::IO(BTreeSet::from([IoEffect::Random]), None, Box::new(int_u))),
                     ),
                 },
             );
@@ -4065,7 +4415,7 @@ impl Infer {
                 vars: vec![],
                 unit_vars: vec![u],
                 constraints: vec![],
-                ty: Ty::IO(BTreeSet::from([IoEffect::Random]), Box::new(float_u)),
+                ty: Ty::IO(BTreeSet::from([IoEffect::Random]), None, Box::new(float_u)),
             });
         }
 
@@ -4075,8 +4425,8 @@ impl Infer {
         self.bind_top(
             "fork",
             Scheme::mono(Ty::Fun(
-                Box::new(Ty::IO(BTreeSet::new(), Box::new(Ty::unit()))),
-                Box::new(Ty::IO(BTreeSet::new(), Box::new(Ty::unit()))),
+                Box::new(Ty::IO(BTreeSet::new(), None, Box::new(Ty::unit()))),
+                Box::new(Ty::IO(BTreeSet::new(), None, Box::new(Ty::unit()))),
             )),
         );
 
@@ -4106,6 +4456,7 @@ impl Infer {
                             Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
                             Box::new(Ty::IO(
                                 BTreeSet::from([IoEffect::Network]),
+                                None,
                                 Box::new(Ty::unit()),
                             )),
                         )),
@@ -4129,7 +4480,7 @@ impl Infer {
                 None,
             );
             let result_ty = Ty::Con("Result".into(), vec![err_ty.clone(), Ty::Var(b)]);
-            let io_ty = Ty::IO(BTreeSet::from([IoEffect::Network]), Box::new(result_ty));
+            let io_ty = Ty::IO(BTreeSet::from([IoEffect::Network]), None, Box::new(result_ty));
             self.bind_top(
                 "fetch",
                 Scheme::poly(
@@ -4146,7 +4497,7 @@ impl Infer {
             let b2 = self.fresh_var();
             let c2 = self.fresh_var();
             let result_ty2 = Ty::Con("Result".into(), vec![err_ty, Ty::Var(b2)]);
-            let io_ty2 = Ty::IO(BTreeSet::from([IoEffect::Network]), Box::new(result_ty2));
+            let io_ty2 = Ty::IO(BTreeSet::from([IoEffect::Network]), None, Box::new(result_ty2));
             self.bind_top(
                 "fetchWith",
                 Scheme::poly(
@@ -4552,7 +4903,7 @@ impl Infer {
             "readFile",
             Scheme::mono(Ty::Fun(
                 Box::new(Ty::Text),
-                Box::new(Ty::IO(BTreeSet::from([IoEffect::Fs]), Box::new(Ty::Text))),
+                Box::new(Ty::IO(BTreeSet::from([IoEffect::Fs]), None, Box::new(Ty::Text))),
             )),
         );
 
@@ -4563,7 +4914,7 @@ impl Infer {
                 Box::new(Ty::Text),
                 Box::new(Ty::Fun(
                     Box::new(Ty::Text),
-                    Box::new(Ty::IO(BTreeSet::from([IoEffect::Fs]), Box::new(Ty::unit()))),
+                    Box::new(Ty::IO(BTreeSet::from([IoEffect::Fs]), None, Box::new(Ty::unit()))),
                 )),
             )),
         );
@@ -4575,7 +4926,7 @@ impl Infer {
                 Box::new(Ty::Text),
                 Box::new(Ty::Fun(
                     Box::new(Ty::Text),
-                    Box::new(Ty::IO(BTreeSet::from([IoEffect::Fs]), Box::new(Ty::unit()))),
+                    Box::new(Ty::IO(BTreeSet::from([IoEffect::Fs]), None, Box::new(Ty::unit()))),
                 )),
             )),
         );
@@ -4585,7 +4936,7 @@ impl Infer {
             "fileExists",
             Scheme::mono(Ty::Fun(
                 Box::new(Ty::Text),
-                Box::new(Ty::IO(BTreeSet::from([IoEffect::Fs]), Box::new(Ty::Bool))),
+                Box::new(Ty::IO(BTreeSet::from([IoEffect::Fs]), None, Box::new(Ty::Bool))),
             )),
         );
 
@@ -4594,7 +4945,7 @@ impl Infer {
             "removeFile",
             Scheme::mono(Ty::Fun(
                 Box::new(Ty::Text),
-                Box::new(Ty::IO(BTreeSet::from([IoEffect::Fs]), Box::new(Ty::unit()))),
+                Box::new(Ty::IO(BTreeSet::from([IoEffect::Fs]), None, Box::new(Ty::unit()))),
             )),
         );
 
@@ -4603,7 +4954,7 @@ impl Infer {
             "listDir",
             Scheme::mono(Ty::Fun(
                 Box::new(Ty::Text),
-                Box::new(Ty::IO(BTreeSet::from([IoEffect::Fs]), Box::new(Ty::Relation(Box::new(Ty::Text))))),
+                Box::new(Ty::IO(BTreeSet::from([IoEffect::Fs]), None, Box::new(Ty::Relation(Box::new(Ty::Text))))),
             )),
         );
 
@@ -4715,12 +5066,12 @@ impl Infer {
             None,
         );
         self.bind_top("generateKeyPair", Scheme::mono(
-            Ty::IO(BTreeSet::from([IoEffect::Random]), Box::new(key_pair_record.clone())),
+            Ty::IO(BTreeSet::from([IoEffect::Random]), None, Box::new(key_pair_record.clone())),
         ));
 
         // generateSigningKeyPair : IO {random} {privateKey: Bytes, publicKey: Bytes}
         self.bind_top("generateSigningKeyPair", Scheme::mono(
-            Ty::IO(BTreeSet::from([IoEffect::Random]), Box::new(key_pair_record)),
+            Ty::IO(BTreeSet::from([IoEffect::Random]), None, Box::new(key_pair_record)),
         ));
 
         // encrypt : Bytes -> Bytes -> IO {random} Bytes
@@ -4730,7 +5081,7 @@ impl Infer {
                 Box::new(Ty::Bytes),
                 Box::new(Ty::Fun(
                     Box::new(Ty::Bytes),
-                    Box::new(Ty::IO(BTreeSet::from([IoEffect::Random]), Box::new(Ty::Bytes))),
+                    Box::new(Ty::IO(BTreeSet::from([IoEffect::Random]), None, Box::new(Ty::Bytes))),
                 )),
             )),
         );
@@ -5180,7 +5531,21 @@ fn collect_vars_ordered(ty: &Ty, out: &mut Vec<TyVar>) {
             collect_vars_ordered(f, out);
             collect_vars_ordered(a, out);
         }
-        Ty::IO(_, inner) => collect_vars_ordered(inner, out),
+        Ty::IO(_, row, inner) => {
+            if let Some(rv) = row {
+                if !out.contains(rv) {
+                    out.push(*rv);
+                }
+            }
+            collect_vars_ordered(inner, out);
+        }
+        Ty::EffectRow(_, row) => {
+            if let Some(rv) = row {
+                if !out.contains(rv) {
+                    out.push(*rv);
+                }
+            }
+        }
         Ty::Forall(bound, inner) => {
             // Collect free vars from the body, then drop the bound ones.
             let mut inner_vars = Vec::new();
@@ -5193,6 +5558,55 @@ fn collect_vars_ordered(ty: &Ty, out: &mut Vec<TyVar>) {
         }
         _ => {}
     }
+}
+
+/// Convert AST-level effects to type-system IoEffects (lossless — all
+/// kinds, including reads/writes, are tracked in the type now).
+fn ast_effects_to_io_effects(effects: &[ast::Effect]) -> BTreeSet<IoEffect> {
+    let mut out = BTreeSet::new();
+    for e in effects {
+        let io = match e {
+            ast::Effect::Reads(name) => IoEffect::Reads(name.clone()),
+            ast::Effect::Writes(name) => IoEffect::Writes(name.clone()),
+            ast::Effect::Console => IoEffect::Console,
+            ast::Effect::Fs => IoEffect::Fs,
+            ast::Effect::Network => IoEffect::Network,
+            ast::Effect::Clock => IoEffect::Clock,
+            ast::Effect::Random => IoEffect::Random,
+        };
+        out.insert(io);
+    }
+    out
+}
+
+fn format_io_effect(e: &IoEffect) -> String {
+    match e {
+        IoEffect::Reads(name) => format!("reads *{}", name),
+        IoEffect::Writes(name) => format!("writes *{}", name),
+        IoEffect::Console => "console".into(),
+        IoEffect::Fs => "fs".into(),
+        IoEffect::Network => "network".into(),
+        IoEffect::Clock => "clock".into(),
+        IoEffect::Random => "random".into(),
+    }
+}
+
+fn display_effect_set_clean(
+    effects: &BTreeSet<IoEffect>,
+    row: Option<TyVar>,
+    names: &HashMap<TyVar, usize>,
+) -> String {
+    if effects.is_empty() && row.is_none() {
+        return String::new();
+    }
+    let mut parts: Vec<String> = effects.iter().map(format_io_effect).collect();
+    if let Some(rv) = row {
+        parts.push(format!(
+            "| {}",
+            var_letter(names.get(&rv).copied().unwrap_or(rv as usize))
+        ));
+    }
+    format!(" {{{}}}", parts.join(", "))
 }
 
 fn var_letter(idx: usize) -> String {
@@ -5272,23 +5686,13 @@ fn display_ty_clean_inner(ty: &Ty, names: &HashMap<TyVar, usize>, in_fun: bool) 
             display_ty_clean(f, names),
             display_ty_clean(a, names)
         ),
-        Ty::IO(effects, inner) => {
-            let effects_str = if effects.is_empty() {
-                String::new()
-            } else {
-                let eff_names: Vec<&str> = effects
-                    .iter()
-                    .map(|e| match e {
-                        IoEffect::Console => "console",
-                        IoEffect::Fs => "fs",
-                        IoEffect::Network => "network",
-                        IoEffect::Clock => "clock",
-                        IoEffect::Random => "random",
-                    })
-                    .collect();
-                format!(" {{{}}}", eff_names.join(", "))
-            };
+        Ty::IO(effects, row, inner) => {
+            let effects_str =
+                display_effect_set_clean(effects, *row, names);
             format!("IO{} {}", effects_str, display_ty_clean(inner, names))
+        }
+        Ty::EffectRow(effects, row) => {
+            format!("Effects{}", display_effect_set_clean(effects, *row, names))
         }
         Ty::Forall(vars, inner) => {
             if vars.is_empty() {
@@ -5369,7 +5773,7 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
             Ty::TyCon(name) if name == "IO" => MonadKind::IO,
             Ty::TyCon(name) => MonadKind::Adt(name.clone()),
             Ty::Relation(_) => MonadKind::Relation,
-            Ty::IO(_, _) => MonadKind::IO,
+            Ty::IO(_, _, _) => MonadKind::IO,
             // Partially applied type constructor, e.g. Result e (App(TyCon("Result"), e))
             Ty::App(f, _) => match f.as_ref() {
                 Ty::TyCon(name) => MonadKind::Adt(name.clone()),

@@ -3223,6 +3223,20 @@ impl Parser {
                     let inner = self.parse_type_atom()?;
                     let span = Span::new(tok.span.start, inner.span.end);
                     Some(Spanned::new(TypeKind::IO { effects, rest, ty: Box::new(inner) }, span))
+                } else if name == "IO" && matches!(self.peek(), TokenKind::Lower(_)) {
+                    // Shorthand: `IO e Type` desugars to `IO {| e} Type`
+                    let row_tok = self.advance();
+                    let TokenKind::Lower(row_name) = row_tok.kind else { unreachable!() };
+                    let inner = self.parse_type_atom()?;
+                    let span = Span::new(tok.span.start, inner.span.end);
+                    Some(Spanned::new(
+                        TypeKind::IO {
+                            effects: Vec::new(),
+                            rest: Some(row_name),
+                            ty: Box::new(inner),
+                        },
+                        span,
+                    ))
                 } else if (name == "Float" || name == "Int") && matches!(self.peek(), TokenKind::Lt) {
                     // Try Float<unit> or Int<unit> — no adjacency check in type context
                     let saved = self.save();

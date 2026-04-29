@@ -2286,6 +2286,20 @@ fn io_type_with_reads_and_row_var() {
     }
 }
 
+#[test]
+fn io_type_bare_row_shorthand() {
+    match first_decl("type X = IO e Int") {
+        DeclKind::TypeAlias { ty, .. } => match &ty.node {
+            TypeKind::IO { effects, rest, .. } => {
+                assert!(effects.is_empty());
+                assert_eq!(rest.as_deref(), Some("e"));
+            }
+            other => panic!("expected IO with rest, got {:?}", other),
+        },
+        other => panic!("expected TypeAlias, got {:?}", other),
+    }
+}
+
 // ── Variant Types ───────────────────────────────────────────────────
 
 #[test]

@@ -4210,6 +4210,10 @@ impl Infer {
             Ty::Record(_, _) => Some("Record".into()),
             Ty::Variant(_, _) => Some("Variant".into()),
             Ty::App(_, _) => Some("App".into()),
+            // Units are erased at runtime, so trait dispatch on a unit-typed
+            // value resolves to the underlying primitive's impl.
+            Ty::IntUnit(_) => Some("Int".into()),
+            Ty::FloatUnit(_) => Some("Float".into()),
             _ => None,
         }
     }

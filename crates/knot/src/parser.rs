@@ -2230,7 +2230,13 @@ impl Parser {
                 self.skip_newlines();
                 // Check for type annotation: `(expr : Type)`
                 if self.eat(&TokenKind::Colon) {
-                    let ty = self.parse_type()?;
+                    let ty = match self.parse_type() {
+                        Some(t) => t,
+                        None => {
+                            self.delimiter_depth -= 1;
+                            return None;
+                        }
+                    };
                     let end_tok = self
                         .expect(
                             &TokenKind::RParen,
@@ -3266,14 +3272,20 @@ impl Parser {
                     self.skip_newlines();
                     self.expect(&TokenKind::RBrace, "expected '}' to close IO effect set")
                         .ok()?;
-                    let inner = self.parse_type_atom()?;
+                    if !self.enter_recursion() { return None; }
+                    let inner = self.parse_type_atom();
+                    self.recursion_depth -= 1;
+                    let inner = inner?;
                     let span = Span::new(tok.span.start, inner.span.end);
                     Some(Spanned::new(TypeKind::IO { effects, rest, ty: Box::new(inner) }, span))
                 } else if name == "IO" && matches!(self.peek(), TokenKind::Lower(_)) {
                     // Shorthand: `IO e Type` desugars to `IO {| e} Type`
                     let row_tok = self.advance();
                     let TokenKind::Lower(row_name) = row_tok.kind else { unreachable!() };
-                    let inner = self.parse_type_atom()?;
+                    if !self.enter_recursion() { return None; }
+                    let inner = self.parse_type_atom();
+                    self.recursion_depth -= 1;
+                    let inner = inner?;
                     let span = Span::new(tok.span.start, inner.span.end);
                     Some(Spanned::new(
                         TypeKind::IO {

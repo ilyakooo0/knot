@@ -666,15 +666,12 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
             expr_is_io(func, io_fns) || expr_is_io(arg, io_fns)
         }
         ExprKind::Var(name) => {
-            matches!(
-                name.as_str(),
-                "println" | "putLine" | "print" | "readLine" | "readFile"
-                    | "writeFile" | "appendFile" | "fileExists" | "removeFile"
-                    | "listDir" | "now" | "sleep" | "randomInt" | "randomFloat"
-                    | "fetch" | "fetchWith" | "fork" | "listen"
-                    | "generateKeyPair" | "generateSigningKeyPair" | "encrypt"
-                    | "logInfo" | "logWarn" | "logError" | "logDebug"
-            ) || io_fns.contains(name.as_str())
+            // `retry` is in EFFECTFUL_BUILTINS but isn't an IO-producing
+            // expression (it's the STM primitive, typed `∀a. a`); excluding
+            // it here matches the filter applied in `expr_contains_io`.
+            (crate::builtins::EFFECTFUL_BUILTINS.contains(&name.as_str())
+                && name.as_str() != "retry")
+                || io_fns.contains(name.as_str())
         }
         ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) => true,
         ExprKind::Set { .. } | ExprKind::FullSet { .. } => true,

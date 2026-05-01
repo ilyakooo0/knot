@@ -114,7 +114,9 @@ pub fn analysis_worker(
                 }
             }
             if let Ok(mut shared) = inference_cache.lock() {
-                *shared = inf_cache_local;
+                for (k, v) in inf_cache_local.into_iter() {
+                    shared.entry(k).or_insert(v);
+                }
             }
 
             if tx

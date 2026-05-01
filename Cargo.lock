@@ -986,6 +986,7 @@ dependencies = [
 name = "knot-lsp"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "knot",
  "knot-compiler",
  "lsp-server",

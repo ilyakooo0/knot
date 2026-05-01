@@ -1,7 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
+use crossbeam_channel::{select, Receiver, RecvTimeoutError, Sender};
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::notification::Notification as _;
 use lsp_types::*;
@@ -43,10 +46,37 @@ struct ServerState {
     documents: HashMap<Uri, DocumentState>,
     workspace_root: Option<PathBuf>,
     /// Cached parsed imports: canonical path → (mtime, module, source text).
-    import_cache: HashMap<PathBuf, (SystemTime, Module, String)>,
+    /// Shared with the analysis worker thread.
+    import_cache: Arc<Mutex<HashMap<PathBuf, (SystemTime, Module, String)>>>,
     /// Cached LSP diagnostics for unopened workspace files, keyed by mtime.
     /// Refreshed lazily; stale entries are dropped when mtime advances.
     workspace_diag_cache: HashMap<PathBuf, (SystemTime, Vec<Diagnostic>)>,
+    /// Edited but not-yet-analyzed sources. When present, this is the source
+    /// the next analysis run will see. Subsequent didChange edits stack on top
+    /// of this rather than the (stale) analyzed source.
+    pending_sources: HashMap<Uri, PendingSource>,
+    /// Sender side of the analysis-task channel. Cloned per outgoing task.
+    analysis_tx: Sender<AnalysisTask>,
+}
+
+struct PendingSource {
+    source: String,
+    /// Latest LSP version observed for this URI (`None` for didOpen).
+    version: Option<i32>,
+}
+
+/// Work item handed to the analysis worker.
+struct AnalysisTask {
+    uri: Uri,
+    source: String,
+    version: Option<i32>,
+}
+
+/// Output from the analysis worker.
+struct AnalysisResult {
+    uri: Uri,
+    version: Option<i32>,
+    doc: DocumentState,
 }
 
 // ── Semantic token legend ───────────────────────────────────────────
@@ -208,11 +238,25 @@ fn main() {
         })
         .and_then(|u| uri_to_path(&u));
 
+    // Spawn the analysis worker. It owns no per-request state of its own —
+    // the import cache is shared (Arc<Mutex>) so the main thread can read it
+    // for auto-import completion suggestions without a round trip.
+    let import_cache = Arc::new(Mutex::new(HashMap::new()));
+    let (analysis_tx, analysis_rx) = crossbeam_channel::unbounded::<AnalysisTask>();
+    let (results_tx, results_rx) = crossbeam_channel::unbounded::<AnalysisResult>();
+    let worker_cache = Arc::clone(&import_cache);
+    let worker = thread::Builder::new()
+        .name("knot-lsp-analysis".into())
+        .spawn(move || analysis_worker(analysis_rx, results_tx, worker_cache))
+        .expect("failed to spawn analysis worker");
+
     let mut state = ServerState {
         documents: HashMap::new(),
         workspace_root,
-        import_cache: HashMap::new(),
+        import_cache,
         workspace_diag_cache: HashMap::new(),
+        pending_sources: HashMap::new(),
+        analysis_tx,
     };
 
     // Register for file watcher notifications (.knot files)
@@ -238,22 +282,122 @@ fn main() {
         .unwrap(),
     )));
 
-    for msg in &connection.receiver {
-        match msg {
-            Message::Request(req) => {
-                if connection.handle_shutdown(&req).unwrap_or(false) {
-                    return;
+    'outer: loop {
+        select! {
+            recv(connection.receiver) -> msg => {
+                let msg = match msg {
+                    Ok(m) => m,
+                    Err(_) => break 'outer,
+                };
+                match msg {
+                    Message::Request(req) => {
+                        if connection.handle_shutdown(&req).unwrap_or(false) {
+                            break 'outer;
+                        }
+                        handle_request(&mut state, &connection, req);
+                    }
+                    Message::Notification(not) => {
+                        handle_notification(&mut state, &connection, not);
+                    }
+                    Message::Response(_) => {}
                 }
-                handle_request(&mut state, &connection, req);
             }
-            Message::Notification(not) => {
-                handle_notification(&mut state, &connection, not);
+            recv(results_rx) -> result => {
+                let result = match result {
+                    Ok(r) => r,
+                    Err(_) => break 'outer,
+                };
+                apply_analysis_result(&mut state, &connection, result);
             }
-            Message::Response(_) => {}
         }
     }
 
+    // Dropping `state` (and thus `analysis_tx`) closes the channel, prompting
+    // the worker to exit on its next blocking `recv`.
+    drop(state);
+    let _ = worker.join();
     io_threads.join().unwrap();
+}
+
+// ── Analysis worker ─────────────────────────────────────────────────
+
+/// Quiet period after the most recent task before processing begins.
+const ANALYSIS_DEBOUNCE: Duration = Duration::from_millis(150);
+/// Hard upper bound on how long a task can sit in the debounce queue. Prevents
+/// continuous typing from indefinitely starving the analysis pass.
+const ANALYSIS_MAX_WAIT: Duration = Duration::from_millis(500);
+
+fn analysis_worker(
+    rx: Receiver<AnalysisTask>,
+    tx: Sender<AnalysisResult>,
+    import_cache: Arc<Mutex<HashMap<PathBuf, (SystemTime, Module, String)>>>,
+) {
+    loop {
+        // Block until something arrives.
+        let first = match rx.recv() {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+
+        // Coalesce: keep the latest task per URI within a debounce window.
+        let mut pending: HashMap<Uri, AnalysisTask> = HashMap::new();
+        pending.insert(first.uri.clone(), first);
+
+        let batch_start = Instant::now();
+        loop {
+            let elapsed = batch_start.elapsed();
+            if elapsed >= ANALYSIS_MAX_WAIT {
+                break;
+            }
+            let timeout = ANALYSIS_DEBOUNCE.min(ANALYSIS_MAX_WAIT - elapsed);
+            match rx.recv_timeout(timeout) {
+                Ok(task) => {
+                    pending.insert(task.uri.clone(), task);
+                }
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+
+        for (_, task) in pending {
+            let mut cache = import_cache.lock().unwrap();
+            let doc = analyze_document(&task.uri, &task.source, &mut cache);
+            drop(cache);
+            if tx
+                .send(AnalysisResult {
+                    uri: task.uri,
+                    version: task.version,
+                    doc,
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+}
+
+/// Apply a finished analysis: replace the document state and publish diagnostics.
+fn apply_analysis_result(state: &mut ServerState, conn: &Connection, result: AnalysisResult) {
+    // Document closed while analysis was in flight: drop the result rather
+    // than resurrecting a removed document.
+    let tracked = state.documents.contains_key(&result.uri)
+        || state.pending_sources.contains_key(&result.uri);
+    if !tracked {
+        return;
+    }
+
+    // If a newer edit was applied while analysis was running, drop the result.
+    // The newer edit will already have queued a fresh task.
+    if let Some(pending) = state.pending_sources.get(&result.uri) {
+        if pending.source != result.doc.source {
+            return;
+        }
+        state.pending_sources.remove(&result.uri);
+    }
+
+    publish_diagnostics(conn, &result.uri, &result.doc, result.version);
+    state.documents.insert(result.uri, result.doc);
 }
 
 // ── Request dispatch ────────────────────────────────────────────────
@@ -370,67 +514,82 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
     if not.method == notification::DidOpenTextDocument::METHOD {
         let params: DidOpenTextDocumentParams = serde_json::from_value(not.params).unwrap();
         let uri = params.text_document.uri.clone();
-        let doc = analyze_document(&uri, &params.text_document.text, &mut state.import_cache);
-        publish_diagnostics(conn, &uri, &doc);
-        state.documents.insert(uri, doc);
+        let version = Some(params.text_document.version);
+        // Park the source as pending until analysis catches up. This lets
+        // subsequent didChange edits stack on top of the freshest text even
+        // before the worker has produced its first AST.
+        state.pending_sources.insert(
+            uri.clone(),
+            PendingSource {
+                source: params.text_document.text.clone(),
+                version,
+            },
+        );
+        queue_analysis(state, uri, params.text_document.text, version);
     } else if not.method == notification::DidChangeTextDocument::METHOD {
         let params: DidChangeTextDocumentParams = serde_json::from_value(not.params).unwrap();
         let uri = params.text_document.uri.clone();
-        // Get current source or start empty
+        let version = Some(params.text_document.version);
+        // Apply edits to the freshest source we know about: the pending one
+        // (if mid-debounce) or the last analyzed one. Falling back to the
+        // analyzed source could lose interleaved edits, so prefer pending.
         let mut source = state
-            .documents
+            .pending_sources
             .get(&uri)
-            .map(|d| d.source.clone())
+            .map(|p| p.source.clone())
+            .or_else(|| state.documents.get(&uri).map(|d| d.source.clone()))
             .unwrap_or_default();
-        // Apply incremental edits (or full replacement if range is None)
         for change in params.content_changes {
             if let Some(range) = change.range {
                 let start = position_to_offset(&source, range.start);
                 let end = position_to_offset(&source, range.end);
                 source.replace_range(start..end, &change.text);
             } else {
-                // Full document replacement (fallback)
                 source = change.text;
             }
         }
-        // Skip re-analysis if the source matches what we already analyzed.
-        // Triggered when a no-op edit fires (e.g. format-on-save with no changes).
+
+        // No-op edits (e.g. format-on-save with no changes) shouldn't queue
+        // redundant work. The pending check covers an edit that was already
+        // queued; the analyzed check covers a steady state.
+        let already_pending = state
+            .pending_sources
+            .get(&uri)
+            .map(|p| p.source == source)
+            .unwrap_or(false);
         let unchanged = state
             .documents
             .get(&uri)
             .map(|d| d.source == source)
             .unwrap_or(false);
-        if !unchanged {
-            let doc = analyze_document(&uri, &source, &mut state.import_cache);
-            publish_diagnostics(conn, &uri, &doc);
-            state.documents.insert(uri.clone(), doc);
+        if already_pending {
+            // Just refresh the version so the result-routing check in
+            // `apply_analysis_result` keeps working.
+            if let Some(p) = state.pending_sources.get_mut(&uri) {
+                p.version = version;
+            }
+            return;
+        }
+        if unchanged {
+            state.pending_sources.remove(&uri);
+            return;
         }
 
-        // Re-analyze open documents that import from the changed file
+        state.pending_sources.insert(
+            uri.clone(),
+            PendingSource {
+                source: source.clone(),
+                version,
+            },
+        );
+        queue_analysis(state, uri.clone(), source, version);
+
+        // When a file changes, dependents may need a fresh pass too.
         if let Some(changed_path) = uri_to_path(&uri).and_then(|p| p.canonicalize().ok()) {
-            let uris_to_refresh: Vec<(Uri, String)> = state
-                .documents
-                .iter()
-                .filter(|(other_uri, other_doc)| {
-                    **other_uri != uri
-                        && other_doc
-                            .imported_files
-                            .keys()
-                            .any(|p| *p == changed_path)
-                })
-                .map(|(u, d)| (u.clone(), d.source.clone()))
-                .collect();
-            for (refresh_uri, refresh_source) in uris_to_refresh {
-                let doc =
-                    analyze_document(&refresh_uri, &refresh_source, &mut state.import_cache);
-                publish_diagnostics(conn, &refresh_uri, &doc);
-                state.documents.insert(refresh_uri, doc);
-            }
+            queue_dependent_analyses(state, &uri, &changed_path);
         }
     } else if not.method == notification::DidChangeWatchedFiles::METHOD {
         let params: DidChangeWatchedFilesParams = serde_json::from_value(not.params).unwrap();
-        // When .knot files change on disk, re-analyze open documents that might
-        // import them (their cross-file navigation data may be stale)
         let changed_paths: HashSet<PathBuf> = params
             .changes
             .iter()
@@ -439,8 +598,7 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
             .collect();
 
         if !changed_paths.is_empty() {
-            // Re-analyze all open documents whose imports overlap with changed files
-            let uris_to_refresh: Vec<(Uri, String)> = state
+            let dependents: Vec<(Uri, String)> = state
                 .documents
                 .iter()
                 .filter(|(_, doc)| {
@@ -448,22 +606,60 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
                         .keys()
                         .any(|p| changed_paths.contains(p))
                 })
-                .map(|(uri, doc)| (uri.clone(), doc.source.clone()))
+                .map(|(uri, doc)| {
+                    let src = state
+                        .pending_sources
+                        .get(uri)
+                        .map(|p| p.source.clone())
+                        .unwrap_or_else(|| doc.source.clone());
+                    (uri.clone(), src)
+                })
                 .collect();
 
-            for (uri, source) in uris_to_refresh {
-                let doc = analyze_document(&uri, &source, &mut state.import_cache);
-                publish_diagnostics(conn, &uri, &doc);
-                state.documents.insert(uri, doc);
+            for (dep_uri, dep_source) in dependents {
+                queue_analysis(state, dep_uri, dep_source, None);
             }
         }
     } else if not.method == notification::DidCloseTextDocument::METHOD {
         let params: DidCloseTextDocumentParams = serde_json::from_value(not.params).unwrap();
         state.documents.remove(&params.text_document.uri);
+        state.pending_sources.remove(&params.text_document.uri);
         // Clear diagnostics
         let diags = PublishDiagnosticsParams::new(params.text_document.uri, vec![], None);
         let not = Notification::new(notification::PublishDiagnostics::METHOD.into(), diags);
         conn.sender.send(Message::Notification(not)).unwrap();
+    }
+}
+
+/// Send an analysis task to the worker. Errors here are unrecoverable — the
+/// worker has died — so we eprintln and continue (other features still work
+/// against the last good analysis).
+fn queue_analysis(state: &ServerState, uri: Uri, source: String, version: Option<i32>) {
+    if let Err(e) = state.analysis_tx.send(AnalysisTask { uri, source, version }) {
+        eprintln!("knot-lsp: analysis worker channel closed: {e}");
+    }
+}
+
+/// Re-queue analysis for any open document whose imports point at `changed_path`.
+fn queue_dependent_analyses(state: &mut ServerState, source_uri: &Uri, changed_path: &Path) {
+    let dependents: Vec<(Uri, String)> = state
+        .documents
+        .iter()
+        .filter(|(other_uri, other_doc)| {
+            *other_uri != source_uri
+                && other_doc.imported_files.keys().any(|p| p == changed_path)
+        })
+        .map(|(u, d)| {
+            let src = state
+                .pending_sources
+                .get(u)
+                .map(|p| p.source.clone())
+                .unwrap_or_else(|| d.source.clone());
+            (u.clone(), src)
+        })
+        .collect();
+    for (dep_uri, dep_source) in dependents {
+        queue_analysis(state, dep_uri, dep_source, None);
     }
 }
 
@@ -683,14 +879,14 @@ fn resolve_import_navigation(
     (imported_files, import_defs, import_origins)
 }
 
-fn publish_diagnostics(conn: &Connection, uri: &Uri, doc: &DocumentState) {
+fn publish_diagnostics(conn: &Connection, uri: &Uri, doc: &DocumentState, version: Option<i32>) {
     let lsp_diags: Vec<Diagnostic> = doc
         .knot_diagnostics
         .iter()
         .filter_map(|d| to_lsp_diagnostic(d, &doc.source, uri))
         .collect();
 
-    let params = PublishDiagnosticsParams::new(uri.clone(), lsp_diags, None);
+    let params = PublishDiagnosticsParams::new(uri.clone(), lsp_diags, version);
     let not = Notification::new(
         notification::PublishDiagnostics::METHOD.into(),
         params,
@@ -1796,8 +1992,14 @@ fn handle_completion(
 
                 // Reuse the cached parsed module if available (populated by
                 // resolve_import_navigation when other files have imported it).
-                let module = if let Some((_, cached_mod, _)) = state.import_cache.get(&canonical) {
-                    cached_mod.clone()
+                let cached_module = state
+                    .import_cache
+                    .lock()
+                    .unwrap()
+                    .get(&canonical)
+                    .map(|(_, m, _)| m.clone());
+                let module = if let Some(m) = cached_module {
+                    m
                 } else {
                     let source_text = match std::fs::read_to_string(&canonical) {
                         Ok(s) => s,
@@ -7319,5 +7521,109 @@ fn error_code_for_diagnostic(message: &str) -> Option<String> {
         Some("I001".into())
     } else {
         None
+    }
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_uri(s: &str) -> Uri {
+        s.parse().unwrap()
+    }
+
+    /// Spin up the analysis worker and feed it tasks. Used to verify the
+    /// debounce/coalesce behavior without going through stdio.
+    fn spawn_worker() -> (Sender<AnalysisTask>, Receiver<AnalysisResult>, thread::JoinHandle<()>) {
+        let (tx, rx) = crossbeam_channel::unbounded::<AnalysisTask>();
+        let (rtx, rrx) = crossbeam_channel::unbounded::<AnalysisResult>();
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let handle = thread::spawn(move || analysis_worker(rx, rtx, cache));
+        (tx, rrx, handle)
+    }
+
+    #[test]
+    fn worker_returns_result_for_single_task() {
+        let (tx, rx, handle) = spawn_worker();
+        let uri = fake_uri("file:///tmp/a.knot");
+        tx.send(AnalysisTask {
+            uri: uri.clone(),
+            source: "x = 1".into(),
+            version: Some(1),
+        })
+        .unwrap();
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker should produce a result");
+        assert_eq!(result.uri, uri);
+        assert_eq!(result.version, Some(1));
+        assert_eq!(result.doc.source, "x = 1");
+
+        drop(tx);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn worker_coalesces_rapid_edits_to_latest() {
+        let (tx, rx, handle) = spawn_worker();
+        let uri = fake_uri("file:///tmp/b.knot");
+        // Three rapid edits within the debounce window — only the latest
+        // should turn into a result.
+        for (i, src) in ["x = 1", "x = 2", "x = 3"].iter().enumerate() {
+            tx.send(AnalysisTask {
+                uri: uri.clone(),
+                source: (*src).into(),
+                version: Some(i as i32 + 1),
+            })
+            .unwrap();
+        }
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker should produce a result");
+        assert_eq!(result.doc.source, "x = 3");
+        assert_eq!(result.version, Some(3));
+
+        // No follow-up result should arrive — the earlier two were dropped.
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+
+        drop(tx);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn worker_keeps_distinct_uris_separate() {
+        let (tx, rx, handle) = spawn_worker();
+        let a = fake_uri("file:///tmp/a.knot");
+        let b = fake_uri("file:///tmp/b.knot");
+        tx.send(AnalysisTask {
+            uri: a.clone(),
+            source: "x = 1".into(),
+            version: Some(1),
+        })
+        .unwrap();
+        tx.send(AnalysisTask {
+            uri: b.clone(),
+            source: "y = 2".into(),
+            version: Some(1),
+        })
+        .unwrap();
+
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            let r = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("worker should produce two results");
+            got.push((r.uri, r.doc.source));
+        }
+        got.sort_by(|x, y| x.0.as_str().cmp(y.0.as_str()));
+        assert_eq!(got[0], (a, "x = 1".into()));
+        assert_eq!(got[1], (b, "y = 2".into()));
+
+        drop(tx);
+        handle.join().unwrap();
     }
 }

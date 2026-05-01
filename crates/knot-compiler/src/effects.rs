@@ -185,36 +185,35 @@ impl EffectChecker {
             }
         };
 
+        // Builtin tables come from `crate::builtins` so the LSP can read the
+        // exact same lists. Adding a new effectful builtin should only require
+        // editing one file.
+        use crate::builtins::{
+            CLOCK_BUILTINS, CONSOLE_BUILTINS, FS_BUILTINS, NETWORK_BUILTINS, PURE_BUILTINS,
+            RANDOM_BUILTINS,
+        };
+
         let mut console_effect = EffectSet::empty();
         console_effect.console = true;
-        insert_many(&["println", "putLine", "print", "readLine",
-                       "logInfo", "logWarn", "logError", "logDebug"], console_effect);
+        insert_many(CONSOLE_BUILTINS, console_effect);
 
         let mut clock_effect = EffectSet::empty();
         clock_effect.clock = true;
-        insert_many(&["now", "sleep"], clock_effect);
+        insert_many(CLOCK_BUILTINS, clock_effect);
 
         let mut random_effect = EffectSet::empty();
         random_effect.random = true;
-        insert_many(&["randomInt", "randomFloat", "generateKeyPair",
-                       "generateSigningKeyPair", "encrypt"], random_effect);
-        insert_many(&["decrypt", "sign", "verify"], EffectSet::empty());
+        insert_many(RANDOM_BUILTINS, random_effect);
 
         let mut network_effect = EffectSet::empty();
         network_effect.network = true;
-        insert_many(&["listen", "fetch", "fetchWith"], network_effect);
+        insert_many(NETWORK_BUILTINS, network_effect);
 
         let mut fs_effect = EffectSet::empty();
         fs_effect.fs = true;
-        insert_many(&["readFile", "writeFile", "appendFile",
-                       "fileExists", "removeFile", "listDir"], fs_effect);
+        insert_many(FS_BUILTINS, fs_effect);
 
-        // Pure builtins
-        insert_many(&["show", "union", "count", "filter", "match", "map",
-                       "fold", "single", "diff", "inter", "sum", "avg",
-                       "toUpper", "toLower", "take", "drop",
-                       "length", "trim", "contains", "reverse", "chars",
-                       "id", "not", "toJson", "parseJson"], EffectSet::empty());
+        insert_many(PURE_BUILTINS, EffectSet::empty());
 
         Self {
             decl_effects: HashMap::new(),

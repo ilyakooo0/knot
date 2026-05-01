@@ -1,192 +1,49 @@
+// ── Module declarations ─────────────────────────────────────────────
+
+mod analysis;
+mod builtins;
+mod defs;
+mod diagnostics;
+mod legend;
+mod state;
+mod type_format;
+mod utils;
+
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
 
-use crossbeam_channel::{select, Receiver, RecvTimeoutError, Sender};
-use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
+use crossbeam_channel::select;
+use lsp_server::{Connection, Message, Notification, Request, RequestId};
 use lsp_types::notification::Notification as _;
 use lsp_types::*;
 
-use knot::ast::{self, DeclKind, Module, Span, TypeKind, TypeScheme};
+use knot::ast::{self, DeclKind, Module, Span, TypeKind};
+#[allow(unused_imports)]
 use knot::diagnostic;
+#[allow(unused_imports)]
 use knot_compiler::effects::EffectSet;
 use knot_compiler::infer::MonadKind;
 
-// ── Types ───────────────────────────────────────────────────────────
-
-struct DocumentState {
-    source: String,
-    module: Module,
-    /// Span-based references: (usage_span → definition_span).
-    references: Vec<(Span, Span)>,
-    /// Fallback name-based definitions for names not covered by AST walk.
-    definitions: HashMap<String, Span>,
-    details: HashMap<String, String>,
-    type_info: HashMap<String, String>,
-    /// Span-based type info for local bindings (let, bind, lambda params, case patterns).
-    local_type_info: HashMap<Span, String>,
-    /// Span-based type info for literal expressions.
-    literal_types: Vec<(Span, String)>,
-    /// Per-declaration effect info (formatted strings).
-    effect_info: HashMap<String, String>,
-    /// Per-declaration effect sets (structured form). Keys mirror `effect_info`
-    /// but the value is the underlying `EffectSet` so callers can do set
-    /// operations (e.g. atomic-context filtering).
-    effect_sets: HashMap<String, EffectSet>,
-    knot_diagnostics: Vec<diagnostic::Diagnostic>,
-    /// Imported files: canonical path → source text
-    imported_files: HashMap<PathBuf, String>,
-    /// Definitions from imported files: name → (canonical path, span in that file)
-    import_defs: HashMap<String, (PathBuf, Span)>,
-    /// Which import path each name originated from (for scoped cross-file matching).
-    import_origins: HashMap<String, String>,
-    /// Doc comments for declarations: name → comment text.
-    doc_comments: HashMap<String, String>,
-    /// Keyword/operator token positions for semantic highlighting.
-    keyword_tokens: Vec<(Span, u32)>,
-    /// Refined-type-alias predicates: type-name → predicate expression. Includes
-    /// every named refined type alias declared (or imported) in this module.
-    refined_types: HashMap<String, ast::Expr>,
-    /// `refine expr` target types: span-of-refine-expr → target refined-type name.
-    refine_targets: HashMap<Span, String>,
-    /// Per-source field refinements: source-name → [(field-name, refined-type-name, predicate-expr)].
-    /// `field-name = None` denotes a whole-element refinement.
-    source_refinements: HashMap<String, Vec<(Option<String>, String, ast::Expr)>>,
-    /// Monad context resolved for each `do` block: span-of-do → kind (Relation/IO/Adt).
-    /// Drives monad-aware completion ranking inside do-blocks.
-    monad_info: HashMap<Span, MonadKind>,
-}
-
-struct ServerState {
-    documents: HashMap<Uri, DocumentState>,
-    workspace_root: Option<PathBuf>,
-    /// Cached parsed files: canonical path → (content hash, parsed module, source text).
-    /// Keyed by content hash rather than mtime — mtime is unreliable across
-    /// `jj`/`git` checkouts that touch timestamps without changing content.
-    /// Shared with the analysis worker thread; populated lazily by every
-    /// caller that reads a `.knot` file (imports, rename, workspace symbol,
-    /// workspace diagnostics, completion).
-    import_cache: Arc<Mutex<HashMap<PathBuf, (u64, Module, String)>>>,
-    /// Cached LSP diagnostics for unopened workspace files, keyed by content hash.
-    workspace_diag_cache: HashMap<PathBuf, (u64, Vec<Diagnostic>)>,
-    /// Edited but not-yet-analyzed sources. When present, this is the source
-    /// the next analysis run will see. Subsequent didChange edits stack on top
-    /// of this rather than the (stale) analyzed source.
-    pending_sources: HashMap<Uri, PendingSource>,
-    /// Sender side of the analysis-task channel. Cloned per outgoing task.
-    analysis_tx: Sender<AnalysisTask>,
-}
-
-struct PendingSource {
-    source: String,
-    /// Latest LSP version observed for this URI (`None` for didOpen).
-    version: Option<i32>,
-}
-
-/// Work item handed to the analysis worker.
-struct AnalysisTask {
-    uri: Uri,
-    source: String,
-    version: Option<i32>,
-}
-
-/// Output from the analysis worker.
-struct AnalysisResult {
-    uri: Uri,
-    version: Option<i32>,
-    doc: DocumentState,
-}
-
-// ── Semantic token legend ───────────────────────────────────────────
-
-const TOK_NAMESPACE: u32 = 0;
-const TOK_TYPE: u32 = 1;
-const TOK_STRUCT: u32 = 2;
-const TOK_ENUM_MEMBER: u32 = 3;
-const TOK_PARAMETER: u32 = 4;
-const TOK_VARIABLE: u32 = 5;
-const TOK_PROPERTY: u32 = 6;
-const TOK_FUNCTION: u32 = 7;
-const TOK_KEYWORD: u32 = 8;
-const TOK_STRING: u32 = 9;
-const TOK_NUMBER: u32 = 10;
-const TOK_OPERATOR: u32 = 11;
-
-const MOD_DECLARATION: u32 = 0b0001;
-const MOD_READONLY: u32 = 0b0010;
-/// Effectful operation (IO, network, fs, clock, random, console).
-/// Maps to `async` since it's the closest standard token modifier — many
-/// editor themes already color async calls distinctively.
-const MOD_EFFECTFUL: u32 = 0b0100;
-/// Mutation: writes to a relation (`set *r = ...`, `full set *r = ...`).
-const MOD_MUTATION: u32 = 0b1000;
-
-fn semantic_token_legend() -> SemanticTokensLegend {
-    SemanticTokensLegend {
-        token_types: vec![
-            SemanticTokenType::NAMESPACE,    // 0
-            SemanticTokenType::TYPE,         // 1
-            SemanticTokenType::STRUCT,       // 2
-            SemanticTokenType::ENUM_MEMBER,  // 3
-            SemanticTokenType::PARAMETER,    // 4
-            SemanticTokenType::VARIABLE,     // 5
-            SemanticTokenType::PROPERTY,     // 6
-            SemanticTokenType::FUNCTION,     // 7
-            SemanticTokenType::KEYWORD,      // 8
-            SemanticTokenType::STRING,       // 9
-            SemanticTokenType::NUMBER,       // 10
-            SemanticTokenType::OPERATOR,     // 11
-        ],
-        token_modifiers: vec![
-            SemanticTokenModifier::DECLARATION,  // bit 0
-            SemanticTokenModifier::READONLY,     // bit 1
-            SemanticTokenModifier::ASYNC,        // bit 2 — used for effectful calls
-            SemanticTokenModifier::MODIFICATION, // bit 3 — used for relation mutations
-        ],
-    }
-}
-
-/// Set of builtin function names that perform IO effects.
-/// Kept in sync with the builtin tables in `effects.rs`.
-const EFFECTFUL_BUILTINS: &[&str] = &[
-    // console
-    "println", "putLine", "print", "readLine",
-    "logInfo", "logWarn", "logError", "logDebug",
-    // clock
-    "now", "sleep",
-    // random
-    "randomInt", "randomFloat",
-    "generateKeyPair", "generateSigningKeyPair", "encrypt",
-    // network
-    "listen", "fetch", "fetchWith",
-    // fs
-    "readFile", "writeFile", "appendFile",
-    "fileExists", "removeFile", "listDir",
-    // concurrency
-    "fork", "retry",
-];
-
-/// Builtin names whose effects are NOT permitted inside an `atomic` block.
-/// `console`, `network`, `fs`, `clock`, and `random` cannot be rolled back, so
-/// the type checker rejects them at compile time. The LSP filters them from
-/// the completion list inside atomic so the user can't even type them.
-///
-/// `fork` and `retry` are intentionally excluded: `fork` returns `IO {} {}`
-/// (the spawned IO is not part of the surrounding transaction), and `retry`
-/// is the STM primitive used *inside* atomic to trigger a retry.
-const ATOMIC_DISALLOWED_BUILTINS: &[&str] = &[
-    "println", "putLine", "print", "readLine",
-    "logInfo", "logWarn", "logError", "logDebug",
-    "now", "sleep",
-    "randomInt", "randomFloat",
-    "generateKeyPair", "generateSigningKeyPair", "encrypt",
-    "listen", "fetch", "fetchWith",
-    "readFile", "writeFile", "appendFile",
-    "fileExists", "removeFile", "listDir",
-];
+use crate::analysis::{analysis_worker, get_or_parse_file_shared, publish_diagnostics};
+use crate::builtins::{ATOMIC_DISALLOWED_BUILTINS, EFFECTFUL_BUILTINS};
+use crate::defs::resolve_definitions;
+use crate::diagnostics::to_lsp_diagnostic;
+use crate::legend::{
+    semantic_token_legend, MOD_DECLARATION, MOD_EFFECTFUL, MOD_MUTATION, MOD_READONLY,
+    TOK_ENUM_MEMBER, TOK_FUNCTION, TOK_NAMESPACE, TOK_NUMBER, TOK_PARAMETER, TOK_PROPERTY,
+    TOK_STRING, TOK_STRUCT, TOK_TYPE, TOK_VARIABLE,
+};
+use crate::state::{
+    content_hash, send_response, AnalysisResult, AnalysisTask, DocumentState, PendingSource,
+    ServerState, WorkspaceSymbolCache, WorkspaceSymbolEntry, BUILTINS, KEYWORDS, SNIPPETS,
+};
+use crate::type_format::{format_type_kind, format_type_scheme};
+use crate::utils::{
+    edit_distance, find_word_in_source, offset_to_position, path_to_uri, position_to_offset,
+    recurse_expr, span_to_range, uri_to_path, word_at_position,
+};
 
 // ── Entry point ─────────────────────────────────────────────────────
 
@@ -258,7 +115,7 @@ fn main() {
         })),
         ..Default::default()
     })
-    .unwrap();
+    .expect("server capabilities are static and always serialize cleanly");
 
     let init_params = match connection.initialize(server_capabilities) {
         Ok(params) => params,
@@ -282,12 +139,21 @@ fn main() {
     // the import cache is shared (Arc<Mutex>) so the main thread can read it
     // for auto-import completion suggestions without a round trip.
     let import_cache = Arc::new(Mutex::new(HashMap::new()));
+    let inference_cache = Arc::new(Mutex::new(HashMap::new()));
     let (analysis_tx, analysis_rx) = crossbeam_channel::unbounded::<AnalysisTask>();
     let (results_tx, results_rx) = crossbeam_channel::unbounded::<AnalysisResult>();
-    let worker_cache = Arc::clone(&import_cache);
+    let worker_import_cache = Arc::clone(&import_cache);
+    let worker_inference_cache = Arc::clone(&inference_cache);
     let worker = thread::Builder::new()
         .name("knot-lsp-analysis".into())
-        .spawn(move || analysis_worker(analysis_rx, results_tx, worker_cache))
+        .spawn(move || {
+            analysis_worker(
+                analysis_rx,
+                results_tx,
+                worker_import_cache,
+                worker_inference_cache,
+            )
+        })
         .expect("failed to spawn analysis worker");
 
     let mut state = ServerState {
@@ -295,32 +161,20 @@ fn main() {
         workspace_root,
         import_cache,
         workspace_diag_cache: HashMap::new(),
+        workspace_symbol_cache: WorkspaceSymbolCache::default(),
         pending_sources: HashMap::new(),
         analysis_tx,
+        reverse_imports: HashMap::new(),
+        inference_cache,
     };
 
-    // Register for file watcher notifications (.knot files)
-    let registration = Registration {
-        id: "knot-file-watcher".into(),
-        method: "workspace/didChangeWatchedFiles".into(),
-        register_options: Some(
-            serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
-                watchers: vec![FileSystemWatcher {
-                    glob_pattern: GlobPattern::String("**/*.knot".into()),
-                    kind: Some(WatchKind::Create | WatchKind::Delete | WatchKind::Change),
-                }],
-            })
-            .unwrap(),
-        ),
-    };
-    let _ = connection.sender.send(Message::Request(Request::new(
-        RequestId::from("register-file-watcher".to_string()),
-        "client/registerCapability".into(),
-        serde_json::to_value(RegistrationParams {
-            registrations: vec![registration],
-        })
-        .unwrap(),
-    )));
+    // Register for file watcher notifications (.knot files). Build the
+    // request defensively: if any payload fails to serialize (this should
+    // never happen for these static structs, but handling it costs nothing),
+    // skip the registration rather than panicking.
+    if let Some(register_request) = build_file_watcher_registration() {
+        let _ = connection.sender.send(Message::Request(register_request));
+    }
 
     'outer: loop {
         select! {
@@ -356,65 +210,36 @@ fn main() {
     // the worker to exit on its next blocking `recv`.
     drop(state);
     let _ = worker.join();
-    io_threads.join().unwrap();
+    if let Err(e) = io_threads.join() {
+        eprintln!("knot-lsp: stdio thread join failed: {e:?}");
+    }
 }
 
-// ── Analysis worker ─────────────────────────────────────────────────
-
-/// Quiet period after the most recent task before processing begins.
-const ANALYSIS_DEBOUNCE: Duration = Duration::from_millis(150);
-/// Hard upper bound on how long a task can sit in the debounce queue. Prevents
-/// continuous typing from indefinitely starving the analysis pass.
-const ANALYSIS_MAX_WAIT: Duration = Duration::from_millis(500);
-
-fn analysis_worker(
-    rx: Receiver<AnalysisTask>,
-    tx: Sender<AnalysisResult>,
-    import_cache: Arc<Mutex<HashMap<PathBuf, (u64, Module, String)>>>,
-) {
-    loop {
-        // Block until something arrives.
-        let first = match rx.recv() {
-            Ok(t) => t,
-            Err(_) => return,
-        };
-
-        // Coalesce: keep the latest task per URI within a debounce window.
-        let mut pending: HashMap<Uri, AnalysisTask> = HashMap::new();
-        pending.insert(first.uri.clone(), first);
-
-        let batch_start = Instant::now();
-        loop {
-            let elapsed = batch_start.elapsed();
-            if elapsed >= ANALYSIS_MAX_WAIT {
-                break;
-            }
-            let timeout = ANALYSIS_DEBOUNCE.min(ANALYSIS_MAX_WAIT - elapsed);
-            match rx.recv_timeout(timeout) {
-                Ok(task) => {
-                    pending.insert(task.uri.clone(), task);
-                }
-                Err(RecvTimeoutError::Timeout) => break,
-                Err(RecvTimeoutError::Disconnected) => return,
-            }
-        }
-
-        for (_, task) in pending {
-            let mut cache = import_cache.lock().unwrap();
-            let doc = analyze_document(&task.uri, &task.source, &mut cache);
-            drop(cache);
-            if tx
-                .send(AnalysisResult {
-                    uri: task.uri,
-                    version: task.version,
-                    doc,
-                })
-                .is_err()
-            {
-                return;
-            }
-        }
-    }
+/// Construct the `client/registerCapability` request that asks the editor to
+/// notify us about changes to `.knot` files. Returns `None` if the static
+/// payloads fail to serialize (defensive — should never happen).
+fn build_file_watcher_registration() -> Option<Request> {
+    let watcher_options = serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+        watchers: vec![FileSystemWatcher {
+            glob_pattern: GlobPattern::String("**/*.knot".into()),
+            kind: Some(WatchKind::Create | WatchKind::Delete | WatchKind::Change),
+        }],
+    })
+    .ok()?;
+    let registration = Registration {
+        id: "knot-file-watcher".into(),
+        method: "workspace/didChangeWatchedFiles".into(),
+        register_options: Some(watcher_options),
+    };
+    let params = serde_json::to_value(RegistrationParams {
+        registrations: vec![registration],
+    })
+    .ok()?;
+    Some(Request::new(
+        RequestId::from("register-file-watcher".to_string()),
+        "client/registerCapability".into(),
+        params,
+    ))
 }
 
 /// Apply a finished analysis: replace the document state and publish diagnostics.
@@ -437,6 +262,26 @@ fn apply_analysis_result(state: &mut ServerState, conn: &Connection, result: Ana
     }
 
     publish_diagnostics(conn, &result.uri, &result.doc, result.version);
+
+    // Update the reverse-import graph for cross-file diagnostics. Each
+    // analyzed module knows which files it imported (`imported_files`); we
+    // invert that map so a later edit to an imported file can re-queue every
+    // open consumer for re-analysis.
+    if let Some(this_path) = uri_to_path(&result.uri).and_then(|p| p.canonicalize().ok()) {
+        // Drop any prior incoming edges from this importer — a removed
+        // `import X` statement should stop pulling X back in for re-checks.
+        for importers in state.reverse_imports.values_mut() {
+            importers.remove(&this_path);
+        }
+        for imported in result.doc.imported_files.keys() {
+            state
+                .reverse_imports
+                .entry(imported.clone())
+                .or_default()
+                .insert(this_path.clone());
+        }
+    }
+
     state.documents.insert(result.uri, result.doc);
 }
 
@@ -511,6 +356,8 @@ fn handle_request(state: &mut ServerState, conn: &Connection, req: Request) {
     } else if let Some(params) = cast_request::<request::WorkspaceSymbolRequest>(&req) {
         let result = handle_workspace_symbol(state, &params);
         send_response(conn, id, result);
+        // Keep workspace_symbol_cache from growing unbounded — pruning happens
+        // inside the handler via the on-disk scan.
     } else if let Some(params) = cast_request::<request::CallHierarchyPrepare>(&req) {
         let result = handle_call_hierarchy_prepare(state, &params);
         send_response(conn, id, result);
@@ -543,16 +390,25 @@ fn cast_request<R: request::Request>(req: &Request) -> Option<R::Params> {
     }
 }
 
-fn send_response<T: serde::Serialize>(conn: &Connection, id: RequestId, result: T) {
-    let resp = Response::new_ok(id, serde_json::to_value(result).unwrap());
-    conn.sender.send(Message::Response(resp)).unwrap();
-}
-
 // ── Notification dispatch ───────────────────────────────────────────
 
 fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notification) {
+    /// Decode notification params or log+drop the message. A malformed payload
+    /// from a misbehaving client must not bring down the server.
+    fn decode<T: serde::de::DeserializeOwned>(method: &str, value: serde_json::Value) -> Option<T> {
+        match serde_json::from_value(value) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("knot-lsp: malformed `{method}` payload: {e}");
+                None
+            }
+        }
+    }
+
     if not.method == notification::DidOpenTextDocument::METHOD {
-        let params: DidOpenTextDocumentParams = serde_json::from_value(not.params).unwrap();
+        let Some(params) = decode::<DidOpenTextDocumentParams>(&not.method, not.params) else {
+            return;
+        };
         let uri = params.text_document.uri.clone();
         let version = Some(params.text_document.version);
         // Park the source as pending until analysis catches up. This lets
@@ -567,7 +423,11 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
         );
         queue_analysis(state, uri, params.text_document.text, version);
     } else if not.method == notification::DidChangeTextDocument::METHOD {
-        let params: DidChangeTextDocumentParams = serde_json::from_value(not.params).unwrap();
+        let Some(params) =
+            decode::<DidChangeTextDocumentParams>(&not.method, not.params)
+        else {
+            return;
+        };
         let uri = params.text_document.uri.clone();
         let version = Some(params.text_document.version);
         // Apply edits to the freshest source we know about: the pending one
@@ -629,7 +489,11 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
             queue_dependent_analyses(state, &uri, &changed_path);
         }
     } else if not.method == notification::DidChangeWatchedFiles::METHOD {
-        let params: DidChangeWatchedFilesParams = serde_json::from_value(not.params).unwrap();
+        let Some(params) =
+            decode::<DidChangeWatchedFilesParams>(&not.method, not.params)
+        else {
+            return;
+        };
         let changed_paths: HashSet<PathBuf> = params
             .changes
             .iter()
@@ -661,13 +525,18 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
             }
         }
     } else if not.method == notification::DidCloseTextDocument::METHOD {
-        let params: DidCloseTextDocumentParams = serde_json::from_value(not.params).unwrap();
+        let Some(params) =
+            decode::<DidCloseTextDocumentParams>(&not.method, not.params)
+        else {
+            return;
+        };
         state.documents.remove(&params.text_document.uri);
         state.pending_sources.remove(&params.text_document.uri);
-        // Clear diagnostics
         let diags = PublishDiagnosticsParams::new(params.text_document.uri, vec![], None);
         let not = Notification::new(notification::PublishDiagnostics::METHOD.into(), diags);
-        conn.sender.send(Message::Notification(not)).unwrap();
+        if let Err(e) = conn.sender.send(Message::Notification(not)) {
+            eprintln!("knot-lsp: failed to publish empty diagnostics on close: {e}");
+        }
     }
 }
 
@@ -680,316 +549,49 @@ fn queue_analysis(state: &ServerState, uri: Uri, source: String, version: Option
     }
 }
 
-/// Re-queue analysis for any open document whose imports point at `changed_path`.
+/// Re-queue analysis for any open document whose imports transitively reach
+/// `changed_path`. Walks the reverse-import graph so even multi-hop dependents
+/// (A imports B imports C; C changes) get a fresh diagnostic pass.
 fn queue_dependent_analyses(state: &mut ServerState, source_uri: &Uri, changed_path: &Path) {
+    // Compute the transitive set of importers of `changed_path` via BFS over
+    // the reverse-import graph. The graph only contains files we've seen
+    // imported, so this stays cheap.
+    let mut to_visit = vec![changed_path.to_path_buf()];
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    let mut affected: HashSet<PathBuf> = HashSet::new();
+    while let Some(p) = to_visit.pop() {
+        if !visited.insert(p.clone()) {
+            continue;
+        }
+        if let Some(importers) = state.reverse_imports.get(&p) {
+            for imp in importers {
+                if affected.insert(imp.clone()) {
+                    to_visit.push(imp.clone());
+                }
+            }
+        }
+    }
+
     let dependents: Vec<(Uri, String)> = state
         .documents
         .iter()
-        .filter(|(other_uri, other_doc)| {
-            *other_uri != source_uri
-                && other_doc.imported_files.keys().any(|p| p == changed_path)
-        })
-        .map(|(u, d)| {
+        .filter(|(other_uri, _)| *other_uri != source_uri)
+        .filter_map(|(uri, doc)| {
+            let path = uri_to_path(uri).and_then(|p| p.canonicalize().ok())?;
+            if !affected.contains(&path) {
+                return None;
+            }
             let src = state
                 .pending_sources
-                .get(u)
+                .get(uri)
                 .map(|p| p.source.clone())
-                .unwrap_or_else(|| d.source.clone());
-            (u.clone(), src)
+                .unwrap_or_else(|| doc.source.clone());
+            Some((uri.clone(), src))
         })
         .collect();
     for (dep_uri, dep_source) in dependents {
         queue_analysis(state, dep_uri, dep_source, None);
     }
-}
-
-// ── Document analysis ───────────────────────────────────────────────
-
-fn analyze_document(
-    uri: &Uri,
-    source: &str,
-    import_cache: &mut HashMap<PathBuf, (u64, Module, String)>,
-) -> DocumentState {
-    let mut all_diags = Vec::new();
-    let mut type_info = HashMap::new();
-    let mut local_type_info = HashMap::new();
-    let mut effect_info = HashMap::new();
-    let mut effect_sets: HashMap<String, EffectSet> = HashMap::new();
-    let mut refined_types: HashMap<String, ast::Expr> = HashMap::new();
-    let mut refine_targets: HashMap<Span, String> = HashMap::new();
-    let mut source_refinements: HashMap<String, Vec<(Option<String>, String, ast::Expr)>> =
-        HashMap::new();
-    let mut monad_info: HashMap<Span, MonadKind> = HashMap::new();
-
-    // Lex always — lex diagnostics and keyword positions are needed every run
-    // and lexing is a small fraction of total analysis time.
-    let lexer = knot::lexer::Lexer::new(source);
-    let (tokens, lex_diags) = lexer.tokenize();
-    all_diags.extend(lex_diags);
-
-    // Collect keyword/operator positions for semantic tokens before parser consumes them.
-    let keyword_tokens = collect_keyword_operator_positions(&tokens);
-
-    // Parse — but reuse the import cache when the source content hash matches a
-    // prior parse of this same path. This kicks in when the file watcher
-    // re-queues analysis for an unchanged dependency, when an undo/redo cycle
-    // returns to a prior content state, or when the same source is analyzed
-    // through multiple code paths in quick succession. (True per-declaration
-    // incremental type checking is deferred — the inference engine in
-    // `infer.rs` runs holistically over all decls; making it incremental would
-    // require restructuring `pre_register` and `infer_declarations` to use a
-    // dependency-aware work queue.)
-    let canonical_path = uri_to_path(uri).and_then(|p| p.canonicalize().ok());
-    let src_hash = content_hash(source);
-    let (module, parse_diags) = match canonical_path.as_ref() {
-        Some(p) => match import_cache.get(p) {
-            Some((cached_hash, cached_module, _)) if *cached_hash == src_hash => {
-                // Re-parse to recover parse diagnostics — the cache only stores
-                // the AST. Lex was already done above; reuse those tokens.
-                let parser = knot::parser::Parser::new(source.to_string(), tokens);
-                let (_reparsed, parse_d) = parser.parse_module();
-                (cached_module.clone(), parse_d)
-            }
-            _ => {
-                let parser = knot::parser::Parser::new(source.to_string(), tokens);
-                let (m, parse_d) = parser.parse_module();
-                import_cache
-                    .insert(p.clone(), (src_hash, m.clone(), source.to_string()));
-                (m, parse_d)
-            }
-        },
-        None => {
-            let parser = knot::parser::Parser::new(source.to_string(), tokens);
-            parser.parse_module()
-        }
-    };
-    all_diags.extend(parse_diags);
-
-    // Build navigation data from original AST
-    let (definitions, references, literal_types) = resolve_definitions(&module, source);
-    let details = build_details(&module);
-
-    // Extract doc comments from source
-    let doc_comments = extract_doc_comments(source, &module);
-
-    // Resolve import navigation (cross-file definitions)
-    let (imported_files, import_defs, import_origins) = if let Some(path) = uri_to_path(uri) {
-        resolve_import_navigation(&module.imports, &path, import_cache)
-    } else {
-        (HashMap::new(), HashMap::new(), HashMap::new())
-    };
-
-    // Run deeper analysis if no parse errors
-    let has_parse_errors = all_diags
-        .iter()
-        .any(|d| matches!(d.severity, diagnostic::Severity::Error));
-
-    if !has_parse_errors {
-        let mut analysis_module = module.clone();
-
-        // Resolve imports
-        if let Some(path) = uri_to_path(uri) {
-            let _ = knot_compiler::modules::resolve_imports(&mut analysis_module, &path);
-        }
-
-        // Inject prelude + desugar
-        knot_compiler::base::inject_prelude(&mut analysis_module);
-        knot_compiler::desugar::desugar(&mut analysis_module);
-
-        // Type inference
-        let (
-            infer_diags,
-            mi,
-            inferred_types,
-            local_types,
-            rt,
-            refined_type_info,
-            _from_json,
-        ) = knot_compiler::infer::check(&analysis_module);
-        all_diags.extend(infer_diags);
-        type_info = inferred_types;
-        local_type_info = local_types;
-        refined_types = refined_type_info;
-        refine_targets = rt;
-        monad_info = mi;
-
-        // Effect inference
-        let (effect_diags, effects) =
-            knot_compiler::effects::check_with_effects(&analysis_module);
-        all_diags.extend(effect_diags);
-        for (name, eff) in &effects {
-            if !eff.is_pure() {
-                effect_info.insert(name.clone(), format!("{eff}"));
-            }
-            effect_sets.insert(name.clone(), eff.clone());
-        }
-
-        // Stratification
-        all_diags.extend(knot_compiler::stratify::check(&analysis_module));
-
-        // Source refinements (per-field & whole-element predicates) come from
-        // the type environment alongside SQL-lint info.
-        let type_env = knot_compiler::types::TypeEnv::from_module(&analysis_module);
-        source_refinements = type_env.source_refinements.clone();
-
-        // SQL optimization lint
-        all_diags.extend(knot_compiler::sql_lint::check(&analysis_module, &type_env));
-    }
-
-    DocumentState {
-        source: source.to_string(),
-        module,
-        references,
-        definitions,
-        details,
-        type_info,
-        local_type_info,
-        literal_types,
-        effect_info,
-        effect_sets,
-        knot_diagnostics: all_diags,
-        imported_files,
-        import_defs,
-        import_origins,
-        doc_comments,
-        keyword_tokens,
-        refined_types,
-        refine_targets,
-        source_refinements,
-        monad_info,
-    }
-}
-
-/// Compute a fast content hash of a source file. Used to key the import cache
-/// stably across `jj`/`git` checkouts that touch mtimes without changing content.
-fn content_hash(s: &str) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
-}
-
-/// Read, lex, and parse a `.knot` file off disk, reusing the content-hash-keyed
-/// cache when possible. Returns `None` only if the file is missing or unreadable.
-///
-/// This is the single funnel through which every off-disk read in the LSP flows
-/// (rename across unopened files, workspace symbol search, workspace diagnostics,
-/// auto-import completion, import resolution). Each of those previously re-parsed
-/// the file on every invocation; routing them through one cache eliminates the
-/// O(n²) workspace scans that dominated those code paths.
-fn get_or_parse_file(
-    path: &Path,
-    cache: &mut HashMap<PathBuf, (u64, Module, String)>,
-) -> Option<(Module, String)> {
-    let source = std::fs::read_to_string(path).ok()?;
-    let hash = content_hash(&source);
-    if let Some((cached_hash, cached_module, cached_source)) = cache.get(path) {
-        if *cached_hash == hash {
-            return Some((cached_module.clone(), cached_source.clone()));
-        }
-    }
-    let lexer = knot::lexer::Lexer::new(&source);
-    let (tokens, _) = lexer.tokenize();
-    let parser = knot::parser::Parser::new(source.clone(), tokens);
-    let (module, _) = parser.parse_module();
-    cache.insert(path.to_path_buf(), (hash, module.clone(), source.clone()));
-    Some((module, source))
-}
-
-/// Like `get_or_parse_file`, but operates against the `Arc<Mutex<…>>` cache held
-/// by `ServerState`. Locks the mutex briefly per call.
-fn get_or_parse_file_shared(
-    path: &Path,
-    cache: &Arc<Mutex<HashMap<PathBuf, (u64, Module, String)>>>,
-) -> Option<(Module, String)> {
-    let mut guard = cache.lock().ok()?;
-    get_or_parse_file(path, &mut guard)
-}
-
-/// Resolve imported files for cross-file navigation.
-fn resolve_import_navigation(
-    imports: &[ast::Import],
-    source_path: &Path,
-    import_cache: &mut HashMap<PathBuf, (u64, Module, String)>,
-) -> (HashMap<PathBuf, String>, HashMap<String, (PathBuf, Span)>, HashMap<String, String>) {
-    let mut imported_files = HashMap::new();
-    let mut import_defs = HashMap::new();
-    let mut import_origins = HashMap::new();
-
-    let base_dir = source_path.parent().unwrap_or(Path::new("."));
-
-    for imp in imports {
-        let rel_path = PathBuf::from(&imp.path).with_extension("knot");
-        let full_path = base_dir.join(&rel_path);
-
-        let canonical = match full_path.canonicalize() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        let (module, source) = match get_or_parse_file(&canonical, import_cache) {
-            Some(v) => v,
-            None => continue,
-        };
-
-        // Register definitions from this file
-        for decl in &module.decls {
-            match &decl.node {
-                DeclKind::Data {
-                    name, constructors, ..
-                } => {
-                    import_defs.insert(name.clone(), (canonical.clone(), decl.span));
-                    import_origins.insert(name.clone(), imp.path.clone());
-                    for ctor in constructors {
-                        // Find constructor span within the data decl
-                        let ctor_span =
-                            find_word_in_source(&source, &ctor.name, decl.span.start, decl.span.end)
-                                .unwrap_or(decl.span);
-                        import_defs.insert(ctor.name.clone(), (canonical.clone(), ctor_span));
-                        import_origins.insert(ctor.name.clone(), imp.path.clone());
-                    }
-                }
-                DeclKind::TypeAlias { name, .. }
-                | DeclKind::Source { name, .. }
-                | DeclKind::View { name, .. }
-                | DeclKind::Derived { name, .. }
-                | DeclKind::Fun { name, .. }
-                | DeclKind::Trait { name, .. }
-                | DeclKind::Route { name, .. }
-                | DeclKind::RouteComposite { name, .. } => {
-                    import_defs.insert(name.clone(), (canonical.clone(), decl.span));
-                    import_origins.insert(name.clone(), imp.path.clone());
-                }
-                DeclKind::Impl { items, .. } => {
-                    for item in items {
-                        if let ast::ImplItem::Method { name, .. } = item {
-                            import_defs.insert(name.clone(), (canonical.clone(), decl.span));
-                            import_origins.insert(name.clone(), imp.path.clone());
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        imported_files.insert(canonical, source);
-    }
-
-    (imported_files, import_defs, import_origins)
-}
-
-fn publish_diagnostics(conn: &Connection, uri: &Uri, doc: &DocumentState, version: Option<i32>) {
-    let lsp_diags: Vec<Diagnostic> = doc
-        .knot_diagnostics
-        .iter()
-        .filter_map(|d| to_lsp_diagnostic(d, &doc.source, uri))
-        .collect();
-
-    let params = PublishDiagnosticsParams::new(uri.clone(), lsp_diags, version);
-    let not = Notification::new(
-        notification::PublishDiagnostics::METHOD.into(),
-        params,
-    );
-    conn.sender.send(Message::Notification(not)).unwrap();
 }
 
 // ── Document symbols (hierarchical) ─────────────────────────────────
@@ -1936,76 +1538,6 @@ fn expr_references_name(expr: &ast::Expr, name: &str) -> bool {
 }
 
 /// Recurse into all sub-expressions of `expr`, calling `f` on each.
-fn recurse_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, mut f: F) {
-    match &expr.node {
-        ast::ExprKind::App { func, arg } => {
-            f(func);
-            f(arg);
-        }
-        ast::ExprKind::Lambda { body, .. } => f(body),
-        ast::ExprKind::BinOp { lhs, rhs, .. } => {
-            f(lhs);
-            f(rhs);
-        }
-        ast::ExprKind::UnaryOp { operand, .. } => f(operand),
-        ast::ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            f(cond);
-            f(then_branch);
-            f(else_branch);
-        }
-        ast::ExprKind::Case { scrutinee, arms } => {
-            f(scrutinee);
-            for arm in arms {
-                f(&arm.body);
-            }
-        }
-        ast::ExprKind::Do(stmts) => {
-            for stmt in stmts {
-                match &stmt.node {
-                    ast::StmtKind::Bind { expr, .. }
-                    | ast::StmtKind::Let { expr, .. }
-                    | ast::StmtKind::Expr(expr)
-                    | ast::StmtKind::Where { cond: expr } => f(expr),
-                    ast::StmtKind::GroupBy { key } => f(key),
-                }
-            }
-        }
-        ast::ExprKind::Atomic(e) | ast::ExprKind::Refine(e) => f(e),
-        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
-            f(target);
-            f(value);
-        }
-        ast::ExprKind::Record(fields) => {
-            for fld in fields {
-                f(&fld.value);
-            }
-        }
-        ast::ExprKind::RecordUpdate { base, fields } => {
-            f(base);
-            for fld in fields {
-                f(&fld.value);
-            }
-        }
-        ast::ExprKind::List(elems) => {
-            for e in elems {
-                f(e);
-            }
-        }
-        ast::ExprKind::FieldAccess { expr, .. } => f(expr),
-        ast::ExprKind::At { relation, time } => {
-            f(relation);
-            f(time);
-        }
-        ast::ExprKind::Annot { expr, .. } => f(expr),
-        ast::ExprKind::UnitLit { value, .. } => f(value),
-        _ => {}
-    }
-}
-
 /// Render a predicate expression as its source text. Falls back to a placeholder
 /// when the span is empty or out of bounds (defensive: predicates always have
 /// real spans, but the LSP is also fed by the import cache, which can outlive
@@ -3161,19 +2693,153 @@ fn handle_inlay_hint(
             continue;
         }
         let hint_pos = offset_to_position(&doc.source, span.end);
+        let unit_tooltip = extract_unit_from_type_str(ty)
+            .map(|u| InlayHintTooltip::String(format!("Inferred unit: `{u}`")));
         hints.push(InlayHint {
             position: hint_pos,
             label: InlayHintLabel::String(format!(": {ty}")),
             kind: Some(InlayHintKind::TYPE),
             text_edits: None,
-            tooltip: None,
+            tooltip: unit_tooltip,
             padding_left: Some(true),
             padding_right: None,
             data: None,
         });
     }
 
+    // Show inferred unit hints on numeric literals whose enclosing binding has
+    // a unit-annotated type. The literals themselves don't carry explicit unit
+    // syntax, so the user otherwise has to mentally trace the type — the hint
+    // shows e.g. `<M>` after `42` in `let distance : Float<M> = 42.0`.
+    add_unit_literal_hints(doc, range_start, range_end, &mut hints);
+
     Some(hints)
+}
+
+/// Extract the unit annotation `<...>` from a formatted type string.
+/// Returns the unit text without the angle brackets, or `None` if the type
+/// has no unit annotation. Skips trivial dimensionless `<1>` annotations.
+fn extract_unit_from_type_str(ty: &str) -> Option<String> {
+    // Find the first `<` that follows `Int` or `Float`. Bail if there's no
+    // such pattern; that's how non-unit types like `Maybe<T>` are excluded.
+    let lt = ty.find('<')?;
+    let prefix = ty[..lt].trim_end();
+    if !prefix.ends_with("Int") && !prefix.ends_with("Float") {
+        return None;
+    }
+    // Find the matching `>` honoring nesting. Units are flat (no nesting in
+    // practice) but compose like `M*S^2`; tracking depth keeps us safe if
+    // someone constructs a parenthesized unit later.
+    let mut depth = 0i32;
+    let bytes = ty.as_bytes();
+    let mut close = None;
+    for (i, &b) in bytes[lt..].iter().enumerate() {
+        match b {
+            b'<' => depth += 1,
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(lt + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    let inner = ty[lt + 1..close].trim();
+    if inner.is_empty() || inner == "1" {
+        return None;
+    }
+    Some(inner.to_string())
+}
+
+/// Walk every binding-with-unit and emit hints on numeric literals inside the
+/// binding's defining expression.
+fn add_unit_literal_hints(
+    doc: &DocumentState,
+    range_start: usize,
+    range_end: usize,
+    hints: &mut Vec<InlayHint>,
+) {
+    fn collect_literals_in_expr(expr: &ast::Expr, out: &mut Vec<Span>) {
+        if matches!(
+            &expr.node,
+            ast::ExprKind::Lit(ast::Literal::Int(_)) | ast::ExprKind::Lit(ast::Literal::Float(_))
+        ) {
+            out.push(expr.span);
+        }
+        recurse_expr(expr, |e| collect_literals_in_expr(e, out));
+    }
+
+    fn collect_literals_in_decl(decl: &ast::Decl, out: &mut Vec<(Span, ast::Expr)>) {
+        match &decl.node {
+            DeclKind::Fun {
+                body: Some(body), ..
+            }
+            | DeclKind::View { body, .. }
+            | DeclKind::Derived { body, .. } => {
+                walk_for_unit_bindings(body, out);
+            }
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { body, .. } = item {
+                        walk_for_unit_bindings(body, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn walk_for_unit_bindings(expr: &ast::Expr, out: &mut Vec<(Span, ast::Expr)>) {
+        if let ast::ExprKind::Do(stmts) = &expr.node {
+            for stmt in stmts {
+                if let ast::StmtKind::Let { pat, expr: rhs } | ast::StmtKind::Bind { pat, expr: rhs } =
+                    &stmt.node
+                {
+                    out.push((pat.span, rhs.clone()));
+                    walk_for_unit_bindings(rhs, out);
+                }
+            }
+        }
+        recurse_expr(expr, |e| walk_for_unit_bindings(e, out));
+    }
+
+    let mut bindings_with_rhs: Vec<(Span, ast::Expr)> = Vec::new();
+    for decl in &doc.module.decls {
+        collect_literals_in_decl(decl, &mut bindings_with_rhs);
+    }
+
+    for (binding_span, rhs) in bindings_with_rhs {
+        let ty = match doc.local_type_info.get(&binding_span) {
+            Some(t) => t,
+            None => continue,
+        };
+        let unit = match extract_unit_from_type_str(ty) {
+            Some(u) => u,
+            None => continue,
+        };
+        let mut literals = Vec::new();
+        collect_literals_in_expr(&rhs, &mut literals);
+        for span in literals {
+            if span.end < range_start || span.start > range_end {
+                continue;
+            }
+            hints.push(InlayHint {
+                position: offset_to_position(&doc.source, span.end),
+                label: InlayHintLabel::String(format!("<{unit}>")),
+                kind: Some(InlayHintKind::TYPE),
+                text_edits: None,
+                tooltip: Some(InlayHintTooltip::String(format!(
+                    "Inferred unit `{unit}` from enclosing binding"
+                ))),
+                padding_left: None,
+                padding_right: None,
+                data: None,
+            });
+        }
+    }
 }
 
 /// Find the byte offset just after the function name within its declaration span.
@@ -3212,8 +2878,21 @@ fn handle_signature_help(
     // then determine which argument position the cursor is in.
     let (func_name, active_param) = find_enclosing_application(&doc.module, &doc.source, offset)?;
 
-    // Look up the function type
-    let type_str = doc.type_info.get(func_name.as_str())?;
+    // Look up the function type. Try the global type table first (covers
+    // top-level decls, builtins, and trait/impl methods), then fall back to
+    // the local-binding table (covers let-bound lambdas and do-block binds).
+    // The fallback matches by name + by the binding span — any local binding
+    // whose name matches and whose span lies before the call site is a
+    // candidate.
+    let type_str_owned: String;
+    let type_str: &str = if let Some(global) = doc.type_info.get(func_name.as_str()) {
+        global.as_str()
+    } else if let Some(local) = lookup_local_binding_type(doc, &func_name, offset) {
+        type_str_owned = local;
+        type_str_owned.as_str()
+    } else {
+        return None;
+    };
 
     // Parse arrow-separated parameters from the type string
     let param_types = parse_function_params(type_str);
@@ -3221,8 +2900,18 @@ fn handle_signature_help(
         return None;
     }
 
-    // Try to extract parameter names from the function definition
-    let param_names = extract_param_names(&doc.module, &func_name);
+    // Try to extract parameter names from the function definition. Falls back
+    // to a synthesized list (`a`, `b`, ...) when the function isn't a
+    // top-level decl with an inferable param list (e.g. an inline lambda).
+    let mut param_names = extract_param_names(&doc.module, &func_name);
+    if param_names.is_empty() && param_types.len() > 1 {
+        // For arrow types `T1 -> T2 -> ... -> R`, the last entry is the
+        // return type — name positional params for the rest.
+        let arity = param_types.len() - 1;
+        param_names = (0..arity)
+            .map(|i| ((b'a' + (i as u8 % 26)) as char).to_string())
+            .collect();
+    }
 
     // Build parameter labels: "name: Type" if we have a name, else just "Type"
     // The label must be a substring of the signature label so the editor can
@@ -3284,6 +2973,41 @@ fn handle_signature_help(
         active_signature: Some(0),
         active_parameter: Some(active),
     })
+}
+
+/// Look up the inferred type of a locally-bound name visible at `call_offset`.
+///
+/// Walks `local_type_info` for any binding whose declared name matches and
+/// whose binding span sits *before* the call site. When several such bindings
+/// exist (e.g. shadowing in nested scopes), returns the one with the latest
+/// (closest, in source order) binding span — that's the binding the parser
+/// would resolve at the call site.
+fn lookup_local_binding_type(
+    doc: &DocumentState,
+    func_name: &str,
+    call_offset: usize,
+) -> Option<String> {
+    let mut best: Option<(Span, String)> = None;
+    for (span, ty) in &doc.local_type_info {
+        if span.end > call_offset {
+            continue;
+        }
+        if span.end > doc.source.len() || span.start > span.end {
+            continue;
+        }
+        let name = &doc.source[span.start..span.end];
+        if name != func_name {
+            continue;
+        }
+        match &best {
+            None => best = Some((*span, ty.clone())),
+            Some((cur, _)) if span.start > cur.start => {
+                best = Some((*span, ty.clone()));
+            }
+            _ => {}
+        }
+    }
+    best.map(|(_, ty)| ty)
 }
 
 /// Build a signature label like `func : a: T1 -> b: T2 -> Result`.
@@ -4559,9 +4283,13 @@ fn handle_formatting(
     // 4. Collapse consecutive blank lines inside blocks to at most one
     // 5. Ensure trailing newline
     // 6. Normalize imports (single blank line after import block)
+    // 7. Sort the leading import block alphabetically
+    // 8. Normalize whitespace inside expressions (commas, arrows) on a per-line
+    //    basis — full AST pretty-printing is deferred since it requires a
+    //    layout-aware printer for do blocks, case arms, record literals, etc.
 
-    // Convert tabs to spaces first
-    let source = &source.replace('\t', "  ");
+    // Convert tabs to spaces first, then sort imports.
+    let source = &normalize_imports(&source.replace('\t', "  "));
     let lines: Vec<&str> = source.split('\n').collect();
     let mut result_lines: Vec<String> = Vec::with_capacity(lines.len());
 
@@ -4639,8 +4367,8 @@ fn handle_formatting(
             continue;
         }
 
-        // Trim trailing whitespace
-        result_lines.push(lines[i].trim_end().to_string());
+        // Trim trailing whitespace and apply per-line spacing normalization.
+        result_lines.push(normalize_line_spacing(lines[i].trim_end()));
         i += 1;
     }
 
@@ -4666,6 +4394,96 @@ fn handle_formatting(
         },
         new_text: formatted,
     }])
+}
+
+/// Sort the leading run of `import ...` lines alphabetically (case-insensitive).
+/// Only affects a contiguous block at the very top of the file (after any
+/// initial blank lines or comments).
+fn normalize_imports(source: &str) -> String {
+    let lines: Vec<&str> = source.split('\n').collect();
+    let mut idx = 0;
+    // Skip leading blank lines / line comments.
+    while idx < lines.len() {
+        let trimmed = lines[idx].trim();
+        if trimmed.is_empty() || trimmed.starts_with("--") {
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+    let block_start = idx;
+    while idx < lines.len() && lines[idx].trim_start().starts_with("import ") {
+        idx += 1;
+    }
+    let block_end = idx;
+    if block_end - block_start < 2 {
+        return source.to_string();
+    }
+    let mut imports: Vec<&str> = lines[block_start..block_end].to_vec();
+    let mut sorted = imports.clone();
+    sorted.sort_by(|a, b| a.trim().to_lowercase().cmp(&b.trim().to_lowercase()));
+    if imports == sorted {
+        return source.to_string();
+    }
+    imports = sorted;
+    let mut out = Vec::with_capacity(lines.len());
+    out.extend_from_slice(&lines[..block_start]);
+    out.extend_from_slice(&imports);
+    out.extend_from_slice(&lines[block_end..]);
+    out.join("\n")
+}
+
+/// Normalize whitespace inside a single line. Conservative — only fixes
+/// patterns that don't change semantics regardless of context. Notably, this
+/// runs PER LINE so it can safely operate on any code without parsing.
+fn normalize_line_spacing(line: &str) -> String {
+    // Skip lines that look like they contain string literals to avoid
+    // mangling content. A real formatter would parse the line; here we just
+    // bail when in doubt.
+    if line.contains('"') {
+        return line.to_string();
+    }
+    let mut out = String::with_capacity(line.len());
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // `,` followed by non-space, non-`)`, non-`]`, non-`}` → insert space.
+        if b == b',' {
+            out.push(',');
+            i += 1;
+            if i < bytes.len()
+                && !matches!(bytes[i], b' ' | b')' | b']' | b'}' | b'\n' | b'\r' | b'\t')
+            {
+                out.push(' ');
+            }
+            continue;
+        }
+        // `->`: ensure single space before and after (only when preceded by an
+        // identifier/closing bracket and followed by an identifier/opening
+        // bracket). This avoids touching markdown comments.
+        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'>' {
+            // Ensure one space before
+            if !out.ends_with(' ') && !out.is_empty() {
+                let last = out.chars().last().unwrap_or(' ');
+                if !matches!(last, '(' | '[' | '{') {
+                    out.push(' ');
+                }
+            }
+            out.push_str("->");
+            i += 2;
+            // Ensure one space after if followed by non-space / non-closing.
+            if i < bytes.len()
+                && !matches!(bytes[i], b' ' | b')' | b']' | b'}' | b'\n' | b'\r' | b'\t')
+            {
+                out.push(' ');
+            }
+            continue;
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    out
 }
 
 // ── Code Actions ────────────────────────────────────────────────────
@@ -5100,6 +4918,11 @@ fn handle_code_action(
             let indent = current_line.len() - current_line.trim_start().len();
             let indent_str = " ".repeat(indent);
 
+            // Pick fresh names that don't collide with anything in scope. Stable
+            // numbering keeps the result deterministic and easy to test.
+            let let_name = fresh_extract_name(doc, "extracted");
+            let fn_name = fresh_extract_name(doc, "extracted_fn");
+
             let mut changes = HashMap::new();
             changes.insert(
                 uri.clone(),
@@ -5110,18 +4933,18 @@ fn handle_code_action(
                             start: offset_to_position(&doc.source, line_start),
                             end: offset_to_position(&doc.source, line_start),
                         },
-                        new_text: format!("{indent_str}let extracted = {trimmed}\n"),
+                        new_text: format!("{indent_str}let {let_name} = {trimmed}\n"),
                     },
                     // Replace the selected expression with the variable name
                     TextEdit {
                         range: params.range,
-                        new_text: "extracted".to_string(),
+                        new_text: let_name.clone(),
                     },
                 ],
             );
 
             actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                title: "Extract to let binding".to_string(),
+                title: format!("Extract to let `{let_name}`"),
                 kind: Some(CodeActionKind::REFACTOR_EXTRACT),
                 edit: Some(WorkspaceEdit {
                     changes: Some(changes),
@@ -5165,19 +4988,19 @@ fn handle_code_action(
                             end: fn_insert_pos,
                         },
                         new_text: format!(
-                            "extracted{params_str} = {trimmed}\n\n"
+                            "{fn_name}{params_str} = {trimmed}\n\n"
                         ),
                     },
                     // Replace the selected expression with a call
                     TextEdit {
                         range: params.range,
-                        new_text: format!("extracted{call_args}"),
+                        new_text: format!("{fn_name}{call_args}"),
                     },
                 ],
             );
 
             actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                title: "Extract to function".to_string(),
+                title: format!("Extract to function `{fn_name}`"),
                 kind: Some(CodeActionKind::REFACTOR_EXTRACT),
                 edit: Some(WorkspaceEdit {
                     changes: Some(fn_changes),
@@ -5277,9 +5100,10 @@ fn handle_code_action(
 
         // Only emit the action if something would change
         let changed = kept_paths != original_paths;
-        if changed {
+        if changed && !doc.module.imports.is_empty() {
             let first_import = &doc.module.imports[0];
-            let last_import = doc.module.imports.last().unwrap();
+            // Safe: just checked imports.is_empty() above.
+            let last_import = doc.module.imports.last().expect("imports is non-empty");
             let import_range = Range {
                 start: offset_to_position(&doc.source, first_import.span.start),
                 end: offset_to_position(&doc.source, last_import.span.end),
@@ -6214,6 +6038,33 @@ fn build_case_arm(c: &ast::ConstructorDef, indent: &str) -> String {
 }
 
 /// Find free variables in a selection that are bound in surrounding scope.
+/// Pick a fresh extract name. Tries the requested base first, then base2,
+/// base3, ... until none collide with the document's known top-level decls
+/// or local bindings. Used by Extract-to-let / Extract-to-function so we
+/// never shadow an existing binding in the user's code.
+fn fresh_extract_name(doc: &DocumentState, base: &str) -> String {
+    // Build the set of names to avoid: top-level declarations + every
+    // identifier currently bound somewhere in the source. Using
+    // `definitions` covers both since it carries name→span for every
+    // resolved declaration; we additionally walk references for names
+    // bound in nested scopes.
+    let mut taken: HashSet<String> = doc.definitions.keys().cloned().collect();
+    for (usage_span, _) in &doc.references {
+        let name = doc.source[usage_span.start..usage_span.end.min(doc.source.len())].to_string();
+        taken.insert(name);
+    }
+    if !taken.contains(base) {
+        return base.to_string();
+    }
+    for n in 2..1000 {
+        let candidate = format!("{base}{n}");
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
+    }
+    base.to_string()
+}
+
 fn find_free_vars_in_selection(
     doc: &DocumentState,
     start: usize,
@@ -6543,23 +6394,49 @@ fn handle_call_hierarchy_outgoing(
             _ => false,
         })?;
 
-    // Collect all references within this declaration that point to other declarations
-    let mut outgoing: HashMap<String, (Span, Vec<Span>)> = HashMap::new(); // callee_name -> (def_span, [call_site_spans])
+    // Higher-order call sites: a `Var(name)` that appears as the *argument* of
+    // an `App` rather than its head means the function is being passed around
+    // (e.g. `map handler list`). The outgoing-call view treats those as edges
+    // so users can navigate from a caller to functions they hand off to.
+    let mut higher_order_arg_spans: HashSet<Span> = HashSet::new();
+    fn collect_higher_order_args(expr: &ast::Expr, out: &mut HashSet<Span>) {
+        if let ast::ExprKind::App { arg, .. } = &expr.node {
+            if matches!(&arg.node, ast::ExprKind::Var(_)) {
+                out.insert(arg.span);
+            }
+        }
+        recurse_expr(expr, |e| collect_higher_order_args(e, out));
+    }
+    match &source_decl.node {
+        DeclKind::Fun {
+            body: Some(body), ..
+        }
+        | DeclKind::View { body, .. }
+        | DeclKind::Derived { body, .. } => {
+            collect_higher_order_args(body, &mut higher_order_arg_spans);
+        }
+        _ => {}
+    }
+
+    // Collect all references within this declaration that point to other
+    // declarations. Track whether each call site is a direct call or a
+    // higher-order pass so we can label them in the outgoing list.
+    let mut outgoing: HashMap<String, (Span, Vec<(Span, bool)>)> = HashMap::new();
 
     for (usage_span, def_span) in &doc.references {
         if usage_span.start < source_decl.span.start || usage_span.end > source_decl.span.end {
             continue;
         }
-        // Find the callee name from the definition
         if let Some((name, _)) = doc.definitions.iter().find(|(_, s)| *s == def_span) {
             if name == source_name {
-                continue; // Skip self-references
+                continue;
             }
+            let is_higher_order = higher_order_arg_spans.contains(usage_span);
             outgoing
                 .entry(name.clone())
                 .or_insert_with(|| (*def_span, Vec::new()))
                 .1
-                .push(*usage_span);
+                .push((*usage_span, is_higher_order));
         }
     }
 
@@ -6583,18 +6460,35 @@ fn handle_call_hierarchy_outgoing(
             })
             .unwrap_or(SymbolKind::FUNCTION);
 
+        // Suffix the detail string with `(passed as argument)` when every
+        // edge to this callee is a higher-order pass — useful for users
+        // skimming the outgoing list to spot indirect calls.
+        let all_higher_order = !sites.is_empty() && sites.iter().all(|(_, ho)| *ho);
+        let detail_base = doc.type_info.get(name).cloned();
+        let detail = if all_higher_order {
+            Some(match detail_base {
+                Some(t) => format!("{t}  -- passed as argument"),
+                None => "passed as argument".to_string(),
+            })
+        } else {
+            detail_base
+        };
+
         result.push(CallHierarchyOutgoingCall {
             to: CallHierarchyItem {
                 name: name.clone(),
                 kind,
                 tags: None,
-                detail: doc.type_info.get(name).cloned(),
+                detail,
                 uri: source_uri.clone(),
                 range,
                 selection_range,
                 data: None,
             },
-            from_ranges: sites.iter().map(|s| span_to_range(*s, &doc.source)).collect(),
+            from_ranges: sites
+                .iter()
+                .map(|(s, _)| span_to_range(*s, &doc.source))
+                .collect(),
         });
     }
 
@@ -6603,78 +6497,120 @@ fn handle_call_hierarchy_outgoing(
 
 // ── Workspace Symbols ───────────────────────────────────────────────
 
+/// Build the cacheable list of symbol entries for a parsed module. Path-keyed,
+/// so the same vector can be reused across queries until the file's content
+/// hash changes. Returns entries with absolute file URIs already resolved.
+fn build_workspace_symbol_entries(
+    module: &Module,
+    source: &str,
+    uri: &Uri,
+) -> Vec<WorkspaceSymbolEntry> {
+    let mut out = Vec::new();
+    for decl in &module.decls {
+        let (name, kind) = match &decl.node {
+            DeclKind::Data { name, .. } => (name.clone(), SymbolKind::STRUCT),
+            DeclKind::TypeAlias { name, .. } => (name.clone(), SymbolKind::TYPE_PARAMETER),
+            DeclKind::Source { name, .. } => (format!("*{name}"), SymbolKind::VARIABLE),
+            DeclKind::View { name, .. } => (format!("*{name}"), SymbolKind::VARIABLE),
+            DeclKind::Derived { name, .. } => (format!("&{name}"), SymbolKind::VARIABLE),
+            DeclKind::Fun { name, .. } => (name.clone(), SymbolKind::FUNCTION),
+            DeclKind::Trait { name, .. } => (name.clone(), SymbolKind::INTERFACE),
+            DeclKind::Impl {
+                trait_name, args, ..
+            } => {
+                let args_str = args
+                    .iter()
+                    .map(|a| format_type_kind(&a.node))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (
+                    format!("impl {trait_name} {args_str}"),
+                    SymbolKind::OBJECT,
+                )
+            }
+            DeclKind::Route { name, .. } | DeclKind::RouteComposite { name, .. } => {
+                (format!("route {name}"), SymbolKind::MODULE)
+            }
+            _ => continue,
+        };
+        out.push(WorkspaceSymbolEntry {
+            name,
+            kind,
+            uri: uri.clone(),
+            range: span_to_range(decl.span, source),
+            container: None,
+        });
+    }
+    out
+}
+
 #[allow(deprecated)]
 fn handle_workspace_symbol(
-    state: &ServerState,
+    state: &mut ServerState,
     params: &WorkspaceSymbolParams,
 ) -> Option<Vec<SymbolInformation>> {
     let query = params.query.to_lowercase();
-    let mut symbols = Vec::new();
+    let mut symbols: Vec<SymbolInformation> = Vec::new();
     let mut seen_paths: HashSet<PathBuf> = HashSet::new();
 
-    // Helper closure to extract symbols from a module
-    let collect_symbols =
-        |module: &Module, source: &str, uri: &Uri, query: &str, symbols: &mut Vec<SymbolInformation>| {
-            for decl in &module.decls {
-                let (name, kind) = match &decl.node {
-                    DeclKind::Data { name, .. } => (name.clone(), SymbolKind::STRUCT),
-                    DeclKind::TypeAlias { name, .. } => (name.clone(), SymbolKind::TYPE_PARAMETER),
-                    DeclKind::Source { name, .. } => (format!("*{name}"), SymbolKind::VARIABLE),
-                    DeclKind::View { name, .. } => (format!("*{name}"), SymbolKind::VARIABLE),
-                    DeclKind::Derived { name, .. } => (format!("&{name}"), SymbolKind::VARIABLE),
-                    DeclKind::Fun { name, .. } => (name.clone(), SymbolKind::FUNCTION),
-                    DeclKind::Trait { name, .. } => (name.clone(), SymbolKind::INTERFACE),
-                    DeclKind::Impl {
-                        trait_name, args, ..
-                    } => {
-                        let args_str = args
-                            .iter()
-                            .map(|a| format_type_kind(&a.node))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        (
-                            format!("impl {trait_name} {args_str}"),
-                            SymbolKind::OBJECT,
-                        )
-                    }
-                    DeclKind::Route { name, .. } | DeclKind::RouteComposite { name, .. } => {
-                        (format!("route {name}"), SymbolKind::MODULE)
-                    }
-                    _ => continue,
-                };
-
-                if !query.is_empty() && !name.to_lowercase().contains(query) {
-                    continue;
-                }
-
-                let range = span_to_range(decl.span, source);
-                symbols.push(SymbolInformation {
-                    name,
-                    kind,
-                    tags: None,
-                    deprecated: None,
-                    location: Location {
-                        uri: uri.clone(),
-                        range,
-                    },
-                    container_name: None,
-                });
+    let push_matching = |entries: &[WorkspaceSymbolEntry],
+                         query: &str,
+                         out: &mut Vec<SymbolInformation>| {
+        for e in entries {
+            if !query.is_empty() && !e.name.to_lowercase().contains(query) {
+                continue;
             }
-        };
-
-    // Phase 1: collect from open documents
-    for (uri, doc) in &state.documents {
-        if let Some(path) = uri_to_path(uri) {
-            if let Ok(canonical) = path.canonicalize() {
-                seen_paths.insert(canonical);
-            }
+            out.push(SymbolInformation {
+                name: e.name.clone(),
+                kind: e.kind,
+                tags: None,
+                deprecated: None,
+                location: Location {
+                    uri: e.uri.clone(),
+                    range: e.range,
+                },
+                container_name: e.container.clone(),
+            });
         }
-        collect_symbols(&doc.module, &doc.source, uri, &query, &mut symbols);
+    };
+
+    // Phase 1: collect from open documents. Always recompute (the user may be
+    // mid-edit), and refresh the cache for that path so that the next time
+    // the file is closed we have a fresh entry.
+    let open_entries: Vec<(PathBuf, u64, Vec<WorkspaceSymbolEntry>)> = state
+        .documents
+        .iter()
+        .filter_map(|(uri, doc)| {
+            let path = uri_to_path(uri)?;
+            let canonical = path.canonicalize().ok()?;
+            seen_paths.insert(canonical.clone());
+            let entries = build_workspace_symbol_entries(&doc.module, &doc.source, uri);
+            push_matching(&entries, &query, &mut symbols);
+            Some((canonical, content_hash(&doc.source), entries))
+        })
+        .collect();
+    for (path, hash, entries) in open_entries {
+        state
+            .workspace_symbol_cache
+            .by_path
+            .insert(path, (hash, entries));
     }
 
-    // Phase 2: scan workspace for .knot files not already open
+    // Phase 2: closed workspace files. Use the cache when the on-disk hash
+    // matches; otherwise re-parse and update the cache.
     if let Some(root) = &state.workspace_root {
         if let Ok(entries) = scan_knot_files(root) {
+            // Keep only paths that still exist on disk to avoid the cache
+            // ballooning over time.
+            let on_disk: HashSet<PathBuf> = entries
+                .iter()
+                .filter_map(|p| p.canonicalize().ok())
+                .collect();
+            state
+                .workspace_symbol_cache
+                .by_path
+                .retain(|path, _| on_disk.contains(path));
+
             for path in entries {
                 let canonical = match path.canonicalize() {
                     Ok(p) => p,
@@ -6683,16 +6619,39 @@ fn handle_workspace_symbol(
                 if seen_paths.contains(&canonical) {
                     continue;
                 }
-                let (module, source) =
-                    match get_or_parse_file_shared(&canonical, &state.import_cache) {
-                        Some(v) => v,
-                        None => continue,
-                    };
+
+                // Read once to compute the hash; use the cached entries when
+                // they're up to date.
+                let source = match std::fs::read_to_string(&canonical) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let hash = content_hash(&source);
+
+                if let Some((cached_hash, cached_entries)) =
+                    state.workspace_symbol_cache.by_path.get(&canonical)
+                {
+                    if *cached_hash == hash {
+                        push_matching(cached_entries, &query, &mut symbols);
+                        continue;
+                    }
+                }
+
+                // Stale or missing — reparse and refresh the cache.
+                let (module, _) = match get_or_parse_file_shared(&canonical, &state.import_cache) {
+                    Some(v) => v,
+                    None => continue,
+                };
                 let uri = match path_to_uri(&canonical) {
                     Some(u) => u,
                     None => continue,
                 };
-                collect_symbols(&module, &source, &uri, &query, &mut symbols);
+                let entries = build_workspace_symbol_entries(&module, &source, &uri);
+                push_matching(&entries, &query, &mut symbols);
+                state
+                    .workspace_symbol_cache
+                    .by_path
+                    .insert(canonical, (hash, entries));
             }
         }
     }
@@ -7563,949 +7522,13 @@ fn analyze_unopened_file(
         .collect()
 }
 
-// ── Constants ───────────────────────────────────────────────────────
-
-const KEYWORDS: &[&str] = &[
-    "import", "data", "type", "trait", "impl", "route", "migrate", "where", "do", "yield", "set",
-    "if", "then", "else", "case", "of", "let", "in", "not", "full", "atomic", "deriving", "with",
-    "export",
-];
-
-const SNIPPETS: &[(&str, &str, &str)] = &[
-    ("do", "do block", "do\n  ${1:x} <- ${2:expr}\n  yield {$3}"),
-    ("case", "case expression", "case ${1:expr} of\n  ${2:pattern} -> ${3:body}"),
-    ("lambda", "lambda expression", "\\\\${1:x} -> ${2:body}"),
-    ("if", "if expression", "if ${1:cond}\n  then ${2:a}\n  else ${3:b}"),
-    ("data", "data declaration", "data ${1:Name} = ${2:Ctor} {${3:field}: ${4:Type}}"),
-    ("source", "source declaration", "*${1:name} : [${2:Type}]"),
-    ("trait", "trait declaration", "trait ${1:Name} ${2:a} where\n  ${3:method} : ${4:Type}"),
-    ("impl", "impl block", "impl ${1:Trait} ${2:Type} where\n  ${3:method} ${4:x} = ${5:body}"),
-];
-
-const BUILTINS: &[&str] = &[
-    "println", "print", "show", "union", "count", "now", "filter", "match", "map", "fold",
-    "single", "diff", "inter", "sum", "avg", "toUpper", "toLower", "take", "drop", "length",
-    "trim", "contains", "reverse", "chars", "id", "toJson", "parseJson", "readFile", "writeFile",
-    "appendFile", "fileExists", "removeFile", "listDir",
-];
-
-// ── Definition resolution ────────────────────────────────────────────
-
-/// Resolve definitions: returns (name_map, span_references, literal_types).
-fn resolve_definitions(
-    module: &Module,
-    source: &str,
-) -> (HashMap<String, Span>, Vec<(Span, Span)>, Vec<(Span, String)>) {
-    let mut resolver = DefResolver {
-        scopes: vec![HashMap::new()],
-        refs: Vec::new(),
-        literals: Vec::new(),
-    };
-
-    // Phase 1: register all top-level declarations
-    for decl in &module.decls {
-        // Use just the name span (not the whole declaration) so document
-        // highlights only cover the identifier, not the entire body.
-        let name_span = |name: &str| {
-            find_word_in_source(source, name, decl.span.start, decl.span.end)
-                .unwrap_or(decl.span)
-        };
-        match &decl.node {
-            DeclKind::Data {
-                name, constructors, ..
-            } => {
-                resolver.define(name, name_span(name));
-                for ctor in constructors {
-                    resolver.define(&ctor.name, name_span(&ctor.name));
-                }
-            }
-            DeclKind::TypeAlias { name, .. } => {
-                resolver.define(name, name_span(name));
-            }
-            DeclKind::Source { name, .. } | DeclKind::View { name, .. } => {
-                resolver.define(name, name_span(name));
-            }
-            DeclKind::Derived { name, .. } => {
-                resolver.define(name, name_span(name));
-            }
-            DeclKind::Fun { name, .. } => {
-                resolver.define(name, name_span(name));
-            }
-            DeclKind::Trait { name, items, .. } => {
-                resolver.define(name, name_span(name));
-                for item in items {
-                    if let ast::TraitItem::Method { name, .. } = item {
-                        resolver.define(name, name_span(name));
-                    }
-                }
-            }
-            DeclKind::Route { name, .. } | DeclKind::RouteComposite { name, .. } => {
-                resolver.define(name, name_span(name));
-            }
-            _ => {}
-        }
-    }
-
-    // Phase 2: walk declaration bodies to resolve references
-    for decl in &module.decls {
-        match &decl.node {
-            DeclKind::Fun { body: Some(body), .. }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => {
-                resolver.resolve_expr(body);
-            }
-            DeclKind::Fun { body: None, .. } => {}
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { params, body, .. } = item {
-                        resolver.push_scope();
-                        for p in params {
-                            resolver.define_pat(p);
-                        }
-                        resolver.resolve_expr(body);
-                        resolver.pop_scope();
-                    }
-                }
-            }
-            DeclKind::Trait { items, .. } => {
-                for item in items {
-                    if let ast::TraitItem::Method {
-                        default_params,
-                        default_body: Some(body),
-                        ..
-                    } = item
-                    {
-                        resolver.push_scope();
-                        for p in default_params {
-                            resolver.define_pat(p);
-                        }
-                        resolver.resolve_expr(body);
-                        resolver.pop_scope();
-                    }
-                }
-            }
-            DeclKind::Migrate { using_fn, .. } => {
-                resolver.resolve_expr(using_fn);
-            }
-            _ => {}
-        }
-    }
-
-    // Build the fallback name map from global scope
-    let name_map = resolver.scopes[0].clone();
-    (name_map, resolver.refs, resolver.literals)
-}
-
-struct DefResolver {
-    scopes: Vec<HashMap<String, Span>>,
-    refs: Vec<(Span, Span)>,
-    literals: Vec<(Span, String)>,
-}
-
-impl DefResolver {
-    fn push_scope(&mut self) {
-        self.scopes.push(HashMap::new());
-    }
-
-    fn pop_scope(&mut self) {
-        self.scopes.pop();
-    }
-
-    fn define(&mut self, name: &str, span: Span) {
-        if let Some(scope) = self.scopes.last_mut() {
-            scope.insert(name.to_string(), span);
-        }
-    }
-
-    fn lookup(&self, name: &str) -> Option<Span> {
-        for scope in self.scopes.iter().rev() {
-            if let Some(span) = scope.get(name) {
-                return Some(*span);
-            }
-        }
-        None
-    }
-
-    fn add_ref(&mut self, usage: Span, name: &str) {
-        if let Some(def) = self.lookup(name) {
-            self.refs.push((usage, def));
-        }
-    }
-
-    fn define_pat(&mut self, pat: &ast::Pat) {
-        match &pat.node {
-            ast::PatKind::Var(name) => self.define(name, pat.span),
-            ast::PatKind::Constructor { name, payload } => {
-                // The constructor name is a reference
-                self.add_ref(pat.span, name);
-                self.define_pat(payload);
-            }
-            ast::PatKind::Record(fields) => {
-                for f in fields {
-                    if let Some(p) = &f.pattern {
-                        self.define_pat(p);
-                    } else {
-                        // Punned: `{name}` introduces `name`
-                        self.define(&f.name, pat.span);
-                    }
-                }
-            }
-            ast::PatKind::List(pats) => {
-                for p in pats {
-                    self.define_pat(p);
-                }
-            }
-            ast::PatKind::Wildcard | ast::PatKind::Lit(_) => {}
-        }
-    }
-
-    fn resolve_expr(&mut self, expr: &ast::Expr) {
-        match &expr.node {
-            ast::ExprKind::Var(name) => self.add_ref(expr.span, name),
-            ast::ExprKind::Constructor(name) => self.add_ref(expr.span, name),
-            ast::ExprKind::SourceRef(name) => self.add_ref(expr.span, name),
-            ast::ExprKind::DerivedRef(name) => self.add_ref(expr.span, name),
-
-            ast::ExprKind::Lambda { params, body } => {
-                self.push_scope();
-                for p in params {
-                    self.define_pat(p);
-                }
-                self.resolve_expr(body);
-                self.pop_scope();
-            }
-
-            ast::ExprKind::Do(stmts) => {
-                self.push_scope();
-                for stmt in stmts {
-                    match &stmt.node {
-                        ast::StmtKind::Bind { pat, expr } => {
-                            self.resolve_expr(expr);
-                            self.define_pat(pat);
-                        }
-                        ast::StmtKind::Let { pat, expr } => {
-                            self.resolve_expr(expr);
-                            self.define_pat(pat);
-                        }
-                        ast::StmtKind::Where { cond } => self.resolve_expr(cond),
-                        ast::StmtKind::GroupBy { key } => self.resolve_expr(key),
-                        ast::StmtKind::Expr(e) => self.resolve_expr(e),
-                    }
-                }
-                self.pop_scope();
-            }
-
-            ast::ExprKind::Case { scrutinee, arms } => {
-                self.resolve_expr(scrutinee);
-                for arm in arms {
-                    self.push_scope();
-                    self.define_pat(&arm.pat);
-                    self.resolve_expr(&arm.body);
-                    self.pop_scope();
-                }
-            }
-
-            ast::ExprKind::App { func, arg } => {
-                self.resolve_expr(func);
-                self.resolve_expr(arg);
-            }
-            ast::ExprKind::BinOp { lhs, rhs, .. } => {
-                self.resolve_expr(lhs);
-                self.resolve_expr(rhs);
-            }
-            ast::ExprKind::UnaryOp { operand, .. } => self.resolve_expr(operand),
-            ast::ExprKind::If {
-                cond,
-                then_branch,
-                else_branch,
-            } => {
-                self.resolve_expr(cond);
-                self.resolve_expr(then_branch);
-                self.resolve_expr(else_branch);
-            }
-            ast::ExprKind::Atomic(e) => self.resolve_expr(e),
-            ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
-                self.resolve_expr(target);
-                self.resolve_expr(value);
-            }
-            ast::ExprKind::At { relation, time } => {
-                self.resolve_expr(relation);
-                self.resolve_expr(time);
-            }
-            ast::ExprKind::Record(fields) => {
-                for f in fields {
-                    self.resolve_expr(&f.value);
-                }
-            }
-            ast::ExprKind::RecordUpdate { base, fields } => {
-                self.resolve_expr(base);
-                for f in fields {
-                    self.resolve_expr(&f.value);
-                }
-            }
-            ast::ExprKind::FieldAccess { expr, .. } => self.resolve_expr(expr),
-            ast::ExprKind::List(elems) => {
-                for e in elems {
-                    self.resolve_expr(e);
-                }
-            }
-            ast::ExprKind::Lit(lit) => {
-                let ty = match lit {
-                    ast::Literal::Int(_) => "Int",
-                    ast::Literal::Float(_) => "Float",
-                    ast::Literal::Text(_) => "Text",
-                    ast::Literal::Bool(_) => "Bool",
-                    ast::Literal::Bytes(_) => "Bytes",
-                };
-                self.literals.push((expr.span, ty.to_string()));
-            }
-            ast::ExprKind::UnitLit { value, .. } => self.resolve_expr(value),
-            ast::ExprKind::Annot { expr: inner, .. } => self.resolve_expr(inner),
-            ast::ExprKind::Refine(inner) => self.resolve_expr(inner),
-        }
-    }
-}
-
-fn build_details(module: &Module) -> HashMap<String, String> {
-    let mut details = HashMap::new();
-
-    for decl in &module.decls {
-        match &decl.node {
-            DeclKind::Data {
-                name,
-                params,
-                constructors,
-                ..
-            } => {
-                let params_str = if params.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {}", params.join(" "))
-                };
-                let ctors: Vec<String> = constructors
-                    .iter()
-                    .map(|c| {
-                        if c.fields.is_empty() {
-                            c.name.clone()
-                        } else {
-                            let fields: Vec<String> = c
-                                .fields
-                                .iter()
-                                .map(|f| format!("{}: {}", f.name, format_type_kind(&f.value.node)))
-                                .collect();
-                            format!("{} {{{}}}", c.name, fields.join(", "))
-                        }
-                    })
-                    .collect();
-                let detail = format!("data {name}{params_str} = {}", ctors.join(" | "));
-                details.insert(name.clone(), detail.clone());
-                // Also add constructors
-                for ctor in constructors {
-                    let fields: Vec<String> = ctor
-                        .fields
-                        .iter()
-                        .map(|f| format!("{}: {}", f.name, format_type_kind(&f.value.node)))
-                        .collect();
-                    let ctor_detail = if fields.is_empty() {
-                        format!("{} — constructor of {name}", ctor.name)
-                    } else {
-                        format!("{} {{{}}} — constructor of {name}", ctor.name, fields.join(", "))
-                    };
-                    details.insert(ctor.name.clone(), ctor_detail);
-                }
-            }
-            DeclKind::TypeAlias { name, params, ty } => {
-                let params_str = if params.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {}", params.join(" "))
-                };
-                details.insert(
-                    name.clone(),
-                    format!("type {name}{params_str} = {}", format_type_kind(&ty.node)),
-                );
-            }
-            DeclKind::Source { name, ty, history } => {
-                let hist = if *history { " with history" } else { "" };
-                details.insert(
-                    name.clone(),
-                    format!("*{name} : [{}]{hist}", format_type_kind(&ty.node)),
-                );
-            }
-            DeclKind::View { name, ty, .. } => {
-                let ty_str = ty
-                    .as_ref()
-                    .map(|t| format!(" : {}", format_type_scheme(t)))
-                    .unwrap_or_default();
-                details.insert(name.clone(), format!("*{name}{ty_str} (view)"));
-            }
-            DeclKind::Derived { name, ty, .. } => {
-                let ty_str = ty
-                    .as_ref()
-                    .map(|t| format!(" : {}", format_type_scheme(t)))
-                    .unwrap_or_default();
-                details.insert(name.clone(), format!("&{name}{ty_str} (derived)"));
-            }
-            DeclKind::Fun { name, ty, .. } => {
-                let ty_str = ty
-                    .as_ref()
-                    .map(|t| format!(" : {}", format_type_scheme(t)))
-                    .unwrap_or_default();
-                details.insert(name.clone(), format!("{name}{ty_str}"));
-            }
-            DeclKind::Trait { name, params, .. } => {
-                let params_str = params
-                    .iter()
-                    .map(|p| {
-                        if let Some(kind) = &p.kind {
-                            format!("({} : {})", p.name, format_type_kind(&kind.node))
-                        } else {
-                            p.name.clone()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                details.insert(name.clone(), format!("trait {name} {params_str}"));
-            }
-            _ => {}
-        }
-    }
-
-    details
-}
-
-// ── Type formatting ─────────────────────────────────────────────────
-
-fn format_type_scheme(ts: &TypeScheme) -> String {
-    let mut s = String::new();
-    for c in &ts.constraints {
-        let args: Vec<String> = c.args.iter().map(|a| format_type_kind(&a.node)).collect();
-        s.push_str(&format!("{} {} => ", c.trait_name, args.join(" ")));
-    }
-    s.push_str(&format_type_kind(&ts.ty.node));
-    s
-}
-
-fn format_type_kind(ty: &TypeKind) -> String {
-    match ty {
-        TypeKind::Named(n) => n.clone(),
-        TypeKind::Var(n) => n.clone(),
-        TypeKind::App { func, arg } => {
-            format!("{} {}", format_type_kind(&func.node), format_type_kind(&arg.node))
-        }
-        TypeKind::Record { fields, rest } => {
-            let fs: Vec<String> = fields
-                .iter()
-                .map(|f| format!("{}: {}", f.name, format_type_kind(&f.value.node)))
-                .collect();
-            match rest {
-                Some(r) => format!("{{{} | {r}}}", fs.join(", ")),
-                None => format!("{{{}}}", fs.join(", ")),
-            }
-        }
-        TypeKind::Relation(inner) => format!("[{}]", format_type_kind(&inner.node)),
-        TypeKind::Function { param, result } => {
-            let p = format_type_kind(&param.node);
-            let r = format_type_kind(&result.node);
-            if matches!(param.node, TypeKind::Function { .. }) {
-                format!("({p}) -> {r}")
-            } else {
-                format!("{p} -> {r}")
-            }
-        }
-        TypeKind::Variant { constructors, rest } => {
-            let cs: Vec<String> = constructors
-                .iter()
-                .map(|c| {
-                    if c.fields.is_empty() {
-                        c.name.clone()
-                    } else {
-                        let fs: Vec<String> = c
-                            .fields
-                            .iter()
-                            .map(|f| format!("{}: {}", f.name, format_type_kind(&f.value.node)))
-                            .collect();
-                        format!("{} {{{}}}", c.name, fs.join(", "))
-                    }
-                })
-                .collect();
-            match rest {
-                Some(r) => format!("<{} | {r}>", cs.join(" | ")),
-                None => format!("<{}>", cs.join(" | ")),
-            }
-        }
-        TypeKind::Effectful { effects, ty } => {
-            let effs: Vec<String> = effects.iter().map(format_effect).collect();
-            format!("{{{}}} {}", effs.join(", "), format_type_kind(&ty.node))
-        }
-        TypeKind::IO { effects, rest, ty } => {
-            if effects.is_empty() && rest.is_none() {
-                format!("IO {}", format_type_kind(&ty.node))
-            } else {
-                let mut parts: Vec<String> =
-                    effects.iter().map(format_effect).collect();
-                if let Some(name) = rest {
-                    parts.push(format!("| {}", name));
-                }
-                format!("IO {{{}}} {}", parts.join(", "), format_type_kind(&ty.node))
-            }
-        }
-        TypeKind::Hole => "_".into(),
-        TypeKind::UnitAnnotated { base, unit } => {
-            format!("{}<{}>", format_type_kind(&base.node), format_unit_expr(unit))
-        }
-        TypeKind::Refined { base, predicate } => {
-            format!("{} where {}", format_type_kind(&base.node), format_expr_brief(&predicate.node))
-        }
-        TypeKind::Forall { vars, ty } => {
-            format!("forall {}. {}", vars.join(" "), format_type_kind(&ty.node))
-        }
-    }
-}
-
-/// Brief structural rendering of an expression for display in type hovers.
-fn format_expr_brief(expr: &ast::ExprKind) -> String {
-    match expr {
-        ast::ExprKind::Var(name) => name.clone(),
-        ast::ExprKind::Lit(ast::Literal::Int(n)) => n.to_string(),
-        ast::ExprKind::Lit(ast::Literal::Float(f)) => f.to_string(),
-        ast::ExprKind::Lit(ast::Literal::Text(s)) => format!("\"{}\"", s),
-        ast::ExprKind::Lit(ast::Literal::Bool(b)) => if *b { "true" } else { "false" }.into(),
-        ast::ExprKind::Lambda { params, body } => {
-            let ps: Vec<String> = params.iter().map(|p| format_pat_brief(&p.node)).collect();
-            format!("\\{} -> {}", ps.join(" "), format_expr_brief(&body.node))
-        }
-        ast::ExprKind::App { func, arg } => {
-            let f = format_expr_brief(&func.node);
-            let a = format_expr_brief(&arg.node);
-            if matches!(arg.node, ast::ExprKind::App { .. } | ast::ExprKind::BinOp { .. }) {
-                format!("{f} ({a})")
-            } else {
-                format!("{f} {a}")
-            }
-        }
-        ast::ExprKind::BinOp { op, lhs, rhs } => {
-            let op_str = match op {
-                ast::BinOp::Add => "+", ast::BinOp::Sub => "-",
-                ast::BinOp::Mul => "*", ast::BinOp::Div => "/",
-                ast::BinOp::Eq => "==", ast::BinOp::Neq => "!=",
-                ast::BinOp::Lt => "<", ast::BinOp::Gt => ">",
-                ast::BinOp::Le => "<=", ast::BinOp::Ge => ">=",
-                ast::BinOp::And => "&&", ast::BinOp::Or => "||",
-                ast::BinOp::Concat => "++", ast::BinOp::Pipe => "|>",
-            };
-            format!("{} {} {}", format_expr_brief(&lhs.node), op_str, format_expr_brief(&rhs.node))
-        }
-        ast::ExprKind::UnaryOp { op, operand } => {
-            let op_str = match op {
-                ast::UnaryOp::Neg => "-",
-                ast::UnaryOp::Not => "not ",
-            };
-            format!("{}{}", op_str, format_expr_brief(&operand.node))
-        }
-        ast::ExprKind::FieldAccess { expr, field } => {
-            format!("{}.{}", format_expr_brief(&expr.node), field)
-        }
-        _ => "...".into(),
-    }
-}
-
-fn format_pat_brief(pat: &ast::PatKind) -> String {
-    match pat {
-        ast::PatKind::Var(name) => name.clone(),
-        ast::PatKind::Wildcard => "_".into(),
-        _ => "...".into(),
-    }
-}
-
-fn format_unit_expr(u: &ast::UnitExpr) -> String {
-    match u {
-        ast::UnitExpr::Dimensionless => "1".into(),
-        ast::UnitExpr::Named(n) => n.clone(),
-        ast::UnitExpr::Mul(a, b) => format!("{}*{}", format_unit_expr(a), format_unit_expr(b)),
-        ast::UnitExpr::Div(a, b) => format!("{}/{}", format_unit_expr(a), format_unit_expr(b)),
-        ast::UnitExpr::Pow(base, exp) => format!("{}^{}", format_unit_expr(base), exp),
-    }
-}
-
-fn format_effect(eff: &ast::Effect) -> String {
-    match eff {
-        ast::Effect::Reads(r) => format!("reads *{r}"),
-        ast::Effect::Writes(r) => format!("writes *{r}"),
-        ast::Effect::Console => "console".into(),
-        ast::Effect::Network => "network".into(),
-        ast::Effect::Fs => "fs".into(),
-        ast::Effect::Clock => "clock".into(),
-        ast::Effect::Random => "random".into(),
-    }
-}
-
-// ── Diagnostic conversion ───────────────────────────────────────────
-
-fn to_lsp_diagnostic(diag: &diagnostic::Diagnostic, source: &str, uri: &Uri) -> Option<Diagnostic> {
-    let severity = match diag.severity {
-        diagnostic::Severity::Error => DiagnosticSeverity::ERROR,
-        diagnostic::Severity::Warning => DiagnosticSeverity::WARNING,
-        diagnostic::Severity::Info => DiagnosticSeverity::INFORMATION,
-    };
-
-    // Use the first valid label's span for the diagnostic range,
-    // or fall back to the start of the file.
-    let range = diag
-        .labels
-        .iter()
-        .find(|l| l.span.start < source.len() && l.span.end <= source.len())
-        .map(|l| span_to_range(l.span, source))
-        .unwrap_or(Range {
-            start: Position::new(0, 0),
-            end: Position::new(0, 0),
-        });
-
-    // Build message with label messages and notes
-    let mut message = diag.message.clone();
-    for label in &diag.labels {
-        if !label.message.is_empty() && label.message != diag.message {
-            message.push_str(&format!("\n  {}", label.message));
-        }
-    }
-    for note in &diag.notes {
-        message.push_str(&format!("\nnote: {note}"));
-    }
-
-    // Build related information from additional labels (with real URI)
-    let related: Vec<DiagnosticRelatedInformation> = diag
-        .labels
-        .iter()
-        .skip(1)
-        .filter(|l| l.span.start < source.len() && l.span.end <= source.len())
-        .map(|l| DiagnosticRelatedInformation {
-            location: Location {
-                uri: uri.clone(),
-                range: span_to_range(l.span, source),
-            },
-            message: l.message.clone(),
-        })
-        .collect();
-
-    // Assign structured error codes based on diagnostic message patterns
-    let code = error_code_for_diagnostic(&diag.message);
-
-    // Assign diagnostic tags: Unnecessary for unused warnings, Deprecated for deprecation
-    let msg_lower = diag.message.to_lowercase();
-    let mut tags = Vec::new();
-    if msg_lower.contains("unused") || msg_lower.contains("never used") {
-        tags.push(DiagnosticTag::UNNECESSARY);
-    }
-    if msg_lower.contains("deprecated") {
-        tags.push(DiagnosticTag::DEPRECATED);
-    }
-
-    Some(Diagnostic {
-        range,
-        severity: Some(severity),
-        code: code.map(NumberOrString::String),
-        source: Some("knot".into()),
-        message,
-        related_information: if related.is_empty() {
-            None
-        } else {
-            Some(related)
-        },
-        tags: if tags.is_empty() { None } else { Some(tags) },
-        ..Default::default()
-    })
-}
-
-// ── Position utilities ──────────────────────────────────────────────
-
-fn span_to_range(span: Span, source: &str) -> Range {
-    Range {
-        start: offset_to_position(source, span.start),
-        end: offset_to_position(source, span.end),
-    }
-}
-
-fn offset_to_position(source: &str, offset: usize) -> Position {
-    // LSP positions use UTF-16 code units by default (we don't negotiate
-    // `positionEncodingKind`), so count code units from the start of the
-    // line up to `offset`, not bytes or codepoints.
-    let clamped = offset.min(source.len());
-    let bytes = source.as_bytes();
-    let mut line: u32 = 0;
-    let mut line_start: usize = 0;
-    for i in 0..clamped {
-        if bytes[i] == b'\n' {
-            line += 1;
-            line_start = i + 1;
-        }
-    }
-    let mut safe_offset = clamped;
-    while safe_offset > line_start && !source.is_char_boundary(safe_offset) {
-        safe_offset -= 1;
-    }
-    let character: u32 = source[line_start..safe_offset]
-        .chars()
-        .map(|c| c.len_utf16() as u32)
-        .sum();
-    Position::new(line, character)
-}
-
-fn position_to_offset(source: &str, pos: Position) -> usize {
-    // Convert an LSP Position (UTF-16 code units) into a byte offset.
-    let mut offset = 0;
-    for (i, line) in source.split('\n').enumerate() {
-        if i == pos.line as usize {
-            let mut utf16_count: u32 = 0;
-            let mut byte_pos: usize = 0;
-            for c in line.chars() {
-                if utf16_count >= pos.character {
-                    break;
-                }
-                utf16_count += c.len_utf16() as u32;
-                byte_pos += c.len_utf8();
-            }
-            return offset + byte_pos;
-        }
-        offset += line.len() + 1;
-    }
-    source.len()
-}
-
-fn word_at_position<'a>(source: &'a str, pos: Position) -> Option<&'a str> {
-    let offset = position_to_offset(source, pos);
-    let bytes = source.as_bytes();
-    if offset >= bytes.len() {
-        return None;
-    }
-
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-
-    if !is_ident(bytes[offset]) {
-        return None;
-    }
-
-    let start = (0..offset)
-        .rev()
-        .find(|&i| !is_ident(bytes[i]))
-        .map(|i| i + 1)
-        .unwrap_or(0);
-
-    let end = (offset..bytes.len())
-        .find(|&i| !is_ident(bytes[i]))
-        .unwrap_or(bytes.len());
-
-    Some(&source[start..end])
-}
-
-fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
-    let s = uri.as_str();
-    s.strip_prefix("file://").map(PathBuf::from)
-}
-
-fn path_to_uri(path: &Path) -> Option<Uri> {
-    let s = format!("file://{}", path.display());
-    s.parse::<Uri>().ok()
-}
-
-/// Compute Levenshtein edit distance between two strings.
-fn edit_distance(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let mut dp = vec![vec![0usize; b.len() + 1]; a.len() + 1];
-    for i in 0..=a.len() {
-        dp[i][0] = i;
-    }
-    for j in 0..=b.len() {
-        dp[0][j] = j;
-    }
-    for i in 1..=a.len() {
-        for j in 1..=b.len() {
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            dp[i][j] = (dp[i - 1][j] + 1)
-                .min(dp[i][j - 1] + 1)
-                .min(dp[i - 1][j - 1] + cost);
-        }
-    }
-    dp[a.len()][b.len()]
-}
-
-/// Find a whole-word occurrence of `name` in `source[start..end]`.
-fn find_word_in_source(source: &str, name: &str, start: usize, end: usize) -> Option<Span> {
-    let end = end.min(source.len());
-    let text = source.get(start..end)?;
-    let bytes = source.as_bytes();
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-
-    let mut search_start = 0;
-    while let Some(pos) = text[search_start..].find(name) {
-        let abs_pos = start + search_start + pos;
-        let abs_end = abs_pos + name.len();
-
-        // Check word boundaries
-        let left_ok = abs_pos == 0 || !is_ident(bytes[abs_pos - 1]);
-        let right_ok = abs_end >= bytes.len() || !is_ident(bytes[abs_end]);
-
-        if left_ok && right_ok {
-            return Some(Span::new(abs_pos, abs_end));
-        }
-        search_start += pos + 1;
-    }
-    None
-}
-
-// ── Doc comment extraction ──────────────────────────────────────────
-
-/// Extract doc comments (lines starting with `-- `) above each declaration.
-fn extract_doc_comments(source: &str, module: &Module) -> HashMap<String, String> {
-    let mut comments = HashMap::new();
-    let lines: Vec<&str> = source.split('\n').collect();
-
-    for decl in &module.decls {
-        let name = match &decl.node {
-            DeclKind::Fun { name, .. }
-            | DeclKind::Data { name, .. }
-            | DeclKind::TypeAlias { name, .. }
-            | DeclKind::Source { name, .. }
-            | DeclKind::View { name, .. }
-            | DeclKind::Derived { name, .. }
-            | DeclKind::Trait { name, .. }
-            | DeclKind::Route { name, .. }
-            | DeclKind::RouteComposite { name, .. } => name.clone(),
-            _ => continue,
-        };
-
-        let decl_line = offset_to_position(source, decl.span.start).line as usize;
-        if decl_line == 0 {
-            continue;
-        }
-
-        // Collect consecutive comment lines above the declaration
-        let mut comment_lines = Vec::new();
-        let mut line_idx = decl_line;
-        while line_idx > 0 {
-            line_idx -= 1;
-            let line = lines.get(line_idx).map(|l| l.trim()).unwrap_or("");
-            if let Some(text) = line.strip_prefix("-- ") {
-                comment_lines.push(text.to_string());
-            } else if line == "--" {
-                comment_lines.push(String::new());
-            } else {
-                break;
-            }
-        }
-
-        if !comment_lines.is_empty() {
-            comment_lines.reverse();
-            comments.insert(name, comment_lines.join("\n"));
-        }
-    }
-
-    comments
-}
-
-// ── Keyword/operator semantic token collection ──────────────────────
-
-/// Collect keyword and operator token positions from the lexer token stream.
-fn collect_keyword_operator_positions(tokens: &[knot::lexer::Token]) -> Vec<(Span, u32)> {
-    use knot::lexer::TokenKind;
-    let mut positions = Vec::new();
-    for token in tokens {
-        let tok_type = match &token.kind {
-            // Keywords
-            TokenKind::Import
-            | TokenKind::Data
-            | TokenKind::Type
-            | TokenKind::Trait
-            | TokenKind::Impl
-            | TokenKind::Route
-            | TokenKind::Migrate
-            | TokenKind::Where
-            | TokenKind::Do
-            | TokenKind::Set
-            | TokenKind::If
-            | TokenKind::Then
-            | TokenKind::Else
-            | TokenKind::Case
-            | TokenKind::Of
-            | TokenKind::Let
-            | TokenKind::In
-            | TokenKind::Not
-            | TokenKind::Full
-            | TokenKind::Atomic
-            | TokenKind::Deriving
-            | TokenKind::With
-            | TokenKind::Export
-            | TokenKind::Unit
-            | TokenKind::Refine => Some(TOK_KEYWORD),
-            // Operators
-            TokenKind::Plus
-            | TokenKind::Minus
-            | TokenKind::Star
-            | TokenKind::Slash
-            | TokenKind::EqEq
-            | TokenKind::BangEq
-            | TokenKind::Lt
-            | TokenKind::Gt
-            | TokenKind::Le
-            | TokenKind::Ge
-            | TokenKind::PlusPlus
-            | TokenKind::AndAnd
-            | TokenKind::OrOr
-            | TokenKind::PipeGt
-            | TokenKind::Caret
-            | TokenKind::Arrow
-            | TokenKind::FatArrow
-            | TokenKind::LArrow => Some(TOK_OPERATOR),
-            _ => None,
-        };
-        if let Some(tt) = tok_type {
-            positions.push((token.span, tt));
-        }
-    }
-    positions
-}
-
-// ── Diagnostic error codes ──────────────────────────────────────────
-
-/// Map diagnostic messages to structured error codes.
-fn error_code_for_diagnostic(message: &str) -> Option<String> {
-    let msg = message.to_lowercase();
-    if msg.contains("type mismatch") || msg.contains("cannot unify") {
-        Some("E001".into())
-    } else if msg.contains("undefined") || msg.contains("unknown") || msg.contains("not found") {
-        Some("E002".into())
-    } else if msg.contains("missing") && msg.contains("field") {
-        Some("E003".into())
-    } else if msg.contains("exhaustive") || msg.contains("missing case") {
-        Some("E004".into())
-    } else if msg.contains("occurs check") || msg.contains("infinite type") {
-        Some("E005".into())
-    } else if msg.contains("duplicate") {
-        Some("E006".into())
-    } else if msg.contains("import") {
-        Some("E007".into())
-    } else if msg.contains("effect") || msg.contains("purity") {
-        Some("E008".into())
-    } else if msg.contains("stratif") {
-        Some("E009".into())
-    } else if msg.contains("trait") && (msg.contains("impl") || msg.contains("instance")) {
-        Some("E010".into())
-    } else if msg.contains("unused") {
-        Some("W001".into())
-    } else if msg.contains("shadow") {
-        Some("W002".into())
-    } else if msg.contains("runtime") && msg.contains("sql") {
-        Some("I001".into())
-    } else {
-        None
-    }
-}
-
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossbeam_channel::{Receiver, Sender};
+    use std::time::Duration;
 
     fn fake_uri(s: &str) -> Uri {
         s.parse().unwrap()
@@ -8517,7 +7540,8 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded::<AnalysisTask>();
         let (rtx, rrx) = crossbeam_channel::unbounded::<AnalysisResult>();
         let cache = Arc::new(Mutex::new(HashMap::new()));
-        let handle = thread::spawn(move || analysis_worker(rx, rtx, cache));
+        let inf_cache = Arc::new(Mutex::new(HashMap::new()));
+        let handle = thread::spawn(move || analysis_worker(rx, rtx, cache, inf_cache));
         (tx, rrx, handle)
     }
 

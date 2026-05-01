@@ -1,0 +1,335 @@
+//! Position, span, URI, word, and edit-distance helpers shared across LSP
+//! handlers. Plus doc-comment extraction and keyword-token collection — both
+//! sit on the boundary between AST and presentation.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use lsp_types::{Position, Range, Uri};
+
+use knot::ast::{self, DeclKind, Module, Span};
+
+use crate::legend::{TOK_KEYWORD, TOK_OPERATOR};
+
+// ── Position ↔ Span ─────────────────────────────────────────────────
+
+pub fn span_to_range(span: Span, source: &str) -> Range {
+    Range {
+        start: offset_to_position(source, span.start),
+        end: offset_to_position(source, span.end),
+    }
+}
+
+pub fn offset_to_position(source: &str, offset: usize) -> Position {
+    // LSP positions use UTF-16 code units by default (we don't negotiate
+    // `positionEncodingKind`), so count code units from the start of the
+    // line up to `offset`, not bytes or codepoints.
+    let clamped = offset.min(source.len());
+    let bytes = source.as_bytes();
+    let mut line: u32 = 0;
+    let mut line_start: usize = 0;
+    for i in 0..clamped {
+        if bytes[i] == b'\n' {
+            line += 1;
+            line_start = i + 1;
+        }
+    }
+    let mut safe_offset = clamped;
+    while safe_offset > line_start && !source.is_char_boundary(safe_offset) {
+        safe_offset -= 1;
+    }
+    let character: u32 = source[line_start..safe_offset]
+        .chars()
+        .map(|c| c.len_utf16() as u32)
+        .sum();
+    Position::new(line, character)
+}
+
+pub fn position_to_offset(source: &str, pos: Position) -> usize {
+    let mut offset = 0;
+    for (i, line) in source.split('\n').enumerate() {
+        if i == pos.line as usize {
+            let mut utf16_count: u32 = 0;
+            let mut byte_pos: usize = 0;
+            for c in line.chars() {
+                if utf16_count >= pos.character {
+                    break;
+                }
+                utf16_count += c.len_utf16() as u32;
+                byte_pos += c.len_utf8();
+            }
+            return offset + byte_pos;
+        }
+        offset += line.len() + 1;
+    }
+    source.len()
+}
+
+pub fn word_at_position<'a>(source: &'a str, pos: Position) -> Option<&'a str> {
+    let offset = position_to_offset(source, pos);
+    let bytes = source.as_bytes();
+    if offset >= bytes.len() {
+        return None;
+    }
+
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+
+    if !is_ident(bytes[offset]) {
+        return None;
+    }
+
+    let start = (0..offset)
+        .rev()
+        .find(|&i| !is_ident(bytes[i]))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+
+    let end = (offset..bytes.len())
+        .find(|&i| !is_ident(bytes[i]))
+        .unwrap_or(bytes.len());
+
+    Some(&source[start..end])
+}
+
+// ── URIs ────────────────────────────────────────────────────────────
+
+pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
+    let s = uri.as_str();
+    s.strip_prefix("file://").map(PathBuf::from)
+}
+
+pub fn path_to_uri(path: &Path) -> Option<Uri> {
+    let s = format!("file://{}", path.display());
+    s.parse::<Uri>().ok()
+}
+
+// ── Edit distance ───────────────────────────────────────────────────
+
+pub fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut dp = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for i in 0..=a.len() {
+        dp[i][0] = i;
+    }
+    for j in 0..=b.len() {
+        dp[0][j] = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            dp[i][j] = (dp[i - 1][j] + 1)
+                .min(dp[i][j - 1] + 1)
+                .min(dp[i - 1][j - 1] + cost);
+        }
+    }
+    dp[a.len()][b.len()]
+}
+
+// ── Word search ────────────────────────────────────────────────────
+
+/// Find a whole-word occurrence of `name` in `source[start..end]`.
+pub fn find_word_in_source(source: &str, name: &str, start: usize, end: usize) -> Option<Span> {
+    let end = end.min(source.len());
+    let text = source.get(start..end)?;
+    let bytes = source.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+
+    let mut search_start = 0;
+    while let Some(pos) = text[search_start..].find(name) {
+        let abs_pos = start + search_start + pos;
+        let abs_end = abs_pos + name.len();
+
+        let left_ok = abs_pos == 0 || !is_ident(bytes[abs_pos - 1]);
+        let right_ok = abs_end >= bytes.len() || !is_ident(bytes[abs_end]);
+
+        if left_ok && right_ok {
+            return Some(Span::new(abs_pos, abs_end));
+        }
+        search_start += pos + 1;
+    }
+    None
+}
+
+// ── Doc comments ────────────────────────────────────────────────────
+
+/// Extract doc comments (lines starting with `-- `) above each declaration.
+pub fn extract_doc_comments(source: &str, module: &Module) -> HashMap<String, String> {
+    let mut comments = HashMap::new();
+    let lines: Vec<&str> = source.split('\n').collect();
+
+    for decl in &module.decls {
+        let name = match &decl.node {
+            DeclKind::Fun { name, .. }
+            | DeclKind::Data { name, .. }
+            | DeclKind::TypeAlias { name, .. }
+            | DeclKind::Source { name, .. }
+            | DeclKind::View { name, .. }
+            | DeclKind::Derived { name, .. }
+            | DeclKind::Trait { name, .. }
+            | DeclKind::Route { name, .. }
+            | DeclKind::RouteComposite { name, .. } => name.clone(),
+            _ => continue,
+        };
+
+        let decl_line = offset_to_position(source, decl.span.start).line as usize;
+        if decl_line == 0 {
+            continue;
+        }
+
+        let mut comment_lines = Vec::new();
+        let mut line_idx = decl_line;
+        while line_idx > 0 {
+            line_idx -= 1;
+            let line = lines.get(line_idx).map(|l| l.trim()).unwrap_or("");
+            if let Some(text) = line.strip_prefix("-- ") {
+                comment_lines.push(text.to_string());
+            } else if line == "--" {
+                comment_lines.push(String::new());
+            } else {
+                break;
+            }
+        }
+
+        if !comment_lines.is_empty() {
+            comment_lines.reverse();
+            comments.insert(name, comment_lines.join("\n"));
+        }
+    }
+
+    comments
+}
+
+// ── Keyword/operator tokens ─────────────────────────────────────────
+
+/// Collect keyword and operator token positions from the lexer token stream.
+pub fn collect_keyword_operator_positions(tokens: &[knot::lexer::Token]) -> Vec<(Span, u32)> {
+    use knot::lexer::TokenKind;
+    let mut positions = Vec::new();
+    for token in tokens {
+        let tok_type = match &token.kind {
+            TokenKind::Import
+            | TokenKind::Data
+            | TokenKind::Type
+            | TokenKind::Trait
+            | TokenKind::Impl
+            | TokenKind::Route
+            | TokenKind::Migrate
+            | TokenKind::Where
+            | TokenKind::Do
+            | TokenKind::Set
+            | TokenKind::If
+            | TokenKind::Then
+            | TokenKind::Else
+            | TokenKind::Case
+            | TokenKind::Of
+            | TokenKind::Let
+            | TokenKind::In
+            | TokenKind::Not
+            | TokenKind::Full
+            | TokenKind::Atomic
+            | TokenKind::Deriving
+            | TokenKind::With
+            | TokenKind::Export
+            | TokenKind::Unit
+            | TokenKind::Refine => Some(TOK_KEYWORD),
+            TokenKind::Plus
+            | TokenKind::Minus
+            | TokenKind::Star
+            | TokenKind::Slash
+            | TokenKind::EqEq
+            | TokenKind::BangEq
+            | TokenKind::Lt
+            | TokenKind::Gt
+            | TokenKind::Le
+            | TokenKind::Ge
+            | TokenKind::PlusPlus
+            | TokenKind::AndAnd
+            | TokenKind::OrOr
+            | TokenKind::PipeGt
+            | TokenKind::Caret
+            | TokenKind::Arrow
+            | TokenKind::FatArrow
+            | TokenKind::LArrow => Some(TOK_OPERATOR),
+            _ => None,
+        };
+        if let Some(tt) = tok_type {
+            positions.push((token.span, tt));
+        }
+    }
+    positions
+}
+
+// ── AST utility ─────────────────────────────────────────────────────
+
+/// Recurse into all sub-expressions of `expr`, calling `f` on each.
+/// Lives here so multiple modules can share it without circular deps.
+pub fn recurse_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, mut f: F) {
+    match &expr.node {
+        ast::ExprKind::App { func, arg } => {
+            f(func);
+            f(arg);
+        }
+        ast::ExprKind::Lambda { body, .. } => f(body),
+        ast::ExprKind::BinOp { lhs, rhs, .. } => {
+            f(lhs);
+            f(rhs);
+        }
+        ast::ExprKind::UnaryOp { operand, .. } => f(operand),
+        ast::ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            f(cond);
+            f(then_branch);
+            f(else_branch);
+        }
+        ast::ExprKind::Case { scrutinee, arms } => {
+            f(scrutinee);
+            for arm in arms {
+                f(&arm.body);
+            }
+        }
+        ast::ExprKind::Do(stmts) => {
+            for stmt in stmts {
+                match &stmt.node {
+                    ast::StmtKind::Bind { expr, .. }
+                    | ast::StmtKind::Let { expr, .. }
+                    | ast::StmtKind::Expr(expr)
+                    | ast::StmtKind::Where { cond: expr } => f(expr),
+                    ast::StmtKind::GroupBy { key } => f(key),
+                }
+            }
+        }
+        ast::ExprKind::Atomic(e) | ast::ExprKind::Refine(e) => f(e),
+        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+            f(target);
+            f(value);
+        }
+        ast::ExprKind::Record(fields) => {
+            for fld in fields {
+                f(&fld.value);
+            }
+        }
+        ast::ExprKind::RecordUpdate { base, fields } => {
+            f(base);
+            for fld in fields {
+                f(&fld.value);
+            }
+        }
+        ast::ExprKind::List(elems) => {
+            for e in elems {
+                f(e);
+            }
+        }
+        ast::ExprKind::FieldAccess { expr, .. } => f(expr),
+        ast::ExprKind::At { relation, time } => {
+            f(relation);
+            f(time);
+        }
+        ast::ExprKind::Annot { expr, .. } => f(expr),
+        ast::ExprKind::UnitLit { value, .. } => f(value),
+        _ => {}
+    }
+}

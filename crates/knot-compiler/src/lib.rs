@@ -1,4 +1,5 @@
 pub mod base;
+pub mod builtins;
 pub mod codegen;
 pub mod desugar;
 pub mod effects;

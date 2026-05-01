@@ -1196,7 +1196,7 @@ mod tests {
             "type T = {name: Text, active: Int}\n\
              *items : [T]\n\
              process = \\target -> do\n\
-               set *items = do\n\
+               *items = do\n\
                  i <- *items\n\
                  yield (if contains target i.name\n\
                    then {i | active: 0}\n\
@@ -1229,7 +1229,7 @@ mod tests {
             "type T = {name: Text, active: Int}\n\
              *items : [T]\n\
              process = \\target -> do\n\
-               set *items = do\n\
+               *items = do\n\
                  i <- *items\n\
                  yield (if i.name == target\n\
                    then {i | active: 0}\n\
@@ -1246,7 +1246,7 @@ mod tests {
              isGood = \\x -> x > 50\n\
              *items : [T]\n\
              cleanup = do\n\
-               set *items = do\n\
+               *items = do\n\
                  i <- *items\n\
                  where isGood i.score\n\
                  yield i\n",
@@ -1263,7 +1263,7 @@ mod tests {
             "type T = {name: Text, score: Int}\n\
              *items : [T]\n\
              cleanup = do\n\
-               set *items = do\n\
+               *items = do\n\
                  i <- *items\n\
                  where i.score > 50\n\
                  yield i\n",

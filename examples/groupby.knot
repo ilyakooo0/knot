@@ -3,7 +3,7 @@ type Todo = {title: Text, owner: Text, done: Int}
 *todos : [Todo]
 
 main = do
-  set *todos = [
+  *todos = [
     {title: "Write parser", owner: "Alice", done: 0},
     {title: "Write codegen", owner: "Alice", done: 0},
     {title: "Write runtime", owner: "Bob", done: 0},

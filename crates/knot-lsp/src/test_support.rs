@@ -156,12 +156,22 @@ pub(crate) struct TempWorkspace {
 
 impl TempWorkspace {
     pub fn new() -> Self {
+        // Combine nanosecond timestamp + an atomic counter + the thread id so
+        // parallel test runs on hosts with coarse system clocks don't collide
+        // on the tempdir name. A collision causes Drop on one workspace to
+        // wipe another's still-open files and produces flakes that look like
+        // missing analysis output.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tid = format!("{:?}", std::thread::current().id());
         let root = std::env::temp_dir().join(format!(
-            "knot-lsp-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            "knot-lsp-test-{nanos}-{n}-{}",
+            tid.replace(['(', ')', ' '], "")
         ));
         std::fs::create_dir_all(&root).expect("create tempdir");
         let mut workspace = TestWorkspace::new();

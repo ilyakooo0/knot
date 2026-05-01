@@ -17,7 +17,7 @@ route Api = TodoApi | AdminApi
 
 addTodo = \title owner priority -> do
   todos <- *todos
-  set *todos = union todos [{title: title, owner: owner, priority: Low {}}]
+  *todos = union todos [{title: title, owner: owner, priority: Low {}}]
 
 getTodos = \owner -> do
   todos <- *todos

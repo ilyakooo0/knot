@@ -321,7 +321,6 @@ pub fn collect_keyword_operator_positions(tokens: &[knot::lexer::Token]) -> Vec<
             | TokenKind::Migrate
             | TokenKind::Where
             | TokenKind::Do
-            | TokenKind::Set
             | TokenKind::If
             | TokenKind::Then
             | TokenKind::Else

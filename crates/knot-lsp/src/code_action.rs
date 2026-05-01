@@ -197,6 +197,14 @@ pub(crate) fn handle_code_action(
                     ..Default::default()
                 }));
             }
+
+            // Convert empty / fully-default impl to a `deriving` clause on the
+            // data declaration. The user wrote `impl Eq for Foo where` with no
+            // body and the trait's required methods all have default bodies —
+            // `deriving (Eq)` is the more idiomatic spelling.
+            if let Some(action) = build_deriving_action(decl, trait_name, items, doc, uri) {
+                actions.push(action);
+            }
         }
     }
 
@@ -296,6 +304,44 @@ pub(crate) fn handle_code_action(
                             ..Default::default()
                         }));
                         let _ = fun_name; // for diagnostics in future
+                    }
+                }
+            }
+        }
+
+        // Wrap-in-constructor quick fixes: when a type mismatch shows that an
+        // expression of type `T` is being passed where `Maybe T`, `Result e T`,
+        // or `IO ... T` is expected, offer to wrap the expression in the
+        // appropriate constructor. Cheaper than asking users to rewrite the
+        // expression themselves.
+        if msg.starts_with("type mismatch:") {
+            if let Some((expected, found)) = parse_type_mismatch(msg) {
+                let diag_start = position_to_offset(&doc.source, diag.range.start);
+                let diag_end = position_to_offset(&doc.source, diag.range.end);
+                if diag_end > diag_start && diag_end <= doc.source.len() {
+                    let snippet = doc.source[diag_start..diag_end].trim();
+                    if !snippet.is_empty() {
+                        for wrap in detect_wrap_suggestions(&expected, &found) {
+                            let mut changes = HashMap::new();
+                            let wrapped = wrap.format_wrapping(snippet);
+                            changes.insert(
+                                uri.clone(),
+                                vec![TextEdit {
+                                    range: diag.range,
+                                    new_text: wrapped,
+                                }],
+                            );
+                            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                                title: wrap.title.clone(),
+                                kind: Some(CodeActionKind::QUICKFIX),
+                                diagnostics: Some(vec![diag.clone()]),
+                                edit: Some(WorkspaceEdit {
+                                    changes: Some(changes),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }));
+                        }
                     }
                 }
             }
@@ -401,6 +447,41 @@ pub(crate) fn handle_code_action(
                         is_preferred: Some(candidates.first().map_or(false, |(s, _)| *s == *suggestion)),
                         ..Default::default()
                     }));
+                }
+
+                // Auto-import: search the workspace for files that declare
+                // `unknown_name` at top level and offer to add an import.
+                if !already_imports(doc, unknown_name) {
+                    let auto_candidates =
+                        find_auto_import_candidates(state, uri, unknown_name);
+                    for cand in auto_candidates {
+                        let (insert_pos, insert_text) =
+                            import_insert_position_and_text(doc, &cand.import_path);
+                        let mut changes = HashMap::new();
+                        changes.insert(
+                            uri.clone(),
+                            vec![TextEdit {
+                                range: Range {
+                                    start: insert_pos,
+                                    end: insert_pos,
+                                },
+                                new_text: insert_text,
+                            }],
+                        );
+                        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                            title: format!(
+                                "Import `{unknown_name}` from `{}`",
+                                cand.import_path
+                            ),
+                            kind: Some(CodeActionKind::QUICKFIX),
+                            diagnostics: Some(vec![diag.clone()]),
+                            edit: Some(WorkspaceEdit {
+                                changes: Some(changes),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }));
+                    }
                 }
             }
         }
@@ -1347,6 +1428,258 @@ fn build_effect_widen_edit(decl: &ast::Decl, source: &str, target_effects: &str)
     None
 }
 
+/// A wrap-in-constructor suggestion derived from a type mismatch.
+struct WrapSuggestion {
+    title: String,
+    template: String,
+}
+
+impl WrapSuggestion {
+    fn format_wrapping(&self, snippet: &str) -> String {
+        // Parenthesize if the snippet contains whitespace so precedence is
+        // preserved. Identifiers, parenthesized exprs, and literals don't
+        // need extra parens.
+        let needs_parens = snippet.contains(' ') && !is_already_parenthesized(snippet);
+        let body = if needs_parens {
+            format!("({snippet})")
+        } else {
+            snippet.to_string()
+        };
+        self.template.replacen("{}", &body, 1)
+    }
+}
+
+fn is_already_parenthesized(s: &str) -> bool {
+    let trimmed = s.trim();
+    if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+        return false;
+    }
+    // Verify the outer parens match — `(a) (b)` shouldn't count.
+    let bytes = trimmed.as_bytes();
+    let mut depth: i32 = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 && i != bytes.len() - 1 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+/// Pull `(expected, found)` out of a `type mismatch: expected X, found Y`
+/// message. Returns `None` if the message doesn't match the expected shape.
+fn parse_type_mismatch(msg: &str) -> Option<(String, String)> {
+    let after_prefix = msg.strip_prefix("type mismatch:")?.trim_start();
+    let after_expected = after_prefix.strip_prefix("expected ")?;
+    // Find `, found ` — uses a comma so we can split robustly.
+    let split_at = after_expected.find(", found ")?;
+    let expected = after_expected[..split_at].trim().to_string();
+    let found = after_expected[split_at + ", found ".len()..]
+        .trim()
+        .trim_end_matches('.')
+        .to_string();
+    Some((expected, found))
+}
+
+/// Decide which wrap suggestions apply for a given expected/found pair.
+/// Returns up to a handful of templates whose `{}` placeholder should be
+/// substituted with the offending expression.
+fn detect_wrap_suggestions(expected: &str, found: &str) -> Vec<WrapSuggestion> {
+    let mut out = Vec::new();
+    // `expected Maybe T, found T` → wrap in Just
+    if let Some(inner) = expected.strip_prefix("Maybe ") {
+        if inner.trim() == found.trim() {
+            out.push(WrapSuggestion {
+                title: "Wrap in `Just`".to_string(),
+                template: "Just {value: {}}".to_string(),
+            });
+        }
+    }
+    // `expected Result E T, found T` → wrap in Ok. Result is two-arg, but
+    // when the success type matches the found type we can offer Ok.
+    if let Some(rest) = expected.strip_prefix("Result ") {
+        // Result E A: split off the last whitespace-separated token as A.
+        // Handles `Result Text Int`. For nested types like
+        // `Result Text (Maybe Int)` we fall back to checking whether the
+        // suffix matches — best-effort, not exhaustive.
+        let trimmed = rest.trim();
+        if trimmed.ends_with(found.trim()) {
+            // Verify there's at least one whitespace before the suffix so
+            // `Result T` (one arg) is rejected.
+            let prefix_len = trimmed.len().saturating_sub(found.trim().len());
+            if prefix_len > 0
+                && trimmed.as_bytes()[prefix_len - 1].is_ascii_whitespace()
+            {
+                out.push(WrapSuggestion {
+                    title: "Wrap in `Ok`".to_string(),
+                    template: "Ok {value: {}}".to_string(),
+                });
+            }
+        }
+    }
+    // `expected IO {…} T, found T` → wrap in pure-IO via `\_ -> ...`. We
+    // don't know if the user wants the side-effect, so this is best left to
+    // the user manually. Skip.
+    out
+}
+
+/// Build a "Convert to deriving" code action for an empty impl whose trait is
+/// fully default-bodied and whose target is a local data type without an
+/// existing entry for that trait. Returns `None` when any precondition fails.
+fn build_deriving_action(
+    impl_decl: &ast::Decl,
+    trait_name: &str,
+    impl_items: &[ast::ImplItem],
+    doc: &DocumentState,
+    uri: &Uri,
+) -> Option<CodeActionOrCommand> {
+    // Only consider literally-empty impls. A non-empty impl with hand-written
+    // bodies isn't equivalent to `deriving` — users may rely on the override.
+    if !impl_items.is_empty() {
+        return None;
+    }
+
+    // The impl arg list must be a single Named type referring to a local data
+    // declaration. Refuse multi-arg impls (HKT impls like `impl Functor []`)
+    // and impls over non-data types — `deriving` only works on data decls.
+    let target_name = match doc
+        .module
+        .decls
+        .iter()
+        .find_map(|d| match &d.node {
+            DeclKind::Impl { args, .. }
+                if d.span == impl_decl.span && args.len() == 1 =>
+            {
+                if let TypeKind::Named(n) = &args[0].node {
+                    Some(n.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }) {
+        Some(n) => n,
+        None => return None,
+    };
+
+    // Find the data decl. Bail if it already lists this trait — the impl is
+    // redundant in that case but `deriving` would be a no-op edit.
+    let data_decl = doc.module.decls.iter().find(|d| {
+        matches!(&d.node, DeclKind::Data { name, .. } if name == &target_name)
+    })?;
+    let existing_deriving = match &data_decl.node {
+        DeclKind::Data { deriving, .. } => deriving.clone(),
+        _ => return None,
+    };
+    // `data_decl.span.end` covers everything up to (but not including) the
+    // start of the next decl. If the file already has `deriving (...)` we
+    // bailed above, so the span ends at the last constructor.
+    let data_decl_end = data_decl.span.end;
+    if existing_deriving.iter().any(|n| n == trait_name) {
+        return None;
+    }
+
+    // The trait must be fully default-bodied so deriving produces equivalent
+    // behavior. If we can't find the trait in this module, bail — the trait
+    // may live in another file and we'd need cross-file analysis to verify.
+    let trait_decl = doc.module.decls.iter().find_map(|d| {
+        if let DeclKind::Trait { name, items, .. } = &d.node {
+            if name == trait_name {
+                return Some(items.clone());
+            }
+        }
+        None
+    })?;
+    // The Knot parser splits a method's signature line and its default body
+    // line into two separate `TraitItem::Method` entries with the same name —
+    // one with `default_body: None` (the signature) and one with
+    // `default_body: Some(...)` (the default impl). For deriving to be valid,
+    // every distinct method name in the trait must have at least one item
+    // carrying a default body.
+    use std::collections::HashSet as _HashSet;
+    let mut all_method_names: _HashSet<&str> = _HashSet::new();
+    let mut names_with_default: _HashSet<&str> = _HashSet::new();
+    for item in &trait_decl {
+        if let ast::TraitItem::Method {
+            name,
+            default_body,
+            ..
+        } = item
+        {
+            all_method_names.insert(name.as_str());
+            if default_body.is_some() {
+                names_with_default.insert(name.as_str());
+            }
+        }
+    }
+    if all_method_names.is_empty() {
+        return None;
+    }
+    if all_method_names != names_with_default {
+        return None;
+    }
+
+    // Build the edit: insert `\n  deriving (Trait)` after the last constructor
+    // of the data decl, and remove the impl decl entirely.
+    let insert_pos = offset_to_position(&doc.source, data_decl_end);
+
+    // Compute the impl removal range — include the trailing newline so we
+    // don't leave a blank gap behind.
+    let impl_line_end = doc.source[impl_decl.span.end..]
+        .find('\n')
+        .map(|p| impl_decl.span.end + p + 1)
+        .unwrap_or(impl_decl.span.end);
+    let impl_line_start = doc.source[..impl_decl.span.start]
+        .rfind('\n')
+        .map(|p| p + 1)
+        .unwrap_or(impl_decl.span.start);
+
+    let new_deriving = if existing_deriving.is_empty() {
+        format!("\n  deriving ({trait_name})")
+    } else {
+        let mut all = existing_deriving.clone();
+        all.push(trait_name.to_string());
+        format!("\n  deriving ({})", all.join(", "))
+    };
+
+    let mut changes = HashMap::new();
+    changes.insert(
+        uri.clone(),
+        vec![
+            TextEdit {
+                range: Range {
+                    start: insert_pos,
+                    end: insert_pos,
+                },
+                new_text: new_deriving,
+            },
+            TextEdit {
+                range: Range {
+                    start: offset_to_position(&doc.source, impl_line_start),
+                    end: offset_to_position(&doc.source, impl_line_end),
+                },
+                new_text: String::new(),
+            },
+        ],
+    );
+
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title: format!("Convert to `deriving ({trait_name})` on `{target_name}`"),
+        kind: Some(CodeActionKind::REFACTOR_REWRITE),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }))
+}
+
 /// Build a trait method stub `name p1 p2 = todo` from a trait method declaration.
 /// Counts arrows in the type signature to determine arity, then synthesizes
 /// fresh `a`, `b`, `c`... parameter names.
@@ -1667,4 +2000,688 @@ fn find_inline_actions(
 /// Convert a pattern AST node to a source string representation.
 fn pat_to_string(pat: &ast::Pat, source: &str) -> String {
     safe_slice(source, pat.span).to_string()
+}
+
+// ── Auto-import ─────────────────────────────────────────────────────
+
+/// A candidate file that defines `name` as a top-level declaration.
+pub(crate) struct AutoImportCandidate {
+    /// Already-formatted relative import path (e.g. `./lib/util`).
+    pub import_path: String,
+}
+
+/// Find files in the workspace that define `name` as a top-level declaration
+/// and produce a relative-import path string usable in an `import` statement.
+/// Searches both open documents and the cached on-disk parse list. Skips the
+/// current file. Returns at most a handful of candidates, sorted by import
+/// path so the action list is stable across runs.
+pub(crate) fn find_auto_import_candidates(
+    state: &ServerState,
+    current_uri: &Uri,
+    name: &str,
+) -> Vec<AutoImportCandidate> {
+    let current_path = match crate::utils::uri_to_path(current_uri) {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let current_canonical = current_path.canonicalize().unwrap_or(current_path.clone());
+
+    let mut seen: HashSet<std::path::PathBuf> = HashSet::new();
+    let mut out: Vec<AutoImportCandidate> = Vec::new();
+
+    // 1. Open documents — fastest, in-memory
+    for (other_uri, other_doc) in &state.documents {
+        if other_uri == current_uri {
+            continue;
+        }
+        if !other_doc.definitions.contains_key(name) {
+            continue;
+        }
+        let other_path = match crate::utils::uri_to_path(other_uri) {
+            Some(p) => p,
+            None => continue,
+        };
+        let canonical = other_path.canonicalize().unwrap_or(other_path);
+        push_candidate(&current_canonical, canonical, &mut seen, &mut out);
+    }
+
+    // 2. Cached on-disk symbol entries
+    for (path, (_, _, entries)) in &state.workspace_symbol_cache.by_path {
+        if entries.iter().any(|e| symbol_entry_matches_name(e, name)) {
+            push_candidate(&current_canonical, path.clone(), &mut seen, &mut out);
+        }
+    }
+
+    // 3. Parsed-but-not-symbolized cache (covers freshly-imported files)
+    if let Ok(cache) = state.import_cache.lock() {
+        for (path, (_, module, _)) in cache.iter() {
+            if module_declares_name(module, name) {
+                push_candidate(&current_canonical, path.clone(), &mut seen, &mut out);
+            }
+        }
+    }
+
+    // Be defensive: also try a direct scan of workspace roots for files we may
+    // not have parsed yet. Only do this if we found no candidates from the
+    // in-memory sources, since disk reads aren't free.
+    if out.is_empty() {
+        let roots = if state.workspace_roots.is_empty() {
+            state.workspace_root.iter().cloned().collect::<Vec<_>>()
+        } else {
+            state.workspace_roots.clone()
+        };
+        let entries =
+            crate::shared::scan_knot_files_in_roots(&roots, state.workspace_root.as_deref());
+        for path in entries {
+            let canonical = match path.canonicalize() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if seen.contains(&canonical) || canonical == current_canonical {
+                continue;
+            }
+            let source = match std::fs::read_to_string(&canonical) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let lexer = knot::lexer::Lexer::new(&source);
+            let (tokens, _) = lexer.tokenize();
+            let parser = knot::parser::Parser::new(source.clone(), tokens);
+            let (module, _) = parser.parse_module();
+            if module_declares_name(&module, name) {
+                push_candidate(&current_canonical, canonical, &mut seen, &mut out);
+            }
+            if out.len() >= 4 {
+                break;
+            }
+        }
+    }
+
+    out.sort_by(|a, b| a.import_path.cmp(&b.import_path));
+    out.truncate(5);
+    out
+}
+
+/// Try to add a candidate keyed on a canonical target path. Skips the current
+/// file and de-duplicates via the `seen` set.
+fn push_candidate(
+    current_canonical: &std::path::Path,
+    target_canonical: std::path::PathBuf,
+    seen: &mut HashSet<std::path::PathBuf>,
+    out: &mut Vec<AutoImportCandidate>,
+) {
+    if target_canonical == current_canonical {
+        return;
+    }
+    if !seen.insert(target_canonical.clone()) {
+        return;
+    }
+    if let Some(rel) = relative_import_path(current_canonical, &target_canonical) {
+        out.push(AutoImportCandidate { import_path: rel });
+    }
+}
+
+/// Check whether a workspace-symbol cache entry matches the bare name. The
+/// cache stores names with sigils (`*src`, `&derived`, `route Foo`,
+/// `impl T A`) — strip those when comparing.
+fn symbol_entry_matches_name(e: &crate::state::WorkspaceSymbolEntry, name: &str) -> bool {
+    let stripped = e
+        .name
+        .strip_prefix('*')
+        .or_else(|| e.name.strip_prefix('&'))
+        .or_else(|| e.name.strip_prefix("route "))
+        .unwrap_or(&e.name);
+    if stripped == name {
+        return true;
+    }
+    // `impl` entries are not import-target candidates; ignore them.
+    false
+}
+
+/// Whether `module` declares a top-level value or type whose name matches
+/// `name`. Matches the same set of decls that `import` makes available.
+fn module_declares_name(module: &Module, name: &str) -> bool {
+    for decl in &module.decls {
+        match &decl.node {
+            DeclKind::Data {
+                name: dname,
+                constructors,
+                ..
+            } => {
+                if dname == name {
+                    return true;
+                }
+                for ctor in constructors {
+                    if ctor.name == name {
+                        return true;
+                    }
+                }
+            }
+            DeclKind::TypeAlias { name: dname, .. }
+            | DeclKind::Source { name: dname, .. }
+            | DeclKind::View { name: dname, .. }
+            | DeclKind::Derived { name: dname, .. }
+            | DeclKind::Fun { name: dname, .. }
+            | DeclKind::Trait { name: dname, .. }
+            | DeclKind::Route { name: dname, .. }
+            | DeclKind::RouteComposite { name: dname, .. } => {
+                if dname == name {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Build a relative import path string (e.g. `./lib/util`, `../shared/x`)
+/// from the current file's canonical path to the target file's canonical
+/// path. Strips the `.knot` extension from the target. Returns `None` if a
+/// relative path can't be computed (e.g. cross-volume on Windows).
+fn relative_import_path(from: &std::path::Path, to: &std::path::Path) -> Option<String> {
+    let from_dir = from.parent()?;
+    let to_no_ext = to.with_extension("");
+    let rel = path_diff(&to_no_ext, from_dir)?;
+    let s = rel.to_str()?.replace('\\', "/");
+    if s.starts_with('.') {
+        Some(s)
+    } else {
+        Some(format!("./{s}"))
+    }
+}
+
+/// Standard relative-path computation. Walks both paths to find the common
+/// prefix, then emits `..` for each base component left over and the
+/// remaining target components. Returns `None` if either path contains
+/// non-normal-or-root-or-prefix components (the `.` and `..` segments must
+/// already be resolved by canonicalize).
+fn path_diff(target: &std::path::Path, base: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::path::{Component, PathBuf};
+
+    let mut target_iter = target.components();
+    let mut base_iter = base.components();
+    let mut common_prefix = 0usize;
+
+    let mut t = target_iter.next();
+    let mut b = base_iter.next();
+    while let (Some(tc), Some(bc)) = (t, b) {
+        if tc == bc {
+            common_prefix += 1;
+            t = target_iter.next();
+            b = base_iter.next();
+        } else {
+            break;
+        }
+    }
+
+    let mut out = PathBuf::new();
+    let total_base = base.components().count();
+    let ascend_count = total_base - common_prefix;
+    for _ in 0..ascend_count {
+        out.push("..");
+    }
+    if let Some(tc) = t {
+        out.push(tc.as_os_str());
+        for c in target_iter {
+            out.push(c.as_os_str());
+        }
+    }
+    if out.as_os_str().is_empty() {
+        out.push(Component::CurDir.as_os_str());
+    }
+    Some(out)
+}
+
+/// Compute where to insert a new `import` line and what text to use. We
+/// always insert at column 0 and append a newline. Position depends on
+/// whether the file already has imports.
+fn import_insert_position_and_text(doc: &DocumentState, import_path: &str) -> (Position, String) {
+    if let Some(last) = doc.module.imports.last() {
+        // Insert after the last existing import line. We anchor to the end of
+        // the line containing `last.span.end` so the new line is a sibling.
+        let after = doc.source[last.span.end..]
+            .find('\n')
+            .map(|p| last.span.end + p + 1)
+            .unwrap_or(doc.source.len());
+        let pos = offset_to_position(&doc.source, after);
+        (pos, format!("import {import_path}\n"))
+    } else {
+        // No imports: insert at the very top of the file. If the first line
+        // is a comment or whitespace, we still insert above it — keeps the
+        // import block visually adjacent to other top-of-file declarations.
+        let pos = Position::new(0, 0);
+        // Add a trailing blank line so the import doesn't crowd the next decl.
+        (pos, format!("import {import_path}\n\n"))
+    }
+}
+
+/// Whether the document already imports `name` (either by selective list or
+/// by importing a module that re-exports it).
+fn already_imports(doc: &DocumentState, name: &str) -> bool {
+    if doc.import_defs.contains_key(name) {
+        return true;
+    }
+    // Selective imports list specific names — guard against the case where
+    // a duplicate `import` action would be redundant.
+    for imp in &doc.module.imports {
+        if let Some(items) = &imp.items {
+            if items.iter().any(|i| i.name == name) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TempWorkspace;
+
+    fn make_unknown_diag(range: Range, name: &str) -> Diagnostic {
+        Diagnostic {
+            range,
+            message: format!("unknown variable: {name}"),
+            severity: Some(DiagnosticSeverity::ERROR),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn auto_import_offers_quickfix_for_unknown_name_defined_in_sibling_file() {
+        let mut tw = TempWorkspace::new();
+        let _other_uri = tw.write_and_open(
+            "util.knot",
+            "doubleIt : Int -> Int\ndoubleIt x = x * 2\n",
+        );
+        let main_uri = tw.write_and_open(
+            "main.knot",
+            "main : IO {} {}\nmain = println (show (doubleIt 5))\n",
+        );
+
+        let doc = tw.workspace.doc(&main_uri);
+        let needle = "doubleIt 5";
+        let off = doc.source.find(needle).expect("needle found");
+        let range = Range {
+            start: crate::utils::offset_to_position(&doc.source, off),
+            end: crate::utils::offset_to_position(&doc.source, off + "doubleIt".len()),
+        };
+        let diag = make_unknown_diag(range, "doubleIt");
+
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier {
+                uri: main_uri.clone(),
+            },
+            range,
+            context: CodeActionContext {
+                diagnostics: vec![diag],
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let actions = handle_code_action(&tw.workspace.state, &params)
+            .expect("code action response");
+        let import_actions: Vec<&CodeAction> = actions
+            .iter()
+            .filter_map(|a| match a {
+                CodeActionOrCommand::CodeAction(ca)
+                    if ca.title.starts_with("Import `doubleIt`") =>
+                {
+                    Some(ca)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !import_actions.is_empty(),
+            "expected an auto-import action, got: {:?}",
+            actions
+                .iter()
+                .map(|a| match a {
+                    CodeActionOrCommand::CodeAction(ca) => ca.title.clone(),
+                    _ => String::new(),
+                })
+                .collect::<Vec<_>>()
+        );
+
+        let edit = import_actions[0].edit.as_ref().expect("has edit");
+        let changes = edit.changes.as_ref().expect("changes map");
+        let edits = changes.get(&main_uri).expect("edits for main.knot");
+        assert_eq!(edits.len(), 1);
+        let new_text = &edits[0].new_text;
+        assert!(
+            new_text.contains("import ./util"),
+            "expected `import ./util` in new_text, got {new_text:?}"
+        );
+    }
+
+    #[test]
+    fn auto_import_skips_when_name_already_imported() {
+        let mut tw = TempWorkspace::new();
+        let _other_uri = tw.write_and_open(
+            "util.knot",
+            "doubleIt : Int -> Int\ndoubleIt x = x * 2\n",
+        );
+        // main.knot already imports util — auto-import should not offer to add
+        // it again. (The diagnostic is hypothetical; we still check that no
+        // duplicate import edit is proposed.)
+        let main_uri = tw.write_and_open(
+            "main.knot",
+            "import ./util\nmain : IO {} {}\nmain = println (show (doubleIt 5))\n",
+        );
+        let doc = tw.workspace.doc(&main_uri);
+        let off = doc.source.find("doubleIt 5").unwrap();
+        let range = Range {
+            start: crate::utils::offset_to_position(&doc.source, off),
+            end: crate::utils::offset_to_position(&doc.source, off + "doubleIt".len()),
+        };
+        let diag = make_unknown_diag(range, "doubleIt");
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier {
+                uri: main_uri.clone(),
+            },
+            range,
+            context: CodeActionContext {
+                diagnostics: vec![diag],
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let actions = handle_code_action(&tw.workspace.state, &params).unwrap_or_default();
+        let has_import = actions.iter().any(|a| match a {
+            CodeActionOrCommand::CodeAction(ca) => ca.title.starts_with("Import `doubleIt`"),
+            _ => false,
+        });
+        assert!(
+            !has_import,
+            "should not offer auto-import when already imported"
+        );
+    }
+
+    #[test]
+    fn relative_import_path_handles_subdirs_and_parent() {
+        use std::path::PathBuf;
+        // Same dir
+        let from = PathBuf::from("/a/b/main.knot");
+        let to = PathBuf::from("/a/b/util.knot");
+        assert_eq!(
+            relative_import_path(&from, &to),
+            Some("./util".to_string())
+        );
+        // Subdir
+        let to2 = PathBuf::from("/a/b/lib/helper.knot");
+        assert_eq!(
+            relative_import_path(&from, &to2),
+            Some("./lib/helper".to_string())
+        );
+        // Parent
+        let to3 = PathBuf::from("/a/shared.knot");
+        assert_eq!(
+            relative_import_path(&from, &to3),
+            Some("../shared".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_type_mismatch_extracts_expected_and_found() {
+        let m = "type mismatch: expected Maybe Int, found Int";
+        assert_eq!(
+            parse_type_mismatch(m),
+            Some(("Maybe Int".to_string(), "Int".to_string()))
+        );
+        let m2 = "type mismatch: expected Result Text Int, found Int.";
+        assert_eq!(
+            parse_type_mismatch(m2),
+            Some(("Result Text Int".to_string(), "Int".to_string()))
+        );
+        assert_eq!(parse_type_mismatch("not a real diagnostic"), None);
+    }
+
+    #[test]
+    fn detect_wrap_suggestions_offers_just_for_maybe() {
+        let suggestions = detect_wrap_suggestions("Maybe Int", "Int");
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].title, "Wrap in `Just`");
+        assert_eq!(suggestions[0].format_wrapping("5"), "Just {value: 5}");
+        assert_eq!(
+            suggestions[0].format_wrapping("a + b"),
+            "Just {value: (a + b)}"
+        );
+    }
+
+    #[test]
+    fn detect_wrap_suggestions_offers_ok_for_result() {
+        let suggestions = detect_wrap_suggestions("Result Text Int", "Int");
+        assert!(suggestions.iter().any(|s| s.title == "Wrap in `Ok`"));
+    }
+
+    #[test]
+    fn detect_wrap_suggestions_no_match_when_unrelated() {
+        let suggestions = detect_wrap_suggestions("Text", "Int");
+        assert!(suggestions.is_empty());
+    }
+
+    #[test]
+    fn wrap_in_just_quickfix_emitted_on_type_mismatch_diagnostic() {
+        let mut tw = TempWorkspace::new();
+        let uri = tw.write_and_open(
+            "main.knot",
+            "f : Maybe Int -> Int\nf m = case m of\n  Just {value} -> value\n  Nothing {} -> 0\n\nmain : IO {} {}\nmain = println (show (f 5))\n",
+        );
+        let doc = tw.workspace.doc(&uri);
+        // Synthesize a diagnostic at `5` claiming Maybe Int was expected.
+        let off = doc.source.rfind("5").unwrap();
+        let range = Range {
+            start: crate::utils::offset_to_position(&doc.source, off),
+            end: crate::utils::offset_to_position(&doc.source, off + 1),
+        };
+        let diag = Diagnostic {
+            range,
+            message: "type mismatch: expected Maybe Int, found Int".into(),
+            severity: Some(DiagnosticSeverity::ERROR),
+            ..Default::default()
+        };
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range,
+            context: CodeActionContext {
+                diagnostics: vec![diag],
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let actions = handle_code_action(&tw.workspace.state, &params).expect("response");
+        let wrap_action = actions.iter().find_map(|a| match a {
+            CodeActionOrCommand::CodeAction(ca) if ca.title == "Wrap in `Just`" => Some(ca),
+            _ => None,
+        });
+        let action = wrap_action.expect("wrap action expected");
+        let edit = &action
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .get(&uri)
+            .unwrap()[0];
+        assert_eq!(edit.new_text, "Just {value: 5}");
+    }
+
+    #[test]
+    fn deriving_action_offered_for_empty_impl_with_default_methods() {
+        let mut tw = TempWorkspace::new();
+        let uri = tw.write_and_open(
+            "main.knot",
+            r#"data Color
+  = Red {}
+  | Green {}
+  | Blue {}
+
+trait Describe a where
+  describe : a -> Text
+  describe x = show x
+
+impl Describe Color where
+"#,
+        );
+        let doc = tw.workspace.doc(&uri);
+        let off = doc.source.find("impl Describe Color").unwrap();
+        let range = Range {
+            start: crate::utils::offset_to_position(&doc.source, off),
+            end: crate::utils::offset_to_position(&doc.source, off + 4),
+        };
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range,
+            context: CodeActionContext {
+                diagnostics: Vec::new(),
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let actions = handle_code_action(&tw.workspace.state, &params)
+            .expect("expected action response");
+        let derive_action = actions.iter().find_map(|a| match a {
+            CodeActionOrCommand::CodeAction(ca)
+                if ca.title.starts_with("Convert to `deriving (Describe)`") =>
+            {
+                Some(ca)
+            }
+            _ => None,
+        });
+        let action = derive_action
+            .expect("deriving action not found");
+        let edits = action
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .get(&uri)
+            .unwrap();
+        // Expect 2 edits: insert deriving on data decl + remove impl decl.
+        assert_eq!(edits.len(), 2, "expected 2 edits");
+        let has_deriving = edits.iter().any(|e| e.new_text.contains("deriving (Describe)"));
+        assert!(has_deriving, "no edit inserts deriving clause");
+        let has_remove = edits.iter().any(|e| e.new_text.is_empty());
+        assert!(has_remove, "no edit removes the empty impl");
+    }
+
+    #[test]
+    fn deriving_action_skipped_when_impl_has_methods() {
+        let mut tw = TempWorkspace::new();
+        let uri = tw.write_and_open(
+            "main.knot",
+            r#"data Color
+  = Red {}
+
+trait Describe a where
+  describe : a -> Text
+  describe x = show x
+
+impl Describe Color where
+  describe c = "red"
+"#,
+        );
+        let doc = tw.workspace.doc(&uri);
+        let off = doc.source.find("impl Describe Color").unwrap();
+        let range = Range {
+            start: crate::utils::offset_to_position(&doc.source, off),
+            end: crate::utils::offset_to_position(&doc.source, off + 4),
+        };
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range,
+            context: CodeActionContext {
+                diagnostics: Vec::new(),
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let actions = handle_code_action(&tw.workspace.state, &params).unwrap_or_default();
+        let has = actions.iter().any(|a| match a {
+            CodeActionOrCommand::CodeAction(ca) => ca.title.starts_with("Convert to `deriving"),
+            _ => false,
+        });
+        assert!(
+            !has,
+            "should not offer deriving for impl that overrides methods"
+        );
+    }
+
+    #[test]
+    fn auto_import_inserts_after_existing_imports() {
+        let mut tw = TempWorkspace::new();
+        let _ = tw.write_and_open(
+            "util.knot",
+            "helper : Int -> Int\nhelper x = x\n",
+        );
+        let _ = tw.write_and_open(
+            "other.knot",
+            "doubleIt : Int -> Int\ndoubleIt x = x * 2\n",
+        );
+        let main_uri = tw.write_and_open(
+            "main.knot",
+            "import ./util\nmain : IO {} {}\nmain = println (show (doubleIt 5))\n",
+        );
+        let doc = tw.workspace.doc(&main_uri);
+        let off = doc.source.find("doubleIt 5").unwrap();
+        let range = Range {
+            start: crate::utils::offset_to_position(&doc.source, off),
+            end: crate::utils::offset_to_position(&doc.source, off + "doubleIt".len()),
+        };
+        let diag = make_unknown_diag(range, "doubleIt");
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier {
+                uri: main_uri.clone(),
+            },
+            range,
+            context: CodeActionContext {
+                diagnostics: vec![diag],
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let actions = handle_code_action(&tw.workspace.state, &params).expect("response");
+        let import_action = actions
+            .iter()
+            .find_map(|a| match a {
+                CodeActionOrCommand::CodeAction(ca)
+                    if ca.title.starts_with("Import `doubleIt`") =>
+                {
+                    Some(ca)
+                }
+                _ => None,
+            })
+            .expect("has import action");
+        let edit = &import_action
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .get(&main_uri)
+            .unwrap()[0];
+        // Expect insertion at the start of line 1 (after `import ./util\n`).
+        assert_eq!(edit.range.start.line, 1);
+        assert_eq!(edit.range.start.character, 0);
+        assert!(edit.new_text.contains("import ./other"));
+    }
 }

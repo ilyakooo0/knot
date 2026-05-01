@@ -1192,13 +1192,13 @@ main = do
             r#"type P = {n: Text}
 *people : [P]
 main = atomic do
-  set *people = [{n: "A"}]
+  *people = [{n: "A"}]
   yield {}
 "#,
         );
         let doc = ws.doc(&uri);
-        // Cursor inside the atomic body, on the line after `set *people = ...`
-        let inside = doc.source.find("set *people").expect("set");
+        // Cursor inside the atomic body, on the line after `*people = ...`
+        let inside = doc.source.find("[{n:").expect("atomic body");
         let pos = offset_to_position(&doc.source, inside);
         let resp = handle_completion(&ws.state, &comp_params(&uri, pos, None))
             .expect("completion returns");

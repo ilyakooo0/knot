@@ -14,12 +14,12 @@ type Todo = {title: Text, owner: Text, priority: Priority, status: Status}
 
 main = do
   -- Insert through the view (auto-fills status: Open)
-  set *openTodos = union *openTodos [{title: "Write docs", owner: "Alice", priority: High {}}]
-  set *openTodos = union *openTodos [{title: "Fix bug", owner: "Bob", priority: Critical {}}]
-  set *openTodos = union *openTodos [{title: "Add tests", owner: "Alice", priority: Low {}}]
+  *openTodos = union *openTodos [{title: "Write docs", owner: "Alice", priority: High {}}]
+  *openTodos = union *openTodos [{title: "Fix bug", owner: "Bob", priority: Critical {}}]
+  *openTodos = union *openTodos [{title: "Add tests", owner: "Alice", priority: Low {}}]
 
   -- Also add a done todo directly to the source
-  set *todos = union *todos [{title: "Setup CI", owner: "Bob", priority: High {}, status: Done {}}]
+  *todos = union *todos [{title: "Setup CI", owner: "Bob", priority: High {}, status: Done {}}]
 
   -- Read through the view: should only show open todos
   println "Open todos:"
@@ -30,7 +30,7 @@ main = do
   println (show *todos)
 
   -- Delete through the view: remove Alice's open todos
-  set *openTodos = do
+  *openTodos = do
     t <- *openTodos
     where t.owner != "Alice"
     yield t

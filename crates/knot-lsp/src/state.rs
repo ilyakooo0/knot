@@ -315,7 +315,7 @@ impl ServerConfig {
 // ── Completion / token grab-bag constants ───────────────────────────
 
 pub const KEYWORDS: &[&str] = &[
-    "import", "data", "type", "trait", "impl", "route", "migrate", "where", "do", "yield", "set",
+    "import", "data", "type", "trait", "impl", "route", "migrate", "where", "do", "yield",
     "if", "then", "else", "case", "of", "let", "in", "not", "full", "atomic", "deriving", "with",
     "export",
 ];

@@ -122,14 +122,14 @@ pipeCountWhere = do
   yield (employees |> countWhere (\e -> e.dept == "Sales"))
 
 main = do
-  set *employees = [
+  *employees = [
     {name: "Alice", dept: "Eng", salary: 90},
     {name: "Bob", dept: "Eng", salary: 80},
     {name: "Carol", dept: "Sales", salary: 70},
     {name: "Dave", dept: "Sales", salary: 60},
     {name: "Eve", dept: "Eng", salary: 100}
   ]
-  set *departments = [
+  *departments = [
     {name: "Eng", budget: 500},
     {name: "Sales", budget: 200}
   ]

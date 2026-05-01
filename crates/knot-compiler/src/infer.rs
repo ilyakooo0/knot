@@ -976,6 +976,32 @@ impl Infer {
                 self.unify(&t1, &inner, span);
                 return;
             }
+            // Forall types: instantiate with fresh vars and unify the body.
+            // Two Forall types with the same shape unify by α-renaming both
+            // sides to fresh vars; a Forall vs. a non-Forall type instantiates
+            // the polymorphic side at the monomorphic side's witness.
+            (Ty::Forall(vars, body), _) => {
+                let scheme = Scheme {
+                    vars: vars.clone(),
+                    unit_vars: vec![],
+                    constraints: vec![],
+                    ty: (**body).clone(),
+                };
+                let inst = self.instantiate_at(&scheme, span);
+                self.unify(&inst, &t2, span);
+                return;
+            }
+            (_, Ty::Forall(vars, body)) => {
+                let scheme = Scheme {
+                    vars: vars.clone(),
+                    unit_vars: vec![],
+                    constraints: vec![],
+                    ty: (**body).clone(),
+                };
+                let inst = self.instantiate_at(&scheme, span);
+                self.unify(&t1, &inst, span);
+                return;
+            }
             (Ty::Var(a), Ty::Var(b)) if a == b => {}
             (Ty::Var(a), Ty::Var(b)) => {
                 // When unifying two variables, bind the non-skolem one
@@ -1935,7 +1961,12 @@ impl Infer {
                 }
             }
         }
-        let unit_vars = self.free_unit_vars_in_ty(&applied);
+        let env_unit_fv = self.free_unit_vars_in_env();
+        let unit_vars: Vec<UnitVar> = self
+            .free_unit_vars_in_ty(&applied)
+            .into_iter()
+            .filter(|u| !env_unit_fv.contains(u))
+            .collect();
         Scheme {
             vars: gen_vars,
             unit_vars,
@@ -2057,6 +2088,27 @@ impl Infer {
         }
         for ty in self.derived_types.values() {
             self.collect_free_vars(ty, &mut s);
+        }
+        s
+    }
+
+    fn free_unit_vars_in_env(&self) -> HashSet<UnitVar> {
+        let mut s = HashSet::new();
+        for scope in &self.scopes {
+            for scheme in scope.values() {
+                let mut fv = HashSet::new();
+                self.collect_free_unit_vars(&scheme.ty, &mut fv);
+                for u in &scheme.unit_vars {
+                    fv.remove(u);
+                }
+                s.extend(fv);
+            }
+        }
+        for ty in self.source_types.values() {
+            self.collect_free_unit_vars(ty, &mut s);
+        }
+        for ty in self.derived_types.values() {
+            self.collect_free_unit_vars(ty, &mut s);
         }
         s
     }
@@ -6247,14 +6299,14 @@ main = applyPred (\\r -> r.x == r.y)\
     #[test]
     fn set_type_matches_source() {
         assert!(check_src(
-            "*nums : [Int]\nmain = set *nums = [1, 2, 3]"
+            "*nums : [Int]\nmain = *nums = [1, 2, 3]"
         ).is_empty());
     }
 
     #[test]
     fn set_type_mismatch() {
         let diags = check_src(
-            "*nums : [Int]\nmain = set *nums = [\"a\", \"b\"]"
+            "*nums : [Int]\nmain = *nums = [\"a\", \"b\"]"
         );
         assert!(has_error(&diags, "type mismatch"));
     }
@@ -7231,7 +7283,7 @@ main = applyPred (\\r -> r.x == r.y)\
             "type Person = {name: Text, age: Int}\n\
              *people : [Person]\n\
              main = do\n\
-               set *people = [{name: \"A\", age: 1}]\n\
+               *people = [{name: \"A\", age: 1}]\n\
                p <- *people\n\
                yield p.name"
         );

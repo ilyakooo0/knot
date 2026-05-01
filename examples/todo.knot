@@ -4,11 +4,11 @@ type Todo = {title: Text, owner: Text, done: Int}
 
 add = \title owner -> do
   todos <- *todos
-  set *todos = union todos [{title: title, owner: owner, done: 0}]
+  *todos = union todos [{title: title, owner: owner, done: 0}]
 
 complete = \title -> do
   todos <- *todos
-  set *todos = do
+  *todos = do
     t <- todos
     yield (if t.title == title
       then {t | done: 1}

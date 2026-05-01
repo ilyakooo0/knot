@@ -11179,11 +11179,11 @@ fn pretty_expr(expr: &ast::Expr) -> String {
             format!("do {{ {} }}", ss.join("; "))
         }
         ast::ExprKind::Set { target, value } => {
-            format!("set {} = {}", pretty_expr(target), pretty_expr(value))
+            format!("{} = {}", pretty_expr(target), pretty_expr(value))
         }
         ast::ExprKind::FullSet { target, value } => {
             format!(
-                "full set {} = {}",
+                "full {} = {}",
                 pretty_expr(target),
                 pretty_expr(value)
             )

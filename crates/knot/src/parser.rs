@@ -288,7 +288,6 @@ impl Parser {
             }
             TokenKind::Where
             | TokenKind::Do
-            | TokenKind::Set
             | TokenKind::If
             | TokenKind::Then
             | TokenKind::Else
@@ -1763,14 +1762,33 @@ impl Parser {
             TokenKind::If => self.parse_if(),
             TokenKind::Case => self.parse_case(),
             TokenKind::Do => self.parse_do_expr(),
-            TokenKind::Set => self.parse_set(false),
+            TokenKind::Star => {
+                // `*name = expr` is a set expression; otherwise just an
+                // ordinary source-ref expression handled by Pratt parsing.
+                let start = self.span();
+                let target = self.parse_expr_bp(0)?;
+                if self.eat(&TokenKind::Eq) {
+                    let value = self.parse_expr()?;
+                    let end_sp = value.span;
+                    Some(Spanned::new(
+                        ExprKind::Set {
+                            target: Box::new(target),
+                            value: Box::new(value),
+                        },
+                        Span::new(start.start, end_sp.end),
+                    ))
+                } else {
+                    Some(target)
+                }
+            }
             TokenKind::Full => {
-                // Skip newlines when checking for `set` after `full`
+                // `full *rel = expr` is a full-set expression. Otherwise
+                // `full` is treated as a regular identifier.
                 let mut offset = 1;
                 while self.peek_ahead(offset) == &TokenKind::Newline {
                     offset += 1;
                 }
-                if self.peek_ahead(offset) == &TokenKind::Set {
+                if self.peek_ahead(offset) == &TokenKind::Star {
                     let full_start = self.span();
                     self.advance(); // consume `full`
                     self.skip_newlines();
@@ -1823,6 +1841,22 @@ impl Parser {
                 break;
             }
 
+            // If `*` is immediately adjacent to a lowercase identifier with no
+            // whitespace, it's a source reference (`*name`), not multiplication.
+            // This matches `can_start_atom`'s rule and prevents the binop loop
+            // from gobbling a `*relation = ...` statement on the next line.
+            if matches!(self.peek(), TokenKind::Star) {
+                if let Some(next) = self.tokens.get(self.pos + 1) {
+                    let cur_end = self.peek_token().span.end;
+                    if matches!(next.kind, TokenKind::Lower(_))
+                        && next.span.start == cur_end
+                    {
+                        self.restore(saved_pos);
+                        break;
+                    }
+                }
+            }
+
             let (op, l_bp, r_bp) = match self.peek() {
                 TokenKind::PipeGt => (BinOp::Pipe, 1, 2),
                 TokenKind::OrOr => (BinOp::Or, 3, 4),
@@ -1851,7 +1885,7 @@ impl Parser {
 
             self.advance(); // consume operator
             self.skip_newlines();
-            // Allow let/if/case/do/lambda/set/atomic/refine on the RHS of
+            // Allow let/if/case/do/lambda/atomic/refine on the RHS of
             // binary operators.  These are handled by `parse_expr` but not by
             // the Pratt sub-parser, so we delegate to `parse_expr` when we see
             // one of these keyword tokens.
@@ -1862,7 +1896,6 @@ impl Parser {
                     | TokenKind::Case
                     | TokenKind::Do
                     | TokenKind::Backslash
-                    | TokenKind::Set
                     | TokenKind::Atomic
                     | TokenKind::Refine
             ) {
@@ -2592,19 +2625,17 @@ impl Parser {
         })
     }
 
-    fn parse_set(&mut self, full: bool) -> Option<Expr> {
-        self.parse_set_with_start(full, self.span())
-    }
-
     fn parse_set_with_start(&mut self, full: bool, start: Span) -> Option<Expr> {
-        let ctx = if full { "full set expression" } else { "set expression" };
+        let ctx = if full {
+            "full set expression"
+        } else {
+            "set expression"
+        };
         self.in_context(ctx, |this| {
-            this.advance(); // consume `set`
-
+            // The caller has already positioned the parser at the target.
             let target = this.parse_expr_bp(0)?;
 
-            // `=` might follow. The spec says `set *rel = expr`.
-            this.expect(&TokenKind::Eq, "expected '=' after target in 'set' expression")
+            this.expect(&TokenKind::Eq, "expected '=' after target")
                 .ok()?;
             let value = this.parse_expr()?;
 

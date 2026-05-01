@@ -964,7 +964,7 @@ mod tests {
         let src = r#"
             *people : [{name: Text, age: Int}]
             main = do
-              set *people = [{name: "Alice", age: 30}]
+              *people = [{name: "Alice", age: 30}]
               p <- *people
               yield p.name
         "#;
@@ -986,7 +986,7 @@ mod tests {
         let src = r#"
             *todos : [{title: Text, done: Int}]
             complete = \title ->
-              set *todos = do
+              *todos = do
                 t <- *todos
                 yield (if t.title == title then {t | done: 1} else t)
         "#;

@@ -3,7 +3,7 @@ type Person = {name: Text, age: Int}
 *people : [Person]
 
 main = do
-  set *people = [{name: "Alice", age: 30}, {name: "Bob", age: 25}, {name: "Carol", age: 35}]
+  *people = [{name: "Alice", age: 30}, {name: "Bob", age: 25}, {name: "Carol", age: 35}]
   p <- *people
   where p.age > 27
   yield p.name

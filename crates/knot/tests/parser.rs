@@ -724,7 +724,7 @@ fn do_multiple_binds() {
 
 #[test]
 fn simple_set() {
-    let src = "x = set *people = [1, 2]";
+    let src = "x = *people = [1, 2]";
     match fun_body(src) {
         ExprKind::Set { target, value } => {
             assert!(matches!(&target.node, ExprKind::SourceRef(n) if n == "people"));
@@ -736,7 +736,7 @@ fn simple_set() {
 
 #[test]
 fn set_with_union() {
-    let src = r#"x = set *people = union *people [{name: "Bob"}]"#;
+    let src = r#"x = *people = union *people [{name: "Bob"}]"#;
     match fun_body(src) {
         ExprKind::Set { target, value } => {
             assert!(matches!(&target.node, ExprKind::SourceRef(n) if n == "people"));
@@ -1102,7 +1102,7 @@ fn fun_as_lambda() {
 
 #[test]
 fn fun_with_multiline_body() {
-    let src = r"add = \title owner priority -> set *todos = union *todos [{title: title}]";
+    let src = r"add = \title owner priority -> *todos = union *todos [{title: title}]";
     match first_decl(src) {
         DeclKind::Fun { name, body: Some(body), .. } => {
             assert_eq!(name, "add");
@@ -1599,7 +1599,7 @@ pendingFor = \\user -> do
 #[test]
 fn function_with_set_and_union() {
     let src =
-        "add = \\title owner priority -> set *todos = union *todos [{title: title, owner, priority, status: Open {}}]";
+        "add = \\title owner priority -> *todos = union *todos [{title: title, owner, priority, status: Open {}}]";
     match first_decl(src) {
         DeclKind::Fun { name, body: Some(body), .. } => {
             assert_eq!(name, "add");
@@ -1725,7 +1725,7 @@ pendingFor = \\user -> do
   yield {title: t.title, priority: t.priority}
 
 add = \\title owner priority ->
-  set *todos = union *todos [{title: formatTitle title, owner, priority, status: Open {}}]
+  *todos = union *todos [{title: formatTitle title, owner, priority, status: Open {}}]
 
 &workload = do
   t <- *todos

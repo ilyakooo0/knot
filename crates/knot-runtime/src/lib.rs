@@ -6589,13 +6589,17 @@ fn json_to_value(json: &serde_json::Value) -> *mut Value {
                     }
                 }
             }
-            // Reconstruct Constructor from {"tag": "...", "value": ...} format
-            // (round-trip with value_to_serde_json's Constructor encoding)
-            if obj.len() == 2 {
-                if let (Some(serde_json::Value::String(tag)), Some(val)) =
-                    (obj.get("tag"), obj.get("value"))
-                {
-                    return alloc(Value::Constructor(intern_str(tag), json_to_value(val)));
+            // Reconstruct Constructor from the `__knot_ctor` marker shape
+            // emitted by value_to_serde_json. Using a `__knot_`-prefixed key
+            // (like `__knot_bytes`/`__knot_bigint`) avoids colliding with
+            // legitimate user records that happen to have `tag`/`value` fields.
+            if obj.len() == 1 {
+                if let Some(serde_json::Value::Object(inner)) = obj.get("__knot_ctor") {
+                    if let (Some(serde_json::Value::String(tag)), Some(val)) =
+                        (inner.get("tag"), inner.get("value"))
+                    {
+                        return alloc(Value::Constructor(intern_str(tag), json_to_value(val)));
+                    }
                 }
             }
             let mut fields: Vec<RecordField> = obj
@@ -11238,9 +11242,13 @@ fn value_to_serde_json(v: *mut Value) -> serde_json::Value {
             serde_json::Value::Array(rows.iter().map(|r| value_to_serde_json(*r)).collect())
         }
         Value::Constructor(tag, payload) => {
-            let mut map = serde_json::Map::with_capacity(2);
-            map.insert("tag".into(), serde_json::Value::String(tag.to_string()));
-            map.insert("value".into(), value_to_serde_json(*payload));
+            // Wrap in `__knot_ctor` so parseJson can reconstruct without
+            // colliding with user records that happen to use `tag`/`value` keys.
+            let mut inner = serde_json::Map::with_capacity(2);
+            inner.insert("tag".into(), serde_json::Value::String(tag.to_string()));
+            inner.insert("value".into(), value_to_serde_json(*payload));
+            let mut map = serde_json::Map::with_capacity(1);
+            map.insert("__knot_ctor".into(), serde_json::Value::Object(inner));
             serde_json::Value::Object(map)
         }
         Value::Function(f) => serde_json::Value::String(format!("<function: {}>", &*f.source)),
@@ -11289,11 +11297,13 @@ fn value_to_json_with(db: *mut c_void, v: *mut Value, to_json_fn: *const u8) -> 
             json
         }
         Value::Constructor(tag, payload) => {
-            let mut json = String::from("{\"tag\":");
+            // Match value_to_serde_json's `__knot_ctor` wrapper so reconstruction
+            // round-trips and user records with `tag`/`value` keys aren't shadowed.
+            let mut json = String::from("{\"__knot_ctor\":{\"tag\":");
             json.push_str(&serde_json::to_string(&**tag).unwrap());
             json.push_str(",\"value\":");
             json.push_str(&call_to_json_dispatcher(db, *payload, to_json_fn));
-            json.push('}');
+            json.push_str("}}");
             json
         }
         // Leaf types: encode directly (no sub-values to dispatch on)

@@ -3619,7 +3619,13 @@ pub extern "C" fn knot_relation_take(
 ) -> *mut Value {
     let n = match unsafe { as_ref(n_val) } {
         Value::SmallInt(i) => (*i).max(0) as usize,
-        Value::Int(i) => i.to_u64().unwrap_or(0) as usize,
+        // BigInt larger than usize::MAX clamps to usize::MAX so semantics
+        // stay monotonic (huge n means "take everything"); a silent 0 would
+        // flip the meaning to "take nothing".
+        Value::Int(i) => i
+            .to_u64()
+            .and_then(|u| usize::try_from(u).ok())
+            .unwrap_or(usize::MAX),
         _ => 0,
     };
     match unsafe { as_ref(rel) } {
@@ -3639,7 +3645,10 @@ pub extern "C" fn knot_relation_drop(
 ) -> *mut Value {
     let n = match unsafe { as_ref(n_val) } {
         Value::SmallInt(i) => (*i).max(0) as usize,
-        Value::Int(i) => i.to_u64().unwrap_or(0) as usize,
+        Value::Int(i) => i
+            .to_u64()
+            .and_then(|u| usize::try_from(u).ok())
+            .unwrap_or(usize::MAX),
         _ => 0,
     };
     match unsafe { as_ref(rel) } {

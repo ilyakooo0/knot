@@ -83,6 +83,7 @@ fn resolve_recursive(
                     "cannot read import '{}': {}",
                     imp.path, e
                 ));
+                in_flight.remove(&canonical);
                 continue;
             }
         };
@@ -112,6 +113,7 @@ fn resolve_recursive(
                     diag.render(&source, &canonical.display().to_string())
                 ));
             }
+            in_flight.remove(&canonical);
             continue;
         }
 

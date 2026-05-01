@@ -15,6 +15,7 @@ mod folding;
 mod formatting;
 mod goto;
 mod hover;
+mod incremental;
 mod inlay_hints;
 mod legend;
 mod linked_editing;

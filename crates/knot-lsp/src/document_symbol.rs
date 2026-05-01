@@ -371,6 +371,26 @@ main = println "hello"
     }
 
     #[test]
+    fn document_symbol_includes_type_detail_for_fun() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            r#"add : Int -> Int -> Int
+add = \x y -> x + y
+"#,
+        );
+        let resp =
+            handle_document_symbol(&ws.state, &ds_params(&uri)).expect("symbols returned");
+        let nested = match resp {
+            DocumentSymbolResponse::Nested(s) => s,
+            _ => panic!("expected nested"),
+        };
+        let add = nested.iter().find(|s| s.name == "add").expect("add present");
+        let detail = add.detail.as_deref().expect("detail set");
+        assert!(detail.contains("Int"), "detail should include type; got: {detail}");
+    }
+
+    #[test]
     fn document_symbol_distinguishes_kinds() {
         let mut ws = TestWorkspace::new();
         let uri = ws.open(

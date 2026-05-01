@@ -837,3 +837,87 @@ fn complete_import_path(base_dir: &Path, partial: &str) -> Vec<CompletionItem> {
 
     items
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestWorkspace;
+    use crate::utils::offset_to_position;
+
+    fn comp_params(uri: &Uri, position: Position, trigger: Option<&str>) -> CompletionParams {
+        CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: Some(CompletionContext {
+                trigger_kind: if trigger.is_some() {
+                    CompletionTriggerKind::TRIGGER_CHARACTER
+                } else {
+                    CompletionTriggerKind::INVOKED
+                },
+                trigger_character: trigger.map(String::from),
+            }),
+        }
+    }
+
+    fn item_labels(resp: CompletionResponse) -> Vec<String> {
+        match resp {
+            CompletionResponse::Array(items) => items.into_iter().map(|i| i.label).collect(),
+            CompletionResponse::List(list) => list.items.into_iter().map(|i| i.label).collect(),
+        }
+    }
+
+    #[test]
+    fn completion_after_star_yields_source_names() {
+        let mut ws = TestWorkspace::new();
+        // Position the cursor immediately after the `*` literal — the
+        // completion handler reads the byte at offset-1 to detect the
+        // trigger context.
+        let uri = ws.open(
+            "main",
+            r#"type P = {n: Text}
+*people : [P]
+*pets : [P]
+get = \_ -> *
+"#,
+        );
+        let doc = ws.doc(&uri);
+        let star = doc.source.find("\\_ -> *").expect("trigger position");
+        let after_star = star + "\\_ -> *".len();
+        let pos = offset_to_position(&doc.source, after_star);
+        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, Some("*")))
+            .expect("completion returns");
+        let labels = item_labels(resp);
+        assert!(labels.contains(&"people".to_string()), "labels: {labels:?}");
+        assert!(labels.contains(&"pets".to_string()), "labels: {labels:?}");
+    }
+
+    #[test]
+    fn completion_filters_io_builtins_in_atomic_block() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            r#"type P = {n: Text}
+*people : [P]
+main = atomic do
+  set *people = [{n: "A"}]
+  yield {}
+"#,
+        );
+        let doc = ws.doc(&uri);
+        // Cursor inside the atomic body, on the line after `set *people = ...`
+        let inside = doc.source.find("set *people").expect("set");
+        let pos = offset_to_position(&doc.source, inside);
+        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, None))
+            .expect("completion returns");
+        let labels = item_labels(resp);
+        // `println` is in ATOMIC_DISALLOWED_BUILTINS — must not appear.
+        assert!(
+            !labels.contains(&"println".to_string()),
+            "println leaked into atomic-context completion; labels: {labels:?}"
+        );
+    }
+}

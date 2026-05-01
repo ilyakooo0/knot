@@ -615,7 +615,13 @@ impl Parser {
                 TokenKind::Int(_) => {
                     let tok = self.advance();
                     let TokenKind::Int(n) = tok.kind else { unreachable!() };
-                    let exp: i32 = n.parse().unwrap_or(1);
+                    let exp: i32 = match n.parse() {
+                        Ok(e) => e,
+                        Err(_) => {
+                            self.error("unit exponent out of range (must fit in i32)");
+                            return None;
+                        }
+                    };
                     Some(UnitExpr::Pow(Box::new(base), if neg { -exp } else { exp }))
                 }
                 _ => {

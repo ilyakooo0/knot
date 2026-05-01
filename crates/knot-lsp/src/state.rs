@@ -16,6 +16,8 @@ use knot::diagnostic;
 use knot_compiler::effects::EffectSet;
 use knot_compiler::infer::MonadKind;
 
+use crate::incremental::ModuleFingerprint;
+
 // ── Inference snapshot cache ────────────────────────────────────────
 
 /// A frozen snapshot of the type-/effect-inference output for a particular
@@ -39,9 +41,27 @@ pub struct InferenceSnapshot {
     pub refine_targets: HashMap<Span, String>,
     pub source_refinements: HashMap<String, Vec<(Option<String>, String, ast::Expr)>>,
     pub monad_info: HashMap<Span, MonadKind>,
+    /// Per-decl AST hash + dependency graph for the snapshot's source.
+    /// When a fresh edit produces a structurally-equal fingerprint
+    /// (whitespace/comment-only changes), the snapshot can be reused even
+    /// though the raw content hash differs.
+    pub fingerprint: ModuleFingerprint,
 }
 
 pub type InferenceCache = HashMap<(PathBuf, u64), InferenceSnapshot>;
+
+/// Secondary index into the inference cache keyed on the module's structure
+/// hash rather than its raw content hash. Lets the analysis pipeline skip
+/// re-inference for whitespace- and comment-only edits where the AST shape
+/// is unchanged. The mapped value is a content hash that points back into
+/// the primary `InferenceCache`.
+///
+/// Reserved for the per-path index optimization: the current implementation
+/// scans cache entries linearly, which is fine while `MAX_INFERENCE_CACHE_ENTRIES`
+/// stays small. When that bound grows, switch the fingerprint lookup to use
+/// this index instead.
+#[allow(dead_code)]
+pub type FingerprintIndex = HashMap<(PathBuf, u64), u64>;
 
 // ── Per-document analysis state ─────────────────────────────────────
 

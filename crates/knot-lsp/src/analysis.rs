@@ -19,6 +19,7 @@ use knot_compiler::infer::MonadKind;
 
 use crate::defs::{build_details, resolve_definitions};
 use crate::diagnostics::to_lsp_diagnostic;
+use crate::incremental::ModuleFingerprint;
 use crate::state::{
     content_hash, AnalysisResult, AnalysisTask, DocumentState, InferenceCache, InferenceSnapshot,
     ANALYSIS_DEBOUNCE, ANALYSIS_MAX_WAIT,
@@ -181,52 +182,70 @@ pub fn analyze_document(
         .any(|d| matches!(d.severity, diagnostic::Severity::Error));
 
     if !has_parse_errors {
-        // Inference-snapshot fast path: if we've already analyzed this exact
-        // (canonical_path, content_hash) pair, replay the cached diagnostics
-        // and inferred-type maps instead of re-running the full pipeline.
-        // This is a meaningful win for undo/redo, format-on-save round trips,
-        // and rapid file switches between unchanged sources. True
-        // per-declaration incrementalism (only re-checking the changed decl
-        // and its dependents) requires restructuring `infer.rs` and is
-        // tracked separately.
+        // Inference-snapshot fast path. Two tiers:
+        //
+        // (1) **Content-hash hit.** Same source bytes as a prior analysis —
+        //     undo/redo, format-on-save round trips, rapid file switching.
+        //
+        // (2) **Fingerprint hit.** Source bytes differ but the AST shape is
+        //     identical (whitespace, comment, doc-comment edits). The
+        //     `ModuleFingerprint` ignores spans and trivia, so a structurally
+        //     equal fingerprint guarantees the inferencer would produce the
+        //     same `(type_info, effect_info, ...)` output. We reuse it.
+        //
+        // True per-declaration incrementalism — re-checking only the changed
+        // decls and their transitive dependents — also depends on the
+        // fingerprint groundwork built here, but additionally requires
+        // changes to `infer.rs::pre_register` so cached schemes can replace
+        // a body-checking pass for "clean" decls. That's a separate effort.
         let cache_key = canonical_path
             .as_ref()
             .map(|p| (p.clone(), src_hash));
+        let new_fingerprint = ModuleFingerprint::from_module(&module);
         if let Some(key) = &cache_key {
+            // Tier 1: exact content hash match.
             if let Some(snap) = inference_cache.get(key) {
-                all_diags.extend(snap.diagnostics.iter().cloned());
-                type_info = snap.type_info.clone();
-                local_type_info = snap.local_type_info.clone();
-                effect_info = snap.effect_info.clone();
-                effect_sets = snap.effect_sets.clone();
-                refined_types = snap.refined_types.clone();
-                refine_targets = snap.refine_targets.clone();
-                source_refinements = snap.source_refinements.clone();
-                monad_info = snap.monad_info.clone();
-
-                return DocumentState {
-                    source: source.to_string(),
+                return reuse_snapshot(
+                    snap,
+                    source,
                     module,
                     references,
                     definitions,
                     details,
-                    type_info,
-                    local_type_info,
                     literal_types,
-                    effect_info,
-                    effect_sets,
-                    knot_diagnostics: all_diags,
                     imported_files,
                     import_defs,
                     import_origins,
                     doc_comments,
                     keyword_tokens,
-                    refined_types,
-                    refine_targets,
-                    source_refinements,
-                    monad_info,
                     unit_info,
-                };
+                    all_diags,
+                );
+            }
+            // Tier 2: structural fingerprint match. Search the per-path
+            // entries — the cache is small enough that a linear scan over
+            // its keys is cheap (bounded by MAX_INFERENCE_CACHE_ENTRIES).
+            for (cached_key, snap) in inference_cache.iter() {
+                if cached_key.0 == key.0
+                    && new_fingerprint.structurally_equal(&snap.fingerprint)
+                {
+                    return reuse_snapshot(
+                        snap,
+                        source,
+                        module,
+                        references,
+                        definitions,
+                        details,
+                        literal_types,
+                        imported_files,
+                        import_defs,
+                        import_origins,
+                        doc_comments,
+                        keyword_tokens,
+                        unit_info,
+                        all_diags,
+                    );
+                }
             }
         }
 
@@ -297,6 +316,7 @@ pub fn analyze_document(
                 refine_targets: refine_targets.clone(),
                 source_refinements: source_refinements.clone(),
                 monad_info: monad_info.clone(),
+                fingerprint: new_fingerprint.clone(),
             };
             inference_cache.insert(key, snapshot);
         }
@@ -323,6 +343,52 @@ pub fn analyze_document(
         refine_targets,
         source_refinements,
         monad_info,
+        unit_info,
+    }
+}
+
+/// Compose a `DocumentState` from a cached inference snapshot. Pulled out
+/// of `analyze_document` so the two cache-hit tiers (content hash and
+/// structural fingerprint) can share the result-assembly path verbatim.
+#[allow(clippy::too_many_arguments)]
+fn reuse_snapshot(
+    snap: &InferenceSnapshot,
+    source: &str,
+    module: Module,
+    references: Vec<(Span, Span)>,
+    definitions: HashMap<String, Span>,
+    details: HashMap<String, String>,
+    literal_types: Vec<(Span, String)>,
+    imported_files: HashMap<PathBuf, String>,
+    import_defs: HashMap<String, (PathBuf, Span)>,
+    import_origins: HashMap<String, String>,
+    doc_comments: HashMap<String, String>,
+    keyword_tokens: Vec<(Span, u32)>,
+    unit_info: HashMap<Span, String>,
+    mut all_diags: Vec<diagnostic::Diagnostic>,
+) -> DocumentState {
+    all_diags.extend(snap.diagnostics.iter().cloned());
+    DocumentState {
+        source: source.to_string(),
+        module,
+        references,
+        definitions,
+        details,
+        type_info: snap.type_info.clone(),
+        local_type_info: snap.local_type_info.clone(),
+        literal_types,
+        effect_info: snap.effect_info.clone(),
+        effect_sets: snap.effect_sets.clone(),
+        knot_diagnostics: all_diags,
+        imported_files,
+        import_defs,
+        import_origins,
+        doc_comments,
+        keyword_tokens,
+        refined_types: snap.refined_types.clone(),
+        refine_targets: snap.refine_targets.clone(),
+        source_refinements: snap.source_refinements.clone(),
+        monad_info: snap.monad_info.clone(),
         unit_info,
     }
 }
@@ -570,5 +636,59 @@ mod tests {
 
         drop(tx);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn fingerprint_cache_reuses_snapshot_for_whitespace_only_edit() {
+        // The inference cache is keyed on a canonical (resolved-on-disk)
+        // path. Use a real temp file so `canonicalize()` succeeds.
+        let dir = std::env::temp_dir().join(format!(
+            "knot-lsp-fp-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fp.knot");
+        std::fs::write(&path, "").unwrap();
+        let canonical = path.canonicalize().unwrap();
+        let uri = fake_uri(&format!("file://{}", canonical.display()));
+
+        let mut import_cache: HashMap<PathBuf, (u64, Module, String)> = HashMap::new();
+        let mut inference_cache: InferenceCache = HashMap::new();
+
+        let v1 = "id = \\x -> x\nmain = id 1\n";
+        std::fs::write(&path, v1).unwrap();
+        let doc1 = analyze_document(&uri, v1, &mut import_cache, &mut inference_cache);
+        let entries_after_v1 = inference_cache.len();
+        assert!(entries_after_v1 >= 1, "v1 should populate the cache");
+        assert!(
+            doc1.type_info.contains_key("id"),
+            "v1 type_info should contain id, got: {:?}",
+            doc1.type_info.keys().collect::<Vec<_>>()
+        );
+
+        // Same shape, different whitespace and a comment — content hash
+        // differs, but the fingerprint matches. The pipeline should reuse
+        // the existing snapshot rather than insert a new one.
+        let v2 = "-- a comment\nid    =   \\x -> x\n\n\nmain = id 1\n";
+        std::fs::write(&path, v2).unwrap();
+        let doc = analyze_document(&uri, v2, &mut import_cache, &mut inference_cache);
+        // Reused snapshot means inferred type info is still populated even
+        // though no fresh inference ran (and no new entry was inserted).
+        assert!(
+            doc.type_info.contains_key("id"),
+            "v2 type_info should contain id (fingerprint reuse), got: {:?}",
+            doc.type_info.keys().collect::<Vec<_>>()
+        );
+        assert!(doc.type_info.contains_key("main"));
+        assert_eq!(
+            inference_cache.len(),
+            entries_after_v1,
+            "fingerprint cache hit should not insert a new entry"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

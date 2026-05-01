@@ -3,9 +3,9 @@
 
 use lsp_types::*;
 
-use knot::ast::{self, DeclKind, Module};
+use knot::ast::{self, DeclKind};
 
-use crate::state::ServerState;
+use crate::state::{DocumentState, ServerState};
 use crate::type_format::{format_type_kind, format_type_scheme};
 use crate::utils::{find_word_in_source, span_to_range};
 
@@ -16,12 +16,34 @@ pub(crate) fn handle_document_symbol(
     params: &DocumentSymbolParams,
 ) -> Option<DocumentSymbolResponse> {
     let doc = state.documents.get(&params.text_document.uri)?;
-    let symbols = build_symbols(&doc.module, &doc.source);
+    let symbols = build_symbols(doc);
     Some(DocumentSymbolResponse::Nested(symbols))
 }
 
+/// Build a hint string combining declared/inferred type and effects.
+/// Falls back to declared type, then inferred type, then effect string alone.
+fn detail_for(doc: &DocumentState, name: &str, declared: Option<String>) -> Option<String> {
+    let mut parts = Vec::new();
+    let ty = declared.or_else(|| doc.type_info.get(name).cloned());
+    if let Some(t) = ty {
+        parts.push(t);
+    }
+    if let Some(eff) = doc.effect_info.get(name) {
+        if !eff.trim_start_matches('{').trim_end_matches('}').trim().is_empty() {
+            parts.push(eff.clone());
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
 #[allow(deprecated)]
-fn build_symbols(module: &Module, source: &str) -> Vec<DocumentSymbol> {
+fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
+    let module = &doc.module;
+    let source = doc.source.as_str();
     let mut symbols = Vec::new();
 
     for decl in &module.decls {
@@ -58,10 +80,19 @@ fn build_symbols(module: &Module, source: &str) -> Vec<DocumentSymbol> {
                         })
                     })
                     .collect();
+                let kind = if constructors.len() > 1 {
+                    SymbolKind::ENUM
+                } else {
+                    SymbolKind::STRUCT
+                };
                 symbols.push(DocumentSymbol {
                     name: name.clone(),
-                    detail: None,
-                    kind: SymbolKind::STRUCT,
+                    detail: Some(format!(
+                        "{} ctor{}",
+                        constructors.len(),
+                        if constructors.len() == 1 { "" } else { "s" }
+                    )),
+                    kind,
                     tags: None,
                     deprecated: None,
                     range,
@@ -85,10 +116,14 @@ fn build_symbols(module: &Module, source: &str) -> Vec<DocumentSymbol> {
                     children: None,
                 });
             }
-            DeclKind::Source { name, .. } => {
+            DeclKind::Source { name, ty, history, .. } => {
+                let mut detail_parts = vec![format_type_kind(&ty.node)];
+                if *history {
+                    detail_parts.push("with history".into());
+                }
                 symbols.push(DocumentSymbol {
                     name: format!("*{name}"),
-                    detail: None,
+                    detail: Some(detail_parts.join(" ")),
                     kind: SymbolKind::VARIABLE,
                     tags: None,
                     deprecated: None,
@@ -97,10 +132,11 @@ fn build_symbols(module: &Module, source: &str) -> Vec<DocumentSymbol> {
                     children: None,
                 });
             }
-            DeclKind::View { name, .. } => {
+            DeclKind::View { name, ty, .. } => {
+                let declared = ty.as_ref().map(format_type_scheme);
                 symbols.push(DocumentSymbol {
                     name: format!("*{name}"),
-                    detail: Some("view".into()),
+                    detail: detail_for(doc, name, declared).or_else(|| Some("view".into())),
                     kind: SymbolKind::VARIABLE,
                     tags: None,
                     deprecated: None,
@@ -109,10 +145,11 @@ fn build_symbols(module: &Module, source: &str) -> Vec<DocumentSymbol> {
                     children: None,
                 });
             }
-            DeclKind::Derived { name, .. } => {
+            DeclKind::Derived { name, ty, .. } => {
+                let declared = ty.as_ref().map(format_type_scheme);
                 symbols.push(DocumentSymbol {
                     name: format!("&{name}"),
-                    detail: Some("derived".into()),
+                    detail: detail_for(doc, name, declared).or_else(|| Some("derived".into())),
                     kind: SymbolKind::VARIABLE,
                     tags: None,
                     deprecated: None,
@@ -121,10 +158,11 @@ fn build_symbols(module: &Module, source: &str) -> Vec<DocumentSymbol> {
                     children: None,
                 });
             }
-            DeclKind::Fun { name, .. } => {
+            DeclKind::Fun { name, ty, .. } => {
+                let declared = ty.as_ref().map(format_type_scheme);
                 symbols.push(DocumentSymbol {
                     name: name.clone(),
-                    detail: None,
+                    detail: detail_for(doc, name, declared),
                     kind: SymbolKind::FUNCTION,
                     tags: None,
                     deprecated: None,
@@ -289,4 +327,71 @@ fn build_symbols(module: &Module, source: &str) -> Vec<DocumentSymbol> {
     }
 
     symbols
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestWorkspace;
+
+    fn ds_params(uri: &Uri) -> DocumentSymbolParams {
+        DocumentSymbolParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }
+    }
+
+    fn names_in(symbols: &[DocumentSymbol]) -> Vec<String> {
+        symbols.iter().map(|s| s.name.clone()).collect()
+    }
+
+    #[test]
+    fn document_symbol_lists_top_level_decls() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            r#"type Person = {name: Text, age: Int}
+*people : [Person]
+greet = \name -> "hi " ++ name
+main = println "hello"
+"#,
+        );
+        let resp =
+            handle_document_symbol(&ws.state, &ds_params(&uri)).expect("symbols returned");
+        let nested = match resp {
+            DocumentSymbolResponse::Nested(s) => s,
+            _ => panic!("expected nested response"),
+        };
+        let names = names_in(&nested);
+        assert!(names.iter().any(|n| n == "Person"), "names: {names:?}");
+        assert!(names.iter().any(|n| n.contains("people")), "names: {names:?}");
+        assert!(names.iter().any(|n| n == "greet"), "names: {names:?}");
+        assert!(names.iter().any(|n| n == "main"), "names: {names:?}");
+    }
+
+    #[test]
+    fn document_symbol_distinguishes_kinds() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            r#"data Color = Red {} | Blue {}
+*items : [{name: Text}]
+main = println "ok"
+"#,
+        );
+        let resp =
+            handle_document_symbol(&ws.state, &ds_params(&uri)).expect("symbols returned");
+        let nested = match resp {
+            DocumentSymbolResponse::Nested(s) => s,
+            _ => panic!("expected nested"),
+        };
+        let color = nested.iter().find(|s| s.name == "Color").expect("Color present");
+        assert_eq!(color.kind, SymbolKind::ENUM);
+        // Constructors should be nested children of the data decl.
+        let children = color.children.as_ref().expect("constructors");
+        let child_names: Vec<_> = children.iter().map(|c| c.name.clone()).collect();
+        assert!(child_names.contains(&"Red".to_string()));
+        assert!(child_names.contains(&"Blue".to_string()));
+    }
 }

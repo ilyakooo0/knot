@@ -424,3 +424,68 @@ pub fn recurse_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, mut f: F) {
         _ => {}
     }
 }
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn position_to_offset_handles_ascii() {
+        let src = "abc\ndef";
+        assert_eq!(position_to_offset(src, Position::new(0, 0)), 0);
+        assert_eq!(position_to_offset(src, Position::new(0, 3)), 3);
+        assert_eq!(position_to_offset(src, Position::new(1, 0)), 4);
+        assert_eq!(position_to_offset(src, Position::new(1, 3)), 7);
+    }
+
+    #[test]
+    fn position_to_offset_treats_character_as_utf16_units() {
+        // "é" is 2 bytes in UTF-8 but 1 UTF-16 code unit.
+        let src = "éx";
+        assert_eq!(position_to_offset(src, Position::new(0, 0)), 0);
+        assert_eq!(position_to_offset(src, Position::new(0, 1)), 2); // after é
+        assert_eq!(position_to_offset(src, Position::new(0, 2)), 3); // after x
+    }
+
+    #[test]
+    fn position_to_offset_handles_surrogate_pairs() {
+        // 😀 is 4 bytes in UTF-8 and 2 UTF-16 code units (surrogate pair).
+        let src = "a😀b";
+        assert_eq!(position_to_offset(src, Position::new(0, 0)), 0); // before a
+        assert_eq!(position_to_offset(src, Position::new(0, 1)), 1); // after a
+        assert_eq!(position_to_offset(src, Position::new(0, 3)), 5); // after 😀 (1 + 4)
+        assert_eq!(position_to_offset(src, Position::new(0, 4)), 6); // after b
+    }
+
+    #[test]
+    fn offset_to_position_round_trips_ascii() {
+        let src = "hello\nworld";
+        for offset in 0..=src.len() {
+            let pos = offset_to_position(src, offset);
+            assert_eq!(position_to_offset(src, pos), offset, "offset {}", offset);
+        }
+    }
+
+    #[test]
+    fn offset_to_position_round_trips_unicode() {
+        let src = "x é\n😀 y";
+        // Round-trip every char-boundary offset.
+        for offset in 0..=src.len() {
+            if !src.is_char_boundary(offset) {
+                continue;
+            }
+            let pos = offset_to_position(src, offset);
+            assert_eq!(position_to_offset(src, pos), offset, "offset {}", offset);
+        }
+    }
+
+    #[test]
+    fn offset_to_position_emits_utf16_columns_for_surrogate_pairs() {
+        let src = "a😀b";
+        // Byte offset 5 is just after 😀 — should be UTF-16 column 3.
+        let pos = offset_to_position(src, 5);
+        assert_eq!(pos, Position::new(0, 3));
+    }
+}

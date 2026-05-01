@@ -2,9 +2,11 @@
 
 use lsp_types::*;
 
-use knot::ast::{self, DeclKind, Module, Span};
+use knot::ast::Span;
 
-use crate::shared::{find_enclosing_application, parse_function_params};
+use crate::shared::{
+    extract_param_names, find_enclosing_application, parse_function_params,
+};
 use crate::state::{DocumentState, ServerState};
 use crate::utils::position_to_offset;
 
@@ -180,95 +182,6 @@ fn build_signature_label(
     // splits all arrow-separated parts including the return type. Keep the
     // final part as-is (no name).
     format!("{func_name} : {}", parts.join(" -> "))
-}
-
-/// Extract parameter names from a function declaration's body.
-/// Returns an empty Vec if the function isn't directly a lambda chain.
-fn extract_param_names(module: &Module, func_name: &str) -> Vec<String> {
-    for decl in &module.decls {
-        match &decl.node {
-            DeclKind::Fun {
-                name,
-                body: Some(body),
-                ..
-            } if name == func_name => {
-                return collect_lambda_param_names(body);
-            }
-            DeclKind::Trait { items, .. } => {
-                for item in items {
-                    if let ast::TraitItem::Method {
-                        name,
-                        default_params,
-                        ..
-                    } = item
-                    {
-                        if name == func_name {
-                            return default_params
-                                .iter()
-                                .map(|p| pat_to_simple_name(&p.node))
-                                .collect();
-                        }
-                    }
-                }
-            }
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { name, params, .. } = item {
-                        if name == func_name {
-                            return params
-                                .iter()
-                                .map(|p| pat_to_simple_name(&p.node))
-                                .collect();
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    Vec::new()
-}
-
-/// Walk a chain of nested lambdas (`\a -> \b -> body`) and collect param names.
-fn collect_lambda_param_names(expr: &ast::Expr) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut cur = expr;
-    loop {
-        match &cur.node {
-            ast::ExprKind::Lambda { params, body } => {
-                for p in params {
-                    names.push(pat_to_simple_name(&p.node));
-                }
-                cur = body;
-            }
-            _ => break,
-        }
-    }
-    names
-}
-
-/// Render a pattern as a simple name for parameter display.
-/// `x` → "x", `{name, age}` → "{name, age}", `_` → "_".
-fn pat_to_simple_name(pat: &ast::PatKind) -> String {
-    match pat {
-        ast::PatKind::Var(name) => name.clone(),
-        ast::PatKind::Wildcard => "_".into(),
-        ast::PatKind::Record(fields) => {
-            let parts: Vec<String> = fields
-                .iter()
-                .map(|f| match &f.pattern {
-                    None => f.name.clone(),
-                    Some(p) => format!("{}: {}", f.name, pat_to_simple_name(&p.node)),
-                })
-                .collect();
-            format!("{{{}}}", parts.join(", "))
-        }
-        ast::PatKind::Constructor { name, payload } => {
-            format!("{name} {}", pat_to_simple_name(&payload.node))
-        }
-        ast::PatKind::List(_) => "[..]".into(),
-        ast::PatKind::Lit(_) => "_".into(),
-    }
 }
 
 /// Look up documentation for a single parameter.

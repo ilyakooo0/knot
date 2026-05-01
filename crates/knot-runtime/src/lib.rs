@@ -9517,8 +9517,13 @@ pub extern "C" fn knot_random_float() -> *mut Value {
     let mut buf = [0u8; 8];
     getrandom::fill(&mut buf).expect("knot runtime: failed to get random bytes");
     let raw = u64::from_le_bytes(buf);
-    // Divide by u64::MAX+1 to get [0.0, 1.0)
-    let result = (raw as f64) / ((u64::MAX as f64) + 1.0);
+    // f64 has 53 mantissa bits; mask `raw` to 53 bits and divide by 2^53 so
+    // the result is exactly representable and stays inside [0.0, 1.0). The
+    // earlier `(raw as f64) / ((u64::MAX as f64) + 1.0)` formulation rounds
+    // the divisor down to 2^64 (precision loss), so for `raw == u64::MAX`
+    // the result was exactly 1.0, violating the half-open contract.
+    let bits = raw >> 11;
+    let result = (bits as f64) * f64::from_bits(0x3CA0_0000_0000_0000); // 2^-53
     alloc_float(result)
 }
 
@@ -12241,7 +12246,15 @@ fn fetch_build_url(base: &str, path_pattern: &str, payload: *mut Value) -> Strin
     let mut remaining = path_pattern;
     while let Some(start) = remaining.find('{') {
         url.push_str(&remaining[..start]);
-        let end = remaining.find('}').expect("unmatched { in path pattern");
+        // Search for the matching `}` *after* the `{` we just found — searching
+        // from the front of `remaining` would let a stray earlier `}` produce
+        // `end < start` and panic on the slice below.
+        let Some(rel_end) = remaining[start + 1..].find('}') else {
+            // Unmatched `{` — emit the rest verbatim and stop substituting.
+            url.push_str(&remaining[start..]);
+            return url;
+        };
+        let end = start + 1 + rel_end;
         let param = &remaining[start + 1..end];
         let (name, _ty) = param.split_once(':').unwrap_or((param, "text"));
         let field_val = knot_record_field(payload, name.as_ptr(), name.len());

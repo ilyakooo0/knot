@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 
 use knot::ast::{self, DeclKind, Module, Span};
 
-use crate::state::DocumentState;
 use crate::type_format::format_type_kind;
 use crate::utils::{recurse_expr, safe_slice};
 
@@ -670,6 +669,109 @@ pub(crate) fn extract_field_name(field_str: &str) -> Option<String> {
     Some(trimmed[..colon].trim().to_string())
 }
 
-// Re-export DocumentState use convenience for callers
-#[allow(dead_code)]
-fn _unused(_: &DocumentState) {}
+// ── Function parameter introspection ────────────────────────────────
+
+/// Extract parameter names from a function declaration's body.
+/// Returns an empty Vec if the function isn't directly a lambda chain or
+/// trait/impl method. Used by signature_help and parameter-name inlay hints.
+pub(crate) fn extract_param_names(module: &Module, func_name: &str) -> Vec<String> {
+    for decl in &module.decls {
+        match &decl.node {
+            DeclKind::Fun {
+                name,
+                body: Some(body),
+                ..
+            } if name == func_name => {
+                return collect_lambda_param_names(body);
+            }
+            DeclKind::Trait { items, .. } => {
+                for item in items {
+                    if let ast::TraitItem::Method {
+                        name,
+                        default_params,
+                        ..
+                    } = item
+                    {
+                        if name == func_name {
+                            return default_params
+                                .iter()
+                                .map(|p| pat_to_simple_name(&p.node))
+                                .collect();
+                        }
+                    }
+                }
+            }
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { name, params, .. } = item {
+                        if name == func_name {
+                            return params
+                                .iter()
+                                .map(|p| pat_to_simple_name(&p.node))
+                                .collect();
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Vec::new()
+}
+
+/// Walk a chain of nested lambdas (`\a -> \b -> body`) and collect param names.
+pub(crate) fn collect_lambda_param_names(expr: &ast::Expr) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut cur = expr;
+    loop {
+        match &cur.node {
+            ast::ExprKind::Lambda { params, body } => {
+                for p in params {
+                    names.push(pat_to_simple_name(&p.node));
+                }
+                cur = body;
+            }
+            _ => break,
+        }
+    }
+    names
+}
+
+/// Render a pattern as a simple name for parameter display.
+/// `x` → "x", `{name, age}` → "{name, age}", `_` → "_".
+pub(crate) fn pat_to_simple_name(pat: &ast::PatKind) -> String {
+    match pat {
+        ast::PatKind::Var(name) => name.clone(),
+        ast::PatKind::Wildcard => "_".into(),
+        ast::PatKind::Record(fields) => {
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|f| match &f.pattern {
+                    None => f.name.clone(),
+                    Some(p) => format!("{}: {}", f.name, pat_to_simple_name(&p.node)),
+                })
+                .collect();
+            format!("{{{}}}", parts.join(", "))
+        }
+        ast::PatKind::Constructor { name, payload } => {
+            format!("{name} {}", pat_to_simple_name(&payload.node))
+        }
+        ast::PatKind::List(_) => "[..]".into(),
+        ast::PatKind::Lit(_) => "_".into(),
+    }
+}
+
+/// Flatten an `App(App(App(f, x), y), z)` chain into `(callee_expr, [x, y, z])`.
+/// Returns the args in source order. The callee is whatever sits at the
+/// bottom of the chain — typically a `Var` for named function calls.
+pub(crate) fn flatten_app_chain<'a>(expr: &'a ast::Expr) -> (&'a ast::Expr, Vec<&'a ast::Expr>) {
+    let mut args: Vec<&ast::Expr> = Vec::new();
+    let mut current = expr;
+    while let ast::ExprKind::App { func, arg } = &current.node {
+        args.push(arg.as_ref());
+        current = func.as_ref();
+    }
+    args.reverse();
+    (current, args)
+}
+

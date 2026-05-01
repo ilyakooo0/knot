@@ -1,10 +1,12 @@
-//! `textDocument/inlayHint` handler. Surfaces inferred types, effects, and
-//! unit annotations as inline-decoration hints.
+//! `textDocument/inlayHint` handler. Surfaces inferred types, effects,
+//! parameter names, monad context, and unit annotations as inline hints.
 
 use lsp_types::*;
 
 use knot::ast::{self, DeclKind, Span};
+use knot_compiler::infer::MonadKind;
 
+use crate::shared::{extract_param_names, flatten_app_chain, parse_function_params};
 use crate::state::{DocumentState, ServerState};
 use crate::utils::{
     offset_to_position, position_to_offset, recurse_expr, safe_slice,
@@ -130,6 +132,16 @@ pub(crate) fn handle_inlay_hint(
     // syntax, so the user otherwise has to mentally trace the type — the hint
     // shows e.g. `<M>` after `42` in `let distance : Float<M> = 42.0`.
     add_unit_literal_hints(doc, range_start, range_end, &mut hints);
+
+    // Show parameter-name hints at named function call sites. The hint shows
+    // `name:` before each argument so multi-arg calls don't require jumping to
+    // the definition to know which argument is which.
+    add_parameter_name_hints(doc, range_start, range_end, &mut hints);
+
+    // Show the resolved monad kind at the start of each `do` block. Helps when
+    // the same `do` syntax can desugar to `[]`, `Maybe`, `Result`, or `IO`
+    // depending on context.
+    add_monad_context_hints(doc, range_start, range_end, &mut hints);
 
     Some(hints)
 }
@@ -279,4 +291,310 @@ fn type_str_mentions_effects(ty: &str, effects: &str) -> bool {
         return true;
     }
     inner.split(',').all(|tok| ty.contains(tok.trim()))
+}
+
+/// Walk the AST looking for App expressions whose callee resolves to a named
+/// function with known parameter names. Emit a `name:` hint at the start of
+/// each argument expression. Hints are suppressed when the argument is a bare
+/// reference whose name already matches the parameter (e.g. `f(name)` →
+/// no `name: name` redundant hint), and when the argument occupies the same
+/// span as the parameter name itself.
+fn add_parameter_name_hints(
+    doc: &DocumentState,
+    range_start: usize,
+    range_end: usize,
+    hints: &mut Vec<InlayHint>,
+) {
+    fn walk_apps(
+        expr: &ast::Expr,
+        doc: &DocumentState,
+        range_start: usize,
+        range_end: usize,
+        hints: &mut Vec<InlayHint>,
+    ) {
+        // When we hit an App chain, flatten it and emit hints for the whole
+        // chain — but recurse only into the args (not the head), so we don't
+        // re-process inner Apps from the same chain.
+        if matches!(expr.node, ast::ExprKind::App { .. }) {
+            let (callee, args) = flatten_app_chain(expr);
+            if let ast::ExprKind::Var(name) = &callee.node {
+                emit_arg_hints(doc, name, &args, range_start, range_end, hints);
+            }
+            for arg in args {
+                walk_apps(arg, doc, range_start, range_end, hints);
+            }
+            return;
+        }
+        recurse_expr(expr, |e| walk_apps(e, doc, range_start, range_end, hints));
+    }
+
+    fn walk_decl(
+        decl: &ast::Decl,
+        doc: &DocumentState,
+        range_start: usize,
+        range_end: usize,
+        hints: &mut Vec<InlayHint>,
+    ) {
+        match &decl.node {
+            DeclKind::Fun {
+                body: Some(body), ..
+            }
+            | DeclKind::View { body, .. }
+            | DeclKind::Derived { body, .. } => {
+                walk_apps(body, doc, range_start, range_end, hints);
+            }
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { body, .. } = item {
+                        walk_apps(body, doc, range_start, range_end, hints);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for decl in &doc.module.decls {
+        if decl.span.end < range_start || decl.span.start > range_end {
+            continue;
+        }
+        walk_decl(decl, doc, range_start, range_end, hints);
+    }
+}
+
+/// Emit one parameter-name hint per positional argument when the callee's
+/// names are known.
+fn emit_arg_hints(
+    doc: &DocumentState,
+    func_name: &str,
+    args: &[&ast::Expr],
+    range_start: usize,
+    range_end: usize,
+    hints: &mut Vec<InlayHint>,
+) {
+    let param_names = extract_param_names(&doc.module, func_name);
+    if param_names.is_empty() {
+        return;
+    }
+    // Limit to single-arg calls being silent (no value), and skip hints when
+    // the call is a postfix pipe (`x |> f`) — those are handled syntactically.
+    // Also skip when arity ≤ 1, since a single argument's role is unambiguous.
+    if param_names.len() <= 1 || args.len() <= 1 {
+        return;
+    }
+    for (i, arg) in args.iter().enumerate() {
+        let name = match param_names.get(i) {
+            Some(n) => n,
+            None => break,
+        };
+        // Suppress hint for bare-name args that already match the parameter
+        // name — `transfer(amount, from, to)` doesn't need `amount: amount`.
+        if let ast::ExprKind::Var(arg_name) = &arg.node {
+            if arg_name == name {
+                continue;
+            }
+        }
+        // Don't hint trivial/anonymous parameter names (`_`, single letters
+        // synthesized by the fallback). Single-letter ASCII params from real
+        // code (`\x -> ...`) are kept — the hint is still useful there.
+        if name == "_" {
+            continue;
+        }
+        // Only hint for arguments visible in the requested range.
+        if arg.span.end < range_start || arg.span.start > range_end {
+            continue;
+        }
+        hints.push(InlayHint {
+            position: offset_to_position(&doc.source, arg.span.start),
+            label: InlayHintLabel::String(format!("{name}:")),
+            kind: Some(InlayHintKind::PARAMETER),
+            text_edits: None,
+            tooltip: function_param_tooltip(doc, func_name, i, name),
+            padding_left: None,
+            padding_right: Some(true),
+            data: None,
+        });
+    }
+}
+
+/// Build a tooltip with the parameter's type and a snippet of the function's
+/// signature. Falls back to `None` if no signature is known.
+fn function_param_tooltip(
+    doc: &DocumentState,
+    func_name: &str,
+    index: usize,
+    param_name: &str,
+) -> Option<InlayHintTooltip> {
+    let ty = doc.type_info.get(func_name)?;
+    let params = parse_function_params(ty);
+    let param_ty = params.get(index)?;
+    Some(InlayHintTooltip::String(format!(
+        "{param_name} : {param_ty}\n\n`{func_name} : {ty}`"
+    )))
+}
+
+/// Walk the AST collecting `do` block spans whose monad has been resolved.
+/// Emit a leading hint at the block's `do` keyword describing the kind.
+fn add_monad_context_hints(
+    doc: &DocumentState,
+    range_start: usize,
+    range_end: usize,
+    hints: &mut Vec<InlayHint>,
+) {
+    fn walk(
+        expr: &ast::Expr,
+        doc: &DocumentState,
+        range_start: usize,
+        range_end: usize,
+        hints: &mut Vec<InlayHint>,
+    ) {
+        if let ast::ExprKind::Do(_) = &expr.node {
+            if expr.span.start >= range_start && expr.span.start <= range_end {
+                if let Some(monad) = doc.monad_info.get(&expr.span) {
+                    let label = match monad {
+                        MonadKind::Relation => "[Relation]".to_string(),
+                        MonadKind::IO => "[IO]".to_string(),
+                        MonadKind::Adt(name) => format!("[{name}]"),
+                    };
+                    let pos = offset_to_position(&doc.source, expr.span.start);
+                    // Anchor the hint just past the `do` keyword. We trust the
+                    // span starts at `do` — emit at start, then let the editor
+                    // render with padding_right.
+                    let do_end = expr.span.start + 2; // length of "do"
+                    let do_pos = if do_end <= doc.source.len() {
+                        offset_to_position(&doc.source, do_end)
+                    } else {
+                        pos
+                    };
+                    hints.push(InlayHint {
+                        position: do_pos,
+                        label: InlayHintLabel::String(label),
+                        kind: None,
+                        text_edits: None,
+                        tooltip: Some(InlayHintTooltip::String(monad_tooltip(monad))),
+                        padding_left: Some(true),
+                        padding_right: Some(true),
+                        data: None,
+                    });
+                }
+            }
+        }
+        recurse_expr(expr, |e| walk(e, doc, range_start, range_end, hints));
+    }
+
+    fn walk_decl(
+        decl: &ast::Decl,
+        doc: &DocumentState,
+        range_start: usize,
+        range_end: usize,
+        hints: &mut Vec<InlayHint>,
+    ) {
+        match &decl.node {
+            DeclKind::Fun {
+                body: Some(body), ..
+            }
+            | DeclKind::View { body, .. }
+            | DeclKind::Derived { body, .. } => {
+                walk(body, doc, range_start, range_end, hints);
+            }
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { body, .. } = item {
+                        walk(body, doc, range_start, range_end, hints);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for decl in &doc.module.decls {
+        if decl.span.end < range_start || decl.span.start > range_end {
+            continue;
+        }
+        walk_decl(decl, doc, range_start, range_end, hints);
+    }
+}
+
+fn monad_tooltip(monad: &MonadKind) -> String {
+    match monad {
+        MonadKind::Relation => {
+            "Relation comprehension. `<-` iterates rows, `where` filters, \
+             `yield` collects, `groupBy` aggregates."
+                .into()
+        }
+        MonadKind::IO => "IO action sequencing. Each statement is an effectful \
+                          action; the final yield/expression is the result."
+            .into(),
+        MonadKind::Adt(name) => {
+            format!("`{name}` monad. Bind dispatches via the `Monad {name}` impl.")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestWorkspace;
+
+    fn hint_params(uri: &Uri, range: Range) -> InlayHintParams {
+        InlayHintParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range,
+            work_done_progress_params: Default::default(),
+        }
+    }
+
+    #[test]
+    fn inlay_hint_shows_inferred_type_for_unannotated_fun() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "id = \\x -> x\n");
+        let range = ws.whole_file_range(&uri);
+        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
+        let labels: Vec<String> = hints
+            .iter()
+            .map(|h| match &h.label {
+                InlayHintLabel::String(s) => s.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        // Expect at least one type-annotation hint (": Type").
+        assert!(
+            labels.iter().any(|l| l.starts_with(":")),
+            "expected `:T` hint; got: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn inlay_hint_emits_monad_context_for_maybe_do_block() {
+        // Maybe is desugared (has Monad/Applicative/Alternative impls), so the
+        // inferencer populates monad_info for its do blocks. IO and pure
+        // sequential do blocks aren't desugared, so they don't get monad_info
+        // entries today — the inlay hint correctly hides itself in that case.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            r#"safe = \x -> do
+  v <- Just {value: x}
+  yield v.value
+"#,
+        );
+        let range = ws.whole_file_range(&uri);
+        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
+        let labels: Vec<String> = hints
+            .iter()
+            .map(|h| match &h.label {
+                InlayHintLabel::String(s) => s.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        // Monad-kind hint shows up as `[Maybe]` or similar.
+        let has_monad_hint = labels
+            .iter()
+            .any(|l| l.starts_with('[') && l.ends_with(']') && !l.contains(':'));
+        assert!(
+            has_monad_hint,
+            "expected `[Monad]` hint; got: {labels:?}"
+        );
+    }
 }

@@ -543,6 +543,12 @@ impl<'src> Lexer<'src> {
                             self.advance();
                             value.push('\r');
                         }
+                        Some(b'0') => {
+                            // Match the byte-string lexer's vocabulary so
+                            // `\0` works in both literal kinds.
+                            self.advance();
+                            value.push('\0');
+                        }
                         Some(_) => {
                             let esc_start = self.pos - 1;
                             // Advance by one full UTF-8 character (not just one byte)
@@ -584,7 +590,11 @@ impl<'src> Lexer<'src> {
 
         loop {
             match self.peek() {
-                None | Some(b'\n') => {
+                None | Some(b'\n') | Some(b'\r') => {
+                    // CR (alone or as part of CRLF) terminates the byte
+                    // string just like \n — matches the regular-string lexer
+                    // (line 507) so byte-string literals can't silently eat a
+                    // line ending.
                     let span = self.span_from(start);
                     self.diagnostics.push(
                         Diagnostic::error("unterminated byte string literal")
@@ -628,6 +638,7 @@ impl<'src> Lexer<'src> {
                             // Hex escape: \xHH
                             let h1 = self.peek().and_then(|b| (b as char).to_digit(16));
                             if let Some(d1) = h1 {
+                                let first_hex_byte = self.bytes[self.pos];
                                 self.advance();
                                 let h2 = self.peek().and_then(|b| (b as char).to_digit(16));
                                 if let Some(d2) = h2 {
@@ -639,9 +650,12 @@ impl<'src> Lexer<'src> {
                                         Diagnostic::error("invalid hex escape in byte string")
                                             .label(span, "expected two hex digits after \\x"),
                                     );
-                                    // Error recovery: emit the partial hex digit
-                                    // so the byte string isn't silently shortened.
-                                    value.push(d1 as u8);
+                                    // Error recovery: emit the literal hex char (e.g.
+                                    // `b'5'` for `\x5`) rather than the digit *value*
+                                    // (`0x05`) so the recovered bytes resemble what
+                                    // the user typed.
+                                    let _ = d1;
+                                    value.push(first_hex_byte);
                                 }
                             } else {
                                 let bad_end = if self.pos < self.source.len() {

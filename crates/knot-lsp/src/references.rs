@@ -106,3 +106,57 @@ pub(crate) fn handle_references(
         Some(locations)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestWorkspace;
+    use crate::utils::offset_to_position;
+
+    fn ref_params(uri: &Uri, position: Position, include_decl: bool) -> ReferenceParams {
+        ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: ReferenceContext {
+                include_declaration: include_decl,
+            },
+        }
+    }
+
+    #[test]
+    fn references_finds_all_call_sites() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            r#"double = \x -> x * 2
+a = double 1
+b = double 2
+main = println (show (double 3))
+"#,
+        );
+        let doc = ws.doc(&uri);
+        let def_pos = doc.source.find("double = ").expect("def");
+        let pos = offset_to_position(&doc.source, def_pos);
+        let locs = handle_references(&ws.state, &ref_params(&uri, pos, false))
+            .expect("references found");
+        // Three call sites: `double 1`, `double 2`, `double 3`.
+        assert_eq!(locs.len(), 3, "got: {locs:?}");
+    }
+
+    #[test]
+    fn references_includes_declaration_when_requested() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "id = \\x -> x\nmain = id 5\n");
+        let doc = ws.doc(&uri);
+        let def_pos = doc.source.find("id =").expect("def");
+        let pos = offset_to_position(&doc.source, def_pos);
+        let locs = handle_references(&ws.state, &ref_params(&uri, pos, true))
+            .expect("references found");
+        // Declaration + one usage
+        assert_eq!(locs.len(), 2, "got: {locs:?}");
+    }
+}

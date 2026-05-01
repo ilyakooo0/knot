@@ -464,3 +464,111 @@ pub fn publish_diagnostics(
         eprintln!("knot-lsp: failed to publish diagnostics: {e}");
     }
 }
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::{Receiver, Sender};
+    use std::thread;
+    use std::time::Duration;
+
+    fn fake_uri(s: &str) -> Uri {
+        s.parse().unwrap()
+    }
+
+    /// Spin up the analysis worker and feed it tasks. Used to verify the
+    /// debounce/coalesce behavior without going through stdio.
+    fn spawn_worker() -> (Sender<AnalysisTask>, Receiver<AnalysisResult>, thread::JoinHandle<()>) {
+        let (tx, rx) = crossbeam_channel::unbounded::<AnalysisTask>();
+        let (rtx, rrx) = crossbeam_channel::unbounded::<AnalysisResult>();
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let inf_cache = Arc::new(Mutex::new(HashMap::new()));
+        let handle = thread::spawn(move || analysis_worker(rx, rtx, cache, inf_cache));
+        (tx, rrx, handle)
+    }
+
+    #[test]
+    fn worker_returns_result_for_single_task() {
+        let (tx, rx, handle) = spawn_worker();
+        let uri = fake_uri("file:///tmp/a.knot");
+        tx.send(AnalysisTask {
+            uri: uri.clone(),
+            source: "x = 1".into(),
+            version: Some(1),
+        })
+        .unwrap();
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker should produce a result");
+        assert_eq!(result.uri, uri);
+        assert_eq!(result.version, Some(1));
+        assert_eq!(result.doc.source, "x = 1");
+
+        drop(tx);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn worker_coalesces_rapid_edits_to_latest() {
+        let (tx, rx, handle) = spawn_worker();
+        let uri = fake_uri("file:///tmp/b.knot");
+        // Three rapid edits within the debounce window — only the latest
+        // should turn into a result.
+        for (i, src) in ["x = 1", "x = 2", "x = 3"].iter().enumerate() {
+            tx.send(AnalysisTask {
+                uri: uri.clone(),
+                source: (*src).into(),
+                version: Some(i as i32 + 1),
+            })
+            .unwrap();
+        }
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker should produce a result");
+        assert_eq!(result.doc.source, "x = 3");
+        assert_eq!(result.version, Some(3));
+
+        // No follow-up result should arrive — the earlier two were dropped.
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+
+        drop(tx);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn worker_keeps_distinct_uris_separate() {
+        let (tx, rx, handle) = spawn_worker();
+        let a = fake_uri("file:///tmp/a.knot");
+        let b = fake_uri("file:///tmp/b.knot");
+        tx.send(AnalysisTask {
+            uri: a.clone(),
+            source: "x = 1".into(),
+            version: Some(1),
+        })
+        .unwrap();
+        tx.send(AnalysisTask {
+            uri: b.clone(),
+            source: "y = 2".into(),
+            version: Some(1),
+        })
+        .unwrap();
+
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            let r = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("worker should produce two results");
+            got.push((r.uri, r.doc.source));
+        }
+        got.sort_by(|x, y| x.0.as_str().cmp(y.0.as_str()));
+        assert_eq!(got[0], (a, "x = 1".into()));
+        assert_eq!(got[1], (b, "y = 2".into()));
+
+        drop(tx);
+        handle.join().unwrap();
+    }
+}

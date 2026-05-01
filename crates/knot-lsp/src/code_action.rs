@@ -624,12 +624,15 @@ pub(crate) fn handle_code_action(
         kept_paths.sort();
         kept_paths.dedup();
 
-        // Only emit the action if something would change
+        // Only emit the action if something would change. Both `first` and
+        // `last` are guaranteed to be `Some` here because the outer
+        // `!doc.module.imports.is_empty()` check holds, but defensively
+        // pattern-match anyway — the cost of a single `if let` is nothing
+        // compared to a panic in the LSP loop.
         let changed = kept_paths != original_paths;
-        if changed && !doc.module.imports.is_empty() {
-            let first_import = &doc.module.imports[0];
-            // Safe: just checked imports.is_empty() above.
-            let last_import = doc.module.imports.last().expect("imports is non-empty");
+        if let (true, Some(first_import), Some(last_import)) =
+            (changed, doc.module.imports.first(), doc.module.imports.last())
+        {
             let import_range = Range {
                 start: offset_to_position(&doc.source, first_import.span.start),
                 end: offset_to_position(&doc.source, last_import.span.end),

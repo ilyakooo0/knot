@@ -17,15 +17,18 @@ pub fn resolve_imports(
     let canonical = source_path
         .canonicalize()
         .unwrap_or_else(|_| source_path.to_path_buf());
-    let mut visited = HashSet::new();
-    visited.insert(canonical.clone());
-    resolve_recursive(module, source_path, &mut visited)
+    let mut in_flight = HashSet::new();
+    in_flight.insert(canonical.clone());
+    let mut imported = HashSet::new();
+    imported.insert(canonical);
+    resolve_recursive(module, source_path, &mut in_flight, &mut imported)
 }
 
 fn resolve_recursive(
     module: &mut ast::Module,
     source_path: &Path,
-    visited: &mut HashSet<PathBuf>,
+    in_flight: &mut HashSet<PathBuf>,
+    imported: &mut HashSet<PathBuf>,
 ) -> Result<(), Vec<String>> {
     if module.imports.is_empty() {
         return Ok(());
@@ -54,14 +57,23 @@ fn resolve_recursive(
             }
         };
 
-        // Cycle detection
-        if !visited.insert(canonical.clone()) {
+        // Cycle detection: only an in-flight import (currently on the
+        // resolution stack) constitutes a cycle. A module that was already
+        // resolved via another sibling import is *not* a cycle — it's a
+        // diamond, and we silently skip the duplicate so its declarations
+        // aren't merged twice.
+        if in_flight.contains(&canonical) {
             errors.push(format!(
                 "import cycle detected: '{}' has already been imported",
                 imp.path
             ));
             continue;
         }
+        if !imported.insert(canonical.clone()) {
+            // Diamond import — already merged via another path.
+            continue;
+        }
+        in_flight.insert(canonical.clone());
 
         // Read and parse the imported file
         let source = match std::fs::read_to_string(&canonical) {
@@ -104,11 +116,14 @@ fn resolve_recursive(
         }
 
         // Recursively resolve imports of the imported module
-        if let Err(sub_errors) = resolve_recursive(
+        let sub_result = resolve_recursive(
             &mut imported_module,
             &canonical,
-            visited,
-        ) {
+            in_flight,
+            imported,
+        );
+        in_flight.remove(&canonical);
+        if let Err(sub_errors) = sub_result {
             errors.extend(sub_errors);
             continue;
         }

@@ -4585,16 +4585,25 @@ impl Infer {
             });
         }
 
-        // fork : IO {} {} -> IO {} {}
-        // Argument must be an IO action. Empty effect set unifies with any
-        // concrete IO type since IO unification merges effect sets.
-        self.bind_top(
-            "fork",
-            Scheme::mono(Ty::Fun(
-                Box::new(Ty::IO(BTreeSet::new(), None, Box::new(Ty::unit()))),
-                Box::new(Ty::IO(BTreeSet::new(), None, Box::new(Ty::unit()))),
-            )),
-        );
+        // fork : ∀a r. IO r a -> IO {} {}
+        // Argument is any IO action (any effects, any result). The spawned
+        // thread runs to completion in the background, so fork's return type
+        // is closed-empty IO {} {} — none of the spawned action's effects
+        // propagate to the caller.
+        {
+            let a = self.fresh_var();
+            let r = self.fresh_var();
+            self.bind_top(
+                "fork",
+                Scheme::poly(
+                    vec![a, r],
+                    Ty::Fun(
+                        Box::new(Ty::IO(BTreeSet::new(), Some(r), Box::new(Ty::Var(a)))),
+                        Box::new(Ty::IO(BTreeSet::new(), None, Box::new(Ty::unit()))),
+                    ),
+                ),
+            );
+        }
 
         // retry : ∀a. a (polymorphic bottom — usable in any context inside atomic)
         let a = self.fresh_var();

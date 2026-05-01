@@ -208,3 +208,76 @@ pub(crate) fn handle_rename(
         ..Default::default()
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestWorkspace;
+    use crate::utils::offset_to_position;
+
+    fn rename_params(uri: &Uri, position: Position, new_name: &str) -> RenameParams {
+        RenameParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position,
+            },
+            new_name: new_name.to_string(),
+            work_done_progress_params: Default::default(),
+        }
+    }
+
+    fn prepare_params(uri: &Uri, position: Position) -> TextDocumentPositionParams {
+        TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            position,
+        }
+    }
+
+    #[test]
+    fn prepare_rename_accepts_known_symbol() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "id = \\x -> x\nmain = id 5\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("id =").expect("id def");
+        let pos = offset_to_position(&doc.source, off);
+        let resp = handle_prepare_rename(&ws.state, &prepare_params(&uri, pos))
+            .expect("prepare rename accepts");
+        match resp {
+            PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. } => {
+                assert_eq!(placeholder, "id");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prepare_rename_rejects_keyword_position() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "id = \\x -> x\n");
+        let doc = ws.doc(&uri);
+        // Cursor on the lambda backslash — not a renameable symbol.
+        let off = doc.source.find('\\').expect("lambda");
+        let pos = offset_to_position(&doc.source, off);
+        let resp = handle_prepare_rename(&ws.state, &prepare_params(&uri, pos));
+        assert!(resp.is_none(), "unexpected accept: {resp:?}");
+    }
+
+    #[test]
+    fn rename_emits_edits_for_decl_and_usages() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            "double = \\x -> x * 2\nmain = println (show (double 21))\n",
+        );
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("double =").expect("def");
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "doubled"))
+            .expect("rename emits edit");
+        let changes = edit.changes.expect("changes present");
+        let edits = changes.get(&uri).expect("edits for main");
+        // Decl + one usage = 2 edits at minimum.
+        assert!(edits.len() >= 2, "got: {edits:?}");
+        assert!(edits.iter().all(|e| e.new_text == "doubled"));
+    }
+}

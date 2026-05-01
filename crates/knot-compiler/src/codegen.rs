@@ -6891,7 +6891,7 @@ impl Codegen {
                         builder.ins().jump(header, &[zero.into()]);
                         builder.switch_to_block(header);
                         let i = builder.append_block_param(header, self.ptr_type);
-                        let cond = builder.ins().icmp(IntCC::SignedLessThan, i, len);
+                        let cond = builder.ins().icmp(IntCC::UnsignedLessThan, i, len);
                         builder.ins().brif(cond, body, &[], exit, &[]);
                         builder.switch_to_block(body);
                         builder.seal_block(body);
@@ -7099,7 +7099,7 @@ impl Codegen {
                     builder.switch_to_block(header);
                     let i = builder.append_block_param(header, self.ptr_type);
                     let cond =
-                        builder.ins().icmp(IntCC::SignedLessThan, i, len);
+                        builder.ins().icmp(IntCC::UnsignedLessThan, i, len);
                     builder.ins().brif(cond, body, &[], exit, &[]);
 
                     builder.switch_to_block(body);
@@ -7366,7 +7366,7 @@ impl Codegen {
                     let g_i = builder.append_block_param(g_header, self.ptr_type);
                     let g_cond = builder
                         .ins()
-                        .icmp(IntCC::SignedLessThan, g_i, groups_len);
+                        .icmp(IntCC::UnsignedLessThan, g_i, groups_len);
                     builder
                         .ins()
                         .brif(g_cond, g_body, &[], g_exit, &[]);

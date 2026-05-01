@@ -303,3 +303,61 @@ fn format_schema_from_type_str(type_str: &str) -> String {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestWorkspace;
+    use crate::utils::offset_to_position;
+
+    fn hover_params(uri: &Uri, position: Position) -> HoverParams {
+        HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+        }
+    }
+
+    fn hover_text(hover: Hover) -> String {
+        match hover.contents {
+            HoverContents::Scalar(MarkedString::String(s)) => s,
+            HoverContents::Scalar(MarkedString::LanguageString(ls)) => ls.value,
+            HoverContents::Markup(m) => m.value,
+            HoverContents::Array(items) => items
+                .into_iter()
+                .map(|i| match i {
+                    MarkedString::String(s) => s,
+                    MarkedString::LanguageString(ls) => ls.value,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+
+    #[test]
+    fn hover_shows_inferred_type_for_function() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "id = \\x -> x\nmain = println (show (id 42))\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("id =").expect("def");
+        let pos = offset_to_position(&doc.source, off);
+        let hover = handle_hover(&ws.state, &hover_params(&uri, pos)).expect("hover");
+        let text = hover_text(hover);
+        assert!(
+            text.contains("id"),
+            "hover should mention symbol; got: {text}"
+        );
+    }
+
+    #[test]
+    fn hover_returns_none_for_blank_position() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "main = println \"hi\"\n");
+        // Position past end of line — no symbol there.
+        let pos = Position::new(5, 5);
+        let resp = handle_hover(&ws.state, &hover_params(&uri, pos));
+        assert!(resp.is_none());
+    }
+}
+

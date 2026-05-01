@@ -112,7 +112,10 @@ impl TypeEnv {
                             name.clone(),
                             ResolvedType::Record(fields.clone()),
                         );
-                        constructors.insert(ctor.name.clone(), fields);
+                        // First-wins: a duplicate ctor name across data types
+                        // is reported as an error in inference; here we just
+                        // need a consistent view of "the" Circle.
+                        constructors.entry(ctor.name.clone()).or_insert(fields);
                     } else {
                         // Multi-variant: register each constructor and create Adt alias
                         let mut adt_ctors = Vec::new();
@@ -131,7 +134,9 @@ impl TypeEnv {
                                     )
                                 })
                                 .collect();
-                            constructors.insert(ctor.name.clone(), fields.clone());
+                            constructors
+                                .entry(ctor.name.clone())
+                                .or_insert_with(|| fields.clone());
                             adt_ctors.push((ctor.name.clone(), fields));
                         }
                         aliases.insert(name.clone(), ResolvedType::Adt(adt_ctors));

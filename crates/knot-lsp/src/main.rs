@@ -43,7 +43,7 @@ use crate::state::{
 use crate::type_format::{format_type_kind, format_type_scheme};
 use crate::utils::{
     edit_distance, find_word_in_source, offset_to_position, path_to_uri, position_to_offset,
-    recurse_expr, span_to_range, uri_to_path, word_at_position,
+    recurse_expr, safe_slice, span_to_range, uri_to_path, word_at_position,
 };
 
 // ── Entry point ─────────────────────────────────────────────────────
@@ -1164,7 +1164,7 @@ fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<Hover> {
         .iter()
         .find(|(span, _)| span.start <= offset && offset < span.end)
     {
-        let source_text = &doc.source[span.start..span.end];
+        let source_text = safe_slice(&doc.source, *span);
         let detail = format!("{source_text} : {ty}");
         return Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
@@ -2367,7 +2367,7 @@ fn handle_references(
         }
 
         for (usage_span, target_span) in &other_doc.references {
-            let target_name = &other_doc.source[target_span.start..target_span.end.min(other_doc.source.len())];
+            let target_name = safe_slice(&other_doc.source, *target_span);
             if other_doc.definitions.get(&symbol_name) == Some(target_span) {
                 locations.push(Location {
                     uri: other_uri.clone(),
@@ -2468,7 +2468,7 @@ fn handle_rename(
     let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
 
     // Rename at definition site in current doc
-    let def_text = &doc.source[def_span.start..def_span.end];
+    let def_text = safe_slice(&doc.source, def_span);
     if let Some(name_start) = def_text.find(old_name) {
         let name_span = Span::new(def_span.start + name_start, def_span.start + name_start + old_name.len());
         changes.entry(uri.clone()).or_default().push(TextEdit {
@@ -2499,7 +2499,7 @@ fn handle_rename(
         }
         // Rename definition if it exists in this doc
         if let Some(other_def) = other_doc.definitions.get(&symbol_name) {
-            let def_text = &other_doc.source[other_def.start..other_def.end.min(other_doc.source.len())];
+            let def_text = safe_slice(&other_doc.source, *other_def);
             if let Some(name_start) = def_text.find(old_name) {
                 let name_span = Span::new(other_def.start + name_start, other_def.start + name_start + old_name.len());
                 changes.entry(other_uri.clone()).or_default().push(TextEdit {
@@ -2510,7 +2510,7 @@ fn handle_rename(
         }
         // Rename usages
         for (usage_span, target_span) in &other_doc.references {
-            let target_name = &other_doc.source[target_span.start..target_span.end.min(other_doc.source.len())];
+            let target_name = safe_slice(&other_doc.source, *target_span);
             if other_doc.definitions.get(&symbol_name) == Some(target_span) || target_name == symbol_name {
                 changes.entry(other_uri.clone()).or_default().push(TextEdit {
                     range: span_to_range(*usage_span, &other_doc.source),
@@ -2555,8 +2555,7 @@ fn handle_rename(
 
                 // Rename at definition sites
                 if let Some(def_span) = defs.get(&symbol_name) {
-                    let def_text =
-                        &file_source[def_span.start..def_span.end.min(file_source.len())];
+                    let def_text = safe_slice(&file_source, *def_span);
                     if let Some(name_start) = def_text.find(old_name) {
                         let name_span = Span::new(
                             def_span.start + name_start,
@@ -2617,9 +2616,9 @@ fn handle_inlay_hint(
         match &decl.node {
             DeclKind::Fun { name, ty: None, .. } => {
                 if let Some(inferred) = doc.type_info.get(name) {
-                    let decl_text = &doc.source[decl.span.start..decl.span.end.min(doc.source.len())];
+                    let decl_text = safe_slice(&doc.source, decl.span);
                     let name_end = decl_text.find(|c: char| !c.is_alphanumeric() && c != '_')
-                        .unwrap_or(name.len());
+                        .unwrap_or(decl_text.len());
                     let hint_offset = decl.span.start + name_end;
                     let hint_pos = offset_to_position(&doc.source, hint_offset);
                     hints.push(InlayHint {
@@ -2666,8 +2665,8 @@ fn handle_inlay_hint(
             }
             DeclKind::View { name, ty: None, .. } | DeclKind::Derived { name, ty: None, .. } => {
                 if let Some(inferred) = doc.type_info.get(name) {
-                    let decl_text = &doc.source[decl.span.start..decl.span.end.min(doc.source.len())];
-                    let name_end = decl_text.find('=').unwrap_or(name.len() + 1);
+                    let decl_text = safe_slice(&doc.source, decl.span);
+                    let name_end = decl_text.find('=').unwrap_or(decl_text.len());
                     let hint_offset = decl.span.start + name_end;
                     let hint_pos = offset_to_position(&doc.source, hint_offset);
                     hints.push(InlayHint {
@@ -2844,11 +2843,11 @@ fn add_unit_literal_hints(
 }
 
 /// Find the byte offset just after the function name within its declaration span.
-fn name_end_offset(source: &str, decl_span: Span, name: &str) -> usize {
-    let decl_text = &source[decl_span.start..decl_span.end.min(source.len())];
+fn name_end_offset(source: &str, decl_span: Span, _name: &str) -> usize {
+    let decl_text = safe_slice(source, decl_span);
     let name_end = decl_text
         .find(|c: char| !c.is_alphanumeric() && c != '_')
-        .unwrap_or(name.len());
+        .unwrap_or(decl_text.len());
     decl_span.start + name_end
 }
 
@@ -4581,8 +4580,7 @@ fn handle_code_action(
         match &decl.node {
             DeclKind::View { name, ty: None, .. } | DeclKind::Derived { name, ty: None, .. } => {
                 if let Some(inferred) = doc.type_info.get(name) {
-                    let decl_text =
-                        &doc.source[decl.span.start..decl.span.end.min(doc.source.len())];
+                    let decl_text = safe_slice(&doc.source, decl.span);
                     if let Some(eq_pos) = decl_text.find('=') {
                         let insert_offset = decl.span.start + eq_pos;
                         let insert_pos = offset_to_position(&doc.source, insert_offset);
@@ -4755,9 +4753,7 @@ fn handle_code_action(
             // runs outside the transaction.
             if msg.contains("IO effects are not allowed inside atomic") {
                 if let Some(call_span) = find_io_call_in_range(&doc, diag_offset) {
-                    let inner_text =
-                        doc.source[call_span.start..call_span.end.min(doc.source.len())]
-                            .to_string();
+                    let inner_text = safe_slice(&doc.source, call_span).to_string();
                     let mut changes = HashMap::new();
                     changes.insert(
                         uri.clone(),
@@ -5088,7 +5084,7 @@ fn handle_code_action(
                     .iter()
                     .map(|p| pat_to_string(p, &doc.source))
                     .collect();
-                let body_text = &doc.source[lam_body.span.start..lam_body.span.end.min(doc.source.len())];
+                let body_text = safe_slice(&doc.source, lam_body.span);
 
                 let mut changes = HashMap::new();
                 changes.insert(

@@ -97,6 +97,28 @@ pub fn word_at_position<'a>(source: &'a str, pos: Position) -> Option<&'a str> {
     Some(&source[start..end])
 }
 
+/// Slice `source` by `span` without panicking on stale or out-of-bounds spans.
+///
+/// Spans recorded during a previous analysis can outlive the source they
+/// point into when an edit truncates the document. Clamping both endpoints
+/// (and snapping to char boundaries) keeps such spans safe to read instead
+/// of taking down the LSP.
+pub fn safe_slice<'a>(source: &'a str, span: Span) -> &'a str {
+    let len = source.len();
+    let mut start = span.start.min(len);
+    let mut end = span.end.min(len);
+    if start > end {
+        start = end;
+    }
+    while start < len && !source.is_char_boundary(start) {
+        start += 1;
+    }
+    while end < len && !source.is_char_boundary(end) {
+        end += 1;
+    }
+    &source[start..end]
+}
+
 // ── URIs ────────────────────────────────────────────────────────────
 
 pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {

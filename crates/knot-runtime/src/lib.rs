@@ -6099,19 +6099,30 @@ pub extern "C" fn knot_relation_avg(
     if rows.is_empty() {
         return alloc_float(0.0);
     }
+    // Kahan compensated summation: keeps the running sum accurate even when
+    // the magnitudes of `total` and individual addends differ by many orders
+    // of magnitude (e.g., averaging a million large unit-int values into a
+    // single Float). Without compensation, low-order bits of small values
+    // are dropped once `total` grows large, so `avg` would skew toward the
+    // first few inputs.
     let mut total = 0.0f64;
+    let mut comp = 0.0f64; // running compensation for lost low bits
     let count = rows.len();
     for &row in rows {
         let val = knot_value_call(db, f, row);
-        match unsafe { as_ref(val) } {
-            Value::Int(n) => total += bigint_to_f64(n),
-            Value::SmallInt(n) => total += *n as f64,
-            Value::Float(n) => total += n,
+        let x = match unsafe { as_ref(val) } {
+            Value::Int(n) => bigint_to_f64(n),
+            Value::SmallInt(n) => *n as f64,
+            Value::Float(n) => *n,
             _ => panic!(
                 "knot runtime: avg projection must return Int or Float, got {}",
                 type_name(val)
             ),
-        }
+        };
+        let y = x - comp;
+        let t = total + y;
+        comp = (t - total) - y;
+        total = t;
     }
     alloc_float(total / count as f64)
 }
@@ -6370,15 +6381,34 @@ pub extern "C" fn knot_text_to_bytes(v: *mut Value) -> *mut Value {
     }
 }
 
-/// bytesToText(bytes) — decode UTF-8 bytes to text
+/// Build `Just {value: payload}` for the built-in `Maybe a` ADT.
+fn make_just(payload: *mut Value) -> *mut Value {
+    let tag = intern_str("Just");
+    let inner = alloc(Value::Record(vec![RecordField {
+        name: intern_str("value"),
+        value: payload,
+    }]));
+    alloc(Value::Constructor(tag, inner))
+}
+
+/// Build `Nothing {}` for the built-in `Maybe a` ADT.
+fn make_nothing() -> *mut Value {
+    let tag = intern_str("Nothing");
+    let inner = alloc(Value::Record(Vec::new()));
+    alloc(Value::Constructor(tag, inner))
+}
+
+/// bytesToText(bytes) — decode UTF-8 bytes to text. Returns `Maybe Text`:
+/// `Just {value: text}` on success, `Nothing {}` if the bytes aren't valid
+/// UTF-8. Wrong-type input (caller bug — should be unreachable from
+/// well-typed Knot code) still panics.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_bytes_to_text(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
-        Value::Bytes(b) => {
-            let s = std::str::from_utf8(b)
-                .unwrap_or_else(|e| panic!("knot runtime: bytesToText: invalid UTF-8: {}", e));
-            alloc(Value::Text(Arc::from(s)))
-        }
+        Value::Bytes(b) => match std::str::from_utf8(b) {
+            Ok(s) => make_just(alloc(Value::Text(Arc::from(s)))),
+            Err(_) => make_nothing(),
+        },
         _ => panic!("knot runtime: bytesToText expected Bytes, got {}", type_name(v)),
     }
 }
@@ -6399,26 +6429,25 @@ pub extern "C" fn knot_bytes_to_hex(v: *mut Value) -> *mut Value {
     }
 }
 
-/// bytesFromHex(text) — decode hex string to bytes
+/// bytesFromHex(text) — decode hex string to bytes. Returns `Maybe Bytes`:
+/// `Just {value: bytes}` on success, `Nothing {}` if the input is non-ASCII,
+/// odd-length, or contains non-hex characters. Wrong-type input still panics.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_bytes_from_hex(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Text(s) => {
             let s = s.trim();
-            if !s.is_ascii() {
-                panic!("knot runtime: bytesFromHex: input contains non-ASCII characters");
+            if !s.is_ascii() || s.len() % 2 != 0 {
+                return make_nothing();
             }
-            if s.len() % 2 != 0 {
-                panic!("knot runtime: bytesFromHex: odd-length hex string");
+            let mut bytes: Vec<u8> = Vec::with_capacity(s.len() / 2);
+            for i in (0..s.len()).step_by(2) {
+                match u8::from_str_radix(&s[i..i + 2], 16) {
+                    Ok(b) => bytes.push(b),
+                    Err(_) => return make_nothing(),
+                }
             }
-            let bytes: Vec<u8> = (0..s.len())
-                .step_by(2)
-                .map(|i| {
-                    u8::from_str_radix(&s[i..i + 2], 16)
-                        .unwrap_or_else(|_| panic!("knot runtime: bytesFromHex: invalid hex at position {}", i))
-                })
-                .collect();
-            alloc(Value::Bytes(Arc::from(bytes)))
+            make_just(alloc(Value::Bytes(Arc::from(bytes))))
         }
         _ => panic!("knot runtime: bytesFromHex expected Text, got {}", type_name(v)),
     }

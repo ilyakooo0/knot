@@ -4036,6 +4036,17 @@ impl Infer {
                         .iter()
                         .map(|f| (f.name.clone(), f.value.clone()))
                         .collect();
+                    // NOTE: distinct ADTs may legally share a constructor name —
+                    // see CLAUDE.md "Constructor patterns in case and do-bind
+                    // create open variant types" and the regression tests
+                    // `case_pattern_infers_open_variant` /
+                    // `open_variant_applied_to_multiple_adts`. Row-polymorphic
+                    // variants depend on this; an error here would forbid the
+                    // documented feature. The later registration *replaces* the
+                    // earlier in `self.constructors` so closed-variant lookups
+                    // resolve to the most recent definition; open-variant
+                    // dispatch goes through `knot_constructor_matches` at
+                    // runtime which doesn't depend on this map.
                     self.constructors.insert(
                         ctor.name.clone(),
                         CtorInfo {
@@ -5149,26 +5160,36 @@ impl Infer {
             Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Bytes))),
         );
 
-        // bytesToText : Bytes -> Text
+        // bytesToText : Bytes -> Maybe Text  (Nothing on invalid UTF-8)
         self.bind_top(
             "bytesToText",
-            Scheme::mono(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Text))),
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Bytes),
+                Box::new(Ty::Con("Maybe".into(), vec![Ty::Text])),
+            )),
         );
 
-        // bytesToHex : Bytes -> Text
+        // bytesToHex : Bytes -> Text  (always succeeds)
         self.bind_top(
             "bytesToHex",
             Scheme::mono(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Text))),
         );
 
-        // bytesFromHex / hexDecode : Text -> Bytes
+        // bytesFromHex / hexDecode : Text -> Maybe Bytes  (Nothing on
+        // odd-length / non-hex / non-ASCII input)
         self.bind_top(
             "bytesFromHex",
-            Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Bytes))),
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Text),
+                Box::new(Ty::Con("Maybe".into(), vec![Ty::Bytes])),
+            )),
         );
         self.bind_top(
             "hexDecode",
-            Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Bytes))),
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Text),
+                Box::new(Ty::Con("Maybe".into(), vec![Ty::Bytes])),
+            )),
         );
 
         // bytesGet : ∀u1 u2. Int<u1> -> Bytes -> Int<u2>

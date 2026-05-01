@@ -11103,6 +11103,24 @@ fn string_to_value(s: &str, ty: &str) -> *mut Value {
     }
 }
 
+/// Strict variant of `string_to_value`: returns `None` when `s` does not
+/// parse as `ty`. Used for HTTP path and query parameters so the server can
+/// reply with a 400 instead of silently coercing `"abc"` to `0` (which would
+/// hide caller bugs and let malformed traffic through unannotated).
+fn try_string_to_value(s: &str, ty: &str) -> Option<*mut Value> {
+    match ty {
+        "int" => s.parse::<BigInt>().ok().map(alloc_int),
+        "float" => s.parse::<f64>().ok().map(alloc_float),
+        "bool" => match s {
+            "true" | "True" => Some(alloc_bool(true)),
+            "false" | "False" => Some(alloc_bool(false)),
+            _ => None,
+        },
+        "tag" => Some(alloc(Value::Constructor(intern_str(s), alloc(Value::Unit)))),
+        _ => Some(alloc(Value::Text(Arc::from(s)))),
+    }
+}
+
 /// Coerce a JSON-parsed value to match the expected field type.
 /// JSON strings become Constructors for "tag"-typed fields (all-nullary ADTs).
 fn coerce_json_field(v: *mut Value, ty: &str) -> *mut Value {
@@ -11580,9 +11598,16 @@ pub extern "C" fn knot_http_listen(
                                 _ => None,
                             })
                             .unwrap_or("text");
+                        let value = match try_string_to_value(val, ty) {
+                            Some(v) => v,
+                            None => return Err((400, format!(
+                                "invalid path parameter '{}': '{}' is not a valid {}",
+                                name, val, ty
+                            ))),
+                        };
                         fields.push(RecordField {
                             name: intern_str(name),
-                            value: string_to_value(val, ty),
+                            value,
                         });
                     }
 
@@ -11595,7 +11620,13 @@ pub extern "C" fn knot_http_listen(
                         let value = if is_maybe {
                             match raw_val {
                                 Some(v) => {
-                                    let inner = string_to_value(v, inner_ty);
+                                    let inner = match try_string_to_value(v, inner_ty) {
+                                        Some(iv) => iv,
+                                        None => return Err((400, format!(
+                                            "invalid query parameter '{}': '{}' is not a valid {}",
+                                            qname, v, inner_ty
+                                        ))),
+                                    };
                                     alloc(Value::Constructor(
                                         "Just".into(),
                                         alloc(Value::Record(vec![
@@ -11606,7 +11637,14 @@ pub extern "C" fn knot_http_listen(
                                 None => alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit))),
                             }
                         } else {
-                            string_to_value(raw_val.unwrap_or(""), inner_ty)
+                            let raw = raw_val.unwrap_or("");
+                            match try_string_to_value(raw, inner_ty) {
+                                Some(v) => v,
+                                None => return Err((400, format!(
+                                    "invalid query parameter '{}': '{}' is not a valid {}",
+                                    qname, raw, inner_ty
+                                ))),
+                            }
                         };
                         fields.push(RecordField {
                             name: intern_str(qname),

@@ -6,6 +6,14 @@ use lsp_types::*;
 use crate::state::ServerState;
 use crate::utils::offset_to_position;
 
+/// UTF-16 code-unit length of a string slice — what LSP `Position::character`
+/// requires (LSP defaults to UTF-16, and this server doesn't negotiate
+/// `positionEncodingKind`). Using `str::len()` would emit byte counts, which
+/// are wrong for any line containing non-ASCII characters.
+fn utf16_len(s: &str) -> u32 {
+    s.chars().map(|c| c.len_utf16() as u32).sum()
+}
+
 // ── Document Formatting ─────────────────────────────────────────────
 
 pub(crate) fn handle_formatting(
@@ -125,7 +133,7 @@ pub(crate) fn handle_formatting(
 
     // Replace entire document
     let last_line = lines.len().saturating_sub(1) as u32;
-    let last_col = lines.last().map_or(0, |l| l.len()) as u32;
+    let last_col = lines.last().map_or(0, |l| utf16_len(l));
     Some(vec![TextEdit {
         range: Range {
             start: Position::new(0, 0),
@@ -254,7 +262,7 @@ pub(crate) fn handle_range_formatting(
             edits.push(TextEdit {
                 range: Range {
                     start: Position::new(i as u32, 0),
-                    end: Position::new(i as u32, line.len() as u32),
+                    end: Position::new(i as u32, utf16_len(line)),
                 },
                 new_text: trimmed.to_string(),
             });
@@ -284,8 +292,8 @@ pub(crate) fn handle_range_formatting(
         if trimmed.len() != line.len() {
             edits.push(TextEdit {
                 range: Range {
-                    start: Position::new(i as u32, trimmed.len() as u32),
-                    end: Position::new(i as u32, line.len() as u32),
+                    start: Position::new(i as u32, utf16_len(trimmed)),
+                    end: Position::new(i as u32, utf16_len(line)),
                 },
                 new_text: String::new(),
             });

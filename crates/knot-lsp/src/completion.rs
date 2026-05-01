@@ -13,8 +13,8 @@ use knot_compiler::infer::MonadKind;
 use crate::analysis::get_or_parse_file_shared;
 use crate::builtins::ATOMIC_DISALLOWED_BUILTINS;
 use crate::shared::{
-    extract_record_fields, find_enclosing_atomic_expr, format_route_constructor_hover,
-    predicate_to_source, scan_knot_files,
+    collect_lambda_param_names, extract_record_fields, find_enclosing_atomic_expr,
+    format_route_constructor_hover, predicate_to_source, scan_knot_files,
 };
 use crate::state::{
     builtins as state_builtins, DocumentState, ServerState, KEYWORDS, SNIPPETS,
@@ -228,10 +228,13 @@ pub(crate) fn handle_completion(
                     ..Default::default()
                 });
                 for ctor in constructors {
+                    let snippet = build_constructor_snippet(&ctor.name, &ctor.fields);
                     items.push(CompletionItem {
                         label: ctor.name.clone(),
                         kind: Some(CompletionItemKind::ENUM_MEMBER),
                         detail: doc.details.get(&ctor.name).cloned(),
+                        insert_text: snippet,
+                        insert_text_format: Some(InsertTextFormat::SNIPPET),
                         ..Default::default()
                     });
                 }
@@ -263,10 +266,13 @@ pub(crate) fn handle_completion(
                 });
             }
             DeclKind::Fun { name, .. } => {
+                let snippet = build_function_call_snippet(&doc.module, name);
                 items.push(CompletionItem {
                     label: name.clone(),
                     kind: Some(CompletionItemKind::FUNCTION),
                     detail: doc.type_info.get(name.as_str()).cloned(),
+                    insert_text: snippet,
+                    insert_text_format: Some(InsertTextFormat::SNIPPET),
                     ..Default::default()
                 });
             }
@@ -282,12 +288,19 @@ pub(crate) fn handle_completion(
         }
     }
 
-    // Built-in functions with type info
+    // Built-in functions with type info. Synthesize a snippet from the
+    // arity recorded in `type_info` so users get tab stops on call.
     for name in state_builtins() {
+        let detail = doc.type_info.get(name).cloned();
+        let snippet = detail
+            .as_deref()
+            .and_then(|ty| build_builtin_call_snippet(name, ty));
         items.push(CompletionItem {
             label: name.to_string(),
             kind: Some(CompletionItemKind::FUNCTION),
-            detail: doc.type_info.get(name).cloned(),
+            detail,
+            insert_text: snippet,
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
             ..Default::default()
         });
     }
@@ -778,6 +791,83 @@ fn data_constructor_summary(module: &Module, name: &str) -> Option<String> {
         }
     }
     None
+}
+
+// ── Snippet builders ────────────────────────────────────────────────
+
+/// Build a snippet expansion for a constructor call. With fields, expands to
+/// `Ctor {field1: $1, field2: $2}` so users can tab through. Without fields,
+/// returns `None` so the plain label is used.
+fn build_constructor_snippet(name: &str, fields: &[ast::Field<ast::Type>]) -> Option<String> {
+    if fields.is_empty() {
+        return None;
+    }
+    let placeholders: Vec<String> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| format!("{}: ${{{}:{}}}", f.name, i + 1, f.name))
+        .collect();
+    Some(format!("{name} {{{}}}", placeholders.join(", ")))
+}
+
+/// Build a snippet expansion for a function call. Walks the function's lambda
+/// chain to recover parameter names; if none are found (e.g. eta-reduced
+/// function defined as a non-lambda value), returns `None`.
+fn build_function_call_snippet(module: &ast::Module, name: &str) -> Option<String> {
+    let params = module.decls.iter().find_map(|decl| match &decl.node {
+        DeclKind::Fun {
+            name: n,
+            body: Some(body),
+            ..
+        } if n == name => Some(collect_lambda_param_names(body)),
+        _ => None,
+    })?;
+    if params.is_empty() {
+        return None;
+    }
+    let placeholders: Vec<String> = params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| format!("${{{}:{}}}", i + 1, p))
+        .collect();
+    Some(format!("{name} {}", placeholders.join(" ")))
+}
+
+/// Build a snippet expansion for a built-in call. We don't have parameter
+/// names for builtins, so we emit `arg1`, `arg2`, … placeholders sized to
+/// the type's arrow arity. Returns `None` for nullary builtins.
+fn build_builtin_call_snippet(name: &str, ty: &str) -> Option<String> {
+    let arity = arrow_arity(ty);
+    if arity == 0 {
+        return None;
+    }
+    let placeholders: Vec<String> = (0..arity)
+        .map(|i| format!("${{{}:arg{}}}", i + 1, i + 1))
+        .collect();
+    Some(format!("{name} {}", placeholders.join(" ")))
+}
+
+/// Count top-level `->` arrows in a type string. Mirrors the cheap split done
+/// by `parse_function_params`, but doesn't allocate the per-param strings.
+fn arrow_arity(ty: &str) -> usize {
+    let mut depth = 0i32;
+    let mut count = 0usize;
+    let bytes = ty.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' | b'<' => depth += 1,
+            b')' | b']' | b'}' | b'>' => depth -= 1,
+            b'-' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'>' => {
+                count += 1;
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    count
 }
 
 // ── Import Path Completion ──────────────────────────────────────────

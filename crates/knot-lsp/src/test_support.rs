@@ -15,7 +15,7 @@ use lsp_types::{Position, Range, Uri};
 
 use crate::analysis::analyze_document;
 use crate::state::{
-    DocumentState, ServerState, WorkspaceSymbolCache,
+    DocumentState, ServerConfig, ServerState, WorkspaceSymbolCache,
 };
 use crate::utils::offset_to_position;
 
@@ -36,6 +36,8 @@ impl TestWorkspace {
         let state = ServerState {
             documents: HashMap::new(),
             workspace_root: None,
+            workspace_roots: Vec::new(),
+            config: ServerConfig::default(),
             import_cache: Arc::new(Mutex::new(HashMap::new())),
             workspace_diag_cache: HashMap::new(),
             workspace_symbol_cache: WorkspaceSymbolCache::default(),

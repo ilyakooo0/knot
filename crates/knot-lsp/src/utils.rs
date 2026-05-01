@@ -74,6 +74,19 @@ pub fn position_to_offset(source: &str, pos: Position) -> usize {
 
 pub fn word_at_position<'a>(source: &'a str, pos: Position) -> Option<&'a str> {
     let offset = position_to_offset(source, pos);
+    let (start, end) = word_bounds_at_offset(source, offset)?;
+    Some(&source[start..end])
+}
+
+/// Like `word_at_position`, but returns the (start, end) byte span of the word
+/// covering `offset`. Used by hover to populate the response range so editors
+/// can highlight the hovered identifier.
+pub fn word_span_at_offset(source: &str, offset: usize) -> Option<Span> {
+    let (start, end) = word_bounds_at_offset(source, offset)?;
+    Some(Span::new(start, end))
+}
+
+fn word_bounds_at_offset(source: &str, offset: usize) -> Option<(usize, usize)> {
     let bytes = source.as_bytes();
     if offset >= bytes.len() {
         return None;
@@ -95,7 +108,7 @@ pub fn word_at_position<'a>(source: &'a str, pos: Position) -> Option<&'a str> {
         .find(|&i| !is_ident(bytes[i]))
         .unwrap_or(bytes.len());
 
-    Some(&source[start..end])
+    Some((start, end))
 }
 
 /// Slice `source` by `span` without panicking on stale or out-of-bounds spans.

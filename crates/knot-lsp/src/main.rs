@@ -68,7 +68,8 @@ use crate::selection_range::handle_selection_range;
 use crate::semantic_tokens::handle_semantic_tokens_full;
 use crate::signature_help::handle_signature_help;
 use crate::state::{
-    send_response, AnalysisResult, AnalysisTask, PendingSource, ServerState, WorkspaceSymbolCache,
+    send_response, AnalysisResult, AnalysisTask, PendingSource, ServerConfig, ServerState,
+    WorkspaceSymbolCache,
 };
 use crate::utils::{position_to_offset, uri_to_path};
 use crate::workspace_diagnostics::{handle_workspace_diagnostics, prune_stale_workspace_diag_cache};
@@ -142,6 +143,16 @@ fn main() {
             workspace_diagnostics: true,
             work_done_progress_options: Default::default(),
         })),
+        // Advertise multi-folder support and lifecycle notifications. Without
+        // this, editors send us only the first folder's URI in initialize and
+        // never report subsequent folder add/remove events.
+        workspace: Some(WorkspaceServerCapabilities {
+            workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                supported: Some(true),
+                change_notifications: Some(OneOf::Left(true)),
+            }),
+            file_operations: None,
+        }),
         ..Default::default()
     })
     .expect("server capabilities are static and always serialize cleanly");
@@ -156,13 +167,25 @@ fn main() {
 
     eprintln!("knot-lsp initialized");
 
-    let workspace_root = serde_json::from_value::<lsp_types::InitializeParams>(init_params)
-        .ok()
-        .and_then(|p| {
-            p.workspace_folders
-                .and_then(|folders| folders.into_iter().next().map(|f| f.uri))
+    let parsed_init = serde_json::from_value::<lsp_types::InitializeParams>(init_params).ok();
+    let workspace_roots: Vec<PathBuf> = parsed_init
+        .as_ref()
+        .and_then(|p| p.workspace_folders.as_ref())
+        .map(|folders| {
+            folders
+                .iter()
+                .filter_map(|f| uri_to_path(&f.uri))
+                .collect()
         })
-        .and_then(|u| uri_to_path(&u));
+        .unwrap_or_default();
+    let workspace_root = workspace_roots.first().cloned();
+    let mut config = ServerConfig::default();
+    if let Some(opts) = parsed_init
+        .as_ref()
+        .and_then(|p| p.initialization_options.as_ref())
+    {
+        config.merge_from_json(opts);
+    }
 
     // Spawn the analysis worker. It owns no per-request state of its own —
     // the import cache is shared (Arc<Mutex>) so the main thread can read it
@@ -188,6 +211,8 @@ fn main() {
     let mut state = ServerState {
         documents: HashMap::new(),
         workspace_root,
+        workspace_roots,
+        config,
         import_cache,
         workspace_diag_cache: HashMap::new(),
         workspace_symbol_cache: WorkspaceSymbolCache::default(),
@@ -566,6 +591,46 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
         if let Err(e) = conn.sender.send(Message::Notification(not)) {
             eprintln!("knot-lsp: failed to publish empty diagnostics on close: {e}");
         }
+    } else if not.method == notification::DidChangeConfiguration::METHOD {
+        // Apply runtime config changes (tab size, inlay-hint toggles, cache
+        // bounds). Refresh inlay hints since their visibility may have flipped.
+        let Some(params) =
+            decode::<DidChangeConfigurationParams>(&not.method, not.params)
+        else {
+            return;
+        };
+        state.config.merge_from_json(&params.settings);
+        // Best-effort hint-refresh request. The client may not honor it, but
+        // sending it is the standard way to invalidate stale hints.
+        let refresh = Request::new(
+            RequestId::from("inlay-hint-refresh".to_string()),
+            "workspace/inlayHint/refresh".into(),
+            serde_json::Value::Null,
+        );
+        let _ = conn.sender.send(Message::Request(refresh));
+    } else if not.method == notification::DidChangeWorkspaceFolders::METHOD {
+        let Some(params) =
+            decode::<DidChangeWorkspaceFoldersParams>(&not.method, not.params)
+        else {
+            return;
+        };
+        // Apply added/removed folders. We rebuild `workspace_roots` from the
+        // delta so the order roughly mirrors editor presentation order.
+        let removed: HashSet<PathBuf> = params
+            .event
+            .removed
+            .iter()
+            .filter_map(|f| uri_to_path(&f.uri))
+            .collect();
+        state.workspace_roots.retain(|p| !removed.contains(p));
+        for added in &params.event.added {
+            if let Some(path) = uri_to_path(&added.uri) {
+                if !state.workspace_roots.contains(&path) {
+                    state.workspace_roots.push(path);
+                }
+            }
+        }
+        state.workspace_root = state.workspace_roots.first().cloned();
     }
 }
 

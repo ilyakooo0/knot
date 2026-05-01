@@ -119,7 +119,18 @@ pub struct DocumentState {
 
 pub struct ServerState {
     pub documents: HashMap<Uri, DocumentState>,
+    /// First (primary) workspace folder. Kept for handlers that only need a
+    /// single root — most workspace scans do, since `.knot` files are
+    /// typically rooted at one folder per project.
     pub workspace_root: Option<PathBuf>,
+    /// All workspace folders the editor handed us (LSP supports multi-root).
+    /// Handlers that walk the whole workspace (workspace symbol, auto-import
+    /// completion, workspace diagnostics) should iterate this list so users
+    /// with multi-root workspaces don't lose visibility into other roots.
+    pub workspace_roots: Vec<PathBuf>,
+    /// Editor-supplied configuration (didChangeConfiguration payload).
+    /// Read on every request so live changes take effect without a restart.
+    pub config: ServerConfig,
     /// Cached parsed files: canonical path → (content hash, parsed module, source text).
     /// Keyed by content hash rather than mtime — mtime is unreliable across
     /// `jj`/`git` checkouts that touch timestamps without changing content.
@@ -199,6 +210,75 @@ pub const ANALYSIS_DEBOUNCE: Duration = Duration::from_millis(150);
 /// Hard upper bound on how long a task can sit in the debounce queue. Prevents
 /// continuous typing from indefinitely starving the analysis pass.
 pub const ANALYSIS_MAX_WAIT: Duration = Duration::from_millis(500);
+
+// ── Configuration ───────────────────────────────────────────────────
+
+/// Editor-side configurable knobs. Populated from `initializationOptions`
+/// at startup and refreshed when the editor sends `workspace/didChangeConfiguration`.
+/// All fields have sensible defaults so missing payloads degrade gracefully.
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    /// Tab width used by the formatter when normalizing indentation.
+    pub tab_size: usize,
+    /// Whether to expand tabs to spaces (true) or keep them (false). Mirrors
+    /// the LSP `formattingOptions.insertSpaces` field.
+    pub insert_spaces: bool,
+    /// Whether unused-import warnings should fire. Some teams prefer to
+    /// disable this in libraries where re-exports look unused.
+    pub warn_unused_imports: bool,
+    /// Whether the inlay-hint pass should emit parameter-name hints. Hints
+    /// are noisy in tight loops, so we let users opt out.
+    pub inlay_parameter_names: bool,
+    /// Whether the inlay-hint pass should emit type hints (binding sites,
+    /// inferred function types).
+    pub inlay_types: bool,
+    /// Maximum entries kept in the workspace diagnostic cache. Old entries
+    /// past this watermark are evicted by an LRU policy.
+    pub max_workspace_diag_cache: usize,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            tab_size: 2,
+            insert_spaces: true,
+            warn_unused_imports: true,
+            inlay_parameter_names: true,
+            inlay_types: true,
+            max_workspace_diag_cache: 256,
+        }
+    }
+}
+
+impl ServerConfig {
+    /// Update fields from a JSON `settings` payload. Unknown keys are ignored
+    /// so future config additions don't break older clients. Keys live under
+    /// the `knot` namespace per LSP convention.
+    pub fn merge_from_json(&mut self, value: &serde_json::Value) {
+        let knot = value.get("knot").unwrap_or(value);
+        if let Some(n) = knot.get("tabSize").and_then(|v| v.as_u64()) {
+            self.tab_size = (n as usize).max(1);
+        }
+        if let Some(b) = knot.get("insertSpaces").and_then(|v| v.as_bool()) {
+            self.insert_spaces = b;
+        }
+        if let Some(b) = knot.get("warnUnusedImports").and_then(|v| v.as_bool()) {
+            self.warn_unused_imports = b;
+        }
+        if let Some(b) = knot.get("inlayParameterNames").and_then(|v| v.as_bool()) {
+            self.inlay_parameter_names = b;
+        }
+        if let Some(b) = knot.get("inlayTypes").and_then(|v| v.as_bool()) {
+            self.inlay_types = b;
+        }
+        if let Some(n) = knot
+            .get("maxWorkspaceDiagCache")
+            .and_then(|v| v.as_u64())
+        {
+            self.max_workspace_diag_cache = (n as usize).max(8);
+        }
+    }
+}
 
 // ── Completion / token grab-bag constants ───────────────────────────
 

@@ -381,13 +381,23 @@ fn delta_encode_tokens(tokens: &[RawToken], source: &str) -> Vec<SemanticToken> 
         }
         let _ = line_start_byte; // explicit: line_start_byte is computed for clarity, not used downstream.
 
+        // Token length must be expressed in UTF-16 code units (LSP spec
+        // for the default UTF-16 position encoding). Compute it from the
+        // token's source slice rather than passing through byte length —
+        // otherwise non-ASCII tokens render with the wrong width.
+        let token_end = (token.start + token.length).min(source.len());
+        let utf16_length: u32 = source
+            .get(token.start..token_end)
+            .map(|slice| slice.chars().map(|c| c.len_utf16() as u32).sum())
+            .unwrap_or(token.length as u32);
+
         let delta_line = line - prev_line;
         let delta_start = if delta_line == 0 { col_utf16 - prev_char } else { col_utf16 };
 
         result.push(SemanticToken {
             delta_line,
             delta_start,
-            length: token.length as u32,
+            length: utf16_length,
             token_type: token.token_type,
             token_modifiers_bitset: token.modifiers,
         });

@@ -115,20 +115,27 @@ fn load_relations(conn: &Connection) -> Vec<RelationInfo> {
         return Vec::new();
     }
 
-    let mut stmt = conn
-        .prepare("SELECT name, schema FROM _knot_schema ORDER BY name")
-        .unwrap();
-    let rows = stmt
-        .query_map([], |row| {
-            let name: String = row.get(0)?;
-            let schema: String = row.get(1)?;
-            Ok((name, schema))
-        })
-        .unwrap();
+    let mut stmt = match conn.prepare("SELECT name, schema FROM _knot_schema ORDER BY name") {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = match stmt.query_map([], |row| {
+        let name: String = row.get(0)?;
+        let schema: String = row.get(1)?;
+        Ok((name, schema))
+    }) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
 
     let mut relations = Vec::new();
     for row in rows {
-        let (name, schema) = row.unwrap();
+        // Skip a single bad row instead of aborting the whole listing —
+        // a corrupted schema entry shouldn't blank out the rest of the DB.
+        let (name, schema) = match row {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
         let table_name = format!("_knot_{}", name);
         let quoted_table = crate::quote_ident(&table_name);
         let count: i64 = conn
@@ -198,16 +205,17 @@ fn load_rows(conn: &Connection, rel: &RelationInfo) -> Vec<Vec<String>> {
                 .map(|(_, ty)| ty.as_str())
                 .collect();
 
-            let rows = stmt
-                .query_map([], |row| {
-                    let mut cells = Vec::with_capacity(col_count);
-                    for i in 0..col_count {
-                        let cell = format_cell(row, i, field_types[i]);
-                        cells.push(cell);
-                    }
-                    Ok(cells)
-                })
-                .unwrap();
+            let rows = match stmt.query_map([], |row| {
+                let mut cells = Vec::with_capacity(col_count);
+                for i in 0..col_count {
+                    let cell = format_cell(row, i, field_types[i]);
+                    cells.push(cell);
+                }
+                Ok(cells)
+            }) {
+                Ok(r) => r,
+                Err(_) => return Vec::new(),
+            };
 
             rows.filter_map(|r| r.ok()).collect()
         }
@@ -234,39 +242,42 @@ fn load_rows(conn: &Connection, rel: &RelationInfo) -> Vec<Vec<String>> {
                 Err(_) => return Vec::new(),
             };
 
-            let rows = stmt
-                .query_map([], |row| {
-                    let tag: String = row.get(0).unwrap_or_default();
+            let rows = match stmt.query_map([], |row| {
+                let tag: String = row.get(0).unwrap_or_default();
 
-                    // Find matching constructor
-                    let ctor = ctors.iter().find(|c| c.name == tag);
+                // Find matching constructor
+                let ctor = ctors.iter().find(|c| c.name == tag);
 
-                    let value = if let Some(ctor) = ctor {
-                        if ctor.fields.is_empty() {
-                            format!("{} {{}}", tag)
-                        } else {
-                            let field_strs: Vec<String> = ctor
-                                .fields
-                                .iter()
-                                .map(|(fname, fty)| {
-                                    // Find column index in all_fields
-                                    let col_idx = all_fields
-                                        .iter()
-                                        .position(|(n, _)| n == fname)
-                                        .unwrap();
-                                    let cell = format_cell(row, col_idx + 1, fty);
-                                    format!("{}: {}", fname, cell)
-                                })
-                                .collect();
-                            format!("{} {{{}}}", tag, field_strs.join(", "))
-                        }
+                let value = if let Some(ctor) = ctor {
+                    if ctor.fields.is_empty() {
+                        format!("{} {{}}", tag)
                     } else {
-                        format!("{} {{...}}", tag)
-                    };
+                        let field_strs: Vec<String> = ctor
+                            .fields
+                            .iter()
+                            .filter_map(|(fname, fty)| {
+                                // Find column index in all_fields. If the
+                                // schema descriptor is inconsistent (e.g. a
+                                // constructor field that wasn't merged into
+                                // all_fields), skip the field rather than
+                                // panicking the TUI.
+                                let col_idx =
+                                    all_fields.iter().position(|(n, _)| n == fname)?;
+                                let cell = format_cell(row, col_idx + 1, fty);
+                                Some(format!("{}: {}", fname, cell))
+                            })
+                            .collect();
+                        format!("{} {{{}}}", tag, field_strs.join(", "))
+                    }
+                } else {
+                    format!("{} {{...}}", tag)
+                };
 
-                    Ok(vec![value])
-                })
-                .unwrap();
+                Ok(vec![value])
+            }) {
+                Ok(r) => r,
+                Err(_) => return Vec::new(),
+            };
 
             rows.filter_map(|r| r.ok()).collect()
         }

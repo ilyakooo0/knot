@@ -2837,6 +2837,17 @@ impl Parser {
     }
 
     fn parse_pat(&mut self) -> Option<Pat> {
+        // Guard recursion here: every pattern-side recursive path
+        // (parens, record fields, list elements) flows through this entry
+        // point, so guarding it alone prevents stack overflow on pathological
+        // input like `((((x))))`.
+        if !self.enter_recursion() { return None; }
+        let result = self.parse_pat_inner();
+        self.recursion_depth -= 1;
+        result
+    }
+
+    fn parse_pat_inner(&mut self) -> Option<Pat> {
         let start = self.span();
         match self.peek() {
             TokenKind::Underscore => {

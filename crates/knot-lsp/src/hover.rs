@@ -11,7 +11,9 @@ use crate::shared::{
 };
 use crate::state::ServerState;
 use crate::type_format::format_type_kind;
-use crate::utils::{position_to_offset, safe_slice, word_at_position};
+use crate::utils::{
+    position_to_offset, safe_slice, span_to_range, word_at_position, word_span_at_offset,
+};
 
 // ── Hover ───────────────────────────────────────────────────────────
 
@@ -35,11 +37,12 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
                 kind: MarkupKind::Markdown,
                 value: format!("```knot\n{detail}\n```"),
             }),
-            range: None,
+            range: Some(span_to_range(*span, &doc.source)),
         });
     }
 
     let word = word_at_position(&doc.source, pos)?;
+    let word_span = word_span_at_offset(&doc.source, offset);
 
     // Try local binding types (let, bind, lambda params, case patterns).
     // Check if cursor is on a binding site or on a usage that references one.
@@ -213,7 +216,7 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
             kind: MarkupKind::Markdown,
             value,
         }),
-        range: None,
+        range: word_span.map(|s| span_to_range(s, &doc.source)),
     })
 }
 

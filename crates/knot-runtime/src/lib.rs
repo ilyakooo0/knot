@@ -2447,9 +2447,8 @@ const TEXT_LITERAL_CACHE_CAP: usize = 4096;
 const LRU_NIL: u32 = u32::MAX;
 
 /// One entry in the LRU cache.  Packed representation (u32 indices)
-/// keeps each node at 24 bytes regardless of pointer width.
+/// keeps each node at 16 bytes (val + prev + next + padding).
 struct LruEntry {
-    key: *const u8,
     val: *mut Value,
     prev: u32,
     next: u32,
@@ -2524,27 +2523,17 @@ impl TextLiteralCache {
         Some(self.entries[idx as usize].val)
     }
 
-    /// Insert a new (key, val).  Evicts the least-recently-used entry
-    /// if the cache is full.  Returns the index assigned.
-    fn insert(&mut self, key: *const u8, val: *mut Value) {
-        // If at capacity, evict the tail (LRU) and reuse its slot.
-        if self.map.len() >= TEXT_LITERAL_CACHE_CAP && self.tail != LRU_NIL {
-            let victim = self.tail;
-            let victim_key = self.entries[victim as usize].key;
-            let victim_val = self.entries[victim as usize].val;
-            self.detach(victim);
-            self.map.remove(&victim_key);
-            unsafe { let _ = Box::from_raw(victim_val); }
-            // Reuse the slot directly.
-            self.entries[victim as usize] = LruEntry {
-                key,
-                val,
-                prev: LRU_NIL,
-                next: LRU_NIL,
-            };
-            self.push_head(victim);
-            self.map.insert(key, victim);
-            return;
+    /// Insert a new (key, val). Returns true if the entry was inserted.
+    ///
+    /// When the cache is full, returns false instead of evicting — the
+    /// previous LRU eviction logic freed the victim's `Value`, but the
+    /// raw pointer had already been handed out to the runtime, leaving
+    /// dangling references on the heap.  Now `knot_value_text_cached`
+    /// is responsible for not orphan-leaking the box when insertion is
+    /// rejected.
+    fn insert(&mut self, key: *const u8, val: *mut Value) -> bool {
+        if self.map.len() >= TEXT_LITERAL_CACHE_CAP {
+            return false;
         }
 
         // Grow: reuse a freed slot if available, otherwise append.
@@ -2552,7 +2541,6 @@ impl TextLiteralCache {
             let slot = self.free;
             self.free = self.entries[slot as usize].next;
             self.entries[slot as usize] = LruEntry {
-                key,
                 val,
                 prev: LRU_NIL,
                 next: LRU_NIL,
@@ -2561,7 +2549,6 @@ impl TextLiteralCache {
         } else {
             let slot = self.entries.len() as u32;
             self.entries.push(LruEntry {
-                key,
                 val,
                 prev: LRU_NIL,
                 next: LRU_NIL,
@@ -2570,6 +2557,7 @@ impl TextLiteralCache {
         };
         self.push_head(idx);
         self.map.insert(key, idx);
+        true
     }
 }
 
@@ -2638,19 +2626,33 @@ pub extern "C" fn knot_value_text(ptr: *const u8, len: usize) -> *mut Value {
 /// Like `knot_value_text` but caches by data pointer, avoiding repeated
 /// allocations for the same string literal.  Cached values live outside the
 /// arena so they survive `knot_arena_reset_to`.
+///
+/// If the per-thread cache is at capacity, the cache rejects the insert and
+/// we fall back to the arena allocator instead of leaking heap boxes (and,
+/// previously, freeing values that the runtime might still reference). The
+/// fallback value is only valid until the next arena reset, so the cache cap
+/// effectively bounds how many literals we promise to keep alive across
+/// resets — pathological dynamic-pointer callers degrade to standard arena
+/// lifetime rather than corrupting memory.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_text_cached(ptr: *const u8, len: usize) -> *mut Value {
     TEXT_LITERAL_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(val) = cache.get(ptr) {
             GC_STATS.bump(&GC_STATS.text_cache_hits);
+            return val;
+        }
+        GC_STATS.bump(&GC_STATS.text_cache_misses);
+        let s = unsafe { str_from_raw(ptr, len) };
+        let val = Box::into_raw(Box::new(Value::Text(Arc::from(s))));
+        if cache.insert(ptr, val) {
             val
         } else {
-            GC_STATS.bump(&GC_STATS.text_cache_misses);
-            let s = unsafe { str_from_raw(ptr, len) };
-            let val = Box::into_raw(Box::new(Value::Text(Arc::from(s))));
-            cache.insert(ptr, val);
-            val
+            // Cache full — drop our box and fall back to the arena.
+            // Same observable result for the caller; just no longer
+            // "survives arena reset".
+            let value = unsafe { *Box::from_raw(val) };
+            alloc(value)
         }
     })
 }
@@ -2681,6 +2683,11 @@ pub unsafe extern "C" fn knot_value_text_intern(
     slot: *mut *mut Value,
 ) -> *mut Value {
     debug_assert!(!slot.is_null(), "knot runtime: null text-literal slot");
+    debug_assert_eq!(
+        slot as usize % std::mem::align_of::<std::sync::atomic::AtomicPtr<Value>>(),
+        0,
+        "knot runtime: text-literal slot is not pointer-aligned (codegen bug)"
+    );
     let atomic = unsafe { &*(slot as *const std::sync::atomic::AtomicPtr<Value>) };
     let cached = atomic.load(std::sync::atomic::Ordering::Acquire);
     if !cached.is_null() {
@@ -6985,7 +6992,7 @@ struct ColumnSpec {
     ty: ColType,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ColType {
     Int,
     Float,
@@ -7191,13 +7198,22 @@ fn sql_type(ty: ColType) -> &'static str {
 }
 
 /// Read a column value from a SQLite row, returning null pointer for SQL NULL.
+///
+/// All `unwrap`s on `row.get_ref(i)` and `row.get(i)` are guarded by callers
+/// that pass a column index in range; if a schema migration drift makes one
+/// out-of-range, the panic message names the column so the cause is
+/// identifiable in `panic = "abort"` builds.
 fn read_sql_column(row: &rusqlite::Row, i: usize, ty: ColType) -> *mut Value {
-    if matches!(row.get_ref(i).unwrap(), ValueRef::Null) {
+    let mismatch = || format!(
+        "knot runtime: schema mismatch reading column {} (type {:?}) — possible migration drift",
+        i, ty
+    );
+    if matches!(row.get_ref(i).unwrap_or_else(|_| panic!("{}", mismatch())), ValueRef::Null) {
         return std::ptr::null_mut();
     }
     match ty {
         ColType::Int => {
-            match row.get_ref(i).unwrap() {
+            match row.get_ref(i).unwrap_or_else(|_| panic!("{}", mismatch())) {
                 ValueRef::Integer(n) => alloc_int(BigInt::from(n)),
                 ValueRef::Blob(b) => {
                     let s = std::str::from_utf8(b).expect("knot runtime: invalid UTF-8 in bigint blob");
@@ -7209,27 +7225,27 @@ fn read_sql_column(row: &rusqlite::Row, i: usize, ty: ColType) -> *mut Value {
                     let n: BigInt = s.parse().expect("knot runtime: invalid bigint in column");
                     alloc_int(n)
                 }
-                other => panic!("knot runtime: unexpected SQLite type for Int column: {:?}", other),
+                other => panic!("knot runtime: unexpected SQLite type for Int column {}: {:?}", i, other),
             }
         }
-        ColType::Float => knot_value_float(row.get::<_, f64>(i).unwrap()),
+        ColType::Float => knot_value_float(row.get::<_, f64>(i).unwrap_or_else(|_| panic!("{}", mismatch()))),
         ColType::Text => {
-            let s: String = row.get(i).unwrap();
+            let s: String = row.get(i).unwrap_or_else(|_| panic!("{}", mismatch()));
             alloc(Value::Text(Arc::from(s)))
         }
-        ColType::Bool => knot_value_bool(row.get::<_, i32>(i).unwrap()),
+        ColType::Bool => knot_value_bool(row.get::<_, i32>(i).unwrap_or_else(|_| panic!("{}", mismatch()))),
         ColType::Bytes => {
-            let b: Vec<u8> = row.get(i).unwrap();
+            let b: Vec<u8> = row.get(i).unwrap_or_else(|_| panic!("{}", mismatch()));
             alloc(Value::Bytes(Arc::from(b)))
         }
         ColType::Tag => {
             // Read TEXT but reconstruct as a Constructor with Unit payload
-            let tag: String = row.get(i).unwrap();
+            let tag: String = row.get(i).unwrap_or_else(|_| panic!("{}", mismatch()));
             alloc(Value::Constructor(intern_str(&tag), alloc(Value::Unit)))
         }
         ColType::Json => {
             // Read TEXT and parse as JSON back into a Knot value (typically a relation)
-            let s: String = row.get(i).unwrap();
+            let s: String = row.get(i).unwrap_or_else(|_| panic!("{}", mismatch()));
             match serde_json::from_str::<serde_json::Value>(&s) {
                 Ok(json) => json_to_value(&json),
                 Err(_) => alloc(Value::Text(Arc::from(s))),
@@ -11314,6 +11330,11 @@ extern "C" fn respond_headers_inner(
     ]))
 }
 
+/// Hard ceiling on bytes read from a single HTTP request or response body.
+/// Bounds memory exposure from unbounded body streams (DoS protection for
+/// `listen`; protection against malicious upstreams for `fetch`).
+const HTTP_MAX_BODY_BYTES: u64 = 16 * 1024 * 1024;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_http_listen(
     _db: *mut c_void,
@@ -11381,8 +11402,23 @@ pub extern "C" fn knot_http_listen(
                 let has_body = !entry.body_fields.is_empty()
                     && entry.method != "GET" && entry.method != "HEAD";
                 let body_bytes = if has_body {
+                    use std::io::Read;
                     let mut buf = Vec::new();
-                    request.as_reader().read_to_end(&mut buf).unwrap_or(0);
+                    // Cap body size to prevent OOM from oversized requests.
+                    let mut limited = request.as_reader().take(HTTP_MAX_BODY_BYTES + 1);
+                    let _ = limited.read_to_end(&mut buf);
+                    if buf.len() as u64 > HTTP_MAX_BODY_BYTES {
+                        eprintln!(
+                            "knot runtime: request body exceeds {} byte limit; rejecting",
+                            HTTP_MAX_BODY_BYTES
+                        );
+                        let response = tiny_http::Response::from_string("{\"error\":\"payload too large\"}")
+                            .with_status_code(413)
+                            .with_header("Content-Type: application/json".parse::<tiny_http::Header>().unwrap());
+                        let _ = request.respond(response);
+                        ARENA.with(|a| a.borrow_mut().pop_frame());
+                        continue;
+                    }
                     buf
                 } else {
                     Vec::new()

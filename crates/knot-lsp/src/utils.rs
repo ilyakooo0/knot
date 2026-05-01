@@ -38,13 +38,14 @@ pub fn offset_to_position(source: &str, offset: usize) -> Position {
     while safe_offset > line_start && !source.is_char_boundary(safe_offset) {
         safe_offset -= 1;
     }
-    // \r in a CRLF line ending is part of the line break (the LSP spec says
-    // CRLF counts as one character), so don't include it in the column count.
-    let character: u32 = source[line_start..safe_offset]
-        .chars()
-        .filter(|&c| c != '\r')
-        .map(|c| c.len_utf16() as u32)
-        .sum();
+    // \r immediately before \n is part of the CRLF line break (LSP spec
+    // says it counts as one character together), so strip it from the
+    // column count. Stray \r in the middle of a line still counts — the
+    // matching `position_to_offset` only strips the *trailing* \r too,
+    // and the round-trip needs to be symmetric.
+    let line_slice = &source[line_start..safe_offset];
+    let line_slice = line_slice.strip_suffix('\r').unwrap_or(line_slice);
+    let character: u32 = line_slice.chars().map(|c| c.len_utf16() as u32).sum();
     Position::new(line, character)
 }
 

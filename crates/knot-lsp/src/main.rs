@@ -5223,8 +5223,7 @@ fn handle_code_action(
     // values are returned as `Result RefinementError T`; this action expands
     // the boilerplate of unwrapping it.
     if let Some((refine_span, target_name)) = find_refine_at(doc, range_start) {
-        let inner_text = doc.source[refine_span.start..refine_span.end.min(doc.source.len())]
-            .to_string();
+        let inner_text = safe_slice(&doc.source, refine_span).to_string();
         let mut changes = HashMap::new();
         changes.insert(
             uri.clone(),
@@ -5283,10 +5282,7 @@ fn find_case_actions(
             ast::ExprKind::Var(name) => doc
                 .local_type_info
                 .iter()
-                .find(|(span, _)| {
-                    let src = &doc.source[span.start..span.end.min(doc.source.len())];
-                    src == name
-                })
+                .find(|(span, _)| safe_slice(&doc.source, **span) == name.as_str())
                 .map(|(_, ty)| ty.clone())
                 .or_else(|| doc.type_info.get(name).cloned()),
             _ => None,
@@ -5712,8 +5708,7 @@ fn find_enclosing_atomic_expr(
             return;
         }
         if let ast::ExprKind::Atomic(inner) = &expr.node {
-            let inner_text =
-                source[inner.span.start..inner.span.end.min(source.len())].to_string();
+            let inner_text = safe_slice(source, inner.span).to_string();
             // Track the smallest enclosing atomic
             let size = expr.span.end - expr.span.start;
             if best
@@ -6094,7 +6089,7 @@ fn fresh_extract_name(doc: &DocumentState, base: &str) -> String {
     // bound in nested scopes.
     let mut taken: HashSet<String> = doc.definitions.keys().cloned().collect();
     for (usage_span, _) in &doc.references {
-        let name = doc.source[usage_span.start..usage_span.end.min(doc.source.len())].to_string();
+        let name = safe_slice(&doc.source, *usage_span).to_string();
         taken.insert(name);
     }
     if !taken.contains(base) {
@@ -6120,7 +6115,7 @@ fn find_free_vars_in_selection(
     // Check all references that start within the selection range
     for (usage_span, _def_span) in &doc.references {
         if usage_span.start >= start && usage_span.end <= end {
-            let name = &doc.source[usage_span.start..usage_span.end.min(doc.source.len())];
+            let name = safe_slice(&doc.source, *usage_span);
             // Only include if it looks like a lowercase variable (not a constructor/type)
             if !name.is_empty()
                 && name.chars().next().map_or(false, |c| c.is_lowercase())
@@ -6128,8 +6123,7 @@ fn find_free_vars_in_selection(
             {
                 // Check it's a local binding, not a top-level definition
                 if doc.local_type_info.keys().any(|span| {
-                    span.start < start
-                        && doc.source.get(span.start..span.end.min(doc.source.len())) == Some(name)
+                    span.start < start && safe_slice(&doc.source, *span) == name
                 }) {
                     seen.insert(name.to_string());
                     free_vars.push(name.to_string());
@@ -6281,7 +6275,7 @@ fn find_inline_actions(
 
 /// Convert a pattern AST node to a source string representation.
 fn pat_to_string(pat: &ast::Pat, source: &str) -> String {
-    source[pat.span.start..pat.span.end.min(source.len())].to_string()
+    safe_slice(source, pat.span).to_string()
 }
 
 // ── Call Hierarchy ───────────────────────────────────────────────────
@@ -6807,7 +6801,7 @@ fn handle_document_link(
 
         // The link range covers the import path string within the import span.
         // Find the path string in the source text of this import.
-        let import_text = &doc.source[imp.span.start..imp.span.end.min(doc.source.len())];
+        let import_text = safe_slice(&doc.source, imp.span);
         if let Some(path_start) = import_text.find(&imp.path) {
             let abs_start = imp.span.start + path_start;
             let abs_end = abs_start + imp.path.len();

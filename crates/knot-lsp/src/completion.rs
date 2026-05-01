@@ -14,7 +14,8 @@ use crate::analysis::get_or_parse_file_shared;
 use crate::builtins::ATOMIC_DISALLOWED_BUILTINS;
 use crate::shared::{
     collect_lambda_param_names, extract_record_fields, find_enclosing_atomic_expr,
-    format_route_constructor_hover, predicate_to_source, scan_knot_files_in_roots,
+    find_field_refinement, format_route_constructor_hover, predicate_to_source,
+    resolve_var_to_source, scan_knot_files_in_roots,
 };
 use crate::state::{
     builtins as state_builtins, DocumentState, ServerState, KEYWORDS, SNIPPETS,
@@ -112,12 +113,35 @@ pub(crate) fn handle_completion(
         let expr_end = offset - 1; // position of the `.`
         let fields = resolve_dot_fields(doc, expr_end);
         if !fields.is_empty() {
+            // If the receiver before the dot is a `Var` bound from a `*source`,
+            // attach the source's field refinement (when present) as completion
+            // detail/documentation so the user sees the predicate without
+            // having to open the source declaration.
+            let receiver_var = receiver_ident_before_dot(&doc.source, expr_end);
+            let owner_source = receiver_var
+                .as_deref()
+                .and_then(|name| resolve_var_to_source(&doc.module, name));
             for name in fields {
-                items.push(CompletionItem {
-                    label: name,
+                let mut item = CompletionItem {
+                    label: name.clone(),
                     kind: Some(CompletionItemKind::FIELD),
                     ..Default::default()
-                });
+                };
+                if let Some(src) = owner_source.as_deref() {
+                    if let Some((type_label, predicate)) =
+                        find_field_refinement(&doc.source_refinements, src, &name)
+                    {
+                        let pred_src = predicate_to_source(predicate, &doc.source);
+                        item.detail = Some(format!("refined `{type_label}` — {pred_src}"));
+                        item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: format!(
+                                "Field `{name}` of `*{src}` is refined; values must satisfy `{pred_src}`."
+                            ),
+                        }));
+                    }
+                }
+                items.push(item);
             }
             return Some(CompletionResponse::Array(items));
         }
@@ -605,6 +629,32 @@ fn type_matches_monad(ty: &str, monad: &MonadKind) -> bool {
             prefix_eq || prefix_app
         }
     }
+}
+
+/// Return the bare identifier immediately preceding the dot at `dot_pos`, if
+/// the receiver is a simple variable. Used to attach refinement metadata to
+/// dot-completion items when the variable was bound from a `*source`.
+fn receiver_ident_before_dot(source: &str, dot_pos: usize) -> Option<String> {
+    let bytes = source.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut end = dot_pos;
+    while end > 0 && bytes[end - 1] == b' ' {
+        end -= 1;
+    }
+    let ident_end = end;
+    while end > 0 && is_ident(bytes[end - 1]) {
+        end -= 1;
+    }
+    if end == ident_end {
+        return None;
+    }
+    let name = &source[end..ident_end];
+    // Reject leading sigils — those land us in source/derived ref territory,
+    // which is handled separately.
+    if name.starts_with('*') || name.starts_with('&') {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 /// Try to resolve field names for dot completion by finding the type of the
@@ -1095,6 +1145,42 @@ route Hello where
         assert!(
             !labels.contains(&"println".to_string()),
             "println leaked into route-decl completion; labels: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn completion_dot_includes_field_refinement_detail() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            r#"*scores : [{name: Text, score: Int where \x -> x >= 0}]
+
+main = do
+  s <- *scores
+  yield s.score
+"#,
+        );
+        let doc = ws.doc(&uri);
+        // Position cursor right after the `.` (between the dot and `score`).
+        let dot = doc.source.rfind("s.score").expect("dot site") + 2;
+        let pos = offset_to_position(&doc.source, dot);
+        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, Some(".")))
+            .expect("completion returns");
+        let items: Vec<CompletionItem> = match resp {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let score = items
+            .iter()
+            .find(|i| i.label == "score")
+            .expect("score field offered");
+        let detail = score
+            .detail
+            .as_deref()
+            .expect("refined field has a detail string");
+        assert!(
+            detail.contains(">= 0") || detail.contains(">=0"),
+            "expected refinement predicate in detail; got: {detail:?}"
         );
     }
 

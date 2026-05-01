@@ -725,10 +725,14 @@ pub(crate) fn pat_to_simple_name(pat: &ast::PatKind) -> String {
                 .collect();
             format!("{{{}}}", parts.join(", "))
         }
-        ast::PatKind::Constructor { name, payload } => {
-            format!("{name} {}", pat_to_simple_name(&payload.node))
+        ast::PatKind::Constructor { name, payload } => match &payload.node {
+            ast::PatKind::Record(fields) if fields.is_empty() => name.clone(),
+            other => format!("{name} {}", pat_to_simple_name(other)),
+        },
+        ast::PatKind::List(pats) => {
+            let parts: Vec<String> = pats.iter().map(|p| pat_to_simple_name(&p.node)).collect();
+            format!("[{}]", parts.join(", "))
         }
-        ast::PatKind::List(_) => "[..]".into(),
         ast::PatKind::Lit(_) => "_".into(),
     }
 }
@@ -745,5 +749,312 @@ pub(crate) fn flatten_app_chain<'a>(expr: &'a ast::Expr) -> (&'a ast::Expr, Vec<
     }
     args.reverse();
     (current, args)
+}
+
+// ── Field-access introspection ──────────────────────────────────────
+
+/// What the cursor pointed to when the user hovered on a field-access's
+/// trailing field-name token. We extract the receiver as a small enum rather
+/// than a borrowed reference so the result can outlive the AST walk closure
+/// (the recursive `recurse_expr` callback can't carry borrowed AST references
+/// in its mutable accumulator).
+#[derive(Debug, Clone)]
+pub(crate) struct FieldAccessAt {
+    pub field_name: String,
+    pub receiver: ReceiverKind,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ReceiverKind {
+    /// `someVar.field` — most common case.
+    Var(String),
+    /// `*src.field` or `&derived.field`.
+    SourceRef(String),
+    DerivedRef(String),
+    /// Anything else; refinement lookup is not supported for these.
+    Other,
+}
+
+/// If a `FieldAccess { expr, field }` node has its field-name token under the
+/// cursor, return the field name and a coarse classification of the receiver.
+/// The field-name span is the trailing `field.len()` bytes of the FieldAccess's
+/// overall span (mirrors `semantic_tokens::visit_expr`).
+pub(crate) fn find_field_access_at_offset(
+    module: &Module,
+    offset: usize,
+) -> Option<FieldAccessAt> {
+    fn classify_receiver(expr: &ast::Expr) -> ReceiverKind {
+        match &expr.node {
+            ast::ExprKind::Var(n) => ReceiverKind::Var(n.clone()),
+            ast::ExprKind::SourceRef(n) => ReceiverKind::SourceRef(n.clone()),
+            ast::ExprKind::DerivedRef(n) => ReceiverKind::DerivedRef(n.clone()),
+            _ => ReceiverKind::Other,
+        }
+    }
+    fn walk(expr: &ast::Expr, offset: usize, best: &mut Option<FieldAccessAt>) {
+        if let ast::ExprKind::FieldAccess { expr: receiver, field } = &expr.node {
+            let field_start = expr.span.end.saturating_sub(field.len());
+            if field_start <= offset && offset < expr.span.end {
+                *best = Some(FieldAccessAt {
+                    field_name: field.clone(),
+                    receiver: classify_receiver(receiver),
+                });
+            }
+        }
+        recurse_expr(expr, |e| walk(e, offset, best));
+    }
+    let mut best = None;
+    for decl in &module.decls {
+        match &decl.node {
+            DeclKind::Fun { body: Some(body), .. }
+            | DeclKind::View { body, .. }
+            | DeclKind::Derived { body, .. } => walk(body, offset, &mut best),
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { body, .. } = item {
+                        walk(body, offset, &mut best);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    best
+}
+
+/// Walk the module looking for a `Bind`/`Let` statement that introduces
+/// `var_name` from a `*source` (or `&derived`) reference, and return the
+/// source name. Handles direct binds: `p <- *people`, `let p = *people`, and
+/// constructor-pattern binds like `Just p <- *people`. Also peels App chains
+/// and pipe operators so `p <- filter f *people` and `p <- *src |> filter f`
+/// resolve to `people` / `src`.
+///
+/// First match wins. In typical knot code, top-level decls bind a given name
+/// at most once, so this is correct in practice; shadowed bindings won't be
+/// distinguished.
+pub(crate) fn resolve_var_to_source(module: &Module, var_name: &str) -> Option<String> {
+    fn pat_binds_var(pat: &ast::Pat, name: &str) -> bool {
+        match &pat.node {
+            ast::PatKind::Var(n) => n == name,
+            ast::PatKind::Constructor { payload, .. } => pat_binds_var(payload, name),
+            ast::PatKind::Record(fields) => fields.iter().any(|f| {
+                if f.name == name && f.pattern.is_none() {
+                    true
+                } else {
+                    f.pattern.as_ref().is_some_and(|p| pat_binds_var(p, name))
+                }
+            }),
+            ast::PatKind::List(pats) => pats.iter().any(|p| pat_binds_var(p, name)),
+            _ => false,
+        }
+    }
+
+    fn rhs_source_name(rhs: &ast::Expr) -> Option<String> {
+        match &rhs.node {
+            ast::ExprKind::SourceRef(n) | ast::ExprKind::DerivedRef(n) => Some(n.clone()),
+            // `filter f *src`, `take n *src`, etc. — peel App chains to find
+            // an underlying source ref.
+            ast::ExprKind::App { func, arg } => {
+                rhs_source_name(arg).or_else(|| rhs_source_name(func))
+            }
+            // Pipe: `*src |> filter f` puts the source on the LHS of pipe,
+            // which desugars to `filter f *src`. Walk both sides.
+            ast::ExprKind::BinOp { op: ast::BinOp::Pipe, lhs, rhs } => {
+                rhs_source_name(lhs).or_else(|| rhs_source_name(rhs))
+            }
+            _ => None,
+        }
+    }
+
+    fn walk(expr: &ast::Expr, var_name: &str, found: &mut Option<String>) {
+        if found.is_some() {
+            return;
+        }
+        if let ast::ExprKind::Do(stmts) = &expr.node {
+            for stmt in stmts {
+                if let ast::StmtKind::Bind { pat, expr: rhs }
+                | ast::StmtKind::Let { pat, expr: rhs } = &stmt.node
+                {
+                    if pat_binds_var(pat, var_name) {
+                        if let Some(name) = rhs_source_name(rhs) {
+                            *found = Some(name);
+                            return;
+                        }
+                    }
+                    walk(rhs, var_name, found);
+                    if found.is_some() {
+                        return;
+                    }
+                }
+                if let ast::StmtKind::Where { cond } | ast::StmtKind::Expr(cond) = &stmt.node {
+                    walk(cond, var_name, found);
+                }
+                if let ast::StmtKind::GroupBy { key } = &stmt.node {
+                    walk(key, var_name, found);
+                }
+            }
+            return;
+        }
+        recurse_expr(expr, |e| walk(e, var_name, found));
+    }
+
+    let mut found = None;
+    for decl in &module.decls {
+        match &decl.node {
+            DeclKind::Fun { body: Some(body), .. }
+            | DeclKind::View { body, .. }
+            | DeclKind::Derived { body, .. } => {
+                walk(body, var_name, &mut found);
+            }
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { body, .. } = item {
+                        walk(body, var_name, &mut found);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if found.is_some() {
+            break;
+        }
+    }
+    found
+}
+
+/// Look up a per-field refinement by source name + field name. Returns the
+/// refined-type label and the predicate expression for hover/completion to
+/// render.
+pub(crate) fn find_field_refinement<'a>(
+    source_refinements: &'a std::collections::HashMap<
+        String,
+        Vec<(Option<String>, String, ast::Expr)>,
+    >,
+    source_name: &str,
+    field_name: &str,
+) -> Option<(&'a str, &'a ast::Expr)> {
+    let entries = source_refinements.get(source_name)?;
+    for (field, type_label, predicate) in entries {
+        if field.as_deref() == Some(field_name) {
+            return Some((type_label.as_str(), predicate));
+        }
+    }
+    None
+}
+
+// ── Type-scheme cursor lookup ───────────────────────────────────────
+
+/// Walk a `Type` AST node and return true if any of its sub-spans contain
+/// `offset`. Used to test whether a cursor is *inside* a type expression.
+fn type_contains_offset(ty: &ast::Type, offset: usize) -> bool {
+    if ty.span.start <= offset && offset < ty.span.end {
+        return true;
+    }
+    match &ty.node {
+        ast::TypeKind::App { func, arg } => {
+            type_contains_offset(func, offset) || type_contains_offset(arg, offset)
+        }
+        ast::TypeKind::Record { fields, .. } => {
+            fields.iter().any(|f| type_contains_offset(&f.value, offset))
+        }
+        ast::TypeKind::Relation(inner) => type_contains_offset(inner, offset),
+        ast::TypeKind::Function { param, result } => {
+            type_contains_offset(param, offset) || type_contains_offset(result, offset)
+        }
+        ast::TypeKind::Variant { constructors, .. } => constructors
+            .iter()
+            .any(|c| c.fields.iter().any(|f| type_contains_offset(&f.value, offset))),
+        ast::TypeKind::Effectful { ty, .. } => type_contains_offset(ty, offset),
+        ast::TypeKind::IO { ty, .. } => type_contains_offset(ty, offset),
+        ast::TypeKind::UnitAnnotated { base, .. } => type_contains_offset(base, offset),
+        ast::TypeKind::Refined { base, .. } => type_contains_offset(base, offset),
+        ast::TypeKind::Forall { ty, .. } => type_contains_offset(ty, offset),
+        _ => false,
+    }
+}
+
+fn scheme_contains_offset(scheme: &ast::TypeScheme, offset: usize) -> bool {
+    if type_contains_offset(&scheme.ty, offset) {
+        return true;
+    }
+    scheme
+        .constraints
+        .iter()
+        .any(|c| c.args.iter().any(|t| type_contains_offset(t, offset)))
+}
+
+/// If the cursor is inside a function/view/derived/trait-method's type
+/// signature, return the `TypeScheme` plus the decl name. Used by hover to
+/// surface trait constraints that mention a generic parameter under the
+/// cursor.
+pub(crate) fn find_enclosing_type_scheme<'a>(
+    module: &'a Module,
+    offset: usize,
+) -> Option<(&'a ast::TypeScheme, &'a str)> {
+    for decl in &module.decls {
+        match &decl.node {
+            DeclKind::Fun { name, ty: Some(scheme), .. }
+            | DeclKind::View { name, ty: Some(scheme), .. }
+            | DeclKind::Derived { name, ty: Some(scheme), .. } => {
+                if scheme_contains_offset(scheme, offset) {
+                    return Some((scheme, name.as_str()));
+                }
+            }
+            DeclKind::Trait { items, .. } => {
+                for item in items {
+                    if let ast::TraitItem::Method { name, ty, .. } = item {
+                        if scheme_contains_offset(ty, offset) {
+                            return Some((ty, name.as_str()));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Constraints from `scheme` that mention the given type variable. Used by
+/// hover to render `Display a, Show a` when the cursor is on `a` in a
+/// `Display a => Show a => [a] -> Text` signature.
+pub(crate) fn constraints_for_type_var<'a>(
+    scheme: &'a ast::TypeScheme,
+    var_name: &str,
+) -> Vec<&'a ast::Constraint> {
+    scheme
+        .constraints
+        .iter()
+        .filter(|c| {
+            c.args.iter().any(|t| type_mentions_var(t, var_name))
+        })
+        .collect()
+}
+
+fn type_mentions_var(ty: &ast::Type, var: &str) -> bool {
+    match &ty.node {
+        ast::TypeKind::Var(n) => n == var,
+        ast::TypeKind::Named(_) | ast::TypeKind::Hole => false,
+        ast::TypeKind::App { func, arg } => {
+            type_mentions_var(func, var) || type_mentions_var(arg, var)
+        }
+        ast::TypeKind::Record { fields, .. } => {
+            fields.iter().any(|f| type_mentions_var(&f.value, var))
+        }
+        ast::TypeKind::Relation(inner) => type_mentions_var(inner, var),
+        ast::TypeKind::Function { param, result } => {
+            type_mentions_var(param, var) || type_mentions_var(result, var)
+        }
+        ast::TypeKind::Variant { constructors, .. } => constructors
+            .iter()
+            .any(|c| c.fields.iter().any(|f| type_mentions_var(&f.value, var))),
+        ast::TypeKind::Effectful { ty, .. }
+        | ast::TypeKind::IO { ty, .. }
+        | ast::TypeKind::UnitAnnotated { base: ty, .. }
+        | ast::TypeKind::Refined { base: ty, .. } => type_mentions_var(ty, var),
+        ast::TypeKind::Forall { vars, ty } => {
+            !vars.iter().any(|n| n == var) && type_mentions_var(ty, var)
+        }
+    }
 }
 

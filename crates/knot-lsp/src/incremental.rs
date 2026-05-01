@@ -71,8 +71,8 @@ impl ModuleFingerprint {
 
     /// Compute the set of decl keys that changed between `prev` and `self`.
     /// A decl is considered changed if its hash differs, was added, or was
-    /// removed. Reserved for the future selective-inference path.
-    #[allow(dead_code)]
+    /// removed. Drives `apply_analysis_result`'s selective dependent
+    /// re-queue: only files that import a *changed* name are re-analyzed.
     pub fn changed_decls(&self, prev: &ModuleFingerprint) -> HashSet<String> {
         let mut changed: HashSet<String> = HashSet::new();
         for (k, h) in &self.decl_hashes {

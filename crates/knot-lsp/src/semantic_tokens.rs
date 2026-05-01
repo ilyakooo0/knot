@@ -19,17 +19,128 @@ use crate::utils::{find_word_in_source, position_to_offset};
 // ── Semantic Tokens ─────────────────────────────────────────────────
 
 pub(crate) fn handle_semantic_tokens_full(
-    state: &ServerState,
+    state: &mut ServerState,
     params: &SemanticTokensParams,
 ) -> Option<SemanticTokensResult> {
     let doc = state.documents.get(&params.text_document.uri)?;
     let raw_tokens = collect_tokens(doc, None);
     let encoded = delta_encode_tokens(&raw_tokens, &doc.source);
 
+    let result_id = next_result_id(state);
+    state
+        .semantic_token_cache
+        .insert(params.text_document.uri.clone(), (result_id.clone(), encoded.clone()));
+
     Some(SemanticTokensResult::Tokens(SemanticTokens {
-        result_id: None,
+        result_id: Some(result_id),
         data: encoded,
     }))
+}
+
+/// `textDocument/semanticTokens/full/delta` — given the result_id of a
+/// previously-emitted token list, return the patch needed to bring the
+/// editor's copy in sync with the latest tokens. Falls back to a full
+/// response when the cached entry is missing or its result_id doesn't match.
+pub(crate) fn handle_semantic_tokens_full_delta(
+    state: &mut ServerState,
+    params: &SemanticTokensDeltaParams,
+) -> Option<SemanticTokensFullDeltaResult> {
+    let uri = &params.text_document.uri;
+    let doc = state.documents.get(uri)?;
+    let raw_tokens = collect_tokens(doc, None);
+    let new_tokens = delta_encode_tokens(&raw_tokens, &doc.source);
+
+    let cached = state
+        .semantic_token_cache
+        .get(uri)
+        .filter(|(rid, _)| *rid == params.previous_result_id)
+        .cloned();
+
+    let result_id = next_result_id(state);
+
+    match cached {
+        Some((_, prev)) => {
+            // Compute a single replace-edit covering the changed middle
+            // section. We work on the SemanticToken array directly — its
+            // u32 fields make equality comparisons cheap and the wire
+            // format mirrors them 1:1.
+            let edits = diff_token_lists(&prev, &new_tokens);
+            state
+                .semantic_token_cache
+                .insert(uri.clone(), (result_id.clone(), new_tokens));
+            Some(SemanticTokensFullDeltaResult::TokensDelta(SemanticTokensDelta {
+                result_id: Some(result_id),
+                edits,
+            }))
+        }
+        None => {
+            state
+                .semantic_token_cache
+                .insert(uri.clone(), (result_id.clone(), new_tokens.clone()));
+            Some(SemanticTokensFullDeltaResult::Tokens(SemanticTokens {
+                result_id: Some(result_id),
+                data: new_tokens,
+            }))
+        }
+    }
+}
+
+fn next_result_id(state: &mut ServerState) -> String {
+    state.semantic_token_counter = state.semantic_token_counter.wrapping_add(1);
+    format!("v{}", state.semantic_token_counter)
+}
+
+/// Compute a minimal patch turning `prev` into `new` as a list of
+/// `SemanticTokensEdit`s. The LSP wire format describes each edit as a
+/// (start, deleteCount, data) triple over the raw `Vec<SemanticToken>`. We
+/// strip a common prefix and a common suffix and emit a single replace edit
+/// covering the divergent middle — sufficient for typical edits while
+/// staying within the spec.
+fn diff_token_lists(
+    prev: &[SemanticToken],
+    new: &[SemanticToken],
+) -> Vec<SemanticTokensEdit> {
+    if prev == new {
+        return Vec::new();
+    }
+    let mut start = 0usize;
+    while start < prev.len()
+        && start < new.len()
+        && tokens_equal(&prev[start], &new[start])
+    {
+        start += 1;
+    }
+    let mut prev_end = prev.len();
+    let mut new_end = new.len();
+    while prev_end > start
+        && new_end > start
+        && tokens_equal(&prev[prev_end - 1], &new[new_end - 1])
+    {
+        prev_end -= 1;
+        new_end -= 1;
+    }
+    let delete_count = (prev_end - start) as u32;
+    let replacement: Vec<SemanticToken> = new[start..new_end].to_vec();
+    if delete_count == 0 && replacement.is_empty() {
+        return Vec::new();
+    }
+    // Per the spec, each edit's `start` is in u5 token-tuple offset.
+    // SemanticToken fields are 5 u32s, but the LSP `start` field is the
+    // *flat token array* index expressed as a count of u32s — so the index
+    // we computed (token-tuple count) needs multiplying by 5.
+    vec![SemanticTokensEdit {
+        start: (start as u32) * 5,
+        delete_count: delete_count * 5,
+        data: Some(replacement),
+    }]
+}
+
+fn tokens_equal(a: &SemanticToken, b: &SemanticToken) -> bool {
+    a.delta_line == b.delta_line
+        && a.delta_start == b.delta_start
+        && a.length == b.length
+        && a.token_type == b.token_type
+        && a.token_modifiers_bitset == b.token_modifiers_bitset
 }
 
 /// `textDocument/semanticTokens/range` — emit tokens only for the visible
@@ -363,6 +474,108 @@ impl<'a> TokenCollector<'a> {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestWorkspace;
+
+    fn full_params(uri: &Uri) -> SemanticTokensParams {
+        SemanticTokensParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }
+    }
+
+    fn delta_params(uri: &Uri, prev: &str) -> SemanticTokensDeltaParams {
+        SemanticTokensDeltaParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            previous_result_id: prev.to_string(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }
+    }
+
+    #[test]
+    fn semantic_tokens_full_caches_result_id() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "id = \\x -> x\n");
+        let resp = handle_semantic_tokens_full(&mut ws.state, &full_params(&uri))
+            .expect("full tokens");
+        let id = match resp {
+            SemanticTokensResult::Tokens(t) => t.result_id,
+            _ => panic!("expected Tokens variant"),
+        };
+        assert!(id.is_some(), "result_id should be set");
+        assert!(
+            ws.state.semantic_token_cache.contains_key(&uri),
+            "cache should be populated"
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_delta_returns_empty_edits_when_unchanged() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "id = \\x -> x\n");
+        let full = handle_semantic_tokens_full(&mut ws.state, &full_params(&uri))
+            .expect("full");
+        let prev_id = match full {
+            SemanticTokensResult::Tokens(t) => t.result_id.unwrap(),
+            _ => panic!(),
+        };
+        let delta = handle_semantic_tokens_full_delta(&mut ws.state, &delta_params(&uri, &prev_id))
+            .expect("delta");
+        match delta {
+            SemanticTokensFullDeltaResult::TokensDelta(d) => {
+                assert!(d.edits.is_empty(), "no changes → no edits");
+            }
+            _ => panic!("expected TokensDelta variant"),
+        }
+    }
+
+    #[test]
+    fn semantic_tokens_delta_falls_back_to_full_on_unknown_id() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "id = \\x -> x\n");
+        // Skip the initial full request — the cache is empty, so delta
+        // should bail out to a full response rather than diffing nothing.
+        let delta = handle_semantic_tokens_full_delta(&mut ws.state, &delta_params(&uri, "stale"))
+            .expect("delta");
+        assert!(
+            matches!(delta, SemanticTokensFullDeltaResult::Tokens(_)),
+            "stale prev_result_id should produce a full response"
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_delta_emits_edits_for_changed_tokens() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "id = \\x -> x\n");
+        let full = handle_semantic_tokens_full(&mut ws.state, &full_params(&uri))
+            .expect("full");
+        let prev_id = match full {
+            SemanticTokensResult::Tokens(t) => t.result_id.unwrap(),
+            _ => panic!(),
+        };
+        // Mutate the underlying document — append a new top-level decl so
+        // the token list grows. Reach in directly since this is a unit
+        // test; in production a didChange notification triggers
+        // re-analysis.
+        if let Some(doc) = ws.state.documents.get_mut(&uri) {
+            doc.source.push_str("y = 42\n");
+        }
+        ws.reanalyze(&uri);
+        let delta = handle_semantic_tokens_full_delta(&mut ws.state, &delta_params(&uri, &prev_id))
+            .expect("delta");
+        match delta {
+            SemanticTokensFullDeltaResult::TokensDelta(d) => {
+                assert!(!d.edits.is_empty(), "expected edits for token change");
+            }
+            other => panic!("expected TokensDelta, got: {other:?}"),
         }
     }
 }

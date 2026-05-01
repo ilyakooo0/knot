@@ -6,8 +6,10 @@ use lsp_types::*;
 use knot::ast::{DeclKind, TypeKind};
 
 use crate::shared::{
-    extract_record_fields, find_enclosing_application, format_route_constructor_hover,
-    parse_function_params, predicate_to_source,
+    constraints_for_type_var, extract_record_fields, find_enclosing_application,
+    find_enclosing_type_scheme, find_field_access_at_offset, find_field_refinement,
+    format_route_constructor_hover, parse_function_params, predicate_to_source,
+    resolve_var_to_source, ReceiverKind,
 };
 use crate::state::ServerState;
 use crate::type_format::format_type_kind;
@@ -65,12 +67,10 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     // and surface their predicates inline. `None` means we showed details only
     // (no inferred type was available), in which case there's nothing to scan.
     let mut type_for_refinement_scan: Option<String> = None;
-    let detail = if let Some(ty) = local_type {
+    let detail_opt = if let Some(ty) = local_type {
         type_for_refinement_scan = Some(ty.clone());
-        format!("{word} : {ty}")
+        Some(format!("{word} : {ty}"))
     } else if let Some(d) = doc.details.get(word) {
-        // If we have an inferred type and the AST detail has no type annotation,
-        // enhance with the inferred type
         let base = if let Some(inferred) = doc.type_info.get(word) {
             type_for_refinement_scan = Some(inferred.clone());
             if !d.contains(':') {
@@ -81,25 +81,45 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
         } else {
             d.clone()
         };
-        // Append effect info if available
-        if let Some(effects) = doc.effect_info.get(word) {
+        Some(if let Some(effects) = doc.effect_info.get(word) {
             format!("{base}\n{effects}")
         } else {
             base
-        }
+        })
     } else if let Some(inferred) = doc.type_info.get(word) {
         type_for_refinement_scan = Some(inferred.clone());
         let base = format!("{word} : {inferred}");
-        if let Some(effects) = doc.effect_info.get(word) {
+        Some(if let Some(effects) = doc.effect_info.get(word) {
             format!("{base}\n{effects}")
         } else {
             base
-        }
+        })
     } else {
-        return None;
+        None
     };
 
-    let mut value = format!("```knot\n{detail}\n```");
+    // The hover handler historically returned None when no symbol info was
+    // available. With field-access and type-variable enrichment, we fall
+    // through and render an informational hover for those cases too.
+    let field_at_cursor = find_field_access_at_offset(&doc.module, offset);
+    let enclosing_scheme = find_enclosing_type_scheme(&doc.module, offset);
+    let type_var_constraints: Vec<&knot::ast::Constraint> = enclosing_scheme
+        .as_ref()
+        .filter(|_| {
+            word.chars()
+                .next()
+                .map(|c| c.is_ascii_lowercase())
+                .unwrap_or(false)
+        })
+        .map(|(scheme, _)| constraints_for_type_var(scheme, word))
+        .unwrap_or_default();
+    if detail_opt.is_none() && field_at_cursor.is_none() && type_var_constraints.is_empty() {
+        return None;
+    }
+    let mut value = match &detail_opt {
+        Some(detail) => format!("```knot\n{detail}\n```"),
+        None => String::new(),
+    };
 
     // At a call site, show the full signature with the active argument highlighted
     if let Some((func_name, active_param)) =
@@ -228,6 +248,59 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
                     None => format!("(whole element) `{type_name}`"),
                 };
                 value.push_str(&format!("\n- {label} — `{pred_src}`"));
+            }
+        }
+    }
+
+    // Trait-constraint hover: if the cursor lands on a generic type parameter
+    // inside a function's type signature, list the trait constraints that
+    // mention that variable. Lets users see at a glance why `a` is required to
+    // be `Display a` without scrolling to the constraint list.
+    if !type_var_constraints.is_empty() {
+        let decl_name = enclosing_scheme.map(|(_, n)| n).unwrap_or("");
+        let rendered: Vec<String> = type_var_constraints
+            .iter()
+            .map(|c| {
+                let args: Vec<String> = c
+                    .args
+                    .iter()
+                    .map(|t| format_type_kind(&t.node))
+                    .collect();
+                format!("`{} {}`", c.trait_name, args.join(" "))
+            })
+            .collect();
+        if !value.is_empty() {
+            value.push_str("\n\n");
+        }
+        value.push_str(&format!(
+            "**Generic parameter `{word}`** of `{decl_name}` — must satisfy: {}",
+            rendered.join(", ")
+        ));
+    }
+
+    // Field-access hover: when the cursor is on a record field name (e.g. the
+    // `age` in `p.age`), surface the source-declared refinement for that field.
+    // The refinement metadata is keyed by (source-name, field-name); we trace
+    // the receiver back to a `Bind`/`Let` from a `*source` to find which source
+    // owns the field.
+    if let Some(field_at) = &field_at_cursor {
+        let owner_source = match &field_at.receiver {
+            ReceiverKind::Var(name) => resolve_var_to_source(&doc.module, name),
+            ReceiverKind::SourceRef(name) | ReceiverKind::DerivedRef(name) => Some(name.clone()),
+            ReceiverKind::Other => None,
+        };
+        if let Some(source_name) = owner_source.as_deref() {
+            if let Some((type_label, predicate)) =
+                find_field_refinement(&doc.source_refinements, source_name, &field_at.field_name)
+            {
+                let pred_src = predicate_to_source(predicate, &doc.source);
+                if !value.is_empty() {
+                    value.push_str("\n\n");
+                }
+                value.push_str(&format!(
+                    "**Field refinement:** `{}.{}` must satisfy `{}` (refined `{}`)",
+                    source_name, field_at.field_name, pred_src, type_label
+                ));
             }
         }
     }
@@ -449,6 +522,63 @@ double = \n -> n + n
         assert!(
             !text.contains("Refinements in this type"),
             "alias hover duplicated refinement section; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn hover_surfaces_field_refinement_for_source_field() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            r#"*scores : [{name: Text, score: Int where \x -> x >= 0}]
+
+main = do
+  s <- *scores
+  yield s.score
+"#,
+        );
+        let doc = ws.doc(&uri);
+        let off = doc.source.rfind("score\n").expect("field use");
+        let pos = offset_to_position(&doc.source, off + 2);
+        let hover = handle_hover(&ws.state, &hover_params(&uri, pos)).expect("hover");
+        let text = hover_text(hover);
+        assert!(
+            text.contains("Field refinement"),
+            "expected field-refinement section; got:\n{text}"
+        );
+        assert!(
+            text.contains(">= 0") || text.contains(">=0"),
+            "expected predicate text; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn hover_shows_trait_constraints_for_generic_param() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            r#"trait Display a where
+  display : a -> Text
+
+show2 : Display a => a -> Text
+show2 = \x -> display x
+"#,
+        );
+        let doc = ws.doc(&uri);
+        // Locate the `a` after `=>` in show2's signature, not the one inside
+        // the trait body.
+        let sig_start = doc.source.find("show2 :").expect("sig start");
+        let arrow = doc.source[sig_start..]
+            .find("=> ")
+            .map(|p| sig_start + p + 3)
+            .expect("arrow site");
+        let pos = offset_to_position(&doc.source, arrow);
+        let hover = handle_hover(&ws.state, &hover_params(&uri, pos))
+            .expect("hover at type-var position");
+        let text = hover_text(hover);
+        assert!(
+            text.contains("Generic parameter") && text.contains("Display"),
+            "expected generic-param section with Display constraint; got:\n{text}"
         );
     }
 

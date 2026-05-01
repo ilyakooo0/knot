@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use crossbeam_channel::Sender;
 use lsp_server::Connection;
-use lsp_types::{Diagnostic, Uri};
+use lsp_types::{Diagnostic, SemanticToken, Uri};
 
 use knot::ast::{self, Module, Span};
 use knot::diagnostic;
@@ -118,6 +118,13 @@ pub struct DocumentState {
     /// exposes per-span unit info this becomes the canonical source.
     #[allow(dead_code)]
     pub unit_info: HashMap<Span, String>,
+    /// Top-level decl names whose AST shape changed between this analysis
+    /// and the previous one for the same file. Empty when no prior snapshot
+    /// exists or the fingerprints matched (typical first analysis or
+    /// whitespace-only edits). Used by `apply_analysis_result` to skip
+    /// re-queuing dependents that don't import any of these names — the
+    /// previous-snapshot machinery already covers same-bytes cache hits.
+    pub changed_decl_names: Vec<String>,
 }
 
 // ── Server-wide state ───────────────────────────────────────────────
@@ -176,6 +183,15 @@ pub struct ServerState {
     /// worker holds its own `Arc` clone and is the only thing that mutates it.
     #[allow(dead_code)]
     pub inference_cache: Arc<Mutex<InferenceCache>>,
+    /// Last semantic-tokens response per URI: `result_id → tokens`. Drives
+    /// `textDocument/semanticTokens/full/delta` so editors can re-fetch
+    /// changes instead of the whole file's tokens on every edit. Pruned on
+    /// document close.
+    pub semantic_token_cache: HashMap<Uri, (String, Vec<SemanticToken>)>,
+    /// Monotonic counter feeding `semantic_token_cache` result-ids. Each
+    /// request bumps this; the resulting string is used as the next
+    /// `result_id` field.
+    pub semantic_token_counter: u64,
 }
 
 /// Symbol entry stored in the workspace symbol cache.

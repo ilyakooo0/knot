@@ -41,12 +41,15 @@ pub(crate) fn handle_inlay_hint(
                         .unwrap_or(decl_text.len());
                     let hint_offset = decl.span.start + name_end;
                     let hint_pos = offset_to_position(&doc.source, hint_offset);
+                    // Text edit emits the signature as a separate statement above the
+                    // function, so anchor it at the declaration start, not at the hint.
+                    let edit_pos = offset_to_position(&doc.source, decl.span.start);
                     hints.push(InlayHint {
                         position: hint_pos,
                         label: InlayHintLabel::String(format!(": {inferred}")),
                         kind: Some(InlayHintKind::TYPE),
                         text_edits: Some(vec![TextEdit {
-                            range: Range { start: hint_pos, end: hint_pos },
+                            range: Range { start: edit_pos, end: edit_pos },
                             new_text: format!("{name} : {inferred}\n"),
                         }]),
                         tooltip: doc.effect_info.get(name).map(|effects| {
@@ -143,7 +146,247 @@ pub(crate) fn handle_inlay_hint(
     // depending on context.
     add_monad_context_hints(doc, range_start, range_end, &mut hints);
 
+    // Show per-field type hints for record-destructure patterns in case arms,
+    // do-binds, and lambda params. The whole-pattern hint (above) shows the
+    // record type; this loop adds `: T` after each individual field name so
+    // users can see the field types without expanding mentally.
+    add_record_pattern_field_hints(doc, range_start, range_end, &mut hints);
+
     Some(hints)
+}
+
+/// Walk record-destructure patterns and emit a `: <field-type>` hint at each
+/// field-name occurrence inside the pattern. The whole-pattern hint already
+/// shows the parent record's type; this complements that by exposing the
+/// field types for users who care about a single field.
+fn add_record_pattern_field_hints(
+    doc: &DocumentState,
+    range_start: usize,
+    range_end: usize,
+    hints: &mut Vec<InlayHint>,
+) {
+    /// Find each pattern that destructures a record. Tracks both the span
+    /// and an optional constructor name for ADT cases like `Person {name}`.
+    fn walk_pat_for_records(pat: &ast::Pat, out: &mut Vec<(Span, Option<String>)>) {
+        match &pat.node {
+            ast::PatKind::Record(_) => out.push((pat.span, None)),
+            ast::PatKind::Constructor { name, payload } => {
+                if matches!(&payload.node, ast::PatKind::Record(_)) {
+                    out.push((pat.span, Some(name.clone())));
+                }
+                walk_pat_for_records(payload, out);
+            }
+            ast::PatKind::List(pats) => {
+                for p in pats {
+                    walk_pat_for_records(p, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_expr(expr: &ast::Expr, out: &mut Vec<(Span, Option<String>)>) {
+        match &expr.node {
+            ast::ExprKind::Lambda { params, body } => {
+                for p in params {
+                    walk_pat_for_records(p, out);
+                }
+                walk_expr(body, out);
+            }
+            ast::ExprKind::Case { scrutinee, arms } => {
+                walk_expr(scrutinee, out);
+                for arm in arms {
+                    walk_pat_for_records(&arm.pat, out);
+                    walk_expr(&arm.body, out);
+                }
+            }
+            ast::ExprKind::Do(stmts) => {
+                for stmt in stmts {
+                    match &stmt.node {
+                        ast::StmtKind::Bind { pat, expr }
+                        | ast::StmtKind::Let { pat, expr } => {
+                            walk_pat_for_records(pat, out);
+                            walk_expr(expr, out);
+                        }
+                        ast::StmtKind::Where { cond } | ast::StmtKind::Expr(cond) => {
+                            walk_expr(cond, out);
+                        }
+                        ast::StmtKind::GroupBy { key } => walk_expr(key, out),
+                    }
+                }
+            }
+            _ => recurse_expr(expr, |e| walk_expr(e, out)),
+        }
+    }
+
+    let mut record_pats: Vec<(Span, Option<String>)> = Vec::new();
+    for decl in &doc.module.decls {
+        match &decl.node {
+            ast::DeclKind::Fun { body: Some(body), .. }
+            | ast::DeclKind::View { body, .. }
+            | ast::DeclKind::Derived { body, .. } => walk_expr(body, &mut record_pats),
+            ast::DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { params, body, .. } = item {
+                        for p in params {
+                            walk_pat_for_records(p, &mut record_pats);
+                        }
+                        walk_expr(body, &mut record_pats);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (span, ctor_opt) in record_pats {
+        if span.end < range_start || span.start > range_end {
+            continue;
+        }
+        // Resolve the field set. Prefer the AST-driven constructor lookup —
+        // the inferencer's local_type_info often doesn't carry an entry at
+        // the constructor pattern's outer span, but the data decl always
+        // does.
+        let mut fields_str: Vec<(String, String)> = Vec::new();
+        let mut tooltip_source = String::from("destructured record");
+        if let Some(ctor_name) = ctor_opt.as_deref() {
+            for d in &doc.module.decls {
+                if let ast::DeclKind::Data { constructors, name: data_name, .. } = &d.node {
+                    for c in constructors {
+                        if c.name == ctor_name {
+                            tooltip_source = format!("{ctor_name} (constructor of {data_name})");
+                            for f in &c.fields {
+                                fields_str.push((
+                                    f.name.clone(),
+                                    crate::type_format::format_type_kind(&f.value.node),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if fields_str.is_empty() {
+            // Fall back to local_type_info — useful for plain Record
+            // destructures (no constructor wrapper).
+            let parent_ty = match doc.local_type_info.get(&span) {
+                Some(t) => t.clone(),
+                None => continue,
+            };
+            let parsed = crate::parsed_type::ParsedType::parse(&parent_ty);
+            let stripped = parsed.strip_io();
+            if let Some(fs) = stripped.record_fields() {
+                for (n, t) in fs {
+                    fields_str.push((n.clone(), t.render()));
+                }
+                tooltip_source = parent_ty.clone();
+            } else if let Some(fs) =
+                extract_variant_ctor_fields(stripped, &doc.source, span)
+            {
+                for (n, t) in fs {
+                    fields_str.push((n, t.render()));
+                }
+                tooltip_source = parent_ty.clone();
+            } else {
+                continue;
+            }
+        }
+        if fields_str.is_empty() {
+            continue;
+        }
+        // Slice once; we need the pattern source to find each field's
+        // position via word-boundary scan.
+        let pat_text = match doc.source.get(span.start..span.end) {
+            Some(s) => s,
+            None => continue,
+        };
+        for (field_name, ty_str) in fields_str {
+            // The field name appears as a whole-word identifier inside the
+            // pattern. Search for it with simple boundary checks.
+            if let Some(rel_pos) = find_word_boundary(pat_text, &field_name) {
+                let abs_end = span.start + rel_pos + field_name.len();
+                if abs_end > span.end {
+                    continue;
+                }
+                let hint_pos = offset_to_position(&doc.source, abs_end);
+                hints.push(InlayHint {
+                    position: hint_pos,
+                    label: InlayHintLabel::String(format!(": {ty_str}")),
+                    kind: Some(InlayHintKind::TYPE),
+                    text_edits: None,
+                    tooltip: Some(InlayHintTooltip::String(format!(
+                        "Field `{field_name}` destructured from `{tooltip_source}`"
+                    ))),
+                    padding_left: Some(true),
+                    padding_right: None,
+                    data: None,
+                });
+            }
+        }
+    }
+}
+
+/// When the pattern's parent type is a Variant (typical for ADT constructor
+/// patterns), pick the constructor whose name appears at the start of the
+/// pattern source, then return its record-shaped payload fields. Returns
+/// `None` if no constructor matches or the payload isn't a record.
+fn extract_variant_ctor_fields(
+    parsed: &crate::parsed_type::ParsedType,
+    source: &str,
+    span: Span,
+) -> Option<Vec<(String, crate::parsed_type::ParsedType)>> {
+    use crate::parsed_type::ParsedType;
+    let ctors = match parsed {
+        ParsedType::Variant(cs, _) => cs,
+        _ => return None,
+    };
+    let pat_text = source.get(span.start..span.end)?;
+    // Pattern source looks like `Person {name, age}` — pull the first
+    // identifier token as the constructor name.
+    let bytes = pat_text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let mut j = i;
+    while j < bytes.len()
+        && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
+    {
+        j += 1;
+    }
+    let ctor_name = pat_text.get(i..j)?;
+    for (name, payload) in ctors {
+        if name == ctor_name {
+            if let Some(p) = payload {
+                if let Some(fields) = p.record_fields() {
+                    return Some(fields.to_vec());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Locate `word` as a whole-word match in `text`. Returns the byte offset of
+/// its first occurrence, or `None`. Avoids matching `name` inside `nameish`.
+fn find_word_boundary(text: &str, word: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let needle = word.as_bytes();
+    if needle.is_empty() || bytes.len() < needle.len() {
+        return None;
+    }
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] == needle {
+            let left_ok = i == 0 || !is_ident(bytes[i - 1]);
+            let right_ok = i + needle.len() >= bytes.len() || !is_ident(bytes[i + needle.len()]);
+            if left_ok && right_ok {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Extract the unit annotation `<...>` from a formatted type string.
@@ -539,6 +782,38 @@ mod tests {
         assert!(
             labels.iter().any(|l| l.starts_with(":")),
             "expected `:T` hint; got: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn inlay_hint_emits_per_field_types_for_record_destructure() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            r#"data Person = Person {name: Text, age: Int}
+
+show1 = \p -> case p of
+  Person {name, age} -> name
+"#,
+        );
+        let range = ws.whole_file_range(&uri);
+        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
+        let labels: Vec<String> = hints
+            .iter()
+            .map(|h| match &h.label {
+                InlayHintLabel::String(s) => s.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        // Expect per-field hints for `name` and `age` derived from the parent
+        // record's type. They render as `: Text` / `: Int`.
+        assert!(
+            labels.iter().any(|l| l == ": Text"),
+            "expected `: Text` hint for destructured `name`; got: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == ": Int"),
+            "expected `: Int` hint for destructured `age`; got: {labels:?}"
         );
     }
 

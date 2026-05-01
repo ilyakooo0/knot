@@ -46,6 +46,8 @@ impl TestWorkspace {
             analysis_tx,
             reverse_imports: HashMap::new(),
             inference_cache: Arc::new(Mutex::new(HashMap::new())),
+            semantic_token_cache: HashMap::new(),
+            semantic_token_counter: 0,
         };
         TestWorkspace {
             state,
@@ -121,6 +123,26 @@ impl TestWorkspace {
             start: Position::new(0, 0),
             end: offset_to_position(&doc.source, doc.source.len()),
         }
+    }
+
+    /// Re-run analysis on the document at `uri` using its current source.
+    /// Used by tests that mutate `doc.source` directly (e.g. semantic-token
+    /// delta tests) to refresh derived state without going through the
+    /// open/close lifecycle.
+    pub fn reanalyze(&mut self, uri: &Uri) {
+        let source = match self.state.documents.get(uri) {
+            Some(d) => d.source.clone(),
+            None => return,
+        };
+        let mut import_cache = HashMap::new();
+        let mut inference_cache = HashMap::new();
+        let doc = analyze_document(uri, &source, &mut import_cache, &mut inference_cache);
+        if let Ok(mut shared) = self.state.import_cache.lock() {
+            for (k, v) in import_cache {
+                shared.insert(k, v);
+            }
+        }
+        self.state.documents.insert(uri.clone(), doc);
     }
 }
 

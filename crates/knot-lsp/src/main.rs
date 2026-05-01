@@ -66,7 +66,9 @@ use crate::linked_editing::handle_linked_editing_range;
 use crate::references::handle_references;
 use crate::rename::{handle_prepare_rename, handle_rename};
 use crate::selection_range::handle_selection_range;
-use crate::semantic_tokens::{handle_semantic_tokens_full, handle_semantic_tokens_range};
+use crate::semantic_tokens::{
+    handle_semantic_tokens_full, handle_semantic_tokens_full_delta, handle_semantic_tokens_range,
+};
 use crate::signature_help::handle_signature_help;
 use crate::state::{
     send_response, AnalysisResult, AnalysisTask, PendingSource, ServerConfig, ServerState,
@@ -114,11 +116,9 @@ fn main() {
         semantic_tokens_provider: Some(
             SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
                 legend: semantic_token_legend(),
-                // Advertise range support so editors can request only the
-                // viewport's tokens for very large files. Delta isn't
-                // supported yet (would require persistent prev-result IDs);
-                // editors will fall back to `full` when they need refresh.
-                full: Some(SemanticTokensFullOptions::Bool(true)),
+                // Advertise range, full, and full/delta — the delta path
+                // lets editors re-fetch only changed tokens after edits.
+                full: Some(SemanticTokensFullOptions::Delta { delta: Some(true) }),
                 range: Some(true),
                 work_done_progress_options: Default::default(),
             }),
@@ -226,6 +226,8 @@ fn main() {
         analysis_tx,
         reverse_imports: HashMap::new(),
         inference_cache,
+        semantic_token_cache: HashMap::new(),
+        semantic_token_counter: 0,
     };
 
     // Register for file watcher notifications (.knot files). Build the
@@ -340,9 +342,94 @@ fn apply_analysis_result(state: &mut ServerState, conn: &Connection, result: Ana
                 .or_default()
                 .insert(this_path.clone());
         }
+
+        // Selective dependent re-analysis: when a file changes, only
+        // re-queue downstream files whose `import_defs` actually reference
+        // a changed decl name. Without this, every keystroke on a popular
+        // utility module re-analyzes its entire dependency closure even
+        // when the user is just editing a function body that no consumer
+        // depends on directly.
+        let changed: HashSet<&str> = result
+            .doc
+            .changed_decl_names
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        if !changed.is_empty() {
+            requeue_dependents_for_changed_decls(state, &result.uri, &this_path, &changed);
+        }
     }
 
     state.documents.insert(result.uri, result.doc);
+}
+
+/// Re-queue analysis for open documents whose imports reference any of the
+/// changed decl names. Walks the reverse-import graph transitively so the
+/// downstream chain (A imports B imports C; C changes) reaches the right set
+/// of consumers.
+fn requeue_dependents_for_changed_decls(
+    state: &mut ServerState,
+    source_uri: &Uri,
+    changed_path: &Path,
+    changed_names: &HashSet<&str>,
+) {
+    // Transitive set of importers via BFS over reverse_imports.
+    let mut to_visit = vec![changed_path.to_path_buf()];
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    let mut affected: HashSet<PathBuf> = HashSet::new();
+    while let Some(p) = to_visit.pop() {
+        if !visited.insert(p.clone()) {
+            continue;
+        }
+        if let Some(importers) = state.reverse_imports.get(&p) {
+            for imp in importers {
+                if affected.insert(imp.clone()) {
+                    to_visit.push(imp.clone());
+                }
+            }
+        }
+    }
+
+    let dependents: Vec<(Uri, PathBuf, String)> = state
+        .documents
+        .iter()
+        .filter(|(other_uri, _)| *other_uri != source_uri)
+        .filter_map(|(uri, doc)| {
+            let path = uri_to_path(uri).and_then(|p| p.canonicalize().ok())?;
+            if !affected.contains(&path) {
+                return None;
+            }
+            // Only re-queue if the dependent imports at least one of the
+            // changed names from `changed_path`. Two-level filter: first
+            // we narrow to importers (via `affected`), then we narrow to
+            // importers that actually use one of the changed names.
+            let uses_changed = doc.import_defs.iter().any(|(n, (origin, _))| {
+                origin == changed_path && changed_names.contains(n.as_str())
+            });
+            if !uses_changed {
+                return None;
+            }
+            let src = state
+                .pending_sources
+                .get(uri)
+                .map(|p| p.source.clone())
+                .unwrap_or_else(|| doc.source.clone());
+            Some((uri.clone(), path, src))
+        })
+        .collect();
+
+    if dependents.is_empty() {
+        return;
+    }
+
+    if let Ok(mut cache) = state.inference_cache.lock() {
+        let dep_paths: HashSet<&PathBuf> = dependents.iter().map(|(_, p, _)| p).collect();
+        cache.retain(|(p, _), _| !dep_paths.contains(p));
+    }
+
+    for (dep_uri, _, dep_source) in dependents {
+        queue_analysis(state, dep_uri, dep_source, None);
+    }
 }
 
 // ── Request dispatch ────────────────────────────────────────────────
@@ -388,6 +475,9 @@ fn handle_request(state: &mut ServerState, conn: &Connection, req: Request) {
         send_response(conn, id, result);
     } else if let Some(params) = cast_request::<request::SemanticTokensFullRequest>(&req) {
         let result = handle_semantic_tokens_full(state, &params);
+        send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::SemanticTokensFullDeltaRequest>(&req) {
+        let result = handle_semantic_tokens_full_delta(state, &params);
         send_response(conn, id, result);
     } else if let Some(params) = cast_request::<request::SemanticTokensRangeRequest>(&req) {
         let result = handle_semantic_tokens_range(state, &params);
@@ -547,10 +637,9 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
         );
         queue_analysis(state, uri.clone(), source, version);
 
-        // When a file changes, dependents may need a fresh pass too.
-        if let Some(changed_path) = uri_to_path(&uri).and_then(|p| p.canonicalize().ok()) {
-            queue_dependent_analyses(state, &uri, &changed_path);
-        }
+        // Dependents are no longer re-queued eagerly here — `apply_analysis_result`
+        // handles them once the changed file's analysis completes, filtered by
+        // the per-decl change set so unrelated dependents stay quiet.
     } else if not.method == notification::DidChangeWatchedFiles::METHOD {
         let Some(params) =
             decode::<DidChangeWatchedFilesParams>(&not.method, not.params)
@@ -607,6 +696,7 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
         };
         state.documents.remove(&params.text_document.uri);
         state.pending_sources.remove(&params.text_document.uri);
+        state.semantic_token_cache.remove(&params.text_document.uri);
         let diags = PublishDiagnosticsParams::new(params.text_document.uri, vec![], None);
         let not = Notification::new(notification::PublishDiagnostics::METHOD.into(), diags);
         if let Err(e) = conn.sender.send(Message::Notification(not)) {
@@ -664,58 +754,3 @@ fn queue_analysis(state: &ServerState, uri: Uri, source: String, version: Option
     }
 }
 
-/// Re-queue analysis for any open document whose imports transitively reach
-/// `changed_path`. Walks the reverse-import graph so even multi-hop dependents
-/// (A imports B imports C; C changes) get a fresh diagnostic pass.
-fn queue_dependent_analyses(state: &mut ServerState, source_uri: &Uri, changed_path: &Path) {
-    // Compute the transitive set of importers of `changed_path` via BFS over
-    // the reverse-import graph. The graph only contains files we've seen
-    // imported, so this stays cheap.
-    let mut to_visit = vec![changed_path.to_path_buf()];
-    let mut visited: HashSet<PathBuf> = HashSet::new();
-    let mut affected: HashSet<PathBuf> = HashSet::new();
-    while let Some(p) = to_visit.pop() {
-        if !visited.insert(p.clone()) {
-            continue;
-        }
-        if let Some(importers) = state.reverse_imports.get(&p) {
-            for imp in importers {
-                if affected.insert(imp.clone()) {
-                    to_visit.push(imp.clone());
-                }
-            }
-        }
-    }
-
-    let dependents: Vec<(Uri, PathBuf, String)> = state
-        .documents
-        .iter()
-        .filter(|(other_uri, _)| *other_uri != source_uri)
-        .filter_map(|(uri, doc)| {
-            let path = uri_to_path(uri).and_then(|p| p.canonicalize().ok())?;
-            if !affected.contains(&path) {
-                return None;
-            }
-            let src = state
-                .pending_sources
-                .get(uri)
-                .map(|p| p.source.clone())
-                .unwrap_or_else(|| doc.source.clone());
-            Some((uri.clone(), path, src))
-        })
-        .collect();
-
-    // Evict cached inference snapshots for the dependents before queueing.
-    // The dependent's source bytes haven't changed, so the (path,
-    // content_hash) cache key would otherwise hit and return the snapshot
-    // computed against the old version of the changed file — including its
-    // stale cross-file diagnostics. Forcing a re-inference is the correct
-    // behavior here; the snapshot will be re-cached after the fresh run.
-    if let Ok(mut cache) = state.inference_cache.lock() {
-        cache.retain(|(p, _), _| !affected.contains(p));
-    }
-
-    for (dep_uri, _, dep_source) in dependents {
-        queue_analysis(state, dep_uri, dep_source, None);
-    }
-}

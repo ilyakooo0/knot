@@ -152,6 +152,7 @@ pub fn analyze_document(
         HashMap::new();
     let mut monad_info: HashMap<Span, MonadKind> = HashMap::new();
     let unit_info: HashMap<Span, String> = HashMap::new();
+    let mut changed_decl_names: Vec<String> = Vec::new();
 
     let lexer = knot::lexer::Lexer::new(source);
     let (tokens, lex_diags) = lexer.tokenize();
@@ -218,33 +219,32 @@ pub fn analyze_document(
             .map(|p| (p.clone(), src_hash));
         let new_fingerprint = ModuleFingerprint::from_module(&module);
 
-        // Telemetry: when the structural fingerprint differs from the most
-        // recent snapshot for this path, log the dirty-decl set. Surfaces
-        // how often edits would benefit from per-decl selective inference
-        // (which requires infer.rs surgery — see incremental.rs notes) and
-        // gives users visibility into why their cache missed. Logged at
-        // eprintln so it lands in the LSP server log without spamming
-        // diagnostics.
-        if std::env::var("KNOT_LSP_TRACE_DIRTY").is_ok() {
-            if let Some(key) = &cache_key {
-                if let Some(latest) = inference_cache
-                    .iter()
-                    .filter(|(k, _)| k.0 == key.0)
-                    .max_by_key(|(_, s)| s.access_clock)
-                {
-                    let dirty = new_fingerprint.changed_decls(&latest.1.fingerprint);
-                    if !dirty.is_empty() {
-                        eprintln!(
-                            "knot-lsp: {} dirty decls in {}: {}",
-                            dirty.len(),
-                            key.0.display(),
-                            {
-                                let mut names: Vec<&String> = dirty.iter().collect();
-                                names.sort();
-                                names.iter().take(8).map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
-                            }
-                        );
-                    }
+        // Compute the per-decl diff between this run and the most recent
+        // snapshot for the same path. Used downstream by `apply_analysis_result`
+        // to skip re-queuing dependents that don't actually import any of the
+        // changed names — a real win when a user edits one decl in a file
+        // with many importers.
+        if let Some(key) = &cache_key {
+            if let Some(latest) = inference_cache
+                .iter()
+                .filter(|(k, _)| k.0 == key.0)
+                .max_by_key(|(_, s)| s.access_clock)
+            {
+                let dirty = new_fingerprint.changed_decls(&latest.1.fingerprint);
+                changed_decl_names = dirty.into_iter().collect();
+                changed_decl_names.sort();
+                if std::env::var("KNOT_LSP_TRACE_DIRTY").is_ok() && !changed_decl_names.is_empty() {
+                    eprintln!(
+                        "knot-lsp: {} dirty decls in {}: {}",
+                        changed_decl_names.len(),
+                        key.0.display(),
+                        changed_decl_names
+                            .iter()
+                            .take(8)
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
                 }
             }
         }
@@ -411,6 +411,7 @@ pub fn analyze_document(
         source_refinements,
         monad_info,
         unit_info,
+        changed_decl_names,
     }
 }
 
@@ -457,6 +458,9 @@ fn reuse_snapshot(
         source_refinements: snap.source_refinements.clone(),
         monad_info: snap.monad_info.clone(),
         unit_info,
+        // Cache hit: the parsed AST is identical (or structurally equal)
+        // to a prior run, so by definition no decls changed since then.
+        changed_decl_names: Vec::new(),
     }
 }
 
@@ -836,6 +840,55 @@ mod tests {
             inference_cache.len(),
             entries_after_v1,
             "fingerprint cache hit should not insert a new entry"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn changed_decl_names_populated_on_body_edit() {
+        let dir = std::env::temp_dir().join(format!(
+            "knot-lsp-changed-decls-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.knot");
+        let canonical = {
+            std::fs::write(&path, "").unwrap();
+            path.canonicalize().unwrap()
+        };
+        let uri = fake_uri(&format!("file://{}", canonical.display()));
+
+        let mut import_cache: HashMap<PathBuf, (u64, Module, String)> = HashMap::new();
+        let mut inference_cache: InferenceCache = HashMap::new();
+
+        let v1 = "double = \\x -> x * 2\nfoo = \\y -> y\n";
+        std::fs::write(&path, v1).unwrap();
+        let doc1 = analyze_document(&uri, v1, &mut import_cache, &mut inference_cache);
+        // First analysis: no prior snapshot → empty changed set.
+        assert!(
+            doc1.changed_decl_names.is_empty(),
+            "first analysis should have no changes; got: {:?}",
+            doc1.changed_decl_names
+        );
+
+        // Edit only `double`'s body. `foo` should not appear in the change
+        // set; `double` should.
+        let v2 = "double = \\x -> x * 3\nfoo = \\y -> y\n";
+        std::fs::write(&path, v2).unwrap();
+        let doc2 = analyze_document(&uri, v2, &mut import_cache, &mut inference_cache);
+        assert!(
+            doc2.changed_decl_names.contains(&"double".to_string()),
+            "double should be in change set; got: {:?}",
+            doc2.changed_decl_names
+        );
+        assert!(
+            !doc2.changed_decl_names.contains(&"foo".to_string()),
+            "foo should NOT be in change set; got: {:?}",
+            doc2.changed_decl_names
         );
 
         let _ = std::fs::remove_dir_all(&dir);

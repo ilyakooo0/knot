@@ -140,7 +140,31 @@ pub fn format_pat_brief(pat: &ast::PatKind) -> String {
     match pat {
         ast::PatKind::Var(name) => name.clone(),
         ast::PatKind::Wildcard => "_".into(),
-        _ => "...".into(),
+        ast::PatKind::Lit(ast::Literal::Int(n)) => n.to_string(),
+        ast::PatKind::Lit(ast::Literal::Float(f)) => f.to_string(),
+        ast::PatKind::Lit(ast::Literal::Text(s)) => format!("\"{s}\""),
+        ast::PatKind::Lit(ast::Literal::Bool(b)) => if *b { "true" } else { "false" }.into(),
+        ast::PatKind::Lit(ast::Literal::Bytes(_)) => "<bytes>".into(),
+        ast::PatKind::Constructor { name, payload } => match &payload.node {
+            // `Open {}` — nullary constructor; drop the empty payload to keep
+            // the brief rendering tight.
+            ast::PatKind::Record(fields) if fields.is_empty() => name.clone(),
+            other => format!("{name} {}", format_pat_brief(other)),
+        },
+        ast::PatKind::Record(fields) => {
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|f| match &f.pattern {
+                    None => f.name.clone(),
+                    Some(p) => format!("{}: {}", f.name, format_pat_brief(&p.node)),
+                })
+                .collect();
+            format!("{{{}}}", parts.join(", "))
+        }
+        ast::PatKind::List(pats) => {
+            let parts: Vec<String> = pats.iter().map(|p| format_pat_brief(&p.node)).collect();
+            format!("[{}]", parts.join(", "))
+        }
     }
 }
 

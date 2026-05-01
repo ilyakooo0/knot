@@ -2626,7 +2626,7 @@ impl Infer {
                 }
                 let rv = self.fresh_var();
                 let constraint = Ty::Record(update_fields, Some(rv));
-                self.unify(&base_ty, &constraint, expr.span);
+                self.unify(&base_ty, &constraint, base.span);
                 base_ty
             }
 
@@ -2714,7 +2714,7 @@ impl Infer {
                     Box::new(arg_ty),
                     Box::new(result_ty.clone()),
                 );
-                self.unify(&func_ty, &expected, expr.span);
+                self.unify(&func_ty, &expected, arg.span);
 
                 // Track parseJson calls for compile-time FromJSON dispatch
                 if let ast::ExprKind::Var(name) = &func.node {
@@ -2772,7 +2772,7 @@ impl Infer {
                 self.unify(&cond_ty, &Ty::Bool, cond.span);
                 let then_ty = self.infer_expr(then_branch);
                 let else_ty = self.infer_expr(else_branch);
-                self.unify(&then_ty, &else_ty, expr.span);
+                self.unify(&then_ty, &else_ty, else_branch.span);
                 // Merge IO effects from both branches — unify only checks
                 // inner types and discards effect sets.
                 let applied_then = self.apply(&then_ty);
@@ -2831,14 +2831,15 @@ impl Infer {
 
             ast::ExprKind::Set { target, value } => {
                 let target_ty = self.infer_expr(target);
-                let value_ty = self.infer_expr(value);
                 let target_applied = self.apply(&target_ty);
-                let value_applied = self.apply(&value_ty);
                 let unwrap_io = |ty: &Ty| match ty {
                     Ty::IO(_, _, inner) => (**inner).clone(),
                     other => other.clone(),
                 };
-                self.unify(&unwrap_io(&target_applied), &unwrap_io(&value_applied), expr.span);
+                let target_inner = unwrap_io(&target_applied);
+                // Push target's element type into the value so element-level
+                // mismatches highlight just the offending element.
+                self.check_expr(value, &target_inner);
                 let mut effects = BTreeSet::new();
                 if let ast::ExprKind::SourceRef(name) = &target.node {
                     effects.insert(IoEffect::Writes(name.clone()));
@@ -2849,14 +2850,13 @@ impl Infer {
 
             ast::ExprKind::FullSet { target, value } => {
                 let target_ty = self.infer_expr(target);
-                let value_ty = self.infer_expr(value);
                 let target_applied = self.apply(&target_ty);
-                let value_applied = self.apply(&value_ty);
                 let unwrap_io = |ty: &Ty| match ty {
                     Ty::IO(_, _, inner) => (**inner).clone(),
                     other => other.clone(),
                 };
-                self.unify(&unwrap_io(&target_applied), &unwrap_io(&value_applied), expr.span);
+                let target_inner = unwrap_io(&target_applied);
+                self.check_expr(value, &target_inner);
                 let mut effects = BTreeSet::new();
                 if let ast::ExprKind::SourceRef(name) = &target.node {
                     effects.insert(IoEffect::Writes(name.clone()));
@@ -2911,7 +2911,7 @@ impl Infer {
             ast::ExprKind::Annot { expr: inner, ty } => {
                 let inner_ty = self.infer_expr(inner);
                 let annot_ty = self.ast_type_to_ty(ty);
-                self.unify(&inner_ty, &annot_ty, expr.span);
+                self.unify(&inner_ty, &annot_ty, inner.span);
                 annot_ty
             }
 
@@ -2970,7 +2970,7 @@ impl Infer {
             ast::ExprKind::Annot { expr: inner, ty } => {
                 let annot_ty = self.ast_type_to_ty(ty);
                 self.check_expr(inner, &annot_ty);
-                self.unify(&annot_ty, expected, expr.span);
+                self.unify(&annot_ty, expected, ty.span);
             }
             ast::ExprKind::Lambda { params, body } => {
                 // Peel `Fun(p, r)` off `expected` for each lambda param,
@@ -3002,7 +3002,7 @@ impl Infer {
                     self.pop_scope();
                 } else {
                     let inferred = self.infer_expr(expr);
-                    self.unify(&inferred, expected, expr.span);
+                    self.unify(expected, &inferred, expr.span);
                 }
             }
             ast::ExprKind::Do(stmts) => {
@@ -3019,11 +3019,73 @@ impl Infer {
                 }
                 let inferred = self.infer_do(stmts, expr.span);
                 self.in_io_do = prev_in_io_do;
-                self.unify(&inferred, expected, expr.span);
+                self.unify(expected, &inferred, do_result_span(stmts, expr.span));
+            }
+            ast::ExprKind::Record(fields) if !fields.is_empty() => {
+                // Bidirectional record checking: when the expected type is a
+                // closed record, push each field's expected type down so a
+                // mismatch lights up just the offending field value, not the
+                // whole record literal.
+                let resolved = self.apply(expected);
+                if let Ty::Record(expected_fields, None) = resolved.peel_alias() {
+                    let expected_fields = expected_fields.clone();
+                    let mut field_tys = BTreeMap::new();
+                    for f in fields {
+                        if let Some(exp_ty) = expected_fields.get(&f.name) {
+                            self.check_expr(&f.value, exp_ty);
+                            field_tys.insert(f.name.clone(), exp_ty.clone());
+                        } else {
+                            let val_ty = self.infer_expr(&f.value);
+                            field_tys.insert(f.name.clone(), val_ty);
+                        }
+                    }
+                    self.unify(expected, &Ty::Record(field_tys, None), expr.span);
+                } else {
+                    let inferred = self.infer_expr(expr);
+                    self.unify(expected, &inferred, expr.span);
+                }
+            }
+            ast::ExprKind::If { cond, then_branch, else_branch } => {
+                // Push expected into both branches so a mismatch lights up
+                // just the offending branch instead of the whole if.
+                let cond_ty = self.infer_expr(cond);
+                self.unify(&cond_ty, &Ty::Bool, cond.span);
+                let then_ty = self.infer_expr(then_branch);
+                self.unify(expected, &then_ty, then_branch.span);
+                let else_ty = self.infer_expr(else_branch);
+                self.unify(expected, &else_ty, else_branch.span);
+            }
+            ast::ExprKind::Case { scrutinee, arms } => {
+                // Push expected into each arm body so a mismatch lights up
+                // just the offending arm instead of the whole case.
+                let scrut_ty = self.infer_expr(scrutinee);
+                for arm in arms {
+                    self.push_scope();
+                    self.check_pattern(&arm.pat, &scrut_ty);
+                    let body_ty = self.infer_expr(&arm.body);
+                    self.unify(expected, &body_ty, arm.body.span);
+                    self.pop_scope();
+                }
+                self.check_exhaustiveness(&scrut_ty, arms, expr.span);
+            }
+            ast::ExprKind::List(elems) if !elems.is_empty() => {
+                // When expected is `[T]`, push T into each element so a
+                // mismatch lights up just the offending element instead of
+                // the whole list literal.
+                let resolved = self.apply(expected);
+                if let Ty::Relation(elem_ty) = resolved.peel_alias() {
+                    let elem_ty = (**elem_ty).clone();
+                    for e in elems {
+                        self.check_expr(e, &elem_ty);
+                    }
+                } else {
+                    let inferred = self.infer_expr(expr);
+                    self.unify(expected, &inferred, expr.span);
+                }
             }
             _ => {
                 let inferred = self.infer_expr(expr);
-                self.unify(&inferred, expected, expr.span);
+                self.unify(expected, &inferred, expr.span);
             }
         }
     }
@@ -5521,6 +5583,23 @@ impl Infer {
             format!("{} => {}", parts.join(" => "), ty_str)
         }
     }
+}
+
+// ── Do-block span helper ──────────────────────────────────────────
+
+/// The span that determines a do-block's result type — the last `yield`'s
+/// argument or the last bare expression. Used to narrow type-error highlights
+/// from the whole do-block to just the offending result expression.
+fn do_result_span(stmts: &[ast::Stmt], fallback: Span) -> Span {
+    for stmt in stmts.iter().rev() {
+        if let ast::StmtKind::Expr(e) = &stmt.node {
+            if let Some(inner) = e.node.as_yield_arg() {
+                return inner.span;
+            }
+            return e.span;
+        }
+    }
+    fallback
 }
 
 // ── Standalone type display (for export, no subst lookups) ────────

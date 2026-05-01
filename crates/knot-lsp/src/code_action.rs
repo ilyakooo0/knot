@@ -1451,6 +1451,17 @@ fn build_case_arm(c: &ast::ConstructorDef, indent: &str) -> String {
 /// base3, ... until none collide with the document's known top-level decls
 /// or local bindings. Used by Extract-to-let / Extract-to-function so we
 /// never shadow an existing binding in the user's code.
+/// Pick a fresh name for an extracted variable/function that doesn't
+/// collide with anything visible to this declaration. Considers:
+///  1. Top-level declarations and every reference span in this file.
+///  2. Imports — names brought in by `import` statements would shadow
+///     a fresh top-level extracted function and break callers, so a
+///     name colliding with `import_defs` is also rejected.
+///
+/// The cross-file collision check is what makes "Extract to function"
+/// safe to use in workspaces with many imports. Without it, extracting
+/// inside a file that already imports `parse` from elsewhere could pick
+/// the name `parse` and silently shadow the import.
 fn fresh_extract_name(doc: &DocumentState, base: &str) -> String {
     // Build the set of names to avoid: top-level declarations + every
     // identifier currently bound somewhere in the source. Using
@@ -1461,6 +1472,16 @@ fn fresh_extract_name(doc: &DocumentState, base: &str) -> String {
     for (usage_span, _) in &doc.references {
         let name = safe_slice(&doc.source, *usage_span).to_string();
         taken.insert(name);
+    }
+    // Cross-file collisions: extend the avoid-set with every imported
+    // symbol so we don't pick a name that would shadow `import` bindings.
+    for name in doc.import_defs.keys() {
+        taken.insert(name.clone());
+    }
+    // Also avoid colliding with built-in names — extracting `filter`
+    // would shadow the prelude.
+    for builtin in crate::state::builtins() {
+        taken.insert(builtin.to_string());
     }
     if !taken.contains(base) {
         return base.to_string();

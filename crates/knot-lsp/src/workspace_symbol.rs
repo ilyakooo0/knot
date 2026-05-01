@@ -9,7 +9,7 @@ use lsp_types::*;
 use knot::ast::{DeclKind, Module};
 
 use crate::analysis::get_or_parse_file_shared;
-use crate::shared::scan_knot_files;
+use crate::shared::scan_knot_files_in_roots;
 use crate::state::{content_hash, ServerState, WorkspaceSymbolEntry};
 use crate::type_format::format_type_kind;
 use crate::utils::{path_to_uri, span_to_range, uri_to_path};
@@ -117,8 +117,12 @@ pub(crate) fn handle_workspace_symbol(
 
     // Phase 2: closed workspace files. Use the cache when the on-disk hash
     // matches; otherwise re-parse and update the cache.
-    if let Some(root) = &state.workspace_root {
-        if let Ok(entries) = scan_knot_files(root) {
+    {
+        let entries = scan_knot_files_in_roots(
+            &state.workspace_roots,
+            state.workspace_root.as_deref(),
+        );
+        if !entries.is_empty() {
             // Keep only paths that still exist on disk to avoid the cache
             // ballooning over time.
             let on_disk: HashSet<PathBuf> = entries

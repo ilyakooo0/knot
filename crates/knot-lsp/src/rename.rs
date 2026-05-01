@@ -9,7 +9,7 @@ use knot::ast::Span;
 
 use crate::analysis::get_or_parse_file_shared;
 use crate::defs::resolve_definitions;
-use crate::shared::scan_knot_files;
+use crate::shared::scan_knot_files_in_roots;
 use crate::state::ServerState;
 use crate::utils::{
     path_to_uri, position_to_offset, safe_slice, span_to_range, uri_to_path, word_at_position,
@@ -138,7 +138,7 @@ pub(crate) fn handle_rename(
     }
 
     // Workspace-wide: scan .knot files not currently open that may import this symbol
-    if let Some(root) = &state.workspace_root {
+    {
         let open_paths: HashSet<PathBuf> = state
             .documents
             .keys()
@@ -146,7 +146,11 @@ pub(crate) fn handle_rename(
             .filter_map(|p| p.canonicalize().ok())
             .collect();
 
-        if let Ok(files) = scan_knot_files(root) {
+        let files = scan_knot_files_in_roots(
+            &state.workspace_roots,
+            state.workspace_root.as_deref(),
+        );
+        if !files.is_empty() {
             for file_path in files {
                 let canonical = match file_path.canonicalize() {
                     Ok(p) => p,

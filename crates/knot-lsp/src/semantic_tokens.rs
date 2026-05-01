@@ -14,7 +14,7 @@ use crate::legend::{
     TOK_VARIABLE,
 };
 use crate::state::ServerState;
-use crate::utils::find_word_in_source;
+use crate::utils::{find_word_in_source, position_to_offset};
 
 // ── Semantic Tokens ─────────────────────────────────────────────────
 
@@ -23,6 +23,41 @@ pub(crate) fn handle_semantic_tokens_full(
     params: &SemanticTokensParams,
 ) -> Option<SemanticTokensResult> {
     let doc = state.documents.get(&params.text_document.uri)?;
+    let raw_tokens = collect_tokens(doc, None);
+    let encoded = delta_encode_tokens(&raw_tokens, &doc.source);
+
+    Some(SemanticTokensResult::Tokens(SemanticTokens {
+        result_id: None,
+        data: encoded,
+    }))
+}
+
+/// `textDocument/semanticTokens/range` — emit tokens only for the visible
+/// viewport. Useful for very large files where a full-document walk would
+/// stall the editor. The byte-range filter is applied on raw tokens before
+/// delta-encoding so column deltas restart cleanly inside the range.
+pub(crate) fn handle_semantic_tokens_range(
+    state: &ServerState,
+    params: &SemanticTokensRangeParams,
+) -> Option<SemanticTokensRangeResult> {
+    let doc = state.documents.get(&params.text_document.uri)?;
+    let start = position_to_offset(&doc.source, params.range.start);
+    let end = position_to_offset(&doc.source, params.range.end);
+    let raw_tokens = collect_tokens(doc, Some((start, end)));
+    let encoded = delta_encode_tokens(&raw_tokens, &doc.source);
+    Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
+        result_id: None,
+        data: encoded,
+    }))
+}
+
+/// Walk the document and collect raw tokens, optionally filtered to a byte
+/// range. Pulled out so `full` and `range` share token production verbatim
+/// — the only difference is which subset of tokens we delta-encode.
+fn collect_tokens(
+    doc: &crate::state::DocumentState,
+    range: Option<(usize, usize)>,
+) -> Vec<RawToken> {
     let mut raw_tokens = Vec::new();
     let mut collector = TokenCollector {
         tokens: &mut raw_tokens,
@@ -30,13 +65,20 @@ pub(crate) fn handle_semantic_tokens_full(
     };
 
     for decl in &doc.module.decls {
+        // Coarse pre-filter: skip decls whose span doesn't overlap the
+        // requested range. Fine-grained per-token filtering still happens
+        // below, but this avoids walking unrelated subtrees.
+        if let Some((rs, re)) = range {
+            if decl.span.end < rs || decl.span.start > re {
+                continue;
+            }
+        }
         collector.visit_decl(decl);
     }
 
     // Add keyword and operator tokens from lexer
     let ast_token_starts: HashSet<usize> = raw_tokens.iter().map(|t| t.start).collect();
     for (span, tok_type) in &doc.keyword_tokens {
-        // Only add if no AST-based token already covers this position
         if !ast_token_starts.contains(&span.start) {
             raw_tokens.push(RawToken {
                 start: span.start,
@@ -47,15 +89,12 @@ pub(crate) fn handle_semantic_tokens_full(
         }
     }
 
+    if let Some((rs, re)) = range {
+        raw_tokens.retain(|t| t.start + t.length > rs && t.start < re);
+    }
+
     raw_tokens.sort_by_key(|t| (t.start, t.length));
-
-    // Delta encode
-    let encoded = delta_encode_tokens(&raw_tokens, &doc.source);
-
-    Some(SemanticTokensResult::Tokens(SemanticTokens {
-        result_id: None,
-        data: encoded,
-    }))
+    raw_tokens
 }
 
 pub(crate) struct RawToken {

@@ -46,6 +46,11 @@ pub struct InferenceSnapshot {
     /// (whitespace/comment-only changes), the snapshot can be reused even
     /// though the raw content hash differs.
     pub fingerprint: ModuleFingerprint,
+    /// LRU access counter — bumped on each cache hit. The eviction policy
+    /// in `analyze_document` drops the entry with the lowest counter when
+    /// the cache reaches its bound, so frequently-touched files stay
+    /// resident through long editing sessions.
+    pub access_clock: u64,
 }
 
 pub type InferenceCache = HashMap<(PathBuf, u64), InferenceSnapshot>;
@@ -138,8 +143,15 @@ pub struct ServerState {
     /// caller that reads a `.knot` file (imports, rename, workspace symbol,
     /// workspace diagnostics, completion).
     pub import_cache: Arc<Mutex<HashMap<PathBuf, (u64, Module, String)>>>,
-    /// Cached LSP diagnostics for unopened workspace files, keyed by content hash.
-    pub workspace_diag_cache: HashMap<PathBuf, (u64, Vec<Diagnostic>)>,
+    /// Cached LSP diagnostics for unopened workspace files, keyed by content
+    /// hash. The third tuple field is a monotonic access counter used for LRU
+    /// eviction in `prune_stale_workspace_diag_cache`. Bumped on every cache
+    /// hit so frequently-queried files survive cap-based pruning.
+    pub workspace_diag_cache: HashMap<PathBuf, (u64, Vec<Diagnostic>, u64)>,
+    /// Monotonic counter incremented on every cache access. Provides a
+    /// total order for LRU eviction without paying for `Instant::now()` on
+    /// hot paths.
+    pub workspace_diag_clock: u64,
     /// Cached workspace symbol index, rebuilt incrementally from file watcher
     /// notifications and on-demand. Avoids walking the disk on every
     /// `workspace/symbol` query.

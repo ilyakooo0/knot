@@ -40,6 +40,7 @@ impl TestWorkspace {
             config: ServerConfig::default(),
             import_cache: Arc::new(Mutex::new(HashMap::new())),
             workspace_diag_cache: HashMap::new(),
+            workspace_diag_clock: 0,
             workspace_symbol_cache: WorkspaceSymbolCache::default(),
             pending_sources: HashMap::new(),
             analysis_tx,

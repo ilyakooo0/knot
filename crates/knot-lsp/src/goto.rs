@@ -8,7 +8,7 @@ use lsp_types::*;
 
 use knot::ast::{self, DeclKind, Module};
 
-use crate::shared::{extract_principal_type_name, scan_knot_files};
+use crate::shared::{extract_principal_type_name, scan_knot_files_in_roots};
 use crate::state::ServerState;
 use crate::utils::{path_to_uri, position_to_offset, span_to_range, uri_to_path, word_at_position};
 
@@ -188,7 +188,7 @@ pub(crate) fn handle_goto_implementation(
     }
 
     // Phase 3: search workspace files not currently open
-    if let Some(root) = &state.workspace_root {
+    {
         let open_paths: HashSet<PathBuf> = state
             .documents
             .keys()
@@ -196,7 +196,11 @@ pub(crate) fn handle_goto_implementation(
             .filter_map(|p| p.canonicalize().ok())
             .collect();
 
-        if let Ok(files) = scan_knot_files(root) {
+        let files = scan_knot_files_in_roots(
+            &state.workspace_roots,
+            state.workspace_root.as_deref(),
+        );
+        if !files.is_empty() {
             for path in files {
                 let canonical = match path.canonicalize() {
                     Ok(p) => p,
@@ -308,5 +312,30 @@ shade = Red {}
         // Either the inferred type lands us on Color, or it doesn't resolve.
         // We just want this to not panic.
         let _ = resp;
+    }
+
+    #[test]
+    fn goto_definition_resolves_type_name_in_annotation() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            r#"type Color = {hex: Text}
+get : Color -> Text
+get = \c -> c.hex
+"#,
+        );
+        let doc = ws.doc(&uri);
+        // Cursor on the `Color` token in `get : Color -> Text`.
+        let off = doc.source.find(": Color").expect("annotation") + 2;
+        let pos = offset_to_position(&doc.source, off);
+        let resp = handle_goto_definition(&ws.state, &goto_params(&uri, pos))
+            .expect("type-name annotation resolves to definition");
+        let loc = match resp {
+            GotoDefinitionResponse::Scalar(l) => l,
+            other => panic!("expected scalar, got {other:?}"),
+        };
+        assert_eq!(loc.uri, uri);
+        // The Color type alias is on line 0.
+        assert_eq!(loc.range.start.line, 0);
     }
 }

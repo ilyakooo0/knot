@@ -70,6 +70,38 @@ pub(crate) fn scan_knot_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// Recursively find all .knot files under any of the given roots. Used by
+/// workspace-wide handlers (auto-import, workspace symbol, workspace
+/// diagnostics) that should see every folder the editor surfaced, not just
+/// the first. Falls back to `legacy_root` when `roots` is empty so single-root
+/// callers stay correct.
+pub(crate) fn scan_knot_files_in_roots(
+    roots: &[PathBuf],
+    legacy_root: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let dirs: Vec<&Path> = if roots.is_empty() {
+        legacy_root.into_iter().collect()
+    } else {
+        roots.iter().map(|p| p.as_path()).collect()
+    };
+    for dir in dirs {
+        if let Ok(files) = scan_knot_files(dir) {
+            for f in files {
+                if let Ok(canonical) = f.canonicalize() {
+                    if seen.insert(canonical.clone()) {
+                        out.push(canonical);
+                    }
+                } else if seen.insert(f.clone()) {
+                    out.push(f);
+                }
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn scan_knot_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -375,47 +407,23 @@ pub(crate) fn find_app_in_expr(
     }
 }
 
-/// Parse a Knot type string like "Int -> Text -> Bool" into parameter types.
+/// Split a Knot type string like `Int -> Text -> Bool` into the rendered
+/// parameter types (and the trailing return). Backed by `ParsedType` so
+/// effect rows (`IO {fx} a`), record nesting, and constraint prefixes
+/// (`Display a => …`) don't fool the splitter.
 pub(crate) fn parse_function_params(type_str: &str) -> Vec<String> {
-    let mut params = Vec::new();
-    let mut depth = 0i32;
-    let mut current = String::new();
-
-    let chars: Vec<char> = type_str.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        match chars[i] {
-            '(' | '[' | '{' | '<' => {
-                depth += 1;
-                current.push(chars[i]);
-            }
-            ')' | ']' | '}' | '>' => {
-                depth -= 1;
-                current.push(chars[i]);
-            }
-            '-' if depth == 0 && i + 1 < chars.len() && chars[i + 1] == '>' => {
-                let trimmed = current.trim().to_string();
-                if !trimmed.is_empty() {
-                    params.push(trimmed);
-                }
-                current.clear();
-                i += 2; // skip "->"
-                continue;
-            }
-            _ => {
-                current.push(chars[i]);
-            }
+    let parsed = crate::parsed_type::ParsedType::parse(type_str);
+    match parsed {
+        crate::parsed_type::ParsedType::Function(params, ret) => {
+            let mut out: Vec<String> = params.iter().map(|p| p.render()).collect();
+            out.push(ret.render());
+            out
         }
-        i += 1;
+        // Constraint prefix gets stripped during parsing, but if the parser
+        // bailed entirely fall back to returning the whole string as a
+        // single non-parametric "type" rather than producing wrong arity.
+        _ => Vec::new(),
     }
-
-    let trimmed = current.trim().to_string();
-    if !trimmed.is_empty() {
-        params.push(trimmed);
-    }
-
-    params
 }
 
 // ── Atomic-context detection (completion / code action) ─────────────
@@ -623,50 +631,14 @@ pub(crate) fn render_route_entry(entry: &ast::RouteEntry) -> String {
 // ── Record-type parsing (used by hover and completion) ──────────────
 
 /// Parse field names from a record type string like `{name: Text, age: Int}`.
+/// Now backed by `ParsedType` so nested records, function-typed fields, and
+/// row variables don't trip the field splitter.
 pub(crate) fn extract_record_fields(type_str: &str) -> Vec<String> {
-    let inner = &type_str[1..type_str.len() - 1]; // strip { }
-    let mut fields = Vec::new();
-    let mut depth = 0i32;
-    let mut current = String::new();
-
-    for ch in inner.chars() {
-        match ch {
-            '{' | '[' | '(' | '<' => {
-                depth += 1;
-                current.push(ch);
-            }
-            '}' | ']' | ')' | '>' => {
-                depth -= 1;
-                current.push(ch);
-            }
-            ',' if depth == 0 => {
-                if let Some(name) = extract_field_name(&current) {
-                    fields.push(name);
-                }
-                current.clear();
-            }
-            '|' if depth == 0 => {
-                // Row variable — stop
-                if let Some(name) = extract_field_name(&current) {
-                    fields.push(name);
-                }
-                break;
-            }
-            _ => current.push(ch),
-        }
-    }
-    if !current.trim().is_empty() {
-        if let Some(name) = extract_field_name(&current) {
-            fields.push(name);
-        }
-    }
-    fields
-}
-
-pub(crate) fn extract_field_name(field_str: &str) -> Option<String> {
-    let trimmed = field_str.trim();
-    let colon = trimmed.find(':')?;
-    Some(trimmed[..colon].trim().to_string())
+    let parsed = crate::parsed_type::ParsedType::parse(type_str);
+    parsed
+        .record_fields()
+        .map(|fs| fs.iter().map(|(n, _)| n.clone()).collect())
+        .unwrap_or_default()
 }
 
 // ── Function parameter introspection ────────────────────────────────

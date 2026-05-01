@@ -33,6 +33,19 @@ use crate::utils::{
 /// the whole edit history.
 const MAX_INFERENCE_CACHE_ENTRIES: usize = 128;
 
+/// Monotonic clock for LRU eviction. Bumped on every cache insert and hit.
+/// `wrapping_add` so the counter never panics on overflow — at one bump
+/// per microsecond the wrap is hundreds of thousands of years away, but
+/// it's free safety against pathological clients.
+fn next_access_clock(cache: &InferenceCache) -> u64 {
+    cache
+        .values()
+        .map(|s| s.access_clock)
+        .max()
+        .unwrap_or(0)
+        .wrapping_add(1)
+}
+
 // ── Analysis worker ─────────────────────────────────────────────────
 
 pub fn analysis_worker(
@@ -202,11 +215,48 @@ pub fn analyze_document(
             .as_ref()
             .map(|p| (p.clone(), src_hash));
         let new_fingerprint = ModuleFingerprint::from_module(&module);
+
+        // Telemetry: when the structural fingerprint differs from the most
+        // recent snapshot for this path, log the dirty-decl set. Surfaces
+        // how often edits would benefit from per-decl selective inference
+        // (which requires infer.rs surgery — see incremental.rs notes) and
+        // gives users visibility into why their cache missed. Logged at
+        // eprintln so it lands in the LSP server log without spamming
+        // diagnostics.
+        if std::env::var("KNOT_LSP_TRACE_DIRTY").is_ok() {
+            if let Some(key) = &cache_key {
+                if let Some(latest) = inference_cache
+                    .iter()
+                    .filter(|(k, _)| k.0 == key.0)
+                    .max_by_key(|(_, s)| s.access_clock)
+                {
+                    let dirty = new_fingerprint.changed_decls(&latest.1.fingerprint);
+                    if !dirty.is_empty() {
+                        eprintln!(
+                            "knot-lsp: {} dirty decls in {}: {}",
+                            dirty.len(),
+                            key.0.display(),
+                            {
+                                let mut names: Vec<&String> = dirty.iter().collect();
+                                names.sort();
+                                names.iter().take(8).map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                            }
+                        );
+                    }
+                }
+            }
+        }
         if let Some(key) = &cache_key {
             // Tier 1: exact content hash match.
-            if let Some(snap) = inference_cache.get(key) {
+            // Use a two-step lookup so we can bump the access clock on the
+            // mutable map without confusing the borrow checker.
+            if inference_cache.contains_key(key) {
+                let new_clock = next_access_clock(inference_cache);
+                let snap = inference_cache.get_mut(key).unwrap();
+                snap.access_clock = new_clock;
+                let snap_ref = &*snap;
                 return reuse_snapshot(
-                    snap,
+                    snap_ref,
                     source,
                     module,
                     references,
@@ -225,27 +275,35 @@ pub fn analyze_document(
             // Tier 2: structural fingerprint match. Search the per-path
             // entries — the cache is small enough that a linear scan over
             // its keys is cheap (bounded by MAX_INFERENCE_CACHE_ENTRIES).
-            for (cached_key, snap) in inference_cache.iter() {
-                if cached_key.0 == key.0
-                    && new_fingerprint.structurally_equal(&snap.fingerprint)
-                {
-                    return reuse_snapshot(
-                        snap,
-                        source,
-                        module,
-                        references,
-                        definitions,
-                        details,
-                        literal_types,
-                        imported_files,
-                        import_defs,
-                        import_origins,
-                        doc_comments,
-                        keyword_tokens,
-                        unit_info,
-                        all_diags,
-                    );
+            // Two-step again so we can bump the clock without aliasing.
+            let matching_key = inference_cache.iter().find_map(|(k, snap)| {
+                if k.0 == key.0 && new_fingerprint.structurally_equal(&snap.fingerprint) {
+                    Some(k.clone())
+                } else {
+                    None
                 }
+            });
+            if let Some(matched) = matching_key {
+                let new_clock = next_access_clock(inference_cache);
+                let snap = inference_cache.get_mut(&matched).unwrap();
+                snap.access_clock = new_clock;
+                let snap_ref = &*snap;
+                return reuse_snapshot(
+                    snap_ref,
+                    source,
+                    module,
+                    references,
+                    definitions,
+                    details,
+                    literal_types,
+                    imported_files,
+                    import_defs,
+                    import_origins,
+                    doc_comments,
+                    keyword_tokens,
+                    unit_info,
+                    all_diags,
+                );
             }
         }
 
@@ -298,11 +356,17 @@ pub fn analyze_document(
 
         // Stash the inferred outputs for the next analysis of this same
         // (path, content_hash) pair. Eviction is bounded — if we're at the
-        // soft cap, drop a single arbitrary entry; that's good enough for a
-        // fast-path cache where stale entries are equivalent to a miss.
+        // soft cap, drop the least-recently-accessed entry. LRU keeps
+        // hot files (the ones the user is actively editing or jumping
+        // between) resident through long sessions; previously the random
+        // eviction could discard a fresh snapshot before its first hit.
         if let Some(key) = cache_key {
             if inference_cache.len() >= MAX_INFERENCE_CACHE_ENTRIES {
-                if let Some(victim) = inference_cache.keys().next().cloned() {
+                if let Some((victim, _)) = inference_cache
+                    .iter()
+                    .min_by_key(|(_, s)| s.access_clock)
+                    .map(|(k, s)| (k.clone(), s.access_clock))
+                {
                     inference_cache.remove(&victim);
                 }
             }
@@ -317,6 +381,7 @@ pub fn analyze_document(
                 source_refinements: source_refinements.clone(),
                 monad_info: monad_info.clone(),
                 fingerprint: new_fingerprint.clone(),
+                access_clock: next_access_clock(inference_cache),
             };
             inference_cache.insert(key, snapshot);
         }
@@ -636,6 +701,57 @@ mod tests {
 
         drop(tx);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn lru_eviction_drops_least_recently_used() {
+        // Synthesize a tiny cache and verify the eviction picks the entry
+        // with the smallest access_clock. We bypass `analyze_document` for
+        // this test because it's about pure cache mechanics — synthesizing
+        // 128 real source files would be slow without testing more.
+        use crate::state::InferenceSnapshot;
+
+        let mut cache: InferenceCache = HashMap::new();
+        for i in 0..MAX_INFERENCE_CACHE_ENTRIES + 5 {
+            let key = (PathBuf::from(format!("/tmp/x{i}.knot")), i as u64);
+            cache.insert(
+                key,
+                InferenceSnapshot {
+                    diagnostics: Vec::new(),
+                    type_info: HashMap::new(),
+                    local_type_info: HashMap::new(),
+                    effect_info: HashMap::new(),
+                    effect_sets: HashMap::new(),
+                    refined_types: HashMap::new(),
+                    refine_targets: HashMap::new(),
+                    source_refinements: HashMap::new(),
+                    monad_info: HashMap::new(),
+                    fingerprint: ModuleFingerprint {
+                        decl_hashes: HashMap::new(),
+                        decl_deps: HashMap::new(),
+                        structure_hash: 0,
+                    },
+                    access_clock: i as u64,
+                },
+            );
+        }
+        // Apply the same eviction the analyzer applies after MAX is hit.
+        while cache.len() > MAX_INFERENCE_CACHE_ENTRIES {
+            let victim = cache
+                .iter()
+                .min_by_key(|(_, s)| s.access_clock)
+                .map(|(k, _)| k.clone())
+                .unwrap();
+            cache.remove(&victim);
+        }
+        // The smallest access_clocks (0, 1, 2, 3, 4) should have been
+        // evicted, leaving 5..132.
+        let surviving: Vec<u64> = cache.values().map(|s| s.access_clock).collect();
+        let min_surviving = surviving.iter().min().copied().unwrap_or_default();
+        assert!(
+            min_surviving >= 5,
+            "expected oldest entries evicted; min surviving access_clock is {min_surviving}"
+        );
     }
 
     #[test]

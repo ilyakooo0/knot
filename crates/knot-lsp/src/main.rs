@@ -19,6 +19,7 @@ mod incremental;
 mod inlay_hints;
 mod legend;
 mod linked_editing;
+mod parsed_type;
 mod references;
 mod rename;
 mod selection_range;
@@ -65,7 +66,7 @@ use crate::linked_editing::handle_linked_editing_range;
 use crate::references::handle_references;
 use crate::rename::{handle_prepare_rename, handle_rename};
 use crate::selection_range::handle_selection_range;
-use crate::semantic_tokens::handle_semantic_tokens_full;
+use crate::semantic_tokens::{handle_semantic_tokens_full, handle_semantic_tokens_range};
 use crate::signature_help::handle_signature_help;
 use crate::state::{
     send_response, AnalysisResult, AnalysisTask, PendingSource, ServerConfig, ServerState,
@@ -113,8 +114,12 @@ fn main() {
         semantic_tokens_provider: Some(
             SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
                 legend: semantic_token_legend(),
+                // Advertise range support so editors can request only the
+                // viewport's tokens for very large files. Delta isn't
+                // supported yet (would require persistent prev-result IDs);
+                // editors will fall back to `full` when they need refresh.
                 full: Some(SemanticTokensFullOptions::Bool(true)),
-                range: None,
+                range: Some(true),
                 work_done_progress_options: Default::default(),
             }),
         ),
@@ -215,6 +220,7 @@ fn main() {
         config,
         import_cache,
         workspace_diag_cache: HashMap::new(),
+        workspace_diag_clock: 0,
         workspace_symbol_cache: WorkspaceSymbolCache::default(),
         pending_sources: HashMap::new(),
         analysis_tx,
@@ -382,6 +388,9 @@ fn handle_request(state: &mut ServerState, conn: &Connection, req: Request) {
         send_response(conn, id, result);
     } else if let Some(params) = cast_request::<request::SemanticTokensFullRequest>(&req) {
         let result = handle_semantic_tokens_full(state, &params);
+        send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::SemanticTokensRangeRequest>(&req) {
+        let result = handle_semantic_tokens_range(state, &params);
         send_response(conn, id, result);
     } else if let Some(params) = cast_request::<request::FoldingRangeRequest>(&req) {
         let result = handle_folding_range(state, &params);
@@ -556,7 +565,7 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
             .collect();
 
         if !changed_paths.is_empty() {
-            let dependents: Vec<(Uri, String)> = state
+            let dependents: Vec<(Uri, PathBuf, String)> = state
                 .documents
                 .iter()
                 .filter(|(_, doc)| {
@@ -564,17 +573,29 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
                         .keys()
                         .any(|p| changed_paths.contains(p))
                 })
-                .map(|(uri, doc)| {
+                .filter_map(|(uri, doc)| {
+                    let path = uri_to_path(uri).and_then(|p| p.canonicalize().ok())?;
                     let src = state
                         .pending_sources
                         .get(uri)
                         .map(|p| p.source.clone())
                         .unwrap_or_else(|| doc.source.clone());
-                    (uri.clone(), src)
+                    Some((uri.clone(), path, src))
                 })
                 .collect();
 
-            for (dep_uri, dep_source) in dependents {
+            // Evict cached snapshots for affected dependents and the
+            // changed paths themselves — the inference for a file whose
+            // imports just changed on disk is no longer valid.
+            if let Ok(mut cache) = state.inference_cache.lock() {
+                let affected: HashSet<&PathBuf> = changed_paths
+                    .iter()
+                    .chain(dependents.iter().map(|(_, p, _)| p))
+                    .collect();
+                cache.retain(|(p, _), _| !affected.contains(p));
+            }
+
+            for (dep_uri, _, dep_source) in dependents {
                 queue_analysis(state, dep_uri, dep_source, None);
             }
         }
@@ -666,7 +687,7 @@ fn queue_dependent_analyses(state: &mut ServerState, source_uri: &Uri, changed_p
         }
     }
 
-    let dependents: Vec<(Uri, String)> = state
+    let dependents: Vec<(Uri, PathBuf, String)> = state
         .documents
         .iter()
         .filter(|(other_uri, _)| *other_uri != source_uri)
@@ -680,10 +701,21 @@ fn queue_dependent_analyses(state: &mut ServerState, source_uri: &Uri, changed_p
                 .get(uri)
                 .map(|p| p.source.clone())
                 .unwrap_or_else(|| doc.source.clone());
-            Some((uri.clone(), src))
+            Some((uri.clone(), path, src))
         })
         .collect();
-    for (dep_uri, dep_source) in dependents {
+
+    // Evict cached inference snapshots for the dependents before queueing.
+    // The dependent's source bytes haven't changed, so the (path,
+    // content_hash) cache key would otherwise hit and return the snapshot
+    // computed against the old version of the changed file — including its
+    // stale cross-file diagnostics. Forcing a re-inference is the correct
+    // behavior here; the snapshot will be re-cached after the fresh run.
+    if let Ok(mut cache) = state.inference_cache.lock() {
+        cache.retain(|(p, _), _| !affected.contains(p));
+    }
+
+    for (dep_uri, _, dep_source) in dependents {
         queue_analysis(state, dep_uri, dep_source, None);
     }
 }

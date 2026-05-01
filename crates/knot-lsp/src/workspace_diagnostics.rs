@@ -12,7 +12,7 @@ use knot::diagnostic;
 
 use crate::analysis::get_or_parse_file_shared;
 use crate::diagnostics::to_lsp_diagnostic;
-use crate::shared::scan_knot_files;
+use crate::shared::scan_knot_files_in_roots;
 use crate::state::{content_hash, ServerState};
 use crate::utils::{path_to_uri, uri_to_path};
 
@@ -52,7 +52,7 @@ pub(crate) fn handle_workspace_diagnostics(
     // beyond the import cache, which is mutex-protected). Speeds up the
     // first workspace-diagnostics call on cold caches by roughly the number
     // of cores.
-    if let Some(root) = &state.workspace_root {
+    {
         let open_paths: HashSet<PathBuf> = state
             .documents
             .keys()
@@ -60,7 +60,11 @@ pub(crate) fn handle_workspace_diagnostics(
             .filter_map(|p| p.canonicalize().ok())
             .collect();
 
-        if let Ok(files) = scan_knot_files(root) {
+        let files = scan_knot_files_in_roots(
+            &state.workspace_roots,
+            state.workspace_root.as_deref(),
+        );
+        if !files.is_empty() {
             // Phase A: cheaply collect the work list — paths to analyze, their
             // current source/module, content hash, and any cached diagnostics.
             // Cached entries skip the parallel pass entirely.
@@ -72,7 +76,7 @@ pub(crate) fn handle_workspace_diagnostics(
                 source: String,
             }
             let mut to_analyze: Vec<WorkItem> = Vec::new();
-            let mut cached_results: Vec<(Uri, Vec<Diagnostic>)> = Vec::new();
+            let mut cached_results: Vec<(Uri, Vec<Diagnostic>, PathBuf)> = Vec::new();
             for file_path in files {
                 let canonical = match file_path.canonicalize() {
                     Ok(p) => p,
@@ -91,11 +95,11 @@ pub(crate) fn handle_workspace_diagnostics(
                     None => continue,
                 };
                 let hash = content_hash(&source);
-                if let Some((cached_h, cached)) =
+                if let Some((cached_h, cached, _)) =
                     state.workspace_diag_cache.get(&canonical)
                 {
                     if *cached_h == hash {
-                        cached_results.push((file_uri, cached.clone()));
+                        cached_results.push((file_uri, cached.clone(), canonical.clone()));
                         continue;
                     }
                 }
@@ -161,9 +165,11 @@ pub(crate) fn handle_workspace_diagnostics(
 
             // Phase C: serialize cache writes and report assembly. Cheap.
             for (canonical, file_uri, hash, lsp_diags) in analysis_results {
+                state.workspace_diag_clock = state.workspace_diag_clock.wrapping_add(1);
+                let access = state.workspace_diag_clock;
                 state
                     .workspace_diag_cache
-                    .insert(canonical, (hash, lsp_diags.clone()));
+                    .insert(canonical, (hash, lsp_diags.clone(), access));
                 if !lsp_diags.is_empty() {
                     items.push(WorkspaceDocumentDiagnosticReport::Full(
                         WorkspaceFullDocumentDiagnosticReport {
@@ -177,7 +183,14 @@ pub(crate) fn handle_workspace_diagnostics(
                     ));
                 }
             }
-            for (file_uri, lsp_diags) in cached_results {
+            for (file_uri, lsp_diags, canonical) in cached_results {
+                // Bump LRU access counter on hit so frequently-touched files
+                // stay resident through cap-based eviction.
+                state.workspace_diag_clock = state.workspace_diag_clock.wrapping_add(1);
+                let access = state.workspace_diag_clock;
+                if let Some(entry) = state.workspace_diag_cache.get_mut(&canonical) {
+                    entry.2 = access;
+                }
                 if !lsp_diags.is_empty() {
                     items.push(WorkspaceDocumentDiagnosticReport::Full(
                         WorkspaceFullDocumentDiagnosticReport {
@@ -199,12 +212,12 @@ pub(crate) fn handle_workspace_diagnostics(
 
 /// Drop cache entries for files whose content has changed (hash mismatch),
 /// that no longer exist, or whose transitive imports have changed since the
-/// entry was cached. Cheap O(n*depth) over the cache; called after each
-/// workspace-diagnostics request.
+/// entry was cached. Then enforce the configured cap by evicting the
+/// least-recently-used remaining entries.
 pub(crate) fn prune_stale_workspace_diag_cache(state: &mut ServerState) {
     // Compute the set of files whose disk content has changed since cached.
     let mut changed: HashSet<PathBuf> = HashSet::new();
-    for (path, (cached_h, _)) in &state.workspace_diag_cache {
+    for (path, (cached_h, _, _)) in &state.workspace_diag_cache {
         match std::fs::read_to_string(path) {
             Ok(s) if content_hash(&s) == *cached_h => {}
             _ => {
@@ -230,6 +243,24 @@ pub(crate) fn prune_stale_workspace_diag_cache(state: &mut ServerState) {
     }
 
     state.workspace_diag_cache.retain(|path, _| !affected.contains(path));
+
+    // Cap-based LRU eviction. The configured `max_workspace_diag_cache` is the
+    // soft ceiling — we sort by the per-entry access counter and drop the
+    // oldest entries until the size is within bounds. O(n log n) on the cache
+    // size, which is bounded; called once per workspace-diagnostics request.
+    let cap = state.config.max_workspace_diag_cache;
+    if state.workspace_diag_cache.len() > cap {
+        let mut by_age: Vec<(PathBuf, u64)> = state
+            .workspace_diag_cache
+            .iter()
+            .map(|(p, (_, _, access))| (p.clone(), *access))
+            .collect();
+        by_age.sort_by_key(|(_, a)| *a); // ascending: oldest first
+        let to_drop = state.workspace_diag_cache.len().saturating_sub(cap);
+        for (p, _) in by_age.into_iter().take(to_drop) {
+            state.workspace_diag_cache.remove(&p);
+        }
+    }
 }
 
 /// Run the full analysis pipeline on an unopened workspace file and return its

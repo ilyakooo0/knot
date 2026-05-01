@@ -14,7 +14,7 @@ use crate::analysis::get_or_parse_file_shared;
 use crate::builtins::ATOMIC_DISALLOWED_BUILTINS;
 use crate::shared::{
     collect_lambda_param_names, extract_record_fields, find_enclosing_atomic_expr,
-    format_route_constructor_hover, predicate_to_source, scan_knot_files,
+    format_route_constructor_hover, predicate_to_source, scan_knot_files_in_roots,
 };
 use crate::state::{
     builtins as state_builtins, DocumentState, ServerState, KEYWORDS, SNIPPETS,
@@ -310,7 +310,7 @@ pub(crate) fn handle_completion(
     // for any open file) plus a one-shot disk read for files we haven't parsed
     // yet. Modules are not re-parsed across completion requests within a single
     // analyze cycle.
-    if let Some(root) = &state.workspace_root {
+    {
         let source_path = uri_to_path(uri);
         let existing_imports: HashSet<String> = doc.module.imports.iter().map(|i| i.path.clone()).collect();
         let local_names: HashSet<&str> = doc.definitions.keys().map(|s| s.as_str()).collect();
@@ -319,7 +319,11 @@ pub(crate) fn handle_completion(
         // `parse`, prefer the one with the lexicographically-shortest path.
         let mut seen_names: HashSet<String> = HashSet::new();
 
-        if let Ok(files) = scan_knot_files(root) {
+        let files = scan_knot_files_in_roots(
+            &state.workspace_roots,
+            state.workspace_root.as_deref(),
+        );
+        if !files.is_empty() {
             for file_path in files {
                 let canonical = match file_path.canonicalize() {
                     Ok(p) => p,

@@ -150,38 +150,15 @@ pub(crate) fn handle_inlay_hint(
 /// Returns the unit text without the angle brackets, or `None` if the type
 /// has no unit annotation. Skips trivial dimensionless `<1>` annotations.
 fn extract_unit_from_type_str(ty: &str) -> Option<String> {
-    // Find the first `<` that follows `Int` or `Float`. Bail if there's no
-    // such pattern; that's how non-unit types like `Maybe<T>` are excluded.
-    let lt = ty.find('<')?;
-    let prefix = ty[..lt].trim_end();
-    if !prefix.ends_with("Int") && !prefix.ends_with("Float") {
-        return None;
-    }
-    // Find the matching `>` honoring nesting. Units are flat (no nesting in
-    // practice) but compose like `M*S^2`; tracking depth keeps us safe if
-    // someone constructs a parenthesized unit later.
-    let mut depth = 0i32;
-    let bytes = ty.as_bytes();
-    let mut close = None;
-    for (i, &b) in bytes[lt..].iter().enumerate() {
-        match b {
-            b'<' => depth += 1,
-            b'>' => {
-                depth -= 1;
-                if depth == 0 {
-                    close = Some(lt + i);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let close = close?;
-    let inner = ty[lt + 1..close].trim();
-    if inner.is_empty() || inner == "1" {
-        return None;
-    }
-    Some(inner.to_string())
+    let parsed = crate::parsed_type::ParsedType::parse(ty);
+    // Look at the function's return type if it's a function; otherwise the
+    // whole type. Unit-annotated parameters aren't surfaced here because the
+    // hint is anchored to the binding's overall type.
+    let value = match &parsed {
+        crate::parsed_type::ParsedType::Function(_, ret) => ret.strip_io(),
+        other => other.strip_io(),
+    };
+    value.unit().map(|s| s.to_string())
 }
 
 /// Walk every binding-with-unit and emit hints on numeric literals inside the

@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use knot::ast::{self, DeclKind, Module, Span};
+use knot::ast::{self, DeclKind, Module, Span, Type, TypeKind};
 
 use crate::type_format::{format_type_kind, format_type_scheme};
 use crate::utils::find_word_in_source;
@@ -68,13 +68,52 @@ pub fn resolve_definitions(
     // Phase 2: walk declaration bodies to resolve references
     for decl in &module.decls {
         match &decl.node {
-            DeclKind::Fun { body: Some(body), .. }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => {
+            DeclKind::Fun { body, ty, .. } => {
+                if let Some(scheme) = ty {
+                    resolver.resolve_type(&scheme.ty, source);
+                    for c in &scheme.constraints {
+                        for arg in &c.args {
+                            resolver.resolve_type(arg, source);
+                        }
+                    }
+                }
+                if let Some(body) = body {
+                    resolver.resolve_expr(body);
+                }
+            }
+            DeclKind::View { body, ty, .. } | DeclKind::Derived { body, ty, .. } => {
+                if let Some(scheme) = ty {
+                    resolver.resolve_type(&scheme.ty, source);
+                    for c in &scheme.constraints {
+                        for arg in &c.args {
+                            resolver.resolve_type(arg, source);
+                        }
+                    }
+                }
                 resolver.resolve_expr(body);
             }
-            DeclKind::Fun { body: None, .. } => {}
-            DeclKind::Impl { items, .. } => {
+            DeclKind::Source { ty, .. } => {
+                resolver.resolve_type(ty, source);
+            }
+            DeclKind::TypeAlias { ty, .. } => {
+                resolver.resolve_type(ty, source);
+            }
+            DeclKind::Data { constructors, .. } => {
+                for ctor in constructors {
+                    for f in &ctor.fields {
+                        resolver.resolve_type(&f.value, source);
+                    }
+                }
+            }
+            DeclKind::Impl { args, items, constraints, .. } => {
+                for arg in args {
+                    resolver.resolve_type(arg, source);
+                }
+                for c in constraints {
+                    for arg in &c.args {
+                        resolver.resolve_type(arg, source);
+                    }
+                }
                 for item in items {
                     if let ast::ImplItem::Method { params, body, .. } = item {
                         resolver.push_scope();
@@ -86,25 +125,65 @@ pub fn resolve_definitions(
                     }
                 }
             }
-            DeclKind::Trait { items, .. } => {
+            DeclKind::Trait { items, supertraits, .. } => {
+                for c in supertraits {
+                    for arg in &c.args {
+                        resolver.resolve_type(arg, source);
+                    }
+                }
                 for item in items {
                     if let ast::TraitItem::Method {
                         default_params,
-                        default_body: Some(body),
+                        default_body,
+                        ty,
                         ..
                     } = item
                     {
-                        resolver.push_scope();
-                        for p in default_params {
-                            resolver.define_pat(p);
+                        resolver.resolve_type(&ty.ty, source);
+                        for c in &ty.constraints {
+                            for arg in &c.args {
+                                resolver.resolve_type(arg, source);
+                            }
                         }
-                        resolver.resolve_expr(body);
-                        resolver.pop_scope();
+                        if let Some(body) = default_body {
+                            resolver.push_scope();
+                            for p in default_params {
+                                resolver.define_pat(p);
+                            }
+                            resolver.resolve_expr(body);
+                            resolver.pop_scope();
+                        }
                     }
                 }
             }
-            DeclKind::Migrate { using_fn, .. } => {
+            DeclKind::Migrate { from_ty, to_ty, using_fn, .. } => {
+                resolver.resolve_type(from_ty, source);
+                resolver.resolve_type(to_ty, source);
                 resolver.resolve_expr(using_fn);
+            }
+            DeclKind::Route { entries, .. } => {
+                for entry in entries {
+                    for f in &entry.body_fields {
+                        resolver.resolve_type(&f.value, source);
+                    }
+                    for f in &entry.query_params {
+                        resolver.resolve_type(&f.value, source);
+                    }
+                    for f in &entry.request_headers {
+                        resolver.resolve_type(&f.value, source);
+                    }
+                    for f in &entry.response_headers {
+                        resolver.resolve_type(&f.value, source);
+                    }
+                    if let Some(resp) = &entry.response_ty {
+                        resolver.resolve_type(resp, source);
+                    }
+                    for seg in &entry.path {
+                        if let ast::PathSegment::Param { ty, .. } = seg {
+                            resolver.resolve_type(ty, source);
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -147,6 +226,50 @@ impl DefResolver {
     fn add_ref(&mut self, usage: Span, name: &str) {
         if let Some(def) = self.lookup(name) {
             self.refs.push((usage, def));
+        }
+    }
+
+    /// Walk a type expression, registering goto-references for each named
+    /// type. The recorded usage span is just the name (not the surrounding
+    /// type construction), so the goto-on-cursor lookup matches identifier
+    /// boundaries the way users expect.
+    fn resolve_type(&mut self, ty: &Type, source: &str) {
+        match &ty.node {
+            TypeKind::Named(name) => {
+                let span = find_word_in_source(source, name, ty.span.start, ty.span.end)
+                    .unwrap_or(ty.span);
+                self.add_ref(span, name);
+            }
+            TypeKind::Var(_) | TypeKind::Hole => {}
+            TypeKind::App { func, arg } => {
+                self.resolve_type(func, source);
+                self.resolve_type(arg, source);
+            }
+            TypeKind::Record { fields, .. } => {
+                for f in fields {
+                    self.resolve_type(&f.value, source);
+                }
+            }
+            TypeKind::Relation(inner) => self.resolve_type(inner, source),
+            TypeKind::Function { param, result } => {
+                self.resolve_type(param, source);
+                self.resolve_type(result, source);
+            }
+            TypeKind::Variant { constructors, .. } => {
+                for ctor in constructors {
+                    for f in &ctor.fields {
+                        self.resolve_type(&f.value, source);
+                    }
+                }
+            }
+            TypeKind::Effectful { ty, .. } => self.resolve_type(ty, source),
+            TypeKind::IO { ty, .. } => self.resolve_type(ty, source),
+            TypeKind::UnitAnnotated { base, .. } => self.resolve_type(base, source),
+            TypeKind::Refined { base, predicate } => {
+                self.resolve_type(base, source);
+                self.resolve_expr(predicate);
+            }
+            TypeKind::Forall { ty, .. } => self.resolve_type(ty, source),
         }
     }
 

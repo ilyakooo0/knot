@@ -8226,16 +8226,45 @@ fn span_to_range(span: Span, source: &str) -> Range {
 }
 
 fn offset_to_position(source: &str, offset: usize) -> Position {
-    let (line, col) = diagnostic::line_col(source, offset);
-    // line_col returns 1-based line, 0-based col; LSP uses 0-based for both
-    Position::new((line - 1) as u32, col as u32)
+    // LSP positions use UTF-16 code units by default (we don't negotiate
+    // `positionEncodingKind`), so count code units from the start of the
+    // line up to `offset`, not bytes or codepoints.
+    let clamped = offset.min(source.len());
+    let bytes = source.as_bytes();
+    let mut line: u32 = 0;
+    let mut line_start: usize = 0;
+    for i in 0..clamped {
+        if bytes[i] == b'\n' {
+            line += 1;
+            line_start = i + 1;
+        }
+    }
+    let mut safe_offset = clamped;
+    while safe_offset > line_start && !source.is_char_boundary(safe_offset) {
+        safe_offset -= 1;
+    }
+    let character: u32 = source[line_start..safe_offset]
+        .chars()
+        .map(|c| c.len_utf16() as u32)
+        .sum();
+    Position::new(line, character)
 }
 
 fn position_to_offset(source: &str, pos: Position) -> usize {
+    // Convert an LSP Position (UTF-16 code units) into a byte offset.
     let mut offset = 0;
     for (i, line) in source.split('\n').enumerate() {
         if i == pos.line as usize {
-            return offset + (pos.character as usize).min(line.len());
+            let mut utf16_count: u32 = 0;
+            let mut byte_pos: usize = 0;
+            for c in line.chars() {
+                if utf16_count >= pos.character {
+                    break;
+                }
+                utf16_count += c.len_utf16() as u32;
+                byte_pos += c.len_utf8();
+            }
+            return offset + byte_pos;
         }
         offset += line.len() + 1;
     }
@@ -8573,5 +8602,63 @@ mod tests {
 
         drop(tx);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn position_to_offset_handles_ascii() {
+        let src = "abc\ndef";
+        assert_eq!(position_to_offset(src, Position::new(0, 0)), 0);
+        assert_eq!(position_to_offset(src, Position::new(0, 3)), 3);
+        assert_eq!(position_to_offset(src, Position::new(1, 0)), 4);
+        assert_eq!(position_to_offset(src, Position::new(1, 3)), 7);
+    }
+
+    #[test]
+    fn position_to_offset_treats_character_as_utf16_units() {
+        // "é" is 2 bytes in UTF-8 but 1 UTF-16 code unit.
+        let src = "éx";
+        assert_eq!(position_to_offset(src, Position::new(0, 0)), 0);
+        assert_eq!(position_to_offset(src, Position::new(0, 1)), 2); // after é
+        assert_eq!(position_to_offset(src, Position::new(0, 2)), 3); // after x
+    }
+
+    #[test]
+    fn position_to_offset_handles_surrogate_pairs() {
+        // 😀 is 4 bytes in UTF-8 and 2 UTF-16 code units (surrogate pair).
+        let src = "a😀b";
+        assert_eq!(position_to_offset(src, Position::new(0, 0)), 0); // before a
+        assert_eq!(position_to_offset(src, Position::new(0, 1)), 1); // after a
+        assert_eq!(position_to_offset(src, Position::new(0, 3)), 5); // after 😀 (1 + 4)
+        assert_eq!(position_to_offset(src, Position::new(0, 4)), 6); // after b
+    }
+
+    #[test]
+    fn offset_to_position_round_trips_ascii() {
+        let src = "hello\nworld";
+        for offset in 0..=src.len() {
+            let pos = offset_to_position(src, offset);
+            assert_eq!(position_to_offset(src, pos), offset, "offset {}", offset);
+        }
+    }
+
+    #[test]
+    fn offset_to_position_round_trips_unicode() {
+        let src = "x é\n😀 y";
+        // Round-trip every char-boundary offset.
+        for offset in 0..=src.len() {
+            if !src.is_char_boundary(offset) {
+                continue;
+            }
+            let pos = offset_to_position(src, offset);
+            assert_eq!(position_to_offset(src, pos), offset, "offset {}", offset);
+        }
+    }
+
+    #[test]
+    fn offset_to_position_emits_utf16_columns_for_surrogate_pairs() {
+        let src = "a😀b";
+        // Byte offset 5 is just after 😀 — should be UTF-16 column 3.
+        let pos = offset_to_position(src, 5);
+        assert_eq!(pos, Position::new(0, 3));
     }
 }

@@ -6031,7 +6031,13 @@ impl Codegen {
             ast::PatKind::Var(name) => env.set(name, val),
             ast::PatKind::Wildcard => {}
             ast::PatKind::Constructor { name, payload } => {
-                if matches!(self.nullable_ctors.get(name), Some(NullableRole::None)) {
+                if name == "True" || name == "False" {
+                    // Bool is represented as Value::Bool, not Value::Constructor —
+                    // calling knot_constructor_payload would panic. The payload is
+                    // conceptually unit (Bool has no fields).
+                    let unit = self.call_rt(builder, "knot_value_unit", &[]);
+                    self.bind_case_pattern(builder, payload, unit, env);
+                } else if matches!(self.nullable_ctors.get(name), Some(NullableRole::None)) {
                     // Nullable none: payload is conceptually unit
                     let unit = self.call_rt(builder, "knot_value_unit", &[]);
                     self.bind_case_pattern(builder, payload, unit, env);
@@ -6189,6 +6195,7 @@ impl Codegen {
             "writeFile", "appendFile", "fileExists", "removeFile",
             "listDir", "now", "sleep", "randomInt", "randomFloat", "fetch", "fetchWith",
             "fork", "listen", "generateKeyPair", "generateSigningKeyPair", "encrypt",
+            "logInfo", "logWarn", "logError", "logDebug",
         ].into_iter().collect();
 
         // Collect function bodies for analysis
@@ -6284,6 +6291,7 @@ impl Codegen {
                         | "listDir" | "now" | "sleep" | "randomInt" | "randomFloat"
                         | "fetch" | "fetchWith" | "fork" | "listen"
                         | "generateKeyPair" | "generateSigningKeyPair" | "encrypt"
+                        | "logInfo" | "logWarn" | "logError" | "logDebug"
                 ) || self.io_functions.contains(name)
             }
             ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,

@@ -67,17 +67,42 @@ pub fn analysis_worker(
         }
 
         for (_, task) in pending {
-            let mut cache = match import_cache.lock() {
-                Ok(g) => g,
-                Err(poison) => poison.into_inner(),
+            // Clone the caches out of the shared mutexes so the heavy analysis
+            // pipeline (lex+parse+infer+effects+stratify+sql_lint, ~100ms) runs
+            // without blocking the main thread. Cache writes are merged back
+            // afterwards. This trades a transient double-allocation for UI
+            // responsiveness — completion, workspace symbol, rename etc. all
+            // need read access to `import_cache` and would otherwise queue
+            // behind the worker on every keystroke.
+            let mut cache_local = match import_cache.lock() {
+                Ok(g) => g.clone(),
+                Err(poison) => poison.into_inner().clone(),
             };
-            let mut inf_cache = match inference_cache.lock() {
-                Ok(g) => g,
-                Err(poison) => poison.into_inner(),
+            let mut inf_cache_local = match inference_cache.lock() {
+                Ok(g) => g.clone(),
+                Err(poison) => poison.into_inner().clone(),
             };
-            let doc = analyze_document(&task.uri, &task.source, &mut cache, &mut inf_cache);
-            drop(inf_cache);
-            drop(cache);
+
+            let doc = analyze_document(
+                &task.uri,
+                &task.source,
+                &mut cache_local,
+                &mut inf_cache_local,
+            );
+
+            // Merge any new entries back. We don't overwrite entries that the
+            // main thread or another worker iteration may have produced
+            // concurrently with a fresher hash — only insert if the key is
+            // missing or our hash matches.
+            if let Ok(mut shared) = import_cache.lock() {
+                for (k, v) in cache_local.into_iter() {
+                    shared.entry(k).or_insert(v);
+                }
+            }
+            if let Ok(mut shared) = inference_cache.lock() {
+                *shared = inf_cache_local;
+            }
+
             if tx
                 .send(AnalysisResult {
                     uri: task.uri,

@@ -477,6 +477,32 @@ impl Infer {
         Ty::Var(self.fresh_var())
     }
 
+    /// Resolve a refined-type alias to its non-refined base, following alias
+    /// chains and detecting cycles. Returns `None` and emits a diagnostic on
+    /// the first cycle so the caller can stop unifying without overflowing
+    /// the stack. The returned `Ty` is guaranteed not to be a refined alias
+    /// (or another nullary `Con` whose name is in `refined_types`).
+    fn resolve_refined_base(&mut self, name: &str, span: Span) -> Option<Ty> {
+        let mut visited: Vec<String> = vec![name.to_string()];
+        let mut current = self.refined_types.get(name)?.0.clone();
+        loop {
+            match &current {
+                Ty::Con(n, args) if args.is_empty() && self.refined_types.contains_key(n) => {
+                    if visited.iter().any(|v| v == n) {
+                        self.error(
+                            format!("refined type alias '{}' has a cyclic definition", visited[0]),
+                            span,
+                        );
+                        return None;
+                    }
+                    visited.push(n.clone());
+                    current = self.refined_types[n].0.clone();
+                }
+                _ => return Some(current),
+            }
+        }
+    }
+
     fn fresh_var(&mut self) -> TyVar {
         let v = self.next_var;
         self.next_var += 1;
@@ -1175,20 +1201,31 @@ impl Infer {
                     self.unify_variants(c1, *r1, &ec, er, span);
                 }
             }
-            // Refined type subsumption: Con("Nat", []) ↔ Int, etc.
+            // Refined type subsumption: Con("Nat", []) ↔ Int, etc. Resolve the
+            // refined alias to its non-refined base, with cycle detection so
+            // `type T = T where ...` or `type A = B / type B = A` diagnoses
+            // instead of overflowing the stack.
             (Ty::Con(name, args), other)
                 if args.is_empty() && self.refined_types.contains_key(name) =>
             {
-                let base_ty = self.refined_types[name].0.clone();
-                let other = other.clone();
-                self.unify(&base_ty, &other, span);
+                match self.resolve_refined_base(name, span) {
+                    Some(base_ty) => {
+                        let other = other.clone();
+                        self.unify(&base_ty, &other, span);
+                    }
+                    None => {} // cycle already reported
+                }
             }
             (other, Ty::Con(name, args))
                 if args.is_empty() && self.refined_types.contains_key(name) =>
             {
-                let base_ty = self.refined_types[name].0.clone();
-                let other = other.clone();
-                self.unify(&other, &base_ty, span);
+                match self.resolve_refined_base(name, span) {
+                    Some(base_ty) => {
+                        let other = other.clone();
+                        self.unify(&other, &base_ty, span);
+                    }
+                    None => {} // cycle already reported
+                }
             }
             _ => {
                 let d1 = self.display_ty(&t1);
@@ -3635,15 +3672,8 @@ impl Infer {
                 self.expr_is_io_prescan(func) || self.expr_is_io_prescan(arg)
             }
             ast::ExprKind::Var(name) => {
-                matches!(
-                    name.as_str(),
-                    "println" | "putLine" | "print" | "readLine" | "readFile"
-                        | "writeFile" | "appendFile" | "fileExists" | "removeFile"
-                        | "listDir" | "now" | "sleep" | "randomInt" | "randomFloat"
-                        | "fetch" | "fetchWith" | "fork" | "listen"
-                        | "generateKeyPair" | "generateSigningKeyPair" | "encrypt"
-                        | "logInfo" | "logWarn" | "logError" | "logDebug"
-                ) || self.lookup(name).map_or(false, |scheme| {
+                (crate::builtins::is_io_builtin(name) || name == "fork")
+                || self.lookup(name).map_or(false, |scheme| {
                     fn returns_io(ty: &Ty) -> bool {
                         match ty {
                             Ty::IO(_, _, _) => true,
@@ -5270,10 +5300,17 @@ impl Infer {
                     .collect();
 
                 // Also include per-method constraints from the type scheme
-                // (e.g., `Applicative f =>` on Traversable.traverse)
+                // (e.g., `Applicative f =>` on Traversable.traverse). Lowercase
+                // type variables parse as `TypeKind::Var`, but a constraint
+                // could also reference an explicit type-parameter name parsed
+                // as `TypeKind::Named`; accept either.
                 for c in &ty.constraints {
                     if c.args.len() == 1 {
-                        if let ast::TypeKind::Named(var_name) = &c.args[0].node {
+                        let var_name = match &c.args[0].node {
+                            ast::TypeKind::Var(n) | ast::TypeKind::Named(n) => Some(n),
+                            _ => None,
+                        };
+                        if let Some(var_name) = var_name {
                             if let Some(&v) = self.annotation_vars.get(var_name) {
                                 constraints.push(TyConstraint {
                                     trait_name: c.trait_name.clone(),

@@ -84,3 +84,51 @@ pub const ATOMIC_DISALLOWED_BUILTINS: &[&str] = &[
     "readFile", "writeFile", "appendFile",
     "fileExists", "removeFile", "listDir",
 ];
+
+/// Built-in trait method names (Eq.eq, Ord.compare, Num.add, etc.). Resolved
+/// at codegen time via runtime tag dispatch.
+pub const TRAIT_METHOD_BUILTINS: &[&str] = &[
+    "eq", "compare", "ap", "bind", "alt", "empty",
+    "add", "sub", "mul", "div", "negate", "append",
+    "yield", "display",
+];
+
+/// Bytes builtins. Pure but kept separate so the LSP/codegen can recognize
+/// them as user-callable and they sort sensibly in completion lists.
+pub const BYTES_BUILTINS: &[&str] = &[
+    "bytesLength", "bytesSlice", "bytesConcat",
+    "textToBytes", "bytesToText", "bytesToHex",
+    "bytesFromHex", "hexDecode", "bytesGet",
+];
+
+/// Internal desugaring helpers emitted by the desugarer. Not user-facing.
+pub const INTERNAL_BUILTINS: &[&str] = &["__bind", "__yield", "__empty"];
+
+/// Single source of truth: every name the compiler treats as a builtin.
+/// Used by `codegen::is_builtin_name` (free-variable filtering) and the LSP
+/// completion suggestions. Adding a new builtin should only require editing
+/// this file and the codegen registration site.
+pub const ALL_BUILTINS: &[&[&str]] = &[
+    CONSOLE_BUILTINS,
+    CLOCK_BUILTINS,
+    RANDOM_BUILTINS,
+    NETWORK_BUILTINS,
+    FS_BUILTINS,
+    CONCURRENCY_BUILTINS,
+    PURE_BUILTINS,
+    TRAIT_METHOD_BUILTINS,
+    BYTES_BUILTINS,
+    INTERNAL_BUILTINS,
+];
+
+/// True if `name` is a known builtin (any category).
+pub fn is_builtin(name: &str) -> bool {
+    ALL_BUILTINS.iter().any(|list| list.contains(&name))
+}
+
+/// True if `name` is an effectful builtin — i.e. calling it produces an IO
+/// value. Excludes `retry` (no IO) and `fork` (returns `IO {} {}`, but its
+/// argument's effects are decoupled from the caller).
+pub fn is_io_builtin(name: &str) -> bool {
+    EFFECTFUL_BUILTINS.contains(&name) && !matches!(name, "retry")
+}

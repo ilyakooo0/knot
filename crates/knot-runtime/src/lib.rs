@@ -1346,6 +1346,10 @@ static TABLE_WATCHERS: std::sync::LazyLock<Mutex<HashMap<String, Vec<Weak<WakeSl
 thread_local! {
     /// Set by `knot_stm_retry`, checked by `knot_stm_check_and_clear` after atomic body.
     static STM_RETRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set when an atomic IO body skips early via a failed constructor-pattern
+    /// bind or false `where` guard. Checked after the body so the surrounding
+    /// `atomic` rolls back instead of committing partial writes.
+    static STM_SKIP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Tables read during current atomic block, with version at read time.
     static STM_READ_VERSIONS: RefCell<HashMap<String, u64>> = RefCell::new(HashMap::new());
     /// Tables written during current atomic block (notification deferred to commit).
@@ -2660,13 +2664,11 @@ pub extern "C" fn knot_value_text_cached(ptr: *const u8, len: usize) -> *mut Val
 /// observe the non-null slot and return it directly — no hashing, no
 /// LRU traversal, no re-allocation.
 ///
-/// The slot is thread-unsafe in theory (no atomic compare-exchange),
-/// but in practice a Knot program's compiled static data isn't
-/// read/written across threads until after main has started, by
-/// which point the dominant literals will have been initialized
-/// serially during startup; worst case, two threads race and one
-/// box leaks (harmless).  Text values are `Arc<str>` wrapped so
-/// duplicate boxes compare equal.
+/// Thread-safe via `AtomicPtr::compare_exchange`: the slot is treated
+/// as a one-shot init cell. On contention the loser drops its newly
+/// allocated box and uses the winner's value, so duplicates never leak.
+/// The slot pointer must outlive the program (true for compiled-code
+/// statics) and start zeroed.
 ///
 /// Compared to `knot_value_text_cached`, this also frees the runtime
 /// LRU from per-call pressure — the LRU remains available for dynamic
@@ -2679,7 +2681,8 @@ pub unsafe extern "C" fn knot_value_text_intern(
     slot: *mut *mut Value,
 ) -> *mut Value {
     debug_assert!(!slot.is_null(), "knot runtime: null text-literal slot");
-    let cached = unsafe { *slot };
+    let atomic = unsafe { &*(slot as *const std::sync::atomic::AtomicPtr<Value>) };
+    let cached = atomic.load(std::sync::atomic::Ordering::Acquire);
     if !cached.is_null() {
         GC_STATS.bump(&GC_STATS.text_cache_hits);
         return cached;
@@ -2687,8 +2690,19 @@ pub unsafe extern "C" fn knot_value_text_intern(
     GC_STATS.bump(&GC_STATS.text_cache_misses);
     let s = unsafe { str_from_raw(ptr, len) };
     let val = Box::into_raw(Box::new(Value::Text(Arc::from(s))));
-    unsafe { *slot = val; }
-    val
+    match atomic.compare_exchange(
+        std::ptr::null_mut(),
+        val,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    ) {
+        Ok(_) => val,
+        Err(winner) => {
+            // Lost the race; drop our box and use the winner's value.
+            unsafe { drop(Box::from_raw(val)); }
+            winner
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -3479,11 +3493,14 @@ fn sql_relations_equal(conn: &Connection, a: &[*mut Value], b: &[*mut Value]) ->
         debug_sql(&sql);
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             all_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-        let has_diff = conn
+        return match conn
             .prepare(&sql)
             .and_then(|mut s| s.query_row(param_refs.as_slice(), |_| Ok(true)))
-            .unwrap_or(false);
-        return Some(!has_diff);
+        {
+            Ok(_) => Some(false),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Some(true),
+            Err(_) => None,
+        };
     }
 
     let t1 = materialize_relation(conn, a, &schema);
@@ -3495,15 +3512,18 @@ fn sql_relations_equal(conn: &Connection, a: &[*mut Value], b: &[*mut Value]) ->
         quote_ident(&t1), quote_ident(&t2), quote_ident(&t2), quote_ident(&t1)
     );
     debug_sql(&sql);
-    let has_diff = conn
+    let result = conn
         .prepare_cached(&sql)
-        .and_then(|mut s| s.query_row([], |_| Ok(true)))
-        .unwrap_or(false);
+        .and_then(|mut s| s.query_row([], |_| Ok(true)));
 
     drop_temp_table(conn, &t1);
     drop_temp_table(conn, &t2);
 
-    Some(!has_diff)
+    match result {
+        Ok(_) => Some(false),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Some(true),
+        Err(_) => None,
+    }
 }
 
 // ── Relation operations ───────────────────────────────────────────
@@ -3588,7 +3608,7 @@ pub extern "C" fn knot_relation_take(
     rel: *mut Value,
 ) -> *mut Value {
     let n = match unsafe { as_ref(n_val) } {
-        Value::SmallInt(i) => *i as usize,
+        Value::SmallInt(i) => (*i).max(0) as usize,
         Value::Int(i) => i.to_u64().unwrap_or(0) as usize,
         _ => 0,
     };
@@ -3608,7 +3628,7 @@ pub extern "C" fn knot_relation_drop(
     rel: *mut Value,
 ) -> *mut Value {
     let n = match unsafe { as_ref(n_val) } {
-        Value::SmallInt(i) => *i as usize,
+        Value::SmallInt(i) => (*i).max(0) as usize,
         Value::Int(i) => i.to_u64().unwrap_or(0) as usize,
         _ => 0,
     };
@@ -5151,6 +5171,25 @@ pub extern "C" fn knot_stm_check_and_clear() -> i32 {
         let val = r.get();
         r.set(false);
         if val { 1 } else { 0 }
+    })
+}
+
+/// Mark the current atomic body as having skipped early (failed pattern bind
+/// or false `where` guard). The surrounding `atomic` will rollback instead of
+/// committing.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_stm_skip() -> *mut Value {
+    STM_SKIP.with(|s| s.set(true));
+    alloc(Value::Unit)
+}
+
+/// Check if the atomic body skipped, and clear the flag. Returns 1 on skip.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_stm_check_skip_and_clear() -> i32 {
+    STM_SKIP.with(|s| {
+        let v = s.get();
+        s.set(false);
+        if v { 1 } else { 0 }
     })
 }
 
@@ -6917,7 +6956,7 @@ struct ColumnSpec {
     ty: ColType,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ColType {
     Int,
     Float,
@@ -6926,7 +6965,10 @@ enum ColType {
     Bytes,
     /// Stored as TEXT, reconstructed as Constructor on read
     Tag,
-    /// Nested relation stored as JSON text in SQLite
+    /// Nested relation stored as JSON text in SQLite. In practice this variant
+    /// never appears in `RecordSchema::columns`/`NestedField::columns` because
+    /// `parse_record_schema` routes `[...]` types into the `nested` channel
+    /// instead — but it remains for ADT field schemas (`parse_adt_schema`).
     Json,
 }
 
@@ -7367,7 +7409,7 @@ fn auto_apply_child_change(
     for old_col in &old_nf.columns {
         match new_nf.columns.iter().find(|c| c.name == old_col.name) {
             Some(new_col) => {
-                if std::mem::discriminant(&old_col.ty) != std::mem::discriminant(&new_col.ty) {
+                if old_col.ty != new_col.ty {
                     return false;
                 }
             }
@@ -7456,7 +7498,7 @@ fn auto_apply_record_change(
     for old_col in &old_rec.columns {
         match new_rec.columns.iter().find(|c| c.name == old_col.name) {
             Some(new_col) => {
-                if std::mem::discriminant(&old_col.ty) != std::mem::discriminant(&new_col.ty) {
+                if old_col.ty != new_col.ty {
                     return false;
                 }
             }

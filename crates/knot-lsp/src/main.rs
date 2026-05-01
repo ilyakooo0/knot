@@ -37,7 +37,8 @@ use crate::legend::{
 };
 use crate::state::{
     content_hash, send_response, AnalysisResult, AnalysisTask, DocumentState, PendingSource,
-    ServerState, WorkspaceSymbolCache, WorkspaceSymbolEntry, BUILTINS, KEYWORDS, SNIPPETS,
+    builtins as state_builtins, ServerState, WorkspaceSymbolCache, WorkspaceSymbolEntry, KEYWORDS,
+    SNIPPETS,
 };
 use crate::type_format::{format_type_kind, format_type_scheme};
 use crate::utils::{
@@ -1896,11 +1897,11 @@ fn handle_completion(
     }
 
     // Built-in functions with type info
-    for name in BUILTINS {
+    for name in state_builtins() {
         items.push(CompletionItem {
             label: name.to_string(),
             kind: Some(CompletionItemKind::FUNCTION),
-            detail: doc.type_info.get(*name).cloned(),
+            detail: doc.type_info.get(name).cloned(),
             ..Default::default()
         });
     }
@@ -3909,18 +3910,60 @@ impl<'a> TokenCollector<'a> {
 }
 
 fn delta_encode_tokens(tokens: &[RawToken], source: &str) -> Vec<SemanticToken> {
-    let mut result = Vec::new();
+    // Tokens arrive in source order. A naive implementation calls
+    // `offset_to_position` per token, each O(N) — yielding O(M·N) overall.
+    // Instead, do a single forward sweep over the source, tracking cumulative
+    // line/UTF-16-column, and convert each token's byte offset by advancing
+    // a cursor.
+    let mut result = Vec::with_capacity(tokens.len());
     let mut prev_line = 0u32;
     let mut prev_char = 0u32;
 
+    let mut byte_cursor = 0usize;
+    let mut line = 0u32;
+    let mut line_start_byte = 0usize;
+    let mut col_utf16 = 0u32;
+    let bytes = source.as_bytes();
+
     for token in tokens {
-        let pos = offset_to_position(source, token.start);
-        let delta_line = pos.line - prev_line;
-        let delta_start = if delta_line == 0 {
-            pos.character - prev_char
-        } else {
-            pos.character
-        };
+        // Tokens may not be sorted in pathological cases; reset and rescan
+        // from the start for any token before the cursor.
+        if token.start < byte_cursor {
+            byte_cursor = 0;
+            line = 0;
+            line_start_byte = 0;
+            col_utf16 = 0;
+        }
+
+        // Advance to token.start, updating line and column as we go.
+        let target = token.start.min(source.len());
+        while byte_cursor < target {
+            // Find the next char boundary so we can decode one codepoint.
+            if bytes[byte_cursor] == b'\n' {
+                line += 1;
+                byte_cursor += 1;
+                line_start_byte = byte_cursor;
+                col_utf16 = 0;
+            } else if bytes[byte_cursor] == b'\r' {
+                // Skip \r in CRLF — it doesn't contribute a UTF-16 column.
+                byte_cursor += 1;
+            } else {
+                let mut next = byte_cursor + 1;
+                while next < source.len() && !source.is_char_boundary(next) {
+                    next += 1;
+                }
+                if let Some(s) = source.get(byte_cursor..next) {
+                    if let Some(c) = s.chars().next() {
+                        col_utf16 += c.len_utf16() as u32;
+                    }
+                }
+                byte_cursor = next;
+            }
+        }
+        let _ = line_start_byte; // explicit: line_start_byte is computed for clarity, not used downstream.
+
+        let delta_line = line - prev_line;
+        let delta_start = if delta_line == 0 { col_utf16 - prev_char } else { col_utf16 };
 
         result.push(SemanticToken {
             delta_line,
@@ -3930,8 +3973,8 @@ fn delta_encode_tokens(tokens: &[RawToken], source: &str) -> Vec<SemanticToken> 
             token_modifiers_bitset: token.modifiers,
         });
 
-        prev_line = pos.line;
-        prev_char = pos.character;
+        prev_line = line;
+        prev_char = col_utf16;
     }
 
     result
@@ -4847,7 +4890,7 @@ fn handle_code_action(
                     }
                 }
                 // Also check builtins
-                for name in BUILTINS {
+                for name in state_builtins() {
                     let dist = edit_distance(unknown_name, name);
                     if dist <= 2 && dist > 0 {
                         candidates.push((name, dist));
@@ -5690,7 +5733,12 @@ fn find_enclosing_atomic_expr(
                 walk(func, source, offset, best);
                 walk(arg, source, offset, best);
             }
-            ast::ExprKind::Lambda { body, .. } => walk(body, source, offset, best),
+            // Don't recurse into lambda bodies: a lambda is a deferred
+            // computation that runs when (and where) it's eventually called,
+            // not in the atomic context that lexically encloses its
+            // definition. `fork (\_ -> println ...)` inside `atomic` should
+            // not flag `println` as atomic-disallowed.
+            ast::ExprKind::Lambda { .. } => {}
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
                 walk(lhs, source, offset, best);
                 walk(rhs, source, offset, best);
@@ -7457,16 +7505,39 @@ fn handle_workspace_diagnostics(
     WorkspaceDiagnosticReportResult::Report(WorkspaceDiagnosticReport { items })
 }
 
-/// Drop cache entries for files whose content has changed (hash mismatch) or
-/// that no longer exist. Cheap O(n) over the cache; called after each
+/// Drop cache entries for files whose content has changed (hash mismatch),
+/// that no longer exist, or whose transitive imports have changed since the
+/// entry was cached. Cheap O(n*depth) over the cache; called after each
 /// workspace-diagnostics request.
 fn prune_stale_workspace_diag_cache(state: &mut ServerState) {
-    state.workspace_diag_cache.retain(|path, (cached_h, _)| {
+    // Compute the set of files whose disk content has changed since cached.
+    let mut changed: HashSet<PathBuf> = HashSet::new();
+    for (path, (cached_h, _)) in &state.workspace_diag_cache {
         match std::fs::read_to_string(path) {
-            Ok(s) => content_hash(&s) == *cached_h,
-            Err(_) => false, // file deleted or inaccessible
+            Ok(s) if content_hash(&s) == *cached_h => {}
+            _ => {
+                changed.insert(path.clone());
+            }
         }
-    });
+    }
+
+    // Propagate invalidation along the reverse-imports graph: any file that
+    // imports a changed file (transitively) must also be evicted, because its
+    // cached diagnostics may have referenced types/effects from the now-stale
+    // import.
+    let mut affected = changed.clone();
+    let mut frontier: Vec<PathBuf> = changed.into_iter().collect();
+    while let Some(p) = frontier.pop() {
+        if let Some(importers) = state.reverse_imports.get(&p) {
+            for imp in importers {
+                if affected.insert(imp.clone()) {
+                    frontier.push(imp.clone());
+                }
+            }
+        }
+    }
+
+    state.workspace_diag_cache.retain(|path, _| !affected.contains(path));
 }
 
 /// Run the full analysis pipeline on an unopened workspace file and return its

@@ -38,8 +38,11 @@ pub fn offset_to_position(source: &str, offset: usize) -> Position {
     while safe_offset > line_start && !source.is_char_boundary(safe_offset) {
         safe_offset -= 1;
     }
+    // \r in a CRLF line ending is part of the line break (the LSP spec says
+    // CRLF counts as one character), so don't include it in the column count.
     let character: u32 = source[line_start..safe_offset]
         .chars()
+        .filter(|&c| c != '\r')
         .map(|c| c.len_utf16() as u32)
         .sum();
     Position::new(line, character)
@@ -49,6 +52,9 @@ pub fn position_to_offset(source: &str, pos: Position) -> usize {
     let mut offset = 0;
     for (i, line) in source.split('\n').enumerate() {
         if i == pos.line as usize {
+            // Strip trailing \r so CRLF line endings don't contribute a phantom
+            // UTF-16 column. The LSP spec says the line break is one character.
+            let line = line.strip_suffix('\r').unwrap_or(line);
             let mut utf16_count: u32 = 0;
             let mut byte_pos: usize = 0;
             for c in line.chars() {
@@ -95,12 +101,67 @@ pub fn word_at_position<'a>(source: &'a str, pos: Position) -> Option<&'a str> {
 
 pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     let s = uri.as_str();
-    s.strip_prefix("file://").map(PathBuf::from)
+    let raw = s.strip_prefix("file://")?;
+    let decoded = percent_decode(raw);
+    // On Windows, file URIs look like `file:///C:/...` — strip the leading
+    // slash before the drive letter so the path is absolute on the host.
+    #[cfg(windows)]
+    let decoded = if decoded.starts_with('/') {
+        let bytes = decoded.as_bytes();
+        if bytes.len() >= 3 && bytes[2] == b':' && bytes[1].is_ascii_alphabetic() {
+            decoded[1..].to_string()
+        } else {
+            decoded
+        }
+    } else {
+        decoded
+    };
+    Some(PathBuf::from(decoded))
 }
 
 pub fn path_to_uri(path: &Path) -> Option<Uri> {
-    let s = format!("file://{}", path.display());
-    s.parse::<Uri>().ok()
+    let path_str = path.to_str()?;
+    // Path components on Unix start with `/`; on Windows `C:\foo` we prepend `/`.
+    let mut encoded = String::from("file://");
+    let needs_leading_slash = !path_str.starts_with('/');
+    if needs_leading_slash {
+        encoded.push('/');
+    }
+    for &b in path_str.as_bytes() {
+        let c = b as char;
+        // Replace Windows backslashes with forward slashes for URIs.
+        let c = if c == '\\' { '/' } else { c };
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~' | '/' | ':') {
+            encoded.push(c);
+        } else {
+            encoded.push_str(&format!("%{:02X}", b));
+        }
+    }
+    encoded.parse::<Uri>().ok()
+}
+
+/// Decode `%xx` sequences in a string. Invalid escapes are left as-is.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    // The percent-decoded path is a sequence of bytes representing the OS
+    // path. On UTF-8 systems it should be valid UTF-8; if it isn't we fall
+    // back to a lossy conversion rather than dropping the path entirely.
+    String::from_utf8(out.clone()).unwrap_or_else(|_| String::from_utf8_lossy(&out).into_owned())
 }
 
 // ── Edit distance ───────────────────────────────────────────────────
@@ -136,7 +197,14 @@ pub fn find_word_in_source(source: &str, name: &str, start: usize, end: usize) -
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
 
     let mut search_start = 0;
-    while let Some(pos) = text[search_start..].find(name) {
+    while search_start <= text.len() {
+        let Some(rest) = text.get(search_start..) else {
+            // search_start landed mid-codepoint; advance to the next char
+            // boundary so the next iteration can slice safely.
+            search_start += 1;
+            continue;
+        };
+        let Some(pos) = rest.find(name) else { break };
         let abs_pos = start + search_start + pos;
         let abs_end = abs_pos + name.len();
 

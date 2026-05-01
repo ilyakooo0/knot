@@ -24,7 +24,7 @@ pub fn to_lsp_diagnostic(
     let range = diag
         .labels
         .iter()
-        .find(|l| l.span.start < source.len() && l.span.end <= source.len())
+        .find(|l| l.span.start <= source.len() && l.span.end <= source.len())
         .map(|l| span_to_range(l.span, source))
         .unwrap_or(Range {
             start: Position::new(0, 0),
@@ -45,7 +45,7 @@ pub fn to_lsp_diagnostic(
         .labels
         .iter()
         .skip(1)
-        .filter(|l| l.span.start < source.len() && l.span.end <= source.len())
+        .filter(|l| l.span.start <= source.len() && l.span.end <= source.len())
         .map(|l| DiagnosticRelatedInformation {
             location: Location {
                 uri: uri.clone(),

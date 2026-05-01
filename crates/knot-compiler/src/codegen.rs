@@ -803,6 +803,8 @@ impl Codegen {
         // STM retry
         self.declare_rt("knot_stm_retry", &[], &[p]);
         self.declare_rt("knot_stm_check_and_clear", &[], &[types::I32]);
+        self.declare_rt("knot_stm_skip", &[], &[p]);
+        self.declare_rt("knot_stm_check_skip_and_clear", &[], &[types::I32]);
         self.declare_rt("knot_stm_snapshot", &[], &[types::I64]);
         self.declare_rt("knot_stm_wait", &[types::I64], &[]);
         self.declare_rt("knot_stm_push", &[], &[]);
@@ -4180,28 +4182,59 @@ impl Codegen {
 
                 self.atomic_retry_block = prev_retry_block;
 
-                // Check if retry was requested (safety net for edge cases)
+                // After the body completes without an explicit retry, three
+                // outcomes are possible:
+                //   1. retry was set     → rollback, wait for changes, loop
+                //   2. skip flag was set → rollback, exit atomic with unit
+                //                          (a constructor-pattern bind or
+                //                          `where` guard failed inside the
+                //                          body; partial writes must NOT be
+                //                          committed)
+                //   3. normal completion → commit and return body's value
                 let retry_flag = self.call_rt(builder, "knot_stm_check_and_clear", &[]);
-                builder.ins().brif(retry_flag, retry_block, &[], done_block, &[val.into()]);
+                let post_retry_block = builder.create_block();
+                builder.append_block_param(post_retry_block, self.ptr_type);
+                builder.ins().brif(retry_flag, retry_block, &[], post_retry_block, &[val.into()]);
 
-                // Retry: rollback, pop arena frame (frees all body allocations
-                // including multi-MB blob reads), wait for changes, loop back.
+                // (1) Retry path
                 builder.switch_to_block(retry_block);
                 builder.seal_block(retry_block);
                 self.call_rt_void(builder, "knot_atomic_rollback", &[db]);
                 self.call_rt_void(builder, "knot_arena_pop_frame", &[]);
                 self.call_rt_void(builder, "knot_stm_wait", &[snapshot]);
                 builder.ins().jump(loop_block, &[]);
-
-                // Now loop_block has both predecessors, seal it
                 builder.seal_block(loop_block);
 
-                // Done: promote result to parent frame, pop body frame, commit
+                // After the body returns without retry, check the skip flag.
+                builder.switch_to_block(post_retry_block);
+                builder.seal_block(post_retry_block);
+                let post_val = builder.block_params(post_retry_block)[0];
+                let skip_flag = self.call_rt(builder, "knot_stm_check_skip_and_clear", &[]);
+                let skip_block = builder.create_block();
+                let commit_block = builder.create_block();
+                builder.ins().brif(skip_flag, skip_block, &[], commit_block, &[]);
+
+                // (2) Skip path: rollback the savepoint (no commit), pop arena,
+                // jump to done with unit so the surrounding IO continues.
+                builder.switch_to_block(skip_block);
+                builder.seal_block(skip_block);
+                self.call_rt_void(builder, "knot_atomic_rollback", &[db]);
+                self.call_rt_void(builder, "knot_arena_pop_frame", &[]);
+                let unit_after_skip = self.call_rt(builder, "knot_value_unit", &[]);
+                builder.ins().jump(done_block, &[unit_after_skip.into()]);
+
+                // (3) Commit path: promote body's allocations to parent frame
+                // (so they survive the frame pop), pop body frame, commit.
+                builder.switch_to_block(commit_block);
+                builder.seal_block(commit_block);
+                let promoted = self.call_rt(builder, "knot_arena_pop_frame_promote", &[post_val]);
+                self.call_rt_void(builder, "knot_atomic_commit", &[db]);
+                builder.ins().jump(done_block, &[promoted.into()]);
+
+                // Done: both skip and commit paths converge here.
                 builder.switch_to_block(done_block);
                 builder.seal_block(done_block);
-                let raw_result = builder.block_params(done_block)[0];
-                let result = self.call_rt(builder, "knot_arena_pop_frame_promote", &[raw_result]);
-                self.call_rt_void(builder, "knot_atomic_commit", &[db]);
+                let result = builder.block_params(done_block)[0];
 
                 // For nested atomics, restore outer tracking and merge inner
                 if is_nested {
@@ -6190,13 +6223,11 @@ impl Codegen {
     /// Detect user functions whose bodies (transitively) produce IO values.
     /// Uses fixed-point iteration to handle transitive IO (e.g., genToken calls randomInt).
     fn detect_io_functions(&mut self, decls: &[ast::Decl]) {
-        let io_builtins: HashSet<&str> = [
-            "println", "putLine", "print", "readLine", "readFile",
-            "writeFile", "appendFile", "fileExists", "removeFile",
-            "listDir", "now", "sleep", "randomInt", "randomFloat", "fetch", "fetchWith",
-            "fork", "listen", "generateKeyPair", "generateSigningKeyPair", "encrypt",
-            "logInfo", "logWarn", "logError", "logDebug",
-        ].into_iter().collect();
+        let io_builtins: HashSet<&str> = crate::builtins::EFFECTFUL_BUILTINS
+            .iter()
+            .filter(|n| **n != "retry")
+            .copied()
+            .collect();
 
         // Collect function bodies for analysis
         let mut fun_bodies: Vec<(String, &ast::Expr)> = Vec::new();
@@ -6284,14 +6315,10 @@ impl Codegen {
                 self.expr_is_io(func) || self.expr_is_io(arg)
             }
             ast::ExprKind::Var(name) => {
-                matches!(
+                crate::builtins::is_io_builtin(name)
+                || matches!(
                     name.as_str(),
-                    "println" | "putLine" | "print" | "readLine" | "readFile"
-                        | "writeFile" | "appendFile" | "fileExists" | "removeFile"
-                        | "listDir" | "now" | "sleep" | "randomInt" | "randomFloat"
-                        | "fetch" | "fetchWith" | "fork" | "listen"
-                        | "generateKeyPair" | "generateSigningKeyPair" | "encrypt"
-                        | "logInfo" | "logWarn" | "logError" | "logDebug"
+                    "fork"
                 ) || self.io_functions.contains(name)
             }
             ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
@@ -6466,7 +6493,8 @@ impl Codegen {
                 ast::StmtKind::Where { cond } => {
                     // In IO do-blocks, where acts as a guard:
                     // if the condition is false, skip remaining statements
-                    // and return unit.
+                    // and return unit. Inside an atomic body, also signal
+                    // skip so the surrounding `atomic` rolls back.
                     let cond_i32 =
                         self.compile_condition(builder, cond, env, db);
                     let is_true =
@@ -6478,6 +6506,9 @@ impl Codegen {
                         .brif(is_true, pass_block, &[], fail_block, &[]);
                     builder.switch_to_block(fail_block);
                     builder.seal_block(fail_block);
+                    if self.atomic_retry_block.is_some() {
+                        self.call_rt(builder, "knot_stm_skip", &[]);
+                    }
                     let unit = self.call_rt(builder, "knot_value_unit", &[]);
                     builder.ins().jump(done_block, &[unit.into()]);
                     builder.switch_to_block(pass_block);
@@ -6629,6 +6660,13 @@ impl Codegen {
                 builder.switch_to_block(fail_block);
                 builder.seal_block(fail_block);
                 if let Some(done) = done_block {
+                    // Inside an atomic IO body, signal "skip" so the
+                    // surrounding `atomic` rolls back rather than committing
+                    // partial writes. Outside atomic this is a no-op (the
+                    // flag will simply be reset on the next atomic entry).
+                    if self.atomic_retry_block.is_some() {
+                        self.call_rt(builder, "knot_stm_skip", &[]);
+                    }
                     let unit = self.call_rt(builder, "knot_value_unit", &[]);
                     builder.ins().jump(done, &[unit.into()]);
                 } else {
@@ -11042,89 +11080,7 @@ fn collect_pat_bindings_set<'a>(pat: &'a ast::Pat, bound: &mut HashSet<&'a str>)
 }
 
 fn is_builtin_name(name: &str) -> bool {
-    matches!(
-        name,
-        "println"
-            | "putLine"
-            | "print"
-            | "show"
-            | "union"
-            | "count"
-            | "filter"
-            | "map"
-            | "fold"
-            | "now"
-            | "__bind"
-            | "__yield"
-            | "__empty"
-            | "listen"
-            | "fetch"
-            | "fetchWith"
-            | "single"
-            | "toUpper"
-            | "toLower"
-            | "take"
-            | "drop"
-            | "length"
-            | "trim"
-            | "contains"
-            | "reverse"
-            | "chars"
-            | "id"
-            | "not"
-            // Built-in trait methods
-            | "eq"
-            | "compare"
-            | "ap"
-            | "bind"
-            | "alt"
-            | "empty"
-            | "add"
-            | "sub"
-            | "mul"
-            | "div"
-            | "negate"
-            | "append"
-            | "yield"
-            | "display"
-            | "readFile"
-            | "writeFile"
-            | "appendFile"
-            | "fileExists"
-            | "removeFile"
-            | "listDir"
-            | "generateKeyPair"
-            | "generateSigningKeyPair"
-            | "encrypt"
-            | "decrypt"
-            | "sign"
-            | "verify"
-            | "randomInt"
-            | "randomFloat"
-            | "sleep"
-            | "readLine"
-            | "retry"
-            | "fork"
-            // JSON
-            | "toJson"
-            | "parseJson"
-            // Set operations
-            | "diff"
-            | "inter"
-            | "sum"
-            | "avg"
-            | "match"
-            // Bytes
-            | "bytesLength"
-            | "bytesSlice"
-            | "bytesConcat"
-            | "textToBytes"
-            | "bytesToText"
-            | "bytesToHex"
-            | "bytesFromHex"
-            | "hexDecode"
-            | "bytesGet"
-    )
+    crate::builtins::is_builtin(name)
 }
 
 // ── AST pretty-printer (for function source display) ─────────────

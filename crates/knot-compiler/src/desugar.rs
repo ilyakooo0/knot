@@ -37,13 +37,11 @@ pub fn desugar(module: &mut Module) {
 /// Detect user functions whose bodies (transitively) produce IO values.
 /// Uses fixed-point iteration to handle transitive IO (e.g., genToken calls randomInt).
 fn detect_io_functions(decls: &[Decl]) -> HashSet<String> {
-    let io_builtins: HashSet<&str> = [
-        "println", "putLine", "print", "readLine", "readFile",
-        "writeFile", "appendFile", "fileExists", "removeFile",
-        "listDir", "now", "sleep", "randomInt", "randomFloat", "fetch", "fetchWith",
-        "fork", "listen", "generateKeyPair", "generateSigningKeyPair", "encrypt",
-        "logInfo", "logWarn", "logError", "logDebug",
-    ].into_iter().collect();
+    let io_builtins: HashSet<&str> = crate::builtins::EFFECTFUL_BUILTINS
+        .iter()
+        .filter(|n| **n != "retry")
+        .copied()
+        .collect();
 
     let mut fun_bodies: Vec<(&str, &Expr)> = Vec::new();
     for decl in decls {

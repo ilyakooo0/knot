@@ -199,12 +199,19 @@ pub const SNIPPETS: &[(&str, &str, &str)] = &[
     ("impl", "impl block", "impl ${1:Trait} ${2:Type} where\n  ${3:method} ${4:x} = ${5:body}"),
 ];
 
-pub const BUILTINS: &[&str] = &[
-    "println", "print", "show", "union", "count", "now", "filter", "match", "map", "fold",
-    "single", "diff", "inter", "sum", "avg", "toUpper", "toLower", "take", "drop", "length",
-    "trim", "contains", "reverse", "chars", "id", "toJson", "parseJson", "readFile", "writeFile",
-    "appendFile", "fileExists", "removeFile", "listDir",
-];
+/// Iterator over every user-callable builtin name. Drawn from the centralized
+/// `knot_compiler::builtins` tables so completion lists stay in sync with the
+/// effect inferencer, codegen, and atomic-context filter. Intentionally
+/// excludes the `__bind`/`__yield`/`__empty` desugar internals (they are
+/// callable in source code but not user-facing).
+pub fn builtins() -> impl Iterator<Item = &'static str> {
+    knot_compiler::builtins::ALL_BUILTINS
+        .iter()
+        .copied()
+        .flatten()
+        .copied()
+        .filter(|n| !n.starts_with("__"))
+}
 
 // ── Hashing utility ─────────────────────────────────────────────────
 

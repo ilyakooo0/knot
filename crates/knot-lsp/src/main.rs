@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{select, Receiver, RecvTimeoutError, Sender};
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
@@ -11,6 +12,8 @@ use lsp_types::*;
 
 use knot::ast::{self, DeclKind, Module, Span, TypeKind, TypeScheme};
 use knot::diagnostic;
+use knot_compiler::effects::EffectSet;
+use knot_compiler::infer::MonadKind;
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -29,6 +32,10 @@ struct DocumentState {
     literal_types: Vec<(Span, String)>,
     /// Per-declaration effect info (formatted strings).
     effect_info: HashMap<String, String>,
+    /// Per-declaration effect sets (structured form). Keys mirror `effect_info`
+    /// but the value is the underlying `EffectSet` so callers can do set
+    /// operations (e.g. atomic-context filtering).
+    effect_sets: HashMap<String, EffectSet>,
     knot_diagnostics: Vec<diagnostic::Diagnostic>,
     /// Imported files: canonical path → source text
     imported_files: HashMap<PathBuf, String>,
@@ -40,17 +47,31 @@ struct DocumentState {
     doc_comments: HashMap<String, String>,
     /// Keyword/operator token positions for semantic highlighting.
     keyword_tokens: Vec<(Span, u32)>,
+    /// Refined-type-alias predicates: type-name → predicate expression. Includes
+    /// every named refined type alias declared (or imported) in this module.
+    refined_types: HashMap<String, ast::Expr>,
+    /// `refine expr` target types: span-of-refine-expr → target refined-type name.
+    refine_targets: HashMap<Span, String>,
+    /// Per-source field refinements: source-name → [(field-name, refined-type-name, predicate-expr)].
+    /// `field-name = None` denotes a whole-element refinement.
+    source_refinements: HashMap<String, Vec<(Option<String>, String, ast::Expr)>>,
+    /// Monad context resolved for each `do` block: span-of-do → kind (Relation/IO/Adt).
+    /// Drives monad-aware completion ranking inside do-blocks.
+    monad_info: HashMap<Span, MonadKind>,
 }
 
 struct ServerState {
     documents: HashMap<Uri, DocumentState>,
     workspace_root: Option<PathBuf>,
-    /// Cached parsed imports: canonical path → (mtime, module, source text).
-    /// Shared with the analysis worker thread.
-    import_cache: Arc<Mutex<HashMap<PathBuf, (SystemTime, Module, String)>>>,
-    /// Cached LSP diagnostics for unopened workspace files, keyed by mtime.
-    /// Refreshed lazily; stale entries are dropped when mtime advances.
-    workspace_diag_cache: HashMap<PathBuf, (SystemTime, Vec<Diagnostic>)>,
+    /// Cached parsed files: canonical path → (content hash, parsed module, source text).
+    /// Keyed by content hash rather than mtime — mtime is unreliable across
+    /// `jj`/`git` checkouts that touch timestamps without changing content.
+    /// Shared with the analysis worker thread; populated lazily by every
+    /// caller that reads a `.knot` file (imports, rename, workspace symbol,
+    /// workspace diagnostics, completion).
+    import_cache: Arc<Mutex<HashMap<PathBuf, (u64, Module, String)>>>,
+    /// Cached LSP diagnostics for unopened workspace files, keyed by content hash.
+    workspace_diag_cache: HashMap<PathBuf, (u64, Vec<Diagnostic>)>,
     /// Edited but not-yet-analyzed sources. When present, this is the source
     /// the next analysis run will see. Subsequent didChange edits stack on top
     /// of this rather than the (stale) analyzed source.
@@ -146,6 +167,25 @@ const EFFECTFUL_BUILTINS: &[&str] = &[
     "fileExists", "removeFile", "listDir",
     // concurrency
     "fork", "retry",
+];
+
+/// Builtin names whose effects are NOT permitted inside an `atomic` block.
+/// `console`, `network`, `fs`, `clock`, and `random` cannot be rolled back, so
+/// the type checker rejects them at compile time. The LSP filters them from
+/// the completion list inside atomic so the user can't even type them.
+///
+/// `fork` and `retry` are intentionally excluded: `fork` returns `IO {} {}`
+/// (the spawned IO is not part of the surrounding transaction), and `retry`
+/// is the STM primitive used *inside* atomic to trigger a retry.
+const ATOMIC_DISALLOWED_BUILTINS: &[&str] = &[
+    "println", "putLine", "print", "readLine",
+    "logInfo", "logWarn", "logError", "logDebug",
+    "now", "sleep",
+    "randomInt", "randomFloat",
+    "generateKeyPair", "generateSigningKeyPair", "encrypt",
+    "listen", "fetch", "fetchWith",
+    "readFile", "writeFile", "appendFile",
+    "fileExists", "removeFile", "listDir",
 ];
 
 // ── Entry point ─────────────────────────────────────────────────────
@@ -330,7 +370,7 @@ const ANALYSIS_MAX_WAIT: Duration = Duration::from_millis(500);
 fn analysis_worker(
     rx: Receiver<AnalysisTask>,
     tx: Sender<AnalysisResult>,
-    import_cache: Arc<Mutex<HashMap<PathBuf, (SystemTime, Module, String)>>>,
+    import_cache: Arc<Mutex<HashMap<PathBuf, (u64, Module, String)>>>,
 ) {
     loop {
         // Block until something arrives.
@@ -668,24 +708,61 @@ fn queue_dependent_analyses(state: &mut ServerState, source_uri: &Uri, changed_p
 fn analyze_document(
     uri: &Uri,
     source: &str,
-    import_cache: &mut HashMap<PathBuf, (SystemTime, Module, String)>,
+    import_cache: &mut HashMap<PathBuf, (u64, Module, String)>,
 ) -> DocumentState {
     let mut all_diags = Vec::new();
     let mut type_info = HashMap::new();
     let mut local_type_info = HashMap::new();
     let mut effect_info = HashMap::new();
+    let mut effect_sets: HashMap<String, EffectSet> = HashMap::new();
+    let mut refined_types: HashMap<String, ast::Expr> = HashMap::new();
+    let mut refine_targets: HashMap<Span, String> = HashMap::new();
+    let mut source_refinements: HashMap<String, Vec<(Option<String>, String, ast::Expr)>> =
+        HashMap::new();
+    let mut monad_info: HashMap<Span, MonadKind> = HashMap::new();
 
-    // Lex
+    // Lex always — lex diagnostics and keyword positions are needed every run
+    // and lexing is a small fraction of total analysis time.
     let lexer = knot::lexer::Lexer::new(source);
     let (tokens, lex_diags) = lexer.tokenize();
     all_diags.extend(lex_diags);
 
-    // Collect keyword/operator positions for semantic tokens before parser consumes them
+    // Collect keyword/operator positions for semantic tokens before parser consumes them.
     let keyword_tokens = collect_keyword_operator_positions(&tokens);
 
-    // Parse
-    let parser = knot::parser::Parser::new(source.to_string(), tokens);
-    let (module, parse_diags) = parser.parse_module();
+    // Parse — but reuse the import cache when the source content hash matches a
+    // prior parse of this same path. This kicks in when the file watcher
+    // re-queues analysis for an unchanged dependency, when an undo/redo cycle
+    // returns to a prior content state, or when the same source is analyzed
+    // through multiple code paths in quick succession. (True per-declaration
+    // incremental type checking is deferred — the inference engine in
+    // `infer.rs` runs holistically over all decls; making it incremental would
+    // require restructuring `pre_register` and `infer_declarations` to use a
+    // dependency-aware work queue.)
+    let canonical_path = uri_to_path(uri).and_then(|p| p.canonicalize().ok());
+    let src_hash = content_hash(source);
+    let (module, parse_diags) = match canonical_path.as_ref() {
+        Some(p) => match import_cache.get(p) {
+            Some((cached_hash, cached_module, _)) if *cached_hash == src_hash => {
+                // Re-parse to recover parse diagnostics — the cache only stores
+                // the AST. Lex was already done above; reuse those tokens.
+                let parser = knot::parser::Parser::new(source.to_string(), tokens);
+                let (_reparsed, parse_d) = parser.parse_module();
+                (cached_module.clone(), parse_d)
+            }
+            _ => {
+                let parser = knot::parser::Parser::new(source.to_string(), tokens);
+                let (m, parse_d) = parser.parse_module();
+                import_cache
+                    .insert(p.clone(), (src_hash, m.clone(), source.to_string()));
+                (m, parse_d)
+            }
+        },
+        None => {
+            let parser = knot::parser::Parser::new(source.to_string(), tokens);
+            parser.parse_module()
+        }
+    };
     all_diags.extend(parse_diags);
 
     // Build navigation data from original AST
@@ -720,11 +797,21 @@ fn analyze_document(
         knot_compiler::desugar::desugar(&mut analysis_module);
 
         // Type inference
-        let (infer_diags, _monad_info, inferred_types, local_types, _refine_targets, _refined_types, _from_json) =
-            knot_compiler::infer::check(&analysis_module);
+        let (
+            infer_diags,
+            mi,
+            inferred_types,
+            local_types,
+            rt,
+            refined_type_info,
+            _from_json,
+        ) = knot_compiler::infer::check(&analysis_module);
         all_diags.extend(infer_diags);
         type_info = inferred_types;
         local_type_info = local_types;
+        refined_types = refined_type_info;
+        refine_targets = rt;
+        monad_info = mi;
 
         // Effect inference
         let (effect_diags, effects) =
@@ -734,13 +821,18 @@ fn analyze_document(
             if !eff.is_pure() {
                 effect_info.insert(name.clone(), format!("{eff}"));
             }
+            effect_sets.insert(name.clone(), eff.clone());
         }
 
         // Stratification
         all_diags.extend(knot_compiler::stratify::check(&analysis_module));
 
-        // SQL optimization lint
+        // Source refinements (per-field & whole-element predicates) come from
+        // the type environment alongside SQL-lint info.
         let type_env = knot_compiler::types::TypeEnv::from_module(&analysis_module);
+        source_refinements = type_env.source_refinements.clone();
+
+        // SQL optimization lint
         all_diags.extend(knot_compiler::sql_lint::check(&analysis_module, &type_env));
     }
 
@@ -754,20 +846,70 @@ fn analyze_document(
         local_type_info,
         literal_types,
         effect_info,
+        effect_sets,
         knot_diagnostics: all_diags,
         imported_files,
         import_defs,
         import_origins,
         doc_comments,
         keyword_tokens,
+        refined_types,
+        refine_targets,
+        source_refinements,
+        monad_info,
     }
+}
+
+/// Compute a fast content hash of a source file. Used to key the import cache
+/// stably across `jj`/`git` checkouts that touch mtimes without changing content.
+fn content_hash(s: &str) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// Read, lex, and parse a `.knot` file off disk, reusing the content-hash-keyed
+/// cache when possible. Returns `None` only if the file is missing or unreadable.
+///
+/// This is the single funnel through which every off-disk read in the LSP flows
+/// (rename across unopened files, workspace symbol search, workspace diagnostics,
+/// auto-import completion, import resolution). Each of those previously re-parsed
+/// the file on every invocation; routing them through one cache eliminates the
+/// O(n²) workspace scans that dominated those code paths.
+fn get_or_parse_file(
+    path: &Path,
+    cache: &mut HashMap<PathBuf, (u64, Module, String)>,
+) -> Option<(Module, String)> {
+    let source = std::fs::read_to_string(path).ok()?;
+    let hash = content_hash(&source);
+    if let Some((cached_hash, cached_module, cached_source)) = cache.get(path) {
+        if *cached_hash == hash {
+            return Some((cached_module.clone(), cached_source.clone()));
+        }
+    }
+    let lexer = knot::lexer::Lexer::new(&source);
+    let (tokens, _) = lexer.tokenize();
+    let parser = knot::parser::Parser::new(source.clone(), tokens);
+    let (module, _) = parser.parse_module();
+    cache.insert(path.to_path_buf(), (hash, module.clone(), source.clone()));
+    Some((module, source))
+}
+
+/// Like `get_or_parse_file`, but operates against the `Arc<Mutex<…>>` cache held
+/// by `ServerState`. Locks the mutex briefly per call.
+fn get_or_parse_file_shared(
+    path: &Path,
+    cache: &Arc<Mutex<HashMap<PathBuf, (u64, Module, String)>>>,
+) -> Option<(Module, String)> {
+    let mut guard = cache.lock().ok()?;
+    get_or_parse_file(path, &mut guard)
 }
 
 /// Resolve imported files for cross-file navigation.
 fn resolve_import_navigation(
     imports: &[ast::Import],
     source_path: &Path,
-    import_cache: &mut HashMap<PathBuf, (SystemTime, Module, String)>,
+    import_cache: &mut HashMap<PathBuf, (u64, Module, String)>,
 ) -> (HashMap<PathBuf, String>, HashMap<String, (PathBuf, Span)>, HashMap<String, String>) {
     let mut imported_files = HashMap::new();
     let mut import_defs = HashMap::new();
@@ -784,53 +926,9 @@ fn resolve_import_navigation(
             Err(_) => continue,
         };
 
-        // Check import cache: reuse if mtime hasn't changed
-        let current_mtime = std::fs::metadata(&canonical)
-            .and_then(|m| m.modified())
-            .ok();
-
-        let (module, source) = if let Some(mtime) = current_mtime {
-            if let Some((cached_mtime, cached_module, cached_source)) =
-                import_cache.get(&canonical)
-            {
-                if *cached_mtime == mtime {
-                    (cached_module.clone(), cached_source.clone())
-                } else {
-                    let source = match std::fs::read_to_string(&canonical) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    let lexer = knot::lexer::Lexer::new(&source);
-                    let (tokens, _) = lexer.tokenize();
-                    let parser = knot::parser::Parser::new(source.clone(), tokens);
-                    let (module, _) = parser.parse_module();
-                    import_cache
-                        .insert(canonical.clone(), (mtime, module.clone(), source.clone()));
-                    (module, source)
-                }
-            } else {
-                let source = match std::fs::read_to_string(&canonical) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                let lexer = knot::lexer::Lexer::new(&source);
-                let (tokens, _) = lexer.tokenize();
-                let parser = knot::parser::Parser::new(source.clone(), tokens);
-                let (module, _) = parser.parse_module();
-                import_cache
-                    .insert(canonical.clone(), (mtime, module.clone(), source.clone()));
-                (module, source)
-            }
-        } else {
-            let source = match std::fs::read_to_string(&canonical) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            let lexer = knot::lexer::Lexer::new(&source);
-            let (tokens, _) = lexer.tokenize();
-            let parser = knot::parser::Parser::new(source.clone(), tokens);
-            let (module, _) = parser.parse_module();
-            (module, source)
+        let (module, source) = match get_or_parse_file(&canonical, import_cache) {
+            Some(v) => v,
+            None => continue,
         };
 
         // Register definitions from this file
@@ -1588,6 +1686,55 @@ fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<Hover> {
         }
     }
 
+    // Routes: if the word names a route constructor, render the resolved URL
+    // with typed path parameters and any declared body/query/headers.
+    if let Some(route_summary) = format_route_constructor_hover(&doc.module, word) {
+        value.push_str("\n\n---\n\n");
+        value.push_str(&route_summary);
+    }
+
+    // Refined types: if the word names a refined type alias, show its predicate.
+    if let Some(predicate) = doc.refined_types.get(word) {
+        let pred_src = predicate_to_source(predicate, &doc.source);
+        value.push_str(&format!(
+            "\n\n**Refined type:** values of `{word}` must satisfy `{pred_src}`"
+        ));
+    }
+
+    // If the cursor is inside a `refine expr` form, show its inferred target type
+    // and the predicate it'll be checked against.
+    if let Some((_, target_name)) = doc
+        .refine_targets
+        .iter()
+        .find(|(span, _)| span.start <= offset && offset < span.end)
+    {
+        let detail = if let Some(predicate) = doc.refined_types.get(target_name) {
+            let pred_src = predicate_to_source(predicate, &doc.source);
+            format!(
+                "\n\n**`refine` target:** `{target_name}` — predicate `{pred_src}` is checked at runtime; result is `Result RefinementError {target_name}`"
+            )
+        } else {
+            format!("\n\n**`refine` target:** `{target_name}`")
+        };
+        value.push_str(&detail);
+    }
+
+    // Sources whose schema declares refined fields: list the refinements so the
+    // user knows which fields will be validated on `set`.
+    if let Some(refinements) = doc.source_refinements.get(word) {
+        if !refinements.is_empty() {
+            value.push_str("\n\n**Refinements (validated on write):**");
+            for (field, type_name, predicate) in refinements {
+                let pred_src = predicate_to_source(predicate, &doc.source);
+                let label = match field {
+                    Some(f) => format!("`{f}: {type_name}`"),
+                    None => format!("(whole element) `{type_name}`"),
+                };
+                value.push_str(&format!("\n- {label} — `{pred_src}`"));
+            }
+        }
+    }
+
     // Include doc comments if available
     if let Some(doc_comment) = doc.doc_comments.get(word) {
         value.push_str("\n\n---\n\n");
@@ -1601,6 +1748,275 @@ fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<Hover> {
         }),
         range: None,
     })
+}
+
+/// English plural suffix for counts. `1 view`, `2 views`.
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// Format a Knot HTTP method as the literal HTTP verb.
+fn http_method_str(m: ast::HttpMethod) -> &'static str {
+    match m {
+        ast::HttpMethod::Get => "GET",
+        ast::HttpMethod::Post => "POST",
+        ast::HttpMethod::Put => "PUT",
+        ast::HttpMethod::Delete => "DELETE",
+        ast::HttpMethod::Patch => "PATCH",
+    }
+}
+
+/// Render a route entry's path with typed `{name: Type}` placeholders.
+fn format_route_path(entry: &ast::RouteEntry) -> String {
+    let mut out = String::new();
+    for seg in &entry.path {
+        match seg {
+            ast::PathSegment::Literal(s) => {
+                out.push('/');
+                out.push_str(s);
+            }
+            ast::PathSegment::Param { name, ty } => {
+                out.push('/');
+                out.push('{');
+                out.push_str(name);
+                out.push_str(": ");
+                out.push_str(&format_type_kind(&ty.node));
+                out.push('}');
+            }
+        }
+    }
+    if out.is_empty() {
+        "/".to_string()
+    } else {
+        out
+    }
+}
+
+/// Find a route entry by its constructor name and render a hover summary
+/// (method + path + body/query/headers/response). Returns `None` if no route
+/// declares this constructor.
+fn format_route_constructor_hover(module: &Module, name: &str) -> Option<String> {
+    for decl in &module.decls {
+        if let DeclKind::Route { entries, .. } = &decl.node {
+            for entry in entries {
+                if entry.constructor == name {
+                    return Some(render_route_entry(entry));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn render_route_entry(entry: &ast::RouteEntry) -> String {
+    let method = http_method_str(entry.method);
+    let path = format_route_path(entry);
+    let mut out = format!("**Route:** `{method} {path}`");
+
+    if !entry.body_fields.is_empty() {
+        let fields: Vec<String> = entry
+            .body_fields
+            .iter()
+            .map(|f| format!("{}: {}", f.name, format_type_kind(&f.value.node)))
+            .collect();
+        out.push_str(&format!("\n\n**Body:** `{{{}}}`", fields.join(", ")));
+    }
+    if !entry.query_params.is_empty() {
+        let fields: Vec<String> = entry
+            .query_params
+            .iter()
+            .map(|f| format!("{}: {}", f.name, format_type_kind(&f.value.node)))
+            .collect();
+        out.push_str(&format!("\n\n**Query:** `{{{}}}`", fields.join(", ")));
+    }
+    if !entry.request_headers.is_empty() {
+        let fields: Vec<String> = entry
+            .request_headers
+            .iter()
+            .map(|f| format!("{}: {}", f.name, format_type_kind(&f.value.node)))
+            .collect();
+        out.push_str(&format!("\n\n**Request headers:** `{{{}}}`", fields.join(", ")));
+    }
+    if let Some(resp) = &entry.response_ty {
+        out.push_str(&format!(
+            "\n\n**Response:** `{}`",
+            format_type_kind(&resp.node)
+        ));
+    }
+    if !entry.response_headers.is_empty() {
+        let fields: Vec<String> = entry
+            .response_headers
+            .iter()
+            .map(|f| format!("{}: {}", f.name, format_type_kind(&f.value.node)))
+            .collect();
+        out.push_str(&format!(
+            "\n\n**Response headers:** `{{{}}}`",
+            fields.join(", ")
+        ));
+    }
+    out
+}
+
+/// Returns true if any decl in the module composes the given route into a
+/// `listen port handler` call. Used by the dead-route lint.
+fn route_is_listened(module: &Module, route_name: &str) -> bool {
+    fn walk(expr: &ast::Expr, route_name: &str, found: &mut bool) {
+        if *found {
+            return;
+        }
+        if let ast::ExprKind::App { func, arg } = &expr.node {
+            // Detect `listen port handler` where one argument references the route.
+            // The handler's body typically destructures the route ADT, so any reference
+            // to the route name (constructor case-match) inside a `listen` call is
+            // a strong signal that the route is wired in.
+            if app_callee_is(func, "listen") && expr_references_name(arg, route_name) {
+                *found = true;
+                return;
+            }
+        }
+        recurse_expr(expr, |e| walk(e, route_name, found));
+    }
+    for decl in &module.decls {
+        match &decl.node {
+            DeclKind::Fun {
+                body: Some(body), ..
+            }
+            | DeclKind::View { body, .. }
+            | DeclKind::Derived { body, .. } => {
+                let mut found = false;
+                walk(body, route_name, &mut found);
+                if found {
+                    return true;
+                }
+            }
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { body, .. } = item {
+                        let mut found = false;
+                        walk(body, route_name, &mut found);
+                        if found {
+                            return true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// True if `expr` is application chain whose head is `Var(name)` (e.g.
+/// `name`, `name x`, `name x y`).
+fn app_callee_is(expr: &ast::Expr, name: &str) -> bool {
+    match &expr.node {
+        ast::ExprKind::Var(n) => n == name,
+        ast::ExprKind::App { func, .. } => app_callee_is(func, name),
+        _ => false,
+    }
+}
+
+/// True if any sub-expression of `expr` references `name` as a `Var` or `Constructor`.
+/// Used to decide whether a `listen` call's argument is wired to a given route.
+fn expr_references_name(expr: &ast::Expr, name: &str) -> bool {
+    let mut found = false;
+    fn walk(expr: &ast::Expr, name: &str, found: &mut bool) {
+        if *found {
+            return;
+        }
+        match &expr.node {
+            ast::ExprKind::Var(n) | ast::ExprKind::Constructor(n) if n == name => {
+                *found = true;
+            }
+            _ => recurse_expr(expr, |e| walk(e, name, found)),
+        }
+    }
+    walk(expr, name, &mut found);
+    found
+}
+
+/// Recurse into all sub-expressions of `expr`, calling `f` on each.
+fn recurse_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, mut f: F) {
+    match &expr.node {
+        ast::ExprKind::App { func, arg } => {
+            f(func);
+            f(arg);
+        }
+        ast::ExprKind::Lambda { body, .. } => f(body),
+        ast::ExprKind::BinOp { lhs, rhs, .. } => {
+            f(lhs);
+            f(rhs);
+        }
+        ast::ExprKind::UnaryOp { operand, .. } => f(operand),
+        ast::ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            f(cond);
+            f(then_branch);
+            f(else_branch);
+        }
+        ast::ExprKind::Case { scrutinee, arms } => {
+            f(scrutinee);
+            for arm in arms {
+                f(&arm.body);
+            }
+        }
+        ast::ExprKind::Do(stmts) => {
+            for stmt in stmts {
+                match &stmt.node {
+                    ast::StmtKind::Bind { expr, .. }
+                    | ast::StmtKind::Let { expr, .. }
+                    | ast::StmtKind::Expr(expr)
+                    | ast::StmtKind::Where { cond: expr } => f(expr),
+                    ast::StmtKind::GroupBy { key } => f(key),
+                }
+            }
+        }
+        ast::ExprKind::Atomic(e) | ast::ExprKind::Refine(e) => f(e),
+        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+            f(target);
+            f(value);
+        }
+        ast::ExprKind::Record(fields) => {
+            for fld in fields {
+                f(&fld.value);
+            }
+        }
+        ast::ExprKind::RecordUpdate { base, fields } => {
+            f(base);
+            for fld in fields {
+                f(&fld.value);
+            }
+        }
+        ast::ExprKind::List(elems) => {
+            for e in elems {
+                f(e);
+            }
+        }
+        ast::ExprKind::FieldAccess { expr, .. } => f(expr),
+        ast::ExprKind::At { relation, time } => {
+            f(relation);
+            f(time);
+        }
+        ast::ExprKind::Annot { expr, .. } => f(expr),
+        ast::ExprKind::UnitLit { value, .. } => f(value),
+        _ => {}
+    }
+}
+
+/// Render a predicate expression as its source text. Falls back to a placeholder
+/// when the span is empty or out of bounds (defensive: predicates always have
+/// real spans, but the LSP is also fed by the import cache, which can outlive
+/// edits to the source).
+fn predicate_to_source(expr: &ast::Expr, source: &str) -> String {
+    let span = expr.span;
+    if span.start < span.end && span.end <= source.len() {
+        source[span.start..span.end].to_string()
+    } else {
+        "<predicate>".to_string()
+    }
 }
 
 /// Format a TypeKind as a markdown schema table for hover display.
@@ -1706,6 +2122,12 @@ fn handle_completion(
     } else {
         None
     };
+
+    // Atomic-block context: when the cursor is inside `atomic { ... }`, the
+    // type checker forbids any IO effects (console/fs/network/clock/random).
+    // Drop those builtins and any user functions that perform IO from the
+    // completion list so the user can't type them.
+    let in_atomic = find_enclosing_atomic_expr(&doc.module, &doc.source, offset).is_some();
 
     let mut items = Vec::new();
 
@@ -1991,25 +2413,13 @@ fn handle_completion(
                 }
 
                 // Reuse the cached parsed module if available (populated by
-                // resolve_import_navigation when other files have imported it).
-                let cached_module = state
-                    .import_cache
-                    .lock()
-                    .unwrap()
-                    .get(&canonical)
-                    .map(|(_, m, _)| m.clone());
-                let module = if let Some(m) = cached_module {
-                    m
-                } else {
-                    let source_text = match std::fs::read_to_string(&canonical) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    let lexer = knot::lexer::Lexer::new(&source_text);
-                    let (tokens, _) = lexer.tokenize();
-                    let parser = knot::parser::Parser::new(source_text, tokens);
-                    let (m, _) = parser.parse_module();
-                    m
+                // resolve_import_navigation when other files have imported it),
+                // and populate the cache if not — auto-import completion is
+                // typically the first request that touches new workspace files.
+                let module = match get_or_parse_file_shared(&canonical, &state.import_cache)
+                {
+                    Some((m, _)) => m,
+                    None => continue,
                 };
 
                 for decl in &module.decls {
@@ -2062,7 +2472,128 @@ fn handle_completion(
         }
     }
 
+    // Monad-aware ranking: inside a do-block, items whose type sits in the
+    // contextual monad sort first. The HKT unifier resolves the monad even when
+    // the source is a partial expression (e.g. mid-typing inside a `<-` bind),
+    // so the bias kicks in continuously as the user types.
+    if let Some(do_span) = find_enclosing_do_span(&doc.module, offset) {
+        if let Some(monad) = monad_for_do_span(&doc.monad_info, do_span) {
+            for item in items.iter_mut() {
+                let label = item.label.trim_start_matches(['*', '&']);
+                if let Some(ty) = doc.type_info.get(label) {
+                    if type_matches_monad(ty, &monad) {
+                        // Prefix the existing sort_text (or label fallback) so
+                        // matching items rank ahead of everything else but keep
+                        // their relative order from the original list.
+                        let base = item
+                            .sort_text
+                            .clone()
+                            .unwrap_or_else(|| item.label.clone());
+                        item.sort_text = Some(format!("aaa_{base}"));
+                    }
+                }
+            }
+        }
+    }
+
+    if in_atomic {
+        items.retain(|item| !is_disallowed_in_atomic(&item.label, doc));
+    }
+
     Some(CompletionResponse::Array(items))
+}
+
+/// True if a completion candidate would be rejected by the effect checker
+/// inside an `atomic` block. Mirrors the rule in `effects.rs`: any builtin
+/// from `ATOMIC_DISALLOWED_BUILTINS`, plus any user function whose inferred
+/// effect set contains console/network/fs/clock/random.
+fn is_disallowed_in_atomic(label: &str, doc: &DocumentState) -> bool {
+    if ATOMIC_DISALLOWED_BUILTINS.contains(&label) {
+        return true;
+    }
+    if let Some(eff) = doc.effect_sets.get(label) {
+        return eff.has_io();
+    }
+    false
+}
+
+/// Find the smallest `do { ... }` whose span encloses `offset`. Walks every
+/// declaration body — do-blocks can nest arbitrarily inside lambdas, case arms,
+/// record fields, etc.
+fn find_enclosing_do_span(module: &Module, offset: usize) -> Option<Span> {
+    fn walk(expr: &ast::Expr, offset: usize, best: &mut Option<Span>) {
+        if expr.span.start > offset || offset > expr.span.end {
+            return;
+        }
+        if let ast::ExprKind::Do(_) = &expr.node {
+            let size = expr.span.end - expr.span.start;
+            if best.map_or(true, |b| size < b.end - b.start) {
+                *best = Some(expr.span);
+            }
+        }
+        recurse_expr(expr, |e| walk(e, offset, best));
+    }
+    let mut best: Option<Span> = None;
+    for decl in &module.decls {
+        if decl.span.start > offset || offset > decl.span.end {
+            continue;
+        }
+        match &decl.node {
+            DeclKind::Fun {
+                body: Some(body), ..
+            }
+            | DeclKind::View { body, .. }
+            | DeclKind::Derived { body, .. } => walk(body, offset, &mut best),
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { body, .. } = item {
+                        walk(body, offset, &mut best);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    best
+}
+
+/// Return the resolved monad kind for the do-block at `do_span`, if any. The
+/// type checker registers monad-vars with spans tied to the desugared
+/// `__bind`/`__yield`/`__empty` callsites, which sit inside the original
+/// do-block, so any `monad_info` entry whose span is contained in `do_span`
+/// is a valid sample of that block's monad.
+fn monad_for_do_span(
+    monad_info: &HashMap<Span, MonadKind>,
+    do_span: Span,
+) -> Option<MonadKind> {
+    monad_info
+        .iter()
+        .find(|(s, _)| s.start >= do_span.start && s.end <= do_span.end)
+        .map(|(_, k)| k.clone())
+}
+
+/// True if the rendered type of a completion candidate is a value in the
+/// requested monad. The match is structural-by-string (we only have the
+/// formatted type text in `type_info`); good enough for ranking, not for
+/// type checking.
+fn type_matches_monad(ty: &str, monad: &MonadKind) -> bool {
+    let t = ty.trim();
+    match monad {
+        MonadKind::Relation => {
+            // Direct relation `[T]`, or the IO-wrapped variant `IO {} [T]`
+            // returned by `*src` / `&derived` / `set` / etc.
+            t.starts_with('[') || t.contains(" [") || t.contains("IO ")
+        }
+        MonadKind::IO => t.starts_with("IO ") || t.starts_with("IO{") || t == "IO",
+        MonadKind::Adt(name) => {
+            let prefix_eq = t == name;
+            let prefix_app = t
+                .split_once(|c: char| c.is_whitespace() || c == '<' || c == '(')
+                .map(|(head, _)| head == name)
+                .unwrap_or(false);
+            prefix_eq || prefix_app
+        }
+    }
 }
 
 /// Try to resolve field names for dot completion by finding the type of the
@@ -2474,10 +3005,11 @@ fn handle_rename(
                 if open_paths.contains(&canonical) {
                     continue;
                 }
-                let file_source = match std::fs::read_to_string(&canonical) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
+                let (module, file_source) =
+                    match get_or_parse_file_shared(&canonical, &state.import_cache) {
+                        Some(v) => v,
+                        None => continue,
+                    };
                 // Quick check: does the file contain the symbol name at all?
                 if !file_source.contains(old_name) {
                     continue;
@@ -2486,10 +3018,6 @@ fn handle_rename(
                     Some(u) => u,
                     None => continue,
                 };
-                let lexer = knot::lexer::Lexer::new(&file_source);
-                let (tokens, _) = lexer.tokenize();
-                let parser = knot::parser::Parser::new(file_source.clone(), tokens);
-                let (module, _) = parser.parse_module();
                 let (defs, refs, _) = resolve_definitions(&module, &file_source);
 
                 // Rename at definition sites
@@ -3113,6 +3641,30 @@ fn handle_code_lens(
     let doc = state.documents.get(uri)?;
     let mut lenses = Vec::new();
 
+    // Lineage: for each relation (source/view/derived), find the consumers and
+    // producers using the per-decl effect sets.
+    //   readers[name] → list of (consumer_name, consumer_kind)
+    //   writers[name] → list of writer decl names
+    // Built once per request; small enough that O(n × m) is fine.
+    let mut readers: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+    let mut writers: HashMap<&str, Vec<&str>> = HashMap::new();
+    for d in &doc.module.decls {
+        let (name, kind) = match &d.node {
+            DeclKind::Fun { name, .. } => (name.as_str(), "fn"),
+            DeclKind::View { name, .. } => (name.as_str(), "view"),
+            DeclKind::Derived { name, .. } => (name.as_str(), "derived"),
+            _ => continue,
+        };
+        if let Some(eff) = doc.effect_sets.get(name) {
+            for r in &eff.reads {
+                readers.entry(r.as_str()).or_default().push((name, kind));
+            }
+            for w in &eff.writes {
+                writers.entry(w.as_str()).or_default().push(name);
+            }
+        }
+    }
+
     for decl in &doc.module.decls {
         match &decl.node {
             DeclKind::Fun { .. }
@@ -3120,7 +3672,8 @@ fn handle_code_lens(
             | DeclKind::View { .. }
             | DeclKind::Derived { .. }
             | DeclKind::Data { .. }
-            | DeclKind::Trait { .. } => {}
+            | DeclKind::Trait { .. }
+            | DeclKind::Route { .. } => {}
             _ => continue,
         }
 
@@ -3159,6 +3712,123 @@ fn handle_code_lens(
             }),
             data: None,
         });
+
+        // Lineage lens: source declarations show their consumers; views/derived
+        // show their producers. The lens command is informational (no nav target),
+        // so we use a no-op command name and put the summary in the title.
+        match &decl.node {
+            DeclKind::Source { name, .. } => {
+                let mut view_count = 0;
+                let mut derived_count = 0;
+                let mut fn_count = 0;
+                if let Some(consumers) = readers.get(name.as_str()) {
+                    for (_, kind) in consumers {
+                        match *kind {
+                            "view" => view_count += 1,
+                            "derived" => derived_count += 1,
+                            "fn" => fn_count += 1,
+                            _ => {}
+                        }
+                    }
+                }
+                let writer_count = writers.get(name.as_str()).map_or(0, |v| v.len());
+                let mut parts = Vec::new();
+                if view_count > 0 {
+                    parts.push(format!("{view_count} view{}", plural(view_count)));
+                }
+                if derived_count > 0 {
+                    parts.push(format!(
+                        "{derived_count} derived"
+                    ));
+                }
+                if fn_count > 0 {
+                    parts.push(format!("{fn_count} fn{}", plural(fn_count)));
+                }
+                if writer_count > 0 {
+                    parts.push(format!(
+                        "written by {writer_count} decl{}",
+                        plural(writer_count)
+                    ));
+                }
+                if !parts.is_empty() {
+                    let title = format!("feeds: {}", parts.join(", "));
+                    lenses.push(CodeLens {
+                        range: Range {
+                            start: range.start,
+                            end: range.start,
+                        },
+                        command: Some(Command {
+                            title,
+                            command: String::new(),
+                            arguments: None,
+                        }),
+                        data: None,
+                    });
+                }
+            }
+            DeclKind::Derived { name, .. } | DeclKind::View { name, .. } => {
+                if let Some(eff) = doc.effect_sets.get(name) {
+                    let mut deps: Vec<String> = Vec::new();
+                    for r in &eff.reads {
+                        deps.push(format!("*{r}"));
+                    }
+                    if !deps.is_empty() {
+                        let title = format!("depends on: {}", deps.join(", "));
+                        lenses.push(CodeLens {
+                            range: Range {
+                                start: range.start,
+                                end: range.start,
+                            },
+                            command: Some(Command {
+                                title,
+                                command: String::new(),
+                                arguments: None,
+                            }),
+                            data: None,
+                        });
+                    }
+                }
+            }
+            DeclKind::Route { name, entries } => {
+                // Per-entry URL preview lens, anchored at the route header. Each
+                // entry's constructor is also separately hoverable for the same
+                // info; this lens makes the URL space visible at a glance.
+                for entry in entries {
+                    let method = http_method_str(entry.method);
+                    let path = format_route_path(entry);
+                    lenses.push(CodeLens {
+                        range: Range {
+                            start: range.start,
+                            end: range.start,
+                        },
+                        command: Some(Command {
+                            title: format!("{method} {path} → {}", entry.constructor),
+                            command: String::new(),
+                            arguments: None,
+                        }),
+                        data: None,
+                    });
+                }
+                // Dead-route lint: this route is never composed into a `listen`
+                // call within the current document. Surface it as a lens so the
+                // user can see at a glance.
+                if !route_is_listened(&doc.module, name) {
+                    lenses.push(CodeLens {
+                        range: Range {
+                            start: range.start,
+                            end: range.start,
+                        },
+                        command: Some(Command {
+                            title: "⚠ no `listen` handler references this route".to_string(),
+                            command: String::new(),
+                            arguments: None,
+                        }),
+                        data: None,
+                    });
+                }
+            }
+            _ => {}
+        }
 
         // For traits: show implementations with clickable lens
         if let DeclKind::Trait { name, .. } = &decl.node {
@@ -4287,6 +4957,63 @@ fn handle_code_action(
             }
         }
 
+        // Unit-mismatch quick fixes: when the inferred unit on a numeric
+        // expression doesn't match what the surrounding context expects
+        // (e.g. `Float<M>` flowing into a `Float<Ft>` slot), offer to wrap the
+        // expression in the strip/with conversion idiom. The user supplies the
+        // numeric factor; the wrapper just gets the types to line up so they
+        // see the call site rather than a type error.
+        if msg.starts_with("unit mismatch:") || msg.contains("unit mismatch") {
+            let diag_start = position_to_offset(&doc.source, diag.range.start);
+            let diag_end = position_to_offset(&doc.source, diag.range.end);
+            if diag_end > diag_start && diag_end <= doc.source.len() {
+                let snippet = &doc.source[diag_start..diag_end];
+                let trimmed = snippet.trim();
+                if !trimmed.is_empty() {
+                    // Float variant — most unit work in the stdlib is Float.
+                    let mut changes_f = HashMap::new();
+                    changes_f.insert(
+                        uri.clone(),
+                        vec![TextEdit {
+                            range: diag.range,
+                            new_text: format!("withFloatUnit (stripFloatUnit ({trimmed}))"),
+                        }],
+                    );
+                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                        title: "Wrap in `withFloatUnit (stripFloatUnit …)`"
+                            .to_string(),
+                        kind: Some(CodeActionKind::QUICKFIX),
+                        diagnostics: Some(vec![diag.clone()]),
+                        edit: Some(WorkspaceEdit {
+                            changes: Some(changes_f),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }));
+
+                    // Int variant — for `Int<u1>` ↔ `Int<u2>` mismatches.
+                    let mut changes_i = HashMap::new();
+                    changes_i.insert(
+                        uri.clone(),
+                        vec![TextEdit {
+                            range: diag.range,
+                            new_text: format!("withUnit (stripUnit ({trimmed}))"),
+                        }],
+                    );
+                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                        title: "Wrap in `withUnit (stripUnit …)`".to_string(),
+                        kind: Some(CodeActionKind::QUICKFIX),
+                        diagnostics: Some(vec![diag.clone()]),
+                        edit: Some(WorkspaceEdit {
+                            changes: Some(changes_i),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }));
+                }
+            }
+        }
+
         // Pattern: "Unknown variable/type/constructor" → suggest similar names
         if msg.contains("nknown") || msg.contains("ndefined") || msg.contains("not found") || msg.contains("unresolved") {
             // Extract the unknown name from the diagnostic range
@@ -4629,11 +5356,49 @@ fn handle_code_action(
         }
     }
 
+    // Action: wrap a `refine expr` in a `case ... of Ok | Err` match. Refined
+    // values are returned as `Result RefinementError T`; this action expands
+    // the boilerplate of unwrapping it.
+    if let Some((refine_span, target_name)) = find_refine_at(doc, range_start) {
+        let inner_text = doc.source[refine_span.start..refine_span.end.min(doc.source.len())]
+            .to_string();
+        let mut changes = HashMap::new();
+        changes.insert(
+            uri.clone(),
+            vec![TextEdit {
+                range: span_to_range(refine_span, &doc.source),
+                new_text: format!(
+                    "case {inner_text} of\n  Ok {{value: x}} -> x\n  Err {{error: e}} -> e"
+                ),
+            }],
+        );
+        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+            title: format!("Match `Result RefinementError {target_name}`"),
+            kind: Some(CodeActionKind::REFACTOR_REWRITE),
+            edit: Some(WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+    }
+
     if actions.is_empty() {
         None
     } else {
         Some(actions)
     }
+}
+
+/// Locate the innermost `refine expr` containing the cursor, returning its full
+/// span (including the `refine` keyword) and the resolved target type name.
+fn find_refine_at(doc: &DocumentState, offset: usize) -> Option<(Span, String)> {
+    let span = doc
+        .refine_targets
+        .iter()
+        .filter(|(s, _)| s.start <= offset && offset < s.end)
+        .min_by_key(|(s, _)| s.end - s.start)?;
+    Some((*span.0, span.1.clone()))
 }
 
 /// Find case expressions at the cursor and offer to fill missing arms.
@@ -5918,18 +6683,15 @@ fn handle_workspace_symbol(
                 if seen_paths.contains(&canonical) {
                     continue;
                 }
-                let source = match std::fs::read_to_string(&canonical) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
+                let (module, source) =
+                    match get_or_parse_file_shared(&canonical, &state.import_cache) {
+                        Some(v) => v,
+                        None => continue,
+                    };
                 let uri = match path_to_uri(&canonical) {
                     Some(u) => u,
                     None => continue,
                 };
-                let lexer = knot::lexer::Lexer::new(&source);
-                let (tokens, _) = lexer.tokenize();
-                let parser = knot::parser::Parser::new(source.clone(), tokens);
-                let (module, _) = parser.parse_module();
                 collect_symbols(&module, &source, &uri, &query, &mut symbols);
             }
         }
@@ -6207,51 +6969,143 @@ fn handle_resolve_completion_item(
     state: &ServerState,
     mut item: CompletionItem,
 ) -> CompletionItem {
-    // Enrich the completion item with documentation and type details
-    let label = &item.label;
+    // Strip the relation/derived prefix so lookups succeed for `*todos`/`&seniors`.
+    let label = item.label.trim_start_matches(['*', '&']).to_string();
 
-    // Search all open documents for matching definitions
-    for doc in state.documents.values() {
-        // Check doc comments
-        if let Some(doc_comment) = doc.doc_comments.get(label.as_str()) {
-            item.documentation = Some(Documentation::MarkupContent(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: doc_comment.clone(),
-            }));
+    // Aggregate enrichment across all open documents — workspace-symbol-style
+    // labels can come from any file, and effect/doc/type info may live in
+    // different files (e.g. trait declared in A, impl in B).
+    let mut detail: Option<String> = item.detail.clone();
+    let mut doc_md: Option<String> = None;
+    let mut sections: Vec<String> = Vec::new();
+
+    let push_unique = |sections: &mut Vec<String>, s: String| {
+        if !sections.contains(&s) {
+            sections.push(s);
         }
-        // Enrich detail with type info if not already present
-        if item.detail.is_none() {
+    };
+
+    for doc in state.documents.values() {
+        if detail.is_none() {
             if let Some(ty) = doc.type_info.get(label.as_str()) {
-                item.detail = Some(ty.clone());
+                detail = Some(ty.clone());
             }
         }
-        // Add effect info as part of documentation
-        if let Some(effects) = doc.effect_info.get(label.as_str()) {
-            let existing = item
-                .documentation
-                .as_ref()
-                .map(|d| match d {
-                    Documentation::String(s) => s.clone(),
-                    Documentation::MarkupContent(m) => m.value.clone(),
-                })
-                .unwrap_or_default();
-            let combined = if existing.is_empty() {
-                format!("*Effects:* `{effects}`")
-            } else {
-                format!("{existing}\n\n---\n\n*Effects:* `{effects}`")
-            };
-            item.documentation = Some(Documentation::MarkupContent(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: combined,
-            }));
+        if doc_md.is_none() {
+            if let Some(d) = doc.doc_comments.get(label.as_str()) {
+                doc_md = Some(d.clone());
+            }
         }
-
-        if item.documentation.is_some() || item.detail.is_some() {
-            break;
+        if let Some(eff) = doc.effect_info.get(label.as_str()) {
+            push_unique(&mut sections, format!("*Effects:* `{eff}`"));
+        }
+        if let Some(predicate) = doc.refined_types.get(label.as_str()) {
+            let pred_src = predicate_to_source(predicate, &doc.source);
+            push_unique(
+                &mut sections,
+                format!("*Refinement:* values of `{label}` must satisfy `{pred_src}`"),
+            );
+        }
+        // Route constructor preview: show method + path so the user can pick
+        // the right ADT variant when constructing routed requests.
+        if let Some(summary) = format_route_constructor_hover(&doc.module, &label) {
+            push_unique(&mut sections, summary);
+        }
+        // Trait method default body: when a method is declared with a default
+        // body, render the source so it's visible in the completion expansion.
+        if let Some(default_src) = trait_method_default_source(&doc.module, &doc.source, &label)
+        {
+            push_unique(
+                &mut sections,
+                format!("*Default impl:*\n```knot\n{default_src}\n```"),
+            );
+        }
+        // Data constructor list: hovering over a type name shouldn't require
+        // a separate trip — show the constructors inline.
+        if let Some(ctors) = data_constructor_summary(&doc.module, &label) {
+            push_unique(&mut sections, ctors);
         }
     }
 
+    item.detail = detail;
+
+    let mut combined = doc_md.unwrap_or_default();
+    for section in sections {
+        if combined.is_empty() {
+            combined = section;
+        } else {
+            combined.push_str("\n\n---\n\n");
+            combined.push_str(&section);
+        }
+    }
+    if !combined.is_empty() {
+        item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: combined,
+        }));
+    }
+
     item
+}
+
+/// If `name` resolves to a trait method with a default body in `module`,
+/// return the default-body source slice for completion preview.
+fn trait_method_default_source(module: &Module, source: &str, name: &str) -> Option<String> {
+    for decl in &module.decls {
+        if let DeclKind::Trait { items, .. } = &decl.node {
+            for item in items {
+                if let ast::TraitItem::Method {
+                    name: m,
+                    default_body: Some(body),
+                    ..
+                } = item
+                {
+                    if m == name {
+                        let s = body.span;
+                        if s.start < s.end && s.end <= source.len() {
+                            return Some(source[s.start..s.end].to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// If `name` resolves to a data type, render its constructors as a markdown
+/// bullet list. Returns None if `name` is not a top-level data type.
+fn data_constructor_summary(module: &Module, name: &str) -> Option<String> {
+    for decl in &module.decls {
+        if let DeclKind::Data {
+            name: dn,
+            constructors,
+            ..
+        } = &decl.node
+        {
+            if dn != name {
+                continue;
+            }
+            if constructors.is_empty() {
+                return None;
+            }
+            let mut out = String::from("*Constructors:*");
+            for ctor in constructors {
+                if ctor.fields.is_empty() {
+                    out.push_str(&format!("\n- `{}`", ctor.name));
+                } else {
+                    let fs: Vec<String> = ctor
+                        .fields
+                        .iter()
+                        .map(|f| format!("{}: {}", f.name, format_type_kind(&f.value.node)))
+                        .collect();
+                    out.push_str(&format!("\n- `{} {{{}}}`", ctor.name, fs.join(", ")));
+                }
+            }
+            return Some(out);
+        }
+    }
+    None
 }
 
 // ── Import Path Completion ──────────────────────────────────────────
@@ -6493,6 +7347,12 @@ fn handle_workspace_diagnostics(
     // Also scan workspace files not currently open. We run the full pipeline
     // (lex → parse → type infer → effect infer → stratify → SQL lint) so
     // cross-file errors surface even when a file isn't open in the editor.
+    //
+    // Analysis is parallelized across all CPUs using `std::thread::scope` —
+    // each unopened-file pipeline is independent (no shared mutable state
+    // beyond the import cache, which is mutex-protected). Speeds up the
+    // first workspace-diagnostics call on cold caches by roughly the number
+    // of cores.
     if let Some(root) = &state.workspace_root {
         let open_paths: HashSet<PathBuf> = state
             .documents
@@ -6502,6 +7362,18 @@ fn handle_workspace_diagnostics(
             .collect();
 
         if let Ok(files) = scan_knot_files(root) {
+            // Phase A: cheaply collect the work list — paths to analyze, their
+            // current source/module, content hash, and any cached diagnostics.
+            // Cached entries skip the parallel pass entirely.
+            struct WorkItem {
+                canonical: PathBuf,
+                file_uri: Uri,
+                hash: u64,
+                module: Module,
+                source: String,
+            }
+            let mut to_analyze: Vec<WorkItem> = Vec::new();
+            let mut cached_results: Vec<(Uri, Vec<Diagnostic>)> = Vec::new();
             for file_path in files {
                 let canonical = match file_path.canonicalize() {
                     Ok(p) => p,
@@ -6510,36 +7382,103 @@ fn handle_workspace_diagnostics(
                 if open_paths.contains(&canonical) {
                     continue;
                 }
-                let source = match std::fs::read_to_string(&canonical) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
+                let (module, source) =
+                    match get_or_parse_file_shared(&canonical, &state.import_cache) {
+                        Some(v) => v,
+                        None => continue,
+                    };
                 let file_uri = match path_to_uri(&canonical) {
                     Some(u) => u,
                     None => continue,
                 };
+                let hash = content_hash(&source);
+                if let Some((cached_h, cached)) =
+                    state.workspace_diag_cache.get(&canonical)
+                {
+                    if *cached_h == hash {
+                        cached_results.push((file_uri, cached.clone()));
+                        continue;
+                    }
+                }
+                to_analyze.push(WorkItem {
+                    canonical,
+                    file_uri,
+                    hash,
+                    module,
+                    source,
+                });
+            }
 
-                // Try the mtime cache first to avoid redundant analysis runs
-                // across requests.
-                let mtime = std::fs::metadata(&canonical)
-                    .and_then(|m| m.modified())
-                    .ok();
+            // Phase B: parallel analysis. `analyze_unopened_file` allocates its
+            // own type/effect/stratify/sql-lint state per call, so the only
+            // shared resource is the import cache (already Arc<Mutex<>>). We
+            // batch into chunks roughly proportional to core count to keep
+            // dispatch overhead small.
+            let cores = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            let chunk_size = ((to_analyze.len() + cores - 1) / cores).max(1);
 
-                let lsp_diags = match mtime {
-                    Some(t) => match state.workspace_diag_cache.get(&canonical) {
-                        Some((cached_t, cached)) if *cached_t == t => cached.clone(),
-                        _ => {
-                            let diags =
-                                analyze_unopened_file(&source, &canonical, &file_uri);
-                            state
-                                .workspace_diag_cache
-                                .insert(canonical.clone(), (t, diags.clone()));
-                            diags
-                        }
-                    },
-                    None => analyze_unopened_file(&source, &canonical, &file_uri),
-                };
+            // Move into per-chunk Vec<WorkItem> so each worker owns its slice.
+            let mut chunks: Vec<Vec<WorkItem>> = Vec::new();
+            let mut buf: Vec<WorkItem> = Vec::with_capacity(chunk_size);
+            for w in to_analyze {
+                buf.push(w);
+                if buf.len() >= chunk_size {
+                    chunks.push(std::mem::take(&mut buf));
+                    buf.reserve(chunk_size);
+                }
+            }
+            if !buf.is_empty() {
+                chunks.push(buf);
+            }
 
+            let mut analysis_results: Vec<(PathBuf, Uri, u64, Vec<Diagnostic>)> = Vec::new();
+            std::thread::scope(|s| {
+                let handles: Vec<_> = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        s.spawn(move || {
+                            let mut out = Vec::with_capacity(chunk.len());
+                            for w in chunk {
+                                let diags = analyze_unopened_file(
+                                    &w.module,
+                                    &w.source,
+                                    &w.canonical,
+                                    &w.file_uri,
+                                );
+                                out.push((w.canonical, w.file_uri, w.hash, diags));
+                            }
+                            out
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    if let Ok(part) = h.join() {
+                        analysis_results.extend(part);
+                    }
+                }
+            });
+
+            // Phase C: serialize cache writes and report assembly. Cheap.
+            for (canonical, file_uri, hash, lsp_diags) in analysis_results {
+                state
+                    .workspace_diag_cache
+                    .insert(canonical, (hash, lsp_diags.clone()));
+                if !lsp_diags.is_empty() {
+                    items.push(WorkspaceDocumentDiagnosticReport::Full(
+                        WorkspaceFullDocumentDiagnosticReport {
+                            uri: file_uri,
+                            version: None,
+                            full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                                result_id: None,
+                                items: lsp_diags,
+                            },
+                        },
+                    ));
+                }
+            }
+            for (file_uri, lsp_diags) in cached_results {
                 if !lsp_diags.is_empty() {
                     items.push(WorkspaceDocumentDiagnosticReport::Full(
                         WorkspaceFullDocumentDiagnosticReport {
@@ -6559,31 +7498,40 @@ fn handle_workspace_diagnostics(
     WorkspaceDiagnosticReportResult::Report(WorkspaceDiagnosticReport { items })
 }
 
-/// Drop cache entries for files that no longer exist or whose mtime has advanced
-/// past the cached value. Cheap O(n) over the cache; called after each
+/// Drop cache entries for files whose content has changed (hash mismatch) or
+/// that no longer exist. Cheap O(n) over the cache; called after each
 /// workspace-diagnostics request.
 fn prune_stale_workspace_diag_cache(state: &mut ServerState) {
-    state.workspace_diag_cache.retain(|path, (cached_t, _)| {
-        match std::fs::metadata(path).and_then(|m| m.modified()) {
-            Ok(t) => t == *cached_t,
+    state.workspace_diag_cache.retain(|path, (cached_h, _)| {
+        match std::fs::read_to_string(path) {
+            Ok(s) => content_hash(&s) == *cached_h,
             Err(_) => false, // file deleted or inaccessible
         }
     });
 }
 
 /// Run the full analysis pipeline on an unopened workspace file and return its
-/// LSP diagnostics. Identical to `analyze_document` but stripped of all the
-/// ancillary metadata (definitions, references, etc.) that this caller doesn't
-/// need.
-fn analyze_unopened_file(source: &str, path: &Path, uri: &Uri) -> Vec<Diagnostic> {
+/// LSP diagnostics. Reuses the parsed module from the import cache so we don't
+/// pay the lex+parse cost twice (the caller already paid it via
+/// `get_or_parse_file_shared`).
+fn analyze_unopened_file(
+    module: &Module,
+    source: &str,
+    path: &Path,
+    uri: &Uri,
+) -> Vec<Diagnostic> {
     let mut all_diags = Vec::new();
 
+    // Re-lex to surface lexer diagnostics (the cache only stored the parsed AST).
     let lexer = knot::lexer::Lexer::new(source);
-    let (tokens, lex_diags) = lexer.tokenize();
+    let (_, lex_diags) = lexer.tokenize();
     all_diags.extend(lex_diags);
 
+    // Re-parse to capture parse diagnostics (the cache discards them too).
+    let lexer2 = knot::lexer::Lexer::new(source);
+    let (tokens, _) = lexer2.tokenize();
     let parser = knot::parser::Parser::new(source.to_string(), tokens);
-    let (module, parse_diags) = parser.parse_module();
+    let (_, parse_diags) = parser.parse_module();
     all_diags.extend(parse_diags);
 
     let has_parse_errors = all_diags

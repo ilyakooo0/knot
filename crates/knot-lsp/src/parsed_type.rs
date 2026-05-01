@@ -328,18 +328,23 @@ impl<'a> Parser<'a> {
             // `IO {fx} T` parses with T as a separate atom; absorb a
             // trailing arg if `ty` is the empty/unknown placeholder.
             if matches!(*ty, ParsedType::Unknown(ref s) if s.is_empty()) {
-                let value_ty = if args.len() == 1 {
-                    Box::new(args.into_iter().next().unwrap())
+                // `args` is guaranteed non-empty here (we returned early on
+                // `args.is_empty()` above), but we still split with a fallback
+                // rather than `.unwrap()` so a future refactor doesn't turn a
+                // misuse into a server-killing panic.
+                let mut iter = args.into_iter();
+                let h = match iter.next() {
+                    Some(h) => h,
+                    None => return Some(ParsedType::Io { effects, rest, ty }),
+                };
+                let mut tail: Vec<ParsedType> = iter.collect();
+                let value_ty = if tail.is_empty() {
+                    Box::new(h)
+                } else if let ParsedType::Named(n, mut a) = h {
+                    a.append(&mut tail);
+                    Box::new(ParsedType::Named(n, a))
                 } else {
-                    let mut iter = args.into_iter();
-                    let h = iter.next().unwrap();
-                    let mut named_args: Vec<ParsedType> = iter.collect();
-                    if let ParsedType::Named(n, mut a) = h {
-                        a.append(&mut named_args);
-                        Box::new(ParsedType::Named(n, a))
-                    } else {
-                        Box::new(h)
-                    }
+                    Box::new(h)
                 };
                 Some(ParsedType::Io {
                     effects,

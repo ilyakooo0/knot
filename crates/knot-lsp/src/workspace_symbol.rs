@@ -95,7 +95,9 @@ pub(crate) fn handle_workspace_symbol(
 
     // Phase 1: collect from open documents. Always recompute (the user may be
     // mid-edit), and refresh the cache for that path so that the next time
-    // the file is closed we have a fresh entry.
+    // the file is closed we have a fresh entry. We deliberately do NOT stamp
+    // an mtime here — the buffer in the editor may be ahead of the on-disk
+    // file, so any cached mtime would falsely match a stale on-disk version.
     let open_entries: Vec<(PathBuf, u64, Vec<WorkspaceSymbolEntry>)> = state
         .documents
         .iter()
@@ -112,7 +114,7 @@ pub(crate) fn handle_workspace_symbol(
         state
             .workspace_symbol_cache
             .by_path
-            .insert(path, (hash, entries));
+            .insert(path, (None, hash, entries));
     }
 
     // Phase 2: closed workspace files. Use the cache when the on-disk hash
@@ -143,19 +145,48 @@ pub(crate) fn handle_workspace_symbol(
                     continue;
                 }
 
-                // Read once to compute the hash; use the cached entries when
-                // they're up to date.
+                // Mtime fast path: if the on-disk mtime matches what we cached
+                // last time, the file content can't have changed, so skip the
+                // read+hash entirely. This is the common case for workspaces
+                // with hundreds of unopened `.knot` files — the user types in
+                // one buffer, we don't touch the rest.
+                let on_disk_mtime = std::fs::metadata(&canonical)
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                if let Some(disk_mtime) = on_disk_mtime {
+                    if let Some((Some(cached_mtime), _, cached_entries)) =
+                        state.workspace_symbol_cache.by_path.get(&canonical)
+                    {
+                        if *cached_mtime == disk_mtime {
+                            push_matching(cached_entries, &query, &mut symbols);
+                            continue;
+                        }
+                    }
+                }
+
+                // Mtime moved (or wasn't recorded). Read and hash to detect
+                // the case where mtime was bumped without a content change
+                // — e.g. `jj`/`git` checkouts that touch timestamps.
                 let source = match std::fs::read_to_string(&canonical) {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
                 let hash = content_hash(&source);
 
-                if let Some((cached_hash, cached_entries)) =
+                if let Some((_, cached_hash, cached_entries)) =
                     state.workspace_symbol_cache.by_path.get(&canonical)
                 {
                     if *cached_hash == hash {
                         push_matching(cached_entries, &query, &mut symbols);
+                        // Refresh the mtime so we hit the fast path next time.
+                        if let Some(disk_mtime) = on_disk_mtime {
+                            let entry = state
+                                .workspace_symbol_cache
+                                .by_path
+                                .get_mut(&canonical)
+                                .unwrap();
+                            entry.0 = Some(disk_mtime);
+                        }
                         continue;
                     }
                 }
@@ -174,7 +205,7 @@ pub(crate) fn handle_workspace_symbol(
                 state
                     .workspace_symbol_cache
                     .by_path
-                    .insert(canonical, (hash, entries));
+                    .insert(canonical, (on_disk_mtime, hash, entries));
             }
         }
     }

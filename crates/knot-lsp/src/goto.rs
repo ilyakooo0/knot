@@ -8,6 +8,7 @@ use lsp_types::*;
 
 use knot::ast::{self, DeclKind, Module};
 
+use crate::analysis::get_or_parse_file_shared;
 use crate::shared::{extract_principal_type_name, scan_knot_files_in_roots};
 use crate::state::ServerState;
 use crate::utils::{path_to_uri, position_to_offset, span_to_range, uri_to_path, word_at_position};
@@ -209,10 +210,11 @@ pub(crate) fn handle_goto_implementation(
                 if open_paths.contains(&canonical) {
                     continue;
                 }
-                let source = match std::fs::read_to_string(&canonical) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
+                let (module, source) =
+                    match get_or_parse_file_shared(&canonical, &state.import_cache) {
+                        Some(v) => v,
+                        None => continue,
+                    };
                 if !source.contains(word) {
                     continue;
                 }
@@ -220,10 +222,6 @@ pub(crate) fn handle_goto_implementation(
                     Some(u) => u,
                     None => continue,
                 };
-                let lexer = knot::lexer::Lexer::new(&source);
-                let (tokens, _) = lexer.tokenize();
-                let parser = knot::parser::Parser::new(source.clone(), tokens);
-                let (module, _) = parser.parse_module();
                 collect_from_module(&module, &file_uri, &source, word, &mut locations);
             }
         }
@@ -244,7 +242,7 @@ pub(crate) fn handle_goto_implementation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TestWorkspace;
+    use crate::test_support::{TempWorkspace, TestWorkspace};
     use crate::utils::offset_to_position;
 
     fn goto_params(uri: &Uri, position: Position) -> GotoDefinitionParams {
@@ -312,6 +310,45 @@ shade = Red {}
         // Either the inferred type lands us on Color, or it doesn't resolve.
         // We just want this to not panic.
         let _ = resp;
+    }
+
+    #[test]
+    fn goto_definition_resolves_imported_trait_method() {
+        // A trait method declared in one file should resolve from a call
+        // site in an importing file. Before the fix this returned `None`
+        // because trait method *signatures* weren't added to `import_defs`
+        // (only trait names and impl methods were).
+        let mut tmp = TempWorkspace::new();
+        tmp.write_and_open(
+            "shapes.knot",
+            r#"trait Display a where
+  display : a -> Text
+"#,
+        );
+        let consumer_uri = tmp.write_and_open(
+            "consumer.knot",
+            r#"import ./shapes
+greet = \x -> display x
+"#,
+        );
+
+        let doc = tmp.workspace.doc(&consumer_uri);
+        let call_offset = doc.source.find("display x").expect("call site") + 1;
+        let pos = offset_to_position(&doc.source, call_offset);
+        let resp = handle_goto_definition(
+            &tmp.workspace.state,
+            &goto_params(&consumer_uri, pos),
+        )
+        .expect("trait method resolves cross-file");
+        let loc = match resp {
+            GotoDefinitionResponse::Scalar(l) => l,
+            other => panic!("expected scalar location, got {other:?}"),
+        };
+        assert!(
+            loc.uri.as_str().ends_with("shapes.knot"),
+            "expected to land in shapes.knot, got {}",
+            loc.uri.as_str()
+        );
     }
 
     #[test]

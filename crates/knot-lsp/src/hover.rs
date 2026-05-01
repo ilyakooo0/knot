@@ -61,12 +61,18 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
         });
 
     // Build hover detail
+    // Track the raw type string so we can later scan it for refined-type names
+    // and surface their predicates inline. `None` means we showed details only
+    // (no inferred type was available), in which case there's nothing to scan.
+    let mut type_for_refinement_scan: Option<String> = None;
     let detail = if let Some(ty) = local_type {
+        type_for_refinement_scan = Some(ty.clone());
         format!("{word} : {ty}")
     } else if let Some(d) = doc.details.get(word) {
         // If we have an inferred type and the AST detail has no type annotation,
         // enhance with the inferred type
         let base = if let Some(inferred) = doc.type_info.get(word) {
+            type_for_refinement_scan = Some(inferred.clone());
             if !d.contains(':') {
                 format!("{d} : {inferred}")
             } else {
@@ -82,6 +88,7 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
             base
         }
     } else if let Some(inferred) = doc.type_info.get(word) {
+        type_for_refinement_scan = Some(inferred.clone());
         let base = format!("{word} : {inferred}");
         if let Some(effects) = doc.effect_info.get(word) {
             format!("{base}\n{effects}")
@@ -169,6 +176,26 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
         value.push_str(&format!(
             "\n\n**Refined type:** values of `{word}` must satisfy `{pred_src}`"
         ));
+    } else if let Some(type_str) = type_for_refinement_scan.as_deref() {
+        // Inline refinements: when the inferred type *contains* refined type
+        // names (e.g. `x : Nat`, `f : Nat -> Nat`), surface each refinement
+        // so the user knows what predicate the value must satisfy. Skip when
+        // hovering on the refined type's own declaration (handled above).
+        let mut mentioned: Vec<&String> = doc
+            .refined_types
+            .keys()
+            .filter(|name| name.as_str() != word && type_contains_name(type_str, name))
+            .collect();
+        if !mentioned.is_empty() {
+            mentioned.sort();
+            value.push_str("\n\n**Refinements in this type:**");
+            for name in mentioned {
+                if let Some(predicate) = doc.refined_types.get(name) {
+                    let pred_src = predicate_to_source(predicate, &doc.source);
+                    value.push_str(&format!("\n- `{name}` — values must satisfy `{pred_src}`"));
+                }
+            }
+        }
     }
 
     // If the cursor is inside a `refine expr` form, show its inferred target type
@@ -218,6 +245,32 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
         }),
         range: word_span.map(|s| span_to_range(s, &doc.source)),
     })
+}
+
+/// Whole-word search for `name` inside a rendered type string. Type strings
+/// run together identifiers with non-identifier punctuation (`->`, `,`, `(`,
+/// `[`, `<`, `{`, whitespace), so a substring scan that respects identifier
+/// boundaries is enough to spot `Nat` in `Nat -> Nat` without falsely
+/// matching `Nation`.
+fn type_contains_name(haystack: &str, name: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let needle = name.as_bytes();
+    if needle.is_empty() || bytes.len() < needle.len() {
+        return false;
+    }
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] == needle {
+            let left_ok = i == 0 || !is_ident(bytes[i - 1]);
+            let right_ok = i + needle.len() >= bytes.len() || !is_ident(bytes[i + needle.len()]);
+            if left_ok && right_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Format a TypeKind as a markdown schema table for hover display.
@@ -350,6 +403,52 @@ mod tests {
         assert!(
             text.contains("id"),
             "hover should mention symbol; got: {text}"
+        );
+    }
+
+    #[test]
+    fn hover_surfaces_refined_type_predicates_inline() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            r#"type Nat = Int where \x -> x >= 0
+double : Nat -> Nat
+double = \n -> n + n
+"#,
+        );
+        let doc = ws.doc(&uri);
+        // Hover on the function name `double`. Its type contains `Nat`
+        // (a refined alias), so the hover should explain the predicate.
+        let off = doc.source.find("double :").expect("definition");
+        let pos = offset_to_position(&doc.source, off);
+        let hover = handle_hover(&ws.state, &hover_params(&uri, pos)).expect("hover");
+        let text = hover_text(hover);
+        assert!(
+            text.contains("Refinements in this type"),
+            "hover should call out embedded refined types; got:\n{text}"
+        );
+        assert!(
+            text.contains(">= 0") || text.contains(">=0"),
+            "hover should include the predicate text; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn hover_does_not_repeat_refinement_when_hovering_alias_itself() {
+        // When the user hovers on the refined-type alias name `Nat`, the
+        // existing handler renders the predicate via the "Refined type:"
+        // section. The new inline scan should not fire on the same name
+        // and produce a duplicate "Refinements in this type" block.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "type Nat = Int where \\x -> x >= 0\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("Nat").expect("alias");
+        let pos = offset_to_position(&doc.source, off);
+        let hover = handle_hover(&ws.state, &hover_params(&uri, pos)).expect("hover");
+        let text = hover_text(hover);
+        assert!(
+            !text.contains("Refinements in this type"),
+            "alias hover duplicated refinement section; got:\n{text}"
         );
     }
 

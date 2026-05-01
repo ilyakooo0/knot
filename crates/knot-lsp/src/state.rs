@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crossbeam_channel::Sender;
 use lsp_server::Connection;
@@ -188,11 +188,15 @@ pub struct WorkspaceSymbolEntry {
     pub container: Option<String>,
 }
 
-/// In-memory workspace symbol index: `path → (content_hash, [entries])`.
-/// The cache is regenerated for a file whenever its content hash changes.
+/// In-memory workspace symbol index: `path → (mtime, content_hash, [entries])`.
+/// On a `workspace/symbol` query we first compare the file's `mtime` against the
+/// cached value — if it matches, we reuse the entries without reading or
+/// hashing the file. If the mtime moved, we read the file and fall back to the
+/// content hash check (mtime can change without the bytes changing, e.g. across
+/// `jj`/`git` checkouts), only re-parsing on a real content difference.
 #[derive(Default)]
 pub struct WorkspaceSymbolCache {
-    pub by_path: HashMap<PathBuf, (u64, Vec<WorkspaceSymbolEntry>)>,
+    pub by_path: HashMap<PathBuf, (Option<SystemTime>, u64, Vec<WorkspaceSymbolEntry>)>,
 }
 
 pub struct PendingSource {

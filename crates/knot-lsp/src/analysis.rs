@@ -551,17 +551,48 @@ pub fn resolve_import_navigation(
                 | DeclKind::View { name, .. }
                 | DeclKind::Derived { name, .. }
                 | DeclKind::Fun { name, .. }
-                | DeclKind::Trait { name, .. }
                 | DeclKind::Route { name, .. }
                 | DeclKind::RouteComposite { name, .. } => {
                     import_defs.insert(name.clone(), (canonical.clone(), decl.span));
                     import_origins.insert(name.clone(), imp.path.clone());
                 }
+                DeclKind::Trait { name, items, .. } => {
+                    import_defs.insert(name.clone(), (canonical.clone(), decl.span));
+                    import_origins.insert(name.clone(), imp.path.clone());
+                    // Trait methods are jumped-to from call sites that reach
+                    // for the *signature*. `goto_implementation` covers the
+                    // impl side. Insert these *before* impl methods so impls
+                    // overwrite only when no trait declared the name — that
+                    // way we always land on the canonical signature when one
+                    // exists.
+                    for item in items {
+                        if let ast::TraitItem::Method {
+                            name: m_name,
+                            name_span,
+                            ..
+                        } = item
+                        {
+                            import_defs.insert(
+                                m_name.clone(),
+                                (canonical.clone(), *name_span),
+                            );
+                            import_origins.insert(m_name.clone(), imp.path.clone());
+                        }
+                    }
+                }
                 DeclKind::Impl { items, .. } => {
                     for item in items {
-                        if let ast::ImplItem::Method { name, .. } = item {
-                            import_defs.insert(name.clone(), (canonical.clone(), decl.span));
-                            import_origins.insert(name.clone(), imp.path.clone());
+                        if let ast::ImplItem::Method { name, name_span, .. } = item {
+                            // Don't overwrite an existing trait-method
+                            // declaration — the trait signature is the
+                            // better goto-definition target. `goto_impl`
+                            // walks the workspace separately for impls.
+                            import_defs
+                                .entry(name.clone())
+                                .or_insert((canonical.clone(), *name_span));
+                            import_origins
+                                .entry(name.clone())
+                                .or_insert(imp.path.clone());
                         }
                     }
                 }

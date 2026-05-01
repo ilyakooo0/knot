@@ -48,6 +48,15 @@ pub(crate) fn handle_completion(
     // completion list so the user can't type them.
     let in_atomic = find_enclosing_atomic_expr(&doc.module, &doc.source, offset).is_some();
 
+    // Route-declaration context: a `route Foo where ...` block contains only
+    // HTTP method keywords, path literals, and field-of-type entries. None of
+    // the runtime builtins, lambdas, or do-block scaffolding belongs here.
+    // Returning a tightly-scoped completion list keeps the user from typing
+    // expression-level snippets that would never parse.
+    if find_enclosing_route_decl_span(&doc.module, offset).is_some() {
+        return Some(CompletionResponse::Array(route_completions(doc)));
+    }
+
     let mut items = Vec::new();
 
     // Context-aware: after `*` only suggest source/view names
@@ -451,6 +460,72 @@ fn is_disallowed_in_atomic(label: &str, doc: &DocumentState) -> bool {
         return eff.has_io();
     }
     false
+}
+
+/// Return the span of a `route` or `route Foo = ...` declaration that
+/// encloses `offset`, or `None` if the cursor is outside any route block.
+fn find_enclosing_route_decl_span(module: &Module, offset: usize) -> Option<Span> {
+    for decl in &module.decls {
+        let in_span = decl.span.start <= offset && offset <= decl.span.end;
+        if !in_span {
+            continue;
+        }
+        if matches!(
+            &decl.node,
+            DeclKind::Route { .. } | DeclKind::RouteComposite { .. }
+        ) {
+            return Some(decl.span);
+        }
+    }
+    None
+}
+
+/// Build the completion list for a position inside a `route … where` block.
+/// Surfaces HTTP method keywords, the soft `headers` keyword, and types that
+/// are valid in field-of-type positions; everything else (functions, builtins,
+/// snippets) would be a parse error inside a route declaration.
+fn route_completions(doc: &DocumentState) -> Vec<CompletionItem> {
+    let mut items = Vec::new();
+
+    for method in ["GET", "POST", "PUT", "DELETE", "PATCH"] {
+        items.push(CompletionItem {
+            label: method.to_string(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            detail: Some("HTTP method".into()),
+            ..Default::default()
+        });
+    }
+
+    items.push(CompletionItem {
+        label: "headers".to_string(),
+        kind: Some(CompletionItemKind::KEYWORD),
+        detail: Some("typed request/response headers block".into()),
+        ..Default::default()
+    });
+
+    for ty in &["Int", "Float", "Text", "Bool", "Bytes", "Maybe", "Result"] {
+        items.push(CompletionItem {
+            label: ty.to_string(),
+            kind: Some(CompletionItemKind::STRUCT),
+            ..Default::default()
+        });
+    }
+
+    for decl in &doc.module.decls {
+        match &decl.node {
+            DeclKind::Data { name, .. } | DeclKind::TypeAlias { name, .. } => {
+                items.push(CompletionItem {
+                    label: name.clone(),
+                    kind: Some(CompletionItemKind::STRUCT),
+                    detail: doc.details.get(name).cloned(),
+                    ..Default::default()
+                });
+            }
+            _ => {}
+        }
+    }
+
+    items
 }
 
 /// Find the smallest `do { ... }` whose span encloses `offset`. Walks every
@@ -987,6 +1062,40 @@ get = \_ -> *
         let labels = item_labels(resp);
         assert!(labels.contains(&"people".to_string()), "labels: {labels:?}");
         assert!(labels.contains(&"pets".to_string()), "labels: {labels:?}");
+    }
+
+    #[test]
+    fn completion_inside_route_decl_offers_methods_and_types_only() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            r#"type Greeting = {message: Text}
+route Hello where
+  GET /hi -> Greeting
+"#,
+        );
+        let doc = ws.doc(&uri);
+        // Cursor on the second line of the route block — inside a route decl
+        // but on a "fresh" line where the user is typing a new entry.
+        let off = doc.source.find("GET /hi").expect("route entry") + 3;
+        let pos = offset_to_position(&doc.source, off);
+        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, None))
+            .expect("completion returns");
+        let labels = item_labels(resp);
+
+        // HTTP methods and the local type alias should be present.
+        assert!(labels.contains(&"GET".to_string()), "labels: {labels:?}");
+        assert!(labels.contains(&"POST".to_string()), "labels: {labels:?}");
+        assert!(
+            labels.contains(&"Greeting".to_string()),
+            "labels: {labels:?}"
+        );
+        // Expression-level builtins like `println` make no sense in a route
+        // declaration and would be a parse error if accepted.
+        assert!(
+            !labels.contains(&"println".to_string()),
+            "println leaked into route-decl completion; labels: {labels:?}"
+        );
     }
 
     #[test]

@@ -1634,12 +1634,15 @@ pub extern "C" fn knot_override_check_help(desc_ptr: *const u8, desc_len: usize)
     eprintln!();
     eprintln!("Options:");
     if !has_debug_override {
-        eprintln!("  --debug          Enable debug output");
+        eprintln!("  --debug                    Enable debug output");
     }
-    eprintln!("  --help           Show this help message");
+    eprintln!("  --help                     Show this help message");
+    eprintln!(
+        "  --http-max-body-bytes=N    Cap HTTP request and response bodies (suffixes: K, M, G; default 16M)"
+    );
 
     for (name, ty) in &overrides {
-        eprintln!("  --{:<14} {} (default from source)", name, ty);
+        eprintln!("  --{:<24} {} (default from source)", name, ty);
     }
 
     std::process::exit(0);
@@ -5231,7 +5234,12 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
 
     let is_empty = STM_READ_VERSIONS.with(|rv| rv.borrow().is_empty());
     if is_empty {
-        std::thread::sleep(Duration::from_secs(1));
+        // No read set means there's nothing to wait *on* — the body retried
+        // without observing any relation, so no notification will ever fire.
+        // Yield briefly so other threads can run, then return; the previous
+        // 1-second sleep stalled retry loops for an entire second per
+        // iteration in this corner case.
+        std::thread::sleep(Duration::from_millis(50));
         // Re-acquire write lock if we held it
         if saved_lock_depth > 0 {
             while WRITE_LOCKED
@@ -11330,10 +11338,101 @@ extern "C" fn respond_headers_inner(
     ]))
 }
 
-/// Hard ceiling on bytes read from a single HTTP request or response body.
+/// Default ceiling on bytes read from a single HTTP request or response body.
 /// Bounds memory exposure from unbounded body streams (DoS protection for
 /// `listen`; protection against malicious upstreams for `fetch`).
-const HTTP_MAX_BODY_BYTES: u64 = 16 * 1024 * 1024;
+const HTTP_MAX_BODY_BYTES_DEFAULT: u64 = 16 * 1024 * 1024;
+
+/// Configurable HTTP body cap. Two ways to override the default:
+///   1. Set `KNOT_HTTP_MAX_BODY_BYTES` in the environment before starting
+///      the program (read once on first access).
+///   2. Call `knot_set_http_max_body_bytes` from the host or from generated
+///      code at any point — subsequent reads see the new limit.
+/// Stored as `AtomicU64` so updates are visible to all threads (`listen`
+/// runs request handlers on a worker pool; `fetch` may be called from
+/// `fork`ed threads).
+static HTTP_MAX_BODY_BYTES_CELL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn http_max_body_bytes() -> u64 {
+    let current = HTTP_MAX_BODY_BYTES_CELL.load(std::sync::atomic::Ordering::Relaxed);
+    if current != 0 {
+        return current;
+    }
+    let resolved = std::env::var("KNOT_HTTP_MAX_BODY_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(HTTP_MAX_BODY_BYTES_DEFAULT);
+    // Best-effort cache; if another thread also resolved it, either store wins.
+    HTTP_MAX_BODY_BYTES_CELL.store(resolved, std::sync::atomic::Ordering::Relaxed);
+    resolved
+}
+
+/// Override the HTTP body cap at runtime. A value of `0` reverts to the
+/// env-or-default resolution path. Exposed through the C ABI so generated
+/// Knot code (or an embedder) can configure the runtime.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_set_http_max_body_bytes(bytes: u64) {
+    HTTP_MAX_BODY_BYTES_CELL.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Parse a byte count with an optional `K`/`M`/`G` suffix (binary, so `1K` is
+/// 1024, `2M` is 2 * 1024 * 1024). Empty input or unrecognised suffix
+/// returns `None`. Used by `--http-max-body-bytes` so users can write `16M`
+/// instead of 16777216.
+fn parse_byte_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num_str, mul): (&str, u64) = match s.as_bytes().last().copied() {
+        Some(b'K') | Some(b'k') => (&s[..s.len() - 1], 1024),
+        Some(b'M') | Some(b'm') => (&s[..s.len() - 1], 1024 * 1024),
+        Some(b'G') | Some(b'g') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        _ => (s, 1),
+    };
+    num_str.parse::<u64>().ok().and_then(|n| n.checked_mul(mul))
+}
+
+/// Scan process args for `--http-max-body-bytes=<size>` (or the two-arg form
+/// `--http-max-body-bytes <size>`) and apply the value via
+/// `knot_set_http_max_body_bytes`. Generated `main` calls this once at
+/// startup so embedders don't need to do anything for the flag to work.
+/// Invalid values exit with a clear error, matching `knot_override_lookup`.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_http_config_init() {
+    const FLAG: &str = "--http-max-body-bytes";
+    let args: Vec<String> = std::env::args().collect();
+    let mut value: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        if let Some(rest) = args[i].strip_prefix(FLAG) {
+            if let Some(v) = rest.strip_prefix('=') {
+                value = Some(v.to_string());
+                break;
+            } else if rest.is_empty()
+                && i + 1 < args.len()
+                && !args[i + 1].starts_with("--")
+            {
+                value = Some(args[i + 1].clone());
+                break;
+            }
+        }
+        i += 1;
+    }
+    let Some(raw) = value else { return };
+    match parse_byte_size(&raw) {
+        Some(n) if n > 0 => knot_set_http_max_body_bytes(n),
+        _ => {
+            eprintln!(
+                "Error: invalid value '{}' for {} (expected positive byte count, optionally with K/M/G suffix)",
+                raw, FLAG
+            );
+            std::process::exit(1);
+        }
+    }
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_http_listen(
@@ -11405,12 +11504,13 @@ pub extern "C" fn knot_http_listen(
                     use std::io::Read;
                     let mut buf = Vec::new();
                     // Cap body size to prevent OOM from oversized requests.
-                    let mut limited = request.as_reader().take(HTTP_MAX_BODY_BYTES + 1);
+                    let max = http_max_body_bytes();
+                    let mut limited = request.as_reader().take(max + 1);
                     let _ = limited.read_to_end(&mut buf);
-                    if buf.len() as u64 > HTTP_MAX_BODY_BYTES {
+                    if buf.len() as u64 > max {
                         eprintln!(
                             "knot runtime: request body exceeds {} byte limit; rejecting",
-                            HTTP_MAX_BODY_BYTES
+                            max
                         );
                         let response = tiny_http::Response::from_string("{\"error\":\"payload too large\"}")
                             .with_status_code(413)
@@ -12001,56 +12101,63 @@ pub extern "C" fn knot_http_fetch_io(
                 let status = response.status().as_u16();
                 log_debug!("[HTTP] <-- {} {}", status, full_url);
 
+                // Parse declared response headers before touching the body so
+                // the immutable header borrow is dropped before `body_mut`.
+                let parsed_headers = if has_resp_hdrs && status < 400 {
+                    let mut hdr_fields = Vec::new();
+                    for field_desc in resp_hdrs_str.split(',') {
+                        if field_desc.is_empty() { continue; }
+                        let (name, ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
+                        let is_maybe = ty.starts_with('?');
+                        let inner_ty = if is_maybe { &ty[1..] } else { ty };
+                        let http_name = camel_to_header_case(name);
+                        let raw_val = response.headers().get(&http_name)
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| s.to_string());
+                        let value = if is_maybe {
+                            match raw_val {
+                                Some(v) => {
+                                    let inner = string_to_value(&v, inner_ty);
+                                    alloc(Value::Constructor(
+                                        "Just".into(),
+                                        alloc(Value::Record(vec![
+                                            RecordField { name: "value".into(), value: inner },
+                                        ])),
+                                    ))
+                                }
+                                None => alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit))),
+                            }
+                        } else {
+                            let v = raw_val.unwrap_or_default();
+                            string_to_value(&v, inner_ty)
+                        };
+                        hdr_fields.push(RecordField {
+                            name: intern_str(name),
+                            value,
+                        });
+                    }
+                    hdr_fields.sort_by(|a, b| a.name.cmp(&b.name));
+                    Some(alloc(Value::Record(hdr_fields)))
+                } else {
+                    None
+                };
+
+                let body_text = match fetch_read_capped_body(response.body_mut()) {
+                    Ok(s) => s,
+                    Err(e) => return fetch_build_err(status, &e),
+                };
+
                 if status >= 400 {
-                    let body_text = response.body_mut().read_to_string().unwrap_or_default();
                     fetch_build_err(status, &body_text)
                 } else {
-                    // Parse response headers before consuming the response body
-                    let parsed_headers = if has_resp_hdrs {
-                        let mut hdr_fields = Vec::new();
-                        for field_desc in resp_hdrs_str.split(',') {
-                            if field_desc.is_empty() { continue; }
-                            let (name, ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
-                            let is_maybe = ty.starts_with('?');
-                            let inner_ty = if is_maybe { &ty[1..] } else { ty };
-                            let http_name = camel_to_header_case(name);
-                            let raw_val = response.headers().get(&http_name)
-                                .and_then(|v| v.to_str().ok())
-                                .map(|s| s.to_string());
-                            let value = if is_maybe {
-                                match raw_val {
-                                    Some(v) => {
-                                        let inner = string_to_value(&v, inner_ty);
-                                        alloc(Value::Constructor(
-                                            "Just".into(),
-                                            alloc(Value::Record(vec![
-                                                RecordField { name: "value".into(), value: inner },
-                                            ])),
-                                        ))
-                                    }
-                                    None => alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit))),
-                                }
-                            } else {
-                                let v = raw_val.unwrap_or_default();
-                                string_to_value(&v, inner_ty)
-                            };
-                            hdr_fields.push(RecordField {
-                                name: intern_str(name),
-                                value,
-                            });
-                        }
-                        hdr_fields.sort_by(|a, b| a.name.cmp(&b.name));
-                        Some(alloc(Value::Record(hdr_fields)))
-                    } else {
-                        None
-                    };
-
-                    let body_text = response.body_mut().read_to_string().unwrap_or_default();
                     let has_resp_schema = matches!(unsafe { as_ref(resp_desc) }, Value::Text(s) if !s.is_empty());
                     let parsed_body = if has_resp_schema {
                         match serde_json::from_str::<serde_json::Value>(&body_text) {
                             Ok(json) => json_to_value(&json),
-                            Err(_) => alloc(Value::Unit),
+                            Err(e) => return fetch_build_err(
+                                status,
+                                &format!("invalid JSON in response: {}", e),
+                            ),
                         }
                     } else {
                         alloc(Value::Text(Arc::from(body_text)))
@@ -12108,6 +12215,24 @@ fn unwrap_maybe(v: *mut Value) -> Option<*mut Value> {
         Value::Constructor(tag, _) if &**tag == "Nothing" => None,
         _ => Some(v),
     }
+}
+
+/// Read an HTTP response body up to the runtime-configurable HTTP body cap.
+/// Returns Err on either a read error or a body exceeding the cap — bounds
+/// memory exposure from malicious or runaway upstreams (the matching ceiling
+/// on inbound requests is enforced in `knot_http_listen`).
+fn fetch_read_capped_body(body: &mut ureq::Body) -> Result<String, String> {
+    use std::io::Read;
+    let max = http_max_body_bytes();
+    let mut buf = Vec::new();
+    body.as_reader()
+        .take(max + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("response read error: {}", e))?;
+    if buf.len() as u64 > max {
+        return Err(format!("response body exceeds {} byte limit", max));
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Build a full URL by substituting `{name:type}` path params from a record.

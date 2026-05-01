@@ -504,8 +504,11 @@ impl<'src> Lexer<'src> {
 
         loop {
             match self.peek() {
-                None | Some(b'\n') => {
-                    // Unterminated string
+                None | Some(b'\n') | Some(b'\r') => {
+                    // Unterminated string. CR (alone or as part of CRLF) is
+                    // also a line break — without this branch a CRLF inside
+                    // an unterminated string would embed the CR in the value
+                    // before the LF tripped the diagnostic.
                     let span = self.span_from(start);
                     self.diagnostics.push(
                         Diagnostic::error("unterminated string literal")

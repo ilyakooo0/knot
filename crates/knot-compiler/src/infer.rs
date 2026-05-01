@@ -1616,15 +1616,34 @@ impl Infer {
             .iter()
             .map(|v| (*v, self.fresh()))
             .collect();
-        // Create deferred constraints for each constraint in the scheme
+        // Create deferred constraints for each constraint in the scheme.
+        //
+        // Most constraints reference a TyVar in `scheme.vars` (e.g.
+        // `Ord a => a -> a -> Bool`), which we freshen alongside the type so
+        // the constraint follows the freshened variable. A constraint can
+        // also reference a variable *not* in `scheme.vars` — that means the
+        // constraint applies to a variable from the outer scope (e.g. a
+        // generalization corner case where the var is shared with an outer
+        // binding). In that case keep the original variable so the
+        // constraint still gets discharged in the outer scope rather than
+        // being silently dropped.
         for c in &scheme.constraints {
-            if let Some(Ty::Var(new_var)) = mapping.get(&c.type_var) {
-                self.deferred_constraints.push(DeferredConstraint {
-                    trait_name: c.trait_name.clone(),
-                    type_var: *new_var,
-                    span,
-                });
-            }
+            let target_var = match mapping.get(&c.type_var) {
+                Some(Ty::Var(new_var)) => *new_var,
+                Some(_) => {
+                    debug_assert!(
+                        false,
+                        "instantiate_at: scheme constraint mapped to non-Var",
+                    );
+                    continue;
+                }
+                None => c.type_var,
+            };
+            self.deferred_constraints.push(DeferredConstraint {
+                trait_name: c.trait_name.clone(),
+                type_var: target_var,
+                span,
+            });
         }
         let ty = self.subst_ty(&scheme.ty, &mapping);
         // Freshen unit variables so each instantiation gets independent units

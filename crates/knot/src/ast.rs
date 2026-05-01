@@ -520,6 +520,10 @@ pub enum TraitItem {
     /// A method signature with optional default body.
     Method {
         name: Name,
+        /// Span of the method name token; used by editor tooling to point
+        /// document symbols and go-to-definition at the method itself
+        /// rather than the enclosing trait.
+        name_span: Span,
         ty: TypeScheme,
         default_params: Vec<Pat>,
         default_body: Option<Expr>,
@@ -534,6 +538,8 @@ pub enum ImplItem {
     /// A method implementation.
     Method {
         name: Name,
+        /// Span of the method name token; used by editor tooling.
+        name_span: Span,
         params: Vec<Pat>,
         body: Expr,
     },

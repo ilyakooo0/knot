@@ -470,9 +470,26 @@ impl Parser {
             if col < indent {
                 break;
             }
+            let before = self.pos;
             match parse_item(self) {
                 Some(item) => items.push(item),
-                None => break,
+                None => {
+                    // No progress means parse_item bailed without consuming a
+                    // token — break to avoid an infinite loop.
+                    if self.pos == before {
+                        break;
+                    }
+                    // The item parser hit an error after consuming tokens.
+                    // Recover by skipping to the next line so subsequent
+                    // items in this block still get parsed; without this
+                    // one bad declaration silently truncates the block.
+                    // parse_item already emitted a diagnostic.
+                    while !self.at_eof() && !self.at(&TokenKind::Newline) {
+                        self.advance();
+                    }
+                    self.skip_newlines();
+                    continue;
+                }
             }
             // Semicolons act as explicit item separators within a block,
             // allowing e.g. `case x of A {} -> 1; B {} -> 2` on one line.
@@ -1124,13 +1141,13 @@ impl Parser {
 
         // Method: name : type_scheme  (or name params = expr for default)
         let method_name = match self.peek() {
-            TokenKind::Lower(_) => Some(self.expect_lower("expected method name").ok()?.0),
+            TokenKind::Lower(_) => Some(self.expect_lower("expected method name").ok()?),
             _ => {
                 self.error("expected method name or 'type' in trait definition");
                 return None;
             }
         };
-        if let Some(name) = method_name {
+        if let Some((name, name_span)) = method_name {
 
             if self.at(&TokenKind::Colon) {
                 self.advance();
@@ -1140,6 +1157,7 @@ impl Parser {
                 // For simplicity, don't handle default bodies in this pass.
                 return Some(TraitItem::Method {
                     name,
+                    name_span,
                     ty: ts,
                     default_params: Vec::new(),
                     default_body: None,
@@ -1161,6 +1179,7 @@ impl Parser {
                 // We need a type for the trait item — use a hole for inference.
                 return Some(TraitItem::Method {
                     name,
+                    name_span,
                     ty: TypeScheme {
                         constraints: vec![],
                         ty: Spanned::new(TypeKind::Hole, self.span()),
@@ -1258,13 +1277,13 @@ impl Parser {
 
         // Method: name params* = expr
         let method_name = match self.peek() {
-            TokenKind::Lower(_) => Some(self.expect_lower("expected method name in impl").ok()?.0),
+            TokenKind::Lower(_) => Some(self.expect_lower("expected method name in impl").ok()?),
             _ => {
                 self.error("expected method name or 'type' in impl definition");
                 return None;
             }
         };
-        if let Some(name) = method_name {
+        if let Some((name, name_span)) = method_name {
             let mut params = Vec::new();
             while self.can_start_pat() && !self.at(&TokenKind::Eq) {
                 if let Some(p) = self.try_parse_pat() {
@@ -1276,7 +1295,7 @@ impl Parser {
             self.expect(&TokenKind::Eq, "expected '=' in method definition")
                 .ok()?;
             let body = self.parse_expr()?;
-            return Some(ImplItem::Method { name, params, body });
+            return Some(ImplItem::Method { name, name_span, params, body });
         }
 
         None

@@ -630,6 +630,9 @@ impl Codegen {
         // Debug
         self.declare_rt("knot_debug_init", &[], &[]);
 
+        // HTTP configuration (--http-max-body-bytes)
+        self.declare_rt("knot_http_config_init", &[], &[]);
+
         // CLI constant overrides
         self.declare_rt("knot_override_lookup", &[p, p, types::I32], &[p]);
         self.declare_rt("knot_override_check_help", &[p, p], &[]);
@@ -1195,6 +1198,7 @@ impl Codegen {
                                 ty,
                                 default_params,
                                 default_body,
+                                ..
                             } => {
                                 let param_count = if default_body.is_some() {
                                     default_params.len()
@@ -2178,7 +2182,7 @@ impl Codegen {
                             .collect();
 
                         for item in items {
-                            if let ast::ImplItem::Method { name, params, body } =
+                            if let ast::ImplItem::Method { name, params, body, .. } =
                                 item
                             {
                                 let mangled = format!(
@@ -3194,6 +3198,11 @@ impl Codegen {
             // Check --debug flag
             let debug_init_ref = cg.import_rt(builder, "knot_debug_init");
             builder.ins().call(debug_init_ref, &[]);
+
+            // Apply --http-max-body-bytes if present (must run before any
+            // listen/fetch so the cap is in effect on the first request).
+            let http_init_ref = cg.import_rt(builder, "knot_http_config_init");
+            builder.ins().call(http_init_ref, &[]);
 
             // Check --help for overridable constants (exclude compile-time overrides)
             let descriptor = {

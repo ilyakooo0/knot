@@ -723,15 +723,22 @@ fn build_symbols(module: &Module, source: &str) -> Vec<DocumentSymbol> {
                 let children: Vec<DocumentSymbol> = items
                     .iter()
                     .filter_map(|item| {
-                        if let ast::TraitItem::Method { name: method_name, ty, .. } = item {
+                        if let ast::TraitItem::Method {
+                            name: method_name,
+                            name_span,
+                            ty,
+                            ..
+                        } = item
+                        {
+                            let method_range = span_to_range(*name_span, source);
                             Some(DocumentSymbol {
                                 name: method_name.clone(),
                                 detail: Some(format_type_scheme(ty)),
                                 kind: SymbolKind::METHOD,
                                 tags: None,
                                 deprecated: None,
-                                range,
-                                selection_range: range,
+                                range: method_range,
+                                selection_range: method_range,
                                 children: None,
                             })
                         } else {
@@ -768,15 +775,16 @@ fn build_symbols(module: &Module, source: &str) -> Vec<DocumentSymbol> {
                 let children: Vec<DocumentSymbol> = items
                     .iter()
                     .filter_map(|item| {
-                        if let ast::ImplItem::Method { name, .. } = item {
+                        if let ast::ImplItem::Method { name, name_span, .. } = item {
+                            let method_range = span_to_range(*name_span, source);
                             Some(DocumentSymbol {
                                 name: name.clone(),
                                 detail: None,
                                 kind: SymbolKind::METHOD,
                                 tags: None,
                                 deprecated: None,
-                                range,
-                                selection_range: range,
+                                range: method_range,
+                                selection_range: method_range,
                                 children: None,
                             })
                         } else {
@@ -2422,18 +2430,27 @@ fn handle_prepare_rename(
         return None;
     }
 
-    // Return the word range
+    // Return the word range. Knot identifiers are ASCII, but a multi-byte
+    // UTF-8 character in an adjacent string/comment can cause a byte-level
+    // walk to land mid-codepoint and panic in `span_to_range`. Snap both
+    // boundaries onto char boundaries to stay safe under any source.
     let word_offset = position_to_offset(&doc.source, pos);
     let bytes = doc.source.as_bytes();
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    let start = (0..word_offset)
+    let mut start = (0..word_offset)
         .rev()
         .find(|&i| !is_ident(bytes[i]))
         .map(|i| i + 1)
         .unwrap_or(0);
-    let end = (word_offset..bytes.len())
+    let mut end = (word_offset..bytes.len())
         .find(|&i| !is_ident(bytes[i]))
         .unwrap_or(bytes.len());
+    while start < doc.source.len() && !doc.source.is_char_boundary(start) {
+        start += 1;
+    }
+    while end < doc.source.len() && !doc.source.is_char_boundary(end) {
+        end += 1;
+    }
 
     let range = span_to_range(Span::new(start, end), &doc.source);
     Some(PrepareRenameResponse::RangeWithPlaceholder {
@@ -3640,9 +3657,17 @@ fn handle_semantic_tokens_full(
 
 struct RawToken {
     start: usize,
+    /// LSP semantic-token length, in UTF-16 code units (per LSP spec). For
+    /// ASCII this matches the byte length; for non-ASCII content (string
+    /// literals containing emoji, CJK, etc.) it differs and must be the
+    /// UTF-16 count or downstream tokens shift left in the editor.
     length: usize,
     token_type: u32,
     modifiers: u32,
+}
+
+fn utf16_len(s: &str) -> usize {
+    s.chars().map(|c| c.len_utf16()).sum()
 }
 
 struct TokenCollector<'a> {
@@ -3657,7 +3682,7 @@ impl<'a> TokenCollector<'a> {
             if !text.contains('\n') {
                 self.tokens.push(RawToken {
                     start: span.start,
-                    length: span.end - span.start,
+                    length: utf16_len(text),
                     token_type,
                     modifiers,
                 });
@@ -3668,7 +3693,7 @@ impl<'a> TokenCollector<'a> {
                     if !line.is_empty() {
                         self.tokens.push(RawToken {
                             start: offset,
-                            length: line.len(),
+                            length: utf16_len(line),
                             token_type,
                             modifiers,
                         });

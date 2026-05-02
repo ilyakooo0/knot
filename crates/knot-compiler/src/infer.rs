@@ -2373,17 +2373,14 @@ impl Infer {
 
     // ── Type display ─────────────────────────────────────────────
 
-    /// Render `{e1, e2 | r}` for an effect set with optional row tail. An
-    /// empty closed set renders as `""` (so callers can omit the braces),
-    /// while a nonempty or open set renders with surrounding braces.
+    /// Render ` {e1, e2 | r}` for an effect set with optional row tail. An
+    /// empty closed set renders as ` {}` — IO and Effects always carry an
+    /// effects row, even when empty.
     fn display_effect_set(
         &self,
         effects: &BTreeSet<IoEffect>,
         row: Option<TyVar>,
     ) -> String {
-        if effects.is_empty() && row.is_none() {
-            return String::new();
-        }
         let mut parts: Vec<String> =
             effects.iter().map(format_io_effect).collect();
         if let Some(rv) = row {
@@ -5931,9 +5928,6 @@ fn display_effect_set_clean(
     row: Option<TyVar>,
     names: &HashMap<TyVar, usize>,
 ) -> String {
-    if effects.is_empty() && row.is_none() {
-        return String::new();
-    }
     let mut parts: Vec<String> = effects.iter().map(format_io_effect).collect();
     if let Some(rv) = row {
         parts.push(format!(

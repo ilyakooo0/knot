@@ -159,15 +159,11 @@ impl ParsedType {
             }
             ParsedType::Relation(t) => format!("[{}]", t.render()),
             ParsedType::Io { effects, rest, ty } => {
-                if effects.is_empty() && rest.is_none() {
-                    format!("IO {}", ty.render_atomic())
-                } else {
-                    let mut parts: Vec<String> = effects.clone();
-                    if let Some(r) = rest {
-                        parts.push(format!("| {r}"));
-                    }
-                    format!("IO {{{}}} {}", parts.join(", "), ty.render_atomic())
+                let mut parts: Vec<String> = effects.clone();
+                if let Some(r) = rest {
+                    parts.push(format!("| {r}"));
                 }
+                format!("IO {{{}}} {}", parts.join(", "), ty.render_atomic())
             }
             ParsedType::UnitAnnotated { base, unit } => {
                 format!("{}<{unit}>", base.render_atomic())

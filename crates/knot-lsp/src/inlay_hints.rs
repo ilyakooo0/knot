@@ -44,13 +44,9 @@ pub(crate) fn handle_inlay_hint(
                     // Text edit emits the signature as a separate statement above the
                     // function, so anchor it at the declaration start, not at the hint.
                     let edit_pos = offset_to_position(&doc.source, decl.span.start);
-                    // The signature inserted into source must include effects;
-                    // the inline hint label keeps to the type only, since the
-                    // tooltip already shows effects on demand.
-                    let full_sig = match doc.effect_sets.get(name) {
-                        Some(eff) => crate::shared::render_signature_with_effects(inferred, eff),
-                        None => inferred.clone(),
-                    };
+                    // Effects (including reads/writes) live inside the IO row of
+                    // the rendered type — no extra prefix is needed.
+                    let full_sig = inferred.clone();
                     hints.push(InlayHint {
                         position: hint_pos,
                         label: InlayHintLabel::String(format!(": {full_sig}")),
@@ -99,10 +95,7 @@ pub(crate) fn handle_inlay_hint(
                     let name_end = decl_text.find('=').unwrap_or(decl_text.len());
                     let hint_offset = decl.span.start + name_end;
                     let hint_pos = offset_to_position(&doc.source, hint_offset);
-                    let full_sig = match doc.effect_sets.get(name) {
-                        Some(eff) => crate::shared::render_signature_with_effects(inferred, eff),
-                        None => inferred.clone(),
-                    };
+                    let full_sig = inferred.clone();
                     hints.push(InlayHint {
                         position: hint_pos,
                         label: InlayHintLabel::String(format!(": {full_sig}")),

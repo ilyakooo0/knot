@@ -8,9 +8,7 @@ use lsp_types::*;
 use knot::ast::{self, DeclKind, Module, Span, TypeKind};
 
 use crate::builtins::EFFECTFUL_BUILTINS;
-use crate::shared::{
-    extract_principal_type_name, find_enclosing_atomic_expr, render_signature_with_effects,
-};
+use crate::shared::{extract_principal_type_name, find_enclosing_atomic_expr};
 use crate::state::{builtins as state_builtins, DocumentState, ServerState};
 use crate::utils::{
     edit_distance, offset_to_position, position_to_offset, safe_slice, span_to_range,
@@ -36,17 +34,13 @@ pub(crate) fn handle_code_action(
             continue;
         }
 
-        // Action: Add type annotation to unannotated functions. The signature
-        // includes any inferred effects (`reads`/`writes` for relation use,
-        // and IO effects not already encoded in the rendered type) so the
-        // suggestion round-trips through the type checker without producing
-        // a fresh "declared effects don't match inferred effects" error.
+        // Action: Add type annotation to unannotated functions. The rendered
+        // type already carries any IO effects (including reads/writes) inside
+        // its `IO {…}` row — effects are tied to IO, not to the function as a
+        // whole, so no extra prefix is needed.
         if let DeclKind::Fun { name, ty: None, .. } = &decl.node {
             if let Some(inferred) = doc.type_info.get(name) {
-                let signature = match doc.effect_sets.get(name) {
-                    Some(eff) => render_signature_with_effects(inferred, eff),
-                    None => inferred.clone(),
-                };
+                let signature = inferred.clone();
                 let insert_pos = offset_to_position(&doc.source, decl.span.start);
 
                 let mut changes = HashMap::new();
@@ -73,16 +67,12 @@ pub(crate) fn handle_code_action(
             }
         }
 
-        // Action: Add type annotation to unannotated views/derived. Same
-        // effect-rendering treatment as the Fun case above — relation-using
-        // views routinely carry `reads`/`writes` that the type alone misses.
+        // Action: Add type annotation to unannotated views/derived. The
+        // rendered type already includes IO effects in its row when present.
         match &decl.node {
             DeclKind::View { name, ty: None, .. } | DeclKind::Derived { name, ty: None, .. } => {
                 if let Some(inferred) = doc.type_info.get(name) {
-                    let signature = match doc.effect_sets.get(name) {
-                        Some(eff) => render_signature_with_effects(inferred, eff),
-                        None => inferred.clone(),
-                    };
+                    let signature = inferred.clone();
                     let decl_text = safe_slice(&doc.source, decl.span);
                     if let Some(eq_pos) = decl_text.find('=') {
                         let insert_offset = decl.span.start + eq_pos;

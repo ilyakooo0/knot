@@ -329,7 +329,7 @@ impl Parser {
             | TokenKind::Let
             | TokenKind::In
             | TokenKind::Not
-            | TokenKind::Full
+            | TokenKind::Replace
             | TokenKind::Atomic
             | TokenKind::Deriving
             | TokenKind::With
@@ -1814,20 +1814,20 @@ impl Parser {
                     Some(target)
                 }
             }
-            TokenKind::Full => {
-                // `full *rel = expr` is a full-set expression. Otherwise
-                // `full` is treated as a regular identifier.
+            TokenKind::Replace => {
+                // `replace *rel = expr` is a replace-set expression. Otherwise
+                // `replace` is treated as a regular identifier.
                 let mut offset = 1;
                 while self.peek_ahead(offset) == &TokenKind::Newline {
                     offset += 1;
                 }
                 if self.peek_ahead(offset) == &TokenKind::Star {
-                    let full_start = self.span();
-                    self.advance(); // consume `full`
+                    let replace_start = self.span();
+                    self.advance(); // consume `replace`
                     self.skip_newlines();
-                    self.parse_set_with_start(true, full_start)
+                    self.parse_set_with_start(true, replace_start)
                 } else {
-                    // `full` used as a regular identifier — fall through to
+                    // `replace` used as a regular identifier — fall through to
                     // Pratt parsing so binary operators and application work.
                     self.parse_expr_bp(0)
                 }
@@ -2045,7 +2045,7 @@ impl Parser {
             | TokenKind::LParen
             | TokenKind::LBrace
             | TokenKind::LBracket
-            | TokenKind::Full
+            | TokenKind::Replace
             | TokenKind::Do => true,
             // `yield` is not a keyword but should not start application atoms
             // (like keywords), to prevent `f; yield x` from parsing as `f yield x`
@@ -2236,9 +2236,9 @@ impl Parser {
                 let TokenKind::Upper(name) = tok.kind else { unreachable!() };
                 Some(Spanned::new(ExprKind::Constructor(name), tok.span))
             }
-            TokenKind::Full => {
+            TokenKind::Replace => {
                 let tok = self.advance();
-                Some(Spanned::new(ExprKind::Var("full".into()), tok.span))
+                Some(Spanned::new(ExprKind::Var("replace".into()), tok.span))
             }
             TokenKind::Star => {
                 // *name — source reference
@@ -2689,9 +2689,9 @@ impl Parser {
         })
     }
 
-    fn parse_set_with_start(&mut self, full: bool, start: Span) -> Option<Expr> {
-        let ctx = if full {
-            "full set expression"
+    fn parse_set_with_start(&mut self, replace: bool, start: Span) -> Option<Expr> {
+        let ctx = if replace {
+            "replace set expression"
         } else {
             "set expression"
         };
@@ -2704,8 +2704,8 @@ impl Parser {
             let value = this.parse_expr()?;
 
             let end_sp = value.span;
-            let kind = if full {
-                ExprKind::FullSet {
+            let kind = if replace {
+                ExprKind::ReplaceSet {
                     target: Box::new(target),
                     value: Box::new(value),
                 }

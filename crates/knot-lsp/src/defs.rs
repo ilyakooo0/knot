@@ -363,7 +363,7 @@ impl DefResolver {
                 self.resolve_expr(else_branch);
             }
             ast::ExprKind::Atomic(e) => self.resolve_expr(e),
-            ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+            ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
                 self.resolve_expr(target);
                 self.resolve_expr(value);
             }

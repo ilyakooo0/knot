@@ -110,13 +110,18 @@ pub(crate) fn handle_inlay_hint(
         }
     }
 
-    // Show inferred types for local bindings (let/bind in do blocks)
+    // Show inferred types for local bindings (let/bind in do blocks). Reads
+    // `unit_info` (populated during analysis) instead of re-parsing each type
+    // string per request — this makes the hint cheap when the file has many
+    // unit-annotated bindings.
     for (span, ty) in &doc.local_type_info {
         if span.end < range_start || span.start > range_end {
             continue;
         }
         let hint_pos = offset_to_position(&doc.source, span.end);
-        let unit_tooltip = extract_unit_from_type_str(ty)
+        let unit_tooltip = doc
+            .unit_info
+            .get(span)
             .map(|u| InlayHintTooltip::String(format!("Inferred unit: `{u}`")));
         hints.push(InlayHint {
             position: hint_pos,
@@ -152,7 +157,109 @@ pub(crate) fn handle_inlay_hint(
     // users can see the field types without expanding mentally.
     add_record_pattern_field_hints(doc, range_start, range_end, &mut hints);
 
+    // Closing-label hints — for blocks that span many lines, show a hint at the
+    // closing token indicating what's ending. Helps when the opener is far
+    // off-screen.
+    add_closing_label_hints(doc, range_start, range_end, &mut hints);
+
     Some(hints)
+}
+
+/// Emit `// end <kind>` style hints at the close of long `do` blocks, lambdas,
+/// and case expressions. Only shown when the block spans more than a threshold
+/// of lines so we don't pollute short bodies with redundant labels.
+fn add_closing_label_hints(
+    doc: &DocumentState,
+    range_start: usize,
+    range_end: usize,
+    hints: &mut Vec<InlayHint>,
+) {
+    const MIN_LINES: u32 = 6;
+
+    fn count_lines(source: &str, span: Span) -> u32 {
+        let mut lines = 0u32;
+        if span.end <= source.len() {
+            for b in source.as_bytes()[span.start..span.end].iter() {
+                if *b == b'\n' {
+                    lines += 1;
+                }
+            }
+        }
+        lines
+    }
+
+    fn collect(
+        expr: &ast::Expr,
+        source: &str,
+        out: &mut Vec<(Span, String)>,
+    ) {
+        match &expr.node {
+            ast::ExprKind::Do(_) => {
+                if count_lines(source, expr.span) >= MIN_LINES {
+                    out.push((expr.span, "end do".into()));
+                }
+                recurse_expr(expr, |e| collect(e, source, out));
+            }
+            ast::ExprKind::Case { .. } => {
+                if count_lines(source, expr.span) >= MIN_LINES {
+                    out.push((expr.span, "end case".into()));
+                }
+                recurse_expr(expr, |e| collect(e, source, out));
+            }
+            ast::ExprKind::Lambda { .. } => {
+                if count_lines(source, expr.span) >= MIN_LINES {
+                    out.push((expr.span, "end λ".into()));
+                }
+                recurse_expr(expr, |e| collect(e, source, out));
+            }
+            ast::ExprKind::Atomic { .. } => {
+                if count_lines(source, expr.span) >= MIN_LINES {
+                    out.push((expr.span, "end atomic".into()));
+                }
+                recurse_expr(expr, |e| collect(e, source, out));
+            }
+            _ => recurse_expr(expr, |e| collect(e, source, out)),
+        }
+    }
+
+    let mut spans: Vec<(Span, String)> = Vec::new();
+    for decl in &doc.module.decls {
+        match &decl.node {
+            DeclKind::Fun {
+                body: Some(body), ..
+            }
+            | DeclKind::View { body, .. }
+            | DeclKind::Derived { body, .. } => collect(body, &doc.source, &mut spans),
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { body, .. } = item {
+                        collect(body, &doc.source, &mut spans);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (span, label) in spans {
+        if span.end < range_start || span.start > range_end {
+            continue;
+        }
+        if span.end == 0 || span.end > doc.source.len() {
+            continue;
+        }
+        let pos = offset_to_position(&doc.source, span.end);
+        hints.push(InlayHint {
+            position: pos,
+            label: InlayHintLabel::String(format!("// {label}")),
+            kind: None,
+            text_edits: None,
+            tooltip: None,
+            padding_left: Some(true),
+            padding_right: None,
+            data: None,
+        });
+    }
 }
 
 /// Walk record-destructure patterns and emit a `: <field-type>` hint at each

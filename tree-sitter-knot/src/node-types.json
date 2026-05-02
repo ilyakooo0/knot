@@ -373,7 +373,7 @@
             "named": true
           },
           {
-            "type": "full_set_expression",
+            "type": "replace_set_expression",
             "named": true
           },
           {
@@ -555,7 +555,7 @@
             "named": true
           },
           {
-            "type": "full_set_expression",
+            "type": "replace_set_expression",
             "named": true
           },
           {
@@ -731,7 +731,7 @@
             "named": true
           },
           {
-            "type": "full_set_expression",
+            "type": "replace_set_expression",
             "named": true
           },
           {
@@ -917,7 +917,7 @@
             "named": true
           },
           {
-            "type": "full_set_expression",
+            "type": "replace_set_expression",
             "named": true
           },
           {
@@ -1479,7 +1479,7 @@
             "named": true
           },
           {
-            "type": "full_set_expression",
+            "type": "replace_set_expression",
             "named": true
           },
           {
@@ -1660,7 +1660,7 @@
           "named": true
         },
         {
-          "type": "full_set_expression",
+          "type": "replace_set_expression",
           "named": true
         },
         {
@@ -2079,7 +2079,7 @@
     }
   },
   {
-    "type": "full_set_expression",
+    "type": "replace_set_expression",
     "named": true,
     "fields": {
       "target": {
@@ -2157,7 +2157,7 @@
             "named": true
           },
           {
-            "type": "full_set_expression",
+            "type": "replace_set_expression",
             "named": true
           },
           {
@@ -2309,7 +2309,7 @@
             "named": true
           },
           {
-            "type": "full_set_expression",
+            "type": "replace_set_expression",
             "named": true
           },
           {
@@ -2572,7 +2572,7 @@
             "named": true
           },
           {
-            "type": "full_set_expression",
+            "type": "replace_set_expression",
             "named": true
           },
           {
@@ -2718,7 +2718,7 @@
             "named": true
           },
           {
-            "type": "full_set_expression",
+            "type": "replace_set_expression",
             "named": true
           },
           {
@@ -2864,7 +2864,7 @@
             "named": true
           },
           {
-            "type": "full_set_expression",
+            "type": "replace_set_expression",
             "named": true
           },
           {
@@ -3135,7 +3135,7 @@
             "named": true
           },
           {
-            "type": "full_set_expression",
+            "type": "replace_set_expression",
             "named": true
           },
           {
@@ -3387,7 +3387,7 @@
             "named": true
           },
           {
-            "type": "full_set_expression",
+            "type": "replace_set_expression",
             "named": true
           },
           {
@@ -3573,7 +3573,7 @@
           "named": true
         },
         {
-          "type": "full_set_expression",
+          "type": "replace_set_expression",
           "named": true
         },
         {
@@ -3782,7 +3782,7 @@
             "named": true
           },
           {
-            "type": "full_set_expression",
+            "type": "replace_set_expression",
             "named": true
           },
           {
@@ -3934,7 +3934,7 @@
           "named": true
         },
         {
-          "type": "full_set_expression",
+          "type": "replace_set_expression",
           "named": true
         },
         {
@@ -4249,7 +4249,7 @@
             "named": true
           },
           {
-            "type": "full_set_expression",
+            "type": "replace_set_expression",
             "named": true
           },
           {
@@ -4812,7 +4812,7 @@
           "named": true
         },
         {
-          "type": "full_set_expression",
+          "type": "replace_set_expression",
           "named": true
         },
         {
@@ -5189,7 +5189,7 @@
             "named": true
           },
           {
-            "type": "full_set_expression",
+            "type": "replace_set_expression",
             "named": true
           },
           {
@@ -5394,7 +5394,7 @@
             "named": true
           },
           {
-            "type": "full_set_expression",
+            "type": "replace_set_expression",
             "named": true
           },
           {
@@ -5891,7 +5891,7 @@
             "named": true
           },
           {
-            "type": "full_set_expression",
+            "type": "replace_set_expression",
             "named": true
           },
           {
@@ -6254,7 +6254,7 @@
           "named": true
         },
         {
-          "type": "full_set_expression",
+          "type": "replace_set_expression",
           "named": true
         },
         {
@@ -6520,7 +6520,7 @@
           "named": true
         },
         {
-          "type": "full_set_expression",
+          "type": "replace_set_expression",
           "named": true
         },
         {
@@ -6720,7 +6720,7 @@
           "named": true
         },
         {
-          "type": "full_set_expression",
+          "type": "replace_set_expression",
           "named": true
         },
         {
@@ -7145,7 +7145,7 @@
             "named": true
           },
           {
-            "type": "full_set_expression",
+            "type": "replace_set_expression",
             "named": true
           },
           {
@@ -7365,7 +7365,7 @@
             "named": true
           },
           {
-            "type": "full_set_expression",
+            "type": "replace_set_expression",
             "named": true
           },
           {
@@ -7527,7 +7527,7 @@
             "named": true
           },
           {
-            "type": "full_set_expression",
+            "type": "replace_set_expression",
             "named": true
           },
           {
@@ -7684,7 +7684,7 @@
             "named": true
           },
           {
-            "type": "full_set_expression",
+            "type": "replace_set_expression",
             "named": true
           },
           {
@@ -7957,10 +7957,6 @@
     "named": false
   },
   {
-    "type": "full",
-    "named": false
-  },
-  {
     "type": "headers",
     "named": false
   },
@@ -8010,6 +8006,10 @@
   },
   {
     "type": "of",
+    "named": false
+  },
+  {
+    "type": "replace",
     "named": false
   },
   {

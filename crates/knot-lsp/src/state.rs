@@ -113,10 +113,9 @@ pub struct DocumentState {
     pub monad_info: HashMap<Span, MonadKind>,
     /// Inferred per-binding units (Float/Int) for inlay-hint display. Keyed by the
     /// binding-site span; value is a normalized unit string like `M/S^2`.
-    /// Currently populated lazily from the formatted type strings inside
-    /// `local_type_info` rather than the raw inferrer output — once `infer.rs`
-    /// exposes per-span unit info this becomes the canonical source.
-    #[allow(dead_code)]
+    /// Populated by `analyze_document` from the formatted local-type strings;
+    /// the inlay-hint handler reads this directly to avoid re-parsing the type
+    /// string on every request.
     pub unit_info: HashMap<Span, String>,
     /// Top-level decl names whose AST shape changed between this analysis
     /// and the previous one for the same file. Empty when no prior snapshot
@@ -332,7 +331,7 @@ impl ServerConfig {
 
 pub const KEYWORDS: &[&str] = &[
     "import", "data", "type", "trait", "impl", "route", "migrate", "where", "do", "yield",
-    "if", "then", "else", "case", "of", "let", "in", "not", "full", "atomic", "deriving", "with",
+    "if", "then", "else", "case", "of", "let", "in", "not", "replace", "atomic", "deriving", "with",
     "export",
 ];
 

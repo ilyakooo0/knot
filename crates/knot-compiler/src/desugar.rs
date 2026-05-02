@@ -18,7 +18,7 @@
 //! [let pat = e, ...rest]            =>  (\pat -> desugar(rest)) e
 //! ```
 //!
-//! Do blocks that are direct values of Set/FullSet are NOT desugared
+//! Do blocks that are direct values of Set/ReplaceSet are NOT desugared
 //! (to preserve SQL optimization patterns in codegen).
 
 use knot::ast::*;
@@ -74,7 +74,7 @@ fn expr_contains_io(expr: &Expr, builtins: &HashSet<&str>, io_fns: &HashSet<Stri
     match &expr.node {
         ExprKind::Var(name) => builtins.contains(name.as_str()) || io_fns.contains(name.as_str()),
         ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) => true,
-        ExprKind::Set { .. } | ExprKind::FullSet { .. } => true,
+        ExprKind::Set { .. } | ExprKind::ReplaceSet { .. } => true,
         ExprKind::At { .. } | ExprKind::Atomic(_) => true,
         ExprKind::UnitLit { value, .. } => expr_contains_io(value, builtins, io_fns),
         ExprKind::Annot { expr, .. } => expr_contains_io(expr, builtins, io_fns),
@@ -325,9 +325,9 @@ fn desugar_decl(decl: &mut DeclKind, io_fns: &HashSet<String>) {
 /// pure comprehensions are replaced with nested App/Lambda/Yield nodes.
 fn desugar_expr(expr: &mut Expr, io_fns: &HashSet<String>) {
     // First, recurse into sub-expressions (bottom-up).
-    // We handle Set/FullSet specially to avoid desugaring their value do blocks.
+    // We handle Set/ReplaceSet specially to avoid desugaring their value do blocks.
     match &mut expr.node {
-        ExprKind::Set { target, value } | ExprKind::FullSet { target, value } => {
+        ExprKind::Set { target, value } | ExprKind::ReplaceSet { target, value } => {
             desugar_expr(target, io_fns);
             // Don't desugar the top-level do block of a set value,
             // but DO recurse into its sub-expressions.
@@ -444,7 +444,7 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &HashSet<String>) {
                 desugar_stmt(stmt, io_fns);
             }
         }
-        ExprKind::Set { target, value } | ExprKind::FullSet { target, value } => {
+        ExprKind::Set { target, value } | ExprKind::ReplaceSet { target, value } => {
             desugar_expr(target, io_fns);
             desugar_expr(value, io_fns);
         }
@@ -674,7 +674,7 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
                 || io_fns.contains(name.as_str())
         }
         ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) => true,
-        ExprKind::Set { .. } | ExprKind::FullSet { .. } => true,
+        ExprKind::Set { .. } | ExprKind::ReplaceSet { .. } => true,
         ExprKind::At { .. } | ExprKind::Atomic(_) => true,
         ExprKind::BinOp { lhs, rhs, .. } => {
             expr_is_io(lhs, io_fns) || expr_is_io(rhs, io_fns)
@@ -931,7 +931,7 @@ mod tests {
             ExprKind::Case { scrutinee, arms } => {
                 has_do_block(scrutinee) || arms.iter().any(|a| has_do_block(&a.body))
             }
-            ExprKind::Set { target, value } | ExprKind::FullSet { target, value } => {
+            ExprKind::Set { target, value } | ExprKind::ReplaceSet { target, value } => {
                 has_do_block(target) || has_do_block(value)
             }
             _ => false,

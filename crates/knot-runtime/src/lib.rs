@@ -1232,7 +1232,7 @@ static ACTIVE_FORKS_CVAR: Condvar = Condvar::new();
 // SQLite WAL allows only one writer at a time. We serialize writes in Rust
 // so threads never contend at the SQLite level.  The lock is reentrant:
 // `atomic` blocks acquire it for their full duration, and individual write
-// functions (full set, set, etc.) inside the block increment the depth
+// functions (replace, set, etc.) inside the block increment the depth
 // without re-acquiring.
 
 static WRITE_LOCKED: AtomicBool = AtomicBool::new(false);
@@ -8791,7 +8791,7 @@ pub extern "C" fn knot_source_write(
     // Delete all existing rows and insert new ones in a transaction
     db_ref
         .conn
-        .execute_batch("SAVEPOINT knot_full_set;")
+        .execute_batch("SAVEPOINT knot_replace;")
         .expect("knot runtime: failed to begin transaction");
 
     let table_name = format!("_knot_{}", name);
@@ -8844,7 +8844,7 @@ pub extern "C" fn knot_source_write(
 
     db_ref
         .conn
-        .execute_batch("RELEASE SAVEPOINT knot_full_set;")
+        .execute_batch("RELEASE SAVEPOINT knot_replace;")
         .expect("knot runtime: failed to commit transaction");
     if db_ref.atomic_depth.get() > 0 {
         stm_track_write(name);

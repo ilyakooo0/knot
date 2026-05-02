@@ -305,6 +305,20 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
         }
     }
 
+    // Trait hover: list all known impls across open documents so the user can
+    // see at a glance which types implement this trait.
+    if let Some(impls_section) = trait_impls_section(state, word) {
+        value.push_str("\n\n---\n\n");
+        value.push_str(&impls_section);
+    }
+
+    // Constructor → parent type: hovering on a constructor surfaces the parent
+    // data type and a link-style listing of sibling constructors.
+    if let Some(ctor_section) = constructor_parent_section(&doc.module, word) {
+        value.push_str("\n\n");
+        value.push_str(&ctor_section);
+    }
+
     // Include doc comments if available
     if let Some(doc_comment) = doc.doc_comments.get(word) {
         value.push_str("\n\n---\n\n");
@@ -318,6 +332,68 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
         }),
         range: word_span.map(|s| span_to_range(s, &doc.source)),
     })
+}
+
+/// If `name` is a trait declared in any open document, render a markdown
+/// section listing the types that implement it (across all open docs).
+fn trait_impls_section(state: &ServerState, name: &str) -> Option<String> {
+    let mut is_trait = false;
+    let mut impls: Vec<(String, String)> = Vec::new(); // (file_label, args_text)
+    for doc in state.documents.values() {
+        for decl in &doc.module.decls {
+            match &decl.node {
+                DeclKind::Trait { name: tn, .. } if tn == name => {
+                    is_trait = true;
+                }
+                DeclKind::Impl {
+                    trait_name, args, ..
+                } if trait_name == name => {
+                    let args_str: Vec<String> =
+                        args.iter().map(|t| format_type_kind(&t.node)).collect();
+                    impls.push((String::new(), args_str.join(" ")));
+                }
+                _ => {}
+            }
+        }
+    }
+    if !is_trait {
+        return None;
+    }
+    if impls.is_empty() {
+        return Some(format!("**Implementations of `{name}`:** _none yet_"));
+    }
+    let mut out = format!("**Implementations of `{name}`:**");
+    for (_, args) in impls {
+        out.push_str(&format!("\n- `impl {name} {args}`"));
+    }
+    Some(out)
+}
+
+/// If `name` is a constructor of a data type declared in `module`, return a
+/// markdown summary linking back to the parent type and listing siblings.
+fn constructor_parent_section(module: &knot::ast::Module, name: &str) -> Option<String> {
+    for decl in &module.decls {
+        if let DeclKind::Data {
+            name: dn,
+            constructors,
+            ..
+        } = &decl.node
+        {
+            if constructors.iter().any(|c| c.name == name) {
+                let siblings: Vec<String> = constructors
+                    .iter()
+                    .filter(|c| c.name != name)
+                    .map(|c| format!("`{}`", c.name))
+                    .collect();
+                let mut out = format!("**Constructor of:** `{dn}`");
+                if !siblings.is_empty() {
+                    out.push_str(&format!("  \nSiblings: {}", siblings.join(", ")));
+                }
+                return Some(out);
+            }
+        }
+    }
+    None
 }
 
 /// Whole-word search for `name` inside a rendered type string. Type strings

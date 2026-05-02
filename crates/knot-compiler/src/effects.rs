@@ -385,7 +385,7 @@ impl EffectChecker {
 
             ast::ExprKind::UnaryOp { operand, .. } => self.infer_effects(operand),
 
-            ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+            ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
                 let mut effects = self.infer_effects(value);
                 if let ast::ExprKind::SourceRef(name) = &target.node {
                     effects.writes.insert(name.clone());

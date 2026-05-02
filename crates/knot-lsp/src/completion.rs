@@ -407,33 +407,24 @@ pub(crate) fn handle_completion(
                     }
                     seen_names.insert(name.clone());
 
-                    // Compute where to insert the import line
-                    let import_insert_pos = if let Some(last_import) = doc.module.imports.last() {
-                        let end = offset_to_position(&doc.source, last_import.span.end);
-                        Position::new(end.line + 1, 0)
-                    } else {
-                        Position::new(0, 0)
-                    };
-                    let import_line = if doc.module.imports.is_empty() {
-                        format!("import {import_path}\n\n")
-                    } else {
-                        format!("import {import_path}\n")
-                    };
-
-                    let additional_edits = vec![TextEdit {
-                        range: Range {
-                            start: import_insert_pos,
-                            end: import_insert_pos,
-                        },
-                        new_text: import_line,
-                    }];
+                    // Defer `additional_text_edits` computation to resolve —
+                    // produce a marker payload via `data` instead. The resolve
+                    // handler computes the import-line edit only for the item
+                    // the user actually selects, avoiding O(workspace_files ×
+                    // decls) edit construction per keystroke.
+                    let data = serde_json::json!({
+                        "kind": "auto_import",
+                        "name": name,
+                        "import_path": import_path,
+                        "source_uri": uri.to_string(),
+                    });
 
                     items.push(CompletionItem {
                         label: name.clone(),
                         kind: Some(kind),
                         detail: Some(format!("auto-import from {import_path}")),
-                        additional_text_edits: Some(additional_edits),
                         sort_text: Some(format!("zz_{name}")), // sort after local items
+                        data: Some(data),
                         ..Default::default()
                     });
                 }
@@ -988,6 +979,39 @@ pub(crate) fn handle_resolve_completion_item(
 ) -> CompletionItem {
     // Strip the relation/derived prefix so lookups succeed for `*todos`/`&seniors`.
     let label = item.label.trim_start_matches(['*', '&']).to_string();
+
+    // If this is an auto-import marker (added by the workspace scan in
+    // `handle_completion`), resolve the actual TextEdit lazily here.
+    if let Some(data) = item.data.clone() {
+        if data.get("kind").and_then(|v| v.as_str()) == Some("auto_import") {
+            let import_path = data.get("import_path").and_then(|v| v.as_str()).unwrap_or("");
+            let source_uri = data.get("source_uri").and_then(|v| v.as_str()).unwrap_or("");
+            if !import_path.is_empty() && !source_uri.is_empty() {
+                if let Ok(uri) = source_uri.parse::<Uri>() {
+                    if let Some(doc) = state.documents.get(&uri) {
+                        let import_insert_pos = if let Some(last_import) = doc.module.imports.last() {
+                            let end = offset_to_position(&doc.source, last_import.span.end);
+                            Position::new(end.line + 1, 0)
+                        } else {
+                            Position::new(0, 0)
+                        };
+                        let import_line = if doc.module.imports.is_empty() {
+                            format!("import {import_path}\n\n")
+                        } else {
+                            format!("import {import_path}\n")
+                        };
+                        item.additional_text_edits = Some(vec![TextEdit {
+                            range: Range {
+                                start: import_insert_pos,
+                                end: import_insert_pos,
+                            },
+                            new_text: import_line,
+                        }]);
+                    }
+                }
+            }
+        }
+    }
 
     // Aggregate enrichment across all open documents — workspace-symbol-style
     // labels can come from any file, and effect/doc/type info may live in

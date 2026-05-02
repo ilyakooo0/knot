@@ -24,7 +24,7 @@ pub const MOD_READONLY: u32 = 0b0010;
 /// Maps to `async` since it's the closest standard token modifier — many
 /// editor themes already color async calls distinctively.
 pub const MOD_EFFECTFUL: u32 = 0b0100;
-/// Mutation: writes to a relation (`set *r = ...`, `full set *r = ...`).
+/// Mutation: writes to a relation (`set *r = ...`, `replace *r = ...`).
 pub const MOD_MUTATION: u32 = 0b1000;
 
 pub fn semantic_token_legend() -> SemanticTokensLegend {

@@ -432,7 +432,7 @@ module.exports = grammar({
         $.case_expression,
         $.do_expression,
         $.set_expression,
-        $.full_set_expression,
+        $.replace_set_expression,
         $.yield_expression,
         $.atomic_expression,
         $.refine_expression,
@@ -535,10 +535,10 @@ module.exports = grammar({
         ),
       ),
 
-    full_set_expression: ($) =>
+    replace_set_expression: ($) =>
       prec.right(
         seq(
-          "full",
+          "replace",
           "set",
           field("target", $.source_ref),
           "=",

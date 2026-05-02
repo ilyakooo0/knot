@@ -21,7 +21,7 @@
   "let"
   "in"
   "not"
-  "full"
+  "replace"
   "atomic"
   "refine"
   "deriving"

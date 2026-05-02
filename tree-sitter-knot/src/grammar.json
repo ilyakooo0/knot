@@ -1584,6 +1584,10 @@
         },
         {
           "type": "SYMBOL",
+          "name": "refined_type"
+        },
+        {
+          "type": "SYMBOL",
           "name": "_type_app"
         }
       ]
@@ -1599,7 +1603,7 @@
             "name": "param",
             "content": {
               "type": "SYMBOL",
-              "name": "_type_app"
+              "name": "refined_type"
             }
           },
           {
@@ -1616,6 +1620,40 @@
           }
         ]
       }
+    },
+    "refined_type": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "FIELD",
+              "name": "base",
+              "content": {
+                "type": "SYMBOL",
+                "name": "_type_app"
+              }
+            },
+            {
+              "type": "STRING",
+              "value": "where"
+            },
+            {
+              "type": "FIELD",
+              "name": "predicate",
+              "content": {
+                "type": "SYMBOL",
+                "name": "_expression"
+              }
+            }
+          ]
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_type_app"
+        }
+      ]
     },
     "_type_app": {
       "type": "CHOICE",
@@ -2069,7 +2107,7 @@
         },
         {
           "type": "SYMBOL",
-          "name": "full_set_expression"
+          "name": "replace_set_expression"
         },
         {
           "type": "SYMBOL",
@@ -2078,6 +2116,10 @@
         {
           "type": "SYMBOL",
           "name": "atomic_expression"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "refine_expression"
         },
         {
           "type": "SYMBOL",
@@ -2457,7 +2499,7 @@
         ]
       }
     },
-    "full_set_expression": {
+    "replace_set_expression": {
       "type": "PREC_RIGHT",
       "value": 0,
       "content": {
@@ -2465,7 +2507,7 @@
         "members": [
           {
             "type": "STRING",
-            "value": "full"
+            "value": "replace"
           },
           {
             "type": "STRING",
@@ -2528,6 +2570,27 @@
           {
             "type": "FIELD",
             "name": "body",
+            "content": {
+              "type": "SYMBOL",
+              "name": "_expression"
+            }
+          }
+        ]
+      }
+    },
+    "refine_expression": {
+      "type": "PREC_RIGHT",
+      "value": 0,
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "STRING",
+            "value": "refine"
+          },
+          {
+            "type": "FIELD",
+            "name": "value",
             "content": {
               "type": "SYMBOL",
               "name": "_expression"

@@ -376,7 +376,7 @@ pub(crate) fn find_app_in_expr(
             }
         }
         ast::ExprKind::Atomic(e) | ast::ExprKind::Refine(e) => find_app_in_expr(e, source, offset, best),
-        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+        ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
             find_app_in_expr(target, source, offset, best);
             find_app_in_expr(value, source, offset, best);
         }
@@ -495,7 +495,7 @@ pub(crate) fn find_enclosing_atomic_expr(
                 }
             }
             ast::ExprKind::Atomic(e) | ast::ExprKind::Refine(e) => walk(e, source, offset, best),
-            ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+            ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
                 walk(target, source, offset, best);
                 walk(value, source, offset, best);
             }

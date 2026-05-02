@@ -166,7 +166,7 @@
         },
         {
           "name": "keyword.other.knot",
-          "match": "\\b(set|full|import|export|deriving|with|migrate)\\b"
+          "match": "\\b(set|replace|import|export|deriving|with|migrate)\\b"
         },
         {
           "name": "keyword.declaration.knot",

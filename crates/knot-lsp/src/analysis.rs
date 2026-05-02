@@ -43,6 +43,17 @@ fn next_access_clock(cache: &InferenceCache) -> u64 {
         .wrapping_add(1)
 }
 
+/// Extract a `<unit>` annotation from a formatted local type string. Returns
+/// `None` for dimensionless types or types without unit info.
+fn extract_unit_from_local_type(ty: &str) -> Option<String> {
+    let parsed = crate::parsed_type::ParsedType::parse(ty);
+    let value = match &parsed {
+        crate::parsed_type::ParsedType::Function(_, ret) => ret.strip_io(),
+        other => other.strip_io(),
+    };
+    value.unit().map(|s| s.to_string())
+}
+
 // ── Analysis worker ─────────────────────────────────────────────────
 
 pub fn analysis_worker(
@@ -148,7 +159,7 @@ pub fn analyze_document(
     let mut source_refinements: HashMap<String, Vec<(Option<String>, String, ast::Expr)>> =
         HashMap::new();
     let mut monad_info: HashMap<Span, MonadKind> = HashMap::new();
-    let unit_info: HashMap<Span, String> = HashMap::new();
+    let mut unit_info: HashMap<Span, String> = HashMap::new();
     let mut changed_decl_names: Vec<String> = Vec::new();
     let mut dirty_decl_closure: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -341,6 +352,16 @@ pub fn analyze_document(
         refined_types = refined_type_info;
         refine_targets = rt;
         monad_info = mi;
+
+        // Populate `unit_info` from the formatted local type strings — every
+        // binding whose type carries a `<unit>` annotation gets an entry. The
+        // inlay-hint handler reads this directly to surface unit annotations
+        // on bindings without re-parsing each type string per request.
+        for (span, ty) in &local_type_info {
+            if let Some(unit) = extract_unit_from_local_type(ty) {
+                unit_info.insert(*span, unit);
+            }
+        }
 
         let (effect_diags, effects) =
             knot_compiler::effects::check_with_effects(&analysis_module);

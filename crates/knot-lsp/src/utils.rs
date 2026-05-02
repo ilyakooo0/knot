@@ -329,7 +329,7 @@ pub fn collect_keyword_operator_positions(tokens: &[knot::lexer::Token]) -> Vec<
             | TokenKind::Let
             | TokenKind::In
             | TokenKind::Not
-            | TokenKind::Full
+            | TokenKind::Replace
             | TokenKind::Atomic
             | TokenKind::Deriving
             | TokenKind::With
@@ -406,7 +406,7 @@ pub fn recurse_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, mut f: F) {
             }
         }
         ast::ExprKind::Atomic(e) | ast::ExprKind::Refine(e) => f(e),
-        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+        ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
             f(target);
             f(value);
         }

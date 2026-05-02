@@ -410,7 +410,7 @@ impl<'a> TokenCollector<'a> {
                 }
             }
             ast::ExprKind::Atomic(e) | ast::ExprKind::Refine(e) => self.visit_expr(e),
-            ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+            ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
                 // Highlight mutation targets distinctly. We re-emit the target
                 // span with a MUTATION modifier overlaying whatever inner type
                 // visit_expr would assign.

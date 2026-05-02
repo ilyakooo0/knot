@@ -143,7 +143,7 @@ fn collect_containing_spans(expr: &ast::Expr, offset: usize, spans: &mut Vec<Spa
         ast::ExprKind::Atomic(e) | ast::ExprKind::Refine(e) => {
             collect_containing_spans(e, offset, spans);
         }
-        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+        ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
             collect_containing_spans(target, offset, spans);
             collect_containing_spans(value, offset, spans);
         }

@@ -13,10 +13,10 @@ type Person = {name: Text, age: Int, email: Text}
 
 main = do
   -- Insert some people
-  full *people = [{name: "Alice", age: 30, email: "alice@example.com"}, {name: "Bob", age: 25, email: "bob@example.com"}]
+  replace *people = [{name: "Alice", age: 30, email: "alice@example.com"}, {name: "Bob", age: 25, email: "bob@example.com"}]
 
   -- Insert a valid order (Alice exists in people)
-  full *orders = [{customer: "Alice", amount: 100}]
+  replace *orders = [{customer: "Alice", amount: 100}]
 
   -- Print current state
   println "People:"

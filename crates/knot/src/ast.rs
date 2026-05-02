@@ -256,8 +256,8 @@ pub enum ExprKind {
     /// `*rel = expr` — update a source relation (must match an optimized pattern).
     Set { target: Box<Expr>, value: Box<Expr> },
 
-    /// `full *rel = expr` — full table replacement (DELETE + INSERT).
-    FullSet { target: Box<Expr>, value: Box<Expr> },
+    /// `replace *rel = expr` — full table replacement (DELETE + INSERT).
+    ReplaceSet { target: Box<Expr>, value: Box<Expr> },
 
     /// `atomic expr` — transactional boundary.
     Atomic(Box<Expr>),

@@ -2961,7 +2961,7 @@ impl Infer {
                     effects.insert(IoEffect::Writes(name.clone()));
                     effects.insert(IoEffect::Reads(name.clone()));
 
-                    // Require `full *rel = ...` when the value is a full
+                    // Require `replace *rel = ...` when the value is a full
                     // replacement (doesn't reference *rel directly or via a
                     // local alias `xs <- *rel`). Skip views and scalar
                     // sources where the distinction is meaningless.
@@ -2982,7 +2982,7 @@ impl Infer {
                             format!(
                                 "`*{name} = ...` must reference `*{name}` \
                                  (directly or via a `<- *{name}` bind); \
-                                 use `full *{name} = ...` for a full replacement"
+                                 use `replace *{name} = ...` for a full replacement"
                             ),
                             expr.span,
                         );
@@ -2991,7 +2991,7 @@ impl Infer {
                 Ty::IO(effects, None, Box::new(Ty::unit()))
             }
 
-            ast::ExprKind::FullSet { target, value } => {
+            ast::ExprKind::ReplaceSet { target, value } => {
                 let target_ty = self.infer_expr(target);
                 let target_applied = self.apply(&target_ty);
                 let unwrap_io = |ty: &Ty| match ty {
@@ -3792,7 +3792,7 @@ impl Infer {
                 })
             }
             ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
-            ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
+            ast::ExprKind::Set { .. } | ast::ExprKind::ReplaceSet { .. } => true,
             ast::ExprKind::At { .. } | ast::ExprKind::Atomic(_) => true,
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
                 self.expr_is_io_prescan(lhs) || self.expr_is_io_prescan(rhs)
@@ -6046,7 +6046,7 @@ fn display_ty_clean_inner(ty: &Ty, names: &HashMap<TyVar, usize>, in_fun: bool) 
 /// `SourceRef`, or via a local variable bound to `*source_name`
 /// (e.g. `xs <- *foo`, then `xs` counts as a reference). Used to
 /// distinguish incremental `set` (must reference the source) from
-/// full replacement (which requires `full *rel = ...`).
+/// full replacement (which requires `replace *rel = ...`).
 fn value_references_source(
     expr: &ast::Expr,
     source_name: &str,
@@ -6122,7 +6122,7 @@ fn value_references_source(
             }
         }),
         ast::ExprKind::Set { target, value }
-        | ast::ExprKind::FullSet { target, value } => {
+        | ast::ExprKind::ReplaceSet { target, value } => {
             value_references_source(target, source_name, aliases)
                 || value_references_source(value, source_name, aliases)
         }
@@ -6456,18 +6456,18 @@ main = applyPred (\\r -> r.x == r.y)\
     #[test]
     fn set_type_matches_source() {
         assert!(check_src(
-            "*nums : [Int]\nmain = full *nums = [1, 2, 3]"
+            "*nums : [Int]\nmain = replace *nums = [1, 2, 3]"
         ).is_empty());
     }
 
     #[test]
     fn bare_set_full_replacement_errors() {
         // `*nums = [1, 2, 3]` doesn't reference *nums, so it's a full
-        // replacement and must use `full` syntax.
+        // replacement and must use `replace` syntax.
         let diags = check_src(
             "*nums : [Int]\nmain = *nums = [1, 2, 3]"
         );
-        assert!(has_error(&diags, "full *nums"));
+        assert!(has_error(&diags, "replace *nums"));
     }
 
     #[test]
@@ -6487,7 +6487,7 @@ main = applyPred (\\r -> r.x == r.y)\
     #[test]
     fn bare_set_value_unrelated_to_source_errors() {
         // Even with a local source bind, replacing with an unrelated value
-        // is a full replacement and must use `full`.
+        // is a full replacement and must use `replace`.
         let diags = check_src(
             "type P = {name: Text, age: Int}\n\
              *people : [P]\n\
@@ -6496,13 +6496,13 @@ main = applyPred (\\r -> r.x == r.y)\
                os <- *other\n\
                *people = os"
         );
-        assert!(has_error(&diags, "full *people"));
+        assert!(has_error(&diags, "replace *people"));
     }
 
     #[test]
     fn set_type_mismatch() {
         let diags = check_src(
-            "*nums : [Int]\nmain = full *nums = [\"a\", \"b\"]"
+            "*nums : [Int]\nmain = replace *nums = [\"a\", \"b\"]"
         );
         assert!(has_error(&diags, "type mismatch"));
     }
@@ -7479,7 +7479,7 @@ main = applyPred (\\r -> r.x == r.y)\
             "type Person = {name: Text, age: Int}\n\
              *people : [Person]\n\
              main = do\n\
-               full *people = [{name: \"A\", age: 1}]\n\
+               replace *people = [{name: \"A\", age: 1}]\n\
                p <- *people\n\
                yield p.name"
         );

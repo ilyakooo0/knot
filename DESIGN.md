@@ -539,7 +539,7 @@ Grouping is executed via SQLite — key columns are inserted into a temp table a
 
 All state operations in Knot return IO values. The IO type carries an effect set that distinguishes DB operations from external effects:
 
-- **DB operations** return `IO {} value` — the empty effect set `{}` indicates pure database interaction with no external side effects. Source refs (`*rel`), derived refs (`&rel`), `set`, `full set`, and temporal queries (`@(timestamp)`) all return `IO {} value`.
+- **DB operations** return `IO {} value` — the empty effect set `{}` indicates pure database interaction with no external side effects. Source refs (`*rel`), derived refs (`&rel`), `set`, `replace`, and temporal queries (`@(timestamp)`) all return `IO {} value`.
 - **External effects** carry specific tags: `IO {console} {}`, `IO {fs} Text`, `IO {network} Result`, `IO {clock} Int`, `IO {random} Float`.
 
 This unified model means all stateful code lives in IO do-blocks, while pure comprehensions over plain values remain non-IO.

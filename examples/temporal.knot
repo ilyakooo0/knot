@@ -11,7 +11,7 @@ addEmployees = do
 
 -- Give everyone a raise
 giveRaises = do
-  full *employees = do
+  replace *employees = do
     e <- *employees
     yield {e | salary: e.salary + 10000}
   yield {}

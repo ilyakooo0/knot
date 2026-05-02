@@ -1048,7 +1048,7 @@ fn find_case_actions(
         ast::ExprKind::Atomic(e) | ast::ExprKind::Refine(e) => {
             find_case_actions(e, doc, uri, range_start, range_end, actions);
         }
-        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+        ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
             find_case_actions(target, doc, uri, range_start, range_end, actions);
             find_case_actions(value, doc, uri, range_start, range_end, actions);
         }
@@ -1219,7 +1219,7 @@ fn collect_names_in_expr(expr: &ast::Expr, out: &mut HashSet<String>) {
             }
         }
         ast::ExprKind::Atomic(e) | ast::ExprKind::Refine(e) => collect_names_in_expr(e, out),
-        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+        ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
             collect_names_in_expr(target, out);
             collect_names_in_expr(value, out);
         }

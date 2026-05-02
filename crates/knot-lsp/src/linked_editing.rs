@@ -157,7 +157,7 @@ fn collect_field_name_spans(
             }
         }
         ast::ExprKind::Atomic(e) | ast::ExprKind::Refine(e) => collect_field_name_spans(e, field_name, source, ranges),
-        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+        ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
             collect_field_name_spans(target, field_name, source, ranges);
             collect_field_name_spans(value, field_name, source, ranges);
         }

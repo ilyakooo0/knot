@@ -4088,7 +4088,7 @@ impl Codegen {
                 }
             }
 
-            ast::ExprKind::FullSet { target, value } => {
+            ast::ExprKind::ReplaceSet { target, value } => {
                 if let ast::ExprKind::SourceRef(name) = &target.node {
                     // Check if target is a view
                     let view_info = self.views.get(name).cloned();
@@ -4136,7 +4136,7 @@ impl Codegen {
                     );
                     self.call_rt(builder, "knot_value_unit", &[])
                 } else {
-                    panic!("codegen: full set target must be a source reference")
+                    panic!("codegen: replace target must be a source reference")
                 }
             }
 
@@ -6187,7 +6187,7 @@ impl Codegen {
     // ── Do-block compilation ──────────────────────────────────────
 
     /// Check if a do-block should be compiled as IO (contains IO-producing builtins).
-    /// Compile an expression that will be used as the value of a `set`/`full set`.
+    /// Compile an expression that will be used as the value of a `set`/`replace`.
     /// Do-blocks in set-value position are always relational comprehensions,
     /// even when they contain SourceRef/DerivedRef binds (which would normally
     /// cause `is_io_do_block` to classify them as IO).
@@ -6269,7 +6269,7 @@ impl Codegen {
         match &expr.node {
             ast::ExprKind::Var(name) => builtins.contains(name.as_str()) || io_fns.contains(name),
             ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
-            ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
+            ast::ExprKind::Set { .. } | ast::ExprKind::ReplaceSet { .. } => true,
             ast::ExprKind::At { .. } | ast::ExprKind::Atomic(_) => true,
             ast::ExprKind::App { func, arg } => {
                 Self::expr_contains_io(func, builtins, io_fns)
@@ -6331,7 +6331,7 @@ impl Codegen {
                 ) || self.io_functions.contains(name)
             }
             ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
-            ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
+            ast::ExprKind::Set { .. } | ast::ExprKind::ReplaceSet { .. } => true,
             ast::ExprKind::At { .. } | ast::ExprKind::Atomic(_) => true,
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
                 self.expr_is_io(lhs) || self.expr_is_io(rhs)
@@ -7075,7 +7075,7 @@ impl Codegen {
                                 | ast::ExprKind::List(_)
                                 | ast::ExprKind::Do(_)
                                 | ast::ExprKind::Set { .. }
-                                | ast::ExprKind::FullSet { .. }
+                                | ast::ExprKind::ReplaceSet { .. }
                         ) || self.expr_is_known_relation(expr);
                         if is_known_relation {
                             val
@@ -7419,7 +7419,7 @@ impl Codegen {
                             "knot_relation_push",
                             &[result, val],
                         );
-                    } else if matches!(&expr.node, ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. }) {
+                    } else if matches!(&expr.node, ast::ExprKind::Set { .. } | ast::ExprKind::ReplaceSet { .. }) {
                         // Compile set inside do block
                         let _ = self.compile_expr(builder, expr, env, db);
                     } else {
@@ -7891,7 +7891,7 @@ impl Codegen {
                 ast::StmtKind::Expr(e) => Self::references_source(e, source_name),
             }),
             ast::ExprKind::Set { target, value }
-            | ast::ExprKind::FullSet { target, value } => {
+            | ast::ExprKind::ReplaceSet { target, value } => {
                 Self::references_source(target, source_name)
                     || Self::references_source(value, source_name)
             }
@@ -10910,7 +10910,7 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
         ast::ExprKind::Atomic(inner) => {
             expr_contains_derived_ref(inner, name)
         }
-        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+        ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
             expr_contains_derived_ref(target, name) || expr_contains_derived_ref(value, name)
         }
         ast::ExprKind::At { relation, time } => {
@@ -11040,7 +11040,7 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
             }
         }
         ast::ExprKind::Set { target, value }
-        | ast::ExprKind::FullSet { target, value } => {
+        | ast::ExprKind::ReplaceSet { target, value } => {
             collect_free_vars(target, bound, free);
             collect_free_vars(value, bound, free);
         }
@@ -11181,9 +11181,9 @@ fn pretty_expr(expr: &ast::Expr) -> String {
         ast::ExprKind::Set { target, value } => {
             format!("{} = {}", pretty_expr(target), pretty_expr(value))
         }
-        ast::ExprKind::FullSet { target, value } => {
+        ast::ExprKind::ReplaceSet { target, value } => {
             format!(
-                "full {} = {}",
+                "replace {} = {}",
                 pretty_expr(target),
                 pretty_expr(value)
             )

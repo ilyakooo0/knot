@@ -150,7 +150,7 @@ fn collect_edges(
         ast::ExprKind::Atomic(inner) => {
             collect_edges(inner, polarity, derived_names, out);
         }
-        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+        ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
             collect_edges(target, polarity, derived_names, out);
             collect_edges(value, polarity, derived_names, out);
         }

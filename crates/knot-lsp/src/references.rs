@@ -1,9 +1,17 @@
 //! `textDocument/references` handler.
 
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
 use lsp_types::*;
 
+use crate::analysis::get_or_parse_file_shared;
+use crate::shared::scan_knot_files_in_roots;
 use crate::state::ServerState;
-use crate::utils::{position_to_offset, safe_slice, span_to_range, uri_to_path, word_at_position};
+use crate::utils::{
+    offset_to_position, position_to_offset, safe_slice, span_to_range, uri_to_path,
+    word_at_position,
+};
 
 // ── Find References ─────────────────────────────────────────────────
 
@@ -100,10 +108,104 @@ pub(crate) fn handle_references(
         }
     }
 
+    // Cross-file: scan workspace files that are not currently open. Cheap when
+    // they're already cached in `import_cache`; falls back to a one-shot parse
+    // otherwise. Limited to a name-equality match (we can't share the open
+    // doc's `references` table for unopened files).
+    let open_paths: HashSet<PathBuf> = state
+        .documents
+        .keys()
+        .filter_map(|u| uri_to_path(u))
+        .filter_map(|p| p.canonicalize().ok())
+        .collect();
+    let workspace_files =
+        scan_knot_files_in_roots(&state.workspace_roots, state.workspace_root.as_deref());
+    for file_path in workspace_files {
+        let canonical = match file_path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if open_paths.contains(&canonical) {
+            continue;
+        }
+        let (_module, source) = match get_or_parse_file_shared(&canonical, &state.import_cache) {
+            Some(p) => p,
+            None => continue,
+        };
+        let other_uri = path_to_file_uri(&canonical);
+        scan_word_occurrences(&source, &symbol_name, &other_uri, &mut locations);
+    }
+
     if locations.is_empty() {
         None
     } else {
+        // De-duplicate by (uri, range) — opens and unopened scans can overlap.
+        let mut seen: HashSet<(String, u32, u32, u32, u32)> = HashSet::new();
+        locations.retain(|loc| {
+            let key = (
+                loc.uri.to_string(),
+                loc.range.start.line,
+                loc.range.start.character,
+                loc.range.end.line,
+                loc.range.end.character,
+            );
+            seen.insert(key)
+        });
         Some(locations)
+    }
+}
+
+/// Build a `file://` Uri from a canonical path. Returns the localhost form
+/// (`file:///...`) which is what the LSP spec mandates.
+fn path_to_file_uri(path: &Path) -> Uri {
+    let s = path.to_string_lossy();
+    let raw = if s.starts_with('/') {
+        format!("file://{s}")
+    } else {
+        format!("file:///{s}")
+    };
+    raw.parse().unwrap_or_else(|_| Uri::from_str_fallback())
+}
+
+/// Append every whole-word occurrence of `name` in `source` as a Location.
+fn scan_word_occurrences(source: &str, name: &str, uri: &Uri, out: &mut Vec<Location>) {
+    let bytes = source.as_bytes();
+    let needle = name.as_bytes();
+    if needle.is_empty() || bytes.len() < needle.len() {
+        return;
+    }
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] == needle {
+            let left_ok = i == 0 || !is_ident(bytes[i - 1]);
+            let right_ok =
+                i + needle.len() >= bytes.len() || !is_ident(bytes[i + needle.len()]);
+            if left_ok && right_ok {
+                let start_pos = offset_to_position(source, i);
+                let end_pos = offset_to_position(source, i + needle.len());
+                out.push(Location {
+                    uri: uri.clone(),
+                    range: Range {
+                        start: start_pos,
+                        end: end_pos,
+                    },
+                });
+                i += needle.len();
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+trait UriFromStrFallback: Sized {
+    fn from_str_fallback() -> Self;
+}
+
+impl UriFromStrFallback for Uri {
+    fn from_str_fallback() -> Self {
+        "file:///".parse().expect("static URI parses")
     }
 }
 

@@ -2,8 +2,8 @@
 //! codes, related-information links, and unused/deprecated tags.
 
 use lsp_types::{
-    Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DiagnosticTag, Location,
-    NumberOrString, Position, Range, Uri,
+    CodeDescription, Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DiagnosticTag,
+    Location, NumberOrString, Position, Range, Uri,
 };
 
 use knot::diagnostic;
@@ -56,6 +56,16 @@ pub fn to_lsp_diagnostic(
         .collect();
 
     let code = error_code_for_diagnostic(&diag.message);
+    if let Some(desc) = code.as_deref().and_then(description_for_code) {
+        message.push_str(&format!("\n[{}] {}", code.as_deref().unwrap_or(""), desc));
+    }
+    let code_description = code.as_deref().and_then(doc_url_for_code).map(|href| {
+        CodeDescription {
+            href: href.parse().ok().unwrap_or_else(|| {
+                "https://example.invalid/".parse().expect("static URI parses")
+            }),
+        }
+    });
 
     let msg_lower = diag.message.to_lowercase();
     let mut tags = Vec::new();
@@ -70,6 +80,7 @@ pub fn to_lsp_diagnostic(
         range,
         severity: Some(severity),
         code: code.map(NumberOrString::String),
+        code_description,
         source: Some("knot".into()),
         message,
         related_information: if related.is_empty() {
@@ -105,6 +116,12 @@ pub fn error_code_for_diagnostic(message: &str) -> Option<String> {
         Some("E009".into())
     } else if msg.contains("trait") && (msg.contains("impl") || msg.contains("instance")) {
         Some("E010".into())
+    } else if msg.contains("refine") || msg.contains("predicate") {
+        Some("E011".into())
+    } else if msg.contains("atomic") {
+        Some("E012".into())
+    } else if msg.contains("unit") && (msg.contains("mismatch") || msg.contains("conflict")) {
+        Some("E013".into())
     } else if msg.contains("unused") {
         Some("W001".into())
     } else if msg.contains("shadow") {
@@ -114,4 +131,33 @@ pub fn error_code_for_diagnostic(message: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Human-readable description for a Knot error code.
+pub fn description_for_code(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "E001" => "Type mismatch — two expressions have incompatible types.",
+        "E002" => "Reference to an undefined name (variable, function, type, or relation).",
+        "E003" => "A record literal or pattern is missing a required field.",
+        "E004" => "A `case` expression is not exhaustive — some constructor patterns are unmatched.",
+        "E005" => "Occurs check failure — a type variable would have to contain itself.",
+        "E006" => "Duplicate declaration — the same name is defined twice.",
+        "E007" => "Import error — the module path does not resolve or has a cycle.",
+        "E008" => "Effect mismatch — actual effects exceed the annotated effect set.",
+        "E009" => "Stratification error — recursion crosses a negation boundary.",
+        "E010" => "Trait/impl error — a required trait implementation is missing or invalid.",
+        "E011" => "Refinement predicate failed — value does not satisfy the refined type.",
+        "E012" => "Atomic-block restriction — only DB interactions allowed inside `atomic`.",
+        "E013" => "Unit-of-measure mismatch — operands have incompatible units.",
+        "W001" => "Unused declaration — defined but never referenced.",
+        "W002" => "Shadowed binding — a name reuses an existing binding in the same scope.",
+        "I001" => "Informational — runtime SQL note.",
+        _ => return None,
+    })
+}
+
+/// Map an error code to a documentation URL (placeholder host —
+/// users can configure their own docs server).
+fn doc_url_for_code(code: &str) -> Option<String> {
+    Some(format!("https://knot-lang.org/errors/{code}"))
 }

@@ -41,7 +41,7 @@ impl TestWorkspace {
             import_cache: Arc::new(Mutex::new(HashMap::new())),
             workspace_diag_cache: HashMap::new(),
             workspace_diag_clock: 0,
-            workspace_symbol_cache: WorkspaceSymbolCache::default(),
+            workspace_symbol_cache: Arc::new(Mutex::new(WorkspaceSymbolCache::default())),
             pending_sources: HashMap::new(),
             analysis_tx,
             reverse_imports: HashMap::new(),

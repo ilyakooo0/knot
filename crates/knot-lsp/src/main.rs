@@ -27,6 +27,7 @@ mod semantic_tokens;
 mod shared;
 mod signature_help;
 mod state;
+mod type_hierarchy;
 #[cfg(test)]
 mod test_support;
 mod type_format;
@@ -74,7 +75,11 @@ use crate::state::{
     send_response, AnalysisResult, AnalysisTask, PendingSource, ServerConfig, ServerState,
     WorkspaceSymbolCache,
 };
-use crate::utils::{position_to_offset, uri_to_path};
+use crate::type_hierarchy::{
+    handle_prepare_type_hierarchy, handle_type_hierarchy_subtypes,
+    handle_type_hierarchy_supertypes,
+};
+use crate::utils::{offset_to_position, position_to_offset, uri_to_path};
 use crate::workspace_diagnostics::{handle_workspace_diagnostics, prune_stale_workspace_diag_cache};
 use crate::workspace_symbol::handle_workspace_symbol;
 
@@ -85,7 +90,7 @@ fn main() {
 
     let (connection, io_threads) = Connection::stdio();
 
-    let server_capabilities = serde_json::to_value(ServerCapabilities {
+    let mut server_capabilities = serde_json::to_value(ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(
             TextDocumentSyncKind::INCREMENTAL,
         )),
@@ -161,11 +166,38 @@ fn main() {
                 supported: Some(true),
                 change_notifications: Some(OneOf::Left(true)),
             }),
-            file_operations: None,
+            // willRename surfaces upcoming file moves *before* the rename
+            // happens, so we can return a WorkspaceEdit that updates every
+            // `import` line referencing the old path. Filter to `.knot` files
+            // so the editor doesn't bother us for unrelated renames.
+            file_operations: Some(WorkspaceFileOperationsServerCapabilities {
+                will_rename: Some(FileOperationRegistrationOptions {
+                    filters: vec![FileOperationFilter {
+                        scheme: Some("file".into()),
+                        pattern: FileOperationPattern {
+                            glob: "**/*.knot".into(),
+                            matches: Some(FileOperationPatternKind::File),
+                            options: None,
+                        },
+                    }],
+                }),
+                ..Default::default()
+            }),
         }),
         ..Default::default()
     })
     .expect("server capabilities are static and always serialize cleanly");
+
+    // Advertise typeHierarchyProvider directly in the JSON — lsp-types 0.97
+    // doesn't yet model this field on `ServerCapabilities`, but the wire
+    // protocol accepts it. The handlers route `textDocument/prepareTypeHierarchy`
+    // and the supertype/subtype follow-ups manually.
+    if let Some(obj) = server_capabilities.as_object_mut() {
+        obj.insert(
+            "typeHierarchyProvider".into(),
+            serde_json::Value::Bool(true),
+        );
+    }
 
     let init_params = match connection.initialize(server_capabilities) {
         Ok(params) => params,
@@ -226,7 +258,7 @@ fn main() {
         import_cache,
         workspace_diag_cache: HashMap::new(),
         workspace_diag_clock: 0,
-        workspace_symbol_cache: WorkspaceSymbolCache::default(),
+        workspace_symbol_cache: Arc::new(Mutex::new(WorkspaceSymbolCache::default())),
         pending_sources: HashMap::new(),
         analysis_tx,
         reverse_imports: HashMap::new(),
@@ -242,6 +274,29 @@ fn main() {
     // skip the registration rather than panicking.
     if let Some(register_request) = build_file_watcher_registration() {
         let _ = connection.sender.send(Message::Request(register_request));
+    }
+
+    // Pre-warm the workspace-symbol cache in the background. The first
+    // `workspace/symbol` query then sees a populated cache instead of having
+    // to walk the entire workspace from scratch. Runs at lower priority than
+    // the analysis worker — held in a thread we don't track, so any panic in
+    // it is contained.
+    {
+        let cache_handle = Arc::clone(&state.workspace_symbol_cache);
+        let import_cache_handle = Arc::clone(&state.import_cache);
+        let roots = state.workspace_roots.clone();
+        let legacy_root = state.workspace_root.clone();
+        thread::Builder::new()
+            .name("knot-lsp-workspace-indexer".into())
+            .spawn(move || {
+                prewarm_workspace_symbol_cache(
+                    cache_handle,
+                    import_cache_handle,
+                    &roots,
+                    legacy_root.as_deref(),
+                );
+            })
+            .ok();
     }
 
     'outer: loop {
@@ -281,6 +336,160 @@ fn main() {
     if let Err(e) = io_threads.join() {
         eprintln!("knot-lsp: stdio thread join failed: {e:?}");
     }
+}
+
+/// Walk every `.knot` file under the given workspace roots and populate the
+/// shared workspace-symbol cache. Each file is read+parsed only if the cache
+/// doesn't already hold a fresh entry (mtime match). The first `workspace/symbol`
+/// query after init then runs against a hot cache.
+fn prewarm_workspace_symbol_cache(
+    cache: Arc<Mutex<WorkspaceSymbolCache>>,
+    import_cache: Arc<Mutex<HashMap<PathBuf, (u64, knot::ast::Module, String)>>>,
+    roots: &[PathBuf],
+    legacy_root: Option<&Path>,
+) {
+    use crate::shared::scan_knot_files_in_roots;
+    use crate::state::content_hash;
+    use crate::utils::path_to_uri;
+    use crate::workspace_symbol::build_workspace_symbol_entries;
+
+    for path in scan_knot_files_in_roots(roots, legacy_root) {
+        let canonical = match path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let on_disk_mtime = std::fs::metadata(&canonical)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        // Mtime fast-path: skip if the cache already has a fresh entry.
+        let already_fresh = cache.lock().ok().is_some_and(|c| {
+            matches!(
+                (c.by_path.get(&canonical), on_disk_mtime),
+                (Some((Some(cached), _, _)), Some(disk)) if *cached == disk
+            )
+        });
+        if already_fresh {
+            continue;
+        }
+        let source = match std::fs::read_to_string(&canonical) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let hash = content_hash(&source);
+        let module = match crate::analysis::get_or_parse_file_shared(&canonical, &import_cache) {
+            Some((m, _)) => m,
+            None => continue,
+        };
+        let uri = match path_to_uri(&canonical) {
+            Some(u) => u,
+            None => continue,
+        };
+        let entries = build_workspace_symbol_entries(&module, &source, &uri);
+        if let Ok(mut c) = cache.lock() {
+            c.by_path.insert(canonical, (on_disk_mtime, hash, entries));
+        }
+    }
+}
+
+/// `workspace/willRenameFiles` — return a `WorkspaceEdit` that updates every
+/// `import` line referencing the moved file. Runs synchronously before the
+/// editor performs the rename; if we miss any importer, the user gets a
+/// diagnostic on the next analysis cycle.
+fn handle_will_rename_files(
+    state: &ServerState,
+    params: &RenameFilesParams,
+) -> Option<WorkspaceEdit> {
+    use std::collections::HashMap as Map;
+    let mut changes: Map<Uri, Vec<TextEdit>> = Map::new();
+
+    for rename in &params.files {
+        let old_uri: Uri = match rename.old_uri.parse() {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+        let new_uri: Uri = match rename.new_uri.parse() {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+        let old_path = match uri_to_path(&old_uri).and_then(|p| p.canonicalize().ok()) {
+            Some(p) => p,
+            None => continue,
+        };
+        let new_path = match uri_to_path(&new_uri) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        for (importer_uri, doc) in &state.documents {
+            let importer_path = match uri_to_path(importer_uri) {
+                Some(p) => p,
+                None => continue,
+            };
+            let importer_dir = match importer_path.parent() {
+                Some(p) => p,
+                None => continue,
+            };
+            for imp in &doc.module.imports {
+                let resolved = importer_dir.join(format!("{}.knot", imp.path));
+                let canonical = match resolved.canonicalize() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                if canonical != old_path {
+                    continue;
+                }
+                // `relative_import_path` takes the importer file (not its dir)
+                // and the destination, normalizes separators to `/`, and adds
+                // a `./` prefix for same-directory paths.
+                let new_rel = match crate::code_action::relative_import_path(
+                    &importer_path,
+                    &new_path,
+                ) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                // The import statement's span covers `import path` — replace
+                // just the path portion. Compute it by finding the first
+                // non-whitespace after `import`.
+                let span = imp.span;
+                let span_text = match doc.source.get(span.start..span.end) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let path_offset_in_span = span_text
+                    .find("import")
+                    .map(|i| i + "import".len())
+                    .unwrap_or(0);
+                let path_start = span.start
+                    + path_offset_in_span
+                    + span_text[path_offset_in_span..]
+                        .chars()
+                        .take_while(|c| c.is_whitespace())
+                        .map(|c| c.len_utf8())
+                        .sum::<usize>();
+                let path_start_pos = offset_to_position(&doc.source, path_start);
+                let path_end_pos = offset_to_position(&doc.source, span.end);
+                changes
+                    .entry(importer_uri.clone())
+                    .or_default()
+                    .push(TextEdit {
+                        range: Range {
+                            start: path_start_pos,
+                            end: path_end_pos,
+                        },
+                        new_text: new_rel,
+                    });
+            }
+        }
+    }
+
+    if changes.is_empty() {
+        return None;
+    }
+    Some(WorkspaceEdit {
+        changes: Some(changes),
+        ..Default::default()
+    })
 }
 
 /// Construct the `client/registerCapability` request that asks the editor to
@@ -538,6 +747,18 @@ fn handle_request(state: &mut ServerState, conn: &Connection, req: Request) {
         // Periodically prune the workspace diagnostics cache to avoid
         // unbounded growth when files are deleted from disk.
         prune_stale_workspace_diag_cache(state);
+    } else if let Some(params) = cast_request::<request::WillRenameFiles>(&req) {
+        let result = handle_will_rename_files(state, &params);
+        send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::TypeHierarchyPrepare>(&req) {
+        let result = handle_prepare_type_hierarchy(state, &params);
+        send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::TypeHierarchySupertypes>(&req) {
+        let result = handle_type_hierarchy_supertypes(state, &params);
+        send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::TypeHierarchySubtypes>(&req) {
+        let result = handle_type_hierarchy_subtypes(state, &params);
+        send_response(conn, id, result);
     }
 }
 
@@ -720,6 +941,11 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
         state.documents.remove(&params.text_document.uri);
         state.pending_sources.remove(&params.text_document.uri);
         state.semantic_token_cache.remove(&params.text_document.uri);
+        // Drop the diagnostic-dedup entry too: otherwise a reopen whose first
+        // analysis hashes the same as the last pre-close run would short-circuit
+        // republishing, leaving the editor with the empty diagnostics we just
+        // sent below.
+        state.published_diag_hashes.remove(&params.text_document.uri);
         let diags = PublishDiagnosticsParams::new(params.text_document.uri, vec![], None);
         let not = Notification::new(notification::PublishDiagnostics::METHOD.into(), diags);
         if let Err(e) = conn.sender.send(Message::Notification(not)) {

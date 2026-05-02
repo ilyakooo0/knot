@@ -39,10 +39,9 @@ pub struct ModuleFingerprint {
     /// constructor uses. Used to compute the transitive dirty set when a
     /// decl's type signature might have changed.
     ///
-    /// Currently consumed by `dirty_closure` (covered by tests); the
-    /// production path uses only the structure-hash equality check until
-    /// `infer.rs` grows a per-decl re-check entry point.
-    #[allow(dead_code)]
+    /// Consumed by `dirty_closure`, which feeds `DocumentState::dirty_decl_closure`.
+    /// Inlay hints surface this set under `KNOT_LSP_TRACE_DIRTY` so
+    /// developers can watch the per-edit dirty closure live.
     pub decl_deps: HashMap<String, HashSet<String>>,
     /// Hash of the module's overall import set + decl signature shapes
     /// (names + declared types, ignoring bodies). When this changes, even
@@ -93,9 +92,9 @@ impl ModuleFingerprint {
 
     /// Transitively expand `seed` to include every decl that depends on a
     /// decl already in the seed set. Conservative: when a decl's type might
-    /// change, every decl referencing it is re-checked. Reserved for the
-    /// future selective-inference path.
-    #[allow(dead_code)]
+    /// change, every decl referencing it is re-checked. Output flows through
+    /// `DocumentState::dirty_decl_closure` to the inlay-hint telemetry path
+    /// and (eventually) the selective-inference entry point.
     pub fn dirty_closure(&self, seed: &HashSet<String>) -> HashSet<String> {
         // Reverse-deps: who references whom.
         let mut reverse: HashMap<&str, Vec<&str>> = HashMap::new();

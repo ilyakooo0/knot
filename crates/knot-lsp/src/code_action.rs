@@ -891,11 +891,256 @@ pub(crate) fn handle_code_action(
         }));
     }
 
+    // Action: negate `if` condition and swap branches. Useful when the
+    // positive case is rare and the user wants to lead with the common path.
+    if let Some((if_span, replacement)) =
+        find_if_negate_at(&doc.module, &doc.source, range_start)
+    {
+        let mut changes = HashMap::new();
+        changes.insert(
+            uri.clone(),
+            vec![TextEdit {
+                range: span_to_range(if_span, &doc.source),
+                new_text: replacement,
+            }],
+        );
+        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+            title: "Negate condition (swap branches)".to_string(),
+            kind: Some(CodeActionKind::REFACTOR_REWRITE),
+            edit: Some(WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+    }
+
+    // Action: add `deriving (Eq, Show)` clause to a data declaration that
+    // doesn't yet derive any traits. Common boilerplate for fresh ADTs.
+    if let Some((data_span, name, insert_pos)) =
+        find_deriving_insertion_at(&doc.module, &doc.source, range_start)
+    {
+        let mut changes = HashMap::new();
+        changes.insert(
+            uri.clone(),
+            vec![TextEdit {
+                range: Range {
+                    start: insert_pos,
+                    end: insert_pos,
+                },
+                new_text: " deriving (Eq, Show)".to_string(),
+            }],
+        );
+        let _ = data_span;
+        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+            title: format!("Add `deriving (Eq, Show)` to `{name}`"),
+            kind: Some(CodeActionKind::REFACTOR_REWRITE),
+            edit: Some(WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+    }
+
+    // Action: wrap selected expression in `Err {error: ...}`. Complements the
+    // existing `Wrap in Ok` quick-fix for ergonomic `Result` construction.
+    if let Some((expr_span, replacement)) =
+        find_wrap_in_err_at(&doc.module, &doc.source, range_start, range_end)
+    {
+        let mut changes = HashMap::new();
+        changes.insert(
+            uri.clone(),
+            vec![TextEdit {
+                range: span_to_range(expr_span, &doc.source),
+                new_text: replacement,
+            }],
+        );
+        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+            title: "Wrap in `Err`".to_string(),
+            kind: Some(CodeActionKind::REFACTOR_REWRITE),
+            edit: Some(WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+    }
+
     if actions.is_empty() {
         None
     } else {
         Some(actions)
     }
+}
+
+/// Find an `if cond then a else b` at `offset` and produce
+/// `if not cond then b else a` as the rewritten text.
+fn find_if_negate_at(
+    module: &Module,
+    source: &str,
+    offset: usize,
+) -> Option<(Span, String)> {
+    fn walk(expr: &ast::Expr, source: &str, offset: usize) -> Option<(Span, String)> {
+        if expr.span.start > offset || expr.span.end < offset {
+            return None;
+        }
+        if let ast::ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } = &expr.node
+        {
+            // Recurse first — prefer the innermost match.
+            if let Some(inner) = walk(cond, source, offset) {
+                return Some(inner);
+            }
+            if let Some(inner) = walk(then_branch, source, offset) {
+                return Some(inner);
+            }
+            if let Some(inner) = walk(else_branch, source, offset) {
+                return Some(inner);
+            }
+            let cond_text = source.get(cond.span.start..cond.span.end)?;
+            let then_text = source.get(then_branch.span.start..then_branch.span.end)?;
+            let else_text = source.get(else_branch.span.start..else_branch.span.end)?;
+            // Strip a leading `not ` if present so the negation cancels out.
+            let new_cond = if let Some(rest) = cond_text.strip_prefix("not ") {
+                rest.to_string()
+            } else if let Some(rest) = cond_text
+                .strip_prefix("(not ")
+                .and_then(|s| s.strip_suffix(')'))
+            {
+                rest.to_string()
+            } else {
+                format!("not ({cond_text})")
+            };
+            return Some((
+                expr.span,
+                format!("if {new_cond} then {else_text} else {then_text}"),
+            ));
+        }
+        let mut found = None;
+        crate::utils::recurse_expr(expr, |child| {
+            if found.is_none() {
+                if let Some(hit) = walk(child, source, offset) {
+                    found = Some(hit);
+                }
+            }
+        });
+        found
+    }
+    for decl in &module.decls {
+        match &decl.node {
+            DeclKind::Fun {
+                body: Some(body), ..
+            }
+            | DeclKind::View { body, .. }
+            | DeclKind::Derived { body, .. } => {
+                if let Some(hit) = walk(body, source, offset) {
+                    return Some(hit);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Locate a `data Name = ...` declaration at the cursor that has no `deriving`
+/// clause. Returns the decl span, the data type name, and the position to
+/// insert the deriving clause (immediately after the last constructor).
+fn find_deriving_insertion_at(
+    module: &Module,
+    source: &str,
+    offset: usize,
+) -> Option<(Span, String, Position)> {
+    for decl in &module.decls {
+        if !(decl.span.start <= offset && offset < decl.span.end) {
+            continue;
+        }
+        if let DeclKind::Data {
+            name,
+            constructors,
+            deriving,
+            ..
+        } = &decl.node
+        {
+            if !deriving.is_empty() {
+                return None;
+            }
+            let _ = constructors;
+            // Insert at the very end of the data declaration's span. Cleanest
+            // anchor that doesn't require constructor-level spans, and matches
+            // the syntax `data Foo = A | B deriving (Eq, Show)`.
+            let pos = offset_to_position(source, decl.span.end);
+            return Some((decl.span, name.clone(), pos));
+        }
+    }
+    None
+}
+
+/// Wrap the cursor's enclosing expression in `Err {error: ...}` if it sits at
+/// an expression position. Best-effort: skips when the cursor isn't on a
+/// well-formed expression span.
+fn find_wrap_in_err_at(
+    module: &Module,
+    source: &str,
+    range_start: usize,
+    range_end: usize,
+) -> Option<(Span, String)> {
+    fn walk(expr: &ast::Expr, range_start: usize, range_end: usize) -> Option<Span> {
+        if expr.span.start > range_end || expr.span.end < range_start {
+            return None;
+        }
+        // Skip wrapping bindings/lambdas/blocks — only wrap leaf-ish exprs.
+        match &expr.node {
+            ast::ExprKind::Lambda { .. }
+            | ast::ExprKind::Do(_)
+            | ast::ExprKind::Case { .. }
+            | ast::ExprKind::If { .. } => {
+                let mut found = None;
+                crate::utils::recurse_expr(expr, |child| {
+                    if found.is_none() {
+                        if let Some(s) = walk(child, range_start, range_end) {
+                            found = Some(s);
+                        }
+                    }
+                });
+                found
+            }
+            _ => {
+                let mut inner = None;
+                crate::utils::recurse_expr(expr, |child| {
+                    if inner.is_none() {
+                        if let Some(s) = walk(child, range_start, range_end) {
+                            inner = Some(s);
+                        }
+                    }
+                });
+                inner.or(Some(expr.span))
+            }
+        }
+    }
+    // Only fire when the user has an explicit selection — wrapping every
+    // expression at a bare cursor position would produce too many actions.
+    if range_start == range_end {
+        return None;
+    }
+    for decl in &module.decls {
+        if let DeclKind::Fun {
+            body: Some(body), ..
+        }
+        | DeclKind::View { body, .. }
+        | DeclKind::Derived { body, .. } = &decl.node
+        {
+            if let Some(span) = walk(body, range_start, range_end) {
+                let text = source.get(span.start..span.end)?;
+                return Some((span, format!("Err {{error: {text}}}")));
+            }
+        }
+    }
+    None
 }
 
 /// Locate the innermost `refine expr` containing the cursor, returning its full
@@ -2121,9 +2366,11 @@ pub(crate) fn find_auto_import_candidates(
     }
 
     // 2. Cached on-disk symbol entries
-    for (path, (_, _, entries)) in &state.workspace_symbol_cache.by_path {
-        if entries.iter().any(|e| symbol_entry_matches_name(e, name)) {
-            push_candidate(&current_canonical, path.clone(), &mut seen, &mut out);
+    if let Ok(cache) = state.workspace_symbol_cache.lock() {
+        for (path, (_, _, entries)) in &cache.by_path {
+            if entries.iter().any(|e| symbol_entry_matches_name(e, name)) {
+                push_candidate(&current_canonical, path.clone(), &mut seen, &mut out);
+            }
         }
     }
 
@@ -2254,7 +2501,7 @@ fn module_declares_name(module: &Module, name: &str) -> bool {
 /// from the current file's canonical path to the target file's canonical
 /// path. Strips the `.knot` extension from the target. Returns `None` if a
 /// relative path can't be computed (e.g. cross-volume on Windows).
-fn relative_import_path(from: &std::path::Path, to: &std::path::Path) -> Option<String> {
+pub(crate) fn relative_import_path(from: &std::path::Path, to: &std::path::Path) -> Option<String> {
     let from_dir = from.parent()?;
     let to_no_ext = to.with_extension("");
     let rel = path_diff(&to_no_ext, from_dir)?;

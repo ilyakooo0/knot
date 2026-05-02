@@ -110,11 +110,10 @@ pub(crate) fn handle_workspace_symbol(
             Some((canonical, content_hash(&doc.source), entries))
         })
         .collect();
-    for (path, hash, entries) in open_entries {
-        state
-            .workspace_symbol_cache
-            .by_path
-            .insert(path, (None, hash, entries));
+    if let Ok(mut cache) = state.workspace_symbol_cache.lock() {
+        for (path, hash, entries) in open_entries {
+            cache.by_path.insert(path, (None, hash, entries));
+        }
     }
 
     // Phase 2: closed workspace files. Use the cache when the on-disk hash
@@ -131,10 +130,9 @@ pub(crate) fn handle_workspace_symbol(
                 .iter()
                 .filter_map(|p| p.canonicalize().ok())
                 .collect();
-            state
-                .workspace_symbol_cache
-                .by_path
-                .retain(|path, _| on_disk.contains(path));
+            if let Ok(mut cache) = state.workspace_symbol_cache.lock() {
+                cache.by_path.retain(|path, _| on_disk.contains(path));
+            }
 
             for path in entries {
                 let canonical = match path.canonicalize() {
@@ -147,48 +145,55 @@ pub(crate) fn handle_workspace_symbol(
 
                 // Mtime fast path: if the on-disk mtime matches what we cached
                 // last time, the file content can't have changed, so skip the
-                // read+hash entirely. This is the common case for workspaces
-                // with hundreds of unopened `.knot` files — the user types in
-                // one buffer, we don't touch the rest.
+                // read+hash entirely.
                 let on_disk_mtime = std::fs::metadata(&canonical)
                     .ok()
                     .and_then(|m| m.modified().ok());
                 if let Some(disk_mtime) = on_disk_mtime {
-                    if let Some((Some(cached_mtime), _, cached_entries)) =
-                        state.workspace_symbol_cache.by_path.get(&canonical)
-                    {
-                        if *cached_mtime == disk_mtime {
-                            push_matching(cached_entries, &query, &mut symbols);
-                            continue;
-                        }
+                    let cached_hit = state
+                        .workspace_symbol_cache
+                        .lock()
+                        .ok()
+                        .and_then(|c| match c.by_path.get(&canonical) {
+                            Some((Some(cached_mtime), _, cached_entries))
+                                if *cached_mtime == disk_mtime =>
+                            {
+                                Some(cached_entries.clone())
+                            }
+                            _ => None,
+                        });
+                    if let Some(entries) = cached_hit {
+                        push_matching(&entries, &query, &mut symbols);
+                        continue;
                     }
                 }
 
-                // Mtime moved (or wasn't recorded). Read and hash to detect
-                // the case where mtime was bumped without a content change
-                // — e.g. `jj`/`git` checkouts that touch timestamps.
+                // Mtime moved or wasn't recorded — read+hash. A content match
+                // refreshes the mtime so the fast path applies next time.
                 let source = match std::fs::read_to_string(&canonical) {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
                 let hash = content_hash(&source);
 
-                if let Some((_, cached_hash, cached_entries)) =
-                    state.workspace_symbol_cache.by_path.get(&canonical)
-                {
-                    if *cached_hash == hash {
-                        push_matching(cached_entries, &query, &mut symbols);
-                        // Refresh the mtime so we hit the fast path next time.
-                        if let Some(disk_mtime) = on_disk_mtime {
-                            let entry = state
-                                .workspace_symbol_cache
-                                .by_path
-                                .get_mut(&canonical)
-                                .unwrap();
-                            entry.0 = Some(disk_mtime);
+                let cached_hit_by_hash = {
+                    let mut cache = match state.workspace_symbol_cache.lock() {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+                    match cache.by_path.get_mut(&canonical) {
+                        Some((mtime_slot, cached_hash, cached_entries)) if *cached_hash == hash => {
+                            if let Some(disk_mtime) = on_disk_mtime {
+                                *mtime_slot = Some(disk_mtime);
+                            }
+                            Some(cached_entries.clone())
                         }
-                        continue;
+                        _ => None,
                     }
+                };
+                if let Some(entries) = cached_hit_by_hash {
+                    push_matching(&entries, &query, &mut symbols);
+                    continue;
                 }
 
                 // Stale or missing — reparse and refresh the cache.
@@ -202,10 +207,11 @@ pub(crate) fn handle_workspace_symbol(
                 };
                 let entries = build_workspace_symbol_entries(&module, &source, &uri);
                 push_matching(&entries, &query, &mut symbols);
-                state
-                    .workspace_symbol_cache
-                    .by_path
-                    .insert(canonical, (on_disk_mtime, hash, entries));
+                if let Ok(mut cache) = state.workspace_symbol_cache.lock() {
+                    cache
+                        .by_path
+                        .insert(canonical, (on_disk_mtime, hash, entries));
+                }
             }
         }
     }

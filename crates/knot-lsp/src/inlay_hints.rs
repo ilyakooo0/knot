@@ -162,7 +162,57 @@ pub(crate) fn handle_inlay_hint(
     // off-screen.
     add_closing_label_hints(doc, range_start, range_end, &mut hints);
 
+    // Per-decl re-check telemetry — gated on KNOT_LSP_TRACE_DIRTY since this
+    // information is mostly useful when investigating incremental-inference
+    // performance, not as everyday UI. Surfaces a "♻" hint at the start of
+    // every decl in `dirty_decl_closure` so the developer can see exactly
+    // which decls were re-analyzed after an edit.
+    if std::env::var("KNOT_LSP_TRACE_DIRTY").is_ok() && !doc.dirty_decl_closure.is_empty() {
+        add_dirty_decl_telemetry(doc, range_start, range_end, &mut hints);
+    }
+
     Some(hints)
+}
+
+/// Emit a "♻ re-checked" hint at the start of every decl whose name appears
+/// in `dirty_decl_closure`. Helps surface incremental-inference activity for
+/// developers debugging the per-decl re-check path.
+fn add_dirty_decl_telemetry(
+    doc: &DocumentState,
+    range_start: usize,
+    range_end: usize,
+    hints: &mut Vec<InlayHint>,
+) {
+    for decl in &doc.module.decls {
+        if decl.span.end < range_start || decl.span.start > range_end {
+            continue;
+        }
+        let name = match &decl.node {
+            DeclKind::Fun { name, .. }
+            | DeclKind::Data { name, .. }
+            | DeclKind::TypeAlias { name, .. }
+            | DeclKind::Trait { name, .. }
+            | DeclKind::View { name, .. }
+            | DeclKind::Derived { name, .. }
+            | DeclKind::Source { name, .. } => name.clone(),
+            _ => continue,
+        };
+        if !doc.dirty_decl_closure.contains(&name) {
+            continue;
+        }
+        hints.push(InlayHint {
+            position: offset_to_position(&doc.source, decl.span.start),
+            label: InlayHintLabel::String("♻ ".into()),
+            kind: None,
+            text_edits: None,
+            tooltip: Some(InlayHintTooltip::String(format!(
+                "Re-analyzed: `{name}` is in this edit's dirty closure"
+            ))),
+            padding_left: None,
+            padding_right: Some(true),
+            data: None,
+        });
+    }
 }
 
 /// Emit `// end <kind>` style hints at the close of long `do` blocks, lambdas,

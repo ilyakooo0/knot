@@ -337,13 +337,9 @@ fn collect_name_uses_in_decl(decl: &ast::Decl, name: &str, out: &mut Vec<Span>) 
     fn walk_pat(pat: &ast::Pat, name: &str, out: &mut Vec<Span>) {
         if let ast::PatKind::Constructor { name: n, payload } = &pat.node {
             if n == name {
-                // The constructor name is the leading identifier of the
-                // pattern's source span. Approximate with the span itself —
-                // when the rename writes `Just` over `Just`, the trailing
-                // payload is unaffected because span lengths match.
-                if let Some(_) = Some(()) {
-                    out.push(Span::new(pat.span.start, pat.span.start + n.len()));
-                }
+                // Constructor names lead the pattern span; `n.len()` is bytes,
+                // matching the byte-indexed span representation.
+                out.push(Span::new(pat.span.start, pat.span.start + n.len()));
             }
             walk_pat(payload, name, out);
         }

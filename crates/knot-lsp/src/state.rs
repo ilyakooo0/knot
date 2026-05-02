@@ -128,11 +128,10 @@ pub struct DocumentState {
     /// inferred type or effects could conceivably have shifted since the
     /// previous analysis, accounting for the per-decl reverse-dependency
     /// graph. Populated by `analyze_document` from the fingerprint, and
-    /// reserved for the future selective-inference path: a passed-through
-    /// `infer.rs::check` overload could use this to skip re-checking decls
-    /// outside the closure. Until then, it's available to feature handlers
-    /// (e.g. so a change-driven UI can highlight "freshly re-checked" decls).
-    #[allow(dead_code)]
+    /// consumed by the inlay-hint handler (gated on `KNOT_LSP_TRACE_DIRTY`)
+    /// to surface a "♻" hint on freshly re-checked decls. Once `infer.rs`
+    /// learns to skip clean decls, this same set becomes the input for the
+    /// selective inference pass.
     pub dirty_decl_closure: std::collections::HashSet<String>,
 }
 
@@ -170,8 +169,10 @@ pub struct ServerState {
     pub workspace_diag_clock: u64,
     /// Cached workspace symbol index, rebuilt incrementally from file watcher
     /// notifications and on-demand. Avoids walking the disk on every
-    /// `workspace/symbol` query.
-    pub workspace_symbol_cache: WorkspaceSymbolCache,
+    /// `workspace/symbol` query. Wrapped in `Arc<Mutex>` so a background
+    /// indexing thread can pre-warm the cache at startup without contending
+    /// with the main thread.
+    pub workspace_symbol_cache: Arc<Mutex<WorkspaceSymbolCache>>,
     /// Edited but not-yet-analyzed sources. When present, this is the source
     /// the next analysis run will see. Subsequent didChange edits stack on top
     /// of this rather than the (stale) analyzed source.

@@ -1382,11 +1382,20 @@ pub extern "C" fn knot_stm_pop_merge() {
             .pop()
             .expect("knot runtime: STM tracking stack underflow")
     });
-    // Merge: outer reads + inner reads (keep earliest version per table)
+    // Merge: outer reads + inner reads (keep earliest version per table).
+    // For tables read in both: outer's saved version is older (versions are
+    // monotonic), so it wins — the outer commit must retry on any change
+    // since the earliest observation.
     STM_READ_VERSIONS.with(|rv| {
         let mut rv = rv.borrow_mut();
         for (table, ver) in saved_reads {
-            rv.entry(table).or_insert(ver);
+            rv.entry(table)
+                .and_modify(|v| {
+                    if ver < *v {
+                        *v = ver;
+                    }
+                })
+                .or_insert(ver);
         }
     });
     // Merge: outer writes + inner writes
@@ -2763,7 +2772,15 @@ pub extern "C" fn knot_value_bytes(ptr: *const u8, len: usize) -> *mut Value {
 pub extern "C" fn knot_value_get_int(v: *mut Value) -> i64 {
     match unsafe { as_ref(v) } {
         Value::SmallInt(n) => *n,
-        Value::Int(n) => n.to_i64().expect("knot runtime: Int too large for i64"),
+        Value::Int(n) => n.to_i64().unwrap_or_else(|| {
+            panic!(
+                "knot runtime: Int {} does not fit in i64 (range [{}, {}]) — \
+                 the runtime callsite expects a machine-sized integer",
+                n,
+                i64::MIN,
+                i64::MAX
+            )
+        }),
         _ => panic!("knot runtime: expected Int, got {}", brief_value(v)),
     }
 }
@@ -3191,7 +3208,14 @@ fn read_temp_row(row: &rusqlite::Row, schema: &TempSchema) -> *mut Value {
                         .map(|(i, (n, _))| (n.as_str(), i)).collect();
                     let record = knot_record_empty(fields.len());
                     for (fname, fty) in fields {
-                        let col_idx = field_idx[fname.as_str()];
+                        let col_idx = *field_idx.get(fname.as_str()).unwrap_or_else(|| {
+                            panic!(
+                                "knot runtime: schema mismatch — constructor `{}` field `{}` not found in stored ADT layout (expected one of: {})",
+                                tag,
+                                fname,
+                                all_fields.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ")
+                            )
+                        });
                         let val = read_sql_column(row, col_idx + 1, *fty);
                         let name_bytes = fname.as_bytes();
                         knot_record_set_field(record, name_bytes.as_ptr(), name_bytes.len(), val);
@@ -7797,7 +7821,12 @@ pub extern "C" fn knot_source_read(
                     // Build a record from the constructor's specific fields
                     let record = knot_record_empty(ctor.fields.len());
                     for field in &ctor.fields {
-                        let col_idx = field_idx[field.name.as_str()];
+                        let col_idx = *field_idx.get(field.name.as_str()).unwrap_or_else(|| {
+                            panic!(
+                                "knot runtime: schema mismatch in `{}` — constructor `{}` field `{}` not present in stored ADT layout",
+                                name, tag, field.name
+                            )
+                        });
                         let val = read_sql_column(row, col_idx + 1, field.ty); // +1 for _tag
                         let fname = field.name.as_bytes();
                         knot_record_set_field(record, fname.as_ptr(), fname.len(), val);
@@ -8094,7 +8123,12 @@ pub extern "C" fn knot_source_read_where(
                 } else {
                     let record = knot_record_empty(ctor.fields.len());
                     for field in &ctor.fields {
-                        let col_idx = field_idx[field.name.as_str()];
+                        let col_idx = *field_idx.get(field.name.as_str()).unwrap_or_else(|| {
+                            panic!(
+                                "knot runtime: schema mismatch in `{}` — constructor `{}` field `{}` not present in stored ADT layout",
+                                name, tag, field.name
+                            )
+                        });
                         let val = read_sql_column(row, col_idx + 1, field.ty);
                         let fname = field.name.as_bytes();
                         knot_record_set_field(record, fname.as_ptr(), fname.len(), val);
@@ -9732,7 +9766,12 @@ pub extern "C" fn knot_source_read_at(
                 } else {
                     let record = knot_record_empty(ctor.fields.len());
                     for field in &ctor.fields {
-                        let col_idx = field_idx[field.name.as_str()];
+                        let col_idx = *field_idx.get(field.name.as_str()).unwrap_or_else(|| {
+                            panic!(
+                                "knot runtime: schema mismatch in `{}` history — constructor `{}` field `{}` not present in stored ADT layout",
+                                name, tag, field.name
+                            )
+                        });
                         let val = read_sql_column(row, col_idx + 1, field.ty);
                         let fname = field.name.as_bytes();
                         knot_record_set_field(record, fname.as_ptr(), fname.len(), val);

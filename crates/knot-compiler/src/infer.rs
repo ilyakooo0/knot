@@ -524,30 +524,42 @@ impl Infer {
     }
 
     fn apply_unit(&self, u: &UnitTy) -> UnitTy {
-        if u.vars.is_empty() {
-            return u.clone();
-        }
-        let mut result = UnitTy { bases: u.bases.clone(), vars: BTreeMap::new() };
-        let mut changed = false;
-        for (&v, &exp) in &u.vars {
-            if let Some(resolved) = self.unit_subst.get(&v) {
-                changed = true;
-                for (name, &base_exp) in &resolved.bases {
-                    *result.bases.entry(name.clone()).or_insert(0) += base_exp * exp;
-                }
-                for (&rv, &rexp) in &resolved.vars {
-                    *result.vars.entry(rv).or_insert(0) += rexp * exp;
-                }
-            } else {
-                *result.vars.entry(v).or_insert(0) += exp;
+        // Iterate to a fixed point. With well-formed `unit_subst` the chain
+        // terminates after one pass per dependency level — the cap is purely a
+        // safety net so that a cycle (which would otherwise be a stack overflow)
+        // surfaces as a recoverable panic instead of taking the process down.
+        // 256 levels is far beyond any sane unit-substitution depth.
+        const MAX_ITERATIONS: usize = 256;
+        let mut current = u.clone();
+        for _ in 0..MAX_ITERATIONS {
+            if current.vars.is_empty() {
+                return current;
             }
+            let mut next = UnitTy { bases: current.bases.clone(), vars: BTreeMap::new() };
+            let mut changed = false;
+            for (&v, &exp) in &current.vars {
+                if let Some(resolved) = self.unit_subst.get(&v) {
+                    changed = true;
+                    for (name, &base_exp) in &resolved.bases {
+                        *next.bases.entry(name.clone()).or_insert(0) += base_exp * exp;
+                    }
+                    for (&rv, &rexp) in &resolved.vars {
+                        *next.vars.entry(rv).or_insert(0) += rexp * exp;
+                    }
+                } else {
+                    *next.vars.entry(v).or_insert(0) += exp;
+                }
+            }
+            next.normalize();
+            if !changed {
+                return next;
+            }
+            current = next;
         }
-        result.normalize();
-        if changed {
-            self.apply_unit(&result)
-        } else {
-            result
-        }
+        panic!(
+            "knot type inference: unit substitution did not converge within {} iterations — likely a cycle in unit_subst",
+            MAX_ITERATIONS
+        );
     }
 
     fn unify_units(&mut self, a: &UnitTy, b: &UnitTy, span: Span) {

@@ -112,6 +112,16 @@ impl EffectSet {
         self.console || self.network || self.fs || self.clock || self.random
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.reads.is_empty()
+            && self.writes.is_empty()
+            && !self.console
+            && !self.network
+            && !self.fs
+            && !self.clock
+            && !self.random
+    }
+
     pub fn from_ast_effects(effects: &[ast::Effect]) -> EffectSet {
         let mut set = EffectSet::empty();
         for effect in effects {
@@ -603,6 +613,16 @@ impl EffectChecker {
                         .note(format!("declared effects: {}", declared))
                         .note(format!("inferred effects: {}", inferred))
                         .note(format!("undeclared effects: {}", extra)),
+                );
+            }
+            let unused = declared.difference(inferred);
+            if !unused.is_empty() {
+                self.diagnostics.push(
+                    Diagnostic::warning("declared effects are not used")
+                        .label(decl_span, "this declaration")
+                        .note(format!("declared effects: {}", declared))
+                        .note(format!("inferred effects: {}", inferred))
+                        .note(format!("unused effects: {}", unused)),
                 );
             }
         }

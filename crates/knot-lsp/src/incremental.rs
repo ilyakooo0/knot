@@ -60,6 +60,13 @@ pub struct ModuleFingerprint {
     /// (names + declared types, ignoring bodies). When this changes, even
     /// "clean-bodied" decls might need re-checking because the trait
     /// resolution / import graph shifted.
+    ///
+    /// Kept around (alongside `structurally_equal`) for the planned
+    /// fingerprint-cache reuse path: it lets a whitespace/comment-only edit
+    /// skip re-inference once a span remapper exists. Today the caller
+    /// (`analyze_document`) only consumes the per-decl `decl_hashes` and
+    /// `decl_signature_hashes`.
+    #[allow(dead_code)]
     pub structure_hash: u64,
 }
 
@@ -160,7 +167,9 @@ impl ModuleFingerprint {
     /// Returns true when `prev` and `self` are structurally identical
     /// (same decl set, same hashes, same module-level shape). When this
     /// holds, comment- and whitespace-only edits can reuse the cached
-    /// inference output even if the raw content hash differs.
+    /// inference output *if the consumer remaps spans* — see the comment
+    /// in `analyze_document` about why the bare reuse path was disabled.
+    #[allow(dead_code)]
     pub fn structurally_equal(&self, prev: &ModuleFingerprint) -> bool {
         self.structure_hash == prev.structure_hash
             && self.decl_hashes.len() == prev.decl_hashes.len()

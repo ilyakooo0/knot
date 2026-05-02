@@ -208,16 +208,24 @@ pub fn analyze_document(
         .any(|d| matches!(d.severity, diagnostic::Severity::Error));
 
     if !has_parse_errors {
-        // Inference-snapshot fast path. Two tiers:
+        // Inference-snapshot fast path. Content-hash exact match only:
+        // same source bytes as a prior analysis (undo/redo, format-on-save
+        // round trips, rapid file switching) reuse the cached inference
+        // output verbatim.
         //
-        // (1) **Content-hash hit.** Same source bytes as a prior analysis —
-        //     undo/redo, format-on-save round trips, rapid file switching.
-        //
-        // (2) **Fingerprint hit.** Source bytes differ but the AST shape is
-        //     identical (whitespace, comment, doc-comment edits). The
-        //     `ModuleFingerprint` ignores spans and trivia, so a structurally
-        //     equal fingerprint guarantees the inferencer would produce the
-        //     same `(type_info, effect_info, ...)` output. We reuse it.
+        // A second tier keyed on `ModuleFingerprint::structurally_equal`
+        // (same AST shape, different bytes — i.e. whitespace/comment edits)
+        // used to fire here too. It was unsound: the snapshot's span-keyed
+        // data (`local_type_info`, `monad_info`, `refine_targets`, diagnostic
+        // labels, plus spans nested inside refined-type predicate `Expr`s)
+        // pointed into the *old* source. Reusing it after a whitespace edit
+        // surfaced diagnostics anchored to byte offsets that no longer held
+        // the offending tokens — squiggles drifted, hover/inlay hints
+        // resolved against the wrong characters, and warnings persisted
+        // after the underlying issue moved off the position they pointed
+        // at. Until we add a span remapper that pairs old/new spans via a
+        // parallel AST walk, structural reuse runs the inference pipeline
+        // fresh.
         //
         // True per-declaration incrementalism — re-checking only the changed
         // decls and their transitive dependents — also depends on the
@@ -274,45 +282,12 @@ pub fn analyze_document(
             }
         }
         if let Some(key) = &cache_key {
-            // Tier 1: exact content hash match.
-            // Use a two-step lookup so we can bump the access clock on the
-            // mutable map without confusing the borrow checker.
+            // Exact content-hash match: reuse the cached snapshot verbatim.
+            // Same source bytes ⇒ same spans, so every Span key in the
+            // cached HashMaps still indexes the right characters.
             if inference_cache.contains_key(key) {
                 let new_clock = next_access_clock(inference_cache);
                 let snap = inference_cache.get_mut(key).unwrap();
-                snap.access_clock = new_clock;
-                let snap_ref = &*snap;
-                return reuse_snapshot(
-                    snap_ref,
-                    source,
-                    module,
-                    references,
-                    definitions,
-                    details,
-                    literal_types,
-                    imported_files,
-                    import_defs,
-                    import_origins,
-                    doc_comments,
-                    keyword_tokens,
-                    unit_info,
-                    all_diags,
-                );
-            }
-            // Tier 2: structural fingerprint match. Search the per-path
-            // entries — the cache is small enough that a linear scan over
-            // its keys is cheap (bounded by MAX_INFERENCE_CACHE_ENTRIES).
-            // Two-step again so we can bump the clock without aliasing.
-            let matching_key = inference_cache.iter().find_map(|(k, snap)| {
-                if k.0 == key.0 && new_fingerprint.structurally_equal(&snap.fingerprint) {
-                    Some(k.clone())
-                } else {
-                    None
-                }
-            });
-            if let Some(matched) = matching_key {
-                let new_clock = next_access_clock(inference_cache);
-                let snap = inference_cache.get_mut(&matched).unwrap();
                 snap.access_clock = new_clock;
                 let snap_ref = &*snap;
                 return reuse_snapshot(
@@ -816,9 +791,15 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_cache_reuses_snapshot_for_whitespace_only_edit() {
-        // The inference cache is keyed on a canonical (resolved-on-disk)
-        // path. Use a real temp file so `canonicalize()` succeeds.
+    fn whitespace_only_edit_runs_fresh_inference_with_correct_spans() {
+        // The structural-fingerprint cache reuse tier was removed because it
+        // returned snapshots whose Span keys pointed at the *old* source —
+        // see the comment in `analyze_document`. After a whitespace/comment
+        // edit we want correct (re-inferred) data, not bytewise-identical
+        // cache reuse. This test pins both halves: type_info still resolves
+        // (so the second analysis actually ran inference), and a *new* cache
+        // entry exists for the new content hash (so we didn't silently
+        // re-route to the old snapshot).
         let dir = std::env::temp_dir().join(format!(
             "knot-lsp-fp-test-{}",
             std::time::SystemTime::now()
@@ -846,24 +827,97 @@ mod tests {
             doc1.type_info.keys().collect::<Vec<_>>()
         );
 
-        // Same shape, different whitespace and a comment — content hash
-        // differs, but the fingerprint matches. The pipeline should reuse
-        // the existing snapshot rather than insert a new one.
+        // Same shape, different whitespace and a comment. We expect a fresh
+        // inference pass: type_info populated and a new cache entry for the
+        // new content hash.
         let v2 = "-- a comment\nid    =   \\x -> x\n\n\nmain = id 1\n";
         std::fs::write(&path, v2).unwrap();
         let doc = analyze_document(&uri, v2, &mut import_cache, &mut inference_cache);
-        // Reused snapshot means inferred type info is still populated even
-        // though no fresh inference ran (and no new entry was inserted).
         assert!(
             doc.type_info.contains_key("id"),
-            "v2 type_info should contain id (fingerprint reuse), got: {:?}",
+            "v2 type_info should contain id, got: {:?}",
             doc.type_info.keys().collect::<Vec<_>>()
         );
         assert!(doc.type_info.contains_key("main"));
         assert_eq!(
             inference_cache.len(),
-            entries_after_v1,
-            "fingerprint cache hit should not insert a new entry"
+            entries_after_v1 + 1,
+            "whitespace edit must produce its own cache entry — \
+             reusing the old snapshot would carry stale span keys"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: whitespace/comment-only edits used to hit the
+    /// structural-fingerprint cache and reuse a snapshot whose Span keys
+    /// pointed into the *old* source. After such an edit, every span in
+    /// `local_type_info`, `monad_info`, `refine_targets`, diagnostic labels
+    /// (and spans nested inside refined-type predicate Exprs) must instead
+    /// resolve against the new source — otherwise inlay hints, hover, and
+    /// squiggles drift to bytes that no longer hold the tokens they were
+    /// computed from. The fix dropped Tier 2 reuse and falls back to fresh
+    /// inference; this pins the user-visible invariant.
+    #[test]
+    fn whitespace_edit_does_not_leave_local_type_info_at_stale_offsets() {
+        let dir = std::env::temp_dir().join(format!(
+            "knot-lsp-fp-spans-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fp.knot");
+        std::fs::write(&path, "").unwrap();
+        let canonical = path.canonicalize().unwrap();
+        let uri = fake_uri(&format!("file://{}", canonical.display()));
+
+        let mut import_cache: HashMap<PathBuf, (u64, Module, String)> = HashMap::new();
+        let mut inference_cache: InferenceCache = HashMap::new();
+
+        // v1 has a `let y = ...` binding whose span is captured in
+        // local_type_info. The target byte offset in v1 is known.
+        let v1 = "f = \\x -> let y = x + 1 in y\n";
+        std::fs::write(&path, v1).unwrap();
+        let doc1 = analyze_document(&uri, v1, &mut import_cache, &mut inference_cache);
+        let v1_y_pos = v1.find("y =").expect("y = exists in v1");
+
+        let v1_y_span = doc1
+            .local_type_info
+            .keys()
+            .find(|s| s.start <= v1_y_pos && s.end > v1_y_pos)
+            .copied()
+            .expect("v1 should have a span covering `y =`");
+        let v1_text = &v1[v1_y_span.start..v1_y_span.end];
+        assert_eq!(v1_text, "y", "v1 span should point at `y`");
+
+        // v2 prepends a comment line. AST shape is identical (fingerprint
+        // matches), but every byte position has shifted by `prefix.len()`.
+        let prefix = "-- shifted\n";
+        let v2 = format!("{prefix}{v1}");
+        std::fs::write(&path, &v2).unwrap();
+        let doc2 = analyze_document(&uri, &v2, &mut import_cache, &mut inference_cache);
+
+        // The reused span should now point at `y` in v2 — i.e. shifted by the
+        // prefix length. If the cache returns the old span verbatim, the text
+        // it covers in v2 is no longer `y` (it's somewhere in the comment),
+        // and inlay hints / hover render against the wrong characters.
+        let v2_y_pos = v2.find("y =").expect("y = exists in v2");
+        let v2_y_span = doc2
+            .local_type_info
+            .keys()
+            .find(|s| s.start <= v2_y_pos && s.end > v2_y_pos)
+            .copied()
+            .expect("v2 should have a span covering `y =` after fingerprint reuse");
+        let v2_text = &v2[v2_y_span.start..v2_y_span.end];
+        assert_eq!(
+            v2_text, "y",
+            "v2 reused span must point at `y` in the new source; got {v2_text:?} \
+             (span {:?}, prefix len {}, expected start {})",
+            v2_y_span,
+            prefix.len(),
+            v1_y_span.start + prefix.len()
         );
 
         let _ = std::fs::remove_dir_all(&dir);

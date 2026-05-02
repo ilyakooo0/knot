@@ -322,18 +322,18 @@ impl EffectChecker {
             ast::DeclKind::Derived { name, body, ty, .. } => {
                 let effects = self.infer_effects(body);
                 self.decl_effects.insert(name.clone(), effects.clone());
-                self.check_annotation(ty, &effects, decl.span);
+                self.check_annotation(ty, &effects);
             }
             ast::DeclKind::View { name, body, ty, .. } => {
                 let effects = self.infer_effects(body);
                 self.decl_effects.insert(name.clone(), effects.clone());
-                self.check_annotation(ty, &effects, decl.span);
+                self.check_annotation(ty, &effects);
             }
             ast::DeclKind::Fun { name, body, ty, .. } => {
                 if let Some(body) = body {
                     let effects = self.fun_body_effects(body);
                     self.decl_effects.insert(name.clone(), effects.clone());
-                    self.check_annotation(ty, &effects, decl.span);
+                    self.check_annotation(ty, &effects);
                 }
             }
             _ => {}
@@ -593,23 +593,23 @@ impl EffectChecker {
     }
 
     /// Check that explicit effect annotations (if any) are a superset of inferred effects.
-    fn check_annotation(
-        &mut self,
-        ty: &Option<ast::TypeScheme>,
-        inferred: &EffectSet,
-        decl_span: Span,
-    ) {
+    ///
+    /// Anchors squiggles to the effect-bearing type subnode (e.g. the `IO {fs} Text`
+    /// part of a signature) rather than the whole declaration span — a decl-wide
+    /// span would also visibly underline any comments inside the body.
+    fn check_annotation(&mut self, ty: &Option<ast::TypeScheme>, inferred: &EffectSet) {
         let scheme = match ty {
             Some(s) => s,
             None => return,
         };
 
         if let Some(declared) = extract_effects(&scheme.ty) {
+            let label_span = effects_span(&scheme.ty).unwrap_or(scheme.ty.span);
             if !inferred.is_subset_of(&declared) {
                 let extra = inferred.difference(&declared);
                 self.diagnostics.push(
                     Diagnostic::error("inferred effects exceed declared effects")
-                        .label(decl_span, "this declaration")
+                        .label(label_span, "declared effects here")
                         .note(format!("declared effects: {}", declared))
                         .note(format!("inferred effects: {}", inferred))
                         .note(format!("undeclared effects: {}", extra)),
@@ -619,13 +619,29 @@ impl EffectChecker {
             if !unused.is_empty() {
                 self.diagnostics.push(
                     Diagnostic::warning("declared effects are not used")
-                        .label(decl_span, "this declaration")
+                        .label(label_span, "declared effects here")
                         .note(format!("declared effects: {}", declared))
                         .note(format!("inferred effects: {}", inferred))
                         .note(format!("unused effects: {}", unused)),
                 );
             }
         }
+    }
+}
+
+/// Find the span of the effect-bearing subnode of a type, if any.
+///
+/// For `a -> IO {fs} b` returns the span of `IO {fs} b`; for a bare
+/// `IO {fs} Text` returns the whole type's span. Used so effect-annotation
+/// diagnostics underline the actual annotation rather than the whole
+/// declaration (which would also cover comments inside the body).
+fn effects_span(ty: &ast::Type) -> Option<Span> {
+    match &ty.node {
+        ast::TypeKind::Effectful { .. } | ast::TypeKind::IO { .. } => Some(ty.span),
+        ast::TypeKind::Function { param, result } => {
+            effects_span(result).or_else(|| effects_span(param))
+        }
+        _ => None,
     }
 }
 
@@ -1173,6 +1189,45 @@ mod tests {
             make_fun_with_type("f", body, ty),
         ]);
         assert!(diags.is_empty());
+    }
+
+    /// Regression: effect-annotation diagnostics anchor to the IO/Effectful
+    /// subnode of the type, not the whole declaration. A decl-wide span runs
+    /// from the declaration's first token to the end of its body — when the
+    /// body contains comments, the LSP renders a squiggle through them, which
+    /// the user reported as "errors underline comments".
+    #[test]
+    fn annotation_diagnostic_label_targets_type_not_decl() {
+        let io_ty = Spanned::new(
+            TypeKind::IO {
+                effects: vec![Effect::Reads("people".into())],
+                rest: None,
+                ty: Box::new(spanned(TypeKind::Relation(Box::new(spanned(
+                    TypeKind::Named("T".into()),
+                ))))),
+            },
+            Span::new(100, 130),
+        );
+        let ty = TypeScheme { constraints: vec![], ty: io_ty };
+        let body = spanned(ExprKind::Lit(Literal::Int("42".into())));
+        let decl = Decl {
+            node: DeclKind::Fun {
+                name: "f".into(),
+                ty: Some(ty),
+                body: Some(body),
+            },
+            span: Span::new(0, 200), // wide decl span, would cover comments
+            exported: false,
+        };
+        let (diags, _) = check_module(vec![decl]);
+        assert_eq!(diags.len(), 1, "expected unused-effects warning");
+        let label_span = diags[0].labels[0].span;
+        assert_eq!(
+            label_span,
+            Span::new(100, 130),
+            "label must point at the IO type subnode (100..130), \
+             not the decl span (0..200) which would underline body comments"
+        );
     }
 
     #[test]

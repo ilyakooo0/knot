@@ -1222,6 +1222,53 @@ fn nested_relation_record_type() {
     }
 }
 
+#[test]
+fn type_hole_underscore() {
+    // `_` in a type position parses as a TypeKind::Hole — a placeholder
+    // that becomes a fresh inference variable during type checking.
+    match first_decl("type X = _") {
+        DeclKind::TypeAlias { ty, .. } => {
+            assert!(matches!(&ty.node, TypeKind::Hole));
+        }
+        other => panic!("expected TypeAlias, got {:?}", other),
+    }
+}
+
+#[test]
+fn type_hole_in_function_signature() {
+    // `_` may appear as a function parameter or result type.
+    match first_decl("type X = Int -> _ -> _") {
+        DeclKind::TypeAlias { ty, .. } => match &ty.node {
+            TypeKind::Function { param, result } => {
+                assert!(matches!(&param.node, TypeKind::Named(n) if n == "Int"));
+                match &result.node {
+                    TypeKind::Function { param, result } => {
+                        assert!(matches!(&param.node, TypeKind::Hole));
+                        assert!(matches!(&result.node, TypeKind::Hole));
+                    }
+                    other => panic!("expected nested Function type, got {:?}", other),
+                }
+            }
+            other => panic!("expected Function type, got {:?}", other),
+        },
+        other => panic!("expected TypeAlias, got {:?}", other),
+    }
+}
+
+#[test]
+fn type_hole_in_relation() {
+    // `[_]` parses as a relation of a type hole.
+    match first_decl("type X = [_]") {
+        DeclKind::TypeAlias { ty, .. } => match &ty.node {
+            TypeKind::Relation(inner) => {
+                assert!(matches!(&inner.node, TypeKind::Hole));
+            }
+            other => panic!("expected Relation type, got {:?}", other),
+        },
+        other => panic!("expected TypeAlias, got {:?}", other),
+    }
+}
+
 // ── Patterns ────────────────────────────────────────────────────────
 
 #[test]

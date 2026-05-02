@@ -657,45 +657,6 @@ pub(crate) fn handle_code_action(
         }
     }
 
-    // Action: Convert lambda to named function
-    for decl in &doc.module.decls {
-        if decl.span.end < range_start || decl.span.start > range_end {
-            continue;
-        }
-        if let DeclKind::Fun { name, body: Some(body), ty: None, .. } = &decl.node {
-            // Check if the body is a lambda — offer to convert to direct function params
-            if let ast::ExprKind::Lambda { params: lam_params, body: lam_body } = &body.node {
-                let param_names: Vec<String> = lam_params
-                    .iter()
-                    .map(|p| pat_to_string(p, &doc.source))
-                    .collect();
-                let body_text = safe_slice(&doc.source, lam_body.span);
-
-                let mut changes = HashMap::new();
-                changes.insert(
-                    uri.clone(),
-                    vec![TextEdit {
-                        range: span_to_range(decl.span, &doc.source),
-                        new_text: format!(
-                            "{name} {} = {body_text}",
-                            param_names.join(" ")
-                        ),
-                    }],
-                );
-
-                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                    title: "Convert lambda to function parameters".to_string(),
-                    kind: Some(CodeActionKind::REFACTOR_REWRITE),
-                    edit: Some(WorkspaceEdit {
-                        changes: Some(changes),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }));
-            }
-        }
-    }
-
     // Action: Organize imports — remove unused, sort, deduplicate
     if !doc.module.imports.is_empty() {
         // Collect names referenced in the document to detect unused imports.
@@ -2554,11 +2515,6 @@ fn find_inline_actions(
         }
         _ => {}
     }
-}
-
-/// Convert a pattern AST node to a source string representation.
-fn pat_to_string(pat: &ast::Pat, source: &str) -> String {
-    safe_slice(source, pat.span).to_string()
 }
 
 // ── Auto-import ─────────────────────────────────────────────────────

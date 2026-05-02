@@ -650,10 +650,20 @@ fn effects_span(ty: &ast::Type) -> Option<Span> {
 /// Both `{effects} a -> b` (old syntax) and `IO {effects} a` (new syntax)
 /// declare effect sets, including reads/writes. The two syntaxes share the
 /// same `Effect` AST representation, so the same conversion applies.
+///
+/// `IO _ a` (wildcard) returns `None` — the user opted out of declaring
+/// effects, so there's nothing for `check_annotation` to compare against.
 fn extract_effects(ty: &ast::Type) -> Option<EffectSet> {
     match &ty.node {
-        ast::TypeKind::Effectful { effects, .. } | ast::TypeKind::IO { effects, .. } => {
+        ast::TypeKind::Effectful { effects, .. } => {
             Some(EffectSet::from_ast_effects(effects))
+        }
+        ast::TypeKind::IO { effects, rest, .. } => {
+            if rest.as_deref() == Some("_") {
+                None
+            } else {
+                Some(EffectSet::from_ast_effects(effects))
+            }
         }
         ast::TypeKind::Function { param, result } => {
             // Effects can appear on either side of the arrow.

@@ -2289,7 +2289,16 @@ impl Infer {
             ast::TypeKind::Effectful { ty, .. } => self.ast_type_to_ty(ty),
             ast::TypeKind::IO { effects, rest, ty: inner_ty } => {
                 let io_effects = ast_effects_to_io_effects(effects);
-                let row_var = rest.as_ref().map(|name| self.annotation_var(name));
+                // `_` (wildcard) gets a fresh row variable per occurrence so
+                // multiple `_`s don't accidentally unify; named variables share
+                // a fresh var across the same annotation scope.
+                let row_var = rest.as_ref().map(|name| {
+                    if name == "_" {
+                        self.fresh_var()
+                    } else {
+                        self.annotation_var(name)
+                    }
+                });
                 Ty::IO(
                     io_effects,
                     row_var,

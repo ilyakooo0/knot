@@ -3392,8 +3392,12 @@ impl Parser {
                                 let TokenKind::Lower(n) = tok.kind else { unreachable!() };
                                 Some(n)
                             }
+                            TokenKind::Underscore => {
+                                self.advance();
+                                Some("_".to_string())
+                            }
                             _ => {
-                                self.error("expected effect row variable name after '|'");
+                                self.error("expected effect row variable name or '_' after '|'");
                                 None
                             }
                         }
@@ -3409,10 +3413,15 @@ impl Parser {
                     let inner = inner?;
                     let span = Span::new(tok.span.start, inner.span.end);
                     Some(Spanned::new(TypeKind::IO { effects, rest, ty: Box::new(inner) }, span))
-                } else if name == "IO" && matches!(self.peek(), TokenKind::Lower(_)) {
-                    // Shorthand: `IO e Type` desugars to `IO {| e} Type`
+                } else if name == "IO" && matches!(self.peek(), TokenKind::Lower(_) | TokenKind::Underscore) {
+                    // Shorthand: `IO e Type` desugars to `IO {| e} Type`.
+                    // `IO _ Type` is the wildcard form — effects are inferred.
                     let row_tok = self.advance();
-                    let TokenKind::Lower(row_name) = row_tok.kind else { unreachable!() };
+                    let row_name = match row_tok.kind {
+                        TokenKind::Lower(n) => n,
+                        TokenKind::Underscore => "_".to_string(),
+                        _ => unreachable!(),
+                    };
                     if !self.enter_recursion() { return None; }
                     let inner = self.parse_type_atom();
                     self.recursion_depth -= 1;

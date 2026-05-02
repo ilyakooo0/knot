@@ -2347,6 +2347,36 @@ fn io_type_bare_row_shorthand() {
     }
 }
 
+#[test]
+fn io_type_wildcard_shorthand() {
+    // `IO _ Int` — wildcard tells the type checker to infer the effect set.
+    match first_decl("type X = IO _ Int") {
+        DeclKind::TypeAlias { ty, .. } => match &ty.node {
+            TypeKind::IO { effects, rest, .. } => {
+                assert!(effects.is_empty());
+                assert_eq!(rest.as_deref(), Some("_"));
+            }
+            other => panic!("expected IO with wildcard rest, got {:?}", other),
+        },
+        other => panic!("expected TypeAlias, got {:?}", other),
+    }
+}
+
+#[test]
+fn io_type_wildcard_in_braces() {
+    // Explicit form: `IO {| _} Int`.
+    match first_decl("type X = IO {| _} Int") {
+        DeclKind::TypeAlias { ty, .. } => match &ty.node {
+            TypeKind::IO { effects, rest, .. } => {
+                assert!(effects.is_empty());
+                assert_eq!(rest.as_deref(), Some("_"));
+            }
+            other => panic!("expected IO with wildcard rest, got {:?}", other),
+        },
+        other => panic!("expected TypeAlias, got {:?}", other),
+    }
+}
+
 // ── Variant Types ───────────────────────────────────────────────────
 
 #[test]

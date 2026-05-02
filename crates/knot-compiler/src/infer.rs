@@ -3024,6 +3024,35 @@ impl Infer {
                 if let ast::ExprKind::SourceRef(name) = &target.node {
                     effects.insert(IoEffect::Writes(name.clone()));
                     effects.insert(IoEffect::Reads(name.clone()));
+
+                    // Reject `replace *rel = ...` when the value references
+                    // `*rel` (directly or via a `<- *rel` bind) — `set` would
+                    // produce the same final state more efficiently. Skip
+                    // views and scalar sources where the distinction is
+                    // meaningless.
+                    let is_view = self.view_names.contains(name);
+                    let is_relation = matches!(
+                        self.source_types.get(name),
+                        Some(Ty::Relation(_))
+                    );
+                    if !is_view
+                        && is_relation
+                        && value_references_source(
+                            value,
+                            name,
+                            &self.source_var_binds,
+                        )
+                    {
+                        self.error(
+                            format!(
+                                "`replace *{name} = ...` is unnecessary when \
+                                 the value references `*{name}` \
+                                 (directly or via a `<- *{name}` bind); \
+                                 use `*{name} = ...` instead"
+                            ),
+                            expr.span,
+                        );
+                    }
                 }
                 Ty::IO(effects, None, Box::new(Ty::unit()))
             }
@@ -6650,6 +6679,51 @@ main = applyPred (\\r -> r.x == r.y)\
                *people = os"
         );
         assert!(has_error(&diags, "replace *people"));
+    }
+
+    #[test]
+    fn replace_referencing_source_errors() {
+        // `replace *rel = expr` where the value references *rel is
+        // unnecessary — `set` would produce the same final state.
+        let diags = check_src(
+            "type P = {name: Text, age: Int}\n\
+             *people : [P]\n\
+             birthday = do\n\
+               replace *people = do\n\
+                 p <- *people\n\
+                 yield {p | age: p.age + 1}\n\
+               yield {}"
+        );
+        assert!(has_error(&diags, "`replace *people = ...` is unnecessary"));
+    }
+
+    #[test]
+    fn replace_referencing_source_via_alias_errors() {
+        // Aliases (`xs <- *rel`) count as referencing the source, so
+        // `replace *rel = union xs new` is also unnecessary.
+        let diags = check_src(
+            "type P = {name: Text, age: Int}\n\
+             *people : [P]\n\
+             insert = \\name age -> do\n\
+               ps <- *people\n\
+               replace *people = union ps [{name: name, age: age}]\n\
+               yield {}"
+        );
+        assert!(has_error(&diags, "`replace *people = ...` is unnecessary"));
+    }
+
+    #[test]
+    fn replace_with_literal_ok() {
+        // The canonical `replace` use case: replacing with a literal that
+        // doesn't reference the source.
+        let diags = check_src(
+            "type P = {name: Text, age: Int}\n\
+             *people : [P]\n\
+             main = do\n\
+               replace *people = [{name: \"Alice\", age: 30}]\n\
+               yield {}"
+        );
+        assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
     }
 
     #[test]

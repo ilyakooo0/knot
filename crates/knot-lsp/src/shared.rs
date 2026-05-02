@@ -5,9 +5,211 @@
 use std::path::{Path, PathBuf};
 
 use knot::ast::{self, DeclKind, Module, Span};
+use knot_compiler::effects::EffectSet;
 
 use crate::type_format::format_type_kind;
 use crate::utils::{recurse_expr, safe_slice};
+
+// ── Signature rendering ─────────────────────────────────────────────
+
+/// Render a type signature for "Add type annotation" suggestions, using the
+/// per-decl `effect_sets` analysis to populate the IO effect row when the
+/// inferred type has one. Effects belong inside the `IO { … }` row, not as a
+/// prefix on the function — this helper only adjusts the row's contents.
+///
+/// HM inference and the effect-checker are separate passes. In some cases
+/// (forward references through annotated callers), HM closes a function's IO
+/// row to `{}` and silently drops body-side effects. The effect-checker is
+/// precise per declaration, so when it disagrees with the rendered type's IO
+/// row, prefer the effect-checker's view.
+///
+/// Falls back to `inferred` unchanged when:
+/// - the type contains no `IO { … }` row (the function isn't IO),
+/// - the effect set is pure (nothing to add),
+/// - the rendered IO row already contains every effect the set knows about.
+pub(crate) fn render_signature_with_effects(inferred: &str, effects: &EffectSet) -> String {
+    if effects.is_pure() {
+        return inferred.to_string();
+    }
+    let Some((row_start, row_end)) = find_outermost_io_row(inferred) else {
+        return inferred.to_string();
+    };
+    let existing_row = &inferred[row_start..row_end];
+    let merged = merge_effects_into_row(existing_row, effects);
+    if merged == existing_row {
+        return inferred.to_string();
+    }
+    format!("{}{}{}", &inferred[..row_start], merged, &inferred[row_end..])
+}
+
+/// Find the byte range of the contents (between `{` and `}`) of the *last*
+/// `IO { … }` row in the rendered type — the result-position one for a
+/// function type. Returns `None` when no IO row is present.
+fn find_outermost_io_row(ty: &str) -> Option<(usize, usize)> {
+    let bytes = ty.as_bytes();
+    let mut last: Option<(usize, usize)> = None;
+    let mut search_from = 0;
+    while let Some(io_pos) = ty[search_from..].find("IO {") {
+        let row_start = search_from + io_pos + 4;
+        let mut depth: i32 = 1;
+        let mut i = row_start;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                break;
+            }
+            i += 1;
+        }
+        if depth != 0 {
+            return None;
+        }
+        last = Some((row_start, i));
+        search_from = i + 1;
+    }
+    last
+}
+
+/// Merge any effects from `effects` that aren't already named in
+/// `existing_row` into the row, preserving the row's existing tokens (and any
+/// trailing row variable like `| r`). Returns the new row contents (no braces).
+fn merge_effects_into_row(existing_row: &str, effects: &EffectSet) -> String {
+    let trimmed = existing_row.trim();
+    let (effects_part, row_var): (&str, Option<String>) = match trimmed.split_once('|') {
+        Some((before, tail)) => (before, Some(format!("| {}", tail.trim()))),
+        None => (trimmed, None),
+    };
+    let existing_effects: Vec<String> = effects_part
+        .split(',')
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+        .collect();
+
+    let mut have: std::collections::BTreeSet<String> =
+        existing_effects.iter().cloned().collect();
+    let mut additions: Vec<String> = Vec::new();
+    for r in &effects.reads {
+        let s = format!("reads *{r}");
+        if have.insert(s.clone()) {
+            additions.push(s);
+        }
+    }
+    for w in &effects.writes {
+        let s = format!("writes *{w}");
+        if have.insert(s.clone()) {
+            additions.push(s);
+        }
+    }
+    for (flag, name) in [
+        (effects.console, "console"),
+        (effects.network, "network"),
+        (effects.fs, "fs"),
+        (effects.clock, "clock"),
+        (effects.random, "random"),
+    ] {
+        if flag {
+            let s = name.to_string();
+            if have.insert(s.clone()) {
+                additions.push(s);
+            }
+        }
+    }
+
+    if additions.is_empty() {
+        return existing_row.to_string();
+    }
+
+    let mut parts = existing_effects;
+    parts.extend(additions);
+    let body = parts.join(", ");
+    match row_var {
+        Some(rv) => format!("{body} {rv}"),
+        None => body,
+    }
+}
+
+#[cfg(test)]
+mod sig_tests {
+    use super::*;
+
+    fn effects(reads: &[&str], writes: &[&str]) -> EffectSet {
+        let mut e = EffectSet::empty();
+        for r in reads {
+            e.reads.insert((*r).to_string());
+        }
+        for w in writes {
+            e.writes.insert((*w).to_string());
+        }
+        e
+    }
+
+    #[test]
+    fn passthrough_when_pure() {
+        let s = render_signature_with_effects("Int -> Int", &EffectSet::empty());
+        assert_eq!(s, "Int -> Int");
+    }
+
+    #[test]
+    fn passthrough_when_no_io_row() {
+        // No IO row in the type → don't invent one, even if the effect set
+        // claims effects (shouldn't happen in practice, but be safe).
+        let s = render_signature_with_effects("Int -> Int", &effects(&["foo"], &[]));
+        assert_eq!(s, "Int -> Int");
+    }
+
+    #[test]
+    fn fills_empty_io_row_with_relation_effects() {
+        let s = render_signature_with_effects(
+            "Timestamp -> IO {} Bool",
+            &effects(&["globalRateCount"], &["globalRateCount"]),
+        );
+        assert_eq!(
+            s,
+            "Timestamp -> IO {reads *globalRateCount, writes *globalRateCount} Bool"
+        );
+    }
+
+    #[test]
+    fn appends_missing_effects_to_existing_row() {
+        let mut e = effects(&[], &[]);
+        e.console = true;
+        let s = render_signature_with_effects("Text -> IO {fs} {}", &e);
+        assert_eq!(s, "Text -> IO {fs, console} {}");
+    }
+
+    #[test]
+    fn no_change_when_io_row_already_complete() {
+        let mut e = EffectSet::empty();
+        e.fs = true;
+        let s = render_signature_with_effects("Text -> IO {fs} Text", &e);
+        assert_eq!(s, "Text -> IO {fs} Text");
+    }
+
+    #[test]
+    fn modifies_only_outermost_io_row() {
+        // Inner IO (callback type) must stay untouched; only the result-position
+        // IO row (the function's own return) gets effects added.
+        let mut e = EffectSet::empty();
+        e.console = true;
+        let s = render_signature_with_effects(
+            "(a -> IO {fs} b) -> IO {} a",
+            &e,
+        );
+        assert_eq!(s, "(a -> IO {fs} b) -> IO {console} a");
+    }
+
+    #[test]
+    fn preserves_row_variable_tail() {
+        let mut e = EffectSet::empty();
+        e.console = true;
+        let s = render_signature_with_effects("Int -> IO {fs | r} Int", &e);
+        assert_eq!(s, "Int -> IO {fs, console | r} Int");
+    }
+}
 
 // ── Type-string parsing ─────────────────────────────────────────────
 

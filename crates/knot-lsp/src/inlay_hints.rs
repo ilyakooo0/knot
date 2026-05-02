@@ -44,9 +44,12 @@ pub(crate) fn handle_inlay_hint(
                     // Text edit emits the signature as a separate statement above the
                     // function, so anchor it at the declaration start, not at the hint.
                     let edit_pos = offset_to_position(&doc.source, decl.span.start);
-                    // Effects (including reads/writes) live inside the IO row of
-                    // the rendered type — no extra prefix is needed.
-                    let full_sig = inferred.clone();
+                    // Merge per-decl effect-checker findings into the IO row of
+                    // the rendered type, in case HM inference dropped them.
+                    let full_sig = match doc.effect_sets.get(name) {
+                        Some(eff) => crate::shared::render_signature_with_effects(inferred, eff),
+                        None => inferred.clone(),
+                    };
                     hints.push(InlayHint {
                         position: hint_pos,
                         label: InlayHintLabel::String(format!(": {full_sig}")),
@@ -95,7 +98,10 @@ pub(crate) fn handle_inlay_hint(
                     let name_end = decl_text.find('=').unwrap_or(decl_text.len());
                     let hint_offset = decl.span.start + name_end;
                     let hint_pos = offset_to_position(&doc.source, hint_offset);
-                    let full_sig = inferred.clone();
+                    let full_sig = match doc.effect_sets.get(name) {
+                        Some(eff) => crate::shared::render_signature_with_effects(inferred, eff),
+                        None => inferred.clone(),
+                    };
                     hints.push(InlayHint {
                         position: hint_pos,
                         label: InlayHintLabel::String(format!(": {full_sig}")),
@@ -1120,6 +1126,80 @@ show1 = \p -> case p of
             "expected `: Int` hint for destructured `age`; got: {labels:?}"
         );
     }
+
+
+    #[test]
+    fn suggestion_includes_effects_when_hm_dropped_them() {
+        // Reproduces the skrepka case: HM inference closes a function's IO row
+        // to `{}` because a forward reference goes through an annotated caller,
+        // but the per-decl effect-checker still tracks the real reads/writes.
+        // The suggestion must merge those back into the IO row.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            r#"type Timestamp = Int<Ms>
+
+*globalRateCount : Int
+*globalRateWindowStart : Timestamp
+*drainPhase : Int
+
+globalRateWindowMs : Int<Ms>
+globalRateWindowMs = 1000
+
+maxGlobalRequestRate : Int
+maxGlobalRequestRate = 1000
+
+gateAuth : Timestamp -> (Text -> a) -> IO {reads *drainPhase, reads *globalRateCount, reads *globalRateWindowStart, writes *globalRateCount, writes *globalRateWindowStart} a
+gateAuth = \t mkErr -> do
+  dp <- *drainPhase
+  g <- checkGlobalRate t
+  if g then yield (mkErr "rate_limited") else yield (mkErr "ok")
+
+checkGlobalRate = \t -> atomic do
+  ws <- *globalRateWindowStart
+  c <- *globalRateCount
+  if t - ws >= globalRateWindowMs then do
+    *globalRateWindowStart = t
+    *globalRateCount = 1
+    yield False {}
+  else if c >= maxGlobalRequestRate then yield True {}
+  else do
+    *globalRateCount = c + 1
+    yield False {}
+"#,
+        );
+        let doc = ws.doc(&uri);
+        let inferred = doc
+            .type_info
+            .get("checkGlobalRate")
+            .expect("checkGlobalRate should have a type");
+        let effects = doc
+            .effect_sets
+            .get("checkGlobalRate")
+            .expect("checkGlobalRate should have effects");
+        let suggested = crate::shared::render_signature_with_effects(inferred, effects);
+        assert!(
+            suggested.contains("reads *globalRateCount"),
+            "suggestion missing reads effect: {suggested}"
+        );
+        assert!(
+            suggested.contains("writes *globalRateCount"),
+            "suggestion missing writes effect: {suggested}"
+        );
+        assert!(
+            suggested.contains("reads *globalRateWindowStart"),
+            "suggestion missing reads effect: {suggested}"
+        );
+        assert!(
+            suggested.contains("writes *globalRateWindowStart"),
+            "suggestion missing writes effect: {suggested}"
+        );
+        assert!(
+            !suggested.contains("*sessions"),
+            "suggestion has spurious sessions effect: {suggested}"
+        );
+    }
+
 
     #[test]
     fn inlay_hint_emits_monad_context_for_maybe_do_block() {

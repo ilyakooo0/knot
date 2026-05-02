@@ -8,7 +8,9 @@ use lsp_types::*;
 use knot::ast::{self, DeclKind, Module, Span, TypeKind};
 
 use crate::builtins::EFFECTFUL_BUILTINS;
-use crate::shared::{extract_principal_type_name, find_enclosing_atomic_expr};
+use crate::shared::{
+    extract_principal_type_name, find_enclosing_atomic_expr, render_signature_with_effects,
+};
 use crate::state::{builtins as state_builtins, DocumentState, ServerState};
 use crate::utils::{
     edit_distance, offset_to_position, position_to_offset, safe_slice, span_to_range,
@@ -34,13 +36,17 @@ pub(crate) fn handle_code_action(
             continue;
         }
 
-        // Action: Add type annotation to unannotated functions. The rendered
-        // type already carries any IO effects (including reads/writes) inside
-        // its `IO {…}` row — effects are tied to IO, not to the function as a
-        // whole, so no extra prefix is needed.
+        // Action: Add type annotation to unannotated functions. Effects belong
+        // inside the IO row of the rendered type — `render_signature_with_effects`
+        // merges any per-decl effect-checker findings into that row when HM
+        // inference dropped them (e.g., forward references through annotated
+        // callers can collapse the row to `{}`).
         if let DeclKind::Fun { name, ty: None, .. } = &decl.node {
             if let Some(inferred) = doc.type_info.get(name) {
-                let signature = inferred.clone();
+                let signature = match doc.effect_sets.get(name) {
+                    Some(eff) => render_signature_with_effects(inferred, eff),
+                    None => inferred.clone(),
+                };
                 let insert_pos = offset_to_position(&doc.source, decl.span.start);
 
                 let mut changes = HashMap::new();
@@ -67,12 +73,15 @@ pub(crate) fn handle_code_action(
             }
         }
 
-        // Action: Add type annotation to unannotated views/derived. The
-        // rendered type already includes IO effects in its row when present.
+        // Action: Add type annotation to unannotated views/derived. Same
+        // effect-merging treatment as the Fun case above.
         match &decl.node {
             DeclKind::View { name, ty: None, .. } | DeclKind::Derived { name, ty: None, .. } => {
                 if let Some(inferred) = doc.type_info.get(name) {
-                    let signature = inferred.clone();
+                    let signature = match doc.effect_sets.get(name) {
+                        Some(eff) => render_signature_with_effects(inferred, eff),
+                        None => inferred.clone(),
+                    };
                     let decl_text = safe_slice(&doc.source, decl.span);
                     if let Some(eq_pos) = decl_text.find('=') {
                         let insert_offset = decl.span.start + eq_pos;

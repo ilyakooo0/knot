@@ -125,8 +125,23 @@ impl Diagnostic {
             Severity::Info => ReportKind::Advice,
         };
 
-        // Pick the offset for the report header from the first label, or 0.
-        let header_offset = self.labels.first().map_or(0, |l| l.span.start);
+        // Knot stores byte-offset spans, but ariadne 0.6 expects character
+        // offsets (per its `Span` trait docs). Convert once per label so
+        // diagnostics line up correctly when the source contains non-ASCII
+        // (e.g. `→`, `—`) above the error.
+        let byte_to_char = |byte_offset: usize| -> usize {
+            let clamped = byte_offset.min(source.len());
+            let mut safe = clamped;
+            while safe > 0 && !source.is_char_boundary(safe) {
+                safe -= 1;
+            }
+            source[..safe].chars().count()
+        };
+
+        let header_offset = self
+            .labels
+            .first()
+            .map_or(0, |l| byte_to_char(l.span.start));
         let fname = filename.to_string();
 
         let mut colors = ColorGenerator::new();
@@ -137,8 +152,10 @@ impl Diagnostic {
 
         for label in &self.labels {
             let color = colors.next();
+            let start = byte_to_char(label.span.start);
+            let end = byte_to_char(label.span.end);
             builder = builder.with_label(
-                ALabel::new((fname.clone(), label.span.start..label.span.end))
+                ALabel::new((fname.clone(), start..end))
                     .with_message(&label.message)
                     .with_color(color),
             );

@@ -45,6 +45,9 @@ fn main() {
             }
             cmd_build(&args[2], &overrides);
         }
+        "fmt" => {
+            cmd_fmt(&args[2..]);
+        }
         "--help" | "-h" | "help" => print_usage(),
         other => {
             eprintln!("Unknown command: {}", other);
@@ -59,7 +62,92 @@ fn print_usage() {
     eprintln!();
     eprintln!("Usage:");
     eprintln!("  knotc build <file.knot> [--name=value ...]   Compile with optional constant overrides");
+    eprintln!("  knotc fmt [--check] [--stdout] <file.knot>   Format a source file in place");
     eprintln!("  knotc help                                   Show this help message");
+}
+
+fn cmd_fmt(args: &[String]) {
+    let mut check = false;
+    let mut to_stdout = false;
+    let mut paths: Vec<&str> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "--check" => check = true,
+            "--stdout" | "-" => to_stdout = true,
+            other if other.starts_with("--") => {
+                eprintln!("Error: unknown fmt flag '{}'", other);
+                eprintln!("Usage: knotc fmt [--check] [--stdout] <file.knot>...");
+                process::exit(2);
+            }
+            other => paths.push(other),
+        }
+    }
+    if paths.is_empty() {
+        eprintln!("Error: missing source file");
+        eprintln!("Usage: knotc fmt [--check] [--stdout] <file.knot>...");
+        process::exit(2);
+    }
+
+    let mut any_diff = false;
+    for path_str in &paths {
+        let source_path = PathBuf::from(path_str);
+        let source = match std::fs::read_to_string(&source_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error reading {}: {}", source_path.display(), e);
+                process::exit(1);
+            }
+        };
+
+        let lexer = knot::lexer::Lexer::new(&source);
+        let (tokens, lex_diags) = lexer.tokenize();
+        let filename = source_path.display().to_string();
+        let lex_errs: Vec<_> = lex_diags
+            .iter()
+            .filter(|d| d.severity == knot::diagnostic::Severity::Error)
+            .collect();
+        if !lex_errs.is_empty() {
+            for d in &lex_errs {
+                eprintln!("{}", d.render(&source, &filename));
+            }
+            process::exit(1);
+        }
+
+        let parser = knot::parser::Parser::new(source.clone(), tokens);
+        let (module, parse_diags) = parser.parse_module();
+        let parse_errs: Vec<_> = parse_diags
+            .iter()
+            .filter(|d| d.severity == knot::diagnostic::Severity::Error)
+            .collect();
+        if !parse_errs.is_empty() {
+            eprintln!("Cannot format {}: parse errors", source_path.display());
+            for d in &parse_errs {
+                eprintln!("{}", d.render(&source, &filename));
+            }
+            process::exit(1);
+        }
+
+        let formatted = knot::format::format_module(&source, &module);
+
+        if check {
+            if formatted != source {
+                eprintln!("{}: not formatted", source_path.display());
+                any_diff = true;
+            }
+        } else if to_stdout {
+            print!("{}", formatted);
+        } else if formatted != source {
+            if let Err(e) = std::fs::write(&source_path, &formatted) {
+                eprintln!("Error writing {}: {}", source_path.display(), e);
+                process::exit(1);
+            }
+            eprintln!("Formatted: {}", source_path.display());
+        }
+    }
+
+    if check && any_diff {
+        process::exit(1);
+    }
 }
 
 fn cmd_build(source_file: &str, overrides: &HashMap<String, String>) {

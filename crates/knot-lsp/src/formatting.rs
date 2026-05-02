@@ -1,10 +1,15 @@
 //! `textDocument/formatting`, `textDocument/rangeFormatting`, and
 //! `textDocument/onTypeFormatting` handlers.
+//!
+//! Document formatting delegates to [`knot::format::format_module`] — the
+//! same AST-based pretty printer that powers `knotc fmt`. Range formatting
+//! still does the heuristic line-level cleanup (trim trailing whitespace,
+//! collapse consecutive blanks) since rendering an arbitrary subrange would
+//! need expression-level slicing the printer can't currently provide.
 
 use lsp_types::*;
 
 use crate::state::ServerState;
-use crate::utils::offset_to_position;
 
 /// UTF-16 code-unit length of a string slice — what LSP `Position::character`
 /// requires (LSP defaults to UTF-16, and this server doesn't negotiate
@@ -23,115 +28,22 @@ pub(crate) fn handle_formatting(
     let doc = state.documents.get(&params.text_document.uri)?;
     let source = &doc.source;
 
-    // Formatter:
-    // 1. Convert tabs to spaces (2 spaces per tab)
-    // 2. Trim trailing whitespace from all lines
-    // 3. Normalize blank lines between top-level declarations (exactly one blank line)
-    // 4. Collapse consecutive blank lines inside blocks to at most one
-    // 5. Ensure trailing newline
-    // 6. Normalize imports (single blank line after import block)
-    // 7. Sort the leading import block alphabetically
-    // 8. Normalize whitespace inside expressions (commas, arrows) on a per-line
-    //    basis — full AST pretty-printing is deferred since it requires a
-    //    layout-aware printer for do blocks, case arms, record literals, etc.
-
-    // Convert tabs to spaces first, then sort imports.
-    let source = &normalize_imports(&source.replace('\t', "  "));
-    let lines: Vec<&str> = source.split('\n').collect();
-    let mut result_lines: Vec<String> = Vec::with_capacity(lines.len());
-
-    // Compute line ranges for each top-level declaration
-    let mut decl_line_ranges: Vec<(u32, u32)> = Vec::new();
-    for decl in &doc.module.decls {
-        let start = offset_to_position(source, decl.span.start);
-        let end = offset_to_position(source, decl.span.end);
-        decl_line_ranges.push((start.line, end.line));
-    }
-    // Also track import line ranges
-    let mut import_line_ranges: Vec<(u32, u32)> = Vec::new();
-    for imp in &doc.module.imports {
-        let start = offset_to_position(source, imp.span.start);
-        let end = offset_to_position(source, imp.span.end);
-        import_line_ranges.push((start.line, end.line));
+    // Skip when the document didn't parse cleanly — we don't want to
+    // rewrite a half-broken file from a partial AST.
+    let has_parse_errors = doc
+        .knot_diagnostics
+        .iter()
+        .any(|d| d.severity == knot::diagnostic::Severity::Error);
+    if has_parse_errors {
+        return None;
     }
 
-    // Merge all block ranges (imports + declarations) sorted by start line
-    let mut block_ranges: Vec<(u32, u32)> = Vec::new();
-    block_ranges.extend_from_slice(&import_line_ranges);
-    block_ranges.extend_from_slice(&decl_line_ranges);
-    block_ranges.sort_by_key(|r| r.0);
-
-    let mut i = 0;
-    while i < lines.len() {
-        let line_num = i as u32;
-
-        // Check if this line is between two top-level blocks (a gap line)
-        let in_block = block_ranges
-            .iter()
-            .any(|(start, end)| line_num >= *start && line_num <= *end);
-        let prev_block_end = block_ranges
-            .iter()
-            .filter(|(_, end)| *end < line_num)
-            .max_by_key(|(_, end)| *end);
-        let next_block_start = block_ranges
-            .iter()
-            .filter(|(start, _)| *start > line_num)
-            .min_by_key(|(start, _)| *start);
-
-        if !in_block && lines[i].trim().is_empty() {
-            // We're in a gap between blocks — check if this is part of
-            // a run of blank lines that should be collapsed to exactly one
-            let gap_start = i;
-            while i < lines.len() && lines[i].trim().is_empty() {
-                i += 1;
-            }
-            // Only emit a blank line if there are blocks on both sides
-            if prev_block_end.is_some() && next_block_start.is_some() {
-                result_lines.push(String::new());
-            } else if prev_block_end.is_some() {
-                // Trailing blank lines at end — skip (trailing newline added later)
-            } else {
-                // Leading blank lines — preserve one at most
-                if gap_start == 0 {
-                    // skip leading blank lines
-                } else {
-                    result_lines.push(String::new());
-                }
-            }
-            continue;
-        }
-
-        // Collapse consecutive blank lines inside blocks to at most one
-        if lines[i].trim().is_empty() && in_block {
-            let mut blank_count = 0;
-            while i < lines.len() && lines[i].trim().is_empty() {
-                blank_count += 1;
-                i += 1;
-            }
-            if blank_count > 0 {
-                result_lines.push(String::new());
-            }
-            continue;
-        }
-
-        // Trim trailing whitespace and apply per-line spacing normalization.
-        result_lines.push(normalize_line_spacing(lines[i].trim_end()));
-        i += 1;
-    }
-
-    // Ensure trailing newline
-    if result_lines.last().map_or(true, |l| !l.is_empty()) {
-        result_lines.push(String::new());
-    }
-
-    let formatted = result_lines.join("\n");
-
-    // Only return edits if something changed
+    let formatted = knot::format::format_module(source, &doc.module);
     if formatted == *source {
         return None;
     }
 
-    // Replace entire document
+    let lines: Vec<&str> = source.split('\n').collect();
     let last_line = lines.len().saturating_sub(1) as u32;
     let last_col = lines.last().map_or(0, |l| utf16_len(l));
     Some(vec![TextEdit {
@@ -141,188 +53,6 @@ pub(crate) fn handle_formatting(
         },
         new_text: formatted,
     }])
-}
-
-/// Sort the leading run of `import ...` lines alphabetically (case-insensitive).
-/// Only affects a contiguous block at the very top of the file (after any
-/// initial blank lines or comments).
-fn normalize_imports(source: &str) -> String {
-    let lines: Vec<&str> = source.split('\n').collect();
-    let mut idx = 0;
-    // Skip leading blank lines / line comments.
-    while idx < lines.len() {
-        let trimmed = lines[idx].trim();
-        if trimmed.is_empty() || trimmed.starts_with("--") {
-            idx += 1;
-        } else {
-            break;
-        }
-    }
-    let block_start = idx;
-    while idx < lines.len() && lines[idx].trim_start().starts_with("import ") {
-        idx += 1;
-    }
-    let block_end = idx;
-    if block_end - block_start < 2 {
-        return source.to_string();
-    }
-    let mut imports: Vec<&str> = lines[block_start..block_end].to_vec();
-    let mut sorted = imports.clone();
-    sorted.sort_by(|a, b| a.trim().to_lowercase().cmp(&b.trim().to_lowercase()));
-    if imports == sorted {
-        return source.to_string();
-    }
-    imports = sorted;
-    let mut out = Vec::with_capacity(lines.len());
-    out.extend_from_slice(&lines[..block_start]);
-    out.extend_from_slice(&imports);
-    out.extend_from_slice(&lines[block_end..]);
-    out.join("\n")
-}
-
-/// Normalize whitespace inside a single line. Conservative — only fixes
-/// patterns that don't change semantics regardless of context. Notably, this
-/// runs PER LINE so it can safely operate on any code without parsing.
-fn normalize_line_spacing(line: &str) -> String {
-    // Skip lines that look like they contain string literals to avoid
-    // mangling content. A real formatter would parse the line; here we just
-    // bail when in doubt.
-    if line.contains('"') {
-        return line.to_string();
-    }
-    // Skip line-comment lines (and tail content of `--` comments) — we don't
-    // want to mangle prose. Comments starting mid-line are handled by
-    // splitting at the first `--` boundary; the prefix is normalized, the
-    // suffix preserved verbatim.
-    let (code, comment) = match find_line_comment_start(line) {
-        Some(idx) => (&line[..idx], Some(&line[idx..])),
-        None => (line, None),
-    };
-
-    // Preserve leading indentation literally — it's already validated by the
-    // tab-to-space pass. Only normalize what comes after.
-    let leading_ws_end = code
-        .as_bytes()
-        .iter()
-        .position(|b| !matches!(*b, b' ' | b'\t'))
-        .unwrap_or(code.len());
-    let indent = &code[..leading_ws_end];
-    let body = &code[leading_ws_end..];
-
-    let normalized_body = normalize_body(body);
-    let mut out = String::with_capacity(line.len());
-    out.push_str(indent);
-    out.push_str(&normalized_body);
-    if let Some(c) = comment {
-        // Preserve a single space gap between code and the trailing comment.
-        if !out.ends_with(' ') && !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(c);
-    }
-    out
-}
-
-/// Find the byte index of the first `--` line-comment marker in a code line,
-/// ignoring `--` inside string literals (those are filtered out by the caller
-/// already, but defending against future relaxations of that policy).
-fn find_line_comment_start(line: &str) -> Option<usize> {
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        if bytes[i] == b'-' && bytes[i + 1] == b'-' {
-            // The `-` could be part of a binary subtraction or a `->` arrow;
-            // require it to be preceded by whitespace or start-of-line for
-            // a comment context.
-            if i == 0 || matches!(bytes[i - 1], b' ' | b'\t') {
-                return Some(i);
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Normalize whitespace inside the non-indented body of a line. Operators we
-/// touch: `,` `->` `<-` `=>`, plus collapsing runs of internal spaces. We
-/// leave `=` alone — distinguishing `=` from `==`/`<=`/`>=`/`/=` reliably
-/// without a parser is more trouble than it's worth.
-fn normalize_body(body: &str) -> String {
-    let mut out = String::with_capacity(body.len());
-    let bytes = body.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        // Collapse runs of internal whitespace to a single space — but only
-        // for runs that don't separate operators we're about to insert space
-        // around. We handle this by emitting at most one space.
-        if matches!(b, b' ' | b'\t') {
-            if !out.ends_with(' ') {
-                out.push(' ');
-            }
-            i += 1;
-            continue;
-        }
-        // `,` followed by non-space, non-`)`, non-`]`, non-`}` → insert space.
-        if b == b',' {
-            out.push(',');
-            i += 1;
-            if i < bytes.len()
-                && !matches!(bytes[i], b' ' | b')' | b']' | b'}' | b'\n' | b'\r' | b'\t')
-            {
-                out.push(' ');
-            }
-            continue;
-        }
-        // `->`: ensure single space before and after.
-        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'>' {
-            if !out.ends_with(' ') && !out.is_empty() {
-                let last = out.chars().last().unwrap_or(' ');
-                if !matches!(last, '(' | '[' | '{') {
-                    out.push(' ');
-                }
-            }
-            out.push_str("->");
-            i += 2;
-            if i < bytes.len()
-                && !matches!(bytes[i], b' ' | b')' | b']' | b'}' | b'\n' | b'\r' | b'\t')
-            {
-                out.push(' ');
-            }
-            continue;
-        }
-        // `<-`: ditto, used in do-block monadic binds.
-        if b == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-            if !out.ends_with(' ') && !out.is_empty() {
-                out.push(' ');
-            }
-            out.push_str("<-");
-            i += 2;
-            if i < bytes.len()
-                && !matches!(bytes[i], b' ' | b')' | b']' | b'}' | b'\n' | b'\r' | b'\t')
-            {
-                out.push(' ');
-            }
-            continue;
-        }
-        // `=>`: trait constraint arrow; same treatment.
-        if b == b'=' && i + 1 < bytes.len() && bytes[i + 1] == b'>' {
-            if !out.ends_with(' ') && !out.is_empty() {
-                out.push(' ');
-            }
-            out.push_str("=>");
-            i += 2;
-            if i < bytes.len()
-                && !matches!(bytes[i], b' ' | b')' | b']' | b'}' | b'\n' | b'\r' | b'\t')
-            {
-                out.push(' ');
-            }
-            continue;
-        }
-        out.push(b as char);
-        i += 1;
-    }
-    out
 }
 
 // ── Range Formatting ────────────────────────────────────────────────

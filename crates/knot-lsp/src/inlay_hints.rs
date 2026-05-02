@@ -162,6 +162,12 @@ pub(crate) fn handle_inlay_hint(
     // off-screen.
     add_closing_label_hints(doc, range_start, range_end, &mut hints);
 
+    // Trait-constraint hints at call sites of constrained functions. The
+    // inferencer doesn't memoize per-call-site substitutions, so we surface
+    // the *declared* constraints — useful for spotting "this call brings in
+    // an Eq/Ord/Display requirement" without jumping to the definition.
+    add_constraint_hints(doc, range_start, range_end, &mut hints);
+
     // Per-decl re-check telemetry — gated on KNOT_LSP_TRACE_DIRTY since this
     // information is mostly useful when investigating incremental-inference
     // performance, not as everyday UI. Surfaces a "♻" hint at the start of
@@ -857,6 +863,143 @@ fn add_monad_context_hints(
             }
         }
         recurse_expr(expr, |e| walk(e, doc, range_start, range_end, hints));
+    }
+
+    fn walk_decl(
+        decl: &ast::Decl,
+        doc: &DocumentState,
+        range_start: usize,
+        range_end: usize,
+        hints: &mut Vec<InlayHint>,
+    ) {
+        match &decl.node {
+            DeclKind::Fun {
+                body: Some(body), ..
+            }
+            | DeclKind::View { body, .. }
+            | DeclKind::Derived { body, .. } => {
+                walk(body, doc, range_start, range_end, hints);
+            }
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { body, .. } = item {
+                        walk(body, doc, range_start, range_end, hints);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for decl in &doc.module.decls {
+        if decl.span.end < range_start || decl.span.start > range_end {
+            continue;
+        }
+        walk_decl(decl, doc, range_start, range_end, hints);
+    }
+}
+
+/// Walk the AST collecting App-chain head positions whose callee resolves to
+/// a function with declared trait constraints. Emits a small `[Trait a, …]`
+/// hint immediately after the callee name so the user sees what trait
+/// dispatch the call is bringing in.
+fn add_constraint_hints(
+    doc: &DocumentState,
+    range_start: usize,
+    range_end: usize,
+    hints: &mut Vec<InlayHint>,
+) {
+    use crate::shared::flatten_app_chain;
+    use crate::type_format::format_type_kind;
+
+    fn walk(
+        expr: &ast::Expr,
+        doc: &DocumentState,
+        range_start: usize,
+        range_end: usize,
+        hints: &mut Vec<InlayHint>,
+    ) {
+        if matches!(expr.node, ast::ExprKind::App { .. }) {
+            let (callee, args) = flatten_app_chain(expr);
+            if let ast::ExprKind::Var(name) = &callee.node {
+                if callee.span.start >= range_start && callee.span.end <= range_end {
+                    if let Some(constraints) = constraints_for_callee(&doc.module, name) {
+                        if !constraints.is_empty() {
+                            let label = format!("[{}]", constraints.join(", "));
+                            hints.push(InlayHint {
+                                position: offset_to_position(&doc.source, callee.span.end),
+                                label: InlayHintLabel::String(label),
+                                kind: None,
+                                text_edits: None,
+                                tooltip: Some(InlayHintTooltip::String(format!(
+                                    "Call site brings in trait constraints from `{name}`'s declaration"
+                                ))),
+                                padding_left: Some(true),
+                                padding_right: None,
+                                data: None,
+                            });
+                        }
+                    }
+                }
+            }
+            for arg in args {
+                walk(arg, doc, range_start, range_end, hints);
+            }
+            return;
+        }
+        recurse_expr(expr, |e| walk(e, doc, range_start, range_end, hints));
+    }
+
+    fn constraints_for_callee(module: &knot::ast::Module, name: &str) -> Option<Vec<String>> {
+        for decl in &module.decls {
+            match &decl.node {
+                DeclKind::Fun {
+                    name: n,
+                    ty: Some(scheme),
+                    ..
+                } if n == name => {
+                    let cs: Vec<String> = scheme
+                        .constraints
+                        .iter()
+                        .map(|c| {
+                            let args: Vec<String> = c
+                                .args
+                                .iter()
+                                .map(|t| format_type_kind(&t.node))
+                                .collect();
+                            format!("{} {}", c.trait_name, args.join(" "))
+                        })
+                        .collect();
+                    return Some(cs);
+                }
+                DeclKind::Trait { items, .. } => {
+                    for item in items {
+                        if let ast::TraitItem::Method {
+                            name: n, ty, ..
+                        } = item
+                        {
+                            if n == name {
+                                let cs: Vec<String> = ty
+                                    .constraints
+                                    .iter()
+                                    .map(|c| {
+                                        let args: Vec<String> = c
+                                            .args
+                                            .iter()
+                                            .map(|t| format_type_kind(&t.node))
+                                            .collect();
+                                        format!("{} {}", c.trait_name, args.join(" "))
+                                    })
+                                    .collect();
+                                return Some(cs);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     fn walk_decl(

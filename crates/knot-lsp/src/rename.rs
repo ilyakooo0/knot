@@ -10,7 +10,7 @@ use knot::ast::{self, DeclKind, Module, Span};
 use crate::analysis::get_or_parse_file_shared;
 use crate::defs::resolve_definitions;
 use crate::shared::scan_knot_files_in_roots;
-use crate::state::{DocumentState, ServerState};
+use crate::state::{builtins, DocumentState, ServerState, KEYWORDS};
 use crate::utils::{
     path_to_uri, position_to_offset, recurse_expr, safe_slice, span_to_range, uri_to_path,
     word_at_position,
@@ -29,6 +29,13 @@ pub(crate) fn handle_prepare_rename(
     // Check if cursor is on a renameable symbol
     let word = word_at_position(&doc.source, pos)?;
 
+    // Reject keywords up front. `word_at_position` returns None for non-ident
+    // chars, so the cursor lands on something that *parses* as an identifier;
+    // if that identifier is a reserved keyword, no rename is meaningful.
+    if KEYWORDS.iter().any(|kw| *kw == word) {
+        return None;
+    }
+
     // Must be on a known definition, a reference to one, or a record field
     // position. Field positions are determined by AST shape — we accept them
     // here so the editor offers the rename action; the actual rewrite is
@@ -39,8 +46,17 @@ pub(crate) fn handle_prepare_rename(
         .any(|(usage, _)| usage.start <= offset && offset < usage.end);
     let is_def = doc.definitions.values().any(|span| span.start <= offset && offset < span.end);
     let is_field = is_at_record_field(&doc.module, &doc.source, offset);
+    let is_imported = doc.import_defs.contains_key(word);
 
-    if !is_ref && !is_def && !is_field {
+    if !is_ref && !is_def && !is_field && !is_imported {
+        return None;
+    }
+
+    // Reject builtins that aren't shadowed by a user definition — renaming a
+    // stdlib symbol like `println` would only edit local references and leave
+    // the binding broken. We keep the rename if a user-declared symbol with
+    // the same name shadows the builtin, since that's the canonical owner.
+    if builtins().any(|b| b == word) && !is_def && !is_imported {
         return None;
     }
 
@@ -64,6 +80,25 @@ pub(crate) fn handle_prepare_rename(
     })
 }
 
+/// Validate that `name` is a syntactically valid Knot identifier:
+/// starts with letter or underscore, contains only ident chars, and isn't a
+/// reserved keyword. Used by `handle_rename` to reject malformed renames
+/// before scanning the workspace.
+fn is_valid_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let first = match chars.next() {
+        Some(c) => c,
+        None => return false,
+    };
+    if !(first.is_alphabetic() || first == '_') {
+        return false;
+    }
+    if !chars.all(|c| c.is_alphanumeric() || c == '_') {
+        return false;
+    }
+    !KEYWORDS.iter().any(|kw| *kw == name)
+}
+
 pub(crate) fn handle_rename(
     state: &ServerState,
     params: &RenameParams,
@@ -74,6 +109,13 @@ pub(crate) fn handle_rename(
     let offset = position_to_offset(&doc.source, pos);
     let new_name = &params.new_name;
     let old_name = word_at_position(&doc.source, pos)?.to_string();
+
+    // Reject malformed new names — keywords, empty strings, names starting
+    // with digits. The LSP spec lets us return null when a rename would
+    // produce an invalid result.
+    if !is_valid_identifier(new_name) || old_name == *new_name {
+        return None;
+    }
 
     // Field rename branch: when the cursor sits on a record field name (not a
     // symbol), the cross-file owner machinery doesn't apply — there's no
@@ -1034,6 +1076,34 @@ mod tests {
             text_document: TextDocumentIdentifier { uri: uri.clone() },
             position,
         }
+    }
+
+    #[test]
+    fn prepare_rename_rejects_unshadowed_builtin() {
+        // Cursor on `println` — a stdlib symbol with no local declaration.
+        // Renaming it would leave the binding broken, so prepare_rename
+        // should bail out before the editor offers the action.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "main = println \"hi\"\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("println").expect("builtin call");
+        let pos = offset_to_position(&doc.source, off);
+        let resp = handle_prepare_rename(&ws.state, &prepare_params(&uri, pos));
+        assert!(resp.is_none(), "rename should bail on unshadowed builtin: {resp:?}");
+    }
+
+    #[test]
+    fn rename_rejects_invalid_new_name() {
+        // Renaming to a Knot keyword would produce a syntax error in every
+        // edited file. Reject before the workspace scan rather than commit
+        // and let the editor flag downstream parse failures.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "double = \\x -> x * 2\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("double").expect("def");
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "do"));
+        assert!(edit.is_none(), "rename to keyword should be rejected: {edit:?}");
     }
 
     #[test]

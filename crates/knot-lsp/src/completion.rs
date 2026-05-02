@@ -199,11 +199,46 @@ pub(crate) fn handle_completion(
         // Only suggest types: data types, type aliases, built-in types
         for decl in &doc.module.decls {
             match &decl.node {
-                DeclKind::Data { name, .. } | DeclKind::TypeAlias { name, .. } => {
+                DeclKind::Data { name, .. } => {
                     items.push(CompletionItem {
                         label: name.clone(),
                         kind: Some(CompletionItemKind::STRUCT),
                         detail: doc.details.get(name).cloned(),
+                        ..Default::default()
+                    });
+                }
+                DeclKind::TypeAlias { name, ty, .. } => {
+                    // Refined-type aliases get their predicate inline as the
+                    // detail string so the user sees what the value must
+                    // satisfy without having to navigate to the declaration.
+                    let (detail, doc_md) = match &ty.node {
+                        TypeKind::Refined { base, predicate } => {
+                            let base_str = format_type_kind(&base.node);
+                            let pred_src = doc
+                                .source
+                                .get(predicate.span.start..predicate.span.end)
+                                .map(|s| s.trim().to_string())
+                                .unwrap_or_else(|| "…".into());
+                            (
+                                Some(format!("refined {base_str} where {pred_src}")),
+                                Some(format!(
+                                    "Refined type. Values of `{name}` must satisfy `{pred_src}`."
+                                )),
+                            )
+                        }
+                        _ => (doc.details.get(name).cloned(), None),
+                    };
+                    let documentation = doc_md.map(|s| {
+                        Documentation::MarkupContent(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: s,
+                        })
+                    });
+                    items.push(CompletionItem {
+                        label: name.clone(),
+                        kind: Some(CompletionItemKind::STRUCT),
+                        detail,
+                        documentation,
                         ..Default::default()
                     });
                 }
@@ -485,7 +520,7 @@ pub(crate) fn handle_completion(
     }
 
     if in_atomic {
-        items.retain(|item| !is_disallowed_in_atomic(&item.label, doc));
+        items.retain(|item| !is_disallowed_in_atomic(&item.label, doc, state));
     }
 
     // Final ordering pass: assign a stable category prefix to every item that
@@ -669,13 +704,27 @@ fn apply_default_category_ranking(items: &mut [CompletionItem], doc: &DocumentSt
 /// True if a completion candidate would be rejected by the effect checker
 /// inside an `atomic` block. Mirrors the rule in `effects.rs`: any builtin
 /// from `ATOMIC_DISALLOWED_BUILTINS`, plus any user function whose inferred
-/// effect set contains console/network/fs/clock/random.
-fn is_disallowed_in_atomic(label: &str, doc: &DocumentState) -> bool {
-    if ATOMIC_DISALLOWED_BUILTINS.contains(&label) {
+/// effect set contains console/network/fs/clock/random — including imported
+/// functions that show up in the *current* doc (effect_sets is populated
+/// after import resolution) and auto-import candidates that show up in any
+/// open document's effect_sets.
+fn is_disallowed_in_atomic(label: &str, doc: &DocumentState, state: &ServerState) -> bool {
+    let bare = label.trim_start_matches(['*', '&']);
+    if ATOMIC_DISALLOWED_BUILTINS.contains(&bare) {
         return true;
     }
-    if let Some(eff) = doc.effect_sets.get(label) {
+    if let Some(eff) = doc.effect_sets.get(bare) {
         return eff.has_io();
+    }
+    // Auto-import items don't have entries in this doc's effect_sets yet
+    // (the import isn't applied), but if any open doc declares the same
+    // name with IO effects, it's almost certainly the same definition.
+    for other in state.documents.values() {
+        if let Some(eff) = other.effect_sets.get(bare) {
+            if eff.has_io() {
+                return true;
+            }
+        }
     }
     false
 }
@@ -804,13 +853,31 @@ fn monad_for_do_span(
 /// True if the rendered type of a completion candidate is a value in the
 /// requested monad. The match is structural-by-string (we only have the
 /// formatted type text in `type_info`); good enough for ranking, not for
-/// type checking.
+/// type checking. For function types like `a -> Maybe a`, also looks at the
+/// return type so constructors that produce monad values rank up too.
 fn type_matches_monad(ty: &str, monad: &MonadKind) -> bool {
     let t = ty.trim();
+    if monad_head_matches(t, monad) {
+        return true;
+    }
+    // Function type: walk past the arrows and look at the final return position.
+    // Constructors are typed `field -> ParentType`, so a Maybe-returning
+    // constructor like `Just : a -> Maybe a` wouldn't match by leading prefix
+    // but should still rank into a Maybe context.
+    let params = crate::shared::parse_function_params(t);
+    if params.len() > 1 {
+        if let Some(ret) = params.last() {
+            return monad_head_matches(ret.trim(), monad);
+        }
+    }
+    false
+}
+
+/// Helper: does the head of a non-function type string sit in the requested
+/// monad? Pure-string match — we don't have AST-level info at this point.
+fn monad_head_matches(t: &str, monad: &MonadKind) -> bool {
     match monad {
         MonadKind::Relation => {
-            // Direct relation `[T]`, or the IO-wrapped variant `IO {} [T]`
-            // returned by `*src` / `&derived` / `set` / etc.
             t.starts_with('[') || t.contains(" [") || t.contains("IO ")
         }
         MonadKind::IO => t.starts_with("IO ") || t.starts_with("IO{") || t == "IO",
@@ -1066,6 +1133,19 @@ pub(crate) fn handle_resolve_completion_item(
         if let Some(ctors) = data_constructor_summary(&doc.module, &label) {
             push_unique(&mut sections, ctors);
         }
+        // Trait dispatch: when the user is completing a method declared by a
+        // trait, list the types that supply it. The companion code-lens shows
+        // the same info inline in the source — completion resolve makes it
+        // discoverable from the picker too.
+        if let Some(dispatch) = trait_method_dispatch_summary(&doc.module, &label) {
+            push_unique(&mut sections, dispatch);
+        }
+        // Function-level trait constraints: surface the `Display a => …`
+        // requirements so the user notices that calling this function brings
+        // in trait dispatch.
+        if let Some(constraints) = function_constraint_summary(&doc.module, &label) {
+            push_unique(&mut sections, constraints);
+        }
     }
 
     item.detail = detail;
@@ -1087,6 +1167,82 @@ pub(crate) fn handle_resolve_completion_item(
     }
 
     item
+}
+
+/// If `name` resolves to a trait method declared in `module`, render a list
+/// of impls in the same module that supply the method. Returns `None` when
+/// the name isn't a trait method or no impls exist locally.
+fn trait_method_dispatch_summary(module: &Module, name: &str) -> Option<String> {
+    let mut owning_trait: Option<String> = None;
+    for decl in &module.decls {
+        if let DeclKind::Trait { name: tn, items, .. } = &decl.node {
+            for item in items {
+                if let ast::TraitItem::Method { name: mn, .. } = item {
+                    if mn == name {
+                        owning_trait = Some(tn.clone());
+                    }
+                }
+            }
+        }
+    }
+    let trait_name = owning_trait?;
+    let mut providing: Vec<String> = Vec::new();
+    for decl in &module.decls {
+        if let DeclKind::Impl { trait_name: tn, args, items, .. } = &decl.node {
+            if tn != &trait_name {
+                continue;
+            }
+            let provides = items.iter().any(|i| {
+                matches!(i, ast::ImplItem::Method { name: n, .. } if n == name)
+            });
+            if !provides {
+                continue;
+            }
+            let label = args
+                .iter()
+                .map(|a| format_type_kind(&a.node))
+                .collect::<Vec<_>>()
+                .join(" ");
+            providing.push(label);
+        }
+    }
+    if providing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "*Method of `{trait_name}`* — impls: {}",
+        providing
+            .iter()
+            .map(|t| format!("`{t}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+/// If `name` resolves to a function with declared trait constraints in
+/// `module`, render the constraint list. Returns `None` when no such
+/// function exists or it has no constraints.
+fn function_constraint_summary(module: &Module, name: &str) -> Option<String> {
+    for decl in &module.decls {
+        if let DeclKind::Fun { name: n, ty: Some(scheme), .. } = &decl.node {
+            if n == name && !scheme.constraints.is_empty() {
+                let cs: Vec<String> = scheme
+                    .constraints
+                    .iter()
+                    .map(|c| {
+                        let args: Vec<String> = c
+                            .args
+                            .iter()
+                            .map(|t| format_type_kind(&t.node))
+                            .collect();
+                        format!("`{} {}`", c.trait_name, args.join(" "))
+                    })
+                    .collect();
+                return Some(format!("*Constraints:* {}", cs.join(", ")));
+            }
+        }
+    }
+    None
 }
 
 /// If `name` resolves to a trait method with a default body in `module`,

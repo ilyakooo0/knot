@@ -321,7 +321,9 @@ pub(crate) fn handle_code_action(
                 if diag_end > diag_start && diag_end <= doc.source.len() {
                     let snippet = doc.source[diag_start..diag_end].trim();
                     if !snippet.is_empty() {
-                        for wrap in detect_wrap_suggestions(&expected, &found) {
+                        let refined_names: HashSet<&str> =
+                            doc.refined_types.keys().map(String::as_str).collect();
+                        for wrap in detect_wrap_suggestions(&expected, &found, &refined_names) {
                             let mut changes = HashMap::new();
                             let wrapped = wrap.format_wrapping(snippet);
                             changes.insert(
@@ -1809,8 +1811,14 @@ fn parse_type_mismatch(msg: &str) -> Option<(String, String)> {
 
 /// Decide which wrap suggestions apply for a given expected/found pair.
 /// Returns up to a handful of templates whose `{}` placeholder should be
-/// substituted with the offending expression.
-fn detect_wrap_suggestions(expected: &str, found: &str) -> Vec<WrapSuggestion> {
+/// substituted with the offending expression. `refined_names` is the set of
+/// refined-type aliases visible in the current document — used to suggest
+/// `refine` wrapping for `expected: RefinedAlias, found: BaseType` mismatches.
+fn detect_wrap_suggestions(
+    expected: &str,
+    found: &str,
+    refined_names: &HashSet<&str>,
+) -> Vec<WrapSuggestion> {
     let mut out = Vec::new();
     // `expected Maybe T, found T` → wrap in Just
     if let Some(inner) = expected.strip_prefix("Maybe ") {
@@ -1842,6 +1850,18 @@ fn detect_wrap_suggestions(expected: &str, found: &str) -> Vec<WrapSuggestion> {
                 });
             }
         }
+    }
+    // `expected RefinedAlias, found BaseType` → suggest `refine`. Refined
+    // aliases stay nominal in inference; the only way to lift a value into
+    // the refined type is through `refine expr`, which yields a
+    // `Result RefinementError T` the user must unwrap. Surface this as a
+    // wrapping action so the user can opt in to the runtime check.
+    let expected_t = expected.trim();
+    if refined_names.contains(expected_t) {
+        out.push(WrapSuggestion {
+            title: format!("Refine into `{expected_t}` (returns `Result`)"),
+            template: "refine ({})".to_string(),
+        });
     }
     // `expected IO {…} T, found T` → wrap in pure-IO via `\_ -> ...`. We
     // don't know if the user wants the side-effect, so this is best left to
@@ -2946,7 +2966,8 @@ mod tests {
 
     #[test]
     fn detect_wrap_suggestions_offers_just_for_maybe() {
-        let suggestions = detect_wrap_suggestions("Maybe Int", "Int");
+        let empty: HashSet<&str> = HashSet::new();
+        let suggestions = detect_wrap_suggestions("Maybe Int", "Int", &empty);
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].title, "Wrap in `Just`");
         assert_eq!(suggestions[0].format_wrapping("5"), "Just {value: 5}");
@@ -2958,14 +2979,31 @@ mod tests {
 
     #[test]
     fn detect_wrap_suggestions_offers_ok_for_result() {
-        let suggestions = detect_wrap_suggestions("Result Text Int", "Int");
+        let empty: HashSet<&str> = HashSet::new();
+        let suggestions = detect_wrap_suggestions("Result Text Int", "Int", &empty);
         assert!(suggestions.iter().any(|s| s.title == "Wrap in `Ok`"));
     }
 
     #[test]
     fn detect_wrap_suggestions_no_match_when_unrelated() {
-        let suggestions = detect_wrap_suggestions("Text", "Int");
+        let empty: HashSet<&str> = HashSet::new();
+        let suggestions = detect_wrap_suggestions("Text", "Int", &empty);
         assert!(suggestions.is_empty());
+    }
+
+    #[test]
+    fn detect_wrap_suggestions_offers_refine_for_refined_alias() {
+        let mut refined: HashSet<&str> = HashSet::new();
+        refined.insert("Nat");
+        let suggestions = detect_wrap_suggestions("Nat", "Int", &refined);
+        assert!(
+            suggestions.iter().any(|s| s.title.starts_with("Refine into")),
+            "expected refine suggestion; got: {:?}",
+            suggestions
+                .iter()
+                .map(|s| s.title.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

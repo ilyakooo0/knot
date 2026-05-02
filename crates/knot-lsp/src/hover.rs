@@ -312,6 +312,35 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
         value.push_str(&impls_section);
     }
 
+    // Trait method hover: when the cursor lands on a method declared inside a
+    // `trait` block, surface the list of impls that override it (and the impls
+    // that fall back to a default body, when the method has one). The trait
+    // dispatch code lens shows the same data, but a hover on the method name
+    // is the most natural place for it too.
+    if let Some(method_section) = trait_method_dispatch_section(state, word) {
+        value.push_str("\n\n");
+        value.push_str(&method_section);
+    }
+
+    // Route hover (on the route declaration's name): list all of its
+    // constructor entries with method+path. Hovering on a single constructor
+    // already shows that one entry; this gives the bird's-eye view when the
+    // user hovers on the route name.
+    if let Some(route_summary) = route_decl_section(&doc.module, word) {
+        value.push_str("\n\n");
+        value.push_str(&route_summary);
+    }
+
+    // Unit-annotated types: surface the canonical unit form and the unit
+    // conversion functions so users can spot dimensionality at a glance and
+    // know how to drop into / out of unit-tagged numeric flows.
+    if let Some(ref ty) = type_for_refinement_scan {
+        if let Some(section) = unit_aware_section(ty) {
+            value.push_str("\n\n");
+            value.push_str(&section);
+        }
+    }
+
     // Constructor → parent type: hovering on a constructor surfaces the parent
     // data type and a link-style listing of sibling constructors.
     if let Some(ctor_section) = constructor_parent_section(&doc.module, word) {
@@ -366,6 +395,138 @@ fn trait_impls_section(state: &ServerState, name: &str) -> Option<String> {
     for (_, args) in impls {
         out.push_str(&format!("\n- `impl {name} {args}`"));
     }
+    Some(out)
+}
+
+/// If `name` is a method declared in any open trait, render the list of impls
+/// that supply it explicitly plus those that inherit the default body.
+fn trait_method_dispatch_section(state: &ServerState, name: &str) -> Option<String> {
+    let mut owning_trait: Option<(String, bool)> = None; // (trait_name, has_default)
+    for doc in state.documents.values() {
+        for decl in &doc.module.decls {
+            if let DeclKind::Trait { name: tn, items, .. } = &decl.node {
+                for item in items {
+                    if let knot::ast::TraitItem::Method {
+                        name: method_name,
+                        default_body,
+                        ..
+                    } = item
+                    {
+                        if method_name == name {
+                            owning_trait = Some((tn.clone(), default_body.is_some()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let (trait_name, has_default) = owning_trait?;
+
+    let mut providing: Vec<String> = Vec::new();
+    let mut defaulted: Vec<String> = Vec::new();
+    for doc in state.documents.values() {
+        for decl in &doc.module.decls {
+            if let DeclKind::Impl {
+                trait_name: tn,
+                args,
+                items,
+                ..
+            } = &decl.node
+            {
+                if tn != &trait_name {
+                    continue;
+                }
+                let arg_label = args
+                    .iter()
+                    .map(|a| format_type_kind(&a.node))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let provides = items.iter().any(|i| {
+                    matches!(i, knot::ast::ImplItem::Method { name: n, .. } if n == name)
+                });
+                if provides {
+                    providing.push(arg_label);
+                } else if has_default {
+                    defaulted.push(arg_label);
+                }
+            }
+        }
+    }
+    if providing.is_empty() && defaulted.is_empty() {
+        return None;
+    }
+    let mut out = format!("**Method `{name}` of `{trait_name}`** dispatches to:");
+    if !providing.is_empty() {
+        out.push_str("\n\n");
+        for ty in &providing {
+            out.push_str(&format!("- `{ty}` (explicit impl)\n"));
+        }
+    }
+    if !defaulted.is_empty() {
+        out.push_str("\n");
+        for ty in &defaulted {
+            out.push_str(&format!("- `{ty}` (uses default body)\n"));
+        }
+    }
+    Some(out.trim_end().to_string())
+}
+
+/// If `name` is a `route` declaration's name in this module, render a summary
+/// of all constructor entries (method + path) the route declares.
+fn route_decl_section(module: &knot::ast::Module, name: &str) -> Option<String> {
+    use crate::shared::{format_route_path, http_method_str};
+    for decl in &module.decls {
+        if let DeclKind::Route { name: rn, entries, .. } = &decl.node {
+            if rn != name {
+                continue;
+            }
+            if entries.is_empty() {
+                return None;
+            }
+            let mut out = format!("**Route `{name}`** entries:");
+            for entry in entries {
+                let method = http_method_str(entry.method);
+                let path = format_route_path(entry);
+                out.push_str(&format!(
+                    "\n- `{method} {path}` → `{}`",
+                    entry.constructor
+                ));
+            }
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// Render unit-aware information when the formatted type carries a `<unit>`
+/// annotation. Walks the parsed type to find any unit on the value (or the
+/// function's return type) and surfaces the conversion idioms so users know
+/// how to bridge into unitless arithmetic.
+fn unit_aware_section(ty: &str) -> Option<String> {
+    let parsed = crate::parsed_type::ParsedType::parse(ty);
+    // Pull the value type out of an outer function or IO wrapper so we can
+    // see units on the result, not on parameters.
+    let value = match &parsed {
+        crate::parsed_type::ParsedType::Function(_, ret) => ret.strip_io(),
+        other => other.strip_io(),
+    };
+    let unit = value.unit()?;
+    let unit_str = unit.trim();
+    // Distinguish Int from Float here — the runtime exposes two pairs of
+    // conversion helpers and the user has to pick the right one.
+    let is_float = match value {
+        crate::parsed_type::ParsedType::Named(name, _) => name == "Float",
+        _ => ty.contains("Float"),
+    };
+    let (strip, with) = if is_float {
+        ("stripFloatUnit", "withFloatUnit")
+    } else {
+        ("stripUnit", "withUnit")
+    };
+    let mut out = format!("**Units:** `<{unit_str}>`");
+    out.push_str(&format!(
+        "  \n*Drop unit:* `{strip} v` — get the unitless number  \n*Re-tag:* `{with} v` — re-attach the inferred unit"
+    ));
     Some(out)
 }
 

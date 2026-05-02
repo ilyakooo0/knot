@@ -104,10 +104,29 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                     },
                 });
             }
-            DeclKind::TypeAlias { name, .. } => {
+            DeclKind::TypeAlias { name, ty, .. } => {
+                // Refined type aliases (`type Nat = Int where \x -> ...`) carry
+                // their predicate in the AST. Surface it in the outline so the
+                // user can scan for refined types without opening each one.
+                let detail = match &ty.node {
+                    ast::TypeKind::Refined { base, predicate } => {
+                        let base_str = format_type_kind(&base.node);
+                        let pred_src = predicate
+                            .span
+                            .start
+                            .checked_add(0)
+                            .and_then(|_| {
+                                doc.source.get(predicate.span.start..predicate.span.end)
+                            })
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or_else(|| "…".into());
+                        Some(format!("refined {base_str} where {pred_src}"))
+                    }
+                    _ => Some(format_type_kind(&ty.node)),
+                };
                 symbols.push(DocumentSymbol {
                     name: name.clone(),
-                    detail: None,
+                    detail,
                     kind: SymbolKind::TYPE_PARAMETER,
                     tags: None,
                     deprecated: None,

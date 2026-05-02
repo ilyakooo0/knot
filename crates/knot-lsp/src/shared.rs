@@ -646,7 +646,14 @@ pub(crate) fn extract_record_fields(type_str: &str) -> Vec<String> {
 /// Extract parameter names from a function declaration's body.
 /// Returns an empty Vec if the function isn't directly a lambda chain or
 /// trait/impl method. Used by signature_help and parameter-name inlay hints.
+///
+/// For trait methods, prefers the trait declaration's `default_params` (the
+/// names the trait author chose, which match the user's mental model of the
+/// API). When the trait method has no default body, falls back to scanning
+/// impl methods — those carry meaningful names that are still better than
+/// the synthesized `a`/`b`/`c` fallback.
 pub(crate) fn extract_param_names(module: &Module, func_name: &str) -> Vec<String> {
+    let mut from_impl: Option<Vec<String>> = None;
     for decl in &module.decls {
         match &decl.node {
             DeclKind::Fun {
@@ -664,7 +671,7 @@ pub(crate) fn extract_param_names(module: &Module, func_name: &str) -> Vec<Strin
                         ..
                     } = item
                     {
-                        if name == func_name {
+                        if name == func_name && !default_params.is_empty() {
                             return default_params
                                 .iter()
                                 .map(|p| pat_to_simple_name(&p.node))
@@ -676,11 +683,13 @@ pub(crate) fn extract_param_names(module: &Module, func_name: &str) -> Vec<Strin
             DeclKind::Impl { items, .. } => {
                 for item in items {
                     if let ast::ImplItem::Method { name, params, .. } = item {
-                        if name == func_name {
-                            return params
-                                .iter()
-                                .map(|p| pat_to_simple_name(&p.node))
-                                .collect();
+                        if name == func_name && from_impl.is_none() {
+                            from_impl = Some(
+                                params
+                                    .iter()
+                                    .map(|p| pat_to_simple_name(&p.node))
+                                    .collect(),
+                            );
                         }
                     }
                 }
@@ -688,7 +697,7 @@ pub(crate) fn extract_param_names(module: &Module, func_name: &str) -> Vec<Strin
             _ => {}
         }
     }
-    Vec::new()
+    from_impl.unwrap_or_default()
 }
 
 /// Walk a chain of nested lambdas (`\a -> \b -> body`) and collect param names.

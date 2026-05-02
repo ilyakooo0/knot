@@ -55,18 +55,12 @@ pub struct InferenceSnapshot {
 
 pub type InferenceCache = HashMap<(PathBuf, u64), InferenceSnapshot>;
 
-/// Secondary index into the inference cache keyed on the module's structure
-/// hash rather than its raw content hash. Lets the analysis pipeline skip
-/// re-inference for whitespace- and comment-only edits where the AST shape
-/// is unchanged. The mapped value is a content hash that points back into
-/// the primary `InferenceCache`.
-///
-/// Reserved for the per-path index optimization: the current implementation
-/// scans cache entries linearly, which is fine while `MAX_INFERENCE_CACHE_ENTRIES`
-/// stays small. When that bound grows, switch the fingerprint lookup to use
-/// this index instead.
-#[allow(dead_code)]
-pub type FingerprintIndex = HashMap<(PathBuf, u64), u64>;
+// The structural-fingerprint lookup currently linear-scans `InferenceCache`,
+// which is fine while `MAX_INFERENCE_CACHE_ENTRIES` stays at 128. A keyed
+// secondary index `HashMap<(PathBuf, structure_hash), content_hash>` would
+// turn that into O(1), but at this size it's pure overhead — the index also
+// has to be maintained on every insert/evict. Wire one up if profiling ever
+// shows the linear scan is a bottleneck.
 
 // ── Per-document analysis state ─────────────────────────────────────
 

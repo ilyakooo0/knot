@@ -26,14 +26,24 @@ pub(crate) fn build_workspace_symbol_entries(
 ) -> Vec<WorkspaceSymbolEntry> {
     let mut out = Vec::new();
     for decl in &module.decls {
-        let (name, kind) = match &decl.node {
-            DeclKind::Data { name, .. } => (name.clone(), SymbolKind::STRUCT),
-            DeclKind::TypeAlias { name, .. } => (name.clone(), SymbolKind::TYPE_PARAMETER),
-            DeclKind::Source { name, .. } => (format!("*{name}"), SymbolKind::VARIABLE),
-            DeclKind::View { name, .. } => (format!("*{name}"), SymbolKind::VARIABLE),
-            DeclKind::Derived { name, .. } => (format!("&{name}"), SymbolKind::VARIABLE),
-            DeclKind::Fun { name, .. } => (name.clone(), SymbolKind::FUNCTION),
-            DeclKind::Trait { name, .. } => (name.clone(), SymbolKind::INTERFACE),
+        let (name, kind, container) = match &decl.node {
+            DeclKind::Data { name, .. } => (name.clone(), SymbolKind::STRUCT, None),
+            DeclKind::TypeAlias { name, ty, .. } => {
+                // Refined types: surface `where` predicate in the container so
+                // the workspace symbol picker shows it inline.
+                let container = match &ty.node {
+                    knot::ast::TypeKind::Refined { predicate, .. } => source
+                        .get(predicate.span.start..predicate.span.end)
+                        .map(|s| format!("refined where {}", s.trim())),
+                    _ => None,
+                };
+                (name.clone(), SymbolKind::TYPE_PARAMETER, container)
+            }
+            DeclKind::Source { name, .. } => (format!("*{name}"), SymbolKind::VARIABLE, None),
+            DeclKind::View { name, .. } => (format!("*{name}"), SymbolKind::VARIABLE, None),
+            DeclKind::Derived { name, .. } => (format!("&{name}"), SymbolKind::VARIABLE, None),
+            DeclKind::Fun { name, .. } => (name.clone(), SymbolKind::FUNCTION, None),
+            DeclKind::Trait { name, .. } => (name.clone(), SymbolKind::INTERFACE, None),
             DeclKind::Impl {
                 trait_name, args, ..
             } => {
@@ -45,10 +55,11 @@ pub(crate) fn build_workspace_symbol_entries(
                 (
                     format!("impl {trait_name} {args_str}"),
                     SymbolKind::OBJECT,
+                    None,
                 )
             }
             DeclKind::Route { name, .. } | DeclKind::RouteComposite { name, .. } => {
-                (format!("route {name}"), SymbolKind::MODULE)
+                (format!("route {name}"), SymbolKind::MODULE, None)
             }
             _ => continue,
         };
@@ -57,7 +68,7 @@ pub(crate) fn build_workspace_symbol_entries(
             kind,
             uri: uri.clone(),
             range: span_to_range(decl.span, source),
-            container: None,
+            container,
         });
     }
     out

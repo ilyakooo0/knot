@@ -251,9 +251,12 @@ impl<'a> TokenCollector<'a> {
 
     fn visit_decl(&mut self, decl: &ast::Decl) {
         match &decl.node {
-            DeclKind::Fun { name, body, .. } => {
+            DeclKind::Fun { name, body, ty, .. } => {
                 if let Some(s) = find_word_in_source(self.source, name, decl.span.start, decl.span.start + name.len() + 20) {
                     self.add(s, TOK_FUNCTION, MOD_DECLARATION);
+                }
+                if let Some(scheme) = ty {
+                    self.visit_type(&scheme.ty);
                 }
                 if let Some(body) = body {
                     self.visit_expr(body);
@@ -269,12 +272,23 @@ impl<'a> TokenCollector<'a> {
                     if let Some(s) = find_word_in_source(self.source, &ctor.name, decl.span.start, decl.span.end) {
                         self.add(s, TOK_ENUM_MEMBER, MOD_DECLARATION);
                     }
+                    for f in &ctor.fields {
+                        self.visit_type(&f.value);
+                    }
                 }
             }
-            DeclKind::Source { name, .. } => {
+            DeclKind::TypeAlias { ty, .. } => {
+                // Refined-type aliases (`type Nat = Int where \x -> x >= 0`)
+                // contain expression-bodied predicates; walk the type so the
+                // predicate's tokens get highlighted alongside the rest of
+                // the file.
+                self.visit_type(ty);
+            }
+            DeclKind::Source { name, ty, .. } => {
                 if let Some(s) = find_word_in_source(self.source, name, decl.span.start, decl.span.end) {
                     self.add(s, TOK_NAMESPACE, MOD_DECLARATION);
                 }
+                self.visit_type(ty);
             }
             DeclKind::View { name, body, .. } => {
                 if let Some(s) = find_word_in_source(self.source, name, decl.span.start, decl.span.end) {
@@ -446,6 +460,49 @@ impl<'a> TokenCollector<'a> {
             }
             ast::ExprKind::Annot { expr: inner, .. } => {
                 self.visit_expr(inner);
+            }
+            _ => {}
+        }
+    }
+
+    /// Walk a type expression and emit semantic tokens for refined-type
+    /// predicate bodies. Refined predicates are arbitrary `Expr`s, so the
+    /// existing expression visitor handles them; this method just locates
+    /// and recurses through the type AST to find each `Refined` node.
+    fn visit_type(&mut self, ty: &ast::Type) {
+        match &ty.node {
+            ast::TypeKind::Refined { base, predicate } => {
+                self.visit_type(base);
+                self.visit_expr(predicate);
+            }
+            ast::TypeKind::Record { fields, .. } => {
+                for f in fields {
+                    self.visit_type(&f.value);
+                }
+            }
+            ast::TypeKind::Variant { constructors, .. } => {
+                for ctor in constructors {
+                    for f in &ctor.fields {
+                        self.visit_type(&f.value);
+                    }
+                }
+            }
+            ast::TypeKind::Relation(inner) | ast::TypeKind::Forall { ty: inner, .. } => {
+                self.visit_type(inner);
+            }
+            ast::TypeKind::App { func, arg } => {
+                self.visit_type(func);
+                self.visit_type(arg);
+            }
+            ast::TypeKind::Function { param, result } => {
+                self.visit_type(param);
+                self.visit_type(result);
+            }
+            ast::TypeKind::IO { ty: inner, .. } | ast::TypeKind::Effectful { ty: inner, .. } => {
+                self.visit_type(inner);
+            }
+            ast::TypeKind::UnitAnnotated { base, .. } => {
+                self.visit_type(base);
             }
             _ => {}
         }

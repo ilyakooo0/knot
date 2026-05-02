@@ -84,7 +84,11 @@ fn collect_folding_ranges_expr(expr: &ast::Expr, source: &str, ranges: &mut Vec<
     let range = span_to_range(expr.span, source);
 
     match &expr.node {
-        ast::ExprKind::Do(_) | ast::ExprKind::Case { .. } => {
+        ast::ExprKind::Do(_)
+        | ast::ExprKind::Case { .. }
+        | ast::ExprKind::Lambda { .. }
+        | ast::ExprKind::Atomic { .. }
+        | ast::ExprKind::Record(_) => {
             if range.end.line > range.start.line {
                 ranges.push(FoldingRange {
                     start_line: range.start.line,

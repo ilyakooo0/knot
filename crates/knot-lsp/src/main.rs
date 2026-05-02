@@ -80,7 +80,9 @@ use crate::type_hierarchy::{
     handle_type_hierarchy_supertypes,
 };
 use crate::utils::{offset_to_position, position_to_offset, uri_to_path};
-use crate::workspace_diagnostics::{handle_workspace_diagnostics, prune_stale_workspace_diag_cache};
+use crate::workspace_diagnostics::{
+    handle_document_diagnostics, handle_workspace_diagnostics, prune_stale_workspace_diag_cache,
+};
 use crate::workspace_symbol::handle_workspace_symbol;
 
 // ── Entry point ─────────────────────────────────────────────────────
@@ -266,6 +268,7 @@ fn main() {
         semantic_token_cache: HashMap::new(),
         semantic_token_counter: 0,
         published_diag_hashes: HashMap::new(),
+        published_lsp_diagnostics: HashMap::new(),
     };
 
     // Register for file watcher notifications (.knot files). Build the
@@ -560,13 +563,16 @@ fn apply_analysis_result(state: &mut ServerState, conn: &Connection, result: Ana
 
         // Selective dependent re-analysis: when a file changes, only
         // re-queue downstream files whose `import_defs` actually reference
-        // a changed decl name. Without this, every keystroke on a popular
-        // utility module re-analyzes its entire dependency closure even
-        // when the user is just editing a function body that no consumer
-        // depends on directly.
+        // a *signature-changed* decl name. Body-only edits to a typed
+        // function don't move its outward-facing type, so dependents of
+        // that name don't need a fresh inference pass — the broader
+        // `changed_decl_names` set is used in-file for telemetry only.
+        // Without this filter, every keystroke on a popular utility module
+        // re-analyzes its entire dependency closure even when the user is
+        // just editing a function body that no consumer depends on directly.
         let changed: HashSet<&str> = result
             .doc
-            .changed_decl_names
+            .signature_changed_decl_names
             .iter()
             .map(|s| s.as_str())
             .collect();
@@ -741,6 +747,9 @@ fn handle_request(state: &mut ServerState, conn: &Connection, req: Request) {
     } else if let Some(params) = cast_request::<request::LinkedEditingRange>(&req) {
         let result = handle_linked_editing_range(state, &params);
         send_response(conn, id, result);
+    } else if let Some(params) = cast_request::<request::DocumentDiagnosticRequest>(&req) {
+        let result = handle_document_diagnostics(state, &params);
+        send_response(conn, id, result);
     } else if let Some(params) = cast_request::<request::WorkspaceDiagnosticRequest>(&req) {
         let result = handle_workspace_diagnostics(state, &params);
         send_response(conn, id, result);
@@ -819,13 +828,93 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
             .map(|p| p.source.clone())
             .or_else(|| state.documents.get(&uri).map(|d| d.source.clone()))
             .unwrap_or_default();
+
+        // Rebase any cached LSP diagnostics through the incoming edits so
+        // their ranges keep tracking the document while the analysis worker
+        // catches up. Without this, the editor renders stale line/character
+        // positions from the last analysis run, and the diagnostics appear
+        // to drift after every keystroke. We shift in byte-offset space (the
+        // diagnostics' line/character ranges convert to byte offsets in the
+        // *current* source, then move with each edit), and finally render
+        // them back to LSP positions against the post-edit source.
+        let cached_diags = state.published_lsp_diagnostics.get(&uri).cloned();
+        // Convert each diagnostic's `Range` (and any related-info ranges that
+        // happen to live in this same file) to byte offsets up front. After
+        // each edit the offsets are adjusted in place; ranges that overlap
+        // an edit are tagged with `usize::MAX` and dropped at the end.
+        let mut diag_byte_ranges: Option<Vec<(usize, usize)>> = cached_diags
+            .as_ref()
+            .map(|ds| {
+                ds.iter()
+                    .map(|d| (
+                        position_to_offset(&source, d.range.start),
+                        position_to_offset(&source, d.range.end),
+                    ))
+                    .collect()
+            });
+
         for change in params.content_changes {
             if let Some(range) = change.range {
                 let start = position_to_offset(&source, range.start);
                 let end = position_to_offset(&source, range.end);
+                let new_len = change.text.len();
+                if let Some(diag_ranges) = diag_byte_ranges.as_mut() {
+                    shift_byte_ranges_for_edit(diag_ranges, start, end, new_len);
+                }
                 source.replace_range(start..end, &change.text);
             } else {
                 source = change.text;
+                // Full replace invalidates every cached range — the document
+                // structure no longer relates to the prior analysis output.
+                if let Some(diag_ranges) = diag_byte_ranges.as_mut() {
+                    for r in diag_ranges {
+                        *r = (usize::MAX, usize::MAX);
+                    }
+                }
+            }
+        }
+
+        // Republish rebased diagnostics with the new version. The editor sees
+        // up-to-date positions immediately; the next analysis push will
+        // either confirm them or replace them with fresh ones.
+        if let (Some(cached), Some(byte_ranges)) = (cached_diags, diag_byte_ranges.as_ref()) {
+            let rebased: Vec<lsp_types::Diagnostic> = cached
+                .iter()
+                .zip(byte_ranges.iter())
+                .filter_map(|(d, &(s, e))| {
+                    if s == usize::MAX || e > source.len() {
+                        return None;
+                    }
+                    let mut shifted = d.clone();
+                    shifted.range = lsp_types::Range {
+                        start: offset_to_position(&source, s),
+                        end: offset_to_position(&source, e),
+                    };
+                    Some(shifted)
+                })
+                .collect();
+            // Skip the LSP roundtrip when nothing actually moved — first
+            // didChange after a publish typically happens before any cached
+            // diagnostic's position drifted.
+            if rebased != cached {
+                let params = lsp_types::PublishDiagnosticsParams::new(
+                    uri.clone(),
+                    rebased.clone(),
+                    version,
+                );
+                let not = Notification::new(
+                    lsp_types::notification::PublishDiagnostics::METHOD.into(),
+                    params,
+                );
+                if let Err(e) = conn.sender.send(Message::Notification(not)) {
+                    eprintln!("knot-lsp: failed to publish rebased diagnostics: {e}");
+                }
+                state
+                    .published_lsp_diagnostics
+                    .insert(uri.clone(), rebased);
+                // The hash dedup uses range positions, so drop the cached
+                // hash — the next real analysis publish must go through.
+                state.published_diag_hashes.remove(&uri);
             }
         }
 
@@ -946,6 +1035,9 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
         // republishing, leaving the editor with the empty diagnostics we just
         // sent below.
         state.published_diag_hashes.remove(&params.text_document.uri);
+        state
+            .published_lsp_diagnostics
+            .remove(&params.text_document.uri);
         let diags = PublishDiagnosticsParams::new(params.text_document.uri, vec![], None);
         let not = Notification::new(notification::PublishDiagnostics::METHOD.into(), diags);
         if let Err(e) = conn.sender.send(Message::Notification(not)) {
@@ -1032,9 +1124,19 @@ fn publish_diagnostics_dedup(
     }
     let new_hash = hasher.finish();
     if state.published_diag_hashes.get(uri).copied() == Some(new_hash) {
+        // Even on a hash hit, refresh the cached diagnostics list so the
+        // didChange rebase logic always works against the freshest known
+        // ranges. The hash key only covers fields that affect rendering;
+        // shifted ranges from a prior didChange wouldn't change the hash.
+        state
+            .published_lsp_diagnostics
+            .insert(uri.clone(), lsp_diags);
         return;
     }
     state.published_diag_hashes.insert(uri.clone(), new_hash);
+    state
+        .published_lsp_diagnostics
+        .insert(uri.clone(), lsp_diags.clone());
     let params = lsp_types::PublishDiagnosticsParams::new(uri.clone(), lsp_diags, version);
     let not = Notification::new(
         lsp_types::notification::PublishDiagnostics::METHOD.into(),
@@ -1042,6 +1144,48 @@ fn publish_diagnostics_dedup(
     );
     if let Err(e) = conn.sender.send(Message::Notification(not)) {
         eprintln!("knot-lsp: failed to publish diagnostics: {e}");
+    }
+}
+
+/// Shift the cached diagnostic byte-ranges through a single edit. The edit
+/// replaces `[edit_start, edit_end)` with `new_len` bytes of new text. For
+/// each cached range:
+///
+/// - Fully before the edit (`r.end <= edit_start`): unchanged.
+/// - Fully after the edit (`r.start >= edit_end`): shifted by `new_len -
+///   (edit_end - edit_start)`.
+/// - Overlapping the edit: marked with `usize::MAX` so the caller drops it.
+///   The diagnostic's content is no longer aligned with valid bytes — better
+///   to hide it until the next analysis pass.
+fn shift_byte_ranges_for_edit(
+    ranges: &mut [(usize, usize)],
+    edit_start: usize,
+    edit_end: usize,
+    new_len: usize,
+) {
+    let removed = edit_end - edit_start;
+    // Compute the shift in signed terms so insertions and deletions both work.
+    // Sentinel ranges (usize::MAX) propagate untouched.
+    let new_len_i = new_len as isize;
+    let removed_i = removed as isize;
+    for r in ranges {
+        if r.0 == usize::MAX {
+            continue;
+        }
+        if r.1 <= edit_start {
+            // Range fully before the edit: nothing to shift.
+            continue;
+        }
+        if r.0 >= edit_end {
+            // Range fully after the edit: shift both endpoints.
+            let delta = new_len_i - removed_i;
+            r.0 = (r.0 as isize + delta).max(0) as usize;
+            r.1 = (r.1 as isize + delta).max(0) as usize;
+            continue;
+        }
+        // Overlap — invalidate. The diagnostic's anchored content has been
+        // partially replaced, so any shifted position would be misleading.
+        *r = (usize::MAX, usize::MAX);
     }
 }
 
@@ -1081,5 +1225,69 @@ fn invalidate_workspace_diag_cache_for(state: &mut ServerState, changed: &HashSe
     state
         .workspace_diag_cache
         .retain(|path, _| !affected.contains(path));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Insertion before every cached range pushes them all forward by the
+    /// inserted byte count.
+    #[test]
+    fn shift_byte_ranges_insertion_before() {
+        let mut ranges = vec![(10, 14), (20, 25)];
+        // Insert 3 bytes at offset 5 (replace 0 bytes).
+        shift_byte_ranges_for_edit(&mut ranges, 5, 5, 3);
+        assert_eq!(ranges, vec![(13, 17), (23, 28)]);
+    }
+
+    /// An edit ending at exactly a range's start should not shift it (the
+    /// range still begins at its same byte content; new text was inserted
+    /// strictly before).
+    #[test]
+    fn shift_byte_ranges_insertion_at_start_boundary_shifts() {
+        let mut ranges = vec![(10, 14)];
+        shift_byte_ranges_for_edit(&mut ranges, 10, 10, 4);
+        // Range starts AT edit_end, so it shifts.
+        assert_eq!(ranges, vec![(14, 18)]);
+    }
+
+    /// Deletion before a range pulls it back.
+    #[test]
+    fn shift_byte_ranges_deletion_before() {
+        let mut ranges = vec![(20, 25)];
+        // Delete 3 bytes (replace [5, 8) with empty).
+        shift_byte_ranges_for_edit(&mut ranges, 5, 8, 0);
+        assert_eq!(ranges, vec![(17, 22)]);
+    }
+
+    /// Edits fully after a range leave it alone.
+    #[test]
+    fn shift_byte_ranges_edit_after_range_leaves_it_alone() {
+        let mut ranges = vec![(2, 5)];
+        shift_byte_ranges_for_edit(&mut ranges, 10, 12, 5);
+        assert_eq!(ranges, vec![(2, 5)]);
+    }
+
+    /// Edits overlapping a range invalidate it.
+    #[test]
+    fn shift_byte_ranges_overlap_invalidates() {
+        let mut ranges = vec![(10, 20), (30, 40)];
+        // Replace [15, 35) — overlaps both ranges.
+        shift_byte_ranges_for_edit(&mut ranges, 15, 35, 5);
+        assert_eq!(ranges, vec![(usize::MAX, usize::MAX), (usize::MAX, usize::MAX)]);
+    }
+
+    /// A previously invalidated range stays invalid through subsequent edits.
+    #[test]
+    fn shift_byte_ranges_invalidated_stays_invalidated() {
+        let mut ranges = vec![(usize::MAX, usize::MAX), (50, 60)];
+        shift_byte_ranges_for_edit(&mut ranges, 0, 0, 10);
+        assert_eq!(
+            ranges,
+            vec![(usize::MAX, usize::MAX), (60, 70)],
+            "sentinel must not be shifted; live range moves by +10"
+        );
+    }
 }
 

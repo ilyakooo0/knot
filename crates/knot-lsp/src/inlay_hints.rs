@@ -44,13 +44,20 @@ pub(crate) fn handle_inlay_hint(
                     // Text edit emits the signature as a separate statement above the
                     // function, so anchor it at the declaration start, not at the hint.
                     let edit_pos = offset_to_position(&doc.source, decl.span.start);
+                    // The signature inserted into source must include effects;
+                    // the inline hint label keeps to the type only, since the
+                    // tooltip already shows effects on demand.
+                    let full_sig = match doc.effect_sets.get(name) {
+                        Some(eff) => crate::shared::render_signature_with_effects(inferred, eff),
+                        None => inferred.clone(),
+                    };
                     hints.push(InlayHint {
                         position: hint_pos,
-                        label: InlayHintLabel::String(format!(": {inferred}")),
+                        label: InlayHintLabel::String(format!(": {full_sig}")),
                         kind: Some(InlayHintKind::TYPE),
                         text_edits: Some(vec![TextEdit {
                             range: Range { start: edit_pos, end: edit_pos },
-                            new_text: format!("{name} : {inferred}\n"),
+                            new_text: format!("{name} : {full_sig}\n"),
                         }]),
                         tooltip: doc.effect_info.get(name).map(|effects| {
                             InlayHintTooltip::String(format!("Effects: {effects}"))
@@ -92,9 +99,13 @@ pub(crate) fn handle_inlay_hint(
                     let name_end = decl_text.find('=').unwrap_or(decl_text.len());
                     let hint_offset = decl.span.start + name_end;
                     let hint_pos = offset_to_position(&doc.source, hint_offset);
+                    let full_sig = match doc.effect_sets.get(name) {
+                        Some(eff) => crate::shared::render_signature_with_effects(inferred, eff),
+                        None => inferred.clone(),
+                    };
                     hints.push(InlayHint {
                         position: hint_pos,
-                        label: InlayHintLabel::String(format!(": {inferred}")),
+                        label: InlayHintLabel::String(format!(": {full_sig}")),
                         kind: Some(InlayHintKind::TYPE),
                         text_edits: None,
                         tooltip: doc.effect_info.get(name).map(|e| {

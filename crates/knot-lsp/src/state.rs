@@ -114,10 +114,21 @@ pub struct DocumentState {
     /// Top-level decl names whose AST shape changed between this analysis
     /// and the previous one for the same file. Empty when no prior snapshot
     /// exists or the fingerprints matched (typical first analysis or
-    /// whitespace-only edits). Used by `apply_analysis_result` to skip
-    /// re-queuing dependents that don't import any of these names — the
-    /// previous-snapshot machinery already covers same-bytes cache hits.
+    /// whitespace-only edits). Used for the in-file dirty closure (telemetry
+    /// + future selective re-inference). Production code currently routes
+    /// dependent re-queue through `signature_changed_decl_names` (a strict
+    /// subset that excludes body-only changes to typed decls); this broader
+    /// field stays populated for tests and the planned in-file selective
+    /// inference pass.
+    #[allow(dead_code)]
     pub changed_decl_names: Vec<String>,
+    /// Strict subset of `changed_decl_names` containing only those decls
+    /// whose externally-visible signature moved. A typed `Fun` whose body
+    /// changed but whose signature is intact lands in `changed_decl_names`
+    /// but NOT here — its dependents needn't be re-analyzed because the
+    /// outward type is unchanged. Drives `apply_analysis_result`'s
+    /// cross-file dependent re-queue.
+    pub signature_changed_decl_names: Vec<String>,
     /// Transitive in-file closure of `changed_decl_names` — every decl whose
     /// inferred type or effects could conceivably have shifted since the
     /// previous analysis, accounting for the per-decl reverse-dependency
@@ -202,6 +213,13 @@ pub struct ServerState {
     /// fingerprint cache already reused the snapshot. Avoids gratuitous LSP
     /// traffic and editor re-renders. Pruned on document close.
     pub published_diag_hashes: HashMap<Uri, u64>,
+    /// Last LSP diagnostics published per URI, kept verbatim so didChange can
+    /// rebase their `Range` fields through pending edits and republish them
+    /// against the new document version. Without this, diagnostics' positions
+    /// drift while the analysis worker catches up — the editor still sees the
+    /// old line/character ranges even though the document has moved on.
+    /// Cleared on document close alongside `published_diag_hashes`.
+    pub published_lsp_diagnostics: HashMap<Uri, Vec<Diagnostic>>,
 }
 
 /// Symbol entry stored in the workspace symbol cache.
@@ -330,15 +348,260 @@ pub const KEYWORDS: &[&str] = &[
     "export",
 ];
 
-pub const SNIPPETS: &[(&str, &str, &str)] = &[
-    ("do", "do block", "do\n  ${1:x} <- ${2:expr}\n  yield {$3}"),
-    ("case", "case expression", "case ${1:expr} of\n  ${2:pattern} -> ${3:body}"),
-    ("lambda", "lambda expression", "\\\\${1:x} -> ${2:body}"),
-    ("if", "if expression", "if ${1:cond}\n  then ${2:a}\n  else ${3:b}"),
-    ("data", "data declaration", "data ${1:Name} = ${2:Ctor} {${3:field}: ${4:Type}}"),
-    ("source", "source declaration", "*${1:name} : [${2:Type}]"),
-    ("trait", "trait declaration", "trait ${1:Name} ${2:a} where\n  ${3:method} : ${4:Type}"),
-    ("impl", "impl block", "impl ${1:Trait} ${2:Type} where\n  ${3:method} ${4:x} = ${5:body}"),
+/// Context tag for a snippet — used by `handle_completion` to filter snippets
+/// to ones that make sense at the cursor. `Any` shows everywhere; `TopLevel`
+/// only shows at the start of a line outside any decl; `RouteBlock` only
+/// inside a `route Foo where` body, etc. This keeps the completion list
+/// focused: typing inside an expression doesn't surface a `route` snippet.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum SnippetContext {
+    /// Always show.
+    Any,
+    /// Only at module top level (start of line, no enclosing expression).
+    TopLevel,
+    /// Inside a function/view/derived body — i.e. expression position.
+    Expression,
+    /// Inside a `do { ... }` block (any monad).
+    DoBlock,
+    /// Inside an `atomic { ... }` block — IO is forbidden; only DB ops.
+    AtomicBlock,
+    /// Inside a `route Foo where` body — already gated by route_completions.
+    /// Listed for completeness; not currently filtered against.
+    RouteBlock,
+}
+
+pub const SNIPPETS: &[(&str, &str, &str, SnippetContext)] = &[
+    // ── Expression-position snippets ───────────────────────────────────
+    (
+        "do",
+        "do block",
+        "do\n  ${1:x} <- ${2:expr}\n  yield {$3}",
+        SnippetContext::Expression,
+    ),
+    (
+        "do-io",
+        "IO do block",
+        "do\n  ${1:x} <- ${2:readLine}\n  println $1",
+        SnippetContext::Expression,
+    ),
+    (
+        "do-where",
+        "do block with filter",
+        "do\n  ${1:x} <- *${2:source}\n  where ${3:cond}\n  yield $1",
+        SnippetContext::Expression,
+    ),
+    (
+        "do-let",
+        "do block with let binding",
+        "do\n  ${1:x} <- ${2:expr}\n  let ${3:y} = ${4:body}\n  yield $3",
+        SnippetContext::Expression,
+    ),
+    (
+        "do-group",
+        "do block grouped by key",
+        "do\n  ${1:x} <- *${2:source}\n  groupBy {${3:key}: $1.$3}\n  yield {$3: $1.$3, count: count $1}",
+        SnippetContext::Expression,
+    ),
+    (
+        "case",
+        "case expression",
+        "case ${1:expr} of\n  ${2:pattern} -> ${3:body}",
+        SnippetContext::Expression,
+    ),
+    (
+        "case-result",
+        "case for Result",
+        "case ${1:expr} of\n  Ok {value: ${2:x}} -> ${3:body}\n  Err {error: ${4:e}} -> ${5:body}",
+        SnippetContext::Expression,
+    ),
+    (
+        "case-maybe",
+        "case for Maybe",
+        "case ${1:expr} of\n  Just {value: ${2:x}} -> ${3:body}\n  Nothing {} -> ${4:body}",
+        SnippetContext::Expression,
+    ),
+    (
+        "case-bool",
+        "case for Bool",
+        "case ${1:expr} of\n  True {} -> ${2:body}\n  False {} -> ${3:body}",
+        SnippetContext::Expression,
+    ),
+    (
+        "lambda",
+        "lambda expression",
+        "\\\\${1:x} -> ${2:body}",
+        SnippetContext::Expression,
+    ),
+    (
+        "if",
+        "if expression",
+        "if ${1:cond}\n  then ${2:a}\n  else ${3:b}",
+        SnippetContext::Expression,
+    ),
+    (
+        "let",
+        "let binding (in do block)",
+        "let ${1:x} = ${2:expr}",
+        SnippetContext::DoBlock,
+    ),
+    (
+        "atomic",
+        "atomic block",
+        "atomic do\n  ${1:x} <- *${2:source}\n  ${3:body}",
+        SnippetContext::Expression,
+    ),
+    (
+        "refine",
+        "refine expression",
+        "case refine ${1:expr} of\n  Ok {value: ${2:x}} -> ${3:body}\n  Err {error: ${4:e}} -> ${5:body}",
+        SnippetContext::Expression,
+    ),
+    (
+        "fold",
+        "fold over a relation",
+        "fold (\\\\${1:acc} ${2:x} -> ${3:body}) ${4:init} ${5:rel}",
+        SnippetContext::Expression,
+    ),
+    (
+        "filter",
+        "filter a relation",
+        "filter (\\\\${1:x} -> ${2:cond}) ${3:rel}",
+        SnippetContext::Expression,
+    ),
+    (
+        "map",
+        "map a relation",
+        "map (\\\\${1:x} -> ${2:body}) ${3:rel}",
+        SnippetContext::Expression,
+    ),
+    // ── Top-level declaration snippets ─────────────────────────────────
+    (
+        "data",
+        "data declaration",
+        "data ${1:Name} = ${2:Ctor} {${3:field}: ${4:Type}}",
+        SnippetContext::TopLevel,
+    ),
+    (
+        "data-deriving",
+        "data declaration with deriving",
+        "data ${1:Name} = ${2:Ctor} {${3:field}: ${4:Type}} deriving (${5:Eq, Show})",
+        SnippetContext::TopLevel,
+    ),
+    (
+        "data-enum",
+        "data declaration (enum-style)",
+        "data ${1:Name} = ${2:A} | ${3:B} | ${4:C}",
+        SnippetContext::TopLevel,
+    ),
+    (
+        "type",
+        "type alias",
+        "type ${1:Name} = ${2:Type}",
+        SnippetContext::TopLevel,
+    ),
+    (
+        "type-refined",
+        "refined type alias",
+        "type ${1:Name} = ${2:Int} where \\\\${3:x} -> ${4:cond}",
+        SnippetContext::TopLevel,
+    ),
+    (
+        "source",
+        "source declaration",
+        "*${1:name} : [${2:Type}]",
+        SnippetContext::TopLevel,
+    ),
+    (
+        "source-history",
+        "source with history",
+        "*${1:name} : [${2:Type}] with history",
+        SnippetContext::TopLevel,
+    ),
+    (
+        "view",
+        "view declaration",
+        "*${1:name} = do\n  ${2:x} <- *${3:source}\n  yield ${4:x}",
+        SnippetContext::TopLevel,
+    ),
+    (
+        "derived",
+        "derived relation",
+        "&${1:name} = do\n  ${2:x} <- *${3:source}\n  yield ${4:x}",
+        SnippetContext::TopLevel,
+    ),
+    (
+        "trait",
+        "trait declaration",
+        "trait ${1:Name} ${2:a} where\n  ${3:method} : ${4:Type}",
+        SnippetContext::TopLevel,
+    ),
+    (
+        "impl",
+        "impl block",
+        "impl ${1:Trait} ${2:Type} where\n  ${3:method} ${4:x} = ${5:body}",
+        SnippetContext::TopLevel,
+    ),
+    (
+        "fun",
+        "function with type signature",
+        "${1:name} : ${2:Type}\n$1 ${3:x} = ${4:body}",
+        SnippetContext::TopLevel,
+    ),
+    (
+        "fun-io",
+        "IO function with effects",
+        "${1:name} : ${2:Args} -> IO {${3:console}} ${4:Result}\n$1 ${5:x} = do\n  ${6:body}",
+        SnippetContext::TopLevel,
+    ),
+    (
+        "route",
+        "route declaration",
+        "route ${1:Name} where\n  GET \"${2:/path}\" -> ${3:Response}",
+        SnippetContext::TopLevel,
+    ),
+    (
+        "route-post",
+        "POST route with body",
+        "route ${1:Name} where\n  POST \"${2:/path}\"\n    body: {${3:field}: ${4:Type}}\n    -> ${5:Response}",
+        SnippetContext::TopLevel,
+    ),
+    (
+        "route-composite",
+        "composite route",
+        "route ${1:Name} = ${2:RouteA} | ${3:RouteB}",
+        SnippetContext::TopLevel,
+    ),
+    (
+        "migrate",
+        "migration",
+        "migrate \"${1:name}\" do\n  ${2:body}",
+        SnippetContext::TopLevel,
+    ),
+    (
+        "import",
+        "import declaration",
+        "import ${1:./path}",
+        SnippetContext::TopLevel,
+    ),
+    (
+        "unit",
+        "unit of measure",
+        "unit ${1:Name}",
+        SnippetContext::TopLevel,
+    ),
+    (
+        "unit-derived",
+        "derived unit",
+        "unit ${1:N} = ${2:Kg} * ${3:M} / ${4:S}^2",
+        SnippetContext::TopLevel,
+    ),
+    (
+        "subset",
+        "subset constraint",
+        "*${1:a}.${2:field} <= *${3:b}.${4:key}",
+        SnippetContext::TopLevel,
+    ),
 ];
 
 /// Iterator over every user-callable builtin name. Drawn from the centralized

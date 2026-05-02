@@ -49,6 +49,7 @@ impl TestWorkspace {
             semantic_token_cache: HashMap::new(),
             semantic_token_counter: 0,
             published_diag_hashes: HashMap::new(),
+            published_lsp_diagnostics: HashMap::new(),
         };
         TestWorkspace {
             state,

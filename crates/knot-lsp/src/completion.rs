@@ -18,7 +18,7 @@ use crate::shared::{
     resolve_var_to_source, scan_knot_files_in_roots,
 };
 use crate::state::{
-    builtins as state_builtins, DocumentState, ServerState, KEYWORDS, SNIPPETS,
+    builtins as state_builtins, DocumentState, ServerState, SnippetContext, KEYWORDS, SNIPPETS,
 };
 use crate::type_format::format_type_kind;
 use crate::utils::{
@@ -271,8 +271,15 @@ pub(crate) fn handle_completion(
         });
     }
 
-    // Snippet completions for common patterns
-    for (label, detail, snippet) in SNIPPETS {
+    // Snippet completions for common patterns. Context-filtered: a `route`
+    // snippet only surfaces at top-level positions, a `let` snippet only
+    // inside a do-block, etc. Keeps the completion list scoped to what the
+    // cursor can actually parse.
+    let snippet_ctx = detect_snippet_context(doc, offset, in_atomic);
+    for (label, detail, snippet, ctx) in SNIPPETS {
+        if !snippet_context_matches(*ctx, snippet_ctx) {
+            continue;
+        }
         items.push(CompletionItem {
             label: label.to_string(),
             kind: Some(CompletionItemKind::SNIPPET),
@@ -833,6 +840,73 @@ fn find_enclosing_do_span(module: &Module, offset: usize) -> Option<Span> {
         }
     }
     best
+}
+
+/// Classify the cursor's surrounding context for snippet filtering. The
+/// returned variant is what the cursor actually *is* — `snippet_context_matches`
+/// then checks whether each snippet's declared context covers it.
+///
+/// Detection precedence (innermost wins): atomic block → do-block → expression
+/// inside any decl → top level. The `in_atomic` flag is computed by the caller
+/// so we don't redo the AST walk; everything else is a quick offset check.
+fn detect_snippet_context(doc: &DocumentState, offset: usize, in_atomic: bool) -> SnippetContext {
+    if in_atomic {
+        return SnippetContext::AtomicBlock;
+    }
+    if find_enclosing_do_span(&doc.module, offset).is_some() {
+        return SnippetContext::DoBlock;
+    }
+    // Inside any declaration body? Treat as expression position. Decls that
+    // don't have a body (data, type, source, trait header, etc.) leave the
+    // cursor at top-level even when textually overlapping their span — but
+    // the body-bearing decls are what matter for expression-position snippets.
+    for decl in &doc.module.decls {
+        let inside = decl.span.start <= offset && offset <= decl.span.end;
+        if !inside {
+            continue;
+        }
+        match &decl.node {
+            ast::DeclKind::Fun { body: Some(body), .. }
+            | ast::DeclKind::View { body, .. }
+            | ast::DeclKind::Derived { body, .. } => {
+                if body.span.start <= offset && offset <= body.span.end {
+                    return SnippetContext::Expression;
+                }
+            }
+            ast::DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { body, .. } = item {
+                        if body.span.start <= offset && offset <= body.span.end {
+                            return SnippetContext::Expression;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    SnippetContext::TopLevel
+}
+
+/// Whether a snippet declared with context `decl` is appropriate at a cursor
+/// whose context is `cursor`. Most declared contexts are concrete; `Any` is
+/// always allowed; `Expression` covers do-blocks and atomic blocks too (they
+/// are expression positions). Atomic-specific snippets aren't gated separately
+/// here — atomic also matches `Expression` since all our atomic snippets are
+/// expression-shaped.
+fn snippet_context_matches(decl: SnippetContext, cursor: SnippetContext) -> bool {
+    match (decl, cursor) {
+        (SnippetContext::Any, _) => true,
+        (d, c) if d == c => true,
+        // Expression-position snippets are also OK in do-blocks and atomic
+        // blocks — those are still expression positions, just with extra
+        // semantic constraints handled by other filters.
+        (SnippetContext::Expression, SnippetContext::DoBlock) => true,
+        (SnippetContext::Expression, SnippetContext::AtomicBlock) => true,
+        // do-block snippets can fire in atomic blocks too.
+        (SnippetContext::DoBlock, SnippetContext::AtomicBlock) => true,
+        _ => false,
+    }
 }
 
 /// Return the resolved monad kind for the do-block at `do_span`, if any. The

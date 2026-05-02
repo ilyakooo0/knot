@@ -8,7 +8,9 @@ use lsp_types::*;
 use knot::ast::{self, DeclKind, Module, Span, TypeKind};
 
 use crate::builtins::EFFECTFUL_BUILTINS;
-use crate::shared::{extract_principal_type_name, find_enclosing_atomic_expr};
+use crate::shared::{
+    extract_principal_type_name, find_enclosing_atomic_expr, render_signature_with_effects,
+};
 use crate::state::{builtins as state_builtins, DocumentState, ServerState};
 use crate::utils::{
     edit_distance, offset_to_position, position_to_offset, safe_slice, span_to_range,
@@ -34,9 +36,17 @@ pub(crate) fn handle_code_action(
             continue;
         }
 
-        // Action: Add type annotation to unannotated functions
+        // Action: Add type annotation to unannotated functions. The signature
+        // includes any inferred effects (`reads`/`writes` for relation use,
+        // and IO effects not already encoded in the rendered type) so the
+        // suggestion round-trips through the type checker without producing
+        // a fresh "declared effects don't match inferred effects" error.
         if let DeclKind::Fun { name, ty: None, .. } = &decl.node {
             if let Some(inferred) = doc.type_info.get(name) {
+                let signature = match doc.effect_sets.get(name) {
+                    Some(eff) => render_signature_with_effects(inferred, eff),
+                    None => inferred.clone(),
+                };
                 let insert_pos = offset_to_position(&doc.source, decl.span.start);
 
                 let mut changes = HashMap::new();
@@ -47,12 +57,12 @@ pub(crate) fn handle_code_action(
                             start: insert_pos,
                             end: insert_pos,
                         },
-                        new_text: format!("{name} : {inferred}\n"),
+                        new_text: format!("{name} : {signature}\n"),
                     }],
                 );
 
                 actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                    title: format!("Add type annotation: {inferred}"),
+                    title: format!("Add type annotation: {signature}"),
                     kind: Some(CodeActionKind::QUICKFIX),
                     edit: Some(WorkspaceEdit {
                         changes: Some(changes),
@@ -63,10 +73,16 @@ pub(crate) fn handle_code_action(
             }
         }
 
-        // Action: Add type annotation to unannotated views/derived
+        // Action: Add type annotation to unannotated views/derived. Same
+        // effect-rendering treatment as the Fun case above — relation-using
+        // views routinely carry `reads`/`writes` that the type alone misses.
         match &decl.node {
             DeclKind::View { name, ty: None, .. } | DeclKind::Derived { name, ty: None, .. } => {
                 if let Some(inferred) = doc.type_info.get(name) {
+                    let signature = match doc.effect_sets.get(name) {
+                        Some(eff) => render_signature_with_effects(inferred, eff),
+                        None => inferred.clone(),
+                    };
                     let decl_text = safe_slice(&doc.source, decl.span);
                     if let Some(eq_pos) = decl_text.find('=') {
                         let insert_offset = decl.span.start + eq_pos;
@@ -80,12 +96,12 @@ pub(crate) fn handle_code_action(
                                     start: insert_pos,
                                     end: insert_pos,
                                 },
-                                new_text: format!(": {inferred} "),
+                                new_text: format!(": {signature} "),
                             }],
                         );
 
                         actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                            title: format!("Add type annotation: {inferred}"),
+                            title: format!("Add type annotation: {signature}"),
                             kind: Some(CodeActionKind::QUICKFIX),
                             edit: Some(WorkspaceEdit {
                                 changes: Some(changes),
@@ -945,6 +961,64 @@ pub(crate) fn handle_code_action(
         }));
     }
 
+    // Action: add a wildcard `_ -> ...` arm to the case expression at the cursor.
+    // Useful when the scrutinee is an open variant (constructor pattern from a
+    // do-block bind) where exhaustiveness can't be statically verified, or as a
+    // quick "stub the rest" while drafting. Skips cases that already have a
+    // wildcard arm so we don't add duplicates.
+    if let Some((case_span, replacement)) =
+        find_add_wildcard_arm_at(&doc.module, &doc.source, range_start)
+    {
+        let mut changes = HashMap::new();
+        changes.insert(
+            uri.clone(),
+            vec![TextEdit {
+                range: span_to_range(case_span, &doc.source),
+                new_text: replacement,
+            }],
+        );
+        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+            title: "Add wildcard `_` arm".to_string(),
+            kind: Some(CodeActionKind::QUICKFIX),
+            edit: Some(WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+    }
+
+    // Action: convert a plain type alias into a refined type alias. Inserts
+    // a stub predicate `where \x -> True` that the user can edit. Skips type
+    // aliases that already have a predicate (refined type aliases parse with
+    // `TypeKind::Refined`), and skips record/function types where a top-level
+    // refinement isn't idiomatic (those use per-field refinements instead).
+    if let Some((alias_span, name, insert_pos)) =
+        find_alias_to_refine_at(&doc.module, &doc.source, range_start)
+    {
+        let mut changes = HashMap::new();
+        changes.insert(
+            uri.clone(),
+            vec![TextEdit {
+                range: Range {
+                    start: insert_pos,
+                    end: insert_pos,
+                },
+                new_text: " where \\x -> True".to_string(),
+            }],
+        );
+        let _ = alias_span;
+        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+            title: format!("Make `{name}` a refined type"),
+            kind: Some(CodeActionKind::REFACTOR_REWRITE),
+            edit: Some(WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+    }
+
     // Action: wrap selected expression in `Err {error: ...}`. Complements the
     // existing `Wrap in Ok` quick-fix for ergonomic `Result` construction.
     if let Some((expr_span, replacement)) =
@@ -974,6 +1048,132 @@ pub(crate) fn handle_code_action(
     } else {
         Some(actions)
     }
+}
+
+/// Find the innermost `case` expression containing `offset` whose arms have no
+/// wildcard pattern, and produce a rewrite that appends `_ -> todo` after the
+/// last arm. The replacement reuses the existing arms verbatim and adds a new
+/// final arm with consistent indentation.
+fn find_add_wildcard_arm_at(
+    module: &Module,
+    source: &str,
+    offset: usize,
+) -> Option<(Span, String)> {
+    fn walk(expr: &ast::Expr, source: &str, offset: usize) -> Option<(Span, String)> {
+        if expr.span.start > offset || expr.span.end < offset {
+            return None;
+        }
+        if let ast::ExprKind::Case { arms, .. } = &expr.node {
+            // Recurse first — pick the innermost match so nested cases work.
+            let mut inner = None;
+            crate::utils::recurse_expr(expr, |child| {
+                if inner.is_none() {
+                    if let Some(hit) = walk(child, source, offset) {
+                        inner = Some(hit);
+                    }
+                }
+            });
+            if inner.is_some() {
+                return inner;
+            }
+
+            // Skip if a wildcard already exists. Wildcards parse as
+            // `PatKind::Wildcard` or as a `Var` bound that's the underscore.
+            let has_wildcard = arms.iter().any(|arm| {
+                matches!(&arm.pat.node, ast::PatKind::Wildcard)
+                    || matches!(&arm.pat.node, ast::PatKind::Var(n) if n == "_")
+            });
+            if has_wildcard || arms.is_empty() {
+                return None;
+            }
+
+            // Compute the indentation of the last arm so the new arm aligns.
+            let last = arms.last()?;
+            let last_line_start = source[..last.pat.span.start]
+                .rfind('\n')
+                .map(|p| p + 1)
+                .unwrap_or(0);
+            let indent: String = source[last_line_start..last.pat.span.start]
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .collect();
+
+            let case_text = source.get(expr.span.start..expr.span.end)?;
+            let mut rewritten = case_text.to_string();
+            // Append the new arm. `todo` is intentionally an undefined name so
+            // the user gets a clear "fill me in" diagnostic.
+            rewritten.push('\n');
+            rewritten.push_str(&indent);
+            rewritten.push_str("_ -> todo");
+            return Some((expr.span, rewritten));
+        }
+        let mut found = None;
+        crate::utils::recurse_expr(expr, |child| {
+            if found.is_none() {
+                if let Some(hit) = walk(child, source, offset) {
+                    found = Some(hit);
+                }
+            }
+        });
+        found
+    }
+    for decl in &module.decls {
+        match &decl.node {
+            DeclKind::Fun {
+                body: Some(body), ..
+            }
+            | DeclKind::View { body, .. }
+            | DeclKind::Derived { body, .. } => {
+                if let Some(hit) = walk(body, source, offset) {
+                    return Some(hit);
+                }
+            }
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { body, .. } = item {
+                        if let Some(hit) = walk(body, source, offset) {
+                            return Some(hit);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Find a `type Name = Base` declaration at the cursor that isn't already
+/// refined and isn't a record/function (those use per-field refinements).
+/// Returns the alias span, the alias name, and the position to insert the
+/// `where \x -> True` clause (immediately after the base type).
+fn find_alias_to_refine_at(
+    module: &Module,
+    source: &str,
+    offset: usize,
+) -> Option<(Span, String, Position)> {
+    for decl in &module.decls {
+        if !(decl.span.start <= offset && offset < decl.span.end) {
+            continue;
+        }
+        if let DeclKind::TypeAlias { name, ty, .. } = &decl.node {
+            // Skip if already refined.
+            if matches!(&ty.node, TypeKind::Refined { .. }) {
+                return None;
+            }
+            // Refining records or functions at the top level isn't idiomatic.
+            // Records use per-field refinements; functions can't be refined
+            // by a value-level predicate.
+            if matches!(&ty.node, TypeKind::Record { .. } | TypeKind::Function { .. }) {
+                return None;
+            }
+            // Insert at the end of the base type's span — that's where the
+            // `where` clause syntactically belongs.
+            let pos = offset_to_position(source, ty.span.end);
+            return Some((decl.span, name.clone(), pos));
+        }
+    }
+    None
 }
 
 /// Find an `if cond then a else b` at `offset` and produce
@@ -1756,6 +1956,13 @@ struct WrapSuggestion {
     template: String,
 }
 
+/// Placeholder substituted inside `WrapSuggestion::template`. Picked to be
+/// unambiguous against Knot syntax: the language's empty-record literal `{}`
+/// would collide with a naïve `{}` placeholder (matters for the
+/// `Nothing {}` template, which intentionally discards the offending
+/// expression and keeps the empty-record syntax verbatim).
+const WRAP_PLACEHOLDER: &str = "__EXPR__";
+
 impl WrapSuggestion {
     fn format_wrapping(&self, snippet: &str) -> String {
         // Parenthesize if the snippet contains whitespace so precedence is
@@ -1767,7 +1974,7 @@ impl WrapSuggestion {
         } else {
             snippet.to_string()
         };
-        self.template.replacen("{}", &body, 1)
+        self.template.replacen(WRAP_PLACEHOLDER, &body, 1)
     }
 }
 
@@ -1825,9 +2032,22 @@ fn detect_wrap_suggestions(
         if inner.trim() == found.trim() {
             out.push(WrapSuggestion {
                 title: "Wrap in `Just`".to_string(),
-                template: "Just {value: {}}".to_string(),
+                template: format!("Just {{value: {WRAP_PLACEHOLDER}}}"),
             });
         }
+    }
+    // `expected Maybe T, found {}` → suggest `Nothing {}`. The `{}` here is
+    // the empty-record literal Knot uses for unit-like values; if the user
+    // wrote `{}` where a `Maybe T` was expected, replacing with `Nothing {}`
+    // is almost always what they meant. The replacement template ignores the
+    // matched expression entirely (`Nothing {}` takes no payload), so it has
+    // no `WRAP_PLACEHOLDER` — `format_wrapping` will return the template
+    // verbatim.
+    if expected.starts_with("Maybe ") && found.trim() == "{}" {
+        out.push(WrapSuggestion {
+            title: "Replace with `Nothing {}`".to_string(),
+            template: "Nothing {}".to_string(),
+        });
     }
     // `expected Result E T, found T` → wrap in Ok. Result is two-arg, but
     // when the success type matches the found type we can offer Ok.
@@ -1846,7 +2066,7 @@ fn detect_wrap_suggestions(
             {
                 out.push(WrapSuggestion {
                     title: "Wrap in `Ok`".to_string(),
-                    template: "Ok {value: {}}".to_string(),
+                    template: format!("Ok {{value: {WRAP_PLACEHOLDER}}}"),
                 });
             }
         }
@@ -1860,7 +2080,7 @@ fn detect_wrap_suggestions(
     if refined_names.contains(expected_t) {
         out.push(WrapSuggestion {
             title: format!("Refine into `{expected_t}` (returns `Result`)"),
-            template: "refine ({})".to_string(),
+            template: format!("refine ({WRAP_PLACEHOLDER})"),
         });
     }
     // `expected IO {…} T, found T` → wrap in pure-IO via `\_ -> ...`. We
@@ -2975,6 +3195,22 @@ mod tests {
             suggestions[0].format_wrapping("a + b"),
             "Just {value: (a + b)}"
         );
+    }
+
+    #[test]
+    fn detect_wrap_suggestions_offers_nothing_for_unit_in_maybe_slot() {
+        // The user wrote `{}` (empty record / unit) where `Maybe T` was
+        // expected. The conventional fix is `Nothing {}` — discarding the
+        // unit literal entirely, since `Nothing` takes no payload.
+        let empty: HashSet<&str> = HashSet::new();
+        let suggestions = detect_wrap_suggestions("Maybe Int", "{}", &empty);
+        let nothing = suggestions
+            .iter()
+            .find(|s| s.title.contains("Nothing"))
+            .expect("expected a Nothing suggestion");
+        // Template has no placeholder — the body is discarded verbatim.
+        assert_eq!(nothing.format_wrapping("{}"), "Nothing {}");
+        assert_eq!(nothing.format_wrapping("anything"), "Nothing {}");
     }
 
     #[test]

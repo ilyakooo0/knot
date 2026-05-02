@@ -5,9 +5,127 @@
 use std::path::{Path, PathBuf};
 
 use knot::ast::{self, DeclKind, Module, Span};
+use knot_compiler::effects::EffectSet;
 
 use crate::type_format::format_type_kind;
 use crate::utils::{recurse_expr, safe_slice};
+
+// ── Signature rendering with effects ────────────────────────────────
+
+/// Compose a Knot type signature that includes effects, suitable for
+/// inserting into source code via "Add type annotation" code actions or
+/// inlay-hint text edits. Inputs:
+///
+/// - `inferred`: the formatted type string (from `DocumentState::type_info`).
+///   For IO functions this already contains the IO effect row, e.g.
+///   `Text -> IO {fs} Text`.
+/// - `effects`: the inferred `EffectSet` (from `DocumentState::effect_sets`).
+///   Includes both relation effects (`reads`/`writes`) AND IO effects
+///   (`console`/`fs`/`clock`/`network`/`random`) — the IO subset usually
+///   overlaps with what's already in the type.
+///
+/// Returns a single line like `{reads *people, writes *people} Text -> {}`
+/// that prepends only the effects *not* already encoded in the type. The
+/// result is empty when the type carries everything (fully covered by an
+/// `IO {…}` row), in which case the caller should use `inferred` verbatim.
+///
+/// Without this, the suggested signatures would write
+/// `Text -> {}` for a function that the rest of the LSP knows reads from
+/// `*people` — when re-checked, the explicit signature would conflict
+/// with the inferred effects.
+pub(crate) fn render_signature_with_effects(inferred: &str, effects: &EffectSet) -> String {
+    let prefix = effect_prefix_not_in_type(inferred, effects);
+    if prefix.is_empty() {
+        inferred.to_string()
+    } else {
+        format!("{prefix} {inferred}")
+    }
+}
+
+/// Build the `{...}` effect prefix containing only effects that aren't already
+/// visible in the rendered type string. Returns an empty string when the
+/// effect set is pure or every effect is already encoded in the type (e.g. an
+/// `IO {fs} Text` whose only effect is `fs`). Reads/writes are *always*
+/// included when present — they live outside the IO row, so the type can't
+/// carry them.
+fn effect_prefix_not_in_type(inferred: &str, effects: &EffectSet) -> String {
+    if effects.is_pure() {
+        return String::new();
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    // Relation effects: never embedded in the type, so always include.
+    for r in &effects.reads {
+        parts.push(format!("reads *{r}"));
+    }
+    for w in &effects.writes {
+        parts.push(format!("writes *{w}"));
+    }
+    // IO effects: include only when the type doesn't already mention the
+    // exact effect token. The check is intentionally loose — we look for the
+    // word as a whole substring of the type, which is safe because the
+    // formatted IO row uses the same canonical names (`fs`, `console`, …).
+    if effects.console && !type_str_has_io_effect(inferred, "console") {
+        parts.push("console".into());
+    }
+    if effects.network && !type_str_has_io_effect(inferred, "network") {
+        parts.push("network".into());
+    }
+    if effects.fs && !type_str_has_io_effect(inferred, "fs") {
+        parts.push("fs".into());
+    }
+    if effects.clock && !type_str_has_io_effect(inferred, "clock") {
+        parts.push("clock".into());
+    }
+    if effects.random && !type_str_has_io_effect(inferred, "random") {
+        parts.push("random".into());
+    }
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("{{{}}}", parts.join(", "))
+    }
+}
+
+/// Approximate test for whether a rendered type string already includes a
+/// given IO effect. Looks for the token inside an `IO { ... }` row — the
+/// canonical place IO effects appear. Treating the lookup as a substring
+/// match is fine in practice: effect names (`fs`, `console`, …) don't
+/// collide with type names in the formatted output.
+fn type_str_has_io_effect(ty: &str, effect: &str) -> bool {
+    // Find an `IO {` and look inside the matching braces. Multiple IO rows
+    // can appear (e.g. higher-order types); a single match is enough.
+    let mut search_from = 0;
+    while let Some(io_pos) = ty[search_from..].find("IO {") {
+        let absolute = search_from + io_pos + 4; // past `IO {`
+        let bytes = ty.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = absolute;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                break;
+            }
+            i += 1;
+        }
+        let row = &ty[absolute..i];
+        // Compare against the comma-separated tokens so `fs` doesn't match
+        // a hypothetical `fsx` or `nfs`.
+        if row
+            .split(|c: char| c == ',' || c == '|' || c.is_whitespace())
+            .any(|tok| tok.trim() == effect)
+        {
+            return true;
+        }
+        search_from = i;
+    }
+    false
+}
 
 // ── Type-string parsing ─────────────────────────────────────────────
 
@@ -1064,6 +1182,82 @@ fn type_mentions_var(ty: &ast::Type, var: &str) -> bool {
         ast::TypeKind::Forall { vars, ty } => {
             !vars.iter().any(|n| n == var) && type_mentions_var(ty, var)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn effects(reads: &[&str], writes: &[&str]) -> EffectSet {
+        let mut e = EffectSet::empty();
+        for r in reads {
+            e.reads.insert((*r).to_string());
+        }
+        for w in writes {
+            e.writes.insert((*w).to_string());
+        }
+        e
+    }
+
+    #[test]
+    fn render_signature_passthrough_for_pure_type() {
+        let s = render_signature_with_effects("Int -> Int", &EffectSet::empty());
+        assert_eq!(s, "Int -> Int");
+    }
+
+    #[test]
+    fn render_signature_prepends_relation_effects() {
+        // Reads/writes are never encoded in the type, so they always make it
+        // into the prefix.
+        let s = render_signature_with_effects(
+            "Text -> {}",
+            &effects(&["people"], &["audit"]),
+        );
+        assert_eq!(s, "{reads *people, writes *audit} Text -> {}");
+    }
+
+    #[test]
+    fn render_signature_skips_io_effects_already_in_type() {
+        // The type already says `IO {fs}`; the prefix shouldn't double-count.
+        let mut e = EffectSet::empty();
+        e.fs = true;
+        let s = render_signature_with_effects("Text -> IO {fs} Text", &e);
+        assert_eq!(s, "Text -> IO {fs} Text");
+    }
+
+    #[test]
+    fn render_signature_includes_io_effect_missing_from_type() {
+        // The type has `IO {fs}` but the effect set claims `console` too.
+        // (Practically: a function whose body printlns inside an IO block
+        // and the inferred type rendering didn't fold that effect in.)
+        let mut e = EffectSet::empty();
+        e.fs = true;
+        e.console = true;
+        let s = render_signature_with_effects("Text -> IO {fs} Text", &e);
+        assert_eq!(s, "{console} Text -> IO {fs} Text");
+    }
+
+    #[test]
+    fn render_signature_combines_relation_and_io_effects() {
+        let mut e = effects(&["people"], &[]);
+        e.console = true;
+        // Type doesn't mention `console`, so it goes into the prefix.
+        let s = render_signature_with_effects("Text -> Text", &e);
+        assert_eq!(s, "{reads *people, console} Text -> Text");
+    }
+
+    #[test]
+    fn type_str_has_io_effect_recognizes_membership() {
+        assert!(type_str_has_io_effect("Text -> IO {fs} Text", "fs"));
+        assert!(type_str_has_io_effect("Text -> IO {fs, console} Text", "console"));
+        assert!(!type_str_has_io_effect("Text -> IO {fs} Text", "console"));
+    }
+
+    #[test]
+    fn type_str_has_io_effect_does_not_substring_match() {
+        // `nfs` shouldn't match `fs` — the lookup is token-based.
+        assert!(!type_str_has_io_effect("Text -> IO {nfs} Text", "fs"));
     }
 }
 

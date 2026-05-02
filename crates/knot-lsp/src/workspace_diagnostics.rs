@@ -1,6 +1,16 @@
-//! `workspace/diagnostic` (pull-model) handler. Combines per-document
-//! diagnostics from open files plus the full analysis pipeline run on
-//! unopened workspace files in parallel.
+//! Pull-model diagnostic handlers — both `textDocument/diagnostic` (single
+//! document) and `workspace/diagnostic` (whole workspace).
+//!
+//! The single-document handler is a thin wrapper over the cached `DocumentState`:
+//! analysis already runs on every change, so the pull request just maps the
+//! cached `knot::diagnostic::Diagnostic` list into LSP form. For files we
+//! haven't analyzed yet (the editor pulls before our `didOpen` analysis
+//! finishes) we run the full pipeline synchronously, mirroring the
+//! workspace handler's unopened-file path.
+//!
+//! The workspace handler additionally reports diagnostics for unopened files
+//! by running the full pipeline (lex → parse → type infer → effect infer →
+//! stratify → SQL lint) on each `.knot` file in the workspace.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -15,6 +25,108 @@ use crate::diagnostics::to_lsp_diagnostic;
 use crate::shared::scan_knot_files_in_roots;
 use crate::state::{content_hash, ServerState};
 use crate::utils::{path_to_uri, uri_to_path};
+
+// ── Document Diagnostics (Pull Model, per-doc) ──────────────────────
+
+/// `textDocument/diagnostic` — pull-model diagnostics for a single document.
+/// Returns the cached analysis output when the document is open; falls back
+/// to a synchronous analysis pass for unopened files (the editor can request
+/// diagnostics on a file it has not opened yet — typically when navigating
+/// to a workspace symbol or via a code-lens follow-up).
+pub(crate) fn handle_document_diagnostics(
+    state: &mut ServerState,
+    params: &DocumentDiagnosticParams,
+) -> DocumentDiagnosticReportResult {
+    let uri = &params.text_document.uri;
+
+    let items: Vec<Diagnostic> = if let Some(doc) = state.documents.get(uri) {
+        // Hot path: analysis has already run on this file — reuse the cached
+        // diagnostics. This is the common case — the editor pulls right after
+        // a didChange that already produced a result.
+        doc.knot_diagnostics
+            .iter()
+            .filter_map(|d| to_lsp_diagnostic(d, &doc.source, uri))
+            .collect()
+    } else if let Some(path) = uri_to_path(uri).and_then(|p| p.canonicalize().ok()) {
+        // Cold path: file isn't open in the editor. Honor the pull anyway —
+        // editors send `textDocument/diagnostic` for files surfaced via
+        // workspace-symbol or goto-definition that haven't been opened yet.
+        // Reuse the cached unopened-file diagnostics when available; otherwise
+        // run the full pipeline and seed the cache.
+        let source = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => {
+                return DocumentDiagnosticReportResult::Report(
+                    DocumentDiagnosticReport::Full(empty_full_report()),
+                );
+            }
+        };
+        let hash = content_hash(&source);
+        // Pull the cached result without holding the immutable borrow across
+        // the cache-update calls below — we only need to know whether the
+        // cached hash matches and, if so, what diagnostics to return.
+        let cached_match = state
+            .workspace_diag_cache
+            .get(&path)
+            .filter(|(cached_h, _, _)| *cached_h == hash)
+            .map(|(_, diags, _)| diags.clone());
+        if let Some(diags) = cached_match {
+            state.workspace_diag_clock = state.workspace_diag_clock.wrapping_add(1);
+            let access = state.workspace_diag_clock;
+            if let Some(entry) = state.workspace_diag_cache.get_mut(&path) {
+                entry.2 = access;
+            }
+            diags
+        } else {
+            analyze_and_cache(state, &path, &source, hash, uri)
+        }
+    } else {
+        Vec::new()
+    };
+
+    DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
+        RelatedFullDocumentDiagnosticReport {
+            related_documents: None,
+            full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                result_id: None,
+                items,
+            },
+        },
+    ))
+}
+
+fn empty_full_report() -> RelatedFullDocumentDiagnosticReport {
+    RelatedFullDocumentDiagnosticReport {
+        related_documents: None,
+        full_document_diagnostic_report: FullDocumentDiagnosticReport {
+            result_id: None,
+            items: Vec::new(),
+        },
+    }
+}
+
+/// Analyze an unopened file synchronously and seed the workspace-diag cache
+/// with its result. Pulled out so the cache-hit and cache-miss paths share
+/// the cache-write code.
+fn analyze_and_cache(
+    state: &mut ServerState,
+    path: &Path,
+    source: &str,
+    hash: u64,
+    uri: &Uri,
+) -> Vec<Diagnostic> {
+    let module = match get_or_parse_file_shared(path, &state.import_cache) {
+        Some((m, _)) => m,
+        None => return Vec::new(),
+    };
+    let diags = analyze_unopened_file(&module, source, path, uri);
+    state.workspace_diag_clock = state.workspace_diag_clock.wrapping_add(1);
+    let access = state.workspace_diag_clock;
+    state
+        .workspace_diag_cache
+        .insert(path.to_path_buf(), (hash, diags.clone(), access));
+    diags
+}
 
 // ── Workspace Diagnostics (Pull Model) ──────────────────────────────
 

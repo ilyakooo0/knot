@@ -34,6 +34,19 @@ pub struct ModuleFingerprint {
     /// only structural content matters, so reformatting a decl that doesn't
     /// change tokens is a "clean" delta.
     pub decl_hashes: HashMap<String, u64>,
+    /// Per-decl signature hash. For `Fun` decls with an explicit type
+    /// annotation this hashes only the signature line — body changes don't
+    /// move the value. For Fun decls *without* a signature, the hash also
+    /// reflects the body, since the inferred type could shift. For other
+    /// decl kinds (Source/View/Derived/Data/Trait/Impl) the signature hash
+    /// covers the externally-visible shape only.
+    ///
+    /// `signature_changed_decls` uses this to compute a narrower change set
+    /// than `changed_decls`: dependents only need to be re-checked when an
+    /// upstream decl's *externally-visible* type/shape changed, not when a
+    /// signed body got rewritten internally. Reduces cascade re-analysis on
+    /// the common "edit a function body" workflow.
+    pub decl_signature_hashes: HashMap<String, u64>,
     /// Dependency graph: `decl_name → set of top-level names it references`.
     /// References include calls to other functions, type uses, and
     /// constructor uses. Used to compute the transitive dirty set when a
@@ -54,18 +67,45 @@ impl ModuleFingerprint {
     /// Compute the fingerprint of a freshly-parsed module.
     pub fn from_module(module: &Module) -> Self {
         let mut decl_hashes = HashMap::new();
+        let mut decl_signature_hashes = HashMap::new();
         let mut decl_deps = HashMap::new();
         for (i, decl) in module.decls.iter().enumerate() {
             let key = decl_key(decl, i);
             decl_hashes.insert(key.clone(), hash_decl(decl));
+            decl_signature_hashes.insert(key.clone(), hash_decl_signature(decl));
             decl_deps.insert(key, collect_decl_deps(decl));
         }
         let structure_hash = hash_structure(module);
         ModuleFingerprint {
             decl_hashes,
+            decl_signature_hashes,
             decl_deps,
             structure_hash,
         }
+    }
+
+    /// Decls whose externally-visible signature changed between `prev` and
+    /// `self`. Strict subset of `changed_decls`: a function whose explicit
+    /// type signature is unchanged but whose body got rewritten falls in
+    /// `changed_decls` but NOT here. Drives the cross-file dependent
+    /// re-queue: dependents of `f` only need re-analysis when `f`'s
+    /// outward-facing type or shape moves.
+    pub fn signature_changed_decls(&self, prev: &ModuleFingerprint) -> HashSet<String> {
+        let mut changed: HashSet<String> = HashSet::new();
+        for (k, h) in &self.decl_signature_hashes {
+            match prev.decl_signature_hashes.get(k) {
+                Some(prev_h) if prev_h == h => {}
+                _ => {
+                    changed.insert(k.clone());
+                }
+            }
+        }
+        for k in prev.decl_signature_hashes.keys() {
+            if !self.decl_signature_hashes.contains_key(k) {
+                changed.insert(k.clone());
+            }
+        }
+        changed
     }
 
     /// Compute the set of decl keys that changed between `prev` and `self`.
@@ -173,6 +213,60 @@ fn hash_decl(decl: &ast::Decl) -> u64 {
     let raw = format!("{:?}", decl.node);
     let stripped = strip_spans(&raw);
     stripped.hash(&mut h);
+    h.finish()
+}
+
+/// Hash only the externally-visible signature of a declaration. Used by
+/// `signature_changed_decls` to detect whether a downstream consumer needs
+/// re-checking. The rule: if a Knot user observes only the `name : Type`
+/// line of a decl, what changes here?
+///
+/// - `Fun` with explicit signature: hash the name + signature only — body
+///   is internal to this decl.
+/// - `Fun` without signature: must include the body (its inferred type
+///   depends on the body, and dependents see the inferred type).
+/// - `Source/View/Derived`: hash the type annotation when present; otherwise
+///   include the body.
+/// - `Data/Trait/Impl/Route/etc.`: shape is the signature — hash the whole
+///   declaration.
+fn hash_decl_signature(decl: &ast::Decl) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match &decl.node {
+        DeclKind::Fun { name, ty, body, .. } => {
+            ("fun_sig", name).hash(&mut h);
+            match ty {
+                Some(ts) => {
+                    strip_spans(&format!("{:?}", ts.ty.node)).hash(&mut h);
+                }
+                None => {
+                    // No declared type — body change can shift the inferred
+                    // type, which dependents see. Include the body.
+                    "untyped".hash(&mut h);
+                    if let Some(b) = body {
+                        strip_spans(&format!("{:?}", b.node)).hash(&mut h);
+                    }
+                }
+            }
+        }
+        DeclKind::View { name, ty, body, .. } | DeclKind::Derived { name, ty, body, .. } => {
+            ("vd_sig", name).hash(&mut h);
+            match ty {
+                Some(ts) => {
+                    strip_spans(&format!("{:?}", ts.ty.node)).hash(&mut h);
+                }
+                None => {
+                    "untyped".hash(&mut h);
+                    strip_spans(&format!("{:?}", body.node)).hash(&mut h);
+                }
+            }
+        }
+        DeclKind::Source { name, ty, history, .. } => {
+            ("source_sig", name, history).hash(&mut h);
+            strip_spans(&format!("{:?}", ty.node)).hash(&mut h);
+        }
+        // Everything else: shape *is* the signature. Reuse the full decl hash.
+        _ => return hash_decl(decl),
+    }
     h.finish()
 }
 
@@ -402,5 +496,61 @@ b = \y -> y
         assert!(!fa.structurally_equal(&fb));
         let changed = fb.changed_decls(&fa);
         assert!(changed.contains("bar"));
+    }
+
+    #[test]
+    fn signature_changed_decls_ignores_body_change_in_typed_fun() {
+        // Typed function: signature stays the same, body shifts. Dependents
+        // shouldn't need re-checking.
+        let a = parse_module("double : Int -> Int\ndouble = \\x -> x * 2\n");
+        let b = parse_module("double : Int -> Int\ndouble = \\x -> x * 3\n");
+        let fa = ModuleFingerprint::from_module(&a);
+        let fb = ModuleFingerprint::from_module(&b);
+
+        // Body-level changed_decls picks up the edit.
+        let body_changed = fb.changed_decls(&fa);
+        assert!(
+            body_changed.contains("double"),
+            "body-level change set should include double; got: {body_changed:?}"
+        );
+
+        // Signature-level set is empty — outside view of the decl is unchanged.
+        let sig_changed = fb.signature_changed_decls(&fa);
+        assert!(
+            !sig_changed.contains("double"),
+            "signature-level change set should NOT include double on body-only \
+             edit of a typed fun; got: {sig_changed:?}"
+        );
+    }
+
+    #[test]
+    fn signature_changed_decls_includes_body_change_in_untyped_fun() {
+        // No explicit signature — the inferred type *can* shift on body
+        // change, so dependents must be considered dirty.
+        let a = parse_module("double = \\x -> x * 2\n");
+        let b = parse_module("double = \\x -> x * 3\n");
+        let fa = ModuleFingerprint::from_module(&a);
+        let fb = ModuleFingerprint::from_module(&b);
+
+        let sig_changed = fb.signature_changed_decls(&fa);
+        assert!(
+            sig_changed.contains("double"),
+            "untyped fun body change must propagate; got: {sig_changed:?}"
+        );
+    }
+
+    #[test]
+    fn signature_changed_decls_detects_signature_edit() {
+        // Signature changed (return type Int → Float) — must propagate.
+        let a = parse_module("double : Int -> Int\ndouble = \\x -> x\n");
+        let b = parse_module("double : Int -> Float\ndouble = \\x -> x\n");
+        let fa = ModuleFingerprint::from_module(&a);
+        let fb = ModuleFingerprint::from_module(&b);
+
+        let sig_changed = fb.signature_changed_decls(&fa);
+        assert!(
+            sig_changed.contains("double"),
+            "signature change must propagate; got: {sig_changed:?}"
+        );
     }
 }

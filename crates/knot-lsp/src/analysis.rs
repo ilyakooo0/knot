@@ -161,6 +161,7 @@ pub fn analyze_document(
     let mut monad_info: HashMap<Span, MonadKind> = HashMap::new();
     let mut unit_info: HashMap<Span, String> = HashMap::new();
     let mut changed_decl_names: Vec<String> = Vec::new();
+    let mut signature_changed_decl_names: Vec<String> = Vec::new();
     let mut dirty_decl_closure: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let lexer = knot::lexer::Lexer::new(source);
@@ -247,6 +248,16 @@ pub fn analyze_document(
                 dirty_decl_closure = new_fingerprint.dirty_closure(&dirty);
                 changed_decl_names = dirty.into_iter().collect();
                 changed_decl_names.sort();
+
+                // The cross-file dependent re-queue (handled by
+                // `apply_analysis_result::requeue_dependents_for_changed_decls`)
+                // only needs to fire when an externally-visible signature
+                // moved. Body-only changes to a *typed* function don't shift
+                // its declared type, so its dependents can sit tight.
+                let sig_dirty = new_fingerprint
+                    .signature_changed_decls(&latest.1.fingerprint);
+                signature_changed_decl_names = sig_dirty.into_iter().collect();
+                signature_changed_decl_names.sort();
                 if std::env::var("KNOT_LSP_TRACE_DIRTY").is_ok() && !changed_decl_names.is_empty() {
                     eprintln!(
                         "knot-lsp: {} dirty decls in {}: {}",
@@ -436,6 +447,7 @@ pub fn analyze_document(
         monad_info,
         unit_info,
         changed_decl_names,
+        signature_changed_decl_names,
         dirty_decl_closure,
     }
 }
@@ -486,6 +498,7 @@ fn reuse_snapshot(
         // Cache hit: the parsed AST is identical (or structurally equal)
         // to a prior run, so by definition no decls changed since then.
         changed_decl_names: Vec::new(),
+        signature_changed_decl_names: Vec::new(),
         dirty_decl_closure: std::collections::HashSet::new(),
     }
 }
@@ -775,6 +788,7 @@ mod tests {
                     monad_info: HashMap::new(),
                     fingerprint: ModuleFingerprint {
                         decl_hashes: HashMap::new(),
+                        decl_signature_hashes: HashMap::new(),
                         decl_deps: HashMap::new(),
                         structure_hash: 0,
                     },

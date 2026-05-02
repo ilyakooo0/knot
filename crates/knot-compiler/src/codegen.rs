@@ -4670,6 +4670,8 @@ impl Codegen {
                 if let Some((source_name, filter_bind, filter_body)) =
                     extract_filter_on_source(&args[0], &self.source_var_binds, &self.fun_bodies)
                 {
+                    let source_name: &str = &source_name;
+                    let filter_body: &ast::Expr = &filter_body;
                     if !self.views.contains_key(source_name) {
                         if let Some(schema) = self.source_schemas.get(source_name).cloned() {
                             if !schema.starts_with('#') && !schema.contains('[') {
@@ -4747,8 +4749,7 @@ impl Codegen {
                 if let Some((source_name, filter_bind, filter_body)) =
                     extract_filter_on_source(&args[0], &self.source_var_binds, &self.fun_bodies)
                 {
-                    let source_name = source_name.to_string();
-                    let filter_bind = filter_bind.to_string();
+                    let filter_body: &ast::Expr = &filter_body;
                     if !self.views.contains_key(&source_name) {
                         if let Some(schema) = self.source_schemas.get(&source_name).cloned() {
                             if !schema.starts_with('#') && !schema.contains('[') {
@@ -4834,8 +4835,7 @@ impl Codegen {
                 if let Some((source_name, filter_bind, filter_body)) =
                     extract_filter_on_source(&args[2], &self.source_var_binds, &self.fun_bodies)
                 {
-                    let source_name = source_name.to_string();
-                    let filter_bind = filter_bind.to_string();
+                    let filter_body: &ast::Expr = &filter_body;
                     if !self.views.contains_key(&source_name) {
                         if let Some(schema) = self.source_schemas.get(&source_name).cloned() {
                             if !schema.starts_with('#') && !schema.contains('[') {
@@ -4944,10 +4944,13 @@ impl Codegen {
                     if let Some((source_name, filter_bind, filter_body)) =
                         extract_filter_on_source(&args[1], &self.source_var_binds, &self.fun_bodies)
                     {
+                        let source_name: &str = &source_name;
+                        let filter_body: &ast::Expr = &filter_body;
                         if !self.views.contains_key(source_name) {
                             if let Some(schema) = self.source_schemas.get(source_name).cloned() {
                                 if !schema.starts_with('#') && !schema.contains('[') {
                                     if let Some((agg_bind, agg_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies) {
+                                        let agg_body: &ast::Expr = &agg_body;
                                         if let Some(col_sql) = extract_sql_field_access(&agg_bind, agg_body, "", &schema) {
                                             if let Some(frag) = Self::try_compile_sql_expr(&filter_bind, filter_body) {
                                                 let arg_sql = if matches!(name.as_str(), "min" | "max") {
@@ -4972,6 +4975,7 @@ impl Codegen {
                     if let ast::ExprKind::Do(stmts) = &args[1].node {
                         if let Some(plan) = self.analyze_sql_plan(stmts, env) {
                             if let Some((agg_bind, agg_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies) {
+                                let agg_body: &ast::Expr = &agg_body;
                                 // Use first table's alias and schema for the aggregate column
                                 let alias = if plan.tables.len() == 1 { &plan.tables[0].alias } else { "" };
                                 let schema = plan.tables.first()
@@ -5007,10 +5011,13 @@ impl Codegen {
                     if let Some((source_name, filter_bind, filter_body)) =
                         extract_filter_on_source(&args[1], &self.source_var_binds, &self.fun_bodies)
                     {
+                        let source_name: &str = &source_name;
+                        let filter_body: &ast::Expr = &filter_body;
                         if !self.views.contains_key(source_name) {
                             if let Some(schema) = self.source_schemas.get(source_name).cloned() {
                                 if !schema.starts_with('#') && !schema.contains('[') {
                                     if let Some((pred_bind, pred_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies) {
+                                        let pred_body: &ast::Expr = &pred_body;
                                         if let Some(pred_frag) = Self::try_compile_sql_expr(&pred_bind, pred_body) {
                                             if let Some(filter_frag) = Self::try_compile_sql_expr(&filter_bind, filter_body) {
                                                 let table = quote_sql_ident(&format!("_knot_{}", source_name));
@@ -5039,6 +5046,7 @@ impl Codegen {
                     if let ast::ExprKind::Do(stmts) = &args[1].node {
                         if let Some(plan) = self.analyze_sql_plan(stmts, env) {
                             if let Some((pred_bind, pred_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies) {
+                                let pred_body: &ast::Expr = &pred_body;
                                 let mut bind_aliases: HashMap<String, String> = HashMap::new();
                                 if plan.tables.len() == 1 {
                                     bind_aliases.insert(pred_bind.clone(), plan.tables[0].alias.clone());
@@ -5077,6 +5085,7 @@ impl Codegen {
                     if let ast::ExprKind::Do(stmts) = &args[1].node {
                         if let Some(mut plan) = self.analyze_sql_plan(stmts, env) {
                             if let Some((bind_var, body)) = extract_single_param_lambda(&args[0], &self.fun_bodies) {
+                                let body: &ast::Expr = &body;
                                 match name.as_str() {
                                     "filter" => {
                                         // Merge WHERE condition into the plan
@@ -5149,6 +5158,7 @@ impl Codegen {
                         if let ast::ExprKind::Var(sort_name) = &sort_name_expr.node {
                             if sort_name == "sortBy" {
                                 if let Some((sort_bind, sort_body)) = extract_single_param_lambda(sort_lambda, &self.fun_bodies) {
+                                    let sort_body: &ast::Expr = &sort_body;
                                     // Case 1: sortBy f *source → SQL ORDER BY + LIMIT
                                     if let ast::ExprKind::SourceRef(source_name) = &sort_source.node {
                                         if !self.views.contains_key(source_name) {
@@ -5249,6 +5259,8 @@ impl Codegen {
                 if let Some((source_name, filter_bind, filter_body)) =
                     extract_filter_on_source(&args[1], &self.source_var_binds, &self.fun_bodies)
                 {
+                    let source_name: &str = &source_name;
+                    let filter_body: &ast::Expr = &filter_body;
                     if !self.views.contains_key(source_name) {
                         if let Some(schema) = self.source_schemas.get(source_name).cloned() {
                             if !schema.starts_with('#') && !schema.contains('[') {
@@ -7976,6 +7988,7 @@ impl Codegen {
         db: Value,
     ) -> Option<Value> {
         let (bind_var, body) = extract_single_param_lambda(lambda_arg, &self.fun_bodies)?;
+        let body: &ast::Expr = &body;
         let table = quote_sql_ident(&format!("_knot_{}", source_name));
 
         match fn_name {
@@ -8295,6 +8308,8 @@ impl Codegen {
         if let Some((source_name, filter_bind, filter_body)) =
             extract_filter_on_source(expr, &self.source_var_binds, &self.fun_bodies)
         {
+            let source_name: &str = &source_name;
+            let filter_body: &ast::Expr = &filter_body;
             if self.views.contains_key(source_name) {
                 return None;
             }
@@ -10038,27 +10053,27 @@ fn split_schema_fields(s: &str) -> Vec<&str> {
 
 // ── Pipe chain analysis ───────────────────────────────────────────
 
-enum PipeOp<'a> {
-    Filter { bind_var: String, body: &'a ast::Expr },
-    Map { bind_var: String, body: &'a ast::Expr },
+enum PipeOp {
+    Filter { bind_var: String, body: ast::Expr },
+    Map { bind_var: String, body: ast::Expr },
     Count,
-    CountWhere { bind_var: String, body: &'a ast::Expr },
-    Take { n: &'a ast::Expr },
-    Drop { n: &'a ast::Expr },
-    Sum { bind_var: String, body: &'a ast::Expr },
-    Avg { bind_var: String, body: &'a ast::Expr },
-    Min { bind_var: String, body: &'a ast::Expr },
-    Max { bind_var: String, body: &'a ast::Expr },
-    SortBy { bind_var: String, body: &'a ast::Expr },
-    TakeRelation { n: &'a ast::Expr },
+    CountWhere { bind_var: String, body: ast::Expr },
+    Take { n: ast::Expr },
+    Drop { n: ast::Expr },
+    Sum { bind_var: String, body: ast::Expr },
+    Avg { bind_var: String, body: ast::Expr },
+    Min { bind_var: String, body: ast::Expr },
+    Max { bind_var: String, body: ast::Expr },
+    SortBy { bind_var: String, body: ast::Expr },
+    TakeRelation { n: ast::Expr },
 }
 
 /// Flatten a nested pipe chain `a |> f |> g |> h` into `(a, [f, g, h])`.
 /// Each operation must be a recognized stdlib function (filter, map, count).
 fn flatten_pipe_chain<'a>(
     expr: &'a ast::Expr,
-    fun_bodies: &'a HashMap<String, ast::Expr>,
-) -> Option<(&'a ast::Expr, Vec<PipeOp<'a>>)> {
+    fun_bodies: &HashMap<String, ast::Expr>,
+) -> Option<(&'a ast::Expr, Vec<PipeOp>)> {
     let mut ops = Vec::new();
     let mut current = expr;
 
@@ -10082,10 +10097,10 @@ fn flatten_pipe_chain<'a>(
 }
 
 /// Recognize a pipe RHS as a SQL-compilable operation.
-fn analyze_pipe_op<'a>(
-    expr: &'a ast::Expr,
-    fun_bodies: &'a HashMap<String, ast::Expr>,
-) -> Option<PipeOp<'a>> {
+fn analyze_pipe_op(
+    expr: &ast::Expr,
+    fun_bodies: &HashMap<String, ast::Expr>,
+) -> Option<PipeOp> {
     match &expr.node {
         ast::ExprKind::Var(name) if name == "count" => Some(PipeOp::Count),
         ast::ExprKind::App { func, arg } => {
@@ -10097,9 +10112,9 @@ fn analyze_pipe_op<'a>(
                     "map" => extract_single_param_lambda(arg, fun_bodies).map(|(bind_var, body)| {
                         PipeOp::Map { bind_var, body }
                     }),
-                    "take" => Some(PipeOp::Take { n: arg }),
-                    "takeRelation" => Some(PipeOp::TakeRelation { n: arg }),
-                    "drop" => Some(PipeOp::Drop { n: arg }),
+                    "take" => Some(PipeOp::Take { n: (**arg).clone() }),
+                    "takeRelation" => Some(PipeOp::TakeRelation { n: (**arg).clone() }),
+                    "drop" => Some(PipeOp::Drop { n: (**arg).clone() }),
                     "sortBy" => extract_single_param_lambda(arg, fun_bodies).map(|(bind_var, body)| {
                         PipeOp::SortBy { bind_var, body }
                     }),
@@ -10128,87 +10143,393 @@ fn analyze_pipe_op<'a>(
     }
 }
 
-/// Extract bind variable name and body from a single-parameter lambda.
-fn extract_single_param_lambda<'a>(
-    expr: &'a ast::Expr,
-    fun_bodies: &'a HashMap<String, ast::Expr>,
-) -> Option<(String, &'a ast::Expr)> {
-    extract_single_param_lambda_depth(expr, fun_bodies, 3)
-}
-
-fn extract_single_param_lambda_depth<'a>(
-    expr: &'a ast::Expr,
-    fun_bodies: &'a HashMap<String, ast::Expr>,
-    depth: usize,
-) -> Option<(String, &'a ast::Expr)> {
-    if let ast::ExprKind::Lambda { params, body } = &expr.node {
+/// Extract bind variable name and body from a single-parameter lambda,
+/// fully inlining function calls (beta-reduction + named-function expansion)
+/// before checking the shape. The body is owned because inlining may
+/// synthesize new sub-expressions.
+fn extract_single_param_lambda(
+    expr: &ast::Expr,
+    fun_bodies: &HashMap<String, ast::Expr>,
+) -> Option<(String, ast::Expr)> {
+    let reduced = beta_reduce(expr, fun_bodies);
+    if let ast::ExprKind::Lambda { params, body } = reduced.node {
         if params.len() == 1 {
             if let ast::PatKind::Var(name) = &params[0].node {
-                return Some((name.clone(), body));
-            }
-        }
-    }
-    // Resolve named function references: isActive → \x -> x.active == 1
-    if depth > 0 {
-        if let ast::ExprKind::Var(name) = &expr.node {
-            if let Some(body) = fun_bodies.get(name) {
-                return extract_single_param_lambda_depth(body, fun_bodies, depth - 1);
+                return Some((name.clone(), *body));
             }
         }
     }
     None
 }
 
-/// Extract `filter (\x -> cond) *source` or `filter (\x -> cond) bound_var` pattern.
-/// Also handles cross-function expansion: `f *source` where `f = filter pred`.
-/// Returns (source_name, bind_var, filter_body).
-fn extract_filter_on_source<'a>(
-    expr: &'a ast::Expr,
-    source_var_binds: &'a HashMap<String, String>,
-    fun_bodies: &'a HashMap<String, ast::Expr>,
-) -> Option<(&'a str, String, &'a ast::Expr)> {
-    if let ast::ExprKind::App { func, arg: source_expr } = &expr.node {
-        let resolve_source = |se: &'a ast::Expr| -> Option<&'a str> {
+/// Extract `filter (\x -> cond) *source` or `filter (\x -> cond) bound_var`
+/// after full inlining. Returns (source_name, bind_var, filter_body).
+fn extract_filter_on_source(
+    expr: &ast::Expr,
+    source_var_binds: &HashMap<String, String>,
+    fun_bodies: &HashMap<String, ast::Expr>,
+) -> Option<(String, String, ast::Expr)> {
+    let reduced = beta_reduce(expr, fun_bodies);
+    if let ast::ExprKind::App { func, arg: source_expr } = &reduced.node {
+        let resolve_source = |se: &ast::Expr| -> Option<String> {
             match &se.node {
-                ast::ExprKind::SourceRef(name) => Some(name.as_str()),
-                ast::ExprKind::Var(name) => {
-                    source_var_binds.get(name).map(|s| s.as_str())
-                }
+                ast::ExprKind::SourceRef(name) => Some(name.clone()),
+                ast::ExprKind::Var(name) => source_var_binds.get(name).cloned(),
                 _ => None,
             }
         };
 
-        // Direct: filter (\x -> cond) *source
         if let ast::ExprKind::App { func: inner_func, arg: filter_lambda } = &func.node {
             if let ast::ExprKind::Var(fn_name) = &inner_func.node {
                 if fn_name == "filter" {
                     if let Some(source_name) = resolve_source(source_expr) {
-                        if let Some((bind_var, body)) = extract_single_param_lambda(filter_lambda, fun_bodies) {
+                        if let Some((bind_var, body)) =
+                            extract_single_param_lambda(filter_lambda, fun_bodies)
+                        {
                             return Some((source_name, bind_var, body));
                         }
                     }
                 }
             }
         }
+    }
+    None
+}
 
-        // Expanded: f *source where f = filter pred (partial application)
-        if let ast::ExprKind::Var(fn_name) = &func.node {
-            if let Some(fn_body) = fun_bodies.get(fn_name) {
-                if let ast::ExprKind::App { func: inner_func, arg: filter_lambda } = &fn_body.node {
-                    if let ast::ExprKind::Var(inner_name) = &inner_func.node {
-                        if inner_name == "filter" {
-                            if let Some(source_name) = resolve_source(source_expr) {
-                                if let Some((bind_var, body)) = extract_single_param_lambda(filter_lambda, fun_bodies) {
-                                    return Some((source_name, bind_var, body));
-                                }
+// ── Beta-reduction / inlining for SQL pushdown ────────────────────────
+//
+// Rewrites an expression by repeatedly:
+//   1. Replacing `Var(f)` with the body of `f` (when `f` is a known top-level
+//      function), and
+//   2. Beta-reducing `App(Lambda, arg)` into the lambda body with the
+//      parameter substituted by `arg`.
+// Continues until no more reductions apply. Recursion through `Var`s is
+// guarded by a `visited` set so recursive functions terminate (we leave
+// recursive references as-is rather than expanding them — pushdown will
+// fall back to runtime).
+//
+// Substitution is capture-avoiding: when entering a `Lambda` (or `Case`
+// arm pattern, etc.) whose bound names overlap with the free vars of the
+// substituted value, we abandon that branch of substitution and leave the
+// expression unchanged, which is sound (just less optimized).
+
+fn beta_reduce(expr: &ast::Expr, fun_bodies: &HashMap<String, ast::Expr>) -> ast::Expr {
+    let mut visited = HashSet::new();
+    beta_reduce_inner(expr, fun_bodies, &mut visited)
+}
+
+fn beta_reduce_inner(
+    expr: &ast::Expr,
+    fun_bodies: &HashMap<String, ast::Expr>,
+    visited: &mut HashSet<String>,
+) -> ast::Expr {
+    use ast::ExprKind::*;
+    let span = expr.span;
+    let new_node = match &expr.node {
+        Var(name) => {
+            if !visited.contains(name) {
+                if let Some(body) = fun_bodies.get(name) {
+                    visited.insert(name.clone());
+                    let result = beta_reduce_inner(body, fun_bodies, visited);
+                    visited.remove(name);
+                    return result;
+                }
+            }
+            Var(name.clone())
+        }
+        App { func, arg } => {
+            let f = beta_reduce_inner(func, fun_bodies, visited);
+            let a = beta_reduce_inner(arg, fun_bodies, visited);
+            if let Lambda { params, body } = &f.node {
+                if !params.is_empty() {
+                    if let ast::PatKind::Var(name) = &params[0].node {
+                        if let Some(substituted) = substitute(body, name, &a) {
+                            if params.len() == 1 {
+                                return beta_reduce_inner(&substituted, fun_bodies, visited);
                             }
+                            let new_lambda = ast::Spanned {
+                                node: Lambda {
+                                    params: params[1..].to_vec(),
+                                    body: Box::new(substituted),
+                                },
+                                span: f.span,
+                            };
+                            return beta_reduce_inner(&new_lambda, fun_bodies, visited);
                         }
                     }
                 }
             }
+            App { func: Box::new(f), arg: Box::new(a) }
         }
+        Lambda { params, body } => Lambda {
+            params: params.clone(),
+            body: Box::new(beta_reduce_inner(body, fun_bodies, visited)),
+        },
+        BinOp { op, lhs, rhs } => BinOp {
+            op: *op,
+            lhs: Box::new(beta_reduce_inner(lhs, fun_bodies, visited)),
+            rhs: Box::new(beta_reduce_inner(rhs, fun_bodies, visited)),
+        },
+        UnaryOp { op, operand } => UnaryOp {
+            op: *op,
+            operand: Box::new(beta_reduce_inner(operand, fun_bodies, visited)),
+        },
+        FieldAccess { expr: e, field } => FieldAccess {
+            expr: Box::new(beta_reduce_inner(e, fun_bodies, visited)),
+            field: field.clone(),
+        },
+        Record(fields) => Record(
+            fields
+                .iter()
+                .map(|f| ast::Field {
+                    name: f.name.clone(),
+                    value: beta_reduce_inner(&f.value, fun_bodies, visited),
+                })
+                .collect(),
+        ),
+        RecordUpdate { base, fields } => RecordUpdate {
+            base: Box::new(beta_reduce_inner(base, fun_bodies, visited)),
+            fields: fields
+                .iter()
+                .map(|f| ast::Field {
+                    name: f.name.clone(),
+                    value: beta_reduce_inner(&f.value, fun_bodies, visited),
+                })
+                .collect(),
+        },
+        List(items) => List(
+            items
+                .iter()
+                .map(|e| beta_reduce_inner(e, fun_bodies, visited))
+                .collect(),
+        ),
+        If { cond, then_branch, else_branch } => If {
+            cond: Box::new(beta_reduce_inner(cond, fun_bodies, visited)),
+            then_branch: Box::new(beta_reduce_inner(then_branch, fun_bodies, visited)),
+            else_branch: Box::new(beta_reduce_inner(else_branch, fun_bodies, visited)),
+        },
+        // For constructs that bind names (Case arms, Do statements, Set, etc.)
+        // we keep them unchanged: SQL pushdown never sees these inside the
+        // expressions it analyzes (lambda bodies of filter/map/aggregate).
+        Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | Case { .. } | Do(_)
+        | Set { .. } | ReplaceSet { .. } | Atomic(_) | At { .. } | UnitLit { .. }
+        | Annot { .. } | Refine(_) => return expr.clone(),
+    };
+    ast::Spanned { node: new_node, span }
+}
+
+/// Capture-avoiding substitution `expr[var := value]`. Returns `None` if
+/// performing the substitution would capture a free variable of `value`
+/// (in which case the caller leaves the expression unchanged).
+fn substitute(expr: &ast::Expr, var: &str, value: &ast::Expr) -> Option<ast::Expr> {
+    let value_fv = compute_free_vars(value);
+    substitute_inner(expr, var, value, &value_fv)
+}
+
+fn substitute_inner(
+    expr: &ast::Expr,
+    var: &str,
+    value: &ast::Expr,
+    value_fv: &HashSet<String>,
+) -> Option<ast::Expr> {
+    use ast::ExprKind::*;
+    let span = expr.span;
+    let new_node = match &expr.node {
+        Var(name) if name == var => return Some(value.clone()),
+        Var(_) | Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) => {
+            return Some(expr.clone())
+        }
+        Lambda { params, body } => {
+            if params.iter().any(|p| pat_binds(p, var)) {
+                return Some(expr.clone());
+            }
+            if params.iter().any(|p| pat_captures(p, value_fv)) {
+                return None;
+            }
+            Lambda {
+                params: params.clone(),
+                body: Box::new(substitute_inner(body, var, value, value_fv)?),
+            }
+        }
+        App { func, arg } => App {
+            func: Box::new(substitute_inner(func, var, value, value_fv)?),
+            arg: Box::new(substitute_inner(arg, var, value, value_fv)?),
+        },
+        BinOp { op, lhs, rhs } => BinOp {
+            op: *op,
+            lhs: Box::new(substitute_inner(lhs, var, value, value_fv)?),
+            rhs: Box::new(substitute_inner(rhs, var, value, value_fv)?),
+        },
+        UnaryOp { op, operand } => UnaryOp {
+            op: *op,
+            operand: Box::new(substitute_inner(operand, var, value, value_fv)?),
+        },
+        FieldAccess { expr: e, field } => FieldAccess {
+            expr: Box::new(substitute_inner(e, var, value, value_fv)?),
+            field: field.clone(),
+        },
+        Record(fields) => Record(
+            fields
+                .iter()
+                .map(|f| {
+                    substitute_inner(&f.value, var, value, value_fv).map(|v| ast::Field {
+                        name: f.name.clone(),
+                        value: v,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        RecordUpdate { base, fields } => RecordUpdate {
+            base: Box::new(substitute_inner(base, var, value, value_fv)?),
+            fields: fields
+                .iter()
+                .map(|f| {
+                    substitute_inner(&f.value, var, value, value_fv).map(|v| ast::Field {
+                        name: f.name.clone(),
+                        value: v,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
+        },
+        List(items) => List(
+            items
+                .iter()
+                .map(|e| substitute_inner(e, var, value, value_fv))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        If { cond, then_branch, else_branch } => If {
+            cond: Box::new(substitute_inner(cond, var, value, value_fv)?),
+            then_branch: Box::new(substitute_inner(then_branch, var, value, value_fv)?),
+            else_branch: Box::new(substitute_inner(else_branch, var, value, value_fv)?),
+        },
+        UnitLit { value: v, unit } => UnitLit {
+            value: Box::new(substitute_inner(v, var, value, value_fv)?),
+            unit: unit.clone(),
+        },
+        Annot { expr: e, ty } => Annot {
+            expr: Box::new(substitute_inner(e, var, value, value_fv)?),
+            ty: ty.clone(),
+        },
+        Refine(e) => Refine(Box::new(substitute_inner(e, var, value, value_fv)?)),
+        // Constructs that introduce binders we don't analyze for SQL: keep
+        // unchanged. Inlining doesn't need to look inside.
+        Case { .. } | Do(_) | Set { .. } | ReplaceSet { .. } | Atomic(_) | At { .. } => {
+            return Some(expr.clone())
+        }
+    };
+    Some(ast::Spanned { node: new_node, span })
+}
+
+fn compute_free_vars(expr: &ast::Expr) -> HashSet<String> {
+    let mut free = HashSet::new();
+    let bound = HashSet::new();
+    collect_free_vars_set(expr, &bound, &mut free);
+    free
+}
+
+fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut HashSet<String>) {
+    use ast::ExprKind::*;
+    match &expr.node {
+        Var(name) => {
+            if !bound.contains(name) {
+                free.insert(name.clone());
+            }
+        }
+        Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) => {}
+        Lambda { params, body } => {
+            let mut new_bound = bound.clone();
+            for p in params {
+                collect_pat_binds(p, &mut new_bound);
+            }
+            collect_free_vars_set(body, &new_bound, free);
+        }
+        App { func, arg } => {
+            collect_free_vars_set(func, bound, free);
+            collect_free_vars_set(arg, bound, free);
+        }
+        BinOp { lhs, rhs, .. } => {
+            collect_free_vars_set(lhs, bound, free);
+            collect_free_vars_set(rhs, bound, free);
+        }
+        UnaryOp { operand, .. } => collect_free_vars_set(operand, bound, free),
+        FieldAccess { expr: e, .. } => collect_free_vars_set(e, bound, free),
+        Record(fields) => {
+            for f in fields {
+                collect_free_vars_set(&f.value, bound, free);
+            }
+        }
+        RecordUpdate { base, fields } => {
+            collect_free_vars_set(base, bound, free);
+            for f in fields {
+                collect_free_vars_set(&f.value, bound, free);
+            }
+        }
+        List(items) => {
+            for e in items {
+                collect_free_vars_set(e, bound, free);
+            }
+        }
+        If { cond, then_branch, else_branch } => {
+            collect_free_vars_set(cond, bound, free);
+            collect_free_vars_set(then_branch, bound, free);
+            collect_free_vars_set(else_branch, bound, free);
+        }
+        UnitLit { value: v, .. } => collect_free_vars_set(v, bound, free),
+        Annot { expr: e, .. } => collect_free_vars_set(e, bound, free),
+        Refine(e) => collect_free_vars_set(e, bound, free),
+        // Conservative: ignore SQL-irrelevant constructs.
+        Case { .. } | Do(_) | Set { .. } | ReplaceSet { .. } | Atomic(_) | At { .. } => {}
     }
-    None
+}
+
+fn collect_pat_binds(pat: &ast::Pat, bound: &mut HashSet<String>) {
+    match &pat.node {
+        ast::PatKind::Var(n) => {
+            bound.insert(n.clone());
+        }
+        ast::PatKind::Constructor { payload, .. } => collect_pat_binds(payload, bound),
+        ast::PatKind::Record(fields) => {
+            for f in fields {
+                if let Some(p) = &f.pattern {
+                    collect_pat_binds(p, bound);
+                } else {
+                    bound.insert(f.name.clone());
+                }
+            }
+        }
+        ast::PatKind::List(items) => {
+            for p in items {
+                collect_pat_binds(p, bound);
+            }
+        }
+        ast::PatKind::Wildcard | ast::PatKind::Lit(_) => {}
+    }
+}
+
+fn pat_binds(pat: &ast::Pat, name: &str) -> bool {
+    match &pat.node {
+        ast::PatKind::Var(n) => n == name,
+        ast::PatKind::Constructor { payload, .. } => pat_binds(payload, name),
+        ast::PatKind::Record(fields) => fields.iter().any(|f| match &f.pattern {
+            Some(p) => pat_binds(p, name),
+            None => f.name == name,
+        }),
+        ast::PatKind::List(items) => items.iter().any(|p| pat_binds(p, name)),
+        ast::PatKind::Wildcard | ast::PatKind::Lit(_) => false,
+    }
+}
+
+fn pat_captures(pat: &ast::Pat, free_vars: &HashSet<String>) -> bool {
+    match &pat.node {
+        ast::PatKind::Var(n) => free_vars.contains(n),
+        ast::PatKind::Constructor { payload, .. } => pat_captures(payload, free_vars),
+        ast::PatKind::Record(fields) => fields.iter().any(|f| match &f.pattern {
+            Some(p) => pat_captures(p, free_vars),
+            None => free_vars.contains(&f.name),
+        }),
+        ast::PatKind::List(items) => items.iter().any(|p| pat_captures(p, free_vars)),
+        ast::PatKind::Wildcard | ast::PatKind::Lit(_) => false,
+    }
 }
 
 /// Convert an expression to a SQL parameter source (literal int or variable).

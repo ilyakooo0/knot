@@ -1500,6 +1500,8 @@ impl Infer {
     /// over `BTreeSet<IoEffect>` instead of fielded maps. Effects are
     /// equality-keyed (no inner type to unify on shared elements), so we
     /// only need to ensure each closed side covers the other's extras.
+    /// When both rows are closed, subset on either side is allowed —
+    /// only effects unique to *both* sides are a true conflict.
     fn unify_io_effects(
         &mut self,
         e1: &BTreeSet<IoEffect>,
@@ -1516,7 +1518,7 @@ impl Infer {
 
         match (r1, r2) {
             (None, None) => {
-                if !only1.is_empty() || !only2.is_empty() {
+                if !only1.is_empty() && !only2.is_empty() {
                     let extras: Vec<String> = only1
                         .iter()
                         .chain(only2.iter())

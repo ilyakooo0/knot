@@ -1,0 +1,85 @@
+name: Release Binaries
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute version from commit date
+        id: version
+        run: |
+          read YEAR MONTH DAY HOUR MINUTE <<< \
+            "$(TZ=UTC git log -1 --format=%cd --date=format-local:'%Y %-m %-d %-H %-M')"
+          TIME=$((HOUR * 100 + MINUTE))
+          echo "tag=${YEAR}.${MONTH}.${DAY}.${TIME}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            name: linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            name: linux-aarch64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            name: macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: macos-aarch64
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: always
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build knotc and runtime
+        run: cargo build --release --target ${{ matrix.target }} -p knot-compiler -p knot-runtime
+
+      - name: Package
+        shell: bash
+        run: |
+          STAGE="knotc-${{ needs.version.outputs.tag }}-${{ matrix.name }}"
+          mkdir -p "$STAGE"
+          cp "target/${{ matrix.target }}/release/knotc" "$STAGE/"
+          cp "target/${{ matrix.target }}/release/libknot_runtime.a" "$STAGE/"
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+          shasum -a 256 "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: Knot ${{ needs.version.outputs.tag }}
+          files: |
+            knotc-*.tar.gz
+            knotc-*.tar.gz.sha256
+          make_latest: true

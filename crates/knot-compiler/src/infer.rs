@@ -5746,12 +5746,18 @@ impl Infer {
 
         for (name, ty) in &self.source_types {
             let applied = self.apply(ty);
-            info.insert(name.clone(), display_ty_clean(&applied, &var_map_for(&applied)));
+            info.insert(
+                name.clone(),
+                display_ty_clean(&applied, &var_map_for(&applied), &unit_var_map_for(&applied)),
+            );
         }
 
         for (name, ty) in &self.derived_types {
             let applied = self.apply(ty);
-            info.insert(name.clone(), display_ty_clean(&applied, &var_map_for(&applied)));
+            info.insert(
+                name.clone(),
+                display_ty_clean(&applied, &var_map_for(&applied), &unit_var_map_for(&applied)),
+            );
         }
 
         info
@@ -5762,7 +5768,8 @@ impl Infer {
         for (span, ty) in &self.binding_types {
             let applied = self.apply(ty);
             let var_map = var_map_for(&applied);
-            info.insert(*span, display_ty_clean(&applied, &var_map));
+            let unit_var_map = unit_var_map_for(&applied);
+            info.insert(*span, display_ty_clean(&applied, &var_map, &unit_var_map));
         }
         info
     }
@@ -5770,7 +5777,8 @@ impl Infer {
     fn display_scheme(&self, scheme: &Scheme) -> String {
         let applied = self.apply(&scheme.ty);
         let var_map = var_map_for(&applied);
-        let ty_str = display_ty_clean(&applied, &var_map);
+        let unit_var_map = unit_var_map_for(&applied);
+        let ty_str = display_ty_clean(&applied, &var_map, &unit_var_map);
 
         if scheme.constraints.is_empty() {
             return ty_str;
@@ -5819,6 +5827,55 @@ fn var_map_for(ty: &Ty) -> HashMap<TyVar, usize> {
         .enumerate()
         .map(|(i, &v)| (v, i))
         .collect()
+}
+
+fn unit_var_map_for(ty: &Ty) -> HashMap<UnitVar, usize> {
+    let mut vars = Vec::new();
+    collect_unit_vars_ordered(ty, &mut vars);
+    vars.iter()
+        .enumerate()
+        .map(|(i, &v)| (v, i))
+        .collect()
+}
+
+fn collect_unit_vars_ordered(ty: &Ty, out: &mut Vec<UnitVar>) {
+    match ty {
+        Ty::IntUnit(u) | Ty::FloatUnit(u) => {
+            for &v in u.vars.keys() {
+                if !out.contains(&v) {
+                    out.push(v);
+                }
+            }
+        }
+        Ty::Fun(p, r) => {
+            collect_unit_vars_ordered(p, out);
+            collect_unit_vars_ordered(r, out);
+        }
+        Ty::Record(fields, _) => {
+            for t in fields.values() {
+                collect_unit_vars_ordered(t, out);
+            }
+        }
+        Ty::Variant(ctors, _) => {
+            for t in ctors.values() {
+                collect_unit_vars_ordered(t, out);
+            }
+        }
+        Ty::Relation(inner) => collect_unit_vars_ordered(inner, out),
+        Ty::Con(_, args) => {
+            for a in args {
+                collect_unit_vars_ordered(a, out);
+            }
+        }
+        Ty::App(f, a) => {
+            collect_unit_vars_ordered(f, out);
+            collect_unit_vars_ordered(a, out);
+        }
+        Ty::IO(_, _, inner) => collect_unit_vars_ordered(inner, out),
+        Ty::Forall(_, inner) => collect_unit_vars_ordered(inner, out),
+        Ty::Alias(_, inner) => collect_unit_vars_ordered(inner, out),
+        _ => {}
+    }
 }
 
 fn collect_vars_ordered(ty: &Ty, out: &mut Vec<TyVar>) {
@@ -5946,20 +6003,99 @@ fn var_letter(idx: usize) -> String {
     }
 }
 
-fn display_ty_clean(ty: &Ty, names: &HashMap<TyVar, usize>) -> String {
-    display_ty_clean_inner(ty, names, false)
+fn unit_var_letter(idx: usize) -> String {
+    if idx == 0 {
+        "u".to_string()
+    } else {
+        format!("u{}", idx)
+    }
 }
 
-fn display_ty_clean_inner(ty: &Ty, names: &HashMap<TyVar, usize>, in_fun: bool) -> String {
+fn display_unit_clean(u: &UnitTy, unit_names: &HashMap<UnitVar, usize>) -> String {
+    if u.is_dimensionless() {
+        return "1".to_string();
+    }
+    let mut num_parts = Vec::new();
+    let mut den_parts = Vec::new();
+    for (name, exp) in &u.bases {
+        if *exp > 0 {
+            if *exp == 1 {
+                num_parts.push(name.clone());
+            } else {
+                num_parts.push(format!("{}^{}", name, exp));
+            }
+        } else if *exp < 0 {
+            if *exp == -1 {
+                den_parts.push(name.clone());
+            } else {
+                den_parts.push(format!("{}^{}", name, -exp));
+            }
+        }
+    }
+    for (&v, &exp) in &u.vars {
+        let var_name = unit_names
+            .get(&v)
+            .copied()
+            .map(unit_var_letter)
+            .unwrap_or_else(|| format!("?u{}", v));
+        if exp > 0 {
+            if exp == 1 {
+                num_parts.push(var_name);
+            } else {
+                num_parts.push(format!("{}^{}", var_name, exp));
+            }
+        } else if exp < 0 {
+            if exp == -1 {
+                den_parts.push(var_name);
+            } else {
+                den_parts.push(format!("{}^{}", var_name, -exp));
+            }
+        }
+    }
+    if den_parts.is_empty() {
+        if num_parts.is_empty() {
+            "1".to_string()
+        } else {
+            num_parts.join("*")
+        }
+    } else if num_parts.is_empty() {
+        format!("1/{}", den_parts.join("*"))
+    } else {
+        format!("{}/{}", num_parts.join("*"), den_parts.join("*"))
+    }
+}
+
+fn display_ty_clean(
+    ty: &Ty,
+    names: &HashMap<TyVar, usize>,
+    unit_names: &HashMap<UnitVar, usize>,
+) -> String {
+    display_ty_clean_inner(ty, names, unit_names, false)
+}
+
+fn display_ty_clean_inner(
+    ty: &Ty,
+    names: &HashMap<TyVar, usize>,
+    unit_names: &HashMap<UnitVar, usize>,
+    in_fun: bool,
+) -> String {
     match ty {
         Ty::Var(v) => var_letter(names.get(v).copied().unwrap_or(*v as usize)),
         Ty::Int => "Int".into(),
         Ty::Float => "Float".into(),
         Ty::IntUnit(u) => {
-            if u.is_dimensionless() { "Int".into() } else { format!("Int<{}>", u.display()) }
+            if u.is_dimensionless() {
+                "Int".into()
+            } else {
+                format!("Int<{}>", display_unit_clean(u, unit_names))
+            }
         }
         Ty::FloatUnit(u) => {
-            if u.is_dimensionless() { "Float".into() } else { format!("Float<{}>", u.display()) }
+            if u.is_dimensionless() {
+                "Float".into()
+            } else {
+                format!("Float<{}>", display_unit_clean(u, unit_names))
+            }
         }
         Ty::Text => "Text".into(),
         Ty::Bool => "Bool".into(),
@@ -5967,8 +6103,8 @@ fn display_ty_clean_inner(ty: &Ty, names: &HashMap<TyVar, usize>, in_fun: bool) 
         Ty::Fun(p, r) => {
             let s = format!(
                 "{} -> {}",
-                display_ty_clean_inner(p, names, true),
-                display_ty_clean_inner(r, names, false)
+                display_ty_clean_inner(p, names, unit_names, true),
+                display_ty_clean_inner(r, names, unit_names, false)
             );
             if in_fun {
                 format!("({})", s)
@@ -5982,27 +6118,27 @@ fn display_ty_clean_inner(ty: &Ty, names: &HashMap<TyVar, usize>, in_fun: bool) 
             }
             let mut parts: Vec<String> = fields
                 .iter()
-                .map(|(n, t)| format!("{}: {}", n, display_ty_clean(t, names)))
+                .map(|(n, t)| format!("{}: {}", n, display_ty_clean(t, names, unit_names)))
                 .collect();
             if let Some(rv) = row {
                 parts.push(format!("| {}", var_letter(names.get(rv).copied().unwrap_or(*rv as usize))));
             }
             format!("{{{}}}", parts.join(", "))
         }
-        Ty::Relation(inner) => format!("[{}]", display_ty_clean(inner, names)),
+        Ty::Relation(inner) => format!("[{}]", display_ty_clean(inner, names, unit_names)),
         Ty::Con(name, args) => {
             if args.is_empty() {
                 name.clone()
             } else {
                 let args_str: Vec<String> =
-                    args.iter().map(|a| display_ty_clean(a, names)).collect();
+                    args.iter().map(|a| display_ty_clean(a, names, unit_names)).collect();
                 format!("{} {}", name, args_str.join(" "))
             }
         }
         Ty::Variant(ctors, row) => {
             let mut parts: Vec<String> = ctors
                 .iter()
-                .map(|(name, ft)| format!("{} {}", name, display_ty_clean(ft, names)))
+                .map(|(name, ft)| format!("{} {}", name, display_ty_clean(ft, names, unit_names)))
                 .collect();
             if let Some(rv) = row {
                 parts.push(var_letter(names.get(rv).copied().unwrap_or(*rv as usize)));
@@ -6012,20 +6148,20 @@ fn display_ty_clean_inner(ty: &Ty, names: &HashMap<TyVar, usize>, in_fun: bool) 
         Ty::TyCon(name) => name.clone(),
         Ty::App(f, a) => format!(
             "({} {})",
-            display_ty_clean(f, names),
-            display_ty_clean(a, names)
+            display_ty_clean(f, names, unit_names),
+            display_ty_clean(a, names, unit_names)
         ),
         Ty::IO(effects, row, inner) => {
             let effects_str =
                 display_effect_set_clean(effects, *row, names);
-            format!("IO{} {}", effects_str, display_ty_clean(inner, names))
+            format!("IO{} {}", effects_str, display_ty_clean(inner, names, unit_names))
         }
         Ty::EffectRow(effects, row) => {
             format!("Effects{}", display_effect_set_clean(effects, *row, names))
         }
         Ty::Forall(vars, inner) => {
             if vars.is_empty() {
-                display_ty_clean_inner(inner, names, in_fun)
+                display_ty_clean_inner(inner, names, unit_names, in_fun)
             } else {
                 let bound: Vec<String> = vars
                     .iter()
@@ -6034,7 +6170,7 @@ fn display_ty_clean_inner(ty: &Ty, names: &HashMap<TyVar, usize>, in_fun: bool) 
                 let s = format!(
                     "forall {}. {}",
                     bound.join(" "),
-                    display_ty_clean_inner(inner, names, false)
+                    display_ty_clean_inner(inner, names, unit_names, false)
                 );
                 if in_fun {
                     format!("({})", s)
@@ -7218,6 +7354,20 @@ main = applyPred (\\r -> r.x == r.y)\
                yield {}"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn type_info_renders_polymorphic_unit_vars_cleanly() {
+        // Inferred type signatures exposed to the LSP must render polymorphic
+        // unit variables as `u`, `u1`, ... — not as raw `?u104` substitutions.
+        let info = type_info_for("len = \\s -> length s");
+        let s = info.get("len").expect("len type should be inferred");
+        assert!(
+            !s.contains("?u"),
+            "type info should not leak raw unit vars: got {:?}",
+            s
+        );
+        assert_eq!(s, "Text -> Int<u>", "got {:?}", s);
     }
 
     // ── Refined types ─────────────────────────────────────────────

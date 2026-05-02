@@ -2551,6 +2551,95 @@ fn multiline_type_signature_does_not_consume_next_decl() {
     assert!(matches!(&m.decls[1].node, DeclKind::Fun { name, body: None, .. } if name == "bar"));
 }
 
+#[test]
+fn multiline_type_signature_app_args_across_lines() {
+    // Type-application arguments split across newlines — continuation line
+    // must be indented past the declaration column.
+    let src = "foo : Map String\n        Int\nfoo = bar";
+    let m = parse_ok(src);
+    let fun = m
+        .decls
+        .iter()
+        .find(|d| matches!(&d.node, DeclKind::Fun { name, .. } if name == "foo"))
+        .expect("should find 'foo'");
+    match &fun.node {
+        DeclKind::Fun { ty: Some(ts), body: Some(_), .. } => {
+            // Map String Int parses as App(App(Map, String), Int)
+            match &ts.ty.node {
+                TypeKind::App { func, arg } => {
+                    assert!(matches!(&arg.node, TypeKind::Named(n) if n == "Int"));
+                    assert!(matches!(&func.node, TypeKind::App { .. }));
+                }
+                other => panic!("expected nested App type, got {:?}", other),
+            }
+        }
+        other => panic!("expected Fun with type and body, got {:?}", other),
+    }
+}
+
+#[test]
+fn multiline_type_signature_app_three_lines() {
+    // Three-line application: head and each argument on its own line.
+    let src = "foo : Map\n        String\n        Int\nfoo = bar";
+    let m = parse_ok(src);
+    let fun = m
+        .decls
+        .iter()
+        .find(|d| matches!(&d.node, DeclKind::Fun { name, .. } if name == "foo"))
+        .expect("should find 'foo'");
+    match &fun.node {
+        DeclKind::Fun { ty: Some(ts), body: Some(_), .. } => match &ts.ty.node {
+            TypeKind::App { func, arg } => {
+                assert!(matches!(&arg.node, TypeKind::Named(n) if n == "Int"));
+                match &func.node {
+                    TypeKind::App { func: f2, arg: a2 } => {
+                        assert!(matches!(&a2.node, TypeKind::Named(n) if n == "String"));
+                        assert!(matches!(&f2.node, TypeKind::Named(n) if n == "Map"));
+                    }
+                    other => panic!("expected inner App, got {:?}", other),
+                }
+            }
+            other => panic!("expected App type, got {:?}", other),
+        },
+        other => panic!("expected Fun with type and body, got {:?}", other),
+    }
+}
+
+#[test]
+fn multiline_type_signature_app_does_not_consume_next_decl() {
+    // After a type-applied signature, the next top-level decl at column 0
+    // must not be sucked into the type.
+    let src = "foo : Map String\nbar : Int";
+    let m = parse_ok(src);
+    assert_eq!(m.decls.len(), 2);
+    assert!(matches!(&m.decls[0].node, DeclKind::Fun { name, body: None, .. } if name == "foo"));
+    assert!(matches!(&m.decls[1].node, DeclKind::Fun { name, body: None, .. } if name == "bar"));
+}
+
+#[test]
+fn multiline_type_signature_app_in_trait_block() {
+    // Type-application across lines inside a trait method signature, where
+    // block_indent is set to the indent of the methods.
+    let src = "trait Foo c where\n  m : Map String\n        Int\n  n : Int";
+    match first_decl(src) {
+        DeclKind::Trait { items, .. } => {
+            assert_eq!(items.len(), 2);
+            match &items[0] {
+                TraitItem::Method { name, ty, .. } => {
+                    assert_eq!(name, "m");
+                    assert!(matches!(&ty.ty.node, TypeKind::App { .. }));
+                }
+                other => panic!("expected Method, got {:?}", other),
+            }
+            match &items[1] {
+                TraitItem::Method { name, .. } => assert_eq!(name, "n"),
+                other => panic!("expected second Method, got {:?}", other),
+            }
+        }
+        other => panic!("expected Trait, got {:?}", other),
+    }
+}
+
 // ── Trait/Impl Advanced ─────────────────────────────────────────────
 
 #[test]

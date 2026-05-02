@@ -1688,9 +1688,17 @@ impl Parser {
                 .ok()?;
 
             this.skip_newlines();
-            // `from`
+            // `from`/`to`/`using` clause keywords sit at one indent inside
+            // the migrate header. Set `block_indent` to the column of the
+            // first clause so that multi-line type continuations (in
+            // `parse_type_app`) only fire when the next line is indented
+            // *past* the sibling clause keywords, not at their column.
+            let prev_block_indent = this.block_indent;
+            this.block_indent = this.column_of(&this.span());
+
             if !matches!(this.peek(), TokenKind::Lower(s) if s == "from") {
                 this.error("expected 'from' in migrate declaration");
+                this.block_indent = prev_block_indent;
                 return None;
             }
             this.advance();
@@ -1701,6 +1709,7 @@ impl Parser {
             // `to`
             if !matches!(this.peek(), TokenKind::Lower(s) if s == "to") {
                 this.error("expected 'to' in migrate declaration");
+                this.block_indent = prev_block_indent;
                 return None;
             }
             this.advance();
@@ -1711,9 +1720,11 @@ impl Parser {
             // `using`
             if !matches!(this.peek(), TokenKind::Lower(s) if s == "using") {
                 this.error("expected 'using' in migrate declaration");
+                this.block_indent = prev_block_indent;
                 return None;
             }
             this.advance();
+            this.block_indent = prev_block_indent;
 
             let using_fn = this.parse_expr()?;
 
@@ -3300,16 +3311,41 @@ impl Parser {
 
     fn parse_type_app(&mut self) -> Option<Type> {
         let mut func = self.parse_type_atom()?;
-        while self.can_start_type_atom() {
-            let arg = self.parse_type_atom()?;
-            let span = Span::new(func.span.start, arg.span.end);
-            func = Spanned::new(
-                TypeKind::App {
-                    func: Box::new(func),
-                    arg: Box::new(arg),
-                },
-                span,
-            );
+        loop {
+            if self.can_start_type_atom() {
+                let arg = self.parse_type_atom()?;
+                let span = Span::new(func.span.start, arg.span.end);
+                func = Spanned::new(
+                    TypeKind::App {
+                        func: Box::new(func),
+                        arg: Box::new(arg),
+                    },
+                    span,
+                );
+                continue;
+            }
+            // Continue across newlines if the next non-newline token is
+            // indented past the current block indent — mirrors the multi-line
+            // continuation rule for expression application.
+            let saved = self.save();
+            self.skip_newlines();
+            if !self.at_eof()
+                && self.column_of(&self.span()) > self.block_indent
+                && self.can_start_type_atom()
+            {
+                let arg = self.parse_type_atom()?;
+                let span = Span::new(func.span.start, arg.span.end);
+                func = Spanned::new(
+                    TypeKind::App {
+                        func: Box::new(func),
+                        arg: Box::new(arg),
+                    },
+                    span,
+                );
+            } else {
+                self.restore(saved);
+                break;
+            }
         }
         Some(func)
     }

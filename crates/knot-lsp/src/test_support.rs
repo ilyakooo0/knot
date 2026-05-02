@@ -48,6 +48,7 @@ impl TestWorkspace {
             inference_cache: Arc::new(Mutex::new(HashMap::new())),
             semantic_token_cache: HashMap::new(),
             semantic_token_counter: 0,
+            published_diag_hashes: HashMap::new(),
         };
         TestWorkspace {
             state,

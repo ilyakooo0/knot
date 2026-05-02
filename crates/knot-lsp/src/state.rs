@@ -125,6 +125,16 @@ pub struct DocumentState {
     /// re-queuing dependents that don't import any of these names — the
     /// previous-snapshot machinery already covers same-bytes cache hits.
     pub changed_decl_names: Vec<String>,
+    /// Transitive in-file closure of `changed_decl_names` — every decl whose
+    /// inferred type or effects could conceivably have shifted since the
+    /// previous analysis, accounting for the per-decl reverse-dependency
+    /// graph. Populated by `analyze_document` from the fingerprint, and
+    /// reserved for the future selective-inference path: a passed-through
+    /// `infer.rs::check` overload could use this to skip re-checking decls
+    /// outside the closure. Until then, it's available to feature handlers
+    /// (e.g. so a change-driven UI can highlight "freshly re-checked" decls).
+    #[allow(dead_code)]
+    pub dirty_decl_closure: std::collections::HashSet<String>,
 }
 
 // ── Server-wide state ───────────────────────────────────────────────
@@ -192,6 +202,12 @@ pub struct ServerState {
     /// request bumps this; the resulting string is used as the next
     /// `result_id` field.
     pub semantic_token_counter: u64,
+    /// Hash of the most recently published diagnostics list per URI. Used to
+    /// short-circuit `publish_diagnostics` when an edit produced an identical
+    /// diagnostic set — common for whitespace/comment edits where the
+    /// fingerprint cache already reused the snapshot. Avoids gratuitous LSP
+    /// traffic and editor re-renders. Pruned on document close.
+    pub published_diag_hashes: HashMap<Uri, u64>,
 }
 
 /// Symbol entry stored in the workspace symbol cache.

@@ -19,7 +19,7 @@
   yield r
 
 main = do
-  *manages = [{manager: "Alice", report: "Bob"}, {manager: "Bob", report: "Carol"}, {manager: "Carol", report: "Dave"}]
+  full *manages = [{manager: "Alice", report: "Bob"}, {manager: "Bob", report: "Carol"}, {manager: "Carol", report: "Dave"}]
   println "All reports-to relationships:"
   r <- &reportsTo
   println (r.ancestor ++ " -> " ++ r.descendant)

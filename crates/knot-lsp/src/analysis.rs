@@ -8,9 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use lsp_server::{Connection, Message, Notification};
-use lsp_types::notification::Notification as _;
-use lsp_types::{notification, Diagnostic, PublishDiagnosticsParams, Uri};
+use lsp_types::Uri;
 
 use knot::ast::{self, DeclKind, Module, Span};
 use knot::diagnostic;
@@ -18,7 +16,6 @@ use knot_compiler::effects::EffectSet;
 use knot_compiler::infer::MonadKind;
 
 use crate::defs::{build_details, resolve_definitions};
-use crate::diagnostics::to_lsp_diagnostic;
 use crate::incremental::ModuleFingerprint;
 use crate::state::{
     content_hash, AnalysisResult, AnalysisTask, DocumentState, InferenceCache, InferenceSnapshot,
@@ -153,6 +150,7 @@ pub fn analyze_document(
     let mut monad_info: HashMap<Span, MonadKind> = HashMap::new();
     let unit_info: HashMap<Span, String> = HashMap::new();
     let mut changed_decl_names: Vec<String> = Vec::new();
+    let mut dirty_decl_closure: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let lexer = knot::lexer::Lexer::new(source);
     let (tokens, lex_diags) = lexer.tokenize();
@@ -231,6 +229,11 @@ pub fn analyze_document(
                 .max_by_key(|(_, s)| s.access_clock)
             {
                 let dirty = new_fingerprint.changed_decls(&latest.1.fingerprint);
+                // Compute the transitive in-file dirty closure too. Stored
+                // on `DocumentState` for selective re-check downstream of
+                // the inference pass once `infer.rs::check` learns to skip
+                // clean decls. Cheap to compute (linear in decl count).
+                dirty_decl_closure = new_fingerprint.dirty_closure(&dirty);
                 changed_decl_names = dirty.into_iter().collect();
                 changed_decl_names.sort();
                 if std::env::var("KNOT_LSP_TRACE_DIRTY").is_ok() && !changed_decl_names.is_empty() {
@@ -412,6 +415,7 @@ pub fn analyze_document(
         monad_info,
         unit_info,
         changed_decl_names,
+        dirty_decl_closure,
     }
 }
 
@@ -461,6 +465,7 @@ fn reuse_snapshot(
         // Cache hit: the parsed AST is identical (or structurally equal)
         // to a prior run, so by definition no decls changed since then.
         changed_decl_names: Vec::new(),
+        dirty_decl_closure: std::collections::HashSet::new(),
     }
 }
 
@@ -612,26 +617,10 @@ pub fn resolve_import_navigation(
     (imported_files, import_defs, import_origins)
 }
 
-// ── Diagnostic publishing ───────────────────────────────────────────
-
-pub fn publish_diagnostics(
-    conn: &Connection,
-    uri: &Uri,
-    doc: &DocumentState,
-    version: Option<i32>,
-) {
-    let lsp_diags: Vec<Diagnostic> = doc
-        .knot_diagnostics
-        .iter()
-        .filter_map(|d| to_lsp_diagnostic(d, &doc.source, uri))
-        .collect();
-
-    let params = PublishDiagnosticsParams::new(uri.clone(), lsp_diags, version);
-    let not = Notification::new(notification::PublishDiagnostics::METHOD.into(), params);
-    if let Err(e) = conn.sender.send(Message::Notification(not)) {
-        eprintln!("knot-lsp: failed to publish diagnostics: {e}");
-    }
-}
+// Diagnostic publishing now lives in `main.rs::publish_diagnostics_dedup` so
+// it can hash against the per-URI `published_diag_hashes` cache and skip
+// redundant LSP roundtrips. The legacy `publish_diagnostics` helper here was
+// removed when that move happened.
 
 // ── Tests ───────────────────────────────────────────────────────────
 

@@ -29,14 +29,18 @@ pub(crate) fn handle_prepare_rename(
     // Check if cursor is on a renameable symbol
     let word = word_at_position(&doc.source, pos)?;
 
-    // Must be on a known definition or a reference to one
+    // Must be on a known definition, a reference to one, or a record field
+    // position. Field positions are determined by AST shape — we accept them
+    // here so the editor offers the rename action; the actual rewrite is
+    // handled in `handle_rename` via `collect_field_rename_sites`.
     let is_ref = doc
         .references
         .iter()
         .any(|(usage, _)| usage.start <= offset && offset < usage.end);
     let is_def = doc.definitions.values().any(|span| span.start <= offset && offset < span.end);
+    let is_field = is_at_record_field(&doc.module, &doc.source, offset);
 
-    if !is_ref && !is_def {
+    if !is_ref && !is_def && !is_field {
         return None;
     }
 
@@ -70,6 +74,34 @@ pub(crate) fn handle_rename(
     let offset = position_to_offset(&doc.source, pos);
     let new_name = &params.new_name;
     let old_name = word_at_position(&doc.source, pos)?.to_string();
+
+    // Field rename branch: when the cursor sits on a record field name (not a
+    // symbol), the cross-file owner machinery doesn't apply — there's no
+    // "owning declaration" the way there is for top-level names. We rewrite
+    // every matching field-name position in the same file. We don't attempt
+    // cross-file field rename: doing it correctly requires record-type
+    // resolution at every site, which the LSP doesn't have plumbed through.
+    if is_at_record_field(&doc.module, &doc.source, offset) {
+        let sites = collect_field_rename_sites(&doc.module, &doc.source, &old_name);
+        if !sites.is_empty() {
+            let mut edits: Vec<TextEdit> = sites
+                .into_iter()
+                .map(|s| TextEdit {
+                    range: span_to_range(s, &doc.source),
+                    new_text: new_name.clone(),
+                })
+                .collect();
+            // Deterministic order (stable across runs) so test expectations
+            // can match a known sequence.
+            edits.sort_by_key(|e| (e.range.start.line, e.range.start.character));
+            let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
+            changes.insert(uri.clone(), edits);
+            return Some(WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            });
+        }
+    }
 
     // Phase 1: identify the canonical owner — the file + span where the
     // symbol's definition lives. If the cursor is on an imported symbol,
@@ -543,6 +575,428 @@ fn file_imports_owner(
         }
     }
     false
+}
+
+/// True if `offset` lands on a record field name. Field names live in:
+/// record-literal field bindings (`{name: x}`), record patterns (`{name: y}`),
+/// field accesses (`p.name`), record-type fields (`type T = {name: Text}`),
+/// and data-constructor fields (`Circle {radius: Float}`). The AST stores
+/// field names as bare strings (no per-name span), so we recover spans by
+/// scanning the field's containing source range.
+fn is_at_record_field(module: &ast::Module, source: &str, offset: usize) -> bool {
+    field_position_at(module, source, offset).is_some()
+}
+
+/// Find the field name (and its span) at `offset`. Returns `None` if the
+/// cursor isn't on a field-name token.
+fn field_position_at(
+    module: &ast::Module,
+    source: &str,
+    offset: usize,
+) -> Option<(String, Span)> {
+    let mut found: Option<(String, Span)> = None;
+    for decl in &module.decls {
+        if decl.span.start > offset || offset > decl.span.end {
+            continue;
+        }
+        scan_decl_for_field(decl, source, offset, &mut found);
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+fn scan_decl_for_field(
+    decl: &ast::Decl,
+    source: &str,
+    offset: usize,
+    found: &mut Option<(String, Span)>,
+) {
+    match &decl.node {
+        DeclKind::Fun {
+            body: Some(body), ..
+        } => scan_expr_for_field(body, source, offset, found),
+        DeclKind::View { body, .. } | DeclKind::Derived { body, .. } => {
+            scan_expr_for_field(body, source, offset, found)
+        }
+        DeclKind::Impl { items, .. } => {
+            for item in items {
+                if let ast::ImplItem::Method { body, .. } = item {
+                    scan_expr_for_field(body, source, offset, found);
+                    if found.is_some() {
+                        return;
+                    }
+                }
+            }
+        }
+        DeclKind::Data { constructors, .. } => {
+            for ctor in constructors {
+                for f in &ctor.fields {
+                    if let Some(span) =
+                        find_field_name_span(source, decl.span, &f.name, offset)
+                    {
+                        *found = Some((f.name.clone(), span));
+                        return;
+                    }
+                }
+            }
+        }
+        DeclKind::TypeAlias { ty, .. } => {
+            scan_type_for_field(ty, source, offset, found);
+        }
+        DeclKind::Source { ty, .. } => {
+            scan_type_for_field(ty, source, offset, found);
+        }
+        _ => {}
+    }
+}
+
+fn scan_expr_for_field(
+    expr: &ast::Expr,
+    source: &str,
+    offset: usize,
+    found: &mut Option<(String, Span)>,
+) {
+    if found.is_some() {
+        return;
+    }
+    if expr.span.start > offset || offset > expr.span.end {
+        return;
+    }
+    match &expr.node {
+        ast::ExprKind::Record(fields) => {
+            for f in fields {
+                if let Some(span) = find_field_name_span(source, expr.span, &f.name, offset)
+                {
+                    *found = Some((f.name.clone(), span));
+                    return;
+                }
+            }
+        }
+        ast::ExprKind::RecordUpdate { fields, .. } => {
+            for f in fields {
+                if let Some(span) = find_field_name_span(source, expr.span, &f.name, offset)
+                {
+                    *found = Some((f.name.clone(), span));
+                    return;
+                }
+            }
+        }
+        ast::ExprKind::FieldAccess { field, expr: rec } => {
+            // Only the field-name suffix is renameable; the receiver is
+            // its own thing. Search for the field token after the receiver.
+            let after_recv = rec.span.end.min(expr.span.end);
+            if let Some(span) = find_field_name_span(
+                source,
+                Span::new(after_recv, expr.span.end),
+                field,
+                offset,
+            ) {
+                *found = Some((field.clone(), span));
+                return;
+            }
+        }
+        ast::ExprKind::Case { arms, .. } => {
+            for arm in arms {
+                scan_pat_for_field(&arm.pat, source, offset, found);
+                if found.is_some() {
+                    return;
+                }
+            }
+        }
+        ast::ExprKind::Do(stmts) => {
+            for stmt in stmts {
+                match &stmt.node {
+                    ast::StmtKind::Bind { pat, .. } | ast::StmtKind::Let { pat, .. } => {
+                        scan_pat_for_field(pat, source, offset, found);
+                        if found.is_some() {
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    crate::utils::recurse_expr(expr, |e| scan_expr_for_field(e, source, offset, found));
+}
+
+fn scan_pat_for_field(
+    pat: &ast::Pat,
+    source: &str,
+    offset: usize,
+    found: &mut Option<(String, Span)>,
+) {
+    if found.is_some() {
+        return;
+    }
+    if pat.span.start > offset || offset > pat.span.end {
+        return;
+    }
+    if let ast::PatKind::Record(fields) = &pat.node {
+        for f in fields {
+            if let Some(span) = find_field_name_span(source, pat.span, &f.name, offset) {
+                *found = Some((f.name.clone(), span));
+                return;
+            }
+            if let Some(inner) = &f.pattern {
+                scan_pat_for_field(inner, source, offset, found);
+                if found.is_some() {
+                    return;
+                }
+            }
+        }
+    }
+    if let ast::PatKind::Constructor { payload, .. } = &pat.node {
+        scan_pat_for_field(payload, source, offset, found);
+    }
+    if let ast::PatKind::List(pats) = &pat.node {
+        for p in pats {
+            scan_pat_for_field(p, source, offset, found);
+            if found.is_some() {
+                return;
+            }
+        }
+    }
+}
+
+fn scan_type_for_field(
+    ty: &ast::Type,
+    source: &str,
+    offset: usize,
+    found: &mut Option<(String, Span)>,
+) {
+    if found.is_some() {
+        return;
+    }
+    if ty.span.start > offset || offset > ty.span.end {
+        return;
+    }
+    if let ast::TypeKind::Record { fields, .. } = &ty.node {
+        for f in fields {
+            if let Some(span) = find_field_name_span(source, ty.span, &f.name, offset) {
+                *found = Some((f.name.clone(), span));
+                return;
+            }
+            scan_type_for_field(&f.value, source, offset, found);
+            if found.is_some() {
+                return;
+            }
+        }
+    }
+}
+
+/// Locate `name` as a whole-word token within the source slice covering
+/// `outer`, picking the occurrence whose span contains `offset`. Returns the
+/// absolute span of the match, or `None` if `offset` doesn't land on a
+/// whole-word `name` inside `outer`.
+fn find_field_name_span(
+    source: &str,
+    outer: Span,
+    name: &str,
+    offset: usize,
+) -> Option<Span> {
+    if name.is_empty() || outer.end > source.len() || outer.start >= outer.end {
+        return None;
+    }
+    let text = &source[outer.start..outer.end];
+    let bytes = text.as_bytes();
+    let needle = name.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] == needle {
+            let left_ok = i == 0 || !is_ident(bytes[i - 1]);
+            let right_ok = i + needle.len() >= bytes.len() || !is_ident(bytes[i + needle.len()]);
+            if left_ok && right_ok {
+                let abs_start = outer.start + i;
+                let abs_end = abs_start + needle.len();
+                if abs_start <= offset && offset < abs_end {
+                    return Some(Span::new(abs_start, abs_end));
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Walk the module and collect every span where `name` appears as a record-
+/// field token. Used by the field-rename path to build the edit list. Casts
+/// a wider net than strict type-aware rename, so users may need to review
+/// edits in a codebase where the same field name appears across multiple
+/// record types.
+fn collect_field_rename_sites(
+    module: &ast::Module,
+    source: &str,
+    name: &str,
+) -> Vec<Span> {
+    let mut out: Vec<Span> = Vec::new();
+    for decl in &module.decls {
+        collect_field_sites_in_decl(decl, source, name, &mut out);
+    }
+    // Dedupe in case the AST walk visits the same span via two branches.
+    out.sort_by_key(|s| (s.start, s.end));
+    out.dedup_by_key(|s| (s.start, s.end));
+    out
+}
+
+fn collect_field_sites_in_decl(
+    decl: &ast::Decl,
+    source: &str,
+    name: &str,
+    out: &mut Vec<Span>,
+) {
+    match &decl.node {
+        DeclKind::Fun {
+            body: Some(body), ..
+        } => collect_field_sites_in_expr(body, source, name, out),
+        DeclKind::View { body, .. } | DeclKind::Derived { body, .. } => {
+            collect_field_sites_in_expr(body, source, name, out);
+        }
+        DeclKind::Impl { items, .. } => {
+            for item in items {
+                if let ast::ImplItem::Method { body, .. } = item {
+                    collect_field_sites_in_expr(body, source, name, out);
+                }
+            }
+        }
+        DeclKind::Data { constructors, .. } => {
+            for ctor in constructors {
+                for f in &ctor.fields {
+                    if f.name == name {
+                        if let Some(span) = find_first_field_name_span(source, decl.span, name) {
+                            out.push(span);
+                        }
+                    }
+                }
+            }
+        }
+        DeclKind::TypeAlias { ty, .. } | DeclKind::Source { ty, .. } => {
+            collect_field_sites_in_type(ty, source, name, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_field_sites_in_expr(
+    expr: &ast::Expr,
+    source: &str,
+    name: &str,
+    out: &mut Vec<Span>,
+) {
+    match &expr.node {
+        ast::ExprKind::Record(fields) | ast::ExprKind::RecordUpdate { fields, .. } => {
+            for f in fields {
+                if f.name == name {
+                    if let Some(span) = find_first_field_name_span(source, expr.span, name) {
+                        out.push(span);
+                    }
+                }
+            }
+        }
+        ast::ExprKind::FieldAccess { field, expr: rec } => {
+            if field == name {
+                let after_recv = rec.span.end.min(expr.span.end);
+                if let Some(span) =
+                    find_first_field_name_span(source, Span::new(after_recv, expr.span.end), name)
+                {
+                    out.push(span);
+                }
+            }
+        }
+        ast::ExprKind::Case { arms, .. } => {
+            for arm in arms {
+                collect_field_sites_in_pat(&arm.pat, source, name, out);
+            }
+        }
+        ast::ExprKind::Do(stmts) => {
+            for stmt in stmts {
+                match &stmt.node {
+                    ast::StmtKind::Bind { pat, .. } | ast::StmtKind::Let { pat, .. } => {
+                        collect_field_sites_in_pat(pat, source, name, out);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    crate::utils::recurse_expr(expr, |e| collect_field_sites_in_expr(e, source, name, out));
+}
+
+fn collect_field_sites_in_pat(
+    pat: &ast::Pat,
+    source: &str,
+    name: &str,
+    out: &mut Vec<Span>,
+) {
+    if let ast::PatKind::Record(fields) = &pat.node {
+        for f in fields {
+            if f.name == name {
+                if let Some(span) = find_first_field_name_span(source, pat.span, name) {
+                    out.push(span);
+                }
+            }
+            if let Some(inner) = &f.pattern {
+                collect_field_sites_in_pat(inner, source, name, out);
+            }
+        }
+    }
+    if let ast::PatKind::Constructor { payload, .. } = &pat.node {
+        collect_field_sites_in_pat(payload, source, name, out);
+    }
+    if let ast::PatKind::List(pats) = &pat.node {
+        for p in pats {
+            collect_field_sites_in_pat(p, source, name, out);
+        }
+    }
+}
+
+fn collect_field_sites_in_type(
+    ty: &ast::Type,
+    source: &str,
+    name: &str,
+    out: &mut Vec<Span>,
+) {
+    if let ast::TypeKind::Record { fields, .. } = &ty.node {
+        for f in fields {
+            if f.name == name {
+                if let Some(span) = find_first_field_name_span(source, ty.span, name) {
+                    out.push(span);
+                }
+            }
+            collect_field_sites_in_type(&f.value, source, name, out);
+        }
+    }
+}
+
+/// Locate the first whole-word occurrence of `name` inside `outer`, returning
+/// its absolute span. Used when we know a field with that name appears within
+/// a span and want to find its source position.
+fn find_first_field_name_span(source: &str, outer: Span, name: &str) -> Option<Span> {
+    if name.is_empty() || outer.end > source.len() || outer.start >= outer.end {
+        return None;
+    }
+    let text = &source[outer.start..outer.end];
+    let bytes = text.as_bytes();
+    let needle = name.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] == needle {
+            let left_ok = i == 0 || !is_ident(bytes[i - 1]);
+            let right_ok = i + needle.len() >= bytes.len() || !is_ident(bytes[i + needle.len()]);
+            if left_ok && right_ok {
+                let abs_start = outer.start + i;
+                return Some(Span::new(abs_start, abs_start + needle.len()));
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// BFS over `state.reverse_imports` to collect every file that transitively

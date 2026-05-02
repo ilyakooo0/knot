@@ -406,6 +406,13 @@ struct Infer {
     /// be used as "return unit" in if/case branches within IO do blocks.
     in_io_do: bool,
 
+    /// Local variables bound directly to a source ref (`x <- *foo` or
+    /// `let x = *foo`). Used to recognize incremental `set` patterns where
+    /// the value references the source via an alias instead of `*foo`.
+    /// Saved and restored across do-blocks (mirrors codegen's
+    /// `source_var_binds`).
+    source_var_binds: HashMap<String, String>,
+
     /// Whether we are currently inside an `atomic` block.
     in_atomic: bool,
 
@@ -462,6 +469,7 @@ impl Infer {
             fetch_response_headers: HashMap::new(),
             in_io_do: false,
             in_atomic: false,
+            source_var_binds: HashMap::new(),
             next_unit_var: 0,
             unit_subst: HashMap::new(),
             declared_units: HashMap::new(),
@@ -2952,6 +2960,33 @@ impl Infer {
                 if let ast::ExprKind::SourceRef(name) = &target.node {
                     effects.insert(IoEffect::Writes(name.clone()));
                     effects.insert(IoEffect::Reads(name.clone()));
+
+                    // Require `full *rel = ...` when the value is a full
+                    // replacement (doesn't reference *rel directly or via a
+                    // local alias `xs <- *rel`). Skip views and scalar
+                    // sources where the distinction is meaningless.
+                    let is_view = self.view_names.contains(name);
+                    let is_relation = matches!(
+                        self.source_types.get(name),
+                        Some(Ty::Relation(_))
+                    );
+                    if !is_view
+                        && is_relation
+                        && !value_references_source(
+                            value,
+                            name,
+                            &self.source_var_binds,
+                        )
+                    {
+                        self.error(
+                            format!(
+                                "`*{name} = ...` must reference `*{name}` \
+                                 (directly or via a `<- *{name}` bind); \
+                                 use `full *{name} = ...` for a full replacement"
+                            ),
+                            expr.span,
+                        );
+                    }
                 }
                 Ty::IO(effects, None, Box::new(Ty::unit()))
             }
@@ -3808,6 +3843,9 @@ impl Infer {
         let prev_in_io_do = self.in_io_do;
         self.in_io_do = self.in_io_do || self.stmt_has_io(stmts);
 
+        // Save source aliases so binds inside this do-block don't leak out.
+        let prev_source_var_binds = self.source_var_binds.clone();
+
         for stmt in stmts {
             match &stmt.node {
                 ast::StmtKind::Bind { pat, expr } => {
@@ -3862,6 +3900,14 @@ impl Infer {
                         );
                         self.check_pattern(pat, &elem_ty);
                     }
+
+                    // Track `x <- *foo` for `set` full-replacement detection.
+                    if let ast::PatKind::Var(var_name) = &pat.node {
+                        if let ast::ExprKind::SourceRef(source_name) = &expr.node {
+                            self.source_var_binds
+                                .insert(var_name.clone(), source_name.clone());
+                        }
+                    }
                 }
                 ast::StmtKind::Let { pat, expr } => {
                     let expr_ty = self.infer_expr(expr);
@@ -3893,6 +3939,14 @@ impl Infer {
                         self.binding_types.push((pat.span, applied));
                     } else {
                         self.check_pattern(pat, &expr_ty);
+                    }
+
+                    // Track `let x = *foo` for `set` full-replacement detection.
+                    if let ast::PatKind::Var(var_name) = &pat.node {
+                        if let ast::ExprKind::SourceRef(source_name) = &expr.node {
+                            self.source_var_binds
+                                .insert(var_name.clone(), source_name.clone());
+                        }
                     }
                 }
                 ast::StmtKind::Where { cond } => {
@@ -3986,6 +4040,7 @@ impl Infer {
 
         self.pop_scope();
         self.in_io_do = prev_in_io_do;
+        self.source_var_binds = prev_source_var_binds;
 
         // Determine block result type:
         // - IO if any statement is IO
@@ -5985,6 +6040,108 @@ fn display_ty_clean_inner(ty: &Ty, names: &HashMap<TyVar, usize>, in_fun: bool) 
     }
 }
 
+// ── `set` full-replacement detection ──────────────────────────────
+
+/// Whether `expr` references `*source_name` — either directly via
+/// `SourceRef`, or via a local variable bound to `*source_name`
+/// (e.g. `xs <- *foo`, then `xs` counts as a reference). Used to
+/// distinguish incremental `set` (must reference the source) from
+/// full replacement (which requires `full *rel = ...`).
+fn value_references_source(
+    expr: &ast::Expr,
+    source_name: &str,
+    aliases: &HashMap<String, String>,
+) -> bool {
+    match &expr.node {
+        ast::ExprKind::SourceRef(name) => name == source_name,
+        ast::ExprKind::Var(name) => {
+            aliases.get(name).map(|s| s.as_str()) == Some(source_name)
+        }
+        ast::ExprKind::Lit(_)
+        | ast::ExprKind::Constructor(_)
+        | ast::ExprKind::DerivedRef(_) => false,
+        ast::ExprKind::Record(fields) => fields
+            .iter()
+            .any(|f| value_references_source(&f.value, source_name, aliases)),
+        ast::ExprKind::RecordUpdate { base, fields } => {
+            value_references_source(base, source_name, aliases)
+                || fields.iter().any(|f| {
+                    value_references_source(&f.value, source_name, aliases)
+                })
+        }
+        ast::ExprKind::FieldAccess { expr, .. } => {
+            value_references_source(expr, source_name, aliases)
+        }
+        ast::ExprKind::List(elems) => elems
+            .iter()
+            .any(|e| value_references_source(e, source_name, aliases)),
+        ast::ExprKind::Lambda { body, .. } => {
+            value_references_source(body, source_name, aliases)
+        }
+        ast::ExprKind::App { func, arg } => {
+            value_references_source(func, source_name, aliases)
+                || value_references_source(arg, source_name, aliases)
+        }
+        ast::ExprKind::BinOp { lhs, rhs, .. } => {
+            value_references_source(lhs, source_name, aliases)
+                || value_references_source(rhs, source_name, aliases)
+        }
+        ast::ExprKind::UnaryOp { operand, .. } => {
+            value_references_source(operand, source_name, aliases)
+        }
+        ast::ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            value_references_source(cond, source_name, aliases)
+                || value_references_source(then_branch, source_name, aliases)
+                || value_references_source(else_branch, source_name, aliases)
+        }
+        ast::ExprKind::Case { scrutinee, arms } => {
+            value_references_source(scrutinee, source_name, aliases)
+                || arms.iter().any(|a| {
+                    value_references_source(&a.body, source_name, aliases)
+                })
+        }
+        ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
+            ast::StmtKind::Bind { expr, .. } => {
+                value_references_source(expr, source_name, aliases)
+            }
+            ast::StmtKind::Let { expr, .. } => {
+                value_references_source(expr, source_name, aliases)
+            }
+            ast::StmtKind::Where { cond } => {
+                value_references_source(cond, source_name, aliases)
+            }
+            ast::StmtKind::GroupBy { key } => {
+                value_references_source(key, source_name, aliases)
+            }
+            ast::StmtKind::Expr(e) => {
+                value_references_source(e, source_name, aliases)
+            }
+        }),
+        ast::ExprKind::Set { target, value }
+        | ast::ExprKind::FullSet { target, value } => {
+            value_references_source(target, source_name, aliases)
+                || value_references_source(value, source_name, aliases)
+        }
+        ast::ExprKind::Atomic(inner) | ast::ExprKind::Refine(inner) => {
+            value_references_source(inner, source_name, aliases)
+        }
+        ast::ExprKind::At { relation, time } => {
+            value_references_source(relation, source_name, aliases)
+                || value_references_source(time, source_name, aliases)
+        }
+        ast::ExprKind::UnitLit { value, .. } => {
+            value_references_source(value, source_name, aliases)
+        }
+        ast::ExprKind::Annot { expr, .. } => {
+            value_references_source(expr, source_name, aliases)
+        }
+    }
+}
+
 // ── Public API ────────────────────────────────────────────────────
 
 /// Run type inference on a parsed module. Returns diagnostics,
@@ -6299,14 +6456,53 @@ main = applyPred (\\r -> r.x == r.y)\
     #[test]
     fn set_type_matches_source() {
         assert!(check_src(
-            "*nums : [Int]\nmain = *nums = [1, 2, 3]"
+            "*nums : [Int]\nmain = full *nums = [1, 2, 3]"
         ).is_empty());
+    }
+
+    #[test]
+    fn bare_set_full_replacement_errors() {
+        // `*nums = [1, 2, 3]` doesn't reference *nums, so it's a full
+        // replacement and must use `full` syntax.
+        let diags = check_src(
+            "*nums : [Int]\nmain = *nums = [1, 2, 3]"
+        );
+        assert!(has_error(&diags, "full *nums"));
+    }
+
+    #[test]
+    fn bare_set_via_local_alias_ok() {
+        // `xs <- *people` makes `xs` an alias for *people, so writing
+        // `union xs [...]` counts as referencing the source.
+        let diags = check_src(
+            "type P = {name: Text, age: Int}\n\
+             *people : [P]\n\
+             insert = \\name age -> do\n\
+               ps <- *people\n\
+               *people = union ps [{name: name, age: age}]"
+        );
+        assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
+    }
+
+    #[test]
+    fn bare_set_value_unrelated_to_source_errors() {
+        // Even with a local source bind, replacing with an unrelated value
+        // is a full replacement and must use `full`.
+        let diags = check_src(
+            "type P = {name: Text, age: Int}\n\
+             *people : [P]\n\
+             *other : [P]\n\
+             copy = do\n\
+               os <- *other\n\
+               *people = os"
+        );
+        assert!(has_error(&diags, "full *people"));
     }
 
     #[test]
     fn set_type_mismatch() {
         let diags = check_src(
-            "*nums : [Int]\nmain = *nums = [\"a\", \"b\"]"
+            "*nums : [Int]\nmain = full *nums = [\"a\", \"b\"]"
         );
         assert!(has_error(&diags, "type mismatch"));
     }
@@ -7283,7 +7479,7 @@ main = applyPred (\\r -> r.x == r.y)\
             "type Person = {name: Text, age: Int}\n\
              *people : [Person]\n\
              main = do\n\
-               *people = [{name: \"A\", age: 1}]\n\
+               full *people = [{name: \"A\", age: 1}]\n\
                p <- *people\n\
                yield p.name"
         );

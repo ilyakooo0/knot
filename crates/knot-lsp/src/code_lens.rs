@@ -93,6 +93,38 @@ pub(crate) fn handle_code_lens(
             data: None,
         });
 
+        // Effect summary lens: surface inferred IO/relation effects inline so
+        // the user sees at a glance whether a function reads/writes relations
+        // or performs IO. Effects are central to knot's semantics — a `set`
+        // hidden behind two helper layers is easy to miss without this.
+        // Suppress the lens for pure-by-construction decl kinds (sources,
+        // data, traits) where the effect summary would be noise.
+        if matches!(
+            &decl.node,
+            DeclKind::Fun { .. } | DeclKind::View { .. } | DeclKind::Derived { .. }
+        ) {
+            let name = match &decl.node {
+                DeclKind::Fun { name, .. }
+                | DeclKind::View { name, .. }
+                | DeclKind::Derived { name, .. } => name.as_str(),
+                _ => "",
+            };
+            if let Some(effects) = doc.effect_info.get(name) {
+                lenses.push(CodeLens {
+                    range: Range {
+                        start: range.start,
+                        end: range.start,
+                    },
+                    command: Some(Command {
+                        title: format!("effects: {effects}"),
+                        command: String::new(),
+                        arguments: None,
+                    }),
+                    data: None,
+                });
+            }
+        }
+
         // Lineage lens: source declarations show their consumers; views/derived
         // show their producers. The lens command is informational (no nav target),
         // so we use a no-op command name and put the summary in the title.

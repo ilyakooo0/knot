@@ -790,6 +790,81 @@ pub(crate) fn handle_code_action(
         }
     }
 
+    // Action: convert `if cond then a else b` to `case cond of True -> a | False -> b`.
+    // Useful when the user wants to extend the conditional with additional
+    // arms (e.g. matching on the cond's variant) without re-typing the body.
+    if let Some((if_span, replacement)) =
+        find_if_to_case_at(&doc.module, &doc.source, range_start)
+    {
+        let mut changes = HashMap::new();
+        changes.insert(
+            uri.clone(),
+            vec![TextEdit {
+                range: span_to_range(if_span, &doc.source),
+                new_text: replacement,
+            }],
+        );
+        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+            title: "Convert `if` to `case`".to_string(),
+            kind: Some(CodeActionKind::REFACTOR_REWRITE),
+            edit: Some(WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+    }
+
+    // Action: flip a commutative binary operator's operands (e.g. `a == b` → `b == a`).
+    // Helpful when a comparison reads more naturally with the other operand
+    // first, especially in `if` conditions or `where` filters.
+    if let Some((bin_span, replacement)) =
+        find_flip_binary_at(&doc.module, &doc.source, range_start)
+    {
+        let mut changes = HashMap::new();
+        changes.insert(
+            uri.clone(),
+            vec![TextEdit {
+                range: span_to_range(bin_span, &doc.source),
+                new_text: replacement,
+            }],
+        );
+        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+            title: "Flip operands".to_string(),
+            kind: Some(CodeActionKind::REFACTOR_REWRITE),
+            edit: Some(WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+    }
+
+    // Action: convert `f x` to `x |> f` (pipe form). Limited to single-argument
+    // applications — multi-arg piping invites ambiguity (`f x y` could become
+    // `x |> f y` or `y |> f x`), so we punt on those rather than guess.
+    if let Some((app_span, replacement)) =
+        find_pipe_conversion_at(&doc.module, &doc.source, range_start)
+    {
+        let mut changes = HashMap::new();
+        changes.insert(
+            uri.clone(),
+            vec![TextEdit {
+                range: span_to_range(app_span, &doc.source),
+                new_text: replacement,
+            }],
+        );
+        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+            title: "Convert to pipe".to_string(),
+            kind: Some(CodeActionKind::REFACTOR_REWRITE),
+            edit: Some(WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+    }
+
     // Action: wrap a `refine expr` in a `case ... of Ok | Err` match. Refined
     // values are returned as `Result RefinementError T`; this action expands
     // the boilerplate of unwrapping it.
@@ -2272,6 +2347,185 @@ fn already_imports(doc: &DocumentState, name: &str) -> bool {
         }
     }
     false
+}
+
+/// Locate the smallest `if cond then a else b` expression containing the
+/// cursor, and return its span plus the equivalent `case` rewrite. Returns
+/// `None` if the cursor isn't inside an if-expression.
+fn find_if_to_case_at(
+    module: &Module,
+    source: &str,
+    offset: usize,
+) -> Option<(Span, String)> {
+    fn walk(
+        expr: &ast::Expr,
+        source: &str,
+        offset: usize,
+        best: &mut Option<(Span, String)>,
+    ) {
+        if expr.span.start > offset || offset > expr.span.end {
+            return;
+        }
+        if let ast::ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } = &expr.node
+        {
+            let size = expr.span.end - expr.span.start;
+            if best.as_ref().map_or(true, |b| size < b.0.end - b.0.start) {
+                let cond_text = safe_slice(source, cond.span);
+                let then_text = safe_slice(source, then_branch.span);
+                let else_text = safe_slice(source, else_branch.span);
+                let replacement = format!(
+                    "case {cond_text} of\n  True {{}} -> {then_text}\n  False {{}} -> {else_text}"
+                );
+                *best = Some((expr.span, replacement));
+            }
+        }
+        crate::utils::recurse_expr(expr, |e| walk(e, source, offset, best));
+    }
+    let mut best = None;
+    for decl in &module.decls {
+        match &decl.node {
+            DeclKind::Fun { body: Some(body), .. }
+            | DeclKind::View { body, .. }
+            | DeclKind::Derived { body, .. } => walk(body, source, offset, &mut best),
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { body, .. } = item {
+                        walk(body, source, offset, &mut best);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    best
+}
+
+/// Locate the smallest commutative binary expression containing the cursor,
+/// returning the span and the operand-flipped source text. Limited to ops
+/// where flipping preserves semantics — `+`, `*`, `==`, `!=`, `&&`, `||`.
+fn find_flip_binary_at(
+    module: &Module,
+    source: &str,
+    offset: usize,
+) -> Option<(Span, String)> {
+    fn walk(
+        expr: &ast::Expr,
+        source: &str,
+        offset: usize,
+        best: &mut Option<(Span, String)>,
+    ) {
+        if expr.span.start > offset || offset > expr.span.end {
+            return;
+        }
+        if let ast::ExprKind::BinOp { op, lhs, rhs } = &expr.node {
+            let op_str = match op {
+                ast::BinOp::Add => Some("+"),
+                ast::BinOp::Mul => Some("*"),
+                ast::BinOp::Eq => Some("=="),
+                ast::BinOp::Neq => Some("!="),
+                ast::BinOp::And => Some("&&"),
+                ast::BinOp::Or => Some("||"),
+                _ => None,
+            };
+            if let Some(op_text) = op_str {
+                let size = expr.span.end - expr.span.start;
+                if best.as_ref().map_or(true, |b| size < b.0.end - b.0.start) {
+                    let lhs_text = safe_slice(source, lhs.span);
+                    let rhs_text = safe_slice(source, rhs.span);
+                    let replacement = format!("{rhs_text} {op_text} {lhs_text}");
+                    *best = Some((expr.span, replacement));
+                }
+            }
+        }
+        crate::utils::recurse_expr(expr, |e| walk(e, source, offset, best));
+    }
+    let mut best = None;
+    for decl in &module.decls {
+        match &decl.node {
+            DeclKind::Fun { body: Some(body), .. }
+            | DeclKind::View { body, .. }
+            | DeclKind::Derived { body, .. } => walk(body, source, offset, &mut best),
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { body, .. } = item {
+                        walk(body, source, offset, &mut best);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    best
+}
+
+/// Locate the smallest single-argument application `f x` containing the
+/// cursor and rewrite it to pipe form `x |> f`. Multi-arg applications are
+/// skipped — `f x y` could pipe in either argument and we'd rather not
+/// guess.
+fn find_pipe_conversion_at(
+    module: &Module,
+    source: &str,
+    offset: usize,
+) -> Option<(Span, String)> {
+    fn walk(
+        expr: &ast::Expr,
+        source: &str,
+        offset: usize,
+        best: &mut Option<(Span, String)>,
+    ) {
+        if expr.span.start > offset || offset > expr.span.end {
+            return;
+        }
+        if let ast::ExprKind::App { func, arg } = &expr.node {
+            // Only convert applications whose function is a simple identifier
+            // (`f x` rather than `(g h) x`). Piping a curried partial
+            // application reads strangely.
+            let is_simple = matches!(
+                &func.node,
+                ast::ExprKind::Var(_) | ast::ExprKind::Constructor(_)
+            );
+            if is_simple {
+                let size = expr.span.end - expr.span.start;
+                if best.as_ref().map_or(true, |b| size < b.0.end - b.0.start) {
+                    let func_text = safe_slice(source, func.span);
+                    let arg_text = safe_slice(source, arg.span);
+                    // Wrap the arg in parens when it isn't a single token —
+                    // a do-block or lambda piped raw would change parse
+                    // structure.
+                    let arg_needs_parens = arg_text.chars().any(|c| c.is_whitespace());
+                    let arg_part = if arg_needs_parens && !is_already_parenthesized(arg_text) {
+                        format!("({arg_text})")
+                    } else {
+                        arg_text.to_string()
+                    };
+                    let replacement = format!("{arg_part} |> {func_text}");
+                    *best = Some((expr.span, replacement));
+                }
+            }
+        }
+        crate::utils::recurse_expr(expr, |e| walk(e, source, offset, best));
+    }
+    let mut best = None;
+    for decl in &module.decls {
+        match &decl.node {
+            DeclKind::Fun { body: Some(body), .. }
+            | DeclKind::View { body, .. }
+            | DeclKind::Derived { body, .. } => walk(body, source, offset, &mut best),
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { body, .. } = item {
+                        walk(body, source, offset, &mut best);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    best
 }
 
 #[cfg(test)]

@@ -44,7 +44,7 @@ use lsp_server::{Connection, Message, Notification, Request, RequestId};
 use lsp_types::notification::Notification as _;
 use lsp_types::*;
 
-use crate::analysis::{analysis_worker, publish_diagnostics};
+use crate::analysis::analysis_worker;
 use crate::call_hierarchy::{
     handle_call_hierarchy_incoming, handle_call_hierarchy_outgoing, handle_call_hierarchy_prepare,
 };
@@ -107,7 +107,12 @@ fn main() {
         inlay_hint_provider: Some(OneOf::Left(true)),
         signature_help_provider: Some(SignatureHelpOptions {
             trigger_characters: Some(vec![" ".into(), "(".into()]),
-            retrigger_characters: None,
+            // Comma triggers re-evaluation: when the user moves between
+            // arguments the active-parameter index needs to update without
+            // re-typing a space. The space-after-arg path is already covered
+            // by `trigger_characters`, but commas in `f a, b` would otherwise
+            // leave the active parameter stuck on `a`.
+            retrigger_characters: Some(vec![",".into(), " ".into()]),
             work_done_progress_options: Default::default(),
         }),
         code_lens_provider: Some(CodeLensOptions {
@@ -228,6 +233,7 @@ fn main() {
         inference_cache,
         semantic_token_cache: HashMap::new(),
         semantic_token_counter: 0,
+        published_diag_hashes: HashMap::new(),
     };
 
     // Register for file watcher notifications (.knot files). Build the
@@ -323,7 +329,7 @@ fn apply_analysis_result(state: &mut ServerState, conn: &Connection, result: Ana
         state.pending_sources.remove(&result.uri);
     }
 
-    publish_diagnostics(conn, &result.uri, &result.doc, result.version);
+    publish_diagnostics_dedup(state, conn, &result.uri, &result.doc, result.version);
 
     // Update the reverse-import graph for cross-file diagnostics. Each
     // analyzed module knows which files it imported (`imported_files`); we
@@ -635,6 +641,17 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
                 version,
             },
         );
+
+        // The current file's edits can invalidate cached diagnostics for any
+        // unopened file that imports it (directly or transitively). The open
+        // file itself is served from `state.documents`, not the workspace
+        // diag cache, so we only need to evict the importers.
+        if let Some(this_path) = uri_to_path(&uri).and_then(|p| p.canonicalize().ok()) {
+            let mut changed = HashSet::new();
+            changed.insert(this_path);
+            invalidate_workspace_diag_cache_for(state, &changed);
+        }
+
         queue_analysis(state, uri.clone(), source, version);
 
         // Dependents are no longer re-queued eagerly here — `apply_analysis_result`
@@ -683,6 +700,12 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
                     .collect();
                 cache.retain(|(p, _), _| !affected.contains(p));
             }
+
+            // Same logic applied to the workspace-diagnostic cache: any
+            // unopened-file diagnostics that referenced the changed file's
+            // exports are stale now. Without eager invalidation, the next
+            // workspace-diag request would replay last run's diagnostics.
+            invalidate_workspace_diag_cache_for(state, &changed_paths);
 
             for (dep_uri, _, dep_source) in dependents {
                 queue_analysis(state, dep_uri, dep_source, None);
@@ -745,6 +768,57 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
     }
 }
 
+/// Publish diagnostics, but skip the LSP roundtrip when the diagnostic set is
+/// identical to the last publish for this URI. Whitespace-only and
+/// comment-only edits go through the fingerprint cache, producing the same
+/// `knot_diagnostics` output verbatim — there's no need to re-render the
+/// editor's gutter for those. We hash the published list so the comparison
+/// stays cheap (a `Vec<Diagnostic>` clone-and-compare would dominate).
+fn publish_diagnostics_dedup(
+    state: &mut ServerState,
+    conn: &Connection,
+    uri: &Uri,
+    doc: &state::DocumentState,
+    version: Option<i32>,
+) {
+    use std::hash::{Hash, Hasher};
+    let lsp_diags: Vec<lsp_types::Diagnostic> = doc
+        .knot_diagnostics
+        .iter()
+        .filter_map(|d| crate::diagnostics::to_lsp_diagnostic(d, &doc.source, uri))
+        .collect();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for d in &lsp_diags {
+        // Hash only the fields that meaningfully define a diagnostic — range
+        // start/end + message + severity. Hashing the whole struct via
+        // `Debug`-derived format would also work but is more allocation-heavy.
+        d.range.start.line.hash(&mut hasher);
+        d.range.start.character.hash(&mut hasher);
+        d.range.end.line.hash(&mut hasher);
+        d.range.end.character.hash(&mut hasher);
+        d.message.hash(&mut hasher);
+        if let Some(sev) = d.severity {
+            // `DiagnosticSeverity` is a non-primitive newtype-style enum
+            // (with `lsp_types`-defined integer constants); reach in via
+            // `Debug` to grab a stable string representation.
+            format!("{sev:?}").hash(&mut hasher);
+        }
+    }
+    let new_hash = hasher.finish();
+    if state.published_diag_hashes.get(uri).copied() == Some(new_hash) {
+        return;
+    }
+    state.published_diag_hashes.insert(uri.clone(), new_hash);
+    let params = lsp_types::PublishDiagnosticsParams::new(uri.clone(), lsp_diags, version);
+    let not = Notification::new(
+        lsp_types::notification::PublishDiagnostics::METHOD.into(),
+        params,
+    );
+    if let Err(e) = conn.sender.send(Message::Notification(not)) {
+        eprintln!("knot-lsp: failed to publish diagnostics: {e}");
+    }
+}
+
 /// Send an analysis task to the worker. Errors here are unrecoverable — the
 /// worker has died — so we eprintln and continue (other features still work
 /// against the last good analysis).
@@ -752,5 +826,34 @@ fn queue_analysis(state: &ServerState, uri: Uri, source: String, version: Option
     if let Err(e) = state.analysis_tx.send(AnalysisTask { uri, source, version }) {
         eprintln!("knot-lsp: analysis worker channel closed: {e}");
     }
+}
+
+/// Eagerly evict workspace-diagnostic cache entries for `changed` and every
+/// file that transitively imports any of them. Without this, the cache can
+/// hand stale diagnostics to the editor between a file edit and the next
+/// pull-mode `workspace/diagnostic` request — the lazy `prune_stale_…` pass
+/// only runs on workspace-diag requests, so cross-file errors caused by an
+/// upstream edit linger until the user happens to ask for them again.
+fn invalidate_workspace_diag_cache_for(state: &mut ServerState, changed: &HashSet<PathBuf>) {
+    if changed.is_empty() {
+        return;
+    }
+    // Transitive closure over the reverse-import graph. We start the BFS from
+    // every changed path and pull in any file that imports them, directly or
+    // through a chain of imports.
+    let mut affected: HashSet<PathBuf> = changed.iter().cloned().collect();
+    let mut frontier: Vec<PathBuf> = changed.iter().cloned().collect();
+    while let Some(p) = frontier.pop() {
+        if let Some(importers) = state.reverse_imports.get(&p) {
+            for imp in importers {
+                if affected.insert(imp.clone()) {
+                    frontier.push(imp.clone());
+                }
+            }
+        }
+    }
+    state
+        .workspace_diag_cache
+        .retain(|path, _| !affected.contains(path));
 }
 

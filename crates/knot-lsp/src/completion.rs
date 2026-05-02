@@ -465,11 +465,214 @@ pub(crate) fn handle_completion(
         }
     }
 
+    // Type-aware ranking: when the cursor sits at an argument position in a
+    // function call we know the expected parameter type. Push candidates
+    // whose return type matches that expectation. This is the same signal
+    // signature-help uses to highlight the active parameter — reusing the
+    // detection here keeps the two features consistent.
+    if let Some((func_name, active_param)) =
+        crate::shared::find_enclosing_application(&doc.module, &doc.source, offset)
+    {
+        // Resolve the function's type. Globals first, then locals (let-bound
+        // lambdas, do-block binds). Mirrors signature_help's lookup order.
+        let func_ty = doc
+            .type_info
+            .get(func_name.as_str())
+            .cloned()
+            .or_else(|| lookup_local_binding_type(doc, &func_name, offset));
+        if let Some(ty) = func_ty {
+            let params = crate::shared::parse_function_params(&ty);
+            // The last entry is the return type; everything before it is a
+            // parameter slot. Skip ranking when the active position is past
+            // the last param (likely typing past the end of an arity-n call).
+            if !params.is_empty() && active_param + 1 < params.len() {
+                let expected = params[active_param].as_str();
+                let arity_remaining = params.len().saturating_sub(active_param + 1);
+                rank_by_type_alignment(&mut items, doc, expected, arity_remaining);
+            }
+        }
+    }
+
     if in_atomic {
         items.retain(|item| !is_disallowed_in_atomic(&item.label, doc));
     }
 
+    // Final ordering pass: assign a stable category prefix to every item that
+    // doesn't already have a higher-priority sort_text. The categories layer
+    // beneath the contextual `aaa_`/`aab_` prefixes set above so type/monad
+    // hits stay first; among the rest, locals beat builtins beat keywords beat
+    // snippets beat auto-imports. Without this the editor falls back to
+    // alphabetical-by-label, which buries the "you almost certainly want
+    // `helper`" candidate behind 80 builtins starting with `a-h`.
+    apply_default_category_ranking(&mut items, doc);
+
     Some(CompletionResponse::Array(items))
+}
+
+/// Bump the `sort_text` of items whose return type matches `expected` and
+/// whose remaining arity matches what the call site needs. We do not replace
+/// existing higher-priority `aaa_` (monad) prefixes — those are stronger
+/// signals — but we do upgrade plain items that have only a default prefix.
+fn rank_by_type_alignment(
+    items: &mut [CompletionItem],
+    doc: &DocumentState,
+    expected: &str,
+    arity_remaining: usize,
+) {
+    let expected_norm = expected.trim();
+    for item in items.iter_mut() {
+        // Items with a stronger ranking (`aaa_*` from monad) keep theirs.
+        if item
+            .sort_text
+            .as_deref()
+            .map_or(false, |s| s.starts_with("aaa_"))
+        {
+            continue;
+        }
+        let label = item.label.trim_start_matches(['*', '&']);
+        let Some(ty) = doc.type_info.get(label).or_else(|| item.detail.as_ref())
+        else {
+            continue;
+        };
+        let candidate_params = crate::shared::parse_function_params(ty);
+        // For non-function items, the type itself is the "return". For
+        // function items, we compare the final arrow segment.
+        let candidate_ret = if candidate_params.is_empty() {
+            ty.as_str()
+        } else {
+            candidate_params.last().map(String::as_str).unwrap_or("")
+        };
+        // Type alignment is approximate: we compare the principal type names
+        // (after stripping IO/list wrappers) so `[Int]` matches `[Int]` and
+        // `Person` matches `Person`. Better than nothing for ranking; not
+        // strict enough to mislead.
+        let aligns = type_strings_align(candidate_ret.trim(), expected_norm);
+        // Arity alignment: a candidate's residual arity (params after partial
+        // application from this call site) must not exceed the slot's needs.
+        // Concretely, if the user is filling slot `n` of an `n+k` call, only
+        // values (arity 0) or single-arg curried functions fit. We give a
+        // smaller bump for arity-mismatched candidates so they don't outrank
+        // a perfect match.
+        let candidate_arity = candidate_params.len().saturating_sub(1);
+        let arity_ok = candidate_arity == 0 || candidate_arity <= arity_remaining;
+        if aligns {
+            let base = item
+                .sort_text
+                .clone()
+                .unwrap_or_else(|| item.label.clone());
+            let prefix = if arity_ok { "aab_" } else { "aac_" };
+            item.sort_text = Some(format!("{prefix}{base}"));
+        }
+    }
+}
+
+/// Approximate type-string equivalence, robust to whitespace and the common
+/// IO/relation wrappers. Both inputs are formatted-type strings drawn from
+/// `type_info`, so we don't have a structured type to compare against.
+fn type_strings_align(a: &str, b: &str) -> bool {
+    let strip = |s: &str| -> String {
+        let t = s.trim();
+        // Drop a leading IO effect annotation: `IO {fs} Text` → `Text`.
+        let t = if let Some(rest) = t.strip_prefix("IO ") {
+            if rest.starts_with('{') {
+                if let Some(close) = rest.find('}') {
+                    rest[close + 1..].trim().to_string()
+                } else {
+                    rest.to_string()
+                }
+            } else {
+                rest.trim().to_string()
+            }
+        } else {
+            t.to_string()
+        };
+        // Collapse runs of whitespace so `[ Int ]` matches `[Int]`.
+        t.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    let a_n = strip(a);
+    let b_n = strip(b);
+    if a_n == b_n {
+        return true;
+    }
+    // Loose match on the principal type name — good for ranking when generic
+    // params differ but the head matches.
+    let head = |s: &str| {
+        s.split(|c: char| c.is_whitespace() || c == '<' || c == '(' || c == '[')
+            .next()
+            .unwrap_or("")
+            .to_string()
+    };
+    let a_head = head(&a_n);
+    let b_head = head(&b_n);
+    !a_head.is_empty() && a_head == b_head
+}
+
+/// Look up the inferred type of a locally-bound name visible at `offset`.
+/// Mirrors signature_help::lookup_local_binding_type — duplicated rather than
+/// shared so the two callers don't pay for an extra import in the common
+/// path.
+fn lookup_local_binding_type(doc: &DocumentState, name: &str, offset: usize) -> Option<String> {
+    let mut best: Option<(Span, String)> = None;
+    for (span, ty) in &doc.local_type_info {
+        if span.end > offset {
+            continue;
+        }
+        if span.end > doc.source.len() || span.start > span.end {
+            continue;
+        }
+        if &doc.source[span.start..span.end] != name {
+            continue;
+        }
+        match &best {
+            None => best = Some((*span, ty.clone())),
+            Some((cur, _)) if span.start > cur.start => best = Some((*span, ty.clone())),
+            _ => {}
+        }
+    }
+    best.map(|(_, ty)| ty)
+}
+
+/// Apply a stable category prefix to every item that doesn't already have a
+/// higher-priority bias. Categories rank as:
+///   `b_local`        — declarations from this document
+///   `c_keyword`      — language keywords
+///   `d_snippet`      — snippet templates
+///   `e_builtin`      — stdlib functions and types
+///   `f_other`        — everything else (auto-import etc. already use `zz_`)
+/// Within a category items keep their original alphabetical order (the
+/// editor sorts on `sort_text`, falling back to `label`).
+fn apply_default_category_ranking(items: &mut [CompletionItem], doc: &DocumentState) {
+    let local_names: std::collections::HashSet<&str> =
+        doc.definitions.keys().map(String::as_str).collect();
+    for item in items.iter_mut() {
+        // Skip items that already carry a contextual prefix — those bumps are
+        // signals about *this* completion request, stronger than category.
+        if let Some(s) = item.sort_text.as_deref() {
+            if s.starts_with("aaa_") || s.starts_with("aab_") || s.starts_with("aac_") {
+                continue;
+            }
+            // Auto-import is already explicitly demoted to `zz_`; respect that.
+            if s.starts_with("zz_") {
+                continue;
+            }
+        }
+        let label = item.label.trim_start_matches(['*', '&']);
+        let prefix = match item.kind {
+            Some(CompletionItemKind::SNIPPET) => "d_snippet_",
+            Some(CompletionItemKind::KEYWORD) => "c_keyword_",
+            _ if local_names.contains(label) => "b_local_",
+            _ if knot_compiler::builtins::ALL_BUILTINS
+                .iter()
+                .copied()
+                .flatten()
+                .any(|n| *n == label) =>
+            {
+                "e_builtin_"
+            }
+            _ => "f_other_",
+        };
+        item.sort_text = Some(format!("{prefix}{label}"));
+    }
 }
 
 /// True if a completion candidate would be rejected by the effect checker

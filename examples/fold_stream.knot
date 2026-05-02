@@ -3,7 +3,7 @@ type Sale = {item: Text, qty: Int, price: Int}
 *sales : [Sale]
 
 main = do
-  *sales = [
+  full *sales = [
     {item: "apple",  qty: 3, price: 50},
     {item: "banana", qty: 7, price: 20},
     {item: "cherry", qty: 2, price: 120},

@@ -65,7 +65,7 @@ type Metric = {name: Text, value: Float, tags: Text}
 -- ── Seed data ────────────────────────────────────────────────────
 
 seedEmployees = do
-  *employees = [
+  full *employees = [
     {name: "Alice Chen",     age: 34, salary: 142000.0, dept: Engineering {}, active: Yes {}},
     {name: "Bob Martinez",   age: 28, salary: 95000.0,  dept: Engineering {}, active: Yes {}},
     {name: "Carol Davis",    age: 41, salary: 155000.0, dept: Engineering {}, active: Yes {}},
@@ -90,7 +90,7 @@ seedEmployees = do
   yield {}
 
 seedProjects = do
-  *projects = [
+  full *projects = [
     {name: "Phoenix",    lead: "Alice Chen",     budget: 500000.0,  priority: Critical {}},
     {name: "Atlas",      lead: "Carol Davis",    budget: 350000.0,  priority: High {}},
     {name: "Meridian",   lead: "Frank Lee",      budget: 200000.0,  priority: Medium {}},
@@ -103,7 +103,7 @@ seedProjects = do
   yield {}
 
 seedTickets = do
-  *tickets = [
+  full *tickets = [
     {title: "Fix auth timeout",           project: "Phoenix",  status: InProgress {assignee: "Bob Martinez"},   priority: Critical {}, points: 8},
     {title: "Add dark mode",              project: "Phoenix",  status: Open {},                                  priority: Medium {},   points: 5},
     {title: "Optimize query planner",     project: "Phoenix",  status: InProgress {assignee: "Alice Chen"},     priority: High {},     points: 13},
@@ -133,7 +133,7 @@ seedTickets = do
   yield {}
 
 seedCustomers = do
-  *customers = [
+  full *customers = [
     {name: "Acme Corp",         email: "admin@acme.com",        tier: Enterprise {}},
     {name: "Widgets Inc",       email: "hello@widgets.io",      tier: Pro {}},
     {name: "Startup Labs",      email: "team@startuplabs.dev",  tier: Free {}},
@@ -150,7 +150,7 @@ seedCustomers = do
   yield {}
 
 seedProducts = do
-  *products = [
+  full *products = [
     {name: "Laptop Pro 16",    price: 2499.99, category: Electronics {}, inStock: Yes {}},
     {name: "Wireless Mouse",   price: 49.99,   category: Electronics {}, inStock: Yes {}},
     {name: "USB-C Hub",        price: 79.99,   category: Electronics {}, inStock: No {}},
@@ -170,7 +170,7 @@ seedProducts = do
   yield {}
 
 seedOrders = do
-  *orders = [
+  full *orders = [
     {customer: "Acme Corp",       product: "Laptop Pro 16",    quantity: 50,  total: 124999.50},
     {customer: "Acme Corp",       product: "4K Monitor",       quantity: 50,  total: 29999.50},
     {customer: "Acme Corp",       product: "IDE License",      quantity: 100, total: 19999.00},
@@ -200,7 +200,7 @@ seedOrders = do
   yield {}
 
 seedTeams = do
-  *teams = [
+  full *teams = [
     {name: "Platform", members: [
       {name: "Alice Chen",    role: "Lead"},
       {name: "Bob Martinez",  role: "Senior"},
@@ -232,7 +232,7 @@ seedTeams = do
   yield {}
 
 seedLogs = do
-  *logs = [
+  full *logs = [
     {timestamp: 1710900000, level: Info {},  message: "Server started on port 8080",              source: "main"},
     {timestamp: 1710900001, level: Info {},  message: "Database connection pool initialized (10)", source: "db"},
     {timestamp: 1710900005, level: Debug {}, message: "Loading configuration from env",            source: "config"},
@@ -262,7 +262,7 @@ seedLogs = do
   yield {}
 
 seedMetrics = do
-  *metrics = [
+  full *metrics = [
     {name: "http_requests_total",     value: 48291.0,  tags: "method=GET,status=200"},
     {name: "http_requests_total",     value: 12847.0,  tags: "method=POST,status=201"},
     {name: "http_requests_total",     value: 342.0,    tags: "method=POST,status=400"},

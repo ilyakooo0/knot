@@ -250,6 +250,39 @@ impl Parser {
         self.diagnostics.push(diag);
     }
 
+    /// Skip tokens until we reach a comma or `}` — the boundary between two
+    /// record fields, or the end of the record. Used to recover from a bad
+    /// field value without aborting the whole record literal. Stops at the
+    /// boundary token *without consuming it* so the surrounding loop can
+    /// inspect and react (continue on `,`, exit on `}`).
+    fn skip_to_record_field_boundary(&mut self) {
+        let mut depth: usize = 0;
+        loop {
+            if self.at_eof() {
+                break;
+            }
+            match self.peek() {
+                TokenKind::LBrace | TokenKind::LParen | TokenKind::LBracket => {
+                    depth += 1;
+                    self.advance();
+                }
+                TokenKind::RBrace if depth == 0 => break,
+                TokenKind::RBrace => {
+                    depth = depth.saturating_sub(1);
+                    self.advance();
+                }
+                TokenKind::RParen | TokenKind::RBracket => {
+                    depth = depth.saturating_sub(1);
+                    self.advance();
+                }
+                TokenKind::Comma if depth == 0 => break,
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+    }
+
     /// Skip tokens until we reach what looks like a new declaration boundary.
     fn skip_to_decl_boundary(&mut self) {
         loop {
@@ -2408,6 +2441,13 @@ impl Parser {
         // If we see `lower:` it's a record literal.
         // If we see `lower,` or `lower}` it's punned fields.
         // If we see an expression followed by `,` or `}` it's punned fields.
+        //
+        // Field-level error recovery: when a field's value or punned
+        // expression fails to parse, skip to the next `,` or `}` instead of
+        // bailing on the whole record. This way a single malformed field
+        // surfaces one diagnostic but doesn't suppress the rest of the
+        // record (and any cascading errors from later code that depends on
+        // the record having parsed).
         let mut fields: Vec<Field<Expr>> = Vec::new();
         loop {
             self.skip_newlines();
@@ -2415,6 +2455,7 @@ impl Parser {
                 break;
             }
 
+            let progress_before = self.pos;
             if matches!(self.peek(), TokenKind::Lower(_)) {
                 // Check if next token after the identifier is `:` (record literal field)
                 if matches!(self.peek_ahead(1), TokenKind::Colon) {
@@ -2422,39 +2463,62 @@ impl Parser {
                     let tok = self.advance(); // consume name
                     let TokenKind::Lower(fname) = tok.kind else { unreachable!() };
                     self.advance(); // consume `:`
-                    let val = self.parse_expr()?;
-                    fields.push(Field {
-                        name: fname,
-                        value: val,
-                    });
+                    match self.parse_expr() {
+                        Some(val) => fields.push(Field {
+                            name: fname,
+                            value: val,
+                        }),
+                        None => self.skip_to_record_field_boundary(),
+                    }
                 } else {
                     // Punned field: {name} means {name: name}
                     // Or it could be an expression like {expr.field}
-                    let expr = self.parse_expr()?;
-                    let field_name = self.extract_pun_name(&expr).unwrap_or_else(|| {
-                        self.error_at(expr.span, "cannot determine field name for punned record field");
-                        "?".into()
-                    });
-                    fields.push(Field {
-                        name: field_name,
-                        value: expr,
-                    });
+                    match self.parse_expr() {
+                        Some(expr) => {
+                            let field_name = self.extract_pun_name(&expr).unwrap_or_else(|| {
+                                self.error_at(
+                                    expr.span,
+                                    "cannot determine field name for punned record field",
+                                );
+                                "?".into()
+                            });
+                            fields.push(Field {
+                                name: field_name,
+                                value: expr,
+                            });
+                        }
+                        None => self.skip_to_record_field_boundary(),
+                    }
                 }
             } else {
                 // Expression-based pun: {expr.field}
-                let expr = self.parse_expr()?;
-                let field_name = self.extract_pun_name(&expr).unwrap_or_else(|| {
-                    self.error_at(expr.span, "cannot determine field name for punned record field");
-                    "?".into()
-                });
-                fields.push(Field {
-                    name: field_name,
-                    value: expr,
-                });
+                match self.parse_expr() {
+                    Some(expr) => {
+                        let field_name = self.extract_pun_name(&expr).unwrap_or_else(|| {
+                            self.error_at(
+                                expr.span,
+                                "cannot determine field name for punned record field",
+                            );
+                            "?".into()
+                        });
+                        fields.push(Field {
+                            name: field_name,
+                            value: expr,
+                        });
+                    }
+                    None => self.skip_to_record_field_boundary(),
+                }
             }
 
             self.skip_newlines();
             if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+            // Defensive: if we made no progress on this iteration AND didn't
+            // hit a comma, bail out to avoid an infinite loop on pathological
+            // inputs (every recovery path advances at least one token, so
+            // this should be unreachable in practice).
+            if self.pos == progress_before {
                 break;
             }
         }

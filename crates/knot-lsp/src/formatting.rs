@@ -190,11 +190,79 @@ fn normalize_line_spacing(line: &str) -> String {
     if line.contains('"') {
         return line.to_string();
     }
+    // Skip line-comment lines (and tail content of `--` comments) — we don't
+    // want to mangle prose. Comments starting mid-line are handled by
+    // splitting at the first `--` boundary; the prefix is normalized, the
+    // suffix preserved verbatim.
+    let (code, comment) = match find_line_comment_start(line) {
+        Some(idx) => (&line[..idx], Some(&line[idx..])),
+        None => (line, None),
+    };
+
+    // Preserve leading indentation literally — it's already validated by the
+    // tab-to-space pass. Only normalize what comes after.
+    let leading_ws_end = code
+        .as_bytes()
+        .iter()
+        .position(|b| !matches!(*b, b' ' | b'\t'))
+        .unwrap_or(code.len());
+    let indent = &code[..leading_ws_end];
+    let body = &code[leading_ws_end..];
+
+    let normalized_body = normalize_body(body);
     let mut out = String::with_capacity(line.len());
+    out.push_str(indent);
+    out.push_str(&normalized_body);
+    if let Some(c) = comment {
+        // Preserve a single space gap between code and the trailing comment.
+        if !out.ends_with(' ') && !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(c);
+    }
+    out
+}
+
+/// Find the byte index of the first `--` line-comment marker in a code line,
+/// ignoring `--` inside string literals (those are filtered out by the caller
+/// already, but defending against future relaxations of that policy).
+fn find_line_comment_start(line: &str) -> Option<usize> {
     let bytes = line.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            // The `-` could be part of a binary subtraction or a `->` arrow;
+            // require it to be preceded by whitespace or start-of-line for
+            // a comment context.
+            if i == 0 || matches!(bytes[i - 1], b' ' | b'\t') {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Normalize whitespace inside the non-indented body of a line. Operators we
+/// touch: `,` `->` `<-` `=>`, plus collapsing runs of internal spaces. We
+/// leave `=` alone — distinguishing `=` from `==`/`<=`/`>=`/`/=` reliably
+/// without a parser is more trouble than it's worth.
+fn normalize_body(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let bytes = body.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
+        // Collapse runs of internal whitespace to a single space — but only
+        // for runs that don't separate operators we're about to insert space
+        // around. We handle this by emitting at most one space.
+        if matches!(b, b' ' | b'\t') {
+            if !out.ends_with(' ') {
+                out.push(' ');
+            }
+            i += 1;
+            continue;
+        }
         // `,` followed by non-space, non-`)`, non-`]`, non-`}` → insert space.
         if b == b',' {
             out.push(',');
@@ -206,11 +274,8 @@ fn normalize_line_spacing(line: &str) -> String {
             }
             continue;
         }
-        // `->`: ensure single space before and after (only when preceded by an
-        // identifier/closing bracket and followed by an identifier/opening
-        // bracket). This avoids touching markdown comments.
+        // `->`: ensure single space before and after.
         if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'>' {
-            // Ensure one space before
             if !out.ends_with(' ') && !out.is_empty() {
                 let last = out.chars().last().unwrap_or(' ');
                 if !matches!(last, '(' | '[' | '{') {
@@ -219,7 +284,34 @@ fn normalize_line_spacing(line: &str) -> String {
             }
             out.push_str("->");
             i += 2;
-            // Ensure one space after if followed by non-space / non-closing.
+            if i < bytes.len()
+                && !matches!(bytes[i], b' ' | b')' | b']' | b'}' | b'\n' | b'\r' | b'\t')
+            {
+                out.push(' ');
+            }
+            continue;
+        }
+        // `<-`: ditto, used in do-block monadic binds.
+        if b == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            if !out.ends_with(' ') && !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str("<-");
+            i += 2;
+            if i < bytes.len()
+                && !matches!(bytes[i], b' ' | b')' | b']' | b'}' | b'\n' | b'\r' | b'\t')
+            {
+                out.push(' ');
+            }
+            continue;
+        }
+        // `=>`: trait constraint arrow; same treatment.
+        if b == b'=' && i + 1 < bytes.len() && bytes[i + 1] == b'>' {
+            if !out.ends_with(' ') && !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str("=>");
+            i += 2;
             if i < bytes.len()
                 && !matches!(bytes[i], b' ' | b')' | b']' | b'}' | b'\n' | b'\r' | b'\t')
             {

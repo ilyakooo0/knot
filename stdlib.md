@@ -576,26 +576,26 @@ Knot provides elliptic-curve cryptography built-ins using X25519 (encryption) an
 ### `generateKeyPair`
 
 ```
-generateKeyPair : {privateKey: Bytes, publicKey: Bytes}
+generateKeyPair : IO {random} {privateKey: Bytes, publicKey: Bytes}
 ```
 
-Generate an X25519 key pair for encryption/decryption.
+Generate an X25519 key pair for encryption/decryption. Inside a `do` block, bind with `keys <- generateKeyPair`.
 
 ### `generateSigningKeyPair`
 
 ```
-generateSigningKeyPair : {privateKey: Bytes, publicKey: Bytes}
+generateSigningKeyPair : IO {random} {privateKey: Bytes, publicKey: Bytes}
 ```
 
-Generate an Ed25519 key pair for signing/verification.
+Generate an Ed25519 key pair for signing/verification. Inside a `do` block, bind with `keys <- generateSigningKeyPair`.
 
 ### `encrypt`
 
 ```
-encrypt : Bytes -> Bytes -> Bytes
+encrypt : Bytes -> Bytes -> IO {random} Bytes
 ```
 
-Encrypt plaintext bytes with a public key (sealed-box: X25519 ECDH + ChaCha20-Poly1305). First argument is the public key, second is the plaintext.
+Encrypt plaintext bytes with a public key (sealed-box: X25519 ECDH + ChaCha20-Poly1305). First argument is the public key, second is the plaintext. Returns IO because a fresh ephemeral key pair and nonce are generated per call.
 
 ### `decrypt`
 

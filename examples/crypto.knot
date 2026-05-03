@@ -2,20 +2,22 @@
 
 main = do
   -- Key pair generation for encryption (X25519)
-  let keys = generateKeyPair
+  keys <- generateKeyPair
   println "Encryption key pair generated"
   println ("  Public key: " ++ bytesToHex keys.publicKey)
 
   -- Encrypt and decrypt a message
   let message = textToBytes "Hello, cryptography!"
-  let ciphertext = encrypt keys.publicKey message
+  ciphertext <- encrypt keys.publicKey message
   println ("  Ciphertext: " ++ bytesToHex ciphertext)
 
   let decrypted = decrypt keys.privateKey ciphertext
-  println ("  Decrypted: " ++ bytesToText decrypted)
+  case bytesToText decrypted of
+    Just t -> println ("  Decrypted: " ++ t.value)
+    Nothing -> println "  Decrypted: <invalid utf-8>"
 
   -- Signing key pair generation (Ed25519)
-  let sigKeys = generateSigningKeyPair
+  sigKeys <- generateSigningKeyPair
   println "Signing key pair generated"
   println ("  Public key: " ++ bytesToHex sigKeys.publicKey)
 

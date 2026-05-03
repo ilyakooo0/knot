@@ -230,6 +230,14 @@ pub struct ServerState {
     /// Monotonic id source for outgoing `workspace/diagnostic/refresh` requests.
     /// Each call bumps this so request ids stay unique across the session.
     pub diagnostic_refresh_counter: u64,
+    /// URIs the *last* `workspace/diagnostic` response reported with non-empty
+    /// diagnostics. Per LSP convention, clients treat URIs absent from a
+    /// workspace report as "unchanged" — so a file that goes from erroring to
+    /// clean must be re-emitted with an empty list to clear the client's
+    /// gutter, otherwise the prior errors stay visible. Every workspace-pull
+    /// rebuilds this set: included with non-empty → kept; transitioned to
+    /// empty → emitted empty + dropped from set; consistently empty → omitted.
+    pub workspace_diag_reported: std::collections::HashSet<Uri>,
 }
 
 /// Symbol entry stored in the workspace symbol cache.

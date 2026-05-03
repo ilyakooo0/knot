@@ -278,6 +278,7 @@ fn main() {
         published_lsp_diagnostics: HashMap::new(),
         client_supports_diagnostic_refresh,
         diagnostic_refresh_counter: 0,
+        workspace_diag_reported: HashSet::new(),
     };
 
     // Register for file watcher notifications (.knot files). Build the

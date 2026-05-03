@@ -6,7 +6,7 @@
 #![cfg(test)]
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -52,6 +52,7 @@ impl TestWorkspace {
             published_lsp_diagnostics: HashMap::new(),
             client_supports_diagnostic_refresh: false,
             diagnostic_refresh_counter: 0,
+            workspace_diag_reported: HashSet::new(),
         };
         TestWorkspace {
             state,

@@ -136,6 +136,15 @@ pub(crate) fn handle_workspace_diagnostics(
 ) -> WorkspaceDiagnosticReportResult {
     let mut items = Vec::new();
 
+    // Snapshot last pull's reported-with-errors set, then rebuild it as we go.
+    // Files that were in the prior set but now have empty diagnostics must be
+    // re-emitted with an empty list — clients treat absent URIs in a workspace
+    // report as unchanged, so a fix that clears errors stays visible until the
+    // server explicitly emits the empty list.
+    let prev_reported: HashSet<Uri> =
+        std::mem::take(&mut state.workspace_diag_reported);
+    let mut now_reported: HashSet<Uri> = HashSet::new();
+
     for (uri, doc) in &state.documents {
         let lsp_diags: Vec<Diagnostic> = doc
             .knot_diagnostics
@@ -143,16 +152,21 @@ pub(crate) fn handle_workspace_diagnostics(
             .filter_map(|d| to_lsp_diagnostic(d, &doc.source, uri))
             .collect();
 
-        items.push(WorkspaceDocumentDiagnosticReport::Full(
-            WorkspaceFullDocumentDiagnosticReport {
-                uri: uri.clone(),
-                version: None,
-                full_document_diagnostic_report: FullDocumentDiagnosticReport {
-                    result_id: None,
-                    items: lsp_diags,
+        if !lsp_diags.is_empty() {
+            now_reported.insert(uri.clone());
+        }
+        if !lsp_diags.is_empty() || prev_reported.contains(uri) {
+            items.push(WorkspaceDocumentDiagnosticReport::Full(
+                WorkspaceFullDocumentDiagnosticReport {
+                    uri: uri.clone(),
+                    version: None,
+                    full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                        result_id: None,
+                        items: lsp_diags,
+                    },
                 },
-            },
-        ));
+            ));
+        }
     }
 
     // Also scan workspace files not currently open. We run the full pipeline
@@ -283,6 +297,9 @@ pub(crate) fn handle_workspace_diagnostics(
                     .workspace_diag_cache
                     .insert(canonical, (hash, lsp_diags.clone(), access));
                 if !lsp_diags.is_empty() {
+                    now_reported.insert(file_uri.clone());
+                }
+                if !lsp_diags.is_empty() || prev_reported.contains(&file_uri) {
                     items.push(WorkspaceDocumentDiagnosticReport::Full(
                         WorkspaceFullDocumentDiagnosticReport {
                             uri: file_uri,
@@ -304,6 +321,9 @@ pub(crate) fn handle_workspace_diagnostics(
                     entry.2 = access;
                 }
                 if !lsp_diags.is_empty() {
+                    now_reported.insert(file_uri.clone());
+                }
+                if !lsp_diags.is_empty() || prev_reported.contains(&file_uri) {
                     items.push(WorkspaceDocumentDiagnosticReport::Full(
                         WorkspaceFullDocumentDiagnosticReport {
                             uri: file_uri,
@@ -318,6 +338,8 @@ pub(crate) fn handle_workspace_diagnostics(
             }
         }
     }
+
+    state.workspace_diag_reported = now_reported;
 
     WorkspaceDiagnosticReportResult::Report(WorkspaceDiagnosticReport { items })
 }

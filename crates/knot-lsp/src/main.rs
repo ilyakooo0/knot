@@ -43,6 +43,7 @@ use std::thread;
 use crossbeam_channel::select;
 use lsp_server::{Connection, Message, Notification, Request, RequestId};
 use lsp_types::notification::Notification as _;
+use lsp_types::request::Request as _;
 use lsp_types::*;
 
 use crate::analysis::analysis_worker;
@@ -230,6 +231,12 @@ fn main() {
     {
         config.merge_from_json(opts);
     }
+    let client_supports_diagnostic_refresh = parsed_init
+        .as_ref()
+        .and_then(|p| p.capabilities.workspace.as_ref())
+        .and_then(|w| w.diagnostic.as_ref())
+        .and_then(|d| d.refresh_support)
+        .unwrap_or(false);
 
     // Spawn the analysis worker. It owns no per-request state of its own —
     // the import cache is shared (Arc<Mutex>) so the main thread can read it
@@ -269,6 +276,8 @@ fn main() {
         semantic_token_counter: 0,
         published_diag_hashes: HashMap::new(),
         published_lsp_diagnostics: HashMap::new(),
+        client_supports_diagnostic_refresh,
+        diagnostic_refresh_counter: 0,
     };
 
     // Register for file watcher notifications (.knot files). Build the
@@ -541,7 +550,14 @@ fn apply_analysis_result(state: &mut ServerState, conn: &Connection, result: Ana
         state.pending_sources.remove(&result.uri);
     }
 
-    publish_diagnostics_dedup(state, conn, &result.uri, &result.doc, result.version);
+    let published = publish_diagnostics_dedup(state, conn, &result.uri, &result.doc, result.version);
+    if published {
+        // Pull-mode clients (notably JetBrains) ignore the publish above and
+        // only refresh diagnostics when the server explicitly invalidates
+        // their cache. Without this, a fix that clears a diagnostic stays
+        // visible in the gutter until the user triggers another pull.
+        request_workspace_diagnostic_refresh(state, conn);
+    }
 
     // Update the reverse-import graph for cross-file diagnostics. Each
     // analyzed module knows which files it imported (`imported_files`); we
@@ -915,6 +931,11 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
                 // The hash dedup uses range positions, so drop the cached
                 // hash — the next real analysis publish must go through.
                 state.published_diag_hashes.remove(&uri);
+                // Don't send a refresh here: pull-mode clients would re-pull
+                // and see the still-stale `state.documents.knot_diagnostics`
+                // (analysis hasn't caught up yet). The post-analysis refresh
+                // in `apply_analysis_result` handles the update once
+                // `state.documents` reflects the new source.
             }
         }
 
@@ -1092,13 +1113,17 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
 /// `knot_diagnostics` output verbatim — there's no need to re-render the
 /// editor's gutter for those. We hash the published list so the comparison
 /// stays cheap (a `Vec<Diagnostic>` clone-and-compare would dominate).
+///
+/// Returns `true` when a publish was actually sent. The caller uses this to
+/// decide whether to follow up with `workspace/diagnostic/refresh` for
+/// pull-mode clients that ignore `publishDiagnostics`.
 fn publish_diagnostics_dedup(
     state: &mut ServerState,
     conn: &Connection,
     uri: &Uri,
     doc: &state::DocumentState,
     version: Option<i32>,
-) {
+) -> bool {
     use std::hash::{Hash, Hasher};
     let lsp_diags: Vec<lsp_types::Diagnostic> = doc
         .knot_diagnostics
@@ -1131,7 +1156,7 @@ fn publish_diagnostics_dedup(
         state
             .published_lsp_diagnostics
             .insert(uri.clone(), lsp_diags);
-        return;
+        return false;
     }
     state.published_diag_hashes.insert(uri.clone(), new_hash);
     state
@@ -1144,6 +1169,29 @@ fn publish_diagnostics_dedup(
     );
     if let Err(e) = conn.sender.send(Message::Notification(not)) {
         eprintln!("knot-lsp: failed to publish diagnostics: {e}");
+    }
+    true
+}
+
+/// Ask a pull-mode client (e.g. JetBrains) to re-pull diagnostics. Pull-mode
+/// clients ignore `publishDiagnostics`, so a fix that clears a diagnostic
+/// would otherwise stay visible until the user triggered another pull (open
+/// a file, edit again, etc.). Push-mode clients ignore the refresh request,
+/// so it's safe to send unconditionally when the capability is advertised.
+///
+/// Counter is monotonic to keep request ids unique across calls.
+fn request_workspace_diagnostic_refresh(state: &mut ServerState, conn: &Connection) {
+    if !state.client_supports_diagnostic_refresh {
+        return;
+    }
+    state.diagnostic_refresh_counter = state.diagnostic_refresh_counter.wrapping_add(1);
+    let req = Request::new(
+        RequestId::from(format!("knot-diag-refresh-{}", state.diagnostic_refresh_counter)),
+        lsp_types::request::WorkspaceDiagnosticRefresh::METHOD.into(),
+        serde_json::Value::Null,
+    );
+    if let Err(e) = conn.sender.send(Message::Request(req)) {
+        eprintln!("knot-lsp: failed to send workspace/diagnostic/refresh: {e}");
     }
 }
 

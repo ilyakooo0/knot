@@ -220,6 +220,16 @@ pub struct ServerState {
     /// old line/character ranges even though the document has moved on.
     /// Cleared on document close alongside `published_diag_hashes`.
     pub published_lsp_diagnostics: HashMap<Uri, Vec<Diagnostic>>,
+    /// Whether the client supports `workspace/diagnostic/refresh`. Pull-mode
+    /// clients (notably JetBrains) ignore `publishDiagnostics` and only update
+    /// when the server explicitly invalidates their cache via this request;
+    /// without it, fixed errors keep showing in the gutter until the next
+    /// user-initiated pull. Set from `clientCapabilities.workspace.diagnostic.
+    /// refreshSupport` at initialize time.
+    pub client_supports_diagnostic_refresh: bool,
+    /// Monotonic id source for outgoing `workspace/diagnostic/refresh` requests.
+    /// Each call bumps this so request ids stay unique across the session.
+    pub diagnostic_refresh_counter: u64,
 }
 
 /// Symbol entry stored in the workspace symbol cache.

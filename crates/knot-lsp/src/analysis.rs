@@ -971,4 +971,146 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn worker_clears_diagnostic_after_fix_edit() {
+        // End-to-end-ish: feed the worker the bad source, then the fix.
+        // The second result must have no `is unnecessary` diagnostic.
+        let (tx, rx, handle) = spawn_worker();
+        let uri = fake_uri("file:///tmp/repro_worker.knot");
+
+        let bad = r#"type Msg = {id: Int, text: Text}
+
+*messages : [Msg]
+
+removeWhere = \xs pred -> do
+  m <- xs
+  where not (pred m)
+  yield m
+
+main = do
+  mssgs <- *messages
+  replace *messages = removeWhere mssgs (\m -> m.text == "spam")
+  yield {}
+"#;
+        let good = r#"type Msg = {id: Int, text: Text}
+
+*messages : [Msg]
+
+removeWhere = \xs pred -> do
+  m <- xs
+  where not (pred m)
+  yield m
+
+main = do
+  mssgs <- *messages
+  *messages = removeWhere mssgs (\m -> m.text == "spam")
+  yield {}
+"#;
+
+        tx.send(AnalysisTask {
+            uri: uri.clone(),
+            source: bad.into(),
+            version: Some(1),
+        })
+        .unwrap();
+        let r1 = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            r1.doc.knot_diagnostics
+                .iter()
+                .any(|d| d.message.contains("is unnecessary")),
+            "first analysis should report `is unnecessary`"
+        );
+
+        // Wait beyond the debounce window so the next task is processed
+        // separately, mimicking a real edit-then-pause cycle.
+        std::thread::sleep(Duration::from_millis(600));
+
+        tx.send(AnalysisTask {
+            uri: uri.clone(),
+            source: good.into(),
+            version: Some(2),
+        })
+        .unwrap();
+        let r2 = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let msgs: Vec<&str> = r2
+            .doc
+            .knot_diagnostics
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert!(
+            !r2.doc.knot_diagnostics
+                .iter()
+                .any(|d| d.message.contains("is unnecessary")),
+            "second analysis should clear `is unnecessary`; got: {:?}",
+            msgs
+        );
+
+        drop(tx);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn analysis_clears_diagnostic_when_replace_removed() {
+        // The user removed `replace ` to silence the "is unnecessary"
+        // diagnostic; the second analysis must reflect that.
+        let uri = fake_uri("file:///tmp/repro.knot");
+        let mut import_cache = HashMap::new();
+        let mut inference_cache = HashMap::new();
+
+        let bad = r#"type Msg = {id: Int, text: Text}
+
+*messages : [Msg]
+
+removeWhere = \xs pred -> do
+  m <- xs
+  where not (pred m)
+  yield m
+
+main = do
+  mssgs <- *messages
+  replace *messages = removeWhere mssgs (\m -> m.text == "spam")
+  yield {}
+"#;
+
+        let good = r#"type Msg = {id: Int, text: Text}
+
+*messages : [Msg]
+
+removeWhere = \xs pred -> do
+  m <- xs
+  where not (pred m)
+  yield m
+
+main = do
+  mssgs <- *messages
+  *messages = removeWhere mssgs (\m -> m.text == "spam")
+  yield {}
+"#;
+
+        let doc1 = analyze_document(&uri, bad, &mut import_cache, &mut inference_cache);
+        assert!(
+            doc1.knot_diagnostics
+                .iter()
+                .any(|d| d.message.contains("is unnecessary")),
+            "expected `is unnecessary` diagnostic on bad source; got: {:?}",
+            doc1.knot_diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let doc2 = analyze_document(&uri, good, &mut import_cache, &mut inference_cache);
+        assert!(
+            !doc2.knot_diagnostics
+                .iter()
+                .any(|d| d.message.contains("is unnecessary")),
+            "did not expect `is unnecessary` diagnostic on good source; got: {:?}",
+            doc2.knot_diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
 }

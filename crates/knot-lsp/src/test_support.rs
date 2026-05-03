@@ -50,6 +50,8 @@ impl TestWorkspace {
             semantic_token_counter: 0,
             published_diag_hashes: HashMap::new(),
             published_lsp_diagnostics: HashMap::new(),
+            client_supports_diagnostic_refresh: false,
+            diagnostic_refresh_counter: 0,
         };
         TestWorkspace {
             state,

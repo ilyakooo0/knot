@@ -92,14 +92,28 @@ fn merge_effects_into_row(existing_row: &str, effects: &EffectSet) -> String {
     let mut have: std::collections::BTreeSet<String> =
         existing_effects.iter().cloned().collect();
     let mut additions: Vec<String> = Vec::new();
-    for r in &effects.reads {
-        let s = format!("reads *{r}");
+    let read_write: std::collections::BTreeSet<&String> =
+        effects.reads.intersection(&effects.writes).collect();
+    for name in &effects.reads {
+        if read_write.contains(name) {
+            continue;
+        }
+        let s = format!("r *{name}");
         if have.insert(s.clone()) {
             additions.push(s);
         }
     }
-    for w in &effects.writes {
-        let s = format!("writes *{w}");
+    for name in &effects.writes {
+        if read_write.contains(name) {
+            continue;
+        }
+        let s = format!("w *{name}");
+        if have.insert(s.clone()) {
+            additions.push(s);
+        }
+    }
+    for name in &read_write {
+        let s = format!("rw *{name}");
         if have.insert(s.clone()) {
             additions.push(s);
         }
@@ -169,7 +183,7 @@ mod sig_tests {
         );
         assert_eq!(
             s,
-            "Timestamp -> IO {reads *globalRateCount, writes *globalRateCount} Bool"
+            "Timestamp -> IO {rw *globalRateCount} Bool"
         );
     }
 

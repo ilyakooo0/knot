@@ -594,18 +594,18 @@ The compiler detects whether a do-block is IO or relational based on the types o
 
 ### DB Effect Inference
 
-DB effects are still inferred as fine-grained capabilities (`{reads *rel}`, `{writes *rel}`), but all relation access returns IO values:
+DB effects are still inferred as fine-grained capabilities (`{r *rel}`, `{w *rel}`), but all relation access returns IO values:
 
 ```knot
 -- Pure (inferred: no effects)
 formatName = \n -> toUpper (take 1 n) ++ drop 1 n
 
--- DB read (inferred: {reads *people})
+-- DB read (inferred: {r *people})
 &seniors = do
   people <- *people
   yield (filter (\p -> p.age > 65) people)
 
--- DB write (inferred: {reads *people, writes *people})
+-- DB write (inferred: {rw *people})
 birthday = \name -> do
   people <- *people
   set *people = do
@@ -618,7 +618,7 @@ birthday = \name -> do
 Effect signatures are inferred but can be written explicitly:
 
 ```knot
-birthday : {reads *people, writes *people} Text -> IO {} {}
+birthday : {rw *people} Text -> IO {} {}
 birthday = \name -> do
   people <- *people
   set *people = do

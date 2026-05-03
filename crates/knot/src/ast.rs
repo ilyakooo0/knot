@@ -428,7 +428,7 @@ pub enum TypeKind {
         rest: Option<Name>,
     },
 
-    /// `{reads *people, writes *people} Text -> {}` — effectful type.
+    /// `{rw *people} Text -> {}` — effectful type.
     Effectful {
         effects: Vec<Effect>,
         ty: Box<Type>,

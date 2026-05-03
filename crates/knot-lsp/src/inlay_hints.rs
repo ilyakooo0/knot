@@ -677,7 +677,7 @@ fn name_end_offset(source: &str, decl_span: Span, _name: &str) -> usize {
 /// Heuristic: does the rendered type string already mention all of the given
 /// effects? Used to suppress redundant effect inlay hints.
 fn type_str_mentions_effects(ty: &str, effects: &str) -> bool {
-    // The effects string looks like `{console, reads *foo}` — pull the inner
+    // The effects string looks like `{console, r *foo}` — pull the inner
     // tokens and check that each appears in the type string.
     let inner = effects.trim_start_matches('{').trim_end_matches('}');
     if inner.is_empty() {
@@ -1149,7 +1149,7 @@ globalRateWindowMs = 1000
 maxGlobalRequestRate : Int
 maxGlobalRequestRate = 1000
 
-gateAuth : Timestamp -> (Text -> a) -> IO {reads *drainPhase, reads *globalRateCount, reads *globalRateWindowStart, writes *globalRateCount, writes *globalRateWindowStart} a
+gateAuth : Timestamp -> (Text -> a) -> IO {r *drainPhase, r *globalRateCount, r *globalRateWindowStart, w *globalRateCount, w *globalRateWindowStart} a
 gateAuth = \t mkErr -> do
   dp <- *drainPhase
   g <- checkGlobalRate t
@@ -1179,20 +1179,12 @@ checkGlobalRate = \t -> atomic do
             .expect("checkGlobalRate should have effects");
         let suggested = crate::shared::render_signature_with_effects(inferred, effects);
         assert!(
-            suggested.contains("reads *globalRateCount"),
-            "suggestion missing reads effect: {suggested}"
+            suggested.contains("rw *globalRateCount"),
+            "suggestion missing rw effect: {suggested}"
         );
         assert!(
-            suggested.contains("writes *globalRateCount"),
-            "suggestion missing writes effect: {suggested}"
-        );
-        assert!(
-            suggested.contains("reads *globalRateWindowStart"),
-            "suggestion missing reads effect: {suggested}"
-        );
-        assert!(
-            suggested.contains("writes *globalRateWindowStart"),
-            "suggestion missing writes effect: {suggested}"
+            suggested.contains("rw *globalRateWindowStart"),
+            "suggestion missing rw effect: {suggested}"
         );
         assert!(
             !suggested.contains("*sessions"),

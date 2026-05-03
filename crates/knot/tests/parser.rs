@@ -2242,7 +2242,7 @@ fn non_time_unit_identifier_not_consumed() {
 
 #[test]
 fn effectful_type_reads() {
-    match first_decl("type X = {reads *users} Int -> Int") {
+    match first_decl("type X = {r *users} Int -> Int") {
         DeclKind::TypeAlias { ty, .. } => match &ty.node {
             TypeKind::Effectful { effects, ty } => {
                 assert_eq!(effects.len(), 1);
@@ -2257,13 +2257,29 @@ fn effectful_type_reads() {
 
 #[test]
 fn effectful_type_multiple_effects() {
-    match first_decl("type X = {reads *people, writes *logs, console} Int") {
+    match first_decl("type X = {r *people, w *logs, console} Int") {
         DeclKind::TypeAlias { ty, .. } => match &ty.node {
             TypeKind::Effectful { effects, .. } => {
                 assert_eq!(effects.len(), 3);
                 assert!(matches!(&effects[0], Effect::Reads(n) if n == "people"));
                 assert!(matches!(&effects[1], Effect::Writes(n) if n == "logs"));
                 assert!(matches!(&effects[2], Effect::Console));
+            }
+            other => panic!("expected Effectful, got {:?}", other),
+        },
+        other => panic!("expected TypeAlias, got {:?}", other),
+    }
+}
+
+#[test]
+fn effectful_type_rw_shorthand() {
+    match first_decl("type X = {rw *people} Int -> Int") {
+        DeclKind::TypeAlias { ty, .. } => match &ty.node {
+            TypeKind::Effectful { effects, ty } => {
+                assert_eq!(effects.len(), 2);
+                assert!(matches!(&effects[0], Effect::Reads(n) if n == "people"));
+                assert!(matches!(&effects[1], Effect::Writes(n) if n == "people"));
+                assert!(matches!(&ty.node, TypeKind::Function { .. }));
             }
             other => panic!("expected Effectful, got {:?}", other),
         },
@@ -2319,7 +2335,7 @@ fn io_type_with_only_effect_row() {
 
 #[test]
 fn io_type_with_reads_and_row_var() {
-    match first_decl("type X = IO {reads *people, console | e} Int") {
+    match first_decl("type X = IO {r *people, console | e} Int") {
         DeclKind::TypeAlias { ty, .. } => match &ty.node {
             TypeKind::IO { effects, rest, .. } => {
                 assert_eq!(effects.len(), 2);

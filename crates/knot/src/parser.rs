@@ -3529,7 +3529,7 @@ impl Parser {
         // Already consumed `{`.
         self.skip_newlines();
 
-        // Check for effectful type: {reads *rel, writes *rel, ...} Type
+        // Check for effectful type: {r *rel, w *rel, ...} Type
         // Effects have special keyword-like identifiers.
         let saved = self.save();
         let diag_count = self.diagnostics.len();
@@ -3605,20 +3605,29 @@ impl Parser {
         let mut effects = Vec::new();
         loop {
             match self.peek() {
-                TokenKind::Lower(s) if s == "reads" => {
+                TokenKind::Lower(s) if s == "r" => {
                     self.advance();
-                    self.expect(&TokenKind::Star, "expected '*' after 'reads'").ok()?;
+                    self.expect(&TokenKind::Star, "expected '*' after 'r'").ok()?;
                     let (name, _) = self
-                        .expect_lower("expected relation name after 'reads *'")
+                        .expect_lower("expected relation name after 'r *'")
                         .ok()?;
                     effects.push(Effect::Reads(name));
                 }
-                TokenKind::Lower(s) if s == "writes" => {
+                TokenKind::Lower(s) if s == "w" => {
                     self.advance();
-                    self.expect(&TokenKind::Star, "expected '*' after 'writes'").ok()?;
+                    self.expect(&TokenKind::Star, "expected '*' after 'w'").ok()?;
                     let (name, _) = self
-                        .expect_lower("expected relation name after 'writes *'")
+                        .expect_lower("expected relation name after 'w *'")
                         .ok()?;
+                    effects.push(Effect::Writes(name));
+                }
+                TokenKind::Lower(s) if s == "rw" => {
+                    self.advance();
+                    self.expect(&TokenKind::Star, "expected '*' after 'rw'").ok()?;
+                    let (name, _) = self
+                        .expect_lower("expected relation name after 'rw *'")
+                        .ok()?;
+                    effects.push(Effect::Reads(name.clone()));
                     effects.push(Effect::Writes(name));
                 }
                 TokenKind::Lower(s) if s == "console" => {

@@ -176,8 +176,8 @@ pub fn format_unit_expr(u: &ast::UnitExpr) -> String {
 
 pub fn format_effect(eff: &ast::Effect) -> String {
     match eff {
-        ast::Effect::Reads(r) => format!("reads *{r}"),
-        ast::Effect::Writes(r) => format!("writes *{r}"),
+        ast::Effect::Reads(name) => format!("r *{name}"),
+        ast::Effect::Writes(name) => format!("w *{name}"),
         ast::Effect::Console => "console".into(),
         ast::Effect::Network => "network".into(),
         ast::Effect::Fs => "fs".into(),

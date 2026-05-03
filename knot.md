@@ -564,7 +564,7 @@ birthday = \name -> do
   set *people = do               -- IO {} {}
     p <- people
     yield (if p.name == name then {p | age: p.age + 1} else p)
--- Inferred effects: {reads *people, writes *people}
+-- Inferred effects: {rw *people}
 -- Type: Text -> IO {} {}
 ```
 

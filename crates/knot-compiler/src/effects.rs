@@ -146,11 +146,19 @@ impl EffectSet {
 impl fmt::Display for EffectSet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut parts = Vec::new();
+        let read_write: BTreeSet<&String> = self.reads.intersection(&self.writes).collect();
         for name in &self.reads {
-            parts.push(format!("reads *{}", name));
+            if !read_write.contains(name) {
+                parts.push(format!("r *{}", name));
+            }
         }
         for name in &self.writes {
-            parts.push(format!("writes *{}", name));
+            if !read_write.contains(name) {
+                parts.push(format!("w *{}", name));
+            }
+        }
+        for name in &read_write {
+            parts.push(format!("rw *{}", name));
         }
         if self.console {
             parts.push("console".into());
@@ -794,7 +802,16 @@ mod tests {
         let mut e = EffectSet::empty();
         e.reads.insert("people".into());
         e.console = true;
-        assert_eq!(format!("{}", e), "{reads *people, console}");
+        assert_eq!(format!("{}", e), "{r *people, console}");
+    }
+
+    #[test]
+    fn display_coalesces_rw() {
+        let mut e = EffectSet::empty();
+        e.reads.insert("people".into());
+        e.writes.insert("people".into());
+        e.reads.insert("logs".into());
+        assert_eq!(format!("{}", e), "{r *logs, rw *people}");
     }
 
     #[test]
@@ -1033,7 +1050,7 @@ mod tests {
 
     #[test]
     fn annotation_ok_when_superset() {
-        // f : {reads *people, console} Int -> Int
+        // f : {r *people, console} Int -> Int
         // f = \x -> do { println *people; yield x }
         let body = spanned(ExprKind::Lambda {
             params: vec![spanned(PatKind::Var("x".into()))],
@@ -1067,7 +1084,7 @@ mod tests {
 
     #[test]
     fn annotation_error_when_missing_effect() {
-        // Declares only {reads *people} but actually uses console too
+        // Declares only {r *people} but actually uses console too
         let body = spanned(ExprKind::Lambda {
             params: vec![spanned(PatKind::Var("x".into()))],
             body: Box::new(spanned(ExprKind::Do(vec![
@@ -1182,7 +1199,7 @@ mod tests {
 
     #[test]
     fn io_annotation_with_reads_accepts_source_ref() {
-        // f : IO {reads *people} [T] — reads declared, source ref allowed
+        // f : IO {r *people} [T] — reads declared, source ref allowed
         let body = spanned(ExprKind::SourceRef("people".into()));
         let ty = TypeScheme {
             constraints: vec![],

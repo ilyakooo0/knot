@@ -988,12 +988,8 @@ fn render_type_prec(t: &Type, ctx: TyPrec) -> String {
         }
         TypeKind::Effectful { effects, ty } => {
             let mut s = String::from("{");
-            for (i, e) in effects.iter().enumerate() {
-                if i > 0 {
-                    s.push_str(", ");
-                }
-                s.push_str(&render_effect(e));
-            }
+            let parts = render_effects_coalesced(effects);
+            s.push_str(&parts.join(", "));
             s.push_str("} ");
             s.push_str(&render_type(ty));
             if ctx > TyPrec::Function {
@@ -1004,12 +1000,8 @@ fn render_type_prec(t: &Type, ctx: TyPrec) -> String {
         }
         TypeKind::IO { effects, rest, ty } => {
             let mut s = String::from("IO {");
-            for (i, e) in effects.iter().enumerate() {
-                if i > 0 {
-                    s.push_str(", ");
-                }
-                s.push_str(&render_effect(e));
-            }
+            let parts = render_effects_coalesced(effects);
+            s.push_str(&parts.join(", "));
             if let Some(r) = rest {
                 if !effects.is_empty() {
                     s.push_str(" | ");
@@ -1058,14 +1050,52 @@ fn render_type_prec(t: &Type, ctx: TyPrec) -> String {
 
 fn render_effect(e: &Effect) -> String {
     match e {
-        Effect::Reads(n) => format!("reads *{}", n),
-        Effect::Writes(n) => format!("writes *{}", n),
+        Effect::Reads(n) => format!("r *{}", n),
+        Effect::Writes(n) => format!("w *{}", n),
         Effect::Console => "console".into(),
         Effect::Network => "network".into(),
         Effect::Fs => "fs".into(),
         Effect::Clock => "clock".into(),
         Effect::Random => "random".into(),
     }
+}
+
+/// Render an effect list, coalescing matching `r *x` and `w *x` pairs into
+/// `rw *x`. Preserves the original ordering for non-coalesced effects.
+fn render_effects_coalesced(effects: &[Effect]) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut reads: BTreeSet<&str> = BTreeSet::new();
+    let mut writes: BTreeSet<&str> = BTreeSet::new();
+    for e in effects {
+        match e {
+            Effect::Reads(n) => {
+                reads.insert(n.as_str());
+            }
+            Effect::Writes(n) => {
+                writes.insert(n.as_str());
+            }
+            _ => {}
+        }
+    }
+    let both: BTreeSet<&str> = reads.intersection(&writes).copied().collect();
+    let mut emitted_rw: BTreeSet<&str> = BTreeSet::new();
+    let mut out = Vec::with_capacity(effects.len());
+    for e in effects {
+        match e {
+            Effect::Reads(n) if both.contains(n.as_str()) => {
+                if emitted_rw.insert(n.as_str()) {
+                    out.push(format!("rw *{}", n));
+                }
+            }
+            Effect::Writes(n) if both.contains(n.as_str()) => {
+                if emitted_rw.insert(n.as_str()) {
+                    out.push(format!("rw *{}", n));
+                }
+            }
+            _ => out.push(render_effect(e)),
+        }
+    }
+    out
 }
 
 fn render_type_scheme(ts: &TypeScheme) -> String {

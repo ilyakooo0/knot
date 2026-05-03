@@ -1856,7 +1856,7 @@ fn find_io_call(expr: &ast::Expr, offset: usize) -> Option<Span> {
 }
 
 /// Pull a `{...}` block out of an effects diagnostic note like
-/// `inferred effects: {console, reads *foo}`.
+/// `inferred effects: {console, r *foo}`.
 fn extract_effect_set_from_message(msg: &str, prefix: &str) -> Option<String> {
     let start = msg.find(prefix)? + prefix.len();
     let rest = msg[start..].trim_start();

@@ -6008,8 +6008,8 @@ fn ast_effects_to_io_effects(effects: &[ast::Effect]) -> BTreeSet<IoEffect> {
 
 fn format_io_effect(e: &IoEffect) -> String {
     match e {
-        IoEffect::Reads(name) => format!("reads *{}", name),
-        IoEffect::Writes(name) => format!("writes *{}", name),
+        IoEffect::Reads(name) => format!("r *{}", name),
+        IoEffect::Writes(name) => format!("w *{}", name),
         IoEffect::Console => "console".into(),
         IoEffect::Fs => "fs".into(),
         IoEffect::Network => "network".into(),
@@ -6023,7 +6023,7 @@ fn display_effect_set_clean(
     row: Option<TyVar>,
     names: &HashMap<TyVar, usize>,
 ) -> String {
-    let mut parts: Vec<String> = effects.iter().map(format_io_effect).collect();
+    let mut parts: Vec<String> = format_io_effects_coalesced(effects);
     if let Some(rv) = row {
         parts.push(format!(
             "| {}",
@@ -6031,6 +6031,40 @@ fn display_effect_set_clean(
         ));
     }
     format!(" {{{}}}", parts.join(", "))
+}
+
+fn format_io_effects_coalesced(effects: &BTreeSet<IoEffect>) -> Vec<String> {
+    let mut reads: BTreeSet<&String> = BTreeSet::new();
+    let mut writes: BTreeSet<&String> = BTreeSet::new();
+    let mut others: Vec<String> = Vec::new();
+    for e in effects {
+        match e {
+            IoEffect::Reads(name) => {
+                reads.insert(name);
+            }
+            IoEffect::Writes(name) => {
+                writes.insert(name);
+            }
+            _ => others.push(format_io_effect(e)),
+        }
+    }
+    let read_write: BTreeSet<&&String> = reads.intersection(&writes).collect();
+    let mut parts: Vec<String> = Vec::new();
+    for name in &reads {
+        if !read_write.contains(name) {
+            parts.push(format!("r *{}", name));
+        }
+    }
+    for name in &writes {
+        if !read_write.contains(name) {
+            parts.push(format!("w *{}", name));
+        }
+    }
+    for name in &read_write {
+        parts.push(format!("rw *{}", name));
+    }
+    parts.extend(others);
+    parts
 }
 
 fn var_letter(idx: usize) -> String {

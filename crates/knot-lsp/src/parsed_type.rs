@@ -525,7 +525,7 @@ impl<'a> Parser<'a> {
                 self.eat_char('}');
                 break;
             }
-            // Effects can have spaces (e.g. `reads *foo`). Read until comma,
+            // Effects can have spaces (e.g. `r *foo`). Read until comma,
             // pipe, or close-brace, respecting balanced delimiters.
             let start = self.pos;
             let mut depth = 0i32;

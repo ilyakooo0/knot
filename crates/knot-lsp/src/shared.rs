@@ -391,7 +391,9 @@ pub(crate) fn route_is_listened(module: &Module, route_name: &str) -> bool {
             // The handler's body typically destructures the route ADT, so any reference
             // to the route name (constructor case-match) inside a `listen` call is
             // a strong signal that the route is wired in.
-            if app_callee_is(func, "listen") && expr_references_name(arg, route_name) {
+            if (app_callee_is(func, "listen") || app_callee_is(func, "listenOn"))
+                && expr_references_name(arg, route_name)
+            {
                 *found = true;
                 return;
             }

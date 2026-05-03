@@ -1,0 +1,25 @@
+-- Hash builtin smoke-test (BLAKE3, polymorphic over any value)
+
+main = do
+  -- Bytes: BLAKE3 of "abc" — expected 6437b3ac...9d85
+  println (bytesToHex (hash (textToBytes "abc")))
+
+  -- Bytes: BLAKE3 of empty bytes — expected af1349b9...3262
+  println (bytesToHex (hash b""))
+
+  -- Text: hashes raw UTF-8 bytes (same digest as bytes form above)
+  println (bytesToHex (hash "abc"))
+
+  -- Records: equal records hash equal
+  println (bytesToHex (hash {x: 1, y: 2}))
+  println (bytesToHex (hash {x: 1, y: 2}))
+
+  -- Different records hash differently
+  println (bytesToHex (hash {x: 1, y: 3}))
+
+  -- Numbers, booleans, lists also work
+  println (bytesToHex (hash 42))
+  println (bytesToHex (hash true))
+  println (bytesToHex (hash [1, 2, 3]))
+
+  yield {}

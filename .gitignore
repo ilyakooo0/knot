@@ -26,3 +26,4 @@ examples/crypto
 examples/log_test
 examples/fold_stream
 examples/inline_pushdown
+examples/hash

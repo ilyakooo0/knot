@@ -21,7 +21,7 @@ pub const RANDOM_BUILTINS: &[&str] = &[
 ];
 
 /// Builtins that perform network IO.
-pub const NETWORK_BUILTINS: &[&str] = &["listen", "fetch", "fetchWith"];
+pub const NETWORK_BUILTINS: &[&str] = &["listen", "listenOn", "fetch", "fetchWith"];
 
 /// Builtins that touch the filesystem.
 pub const FS_BUILTINS: &[&str] = &[
@@ -59,7 +59,7 @@ pub const EFFECTFUL_BUILTINS: &[&str] = &[
     "randomInt", "randomFloat",
     "generateKeyPair", "generateSigningKeyPair", "encrypt",
     // network
-    "listen", "fetch", "fetchWith",
+    "listen", "listenOn", "fetch", "fetchWith",
     // fs
     "readFile", "writeFile", "appendFile",
     "fileExists", "removeFile", "listDir",
@@ -80,7 +80,7 @@ pub const ATOMIC_DISALLOWED_BUILTINS: &[&str] = &[
     "now", "sleep",
     "randomInt", "randomFloat",
     "generateKeyPair", "generateSigningKeyPair", "encrypt",
-    "listen", "fetch", "fetchWith",
+    "listen", "listenOn", "fetch", "fetchWith",
     "readFile", "writeFile", "appendFile",
     "fileExists", "removeFile", "listDir",
 ];
@@ -99,6 +99,7 @@ pub const BYTES_BUILTINS: &[&str] = &[
     "bytesLength", "bytesSlice", "bytesConcat",
     "textToBytes", "bytesToText", "bytesToHex",
     "bytesFromHex", "hexDecode", "bytesGet",
+    "hash",
 ];
 
 /// Internal desugaring helpers emitted by the desugarer. Not user-facing.

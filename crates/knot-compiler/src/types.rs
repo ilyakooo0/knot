@@ -493,7 +493,7 @@ fn schema_for_source(
     match &unwrapped.node {
         TypeKind::Relation(inner) => {
             let resolved = resolve_type(inner, aliases, assoc_types);
-            schema_descriptor(&resolved)
+            relation_inner_schema(&resolved)
         }
         _ => {
             // The type might be a named alias that resolves to a Relation
@@ -501,12 +501,24 @@ fn schema_for_source(
             // Check the resolved type before falling back to scalar schema.
             let resolved = resolve_type(unwrapped, aliases, assoc_types);
             if let ResolvedType::Relation(inner) = &resolved {
-                return schema_descriptor(inner);
+                return relation_inner_schema(inner);
             }
             // Non-relation source type (e.g. `*counter : Int`):
             // wrap as a single-column `_value` schema.
             format!("_value:{}", col_type_str(&resolved))
         }
+    }
+}
+
+/// Schema for the inner type of a relation. Records/ADTs delegate to
+/// `schema_descriptor`; primitive inner types (e.g. `*tags : [Text]`) get
+/// wrapped as a single-column `_value:<scalar>` schema, matching how scalar
+/// sources are stored. Without this wrapping the runtime sees a bare type
+/// name like `"text"` and panics in `parse_record_schema`.
+fn relation_inner_schema(inner: &ResolvedType) -> String {
+    match inner {
+        ResolvedType::Record(_) | ResolvedType::Adt(_) => schema_descriptor(inner),
+        _ => format!("_value:{}", col_type_str(inner)),
     }
 }
 

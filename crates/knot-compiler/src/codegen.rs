@@ -754,6 +754,7 @@ impl Codegen {
         self.declare_rt("knot_bytes_to_hex", &[p], &[p]);
         self.declare_rt("knot_bytes_from_hex", &[p], &[p]);
         self.declare_rt("knot_bytes_get", &[p, p], &[p]);
+        self.declare_rt("knot_hash", &[p], &[p]);
 
         // Standard library: file system operations
         self.declare_rt("knot_fs_read_file", &[p], &[p]);
@@ -824,6 +825,8 @@ impl Codegen {
             &[],
         );
         self.declare_rt("knot_http_listen", &[p, p, p, p], &[p]);
+        // (db, host_value, port_value, route_table, handler) — host is a Value::Text.
+        self.declare_rt("knot_http_listen_on", &[p, p, p, p, p], &[p]);
 
         // HTTP client (fetch)
         // (base_url, method_ptr, method_len, path_ptr, path_len, payload,
@@ -1075,7 +1078,7 @@ impl Codegen {
             "stripUnit", "withUnit", "stripFloatUnit", "withFloatUnit",
             "bytesLength", "bytesSlice", "bytesConcat",
             "textToBytes", "bytesToText", "bytesToHex", "bytesFromHex", "hexDecode",
-            "bytesGet",
+            "bytesGet", "hash",
             "readFile", "writeFile", "appendFile",
             "fileExists", "removeFile", "listDir",
             "randomInt", "sleep", "fork",
@@ -2092,6 +2095,7 @@ impl Codegen {
         self.define_stdlib_fn_1("bytesToHex", "knot_bytes_to_hex");
         self.define_stdlib_fn_1("bytesFromHex", "knot_bytes_from_hex");
         self.define_stdlib_fn_1("hexDecode", "knot_bytes_from_hex");
+        self.define_stdlib_fn_1("hash", "knot_hash");
 
         // Bytes: 2-param (curried)
         self.define_stdlib_fn_2("bytesConcat", "knot_bytes_concat", false);
@@ -5492,9 +5496,11 @@ impl Codegen {
                     self.call_rt(builder, "knot_value_unit", &[])
                 }
             }
-            ast::ExprKind::Var(name) if name == "listen" => {
-                if compiled_args.len() == 2 {
-                    // listen port handler
+            ast::ExprKind::Var(name) if name == "listen" || name == "listenOn" => {
+                let is_listen_on = name == "listenOn";
+                let expected_arity = if is_listen_on { 3 } else { 2 };
+                if compiled_args.len() == expected_arity {
+                    // listen port handler  /  listenOn host port handler
                     // Build route table from known route declarations
                     let table = self.call_rt(builder, "knot_route_table_new", &[]);
 
@@ -5560,11 +5566,19 @@ impl Codegen {
                         );
                     }
 
-                    self.call_rt(
-                        builder,
-                        "knot_http_listen",
-                        &[db, compiled_args[0], table, compiled_args[1]],
-                    )
+                    if is_listen_on {
+                        self.call_rt(
+                            builder,
+                            "knot_http_listen_on",
+                            &[db, compiled_args[0], compiled_args[1], table, compiled_args[2]],
+                        )
+                    } else {
+                        self.call_rt(
+                            builder,
+                            "knot_http_listen",
+                            &[db, compiled_args[0], table, compiled_args[1]],
+                        )
+                    }
                 } else {
                     self.call_rt(builder, "knot_value_unit", &[])
                 }

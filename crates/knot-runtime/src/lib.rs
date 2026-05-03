@@ -6501,6 +6501,24 @@ pub extern "C" fn knot_bytes_from_hex(v: *mut Value) -> *mut Value {
     }
 }
 
+/// hash(value) — BLAKE3 digest of any value. Returns 32 bytes.
+/// Bytes/Text hash their raw contents; structured values (records, ADTs,
+/// relations) hash their canonical byte serialization (the same one used
+/// for set dedup), so two values that are `==` produce the same digest.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_hash(v: *mut Value) -> *mut Value {
+    let digest = match unsafe { as_ref(v) } {
+        Value::Bytes(b) => blake3::hash(b.as_ref()),
+        Value::Text(s) => blake3::hash(s.as_bytes()),
+        _ => {
+            let mut buf = Vec::new();
+            value_to_hash_bytes(v, &mut buf);
+            blake3::hash(&buf)
+        }
+    };
+    alloc(Value::Bytes(Arc::from(digest.as_bytes().to_vec())))
+}
+
 /// bytesGet(index, bytes) — get byte at index as Int (0-255)
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_bytes_get(index: *mut Value, bytes: *mut Value) -> *mut Value {
@@ -7185,7 +7203,10 @@ fn parse_record_schema(spec: &str) -> RecordSchema {
     for part in split_respecting_brackets(spec, ',') {
         // Find the first ':' (field name separator)
         let colon = part.find(':').unwrap_or_else(|| {
-            panic!("knot runtime: malformed schema field '{}'", part)
+            panic!(
+                "knot runtime: malformed schema field '{}' (full schema: '{}')",
+                part, spec
+            )
         });
         let name = part[..colon].to_string();
         let type_str = &part[colon + 1..];
@@ -11515,6 +11536,20 @@ pub extern "C" fn knot_http_config_init() {
     }
 }
 
+/// Parse a `Value` carrying a port number (SmallInt or Int) into a `u16`.
+/// Used by both `knot_http_listen` and `knot_http_listen_on`.
+fn parse_port_value(port_val: *mut Value, fn_name: &str) -> u16 {
+    match unsafe { as_ref(port_val) } {
+        Value::SmallInt(n) => u16::try_from(*n).expect("knot runtime: port number out of range"),
+        Value::Int(n) => n.to_u16().expect("knot runtime: port number out of range"),
+        _ => panic!(
+            "knot runtime: {} expects Int port, got {}",
+            fn_name,
+            type_name(port_val)
+        ),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_http_listen(
     _db: *mut c_void,
@@ -11522,16 +11557,48 @@ pub extern "C" fn knot_http_listen(
     route_table: *mut c_void,
     handler: *mut Value,
 ) -> *mut Value {
-    let port: u16 = match unsafe { as_ref(port_val) } {
-        Value::SmallInt(n) => u16::try_from(*n).expect("knot runtime: port number out of range"),
-        Value::Int(n) => n.to_u16().expect("knot runtime: port number out of range"),
-        _ => panic!("knot runtime: listen expects Int port, got {}", type_name(port_val)),
+    let port = parse_port_value(port_val, "listen");
+    http_serve_loop(format!("0.0.0.0:{}", port), route_table, handler)
+}
+
+/// Like `knot_http_listen`, but binds to the supplied host. If `host` looks
+/// like a bare IPv6 address (contains `:` and isn't already bracketed), wrap
+/// it in `[...]` so `tiny_http` parses the `host:port` correctly.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_http_listen_on(
+    _db: *mut c_void,
+    host_val: *mut Value,
+    port_val: *mut Value,
+    route_table: *mut c_void,
+    handler: *mut Value,
+) -> *mut Value {
+    let host: String = match unsafe { as_ref(host_val) } {
+        Value::Text(s) => s.to_string(),
+        _ => panic!(
+            "knot runtime: listenOn expects Text host, got {}",
+            type_name(host_val)
+        ),
     };
+    let port = parse_port_value(port_val, "listenOn");
+    let addr = if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    };
+    http_serve_loop(addr, route_table, handler)
+}
+
+/// Shared body for `knot_http_listen` / `knot_http_listen_on`: bind, log,
+/// then run the request-accept loop forever.
+fn http_serve_loop(
+    addr: String,
+    route_table: *mut c_void,
+    handler: *mut Value,
+) -> *mut Value {
     let table = Arc::new(*unsafe { Box::from_raw(route_table as *mut RouteTable) });
-    let addr = format!("0.0.0.0:{}", port);
     let server = Arc::new(tiny_http::Server::http(&addr)
         .unwrap_or_else(|e| panic!("knot runtime: failed to start HTTP server on {}: {}", addr, e)));
-    eprintln!("Knot HTTP server listening on http://0.0.0.0:{}", port);
+    eprintln!("Knot HTTP server listening on http://{}", addr);
 
     loop {
         // Isolate each request's main-thread allocations in a dedicated

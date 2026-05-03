@@ -4800,6 +4800,38 @@ impl Infer {
             );
         }
 
+        // listenOn : ∀a b u. Text -> Int<u> -> (a -> b) -> IO {network} {}
+        // Like `listen`, but binds to the supplied host (e.g. "127.0.0.1",
+        // "0.0.0.0", "::1") rather than hardcoding "0.0.0.0".
+        {
+            let a = self.fresh_var();
+            let b = self.fresh_var();
+            let u = self.fresh_unit_var();
+            let int_u = Ty::IntUnit(UnitTy::var(u));
+            self.bind_top(
+                "listenOn",
+                Scheme {
+                    vars: vec![a, b],
+                    unit_vars: vec![u],
+                    constraints: vec![],
+                    ty: Ty::Fun(
+                        Box::new(Ty::Text),
+                        Box::new(Ty::Fun(
+                            Box::new(int_u),
+                            Box::new(Ty::Fun(
+                                Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
+                                Box::new(Ty::IO(
+                                    BTreeSet::from([IoEffect::Network]),
+                                    None,
+                                    Box::new(Ty::unit()),
+                                )),
+                            )),
+                        )),
+                    ),
+                },
+            );
+        }
+
         // fetch : ∀a b. Text -> a -> IO {network} (Result {status: Int, message: Text} b)
         // (also accepts 3-arg form with options record in the middle)
         // The response type `b` is resolved via special inference when the
@@ -5362,6 +5394,16 @@ impl Infer {
             "bytesToHex",
             Scheme::mono(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Text))),
         );
+
+        // hash : ∀a. a -> Bytes  (SHA-256, returns 32 bytes; Bytes/Text hash
+        // their raw contents, structured values hash a canonical serialization)
+        {
+            let a = self.fresh_var();
+            self.bind_top(
+                "hash",
+                Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Bytes))),
+            );
+        }
 
         // bytesFromHex / hexDecode : Text -> Maybe Bytes  (Nothing on
         // odd-length / non-hex / non-ASCII input)

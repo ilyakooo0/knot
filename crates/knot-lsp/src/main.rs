@@ -550,14 +550,16 @@ fn apply_analysis_result(state: &mut ServerState, conn: &Connection, result: Ana
         state.pending_sources.remove(&result.uri);
     }
 
-    let published = publish_diagnostics_dedup(state, conn, &result.uri, &result.doc, result.version);
-    if published {
-        // Pull-mode clients (notably JetBrains) ignore the publish above and
-        // only refresh diagnostics when the server explicitly invalidates
-        // their cache. Without this, a fix that clears a diagnostic stays
-        // visible in the gutter until the user triggers another pull.
-        request_workspace_diagnostic_refresh(state, conn);
-    }
+    // Compute the LSP-shaped diagnostics from the freshly analyzed doc *before*
+    // moving the doc into `state.documents`. We need these for the publish
+    // call after the insert (the publish helper no longer holds a doc
+    // reference, so the borrow checker is happy).
+    let lsp_diags: Vec<lsp_types::Diagnostic> = result
+        .doc
+        .knot_diagnostics
+        .iter()
+        .filter_map(|d| crate::diagnostics::to_lsp_diagnostic(d, &result.doc.source, &result.uri))
+        .collect();
 
     // Update the reverse-import graph for cross-file diagnostics. Each
     // analyzed module knows which files it imported (`imported_files`); we
@@ -597,7 +599,24 @@ fn apply_analysis_result(state: &mut ServerState, conn: &Connection, result: Ana
         }
     }
 
+    // Update `state.documents` *before* publishing or sending the diagnostic
+    // refresh. Pull-mode clients (JetBrains) react to the refresh by
+    // immediately re-pulling via `textDocument/diagnostic`; that handler
+    // reads `state.documents.knot_diagnostics`. If we sent the refresh
+    // before this insert, the client would re-pull and get the stale prior
+    // doc — which is exactly the bug this is meant to fix.
+    let uri = result.uri.clone();
+    let version = result.version;
     state.documents.insert(result.uri, result.doc);
+
+    let published = publish_diagnostics_dedup(state, conn, &uri, lsp_diags, version);
+    if published {
+        // Pull-mode clients (notably JetBrains) ignore the publish above and
+        // only refresh diagnostics when the server explicitly invalidates
+        // their cache. Without this, a fix that clears a diagnostic stays
+        // visible in the gutter until the user triggers another pull.
+        request_workspace_diagnostic_refresh(state, conn);
+    }
 }
 
 /// Re-queue analysis for open documents whose imports reference any of the
@@ -1117,19 +1136,18 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
 /// Returns `true` when a publish was actually sent. The caller uses this to
 /// decide whether to follow up with `workspace/diagnostic/refresh` for
 /// pull-mode clients that ignore `publishDiagnostics`.
+///
+/// Takes `lsp_diags` by value rather than borrowing the source `DocumentState`
+/// so the caller can move the doc into `state.documents` *before* invoking
+/// publish — that ordering matters for pull-mode clients (see callers).
 fn publish_diagnostics_dedup(
     state: &mut ServerState,
     conn: &Connection,
     uri: &Uri,
-    doc: &state::DocumentState,
+    lsp_diags: Vec<lsp_types::Diagnostic>,
     version: Option<i32>,
 ) -> bool {
     use std::hash::{Hash, Hasher};
-    let lsp_diags: Vec<lsp_types::Diagnostic> = doc
-        .knot_diagnostics
-        .iter()
-        .filter_map(|d| crate::diagnostics::to_lsp_diagnostic(d, &doc.source, uri))
-        .collect();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for d in &lsp_diags {
         // Hash only the fields that meaningfully define a diagnostic — range

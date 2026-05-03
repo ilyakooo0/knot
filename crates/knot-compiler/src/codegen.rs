@@ -10215,22 +10215,33 @@ fn extract_filter_on_source(
 
 fn beta_reduce(expr: &ast::Expr, fun_bodies: &HashMap<String, ast::Expr>) -> ast::Expr {
     let mut visited = HashSet::new();
-    beta_reduce_inner(expr, fun_bodies, &mut visited)
+    // Fuel bounds work to prevent exponential expansion when substituted
+    // bodies contain repeated occurrences of their parameter — re-reducing
+    // the substituted result can multiply work at each level. On budget
+    // exhaustion we return the partially-reduced expression, which is still
+    // sound (callers fall back to None when the shape isn't recognized).
+    let mut fuel: usize = 50_000;
+    beta_reduce_inner(expr, fun_bodies, &mut visited, &mut fuel)
 }
 
 fn beta_reduce_inner(
     expr: &ast::Expr,
     fun_bodies: &HashMap<String, ast::Expr>,
     visited: &mut HashSet<String>,
+    fuel: &mut usize,
 ) -> ast::Expr {
     use ast::ExprKind::*;
+    if *fuel == 0 {
+        return expr.clone();
+    }
+    *fuel -= 1;
     let span = expr.span;
     let new_node = match &expr.node {
         Var(name) => {
             if !visited.contains(name) {
                 if let Some(body) = fun_bodies.get(name) {
                     visited.insert(name.clone());
-                    let result = beta_reduce_inner(body, fun_bodies, visited);
+                    let result = beta_reduce_inner(body, fun_bodies, visited, fuel);
                     visited.remove(name);
                     return result;
                 }
@@ -10238,14 +10249,14 @@ fn beta_reduce_inner(
             Var(name.clone())
         }
         App { func, arg } => {
-            let f = beta_reduce_inner(func, fun_bodies, visited);
-            let a = beta_reduce_inner(arg, fun_bodies, visited);
+            let f = beta_reduce_inner(func, fun_bodies, visited, fuel);
+            let a = beta_reduce_inner(arg, fun_bodies, visited, fuel);
             if let Lambda { params, body } = &f.node {
                 if !params.is_empty() {
                     if let ast::PatKind::Var(name) = &params[0].node {
                         if let Some(substituted) = substitute(body, name, &a) {
                             if params.len() == 1 {
-                                return beta_reduce_inner(&substituted, fun_bodies, visited);
+                                return beta_reduce_inner(&substituted, fun_bodies, visited, fuel);
                             }
                             let new_lambda = ast::Spanned {
                                 node: Lambda {
@@ -10254,7 +10265,7 @@ fn beta_reduce_inner(
                                 },
                                 span: f.span,
                             };
-                            return beta_reduce_inner(&new_lambda, fun_bodies, visited);
+                            return beta_reduce_inner(&new_lambda, fun_bodies, visited, fuel);
                         }
                     }
                 }
@@ -10263,19 +10274,19 @@ fn beta_reduce_inner(
         }
         Lambda { params, body } => Lambda {
             params: params.clone(),
-            body: Box::new(beta_reduce_inner(body, fun_bodies, visited)),
+            body: Box::new(beta_reduce_inner(body, fun_bodies, visited, fuel)),
         },
         BinOp { op, lhs, rhs } => BinOp {
             op: *op,
-            lhs: Box::new(beta_reduce_inner(lhs, fun_bodies, visited)),
-            rhs: Box::new(beta_reduce_inner(rhs, fun_bodies, visited)),
+            lhs: Box::new(beta_reduce_inner(lhs, fun_bodies, visited, fuel)),
+            rhs: Box::new(beta_reduce_inner(rhs, fun_bodies, visited, fuel)),
         },
         UnaryOp { op, operand } => UnaryOp {
             op: *op,
-            operand: Box::new(beta_reduce_inner(operand, fun_bodies, visited)),
+            operand: Box::new(beta_reduce_inner(operand, fun_bodies, visited, fuel)),
         },
         FieldAccess { expr: e, field } => FieldAccess {
-            expr: Box::new(beta_reduce_inner(e, fun_bodies, visited)),
+            expr: Box::new(beta_reduce_inner(e, fun_bodies, visited, fuel)),
             field: field.clone(),
         },
         Record(fields) => Record(
@@ -10283,30 +10294,30 @@ fn beta_reduce_inner(
                 .iter()
                 .map(|f| ast::Field {
                     name: f.name.clone(),
-                    value: beta_reduce_inner(&f.value, fun_bodies, visited),
+                    value: beta_reduce_inner(&f.value, fun_bodies, visited, fuel),
                 })
                 .collect(),
         ),
         RecordUpdate { base, fields } => RecordUpdate {
-            base: Box::new(beta_reduce_inner(base, fun_bodies, visited)),
+            base: Box::new(beta_reduce_inner(base, fun_bodies, visited, fuel)),
             fields: fields
                 .iter()
                 .map(|f| ast::Field {
                     name: f.name.clone(),
-                    value: beta_reduce_inner(&f.value, fun_bodies, visited),
+                    value: beta_reduce_inner(&f.value, fun_bodies, visited, fuel),
                 })
                 .collect(),
         },
         List(items) => List(
             items
                 .iter()
-                .map(|e| beta_reduce_inner(e, fun_bodies, visited))
+                .map(|e| beta_reduce_inner(e, fun_bodies, visited, fuel))
                 .collect(),
         ),
         If { cond, then_branch, else_branch } => If {
-            cond: Box::new(beta_reduce_inner(cond, fun_bodies, visited)),
-            then_branch: Box::new(beta_reduce_inner(then_branch, fun_bodies, visited)),
-            else_branch: Box::new(beta_reduce_inner(else_branch, fun_bodies, visited)),
+            cond: Box::new(beta_reduce_inner(cond, fun_bodies, visited, fuel)),
+            then_branch: Box::new(beta_reduce_inner(then_branch, fun_bodies, visited, fuel)),
+            else_branch: Box::new(beta_reduce_inner(else_branch, fun_bodies, visited, fuel)),
         },
         // For constructs that bind names (Case arms, Do statements, Set, etc.)
         // we keep them unchanged: SQL pushdown never sees these inside the

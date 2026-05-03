@@ -3708,6 +3708,18 @@ x = case n of
     }
 }
 
+#[test]
+fn case_single_line_semicolons() {
+    // Top-level one-line case with `;` separators (no surrounding delimiters).
+    let src = "x = case n of A {} -> 1; B {} -> 2; C {} -> 3";
+    match fun_body(src) {
+        ExprKind::Case { arms, .. } => {
+            assert_eq!(arms.len(), 3);
+        }
+        other => panic!("expected Case with 3 arms, got {:?}", other),
+    }
+}
+
 // ── Data Declarations Edge Cases ────────────────────────────────────
 
 #[test]

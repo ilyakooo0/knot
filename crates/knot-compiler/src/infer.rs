@@ -3088,29 +3088,23 @@ impl Infer {
                     effects.insert(IoEffect::Reads(name.clone()));
 
                     // Reject `replace *rel = ...` when the value references
-                    // `*rel` (directly or via a `<- *rel` bind) — `set` would
-                    // produce the same final state more efficiently. Skip
-                    // views and scalar sources where the distinction is
-                    // meaningless.
+                    // `*rel` (directly, via a `<- *rel` bind, or via a let
+                    // binding that ultimately reads from `*rel`) — `set`
+                    // would produce the same final state more efficiently.
+                    // Skip views and scalar sources where the distinction
+                    // is meaningless.
                     let is_view = self.view_names.contains(name);
                     let is_relation = matches!(
                         self.source_types.get(name),
                         Some(Ty::Relation(_))
                     );
-                    // Use an empty let-bindings map for this check so we
-                    // don't retroactively flag existing `replace ... =
-                    // let_bound_value` code as an error. The set-check
-                    // does fold through lets (so the user has the option
-                    // to reach for `set`), but the replace-warning stays
-                    // syntactic to avoid breaking working code.
-                    let empty_lets = HashMap::new();
                     if !is_view
                         && is_relation
                         && value_references_source(
                             value,
                             name,
                             &self.source_var_binds,
-                            &empty_lets,
+                            &self.let_bindings,
                         )
                     {
                         self.error(

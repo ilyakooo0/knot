@@ -1,0 +1,47 @@
+-- Verifies that SQL pushdown matchers fold through `let` bindings.
+-- Each pattern below stores its rewrite in a local `let` first; the
+-- compiler inlines the let body when matching the set/replace shape.
+
+type Item = {name: Text, price: Int}
+
+*items : [Item]
+
+-- Append: `union items new` hidden behind a let.
+appendDemo = do
+  items <- *items
+  let extra = [{name: "Charlie", price: 30}]
+  let merged = union items extra
+  *items = merged
+
+-- Conditional update: do-block update body bound to a let.
+discountDemo = do
+  items <- *items
+  let discounted = do
+    i <- items
+    yield (if i.price > 20 then {i | price: i.price - 5} else i)
+  *items = discounted
+
+-- Filter only: do-block filter body bound to a let.
+pruneDemo = do
+  items <- *items
+  let kept = do
+    i <- items
+    where i.price > 0
+    yield i
+  *items = kept
+
+main = do
+  replace *items = [
+    {name: "Alice", price: 10},
+    {name: "Bob", price: 25}
+  ]
+  appendDemo
+  rows1 <- *items
+  println ("after append: " ++ show rows1)
+  discountDemo
+  rows2 <- *items
+  println ("after discount: " ++ show rows2)
+  pruneDemo
+  rows3 <- *items
+  println ("after prune: " ++ show rows3)
+  yield {}

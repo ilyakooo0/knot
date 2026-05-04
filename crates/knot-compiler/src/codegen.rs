@@ -60,6 +60,14 @@ pub struct Codegen {
     /// predicates and partial applications to their definitions.
     fun_bodies: HashMap<String, ast::Expr>,
 
+    /// In-scope `let pat = expr` bindings inside the current do-block.
+    /// Populated by `compile_do` / `compile_io_do_eager` as they walk
+    /// statements; saved/restored around each do-block scope.  Lets the
+    /// SQL pushdown matchers fold through `let foo = union *rel new`
+    /// before pattern-matching on `foo`.  Local entries shadow
+    /// `fun_bodies` during inlining.
+    let_bindings: HashMap<String, ast::Expr>,
+
     // Constructor info: ctor_name -> [(field_name, field_type_str)]
     constructors: HashMap<String, Vec<(String, String)>>,
 
@@ -484,6 +492,7 @@ impl Codegen {
             source_schemas: HashMap::new(),
             source_var_binds: HashMap::new(),
             fun_bodies: HashMap::new(),
+            let_bindings: HashMap::new(),
             constructors: HashMap::new(),
             lambda_counter: 0,
             pending_lambdas: Vec::new(),
@@ -3908,7 +3917,15 @@ impl Codegen {
                         return self.call_rt(builder, "knot_value_unit", &[]);
                     }
 
-                    if let Some(new_rows_expr) = self.match_union_append(name, value) {
+                    // Inline let-bindings and named-function bodies before
+                    // running shape matchers, so a let-bound `union`,
+                    // filter-only do-block, or conditional update is
+                    // recognised even when the value is a bare `Var`.
+                    let inlined =
+                        beta_reduce(value, &self.fun_bodies, &self.let_bindings);
+                    let match_value: &ast::Expr = &inlined;
+
+                    if let Some(new_rows_expr) = self.match_union_append(name, match_value) {
                         // 1. Append: union *rel <new> → INSERT only
                         // Skip refinement checks: appended data was already validated
                         // at the route handler boundary (HTTP body field validation).
@@ -3921,7 +3938,7 @@ impl Codegen {
                             "knot_source_append",
                             &[db, name_ptr, name_len, schema_ptr, schema_len, new_rows],
                         );
-                    } else if !Self::references_source(value, name) {
+                    } else if !Self::references_source(match_value, name) {
                         // 2. Full replace: value doesn't read the source
                         let val = self.compile_set_value_expr(builder, value, env, db);
                         self.emit_refinement_checks(builder, name, val, env, db);
@@ -3936,7 +3953,7 @@ impl Codegen {
                     } else if !schema.contains('[')
                         && !self.source_refinements.contains_key(name)
                         && let Some((bind_var, cond, update_fields)) =
-                            Self::match_conditional_update(name, value)
+                            Self::match_conditional_update(name, match_value)
                     {
                         // 3. Conditional update: do { t <- *rel; yield (if cond then {t | ...} else t) }
                         //    Try SQL UPDATE WHERE (skip for nested relations — child tables need full rewrite)
@@ -4011,7 +4028,7 @@ impl Codegen {
                         }
                     } else if !schema.contains('[')
                         && let Some((bind_var, conditions)) =
-                            Self::match_filter_only(name, value)
+                            Self::match_filter_only(name, match_value)
                     {
                         // 4. Filter only: do { t <- *rel; where cond; yield t }
                         //    Try SQL DELETE WHERE (skip for nested relations — child tables need full rewrite)
@@ -4070,7 +4087,7 @@ impl Codegen {
                                 &[db, name_ptr, name_len, schema_ptr, schema_len, val],
                             );
                         }
-                    } else if Self::match_map_no_filter(name, value) {
+                    } else if Self::match_map_no_filter(name, match_value) {
                         // 5. Map without filter: every row transformed, no filtering
                         //    Full write is safe and avoids diff overhead.
                         let val = self.compile_set_value_expr(builder, value, env, db);
@@ -4465,8 +4482,11 @@ impl Codegen {
         // Compute rename mapping: view→source for writing (records have view names)
         let (_, view_to_src) = Self::compute_view_renames(view);
 
-        // Check for append optimization: set *view = union *view newRows
-        if let Some(new_rows_expr) = self.match_union_append(view_name, value) {
+        // Check for append optimization: set *view = union *view newRows.
+        // Inline let/fun bindings first so the union shape is visible
+        // even when value is a let-bound `Var`.
+        let inlined_value = beta_reduce(value, &self.fun_bodies, &self.let_bindings);
+        if let Some(new_rows_expr) = self.match_union_append(view_name, &inlined_value) {
             let new_rows_expr = new_rows_expr.clone();
             let mut new_rows = self.compile_expr(builder, &new_rows_expr, env, db);
             // Rename view columns → source columns before writing
@@ -4682,7 +4702,7 @@ impl Codegen {
 
                 // count (filter f *source) → SELECT COUNT(*) FROM ... WHERE ...
                 if let Some((source_name, filter_bind, filter_body)) =
-                    extract_filter_on_source(&args[0], &self.source_var_binds, &self.fun_bodies)
+                    extract_filter_on_source(&args[0], &self.source_var_binds, &self.fun_bodies, &self.let_bindings)
                 {
                     let source_name: &str = &source_name;
                     let filter_body: &ast::Expr = &filter_body;
@@ -4761,7 +4781,7 @@ impl Codegen {
 
                 // single (filter f *source) → SELECT ... WHERE ... LIMIT 2
                 if let Some((source_name, filter_bind, filter_body)) =
-                    extract_filter_on_source(&args[0], &self.source_var_binds, &self.fun_bodies)
+                    extract_filter_on_source(&args[0], &self.source_var_binds, &self.fun_bodies, &self.let_bindings)
                 {
                     let filter_body: &ast::Expr = &filter_body;
                     if !self.views.contains_key(&source_name) {
@@ -4847,7 +4867,7 @@ impl Codegen {
 
                 // fold f init (filter g *source) → SELECT cols FROM table WHERE ...; stream
                 if let Some((source_name, filter_bind, filter_body)) =
-                    extract_filter_on_source(&args[2], &self.source_var_binds, &self.fun_bodies)
+                    extract_filter_on_source(&args[2], &self.source_var_binds, &self.fun_bodies, &self.let_bindings)
                 {
                     let filter_body: &ast::Expr = &filter_body;
                     if !self.views.contains_key(&source_name) {
@@ -4956,14 +4976,14 @@ impl Codegen {
                 // sum/avg/min/max lambda (filter f *source) → SQL aggregate with WHERE
                 if let Some((sql_func, rt_fn)) = aggregate_sql_func_runtime(name) {
                     if let Some((source_name, filter_bind, filter_body)) =
-                        extract_filter_on_source(&args[1], &self.source_var_binds, &self.fun_bodies)
+                        extract_filter_on_source(&args[1], &self.source_var_binds, &self.fun_bodies, &self.let_bindings)
                     {
                         let source_name: &str = &source_name;
                         let filter_body: &ast::Expr = &filter_body;
                         if !self.views.contains_key(source_name) {
                             if let Some(schema) = self.source_schemas.get(source_name).cloned() {
                                 if !schema.starts_with('#') && !schema.contains('[') {
-                                    if let Some((agg_bind, agg_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies) {
+                                    if let Some((agg_bind, agg_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies, &self.let_bindings) {
                                         let agg_body: &ast::Expr = &agg_body;
                                         if let Some(col_sql) = extract_sql_field_access(&agg_bind, agg_body, "", &schema) {
                                             if let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body) {
@@ -4988,7 +5008,7 @@ impl Codegen {
                     // sum/avg/min/max lambda (do { ... }) → SQL aggregate from plan
                     if let ast::ExprKind::Do(stmts) = &args[1].node {
                         if let Some(plan) = self.analyze_sql_plan(stmts, env) {
-                            if let Some((agg_bind, agg_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies) {
+                            if let Some((agg_bind, agg_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies, &self.let_bindings) {
                                 let agg_body: &ast::Expr = &agg_body;
                                 // Use first table's alias and schema for the aggregate column
                                 let alias = if plan.tables.len() == 1 { &plan.tables[0].alias } else { "" };
@@ -5023,14 +5043,14 @@ impl Codegen {
                 // countWhere predicate (filter f *source) → SELECT COUNT(*) FROM ... WHERE pred AND filter
                 if name == "countWhere" {
                     if let Some((source_name, filter_bind, filter_body)) =
-                        extract_filter_on_source(&args[1], &self.source_var_binds, &self.fun_bodies)
+                        extract_filter_on_source(&args[1], &self.source_var_binds, &self.fun_bodies, &self.let_bindings)
                     {
                         let source_name: &str = &source_name;
                         let filter_body: &ast::Expr = &filter_body;
                         if !self.views.contains_key(source_name) {
                             if let Some(schema) = self.source_schemas.get(source_name).cloned() {
                                 if !schema.starts_with('#') && !schema.contains('[') {
-                                    if let Some((pred_bind, pred_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies) {
+                                    if let Some((pred_bind, pred_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies, &self.let_bindings) {
                                         let pred_body: &ast::Expr = &pred_body;
                                         if let Some(pred_frag) = self.try_compile_sql_expr(&pred_bind, pred_body) {
                                             if let Some(filter_frag) = self.try_compile_sql_expr(&filter_bind, filter_body) {
@@ -5059,7 +5079,7 @@ impl Codegen {
                     // countWhere predicate (do { ... }) → SELECT COUNT(*) FROM plan WHERE pred
                     if let ast::ExprKind::Do(stmts) = &args[1].node {
                         if let Some(plan) = self.analyze_sql_plan(stmts, env) {
-                            if let Some((pred_bind, pred_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies) {
+                            if let Some((pred_bind, pred_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies, &self.let_bindings) {
                                 let pred_body: &ast::Expr = &pred_body;
                                 let mut bind_aliases: HashMap<String, String> = HashMap::new();
                                 if plan.tables.len() == 1 {
@@ -5098,7 +5118,7 @@ impl Codegen {
                 if matches!(name.as_str(), "filter" | "sortBy") {
                     if let ast::ExprKind::Do(stmts) = &args[1].node {
                         if let Some(mut plan) = self.analyze_sql_plan(stmts, env) {
-                            if let Some((bind_var, body)) = extract_single_param_lambda(&args[0], &self.fun_bodies) {
+                            if let Some((bind_var, body)) = extract_single_param_lambda(&args[0], &self.fun_bodies, &self.let_bindings) {
                                 let body: &ast::Expr = &body;
                                 match name.as_str() {
                                     "filter" => {
@@ -5171,7 +5191,7 @@ impl Codegen {
                     if let ast::ExprKind::App { func: sort_name_expr, arg: sort_lambda } = &sort_func.node {
                         if let ast::ExprKind::Var(sort_name) = &sort_name_expr.node {
                             if sort_name == "sortBy" {
-                                if let Some((sort_bind, sort_body)) = extract_single_param_lambda(sort_lambda, &self.fun_bodies) {
+                                if let Some((sort_bind, sort_body)) = extract_single_param_lambda(sort_lambda, &self.fun_bodies, &self.let_bindings) {
                                     let sort_body: &ast::Expr = &sort_body;
                                     // Case 1: sortBy f *source → SQL ORDER BY + LIMIT
                                     if let ast::ExprKind::SourceRef(source_name) = &sort_source.node {
@@ -5271,7 +5291,7 @@ impl Codegen {
 
                 // takeRelation N (filter f *source) → SQL WHERE + LIMIT
                 if let Some((source_name, filter_bind, filter_body)) =
-                    extract_filter_on_source(&args[1], &self.source_var_binds, &self.fun_bodies)
+                    extract_filter_on_source(&args[1], &self.source_var_binds, &self.fun_bodies, &self.let_bindings)
                 {
                     let source_name: &str = &source_name;
                     let filter_body: &ast::Expr = &filter_body;
@@ -6505,6 +6525,11 @@ impl Codegen {
         // inner do-blocks (else branches, nested blocks) inherit entries
         // from the enclosing scope.
         let prev_source_var_binds = self.source_var_binds.clone();
+        // Save let_bindings so the in-scope set we accumulate here is
+        // restored on exit.  We DO clear new entries on a per-name basis
+        // (via the saved snapshot) but keep outer-scope entries visible
+        // while compiling inner do-blocks.
+        let prev_let_bindings = self.let_bindings.clone();
         let mut last_val = self.call_rt(builder, "knot_value_unit", &[]);
 
         // Create a done block for early exit on guard/pattern failures.
@@ -6531,6 +6556,12 @@ impl Codegen {
                     last_val = result;
                 }
                 ast::StmtKind::Let { pat, expr } => {
+                    // Track let-bound expressions so SQL pushdown matchers
+                    // can fold through them when matching set/replace shapes
+                    // later in the do-block.
+                    if let ast::PatKind::Var(var_name) = &pat.node {
+                        self.let_bindings.insert(var_name.clone(), expr.clone());
+                    }
                     let val = self.compile_expr(builder, expr, env, db);
                     self.bind_io_pattern(builder, pat, val, env, Some(done_block));
                     last_val = val;
@@ -6575,6 +6606,7 @@ impl Codegen {
 
         self.in_io_eager = prev_io_eager;
         self.source_var_binds = prev_source_var_binds;
+        self.let_bindings = prev_let_bindings;
         done_param
     }
 
@@ -6759,6 +6791,10 @@ impl Codegen {
         if let Some(val) = self.try_compile_full_sql(builder, stmts, env, db) {
             return val;
         }
+
+        // Save let_bindings for restoration on exit; new entries inserted
+        // below are visible only inside this do-block's scope.
+        let prev_let_bindings = self.let_bindings.clone();
 
         // Wrap the do-block in a dedicated arena frame.  Every yielded value
         // is `knot_arena_promote`d into pinned, which survives the
@@ -7237,6 +7273,12 @@ impl Codegen {
                 }
 
                 ast::StmtKind::Let { pat, expr } => {
+                    // Track let-bound expressions so SQL pushdown matchers
+                    // can fold through them when matching set/replace shapes
+                    // later in the do-block.
+                    if let ast::PatKind::Var(var_name) = &pat.node {
+                        self.let_bindings.insert(var_name.clone(), expr.clone());
+                    }
                     let val = self.compile_expr(builder, expr, env, db);
 
                     // Track schema of Let-bound relation variables for groupBy support.
@@ -7512,7 +7554,9 @@ impl Codegen {
         // Pop the do-block's frame, deep-cloning `result` into the parent.
         // This frees every per-iteration pinned yield that would otherwise
         // live until the caller returned.
-        self.call_rt(builder, "knot_arena_pop_frame_promote", &[result])
+        let promoted = self.call_rt(builder, "knot_arena_pop_frame_promote", &[result]);
+        self.let_bindings = prev_let_bindings;
+        promoted
     }
 
     // ── Lambda compilation ────────────────────────────────────────
@@ -8011,7 +8055,7 @@ impl Codegen {
         env: &mut Env,
         db: Value,
     ) -> Option<Value> {
-        let (bind_var, body) = extract_single_param_lambda(lambda_arg, &self.fun_bodies)?;
+        let (bind_var, body) = extract_single_param_lambda(lambda_arg, &self.fun_bodies, &self.let_bindings)?;
         let body: &ast::Expr = &body;
         let table = quote_sql_ident(&format!("_knot_{}", source_name));
 
@@ -8083,7 +8127,7 @@ impl Codegen {
         env: &mut Env,
         db: Value,
     ) -> Option<Value> {
-        let (source, ops) = flatten_pipe_chain(expr, &self.fun_bodies)?;
+        let (source, ops) = flatten_pipe_chain(expr, &self.fun_bodies, &self.let_bindings)?;
         if ops.is_empty() {
             return None;
         }
@@ -8330,7 +8374,7 @@ impl Codegen {
 
         // Case 2: filter f *source
         if let Some((source_name, filter_bind, filter_body)) =
-            extract_filter_on_source(expr, &self.source_var_binds, &self.fun_bodies)
+            extract_filter_on_source(expr, &self.source_var_binds, &self.fun_bodies, &self.let_bindings)
         {
             let source_name: &str = &source_name;
             let filter_body: &ast::Expr = &filter_body;
@@ -10142,6 +10186,7 @@ enum PipeOp {
 fn flatten_pipe_chain<'a>(
     expr: &'a ast::Expr,
     fun_bodies: &HashMap<String, ast::Expr>,
+    let_bindings: &HashMap<String, ast::Expr>,
 ) -> Option<(&'a ast::Expr, Vec<PipeOp>)> {
     let mut ops = Vec::new();
     let mut current = expr;
@@ -10153,7 +10198,7 @@ fn flatten_pipe_chain<'a>(
                 lhs,
                 rhs,
             } => {
-                let pipe_op = analyze_pipe_op(rhs, fun_bodies)?;
+                let pipe_op = analyze_pipe_op(rhs, fun_bodies, let_bindings)?;
                 ops.push(pipe_op);
                 current = lhs;
             }
@@ -10169,37 +10214,38 @@ fn flatten_pipe_chain<'a>(
 fn analyze_pipe_op(
     expr: &ast::Expr,
     fun_bodies: &HashMap<String, ast::Expr>,
+    let_bindings: &HashMap<String, ast::Expr>,
 ) -> Option<PipeOp> {
     match &expr.node {
         ast::ExprKind::Var(name) if name == "count" => Some(PipeOp::Count),
         ast::ExprKind::App { func, arg } => {
             if let ast::ExprKind::Var(name) = &func.node {
                 match name.as_str() {
-                    "filter" => extract_single_param_lambda(arg, fun_bodies).map(|(bind_var, body)| {
+                    "filter" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
                         PipeOp::Filter { bind_var, body }
                     }),
-                    "map" => extract_single_param_lambda(arg, fun_bodies).map(|(bind_var, body)| {
+                    "map" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
                         PipeOp::Map { bind_var, body }
                     }),
                     "take" => Some(PipeOp::Take { n: (**arg).clone() }),
                     "takeRelation" => Some(PipeOp::TakeRelation { n: (**arg).clone() }),
                     "drop" => Some(PipeOp::Drop { n: (**arg).clone() }),
-                    "sortBy" => extract_single_param_lambda(arg, fun_bodies).map(|(bind_var, body)| {
+                    "sortBy" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
                         PipeOp::SortBy { bind_var, body }
                     }),
-                    "sum" => extract_single_param_lambda(arg, fun_bodies).map(|(bind_var, body)| {
+                    "sum" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
                         PipeOp::Sum { bind_var, body }
                     }),
-                    "avg" => extract_single_param_lambda(arg, fun_bodies).map(|(bind_var, body)| {
+                    "avg" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
                         PipeOp::Avg { bind_var, body }
                     }),
-                    "min" => extract_single_param_lambda(arg, fun_bodies).map(|(bind_var, body)| {
+                    "min" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
                         PipeOp::Min { bind_var, body }
                     }),
-                    "max" => extract_single_param_lambda(arg, fun_bodies).map(|(bind_var, body)| {
+                    "max" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
                         PipeOp::Max { bind_var, body }
                     }),
-                    "countWhere" => extract_single_param_lambda(arg, fun_bodies).map(|(bind_var, body)| {
+                    "countWhere" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
                         PipeOp::CountWhere { bind_var, body }
                     }),
                     _ => None,
@@ -10219,8 +10265,9 @@ fn analyze_pipe_op(
 fn extract_single_param_lambda(
     expr: &ast::Expr,
     fun_bodies: &HashMap<String, ast::Expr>,
+    let_bindings: &HashMap<String, ast::Expr>,
 ) -> Option<(String, ast::Expr)> {
-    let reduced = beta_reduce(expr, fun_bodies);
+    let reduced = beta_reduce(expr, fun_bodies, let_bindings);
     if let ast::ExprKind::Lambda { params, body } = reduced.node {
         if params.len() == 1 {
             if let ast::PatKind::Var(name) = &params[0].node {
@@ -10237,8 +10284,9 @@ fn extract_filter_on_source(
     expr: &ast::Expr,
     source_var_binds: &HashMap<String, String>,
     fun_bodies: &HashMap<String, ast::Expr>,
+    let_bindings: &HashMap<String, ast::Expr>,
 ) -> Option<(String, String, ast::Expr)> {
-    let reduced = beta_reduce(expr, fun_bodies);
+    let reduced = beta_reduce(expr, fun_bodies, let_bindings);
     if let ast::ExprKind::App { func, arg: source_expr } = &reduced.node {
         let resolve_source = |se: &ast::Expr| -> Option<String> {
             match &se.node {
@@ -10253,7 +10301,7 @@ fn extract_filter_on_source(
                 if fn_name == "filter" {
                     if let Some(source_name) = resolve_source(source_expr) {
                         if let Some((bind_var, body)) =
-                            extract_single_param_lambda(filter_lambda, fun_bodies)
+                            extract_single_param_lambda(filter_lambda, fun_bodies, let_bindings)
                         {
                             return Some((source_name, bind_var, body));
                         }
@@ -10282,7 +10330,11 @@ fn extract_filter_on_source(
 // substituted value, we abandon that branch of substitution and leave the
 // expression unchanged, which is sound (just less optimized).
 
-fn beta_reduce(expr: &ast::Expr, fun_bodies: &HashMap<String, ast::Expr>) -> ast::Expr {
+fn beta_reduce(
+    expr: &ast::Expr,
+    fun_bodies: &HashMap<String, ast::Expr>,
+    let_bindings: &HashMap<String, ast::Expr>,
+) -> ast::Expr {
     let mut visited = HashSet::new();
     // Fuel bounds work to prevent exponential expansion when substituted
     // bodies contain repeated occurrences of their parameter — re-reducing
@@ -10290,12 +10342,13 @@ fn beta_reduce(expr: &ast::Expr, fun_bodies: &HashMap<String, ast::Expr>) -> ast
     // exhaustion we return the partially-reduced expression, which is still
     // sound (callers fall back to None when the shape isn't recognized).
     let mut fuel: usize = 50_000;
-    beta_reduce_inner(expr, fun_bodies, &mut visited, &mut fuel)
+    beta_reduce_inner(expr, fun_bodies, let_bindings, &mut visited, &mut fuel)
 }
 
 fn beta_reduce_inner(
     expr: &ast::Expr,
     fun_bodies: &HashMap<String, ast::Expr>,
+    let_bindings: &HashMap<String, ast::Expr>,
     visited: &mut HashSet<String>,
     fuel: &mut usize,
 ) -> ast::Expr {
@@ -10308,9 +10361,15 @@ fn beta_reduce_inner(
     let new_node = match &expr.node {
         Var(name) => {
             if !visited.contains(name) {
-                if let Some(body) = fun_bodies.get(name) {
+                // Local let bindings shadow top-level functions: a let
+                // inside a do-block introduces a fresh name in scope,
+                // and the matchers see the do-block AST so the local
+                // definition is the relevant one.
+                let body = let_bindings.get(name).or_else(|| fun_bodies.get(name));
+                if let Some(body) = body {
                     visited.insert(name.clone());
-                    let result = beta_reduce_inner(body, fun_bodies, visited, fuel);
+                    let result =
+                        beta_reduce_inner(body, fun_bodies, let_bindings, visited, fuel);
                     visited.remove(name);
                     return result;
                 }
@@ -10318,14 +10377,16 @@ fn beta_reduce_inner(
             Var(name.clone())
         }
         App { func, arg } => {
-            let f = beta_reduce_inner(func, fun_bodies, visited, fuel);
-            let a = beta_reduce_inner(arg, fun_bodies, visited, fuel);
+            let f = beta_reduce_inner(func, fun_bodies, let_bindings, visited, fuel);
+            let a = beta_reduce_inner(arg, fun_bodies, let_bindings, visited, fuel);
             if let Lambda { params, body } = &f.node {
                 if !params.is_empty() {
                     if let ast::PatKind::Var(name) = &params[0].node {
                         if let Some(substituted) = substitute(body, name, &a) {
                             if params.len() == 1 {
-                                return beta_reduce_inner(&substituted, fun_bodies, visited, fuel);
+                                return beta_reduce_inner(
+                                    &substituted, fun_bodies, let_bindings, visited, fuel,
+                                );
                             }
                             let new_lambda = ast::Spanned {
                                 node: Lambda {
@@ -10334,7 +10395,9 @@ fn beta_reduce_inner(
                                 },
                                 span: f.span,
                             };
-                            return beta_reduce_inner(&new_lambda, fun_bodies, visited, fuel);
+                            return beta_reduce_inner(
+                                &new_lambda, fun_bodies, let_bindings, visited, fuel,
+                            );
                         }
                     }
                 }
@@ -10343,19 +10406,19 @@ fn beta_reduce_inner(
         }
         Lambda { params, body } => Lambda {
             params: params.clone(),
-            body: Box::new(beta_reduce_inner(body, fun_bodies, visited, fuel)),
+            body: Box::new(beta_reduce_inner(body, fun_bodies, let_bindings, visited, fuel)),
         },
         BinOp { op, lhs, rhs } => BinOp {
             op: *op,
-            lhs: Box::new(beta_reduce_inner(lhs, fun_bodies, visited, fuel)),
-            rhs: Box::new(beta_reduce_inner(rhs, fun_bodies, visited, fuel)),
+            lhs: Box::new(beta_reduce_inner(lhs, fun_bodies, let_bindings, visited, fuel)),
+            rhs: Box::new(beta_reduce_inner(rhs, fun_bodies, let_bindings, visited, fuel)),
         },
         UnaryOp { op, operand } => UnaryOp {
             op: *op,
-            operand: Box::new(beta_reduce_inner(operand, fun_bodies, visited, fuel)),
+            operand: Box::new(beta_reduce_inner(operand, fun_bodies, let_bindings, visited, fuel)),
         },
         FieldAccess { expr: e, field } => FieldAccess {
-            expr: Box::new(beta_reduce_inner(e, fun_bodies, visited, fuel)),
+            expr: Box::new(beta_reduce_inner(e, fun_bodies, let_bindings, visited, fuel)),
             field: field.clone(),
         },
         Record(fields) => Record(
@@ -10363,30 +10426,42 @@ fn beta_reduce_inner(
                 .iter()
                 .map(|f| ast::Field {
                     name: f.name.clone(),
-                    value: beta_reduce_inner(&f.value, fun_bodies, visited, fuel),
+                    value: beta_reduce_inner(&f.value, fun_bodies, let_bindings, visited, fuel),
                 })
                 .collect(),
         ),
         RecordUpdate { base, fields } => RecordUpdate {
-            base: Box::new(beta_reduce_inner(base, fun_bodies, visited, fuel)),
+            base: Box::new(beta_reduce_inner(base, fun_bodies, let_bindings, visited, fuel)),
             fields: fields
                 .iter()
                 .map(|f| ast::Field {
                     name: f.name.clone(),
-                    value: beta_reduce_inner(&f.value, fun_bodies, visited, fuel),
+                    value: beta_reduce_inner(&f.value, fun_bodies, let_bindings, visited, fuel),
                 })
                 .collect(),
         },
         List(items) => List(
             items
                 .iter()
-                .map(|e| beta_reduce_inner(e, fun_bodies, visited, fuel))
+                .map(|e| beta_reduce_inner(e, fun_bodies, let_bindings, visited, fuel))
                 .collect(),
         ),
         If { cond, then_branch, else_branch } => If {
-            cond: Box::new(beta_reduce_inner(cond, fun_bodies, visited, fuel)),
-            then_branch: Box::new(beta_reduce_inner(then_branch, fun_bodies, visited, fuel)),
-            else_branch: Box::new(beta_reduce_inner(else_branch, fun_bodies, visited, fuel)),
+            cond: Box::new(beta_reduce_inner(cond, fun_bodies, let_bindings, visited, fuel)),
+            then_branch: Box::new(beta_reduce_inner(
+                then_branch,
+                fun_bodies,
+                let_bindings,
+                visited,
+                fuel,
+            )),
+            else_branch: Box::new(beta_reduce_inner(
+                else_branch,
+                fun_bodies,
+                let_bindings,
+                visited,
+                fuel,
+            )),
         },
         // For constructs that bind names (Case arms, Do statements, Set, etc.)
         // we keep them unchanged: SQL pushdown never sees these inside the
@@ -11991,5 +12066,89 @@ fn resolved_type_to_descriptor(ty: &ResolvedType) -> String {
         }
         ResolvedType::Named(n) => n.to_lowercase(),
         _ => "text".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_expr(source: &str) -> ast::Expr {
+        // Wrap the source as a top-level binding so it parses as a module
+        // declaration; pull the body back out.
+        let module_src = format!("__test = {}\n", source);
+        let lexer = knot::lexer::Lexer::new(&module_src);
+        let (tokens, _) = lexer.tokenize();
+        let parser = knot::parser::Parser::new(module_src.clone(), tokens);
+        let (module, _) = parser.parse_module();
+        for decl in module.decls {
+            if let ast::DeclKind::Fun { body: Some(body), .. } = decl.node {
+                return body;
+            }
+        }
+        panic!("parse_expr: expected a single function declaration");
+    }
+
+    /// `Var(x)` resolves through `let_bindings` first, falling back to
+    /// `fun_bodies` when no local binding exists.  Local entries shadow
+    /// top-level functions of the same name.
+    #[test]
+    fn beta_reduce_folds_through_let_bindings() {
+        let value = parse_expr("merged");
+        let union_call = parse_expr("union 1 2");
+        let mut let_bindings = HashMap::new();
+        let_bindings.insert("merged".to_string(), union_call);
+        let fun_bodies = HashMap::new();
+
+        let reduced = beta_reduce(&value, &fun_bodies, &let_bindings);
+        match &reduced.node {
+            ast::ExprKind::App { func, arg: _ } => match &func.node {
+                ast::ExprKind::App { func: inner, .. } => match &inner.node {
+                    ast::ExprKind::Var(name) => assert_eq!(name, "union"),
+                    other => panic!("expected Var(union), got {:?}", other),
+                },
+                other => panic!("expected nested App, got {:?}", other),
+            },
+            other => panic!("expected App after inlining, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn beta_reduce_local_shadows_fun_bodies() {
+        let value = parse_expr("foo");
+        let mut fun_bodies = HashMap::new();
+        fun_bodies.insert("foo".to_string(), parse_expr("1"));
+        let mut let_bindings = HashMap::new();
+        let_bindings.insert("foo".to_string(), parse_expr("2"));
+
+        let reduced = beta_reduce(&value, &fun_bodies, &let_bindings);
+        match &reduced.node {
+            ast::ExprKind::Lit(ast::Literal::Int(n)) => assert_eq!(n, "2"),
+            other => panic!("expected literal 2, got {:?}", other),
+        }
+    }
+
+    /// A let body whose value also references another let entry is
+    /// resolved transitively; the matchers ultimately see the fully
+    /// expanded shape.
+    #[test]
+    fn beta_reduce_chains_through_nested_lets() {
+        let value = parse_expr("outer");
+        let mut let_bindings = HashMap::new();
+        let_bindings.insert("inner".to_string(), parse_expr("union 1 2"));
+        let_bindings.insert("outer".to_string(), parse_expr("inner"));
+        let fun_bodies = HashMap::new();
+
+        let reduced = beta_reduce(&value, &fun_bodies, &let_bindings);
+        match &reduced.node {
+            ast::ExprKind::App { func, .. } => match &func.node {
+                ast::ExprKind::App { func: inner, .. } => match &inner.node {
+                    ast::ExprKind::Var(n) => assert_eq!(n, "union"),
+                    other => panic!("expected Var(union), got {:?}", other),
+                },
+                other => panic!("expected nested App, got {:?}", other),
+            },
+            other => panic!("expected union App, got {:?}", other),
+        }
     }
 }

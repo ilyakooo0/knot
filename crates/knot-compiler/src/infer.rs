@@ -419,6 +419,13 @@ struct Infer {
     /// `source_var_binds`).
     source_var_binds: HashMap<String, String>,
 
+    /// In-scope `let pat = expr` bindings inside the current do-block.
+    /// Used by the set/replace full-replacement detector so that
+    /// `*rel = let_bound_var` is correctly classified as incremental
+    /// when the let body references the source.  Mirrors codegen's
+    /// `let_bindings`.
+    let_bindings: HashMap<String, ast::Expr>,
+
     /// Whether we are currently inside an `atomic` block.
     in_atomic: bool,
 
@@ -480,6 +487,7 @@ impl Infer {
             in_io_do: false,
             in_atomic: false,
             source_var_binds: HashMap::new(),
+            let_bindings: HashMap::new(),
             next_unit_var: 0,
             unit_subst: HashMap::new(),
             declared_units: HashMap::new(),
@@ -3049,6 +3057,7 @@ impl Infer {
                             value,
                             name,
                             &self.source_var_binds,
+                            &self.let_bindings,
                         )
                     {
                         self.error(
@@ -3088,12 +3097,20 @@ impl Infer {
                         self.source_types.get(name),
                         Some(Ty::Relation(_))
                     );
+                    // Use an empty let-bindings map for this check so we
+                    // don't retroactively flag existing `replace ... =
+                    // let_bound_value` code as an error. The set-check
+                    // does fold through lets (so the user has the option
+                    // to reach for `set`), but the replace-warning stays
+                    // syntactic to avoid breaking working code.
+                    let empty_lets = HashMap::new();
                     if !is_view
                         && is_relation
                         && value_references_source(
                             value,
                             name,
                             &self.source_var_binds,
+                            &empty_lets,
                         )
                     {
                         self.error(
@@ -3947,6 +3964,7 @@ impl Infer {
 
         // Save source aliases so binds inside this do-block don't leak out.
         let prev_source_var_binds = self.source_var_binds.clone();
+        let prev_let_bindings = self.let_bindings.clone();
 
         for stmt in stmts {
             match &stmt.node {
@@ -4049,6 +4067,10 @@ impl Infer {
                             self.source_var_binds
                                 .insert(var_name.clone(), source_name.clone());
                         }
+                        // Track the let body so the full-replacement check
+                        // can fold through `*rel = let_bound_var` when the
+                        // body references the source.
+                        self.let_bindings.insert(var_name.clone(), expr.clone());
                     }
                 }
                 ast::StmtKind::Where { cond } => {
@@ -4143,6 +4165,7 @@ impl Infer {
         self.pop_scope();
         self.in_io_do = prev_in_io_do;
         self.source_var_binds = prev_source_var_binds;
+        self.let_bindings = prev_let_bindings;
 
         // Determine block result type:
         // - IO if any statement is IO
@@ -6371,101 +6394,152 @@ fn display_ty_clean_inner(
 
 /// Whether `expr` references `*source_name` — either directly via
 /// `SourceRef`, or via a local variable bound to `*source_name`
-/// (e.g. `xs <- *foo`, then `xs` counts as a reference). Used to
-/// distinguish incremental `set` (must reference the source) from
-/// full replacement (which requires `replace *rel = ...`).
+/// (e.g. `xs <- *foo`, then `xs` counts as a reference), or via a
+/// `let`-bound expression that itself references the source. Used
+/// to distinguish incremental `set` (must reference the source)
+/// from full replacement (which requires `replace *rel = ...`).
 fn value_references_source(
     expr: &ast::Expr,
     source_name: &str,
     aliases: &HashMap<String, String>,
+    let_bindings: &HashMap<String, ast::Expr>,
+) -> bool {
+    let mut visited: HashSet<String> = HashSet::new();
+    value_references_source_inner(expr, source_name, aliases, let_bindings, &mut visited)
+}
+
+fn value_references_source_inner(
+    expr: &ast::Expr,
+    source_name: &str,
+    aliases: &HashMap<String, String>,
+    let_bindings: &HashMap<String, ast::Expr>,
+    visited: &mut HashSet<String>,
 ) -> bool {
     match &expr.node {
         ast::ExprKind::SourceRef(name) => name == source_name,
         ast::ExprKind::Var(name) => {
-            aliases.get(name).map(|s| s.as_str()) == Some(source_name)
+            if aliases.get(name).map(|s| s.as_str()) == Some(source_name) {
+                return true;
+            }
+            // Fold through let bindings: `let foo = ...; *rel = foo`
+            // counts as referencing the source if the body does.
+            if visited.insert(name.clone()) {
+                if let Some(body) = let_bindings.get(name) {
+                    let result = value_references_source_inner(
+                        body, source_name, aliases, let_bindings, visited,
+                    );
+                    visited.remove(name);
+                    return result;
+                }
+            }
+            false
         }
         ast::ExprKind::Lit(_)
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::DerivedRef(_) => false,
-        ast::ExprKind::Record(fields) => fields
-            .iter()
-            .any(|f| value_references_source(&f.value, source_name, aliases)),
+        ast::ExprKind::Record(fields) => fields.iter().any(|f| {
+            value_references_source_inner(
+                &f.value, source_name, aliases, let_bindings, visited,
+            )
+        }),
         ast::ExprKind::RecordUpdate { base, fields } => {
-            value_references_source(base, source_name, aliases)
-                || fields.iter().any(|f| {
-                    value_references_source(&f.value, source_name, aliases)
-                })
+            value_references_source_inner(
+                base, source_name, aliases, let_bindings, visited,
+            ) || fields.iter().any(|f| {
+                value_references_source_inner(
+                    &f.value, source_name, aliases, let_bindings, visited,
+                )
+            })
         }
-        ast::ExprKind::FieldAccess { expr, .. } => {
-            value_references_source(expr, source_name, aliases)
-        }
-        ast::ExprKind::List(elems) => elems
-            .iter()
-            .any(|e| value_references_source(e, source_name, aliases)),
-        ast::ExprKind::Lambda { body, .. } => {
-            value_references_source(body, source_name, aliases)
-        }
+        ast::ExprKind::FieldAccess { expr, .. } => value_references_source_inner(
+            expr, source_name, aliases, let_bindings, visited,
+        ),
+        ast::ExprKind::List(elems) => elems.iter().any(|e| {
+            value_references_source_inner(e, source_name, aliases, let_bindings, visited)
+        }),
+        ast::ExprKind::Lambda { body, .. } => value_references_source_inner(
+            body, source_name, aliases, let_bindings, visited,
+        ),
         ast::ExprKind::App { func, arg } => {
-            value_references_source(func, source_name, aliases)
-                || value_references_source(arg, source_name, aliases)
+            value_references_source_inner(func, source_name, aliases, let_bindings, visited)
+                || value_references_source_inner(
+                    arg, source_name, aliases, let_bindings, visited,
+                )
         }
         ast::ExprKind::BinOp { lhs, rhs, .. } => {
-            value_references_source(lhs, source_name, aliases)
-                || value_references_source(rhs, source_name, aliases)
+            value_references_source_inner(lhs, source_name, aliases, let_bindings, visited)
+                || value_references_source_inner(
+                    rhs, source_name, aliases, let_bindings, visited,
+                )
         }
-        ast::ExprKind::UnaryOp { operand, .. } => {
-            value_references_source(operand, source_name, aliases)
-        }
+        ast::ExprKind::UnaryOp { operand, .. } => value_references_source_inner(
+            operand, source_name, aliases, let_bindings, visited,
+        ),
         ast::ExprKind::If {
             cond,
             then_branch,
             else_branch,
         } => {
-            value_references_source(cond, source_name, aliases)
-                || value_references_source(then_branch, source_name, aliases)
-                || value_references_source(else_branch, source_name, aliases)
+            value_references_source_inner(
+                cond, source_name, aliases, let_bindings, visited,
+            ) || value_references_source_inner(
+                then_branch, source_name, aliases, let_bindings, visited,
+            ) || value_references_source_inner(
+                else_branch, source_name, aliases, let_bindings, visited,
+            )
         }
         ast::ExprKind::Case { scrutinee, arms } => {
-            value_references_source(scrutinee, source_name, aliases)
-                || arms.iter().any(|a| {
-                    value_references_source(&a.body, source_name, aliases)
-                })
+            value_references_source_inner(
+                scrutinee, source_name, aliases, let_bindings, visited,
+            ) || arms.iter().any(|a| {
+                value_references_source_inner(
+                    &a.body, source_name, aliases, let_bindings, visited,
+                )
+            })
         }
         ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
-            ast::StmtKind::Bind { expr, .. } => {
-                value_references_source(expr, source_name, aliases)
-            }
-            ast::StmtKind::Let { expr, .. } => {
-                value_references_source(expr, source_name, aliases)
-            }
-            ast::StmtKind::Where { cond } => {
-                value_references_source(cond, source_name, aliases)
-            }
-            ast::StmtKind::GroupBy { key } => {
-                value_references_source(key, source_name, aliases)
-            }
-            ast::StmtKind::Expr(e) => {
-                value_references_source(e, source_name, aliases)
-            }
+            ast::StmtKind::Bind { expr, .. } => value_references_source_inner(
+                expr, source_name, aliases, let_bindings, visited,
+            ),
+            ast::StmtKind::Let { expr, .. } => value_references_source_inner(
+                expr, source_name, aliases, let_bindings, visited,
+            ),
+            ast::StmtKind::Where { cond } => value_references_source_inner(
+                cond, source_name, aliases, let_bindings, visited,
+            ),
+            ast::StmtKind::GroupBy { key } => value_references_source_inner(
+                key, source_name, aliases, let_bindings, visited,
+            ),
+            ast::StmtKind::Expr(e) => value_references_source_inner(
+                e, source_name, aliases, let_bindings, visited,
+            ),
         }),
         ast::ExprKind::Set { target, value }
         | ast::ExprKind::ReplaceSet { target, value } => {
-            value_references_source(target, source_name, aliases)
-                || value_references_source(value, source_name, aliases)
+            value_references_source_inner(
+                target, source_name, aliases, let_bindings, visited,
+            ) || value_references_source_inner(
+                value, source_name, aliases, let_bindings, visited,
+            )
         }
         ast::ExprKind::Atomic(inner) | ast::ExprKind::Refine(inner) => {
-            value_references_source(inner, source_name, aliases)
+            value_references_source_inner(
+                inner, source_name, aliases, let_bindings, visited,
+            )
         }
         ast::ExprKind::At { relation, time } => {
-            value_references_source(relation, source_name, aliases)
-                || value_references_source(time, source_name, aliases)
+            value_references_source_inner(
+                relation, source_name, aliases, let_bindings, visited,
+            ) || value_references_source_inner(
+                time, source_name, aliases, let_bindings, visited,
+            )
         }
-        ast::ExprKind::UnitLit { value, .. } => {
-            value_references_source(value, source_name, aliases)
-        }
-        ast::ExprKind::Annot { expr, .. } => {
-            value_references_source(expr, source_name, aliases)
-        }
+        ast::ExprKind::UnitLit { value, .. } => value_references_source_inner(
+            value, source_name, aliases, let_bindings, visited,
+        ),
+        ast::ExprKind::Annot { expr, .. } => value_references_source_inner(
+            expr, source_name, aliases, let_bindings, visited,
+        ),
     }
 }
 

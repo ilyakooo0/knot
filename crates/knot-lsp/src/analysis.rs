@@ -331,6 +331,7 @@ pub fn analyze_document(
             rt,
             refined_type_info,
             _from_json,
+            _elem_pushdown,
         ) = knot_compiler::infer::check(&analysis_module);
         all_diags.extend(infer_diags);
         type_info = inferred_types;

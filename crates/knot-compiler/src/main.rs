@@ -207,7 +207,7 @@ fn cmd_build(source_file: &str, overrides: &HashMap<String, String>) {
     let type_env = types::TypeEnv::from_module(&module);
 
     // Type inference
-    let (infer_diags, monad_info, type_info, _local_types, refine_targets, refined_types, from_json_targets) = infer::check(&module);
+    let (infer_diags, monad_info, type_info, _local_types, refine_targets, refined_types, from_json_targets, elem_pushdown_ok) = infer::check(&module);
     if !infer_diags.is_empty() {
         for diag in &infer_diags {
             eprintln!("{}", diag.render(&source, &filename));
@@ -263,7 +263,7 @@ fn cmd_build(source_file: &str, overrides: &HashMap<String, String>) {
     }
 
     // Code generation
-    let obj_bytes = match codegen::compile(&module, &type_env, source_file, &monad_info, &refine_targets, &refined_types, &from_json_targets, &type_info, overrides) {
+    let obj_bytes = match codegen::compile(&module, &type_env, source_file, &monad_info, &refine_targets, &refined_types, &from_json_targets, &type_info, &elem_pushdown_ok, overrides) {
         Ok(bytes) => bytes,
         Err(diags) => {
             for diag in &diags {

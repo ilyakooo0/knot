@@ -54,6 +54,14 @@ pub type LocalTypeInfo = HashMap<Span, String>;
 /// Maps parseJson call-site spans to the resolved target type name for compile-time FromJSON dispatch.
 pub type FromJsonTargets = HashMap<Span, String>;
 
+/// Spans of `elem needle haystack` haystack arguments whose element type is a
+/// SQL-pushable scalar (Text/Float/Bool, peeling aliases & refined types).
+/// Codegen consults this set to decide whether to emit
+/// `IN (SELECT value FROM json_each(?))` for dynamic haystacks.
+/// Int (BigInt) is intentionally excluded — the JSON encoding for ints that
+/// don't fit i64 produces tagged objects that don't compare cleanly.
+pub type ElemPushdownOk = HashSet<Span>;
+
 // ── Units of measure ──────────────────────────────────────────────
 
 type UnitVar = u32;
@@ -437,6 +445,10 @@ struct Infer {
     refined_types: HashMap<String, (Ty, knot::ast::Expr)>,
     /// Refine expression type vars: (span, alpha_var, inner_ty) for post-inference resolution.
     refine_vars: Vec<(Span, TyVar, Ty)>,
+
+    /// Spans of `elem` haystack args whose element type is SQL-pushable
+    /// (Text/Float/Bool). Recorded during App inference, exported for codegen.
+    elem_pushdown_ok: ElemPushdownOk,
 }
 
 // ── Core operations ───────────────────────────────────────────────
@@ -478,11 +490,41 @@ impl Infer {
             show_unit_strings: HashMap::new(),
             refined_types: HashMap::new(),
             refine_vars: Vec::new(),
+            elem_pushdown_ok: HashSet::new(),
         }
     }
 
     fn fresh(&mut self) -> Ty {
         Ty::Var(self.fresh_var())
+    }
+
+    /// Whether a resolved haystack type for `elem` is SQL-pushable: it must
+    /// be `[a]` (`Ty::Relation`) and `a` must be Text/Float/Bool — Int is
+    /// excluded because BigInts that don't fit i64 JSON-encode as tagged
+    /// objects, and ADTs/Records would JSON-encode as objects too.
+    fn is_elem_haystack_pushable(&self, ty: &Ty) -> bool {
+        let peeled = ty.peel_alias();
+        let inner = match peeled {
+            Ty::Relation(t) => self.apply(t),
+            _ => return false,
+        };
+        self.is_sql_pushable_scalar_for_elem(&inner)
+    }
+
+    fn is_sql_pushable_scalar_for_elem(&self, ty: &Ty) -> bool {
+        match ty.peel_alias() {
+            Ty::Text | Ty::Float | Ty::Bool | Ty::FloatUnit(_) => true,
+            // Refined nominal alias `type Nat = Int where ...` shows up as
+            // `Con(name, [])`; recurse to its base type.
+            Ty::Con(name, args) if args.is_empty() => {
+                self.refined_types
+                    .get(name)
+                    .map(|(base, _)| self.is_sql_pushable_scalar_for_elem(base))
+                    .unwrap_or(false)
+            }
+            // Int / IntUnit explicitly excluded per BigInt encoding concern.
+            _ => false,
+        }
     }
 
     /// Resolve a refined-type alias to its non-refined base, following alias
@@ -2847,7 +2889,7 @@ impl Infer {
                 let arg_ty = self.infer_expr(arg);
                 let result_ty = self.fresh();
                 let expected = Ty::Fun(
-                    Box::new(arg_ty),
+                    Box::new(arg_ty.clone()),
                     Box::new(result_ty.clone()),
                 );
                 self.unify(&func_ty, &expected, arg.span);
@@ -2857,6 +2899,21 @@ impl Infer {
                     if name == "parseJson" {
                         if let Ty::Var(v) = &result_ty {
                             self.from_json_calls.push((expr.span, *v));
+                        }
+                    }
+                }
+
+                // Track `elem needle haystack` haystack types for SQL pushdown.
+                // Curried: outer App's func is `App(Var("elem"), needle)`,
+                // outer App's arg is the haystack. Record only when the
+                // haystack's element type is a SQL-pushable scalar.
+                if let ast::ExprKind::App { func: inner_f, .. } = &func.node {
+                    if let ast::ExprKind::Var(name) = &inner_f.node {
+                        if name == "elem" {
+                            let resolved = self.apply(&arg_ty);
+                            if self.is_elem_haystack_pushable(&resolved) {
+                                self.elem_pushdown_ok.insert(arg.span);
+                            }
                         }
                     }
                 }
@@ -6421,7 +6478,7 @@ fn value_references_source(
 /// Run type inference on a parsed module. Returns diagnostics,
 /// resolved monad info for desugared do-blocks, and inferred type info
 /// mapping declaration names to their display type strings.
-pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, LocalTypeInfo, RefineTargets, RefinedTypeInfoMap, FromJsonTargets) {
+pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, LocalTypeInfo, RefineTargets, RefinedTypeInfoMap, FromJsonTargets, ElemPushdownOk) {
     let mut infer = Infer::new();
 
     // Phase 1: Collect type aliases, data types, constructors
@@ -6535,8 +6592,9 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
 
     let type_info = infer.extract_type_info();
     let local_type_info = infer.extract_local_type_info();
+    let elem_pushdown_ok = infer.elem_pushdown_ok.clone();
 
-    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets)
+    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok)
 }
 
 /// Extract a simple type name from a resolved type for trait dispatch purposes.
@@ -6571,14 +6629,14 @@ mod tests {
     fn check_src(src: &str) -> Vec<Diagnostic> {
         let mut module = parse(src);
         crate::desugar::desugar(&mut module);
-        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json) = check(&module);
+        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown) = check(&module);
         diags
     }
 
     fn type_info_for(src: &str) -> TypeInfo {
         let mut module = parse(src);
         crate::desugar::desugar(&mut module);
-        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json) = check(&module);
+        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown) = check(&module);
         type_info
     }
 

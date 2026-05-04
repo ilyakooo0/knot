@@ -176,6 +176,11 @@ pub struct Codegen {
     refined_predicate_fns: HashMap<String, FuncId>,
     // parseJson call targets: app_span -> resolved return type name (for compile-time FromJSON dispatch)
     from_json_targets: HashMap<knot::ast::Span, String>,
+
+    // Spans of `elem` haystack args whose element type is SQL-pushable
+    // (Text/Float/Bool). Codegen emits `IN (SELECT value FROM json_each(?))`
+    // for these instead of falling back to in-memory filter.
+    elem_pushdown_ok: HashSet<knot::ast::Span>,
 }
 
 /// Role of a constructor in a nullable-encoded ADT.
@@ -315,6 +320,7 @@ pub fn compile(
     refined_types: &crate::infer::RefinedTypeInfoMap,
     from_json_targets: &crate::infer::FromJsonTargets,
     type_info: &crate::infer::TypeInfo,
+    elem_pushdown_ok: &crate::infer::ElemPushdownOk,
     compile_time_overrides: &HashMap<String, String>,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     let mut cg = Codegen::new();
@@ -338,6 +344,7 @@ pub fn compile(
     cg.refine_targets = refine_targets.clone();
     cg.refined_types = refined_types.clone();
     cg.from_json_targets = from_json_targets.clone();
+    cg.elem_pushdown_ok = elem_pushdown_ok.clone();
     cg.source_refinements = type_env.source_refinements.clone();
     for (name, fields) in &type_env.constructors {
         let field_strs: Vec<(String, String)> = fields
@@ -515,6 +522,7 @@ impl Codegen {
             refined_predicate_fns: HashMap::new(),
             source_refinements: HashMap::new(),
             from_json_targets: HashMap::new(),
+            elem_pushdown_ok: HashSet::new(),
         }
     }
 
@@ -3933,7 +3941,7 @@ impl Codegen {
                         // 3. Conditional update: do { t <- *rel; yield (if cond then {t | ...} else t) }
                         //    Try SQL UPDATE WHERE (skip for nested relations — child tables need full rewrite)
                         //    Skip when source has refinements — SQL bypasses Knot-level validation
-                        let where_frag = Self::try_compile_sql_expr(&bind_var, cond);
+                        let where_frag = self.try_compile_sql_expr(&bind_var, cond);
                         let set_frag = where_frag.as_ref().and_then(|_| {
                             let mut parts = Vec::new();
                             let mut params = Vec::new();
@@ -4012,7 +4020,7 @@ impl Codegen {
                             let mut all_ok = true;
                             for cond in &conditions {
                                 if let Some(f) =
-                                    Self::try_compile_sql_expr(&bind_var, cond)
+                                    self.try_compile_sql_expr(&bind_var, cond)
                                 {
                                     frags.push(f);
                                 } else {
@@ -4681,7 +4689,7 @@ impl Codegen {
                     if !self.views.contains_key(source_name) {
                         if let Some(schema) = self.source_schemas.get(source_name).cloned() {
                             if !schema.starts_with('#') && !schema.contains('[') {
-                                if let Some(frag) = Self::try_compile_sql_expr(&filter_bind, filter_body) {
+                                if let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body) {
                                     let table = quote_sql_ident(&format!("_knot_{}", source_name));
                                     let sql = format!("SELECT COUNT(*) FROM {} WHERE {}", table, frag.sql);
                                     let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
@@ -4759,7 +4767,7 @@ impl Codegen {
                     if !self.views.contains_key(&source_name) {
                         if let Some(schema) = self.source_schemas.get(&source_name).cloned() {
                             if !schema.starts_with('#') && !schema.contains('[') {
-                                if let Some(frag) = Self::try_compile_sql_expr(&filter_bind, filter_body) {
+                                if let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body) {
                                     let table = quote_sql_ident(&format!("_knot_{}", source_name));
                                     let cols = parse_schema_columns(&schema).iter()
                                         .map(|(name, _)| quote_sql_ident(name))
@@ -4845,7 +4853,7 @@ impl Codegen {
                     if !self.views.contains_key(&source_name) {
                         if let Some(schema) = self.source_schemas.get(&source_name).cloned() {
                             if !schema.starts_with('#') && !schema.contains('[') {
-                                if let Some(frag) = Self::try_compile_sql_expr(&filter_bind, filter_body) {
+                                if let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body) {
                                     let f = self.compile_expr(builder, &args[0], env, db);
                                     let init = self.compile_expr(builder, &args[1], env, db);
                                     let table = quote_sql_ident(&format!("_knot_{}", source_name));
@@ -4958,7 +4966,7 @@ impl Codegen {
                                     if let Some((agg_bind, agg_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies) {
                                         let agg_body: &ast::Expr = &agg_body;
                                         if let Some(col_sql) = extract_sql_field_access(&agg_bind, agg_body, "", &schema) {
-                                            if let Some(frag) = Self::try_compile_sql_expr(&filter_bind, filter_body) {
+                                            if let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body) {
                                                 let arg_sql = if matches!(name.as_str(), "min" | "max") {
                                                     col_sql_for_minmax(&col_sql, &agg_bind, agg_body, &schema)
                                                 } else {
@@ -5024,8 +5032,8 @@ impl Codegen {
                                 if !schema.starts_with('#') && !schema.contains('[') {
                                     if let Some((pred_bind, pred_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies) {
                                         let pred_body: &ast::Expr = &pred_body;
-                                        if let Some(pred_frag) = Self::try_compile_sql_expr(&pred_bind, pred_body) {
-                                            if let Some(filter_frag) = Self::try_compile_sql_expr(&filter_bind, filter_body) {
+                                        if let Some(pred_frag) = self.try_compile_sql_expr(&pred_bind, pred_body) {
+                                            if let Some(filter_frag) = self.try_compile_sql_expr(&filter_bind, filter_body) {
                                                 let table = quote_sql_ident(&format!("_knot_{}", source_name));
                                                 let sql = format!(
                                                     "SELECT COUNT(*) FROM {} WHERE {} AND {}",
@@ -5270,7 +5278,7 @@ impl Codegen {
                     if !self.views.contains_key(source_name) {
                         if let Some(schema) = self.source_schemas.get(source_name).cloned() {
                             if !schema.starts_with('#') && !schema.contains('[') {
-                                if let Some(frag) = Self::try_compile_sql_expr(&filter_bind, filter_body) {
+                                if let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body) {
                                     let table = quote_sql_ident(&format!("_knot_{}", source_name));
                                     let cols = parse_schema_columns(&schema).iter()
                                         .map(|(n, _)| quote_sql_ident(n))
@@ -7007,7 +7015,7 @@ impl Codegen {
                                     if let ast::StmtKind::Where { cond } = &stmts[wi].node {
                                         // Check all param sources are in scope
                                         if let Some(frag) =
-                                            Self::try_compile_sql_expr(bind_var, cond)
+                                            self.try_compile_sql_expr(bind_var, cond)
                                         {
                                             let params_ok = frag.params.iter().all(|p| match p {
                                                 SqlParamSource::Literal(_) | SqlParamSource::Expr(_) => true,
@@ -8010,7 +8018,7 @@ impl Codegen {
         match fn_name {
             "filter" => {
                 // Use unqualified column names for knot_source_read_where
-                let frag = Self::try_compile_sql_expr(&bind_var, body)?;
+                let frag = self.try_compile_sql_expr(&bind_var, body)?;
                 let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
                 let (name_ptr, name_len) = self.string_ptr(builder, source_name);
                 let (schema_ptr, schema_len) = self.string_ptr(builder, schema);
@@ -8036,7 +8044,7 @@ impl Codegen {
                 Some(self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]))
             }
             "countWhere" => {
-                let frag = Self::try_compile_sql_expr(&bind_var, body)?;
+                let frag = self.try_compile_sql_expr(&bind_var, body)?;
                 let sql = format!("SELECT COUNT(*) FROM {} WHERE {}", table, frag.sql);
                 let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
                 let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
@@ -8333,7 +8341,7 @@ impl Codegen {
             if schema.starts_with('#') || schema.contains('[') {
                 return None;
             }
-            let frag = Self::try_compile_sql_expr(&filter_bind, filter_body)?;
+            let frag = self.try_compile_sql_expr(&filter_bind, filter_body)?;
             let table = quote_sql_ident(&format!("_knot_{}", source_name));
             let cols = parse_schema_columns(schema).iter()
                 .map(|(name, _)| quote_sql_ident(name))
@@ -8774,14 +8782,15 @@ impl Codegen {
     /// Field accesses on bind_var become column references;
     /// literals and free variables become bind parameters (?).
     fn try_compile_sql_expr(
+        &self,
         bind_var: &str,
         expr: &ast::Expr,
     ) -> Option<SqlFragment> {
         match &expr.node {
             ast::ExprKind::BinOp { op, lhs, rhs } => match op {
                 ast::BinOp::And => {
-                    let l = Self::try_compile_sql_expr(bind_var, lhs)?;
-                    let r = Self::try_compile_sql_expr(bind_var, rhs)?;
+                    let l = self.try_compile_sql_expr(bind_var, lhs)?;
+                    let r = self.try_compile_sql_expr(bind_var, rhs)?;
                     let mut params = l.params;
                     params.extend(r.params);
                     Some(SqlFragment {
@@ -8790,8 +8799,8 @@ impl Codegen {
                     })
                 }
                 ast::BinOp::Or => {
-                    let l = Self::try_compile_sql_expr(bind_var, lhs)?;
-                    let r = Self::try_compile_sql_expr(bind_var, rhs)?;
+                    let l = self.try_compile_sql_expr(bind_var, lhs)?;
+                    let r = self.try_compile_sql_expr(bind_var, rhs)?;
                     let mut params = l.params;
                     params.extend(r.params);
                     Some(SqlFragment {
@@ -8843,7 +8852,7 @@ impl Codegen {
                 op: ast::UnaryOp::Not,
                 operand,
             } => {
-                let inner = Self::try_compile_sql_expr(bind_var, operand)?;
+                let inner = self.try_compile_sql_expr(bind_var, operand)?;
                 Some(SqlFragment {
                     sql: format!("NOT ({})", inner.sql),
                     params: inner.params,
@@ -8854,7 +8863,7 @@ impl Codegen {
             ast::ExprKind::App { func, arg } => {
                 if let ast::ExprKind::Var(name) = &func.node {
                     if name == "not" {
-                        let inner = Self::try_compile_sql_expr(bind_var, arg)?;
+                        let inner = self.try_compile_sql_expr(bind_var, arg)?;
                         return Some(SqlFragment {
                             sql: format!("NOT ({})", inner.sql),
                             params: inner.params,
@@ -8875,32 +8884,50 @@ impl Codegen {
                             });
                         }
                         if name == "elem" {
-                            // elem needle [a, b, ...] → needle IN (a, b, ...)
-                            // The list arg must be a syntactic list literal; its
-                            // elements can be any sql-pushable atom (literal, var,
-                            // or field access).
                             let needle = Self::try_compile_single_table_atom(bind_var, first_arg)?;
-                            let elems = match &arg.node {
-                                ast::ExprKind::List(es) => es,
-                                _ => return None,
-                            };
-                            if elems.is_empty() {
+                            // (a) Literal list: emit `IN (?, ?, …)` directly so
+                            //     SQLite can compare each element by type
+                            //     affinity without going through json_each.
+                            if let ast::ExprKind::List(elems) = &arg.node {
+                                if elems.is_empty() {
+                                    return Some(SqlFragment {
+                                        sql: "0".to_string(),
+                                        params: vec![],
+                                    });
+                                }
+                                let mut parts = Vec::with_capacity(elems.len());
+                                let mut params = needle.params;
+                                for e in elems {
+                                    let frag = Self::try_compile_single_table_atom(bind_var, e)?;
+                                    parts.push(frag.sql);
+                                    params.extend(frag.params);
+                                }
                                 return Some(SqlFragment {
-                                    sql: "0".to_string(),
-                                    params: vec![],
+                                    sql: format!("{} IN ({})", needle.sql, parts.join(", ")),
+                                    params,
                                 });
                             }
-                            let mut parts = Vec::with_capacity(elems.len());
-                            let mut params = needle.params;
-                            for e in elems {
-                                let frag = Self::try_compile_single_table_atom(bind_var, e)?;
-                                parts.push(frag.sql);
-                                params.extend(frag.params);
+                            // (b) Dynamic haystack: bind the whole list as a
+                            //     single JSON-encoded param (value_to_sql_param
+                            //     auto-encodes Relations) and expand via
+                            //     json_each. Gated by inference's element-type
+                            //     check (Text/Float/Bool only — Int excluded).
+                            //     Param can't reference the bind var since the
+                            //     haystack is evaluated outside the SQL row scope.
+                            if self.elem_pushdown_ok.contains(&arg.span)
+                                && !Self::expr_refs_var(arg, bind_var)
+                            {
+                                let mut params = needle.params;
+                                params.push(SqlParamSource::Expr((**arg).clone()));
+                                return Some(SqlFragment {
+                                    sql: format!(
+                                        "{} IN (SELECT value FROM json_each(?))",
+                                        needle.sql,
+                                    ),
+                                    params,
+                                });
                             }
-                            return Some(SqlFragment {
-                                sql: format!("{} IN ({})", needle.sql, parts.join(", ")),
-                                params,
-                            });
+                            return None;
                         }
                     }
                 }

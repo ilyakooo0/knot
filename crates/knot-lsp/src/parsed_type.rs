@@ -654,21 +654,26 @@ impl<'a> Parser<'a> {
 
     fn peek_ident(&self) -> Option<String> {
         let mut i = self.pos;
-        let bytes = self.src.as_bytes();
         let first = self.src[i..].chars().next()?;
         if !(first.is_alphabetic() || first == '_') {
             return None;
         }
         i += first.len_utf8();
         while i < self.src.len() {
-            let c = self.src[i..].chars().next().unwrap();
+            // `chars().next()` would only be `None` if `i` landed on a
+            // non-char-boundary, but we always advance by `c.len_utf8()`
+            // so it can't. Defensively `break` instead of unwrapping
+            // anyway — a malformed type string from upstream shouldn't
+            // crash the LSP.
+            let Some(c) = self.src[i..].chars().next() else {
+                break;
+            };
             if is_ident_cont(c) {
                 i += c.len_utf8();
             } else {
                 break;
             }
         }
-        let _ = bytes;
         Some(self.src[self.pos..i].to_string())
     }
 }

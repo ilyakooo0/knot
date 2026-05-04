@@ -428,7 +428,13 @@ impl Parser {
                     }
                     ref tok if tok.keyword_str().is_some() => {
                         let tok = self.advance();
-                        path.push_str(tok.kind.keyword_str().unwrap());
+                        match tok.kind.keyword_str() {
+                            Some(s) => path.push_str(s),
+                            None => {
+                                self.error("expected path segment after '/'");
+                                return None;
+                            }
+                        }
                     }
                     _ => {
                         self.error("expected path segment after '/'");
@@ -1610,7 +1616,12 @@ impl Parser {
                 segments.push(PathSegment::Literal(seg));
             } else if self.peek().keyword_str().is_some() {
                 let tok = self.advance();
-                let mut seg = tok.kind.keyword_str().unwrap().to_string();
+                let Some(kw) = tok.kind.keyword_str() else {
+                    // Token disappeared between peek and advance; bail
+                    // out of segment collection rather than panicking.
+                    break;
+                };
+                let mut seg = kw.to_string();
                 while self.at(&TokenKind::Minus) && matches!(self.peek_ahead(1), TokenKind::Lower(_) | TokenKind::Upper(_)) {
                     self.advance(); // consume `-`
                     let next = self.advance();
@@ -2131,12 +2142,10 @@ impl Parser {
                 self.advance(); // consume `@`
                 self.advance(); // consume `(`
                 self.delimiter_depth += 1;
-                let time = self.parse_expr();
-                if time.is_none() {
+                let Some(time) = self.parse_expr() else {
                     self.delimiter_depth -= 1;
                     return None;
-                }
-                let time = time.unwrap();
+                };
                 self.delimiter_depth -= 1;
                 let end_tok = self
                     .expect(&TokenKind::RParen, "expected ')' to close temporal query '@(...)'")
@@ -2298,12 +2307,10 @@ impl Parser {
                         Span::new(start.start, self.prev_span().end),
                     ));
                 }
-                let inner = self.parse_expr();
-                if inner.is_none() {
+                let Some(inner) = self.parse_expr() else {
                     self.delimiter_depth -= 1;
                     return None;
-                }
-                let inner = inner.unwrap();
+                };
                 self.skip_newlines();
                 // Check for type annotation: `(expr : Type)`
                 if self.eat(&TokenKind::Colon) {

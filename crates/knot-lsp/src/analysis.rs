@@ -3,6 +3,7 @@
 //! cross-file features.
 
 use std::collections::HashMap;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -11,7 +12,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use lsp_types::Uri;
 
 use knot::ast::{self, DeclKind, Module, Span};
-use knot::diagnostic;
+use knot::diagnostic::{self, Diagnostic};
 use knot_compiler::effects::EffectSet;
 use knot_compiler::infer::MonadKind;
 
@@ -117,12 +118,38 @@ pub fn analysis_worker(
                 .map(|(k, (h, _, _))| (k.clone(), *h))
                 .collect();
 
-            let doc = analyze_document(
-                &task.uri,
-                &task.source,
-                &mut cache_local,
-                &mut inf_cache_local,
-            );
+            // Run the compiler pipeline behind a panic boundary. If any
+            // stage (parser, inference, effect check, stratify, sql_lint)
+            // panics on malformed input, recover and emit a synthetic
+            // diagnostic instead of letting the worker thread die — a
+            // dead worker silently stops processing all subsequent edits
+            // for the entire session.
+            let task_uri = task.uri.clone();
+            let task_source = task.source.clone();
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                analyze_document(
+                    &task_uri,
+                    &task_source,
+                    &mut cache_local,
+                    &mut inf_cache_local,
+                )
+            }));
+
+            let (doc, merge_caches) = match result {
+                Ok(doc) => (doc, true),
+                Err(payload) => {
+                    let msg = panic_message(&payload);
+                    eprintln!(
+                        "knot-lsp: analysis panicked for {}: {msg}",
+                        task.uri.as_str()
+                    );
+                    // Discard locally-mutated caches: a panic mid-analysis
+                    // could have left them in an inconsistent state, and
+                    // skipping the merge keeps the shared caches at their
+                    // last-known-good contents.
+                    (panic_recovery_state(&task.source, &msg), false)
+                }
+            };
 
             // Merge entries back: for the import cache, overwrite only the
             // keys whose hash changed during analysis (the file we just
@@ -130,17 +157,19 @@ pub fn analysis_worker(
             // `or_insert` left a stale (hash, module) for the edited file
             // in the shared cache, so dependents importing it kept seeing
             // the pre-edit AST until the editor was restarted.
-            if let Ok(mut shared) = import_cache.lock() {
-                for (k, v) in cache_local.into_iter() {
-                    let before_hash = import_cache_before.get(&k).copied();
-                    if before_hash != Some(v.0) {
-                        shared.insert(k, v);
+            if merge_caches {
+                if let Ok(mut shared) = import_cache.lock() {
+                    for (k, v) in cache_local.into_iter() {
+                        let before_hash = import_cache_before.get(&k).copied();
+                        if before_hash != Some(v.0) {
+                            shared.insert(k, v);
+                        }
                     }
                 }
-            }
-            if let Ok(mut shared) = inference_cache.lock() {
-                for (k, v) in inf_cache_local.into_iter() {
-                    shared.entry(k).or_insert(v);
+                if let Ok(mut shared) = inference_cache.lock() {
+                    for (k, v) in inf_cache_local.into_iter() {
+                        shared.entry(k).or_insert(v);
+                    }
                 }
             }
 
@@ -155,6 +184,63 @@ pub fn analysis_worker(
                 return;
             }
         }
+    }
+}
+
+/// Best-effort extraction of a panic payload's message. `panic!` payloads are
+/// usually `&'static str` or `String`; anything else falls back to a generic
+/// label so the diagnostic still surfaces the failure.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "panic with non-string payload".to_string()
+    }
+}
+
+/// Synthesize a minimal `DocumentState` after the analysis pipeline panicked.
+/// Carries a single error diagnostic at the start of the file so the editor
+/// surfaces a visible failure instead of going silent. All cross-cutting
+/// data (definitions, references, type info, etc.) is empty — features that
+/// depend on them degrade gracefully via existing `None` / empty-map paths.
+fn panic_recovery_state(source: &str, message: &str) -> DocumentState {
+    let span = Span::new(0, 0);
+    let diag = Diagnostic::error(format!(
+        "internal LSP error during analysis: {message}"
+    ))
+    .label(span, "analysis aborted here")
+    .note("this is a bug in the language server; other files are unaffected");
+
+    DocumentState {
+        source: source.to_string(),
+        module: Module {
+            imports: Vec::new(),
+            decls: Vec::new(),
+        },
+        references: Vec::new(),
+        definitions: HashMap::new(),
+        details: HashMap::new(),
+        type_info: HashMap::new(),
+        local_type_info: HashMap::new(),
+        literal_types: Vec::new(),
+        effect_info: HashMap::new(),
+        effect_sets: HashMap::new(),
+        knot_diagnostics: vec![diag],
+        imported_files: HashMap::new(),
+        import_defs: HashMap::new(),
+        import_origins: HashMap::new(),
+        doc_comments: HashMap::new(),
+        keyword_tokens: Vec::new(),
+        refined_types: HashMap::new(),
+        refine_targets: HashMap::new(),
+        source_refinements: HashMap::new(),
+        monad_info: HashMap::new(),
+        unit_info: HashMap::new(),
+        changed_decl_names: Vec::new(),
+        signature_changed_decl_names: Vec::new(),
+        dirty_decl_closure: std::collections::HashSet::new(),
     }
 }
 
@@ -302,9 +388,8 @@ pub fn analyze_document(
             // Exact content-hash match: reuse the cached snapshot verbatim.
             // Same source bytes ⇒ same spans, so every Span key in the
             // cached HashMaps still indexes the right characters.
-            if inference_cache.contains_key(key) {
-                let new_clock = next_access_clock(inference_cache);
-                let snap = inference_cache.get_mut(key).unwrap();
+            let new_clock = next_access_clock(inference_cache);
+            if let Some(snap) = inference_cache.get_mut(key) {
                 snap.access_clock = new_clock;
                 let snap_ref = &*snap;
                 return reuse_snapshot(
@@ -1130,5 +1215,168 @@ main = do
                 .map(|d| d.message.as_str())
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// Adversarial corpus of malformed `.knot` snippets. The contract: every
+    /// input — no matter how broken — must return a `DocumentState` without
+    /// panicking. Diagnostics are expected; a thread crash (which would silently
+    /// kill the analysis worker for the rest of the session) is not.
+    ///
+    /// The list is intentionally varied: incomplete tokens, mismatched
+    /// delimiters, half-typed declarations the user might leave on screen
+    /// mid-edit, byte-level oddities. Add new entries when a real-world
+    /// crash report points at a class we don't cover.
+    #[test]
+    fn malformed_input_does_not_panic() {
+        let cases: &[(&str, &str)] = &[
+            ("empty", ""),
+            ("single_char", "x"),
+            ("trailing_equals", "x ="),
+            ("unterminated_string", "x = \"hello"),
+            ("unterminated_comment", "x = 1 -- comment with no newline"),
+            ("only_operators", "+ - * /"),
+            ("only_punctuation", "(((((((((("),
+            ("mismatched_braces", "f = {a: 1, b: 2"),
+            ("mismatched_brackets", "xs = [1, 2, 3"),
+            ("naked_arrow", "->"),
+            ("naked_pipe", "|"),
+            ("naked_lambda", "\\"),
+            ("partial_lambda", "\\x ->"),
+            ("partial_do", "main = do"),
+            ("do_with_dangling_bind", "main = do\n  x <-"),
+            ("partial_case", "x = case y of"),
+            ("case_dangling_arrow", "x = case y of\n  Foo ->"),
+            ("partial_let", "x = let"),
+            ("partial_if", "x = if"),
+            ("if_no_then", "x = if true"),
+            ("if_no_else", "x = if true then 1"),
+            ("partial_type_alias", "type Foo ="),
+            ("partial_data", "data Foo ="),
+            ("data_dangling_bar", "data Foo = A |"),
+            ("partial_record_type", "type R = {name:"),
+            ("partial_route", "route R where"),
+            ("partial_import", "import"),
+            ("import_no_path", "import "),
+            ("import_trailing_slash", "import foo/"),
+            ("import_keyword_segment", "import foo/where"),
+            ("partial_trait", "trait T where"),
+            ("partial_impl", "impl T for"),
+            ("source_no_type", "*xs :"),
+            ("source_no_name", "*"),
+            ("derived_no_body", "&xs ="),
+            ("temporal_query_unclosed", "x = *xs @("),
+            ("temporal_query_empty", "x = *xs @()"),
+            ("type_annotation_unclosed", "x = (1 :"),
+            ("paren_unclosed", "x = (1 + 2"),
+            ("nested_paren_unclosed", "x = (((((1"),
+            ("malformed_unit_literal", "x = 42<"),
+            ("malformed_unit_decl", "unit"),
+            ("refine_no_predicate", "x = refine"),
+            ("groupby_no_key", "main = do\n  x <- xs\n  groupBy"),
+            ("non_ascii_at_start", "λ"),
+            ("emoji_in_ident", "x😀 = 1"),
+            ("zero_width_joiner", "x\u{200d}y = 1"),
+            ("just_newlines", "\n\n\n\n"),
+            ("just_whitespace", "                "),
+            ("mixed_garbage", "@@##$$%%^^&&"),
+            ("very_deep_nesting", &"(".repeat(200)),
+            ("alternating_brackets", "[(){}[(){}[(){}"),
+            ("keyword_as_value", "x = where"),
+            ("incomplete_route_path", "route R where\n  GET /api/"),
+            ("route_with_keyword_segment_dangling", "route R where\n  GET /api/where"),
+        ];
+
+        let uri = fake_uri("file:///tmp/fuzz.knot");
+        for (label, src) in cases {
+            let mut import_cache: HashMap<PathBuf, (u64, Module, String)> = HashMap::new();
+            let mut inference_cache: InferenceCache = HashMap::new();
+            // Wrap in catch_unwind so a single bad case shows up in the
+            // assertion below instead of taking down the test binary.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                analyze_document(&uri, src, &mut import_cache, &mut inference_cache)
+            }));
+            assert!(
+                result.is_ok(),
+                "analyze_document panicked on case `{label}`: {src:?}"
+            );
+        }
+    }
+
+    /// The analysis worker must keep running even when a task triggers a
+    /// panic in the compiler pipeline. We can't easily force a real panic
+    /// from valid call paths, so this drives the worker with a permuted
+    /// version of the adversarial corpus and confirms (a) every task
+    /// produces a result, and (b) the worker thread is still alive
+    /// afterwards (verified by feeding it one final well-formed task).
+    #[test]
+    fn worker_survives_adversarial_corpus() {
+        let (tx, rx, handle) = spawn_worker();
+
+        let bad_inputs = [
+            "x =",
+            "main = do",
+            "data Foo = A |",
+            "(((((",
+            "type R = {a:",
+            "import foo/",
+            "x = case y of",
+            "*xs :",
+        ];
+
+        for (i, src) in bad_inputs.iter().enumerate() {
+            let uri = fake_uri(&format!("file:///tmp/adv_{i}.knot"));
+            tx.send(AnalysisTask {
+                uri: uri.clone(),
+                source: (*src).into(),
+                version: Some(1),
+            })
+            .unwrap();
+            // Wait beyond the debounce window so each task gets processed
+            // separately rather than coalesced.
+            std::thread::sleep(Duration::from_millis(120));
+            let _ = rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| panic!("worker died after malformed input #{i}: {src:?}"));
+        }
+
+        // Final canary: feed a well-formed task to confirm the worker is
+        // still healthy and serving requests.
+        let uri = fake_uri("file:///tmp/canary.knot");
+        tx.send(AnalysisTask {
+            uri: uri.clone(),
+            source: "x = 1\n".into(),
+            version: Some(99),
+        })
+        .unwrap();
+        let canary = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker should still produce results after adversarial corpus");
+        assert_eq!(canary.uri, uri);
+        assert_eq!(canary.version, Some(99));
+
+        drop(tx);
+        handle.join().unwrap();
+    }
+
+    /// Direct test of the panic-recovery fallback: the synthetic state
+    /// must carry a single error diagnostic and otherwise empty fields, so
+    /// downstream features degrade rather than crash.
+    #[test]
+    fn panic_recovery_state_emits_error_diagnostic() {
+        let state = panic_recovery_state("source bytes\n", "synthetic panic");
+        assert_eq!(state.source, "source bytes\n");
+        assert_eq!(state.knot_diagnostics.len(), 1);
+        assert_eq!(state.knot_diagnostics[0].severity, diagnostic::Severity::Error);
+        assert!(
+            state.knot_diagnostics[0]
+                .message
+                .contains("synthetic panic"),
+            "diagnostic should embed the panic message; got: {}",
+            state.knot_diagnostics[0].message
+        );
+        assert!(state.module.decls.is_empty());
+        assert!(state.references.is_empty());
+        assert!(state.type_info.is_empty());
+        assert!(state.local_type_info.is_empty());
     }
 }

@@ -16,9 +16,6 @@ gc-stats = []
 [dependencies]
 rusqlite = { workspace = true }
 tiny_http = { workspace = true }
-num-bigint = { workspace = true }
-num-traits = { workspace = true }
-num-integer = { workspace = true }
 ratatui = "0.30"
 crossterm = "0.29"
 getrandom = "0.4"

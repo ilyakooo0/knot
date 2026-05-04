@@ -25,8 +25,5 @@ target-lexicon = "0.13"
 rusqlite = { version = "0.39", features = ["bundled", "collation"] }
 tiny_http = "0.12"
 ureq = "3"
-num-bigint = "0.4"
-num-traits = "0.2"
-num-integer = "0.1"
 serde_json = "1"
 ariadne = "0.6"

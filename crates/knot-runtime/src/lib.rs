@@ -7,9 +7,6 @@
 pub mod log;
 mod tui;
 
-use num_bigint::BigInt;
-use num_traits::ToPrimitive;
-use num_traits::Zero;
 use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use std::cell::RefCell;
@@ -925,7 +922,7 @@ impl Arena {
         // heap-resident payload, so there's nothing to walk.
         if is_tagged(val) { return val; }
         match unsafe { &*val } {
-            Value::Int(_) | Value::SmallInt(_) | Value::Float(_) | Value::Text(_)
+            Value::Int(_) | Value::Float(_) | Value::Text(_)
             | Value::Bool(_) | Value::Bytes(_) | Value::Unit => val,
 
             Value::Record(fields) => {
@@ -1043,8 +1040,7 @@ impl Arena {
         if is_tagged(val) { return val; }
         GC_STATS.bump(&GC_STATS.clone_into_pinned);
         let cloned = match unsafe { &*val } {
-            Value::Int(n) => Value::Int(n.clone()),
-            Value::SmallInt(n) => Value::SmallInt(*n),
+            Value::Int(n) => Value::Int(*n),
             Value::Float(f) => Value::Float(*f),
             Value::Text(s) => Value::Text(s.clone()),
             Value::Bool(b) => Value::Bool(*b),
@@ -1077,7 +1073,7 @@ impl Arena {
                     // always identity-copyable, never chunk-owned.
                     if is_tagged(r) { return true; }
                     let is_leaf = matches!(unsafe { &*r },
-                        Value::SmallInt(_) | Value::Int(_) | Value::Float(_)
+                        Value::Int(_) | Value::Float(_)
                         | Value::Bool(_) | Value::Unit | Value::Text(_)
                         | Value::Bytes(_));
                     is_leaf && !self.frames[frame_idx].owns_in_chunks(r)
@@ -1151,8 +1147,7 @@ impl Arena {
             return cached;
         }
         let cloned = match unsafe { &*val } {
-            Value::Int(n) => Value::Int(n.clone()),
-            Value::SmallInt(n) => Value::SmallInt(*n),
+            Value::Int(n) => Value::Int(*n),
             Value::Float(f) => Value::Float(*f),
             Value::Text(s) => Value::Text(s.clone()),
             Value::Bool(b) => Value::Bool(*b),
@@ -1562,7 +1557,7 @@ pub extern "C" fn knot_override_lookup(
         0 => {
             // Int
             match val_str.parse::<i64>() {
-                Ok(n) => alloc_small_int(n),
+                Ok(n) => alloc_int(n),
                 Err(_) => {
                     eprintln!(
                         "Error: invalid value '{}' for --{} (expected {})",
@@ -1883,9 +1878,9 @@ fn intern_str(s: &str) -> Arc<str> {
 // `lib.rs`) would need to dispatch through a decoder before tagged
 // pointers can safely flow through compiled-code boundaries.  Wiring
 // that in universally requires a careful audit — the encoders are
-// shipped here so the infrastructure is ready, but `alloc_small_int`
+// shipped here so the infrastructure is ready, but `alloc_int`
 // et al. still return real pointers.  Activating tagging is a matter
-// of (a) returning `encode_smallint(n)` from `alloc_small_int` when
+// of (a) returning `encode_smallint(n)` from `alloc_int` when
 // `n` fits in 61 bits, (b) teaching `as_ref` to decode, and (c)
 // spot-checking that Drop-sensitive variants (`Relation` in particular)
 // never receive tagged pointers.
@@ -1948,7 +1943,7 @@ pub(crate) fn decode_tagged(p: *mut Value) -> Value {
         TAG_SMALLINT => {
             // Sign-extend from 61-bit field.
             let shifted = (raw as i64) >> 3;
-            Value::SmallInt(shifted)
+            Value::Int(shifted)
         }
         TAG_BOOL => Value::Bool((raw >> 3) & 1 == 1),
         TAG_UNIT => Value::Unit,
@@ -1963,27 +1958,11 @@ pub(crate) fn decode_tagged(p: *mut Value) -> Value {
 /// Every Knot expression evaluates to a heap-allocated `Value`.
 /// The Cranelift-generated code works exclusively with `*mut Value` pointers.
 pub enum Value {
-    /// Big integer (arbitrary precision), boxed.  Boxing keeps the
-    /// `Value` enum uniformly pointer-sized across variants — `BigInt`
-    /// inline would be 32 B (Sign + `Vec<u32>`), tying with
-    /// `Vec<RecordField>` for largest.  Today `Value` is still 32 B
-    /// because other variants (`Record`, `Relation`, `Constructor`) are
-    /// already 24 B; boxing `BigInt` costs one heap alloc per true
-    /// bignum (rare — `SmallInt` catches every integer that fits in
-    /// `i64`) and lines the enum up for a future shrink once those
-    /// other variants are squeezed into `Arc<[T]>` / similar.
-    Int(Box<BigInt>),
-    /// Fast-path integer: `i64`-sized, inline.  Produced by
-    /// `knot_value_int` / `alloc_int` for values in `i64` range that
-    /// aren't already covered by the small-int singleton cache.
-    /// Arithmetic preserves this variant when both operands fit and
-    /// the result doesn't overflow; on overflow, falls back to `Int`.
-    ///
-    /// Saves one heap allocation per non-singleton integer creation:
-    /// `BigInt::from(n)` internally allocates a `Vec<u32>` (currently
-    /// 16-24 bytes + the Vec header), which is the dominant cost for
-    /// integer-heavy workloads like row iteration or numeric reduction.
-    SmallInt(i64),
+    /// 64-bit signed integer, inline.  Produced by `knot_value_int` /
+    /// `alloc_int` for values that aren't already covered by the
+    /// small-int singleton cache or the i61-range pointer-tagged path.
+    /// Arithmetic uses checked operations and panics on overflow.
+    Int(i64),
     Float(f64),
     /// Immutable UTF-8 text.  Stored as `Arc<str>` so `clone()` is a
     /// refcount bump (not a heap allocation) and large strings shared
@@ -2126,72 +2105,40 @@ fn alloc(v: Value) -> *mut Value {
     ARENA.with(|a| a.borrow_mut().alloc(v))
 }
 
-/// Allocate an integer, returning a cached pointer for small values
-/// in the singleton range, a tagged pointer for i61-range values, a
-/// `SmallInt` for values that fit in `i64` but not i61, or a `BigInt`
-/// for larger values.
-fn alloc_int(n: BigInt) -> *mut Value {
-    if let Some(small) = n.to_i64() {
-        if small >= SMALL_INT_MIN && small <= SMALL_INT_MAX {
-            return SINGLETONS.with(|s| s.small_ints[(small - SMALL_INT_MIN) as usize]);
-        }
-        if let Some(tagged) = encode_smallint(small) {
-            return tagged;
-        }
-        return alloc(Value::SmallInt(small));
-    }
-    alloc(Value::Int(Box::new(n)))
-}
-
-/// Allocate an `i64`-sized integer directly.  The singleton cache for
-/// [-128, 127] is tried first, then pointer tagging for i61-range
-/// values (≈ 2.3 × 10^18), falling back to an arena `SmallInt` for the
-/// tails of the i64 range.  Tagged pointers carry the integer inline
-/// in the pointer's upper 61 bits with a `0b001` tag in the low 3
-/// bits; `as_ref` / callers that dereference route through a
-/// tagged-aware scratch ring, so tagged pointers can flow transparently
-/// through all existing runtime functions.
+/// Allocate an `i64` integer.  The singleton cache for `[-128, 127]`
+/// is tried first, then pointer tagging for i61-range values
+/// (≈ 2.3 × 10^18), falling back to an arena `Int` for the tails of
+/// the i64 range.  Tagged pointers carry the integer inline in the
+/// pointer's upper 61 bits with a `0b001` tag in the low 3 bits;
+/// `as_ref` / callers that dereference route through a tagged-aware
+/// scratch ring, so tagged pointers can flow transparently through all
+/// existing runtime functions.
 #[inline]
-fn alloc_small_int(n: i64) -> *mut Value {
+fn alloc_int(n: i64) -> *mut Value {
     if n >= SMALL_INT_MIN && n <= SMALL_INT_MAX {
         return SINGLETONS.with(|s| s.small_ints[(n - SMALL_INT_MIN) as usize]);
     }
     if let Some(tagged) = encode_smallint(n) {
         return tagged;
     }
-    alloc(Value::SmallInt(n))
+    alloc(Value::Int(n))
 }
 
-/// Extract an `i64` from a `SmallInt` or `Int` value without allocating.
-/// Returns `None` if the integer doesn't fit in `i64`.
+/// Extract an `i64` from an integer value without allocating.
 #[inline]
 fn int_as_i64(v: &Value) -> Option<i64> {
     match v {
-        Value::SmallInt(n) => Some(*n),
-        Value::Int(n) => n.to_i64(),
+        Value::Int(n) => Some(*n),
         _ => None,
     }
 }
 
-/// Produce a `BigInt` from either integer variant.  For `Int`, this
-/// clones; for `SmallInt`, this allocates a fresh `BigInt`.
-#[inline]
-#[allow(dead_code)]
-fn int_to_bigint(v: &Value) -> Option<BigInt> {
-    match v {
-        Value::SmallInt(n) => Some(BigInt::from(*n)),
-        Value::Int(n) => Some((**n).clone()),
-        _ => None,
-    }
-}
-
-/// Extract a `usize` from either integer variant.  Returns `None` if
-/// the value doesn't fit (e.g., negative or too large).
+/// Extract a `usize` from an integer value.  Returns `None` if the
+/// value doesn't fit (e.g., negative or too large).
 #[inline]
 fn int_as_usize(v: &Value) -> Option<usize> {
     match v {
-        Value::SmallInt(n) => usize::try_from(*n).ok(),
-        Value::Int(n) => n.to_usize(),
+        Value::Int(n) => usize::try_from(*n).ok(),
         _ => None,
     }
 }
@@ -2350,7 +2297,7 @@ fn type_name(v: *mut Value) -> &'static str {
         return "null";
     }
     match unsafe { as_ref(v) } {
-        Value::Int(_) | Value::SmallInt(_) => "Int",
+        Value::Int(_) => "Int",
         Value::Float(_) => "Float",
         Value::Text(_) => "Text",
         Value::Bool(_) => "Bool",
@@ -2371,7 +2318,6 @@ fn brief_value(v: *mut Value) -> String {
     }
     match unsafe { as_ref(v) } {
         Value::Int(n) => format!("Int({})", n),
-        Value::SmallInt(n) => format!("Int({})", n),
         Value::Float(n) => format!("Float({})", n),
         Value::Text(s) => {
             if s.len() > 30 {
@@ -2585,15 +2531,8 @@ impl Drop for TextLiteralCache {
 
 thread_local! {
     static SINGLETONS: ValueSingletons = ValueSingletons {
-        // Use the `SmallInt` fast-path variant so the singleton payload is a
-        // bare `i64` (no `BigInt::Vec<u32>` heap tail).  All integer
-        // arithmetic / equality paths treat `SmallInt` and `Int` as
-        // equivalent (see `values_equal`, `int_as_i64`, `int_as_bigint`),
-        // so callers that reach one of these 256 singletons via
-        // `alloc_int` or `alloc_small_int` get the same semantics with
-        // one less allocation per singleton and a smaller hot-path branch.
         small_ints: (SMALL_INT_MIN..=SMALL_INT_MAX)
-            .map(|n| Box::into_raw(Box::new(Value::SmallInt(n))))
+            .map(|n| Box::into_raw(Box::new(Value::Int(n))))
             .collect(),
         unit: Box::into_raw(Box::new(Value::Unit)),
         bool_true: Box::into_raw(Box::new(Value::Bool(true))),
@@ -2608,13 +2547,13 @@ thread_local! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_int(n: i64) -> *mut Value {
-    alloc_small_int(n)
+    alloc_int(n)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_int_from_str(ptr: *const u8, len: usize) -> *mut Value {
     let s = unsafe { str_from_raw(ptr, len) };
-    let n = s.parse::<BigInt>().unwrap_or_else(|e| panic!("knot runtime: invalid integer literal '{}': {}", s, e));
+    let n = s.parse::<i64>().unwrap_or_else(|e| panic!("knot runtime: invalid integer literal '{}': {}", s, e));
     alloc_int(n)
 }
 
@@ -2771,16 +2710,7 @@ pub extern "C" fn knot_value_bytes(ptr: *const u8, len: usize) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_get_int(v: *mut Value) -> i64 {
     match unsafe { as_ref(v) } {
-        Value::SmallInt(n) => *n,
-        Value::Int(n) => n.to_i64().unwrap_or_else(|| {
-            panic!(
-                "knot runtime: Int {} does not fit in i64 (range [{}, {}]) — \
-                 the runtime callsite expects a machine-sized integer",
-                n,
-                i64::MIN,
-                i64::MAX
-            )
-        }),
+        Value::Int(n) => *n,
         _ => panic!("knot runtime: expected Int, got {}", brief_value(v)),
     }
 }
@@ -2807,7 +2737,7 @@ pub extern "C" fn knot_value_get_tag(v: *mut Value) -> i32 {
         return 9; // Nullable none (null pointer)
     }
     match unsafe { as_ref(v) } {
-        Value::Int(_) | Value::SmallInt(_) => 0,
+        Value::Int(_) => 0,
         Value::Float(_) => 1,
         Value::Text(_) => 2,
         Value::Bool(_) => 3,
@@ -2972,7 +2902,7 @@ fn infer_col_type(v: *mut Value) -> Option<ColType> {
         return Some(ColType::Text);
     }
     match unsafe { as_ref(v) } {
-        Value::Int(_) | Value::SmallInt(_) => Some(ColType::Int),
+        Value::Int(_) => Some(ColType::Int),
         Value::Float(_) => Some(ColType::Float),
         Value::Text(_) => Some(ColType::Text),
         Value::Bool(_) => Some(ColType::Bool),
@@ -3059,7 +2989,7 @@ fn infer_temp_schema(rows: &[*mut Value]) -> Option<TempSchema> {
             Some(TempSchema::Adt { constructors: ctors, all_fields })
         }
         Value::Unit => Some(TempSchema::Unit),
-        Value::Int(_) | Value::SmallInt(_) => Some(TempSchema::Scalar(ColType::Int)),
+        Value::Int(_) => Some(TempSchema::Scalar(ColType::Int)),
         Value::Float(_) => Some(TempSchema::Scalar(ColType::Float)),
         Value::Text(_) => Some(TempSchema::Scalar(ColType::Text)),
         Value::Bool(_) => Some(TempSchema::Scalar(ColType::Bool)),
@@ -3586,7 +3516,7 @@ pub extern "C" fn knot_scalar_source_unwrap(rel: *mut Value) -> *mut Value {
     match unsafe { as_ref(rel) } {
         Value::Relation(rows) => {
             if rows.is_empty() {
-                alloc_int(BigInt::ZERO)
+                alloc_int(0)
             } else {
                 knot_record_field(rows[0], "_value".as_ptr(), 6)
             }
@@ -3642,14 +3572,7 @@ pub extern "C" fn knot_relation_take(
     rel: *mut Value,
 ) -> *mut Value {
     let n = match unsafe { as_ref(n_val) } {
-        Value::SmallInt(i) => (*i).max(0) as usize,
-        // BigInt larger than usize::MAX clamps to usize::MAX so semantics
-        // stay monotonic (huge n means "take everything"); a silent 0 would
-        // flip the meaning to "take nothing".
-        Value::Int(i) => i
-            .to_u64()
-            .and_then(|u| usize::try_from(u).ok())
-            .unwrap_or(usize::MAX),
+        Value::Int(i) => (*i).max(0) as usize,
         _ => 0,
     };
     match unsafe { as_ref(rel) } {
@@ -3668,11 +3591,7 @@ pub extern "C" fn knot_relation_drop(
     rel: *mut Value,
 ) -> *mut Value {
     let n = match unsafe { as_ref(n_val) } {
-        Value::SmallInt(i) => (*i).max(0) as usize,
-        Value::Int(i) => i
-            .to_u64()
-            .and_then(|u| usize::try_from(u).ok())
-            .unwrap_or(usize::MAX),
+        Value::Int(i) => (*i).max(0) as usize,
         _ => 0,
     };
     match unsafe { as_ref(rel) } {
@@ -4064,17 +3983,7 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
     match unsafe { as_ref(v) } {
         Value::Int(n) => {
             buf.push(0);
-            let bytes = n.to_signed_bytes_le();
-            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&bytes);
-        }
-        Value::SmallInt(n) => {
-            // Hash identically to BigInt(n) so SmallInt(5) and Int(5)
-            // produce the same hash (matching `values_equal`).
-            buf.push(0);
-            let bytes = BigInt::from(*n).to_signed_bytes_le();
-            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&bytes);
+            buf.extend_from_slice(&n.to_le_bytes());
         }
         Value::Float(f) => {
             buf.push(1);
@@ -4165,16 +4074,10 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
         return false; // a == b already handled both-null
     }
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
-        // Fast path: both SmallInt — direct i64 compare.
-        (Value::SmallInt(x), Value::SmallInt(y)) => x == y,
         (Value::Int(x), Value::Int(y)) => x == y,
-        (Value::SmallInt(x), Value::Int(y)) => BigInt::from(*x) == **y,
-        (Value::Int(x), Value::SmallInt(y)) => **x == BigInt::from(*y),
         (Value::Float(x), Value::Float(y)) => x.total_cmp(y) == std::cmp::Ordering::Equal,
-        (Value::Int(x), Value::Float(y)) => bigint_to_f64(x).total_cmp(y) == std::cmp::Ordering::Equal,
-        (Value::Float(x), Value::Int(y)) => x.total_cmp(&bigint_to_f64(y)) == std::cmp::Ordering::Equal,
-        (Value::SmallInt(x), Value::Float(y)) => (*x as f64).total_cmp(y) == std::cmp::Ordering::Equal,
-        (Value::Float(x), Value::SmallInt(y)) => x.total_cmp(&(*y as f64)) == std::cmp::Ordering::Equal,
+        (Value::Int(x), Value::Float(y)) => (*x as f64).total_cmp(y) == std::cmp::Ordering::Equal,
+        (Value::Float(x), Value::Int(y)) => x.total_cmp(&(*y as f64)) == std::cmp::Ordering::Equal,
         (Value::Text(x), Value::Text(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Bytes(x), Value::Bytes(y)) => x == y,
@@ -4217,24 +4120,15 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
 
 // ── Binary operations ─────────────────────────────────────────────
 
-fn bigint_to_f64(n: &BigInt) -> f64 {
-    n.to_f64().unwrap_or(if n.sign() == num_bigint::Sign::Minus { f64::NEG_INFINITY } else { f64::INFINITY })
-}
-
-/// Numeric view used by arithmetic and comparison after the SmallInt
-/// fast path failed.  `Int` and `SmallInt` are unified by widening
-/// SmallInt to BigInt.  Returns `None` for non-numeric values so the
-/// caller can produce a precise type error.
 enum NumView {
-    Int(BigInt),
+    Int(i64),
     Float(f64),
 }
 
 #[inline]
 fn to_num_view(v: &Value) -> Option<NumView> {
     match v {
-        Value::Int(n) => Some(NumView::Int((**n).clone())),
-        Value::SmallInt(n) => Some(NumView::Int(BigInt::from(*n))),
+        Value::Int(n) => Some(NumView::Int(*n)),
         Value::Float(f) => Some(NumView::Float(*f)),
         _ => None,
     }
@@ -4244,17 +4138,14 @@ fn to_num_view(v: &Value) -> Option<NumView> {
 pub extern "C" fn knot_value_add(a: *mut Value, b: *mut Value) -> *mut Value {
     let av = unsafe { as_ref(a) };
     let bv = unsafe { as_ref(b) };
-    // Fast path: SmallInt + SmallInt with overflow detection.
-    if let (Value::SmallInt(x), Value::SmallInt(y)) = (av, bv) {
-        if let Some(r) = x.checked_add(*y) {
-            return alloc_small_int(r);
-        }
-    }
     match (to_num_view(av), to_num_view(bv)) {
-        (Some(NumView::Int(x)), Some(NumView::Int(y))) => alloc_int(x + y),
+        (Some(NumView::Int(x)), Some(NumView::Int(y))) => match x.checked_add(y) {
+            Some(r) => alloc_int(r),
+            None => panic!("knot runtime: integer overflow in {} + {}", x, y),
+        },
         (Some(NumView::Float(x)), Some(NumView::Float(y))) => alloc_float(x + y),
-        (Some(NumView::Int(x)), Some(NumView::Float(y))) => alloc_float(bigint_to_f64(&x) + y),
-        (Some(NumView::Float(x)), Some(NumView::Int(y))) => alloc_float(x + bigint_to_f64(&y)),
+        (Some(NumView::Int(x)), Some(NumView::Float(y))) => alloc_float(x as f64 + y),
+        (Some(NumView::Float(x)), Some(NumView::Int(y))) => alloc_float(x + y as f64),
         _ => panic!("knot runtime: cannot add {} + {}", type_name(a), type_name(b)),
     }
 }
@@ -4263,16 +4154,14 @@ pub extern "C" fn knot_value_add(a: *mut Value, b: *mut Value) -> *mut Value {
 pub extern "C" fn knot_value_sub(a: *mut Value, b: *mut Value) -> *mut Value {
     let av = unsafe { as_ref(a) };
     let bv = unsafe { as_ref(b) };
-    if let (Value::SmallInt(x), Value::SmallInt(y)) = (av, bv) {
-        if let Some(r) = x.checked_sub(*y) {
-            return alloc_small_int(r);
-        }
-    }
     match (to_num_view(av), to_num_view(bv)) {
-        (Some(NumView::Int(x)), Some(NumView::Int(y))) => alloc_int(x - y),
+        (Some(NumView::Int(x)), Some(NumView::Int(y))) => match x.checked_sub(y) {
+            Some(r) => alloc_int(r),
+            None => panic!("knot runtime: integer overflow in {} - {}", x, y),
+        },
         (Some(NumView::Float(x)), Some(NumView::Float(y))) => alloc_float(x - y),
-        (Some(NumView::Int(x)), Some(NumView::Float(y))) => alloc_float(bigint_to_f64(&x) - y),
-        (Some(NumView::Float(x)), Some(NumView::Int(y))) => alloc_float(x - bigint_to_f64(&y)),
+        (Some(NumView::Int(x)), Some(NumView::Float(y))) => alloc_float(x as f64 - y),
+        (Some(NumView::Float(x)), Some(NumView::Int(y))) => alloc_float(x - y as f64),
         _ => panic!("knot runtime: cannot subtract {} - {}", type_name(a), type_name(b)),
     }
 }
@@ -4281,16 +4170,14 @@ pub extern "C" fn knot_value_sub(a: *mut Value, b: *mut Value) -> *mut Value {
 pub extern "C" fn knot_value_mul(a: *mut Value, b: *mut Value) -> *mut Value {
     let av = unsafe { as_ref(a) };
     let bv = unsafe { as_ref(b) };
-    if let (Value::SmallInt(x), Value::SmallInt(y)) = (av, bv) {
-        if let Some(r) = x.checked_mul(*y) {
-            return alloc_small_int(r);
-        }
-    }
     match (to_num_view(av), to_num_view(bv)) {
-        (Some(NumView::Int(x)), Some(NumView::Int(y))) => alloc_int(x * y),
+        (Some(NumView::Int(x)), Some(NumView::Int(y))) => match x.checked_mul(y) {
+            Some(r) => alloc_int(r),
+            None => panic!("knot runtime: integer overflow in {} * {}", x, y),
+        },
         (Some(NumView::Float(x)), Some(NumView::Float(y))) => alloc_float(x * y),
-        (Some(NumView::Int(x)), Some(NumView::Float(y))) => alloc_float(bigint_to_f64(&x) * y),
-        (Some(NumView::Float(x)), Some(NumView::Int(y))) => alloc_float(x * bigint_to_f64(&y)),
+        (Some(NumView::Int(x)), Some(NumView::Float(y))) => alloc_float(x as f64 * y),
+        (Some(NumView::Float(x)), Some(NumView::Int(y))) => alloc_float(x * y as f64),
         _ => panic!("knot runtime: cannot multiply {} * {}", type_name(a), type_name(b)),
     }
 }
@@ -4299,21 +4186,15 @@ pub extern "C" fn knot_value_mul(a: *mut Value, b: *mut Value) -> *mut Value {
 pub extern "C" fn knot_value_div(a: *mut Value, b: *mut Value) -> *mut Value {
     let av = unsafe { as_ref(a) };
     let bv = unsafe { as_ref(b) };
-    if let (Value::SmallInt(x), Value::SmallInt(y)) = (av, bv) {
-        if *y == 0 {
-            panic!("knot runtime: division by zero");
-        }
-        // Use checked_div to handle i64::MIN / -1 overflow case.
-        if let Some(r) = x.checked_div(*y) {
-            return alloc_small_int(r);
-        }
-    }
     match (to_num_view(av), to_num_view(bv)) {
         (Some(NumView::Int(x)), Some(NumView::Int(y))) => {
-            if y.is_zero() {
+            if y == 0 {
                 panic!("knot runtime: division by zero");
             }
-            alloc_int(x / y)
+            match x.checked_div(y) {
+                Some(r) => alloc_int(r),
+                None => panic!("knot runtime: integer overflow in {} / {}", x, y),
+            }
         }
         (Some(NumView::Float(x)), Some(NumView::Float(y))) => {
             if y == 0.0 {
@@ -4325,13 +4206,13 @@ pub extern "C" fn knot_value_div(a: *mut Value, b: *mut Value) -> *mut Value {
             if y == 0.0 {
                 panic!("knot runtime: division by zero");
             }
-            alloc_float(bigint_to_f64(&x) / y)
+            alloc_float(x as f64 / y)
         }
         (Some(NumView::Float(x)), Some(NumView::Int(y))) => {
-            if y.is_zero() {
+            if y == 0 {
                 panic!("knot runtime: division by zero");
             }
-            alloc_float(x / bigint_to_f64(&y))
+            alloc_float(x / y as f64)
         }
         _ => panic!("knot runtime: cannot divide {} / {}", type_name(a), type_name(b)),
     }
@@ -4367,17 +4248,14 @@ fn compare_lt(a: *mut Value, b: *mut Value) -> bool {
     }
     let av = unsafe { as_ref(a) };
     let bv = unsafe { as_ref(b) };
-    if let (Value::SmallInt(x), Value::SmallInt(y)) = (av, bv) {
-        return x < y;
-    }
     if let (Value::Text(x), Value::Text(y)) = (av, bv) {
         return x < y;
     }
     match (to_num_view(av), to_num_view(bv)) {
         (Some(NumView::Int(x)), Some(NumView::Int(y))) => x < y,
         (Some(NumView::Float(x)), Some(NumView::Float(y))) => x.total_cmp(&y) == std::cmp::Ordering::Less,
-        (Some(NumView::Int(x)), Some(NumView::Float(y))) => bigint_to_f64(&x).total_cmp(&y) == std::cmp::Ordering::Less,
-        (Some(NumView::Float(x)), Some(NumView::Int(y))) => x.total_cmp(&bigint_to_f64(&y)) == std::cmp::Ordering::Less,
+        (Some(NumView::Int(x)), Some(NumView::Float(y))) => (x as f64).total_cmp(&y) == std::cmp::Ordering::Less,
+        (Some(NumView::Float(x)), Some(NumView::Int(y))) => x.total_cmp(&(y as f64)) == std::cmp::Ordering::Less,
         _ => panic!("knot runtime: cannot compare {} < {}", type_name(a), type_name(b)),
     }
 }
@@ -4391,17 +4269,14 @@ fn compare_gt(a: *mut Value, b: *mut Value) -> bool {
     }
     let av = unsafe { as_ref(a) };
     let bv = unsafe { as_ref(b) };
-    if let (Value::SmallInt(x), Value::SmallInt(y)) = (av, bv) {
-        return x > y;
-    }
     if let (Value::Text(x), Value::Text(y)) = (av, bv) {
         return x > y;
     }
     match (to_num_view(av), to_num_view(bv)) {
         (Some(NumView::Int(x)), Some(NumView::Int(y))) => x > y,
         (Some(NumView::Float(x)), Some(NumView::Float(y))) => x.total_cmp(&y) == std::cmp::Ordering::Greater,
-        (Some(NumView::Int(x)), Some(NumView::Float(y))) => bigint_to_f64(&x).total_cmp(&y) == std::cmp::Ordering::Greater,
-        (Some(NumView::Float(x)), Some(NumView::Int(y))) => x.total_cmp(&bigint_to_f64(&y)) == std::cmp::Ordering::Greater,
+        (Some(NumView::Int(x)), Some(NumView::Float(y))) => (x as f64).total_cmp(&y) == std::cmp::Ordering::Greater,
+        (Some(NumView::Float(x)), Some(NumView::Int(y))) => x.total_cmp(&(y as f64)) == std::cmp::Ordering::Greater,
         _ => panic!("knot runtime: cannot compare {} > {}", type_name(a), type_name(b)),
     }
 }
@@ -4546,17 +4421,14 @@ pub extern "C" fn knot_value_compare_ord(a: *mut Value, b: *mut Value) -> i32 {
 fn compare_values(a: *mut Value, b: *mut Value) -> std::cmp::Ordering {
     let av = unsafe { as_ref(a) };
     let bv = unsafe { as_ref(b) };
-    if let (Value::SmallInt(x), Value::SmallInt(y)) = (av, bv) {
-        return x.cmp(y);
-    }
     if let (Value::Text(x), Value::Text(y)) = (av, bv) {
         return x.cmp(y);
     }
     match (to_num_view(av), to_num_view(bv)) {
         (Some(NumView::Int(x)), Some(NumView::Int(y))) => x.cmp(&y),
         (Some(NumView::Float(x)), Some(NumView::Float(y))) => x.total_cmp(&y),
-        (Some(NumView::Int(x)), Some(NumView::Float(y))) => bigint_to_f64(&x).total_cmp(&y),
-        (Some(NumView::Float(x)), Some(NumView::Int(y))) => x.total_cmp(&bigint_to_f64(&y)),
+        (Some(NumView::Int(x)), Some(NumView::Float(y))) => (x as f64).total_cmp(&y),
+        (Some(NumView::Float(x)), Some(NumView::Int(y))) => x.total_cmp(&(y as f64)),
         _ => panic!(
             "knot runtime: cannot compare {} with {}",
             type_name(a),
@@ -4585,11 +4457,10 @@ pub extern "C" fn knot_ordering_tag_i32(v: *mut Value) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_value_negate(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
-        Value::SmallInt(n) => match n.checked_neg() {
-            Some(r) => alloc_small_int(r),
-            None => alloc_int(-BigInt::from(*n)),
+        Value::Int(n) => match n.checked_neg() {
+            Some(r) => alloc_int(r),
+            None => panic!("knot runtime: integer overflow in negation of {}", n),
         },
-        Value::Int(n) => alloc_int(-&**n),
         Value::Float(n) => alloc_float(-n),
         _ => panic!("knot runtime: cannot negate {}", type_name(v)),
     }
@@ -4630,7 +4501,6 @@ fn format_value(v: *mut Value) -> String {
     }
     match unsafe { as_ref(v) } {
         Value::Int(n) => n.to_string(),
-        Value::SmallInt(n) => n.to_string(),
         Value::Float(n) => {
             if n.is_nan() || n.is_infinite() {
                 format!("{}", n)
@@ -4751,7 +4621,6 @@ pub extern "C" fn knot_value_show(v: *mut Value) -> *mut Value {
         }
         match unsafe { as_ref(v) } {
             Value::Int(n) => n.to_string(),
-            Value::SmallInt(n) => n.to_string(),
             Value::Float(n) => {
                 if n.is_nan() || n.is_infinite() {
                     format!("{}", n)
@@ -4927,7 +4796,6 @@ pub extern "C" fn knot_io_map(f: *mut Value, io: *mut Value) -> *mut Value {
 /// atomic increments — large strings/blobs in fork envs are shared
 /// across threads without copying.  Records and Relations still require
 /// fresh Vec allocation (their backing is mutable `Vec`, not an Arc).
-/// BigInt is cloned (its internal Vec is deep-copied).
 /// Iterative deep-clone.  Uses an explicit work stack so a deeply
 /// nested structure (a long linked list in an ADT, a record whose
 /// field is another record whose field is another ...) can't blow the
@@ -4959,8 +4827,7 @@ fn deep_clone_value(val: *mut Value) -> *mut Value {
         // compound variants have placeholder-null children to be filled
         // in phase 2.
         let shell = match unsafe { &*src } {
-            Value::Int(n) => Value::Int(n.clone()),
-            Value::SmallInt(n) => Value::SmallInt(*n),
+            Value::Int(n) => Value::Int(*n),
             Value::Float(f) => Value::Float(*f),
             Value::Text(s) => Value::Text(s.clone()),
             Value::Bool(b) => Value::Bool(*b),
@@ -6122,7 +5989,7 @@ pub extern "C" fn knot_relation_sum(
             type_name(rel)
         ),
     };
-    let mut acc = alloc_int(BigInt::ZERO);
+    let mut acc = alloc_int(0);
     for &row in rows {
         let val = knot_value_call(db, f, row);
         acc = knot_value_add(acc, val);
@@ -6159,8 +6026,7 @@ pub extern "C" fn knot_relation_avg(
     for &row in rows {
         let val = knot_value_call(db, f, row);
         let x = match unsafe { as_ref(val) } {
-            Value::Int(n) => bigint_to_f64(n),
-            Value::SmallInt(n) => *n as f64,
+            Value::Int(n) => *n as f64,
             Value::Float(n) => *n,
             _ => panic!(
                 "knot runtime: avg projection must return Int or Float, got {}",
@@ -6201,7 +6067,7 @@ pub extern "C" fn knot_relation_count_where(
             ),
         }
     }
-    alloc_int(BigInt::from(n))
+    alloc_int(n)
 }
 
 /// min(f, rel) — minimum of f(x) for each x in rel.
@@ -6620,13 +6486,11 @@ fn json_to_value(json: &serde_json::Value) -> *mut Value {
         serde_json::Value::Bool(b) => alloc_bool(*b),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                alloc_int(BigInt::from(i))
-            } else if let Some(u) = n.as_u64() {
-                alloc_int(BigInt::from(u))
+                alloc_int(i)
             } else if let Some(f) = n.as_f64() {
                 alloc_float(f)
             } else {
-                alloc_int(BigInt::ZERO)
+                alloc_int(0)
             }
         }
         serde_json::Value::String(s) => alloc(Value::Text(Arc::from(s.as_str()))),
@@ -6639,15 +6503,9 @@ fn json_to_value(json: &serde_json::Value) -> *mut Value {
                 return alloc(Value::Record(Vec::new()));
             }
             // Reconstruct Bytes from {"__knot_bytes": "base64..."} format
-            // Reconstruct BigInt from {"__knot_bigint": "12345..."} format
             if obj.len() == 1 {
                 if let Some(serde_json::Value::String(b64)) = obj.get("__knot_bytes") {
                     return alloc(Value::Bytes(Arc::from(base64_decode(b64))));
-                }
-                if let Some(serde_json::Value::String(s)) = obj.get("__knot_bigint") {
-                    if let Ok(n) = s.parse::<BigInt>() {
-                        return alloc_int(n);
-                    }
                 }
             }
             // Reconstruct Constructor from the `__knot_ctor` marker shape
@@ -6812,7 +6670,7 @@ pub extern "C" fn knot_db_open(path_ptr: *const u8, path_len: usize) -> *mut c_v
     *DB_PATH.lock().unwrap() = path.to_string();
     let conn = Connection::open(path).expect("knot runtime: failed to open database");
     conn.create_collation("KNOT_INT", |a: &str, b: &str| {
-        match (a.parse::<BigInt>(), b.parse::<BigInt>()) {
+        match (a.parse::<i64>(), b.parse::<i64>()) {
             (Ok(pa), Ok(pb)) => pa.cmp(&pb),
             (Ok(_), Err(_)) => std::cmp::Ordering::Less,
             (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
@@ -7299,15 +7157,10 @@ fn read_sql_column(row: &rusqlite::Row, i: usize, ty: ColType) -> *mut Value {
     match ty {
         ColType::Int => {
             match row.get_ref(i).unwrap_or_else(|_| panic!("{}", mismatch())) {
-                ValueRef::Integer(n) => alloc_int(BigInt::from(n)),
-                ValueRef::Blob(b) => {
-                    let s = std::str::from_utf8(b).expect("knot runtime: invalid UTF-8 in bigint blob");
-                    let n: BigInt = s.parse().expect("knot runtime: invalid bigint in column");
-                    alloc_int(n)
-                }
+                ValueRef::Integer(n) => alloc_int(n),
                 ValueRef::Text(s) => {
                     let s = std::str::from_utf8(s).expect("knot runtime: invalid UTF-8 in int column");
-                    let n: BigInt = s.parse().expect("knot runtime: invalid bigint in column");
+                    let n: i64 = s.parse().expect("knot runtime: invalid integer in column");
                     alloc_int(n)
                 }
                 other => panic!("knot runtime: unexpected SQLite type for Int column {}: {:?}", i, other),
@@ -7930,7 +7783,7 @@ pub extern "C" fn knot_source_query_count(
         .conn
         .query_row(sql, param_refs.as_slice(), |row| row.get(0))
         .unwrap_or_else(|e| panic!("knot runtime: query_count error: {}\n  SQL: {}", e, sql));
-    alloc_int(BigInt::from(count))
+    alloc_int(count)
 }
 
 /// Execute a SQL aggregate query returning a float (e.g. AVG).
@@ -7999,20 +7852,20 @@ pub extern "C" fn knot_source_query_sum(
         .conn
         .query_row(sql, param_refs.as_slice(), |row| {
             match row.get_ref(0).unwrap() {
-                ValueRef::Null => Ok(alloc_int(BigInt::ZERO)),
-                ValueRef::Integer(n) => Ok(alloc_int(BigInt::from(n))),
+                ValueRef::Null => Ok(alloc_int(0)),
+                ValueRef::Integer(n) => Ok(alloc_int(n)),
                 ValueRef::Real(f) => Ok(alloc_float(f)),
                 ValueRef::Text(s) => {
                     let s = std::str::from_utf8(s).expect("knot runtime: invalid UTF-8 in sum result");
-                    if let Ok(n) = s.parse::<BigInt>() {
+                    if let Ok(n) = s.parse::<i64>() {
                         Ok(alloc_int(n))
                     } else if let Ok(f) = s.parse::<f64>() {
                         Ok(alloc_float(f))
                     } else {
-                        Ok(alloc_int(BigInt::ZERO))
+                        Ok(alloc_int(0))
                     }
                 }
-                _ => Ok(alloc_int(BigInt::ZERO)),
+                _ => Ok(alloc_int(0)),
             }
         })
         .unwrap_or_else(|e| panic!("knot runtime: query_sum error: {}\n  SQL: {}", e, sql))
@@ -8050,7 +7903,7 @@ pub extern "C" fn knot_source_query_value(
         .query_row(sql, param_refs.as_slice(), |row| {
             match row.get_ref(0).unwrap() {
                 ValueRef::Null => panic!("knot runtime: aggregate on empty relation\n  SQL: {}", sql),
-                ValueRef::Integer(n) => Ok(alloc_int(BigInt::from(n))),
+                ValueRef::Integer(n) => Ok(alloc_int(n)),
                 ValueRef::Real(f) => Ok(alloc_float(f)),
                 ValueRef::Text(s) => {
                     let s = std::str::from_utf8(s)
@@ -8083,7 +7936,7 @@ pub extern "C" fn knot_source_count(
         .conn
         .query_row(&sql, [], |row| row.get(0))
         .unwrap_or_else(|e| panic!("knot runtime: count error: {}", e));
-    alloc_int(BigInt::from(count))
+    alloc_int(count)
 }
 
 /// Read rows from a source relation with a WHERE clause.
@@ -9501,7 +9354,6 @@ fn value_to_sql_param(v: *mut Value) -> rusqlite::types::Value {
     }
     match unsafe { as_ref(v) } {
         Value::Int(n) => rusqlite::types::Value::Text(n.to_string()),
-        Value::SmallInt(n) => rusqlite::types::Value::Text(n.to_string()),
         Value::Float(n) => rusqlite::types::Value::Real(*n),
         Value::Text(s) => rusqlite::types::Value::Text((**s).to_string()),
         Value::Bool(b) => rusqlite::types::Value::Integer(*b as i64),
@@ -9523,7 +9375,6 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
     }
     match (unsafe { as_ref(v) }, ty) {
         (Value::Int(n), _) => rusqlite::types::Value::Text(n.to_string()),
-        (Value::SmallInt(n), _) => rusqlite::types::Value::Text(n.to_string()),
         (Value::Float(n), _) => rusqlite::types::Value::Real(*n),
         (Value::Text(s), _) => rusqlite::types::Value::Text((**s).to_string()),
         (Value::Bool(b), _) => rusqlite::types::Value::Integer(*b as i64),
@@ -9563,8 +9414,7 @@ pub extern "C" fn knot_now() -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_sleep(ms_val: *mut Value) -> *mut Value {
     let ms: u64 = match unsafe { as_ref(ms_val) } {
-        Value::SmallInt(i) => u64::try_from(*i).expect("knot runtime: sleep duration must be non-negative"),
-        Value::Int(i) => i.to_u64().expect("knot runtime: sleep duration must be non-negative"),
+        Value::Int(i) => u64::try_from(*i).expect("knot runtime: sleep duration must be non-negative"),
         _ => panic!("knot runtime: sleep expects Int argument"),
     };
     std::thread::sleep(std::time::Duration::from_millis(ms));
@@ -9577,8 +9427,7 @@ pub extern "C" fn knot_sleep(ms_val: *mut Value) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_random_int(bound: *mut Value) -> *mut Value {
     let n: u64 = match unsafe { as_ref(bound) } {
-        Value::SmallInt(i) => u64::try_from(*i).expect("knot runtime: randomInt bound must be positive"),
-        Value::Int(i) => i.to_u64().expect("knot runtime: randomInt bound must be positive"),
+        Value::Int(i) => u64::try_from(*i).expect("knot runtime: randomInt bound must be positive"),
         _ => panic!(
             "knot runtime: randomInt expected Int, got {}",
             type_name(bound)
@@ -9595,7 +9444,7 @@ pub extern "C" fn knot_random_int(bound: *mut Value) -> *mut Value {
             break raw % n;
         }
     };
-    alloc_int(BigInt::from(result))
+    alloc_int(result as i64)
 }
 
 /// Return a random Float in [0.0, 1.0).
@@ -11168,7 +11017,7 @@ fn hex_val(b: u8) -> Option<u8> {
 fn string_to_value(s: &str, ty: &str) -> *mut Value {
     match ty {
         "int" => {
-            let n: BigInt = s.parse().unwrap_or(BigInt::ZERO);
+            let n: i64 = s.parse().unwrap_or(0);
             alloc_int(n)
         }
         "float" => {
@@ -11192,7 +11041,7 @@ fn string_to_value(s: &str, ty: &str) -> *mut Value {
 /// hide caller bugs and let malformed traffic through unannotated).
 fn try_string_to_value(s: &str, ty: &str) -> Option<*mut Value> {
     match ty {
-        "int" => s.parse::<BigInt>().ok().map(alloc_int),
+        "int" => s.parse::<i64>().ok().map(alloc_int),
         "float" => s.parse::<f64>().ok().map(alloc_float),
         "bool" => match s {
             "true" | "True" => Some(alloc_bool(true)),
@@ -11284,17 +11133,7 @@ fn value_to_serde_json(v: *mut Value) -> serde_json::Value {
         return serde_json::Value::Null;
     }
     match unsafe { as_ref(v) } {
-        Value::Int(n) => {
-            if let Some(i) = n.to_i64() {
-                serde_json::Value::Number(i.into())
-            } else {
-                // BigInt too large for i64 — encode as tagged object for lossless round-trip
-                let mut map = serde_json::Map::with_capacity(1);
-                map.insert("__knot_bigint".into(), serde_json::Value::String(n.to_string()));
-                serde_json::Value::Object(map)
-            }
-        }
-        Value::SmallInt(n) => serde_json::Value::Number((*n).into()),
+        Value::Int(n) => serde_json::Value::Number((*n).into()),
         Value::Float(n) => {
             if n.is_finite() {
                 serde_json::json!(*n)
@@ -11555,12 +11394,11 @@ pub extern "C" fn knot_http_config_init() {
     }
 }
 
-/// Parse a `Value` carrying a port number (SmallInt or Int) into a `u16`.
+/// Parse a `Value` carrying a port number into a `u16`.
 /// Used by both `knot_http_listen` and `knot_http_listen_on`.
 fn parse_port_value(port_val: *mut Value, fn_name: &str) -> u16 {
     match unsafe { as_ref(port_val) } {
-        Value::SmallInt(n) => u16::try_from(*n).expect("knot runtime: port number out of range"),
-        Value::Int(n) => n.to_u16().expect("knot runtime: port number out of range"),
+        Value::Int(n) => u16::try_from(*n).expect("knot runtime: port number out of range"),
         _ => panic!(
             "knot runtime: {} expects Int port, got {}",
             fn_name,
@@ -12500,7 +12338,6 @@ fn fetch_value_to_text(v: *mut Value) -> String {
     }
     match unsafe { as_ref(v) } {
         Value::Int(n) => n.to_string(),
-        Value::SmallInt(n) => n.to_string(),
         Value::Float(n) => n.to_string(),
         Value::Text(s) => (**s).to_string(),
         Value::Bool(b) => b.to_string(),
@@ -12532,7 +12369,7 @@ fn fetch_build_err(status: u16, message: &str) -> *mut Value {
         },
         RecordField {
             name: "status".into(),
-            value: alloc_int(BigInt::from(status)),
+            value: alloc_int(status as i64),
         },
     ]));
     alloc(Value::Constructor(
@@ -12926,16 +12763,7 @@ fn serialize_value_for_hash_into(v: *mut Value, buf: &mut Vec<u8>) {
     match unsafe { as_ref(v) } {
         Value::Int(n) => {
             buf.push(0);
-            let bytes = n.to_signed_bytes_le();
-            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&bytes);
-        }
-        Value::SmallInt(n) => {
-            // Match BigInt(n) hash for cross-path consistency.
-            buf.push(0);
-            let bytes = BigInt::from(*n).to_signed_bytes_le();
-            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&bytes);
+            buf.extend_from_slice(&n.to_le_bytes());
         }
         Value::Float(f) => {
             buf.push(1);

@@ -9782,8 +9782,6 @@ fn expr_is_promote_safe(expr: &ast::Expr) -> bool {
     match &expr.node {
         ast::ExprKind::Lit(lit) => match lit {
             ast::Literal::Int(s) => {
-                // Small-int singletons cover -128..=127; anything outside
-                // allocates a fresh BigInt, which must be promoted.
                 s.parse::<i64>().map_or(false, |n| (-128..=127).contains(&n))
             }
             ast::Literal::Bool(_) => true,
@@ -9940,11 +9938,11 @@ fn aggregate_sql_func_runtime(name: &str) -> Option<(&'static str, &'static str)
 
 /// Wrap a column SQL expression for use inside MIN/MAX so integer-typed
 /// columns sort numerically rather than lexicographically. Knot stores
-/// `Int` columns as `TEXT COLLATE KNOT_INT` (to support arbitrary BigInts),
-/// but SQLite does not propagate column collation through MIN/MAX, so we
-/// add `COLLATE KNOT_INT` explicitly when the projection is a simple Int
-/// field access. For Float/Text columns and arithmetic expressions, the
-/// expression is returned unchanged.
+/// `Int` columns as `TEXT COLLATE KNOT_INT`, but SQLite does not propagate
+/// column collation through MIN/MAX, so we add `COLLATE KNOT_INT`
+/// explicitly when the projection is a simple Int field access. For
+/// Float/Text columns and arithmetic expressions, the expression is
+/// returned unchanged.
 fn col_sql_for_minmax(
     col_sql: &str,
     bind_var: &str,

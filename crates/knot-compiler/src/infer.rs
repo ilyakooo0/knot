@@ -55,11 +55,9 @@ pub type LocalTypeInfo = HashMap<Span, String>;
 pub type FromJsonTargets = HashMap<Span, String>;
 
 /// Spans of `elem needle haystack` haystack arguments whose element type is a
-/// SQL-pushable scalar (Text/Float/Bool, peeling aliases & refined types).
+/// SQL-pushable scalar (Int/Text/Float/Bool, peeling aliases & refined types).
 /// Codegen consults this set to decide whether to emit
 /// `IN (SELECT value FROM json_each(?))` for dynamic haystacks.
-/// Int (BigInt) is intentionally excluded — the JSON encoding for ints that
-/// don't fit i64 produces tagged objects that don't compare cleanly.
 pub type ElemPushdownOk = HashSet<Span>;
 
 // ── Units of measure ──────────────────────────────────────────────
@@ -499,9 +497,8 @@ impl Infer {
     }
 
     /// Whether a resolved haystack type for `elem` is SQL-pushable: it must
-    /// be `[a]` (`Ty::Relation`) and `a` must be Text/Float/Bool — Int is
-    /// excluded because BigInts that don't fit i64 JSON-encode as tagged
-    /// objects, and ADTs/Records would JSON-encode as objects too.
+    /// be `[a]` (`Ty::Relation`) and `a` must be a scalar (Int/Text/Float/Bool)
+    /// — ADTs/Records would JSON-encode as objects and don't compare cleanly.
     fn is_elem_haystack_pushable(&self, ty: &Ty) -> bool {
         let peeled = ty.peel_alias();
         let inner = match peeled {
@@ -513,7 +510,7 @@ impl Infer {
 
     fn is_sql_pushable_scalar_for_elem(&self, ty: &Ty) -> bool {
         match ty.peel_alias() {
-            Ty::Text | Ty::Float | Ty::Bool | Ty::FloatUnit(_) => true,
+            Ty::Int | Ty::Text | Ty::Float | Ty::Bool | Ty::IntUnit(_) | Ty::FloatUnit(_) => true,
             // Refined nominal alias `type Nat = Int where ...` shows up as
             // `Con(name, [])`; recurse to its base type.
             Ty::Con(name, args) if args.is_empty() => {
@@ -522,7 +519,6 @@ impl Infer {
                     .map(|(base, _)| self.is_sql_pushable_scalar_for_elem(base))
                     .unwrap_or(false)
             }
-            // Int / IntUnit explicitly excluded per BigInt encoding concern.
             _ => false,
         }
     }

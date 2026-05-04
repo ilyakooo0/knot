@@ -5163,6 +5163,22 @@ impl Infer {
             )),
         );
 
+        // elem : ∀a. a -> [a] -> Bool
+        let a = self.fresh_var();
+        self.bind_top(
+            "elem",
+            Scheme::poly(
+                vec![a],
+                Ty::Fun(
+                    Box::new(Ty::Var(a)),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        Box::new(Ty::Bool),
+                    )),
+                ),
+            ),
+        );
+
         // reverse : Text -> Text
         self.bind_top(
             "reverse",

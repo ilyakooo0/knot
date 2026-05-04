@@ -41,7 +41,7 @@ pub const PURE_BUILTINS: &[&str] = &[
     "show", "union", "count", "filter", "match", "map",
     "fold", "single", "diff", "inter", "sum", "avg",
     "toUpper", "toLower", "take", "drop",
-    "length", "trim", "contains", "reverse", "chars",
+    "length", "trim", "contains", "elem", "reverse", "chars",
     "id", "not", "toJson", "parseJson",
     "decrypt", "sign", "verify",
 ];

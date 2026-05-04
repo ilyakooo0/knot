@@ -6339,6 +6339,25 @@ pub extern "C" fn knot_text_contains(needle: *mut Value, haystack: *mut Value) -
     }
 }
 
+/// elem(needle, haystack) — check if a list contains a value (by structural equality)
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_list_elem(needle: *mut Value, haystack: *mut Value) -> *mut Value {
+    match unsafe { as_ref(haystack) } {
+        Value::Relation(rows) => {
+            for row in rows.iter() {
+                if values_equal(needle, *row) {
+                    return alloc_bool(true);
+                }
+            }
+            alloc_bool(false)
+        }
+        _ => panic!(
+            "knot runtime: elem expected list as second arg, got {}",
+            type_name(haystack)
+        ),
+    }
+}
+
 /// reverse(text) — reverse a text value
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_text_reverse(v: *mut Value) -> *mut Value {

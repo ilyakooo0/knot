@@ -731,6 +731,7 @@ impl Codegen {
         self.declare_rt("knot_text_length", &[p], &[p]);
         self.declare_rt("knot_text_trim", &[p], &[p]);
         self.declare_rt("knot_text_contains", &[p, p], &[p]);
+        self.declare_rt("knot_list_elem", &[p, p], &[p]);
         self.declare_rt("knot_text_reverse", &[p], &[p]);
         self.declare_rt("knot_text_chars", &[p], &[p]);
 
@@ -1073,7 +1074,7 @@ impl Codegen {
             "filter", "match", "single", "diff", "inter", "sum", "avg",
             "min", "max", "countWhere",
             "toUpper", "toLower", "take", "drop", "sortBy", "takeRelation", "dropRelation",
-            "length", "trim", "contains", "reverse",
+            "length", "trim", "contains", "elem", "reverse",
             "chars", "id", "not",
             "stripUnit", "withUnit", "stripFloatUnit", "withFloatUnit",
             "bytesLength", "bytesSlice", "bytesConcat",
@@ -2080,6 +2081,7 @@ impl Codegen {
         self.define_stdlib_fn_2("takeRelation", "knot_relation_take", false);
         self.define_stdlib_fn_2("dropRelation", "knot_relation_drop", false);
         self.define_stdlib_fn_2("contains", "knot_text_contains", false);
+        self.define_stdlib_fn_2("elem", "knot_list_elem", false);
         self.define_stdlib_fn_2("diff", "knot_relation_diff", true);
         self.define_stdlib_fn_2("inter", "knot_relation_inter", true);
         self.define_stdlib_fn_2("sum", "knot_relation_sum", true);
@@ -8872,6 +8874,34 @@ impl Codegen {
                                 params,
                             });
                         }
+                        if name == "elem" {
+                            // elem needle [a, b, ...] → needle IN (a, b, ...)
+                            // The list arg must be a syntactic list literal; its
+                            // elements can be any sql-pushable atom (literal, var,
+                            // or field access).
+                            let needle = Self::try_compile_single_table_atom(bind_var, first_arg)?;
+                            let elems = match &arg.node {
+                                ast::ExprKind::List(es) => es,
+                                _ => return None,
+                            };
+                            if elems.is_empty() {
+                                return Some(SqlFragment {
+                                    sql: "0".to_string(),
+                                    params: vec![],
+                                });
+                            }
+                            let mut parts = Vec::with_capacity(elems.len());
+                            let mut params = needle.params;
+                            for e in elems {
+                                let frag = Self::try_compile_single_table_atom(bind_var, e)?;
+                                parts.push(frag.sql);
+                                params.extend(frag.params);
+                            }
+                            return Some(SqlFragment {
+                                sql: format!("{} IN ({})", needle.sql, parts.join(", ")),
+                                params,
+                            });
+                        }
                     }
                 }
                 None
@@ -10672,6 +10702,33 @@ fn try_sql_inline_condition(
                         let needle = try_sql_arithmetic_expr(bind_var, first_arg, alias, schema)?;
                         let haystack = try_sql_arithmetic_expr(bind_var, arg, alias, schema)?;
                         return Some(format!("INSTR({}, {}) > 0", haystack, needle));
+                    }
+                    if name == "elem" {
+                        // elem (bind_var.field) [lit, lit, ...] → field IN (lit, lit, ...)
+                        // Empty list → always-false (`0`).
+                        let col = try_sql_arithmetic_expr(bind_var, first_arg, alias, schema)?;
+                        let elems = match &arg.node {
+                            ast::ExprKind::List(es) => es,
+                            _ => return None,
+                        };
+                        if elems.is_empty() {
+                            return Some("0".to_string());
+                        }
+                        let mut parts = Vec::with_capacity(elems.len());
+                        for e in elems {
+                            match &e.node {
+                                ast::ExprKind::Lit(ast::Literal::Int(n)) => parts.push(n.to_string()),
+                                ast::ExprKind::Lit(ast::Literal::Float(f)) => parts.push(f.to_string()),
+                                ast::ExprKind::Lit(ast::Literal::Text(s)) => {
+                                    parts.push(format!("'{}'", s.replace('\'', "''")))
+                                }
+                                ast::ExprKind::Lit(ast::Literal::Bool(b)) => {
+                                    parts.push(if *b { "1" } else { "0" }.to_string())
+                                }
+                                _ => return None,
+                            }
+                        }
+                        return Some(format!("{} IN ({})", col, parts.join(", ")));
                     }
                 }
             }

@@ -617,6 +617,18 @@ fn try_compile_sql_expr(bind_var: &str, expr: &Expr) -> Option<()> {
                         try_sql_atom(bind_var, first_arg)?;
                         return try_sql_atom(bind_var, arg);
                     }
+                    if name == "elem" {
+                        try_sql_atom(bind_var, first_arg)?;
+                        // The list arg must be a literal list; each element must
+                        // be a sql-pushable atom.
+                        if let ExprKind::List(elems) = &arg.node {
+                            for e in elems {
+                                try_sql_atom(bind_var, e)?;
+                            }
+                            return Some(());
+                        }
+                        return None;
+                    }
                 }
             }
             None
@@ -1134,6 +1146,23 @@ fn try_sql_inline_cond(bind_var: &str, expr: &Expr) -> Option<()> {
                         try_sql_column_expr(bind_var, first_arg)?;
                         return try_sql_column_expr(bind_var, arg);
                     }
+                    if name == "elem" {
+                        try_sql_column_expr(bind_var, first_arg)?;
+                        // The list arg must be a literal list of scalar literals.
+                        if let ExprKind::List(elems) = &arg.node {
+                            for e in elems {
+                                match &e.node {
+                                    ExprKind::Lit(Literal::Int(_))
+                                    | ExprKind::Lit(Literal::Float(_))
+                                    | ExprKind::Lit(Literal::Text(_))
+                                    | ExprKind::Lit(Literal::Bool(_)) => {}
+                                    _ => return None,
+                                }
+                            }
+                            return Some(());
+                        }
+                        return None;
+                    }
                 }
             }
             None
@@ -1309,6 +1338,35 @@ mod tests {
                yield p\n",
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
+    }
+
+    #[test]
+    fn no_lint_on_elem_literal_list_in_where() {
+        // elem with a literal list pushes down to SQL IN (...).
+        let diags = lint(
+            "type T = {name: Text, status: Text}\n\
+             *items : [T]\n\
+             main = do\n\
+               i <- *items\n\
+               where elem i.status [\"open\", \"pending\"]\n\
+               yield i\n",
+        );
+        assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
+    }
+
+    #[test]
+    fn lint_on_elem_non_literal_list_in_where() {
+        // elem against a non-literal list cannot be pushed to SQL IN.
+        let diags = lint(
+            "type T = {name: Text, status: Text}\n\
+             *items : [T]\n\
+             allowed = [\"open\", \"pending\"]\n\
+             main = do\n\
+               i <- *items\n\
+               where elem i.status allowed\n\
+               yield i\n",
+        );
+        assert!(!diags.is_empty(), "expected diagnostic for non-literal list");
     }
 
     #[test]

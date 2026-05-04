@@ -94,8 +94,18 @@ fn main() {
     let (connection, io_threads) = Connection::stdio();
 
     let mut server_capabilities = serde_json::to_value(ServerCapabilities {
-        text_document_sync: Some(TextDocumentSyncCapability::Kind(
-            TextDocumentSyncKind::INCREMENTAL,
+        text_document_sync: Some(TextDocumentSyncCapability::Options(
+            TextDocumentSyncOptions {
+                open_close: Some(true),
+                change: Some(TextDocumentSyncKind::INCREMENTAL),
+                // Save events drive the didSave robustness backstop in the
+                // notification handler. We don't request `include_text` —
+                // the buffer the editor saved already matches the source we
+                // last analyzed (didSave fires after didChange), so re-reading
+                // it would be wasted bandwidth.
+                save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+                ..Default::default()
+            },
         )),
         document_symbol_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
@@ -274,7 +284,6 @@ fn main() {
         inference_cache,
         semantic_token_cache: HashMap::new(),
         semantic_token_counter: 0,
-        published_diag_hashes: HashMap::new(),
         published_lsp_diagnostics: HashMap::new(),
         client_supports_diagnostic_refresh,
         diagnostic_refresh_counter: 0,
@@ -948,9 +957,6 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
                 state
                     .published_lsp_diagnostics
                     .insert(uri.clone(), rebased);
-                // The hash dedup uses range positions, so drop the cached
-                // hash — the next real analysis publish must go through.
-                state.published_diag_hashes.remove(&uri);
                 // Don't send a refresh here: pull-mode clients would re-pull
                 // and see the still-stale `state.documents.knot_diagnostics`
                 // (analysis hasn't caught up yet). The post-analysis refresh
@@ -1062,6 +1068,31 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
                 queue_analysis(state, dep_uri, dep_source, None);
             }
         }
+    } else if not.method == notification::DidSaveTextDocument::METHOD {
+        // Save is a robustness backstop: re-render whatever diagnostics we
+        // currently believe are correct and bypass the dedup, so any prior
+        // dropped/coalesced publish (or an out-of-sync editor) gets a fresh
+        // copy. Doesn't queue analysis — the source is already what we just
+        // analyzed, save events carry no new content (we don't opt into
+        // `includeText`).
+        let Some(params) =
+            decode::<DidSaveTextDocumentParams>(&not.method, not.params)
+        else {
+            return;
+        };
+        let uri = params.text_document.uri;
+        if let Some(doc) = state.documents.get(&uri) {
+            let lsp_diags: Vec<Diagnostic> = doc
+                .knot_diagnostics
+                .iter()
+                .filter_map(|d| crate::diagnostics::to_lsp_diagnostic(d, &doc.source, &uri))
+                .collect();
+            // Force-publish: clear the dedup cache first so the publish always
+            // goes out, then update the cache to the just-sent list.
+            state.published_lsp_diagnostics.remove(&uri);
+            publish_diagnostics_dedup(state, conn, &uri, lsp_diags, None);
+            request_workspace_diagnostic_refresh(state, conn);
+        }
     } else if not.method == notification::DidCloseTextDocument::METHOD {
         let Some(params) =
             decode::<DidCloseTextDocumentParams>(&not.method, not.params)
@@ -1072,10 +1103,9 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
         state.pending_sources.remove(&params.text_document.uri);
         state.semantic_token_cache.remove(&params.text_document.uri);
         // Drop the diagnostic-dedup entry too: otherwise a reopen whose first
-        // analysis hashes the same as the last pre-close run would short-circuit
-        // republishing, leaving the editor with the empty diagnostics we just
-        // sent below.
-        state.published_diag_hashes.remove(&params.text_document.uri);
+        // analysis produced the same list as the last pre-close run would
+        // short-circuit republishing, leaving the editor with the empty
+        // diagnostics we just sent below.
         state
             .published_lsp_diagnostics
             .remove(&params.text_document.uri);
@@ -1131,8 +1161,7 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
 /// identical to the last publish for this URI. Whitespace-only and
 /// comment-only edits go through the fingerprint cache, producing the same
 /// `knot_diagnostics` output verbatim — there's no need to re-render the
-/// editor's gutter for those. We hash the published list so the comparison
-/// stays cheap (a `Vec<Diagnostic>` clone-and-compare would dominate).
+/// editor's gutter for those.
 ///
 /// Returns `true` when a publish was actually sent. The caller uses this to
 /// decide whether to follow up with `workspace/diagnostic/refresh` for
@@ -1148,36 +1177,15 @@ fn publish_diagnostics_dedup(
     lsp_diags: Vec<lsp_types::Diagnostic>,
     version: Option<i32>,
 ) -> bool {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for d in &lsp_diags {
-        // Hash only the fields that meaningfully define a diagnostic — range
-        // start/end + message + severity. Hashing the whole struct via
-        // `Debug`-derived format would also work but is more allocation-heavy.
-        d.range.start.line.hash(&mut hasher);
-        d.range.start.character.hash(&mut hasher);
-        d.range.end.line.hash(&mut hasher);
-        d.range.end.character.hash(&mut hasher);
-        d.message.hash(&mut hasher);
-        if let Some(sev) = d.severity {
-            // `DiagnosticSeverity` is a non-primitive newtype-style enum
-            // (with `lsp_types`-defined integer constants); reach in via
-            // `Debug` to grab a stable string representation.
-            format!("{sev:?}").hash(&mut hasher);
-        }
-    }
-    let new_hash = hasher.finish();
-    if state.published_diag_hashes.get(uri).copied() == Some(new_hash) {
-        // Even on a hash hit, refresh the cached diagnostics list so the
-        // didChange rebase logic always works against the freshest known
-        // ranges. The hash key only covers fields that affect rendering;
-        // shifted ranges from a prior didChange wouldn't change the hash.
-        state
-            .published_lsp_diagnostics
-            .insert(uri.clone(), lsp_diags);
+    // Direct equality against the cached list. We previously kept a separate
+    // 64-bit hash to dedup, but a hash collision (rare but not impossible)
+    // would silently swallow a needed publish, leaving stale diagnostics in
+    // the gutter — and since we already store the full list for the rebase
+    // path, the hash bought no memory savings. Equality on a typically-tiny
+    // `Vec<Diagnostic>` is cheap.
+    if state.published_lsp_diagnostics.get(uri) == Some(&lsp_diags) {
         return false;
     }
-    state.published_diag_hashes.insert(uri.clone(), new_hash);
     state
         .published_lsp_diagnostics
         .insert(uri.clone(), lsp_diags.clone());
@@ -1354,6 +1362,210 @@ mod tests {
             ranges,
             vec![(usize::MAX, usize::MAX), (60, 70)],
             "sentinel must not be shifted; live range moves by +10"
+        );
+    }
+
+    // ── apply_analysis_result + publish_diagnostics_dedup tests ────────
+    //
+    // These use a `Connection::memory()` pair so we can inspect what the
+    // server actually sends over the wire. The worker thread isn't spawned —
+    // we drive `analyze_document` synchronously and feed the result directly
+    // into `apply_analysis_result`, which is the same path the worker would
+    // hit after a `select!` dispatch.
+
+    use crate::analysis::analyze_document;
+    use crate::state::{ServerConfig, ServerState, WorkspaceSymbolCache};
+    use lsp_server::Connection;
+    use std::str::FromStr;
+    use std::sync::{Arc, Mutex};
+
+    fn make_state() -> ServerState {
+        let (analysis_tx, _rx) = crossbeam_channel::unbounded();
+        ServerState {
+            documents: HashMap::new(),
+            workspace_root: None,
+            workspace_roots: Vec::new(),
+            config: ServerConfig::default(),
+            import_cache: Arc::new(Mutex::new(HashMap::new())),
+            workspace_diag_cache: HashMap::new(),
+            workspace_diag_clock: 0,
+            workspace_symbol_cache: Arc::new(Mutex::new(WorkspaceSymbolCache::default())),
+            pending_sources: HashMap::new(),
+            analysis_tx,
+            reverse_imports: HashMap::new(),
+            inference_cache: Arc::new(Mutex::new(HashMap::new())),
+            semantic_token_cache: HashMap::new(),
+            semantic_token_counter: 0,
+            published_lsp_diagnostics: HashMap::new(),
+            client_supports_diagnostic_refresh: false,
+            diagnostic_refresh_counter: 0,
+            workspace_diag_reported: HashSet::new(),
+        }
+    }
+
+    /// Drain all queued publishDiagnostics notifications from the client side
+    /// of a memory connection. Returns one entry per notification: (uri,
+    /// version, diagnostic count, list of message prefixes). Non-publish
+    /// messages (capability registrations etc.) are ignored.
+    fn drain_publishes(client: &Connection) -> Vec<(String, Option<i32>, usize, Vec<String>)> {
+        let mut out = Vec::new();
+        while let Ok(msg) = client.receiver.try_recv() {
+            if let Message::Notification(n) = msg {
+                if n.method == lsp_types::notification::PublishDiagnostics::METHOD {
+                    if let Ok(p) = serde_json::from_value::<
+                        lsp_types::PublishDiagnosticsParams,
+                    >(n.params)
+                    {
+                        let msgs: Vec<String> = p
+                            .diagnostics
+                            .iter()
+                            .map(|d| d.message.chars().take(60).collect())
+                            .collect();
+                        out.push((p.uri.as_str().to_string(), p.version, p.diagnostics.len(), msgs));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// One-shot helper: analyze `source`, build an `AnalysisResult`, set
+    /// up `pending_sources` so the apply path doesn't early-return, and
+    /// invoke `apply_analysis_result` against the given server connection.
+    fn apply_analysis_in(
+        state: &mut ServerState,
+        conn: &Connection,
+        uri: &Uri,
+        source: &str,
+        version: Option<i32>,
+    ) {
+        let mut import_cache_local = match state.import_cache.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        };
+        let mut inf_cache_local = match state.inference_cache.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        };
+        let doc = analyze_document(uri, source, &mut import_cache_local, &mut inf_cache_local);
+        state.pending_sources.insert(
+            uri.clone(),
+            crate::state::PendingSource {
+                source: source.to_string(),
+                version,
+            },
+        );
+        let result = AnalysisResult {
+            uri: uri.clone(),
+            version,
+            doc,
+        };
+        apply_analysis_result(state, conn, result);
+    }
+
+    const BAD_SOURCE: &str = r#"type Msg = {id: Int, text: Text}
+
+*messages : [Msg]
+
+removeWhere = \xs pred -> do
+  m <- xs
+  where not (pred m)
+  yield m
+
+main = do
+  mssgs <- *messages
+  replace *messages = removeWhere mssgs (\m -> m.text == "spam")
+  yield {}
+"#;
+
+    const GOOD_SOURCE: &str = r#"type Msg = {id: Int, text: Text}
+
+*messages : [Msg]
+
+removeWhere = \xs pred -> do
+  m <- xs
+  where not (pred m)
+  yield m
+
+main = do
+  mssgs <- *messages
+  *messages = removeWhere mssgs (\m -> m.text == "spam")
+  yield {}
+"#;
+
+    /// Bad source → exactly one publishDiagnostics with the "is unnecessary"
+    /// error. Locks down the basic publish-on-error path.
+    #[test]
+    fn apply_analysis_result_publishes_error_diags() {
+        let (server, client) = Connection::memory();
+        let mut state = make_state();
+        let uri = Uri::from_str("file:///test/repro.knot").unwrap();
+        apply_analysis_in(&mut state, &server, &uri, BAD_SOURCE, Some(1));
+        let pubs = drain_publishes(&client);
+        assert_eq!(pubs.len(), 1, "expected one publish; got: {:?}", pubs);
+        assert_eq!(pubs[0].2, 1, "expected one diagnostic");
+        assert!(
+            pubs[0].3[0].contains("is unnecessary"),
+            "expected `is unnecessary` message; got {:?}",
+            pubs[0].3
+        );
+    }
+
+    /// Bad → good must clear the diagnostic with an empty publish. This is
+    /// the path the user reported as broken; the test pins it.
+    #[test]
+    fn apply_analysis_result_clears_diags_on_fix() {
+        let (server, client) = Connection::memory();
+        let mut state = make_state();
+        let uri = Uri::from_str("file:///test/repro.knot").unwrap();
+        apply_analysis_in(&mut state, &server, &uri, BAD_SOURCE, Some(1));
+        apply_analysis_in(&mut state, &server, &uri, GOOD_SOURCE, Some(2));
+        let pubs = drain_publishes(&client);
+        assert_eq!(pubs.len(), 2, "expected two publishes; got: {:?}", pubs);
+        assert_eq!(pubs[1].2, 0, "expected the fix-publish to be empty");
+        assert_eq!(pubs[1].1, Some(2), "expected v2 on the fix-publish");
+    }
+
+    /// Re-applying the same analysis output (e.g. a whitespace edit that
+    /// went through the fingerprint cache) must NOT publish again. Verifies
+    /// the dedup short-circuit using direct `Vec<Diagnostic>` equality.
+    #[test]
+    fn publish_dedup_skips_identical_diags() {
+        let (server, client) = Connection::memory();
+        let mut state = make_state();
+        let uri = Uri::from_str("file:///test/repro.knot").unwrap();
+        apply_analysis_in(&mut state, &server, &uri, BAD_SOURCE, Some(1));
+        apply_analysis_in(&mut state, &server, &uri, BAD_SOURCE, Some(2));
+        let pubs = drain_publishes(&client);
+        assert_eq!(
+            pubs.len(),
+            1,
+            "second apply with identical diags must dedup; got: {:?}",
+            pubs
+        );
+    }
+
+    /// Closing a document publishes empty diagnostics and drops the cache,
+    /// so a subsequent reopen with the same content actually re-publishes.
+    #[test]
+    fn close_drops_cache_so_reopen_republishes() {
+        let (server, client) = Connection::memory();
+        let mut state = make_state();
+        let uri = Uri::from_str("file:///test/repro.knot").unwrap();
+        apply_analysis_in(&mut state, &server, &uri, BAD_SOURCE, Some(1));
+        // Simulate didClose without going through the full notification
+        // dispatcher: we only need the state-cleanup half here.
+        state.documents.remove(&uri);
+        state.pending_sources.remove(&uri);
+        state.published_lsp_diagnostics.remove(&uri);
+        // Re-applying the same source must republish (cache was dropped).
+        apply_analysis_in(&mut state, &server, &uri, BAD_SOURCE, Some(2));
+        let pubs = drain_publishes(&client);
+        assert_eq!(
+            pubs.len(),
+            2,
+            "expected publish-on-open + publish-after-reopen; got: {:?}",
+            pubs
         );
     }
 }

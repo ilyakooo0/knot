@@ -105,6 +105,18 @@ pub fn analysis_worker(
                 Err(poison) => poison.into_inner().clone(),
             };
 
+            // Snapshot the import-cache hash for each key so we can detect
+            // which entries the worker actually mutated during analysis. The
+            // shared cache may be touched by request handlers (hover, rename,
+            // completion) while we're running, so blanket-overwriting at merge
+            // time would clobber their fresher entries. Inference-cache keys
+            // include the content hash, so its entries are content-addressed
+            // and never need overwrite-vs-skip resolution.
+            let import_cache_before: HashMap<PathBuf, u64> = cache_local
+                .iter()
+                .map(|(k, (h, _, _))| (k.clone(), *h))
+                .collect();
+
             let doc = analyze_document(
                 &task.uri,
                 &task.source,
@@ -112,13 +124,18 @@ pub fn analysis_worker(
                 &mut inf_cache_local,
             );
 
-            // Merge any new entries back. We don't overwrite entries that the
-            // main thread or another worker iteration may have produced
-            // concurrently with a fresher hash — only insert if the key is
-            // missing or our hash matches.
+            // Merge entries back: for the import cache, overwrite only the
+            // keys whose hash changed during analysis (the file we just
+            // re-parsed and any imports re-read off disk). The previous
+            // `or_insert` left a stale (hash, module) for the edited file
+            // in the shared cache, so dependents importing it kept seeing
+            // the pre-edit AST until the editor was restarted.
             if let Ok(mut shared) = import_cache.lock() {
                 for (k, v) in cache_local.into_iter() {
-                    shared.entry(k).or_insert(v);
+                    let before_hash = import_cache_before.get(&k).copied();
+                    if before_hash != Some(v.0) {
+                        shared.insert(k, v);
+                    }
                 }
             }
             if let Ok(mut shared) = inference_cache.lock() {
@@ -628,9 +645,9 @@ pub fn resolve_import_navigation(
 }
 
 // Diagnostic publishing now lives in `main.rs::publish_diagnostics_dedup` so
-// it can hash against the per-URI `published_diag_hashes` cache and skip
-// redundant LSP roundtrips. The legacy `publish_diagnostics` helper here was
-// removed when that move happened.
+// it can compare against the per-URI `published_lsp_diagnostics` cache and
+// skip redundant LSP roundtrips. The legacy `publish_diagnostics` helper
+// here was removed when that move happened.
 
 // ── Tests ───────────────────────────────────────────────────────────
 

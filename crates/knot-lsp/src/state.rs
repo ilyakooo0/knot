@@ -207,18 +207,19 @@ pub struct ServerState {
     /// request bumps this; the resulting string is used as the next
     /// `result_id` field.
     pub semantic_token_counter: u64,
-    /// Hash of the most recently published diagnostics list per URI. Used to
-    /// short-circuit `publish_diagnostics` when an edit produced an identical
-    /// diagnostic set — common for whitespace/comment edits where the
-    /// fingerprint cache already reused the snapshot. Avoids gratuitous LSP
-    /// traffic and editor re-renders. Pruned on document close.
-    pub published_diag_hashes: HashMap<Uri, u64>,
-    /// Last LSP diagnostics published per URI, kept verbatim so didChange can
-    /// rebase their `Range` fields through pending edits and republish them
-    /// against the new document version. Without this, diagnostics' positions
-    /// drift while the analysis worker catches up — the editor still sees the
-    /// old line/character ranges even though the document has moved on.
-    /// Cleared on document close alongside `published_diag_hashes`.
+    /// Last LSP diagnostics published per URI. Two roles:
+    /// 1. Short-circuits `publish_diagnostics_dedup` when the new list is byte-
+    ///    for-byte identical to the previous publish — common for whitespace/
+    ///    comment edits that hit the fingerprint cache and produce the same
+    ///    diagnostics. Avoids gratuitous editor re-renders.
+    /// 2. Lets `didChange` rebase the cached `Range` fields through pending
+    ///    edits and republish against the new document version, keeping
+    ///    squiggle positions in sync while the analysis worker catches up.
+    ///
+    /// Direct `Vec<Diagnostic>` equality is used instead of a separate hash
+    /// because the rebase logic already holds the full list and a hash
+    /// collision (rare but not impossible) silently skips a needed publish.
+    /// Cleared on document close.
     pub published_lsp_diagnostics: HashMap<Uri, Vec<Diagnostic>>,
     /// Whether the client supports `workspace/diagnostic/refresh`. Pull-mode
     /// clients (notably JetBrains) ignore `publishDiagnostics` and only update

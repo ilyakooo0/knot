@@ -125,7 +125,34 @@ fn analyze_and_cache(
     state
         .workspace_diag_cache
         .insert(path.to_path_buf(), (hash, diags.clone(), access));
+    // Per-document pulls that never fire a `workspace/diagnostic` would
+    // otherwise let the cache grow unbounded — full pruning runs only after
+    // workspace pulls. The cap-only eviction here skips the disk-read
+    // invalidation step (too expensive on every textDocument/diagnostic) and
+    // just trims the oldest entries when over budget.
+    enforce_workspace_diag_cap(state);
     diags
+}
+
+/// LRU cap eviction without disk-read invalidation. Cheap enough to call on
+/// every per-document diagnostic pull. Invariant kept: cache size ≤ cap after
+/// return. The full `prune_stale_workspace_diag_cache` is still the
+/// authoritative cleanup — it additionally re-validates content against disk.
+fn enforce_workspace_diag_cap(state: &mut ServerState) {
+    let cap = state.config.max_workspace_diag_cache;
+    if state.workspace_diag_cache.len() <= cap {
+        return;
+    }
+    let mut by_age: Vec<(PathBuf, u64)> = state
+        .workspace_diag_cache
+        .iter()
+        .map(|(p, (_, _, access))| (p.clone(), *access))
+        .collect();
+    by_age.sort_by_key(|(_, a)| *a);
+    let to_drop = state.workspace_diag_cache.len().saturating_sub(cap);
+    for (p, _) in by_age.into_iter().take(to_drop) {
+        state.workspace_diag_cache.remove(&p);
+    }
 }
 
 // ── Workspace Diagnostics (Pull Model) ──────────────────────────────
@@ -378,23 +405,7 @@ pub(crate) fn prune_stale_workspace_diag_cache(state: &mut ServerState) {
 
     state.workspace_diag_cache.retain(|path, _| !affected.contains(path));
 
-    // Cap-based LRU eviction. The configured `max_workspace_diag_cache` is the
-    // soft ceiling — we sort by the per-entry access counter and drop the
-    // oldest entries until the size is within bounds. O(n log n) on the cache
-    // size, which is bounded; called once per workspace-diagnostics request.
-    let cap = state.config.max_workspace_diag_cache;
-    if state.workspace_diag_cache.len() > cap {
-        let mut by_age: Vec<(PathBuf, u64)> = state
-            .workspace_diag_cache
-            .iter()
-            .map(|(p, (_, _, access))| (p.clone(), *access))
-            .collect();
-        by_age.sort_by_key(|(_, a)| *a); // ascending: oldest first
-        let to_drop = state.workspace_diag_cache.len().saturating_sub(cap);
-        for (p, _) in by_age.into_iter().take(to_drop) {
-            state.workspace_diag_cache.remove(&p);
-        }
-    }
+    enforce_workspace_diag_cap(state);
 }
 
 /// Run the full analysis pipeline on an unopened workspace file and return its
@@ -448,4 +459,87 @@ fn analyze_unopened_file(
         .iter()
         .filter_map(|d| to_lsp_diagnostic(d, source, uri))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestWorkspace;
+
+    /// Seed `workspace_diag_cache` with `count` synthetic entries with strictly
+    /// increasing access timestamps. Returns paths in insertion order, so
+    /// callers can assert about which entries survive eviction.
+    fn seed_cache(state: &mut ServerState, count: usize) -> Vec<PathBuf> {
+        let mut paths = Vec::with_capacity(count);
+        for i in 0..count {
+            let p = PathBuf::from(format!("/tmp/knot-lsp-cap-test/file_{i}.knot"));
+            state.workspace_diag_clock = state.workspace_diag_clock.wrapping_add(1);
+            let access = state.workspace_diag_clock;
+            state
+                .workspace_diag_cache
+                .insert(p.clone(), (i as u64, Vec::new(), access));
+            paths.push(p);
+        }
+        paths
+    }
+
+    #[test]
+    fn enforce_cap_evicts_oldest_entries_when_over_budget() {
+        let mut ws = TestWorkspace::new();
+        ws.state.config.max_workspace_diag_cache = 3;
+
+        let paths = seed_cache(&mut ws.state, 5);
+        assert_eq!(ws.state.workspace_diag_cache.len(), 5);
+
+        enforce_workspace_diag_cap(&mut ws.state);
+
+        assert_eq!(ws.state.workspace_diag_cache.len(), 3);
+        // Oldest two entries (paths[0], paths[1]) should be gone.
+        assert!(!ws.state.workspace_diag_cache.contains_key(&paths[0]));
+        assert!(!ws.state.workspace_diag_cache.contains_key(&paths[1]));
+        assert!(ws.state.workspace_diag_cache.contains_key(&paths[2]));
+        assert!(ws.state.workspace_diag_cache.contains_key(&paths[3]));
+        assert!(ws.state.workspace_diag_cache.contains_key(&paths[4]));
+    }
+
+    #[test]
+    fn enforce_cap_no_op_when_under_budget() {
+        let mut ws = TestWorkspace::new();
+        ws.state.config.max_workspace_diag_cache = 10;
+
+        let paths = seed_cache(&mut ws.state, 4);
+        let before_clock = ws.state.workspace_diag_clock;
+
+        enforce_workspace_diag_cap(&mut ws.state);
+
+        assert_eq!(ws.state.workspace_diag_cache.len(), 4);
+        for p in &paths {
+            assert!(ws.state.workspace_diag_cache.contains_key(p));
+        }
+        // The cap-only path must not bump the access clock — only
+        // insert/hit paths do.
+        assert_eq!(ws.state.workspace_diag_clock, before_clock);
+    }
+
+    #[test]
+    fn enforce_cap_respects_recency_after_access_bump() {
+        let mut ws = TestWorkspace::new();
+        ws.state.config.max_workspace_diag_cache = 2;
+
+        let paths = seed_cache(&mut ws.state, 3);
+        // Touch paths[0] so it's now the most recently used. Without this
+        // bump it would be evicted first; with it, paths[1] should go.
+        ws.state.workspace_diag_clock = ws.state.workspace_diag_clock.wrapping_add(1);
+        let access = ws.state.workspace_diag_clock;
+        if let Some(entry) = ws.state.workspace_diag_cache.get_mut(&paths[0]) {
+            entry.2 = access;
+        }
+
+        enforce_workspace_diag_cap(&mut ws.state);
+
+        assert_eq!(ws.state.workspace_diag_cache.len(), 2);
+        assert!(ws.state.workspace_diag_cache.contains_key(&paths[0]));
+        assert!(!ws.state.workspace_diag_cache.contains_key(&paths[1]));
+        assert!(ws.state.workspace_diag_cache.contains_key(&paths[2]));
+    }
 }

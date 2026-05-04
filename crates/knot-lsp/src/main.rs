@@ -301,8 +301,10 @@ fn main() {
     // Pre-warm the workspace-symbol cache in the background. The first
     // `workspace/symbol` query then sees a populated cache instead of having
     // to walk the entire workspace from scratch. Runs at lower priority than
-    // the analysis worker — held in a thread we don't track, so any panic in
-    // it is contained.
+    // the analysis worker. Wrapped in catch_unwind so a malformed file on
+    // disk that trips a parser/inference panic doesn't silently kill the
+    // indexer thread — the analysis worker has the same boundary for the
+    // same reason.
     {
         let cache_handle = Arc::clone(&state.workspace_symbol_cache);
         let import_cache_handle = Arc::clone(&state.import_cache);
@@ -311,12 +313,24 @@ fn main() {
         thread::Builder::new()
             .name("knot-lsp-workspace-indexer".into())
             .spawn(move || {
-                prewarm_workspace_symbol_cache(
-                    cache_handle,
-                    import_cache_handle,
-                    &roots,
-                    legacy_root.as_deref(),
-                );
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    prewarm_workspace_symbol_cache(
+                        cache_handle,
+                        import_cache_handle,
+                        &roots,
+                        legacy_root.as_deref(),
+                    );
+                }));
+                if let Err(payload) = result {
+                    let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "panic with non-string payload".to_string()
+                    };
+                    eprintln!("knot-lsp: workspace indexer panicked: {msg}");
+                }
             })
             .ok();
     }

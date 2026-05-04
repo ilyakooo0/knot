@@ -188,6 +188,13 @@ struct EffectChecker {
     builtin_effects: HashMap<String, EffectSet>,
     /// Known source relation names.
     source_names: HashSet<String>,
+    /// Names of declarations whose annotated signature carries an effect-row
+    /// variable (e.g. `IO {r *sessions | e} a`). Calls to these functions
+    /// propagate the effects of their lambda arguments — matching HM's
+    /// row-polymorphic effect inference. Without an effect row variable
+    /// (e.g. `forEach : (a -> IO {} {}) -> IO {} {}`), the callback's effects
+    /// are absorbed by the declared row, so we don't propagate.
+    row_poly_decls: HashSet<String>,
     /// Accumulated diagnostics.
     diagnostics: Vec<Diagnostic>,
 }
@@ -237,6 +244,7 @@ impl EffectChecker {
             decl_effects: HashMap::new(),
             builtin_effects,
             source_names: HashSet::new(),
+            row_poly_decls: HashSet::new(),
             diagnostics: Vec::new(),
         }
     }
@@ -246,6 +254,22 @@ impl EffectChecker {
         for decl in &module.decls {
             if let ast::DeclKind::Source { name, .. } = &decl.node {
                 self.source_names.insert(name.clone());
+            }
+        }
+
+        // Collect declarations whose annotated signature uses an effect-row
+        // variable. Knowing this up front lets the App handler propagate
+        // lambda-arg effects through row-polymorphic callees only.
+        for decl in &module.decls {
+            match &decl.node {
+                ast::DeclKind::Fun { name, ty: Some(scheme), .. }
+                | ast::DeclKind::View { name, ty: Some(scheme), .. }
+                | ast::DeclKind::Derived { name, ty: Some(scheme), .. } => {
+                    if type_has_effect_row_var(&scheme.ty) {
+                        self.row_poly_decls.insert(name.clone());
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -384,7 +408,14 @@ impl EffectChecker {
             }
 
             ast::ExprKind::App { func, arg } => {
-                let arg_effects = self.infer_effects(arg);
+                let propagate_lambda = head_name(func)
+                    .map(|n| self.row_poly_decls.contains(n))
+                    .unwrap_or(false);
+                let arg_effects = if propagate_lambda {
+                    self.arg_effects(arg)
+                } else {
+                    self.infer_effects(arg)
+                };
                 let call_effects = self.callee_effects(func);
                 arg_effects.union(&call_effects)
             }
@@ -527,6 +558,20 @@ impl EffectChecker {
         }
     }
 
+    /// Effects of a function-call argument. Like `infer_effects`, but if the
+    /// argument is a lambda the callee will likely invoke, also include the
+    /// lambda body's effects. HM unifies higher-order callbacks via effect-row
+    /// variables (e.g. `IO {| e}` → `IO {r *sessions | e}`); without this
+    /// propagation, the effect checker under-approximates and disagrees with
+    /// the LSP's HM-derived signatures.
+    fn arg_effects(&mut self, arg: &ast::Expr) -> EffectSet {
+        let mut effects = self.infer_effects(arg);
+        if is_lambda_arg(arg) {
+            effects = effects.union(&self.fun_body_effects(arg));
+        }
+        effects
+    }
+
     /// Resolve effects when a function expression is *called*.
     fn callee_effects(&mut self, func_expr: &ast::Expr) -> EffectSet {
         match &func_expr.node {
@@ -643,6 +688,56 @@ impl EffectChecker {
 /// `IO {fs} Text` returns the whole type's span. Used so effect-annotation
 /// diagnostics underline the actual annotation rather than the whole
 /// declaration (which would also cover comments inside the body).
+/// Whether `arg` is a lambda (possibly wrapped in annotations / refinements).
+/// Mirrors the wrappers `fun_body_effects` traverses, so the two stay in sync.
+fn is_lambda_arg(arg: &ast::Expr) -> bool {
+    match &arg.node {
+        ast::ExprKind::Lambda { .. } => true,
+        ast::ExprKind::UnitLit { value, .. }
+        | ast::ExprKind::Annot { expr: value, .. }
+        | ast::ExprKind::Refine(value) => is_lambda_arg(value),
+        _ => false,
+    }
+}
+
+/// Resolve the head name of a (possibly curried) function expression.
+/// `f x y z` → `Some("f")`. Returns `None` for non-named callees.
+fn head_name(expr: &ast::Expr) -> Option<&str> {
+    match &expr.node {
+        ast::ExprKind::Var(name) => Some(name.as_str()),
+        ast::ExprKind::App { func, .. } => head_name(func),
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::Annot { expr: value, .. } => {
+            head_name(value)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `ty` contains an `IO {... | r}` row variable anywhere in its
+/// structure. Used to detect row-polymorphic effect signatures so that
+/// higher-order callbacks pass their effects through to the caller — the
+/// effect-checker analogue of HM's row-polymorphic IO unification.
+fn type_has_effect_row_var(ty: &ast::Type) -> bool {
+    match &ty.node {
+        ast::TypeKind::IO { rest: Some(name), ty: inner, .. } => {
+            // `_` opts out of effect checking and isn't a row variable.
+            name != "_" || type_has_effect_row_var(inner)
+        }
+        ast::TypeKind::IO { ty: inner, .. } => type_has_effect_row_var(inner),
+        ast::TypeKind::Function { param, result } => {
+            type_has_effect_row_var(param) || type_has_effect_row_var(result)
+        }
+        ast::TypeKind::Effectful { ty: inner, .. } => type_has_effect_row_var(inner),
+        ast::TypeKind::App { func, arg } => {
+            type_has_effect_row_var(func) || type_has_effect_row_var(arg)
+        }
+        ast::TypeKind::Relation(inner) => type_has_effect_row_var(inner),
+        ast::TypeKind::UnitAnnotated { base, .. } => type_has_effect_row_var(base),
+        ast::TypeKind::Refined { base, .. } => type_has_effect_row_var(base),
+        _ => false,
+    }
+}
+
 fn effects_span(ty: &ast::Type) -> Option<Span> {
     match &ty.node {
         ast::TypeKind::Effectful { .. } | ast::TypeKind::IO { .. } => Some(ty.span),
@@ -1254,6 +1349,120 @@ mod tests {
             Span::new(100, 130),
             "label must point at the IO type subnode (100..130), \
              not the decl span (0..200) which would underline body comments"
+        );
+    }
+
+    /// Effects of a lambda passed to a row-polymorphic callee propagate to the
+    /// caller. Mirrors the HM behavior where the IO row variable in
+    /// `withCallback : (a -> IO {| e} b) -> IO {| e} b` unifies with the
+    /// lambda's effect row.
+    #[test]
+    fn row_poly_callee_propagates_lambda_effects() {
+        // withCb : (Int -> IO {| e} {}) -> IO {| e} {}
+        // withCb = \cb -> cb 0
+        let with_cb_body = spanned(ExprKind::Lambda {
+            params: vec![spanned(PatKind::Var("cb".into()))],
+            body: Box::new(spanned(ExprKind::App {
+                func: Box::new(spanned(ExprKind::Var("cb".into()))),
+                arg: Box::new(spanned(ExprKind::Lit(Literal::Int("0".into())))),
+            })),
+        });
+        let unit_ty = || spanned(TypeKind::Record { fields: vec![], rest: None });
+        let with_cb_ty = TypeScheme {
+            constraints: vec![],
+            ty: spanned(TypeKind::Function {
+                param: Box::new(spanned(TypeKind::Function {
+                    param: Box::new(spanned(TypeKind::Named("Int".into()))),
+                    result: Box::new(spanned(TypeKind::IO {
+                        effects: vec![],
+                        rest: Some("e".into()),
+                        ty: Box::new(unit_ty()),
+                    })),
+                })),
+                result: Box::new(spanned(TypeKind::IO {
+                    effects: vec![],
+                    rest: Some("e".into()),
+                    ty: Box::new(unit_ty()),
+                })),
+            }),
+        };
+
+        // f = withCb (\_ -> println "hi")
+        let f_body = spanned(ExprKind::App {
+            func: Box::new(spanned(ExprKind::Var("withCb".into()))),
+            arg: Box::new(spanned(ExprKind::Lambda {
+                params: vec![spanned(PatKind::Var("_".into()))],
+                body: Box::new(spanned(ExprKind::App {
+                    func: Box::new(spanned(ExprKind::Var("println".into()))),
+                    arg: Box::new(spanned(ExprKind::Lit(Literal::Text("hi".into())))),
+                })),
+            })),
+        });
+
+        let (diags, effects) = check_module(vec![
+            make_fun_with_type("withCb", with_cb_body, with_cb_ty),
+            make_fun("f", f_body),
+        ]);
+        assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
+        assert!(
+            effects["f"].console,
+            "lambda's println effect should propagate through row-poly callee"
+        );
+    }
+
+    /// A non-row-poly callee (e.g. `forEach : (a -> IO {} {}) -> IO {} {}`)
+    /// absorbs its callback's effects in its declared row, so we do *not*
+    /// propagate the lambda's body effects to the caller.
+    #[test]
+    fn non_row_poly_callee_does_not_propagate_lambda_effects() {
+        // runIt : (Int -> IO {} {}) -> IO {} {}
+        // runIt = \cb -> cb 0
+        let run_it_body = spanned(ExprKind::Lambda {
+            params: vec![spanned(PatKind::Var("cb".into()))],
+            body: Box::new(spanned(ExprKind::App {
+                func: Box::new(spanned(ExprKind::Var("cb".into()))),
+                arg: Box::new(spanned(ExprKind::Lit(Literal::Int("0".into())))),
+            })),
+        });
+        let unit_ty = || spanned(TypeKind::Record { fields: vec![], rest: None });
+        let run_it_ty = TypeScheme {
+            constraints: vec![],
+            ty: spanned(TypeKind::Function {
+                param: Box::new(spanned(TypeKind::Function {
+                    param: Box::new(spanned(TypeKind::Named("Int".into()))),
+                    result: Box::new(spanned(TypeKind::IO {
+                        effects: vec![],
+                        rest: None,
+                        ty: Box::new(unit_ty()),
+                    })),
+                })),
+                result: Box::new(spanned(TypeKind::IO {
+                    effects: vec![],
+                    rest: None,
+                    ty: Box::new(unit_ty()),
+                })),
+            }),
+        };
+
+        // g = runIt (\_ -> println "hi") — caller declares no console effect
+        let g_body = spanned(ExprKind::App {
+            func: Box::new(spanned(ExprKind::Var("runIt".into()))),
+            arg: Box::new(spanned(ExprKind::Lambda {
+                params: vec![spanned(PatKind::Var("_".into()))],
+                body: Box::new(spanned(ExprKind::App {
+                    func: Box::new(spanned(ExprKind::Var("println".into()))),
+                    arg: Box::new(spanned(ExprKind::Lit(Literal::Text("hi".into())))),
+                })),
+            })),
+        });
+
+        let (_diags, effects) = check_module(vec![
+            make_fun_with_type("runIt", run_it_body, run_it_ty),
+            make_fun("g", g_body),
+        ]);
+        assert!(
+            !effects["g"].console,
+            "non-row-poly callee should absorb lambda effects, not propagate"
         );
     }
 

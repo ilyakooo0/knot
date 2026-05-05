@@ -386,6 +386,12 @@ pub(crate) fn handle_completion(
     // yet. Modules are not re-parsed across completion requests within a single
     // analyze cycle.
     {
+        // Cap auto-import suggestions so a workspace with thousands of exported
+        // symbols can't generate a giant payload on every keystroke. The user
+        // will type-filter further; clients also typically truncate before
+        // rendering.
+        const MAX_AUTO_IMPORT_ITEMS: usize = 500;
+
         let source_path = uri_to_path(uri);
         let existing_imports: HashSet<String> = doc.module.imports.iter().map(|i| i.path.clone()).collect();
         let local_names: HashSet<&str> = doc.definitions.keys().map(|s| s.as_str()).collect();
@@ -393,82 +399,88 @@ pub(crate) fn handle_completion(
         // De-dupe by name across files: if two workspace files both export
         // `parse`, prefer the one with the lexicographically-shortest path.
         let mut seen_names: HashSet<String> = HashSet::new();
+        let mut auto_imports_added: usize = 0;
 
         let files = scan_knot_files_in_roots(
             &state.workspace_roots,
             state.workspace_root.as_deref(),
         );
-        if !files.is_empty() {
-            for file_path in files {
-                let canonical = match file_path.canonicalize() {
-                    Ok(p) => p,
-                    Err(_) => continue,
+        'files: for file_path in files {
+            if auto_imports_added >= MAX_AUTO_IMPORT_ITEMS {
+                break;
+            }
+            let canonical = match file_path.canonicalize() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            // Skip current file
+            if source_path.as_ref().and_then(|p| p.canonicalize().ok()) == Some(canonical.clone()) {
+                continue;
+            }
+            // Compute the import path relative to the current file
+            let import_path = match source_path.as_ref().and_then(|p| p.parent()) {
+                Some(base) => {
+                    match canonical.strip_prefix(base) {
+                        Ok(rel) => rel.with_extension("").to_string_lossy().to_string(),
+                        Err(_) => continue,
+                    }
+                }
+                None => continue,
+            };
+            // Skip already imported files
+            if existing_imports.contains(&import_path) {
+                continue;
+            }
+
+            // Reuse the cached parsed module if available (populated by
+            // resolve_import_navigation when other files have imported it),
+            // and populate the cache if not — auto-import completion is
+            // typically the first request that touches new workspace files.
+            let module = match get_or_parse_file_shared(&canonical, &state.import_cache)
+            {
+                Some((m, _)) => m,
+                None => continue,
+            };
+
+            for decl in &module.decls {
+                // Only suggest exported names (or all top-level if `export`
+                // isn't being used in this file)
+                let (name, kind) = match &decl.node {
+                    DeclKind::Fun { name, .. } => (name.clone(), CompletionItemKind::FUNCTION),
+                    DeclKind::Data { name, .. } => (name.clone(), CompletionItemKind::STRUCT),
+                    DeclKind::TypeAlias { name, .. } => (name.clone(), CompletionItemKind::STRUCT),
+                    DeclKind::Trait { name, .. } => (name.clone(), CompletionItemKind::INTERFACE),
+                    _ => continue,
                 };
-                // Skip current file
-                if source_path.as_ref().and_then(|p| p.canonicalize().ok()) == Some(canonical.clone()) {
+                // Skip names already defined locally or already suggested
+                if local_names.contains(name.as_str()) || seen_names.contains(&name) {
                     continue;
                 }
-                // Compute the import path relative to the current file
-                let import_path = match source_path.as_ref().and_then(|p| p.parent()) {
-                    Some(base) => {
-                        match canonical.strip_prefix(base) {
-                            Ok(rel) => rel.with_extension("").to_string_lossy().to_string(),
-                            Err(_) => continue,
-                        }
-                    }
-                    None => continue,
-                };
-                // Skip already imported files
-                if existing_imports.contains(&import_path) {
-                    continue;
-                }
+                seen_names.insert(name.clone());
 
-                // Reuse the cached parsed module if available (populated by
-                // resolve_import_navigation when other files have imported it),
-                // and populate the cache if not — auto-import completion is
-                // typically the first request that touches new workspace files.
-                let module = match get_or_parse_file_shared(&canonical, &state.import_cache)
-                {
-                    Some((m, _)) => m,
-                    None => continue,
-                };
+                // Defer `additional_text_edits` computation to resolve —
+                // produce a marker payload via `data` instead. The resolve
+                // handler computes the import-line edit only for the item
+                // the user actually selects, avoiding O(workspace_files ×
+                // decls) edit construction per keystroke.
+                let data = serde_json::json!({
+                    "kind": "auto_import",
+                    "name": name,
+                    "import_path": import_path,
+                    "source_uri": uri.to_string(),
+                });
 
-                for decl in &module.decls {
-                    // Only suggest exported names (or all top-level if `export`
-                    // isn't being used in this file)
-                    let (name, kind) = match &decl.node {
-                        DeclKind::Fun { name, .. } => (name.clone(), CompletionItemKind::FUNCTION),
-                        DeclKind::Data { name, .. } => (name.clone(), CompletionItemKind::STRUCT),
-                        DeclKind::TypeAlias { name, .. } => (name.clone(), CompletionItemKind::STRUCT),
-                        DeclKind::Trait { name, .. } => (name.clone(), CompletionItemKind::INTERFACE),
-                        _ => continue,
-                    };
-                    // Skip names already defined locally or already suggested
-                    if local_names.contains(name.as_str()) || seen_names.contains(&name) {
-                        continue;
-                    }
-                    seen_names.insert(name.clone());
-
-                    // Defer `additional_text_edits` computation to resolve —
-                    // produce a marker payload via `data` instead. The resolve
-                    // handler computes the import-line edit only for the item
-                    // the user actually selects, avoiding O(workspace_files ×
-                    // decls) edit construction per keystroke.
-                    let data = serde_json::json!({
-                        "kind": "auto_import",
-                        "name": name,
-                        "import_path": import_path,
-                        "source_uri": uri.to_string(),
-                    });
-
-                    items.push(CompletionItem {
-                        label: name.clone(),
-                        kind: Some(kind),
-                        detail: Some(format!("auto-import from {import_path}")),
-                        sort_text: Some(format!("zz_{name}")), // sort after local items
-                        data: Some(data),
-                        ..Default::default()
-                    });
+                items.push(CompletionItem {
+                    label: name.clone(),
+                    kind: Some(kind),
+                    detail: Some(format!("auto-import from {import_path}")),
+                    sort_text: Some(format!("zz_{name}")), // sort after local items
+                    data: Some(data),
+                    ..Default::default()
+                });
+                auto_imports_added += 1;
+                if auto_imports_added >= MAX_AUTO_IMPORT_ITEMS {
+                    break 'files;
                 }
             }
         }

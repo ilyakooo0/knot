@@ -46,7 +46,7 @@ use lsp_types::notification::Notification as _;
 use lsp_types::request::Request as _;
 use lsp_types::*;
 
-use crate::analysis::analysis_worker;
+use crate::analysis::{analysis_worker, panic_message};
 use crate::call_hierarchy::{
     handle_call_hierarchy_incoming, handle_call_hierarchy_outgoing, handle_call_hierarchy_prepare,
 };
@@ -73,8 +73,8 @@ use crate::semantic_tokens::{
 };
 use crate::signature_help::handle_signature_help;
 use crate::state::{
-    send_response, AnalysisResult, AnalysisTask, PendingSource, ServerConfig, ServerState,
-    WorkspaceSymbolCache,
+    send_internal_error, send_response, AnalysisResult, AnalysisTask, PendingSource, ServerConfig,
+    ServerState, WorkspaceSymbolCache,
 };
 use crate::type_hierarchy::{
     handle_prepare_type_hierarchy, handle_type_hierarchy_subtypes,
@@ -347,10 +347,28 @@ fn main() {
                         if connection.handle_shutdown(&req).unwrap_or(false) {
                             break 'outer;
                         }
-                        handle_request(&mut state, &connection, req);
+                        let id = req.id.clone();
+                        let method = req.method.clone();
+                        // A panic in any handler must not bring the server
+                        // down — reply with an error so the client unblocks.
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            handle_request(&mut state, &connection, req);
+                        }));
+                        if let Err(payload) = result {
+                            let msg = panic_message(&payload);
+                            eprintln!("knot-lsp: handler `{method}` panicked: {msg}");
+                            send_internal_error(&connection, id, &method, &msg);
+                        }
                     }
                     Message::Notification(not) => {
-                        handle_notification(&mut state, &connection, not);
+                        let method = not.method.clone();
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            handle_notification(&mut state, &connection, not);
+                        }));
+                        if let Err(payload) = result {
+                            let msg = panic_message(&payload);
+                            eprintln!("knot-lsp: notification `{method}` panicked: {msg}");
+                        }
                     }
                     Message::Response(_) => {}
                 }
@@ -360,7 +378,13 @@ fn main() {
                     Ok(r) => r,
                     Err(_) => break 'outer,
                 };
-                apply_analysis_result(&mut state, &connection, result);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    apply_analysis_result(&mut state, &connection, result);
+                }));
+                if let Err(payload) = result {
+                    let msg = panic_message(&payload);
+                    eprintln!("knot-lsp: applying analysis result panicked: {msg}");
+                }
             }
         }
     }

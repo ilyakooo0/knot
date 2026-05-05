@@ -671,3 +671,22 @@ pub fn send_response<T: serde::Serialize>(
         eprintln!("knot-lsp: failed to send response: {e}");
     }
 }
+
+/// Send an LSP `InternalError` response. Used by the request dispatcher when
+/// a handler panics — without an error response the client would hang waiting
+/// indefinitely.
+pub fn send_internal_error(
+    conn: &Connection,
+    id: lsp_server::RequestId,
+    method: &str,
+    detail: &str,
+) {
+    let resp = lsp_server::Response::new_err(
+        id,
+        lsp_server::ErrorCode::InternalError as i32,
+        format!("knot-lsp internal error in `{method}`: {detail}"),
+    );
+    if let Err(e) = conn.sender.send(lsp_server::Message::Response(resp)) {
+        eprintln!("knot-lsp: failed to send error response: {e}");
+    }
+}

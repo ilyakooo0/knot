@@ -190,7 +190,7 @@ pub fn analysis_worker(
 /// Best-effort extraction of a panic payload's message. `panic!` payloads are
 /// usually `&'static str` or `String`; anything else falls back to a generic
 /// label so the diagnostic still surfaces the failure.
-fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+pub fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -609,13 +609,32 @@ pub fn get_or_parse_file(
 }
 
 /// Like `get_or_parse_file`, but operates against the `Arc<Mutex<…>>` cache held
-/// by `ServerState`. Locks the mutex briefly per call.
+/// by `ServerState`. Reads the file and (on cache miss) parses it *outside* the
+/// lock so concurrent callers don't serialize on disk-IO + parse work for
+/// unrelated files. The lock is held only for the cheap hash-key lookup and
+/// final insert.
 pub fn get_or_parse_file_shared(
     path: &Path,
     cache: &Arc<Mutex<HashMap<PathBuf, (u64, Module, String)>>>,
 ) -> Option<(Module, String)> {
-    let mut guard = cache.lock().ok()?;
-    get_or_parse_file(path, &mut guard)
+    let source = std::fs::read_to_string(path).ok()?;
+    let hash = content_hash(&source);
+    {
+        let guard = cache.lock().ok()?;
+        if let Some((cached_hash, cached_module, cached_source)) = guard.get(path) {
+            if *cached_hash == hash {
+                return Some((cached_module.clone(), cached_source.clone()));
+            }
+        }
+    }
+    let lexer = knot::lexer::Lexer::new(&source);
+    let (tokens, _) = lexer.tokenize();
+    let parser = knot::parser::Parser::new(source.clone(), tokens);
+    let (module, _) = parser.parse_module();
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(path.to_path_buf(), (hash, module.clone(), source.clone()));
+    }
+    Some((module, source))
 }
 
 // ── Import navigation ───────────────────────────────────────────────

@@ -30,6 +30,11 @@ pub(crate) fn handle_semantic_tokens_full(
     state
         .semantic_token_cache
         .insert(params.text_document.uri.clone(), (result_id.clone(), encoded.clone()));
+    crate::state::enforce_uri_cache_cap(
+        &mut state.semantic_token_cache,
+        &state.documents,
+        crate::state::MAX_SEMANTIC_TOKEN_CACHE,
+    );
 
     Some(SemanticTokensResult::Tokens(SemanticTokens {
         result_id: Some(result_id),
@@ -68,6 +73,11 @@ pub(crate) fn handle_semantic_tokens_full_delta(
             state
                 .semantic_token_cache
                 .insert(uri.clone(), (result_id.clone(), new_tokens));
+            crate::state::enforce_uri_cache_cap(
+                &mut state.semantic_token_cache,
+                &state.documents,
+                crate::state::MAX_SEMANTIC_TOKEN_CACHE,
+            );
             Some(SemanticTokensFullDeltaResult::TokensDelta(SemanticTokensDelta {
                 result_id: Some(result_id),
                 edits,
@@ -77,6 +87,11 @@ pub(crate) fn handle_semantic_tokens_full_delta(
             state
                 .semantic_token_cache
                 .insert(uri.clone(), (result_id.clone(), new_tokens.clone()));
+            crate::state::enforce_uri_cache_cap(
+                &mut state.semantic_token_cache,
+                &state.documents,
+                crate::state::MAX_SEMANTIC_TOKEN_CACHE,
+            );
             Some(SemanticTokensFullDeltaResult::Tokens(SemanticTokens {
                 result_id: Some(result_id),
                 data: new_tokens,

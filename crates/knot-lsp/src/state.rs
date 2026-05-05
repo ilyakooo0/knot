@@ -83,6 +83,90 @@ pub struct ImportCacheEntry {
 
 pub type ImportCache = HashMap<PathBuf, ImportCacheEntry>;
 
+// ── Soft caps on per-URI / per-path server caches ───────────────────
+//
+// These caches are normally drained by `didClose` (per-URI) or by
+// `apply_analysis_result` re-sweeps (reverse-import edges). A misbehaving
+// client that drops the connection mid-session, or a worker task that
+// disappears before sending its result, would otherwise leak entries into
+// the corresponding cache forever. The caps below are a final safety net —
+// well above any realistic open-document count, but bounded.
+
+/// Hard ceiling on the number of distinct *imported* paths tracked in
+/// `reverse_imports`. The map is naturally bounded by the transitive import
+/// closure of every open document; this cap only kicks in for pathological
+/// workspaces where one project imports thousands of unique files.
+pub const MAX_REVERSE_IMPORT_KEYS: usize = 4096;
+/// Cap on the per-URI semantic-token cache. Each entry carries the full
+/// encoded token list; a few hundred fits comfortably in memory and is
+/// far more than any editor opens at once.
+pub const MAX_SEMANTIC_TOKEN_CACHE: usize = 256;
+/// Cap on the per-URI published-diagnostics cache. Two roles per URI
+/// (dedup + range rebase), so we keep this a bit higher than
+/// `MAX_SEMANTIC_TOKEN_CACHE`.
+pub const MAX_PUBLISHED_DIAGNOSTICS: usize = 512;
+/// Cap on the per-URI pending-source map. In steady state this should be
+/// bounded by `state.documents.len()` (one entry per file currently being
+/// edited), but a worker that loses a task could leave a stuck entry; the
+/// cap forces eventual eviction.
+pub const MAX_PENDING_SOURCES: usize = 256;
+
+/// Drop reverse-import entries whose importer set went empty after the last
+/// re-analysis pruned the final incoming edge. An empty set can never
+/// trigger a useful re-queue, but unpruned keys would otherwise accumulate
+/// across long sessions as files are touched and abandoned. After the
+/// retain pass, fall back to a hard cap so a pathological workspace can't
+/// blow the map up either.
+pub fn prune_reverse_imports(
+    map: &mut HashMap<PathBuf, std::collections::HashSet<PathBuf>>,
+) {
+    map.retain(|_, importers| !importers.is_empty());
+    if map.len() > MAX_REVERSE_IMPORT_KEYS {
+        let drop_count = map.len() - MAX_REVERSE_IMPORT_KEYS;
+        let victims: Vec<PathBuf> = map.keys().take(drop_count).cloned().collect();
+        for k in victims {
+            map.remove(&k);
+        }
+    }
+}
+
+/// Bound a per-URI cache to `cap` entries. First evicts URIs that are no
+/// longer open in the editor — those entries serve no purpose once the
+/// document has closed but the client failed to send `didClose`. If the
+/// cache is *still* over the cap (every URI is open), drops arbitrary
+/// entries to bring it back. Generic over the cache value type so the same
+/// helper services `semantic_token_cache`, `published_lsp_diagnostics`,
+/// and `pending_sources` without churn.
+pub fn enforce_uri_cache_cap<V, OV>(
+    cache: &mut HashMap<Uri, V>,
+    open: &HashMap<Uri, OV>,
+    cap: usize,
+) {
+    if cache.len() <= cap {
+        return;
+    }
+    let stale: Vec<Uri> = cache
+        .keys()
+        .filter(|u| !open.contains_key(*u))
+        .cloned()
+        .collect();
+    for u in stale {
+        if cache.len() <= cap {
+            break;
+        }
+        cache.remove(&u);
+    }
+    while cache.len() > cap {
+        let victim = cache.keys().next().cloned();
+        match victim {
+            Some(k) => {
+                cache.remove(&k);
+            }
+            None => break,
+        }
+    }
+}
+
 // ── Per-document analysis state ─────────────────────────────────────
 
 pub struct DocumentState {

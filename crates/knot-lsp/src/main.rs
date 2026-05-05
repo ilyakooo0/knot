@@ -672,6 +672,11 @@ fn apply_analysis_result(state: &mut ServerState, conn: &Connection, result: Ana
                 .or_default()
                 .insert(this_path.clone());
         }
+        // Drop now-empty importer sets and bound the map. The remove loop
+        // above only clears edges, so without this sweep the keys for
+        // files whose last importer just dropped would pile up across
+        // long sessions.
+        crate::state::prune_reverse_imports(&mut state.reverse_imports);
 
         // Selective dependent re-analysis: when a file changes, only
         // re-queue downstream files whose `import_defs` actually reference
@@ -939,6 +944,11 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
                 version,
             },
         );
+        crate::state::enforce_uri_cache_cap(
+            &mut state.pending_sources,
+            &state.documents,
+            crate::state::MAX_PENDING_SOURCES,
+        );
         queue_analysis(state, uri, params.text_document.text, version);
     } else if not.method == notification::DidChangeTextDocument::METHOD {
         let Some(params) =
@@ -1041,6 +1051,11 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
                 state
                     .published_lsp_diagnostics
                     .insert(uri.clone(), rebased);
+                crate::state::enforce_uri_cache_cap(
+                    &mut state.published_lsp_diagnostics,
+                    &state.documents,
+                    crate::state::MAX_PUBLISHED_DIAGNOSTICS,
+                );
                 // Don't send a refresh here: pull-mode clients would re-pull
                 // and see the still-stale `state.documents.knot_diagnostics`
                 // (analysis hasn't caught up yet). The post-analysis refresh
@@ -1081,6 +1096,11 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
                 source: source.clone(),
                 version,
             },
+        );
+        crate::state::enforce_uri_cache_cap(
+            &mut state.pending_sources,
+            &state.documents,
+            crate::state::MAX_PENDING_SOURCES,
         );
 
         // The current file's edits can invalidate cached diagnostics for any
@@ -1328,6 +1348,11 @@ fn publish_diagnostics_dedup(
     state
         .published_lsp_diagnostics
         .insert(uri.clone(), lsp_diags.clone());
+    crate::state::enforce_uri_cache_cap(
+        &mut state.published_lsp_diagnostics,
+        &state.documents,
+        crate::state::MAX_PUBLISHED_DIAGNOSTICS,
+    );
     let params = lsp_types::PublishDiagnosticsParams::new(uri.clone(), lsp_diags, version);
     let not = Notification::new(
         lsp_types::notification::PublishDiagnostics::METHOD.into(),

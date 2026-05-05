@@ -279,10 +279,21 @@ pub(crate) fn extract_principal_type_name(type_str: &str) -> Option<String> {
 
 // ── Workspace file scanning ─────────────────────────────────────────
 
+/// Maximum directory depth walked when scanning for `.knot` files. Real
+/// workspaces don't nest this deeply; the cap exists to terminate symlink
+/// loops that slip past the symlink filter (e.g. via bind mounts) and
+/// pathological generated trees.
+const MAX_SCAN_DEPTH: usize = 32;
+/// Hard ceiling on `.knot` files collected per scan. Workspace-wide handlers
+/// run on every keystroke (workspace/symbol, auto-import); a runaway scan
+/// — say, the user pointed the LSP at `$HOME` — would otherwise eat memory
+/// and stall. Well above any realistic project size.
+const MAX_SCAN_FILES: usize = 50_000;
+
 /// Recursively find all .knot files under a directory.
 pub(crate) fn scan_knot_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    scan_knot_files_recursive(dir, &mut files)?;
+    scan_knot_files_recursive(dir, &mut files, 0)?;
     Ok(files)
 }
 
@@ -318,18 +329,42 @@ pub(crate) fn scan_knot_files_in_roots(
     out
 }
 
-pub(crate) fn scan_knot_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
+pub(crate) fn scan_knot_files_recursive(
+    dir: &Path,
+    files: &mut Vec<PathBuf>,
+    depth: usize,
+) -> std::io::Result<()> {
+    if depth >= MAX_SCAN_DEPTH || files.len() >= MAX_SCAN_FILES {
+        return Ok(());
+    }
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
+        // Use the dirent's metadata, not Path::is_dir, so we don't follow
+        // symlinks — a self-referential symlink chain (`a -> b`, `b -> a`)
+        // would otherwise recurse until the depth cap, doing pointless IO.
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
         let path = entry.path();
-        if path.is_dir() {
-            // Skip hidden dirs and common non-source dirs
+        if file_type.is_dir() {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if !name.starts_with('.') && name != "target" && name != "node_modules" {
-                scan_knot_files_recursive(&path, files)?;
+                scan_knot_files_recursive(&path, files, depth + 1)?;
+                if files.len() >= MAX_SCAN_FILES {
+                    return Ok(());
+                }
             }
-        } else if path.extension().and_then(|e| e.to_str()) == Some("knot") {
+        } else if file_type.is_file()
+            && path.extension().and_then(|e| e.to_str()) == Some("knot")
+        {
             files.push(path);
+            if files.len() >= MAX_SCAN_FILES {
+                return Ok(());
+            }
         }
     }
     Ok(())

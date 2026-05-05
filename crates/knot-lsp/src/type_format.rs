@@ -3,6 +3,13 @@
 
 use knot::ast::{self, TypeKind, TypeScheme};
 
+/// Maximum nesting depth for type/expr/pattern/unit formatting. Inference can
+/// produce pathologically nested types (deep curried functions, recursive ADT
+/// expansions, refinement predicates with large expression trees) that would
+/// otherwise blow the stack on hover. Past the cap, we emit `…` so the user
+/// sees something rather than crashing the server.
+const MAX_FORMAT_DEPTH: usize = 64;
+
 pub fn format_type_scheme(ts: &TypeScheme) -> String {
     let mut s = String::new();
     for c in &ts.constraints {
@@ -14,26 +21,34 @@ pub fn format_type_scheme(ts: &TypeScheme) -> String {
 }
 
 pub fn format_type_kind(ty: &TypeKind) -> String {
+    format_type_kind_d(ty, 0)
+}
+
+fn format_type_kind_d(ty: &TypeKind, depth: usize) -> String {
+    if depth >= MAX_FORMAT_DEPTH {
+        return "…".into();
+    }
+    let d = depth + 1;
     match ty {
         TypeKind::Named(n) => n.clone(),
         TypeKind::Var(n) => n.clone(),
         TypeKind::App { func, arg } => {
-            format!("{} {}", format_type_kind(&func.node), format_type_kind(&arg.node))
+            format!("{} {}", format_type_kind_d(&func.node, d), format_type_kind_d(&arg.node, d))
         }
         TypeKind::Record { fields, rest } => {
             let fs: Vec<String> = fields
                 .iter()
-                .map(|f| format!("{}: {}", f.name, format_type_kind(&f.value.node)))
+                .map(|f| format!("{}: {}", f.name, format_type_kind_d(&f.value.node, d)))
                 .collect();
             match rest {
                 Some(r) => format!("{{{} | {r}}}", fs.join(", ")),
                 None => format!("{{{}}}", fs.join(", ")),
             }
         }
-        TypeKind::Relation(inner) => format!("[{}]", format_type_kind(&inner.node)),
+        TypeKind::Relation(inner) => format!("[{}]", format_type_kind_d(&inner.node, d)),
         TypeKind::Function { param, result } => {
-            let p = format_type_kind(&param.node);
-            let r = format_type_kind(&result.node);
+            let p = format_type_kind_d(&param.node, d);
+            let r = format_type_kind_d(&result.node, d);
             if matches!(param.node, TypeKind::Function { .. }) {
                 format!("({p}) -> {r}")
             } else {
@@ -50,7 +65,7 @@ pub fn format_type_kind(ty: &TypeKind) -> String {
                         let fs: Vec<String> = c
                             .fields
                             .iter()
-                            .map(|f| format!("{}: {}", f.name, format_type_kind(&f.value.node)))
+                            .map(|f| format!("{}: {}", f.name, format_type_kind_d(&f.value.node, d)))
                             .collect();
                         format!("{} {{{}}}", c.name, fs.join(", "))
                     }
@@ -63,30 +78,38 @@ pub fn format_type_kind(ty: &TypeKind) -> String {
         }
         TypeKind::Effectful { effects, ty } => {
             let effs: Vec<String> = effects.iter().map(format_effect).collect();
-            format!("{{{}}} {}", effs.join(", "), format_type_kind(&ty.node))
+            format!("{{{}}} {}", effs.join(", "), format_type_kind_d(&ty.node, d))
         }
         TypeKind::IO { effects, rest, ty } => {
             let mut parts: Vec<String> = effects.iter().map(format_effect).collect();
             if let Some(name) = rest {
                 parts.push(format!("| {}", name));
             }
-            format!("IO {{{}}} {}", parts.join(", "), format_type_kind(&ty.node))
+            format!("IO {{{}}} {}", parts.join(", "), format_type_kind_d(&ty.node, d))
         }
         TypeKind::Hole => "_".into(),
         TypeKind::UnitAnnotated { base, unit } => {
-            format!("{}<{}>", format_type_kind(&base.node), format_unit_expr(unit))
+            format!("{}<{}>", format_type_kind_d(&base.node, d), format_unit_expr_d(unit, d))
         }
         TypeKind::Refined { base, predicate } => {
-            format!("{} where {}", format_type_kind(&base.node), format_expr_brief(&predicate.node))
+            format!(
+                "{} where {}",
+                format_type_kind_d(&base.node, d),
+                format_expr_brief_d(&predicate.node, d)
+            )
         }
         TypeKind::Forall { vars, ty } => {
-            format!("forall {}. {}", vars.join(" "), format_type_kind(&ty.node))
+            format!("forall {}. {}", vars.join(" "), format_type_kind_d(&ty.node, d))
         }
     }
 }
 
 /// Brief structural rendering of an expression for display in type hovers.
-pub fn format_expr_brief(expr: &ast::ExprKind) -> String {
+fn format_expr_brief_d(expr: &ast::ExprKind, depth: usize) -> String {
+    if depth >= MAX_FORMAT_DEPTH {
+        return "…".into();
+    }
+    let d = depth + 1;
     match expr {
         ast::ExprKind::Var(name) => name.clone(),
         ast::ExprKind::Lit(ast::Literal::Int(n)) => n.to_string(),
@@ -94,12 +117,12 @@ pub fn format_expr_brief(expr: &ast::ExprKind) -> String {
         ast::ExprKind::Lit(ast::Literal::Text(s)) => format!("\"{}\"", s),
         ast::ExprKind::Lit(ast::Literal::Bool(b)) => if *b { "true" } else { "false" }.into(),
         ast::ExprKind::Lambda { params, body } => {
-            let ps: Vec<String> = params.iter().map(|p| format_pat_brief(&p.node)).collect();
-            format!("\\{} -> {}", ps.join(" "), format_expr_brief(&body.node))
+            let ps: Vec<String> = params.iter().map(|p| format_pat_brief_d(&p.node, d)).collect();
+            format!("\\{} -> {}", ps.join(" "), format_expr_brief_d(&body.node, d))
         }
         ast::ExprKind::App { func, arg } => {
-            let f = format_expr_brief(&func.node);
-            let a = format_expr_brief(&arg.node);
+            let f = format_expr_brief_d(&func.node, d);
+            let a = format_expr_brief_d(&arg.node, d);
             if matches!(arg.node, ast::ExprKind::App { .. } | ast::ExprKind::BinOp { .. }) {
                 format!("{f} ({a})")
             } else {
@@ -116,23 +139,32 @@ pub fn format_expr_brief(expr: &ast::ExprKind) -> String {
                 ast::BinOp::And => "&&", ast::BinOp::Or => "||",
                 ast::BinOp::Concat => "++", ast::BinOp::Pipe => "|>",
             };
-            format!("{} {} {}", format_expr_brief(&lhs.node), op_str, format_expr_brief(&rhs.node))
+            format!(
+                "{} {} {}",
+                format_expr_brief_d(&lhs.node, d),
+                op_str,
+                format_expr_brief_d(&rhs.node, d)
+            )
         }
         ast::ExprKind::UnaryOp { op, operand } => {
             let op_str = match op {
                 ast::UnaryOp::Neg => "-",
                 ast::UnaryOp::Not => "not ",
             };
-            format!("{}{}", op_str, format_expr_brief(&operand.node))
+            format!("{}{}", op_str, format_expr_brief_d(&operand.node, d))
         }
         ast::ExprKind::FieldAccess { expr, field } => {
-            format!("{}.{}", format_expr_brief(&expr.node), field)
+            format!("{}.{}", format_expr_brief_d(&expr.node, d), field)
         }
         _ => "...".into(),
     }
 }
 
-pub fn format_pat_brief(pat: &ast::PatKind) -> String {
+fn format_pat_brief_d(pat: &ast::PatKind, depth: usize) -> String {
+    if depth >= MAX_FORMAT_DEPTH {
+        return "…".into();
+    }
+    let d = depth + 1;
     match pat {
         ast::PatKind::Var(name) => name.clone(),
         ast::PatKind::Wildcard => "_".into(),
@@ -145,32 +177,40 @@ pub fn format_pat_brief(pat: &ast::PatKind) -> String {
             // `Open {}` — nullary constructor; drop the empty payload to keep
             // the brief rendering tight.
             ast::PatKind::Record(fields) if fields.is_empty() => name.clone(),
-            other => format!("{name} {}", format_pat_brief(other)),
+            other => format!("{name} {}", format_pat_brief_d(other, d)),
         },
         ast::PatKind::Record(fields) => {
             let parts: Vec<String> = fields
                 .iter()
                 .map(|f| match &f.pattern {
                     None => f.name.clone(),
-                    Some(p) => format!("{}: {}", f.name, format_pat_brief(&p.node)),
+                    Some(p) => format!("{}: {}", f.name, format_pat_brief_d(&p.node, d)),
                 })
                 .collect();
             format!("{{{}}}", parts.join(", "))
         }
         ast::PatKind::List(pats) => {
-            let parts: Vec<String> = pats.iter().map(|p| format_pat_brief(&p.node)).collect();
+            let parts: Vec<String> = pats.iter().map(|p| format_pat_brief_d(&p.node, d)).collect();
             format!("[{}]", parts.join(", "))
         }
     }
 }
 
-pub fn format_unit_expr(u: &ast::UnitExpr) -> String {
+fn format_unit_expr_d(u: &ast::UnitExpr, depth: usize) -> String {
+    if depth >= MAX_FORMAT_DEPTH {
+        return "…".into();
+    }
+    let d = depth + 1;
     match u {
         ast::UnitExpr::Dimensionless => "1".into(),
         ast::UnitExpr::Named(n) => n.clone(),
-        ast::UnitExpr::Mul(a, b) => format!("{}*{}", format_unit_expr(a), format_unit_expr(b)),
-        ast::UnitExpr::Div(a, b) => format!("{}/{}", format_unit_expr(a), format_unit_expr(b)),
-        ast::UnitExpr::Pow(base, exp) => format!("{}^{}", format_unit_expr(base), exp),
+        ast::UnitExpr::Mul(a, b) => {
+            format!("{}*{}", format_unit_expr_d(a, d), format_unit_expr_d(b, d))
+        }
+        ast::UnitExpr::Div(a, b) => {
+            format!("{}/{}", format_unit_expr_d(a, d), format_unit_expr_d(b, d))
+        }
+        ast::UnitExpr::Pow(base, exp) => format!("{}^{}", format_unit_expr_d(base, d), exp),
     }
 }
 

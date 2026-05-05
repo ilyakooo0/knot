@@ -123,7 +123,7 @@ pub(crate) fn handle_workspace_symbol(
         .collect();
     if let Ok(mut cache) = state.workspace_symbol_cache.lock() {
         for (path, hash, entries) in open_entries {
-            cache.by_path.insert(path, (None, hash, entries));
+            cache.insert_capped(path, (None, hash, entries));
         }
     }
 
@@ -219,9 +219,7 @@ pub(crate) fn handle_workspace_symbol(
                 let entries = build_workspace_symbol_entries(&module, &source, &uri);
                 push_matching(&entries, &query, &mut symbols);
                 if let Ok(mut cache) = state.workspace_symbol_cache.lock() {
-                    cache
-                        .by_path
-                        .insert(canonical, (on_disk_mtime, hash, entries));
+                    cache.insert_capped(canonical, (on_disk_mtime, hash, entries));
                 }
             }
         }

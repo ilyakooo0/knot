@@ -110,6 +110,13 @@ pub const MAX_PUBLISHED_DIAGNOSTICS: usize = 512;
 /// edited), but a worker that loses a task could leave a stuck entry; the
 /// cap forces eventual eviction.
 pub const MAX_PENDING_SOURCES: usize = 256;
+/// Hard ceiling on entries in `WorkspaceSymbolCache`. Naturally bounded by the
+/// `.knot` files on disk in the workspace (and the file-scan cap), and pruned
+/// on every workspace/symbol query. This cap only matters between scans, when
+/// the editor opens many files via `didOpen` without ever issuing a symbol
+/// query — without it, the per-open-doc inserts in Phase 1 of
+/// `handle_workspace_symbol` would accumulate forever.
+pub const MAX_WORKSPACE_SYMBOL_CACHE: usize = 4096;
 
 /// Drop reverse-import entries whose importer set went empty after the last
 /// re-analysis pruned the final incoming edge. An empty set can never
@@ -374,6 +381,29 @@ pub struct WorkspaceSymbolEntry {
 #[derive(Default)]
 pub struct WorkspaceSymbolCache {
     pub by_path: HashMap<PathBuf, (Option<SystemTime>, u64, Vec<WorkspaceSymbolEntry>)>,
+}
+
+impl WorkspaceSymbolCache {
+    /// Insert an entry and enforce `MAX_WORKSPACE_SYMBOL_CACHE`. Eviction is
+    /// arbitrary (whichever keys the iterator yields first) — entries are
+    /// content-addressed, so an evicted entry just costs a re-parse the next
+    /// time the file is queried. No correctness impact.
+    pub fn insert_capped(
+        &mut self,
+        path: PathBuf,
+        value: (Option<SystemTime>, u64, Vec<WorkspaceSymbolEntry>),
+    ) {
+        self.by_path.insert(path, value);
+        while self.by_path.len() > MAX_WORKSPACE_SYMBOL_CACHE {
+            let victim = self.by_path.keys().next().cloned();
+            match victim {
+                Some(k) => {
+                    self.by_path.remove(&k);
+                }
+                None => break,
+            }
+        }
+    }
 }
 
 pub struct PendingSource {

@@ -492,7 +492,7 @@ fn prewarm_workspace_symbol_cache(
         };
         let entries = build_workspace_symbol_entries(&module, &source, &uri);
         if let Ok(mut c) = cache.lock() {
-            c.by_path.insert(canonical, (on_disk_mtime, hash, entries));
+            c.insert_capped(canonical, (on_disk_mtime, hash, entries));
         }
     }
 }

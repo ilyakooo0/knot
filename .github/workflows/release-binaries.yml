@@ -61,16 +61,25 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build knotc and runtime
-        run: cargo build --release --target ${{ matrix.target }} -p knot-compiler -p knot-runtime
+      - name: Build knotc, knot-lsp, and runtime
+        run: cargo build --release --target ${{ matrix.target }} -p knot-compiler -p knot-lsp -p knot-runtime
 
-      - name: Package
+      - name: Package knotc
         shell: bash
         run: |
           STAGE="knotc-${{ needs.version.outputs.tag }}-${{ matrix.name }}"
           mkdir -p "$STAGE"
           cp "target/${{ matrix.target }}/release/knotc" "$STAGE/"
           cp "target/${{ matrix.target }}/release/libknot_runtime.a" "$STAGE/"
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+          shasum -a 256 "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+
+      - name: Package knot-lsp
+        shell: bash
+        run: |
+          STAGE="knot-lsp-${{ needs.version.outputs.tag }}-${{ matrix.name }}"
+          mkdir -p "$STAGE"
+          cp "target/${{ matrix.target }}/release/knot-lsp" "$STAGE/"
           tar -czf "$STAGE.tar.gz" "$STAGE"
           shasum -a 256 "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
 
@@ -82,4 +91,6 @@ jobs:
           files: |
             knotc-*.tar.gz
             knotc-*.tar.gz.sha256
+            knot-lsp-*.tar.gz
+            knot-lsp-*.tar.gz.sha256
           make_latest: true

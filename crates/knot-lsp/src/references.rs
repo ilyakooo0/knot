@@ -13,6 +13,15 @@ use crate::utils::{
     word_at_position,
 };
 
+/// Cap on the number of locations returned by a single `textDocument/references`
+/// request. Common identifier names (`x`, `i`, `name`) in a multi-file workspace
+/// can match thousands of times across open docs and disk; without a cap, the
+/// reply takes long enough to encode that the editor's "Find References" pane
+/// hangs, and the resulting payload usually overflows what's actually useful
+/// to the user. Truncation is silent — the editor renders the first 10k hits,
+/// which is far more than anyone scrolls through anyway.
+const MAX_REFERENCE_LOCATIONS: usize = 10_000;
+
 // ── Find References ─────────────────────────────────────────────────
 
 pub(crate) fn handle_references(
@@ -49,6 +58,9 @@ pub(crate) fn handle_references(
 
     // Find all usages in current document
     for (usage_span, target_span) in &doc.references {
+        if locations.len() >= MAX_REFERENCE_LOCATIONS {
+            break;
+        }
         if *target_span == def_span {
             locations.push(Location {
                 uri: uri.clone(),
@@ -62,7 +74,10 @@ pub(crate) fn handle_references(
     let _current_file = uri_to_path(uri).and_then(|p| p.canonicalize().ok());
 
     // Cross-file: search all other open documents for references to the same name
-    for (other_uri, other_doc) in &state.documents {
+    'open_docs: for (other_uri, other_doc) in &state.documents {
+        if locations.len() >= MAX_REFERENCE_LOCATIONS {
+            break;
+        }
         if other_uri == uri {
             continue;
         }
@@ -84,6 +99,9 @@ pub(crate) fn handle_references(
         }
 
         for (usage_span, target_span) in &other_doc.references {
+            if locations.len() >= MAX_REFERENCE_LOCATIONS {
+                break 'open_docs;
+            }
             let target_name = safe_slice(&other_doc.source, *target_span);
             if other_doc.definitions.get(&symbol_name) == Some(target_span) {
                 locations.push(Location {
@@ -98,7 +116,7 @@ pub(crate) fn handle_references(
             }
         }
         // Also check if the other doc has a definition of this name (for include_declaration)
-        if params.context.include_declaration {
+        if params.context.include_declaration && locations.len() < MAX_REFERENCE_LOCATIONS {
             if let Some(other_def) = other_doc.definitions.get(&symbol_name) {
                 locations.push(Location {
                     uri: other_uri.clone(),
@@ -121,6 +139,9 @@ pub(crate) fn handle_references(
     let workspace_files =
         scan_knot_files_in_roots(&state.workspace_roots, state.workspace_root.as_deref());
     for file_path in workspace_files {
+        if locations.len() >= MAX_REFERENCE_LOCATIONS {
+            break;
+        }
         let canonical = match file_path.canonicalize() {
             Ok(p) => p,
             Err(_) => continue,
@@ -160,7 +181,10 @@ pub(crate) fn handle_references(
     }
 }
 
-/// Append every whole-word occurrence of `name` in `source` as a Location.
+/// Append every whole-word occurrence of `name` in `source` as a Location, up
+/// to the global `MAX_REFERENCE_LOCATIONS` cap. The cap is checked against the
+/// caller-provided `out` so per-file scans don't independently fill the buffer
+/// — instead we stop as soon as the workspace-wide total is reached.
 fn scan_word_occurrences(source: &str, name: &str, uri: &Uri, out: &mut Vec<Location>) {
     let bytes = source.as_bytes();
     let needle = name.as_bytes();
@@ -170,6 +194,9 @@ fn scan_word_occurrences(source: &str, name: &str, uri: &Uri, out: &mut Vec<Loca
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     let mut i = 0;
     while i + needle.len() <= bytes.len() {
+        if out.len() >= MAX_REFERENCE_LOCATIONS {
+            return;
+        }
         if &bytes[i..i + needle.len()] == needle {
             let left_ok = i == 0 || !is_ident(bytes[i - 1]);
             let right_ok =
@@ -230,6 +257,32 @@ main = println (show (double 3))
             .expect("references found");
         // Three call sites: `double 1`, `double 2`, `double 3`.
         assert_eq!(locs.len(), 3, "got: {locs:?}");
+    }
+
+    #[test]
+    fn scan_word_occurrences_respects_cap() {
+        // Pre-fill the buffer near the cap and scan a source dense with
+        // matches; only the slots up to the cap should be appended.
+        let uri: Uri = "file:///tmp/scan.knot".parse().unwrap();
+        let source = "x ".repeat(MAX_REFERENCE_LOCATIONS + 100);
+        let mut out = Vec::with_capacity(MAX_REFERENCE_LOCATIONS);
+        // Seed with enough entries that only a handful of room remains —
+        // exercising the boundary check without allocating the full cap.
+        for _ in 0..(MAX_REFERENCE_LOCATIONS - 5) {
+            out.push(Location {
+                uri: uri.clone(),
+                range: Range {
+                    start: Position::new(0, 0),
+                    end: Position::new(0, 0),
+                },
+            });
+        }
+        scan_word_occurrences(&source, "x", &uri, &mut out);
+        assert_eq!(
+            out.len(),
+            MAX_REFERENCE_LOCATIONS,
+            "scan should stop exactly at the cap"
+        );
     }
 
     #[test]

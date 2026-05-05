@@ -27,9 +27,15 @@ pub(crate) fn handle_inlay_hint(
     // Show inferred types for unannotated function declarations.
     // For annotated functions, show only the inferred *effects* if they exist
     // and aren't already in the type signature.
+    //
+    // `decls` is in source order (parser pushes them sequentially) so once the
+    // start exceeds the visible range we can stop — the linear scan is bounded
+    // by the visible-region size, not by the file's total decl count.
     for decl in &doc.module.decls {
-        // Only show hints within the visible range
-        if decl.span.end < range_start || decl.span.start > range_end {
+        if decl.span.start > range_end {
+            break;
+        }
+        if decl.span.end < range_start {
             continue;
         }
 
@@ -124,8 +130,20 @@ pub(crate) fn handle_inlay_hint(
     // `unit_info` (populated during analysis) instead of re-parsing each type
     // string per request — this makes the hint cheap when the file has many
     // unit-annotated bindings.
-    for (span, ty) in &doc.local_type_info {
-        if span.end < range_start || span.start > range_end {
+    //
+    // `local_type_info_sorted` is the analysis output's `local_type_info`
+    // sorted by `span.start`. Binary-search for the first entry whose start
+    // exceeds the visible range and clip — bindings past that point are
+    // certainly off-screen, so we avoid scanning the whole map on every
+    // cursor move. Bindings *before* the visible range may still overlap
+    // (an outer let around the cursor's expression starts well before its
+    // end), so the lower bound is enforced per-iteration with the existing
+    // `span.end < range_start` check.
+    let upper = doc
+        .local_type_info_sorted
+        .partition_point(|(s, _)| s.start <= range_end);
+    for (span, ty) in &doc.local_type_info_sorted[..upper] {
+        if span.end < range_start {
             continue;
         }
         let hint_pos = offset_to_position(&doc.source, span.end);
@@ -1073,6 +1091,31 @@ mod tests {
             range,
             work_done_progress_params: Default::default(),
         }
+    }
+
+    #[test]
+    fn inlay_hint_skips_bindings_outside_visible_range() {
+        // Two `let` bindings, far enough apart that a narrow viewport can
+        // include only one. The pre-indexed `local_type_info_sorted` should
+        // clip out the off-screen binding via binary search; the on-screen
+        // binding still appears.
+        let mut ws = TestWorkspace::new();
+        let src = "early = (\\_ -> let a = 1 in a) ()\nfiller1 = 0\nfiller2 = 0\nfiller3 = 0\nlate = (\\_ -> let z = 99 in z) ()\n";
+        let uri = ws.open("main", src);
+        let doc = ws.doc(&uri);
+        // Compute a range covering only the `late` line.
+        let late_pos = doc.source.find("late =").expect("late") as u32;
+        let late_end = doc.source.len() as u32;
+        let start = offset_to_position(&doc.source, late_pos as usize);
+        let end = offset_to_position(&doc.source, late_end as usize);
+        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, Range { start, end }))
+            .unwrap_or_default();
+        // No hint position should sit on the `early` line (line 0).
+        let has_early_hint = hints.iter().any(|h| h.position.line == 0);
+        assert!(
+            !has_early_hint,
+            "off-screen binding produced a hint anyway: {hints:?}"
+        );
     }
 
     #[test]

@@ -221,7 +221,7 @@ fn resolve_canonical_owner(
             .cloned()
             .or_else(|| {
                 let cache = state.import_cache.lock().ok()?;
-                cache.get(other_path).map(|(_, _, src)| src.clone())
+                cache.get(other_path).map(|e| e.source.clone())
             })
             .unwrap_or_default();
         let name_span = name_span_within(&other_source, *decl_span, name).unwrap_or(*decl_span);

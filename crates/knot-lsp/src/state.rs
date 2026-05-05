@@ -62,6 +62,27 @@ pub type InferenceCache = HashMap<(PathBuf, u64), InferenceSnapshot>;
 // has to be maintained on every insert/evict. Wire one up if profiling ever
 // shows the linear scan is a bottleneck.
 
+// ── Import cache ────────────────────────────────────────────────────
+
+/// One entry in the parsed-file cache. Holds the parsed AST and its source
+/// for a `.knot` file, keyed (in `ImportCache`) by canonical path. The
+/// `access_clock` field is a monotonic counter used by the LRU eviction in
+/// `analysis::analyze_document`, mirroring the policy on `InferenceCache`.
+#[derive(Clone)]
+pub struct ImportCacheEntry {
+    pub content_hash: u64,
+    pub module: Module,
+    pub source: String,
+    /// Bumped on every cache hit and insert. The eviction policy drops the
+    /// entry with the lowest counter when the cache is at its cap, so files
+    /// the user is actively touching (open docs + their imports) stay
+    /// resident through long sessions where many other files are visited
+    /// transiently (workspace symbol search, rename across the workspace).
+    pub access_clock: u64,
+}
+
+pub type ImportCache = HashMap<PathBuf, ImportCacheEntry>;
+
 // ── Per-document analysis state ─────────────────────────────────────
 
 pub struct DocumentState {
@@ -75,6 +96,15 @@ pub struct DocumentState {
     pub type_info: HashMap<String, String>,
     /// Span-based type info for local bindings (let, bind, lambda params, case patterns).
     pub local_type_info: HashMap<Span, String>,
+    /// `local_type_info` sorted by `span.start` ascending. Built once per
+    /// analysis so request-time consumers (notably `inlay_hints`) can
+    /// binary-search to the visible byte range instead of linear-scanning the
+    /// whole map on every cursor move. Stored as `(Span, String)` pairs (i.e.
+    /// type strings duplicated from `local_type_info`) so the inlay loop is a
+    /// single sequential read; the HashMap remains for direct-by-span lookup
+    /// in completion. Sized in proportion to a single document, not the whole
+    /// workspace, so the duplication is bounded.
+    pub local_type_info_sorted: Vec<(Span, String)>,
     /// Span-based type info for literal expressions.
     pub literal_types: Vec<(Span, String)>,
     /// Per-declaration effect info (formatted strings).
@@ -162,7 +192,7 @@ pub struct ServerState {
     /// Shared with the analysis worker thread; populated lazily by every
     /// caller that reads a `.knot` file (imports, rename, workspace symbol,
     /// workspace diagnostics, completion).
-    pub import_cache: Arc<Mutex<HashMap<PathBuf, (u64, Module, String)>>>,
+    pub import_cache: Arc<Mutex<ImportCache>>,
     /// Cached LSP diagnostics for unopened workspace files, keyed by content
     /// hash. The third tuple field is a monotonic access counter used for LRU
     /// eviction in `prune_stale_workspace_diag_cache`. Bumped on every cache

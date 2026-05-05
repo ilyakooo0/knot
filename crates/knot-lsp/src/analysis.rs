@@ -19,8 +19,8 @@ use knot_compiler::infer::MonadKind;
 use crate::defs::{build_details, resolve_definitions};
 use crate::incremental::ModuleFingerprint;
 use crate::state::{
-    content_hash, AnalysisResult, AnalysisTask, DocumentState, InferenceCache, InferenceSnapshot,
-    ANALYSIS_DEBOUNCE, ANALYSIS_MAX_WAIT,
+    content_hash, AnalysisResult, AnalysisTask, DocumentState, ImportCache, ImportCacheEntry,
+    InferenceCache, InferenceSnapshot, ANALYSIS_DEBOUNCE, ANALYSIS_MAX_WAIT,
 };
 use crate::utils::{
     collect_keyword_operator_positions, extract_doc_comments, find_word_in_source, uri_to_path,
@@ -30,6 +30,13 @@ use crate::utils::{
 /// switching are well-served by even a small cache; we don't need to retain
 /// the whole edit history.
 const MAX_INFERENCE_CACHE_ENTRIES: usize = 128;
+
+/// Soft cap on cached parsed files. Each entry holds the AST plus the source
+/// text, so the per-entry footprint is much larger than an inference snapshot;
+/// we keep the cap a bit higher than `MAX_INFERENCE_CACHE_ENTRIES` because
+/// import-resolution touches transitively-imported files that aren't open in
+/// the editor and would otherwise re-parse on every cross-file query.
+const MAX_IMPORT_CACHE_ENTRIES: usize = 256;
 
 /// Monotonic clock for LRU eviction. Bumped on every cache insert and hit.
 /// `wrapping_add` so the counter never panics on overflow — at one bump
@@ -42,6 +49,40 @@ fn next_access_clock(cache: &InferenceCache) -> u64 {
         .max()
         .unwrap_or(0)
         .wrapping_add(1)
+}
+
+/// Same monotonic-clock helper, for `ImportCache`. Separate from
+/// `next_access_clock` because the cache types are unrelated, and inlining
+/// `.values().map(...).max()` everywhere obscures intent.
+fn next_import_clock(cache: &ImportCache) -> u64 {
+    cache
+        .values()
+        .map(|e| e.access_clock)
+        .max()
+        .unwrap_or(0)
+        .wrapping_add(1)
+}
+
+/// LRU eviction for `ImportCache`. Drops the least-recently-touched entries
+/// until the cache is back under `MAX_IMPORT_CACHE_ENTRIES`. Called from
+/// every insertion site (`analyze_document`, `get_or_parse_file`,
+/// `get_or_parse_file_shared`) so growth stays bounded regardless of which
+/// path inserts; without this the cache grew linearly with unique files
+/// touched across the entire session (workspace symbol search alone visits
+/// every `.knot` file in the workspace once).
+fn enforce_import_cache_cap(cache: &mut ImportCache) {
+    while cache.len() > MAX_IMPORT_CACHE_ENTRIES {
+        let victim = cache
+            .iter()
+            .min_by_key(|(_, e)| e.access_clock)
+            .map(|(k, _)| k.clone());
+        match victim {
+            Some(k) => {
+                cache.remove(&k);
+            }
+            None => break,
+        }
+    }
 }
 
 /// Extract a `<unit>` annotation from a formatted local type string. Returns
@@ -60,7 +101,7 @@ fn extract_unit_from_local_type(ty: &str) -> Option<String> {
 pub fn analysis_worker(
     rx: Receiver<AnalysisTask>,
     tx: Sender<AnalysisResult>,
-    import_cache: Arc<Mutex<HashMap<PathBuf, (u64, Module, String)>>>,
+    import_cache: Arc<Mutex<ImportCache>>,
     inference_cache: Arc<Mutex<InferenceCache>>,
 ) {
     loop {
@@ -115,7 +156,7 @@ pub fn analysis_worker(
             // and never need overwrite-vs-skip resolution.
             let import_cache_before: HashMap<PathBuf, u64> = cache_local
                 .iter()
-                .map(|(k, (h, _, _))| (k.clone(), *h))
+                .map(|(k, e)| (k.clone(), e.content_hash))
                 .collect();
 
             // Run the compiler pipeline behind a panic boundary. If any
@@ -161,10 +202,17 @@ pub fn analysis_worker(
                 if let Ok(mut shared) = import_cache.lock() {
                     for (k, v) in cache_local.into_iter() {
                         let before_hash = import_cache_before.get(&k).copied();
-                        if before_hash != Some(v.0) {
+                        if before_hash != Some(v.content_hash) {
                             shared.insert(k, v);
                         }
                     }
+                    // Worker-side eviction operates on the local clone, so the
+                    // shared cache can drift over the cap when handlers
+                    // (rename, completion, workspace symbol) insert in
+                    // parallel between merges. Re-enforce the cap on the
+                    // shared cache here so growth stays bounded across
+                    // sessions regardless of which path inserts.
+                    enforce_import_cache_cap(&mut shared);
                 }
                 if let Ok(mut shared) = inference_cache.lock() {
                     for (k, v) in inf_cache_local.into_iter() {
@@ -224,6 +272,7 @@ fn panic_recovery_state(source: &str, message: &str) -> DocumentState {
         details: HashMap::new(),
         type_info: HashMap::new(),
         local_type_info: HashMap::new(),
+        local_type_info_sorted: Vec::new(),
         literal_types: Vec::new(),
         effect_info: HashMap::new(),
         effect_sets: HashMap::new(),
@@ -249,7 +298,7 @@ fn panic_recovery_state(source: &str, message: &str) -> DocumentState {
 pub fn analyze_document(
     uri: &Uri,
     source: &str,
-    import_cache: &mut HashMap<PathBuf, (u64, Module, String)>,
+    import_cache: &mut ImportCache,
     inference_cache: &mut InferenceCache,
 ) -> DocumentState {
     let mut all_diags = Vec::new();
@@ -276,19 +325,42 @@ pub fn analyze_document(
     let canonical_path = uri_to_path(uri).and_then(|p| p.canonicalize().ok());
     let src_hash = content_hash(source);
     let (module, parse_diags) = match canonical_path.as_ref() {
-        Some(p) => match import_cache.get(p) {
-            Some((cached_hash, cached_module, _)) if *cached_hash == src_hash => {
-                let parser = knot::parser::Parser::new(source.to_string(), tokens);
-                let (_reparsed, parse_d) = parser.parse_module();
-                (cached_module.clone(), parse_d)
+        Some(p) => {
+            // Bump access_clock on hits so the LRU eviction below preserves
+            // entries the user is actively touching, even when the content
+            // hasn't changed (re-analysis for the same buffer is the common
+            // case, e.g. `didChange` arriving back in the worker).
+            let new_clock = next_import_clock(import_cache);
+            let cache_hit = import_cache
+                .get_mut(p)
+                .filter(|e| e.content_hash == src_hash)
+                .map(|e| {
+                    e.access_clock = new_clock;
+                    e.module.clone()
+                });
+            match cache_hit {
+                Some(cached_module) => {
+                    let parser = knot::parser::Parser::new(source.to_string(), tokens);
+                    let (_reparsed, parse_d) = parser.parse_module();
+                    (cached_module, parse_d)
+                }
+                None => {
+                    let parser = knot::parser::Parser::new(source.to_string(), tokens);
+                    let (m, parse_d) = parser.parse_module();
+                    import_cache.insert(
+                        p.clone(),
+                        ImportCacheEntry {
+                            content_hash: src_hash,
+                            module: m.clone(),
+                            source: source.to_string(),
+                            access_clock: new_clock,
+                        },
+                    );
+                    enforce_import_cache_cap(import_cache);
+                    (m, parse_d)
+                }
             }
-            _ => {
-                let parser = knot::parser::Parser::new(source.to_string(), tokens);
-                let (m, parse_d) = parser.parse_module();
-                import_cache.insert(p.clone(), (src_hash, m.clone(), source.to_string()));
-                (m, parse_d)
-            }
-        },
+        }
         None => {
             let parser = knot::parser::Parser::new(source.to_string(), tokens);
             parser.parse_module()
@@ -502,6 +574,7 @@ pub fn analyze_document(
         }
     }
 
+    let local_type_info_sorted = sort_local_type_info(&local_type_info);
     DocumentState {
         source: source.to_string(),
         module,
@@ -510,6 +583,7 @@ pub fn analyze_document(
         details,
         type_info,
         local_type_info,
+        local_type_info_sorted,
         literal_types,
         effect_info,
         effect_sets,
@@ -528,6 +602,15 @@ pub fn analyze_document(
         signature_changed_decl_names,
         dirty_decl_closure,
     }
+}
+
+/// Build a `(Span, type)` list sorted by `span.start`. Consumers (notably the
+/// inlay-hint handler) binary-search this to clip to the visible byte range
+/// instead of linear-scanning every binding on every cursor move.
+fn sort_local_type_info(map: &HashMap<Span, String>) -> Vec<(Span, String)> {
+    let mut sorted: Vec<(Span, String)> = map.iter().map(|(s, t)| (*s, t.clone())).collect();
+    sorted.sort_by_key(|(s, _)| s.start);
+    sorted
 }
 
 /// Compose a `DocumentState` from a cached inference snapshot. Pulled out
@@ -551,6 +634,7 @@ fn reuse_snapshot(
     mut all_diags: Vec<diagnostic::Diagnostic>,
 ) -> DocumentState {
     all_diags.extend(snap.diagnostics.iter().cloned());
+    let local_type_info_sorted = sort_local_type_info(&snap.local_type_info);
     DocumentState {
         source: source.to_string(),
         module,
@@ -559,6 +643,7 @@ fn reuse_snapshot(
         details,
         type_info: snap.type_info.clone(),
         local_type_info: snap.local_type_info.clone(),
+        local_type_info_sorted,
         literal_types,
         effect_info: snap.effect_info.clone(),
         effect_sets: snap.effect_sets.clone(),
@@ -591,20 +676,31 @@ fn reuse_snapshot(
 /// auto-import completion, import resolution).
 pub fn get_or_parse_file(
     path: &Path,
-    cache: &mut HashMap<PathBuf, (u64, Module, String)>,
+    cache: &mut ImportCache,
 ) -> Option<(Module, String)> {
     let source = std::fs::read_to_string(path).ok()?;
     let hash = content_hash(&source);
-    if let Some((cached_hash, cached_module, cached_source)) = cache.get(path) {
-        if *cached_hash == hash {
-            return Some((cached_module.clone(), cached_source.clone()));
+    let new_clock = next_import_clock(cache);
+    if let Some(entry) = cache.get_mut(path) {
+        if entry.content_hash == hash {
+            entry.access_clock = new_clock;
+            return Some((entry.module.clone(), entry.source.clone()));
         }
     }
     let lexer = knot::lexer::Lexer::new(&source);
     let (tokens, _) = lexer.tokenize();
     let parser = knot::parser::Parser::new(source.clone(), tokens);
     let (module, _) = parser.parse_module();
-    cache.insert(path.to_path_buf(), (hash, module.clone(), source.clone()));
+    cache.insert(
+        path.to_path_buf(),
+        ImportCacheEntry {
+            content_hash: hash,
+            module: module.clone(),
+            source: source.clone(),
+            access_clock: new_clock,
+        },
+    );
+    enforce_import_cache_cap(cache);
     Some((module, source))
 }
 
@@ -615,15 +711,17 @@ pub fn get_or_parse_file(
 /// final insert.
 pub fn get_or_parse_file_shared(
     path: &Path,
-    cache: &Arc<Mutex<HashMap<PathBuf, (u64, Module, String)>>>,
+    cache: &Arc<Mutex<ImportCache>>,
 ) -> Option<(Module, String)> {
     let source = std::fs::read_to_string(path).ok()?;
     let hash = content_hash(&source);
     {
-        let guard = cache.lock().ok()?;
-        if let Some((cached_hash, cached_module, cached_source)) = guard.get(path) {
-            if *cached_hash == hash {
-                return Some((cached_module.clone(), cached_source.clone()));
+        let mut guard = cache.lock().ok()?;
+        let new_clock = next_import_clock(&guard);
+        if let Some(entry) = guard.get_mut(path) {
+            if entry.content_hash == hash {
+                entry.access_clock = new_clock;
+                return Some((entry.module.clone(), entry.source.clone()));
             }
         }
     }
@@ -632,7 +730,17 @@ pub fn get_or_parse_file_shared(
     let parser = knot::parser::Parser::new(source.clone(), tokens);
     let (module, _) = parser.parse_module();
     if let Ok(mut guard) = cache.lock() {
-        guard.insert(path.to_path_buf(), (hash, module.clone(), source.clone()));
+        let new_clock = next_import_clock(&guard);
+        guard.insert(
+            path.to_path_buf(),
+            ImportCacheEntry {
+                content_hash: hash,
+                module: module.clone(),
+                source: source.clone(),
+                access_clock: new_clock,
+            },
+        );
+        enforce_import_cache_cap(&mut guard);
     }
     Some((module, source))
 }
@@ -643,7 +751,7 @@ pub fn get_or_parse_file_shared(
 pub fn resolve_import_navigation(
     imports: &[ast::Import],
     source_path: &Path,
-    import_cache: &mut HashMap<PathBuf, (u64, Module, String)>,
+    import_cache: &mut ImportCache,
 ) -> (
     HashMap<PathBuf, String>,
     HashMap<String, (PathBuf, Span)>,
@@ -913,6 +1021,77 @@ mod tests {
     }
 
     #[test]
+    fn import_cache_lru_evicts_least_recently_used() {
+        // Insert beyond the cap, then verify enforcement keeps only the
+        // freshest `MAX_IMPORT_CACHE_ENTRIES` entries.
+        let mut cache: ImportCache = HashMap::new();
+        for i in 0..MAX_IMPORT_CACHE_ENTRIES + 10 {
+            cache.insert(
+                PathBuf::from(format!("/tmp/lru{i}.knot")),
+                ImportCacheEntry {
+                    content_hash: i as u64,
+                    module: Module {
+                        imports: Vec::new(),
+                        decls: Vec::new(),
+                    },
+                    source: String::new(),
+                    access_clock: i as u64,
+                },
+            );
+        }
+        enforce_import_cache_cap(&mut cache);
+        assert_eq!(cache.len(), MAX_IMPORT_CACHE_ENTRIES);
+        // The oldest 10 entries (clocks 0..9) should be the ones evicted.
+        let min_surviving = cache
+            .values()
+            .map(|e| e.access_clock)
+            .min()
+            .unwrap_or_default();
+        assert!(
+            min_surviving >= 10,
+            "expected the 10 oldest entries to be evicted; min surviving clock is {min_surviving}"
+        );
+    }
+
+    #[test]
+    fn import_cache_hit_bumps_access_clock() {
+        // Re-analyzing the same file should bump its access_clock so it
+        // survives subsequent eviction passes triggered by unrelated inserts.
+        let dir = std::env::temp_dir().join(format!(
+            "knot-lsp-import-lru-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lru.knot");
+        std::fs::write(&path, "x = 1\n").unwrap();
+        let canonical = path.canonicalize().unwrap();
+        let uri = fake_uri(&format!("file://{}", canonical.display()));
+
+        let mut import_cache: ImportCache = HashMap::new();
+        let mut inference_cache: InferenceCache = HashMap::new();
+        let _ = analyze_document(&uri, "x = 1\n", &mut import_cache, &mut inference_cache);
+        let first_clock = import_cache
+            .get(&canonical)
+            .map(|e| e.access_clock)
+            .expect("entry should be cached after first analyze");
+
+        let _ = analyze_document(&uri, "x = 1\n", &mut import_cache, &mut inference_cache);
+        let second_clock = import_cache
+            .get(&canonical)
+            .map(|e| e.access_clock)
+            .expect("entry should still be cached after second analyze");
+        assert!(
+            second_clock > first_clock,
+            "cache hit should bump access_clock; first={first_clock}, second={second_clock}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn whitespace_only_edit_runs_fresh_inference_with_correct_spans() {
         // The structural-fingerprint cache reuse tier was removed because it
         // returned snapshots whose Span keys pointed at the *old* source —
@@ -935,7 +1114,7 @@ mod tests {
         let canonical = path.canonicalize().unwrap();
         let uri = fake_uri(&format!("file://{}", canonical.display()));
 
-        let mut import_cache: HashMap<PathBuf, (u64, Module, String)> = HashMap::new();
+        let mut import_cache: ImportCache = HashMap::new();
         let mut inference_cache: InferenceCache = HashMap::new();
 
         let v1 = "id = \\x -> x\nmain = id 1\n";
@@ -995,7 +1174,7 @@ mod tests {
         let canonical = path.canonicalize().unwrap();
         let uri = fake_uri(&format!("file://{}", canonical.display()));
 
-        let mut import_cache: HashMap<PathBuf, (u64, Module, String)> = HashMap::new();
+        let mut import_cache: ImportCache = HashMap::new();
         let mut inference_cache: InferenceCache = HashMap::new();
 
         // v1 has a `let y = ...` binding whose span is captured in
@@ -1062,7 +1241,7 @@ mod tests {
         };
         let uri = fake_uri(&format!("file://{}", canonical.display()));
 
-        let mut import_cache: HashMap<PathBuf, (u64, Module, String)> = HashMap::new();
+        let mut import_cache: ImportCache = HashMap::new();
         let mut inference_cache: InferenceCache = HashMap::new();
 
         let v1 = "double = \\x -> x * 2\nfoo = \\y -> y\n";
@@ -1307,7 +1486,7 @@ main = do
 
         let uri = fake_uri("file:///tmp/fuzz.knot");
         for (label, src) in cases {
-            let mut import_cache: HashMap<PathBuf, (u64, Module, String)> = HashMap::new();
+            let mut import_cache: ImportCache = HashMap::new();
             let mut inference_cache: InferenceCache = HashMap::new();
             // Wrap in catch_unwind so a single bad case shows up in the
             // assertion below instead of taking down the test binary.

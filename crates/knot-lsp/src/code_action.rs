@@ -2571,8 +2571,8 @@ pub(crate) fn find_auto_import_candidates(
 
     // 3. Parsed-but-not-symbolized cache (covers freshly-imported files)
     if let Ok(cache) = state.import_cache.lock() {
-        for (path, (_, module, _)) in cache.iter() {
-            if module_declares_name(module, name) {
+        for (path, entry) in cache.iter() {
+            if module_declares_name(&entry.module, name) {
                 push_candidate(&current_canonical, path.clone(), &mut seen, &mut out);
             }
         }

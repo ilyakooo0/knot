@@ -450,7 +450,7 @@ fn prune_caches_outside_roots(state: &mut ServerState) {
 /// query after init then runs against a hot cache.
 fn prewarm_workspace_symbol_cache(
     cache: Arc<Mutex<WorkspaceSymbolCache>>,
-    import_cache: Arc<Mutex<HashMap<PathBuf, (u64, knot::ast::Module, String)>>>,
+    import_cache: Arc<Mutex<crate::state::ImportCache>>,
     roots: &[PathBuf],
     legacy_root: Option<&Path>,
 ) {
@@ -1104,6 +1104,25 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
         else {
             return;
         };
+        // Track deletions separately: a deleted path needs its entries flushed
+        // from every off-disk cache (parsed AST, reverse-import edges,
+        // workspace symbol index) so the next request doesn't read stale data
+        // for a file that no longer exists. Other change kinds — Created,
+        // Changed — only invalidate inference; the parse cache is keyed by
+        // content hash and naturally re-populates.
+        let mut deleted_paths: HashSet<PathBuf> = HashSet::new();
+        for c in &params.changes {
+            if matches!(c.typ, FileChangeType::DELETED) {
+                if let Some(p) = uri_to_path(&c.uri) {
+                    // `canonicalize` fails on paths the OS no longer knows
+                    // about, so fall back to the lexical path. Either form is
+                    // acceptable here — the cache keys are canonical paths
+                    // captured when the file was first analyzed, and we'll
+                    // try both shapes when evicting.
+                    deleted_paths.insert(p.canonicalize().unwrap_or(p));
+                }
+            }
+        }
         let changed_paths: HashSet<PathBuf> = params
             .changes
             .iter()
@@ -1111,14 +1130,14 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
             .filter_map(|p| p.canonicalize().ok())
             .collect();
 
-        if !changed_paths.is_empty() {
+        if !changed_paths.is_empty() || !deleted_paths.is_empty() {
             let dependents: Vec<(Uri, PathBuf, String)> = state
                 .documents
                 .iter()
                 .filter(|(_, doc)| {
                     doc.imported_files
                         .keys()
-                        .any(|p| changed_paths.contains(p))
+                        .any(|p| changed_paths.contains(p) || deleted_paths.contains(p))
                 })
                 .filter_map(|(uri, doc)| {
                     let path = uri_to_path(uri).and_then(|p| p.canonicalize().ok())?;
@@ -1137,6 +1156,7 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
             if let Ok(mut cache) = state.inference_cache.lock() {
                 let affected: HashSet<&PathBuf> = changed_paths
                     .iter()
+                    .chain(deleted_paths.iter())
                     .chain(dependents.iter().map(|(_, p, _)| p))
                     .collect();
                 cache.retain(|(p, _), _| !affected.contains(p));
@@ -1146,7 +1166,33 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
             // unopened-file diagnostics that referenced the changed file's
             // exports are stale now. Without eager invalidation, the next
             // workspace-diag request would replay last run's diagnostics.
-            invalidate_workspace_diag_cache_for(state, &changed_paths);
+            let mut diag_invalidate = changed_paths.clone();
+            diag_invalidate.extend(deleted_paths.iter().cloned());
+            invalidate_workspace_diag_cache_for(state, &diag_invalidate);
+
+            // Hard-evict deleted files from every cache that's keyed by a
+            // disk path. Without this, the parsed AST, the reverse-import
+            // edges, and the workspace-symbol entries for a removed file
+            // outlive the file itself for the rest of the session — slow
+            // leaks plus the risk of handlers handing back data anchored to
+            // bytes that no longer exist on disk.
+            if !deleted_paths.is_empty() {
+                if let Ok(mut cache) = state.import_cache.lock() {
+                    cache.retain(|p, _| !deleted_paths.contains(p));
+                }
+                state
+                    .reverse_imports
+                    .retain(|p, _| !deleted_paths.contains(p));
+                for importers in state.reverse_imports.values_mut() {
+                    importers.retain(|p| !deleted_paths.contains(p));
+                }
+                if let Ok(mut sym) = state.workspace_symbol_cache.lock() {
+                    sym.by_path.retain(|p, _| !deleted_paths.contains(p));
+                }
+                state
+                    .workspace_diag_cache
+                    .retain(|p, _| !deleted_paths.contains(p));
+            }
 
             for (dep_uri, _, dep_source) in dependents {
                 queue_analysis(state, dep_uri, dep_source, None);

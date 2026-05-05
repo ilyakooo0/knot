@@ -15,6 +15,7 @@
 use std::collections::HashSet;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use lsp_types::*;
 
@@ -69,13 +70,21 @@ pub(crate) fn handle_document_diagnostics(
         let cached_match = state
             .workspace_diag_cache
             .get(&path)
-            .filter(|(cached_h, _, _)| *cached_h == hash)
-            .map(|(_, diags, _)| diags.clone());
+            .filter(|(cached_h, _, _, _)| *cached_h == hash)
+            .map(|(_, diags, _, _)| diags.clone());
         if let Some(diags) = cached_match {
             state.workspace_diag_clock = state.workspace_diag_clock.wrapping_add(1);
             let access = state.workspace_diag_clock;
+            // Refresh the recorded mtime to the current disk mtime: we just
+            // verified content matches, so future prune/Phase-A passes can
+            // take the mtime fast-path even if `jj`/`git` touched the file
+            // without changing its bytes.
+            let disk_mtime = current_mtime(&path);
             if let Some(entry) = state.workspace_diag_cache.get_mut(&path) {
                 entry.2 = access;
+                if disk_mtime.is_some() {
+                    entry.3 = disk_mtime;
+                }
             }
             diags
         } else {
@@ -123,9 +132,10 @@ fn analyze_and_cache(
     let diags = analyze_unopened_file(&module, source, path, uri);
     state.workspace_diag_clock = state.workspace_diag_clock.wrapping_add(1);
     let access = state.workspace_diag_clock;
+    let mtime = current_mtime(path);
     state
         .workspace_diag_cache
-        .insert(path.to_path_buf(), (hash, diags.clone(), access));
+        .insert(path.to_path_buf(), (hash, diags.clone(), access, mtime));
     // Per-document pulls that never fire a `workspace/diagnostic` would
     // otherwise let the cache grow unbounded — full pruning runs only after
     // workspace pulls. The cap-only eviction here skips the disk-read
@@ -147,13 +157,20 @@ fn enforce_workspace_diag_cap(state: &mut ServerState) {
     let mut by_age: Vec<(PathBuf, u64)> = state
         .workspace_diag_cache
         .iter()
-        .map(|(p, (_, _, access))| (p.clone(), *access))
+        .map(|(p, (_, _, access, _))| (p.clone(), *access))
         .collect();
     by_age.sort_by_key(|(_, a)| *a);
     let to_drop = state.workspace_diag_cache.len().saturating_sub(cap);
     for (p, _) in by_age.into_iter().take(to_drop) {
         state.workspace_diag_cache.remove(&p);
     }
+}
+
+/// Read the on-disk modification time for `path`. Returns `None` on any I/O
+/// error (file gone, permission denied) or on filesystems that don't expose
+/// mtime; callers fall back to the slower hash-based verification.
+fn current_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
 // ── Workspace Diagnostics (Pull Model) ──────────────────────────────
@@ -231,6 +248,9 @@ pub(crate) fn handle_workspace_diagnostics(
             }
             let mut to_analyze: Vec<WorkItem> = Vec::new();
             let mut cached_results: Vec<(Uri, Vec<Diagnostic>, PathBuf)> = Vec::new();
+            // mtime hits we should refresh after the read+hash fallback
+            // confirmed content was unchanged (jj/git checkout case).
+            let mut mtime_refreshes: Vec<(PathBuf, SystemTime)> = Vec::new();
             for file_path in files {
                 let canonical = match file_path.canonicalize() {
                     Ok(p) => p,
@@ -239,20 +259,49 @@ pub(crate) fn handle_workspace_diagnostics(
                 if open_paths.contains(&canonical) {
                     continue;
                 }
+                let file_uri = match path_to_uri(&canonical) {
+                    Some(u) => u,
+                    None => continue,
+                };
+
+                // Mtime fast path: if the on-disk mtime matches the mtime
+                // recorded with the cache entry, the bytes can't have
+                // changed since we last verified them — reuse the cached
+                // diagnostics without reading or hashing the file. Saves
+                // O(workspace_size) disk reads per workspace pull.
+                let disk_mtime = current_mtime(&canonical);
+                if let Some(dm) = disk_mtime {
+                    if let Some((_, cached, _, Some(cached_mtime))) =
+                        state.workspace_diag_cache.get(&canonical)
+                    {
+                        if *cached_mtime == dm {
+                            cached_results.push((
+                                file_uri,
+                                cached.clone(),
+                                canonical.clone(),
+                            ));
+                            continue;
+                        }
+                    }
+                }
+
+                // Mtime missing or moved — fall through to read+hash.
                 let (module, source) =
                     match get_or_parse_file_shared(&canonical, &state.import_cache) {
                         Some(v) => v,
                         None => continue,
                     };
-                let file_uri = match path_to_uri(&canonical) {
-                    Some(u) => u,
-                    None => continue,
-                };
                 let hash = content_hash(&source);
-                if let Some((cached_h, cached, _)) =
+                if let Some((cached_h, cached, _, _)) =
                     state.workspace_diag_cache.get(&canonical)
                 {
                     if *cached_h == hash {
+                        // Content is unchanged but the mtime moved (typical
+                        // after `jj` / `git` checkouts). Schedule a mtime
+                        // refresh so the fast path applies on the next pull.
+                        if let Some(dm) = disk_mtime {
+                            mtime_refreshes.push((canonical.clone(), dm));
+                        }
                         cached_results.push((file_uri, cached.clone(), canonical.clone()));
                         continue;
                     }
@@ -264,6 +313,11 @@ pub(crate) fn handle_workspace_diagnostics(
                     module,
                     source,
                 });
+            }
+            for (path, mtime) in mtime_refreshes {
+                if let Some(entry) = state.workspace_diag_cache.get_mut(&path) {
+                    entry.3 = Some(mtime);
+                }
             }
 
             // Phase B: parallel analysis. `analyze_unopened_file` allocates its
@@ -321,9 +375,10 @@ pub(crate) fn handle_workspace_diagnostics(
             for (canonical, file_uri, hash, lsp_diags) in analysis_results {
                 state.workspace_diag_clock = state.workspace_diag_clock.wrapping_add(1);
                 let access = state.workspace_diag_clock;
+                let mtime = current_mtime(&canonical);
                 state
                     .workspace_diag_cache
-                    .insert(canonical, (hash, lsp_diags.clone(), access));
+                    .insert(canonical, (hash, lsp_diags.clone(), access, mtime));
                 if !lsp_diags.is_empty() {
                     now_reported.insert(file_uri.clone());
                 }
@@ -369,6 +424,15 @@ pub(crate) fn handle_workspace_diagnostics(
 
     state.workspace_diag_reported = now_reported;
 
+    // Belt-and-suspenders: a workspace pull can mass-insert cache entries
+    // (one per `.knot` file in the workspace), so cap inline rather than
+    // relying on the caller to call `prune_stale_workspace_diag_cache`
+    // afterwards. The prune still runs in the main loop and is the
+    // authoritative invalidation pass; this just guarantees the bound is
+    // re-established before we hand control back, even if a future refactor
+    // changes how prune is wired up.
+    enforce_workspace_diag_cap(state);
+
     WorkspaceDiagnosticReportResult::Report(WorkspaceDiagnosticReport { items })
 }
 
@@ -378,13 +442,36 @@ pub(crate) fn handle_workspace_diagnostics(
 /// least-recently-used remaining entries.
 pub(crate) fn prune_stale_workspace_diag_cache(state: &mut ServerState) {
     // Compute the set of files whose disk content has changed since cached.
+    // For the common case (file unchanged on disk since the cache entry was
+    // written) the on-disk mtime still matches the recorded mtime and we
+    // skip the read+hash entirely — keeps prune O(workspace_size) stat
+    // calls instead of O(workspace_size) reads on a clean workspace.
     let mut changed: HashSet<PathBuf> = HashSet::new();
-    for (path, (cached_h, _, _)) in &state.workspace_diag_cache {
+    let mut mtime_refreshes: Vec<(PathBuf, SystemTime)> = Vec::new();
+    for (path, (cached_h, _, _, cached_mtime)) in &state.workspace_diag_cache {
+        let disk_mtime = current_mtime(path);
+        if let (Some(cm), Some(dm)) = (cached_mtime, disk_mtime) {
+            if *cm == dm {
+                continue;
+            }
+        }
+        // Mtime missing or moved — verify by hash. A content match here means
+        // the bytes were untouched but mtime was bumped (`jj`/`git` checkout):
+        // refresh the recorded mtime so the fast path applies next time.
         match std::fs::read_to_string(path) {
-            Ok(s) if content_hash(&s) == *cached_h => {}
+            Ok(s) if content_hash(&s) == *cached_h => {
+                if let Some(dm) = disk_mtime {
+                    mtime_refreshes.push((path.clone(), dm));
+                }
+            }
             _ => {
                 changed.insert(path.clone());
             }
+        }
+    }
+    for (p, mtime) in mtime_refreshes {
+        if let Some(entry) = state.workspace_diag_cache.get_mut(&p) {
+            entry.3 = Some(mtime);
         }
     }
 
@@ -522,7 +609,7 @@ mod tests {
             let access = state.workspace_diag_clock;
             state
                 .workspace_diag_cache
-                .insert(p.clone(), (i as u64, Vec::new(), access));
+                .insert(p.clone(), (i as u64, Vec::new(), access, None));
             paths.push(p);
         }
         paths
@@ -564,6 +651,94 @@ mod tests {
         // The cap-only path must not bump the access clock — only
         // insert/hit paths do.
         assert_eq!(ws.state.workspace_diag_clock, before_clock);
+    }
+
+    #[test]
+    fn prune_skips_disk_read_when_mtime_matches() {
+        // The mtime fast-path is the whole reason we threaded mtime through
+        // the cache value. Set a real on-disk file, write a cache entry
+        // anchored to its current mtime but with a *deliberately wrong*
+        // content hash, and confirm prune leaves the entry in place — proof
+        // that no disk read happened (a read+hash would have flagged the
+        // hash mismatch and evicted).
+        let dir = std::env::temp_dir().join("knot-lsp-prune-mtime");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("hot.knot");
+        std::fs::write(&path, "actual content\n").expect("seed file");
+        let mtime = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .expect("mtime available on this fs");
+
+        let mut ws = TestWorkspace::new();
+        ws.state.config.max_workspace_diag_cache = 16;
+        ws.state.workspace_diag_clock = 1;
+        // Hash 0xDEAD doesn't match the real content's hash — if prune
+        // reads the file, it'll evict on hash mismatch.
+        ws.state
+            .workspace_diag_cache
+            .insert(path.clone(), (0xDEAD, Vec::new(), 1, Some(mtime)));
+
+        prune_stale_workspace_diag_cache(&mut ws.state);
+
+        assert!(
+            ws.state.workspace_diag_cache.contains_key(&path),
+            "mtime fast-path should have skipped the disk read entirely"
+        );
+
+        // Flip the cached mtime to a value that won't match disk; now prune
+        // *must* read+hash and find the mismatch, so the entry is dropped.
+        let bogus_mtime = mtime - std::time::Duration::from_secs(3600);
+        ws.state
+            .workspace_diag_cache
+            .insert(path.clone(), (0xDEAD, Vec::new(), 1, Some(bogus_mtime)));
+
+        prune_stale_workspace_diag_cache(&mut ws.state);
+
+        assert!(
+            !ws.state.workspace_diag_cache.contains_key(&path),
+            "mtime miss should fall through to read+hash and evict on mismatch"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn prune_refreshes_mtime_when_content_unchanged() {
+        // The bookkeeping for the jj/git checkout case: mtime moves but
+        // bytes don't. After the read+hash confirms content unchanged, the
+        // recorded mtime should be refreshed so the fast path applies on
+        // the next pull.
+        let dir = std::env::temp_dir().join("knot-lsp-prune-mtime-refresh");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("touched.knot");
+        std::fs::write(&path, "stable content\n").expect("seed file");
+        let real_hash = content_hash("stable content\n");
+        let real_mtime = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .expect("mtime available on this fs");
+
+        let mut ws = TestWorkspace::new();
+        ws.state.config.max_workspace_diag_cache = 16;
+        ws.state.workspace_diag_clock = 1;
+        let stale_mtime = real_mtime - std::time::Duration::from_secs(3600);
+        ws.state
+            .workspace_diag_cache
+            .insert(path.clone(), (real_hash, Vec::new(), 1, Some(stale_mtime)));
+
+        prune_stale_workspace_diag_cache(&mut ws.state);
+
+        let entry = ws
+            .state
+            .workspace_diag_cache
+            .get(&path)
+            .expect("entry should survive — content matched cached hash");
+        assert_eq!(
+            entry.3,
+            Some(real_mtime),
+            "mtime should be refreshed to disk's current mtime"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

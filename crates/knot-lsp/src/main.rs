@@ -1725,11 +1725,11 @@ main = do
 
         state.workspace_diag_cache.insert(
             kept_path.clone(),
-            (0, Vec::new(), 0),
+            (0, Vec::new(), 0, None),
         );
         state.workspace_diag_cache.insert(
             dropped_path.clone(),
-            (0, Vec::new(), 0),
+            (0, Vec::new(), 0, None),
         );
         state
             .reverse_imports

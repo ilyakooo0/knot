@@ -284,11 +284,21 @@ pub struct ServerState {
     /// caller that reads a `.knot` file (imports, rename, workspace symbol,
     /// workspace diagnostics, completion).
     pub import_cache: Arc<Mutex<ImportCache>>,
-    /// Cached LSP diagnostics for unopened workspace files, keyed by content
-    /// hash. The third tuple field is a monotonic access counter used for LRU
-    /// eviction in `prune_stale_workspace_diag_cache`. Bumped on every cache
-    /// hit so frequently-queried files survive cap-based pruning.
-    pub workspace_diag_cache: HashMap<PathBuf, (u64, Vec<Diagnostic>, u64)>,
+    /// Cached LSP diagnostics for unopened workspace files. Tuple shape is
+    /// `(content_hash, diagnostics, access_clock, mtime)`:
+    /// - `content_hash` keys the cache content-addressively, so a file whose
+    ///   bytes match a prior analysis reuses its diagnostics.
+    /// - `access_clock` is a monotonic counter bumped on every cache hit;
+    ///   `prune_stale_workspace_diag_cache` evicts the lowest-counter entries
+    ///   first, so frequently-queried files survive cap-based pruning.
+    /// - `mtime` is the on-disk modification timestamp at the time the entry
+    ///   was last verified against disk. The workspace-pull and prune paths
+    ///   short-circuit the read+hash step when the current disk mtime matches:
+    ///   bytes can't have changed, so the entry is still valid. `None` on
+    ///   filesystems that don't expose mtime (or after a state restore that
+    ///   didn't capture it) — those entries always fall through to the
+    ///   slower hash-based verification.
+    pub workspace_diag_cache: HashMap<PathBuf, (u64, Vec<Diagnostic>, u64, Option<SystemTime>)>,
     /// Monotonic counter incremented on every cache access. Provides a
     /// total order for LRU eviction without paying for `Instant::now()` on
     /// hot paths.

@@ -706,10 +706,22 @@ fn apply_analysis_result(state: &mut ServerState, conn: &Connection, result: Ana
     // doc — which is exactly the bug this is meant to fix.
     let uri = result.uri.clone();
     let version = result.version;
+    // Snapshot whether the cached doc diagnostics actually moved. Pull-mode
+    // clients sit on whatever they last pulled until we send a refresh, so
+    // any change to `state.documents.knot_diagnostics` must trigger one —
+    // even when the push-publish dedups out below. The dedup commonly
+    // skips a fix-clearing publish because `didChange` already pre-rebased
+    // `published_lsp_diagnostics` to the cleared list (which pull-mode
+    // clients never saw), so the post-analysis refresh is the only signal
+    // that gets a JetBrains gutter to drop the stale squiggle.
+    let doc_diags_changed = match state.documents.get(&uri) {
+        Some(prev) => prev.knot_diagnostics != result.doc.knot_diagnostics,
+        None => !result.doc.knot_diagnostics.is_empty(),
+    };
     state.documents.insert(result.uri, result.doc);
 
     let published = publish_diagnostics_dedup(state, conn, &uri, lsp_diags, version);
-    if published {
+    if published || doc_diags_changed {
         // Pull-mode clients (notably JetBrains) ignore the publish above and
         // only refresh diagnostics when the server explicitly invalidates
         // their cache. Without this, a fix that clears a diagnostic stays
@@ -1688,6 +1700,70 @@ main = do
         assert_eq!(pubs.len(), 2, "expected two publishes; got: {:?}", pubs);
         assert_eq!(pubs[1].2, 0, "expected the fix-publish to be empty");
         assert_eq!(pubs[1].1, Some(2), "expected v2 on the fix-publish");
+    }
+
+    /// Drain every message queued on the client side, returning a count of
+    /// publishes and a count of `workspace/diagnostic/refresh` requests.
+    /// Combining the two avoids the trap where a publish-only drain silently
+    /// consumes refresh requests, hiding the very signal a test wants to
+    /// assert on.
+    fn drain_messages(client: &Connection) -> (usize, usize) {
+        let mut publishes = 0;
+        let mut refreshes = 0;
+        while let Ok(msg) = client.receiver.try_recv() {
+            match msg {
+                Message::Notification(n)
+                    if n.method == lsp_types::notification::PublishDiagnostics::METHOD =>
+                {
+                    publishes += 1;
+                }
+                Message::Request(req)
+                    if req.method
+                        == lsp_types::request::WorkspaceDiagnosticRefresh::METHOD =>
+                {
+                    refreshes += 1;
+                }
+                _ => {}
+            }
+        }
+        (publishes, refreshes)
+    }
+
+    /// Pull-mode regression: when `didChange` has already pre-rebased the
+    /// push-cache to an empty list (typical when the user's fix overlaps
+    /// the diagnostic span), a fix-clearing analysis result will dedup out
+    /// of the publish path. The post-analysis refresh must still fire so
+    /// JetBrains-style clients re-pull and drop the stale squiggle —
+    /// otherwise the error sticks around until the next unrelated edit.
+    #[test]
+    fn fix_clearing_analysis_refreshes_pull_clients_even_when_push_dedups() {
+        let (server, client) = Connection::memory();
+        let mut state = make_state();
+        state.client_supports_diagnostic_refresh = true;
+        let uri = Uri::from_str("file:///test/repro.knot").unwrap();
+        // Seed state with a prior bad analysis so `state.documents` reflects
+        // the error that the pull-mode client last pulled.
+        apply_analysis_in(&mut state, &server, &uri, BAD_SOURCE, Some(1));
+        // Simulate the `didChange` pre-rebase: the push-cache now claims the
+        // editor was already told there are no diagnostics. (In production
+        // this is what happens when the fix-edit overlaps the diagnostic
+        // span.) Pull-mode clients never saw this — they ignore publishes.
+        state.published_lsp_diagnostics.insert(uri.clone(), Vec::new());
+        let (_, _) = drain_messages(&client);
+        // Apply the fix-analysis. Push dedup should suppress the publish
+        // (cache and new diagnostics are both empty), but pull-mode clients
+        // still need a refresh because `state.documents` just flipped from
+        // having errors to being clean.
+        apply_analysis_in(&mut state, &server, &uri, GOOD_SOURCE, Some(2));
+        let (publishes, refreshes) = drain_messages(&client);
+        assert_eq!(
+            publishes, 0,
+            "push-publish should dedup against the pre-rebased empty cache"
+        );
+        assert_eq!(
+            refreshes, 1,
+            "pull-mode clients must be refreshed when state.documents diagnostics change, even if push-publish dedups"
+        );
     }
 
     /// Re-applying the same analysis output (e.g. a whitespace edit that

@@ -59,6 +59,8 @@ pub fn to_lsp_diagnostic(
     if let Some(desc) = code.as_deref().and_then(description_for_code) {
         message.push_str(&format!("\n[{}] {}", code.as_deref().unwrap_or(""), desc));
     }
+
+    truncate_message(&mut message);
     let code_description = code.as_deref().and_then(doc_url_for_code).map(|href| {
         CodeDescription {
             href: href.parse().ok().unwrap_or_else(|| {
@@ -91,6 +93,29 @@ pub fn to_lsp_diagnostic(
         tags: if tags.is_empty() { None } else { Some(tags) },
         ..Default::default()
     })
+}
+
+/// Hard cap on a single diagnostic message's serialized size. Compiler
+/// diagnostics with a long chain of notes (e.g. trait-resolution failures
+/// dragging in dozens of candidate impls) can blow past 100KB on the wire,
+/// and some clients buffer the whole list in memory. Truncating to a few
+/// kilobytes keeps editor responsiveness while still showing the bulk of
+/// the explanation.
+const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 8 * 1024;
+
+fn truncate_message(message: &mut String) {
+    if message.len() <= MAX_DIAGNOSTIC_MESSAGE_BYTES {
+        return;
+    }
+    // Truncate on a UTF-8 char boundary so the resulting String stays valid.
+    // Walk backwards from the cap until we find one — at most 3 bytes back
+    // for any valid UTF-8 sequence.
+    let mut cut = MAX_DIAGNOSTIC_MESSAGE_BYTES;
+    while cut > 0 && !message.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    message.truncate(cut);
+    message.push_str("\n… (diagnostic truncated)");
 }
 
 /// Map diagnostic messages to structured error codes.
@@ -160,4 +185,39 @@ pub fn description_for_code(code: &str) -> Option<&'static str> {
 /// users can configure their own docs server).
 fn doc_url_for_code(code: &str) -> Option<String> {
     Some(format!("https://knot-lang.org/errors/{code}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_leaves_short_messages_alone() {
+        let mut s = "hello".to_string();
+        truncate_message(&mut s);
+        assert_eq!(s, "hello");
+    }
+
+    #[test]
+    fn truncate_caps_oversized_messages() {
+        let mut s = "x".repeat(MAX_DIAGNOSTIC_MESSAGE_BYTES * 2);
+        truncate_message(&mut s);
+        assert!(s.len() <= MAX_DIAGNOSTIC_MESSAGE_BYTES + 64);
+        assert!(s.ends_with("(diagnostic truncated)"));
+    }
+
+    #[test]
+    fn truncate_keeps_utf8_valid_at_multibyte_boundary() {
+        // Build a message where the cap lands inside a 4-byte emoji. The
+        // truncate must back off to the prior char boundary instead of
+        // producing an invalid string.
+        let prefix = "a".repeat(MAX_DIAGNOSTIC_MESSAGE_BYTES - 2);
+        let mut s = format!("{prefix}🦀tail");
+        truncate_message(&mut s);
+        // Round-trip through chars to confirm it's still valid UTF-8 — the
+        // String type already enforces this on the .truncate path, but the
+        // assertion makes the intent explicit.
+        let _: Vec<char> = s.chars().collect();
+        assert!(s.ends_with("(diagnostic truncated)"));
+    }
 }

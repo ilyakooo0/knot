@@ -374,6 +374,52 @@ fn main() {
     }
 }
 
+/// Drop cache entries for paths that no longer fall under any workspace root.
+/// Called when folders are removed via `workspace/didChangeWorkspaceFolders`.
+/// We don't touch entries belonging to currently-open documents — the editor
+/// can keep editing a file even after its containing folder was removed, and
+/// we want analysis results to keep flowing.
+fn prune_caches_outside_roots(state: &mut ServerState) {
+    let roots = state.workspace_roots.clone();
+    let open_paths: HashSet<PathBuf> = state
+        .documents
+        .keys()
+        .filter_map(|u| uri_to_path(u))
+        .filter_map(|p| p.canonicalize().ok())
+        .collect();
+    let in_scope = |p: &Path| -> bool {
+        if open_paths.contains(p) {
+            return true;
+        }
+        roots.iter().any(|r| p.starts_with(r))
+    };
+
+    state
+        .workspace_diag_cache
+        .retain(|p, _| in_scope(p));
+    state
+        .reverse_imports
+        .retain(|p, _| in_scope(p));
+    for importers in state.reverse_imports.values_mut() {
+        importers.retain(|p| in_scope(p));
+    }
+    if let Ok(mut cache) = state.import_cache.lock() {
+        cache.retain(|p, _| in_scope(p));
+    }
+    if let Ok(mut sym) = state.workspace_symbol_cache.lock() {
+        sym.by_path.retain(|p, _| in_scope(p));
+    }
+    // Also drop the "previously reported" tracking set so a re-added folder
+    // doesn't get a one-shot empty-diagnostic flush for files that no longer
+    // exist in this session.
+    state
+        .workspace_diag_reported
+        .retain(|uri| match uri_to_path(uri).and_then(|p| p.canonicalize().ok()) {
+            Some(p) => in_scope(&p),
+            None => false,
+        });
+}
+
 /// Walk every `.knot` file under the given workspace roots and populate the
 /// shared workspace-symbol cache. Each file is read+parsed only if the cache
 /// doesn't already hold a fresh entry (mtime match). The first `workspace/symbol`
@@ -1168,6 +1214,15 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
             }
         }
         state.workspace_root = state.workspace_roots.first().cloned();
+
+        // Drop cached state for files that fall outside the surviving roots.
+        // Without this, a removed folder's `import_cache` / `reverse_imports` /
+        // `workspace_diag_cache` / `workspace_symbol_cache` entries persist for
+        // the rest of the session, surfacing stale errors on reopened folders
+        // that share filenames and bloating memory in long-lived sessions.
+        if !removed.is_empty() {
+            prune_caches_outside_roots(state);
+        }
     }
 }
 
@@ -1557,6 +1612,51 @@ main = do
             "second apply with identical diags must dedup; got: {:?}",
             pubs
         );
+    }
+
+    /// Removing a workspace folder must drop cache entries for files under
+    /// the removed root — both the workspace diagnostic cache and the
+    /// reverse-imports graph. Open files are kept regardless of root.
+    #[test]
+    fn prune_caches_drops_paths_outside_remaining_roots() {
+        let mut state = make_state();
+        // Set up two "roots": /a (kept) and /b (removed).
+        let kept_root = PathBuf::from("/tmp/knot-prune-test/a");
+        let removed_root = PathBuf::from("/tmp/knot-prune-test/b");
+        state.workspace_roots = vec![kept_root.clone()];
+
+        let kept_path = kept_root.join("kept.knot");
+        let dropped_path = removed_root.join("dropped.knot");
+
+        state.workspace_diag_cache.insert(
+            kept_path.clone(),
+            (0, Vec::new(), 0),
+        );
+        state.workspace_diag_cache.insert(
+            dropped_path.clone(),
+            (0, Vec::new(), 0),
+        );
+        state
+            .reverse_imports
+            .entry(kept_path.clone())
+            .or_default()
+            .insert(dropped_path.clone());
+        state
+            .reverse_imports
+            .entry(dropped_path.clone())
+            .or_default()
+            .insert(kept_path.clone());
+
+        prune_caches_outside_roots(&mut state);
+
+        assert!(state.workspace_diag_cache.contains_key(&kept_path));
+        assert!(!state.workspace_diag_cache.contains_key(&dropped_path));
+        assert!(state.reverse_imports.contains_key(&kept_path));
+        assert!(!state.reverse_imports.contains_key(&dropped_path));
+        // The remaining edge set on `kept_path` must also drop the stale
+        // pointer to a now-out-of-scope importer.
+        let importers = state.reverse_imports.get(&kept_path).unwrap();
+        assert!(!importers.contains(&dropped_path));
     }
 
     /// Closing a document publishes empty diagnostics and drops the cache,

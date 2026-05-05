@@ -13,6 +13,7 @@
 //! stratify → SQL lint) on each `.knot` file in the workspace.
 
 use std::collections::HashSet;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
 use lsp_types::*;
@@ -412,7 +413,51 @@ pub(crate) fn prune_stale_workspace_diag_cache(state: &mut ServerState) {
 /// LSP diagnostics. Reuses the parsed module from the import cache so we don't
 /// pay the lex+parse cost twice (the caller already paid it via
 /// `get_or_parse_file_shared`).
+///
+/// Panics inside the compiler pipeline (parser, infer, effects, stratify,
+/// sql_lint) on malformed input would otherwise kill the worker thread silently
+/// — `std::thread::scope` swallows the join error in our caller, leaving the
+/// file with no diagnostics and the user with no signal that anything broke.
+/// Catch them here, log the message, and emit a synthetic diagnostic so the
+/// failure surfaces in the gutter.
 fn analyze_unopened_file(
+    module: &Module,
+    source: &str,
+    path: &Path,
+    uri: &Uri,
+) -> Vec<Diagnostic> {
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        analyze_unopened_file_inner(module, source, path, uri)
+    }));
+    match result {
+        Ok(diags) => diags,
+        Err(payload) => {
+            let msg = panic_payload_message(&payload);
+            eprintln!(
+                "knot-lsp: workspace analysis panicked for {}: {msg}",
+                uri.as_str()
+            );
+            let raw = diagnostic::Diagnostic::error(format!(
+                "internal LSP error during workspace analysis: {msg}"
+            ))
+            .label(knot::ast::Span::new(0, 0), "analysis aborted here")
+            .note("this is a bug in the language server; other files are unaffected");
+            to_lsp_diagnostic(&raw, source, uri).into_iter().collect()
+        }
+    }
+}
+
+fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "panic with non-string payload".to_string()
+    }
+}
+
+fn analyze_unopened_file_inner(
     module: &Module,
     source: &str,
     path: &Path,

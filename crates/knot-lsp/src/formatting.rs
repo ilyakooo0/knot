@@ -19,6 +19,18 @@ fn utf16_len(s: &str) -> u32 {
     s.chars().map(|c| c.len_utf16() as u32).sum()
 }
 
+/// Sane upper bound on a single indent step. Clients normally send 2/4/8;
+/// anything larger is either a misconfiguration or an attempt to wedge the
+/// server with a giant `" ".repeat(tab_size)` allocation.
+const MAX_TAB_SIZE: usize = 16;
+
+/// Clamp the client-supplied tab size to a sane range. The LSP type is `u32`,
+/// and clients have been observed to send `0` (which would suppress all
+/// indentation) and absurdly large values (which would explode `repeat()`).
+fn clamp_tab_size(raw: u32) -> usize {
+    (raw as usize).clamp(1, MAX_TAB_SIZE)
+}
+
 // ── Document Formatting ─────────────────────────────────────────────
 
 pub(crate) fn handle_formatting(
@@ -63,7 +75,7 @@ pub(crate) fn handle_range_formatting(
 ) -> Option<Vec<TextEdit>> {
     let doc = state.documents.get(&params.text_document.uri)?;
     let source = &doc.source;
-    let tab_size = params.options.tab_size as usize;
+    let tab_size = clamp_tab_size(params.options.tab_size);
     let use_spaces = params.options.insert_spaces;
 
     let start_line = params.range.start.line as usize;

@@ -336,7 +336,9 @@ impl ServerConfig {
     pub fn merge_from_json(&mut self, value: &serde_json::Value) {
         let knot = value.get("knot").unwrap_or(value);
         if let Some(n) = knot.get("tabSize").and_then(|v| v.as_u64()) {
-            self.tab_size = (n as usize).max(1);
+            // Clamp upper bound: a buggy/hostile client can otherwise wedge
+            // formatters that expand indentation via `" ".repeat(tab_size)`.
+            self.tab_size = (n as usize).clamp(1, 16);
         }
         if let Some(b) = knot.get("insertSpaces").and_then(|v| v.as_bool()) {
             self.insert_spaces = b;

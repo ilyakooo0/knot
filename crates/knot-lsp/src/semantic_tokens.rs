@@ -609,6 +609,36 @@ mod tests {
     }
 
     #[test]
+    fn delta_encode_handles_out_of_order_tokens_without_underflow() {
+        // Tokens are normally sorted by start offset; the encoder's reset
+        // path handles the out-of-order case by rewinding the cursor. Before
+        // the saturating-arithmetic fix, the rewind left `prev_line` /
+        // `prev_char` reflecting the later token, so the second iteration
+        // computed `0 - prev_line` and panicked in debug builds.
+        let source = "abc\ndef\n";
+        let tokens = vec![
+            super::RawToken {
+                start: 4,
+                length: 3,
+                token_type: 0,
+                modifiers: 0,
+            },
+            super::RawToken {
+                start: 0,
+                length: 3,
+                token_type: 0,
+                modifiers: 0,
+            },
+        ];
+        let encoded = super::delta_encode_tokens(&tokens, source);
+        assert_eq!(encoded.len(), 2);
+        // The clamp produces a (lossy but well-formed) encoding rather than
+        // a panic. Exact deltas don't matter — just that we got back two
+        // entries with no overflow propagated through `length`.
+        assert!(encoded.iter().all(|t| t.length == 3));
+    }
+
+    #[test]
     fn semantic_tokens_delta_emits_edits_for_changed_tokens() {
         let mut ws = TestWorkspace::new();
         let uri = ws.open("main", "id = \\x -> x\n");
@@ -700,8 +730,18 @@ fn delta_encode_tokens(tokens: &[RawToken], source: &str) -> Vec<SemanticToken> 
             .map(|slice| slice.chars().map(|c| c.len_utf16() as u32).sum())
             .unwrap_or(token.length as u32);
 
-        let delta_line = line - prev_line;
-        let delta_start = if delta_line == 0 { col_utf16 - prev_char } else { col_utf16 };
+        // Saturating arithmetic guards the out-of-order reset above: when a
+        // token's `start` is before the cursor we rewind line/col to 0, but
+        // `prev_line`/`prev_char` still reflect the previous (later) token.
+        // A naive subtraction would underflow into a huge u32 and feed the
+        // editor a nonsense delta. Clamping to 0 produces a valid (if
+        // suboptimal) encoding instead of a panic in debug builds.
+        let delta_line = line.saturating_sub(prev_line);
+        let delta_start = if delta_line == 0 {
+            col_utf16.saturating_sub(prev_char)
+        } else {
+            col_utf16
+        };
 
         result.push(SemanticToken {
             delta_line,

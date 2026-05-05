@@ -479,6 +479,9 @@ pub fn analyze_document(
                     keyword_tokens,
                     unit_info,
                     all_diags,
+                    changed_decl_names,
+                    signature_changed_decl_names,
+                    dirty_decl_closure,
                 );
             }
         }
@@ -616,6 +619,15 @@ fn sort_local_type_info(map: &HashMap<Span, String>) -> Vec<(Span, String)> {
 /// Compose a `DocumentState` from a cached inference snapshot. Pulled out
 /// of `analyze_document` so the two cache-hit tiers (content hash and
 /// structural fingerprint) can share the result-assembly path verbatim.
+///
+/// `changed_decl_names`/`signature_changed_decl_names`/`dirty_decl_closure`
+/// reflect the diff against the *most recent* snapshot for the same path,
+/// not against the snapshot we're reusing — when the user reverts a file
+/// (A v1 → A v2 → A v1), the cache-hit on v1 still represents a "change"
+/// from the perspective of dependents that were re-checked against v2's
+/// signatures. Without these fields propagating, `apply_analysis_result`
+/// would skip re-queuing dependents and any errors they picked up from v2
+/// would linger after the revert.
 #[allow(clippy::too_many_arguments)]
 fn reuse_snapshot(
     snap: &InferenceSnapshot,
@@ -632,6 +644,9 @@ fn reuse_snapshot(
     keyword_tokens: Vec<(Span, u32)>,
     unit_info: HashMap<Span, String>,
     mut all_diags: Vec<diagnostic::Diagnostic>,
+    changed_decl_names: Vec<String>,
+    signature_changed_decl_names: Vec<String>,
+    dirty_decl_closure: std::collections::HashSet<String>,
 ) -> DocumentState {
     all_diags.extend(snap.diagnostics.iter().cloned());
     let local_type_info_sorted = sort_local_type_info(&snap.local_type_info);
@@ -658,11 +673,9 @@ fn reuse_snapshot(
         source_refinements: snap.source_refinements.clone(),
         monad_info: snap.monad_info.clone(),
         unit_info,
-        // Cache hit: the parsed AST is identical (or structurally equal)
-        // to a prior run, so by definition no decls changed since then.
-        changed_decl_names: Vec::new(),
-        signature_changed_decl_names: Vec::new(),
-        dirty_decl_closure: std::collections::HashSet::new(),
+        changed_decl_names,
+        signature_changed_decl_names,
+        dirty_decl_closure,
     }
 }
 
@@ -1268,6 +1281,57 @@ mod tests {
             !doc2.changed_decl_names.contains(&"foo".to_string()),
             "foo should NOT be in change set; got: {:?}",
             doc2.changed_decl_names
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reverting a file to a previously-cached state must still report a
+    /// non-empty `signature_changed_decl_names` when the most recent
+    /// snapshot's signatures differ. Otherwise `apply_analysis_result` skips
+    /// the dependent re-queue, and any diagnostic a dependent picked up
+    /// from the divergent state lingers after the revert.
+    #[test]
+    fn revert_to_cached_source_still_reports_signature_changes() {
+        let dir = std::env::temp_dir().join(format!(
+            "knot-lsp-revert-cache-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.knot");
+        std::fs::write(&path, "").unwrap();
+        let canonical = path.canonicalize().unwrap();
+        let uri = fake_uri(&format!("file://{}", canonical.display()));
+
+        let mut import_cache: ImportCache = HashMap::new();
+        let mut inference_cache: InferenceCache = HashMap::new();
+
+        let v1 = "foo : Int -> Int\nfoo = \\x -> x\n";
+        let v2 = "foo : Int -> Text\nfoo = \\x -> show x\n";
+
+        std::fs::write(&path, v1).unwrap();
+        let _ = analyze_document(&uri, v1, &mut import_cache, &mut inference_cache);
+
+        std::fs::write(&path, v2).unwrap();
+        let doc_v2 = analyze_document(&uri, v2, &mut import_cache, &mut inference_cache);
+        assert!(
+            doc_v2.signature_changed_decl_names.contains(&"foo".to_string()),
+            "v1 → v2 must report `foo` as signature-changed; got: {:?}",
+            doc_v2.signature_changed_decl_names
+        );
+
+        // Revert to v1: cache hit on the v1 snapshot. The diff against the
+        // most-recent snapshot (v2) must still surface `foo` so dependents
+        // re-queue and clear their stale errors.
+        std::fs::write(&path, v1).unwrap();
+        let doc_revert = analyze_document(&uri, v1, &mut import_cache, &mut inference_cache);
+        assert!(
+            doc_revert.signature_changed_decl_names.contains(&"foo".to_string()),
+            "revert v2 → v1 must still report `foo` as signature-changed; got: {:?}",
+            doc_revert.signature_changed_decl_names
         );
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -6841,7 +6841,16 @@ fn find_non_respond_leaf(
 ) -> Option<Span> {
     let locals: std::collections::HashMap<String, &ast::Expr> =
         std::collections::HashMap::new();
-    match check_handler_leaf(expr, module, visiting, &locals) {
+    // Strip outer Lambda layers — `listen` will invoke the handler, so
+    // its body is what runs. Inside `check_handler_leaf` a Lambda is
+    // treated as a closure value (Bad), since just *evaluating* a Lambda
+    // expression doesn't run its body; we only enter a Lambda body via
+    // explicit invocation (App-Lambda or substitution into a callee).
+    let mut e = expr;
+    while let ast::ExprKind::Lambda { body, .. } = &e.node {
+        e = body;
+    }
+    match check_handler_leaf(e, module, visiting, &locals) {
         LeafCheck::Ok => None,
         LeafCheck::Bad(s) => Some(s),
         LeafCheck::Cycle => Some(expr.span),
@@ -6854,6 +6863,35 @@ fn check_handler_leaf<'a>(
     visiting: &mut Vec<String>,
     locals: &std::collections::HashMap<String, &'a ast::Expr>,
 ) -> LeafCheck {
+    // Desugared do-block forms (the desugarer rewrites pure-comprehension
+    // do-blocks into __bind/__yield/__empty calls). Treat them like the
+    // original Do: chase the "tail" of the chain to find the yielded value.
+    //   `do x <- action; rest` ≡ `App(App(__bind, \x -> rest), action)`
+    //   `yield v`              ≡ `App(__yield, v)`
+    //   `empty`                ≡ `__empty`
+    if let ast::ExprKind::App { func, .. } = &expr.node {
+        if let ast::ExprKind::App { func: bind_fn, arg: bind_lambda } = &func.node {
+            if let ast::ExprKind::Var(name) = &bind_fn.node {
+                if name == "__bind" {
+                    if let ast::ExprKind::Lambda { body: rest, .. } = &bind_lambda.node {
+                        return check_handler_leaf(rest, module, visiting, locals);
+                    }
+                }
+            }
+        }
+        if let ast::ExprKind::Var(name) = &func.node {
+            if name == "__yield" {
+                if let ast::ExprKind::App { arg, .. } = &expr.node {
+                    return check_handler_leaf(arg, module, visiting, locals);
+                }
+            }
+        }
+    }
+    if let ast::ExprKind::Var(name) = &expr.node {
+        if name == "__empty" {
+            return LeafCheck::Bad(expr.span);
+        }
+    }
     match &expr.node {
         ast::ExprKind::App { func, arg } => {
             // Walk through curried applications to find the root function.
@@ -6861,14 +6899,18 @@ fn check_handler_leaf<'a>(
             loop {
                 match &f.node {
                     ast::ExprKind::Var(name) if name == "respond" => {
-                        // `respond` may have been shadowed by a let binding or
-                        // lambda parameter — if so, resolve through the shadow.
+                        // `respond` may have been shadowed — by a let binding,
+                        // a lambda parameter, or substitution propagating a
+                        // wrapper callback into a callee. Verify the shadow
+                        // still reaches respond when invoked.
                         if let Some(local) = locals.get("respond") {
                             if visiting.iter().any(|n| n == "respond") {
                                 return LeafCheck::Cycle;
                             }
                             visiting.push("respond".to_string());
-                            let r = check_handler_leaf(local, module, visiting, locals);
+                            let r = is_valid_respond_callable(
+                                local, module, visiting, locals,
+                            );
                             visiting.pop();
                             return match r {
                                 LeafCheck::Cycle => LeafCheck::Bad(f.span),
@@ -6898,9 +6940,16 @@ fn check_handler_leaf<'a>(
                         // body resolve through the shadow rather than the
                         // outer scope.
                         if params.len() == 1 {
-                            if let ast::PatKind::Var(pname) = &params[0].node {
+                            if matches!(&params[0].node, ast::PatKind::Var(_)) {
                                 let mut new_locals = locals.clone();
-                                new_locals.insert(pname.clone(), arg);
+                                let args_slice: [&ast::Expr; 1] = [arg];
+                                bind_params(
+                                    &mut new_locals,
+                                    locals,
+                                    module,
+                                    params,
+                                    &args_slice,
+                                );
                                 return check_handler_leaf(body, module, visiting, &new_locals);
                             }
                         }
@@ -6913,17 +6962,23 @@ fn check_handler_leaf<'a>(
             // Root function is not `respond`. Eager evaluation means each
             // argument is evaluated before the call — so if any argument
             // contains a guaranteed `respond` call, the call site does too.
-            // Walk back through the App chain checking each argument.
+            // Walk back through the App chain checking each argument with
+            // strict (eager-value) semantics: a Lambda or Do-block in arg
+            // position evaluates to a closure / IO value without running
+            // its body, so it can't establish that respond was called.
+            let mut all_args: Vec<&ast::Expr> = Vec::new();
             let mut e = expr;
             while let ast::ExprKind::App { func: f_inner, arg: a } = &e.node {
                 if matches!(
-                    check_handler_leaf(a, module, visiting, locals),
+                    check_arg_eager(a, module, visiting, locals),
                     LeafCheck::Ok
                 ) {
                     return LeafCheck::Ok;
                 }
+                all_args.push(a.as_ref());
                 e = f_inner;
             }
+            all_args.reverse();
             // If the root is a Var that's a transitive alias for the
             // original (unshadowed) `respond`, treat the call as Ok.
             let mut seen = std::collections::HashSet::new();
@@ -6931,9 +6986,47 @@ fn check_handler_leaf<'a>(
                 return LeafCheck::Ok;
             }
             // No argument guarantees a respond call. If the root resolves
-            // to a known function (local let-bound or module-level), recurse
-            // into its body. Otherwise the call doesn't reach respond.
+            // to a known function (local let-bound or module-level), try
+            // to substitute the args into its parameters and recurse into
+            // the body — this is what catches "callback discarded" bypasses
+            // like `discard (\_ -> respond [...]) bottom`: discard's body
+            // returns `x` (= bottom), never invoking the lambda.
             if let ast::ExprKind::Var(name) = &f.node {
+                let mut visited = std::collections::HashSet::new();
+                if let Some((params, body)) =
+                    resolve_to_lambda(f, module, locals, &mut visited)
+                {
+                    if params.len() == all_args.len() {
+                        if visiting.iter().any(|n| n == name) {
+                            return LeafCheck::Cycle;
+                        }
+                        let mut new_locals = locals.clone();
+                        bind_params(
+                            &mut new_locals,
+                            locals,
+                            module,
+                            params,
+                            &all_args,
+                        );
+                        // Strip nested Lambdas in the body — handles curried
+                        // function definitions like `f = \a -> \b -> body`.
+                        let mut e = body;
+                        while let ast::ExprKind::Lambda { body: inner, .. } =
+                            &e.node
+                        {
+                            e = inner;
+                        }
+                        visiting.push(name.to_string());
+                        let r = check_handler_leaf(
+                            e, module, visiting, &new_locals,
+                        );
+                        visiting.pop();
+                        return match r {
+                            LeafCheck::Cycle => LeafCheck::Bad(expr.span),
+                            other => other,
+                        };
+                    }
+                }
                 return resolve_var(name, expr.span, module, visiting, locals);
             }
             LeafCheck::Bad(expr.span)
@@ -6959,9 +7052,7 @@ fn check_handler_leaf<'a>(
             ]
             .into_iter(),
         ),
-        ast::ExprKind::Lambda { body, .. } => {
-            check_handler_leaf(body, module, visiting, locals)
-        }
+        ast::ExprKind::Lambda { .. } => LeafCheck::Bad(expr.span),
         ast::ExprKind::Atomic(inner) => {
             check_handler_leaf(inner, module, visiting, locals)
         }
@@ -6990,6 +7081,186 @@ fn check_handler_leaf<'a>(
         }
         _ => LeafCheck::Bad(expr.span),
     }
+}
+
+/// Check whether evaluating `expr` to a value calls `respond`. Used for
+/// argument-position checks: a Lambda or Do-block in arg position evaluates
+/// to a closure / IO value without invoking the body, so neither can
+/// establish a guaranteed respond call. The bypass this guards against is
+/// `discard (\_ -> respond [...]) bottom` — the lambda contains respond
+/// but `discard` ignores the lambda and returns its second arg.
+fn check_arg_eager<'a>(
+    expr: &'a ast::Expr,
+    module: &'a ast::Module,
+    visiting: &mut Vec<String>,
+    locals: &std::collections::HashMap<String, &'a ast::Expr>,
+) -> LeafCheck {
+    match &expr.node {
+        ast::ExprKind::Lambda { .. } | ast::ExprKind::Do(_) => {
+            LeafCheck::Bad(expr.span)
+        }
+        _ => check_handler_leaf(expr, module, visiting, locals),
+    }
+}
+
+/// Check whether `expr`, when invoked as a function, calls `respond`. This
+/// is the "callable check": follows Var aliases through the scope, descends
+/// into Lambda bodies (a Lambda is a closure, but invoking it runs the
+/// body), and treats the literal `Var("respond")` (when not shadowed) as
+/// the original respond callback. Returns `Ok` for valid respond-replacements
+/// (original, alias chains, wrapper Lambdas) and `Bad` otherwise.
+fn is_valid_respond_callable<'a>(
+    expr: &'a ast::Expr,
+    module: &'a ast::Module,
+    visiting: &mut Vec<String>,
+    locals: &std::collections::HashMap<String, &'a ast::Expr>,
+) -> LeafCheck {
+    match &expr.node {
+        ast::ExprKind::Var(name) => {
+            if name == "respond" && !locals.contains_key("respond") {
+                return LeafCheck::Ok;
+            }
+            if visiting.iter().any(|n| n == name) {
+                return LeafCheck::Cycle;
+            }
+            if let Some(local) = locals.get(name) {
+                visiting.push(name.to_string());
+                let r = is_valid_respond_callable(local, module, visiting, locals);
+                visiting.pop();
+                return match r {
+                    LeafCheck::Cycle => LeafCheck::Bad(expr.span),
+                    other => other,
+                };
+            }
+            for decl in &module.decls {
+                if let ast::DeclKind::Fun {
+                    name: fn_name,
+                    body: Some(body),
+                    ..
+                } = &decl.node
+                {
+                    if fn_name == name {
+                        visiting.push(name.to_string());
+                        let r = is_valid_respond_callable(
+                            body, module, visiting, locals,
+                        );
+                        visiting.pop();
+                        return match r {
+                            LeafCheck::Cycle => LeafCheck::Bad(expr.span),
+                            other => other,
+                        };
+                    }
+                }
+            }
+            LeafCheck::Bad(expr.span)
+        }
+        ast::ExprKind::Lambda { body, .. } => {
+            let mut e = body.as_ref();
+            while let ast::ExprKind::Lambda { body: inner, .. } = &e.node {
+                e = inner.as_ref();
+            }
+            check_handler_leaf(e, module, visiting, locals)
+        }
+        _ => LeafCheck::Bad(expr.span),
+    }
+}
+
+/// Resolve an expression to a Lambda, following Var aliases through
+/// `locals` and module declarations. Returns the Lambda's params and body.
+/// Used to find the callable when the call site applies a Var that aliases
+/// (possibly transitively) the actual function — common after substitution
+/// when a caller passes a parameter whose name shadows a local of the same
+/// name in the callee's scope.
+fn resolve_to_lambda<'a>(
+    expr: &'a ast::Expr,
+    module: &'a ast::Module,
+    locals: &std::collections::HashMap<String, &'a ast::Expr>,
+    visited: &mut std::collections::HashSet<String>,
+) -> Option<(&'a [ast::Pat], &'a ast::Expr)> {
+    match &expr.node {
+        ast::ExprKind::Lambda { params, body } => {
+            Some((params.as_slice(), body.as_ref()))
+        }
+        ast::ExprKind::Var(name) => {
+            if !visited.insert(name.clone()) {
+                return None;
+            }
+            if let Some(local) = locals.get(name) {
+                return resolve_to_lambda(local, module, locals, visited);
+            }
+            for decl in &module.decls {
+                if let ast::DeclKind::Fun {
+                    name: fn_name,
+                    body: Some(body),
+                    ..
+                } = &decl.node
+                {
+                    if fn_name == name {
+                        return resolve_to_lambda(body, module, locals, visited);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Bind each parameter to its corresponding argument in `new_locals`. When
+/// the parameter is named `respond` and the argument is a valid respond-
+/// callable (the original respond, an alias chain to it, or a wrapper
+/// Lambda whose body reaches respond), skip the binding so callee
+/// references to `respond` continue to resolve as if pointing at the
+/// original. For other params, resolve the argument through caller's
+/// scope before binding — when caller and callee share a parameter name
+/// (e.g. both have `onAuth`), the unresolved binding would create a
+/// self-referential lookup in the callee. Chain-resolving once recovers
+/// the caller's actual value (the Lambda or whatever) so the callee's
+/// references find the right thing.
+fn bind_params<'a>(
+    new_locals: &mut std::collections::HashMap<String, &'a ast::Expr>,
+    outer_locals: &std::collections::HashMap<String, &'a ast::Expr>,
+    module: &'a ast::Module,
+    params: &[ast::Pat],
+    args: &[&'a ast::Expr],
+) {
+    for (p, a) in params.iter().zip(args.iter()) {
+        if let ast::PatKind::Var(pname) = &p.node {
+            if pname == "respond" {
+                let mut visiting = Vec::new();
+                if matches!(
+                    is_valid_respond_callable(a, module, &mut visiting, outer_locals),
+                    LeafCheck::Ok
+                ) {
+                    continue;
+                }
+            }
+            let mut visited = std::collections::HashSet::new();
+            let resolved = resolve_var_chain(*a, outer_locals, &mut visited);
+            new_locals.insert(pname.clone(), resolved);
+        }
+    }
+}
+
+/// Follow a chain of `Var` aliases through `locals` to its terminus (the
+/// first non-Var expression, or a Var that doesn't resolve further). Used
+/// when substituting args into a callee's locals: if the arg is `Var(x)`
+/// and locals[x] is a Lambda, we want to bind the param directly to the
+/// Lambda so the callee's lookups reach a callable, not a self-referential
+/// Var.
+fn resolve_var_chain<'a>(
+    expr: &'a ast::Expr,
+    locals: &std::collections::HashMap<String, &'a ast::Expr>,
+    visited: &mut std::collections::HashSet<String>,
+) -> &'a ast::Expr {
+    if let ast::ExprKind::Var(name) = &expr.node {
+        if visited.insert(name.clone()) {
+            if let Some(local) = locals.get(name) {
+                return resolve_var_chain(local, locals, visited);
+            }
+        }
+    }
+    expr
 }
 
 /// Check whether a case-arm pattern binds `respond` from an untrusted
@@ -7068,8 +7339,18 @@ fn resolve_var<'a>(
         } = &decl.node
         {
             if fn_name == name {
+                // A `Var(name)` referring to a top-level function is a
+                // closure value, not a call — but in handler contexts the
+                // name's referent is what `listen` will invoke (e.g.
+                // `listen port handler` where `handler = \req -> ...`).
+                // Strip outer Lambda layers so we check the actual body
+                // rather than rejecting the closure-value AST node.
+                let mut e = body;
+                while let ast::ExprKind::Lambda { body: inner, .. } = &e.node {
+                    e = inner;
+                }
                 visiting.push(name.to_string());
-                let r = check_handler_leaf(body, module, visiting, locals);
+                let r = check_handler_leaf(e, module, visiting, locals);
                 visiting.pop();
                 return match r {
                     LeafCheck::Cycle => LeafCheck::Bad(span),

@@ -6846,11 +6846,60 @@ fn find_non_respond_leaf(
     // treated as a closure value (Bad), since just *evaluating* a Lambda
     // expression doesn't run its body; we only enter a Lambda body via
     // explicit invocation (App-Lambda or substitution into a callee).
+    // The first param of the outermost Lambda is the handler's input —
+    // a route ADT request constructed by `listen` with the framework's
+    // real `respond` callback. Constructor patterns scrutinizing that
+    // input are trusted; constructor patterns on any other value are
+    // not (a forged `Ctor {respond: fakeR}` could otherwise sneak past).
+    // Scan through Var → Fun and outer Lambdas to capture the first
+    // parameter of the outermost Lambda — the framework-supplied request.
+    let mut input_param: Option<String> = None;
+    {
+        let mut scan = expr;
+        let mut visited: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        loop {
+            match &scan.node {
+                ast::ExprKind::Lambda { params, .. } => {
+                    if !params.is_empty() {
+                        if let ast::PatKind::Var(name) = &params[0].node {
+                            input_param = Some(name.clone());
+                        }
+                    }
+                    break;
+                }
+                ast::ExprKind::Var(name) => {
+                    if !visited.insert(name.clone()) {
+                        break;
+                    }
+                    let mut found = false;
+                    for decl in &module.decls {
+                        if let ast::DeclKind::Fun {
+                            name: fn_name,
+                            body: Some(body),
+                            ..
+                        } = &decl.node
+                        {
+                            if fn_name == name {
+                                scan = body;
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !found {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+    }
     let mut e = expr;
     while let ast::ExprKind::Lambda { body, .. } = &e.node {
         e = body;
     }
-    match check_handler_leaf(e, module, visiting, &locals) {
+    match check_handler_leaf(e, module, visiting, &locals, input_param.as_deref()) {
         LeafCheck::Ok => None,
         LeafCheck::Bad(s) => Some(s),
         LeafCheck::Cycle => Some(expr.span),
@@ -6862,6 +6911,7 @@ fn check_handler_leaf<'a>(
     module: &'a ast::Module,
     visiting: &mut Vec<String>,
     locals: &std::collections::HashMap<String, &'a ast::Expr>,
+    input_param: Option<&str>,
 ) -> LeafCheck {
     // Desugared do-block forms (the desugarer rewrites pure-comprehension
     // do-blocks into __bind/__yield/__empty calls). Treat them like the
@@ -6874,7 +6924,7 @@ fn check_handler_leaf<'a>(
             if let ast::ExprKind::Var(name) = &bind_fn.node {
                 if name == "__bind" {
                     if let ast::ExprKind::Lambda { body: rest, .. } = &bind_lambda.node {
-                        return check_handler_leaf(rest, module, visiting, locals);
+                        return check_handler_leaf(rest, module, visiting, locals, input_param);
                     }
                 }
             }
@@ -6882,7 +6932,7 @@ fn check_handler_leaf<'a>(
         if let ast::ExprKind::Var(name) = &func.node {
             if name == "__yield" {
                 if let ast::ExprKind::App { arg, .. } = &expr.node {
-                    return check_handler_leaf(arg, module, visiting, locals);
+                    return check_handler_leaf(arg, module, visiting, locals, input_param);
                 }
             }
         }
@@ -6909,7 +6959,7 @@ fn check_handler_leaf<'a>(
                             }
                             visiting.push("respond".to_string());
                             let r = is_valid_respond_callable(
-                                local, module, visiting, locals,
+                                local, module, visiting, locals, input_param,
                             );
                             visiting.pop();
                             return match r {
@@ -6932,7 +6982,7 @@ fn check_handler_leaf<'a>(
                                 _ => false,
                             }) {
                                 // Body is just a parameter - check the argument
-                                return check_handler_leaf(arg, module, visiting, locals);
+                                return check_handler_leaf(arg, module, visiting, locals, input_param);
                             }
                         }
                         // Single-param lambda (let-in desugaring): bind the
@@ -6949,12 +6999,13 @@ fn check_handler_leaf<'a>(
                                     module,
                                     params,
                                     &args_slice,
+                                    input_param,
                                 );
-                                return check_handler_leaf(body, module, visiting, &new_locals);
+                                return check_handler_leaf(body, module, visiting, &new_locals, input_param);
                             }
                         }
                         // Body does something more complex - check it
-                        return check_handler_leaf(f, module, visiting, locals);
+                        return check_handler_leaf(f, module, visiting, locals, input_param);
                     }
                     _ => break,
                 }
@@ -6970,7 +7021,7 @@ fn check_handler_leaf<'a>(
             let mut e = expr;
             while let ast::ExprKind::App { func: f_inner, arg: a } = &e.node {
                 if matches!(
-                    check_arg_eager(a, module, visiting, locals),
+                    check_arg_eager(a, module, visiting, locals, input_param),
                     LeafCheck::Ok
                 ) {
                     return LeafCheck::Ok;
@@ -7007,6 +7058,7 @@ fn check_handler_leaf<'a>(
                             module,
                             params,
                             &all_args,
+                            input_param,
                         );
                         // Strip nested Lambdas in the body — handles curried
                         // function definitions like `f = \a -> \b -> body`.
@@ -7018,7 +7070,7 @@ fn check_handler_leaf<'a>(
                         }
                         visiting.push(name.to_string());
                         let r = check_handler_leaf(
-                            e, module, visiting, &new_locals,
+                            e, module, visiting, &new_locals, input_param,
                         );
                         visiting.pop();
                         return match r {
@@ -7027,37 +7079,49 @@ fn check_handler_leaf<'a>(
                         };
                     }
                 }
-                return resolve_var(name, expr.span, module, visiting, locals);
+                return resolve_var(name, expr.span, module, visiting, locals, input_param);
             }
             LeafCheck::Bad(expr.span)
         }
         ast::ExprKind::Case { scrutinee, arms } => combine_branches(
             arms.iter().map(|arm| {
-                // If the arm pattern binds `respond` outside of a Constructor
-                // pattern, the binding is untrusted (it's destructuring an
-                // arbitrary scrutinee, not a route ADT's request). Shadow
-                // respond with the scrutinee expression so subsequent
-                // references resolve through the scrutinee.
+                // The scrutinee is "trusted" when it's the handler's input
+                // parameter (or alias chain to it) — `listen` constructs
+                // that value with the framework's real respond, so a
+                // Constructor pattern destructuring it (the standard
+                // `case req of Ctor {respond} -> ...` shape) does NOT
+                // shadow respond. Otherwise (an inner case on a forged
+                // value like `case (Ctor {respond: fakeR}) of Ctor {respond}
+                // -> ...`), Constructor patterns DO shadow — the bound
+                // respond is whatever the scrutinee carried.
                 let mut new_locals = locals.clone();
-                if pattern_shadows_respond(&arm.pat) {
+                let trusted = scrutinee_chains_to_input(
+                    scrutinee, input_param, locals,
+                );
+                let shadows = if trusted {
+                    pattern_shadows_respond(&arm.pat)
+                } else {
+                    pattern_shadows_respond_strict(&arm.pat)
+                };
+                if shadows {
                     new_locals.insert("respond".to_string(), scrutinee.as_ref());
                 }
-                check_handler_leaf(&arm.body, module, visiting, &new_locals)
+                check_handler_leaf(&arm.body, module, visiting, &new_locals, input_param)
             }),
         ),
         ast::ExprKind::If { then_branch, else_branch, .. } => combine_branches(
             [
-                check_handler_leaf(then_branch, module, visiting, locals),
-                check_handler_leaf(else_branch, module, visiting, locals),
+                check_handler_leaf(then_branch, module, visiting, locals, input_param),
+                check_handler_leaf(else_branch, module, visiting, locals, input_param),
             ]
             .into_iter(),
         ),
         ast::ExprKind::Lambda { .. } => LeafCheck::Bad(expr.span),
         ast::ExprKind::Atomic(inner) => {
-            check_handler_leaf(inner, module, visiting, locals)
+            check_handler_leaf(inner, module, visiting, locals, input_param)
         }
         ast::ExprKind::Annot { expr, .. } => {
-            check_handler_leaf(expr, module, visiting, locals)
+            check_handler_leaf(expr, module, visiting, locals, input_param)
         }
         ast::ExprKind::Do(stmts) => {
             // Extend locals with `let` bindings before checking the body.
@@ -7085,13 +7149,13 @@ fn check_handler_leaf<'a>(
             }
             match stmts.last().map(|s| &s.node) {
                 Some(ast::StmtKind::Expr(e)) => {
-                    check_handler_leaf(e, module, visiting, &new_locals)
+                    check_handler_leaf(e, module, visiting, &new_locals, input_param)
                 }
                 _ => LeafCheck::Bad(expr.span),
             }
         }
         ast::ExprKind::Var(name) => {
-            resolve_var(name, expr.span, module, visiting, locals)
+            resolve_var(name, expr.span, module, visiting, locals, input_param)
         }
         _ => LeafCheck::Bad(expr.span),
     }
@@ -7108,12 +7172,13 @@ fn check_arg_eager<'a>(
     module: &'a ast::Module,
     visiting: &mut Vec<String>,
     locals: &std::collections::HashMap<String, &'a ast::Expr>,
+    input_param: Option<&str>,
 ) -> LeafCheck {
     match &expr.node {
         ast::ExprKind::Lambda { .. } | ast::ExprKind::Do(_) => {
             LeafCheck::Bad(expr.span)
         }
-        _ => check_handler_leaf(expr, module, visiting, locals),
+        _ => check_handler_leaf(expr, module, visiting, locals, input_param),
     }
 }
 
@@ -7128,6 +7193,7 @@ fn is_valid_respond_callable<'a>(
     module: &'a ast::Module,
     visiting: &mut Vec<String>,
     locals: &std::collections::HashMap<String, &'a ast::Expr>,
+    input_param: Option<&str>,
 ) -> LeafCheck {
     match &expr.node {
         ast::ExprKind::Var(name) => {
@@ -7139,7 +7205,7 @@ fn is_valid_respond_callable<'a>(
             }
             if let Some(local) = locals.get(name) {
                 visiting.push(name.to_string());
-                let r = is_valid_respond_callable(local, module, visiting, locals);
+                let r = is_valid_respond_callable(local, module, visiting, locals, input_param);
                 visiting.pop();
                 return match r {
                     LeafCheck::Cycle => LeafCheck::Bad(expr.span),
@@ -7156,7 +7222,7 @@ fn is_valid_respond_callable<'a>(
                     if fn_name == name {
                         visiting.push(name.to_string());
                         let r = is_valid_respond_callable(
-                            body, module, visiting, locals,
+                            body, module, visiting, locals, input_param,
                         );
                         visiting.pop();
                         return match r {
@@ -7173,7 +7239,7 @@ fn is_valid_respond_callable<'a>(
             while let ast::ExprKind::Lambda { body: inner, .. } = &e.node {
                 e = inner.as_ref();
             }
-            check_handler_leaf(e, module, visiting, locals)
+            check_handler_leaf(e, module, visiting, locals, input_param)
         }
         _ => LeafCheck::Bad(expr.span),
     }
@@ -7237,13 +7303,14 @@ fn bind_params<'a>(
     module: &'a ast::Module,
     params: &[ast::Pat],
     args: &[&'a ast::Expr],
+    input_param: Option<&str>,
 ) {
     for (p, a) in params.iter().zip(args.iter()) {
         if let ast::PatKind::Var(pname) = &p.node {
             if pname == "respond" {
                 let mut visiting = Vec::new();
                 if matches!(
-                    is_valid_respond_callable(a, module, &mut visiting, outer_locals),
+                    is_valid_respond_callable(a, module, &mut visiting, outer_locals, input_param),
                     LeafCheck::Ok
                 ) {
                     continue;
@@ -7280,7 +7347,11 @@ fn resolve_var_chain<'a>(
 /// Check whether a case-arm pattern binds `respond` from an untrusted
 /// source (i.e., not inside a Constructor pattern). Bare record
 /// destructuring like `case x of {respond} -> ...` shadows the handler's
-/// trusted respond with whatever the scrutinee provides.
+/// trusted respond with whatever the scrutinee provides. Constructor
+/// patterns are treated as trusted — this is for the typical outer
+/// `case req of Ctor {respond} -> ...` shape on the handler's input.
+/// Use `pattern_shadows_respond_strict` instead when the scrutinee is
+/// not the trusted handler input.
 fn pattern_shadows_respond(pat: &ast::Pat) -> bool {
     match &pat.node {
         ast::PatKind::Var(name) => name == "respond",
@@ -7292,10 +7363,67 @@ fn pattern_shadows_respond(pat: &ast::Pat) -> bool {
             }
         }),
         ast::PatKind::List(pats) => pats.iter().any(pattern_shadows_respond),
-        // Bindings nested inside a Constructor pattern are treated as
-        // trusted: this is the typical handler shape `Ctor {respond, ...}`.
         ast::PatKind::Constructor { .. } => false,
         _ => false,
+    }
+}
+
+/// Like `pattern_shadows_respond` but treats Constructor patterns as
+/// untrusted too — recurses into the constructor's payload pattern.
+/// Used when a `case` expression scrutinizes a value that isn't the
+/// handler's framework-supplied input: the user could have written
+/// `case (Ctor {respond: fakeR}) of Ctor {respond} -> respond [...]`,
+/// and the bound respond is the forged one from the scrutinee.
+fn pattern_shadows_respond_strict(pat: &ast::Pat) -> bool {
+    match &pat.node {
+        ast::PatKind::Var(name) => name == "respond",
+        ast::PatKind::Record(fields) => fields.iter().any(|f| {
+            if let Some(p) = &f.pattern {
+                pattern_shadows_respond_strict(p)
+            } else {
+                f.name == "respond"
+            }
+        }),
+        ast::PatKind::List(pats) => pats.iter().any(pattern_shadows_respond_strict),
+        ast::PatKind::Constructor { payload, .. } => {
+            pattern_shadows_respond_strict(payload)
+        }
+        _ => false,
+    }
+}
+
+/// Walk a case scrutinee through `Var` aliases in `locals` and check
+/// whether it ultimately names the handler's input parameter. The input
+/// is the only value we trust to be a framework-constructed route ADT
+/// request (with the real `respond` callback in its fields); any other
+/// scrutinee could be an inner forged value.
+fn scrutinee_chains_to_input(
+    expr: &ast::Expr,
+    input_param: Option<&str>,
+    locals: &std::collections::HashMap<String, &ast::Expr>,
+) -> bool {
+    let input = match input_param {
+        Some(name) => name,
+        None => return false,
+    };
+    let mut cur = expr;
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        match &cur.node {
+            ast::ExprKind::Var(name) => {
+                if name == input {
+                    return true;
+                }
+                if !seen.insert(name.clone()) {
+                    return false;
+                }
+                match locals.get(name) {
+                    Some(next) => cur = next,
+                    None => return false,
+                }
+            }
+            _ => return false,
+        }
     }
 }
 
@@ -7332,13 +7460,14 @@ fn resolve_var<'a>(
     module: &'a ast::Module,
     visiting: &mut Vec<String>,
     locals: &std::collections::HashMap<String, &'a ast::Expr>,
+    input_param: Option<&str>,
 ) -> LeafCheck {
     if visiting.iter().any(|n| n == name) {
         return LeafCheck::Cycle;
     }
     if let Some(local_body) = locals.get(name) {
         visiting.push(name.to_string());
-        let r = check_handler_leaf(local_body, module, visiting, locals);
+        let r = check_handler_leaf(local_body, module, visiting, locals, input_param);
         visiting.pop();
         return match r {
             LeafCheck::Cycle => LeafCheck::Bad(span),
@@ -7364,7 +7493,7 @@ fn resolve_var<'a>(
                     e = inner;
                 }
                 visiting.push(name.to_string());
-                let r = check_handler_leaf(e, module, visiting, locals);
+                let r = check_handler_leaf(e, module, visiting, locals, input_param);
                 visiting.pop();
                 return match r {
                     LeafCheck::Cycle => LeafCheck::Bad(span),
@@ -8783,6 +8912,32 @@ main = applyPred (\\r -> r.x == r.y)\
         assert!(
             !diags.is_empty(),
             "handler returning polymorphic value should be rejected"
+        );
+    }
+
+    #[test]
+    fn handler_inner_case_constructor_pattern_shadowing_respond_rejected() {
+        // A handler that destructures a forged constructor (e.g.
+        // `case (MakeBox {respond: fakeR}) of MakeBox {respond} -> respond ...`)
+        // should be rejected. Constructor patterns are trusted only when
+        // the case scrutinee chains to the handler's input parameter —
+        // an inner case on a freshly-built constructor is not.
+        let diags = check_src(
+            "type Todo = {title: Text}\n\
+             *todos : [Todo]\n\
+             route Api where\n  GET /todos -> [Todo] = GetTodos\n\
+             data Box = MakeBox {respond: [Todo] -> Response}\n\
+             bottom : a\n\
+             bottom = bottom\n\
+             fakeR : [Todo] -> Response\n\
+             fakeR = \\_ -> bottom\n\
+             bad = \\req -> case req of\n  GetTodos {respond: origRespond} -> do\n    _ <- *todos\n    case MakeBox {respond: fakeR} of\n      MakeBox {respond} -> yield (respond [{title: \"x\"}])\n\
+             main = listen 8080 bad"
+        );
+        assert!(
+            has_error(&diags, "respond"),
+            "inner case Constructor pattern shadowing respond should be rejected: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
 

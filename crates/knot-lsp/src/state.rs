@@ -443,6 +443,14 @@ pub const ANALYSIS_DEBOUNCE: Duration = Duration::from_millis(150);
 /// Hard upper bound on how long a task can sit in the debounce queue. Prevents
 /// continuous typing from indefinitely starving the analysis pass.
 pub const ANALYSIS_MAX_WAIT: Duration = Duration::from_millis(500);
+/// Bound on the analysis task channel. Each task carries a copy of the file
+/// source, so an unbounded queue lets a runaway editor (or a buggy client
+/// firing didChange in a tight loop) grow memory without limit. The worker
+/// coalesces by URI, so dropping a task on a full queue is safe — a fresher
+/// version of that URI's source will follow shortly. The cap is generous
+/// enough that bursts during multi-file workspace operations (e.g. find/
+/// replace across many files) don't shed work in practice.
+pub const ANALYSIS_QUEUE_CAPACITY: usize = 256;
 
 // ── Configuration ───────────────────────────────────────────────────
 
@@ -839,6 +847,42 @@ pub fn send_internal_error(
         id,
         lsp_server::ErrorCode::InternalError as i32,
         format!("knot-lsp internal error in `{method}`: {detail}"),
+    );
+    if let Err(e) = conn.sender.send(lsp_server::Message::Response(resp)) {
+        eprintln!("knot-lsp: failed to send error response: {e}");
+    }
+}
+
+/// Send an LSP `MethodNotFound` (-32601) response. Used by the request
+/// dispatcher's terminal fallback so clients don't hang on a request whose
+/// method we don't implement (or have misspelled in our routing).
+pub fn send_method_not_found(
+    conn: &Connection,
+    id: lsp_server::RequestId,
+    method: &str,
+) {
+    let resp = lsp_server::Response::new_err(
+        id,
+        lsp_server::ErrorCode::MethodNotFound as i32,
+        format!("knot-lsp does not handle `{method}`"),
+    );
+    if let Err(e) = conn.sender.send(lsp_server::Message::Response(resp)) {
+        eprintln!("knot-lsp: failed to send error response: {e}");
+    }
+}
+
+/// Send an LSP `InvalidParams` (-32602) response. Used when a request's
+/// method matches a handler but the params payload fails to deserialize.
+pub fn send_invalid_params(
+    conn: &Connection,
+    id: lsp_server::RequestId,
+    method: &str,
+    detail: &str,
+) {
+    let resp = lsp_server::Response::new_err(
+        id,
+        lsp_server::ErrorCode::InvalidParams as i32,
+        format!("knot-lsp received malformed params for `{method}`: {detail}"),
     );
     if let Err(e) = conn.sender.send(lsp_server::Message::Response(resp)) {
         eprintln!("knot-lsp: failed to send error response: {e}");

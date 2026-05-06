@@ -73,8 +73,8 @@ use crate::semantic_tokens::{
 };
 use crate::signature_help::handle_signature_help;
 use crate::state::{
-    send_internal_error, send_response, AnalysisResult, AnalysisTask, PendingSource, ServerConfig,
-    ServerState, WorkspaceSymbolCache,
+    send_internal_error, send_invalid_params, send_method_not_found, send_response,
+    AnalysisResult, AnalysisTask, PendingSource, ServerConfig, ServerState, WorkspaceSymbolCache,
 };
 use crate::type_hierarchy::{
     handle_prepare_type_hierarchy, handle_type_hierarchy_subtypes,
@@ -253,7 +253,11 @@ fn main() {
     // for auto-import completion suggestions without a round trip.
     let import_cache = Arc::new(Mutex::new(HashMap::new()));
     let inference_cache = Arc::new(Mutex::new(HashMap::new()));
-    let (analysis_tx, analysis_rx) = crossbeam_channel::unbounded::<AnalysisTask>();
+    // Bounded so a misbehaving client can't grow the queue without limit.
+    // Tasks carry a clone of the file source; coalescing in the worker means
+    // dropping on overflow is safe (the next didChange supersedes anyway).
+    let (analysis_tx, analysis_rx) =
+        crossbeam_channel::bounded::<AnalysisTask>(state::ANALYSIS_QUEUE_CAPACITY);
     let (results_tx, results_rx) = crossbeam_channel::unbounded::<AnalysisResult>();
     let worker_import_cache = Arc::clone(&import_cache);
     let worker_inference_cache = Arc::clone(&inference_cache);
@@ -293,9 +297,14 @@ fn main() {
     // Register for file watcher notifications (.knot files). Build the
     // request defensively: if any payload fails to serialize (this should
     // never happen for these static structs, but handling it costs nothing),
-    // skip the registration rather than panicking.
+    // skip the registration rather than panicking. A send failure here is
+    // also non-fatal — the editor just won't push file-change events — but
+    // log it so we don't silently lose cross-file invalidation if the
+    // connection has gone bad.
     if let Some(register_request) = build_file_watcher_registration() {
-        let _ = connection.sender.send(Message::Request(register_request));
+        if let Err(e) = connection.sender.send(Message::Request(register_request)) {
+            eprintln!("knot-lsp: failed to register file watcher: {e}");
+        }
     }
 
     // Pre-warm the workspace-symbol cache in the background. The first
@@ -310,7 +319,11 @@ fn main() {
         let import_cache_handle = Arc::clone(&state.import_cache);
         let roots = state.workspace_roots.clone();
         let legacy_root = state.workspace_root.clone();
-        thread::Builder::new()
+        // Spawn failures are rare (resource exhaustion) but worth logging:
+        // without the prewarm thread, the first `workspace/symbol` query
+        // walks the workspace from cold instead of finding a populated
+        // cache — degraded UX, but not fatal.
+        let spawn_result = thread::Builder::new()
             .name("knot-lsp-workspace-indexer".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -331,8 +344,10 @@ fn main() {
                     };
                     eprintln!("knot-lsp: workspace indexer panicked: {msg}");
                 }
-            })
-            .ok();
+            });
+        if let Err(e) = spawn_result {
+            eprintln!("knot-lsp: failed to spawn workspace indexer thread: {e}");
+        }
     }
 
     'outer: loop {
@@ -801,128 +816,140 @@ fn requeue_dependents_for_changed_decls(
 
 // ── Request dispatch ────────────────────────────────────────────────
 
-fn handle_request(state: &mut ServerState, conn: &Connection, req: Request) {
-    let id = req.id.clone();
+/// Tristate result of attempting to decode a `Request` as a specific LSP
+/// request type. Splitting "method matches but params don't deserialize" out
+/// from "method doesn't match this handler" lets the dispatcher reply with
+/// `InvalidParams` (-32602) instead of letting the request fall through to
+/// the `MethodNotFound` (-32601) fallback or — worse, before the fallback
+/// existed — be silently dropped while the client hangs on a response that
+/// never comes.
+enum Cast<T> {
+    /// Method and params both matched; ready to invoke the handler.
+    Matched(T),
+    /// Method matched but the params payload failed to deserialize.
+    Malformed(serde_json::Error),
+    /// Different method — try the next handler.
+    Other,
+}
 
-    if let Some(params) = cast_request::<request::DocumentSymbolRequest>(&req) {
-        let result = handle_document_symbol(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::GotoDefinition>(&req) {
-        let result = handle_goto_definition(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::GotoTypeDefinition>(&req) {
-        let result = handle_goto_type_definition(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::GotoImplementation>(&req) {
-        let result = handle_goto_implementation(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::HoverRequest>(&req) {
-        let result = handle_hover(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::Completion>(&req) {
-        let result = handle_completion(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::References>(&req) {
-        let result = handle_references(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::PrepareRenameRequest>(&req) {
-        let result = handle_prepare_rename(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::Rename>(&req) {
-        let result = handle_rename(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::InlayHintRequest>(&req) {
-        let result = handle_inlay_hint(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::SignatureHelpRequest>(&req) {
-        let result = handle_signature_help(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::CodeLensRequest>(&req) {
-        let result = handle_code_lens(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::SemanticTokensFullRequest>(&req) {
-        let result = handle_semantic_tokens_full(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::SemanticTokensFullDeltaRequest>(&req) {
-        let result = handle_semantic_tokens_full_delta(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::SemanticTokensRangeRequest>(&req) {
-        let result = handle_semantic_tokens_range(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::FoldingRangeRequest>(&req) {
-        let result = handle_folding_range(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::SelectionRangeRequest>(&req) {
-        let result = handle_selection_range(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::Formatting>(&req) {
-        let result = handle_formatting(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::RangeFormatting>(&req) {
-        let result = handle_range_formatting(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::OnTypeFormatting>(&req) {
-        let result = handle_on_type_formatting(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::DocumentHighlightRequest>(&req) {
-        let result = handle_document_highlight(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::DocumentLinkRequest>(&req) {
-        let result = handle_document_link(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::CodeActionRequest>(&req) {
-        let result = handle_code_action(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::WorkspaceSymbolRequest>(&req) {
-        let result = handle_workspace_symbol(state, &params);
-        send_response(conn, id, result);
-        // Keep workspace_symbol_cache from growing unbounded — pruning happens
-        // inside the handler via the on-disk scan.
-    } else if let Some(params) = cast_request::<request::CallHierarchyPrepare>(&req) {
-        let result = handle_call_hierarchy_prepare(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::CallHierarchyIncomingCalls>(&req) {
-        let result = handle_call_hierarchy_incoming(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::CallHierarchyOutgoingCalls>(&req) {
-        let result = handle_call_hierarchy_outgoing(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::ResolveCompletionItem>(&req) {
-        let result = handle_resolve_completion_item(state, params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::LinkedEditingRange>(&req) {
-        let result = handle_linked_editing_range(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::DocumentDiagnosticRequest>(&req) {
-        let result = handle_document_diagnostics(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::WorkspaceDiagnosticRequest>(&req) {
-        let result = handle_workspace_diagnostics(state, &params);
-        send_response(conn, id, result);
-        // Periodically prune the workspace diagnostics cache to avoid
-        // unbounded growth when files are deleted from disk.
-        prune_stale_workspace_diag_cache(state);
-    } else if let Some(params) = cast_request::<request::WillRenameFiles>(&req) {
-        let result = handle_will_rename_files(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::TypeHierarchyPrepare>(&req) {
-        let result = handle_prepare_type_hierarchy(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::TypeHierarchySupertypes>(&req) {
-        let result = handle_type_hierarchy_supertypes(state, &params);
-        send_response(conn, id, result);
-    } else if let Some(params) = cast_request::<request::TypeHierarchySubtypes>(&req) {
-        let result = handle_type_hierarchy_subtypes(state, &params);
-        send_response(conn, id, result);
+fn cast_request<R: request::Request>(req: &Request) -> Cast<R::Params> {
+    if req.method != R::METHOD {
+        return Cast::Other;
+    }
+    match serde_json::from_value(req.params.clone()) {
+        Ok(params) => Cast::Matched(params),
+        Err(e) => Cast::Malformed(e),
     }
 }
 
-fn cast_request<R: request::Request>(req: &Request) -> Option<R::Params> {
-    if req.method == R::METHOD {
-        serde_json::from_value(req.params.clone()).ok()
-    } else {
-        None
+/// Dispatch a single request to its handler.
+///
+/// Each `try_handle!` arm runs `cast_request` for one LSP request type:
+/// - On `Matched`, it evaluates the handler expression, sends the response,
+///   and returns from the enclosing function.
+/// - On `Malformed`, it logs and replies with `InvalidParams`, then returns.
+/// - On `Other`, it falls through so the next arm can try its method.
+///
+/// The closure-style `|p| ...` syntax keeps each call site to a single line
+/// while letting the body capture `state` mutably; the borrow ends when the
+/// macro expansion returns from the enclosing function (Matched/Malformed)
+/// or releases at the next statement (Other).
+macro_rules! try_handle {
+    ($req:expr, $conn:expr, $req_ty:ty, |$params:ident| $body:expr) => {
+        match cast_request::<$req_ty>($req) {
+            Cast::Matched($params) => {
+                let __result = $body;
+                send_response($conn, $req.id.clone(), __result);
+                return;
+            }
+            Cast::Malformed(__e) => {
+                eprintln!(
+                    "knot-lsp: malformed `{}` params: {}",
+                    <$req_ty as request::Request>::METHOD,
+                    __e
+                );
+                send_invalid_params(
+                    $conn,
+                    $req.id.clone(),
+                    <$req_ty as request::Request>::METHOD,
+                    &__e.to_string(),
+                );
+                return;
+            }
+            Cast::Other => {}
+        }
+    };
+}
+
+fn handle_request(state: &mut ServerState, conn: &Connection, req: Request) {
+    try_handle!(&req, conn, request::DocumentSymbolRequest, |p| handle_document_symbol(state, &p));
+    try_handle!(&req, conn, request::GotoDefinition, |p| handle_goto_definition(state, &p));
+    try_handle!(&req, conn, request::GotoTypeDefinition, |p| handle_goto_type_definition(state, &p));
+    try_handle!(&req, conn, request::GotoImplementation, |p| handle_goto_implementation(state, &p));
+    try_handle!(&req, conn, request::HoverRequest, |p| handle_hover(state, &p));
+    try_handle!(&req, conn, request::Completion, |p| handle_completion(state, &p));
+    try_handle!(&req, conn, request::References, |p| handle_references(state, &p));
+    try_handle!(&req, conn, request::PrepareRenameRequest, |p| handle_prepare_rename(state, &p));
+    try_handle!(&req, conn, request::Rename, |p| handle_rename(state, &p));
+    try_handle!(&req, conn, request::InlayHintRequest, |p| handle_inlay_hint(state, &p));
+    try_handle!(&req, conn, request::SignatureHelpRequest, |p| handle_signature_help(state, &p));
+    try_handle!(&req, conn, request::CodeLensRequest, |p| handle_code_lens(state, &p));
+    try_handle!(&req, conn, request::SemanticTokensFullRequest, |p| handle_semantic_tokens_full(state, &p));
+    try_handle!(&req, conn, request::SemanticTokensFullDeltaRequest, |p| handle_semantic_tokens_full_delta(state, &p));
+    try_handle!(&req, conn, request::SemanticTokensRangeRequest, |p| handle_semantic_tokens_range(state, &p));
+    try_handle!(&req, conn, request::FoldingRangeRequest, |p| handle_folding_range(state, &p));
+    try_handle!(&req, conn, request::SelectionRangeRequest, |p| handle_selection_range(state, &p));
+    try_handle!(&req, conn, request::Formatting, |p| handle_formatting(state, &p));
+    try_handle!(&req, conn, request::RangeFormatting, |p| handle_range_formatting(state, &p));
+    try_handle!(&req, conn, request::OnTypeFormatting, |p| handle_on_type_formatting(state, &p));
+    try_handle!(&req, conn, request::DocumentHighlightRequest, |p| handle_document_highlight(state, &p));
+    try_handle!(&req, conn, request::DocumentLinkRequest, |p| handle_document_link(state, &p));
+    try_handle!(&req, conn, request::CodeActionRequest, |p| handle_code_action(state, &p));
+    // Keep workspace_symbol_cache from growing unbounded — pruning happens
+    // inside the handler via the on-disk scan.
+    try_handle!(&req, conn, request::WorkspaceSymbolRequest, |p| handle_workspace_symbol(state, &p));
+    try_handle!(&req, conn, request::CallHierarchyPrepare, |p| handle_call_hierarchy_prepare(state, &p));
+    try_handle!(&req, conn, request::CallHierarchyIncomingCalls, |p| handle_call_hierarchy_incoming(state, &p));
+    try_handle!(&req, conn, request::CallHierarchyOutgoingCalls, |p| handle_call_hierarchy_outgoing(state, &p));
+    try_handle!(&req, conn, request::ResolveCompletionItem, |p| handle_resolve_completion_item(state, p));
+    try_handle!(&req, conn, request::LinkedEditingRange, |p| handle_linked_editing_range(state, &p));
+    try_handle!(&req, conn, request::DocumentDiagnosticRequest, |p| handle_document_diagnostics(state, &p));
+    // Workspace-diagnostic results piggyback a cache prune so deleted files
+    // don't leave stale entries; bundle that side-effect into the handler
+    // call here rather than splitting it out across the macro.
+    match cast_request::<request::WorkspaceDiagnosticRequest>(&req) {
+        Cast::Matched(params) => {
+            let result = handle_workspace_diagnostics(state, &params);
+            send_response(conn, req.id.clone(), result);
+            prune_stale_workspace_diag_cache(state);
+            return;
+        }
+        Cast::Malformed(e) => {
+            eprintln!(
+                "knot-lsp: malformed `{}` params: {e}",
+                <request::WorkspaceDiagnosticRequest as request::Request>::METHOD
+            );
+            send_invalid_params(
+                conn,
+                req.id.clone(),
+                <request::WorkspaceDiagnosticRequest as request::Request>::METHOD,
+                &e.to_string(),
+            );
+            return;
+        }
+        Cast::Other => {}
     }
+    try_handle!(&req, conn, request::WillRenameFiles, |p| handle_will_rename_files(state, &p));
+    try_handle!(&req, conn, request::TypeHierarchyPrepare, |p| handle_prepare_type_hierarchy(state, &p));
+    try_handle!(&req, conn, request::TypeHierarchySupertypes, |p| handle_type_hierarchy_supertypes(state, &p));
+    try_handle!(&req, conn, request::TypeHierarchySubtypes, |p| handle_type_hierarchy_subtypes(state, &p));
+
+    // Fallback: every known method is handled above, so reaching here means
+    // the client sent something we don't implement. Replying with
+    // `MethodNotFound` (-32601) is mandatory — without a response the client
+    // would block waiting for the request id forever.
+    eprintln!("knot-lsp: unhandled request method `{}`", req.method);
+    send_method_not_found(conn, req.id, &req.method);
 }
 
 // ── Notification dispatch ───────────────────────────────────────────
@@ -1440,12 +1467,31 @@ fn shift_byte_ranges_for_edit(
     }
 }
 
-/// Send an analysis task to the worker. Errors here are unrecoverable — the
-/// worker has died — so we eprintln and continue (other features still work
-/// against the last good analysis).
+/// Send an analysis task to the worker. The channel is bounded
+/// (`ANALYSIS_QUEUE_CAPACITY`); we use `try_send` so a runaway client can't
+/// block the main event loop on a full queue. Two distinct failure modes:
+///
+/// - `Full`: the worker is behind. Drop the task with a one-line warning.
+///   The worker coalesces by URI internally, so a fresher copy of this
+///   file's source will follow shortly via the next didChange (or, in the
+///   worst case, the user's next keystroke); silently dropping an
+///   already-stale snapshot is the right call.
+/// - `Disconnected`: the worker thread has died. Other features still work
+///   against the last good analysis, so log and continue rather than crash.
 fn queue_analysis(state: &ServerState, uri: Uri, source: String, version: Option<i32>) {
-    if let Err(e) = state.analysis_tx.send(AnalysisTask { uri, source, version }) {
-        eprintln!("knot-lsp: analysis worker channel closed: {e}");
+    use crossbeam_channel::TrySendError;
+    match state.analysis_tx.try_send(AnalysisTask { uri, source, version }) {
+        Ok(()) => {}
+        Err(TrySendError::Full(task)) => {
+            eprintln!(
+                "knot-lsp: analysis queue full ({} tasks); dropping task for `{}`",
+                state::ANALYSIS_QUEUE_CAPACITY,
+                task.uri.as_str()
+            );
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            eprintln!("knot-lsp: analysis worker channel closed");
+        }
     }
 }
 

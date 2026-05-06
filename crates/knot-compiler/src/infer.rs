@@ -6880,13 +6880,51 @@ fn check_handler_leaf(
                         // Body does something more complex - check it
                         return check_handler_leaf(f, module, visiting);
                     }
-                    _ => {
-                        // Other function references (e.g., calls to defined functions)
-                        // are trusted to call respond.
-                        return LeafCheck::Ok;
+                    _ => break,
+                }
+            }
+            // Root function is not `respond`. Eager evaluation means each
+            // argument is evaluated before the call — so if any argument
+            // contains a guaranteed `respond` call, the call site does too.
+            // Walk back through the App chain checking each argument.
+            let mut e = expr;
+            while let ast::ExprKind::App { func: f_inner, arg: a } = &e.node {
+                if matches!(
+                    check_handler_leaf(a, module, visiting),
+                    LeafCheck::Ok
+                ) {
+                    return LeafCheck::Ok;
+                }
+                e = f_inner;
+            }
+            // No argument guarantees a respond call. If the root is a known
+            // user-defined function, recurse into its body. Otherwise trust
+            // the call (e.g., builtin or imported helper).
+            if let ast::ExprKind::Var(name) = &f.node {
+                if visiting.iter().any(|n| n == name) {
+                    return LeafCheck::Cycle;
+                }
+                for decl in &module.decls {
+                    if let ast::DeclKind::Fun {
+                        name: fn_name,
+                        body: Some(body),
+                        ..
+                    } = &decl.node
+                    {
+                        if fn_name == name {
+                            visiting.push(name.clone());
+                            let r = check_handler_leaf(body, module, visiting);
+                            visiting.pop();
+                            return match r {
+                                LeafCheck::Cycle => LeafCheck::Bad(expr.span),
+                                other => other,
+                            };
+                        }
                     }
                 }
             }
+            // Unknown function — trust it.
+            LeafCheck::Ok
         }
         ast::ExprKind::Case { arms, .. } => combine_branches(
             arms.iter().map(|arm| {
@@ -6930,7 +6968,15 @@ fn check_handler_leaf(
                         visiting.push(name.clone());
                         let r = check_handler_leaf(body, module, visiting);
                         visiting.pop();
-                        return r;
+                        // Cycle returned from a fully-recursed function means
+                        // the function has no path reaching respond. From the
+                        // caller's perspective, that's Bad. Self-recursive
+                        // cycles within a legitimate function would have been
+                        // absorbed by combine_branches alongside an Ok branch.
+                        return match r {
+                            LeafCheck::Cycle => LeafCheck::Bad(expr.span),
+                            other => other,
+                        };
                     }
                 }
             }

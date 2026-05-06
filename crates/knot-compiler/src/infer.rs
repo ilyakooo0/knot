@@ -6852,7 +6852,7 @@ fn check_handler_leaf(
     visiting: &mut Vec<String>,
 ) -> LeafCheck {
     match &expr.node {
-        ast::ExprKind::App { func, .. } => {
+        ast::ExprKind::App { func, arg } => {
             // Walk through curried applications to find the root function.
             let mut f = func.as_ref();
             loop {
@@ -6863,10 +6863,30 @@ fn check_handler_leaf(
                     ast::ExprKind::App { func: inner, .. } => {
                         f = inner.as_ref();
                     }
-                    _ => break,
+                    ast::ExprKind::Lambda { params, body } => {
+                        // Lambda applications (e.g., from `let...in` desugaring).
+                        // If the body is just a reference to a parameter, the lambda
+                        // returns its argument, so we need to check the argument.
+                        // Otherwise, check the lambda body.
+                        if let ast::ExprKind::Var(name) = &body.node {
+                            if params.iter().any(|p| match &p.node {
+                                ast::PatKind::Var(pname) => pname == name,
+                                _ => false,
+                            }) {
+                                // Body is just a parameter - check the argument
+                                return check_handler_leaf(arg, module, visiting);
+                            }
+                        }
+                        // Body does something more complex - check it
+                        return check_handler_leaf(f, module, visiting);
+                    }
+                    _ => {
+                        // Other function references (e.g., calls to defined functions)
+                        // are trusted to call respond.
+                        return LeafCheck::Ok;
+                    }
                 }
             }
-            LeafCheck::Ok
         }
         ast::ExprKind::Case { arms, .. } => combine_branches(
             arms.iter().map(|arm| {

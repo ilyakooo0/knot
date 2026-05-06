@@ -407,6 +407,14 @@ struct Infer {
     /// Route constructor → response header fields (for `fetch` response wrapping).
     fetch_response_headers: HashMap<String, Vec<ast::Field<ast::Type>>>,
 
+    /// Names of ADT types declared via `route` / `route ... =` (the only types
+    /// `listen` accepts as a handler input). Populated in `pre_register`.
+    route_types: HashSet<String>,
+
+    /// `(span, handler_arg_ty)` for each `listen` / `listenOn` call site.
+    /// Validated post-inference: the resolved arg type must be a route ADT.
+    listen_calls: Vec<(Span, Ty)>,
+
     /// Whether we are currently inside an IO do-block. When true, `yield expr`
     /// produces `IO {} expr_type` instead of `[expr_type]`, allowing yield to
     /// be used as "return unit" in if/case branches within IO do blocks.
@@ -484,6 +492,8 @@ impl Infer {
             trait_params: HashMap::new(),
             fetch_response_types: HashMap::new(),
             fetch_response_headers: HashMap::new(),
+            route_types: HashSet::new(),
+            listen_calls: Vec::new(),
             in_io_do: false,
             in_atomic: false,
             source_var_binds: HashMap::new(),
@@ -2934,6 +2944,15 @@ impl Infer {
                     }
                 }
 
+                // Track `listen` / `listenOn` call sites so we can verify
+                // post-inference that the handler's argument type is a
+                // route ADT. Without this, identity-like handlers
+                // (`\req -> req`) bypass the `Response` constraint by
+                // collapsing the handler's input and output types.
+                if let Some(handler_arg_ty) = self.detect_listen_handler_arg(expr, &arg_ty) {
+                    self.listen_calls.push((expr.span, handler_arg_ty));
+                }
+
                 result_ty
             }
 
@@ -3355,6 +3374,33 @@ impl Infer {
                 let inferred = self.infer_expr(expr);
                 self.unify(expected, &inferred, expr.span);
             }
+        }
+    }
+
+    /// If `expr` is `listen port handler` or `listenOn host port handler`,
+    /// return the handler argument's input type so it can be validated
+    /// post-inference. The check is anchored on the outer App so it fires
+    /// once per call site (inner curried Apps have too few arguments).
+    fn detect_listen_handler_arg(&self, expr: &ast::Expr, arg_ty: &Ty) -> Option<Ty> {
+        let (root, args) = uncurry_fetch(expr);
+        let name = match &root.node {
+            ast::ExprKind::Var(n) => n.as_str(),
+            _ => return None,
+        };
+        let expected_args = match name {
+            "listen" => 2,
+            "listenOn" => 3,
+            _ => return None,
+        };
+        if args.len() != expected_args {
+            return None;
+        }
+        // The handler is the last argument; `arg_ty` is its inferred type
+        // (a function type). Pull out its parameter type.
+        if let Ty::Fun(param, _) = arg_ty {
+            Some((**param).clone())
+        } else {
+            None
         }
     }
 
@@ -4517,7 +4563,8 @@ impl Infer {
                 } => {
                     self.register_trait_methods(trait_name, params, items);
                 }
-                ast::DeclKind::Route { entries, .. } => {
+                ast::DeclKind::Route { name, entries } => {
+                    self.route_types.insert(name.clone());
                     for entry in entries {
                         if let Some(ref resp_ty) = entry.response_ty {
                             self.fetch_response_types
@@ -4528,6 +4575,9 @@ impl Infer {
                                 .insert(entry.constructor.clone(), entry.response_headers.clone());
                         }
                     }
+                }
+                ast::DeclKind::RouteComposite { name, .. } => {
+                    self.route_types.insert(name.clone());
                 }
                 _ => {}
             }
@@ -6671,11 +6721,67 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
         }
     }
 
+    // Phase 8: Validate `listen` / `listenOn` handler argument types.
+    // The handler must take a route ADT — without this check, an identity
+    // handler `\req -> req` would type-check by collapsing `a = Response`,
+    // and a `\req -> bottom` would type-check with a free type variable.
+    // Case-pattern handlers infer the arg as an open `Ty::Variant`; accept
+    // those when every constructor belongs to a single route ADT.
+    let listen_calls = std::mem::take(&mut infer.listen_calls);
+    for (span, arg_ty) in listen_calls {
+        let resolved = infer.apply(&arg_ty);
+        if !is_route_handler_arg(&resolved, &infer) {
+            infer.errors.push((
+                format!(
+                    "listen handler must take a route ADT, found {}",
+                    infer.display_ty(&resolved)
+                ),
+                span,
+            ));
+        }
+    }
+
     let type_info = infer.extract_type_info();
     let local_type_info = infer.extract_local_type_info();
     let elem_pushdown_ok = infer.elem_pushdown_ok.clone();
 
     (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok)
+}
+
+/// Check that the inferred argument type of a `listen` handler is a route ADT.
+/// Accepts:
+/// - `Ty::Alias(name, _)` where `name` is a route (single-variant route ADTs
+///   surface as aliases of their inner record).
+/// - `Ty::Con(name, _)` where `name` is a route.
+/// - `Ty::Variant(ctors, _)` where every constructor belongs to one route ADT
+///   (case-pattern handlers infer the scrutinee as an open variant rather
+///   than the named ADT).
+fn is_route_handler_arg(ty: &Ty, infer: &Infer) -> bool {
+    if let Ty::Alias(name, _) = ty {
+        if infer.route_types.contains(name) {
+            return true;
+        }
+    }
+    match ty.peel_alias() {
+        Ty::Con(name, _) => infer.route_types.contains(name),
+        Ty::Variant(ctors, _) => {
+            let mut data_type: Option<&str> = None;
+            ctors.keys().all(|ctor_name| {
+                let info = match infer.constructors.get(ctor_name) {
+                    Some(info) => info,
+                    None => return false,
+                };
+                match data_type {
+                    None => {
+                        data_type = Some(info.data_type.as_str());
+                        infer.route_types.contains(&info.data_type)
+                    }
+                    Some(dt) => dt == info.data_type,
+                }
+            })
+        }
+        _ => false,
+    }
 }
 
 /// Extract a simple type name from a resolved type for trait dispatch purposes.

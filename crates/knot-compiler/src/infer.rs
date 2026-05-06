@@ -6839,17 +6839,20 @@ fn find_non_respond_leaf(
     module: &ast::Module,
     visiting: &mut Vec<String>,
 ) -> Option<Span> {
-    match check_handler_leaf(expr, module, visiting) {
+    let locals: std::collections::HashMap<String, &ast::Expr> =
+        std::collections::HashMap::new();
+    match check_handler_leaf(expr, module, visiting, &locals) {
         LeafCheck::Ok => None,
         LeafCheck::Bad(s) => Some(s),
         LeafCheck::Cycle => Some(expr.span),
     }
 }
 
-fn check_handler_leaf(
-    expr: &ast::Expr,
-    module: &ast::Module,
+fn check_handler_leaf<'a>(
+    expr: &'a ast::Expr,
+    module: &'a ast::Module,
     visiting: &mut Vec<String>,
+    locals: &std::collections::HashMap<String, &'a ast::Expr>,
 ) -> LeafCheck {
     match &expr.node {
         ast::ExprKind::App { func, arg } => {
@@ -6874,11 +6877,11 @@ fn check_handler_leaf(
                                 _ => false,
                             }) {
                                 // Body is just a parameter - check the argument
-                                return check_handler_leaf(arg, module, visiting);
+                                return check_handler_leaf(arg, module, visiting, locals);
                             }
                         }
                         // Body does something more complex - check it
-                        return check_handler_leaf(f, module, visiting);
+                        return check_handler_leaf(f, module, visiting, locals);
                     }
                     _ => break,
                 }
@@ -6890,100 +6893,108 @@ fn check_handler_leaf(
             let mut e = expr;
             while let ast::ExprKind::App { func: f_inner, arg: a } = &e.node {
                 if matches!(
-                    check_handler_leaf(a, module, visiting),
+                    check_handler_leaf(a, module, visiting, locals),
                     LeafCheck::Ok
                 ) {
                     return LeafCheck::Ok;
                 }
                 e = f_inner;
             }
-            // No argument guarantees a respond call. If the root is a known
-            // user-defined function, recurse into its body. Otherwise trust
-            // the call (e.g., builtin or imported helper).
+            // No argument guarantees a respond call. If the root resolves
+            // to a known function (local let-bound or module-level), recurse
+            // into its body. Otherwise the call doesn't reach respond.
             if let ast::ExprKind::Var(name) = &f.node {
-                if visiting.iter().any(|n| n == name) {
-                    return LeafCheck::Cycle;
-                }
-                for decl in &module.decls {
-                    if let ast::DeclKind::Fun {
-                        name: fn_name,
-                        body: Some(body),
-                        ..
-                    } = &decl.node
-                    {
-                        if fn_name == name {
-                            visiting.push(name.clone());
-                            let r = check_handler_leaf(body, module, visiting);
-                            visiting.pop();
-                            return match r {
-                                LeafCheck::Cycle => LeafCheck::Bad(expr.span),
-                                other => other,
-                            };
-                        }
-                    }
-                }
+                return resolve_var(name, expr.span, module, visiting, locals);
             }
-            // Unknown function — trust it.
-            LeafCheck::Ok
+            LeafCheck::Bad(expr.span)
         }
         ast::ExprKind::Case { arms, .. } => combine_branches(
             arms.iter().map(|arm| {
-                check_handler_leaf(&arm.body, module, visiting)
+                check_handler_leaf(&arm.body, module, visiting, locals)
             }),
         ),
         ast::ExprKind::If { then_branch, else_branch, .. } => combine_branches(
             [
-                check_handler_leaf(then_branch, module, visiting),
-                check_handler_leaf(else_branch, module, visiting),
+                check_handler_leaf(then_branch, module, visiting, locals),
+                check_handler_leaf(else_branch, module, visiting, locals),
             ]
             .into_iter(),
         ),
         ast::ExprKind::Lambda { body, .. } => {
-            check_handler_leaf(body, module, visiting)
+            check_handler_leaf(body, module, visiting, locals)
         }
         ast::ExprKind::Atomic(inner) => {
-            check_handler_leaf(inner, module, visiting)
+            check_handler_leaf(inner, module, visiting, locals)
         }
         ast::ExprKind::Annot { expr, .. } => {
-            check_handler_leaf(expr, module, visiting)
+            check_handler_leaf(expr, module, visiting, locals)
         }
-        ast::ExprKind::Do(stmts) => match stmts.last().map(|s| &s.node) {
-            Some(ast::StmtKind::Expr(e)) => {
-                check_handler_leaf(e, module, visiting)
-            }
-            _ => LeafCheck::Bad(expr.span),
-        },
-        ast::ExprKind::Var(name) => {
-            if visiting.iter().any(|n| n == name) {
-                return LeafCheck::Cycle;
-            }
-            for decl in &module.decls {
-                if let ast::DeclKind::Fun {
-                    name: fn_name,
-                    body: Some(body),
-                    ..
-                } = &decl.node
-                {
-                    if fn_name == name {
-                        visiting.push(name.clone());
-                        let r = check_handler_leaf(body, module, visiting);
-                        visiting.pop();
-                        // Cycle returned from a fully-recursed function means
-                        // the function has no path reaching respond. From the
-                        // caller's perspective, that's Bad. Self-recursive
-                        // cycles within a legitimate function would have been
-                        // absorbed by combine_branches alongside an Ok branch.
-                        return match r {
-                            LeafCheck::Cycle => LeafCheck::Bad(expr.span),
-                            other => other,
-                        };
+        ast::ExprKind::Do(stmts) => {
+            // Extend locals with `let` bindings before checking the body.
+            let mut new_locals = locals.clone();
+            for stmt in stmts.iter() {
+                if let ast::StmtKind::Let { pat, expr: rhs } = &stmt.node {
+                    if let ast::PatKind::Var(name) = &pat.node {
+                        new_locals.insert(name.clone(), rhs);
                     }
                 }
             }
-            LeafCheck::Bad(expr.span)
+            match stmts.last().map(|s| &s.node) {
+                Some(ast::StmtKind::Expr(e)) => {
+                    check_handler_leaf(e, module, visiting, &new_locals)
+                }
+                _ => LeafCheck::Bad(expr.span),
+            }
+        }
+        ast::ExprKind::Var(name) => {
+            resolve_var(name, expr.span, module, visiting, locals)
         }
         _ => LeafCheck::Bad(expr.span),
     }
+}
+
+/// Look up a variable, checking local let-bindings first, then module
+/// declarations. Returns Cycle if we're already verifying this name.
+/// Cycle returned from a fully-recursed function is converted to Bad —
+/// it means the function had no path reaching respond.
+fn resolve_var<'a>(
+    name: &str,
+    span: Span,
+    module: &'a ast::Module,
+    visiting: &mut Vec<String>,
+    locals: &std::collections::HashMap<String, &'a ast::Expr>,
+) -> LeafCheck {
+    if visiting.iter().any(|n| n == name) {
+        return LeafCheck::Cycle;
+    }
+    if let Some(local_body) = locals.get(name) {
+        visiting.push(name.to_string());
+        let r = check_handler_leaf(local_body, module, visiting, locals);
+        visiting.pop();
+        return match r {
+            LeafCheck::Cycle => LeafCheck::Bad(span),
+            other => other,
+        };
+    }
+    for decl in &module.decls {
+        if let ast::DeclKind::Fun {
+            name: fn_name,
+            body: Some(body),
+            ..
+        } = &decl.node
+        {
+            if fn_name == name {
+                visiting.push(name.to_string());
+                let r = check_handler_leaf(body, module, visiting, locals);
+                visiting.pop();
+                return match r {
+                    LeafCheck::Cycle => LeafCheck::Bad(span),
+                    other => other,
+                };
+            }
+        }
+    }
+    LeafCheck::Bad(span)
 }
 
 /// Combine sibling branches (case arms, if branches). Bad short-circuits;

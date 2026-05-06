@@ -189,15 +189,15 @@ fn desugar_routes(module: &mut Module) {
 }
 
 /// Convert route entries into constructor definitions.
-/// All fields (path params, query params, body fields) are top-level constructor fields.
-/// Routes with a response type get a `respond : ResponseType -> Response` field
-/// that provides compile-time type safety for each handler branch.
+/// Each constructor's fields are exactly the request inputs: path params,
+/// query params, body fields, and request headers. The endpoint's response
+/// type is enforced by `serve` typing — the constructor itself does not
+/// carry a `respond` callback.
 fn route_entries_to_constructors(entries: &[RouteEntry]) -> Vec<ConstructorDef> {
     entries
         .iter()
         .map(|entry| {
             let mut fields: Vec<Field<Type>> = Vec::new();
-            // Path params
             for seg in &entry.path {
                 if let PathSegment::Param { name, ty } = seg {
                     fields.push(Field {
@@ -206,70 +206,22 @@ fn route_entries_to_constructors(entries: &[RouteEntry]) -> Vec<ConstructorDef> 
                     });
                 }
             }
-            // Query params
             for qp in &entry.query_params {
                 fields.push(Field {
                     name: qp.name.clone(),
                     value: qp.value.clone(),
                 });
             }
-            // Body fields — flat, same level as path/query params
             for bf in &entry.body_fields {
                 fields.push(Field {
                     name: bf.name.clone(),
                     value: bf.value.clone(),
                 });
             }
-            // Request header fields — flat, same level as other params
             for hf in &entry.request_headers {
                 fields.push(Field {
                     name: hf.name.clone(),
                     value: hf.value.clone(),
-                });
-            }
-            // Add `respond` field if route has a response type.
-            // With response headers: `respond : ResponseType -> {h1: T, ...} -> Response`
-            // Without: `respond : ResponseType -> Response`
-            if let Some(response_ty) = &entry.response_ty {
-                let span = response_ty.span;
-                let response_named = Spanned::new(
-                    TypeKind::Named("Response".into()),
-                    span,
-                );
-                let respond_ty = if entry.response_headers.is_empty() {
-                    Spanned::new(
-                        TypeKind::Function {
-                            param: Box::new(response_ty.clone()),
-                            result: Box::new(response_named),
-                        },
-                        span,
-                    )
-                } else {
-                    // respond : ResponseType -> {h1: T, ...} -> Response
-                    let headers_record = Spanned::new(
-                        TypeKind::Record {
-                            fields: entry.response_headers.clone(),
-                            rest: None,
-                        },
-                        span,
-                    );
-                    Spanned::new(
-                        TypeKind::Function {
-                            param: Box::new(response_ty.clone()),
-                            result: Box::new(Spanned::new(
-                                TypeKind::Function {
-                                    param: Box::new(headers_record),
-                                    result: Box::new(response_named),
-                                },
-                                span,
-                            )),
-                        },
-                        span,
-                    )
-                };
-                fields.push(Field {
-                    name: "respond".to_string(),
-                    value: respond_ty,
                 });
             }
             ConstructorDef {
@@ -456,6 +408,11 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &HashSet<String>) {
         ExprKind::UnitLit { value, .. } => desugar_expr(value, io_fns),
         ExprKind::Annot { expr, .. } => desugar_expr(expr, io_fns),
         ExprKind::Refine(inner) => desugar_expr(inner, io_fns),
+        ExprKind::Serve { handlers, .. } => {
+            for h in handlers {
+                desugar_expr(&mut h.body, io_fns);
+            }
+        }
     }
 }
 

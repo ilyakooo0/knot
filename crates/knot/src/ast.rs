@@ -282,6 +282,23 @@ pub enum ExprKind {
 
     /// `refine expr` — runtime refinement check, returns Result.
     Refine(Box<Expr>),
+
+    /// `serve Api where E1 = expr1; E2 = expr2; ...` — typed server value.
+    /// Each handler is bound to a route endpoint constructor; the whole
+    /// expression has type `Server Api`.
+    Serve {
+        api: Name,
+        api_span: Span,
+        handlers: Vec<ServeHandler>,
+    },
+}
+
+/// A single endpoint binding inside a `serve` expression.
+#[derive(Debug, Clone)]
+pub struct ServeHandler {
+    pub endpoint: Name,
+    pub endpoint_span: Span,
+    pub body: Expr,
 }
 
 impl ExprKind {

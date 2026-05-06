@@ -167,6 +167,11 @@ fn collect_edges(
         ast::ExprKind::Refine(inner) => {
             collect_edges(inner, polarity, derived_names, out);
         }
+        ast::ExprKind::Serve { handlers, .. } => {
+            for h in handlers {
+                collect_edges(&h.body, polarity, derived_names, out);
+            }
+        }
     }
 }
 

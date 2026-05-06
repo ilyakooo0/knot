@@ -339,6 +339,7 @@ impl Parser {
             | TokenKind::Trait
             | TokenKind::Impl
             | TokenKind::Route
+            | TokenKind::Serve
             | TokenKind::Migrate
             | TokenKind::Export => {
                 let kw = format!("{:?}", self.peek()).to_lowercase();
@@ -1817,6 +1818,7 @@ impl Parser {
             TokenKind::If => self.parse_if(),
             TokenKind::Case => self.parse_case(),
             TokenKind::Do => self.parse_do_expr(),
+            TokenKind::Serve => self.parse_serve_expr(),
             TokenKind::Star => {
                 // `*name = expr` is a set expression; otherwise just an
                 // ordinary source-ref expression handled by Pratt parsing.
@@ -2351,6 +2353,7 @@ impl Parser {
                 ))
             }
             TokenKind::Do => self.parse_do_expr(),
+            TokenKind::Serve => self.parse_serve_expr(),
             TokenKind::LBrace => {
                 self.advance();
                 self.delimiter_depth += 1;
@@ -2704,6 +2707,44 @@ impl Parser {
                 ExprKind::Do(stmts),
                 Span::new(start.start, end.end),
             ))
+        })
+    }
+
+    /// Parse `serve Api where E1 = expr1; E2 = expr2; ...`
+    fn parse_serve_expr(&mut self) -> Option<Expr> {
+        let start = self.span();
+        self.in_context("serve expression", |this| {
+            this.advance(); // consume `serve`
+            let (api, api_span) = this.expect_upper("expected route name after 'serve'").ok()?;
+            this.skip_newlines();
+            this.expect(&TokenKind::Where, "expected 'where' after API name in 'serve'")
+                .ok()?;
+            let handlers = this.parse_block(|p| p.parse_serve_handler());
+            let end = this.prev_span();
+            Some(Spanned::new(
+                ExprKind::Serve {
+                    api,
+                    api_span,
+                    handlers,
+                },
+                Span::new(start.start, end.end),
+            ))
+        })
+    }
+
+    fn parse_serve_handler(&mut self) -> Option<ServeHandler> {
+        self.skip_newlines();
+        if self.at_eof() {
+            return None;
+        }
+        let (endpoint, endpoint_span) =
+            self.expect_upper("expected endpoint constructor name").ok()?;
+        self.expect(&TokenKind::Eq, "expected '=' after endpoint name").ok()?;
+        let body = self.parse_expr()?;
+        Some(ServeHandler {
+            endpoint,
+            endpoint_span,
+            body,
         })
     }
 

@@ -401,6 +401,12 @@ impl DefResolver {
             ast::ExprKind::UnitLit { value, .. } => self.resolve_expr(value),
             ast::ExprKind::Annot { expr: inner, .. } => self.resolve_expr(inner),
             ast::ExprKind::Refine(inner) => self.resolve_expr(inner),
+            ast::ExprKind::Serve { api, api_span, handlers } => {
+                self.add_ref(*api_span, api);
+                for h in handlers {
+                    self.resolve_expr(&h.body);
+                }
+            }
         }
     }
 }

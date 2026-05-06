@@ -153,6 +153,11 @@ fn lint_expr(
         ExprKind::Refine(inner) => {
             lint_expr(inner, source_schemas, views, diags);
         }
+        ExprKind::Serve { handlers, .. } => {
+            for h in handlers {
+                lint_expr(&h.body, source_schemas, views, diags);
+            }
+        }
         // Terminals — nothing to recurse into
         ExprKind::Lit(_)
         | ExprKind::Var(_)
@@ -908,6 +913,9 @@ fn references_source(expr: &Expr, source_name: &str) -> bool {
             references_source(relation, source_name) || references_source(time, source_name)
         }
         ExprKind::UnitLit { value, .. } => references_source(value, source_name),
+        ExprKind::Serve { handlers, .. } => {
+            handlers.iter().any(|h| references_source(&h.body, source_name))
+        }
     }
 }
 

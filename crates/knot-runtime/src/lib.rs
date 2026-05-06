@@ -11257,47 +11257,6 @@ fn camel_to_header_case(s: &str) -> String {
     result
 }
 
-/// Identity function used as the `respond` field in route constructors.
-/// At runtime, respond just passes through the value unchanged — the type system
-/// uses it to check that each handler branch returns the declared response type.
-extern "C" fn respond_identity(
-    _db: *mut c_void,
-    _env: *mut Value,
-    arg: *mut Value,
-) -> *mut Value {
-    arg
-}
-
-/// Curried respond function for routes with response headers.
-/// First call with body returns a closure; second call with headers record
-/// returns `{body: body, headers: headers}`.
-extern "C" fn respond_with_headers(
-    _db: *mut c_void,
-    _env: *mut Value,
-    body: *mut Value,
-) -> *mut Value {
-    let env = alloc(Value::Record(vec![
-        RecordField { name: "body".into(), value: body },
-    ]));
-    alloc(Value::Function(Box::new(FunctionInner {
-        fn_ptr: respond_headers_inner as *const u8,
-        env,
-        source: "respond".into(),
-    })))
-}
-
-extern "C" fn respond_headers_inner(
-    _db: *mut c_void,
-    env: *mut Value,
-    headers: *mut Value,
-) -> *mut Value {
-    let body = knot_record_field_by_index(env, 0); // "body" is first (only) field
-    alloc(Value::Record(vec![
-        RecordField { name: "body".into(), value: body },
-        RecordField { name: "headers".into(), value: headers },
-    ]))
-}
-
 /// Default ceiling on bytes read from a single HTTP request or response body.
 /// Bounds memory exposure from unbounded body streams (DoS protection for
 /// `listen`; protection against malicious upstreams for `fetch`).
@@ -11733,33 +11692,14 @@ fn http_serve_loop(
                         }
                     }
 
-                    // Add `respond` field
-                    let has_resp_headers = !entry_response_headers.is_empty();
-                    if has_resp_headers {
-                        fields.push(RecordField {
-                            name: "respond".into(),
-                            value: alloc(Value::Function(Box::new(FunctionInner {
-                                fn_ptr: respond_with_headers as *const u8,
-                                env: std::ptr::null_mut(),
-                                source: "respond".into(),
-                            }))),
-                        });
-                    } else {
-                        fields.push(RecordField {
-                            name: "respond".into(),
-                            value: alloc(Value::Function(Box::new(FunctionInner {
-                                fn_ptr: respond_identity as *const u8,
-                                env: std::ptr::null_mut(),
-                                source: "respond".into(),
-                            }))),
-                        });
-                    }
-
                     fields.sort_by(|a, b| a.name.cmp(&b.name));
                     let record = alloc(Value::Record(fields));
                     let ctor_val = alloc(Value::Constructor(intern_str(&entry_constructor), record));
 
-                    // Call handler
+                    // Call handler. The Server value is just a Knot function
+                    // that takes the route ADT and returns the endpoint's
+                    // declared response (or {body, headers} when response
+                    // headers are declared). Run any IO thunks to completion.
                     let mut result = knot_value_call(db, handler, ctor_val);
                     while matches!(unsafe { as_ref(result) }, Value::IO(..)) {
                         result = knot_io_run(db, result);

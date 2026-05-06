@@ -1656,6 +1656,13 @@ fn collect_names_in_expr(expr: &ast::Expr, out: &mut HashSet<String>) {
             collect_names_in_expr(expr, out);
             collect_names_in_type(ty, out);
         }
+        ast::ExprKind::Serve { api, handlers, .. } => {
+            out.insert(api.clone());
+            for h in handlers {
+                out.insert(h.endpoint.clone());
+                collect_names_in_expr(&h.body, out);
+            }
+        }
         ast::ExprKind::Lit(_) => {}
     }
 }

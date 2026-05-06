@@ -1364,6 +1364,16 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             let s = format!("refine {}", render_expr_inline(inner, Prec::App));
             paren_if(parent > Prec::Lowest, s)
         }
+        ExprKind::Serve { api, handlers, .. } => {
+            let mut s = format!("serve {} where", api);
+            for h in handlers {
+                s.push_str("; ");
+                s.push_str(&h.endpoint);
+                s.push_str(" = ");
+                s.push_str(&render_expr_inline(&h.body, Prec::Lowest));
+            }
+            paren_if(parent > Prec::Lowest, s)
+        }
     }
 }
 
@@ -1546,6 +1556,29 @@ fn render_expr_block(p: &mut Printer, e: &Expr, parent: Prec) {
             p.write(" : ");
             p.write(&render_type(ty));
             p.write(")");
+        }
+        ExprKind::Serve { api, handlers, .. } => {
+            let need_parens = parent > Prec::Lowest;
+            if need_parens {
+                p.write("(");
+            }
+            p.write("serve ");
+            p.write(api);
+            p.write(" where");
+            p.newline();
+            p.with_indent(|p| {
+                for (i, h) in handlers.iter().enumerate() {
+                    p.write(&h.endpoint);
+                    p.write(" = ");
+                    render_expr(p, &h.body, Prec::Lowest);
+                    if i + 1 < handlers.len() {
+                        p.newline();
+                    }
+                }
+            });
+            if need_parens {
+                p.write(")");
+            }
         }
         _ => p.write(&render_expr_inline(e, parent)),
     }

@@ -27,15 +27,13 @@ getTodos = \owner -> do
     yield t
   yield result
 
-serve = \req -> case req of
-  GetTodos {owner, respond} -> do
-    result <- getTodos owner
-    respond result
-  CreateTodo {title, owner, priority, respond} -> do
+api = serve Api where
+  GetTodos = \{owner} -> getTodos owner
+  CreateTodo = \{title, owner, priority} -> do
     addTodo title owner priority
-    respond {title: title, owner: owner, priority: Low {}}
-  GetCount {respond} -> do
+    yield {title: title, owner: owner, priority: Low {}}
+  GetCount = \{} -> do
     todos <- *todos
-    respond (count todos)
+    yield (count todos)
 
-main = listen 8080 serve
+main = listen 8080 api

@@ -4387,6 +4387,10 @@ impl Codegen {
                     panic!("codegen: temporal query @(...) is only supported on source relations")
                 }
             }
+
+            ast::ExprKind::Serve { api, handlers, .. } => {
+                self.compile_serve(builder, api, handlers, expr.span, env, db)
+            }
         }
     }
 
@@ -5758,6 +5762,67 @@ impl Codegen {
     }
 
     // ── Refine expression compilation ─────────────────────────────
+
+    /// Compile `serve Api where E1 = h1; ... En = hn` into a function value
+    /// that dispatches on the route ADT constructor and applies the matching
+    /// handler to the constructor's payload record.
+    ///
+    /// We desugar to a synthetic AST `\req -> case req of Ei pi -> hi pi`
+    /// and reuse the existing lambda + case codegen.  At runtime the resulting
+    /// `Server Api` value is just a `Value::Function` — `listen` invokes it
+    /// like any other 1-arg function and serializes the returned body.
+    fn compile_serve(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        _api: &str,
+        handlers: &[ast::ServeHandler],
+        span: ast::Span,
+        env: &mut Env,
+        db: Value,
+    ) -> Value {
+        let req_name = format!("__serve_req_{}", self.lambda_counter);
+        let payload_name = format!("__serve_payload_{}", self.lambda_counter);
+
+        let arms: Vec<ast::CaseArm> = handlers
+            .iter()
+            .map(|h| {
+                let payload_pat = ast::Spanned::new(
+                    ast::PatKind::Var(payload_name.clone()),
+                    h.endpoint_span,
+                );
+                let arm_pat = ast::Spanned::new(
+                    ast::PatKind::Constructor {
+                        name: h.endpoint.clone(),
+                        payload: Box::new(payload_pat),
+                    },
+                    h.endpoint_span,
+                );
+                let payload_var = ast::Spanned::new(
+                    ast::ExprKind::Var(payload_name.clone()),
+                    h.endpoint_span,
+                );
+                let arm_body = ast::Spanned::new(
+                    ast::ExprKind::App {
+                        func: Box::new(h.body.clone()),
+                        arg: Box::new(payload_var),
+                    },
+                    h.body.span,
+                );
+                ast::CaseArm { pat: arm_pat, body: arm_body }
+            })
+            .collect();
+
+        let req_var = ast::Spanned::new(ast::ExprKind::Var(req_name.clone()), span);
+        let case_expr = ast::Spanned::new(
+            ast::ExprKind::Case {
+                scrutinee: Box::new(req_var),
+                arms,
+            },
+            span,
+        );
+        let req_pat = ast::Spanned::new(ast::PatKind::Var(req_name), span);
+        self.compile_lambda(builder, &[req_pat], &case_expr, env, db)
+    }
 
     fn compile_refine(
         &mut self,
@@ -7983,6 +8048,9 @@ impl Codegen {
             ast::ExprKind::UnitLit { value, .. } => Self::references_source(value, source_name),
             ast::ExprKind::Annot { expr, .. } => Self::references_source(expr, source_name),
             ast::ExprKind::Refine(inner) => Self::references_source(inner, source_name),
+            ast::ExprKind::Serve { handlers, .. } => handlers
+                .iter()
+                .any(|h| Self::references_source(&h.body, source_name)),
         }
     }
 
@@ -10468,7 +10536,7 @@ fn beta_reduce_inner(
         // expressions it analyzes (lambda bodies of filter/map/aggregate).
         Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | Case { .. } | Do(_)
         | Set { .. } | ReplaceSet { .. } | Atomic(_) | At { .. } | UnitLit { .. }
-        | Annot { .. } | Refine(_) => return expr.clone(),
+        | Annot { .. } | Refine(_) | Serve { .. } => return expr.clone(),
     };
     ast::Spanned { node: new_node, span }
 }
@@ -10568,7 +10636,8 @@ fn substitute_inner(
         Refine(e) => Refine(Box::new(substitute_inner(e, var, value, value_fv)?)),
         // Constructs that introduce binders we don't analyze for SQL: keep
         // unchanged. Inlining doesn't need to look inside.
-        Case { .. } | Do(_) | Set { .. } | ReplaceSet { .. } | Atomic(_) | At { .. } => {
+        Case { .. } | Do(_) | Set { .. } | ReplaceSet { .. } | Atomic(_) | At { .. }
+        | Serve { .. } => {
             return Some(expr.clone())
         }
     };
@@ -10632,6 +10701,11 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
         UnitLit { value: v, .. } => collect_free_vars_set(v, bound, free),
         Annot { expr: e, .. } => collect_free_vars_set(e, bound, free),
         Refine(e) => collect_free_vars_set(e, bound, free),
+        Serve { handlers, .. } => {
+            for h in handlers {
+                collect_free_vars_set(&h.body, bound, free);
+            }
+        }
         // Conservative: ignore SQL-irrelevant constructs.
         Case { .. } | Do(_) | Set { .. } | ReplaceSet { .. } | Atomic(_) | At { .. } => {}
     }
@@ -11422,6 +11496,9 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
         ast::ExprKind::UnitLit { value, .. } => expr_contains_derived_ref(value, name),
         ast::ExprKind::Annot { expr, .. } => expr_contains_derived_ref(expr, name),
         ast::ExprKind::Refine(inner) => expr_contains_derived_ref(inner, name),
+        ast::ExprKind::Serve { handlers, .. } => handlers
+            .iter()
+            .any(|h| expr_contains_derived_ref(&h.body, name)),
     }
 }
 
@@ -11563,6 +11640,11 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
         ast::ExprKind::Refine(inner) => {
             collect_free_vars(inner, bound, free);
         }
+        ast::ExprKind::Serve { handlers, .. } => {
+            for h in handlers {
+                collect_free_vars(&h.body, bound, free);
+            }
+        }
     }
 }
 
@@ -11698,6 +11780,13 @@ fn pretty_expr(expr: &ast::Expr) -> String {
         ast::ExprKind::UnitLit { value, .. } => pretty_expr(value),
         ast::ExprKind::Annot { expr, .. } => pretty_expr(expr),
         ast::ExprKind::Refine(inner) => format!("refine {}", pretty_expr(inner)),
+        ast::ExprKind::Serve { api, handlers, .. } => {
+            let hs: Vec<String> = handlers
+                .iter()
+                .map(|h| format!("{} = {}", h.endpoint, pretty_expr(&h.body)))
+                .collect();
+            format!("serve {} where {{ {} }}", api, hs.join("; "))
+        }
     }
 }
 

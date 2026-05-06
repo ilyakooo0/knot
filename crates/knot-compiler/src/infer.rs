@@ -411,13 +411,11 @@ struct Infer {
     /// `listen` accepts as a handler input). Populated in `pre_register`.
     route_types: HashSet<String>,
 
-    /// `(span, handler_arg_ty, handler_expr)` for each `listen` / `listenOn`
-    /// call site. Validated post-inference:
-    /// - The resolved arg type must be a route ADT.
-    /// - Every leaf return position in the handler body must be a `respond`
-    ///   call (or chain to one). This prevents handlers like
-    ///   `\req -> bottom` from collapsing a free type variable to `Response`.
-    listen_calls: Vec<(Span, Ty, ast::Expr)>,
+    /// Route ADT name → flat list of (constructor name, route entry) pairs,
+    /// including composite routes which inherit their components' entries.
+    /// Used by `serve` typing to derive each handler's expected type from
+    /// the matching route entry. Populated in `pre_register`.
+    route_entries_by_api: HashMap<String, Vec<ast::RouteEntry>>,
 
     /// Whether we are currently inside an IO do-block. When true, `yield expr`
     /// produces `IO {} expr_type` instead of `[expr_type]`, allowing yield to
@@ -495,9 +493,9 @@ impl Infer {
             binding_types: Vec::new(),
             trait_params: HashMap::new(),
             fetch_response_types: HashMap::new(),
+            route_entries_by_api: HashMap::new(),
             fetch_response_headers: HashMap::new(),
             route_types: HashSet::new(),
-            listen_calls: Vec::new(),
             in_io_do: false,
             in_atomic: false,
             source_var_binds: HashMap::new(),
@@ -1223,22 +1221,10 @@ impl Infer {
             }
             // In IO do blocks, allow Relation types to unify with IO or
             // Unit types. Route handlers mix relational operations and
-            // `respond` calls in if/case branches.
+            // their declared response type in if/case branches.
             (Ty::Relation(a), Ty::IO(_, _, b))
             | (Ty::IO(_, _, b), Ty::Relation(a)) if self.in_io_do => {
                 self.unify(a, b, span);
-            }
-            // A route handler's expected return type is `Response`, but a
-            // do-block ending in `respond x` is wrapped to `IO _ _ Response`
-            // when it contains any IO statement. Treat that wrapper as
-            // transparent: the runtime unwraps IO from the handler result
-            // before sending the HTTP response.
-            (Ty::IO(_, _, inner), Ty::Con(name, args))
-            | (Ty::Con(name, args), Ty::IO(_, _, inner))
-                if name == "Response" && args.is_empty() =>
-            {
-                let inner = (**inner).clone();
-                self.unify(&inner, &Ty::Con("Response".into(), vec![]), span);
             }
             (Ty::Relation(_), Ty::Record(fields, None)) | (Ty::Record(fields, None), Ty::Relation(_))
                 if self.in_io_do && fields.is_empty() => {}
@@ -2887,8 +2873,8 @@ impl Infer {
             }
 
             ast::ExprKind::App { func, arg } => {
-                // Special case: fully handle `fetch url (Ctor {..})` to
-                // skip the `respond` field and resolve the response type.
+                // Special case: fully handle `fetch url (Ctor {..})` so the
+                // response type can be resolved from route metadata.
                 if let Some(ty) = self.try_infer_fetch(expr) {
                     return ty;
                 }
@@ -2946,15 +2932,6 @@ impl Infer {
                             }
                         }
                     }
-                }
-
-                // Track `listen` / `listenOn` call sites so we can verify
-                // post-inference that the handler's argument type is a
-                // route ADT. Without this, identity-like handlers
-                // (`\req -> req`) bypass the `Response` constraint by
-                // collapsing the handler's input and output types.
-                if let Some(handler_arg_ty) = self.detect_listen_handler_arg(expr, &arg_ty) {
-                    self.listen_calls.push((expr.span, handler_arg_ty, (**arg).clone()));
                 }
 
                 result_ty
@@ -3227,6 +3204,10 @@ impl Infer {
                     vec![refinement_error_ty, alpha],
                 )
             }
+
+            ast::ExprKind::Serve { api, api_span, handlers } => {
+                self.infer_serve(api, *api_span, handlers, expr.span)
+            }
         }
     }
 
@@ -3381,31 +3362,140 @@ impl Infer {
         }
     }
 
-    /// If `expr` is `listen port handler` or `listenOn host port handler`,
-    /// return the handler argument's input type so it can be validated
-    /// post-inference. The check is anchored on the outer App so it fires
-    /// once per call site (inner curried Apps have too few arguments).
-    fn detect_listen_handler_arg(&self, expr: &ast::Expr, arg_ty: &Ty) -> Option<Ty> {
-        let (root, args) = uncurry_fetch(expr);
-        let name = match &root.node {
-            ast::ExprKind::Var(n) => n.as_str(),
-            _ => return None,
+    /// Type-check a `serve Api where ...` expression, returning `Server Api`.
+    ///
+    /// Each handler is checked against the type derived from its route entry:
+    ///   - input: a record of (path params, query params, body fields,
+    ///     request headers)
+    ///   - output: the entry's declared response type, or
+    ///     `{body: ResponseTy, headers: {h: T, ...}}` when response headers
+    ///     are declared. The handler may also return `IO {effects} <output>`.
+    ///
+    /// Exhaustiveness and uniqueness are enforced: every constructor of the
+    /// route ADT must be handled exactly once.
+    fn infer_serve(
+        &mut self,
+        api: &str,
+        api_span: Span,
+        handlers: &[ast::ServeHandler],
+        span: Span,
+    ) -> Ty {
+        let entries = match self.route_entries_by_api.get(api).cloned() {
+            Some(e) => e,
+            None => {
+                self.error(format!("'{}' is not a route type", api), api_span);
+                // Still infer handlers so other diagnostics surface, then
+                // return a fresh Server type.
+                for h in handlers {
+                    let _ = self.infer_expr(&h.body);
+                }
+                let a = self.fresh_var();
+                return Ty::Con("Server".into(), vec![Ty::Var(a)]);
+            }
         };
-        let expected_args = match name {
-            "listen" => 2,
-            "listenOn" => 3,
-            _ => return None,
+
+        let entry_by_ctor: std::collections::HashMap<String, ast::RouteEntry> = entries
+            .iter()
+            .cloned()
+            .map(|e| (e.constructor.clone(), e))
+            .collect();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        for h in handlers {
+            if !seen.insert(h.endpoint.clone()) {
+                self.error(
+                    format!(
+                        "duplicate handler for endpoint '{}' in serve {}",
+                        h.endpoint, api
+                    ),
+                    h.endpoint_span,
+                );
+                let _ = self.infer_expr(&h.body);
+                continue;
+            }
+            let entry = match entry_by_ctor.get(&h.endpoint) {
+                Some(e) => e,
+                None => {
+                    self.error(
+                        format!(
+                            "'{}' is not an endpoint of route {}",
+                            h.endpoint, api
+                        ),
+                        h.endpoint_span,
+                    );
+                    let _ = self.infer_expr(&h.body);
+                    continue;
+                }
+            };
+            let expected = self.serve_handler_type(entry);
+            self.check_expr(&h.body, &expected);
+        }
+
+        // Missing handlers
+        for entry in &entries {
+            if !seen.contains(&entry.constructor) {
+                self.error(
+                    format!(
+                        "missing handler for endpoint '{}' in serve {}",
+                        entry.constructor, api
+                    ),
+                    span,
+                );
+            }
+        }
+
+        Ty::Con("Server".into(), vec![Ty::Con(api.to_string(), vec![])])
+    }
+
+    /// Build the expected type of a single endpoint handler.
+    /// Input is a record of all request fields (path params, query params,
+    /// body fields, request headers). Output is the declared response type
+    /// wrapped in `IO {| r} _` with an open effect row, so handlers can
+    /// return either an IO action that produces the response value or
+    /// (after lifting) a pure value of that type.
+    fn serve_handler_type(&mut self, entry: &ast::RouteEntry) -> Ty {
+        let mut input_fields: BTreeMap<String, Ty> = BTreeMap::new();
+        for seg in &entry.path {
+            if let ast::PathSegment::Param { name, ty } = seg {
+                input_fields.insert(name.clone(), self.ast_type_to_ty(ty));
+            }
+        }
+        for qp in &entry.query_params {
+            input_fields.insert(qp.name.clone(), self.ast_type_to_ty(&qp.value));
+        }
+        for bf in &entry.body_fields {
+            input_fields.insert(bf.name.clone(), self.ast_type_to_ty(&bf.value));
+        }
+        for hf in &entry.request_headers {
+            input_fields.insert(hf.name.clone(), self.ast_type_to_ty(&hf.value));
+        }
+        let input = Ty::Record(input_fields, None);
+
+        let response = match &entry.response_ty {
+            Some(resp_ty) => {
+                let resp = self.ast_type_to_ty(resp_ty);
+                if entry.response_headers.is_empty() {
+                    resp
+                } else {
+                    let hdrs = entry
+                        .response_headers
+                        .iter()
+                        .map(|f| (f.name.clone(), self.ast_type_to_ty(&f.value)))
+                        .collect();
+                    Ty::Record(
+                        BTreeMap::from([
+                            ("body".into(), resp),
+                            ("headers".into(), Ty::Record(hdrs, None)),
+                        ]),
+                        None,
+                    )
+                }
+            }
+            None => Ty::Var(self.fresh_var()),
         };
-        if args.len() != expected_args {
-            return None;
-        }
-        // The handler is the last argument; `arg_ty` is its inferred type
-        // (a function type). Pull out its parameter type.
-        if let Ty::Fun(param, _) = arg_ty {
-            Some((**param).clone())
-        } else {
-            None
-        }
+        let r = self.fresh_var();
+        let output = Ty::IO(BTreeSet::new(), Some(r), Box::new(response));
+        Ty::Fun(Box::new(input), Box::new(output))
     }
 
     /// Try to infer a `fetch` call. Returns `Some(ty)` if the expression
@@ -3439,7 +3529,7 @@ impl Infer {
             let _opts_ty = self.infer_expr(args[1]);
         }
 
-        // Infer the constructor's record payload WITHOUT the `respond` field.
+        // Infer the constructor's record payload (request fields only).
         let ctor_arg = args.last().unwrap();
         let record_arg = match &ctor_arg.node {
             ast::ExprKind::App { arg, .. } => arg.as_ref(),
@@ -3447,9 +3537,9 @@ impl Infer {
         };
         let record_ty = self.infer_expr(record_arg);
 
-        // Build the expected request fields from the route entry (exclude `respond`)
-        // Save and restore annotation_vars so fetch inference doesn't corrupt
-        // the enclosing declaration's type variable mapping.
+        // Build the expected request fields from the route entry. Save and
+        // restore annotation_vars so fetch inference doesn't corrupt the
+        // enclosing declaration's type variable mapping.
         let saved_annotation_vars = self.annotation_vars.clone();
         if let Some(info) = self.constructors.get(ctor_name).cloned() {
             self.annotation_vars.clear();
@@ -3460,7 +3550,6 @@ impl Infer {
             let field_tys: BTreeMap<String, Ty> = info
                 .fields
                 .iter()
-                .filter(|(name, _)| name != "respond")
                 .map(|(name, ty)| (name.clone(), self.ast_type_to_ty(ty)))
                 .collect();
             let expected_record = Ty::Record(field_tys, None);
@@ -4569,6 +4658,8 @@ impl Infer {
                 }
                 ast::DeclKind::Route { name, entries } => {
                     self.route_types.insert(name.clone());
+                    self.route_entries_by_api
+                        .insert(name.clone(), entries.clone());
                     for entry in entries {
                         if let Some(ref resp_ty) = entry.response_ty {
                             self.fetch_response_types
@@ -4585,6 +4676,28 @@ impl Infer {
                 }
                 _ => {}
             }
+        }
+
+        // Resolve composite routes: flatten their components' entries into
+        // `route_entries_by_api` so `serve` can find them by composite name.
+        let composites: Vec<(String, Vec<String>)> = module
+            .decls
+            .iter()
+            .filter_map(|d| match &d.node {
+                ast::DeclKind::RouteComposite { name, components } => {
+                    Some((name.clone(), components.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        for (name, components) in composites {
+            let mut combined = Vec::new();
+            for comp in &components {
+                if let Some(entries) = self.route_entries_by_api.get(comp) {
+                    combined.extend(entries.iter().cloned());
+                }
+            }
+            self.route_entries_by_api.insert(name, combined);
         }
 
         // Re-bind toJson/parseJson as unconstrained after trait processing.
@@ -4909,17 +5022,16 @@ impl Infer {
         // with polymorphic HKT types: ∀m a b. (a -> m b) -> m a -> m b, etc.
         // This allows do-block desugaring to work with any monad, not just [].
 
-        // listen : ∀a u. Int<u> -> (a -> Response) -> IO {network} {}
-        // The handler must return `Response`, the synthetic type produced
-        // by each route's `respond` field — this forces every case branch
-        // to call `respond`. Branches using IO (e.g. relation reads)
-        // produce `IO _ _ Response`, which a unification rule below
-        // treats as compatible with `Response`.
+        // listen : ∀a u. Int<u> -> Server a -> IO {network} {}
+        // The handler value must be a `Server a`, produced by the
+        // `serve a where ...` expression. Each endpoint handler returns
+        // its own response type; the runtime serializes the result based
+        // on which endpoint matched.
         {
             let a = self.fresh_var();
             let u = self.fresh_unit_var();
             let int_u = Ty::IntUnit(UnitTy::var(u));
-            let response = Ty::Con("Response".into(), vec![]);
+            let server = Ty::Con("Server".into(), vec![Ty::Var(a)]);
             self.bind_top(
                 "listen",
                 Scheme {
@@ -4929,7 +5041,7 @@ impl Infer {
                     ty: Ty::Fun(
                         Box::new(int_u),
                         Box::new(Ty::Fun(
-                            Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(response))),
+                            Box::new(server),
                             Box::new(Ty::IO(
                                 BTreeSet::from([IoEffect::Network]),
                                 None,
@@ -4941,14 +5053,12 @@ impl Infer {
             );
         }
 
-        // listenOn : ∀a u. Text -> Int<u> -> (a -> Response) -> IO {network} {}
-        // Like `listen`, but binds to the supplied host (e.g. "127.0.0.1",
-        // "0.0.0.0", "::1") rather than hardcoding "0.0.0.0".
+        // listenOn : ∀a u. Text -> Int<u> -> Server a -> IO {network} {}
         {
             let a = self.fresh_var();
             let u = self.fresh_unit_var();
             let int_u = Ty::IntUnit(UnitTy::var(u));
-            let response = Ty::Con("Response".into(), vec![]);
+            let server = Ty::Con("Server".into(), vec![Ty::Var(a)]);
             self.bind_top(
                 "listenOn",
                 Scheme {
@@ -4960,7 +5070,7 @@ impl Infer {
                         Box::new(Ty::Fun(
                             Box::new(int_u),
                             Box::new(Ty::Fun(
-                                Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(response))),
+                                Box::new(server),
                                 Box::new(Ty::IO(
                                     BTreeSet::from([IoEffect::Network]),
                                     None,
@@ -6605,6 +6715,11 @@ fn value_references_source_inner(
         ast::ExprKind::Annot { expr, .. } => value_references_source_inner(
             expr, source_name, aliases, let_bindings, visited,
         ),
+        ast::ExprKind::Serve { handlers, .. } => handlers.iter().any(|h| {
+            value_references_source_inner(
+                &h.body, source_name, aliases, let_bindings, visited,
+            )
+        }),
     }
 }
 
@@ -6725,40 +6840,6 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
         }
     }
 
-    // Phase 8: Validate `listen` / `listenOn` handler argument types and
-    // bodies.
-    //   (a) The handler input type must be a route ADT — without this,
-    //       an identity handler `\req -> req` would type-check by
-    //       collapsing `a = Response`.
-    //   (b) Every leaf return position in the handler body must be a
-    //       `respond` call (or chain to one). Without this, a handler
-    //       like `\req -> bottom` would type-check by collapsing a free
-    //       type variable to `Response`, even though no `Response` value
-    //       is ever produced at runtime.
-    // Case-pattern handlers infer the arg as an open `Ty::Variant`;
-    // accept those when every constructor belongs to a single route ADT.
-    let listen_calls = std::mem::take(&mut infer.listen_calls);
-    for (span, arg_ty, handler_expr) in listen_calls {
-        let resolved = infer.apply(&arg_ty);
-        if !is_route_handler_arg(&resolved, &infer) {
-            infer.errors.push((
-                format!(
-                    "listen handler must take a route ADT, found {}",
-                    infer.display_ty(&resolved)
-                ),
-                span,
-            ));
-        }
-        if let Some(bad_span) =
-            find_non_respond_leaf(&handler_expr, module, &mut Vec::new())
-        {
-            infer.errors.push((
-                "listen handler must call `respond` in every branch".into(),
-                bad_span,
-            ));
-        }
-    }
-
     let type_info = infer.extract_type_info();
     let local_type_info = infer.extract_local_type_info();
     let elem_pushdown_ok = infer.elem_pushdown_ok.clone();
@@ -6766,771 +6847,6 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
     (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok)
 }
 
-/// Check that the inferred argument type of a `listen` handler is a route ADT.
-/// Accepts:
-/// - `Ty::Alias(name, _)` where `name` is a route (single-variant route ADTs
-///   surface as aliases of their inner record).
-/// - `Ty::Con(name, _)` where `name` is a route.
-/// - `Ty::Variant(ctors, _)` where every constructor belongs to one route ADT
-///   (case-pattern handlers infer the scrutinee as an open variant rather
-///   than the named ADT).
-fn is_route_handler_arg(ty: &Ty, infer: &Infer) -> bool {
-    if let Ty::Alias(name, _) = ty {
-        if infer.route_types.contains(name) {
-            return true;
-        }
-    }
-    match ty.peel_alias() {
-        Ty::Con(name, _) => infer.route_types.contains(name),
-        Ty::Variant(ctors, _) => {
-            let mut data_type: Option<&str> = None;
-            ctors.keys().all(|ctor_name| {
-                let info = match infer.constructors.get(ctor_name) {
-                    Some(info) => info,
-                    None => return false,
-                };
-                match data_type {
-                    None => {
-                        data_type = Some(info.data_type.as_str());
-                        infer.route_types.contains(&info.data_type)
-                    }
-                    Some(dt) => dt == info.data_type,
-                }
-            })
-        }
-        _ => false,
-    }
-}
-
-/// Result of structurally checking a `listen` handler body's leaves.
-enum LeafCheck {
-    /// Every path through this expression reaches a `respond` call (or a
-    /// trusted function application).
-    Ok,
-    /// Every path through this expression hits a self-recursive call back
-    /// into a function we're already walking. Legitimate when *some other*
-    /// path through that function reaches `respond`; bad when the entire
-    /// function is just a recursive cycle (e.g. `bottom = bottom`).
-    Cycle,
-    /// A non-respond leaf was found at the given span.
-    Bad(Span),
-}
-
-/// Walk a `listen` handler argument expression and verify that every leaf
-/// is a `respond` call (or chain that reaches one). Returns the span of
-/// the first offending leaf, or `None` if the handler is well-formed.
-///
-/// What counts as a leaf and how it's classified:
-/// - `respond x` (or curried `respond x y` for header responses) — Ok
-/// - Other function applications — Ok (their return type is constrained
-///   by the type system, so a non-`Response` return errors elsewhere)
-/// - `Case` / `If` — recurse into each branch
-/// - `Lambda` / `Atomic` / `Annot` — recurse into the inner expression
-/// - `Do` — recurse into the last statement's expression
-/// - `Var(name)` referencing a top-level function — recurse into its body
-///   so `listen port handler` works when `handler` is defined separately
-/// - Self-recursive `Var(name)` (already in the call stack) — Cycle
-/// - Bare locals, literals, records, etc. — Bad
-///
-/// At the top level, `Cycle` is treated as `Bad`: a function whose every
-/// path is a self-recursion never produces a `Response` value.
-fn find_non_respond_leaf(
-    expr: &ast::Expr,
-    module: &ast::Module,
-    visiting: &mut Vec<String>,
-) -> Option<Span> {
-    let locals: std::collections::HashMap<String, &ast::Expr> =
-        std::collections::HashMap::new();
-    // Strip outer Lambda layers — `listen` will invoke the handler, so
-    // its body is what runs. Inside `check_handler_leaf` a Lambda is
-    // treated as a closure value (Bad), since just *evaluating* a Lambda
-    // expression doesn't run its body; we only enter a Lambda body via
-    // explicit invocation (App-Lambda or substitution into a callee).
-    // The first param of the outermost Lambda is the handler's input —
-    // a route ADT request constructed by `listen` with the framework's
-    // real `respond` callback. Constructor patterns scrutinizing that
-    // input are trusted; constructor patterns on any other value are
-    // not (a forged `Ctor {respond: fakeR}` could otherwise sneak past).
-    // Scan through Var → Fun and outer Lambdas to capture the first
-    // parameter of the outermost Lambda — the framework-supplied request.
-    let mut input_param: Option<String> = None;
-    {
-        let mut scan = expr;
-        let mut visited: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        loop {
-            match &scan.node {
-                ast::ExprKind::Lambda { params, .. } => {
-                    if !params.is_empty() {
-                        if let ast::PatKind::Var(name) = &params[0].node {
-                            input_param = Some(name.clone());
-                        }
-                    }
-                    break;
-                }
-                ast::ExprKind::Var(name) => {
-                    if !visited.insert(name.clone()) {
-                        break;
-                    }
-                    let mut found = false;
-                    for decl in &module.decls {
-                        if let ast::DeclKind::Fun {
-                            name: fn_name,
-                            body: Some(body),
-                            ..
-                        } = &decl.node
-                        {
-                            if fn_name == name {
-                                scan = body;
-                                found = true;
-                                break;
-                            }
-                        }
-                    }
-                    if !found {
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-    }
-    let mut e = expr;
-    while let ast::ExprKind::Lambda { body, .. } = &e.node {
-        e = body;
-    }
-    match check_handler_leaf(e, module, visiting, &locals, input_param.as_deref()) {
-        LeafCheck::Ok => None,
-        LeafCheck::Bad(s) => Some(s),
-        LeafCheck::Cycle => Some(expr.span),
-    }
-}
-
-fn check_handler_leaf<'a>(
-    expr: &'a ast::Expr,
-    module: &'a ast::Module,
-    visiting: &mut Vec<String>,
-    locals: &std::collections::HashMap<String, &'a ast::Expr>,
-    input_param: Option<&str>,
-) -> LeafCheck {
-    // Desugared do-block forms (the desugarer rewrites pure-comprehension
-    // do-blocks into __bind/__yield/__empty calls). Treat them like the
-    // original Do: chase the "tail" of the chain to find the yielded value.
-    //   `do x <- action; rest` ≡ `App(App(__bind, \x -> rest), action)`
-    //   `yield v`              ≡ `App(__yield, v)`
-    //   `empty`                ≡ `__empty`
-    if let ast::ExprKind::App { func, .. } = &expr.node {
-        if let ast::ExprKind::App { func: bind_fn, arg: bind_lambda } = &func.node {
-            if let ast::ExprKind::Var(name) = &bind_fn.node {
-                if name == "__bind" {
-                    if let ast::ExprKind::Lambda { body: rest, .. } = &bind_lambda.node {
-                        return check_handler_leaf(rest, module, visiting, locals, input_param);
-                    }
-                }
-            }
-        }
-        if let ast::ExprKind::Var(name) = &func.node {
-            if name == "__yield" {
-                if let ast::ExprKind::App { arg, .. } = &expr.node {
-                    return check_handler_leaf(arg, module, visiting, locals, input_param);
-                }
-            }
-        }
-    }
-    if let ast::ExprKind::Var(name) = &expr.node {
-        if name == "__empty" {
-            return LeafCheck::Bad(expr.span);
-        }
-    }
-    match &expr.node {
-        ast::ExprKind::App { func, arg } => {
-            // Walk through curried applications to find the root function.
-            let mut f = func.as_ref();
-            loop {
-                match &f.node {
-                    ast::ExprKind::Var(name) if name == "respond" => {
-                        // `respond` may have been shadowed — by a let binding,
-                        // a lambda parameter, or substitution propagating a
-                        // wrapper callback into a callee. Verify the shadow
-                        // still reaches respond when invoked.
-                        if let Some(local) = locals.get("respond") {
-                            if visiting.iter().any(|n| n == "respond") {
-                                return LeafCheck::Cycle;
-                            }
-                            visiting.push("respond".to_string());
-                            let r = is_valid_respond_callable(
-                                local, module, visiting, locals, input_param,
-                            );
-                            visiting.pop();
-                            return match r {
-                                LeafCheck::Cycle => LeafCheck::Bad(f.span),
-                                other => other,
-                            };
-                        }
-                        return LeafCheck::Ok;
-                    }
-                    ast::ExprKind::App { func: inner, .. } => {
-                        f = inner.as_ref();
-                    }
-                    ast::ExprKind::Lambda { params, body } => {
-                        // Lambda applications (e.g., from `let...in` desugaring).
-                        // If the body is just a reference to a parameter, the lambda
-                        // returns its argument, so we need to check the argument.
-                        if let ast::ExprKind::Var(name) = &body.node {
-                            if params.iter().any(|p| match &p.node {
-                                ast::PatKind::Var(pname) => pname == name,
-                                _ => false,
-                            }) {
-                                // Body is just a parameter - check the argument
-                                return check_handler_leaf(arg, module, visiting, locals, input_param);
-                            }
-                        }
-                        // Single-param lambda (let-in desugaring): bind the
-                        // parameter to the argument so references inside the
-                        // body resolve through the shadow rather than the
-                        // outer scope.
-                        if params.len() == 1 {
-                            if matches!(&params[0].node, ast::PatKind::Var(_)) {
-                                let mut new_locals = locals.clone();
-                                let args_slice: [&ast::Expr; 1] = [arg];
-                                bind_params(
-                                    &mut new_locals,
-                                    locals,
-                                    module,
-                                    params,
-                                    &args_slice,
-                                    input_param,
-                                );
-                                return check_handler_leaf(body, module, visiting, &new_locals, input_param);
-                            }
-                        }
-                        // Body does something more complex - check it
-                        return check_handler_leaf(f, module, visiting, locals, input_param);
-                    }
-                    _ => break,
-                }
-            }
-            // Root function is not `respond`. Eager evaluation means each
-            // argument is evaluated before the call — so if any argument
-            // contains a guaranteed `respond` call, the call site does too.
-            // Walk back through the App chain checking each argument with
-            // strict (eager-value) semantics: a Lambda or Do-block in arg
-            // position evaluates to a closure / IO value without running
-            // its body, so it can't establish that respond was called.
-            let mut all_args: Vec<&ast::Expr> = Vec::new();
-            let mut e = expr;
-            while let ast::ExprKind::App { func: f_inner, arg: a } = &e.node {
-                if matches!(
-                    check_arg_eager(a, module, visiting, locals, input_param),
-                    LeafCheck::Ok
-                ) {
-                    return LeafCheck::Ok;
-                }
-                all_args.push(a.as_ref());
-                e = f_inner;
-            }
-            all_args.reverse();
-            // If the root is a Var that's a transitive alias for the
-            // original (unshadowed) `respond`, treat the call as Ok.
-            let mut seen = std::collections::HashSet::new();
-            if resolves_to_original_respond(f, locals, &mut seen) {
-                return LeafCheck::Ok;
-            }
-            // No argument guarantees a respond call. If the root resolves
-            // to a known function (local let-bound or module-level), try
-            // to substitute the args into its parameters and recurse into
-            // the body — this is what catches "callback discarded" bypasses
-            // like `discard (\_ -> respond [...]) bottom`: discard's body
-            // returns `x` (= bottom), never invoking the lambda.
-            if let ast::ExprKind::Var(name) = &f.node {
-                let mut visited = std::collections::HashSet::new();
-                if let Some((params, body)) =
-                    resolve_to_lambda(f, module, locals, &mut visited)
-                {
-                    if params.len() == all_args.len() {
-                        if visiting.iter().any(|n| n == name) {
-                            return LeafCheck::Cycle;
-                        }
-                        let mut new_locals = locals.clone();
-                        bind_params(
-                            &mut new_locals,
-                            locals,
-                            module,
-                            params,
-                            &all_args,
-                            input_param,
-                        );
-                        // Strip nested Lambdas in the body — handles curried
-                        // function definitions like `f = \a -> \b -> body`.
-                        let mut e = body;
-                        while let ast::ExprKind::Lambda { body: inner, .. } =
-                            &e.node
-                        {
-                            e = inner;
-                        }
-                        visiting.push(name.to_string());
-                        let r = check_handler_leaf(
-                            e, module, visiting, &new_locals, input_param,
-                        );
-                        visiting.pop();
-                        return match r {
-                            LeafCheck::Cycle => LeafCheck::Bad(expr.span),
-                            other => other,
-                        };
-                    }
-                }
-                return resolve_var(name, expr.span, module, visiting, locals, input_param);
-            }
-            LeafCheck::Bad(expr.span)
-        }
-        ast::ExprKind::Case { scrutinee, arms } => combine_branches(
-            arms.iter().map(|arm| {
-                // The scrutinee is "trusted" when it's the handler's input
-                // parameter (or alias chain to it) — `listen` constructs
-                // that value with the framework's real respond, so a
-                // Constructor pattern destructuring it (the standard
-                // `case req of Ctor {respond} -> ...` shape) does NOT
-                // shadow respond. Otherwise (an inner case on a forged
-                // value like `case (Ctor {respond: fakeR}) of Ctor {respond}
-                // -> ...`), Constructor patterns DO shadow — the bound
-                // respond is whatever the scrutinee carried.
-                let mut new_locals = locals.clone();
-                let trusted = scrutinee_chains_to_input(
-                    scrutinee, input_param, locals,
-                );
-                let shadows = if trusted {
-                    pattern_shadows_respond(&arm.pat)
-                } else {
-                    pattern_shadows_respond_strict(&arm.pat)
-                };
-                if shadows {
-                    new_locals.insert("respond".to_string(), scrutinee.as_ref());
-                }
-                check_handler_leaf(&arm.body, module, visiting, &new_locals, input_param)
-            }),
-        ),
-        ast::ExprKind::If { then_branch, else_branch, .. } => combine_branches(
-            [
-                check_handler_leaf(then_branch, module, visiting, locals, input_param),
-                check_handler_leaf(else_branch, module, visiting, locals, input_param),
-            ]
-            .into_iter(),
-        ),
-        ast::ExprKind::Lambda { .. } => LeafCheck::Bad(expr.span),
-        ast::ExprKind::Atomic(inner) => {
-            check_handler_leaf(inner, module, visiting, locals, input_param)
-        }
-        ast::ExprKind::Annot { expr, .. } => {
-            check_handler_leaf(expr, module, visiting, locals, input_param)
-        }
-        ast::ExprKind::Do(stmts) => {
-            // Extend locals with `let` bindings before checking the body.
-            // Also catch `let` and `<-` patterns that destructure `respond`
-            // from an arbitrary scrutinee — those rebind `respond` to an
-            // untrusted value, so subsequent calls must not be treated as
-            // calling the handler's original respond. Use the strict
-            // shadow check here: a `let Just {value: respond} = ...` binds
-            // respond from whatever the user-supplied RHS carries, so a
-            // forged `Just {value: fakeR}` would otherwise sneak past.
-            let mut new_locals = locals.clone();
-            for stmt in stmts.iter() {
-                match &stmt.node {
-                    ast::StmtKind::Let { pat, expr: rhs } => {
-                        if let ast::PatKind::Var(name) = &pat.node {
-                            new_locals.insert(name.clone(), rhs);
-                        } else if pattern_shadows_respond_strict(pat) {
-                            new_locals.insert("respond".to_string(), rhs);
-                        }
-                    }
-                    ast::StmtKind::Bind { pat, expr: rhs } => {
-                        if pattern_shadows_respond_strict(pat) {
-                            new_locals.insert("respond".to_string(), rhs);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            match stmts.last().map(|s| &s.node) {
-                Some(ast::StmtKind::Expr(e)) => {
-                    check_handler_leaf(e, module, visiting, &new_locals, input_param)
-                }
-                _ => LeafCheck::Bad(expr.span),
-            }
-        }
-        ast::ExprKind::Var(name) => {
-            resolve_var(name, expr.span, module, visiting, locals, input_param)
-        }
-        _ => LeafCheck::Bad(expr.span),
-    }
-}
-
-/// Check whether evaluating `expr` to a value calls `respond`. Used for
-/// argument-position checks: a Lambda or Do-block in arg position evaluates
-/// to a closure / IO value without invoking the body, so neither can
-/// establish a guaranteed respond call. The bypass this guards against is
-/// `discard (\_ -> respond [...]) bottom` — the lambda contains respond
-/// but `discard` ignores the lambda and returns its second arg.
-fn check_arg_eager<'a>(
-    expr: &'a ast::Expr,
-    module: &'a ast::Module,
-    visiting: &mut Vec<String>,
-    locals: &std::collections::HashMap<String, &'a ast::Expr>,
-    input_param: Option<&str>,
-) -> LeafCheck {
-    match &expr.node {
-        ast::ExprKind::Lambda { .. } | ast::ExprKind::Do(_) => {
-            LeafCheck::Bad(expr.span)
-        }
-        _ => check_handler_leaf(expr, module, visiting, locals, input_param),
-    }
-}
-
-/// Check whether `expr`, when invoked as a function, calls `respond`. This
-/// is the "callable check": follows Var aliases through the scope, descends
-/// into Lambda bodies (a Lambda is a closure, but invoking it runs the
-/// body), and treats the literal `Var("respond")` (when not shadowed) as
-/// the original respond callback. Returns `Ok` for valid respond-replacements
-/// (original, alias chains, wrapper Lambdas) and `Bad` otherwise.
-fn is_valid_respond_callable<'a>(
-    expr: &'a ast::Expr,
-    module: &'a ast::Module,
-    visiting: &mut Vec<String>,
-    locals: &std::collections::HashMap<String, &'a ast::Expr>,
-    input_param: Option<&str>,
-) -> LeafCheck {
-    match &expr.node {
-        ast::ExprKind::Var(name) => {
-            if name == "respond" && !locals.contains_key("respond") {
-                return LeafCheck::Ok;
-            }
-            if visiting.iter().any(|n| n == name) {
-                return LeafCheck::Cycle;
-            }
-            if let Some(local) = locals.get(name) {
-                visiting.push(name.to_string());
-                let r = is_valid_respond_callable(local, module, visiting, locals, input_param);
-                visiting.pop();
-                return match r {
-                    LeafCheck::Cycle => LeafCheck::Bad(expr.span),
-                    other => other,
-                };
-            }
-            for decl in &module.decls {
-                if let ast::DeclKind::Fun {
-                    name: fn_name,
-                    body: Some(body),
-                    ..
-                } = &decl.node
-                {
-                    if fn_name == name {
-                        visiting.push(name.to_string());
-                        let r = is_valid_respond_callable(
-                            body, module, visiting, locals, input_param,
-                        );
-                        visiting.pop();
-                        return match r {
-                            LeafCheck::Cycle => LeafCheck::Bad(expr.span),
-                            other => other,
-                        };
-                    }
-                }
-            }
-            LeafCheck::Bad(expr.span)
-        }
-        ast::ExprKind::Lambda { body, .. } => {
-            let mut e = body.as_ref();
-            while let ast::ExprKind::Lambda { body: inner, .. } = &e.node {
-                e = inner.as_ref();
-            }
-            check_handler_leaf(e, module, visiting, locals, input_param)
-        }
-        _ => LeafCheck::Bad(expr.span),
-    }
-}
-
-/// Resolve an expression to a Lambda, following Var aliases through
-/// `locals` and module declarations. Returns the Lambda's params and body.
-/// Used to find the callable when the call site applies a Var that aliases
-/// (possibly transitively) the actual function — common after substitution
-/// when a caller passes a parameter whose name shadows a local of the same
-/// name in the callee's scope.
-fn resolve_to_lambda<'a>(
-    expr: &'a ast::Expr,
-    module: &'a ast::Module,
-    locals: &std::collections::HashMap<String, &'a ast::Expr>,
-    visited: &mut std::collections::HashSet<String>,
-) -> Option<(&'a [ast::Pat], &'a ast::Expr)> {
-    match &expr.node {
-        ast::ExprKind::Lambda { params, body } => {
-            Some((params.as_slice(), body.as_ref()))
-        }
-        ast::ExprKind::Var(name) => {
-            if !visited.insert(name.clone()) {
-                return None;
-            }
-            if let Some(local) = locals.get(name) {
-                return resolve_to_lambda(local, module, locals, visited);
-            }
-            for decl in &module.decls {
-                if let ast::DeclKind::Fun {
-                    name: fn_name,
-                    body: Some(body),
-                    ..
-                } = &decl.node
-                {
-                    if fn_name == name {
-                        return resolve_to_lambda(body, module, locals, visited);
-                    }
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-/// Bind each parameter to its corresponding argument in `new_locals`. When
-/// the parameter is named `respond` and the argument is a valid respond-
-/// callable (the original respond, an alias chain to it, or a wrapper
-/// Lambda whose body reaches respond), skip the binding so callee
-/// references to `respond` continue to resolve as if pointing at the
-/// original. For other params, resolve the argument through caller's
-/// scope before binding — when caller and callee share a parameter name
-/// (e.g. both have `onAuth`), the unresolved binding would create a
-/// self-referential lookup in the callee. Chain-resolving once recovers
-/// the caller's actual value (the Lambda or whatever) so the callee's
-/// references find the right thing.
-fn bind_params<'a>(
-    new_locals: &mut std::collections::HashMap<String, &'a ast::Expr>,
-    outer_locals: &std::collections::HashMap<String, &'a ast::Expr>,
-    module: &'a ast::Module,
-    params: &[ast::Pat],
-    args: &[&'a ast::Expr],
-    input_param: Option<&str>,
-) {
-    for (p, a) in params.iter().zip(args.iter()) {
-        if let ast::PatKind::Var(pname) = &p.node {
-            if pname == "respond" {
-                let mut visiting = Vec::new();
-                if matches!(
-                    is_valid_respond_callable(a, module, &mut visiting, outer_locals, input_param),
-                    LeafCheck::Ok
-                ) {
-                    continue;
-                }
-            }
-            let mut visited = std::collections::HashSet::new();
-            let resolved = resolve_var_chain(*a, outer_locals, &mut visited);
-            new_locals.insert(pname.clone(), resolved);
-        }
-    }
-}
-
-/// Follow a chain of `Var` aliases through `locals` to its terminus (the
-/// first non-Var expression, or a Var that doesn't resolve further). Used
-/// when substituting args into a callee's locals: if the arg is `Var(x)`
-/// and locals[x] is a Lambda, we want to bind the param directly to the
-/// Lambda so the callee's lookups reach a callable, not a self-referential
-/// Var.
-fn resolve_var_chain<'a>(
-    expr: &'a ast::Expr,
-    locals: &std::collections::HashMap<String, &'a ast::Expr>,
-    visited: &mut std::collections::HashSet<String>,
-) -> &'a ast::Expr {
-    if let ast::ExprKind::Var(name) = &expr.node {
-        if visited.insert(name.clone()) {
-            if let Some(local) = locals.get(name) {
-                return resolve_var_chain(local, locals, visited);
-            }
-        }
-    }
-    expr
-}
-
-/// Check whether a case-arm pattern binds `respond` from an untrusted
-/// source (i.e., not inside a Constructor pattern). Bare record
-/// destructuring like `case x of {respond} -> ...` shadows the handler's
-/// trusted respond with whatever the scrutinee provides. Constructor
-/// patterns are treated as trusted — this is for the typical outer
-/// `case req of Ctor {respond} -> ...` shape on the handler's input.
-/// Use `pattern_shadows_respond_strict` instead when the scrutinee is
-/// not the trusted handler input.
-fn pattern_shadows_respond(pat: &ast::Pat) -> bool {
-    match &pat.node {
-        ast::PatKind::Var(name) => name == "respond",
-        ast::PatKind::Record(fields) => fields.iter().any(|f| {
-            if let Some(p) = &f.pattern {
-                pattern_shadows_respond(p)
-            } else {
-                f.name == "respond"
-            }
-        }),
-        ast::PatKind::List(pats) => pats.iter().any(pattern_shadows_respond),
-        ast::PatKind::Constructor { .. } => false,
-        _ => false,
-    }
-}
-
-/// Like `pattern_shadows_respond` but treats Constructor patterns as
-/// untrusted too — recurses into the constructor's payload pattern.
-/// Used when a `case` expression scrutinizes a value that isn't the
-/// handler's framework-supplied input: the user could have written
-/// `case (Ctor {respond: fakeR}) of Ctor {respond} -> respond [...]`,
-/// and the bound respond is the forged one from the scrutinee.
-fn pattern_shadows_respond_strict(pat: &ast::Pat) -> bool {
-    match &pat.node {
-        ast::PatKind::Var(name) => name == "respond",
-        ast::PatKind::Record(fields) => fields.iter().any(|f| {
-            if let Some(p) = &f.pattern {
-                pattern_shadows_respond_strict(p)
-            } else {
-                f.name == "respond"
-            }
-        }),
-        ast::PatKind::List(pats) => pats.iter().any(pattern_shadows_respond_strict),
-        ast::PatKind::Constructor { payload, .. } => {
-            pattern_shadows_respond_strict(payload)
-        }
-        _ => false,
-    }
-}
-
-/// Walk a case scrutinee through `Var` aliases in `locals` and check
-/// whether it ultimately names the handler's input parameter. The input
-/// is the only value we trust to be a framework-constructed route ADT
-/// request (with the real `respond` callback in its fields); any other
-/// scrutinee could be an inner forged value.
-fn scrutinee_chains_to_input(
-    expr: &ast::Expr,
-    input_param: Option<&str>,
-    locals: &std::collections::HashMap<String, &ast::Expr>,
-) -> bool {
-    let input = match input_param {
-        Some(name) => name,
-        None => return false,
-    };
-    let mut cur = expr;
-    let mut seen = std::collections::HashSet::new();
-    loop {
-        match &cur.node {
-            ast::ExprKind::Var(name) => {
-                if name == input {
-                    return true;
-                }
-                if !seen.insert(name.clone()) {
-                    return false;
-                }
-                match locals.get(name) {
-                    Some(next) => cur = next,
-                    None => return false,
-                }
-            }
-            _ => return false,
-        }
-    }
-}
-
-/// Walk through a chain of `Var` aliases via the locals map and report
-/// whether the chain ends at the original (unshadowed) `respond` callback.
-/// `let alias = respond in alias [...]` should be Ok because `alias` is
-/// simply another name for the handler's respond.
-fn resolves_to_original_respond<'a>(
-    expr: &'a ast::Expr,
-    locals: &std::collections::HashMap<String, &'a ast::Expr>,
-    seen: &mut std::collections::HashSet<String>,
-) -> bool {
-    if let ast::ExprKind::Var(name) = &expr.node {
-        if name == "respond" {
-            return !locals.contains_key("respond");
-        }
-        if !seen.insert(name.clone()) {
-            return false;
-        }
-        if let Some(body) = locals.get(name) {
-            return resolves_to_original_respond(body, locals, seen);
-        }
-    }
-    false
-}
-
-/// Look up a variable, checking local let-bindings first, then module
-/// declarations. Returns Cycle if we're already verifying this name.
-/// Cycle returned from a fully-recursed function is converted to Bad —
-/// it means the function had no path reaching respond.
-fn resolve_var<'a>(
-    name: &str,
-    span: Span,
-    module: &'a ast::Module,
-    visiting: &mut Vec<String>,
-    locals: &std::collections::HashMap<String, &'a ast::Expr>,
-    input_param: Option<&str>,
-) -> LeafCheck {
-    if visiting.iter().any(|n| n == name) {
-        return LeafCheck::Cycle;
-    }
-    if let Some(local_body) = locals.get(name) {
-        visiting.push(name.to_string());
-        let r = check_handler_leaf(local_body, module, visiting, locals, input_param);
-        visiting.pop();
-        return match r {
-            LeafCheck::Cycle => LeafCheck::Bad(span),
-            other => other,
-        };
-    }
-    for decl in &module.decls {
-        if let ast::DeclKind::Fun {
-            name: fn_name,
-            body: Some(body),
-            ..
-        } = &decl.node
-        {
-            if fn_name == name {
-                // A `Var(name)` referring to a top-level function is a
-                // closure value, not a call — but in handler contexts the
-                // name's referent is what `listen` will invoke (e.g.
-                // `listen port handler` where `handler = \req -> ...`).
-                // Strip outer Lambda layers so we check the actual body
-                // rather than rejecting the closure-value AST node.
-                let mut e = body;
-                while let ast::ExprKind::Lambda { body: inner, .. } = &e.node {
-                    e = inner;
-                }
-                visiting.push(name.to_string());
-                let r = check_handler_leaf(e, module, visiting, locals, input_param);
-                visiting.pop();
-                return match r {
-                    LeafCheck::Cycle => LeafCheck::Bad(span),
-                    other => other,
-                };
-            }
-        }
-    }
-    LeafCheck::Bad(span)
-}
-
-/// Combine sibling branches (case arms, if branches). Bad short-circuits;
-/// any Ok branch makes the whole expression Ok (the recursive path is
-/// well-founded if at least one branch reaches respond); only when *all*
-/// branches are Cycle do we propagate Cycle.
-fn combine_branches(results: impl Iterator<Item = LeafCheck>) -> LeafCheck {
-    let mut has_ok = false;
-    let mut has_cycle = false;
-    for r in results {
-        match r {
-            LeafCheck::Bad(s) => return LeafCheck::Bad(s),
-            LeafCheck::Ok => has_ok = true,
-            LeafCheck::Cycle => has_cycle = true,
-        }
-    }
-    if has_ok {
-        LeafCheck::Ok
-    } else if has_cycle {
-        LeafCheck::Cycle
-    } else {
-        // No branches at all — vacuously Ok.
-        LeafCheck::Ok
-    }
-}
 
 /// Extract a simple type name from a resolved type for trait dispatch purposes.
 fn ty_to_type_name(ty: &Ty) -> Option<String> {
@@ -8880,141 +8196,6 @@ main = applyPred (\\r -> r.x == r.y)\
         );
     }
 
-    #[test]
-    fn respond_field_returns_response_type() {
-        // The synthetic `respond` field on each route constructor must be
-        // typed as `ResponseType -> Response`, not polymorphic. A handler
-        // that uses respond's result in a non-Response context must error.
-        let diags = check_src(
-            "type Todo = {title: Text}\n\
-             route Api where\n  GET /todos -> [Todo] = GetTodos\n\
-             bad = \\req -> case req of\n  GetTodos {respond} -> respond [{title: \"x\"}] + 1\n\
-             main = listen 8080 bad"
-        );
-        assert!(
-            has_error(&diags, "Response"),
-            "respond's result should be Response, not polymorphic: {:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn handler_with_bottom_should_be_rejected() {
-        // A handler that returns a polymorphic value (like bottom) instead
-        // of calling respond should be rejected. Today the free type var
-        // collapses to Response, which is wrong: the handler must produce
-        // a Response by calling respond, not by lifting an arbitrary value.
-        let diags = check_src(
-            "type Todo = {title: Text}\n\
-             route Api where\n  GET /todos -> [Todo] = GetTodos\n\
-             bottom : a\n\
-             bottom = bottom\n\
-             bad = \\req -> case req of\n  GetTodos {respond} -> bottom\n\
-             main = listen 8080 bad"
-        );
-        assert!(
-            !diags.is_empty(),
-            "handler returning polymorphic value should be rejected"
-        );
-    }
-
-    #[test]
-    fn handler_inner_case_constructor_pattern_shadowing_respond_rejected() {
-        // A handler that destructures a forged constructor (e.g.
-        // `case (MakeBox {respond: fakeR}) of MakeBox {respond} -> respond ...`)
-        // should be rejected. Constructor patterns are trusted only when
-        // the case scrutinee chains to the handler's input parameter —
-        // an inner case on a freshly-built constructor is not.
-        let diags = check_src(
-            "type Todo = {title: Text}\n\
-             *todos : [Todo]\n\
-             route Api where\n  GET /todos -> [Todo] = GetTodos\n\
-             data Box = MakeBox {respond: [Todo] -> Response}\n\
-             bottom : a\n\
-             bottom = bottom\n\
-             fakeR : [Todo] -> Response\n\
-             fakeR = \\_ -> bottom\n\
-             bad = \\req -> case req of\n  GetTodos {respond: origRespond} -> do\n    _ <- *todos\n    case MakeBox {respond: fakeR} of\n      MakeBox {respond} -> yield (respond [{title: \"x\"}])\n\
-             main = listen 8080 bad"
-        );
-        assert!(
-            has_error(&diags, "respond"),
-            "inner case Constructor pattern shadowing respond should be rejected: {:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn handler_let_record_destructure_shadowing_respond_rejected() {
-        // A handler that shadows `respond` via a let with a record-
-        // destructure pattern (`let {respond} = {respond: fakeR}`) and
-        // then calls the destructured value should be rejected — the new
-        // `respond` is not the handler's original respond callback.
-        let diags = check_src(
-            "type Todo = {title: Text}\n\
-             *todos : [Todo]\n\
-             route Api where\n  GET /todos -> [Todo] = GetTodos\n\
-             bottom : a\n\
-             bottom = bottom\n\
-             fakeR : [Todo] -> Response\n\
-             fakeR = \\_ -> bottom\n\
-             bad = \\req -> case req of\n  GetTodos {respond: origRespond} -> do\n    _ <- *todos\n    let {respond} = {respond: fakeR}\n    yield (respond [{title: \"x\"}])\n\
-             main = listen 8080 bad"
-        );
-        assert!(
-            has_error(&diags, "respond"),
-            "let with record destructure shadowing respond should be rejected: {:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn handler_let_constructor_pattern_in_do_shadowing_respond_rejected() {
-        // A handler that shadows `respond` via a `let` with a constructor
-        // pattern inside a do block (`let Just {value: respond} = Just
-        // {value: fakeR}`) and then calls the destructured value should
-        // be rejected. The do-block let/bind shadow check must recurse
-        // into constructor patterns — a forged `Just {value: fakeR}`
-        // should not let respond through as if it were the original.
-        let diags = check_src(
-            "type Todo = {title: Text}\n\
-             *todos : [Todo]\n\
-             route Api where\n  GET /todos -> [Todo] = GetTodos\n\
-             bottom : a\n\
-             bottom = bottom\n\
-             fakeR : [Todo] -> Response\n\
-             fakeR = \\_ -> bottom\n\
-             bad = \\req -> case req of\n  GetTodos {respond: origRespond} -> do\n    _ <- *todos\n    let Just {value: respond} = Just {value: fakeR}\n    yield (respond [{title: \"x\"}])\n\
-             main = listen 8080 bad"
-        );
-        assert!(
-            has_error(&diags, "respond"),
-            "let with constructor pattern shadowing respond in do block should be rejected: {:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn respond_typed_as_response_in_handler() {
-        // The inferred type of a handler body using `respond` should be
-        // `Response`, so a route ADT handler is `Api -> Response`.
-        let info = type_info_for(
-            "type Todo = {title: Text}\n\
-             route Api where\n  GET /todos -> [Todo] = GetTodos\n\
-             handler = \\req -> case req of\n  GetTodos {respond} -> respond [{title: \"x\"}]\n\
-             main = listen 8080 handler"
-        );
-        let ty = info.get("handler").expect("missing handler type");
-        // The handler's return type after `-> ` should be `Response`,
-        // not a free type variable. The argument is an open variant
-        // containing the route's constructors, but the return must be
-        // the synthetic `Response` type produced by `respond`.
-        assert!(
-            ty.ends_with("-> Response"),
-            "handler should return Response, got: {}",
-            ty
-        );
-    }
 }
 
 /// Extract the constructor name from a `fetch url (Ctor {..})` or

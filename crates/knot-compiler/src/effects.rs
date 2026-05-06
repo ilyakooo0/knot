@@ -544,6 +544,11 @@ impl EffectChecker {
             ast::ExprKind::UnitLit { value, .. } => self.infer_effects(value),
             ast::ExprKind::Annot { expr: inner, .. } => self.infer_effects(inner),
             ast::ExprKind::Refine(inner) => self.infer_effects(inner),
+
+            // A `serve` expression is a value (the Server). Its handlers are
+            // not run here — they execute when the server receives a request.
+            // So evaluating `serve` produces no effects of its own.
+            ast::ExprKind::Serve { .. } => EffectSet::empty(),
         }
     }
 

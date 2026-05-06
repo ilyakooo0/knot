@@ -6861,6 +6861,20 @@ fn check_handler_leaf<'a>(
             loop {
                 match &f.node {
                     ast::ExprKind::Var(name) if name == "respond" => {
+                        // `respond` may have been shadowed by a let binding or
+                        // lambda parameter — if so, resolve through the shadow.
+                        if let Some(local) = locals.get("respond") {
+                            if visiting.iter().any(|n| n == "respond") {
+                                return LeafCheck::Cycle;
+                            }
+                            visiting.push("respond".to_string());
+                            let r = check_handler_leaf(local, module, visiting, locals);
+                            visiting.pop();
+                            return match r {
+                                LeafCheck::Cycle => LeafCheck::Bad(f.span),
+                                other => other,
+                            };
+                        }
                         return LeafCheck::Ok;
                     }
                     ast::ExprKind::App { func: inner, .. } => {
@@ -6870,7 +6884,6 @@ fn check_handler_leaf<'a>(
                         // Lambda applications (e.g., from `let...in` desugaring).
                         // If the body is just a reference to a parameter, the lambda
                         // returns its argument, so we need to check the argument.
-                        // Otherwise, check the lambda body.
                         if let ast::ExprKind::Var(name) = &body.node {
                             if params.iter().any(|p| match &p.node {
                                 ast::PatKind::Var(pname) => pname == name,
@@ -6878,6 +6891,17 @@ fn check_handler_leaf<'a>(
                             }) {
                                 // Body is just a parameter - check the argument
                                 return check_handler_leaf(arg, module, visiting, locals);
+                            }
+                        }
+                        // Single-param lambda (let-in desugaring): bind the
+                        // parameter to the argument so references inside the
+                        // body resolve through the shadow rather than the
+                        // outer scope.
+                        if params.len() == 1 {
+                            if let ast::PatKind::Var(pname) = &params[0].node {
+                                let mut new_locals = locals.clone();
+                                new_locals.insert(pname.clone(), arg);
+                                return check_handler_leaf(body, module, visiting, &new_locals);
                             }
                         }
                         // Body does something more complex - check it
@@ -6899,6 +6923,12 @@ fn check_handler_leaf<'a>(
                     return LeafCheck::Ok;
                 }
                 e = f_inner;
+            }
+            // If the root is a Var that's a transitive alias for the
+            // original (unshadowed) `respond`, treat the call as Ok.
+            let mut seen = std::collections::HashSet::new();
+            if resolves_to_original_respond(f, locals, &mut seen) {
+                return LeafCheck::Ok;
             }
             // No argument guarantees a respond call. If the root resolves
             // to a known function (local let-bound or module-level), recurse
@@ -6951,6 +6981,29 @@ fn check_handler_leaf<'a>(
         }
         _ => LeafCheck::Bad(expr.span),
     }
+}
+
+/// Walk through a chain of `Var` aliases via the locals map and report
+/// whether the chain ends at the original (unshadowed) `respond` callback.
+/// `let alias = respond in alias [...]` should be Ok because `alias` is
+/// simply another name for the handler's respond.
+fn resolves_to_original_respond<'a>(
+    expr: &'a ast::Expr,
+    locals: &std::collections::HashMap<String, &'a ast::Expr>,
+    seen: &mut std::collections::HashSet<String>,
+) -> bool {
+    if let ast::ExprKind::Var(name) = &expr.node {
+        if name == "respond" {
+            return !locals.contains_key("respond");
+        }
+        if !seen.insert(name.clone()) {
+            return false;
+        }
+        if let Some(body) = locals.get(name) {
+            return resolves_to_original_respond(body, locals, seen);
+        }
+    }
+    false
 }
 
 /// Look up a variable, checking local let-bindings first, then module

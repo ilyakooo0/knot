@@ -6938,9 +6938,18 @@ fn check_handler_leaf<'a>(
             }
             LeafCheck::Bad(expr.span)
         }
-        ast::ExprKind::Case { arms, .. } => combine_branches(
+        ast::ExprKind::Case { scrutinee, arms } => combine_branches(
             arms.iter().map(|arm| {
-                check_handler_leaf(&arm.body, module, visiting, locals)
+                // If the arm pattern binds `respond` outside of a Constructor
+                // pattern, the binding is untrusted (it's destructuring an
+                // arbitrary scrutinee, not a route ADT's request). Shadow
+                // respond with the scrutinee expression so subsequent
+                // references resolve through the scrutinee.
+                let mut new_locals = locals.clone();
+                if pattern_shadows_respond(&arm.pat) {
+                    new_locals.insert("respond".to_string(), scrutinee.as_ref());
+                }
+                check_handler_leaf(&arm.body, module, visiting, &new_locals)
             }),
         ),
         ast::ExprKind::If { then_branch, else_branch, .. } => combine_branches(
@@ -6980,6 +6989,28 @@ fn check_handler_leaf<'a>(
             resolve_var(name, expr.span, module, visiting, locals)
         }
         _ => LeafCheck::Bad(expr.span),
+    }
+}
+
+/// Check whether a case-arm pattern binds `respond` from an untrusted
+/// source (i.e., not inside a Constructor pattern). Bare record
+/// destructuring like `case x of {respond} -> ...` shadows the handler's
+/// trusted respond with whatever the scrutinee provides.
+fn pattern_shadows_respond(pat: &ast::Pat) -> bool {
+    match &pat.node {
+        ast::PatKind::Var(name) => name == "respond",
+        ast::PatKind::Record(fields) => fields.iter().any(|f| {
+            if let Some(p) = &f.pattern {
+                pattern_shadows_respond(p)
+            } else {
+                f.name == "respond"
+            }
+        }),
+        ast::PatKind::List(pats) => pats.iter().any(pattern_shadows_respond),
+        // Bindings nested inside a Constructor pattern are treated as
+        // trusted: this is the typical handler shape `Ctor {respond, ...}`.
+        ast::PatKind::Constructor { .. } => false,
+        _ => false,
     }
 }
 

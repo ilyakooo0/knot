@@ -1214,6 +1214,18 @@ impl Infer {
             | (Ty::IO(_, _, b), Ty::Relation(a)) if self.in_io_do => {
                 self.unify(a, b, span);
             }
+            // A route handler's expected return type is `Response`, but a
+            // do-block ending in `respond x` is wrapped to `IO _ _ Response`
+            // when it contains any IO statement. Treat that wrapper as
+            // transparent: the runtime unwraps IO from the handler result
+            // before sending the HTTP response.
+            (Ty::IO(_, _, inner), Ty::Con(name, args))
+            | (Ty::Con(name, args), Ty::IO(_, _, inner))
+                if name == "Response" && args.is_empty() =>
+            {
+                let inner = (**inner).clone();
+                self.unify(&inner, &Ty::Con("Response".into(), vec![]), span);
+            }
             (Ty::Relation(_), Ty::Record(fields, None)) | (Ty::Record(fields, None), Ty::Relation(_))
                 if self.in_io_do && fields.is_empty() => {}
 
@@ -4843,22 +4855,27 @@ impl Infer {
         // with polymorphic HKT types: ∀m a b. (a -> m b) -> m a -> m b, etc.
         // This allows do-block desugaring to work with any monad, not just [].
 
-        // listen : ∀a b u. Int<u> -> (a -> b) -> IO {network} {}
+        // listen : ∀a u. Int<u> -> (a -> Response) -> IO {network} {}
+        // The handler must return `Response`, the synthetic type produced
+        // by each route's `respond` field — this forces every case branch
+        // to call `respond`. Branches using IO (e.g. relation reads)
+        // produce `IO _ _ Response`, which a unification rule below
+        // treats as compatible with `Response`.
         {
             let a = self.fresh_var();
-            let b = self.fresh_var();
             let u = self.fresh_unit_var();
             let int_u = Ty::IntUnit(UnitTy::var(u));
+            let response = Ty::Con("Response".into(), vec![]);
             self.bind_top(
                 "listen",
                 Scheme {
-                    vars: vec![a, b],
+                    vars: vec![a],
                     unit_vars: vec![u],
                     constraints: vec![],
                     ty: Ty::Fun(
                         Box::new(int_u),
                         Box::new(Ty::Fun(
-                            Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
+                            Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(response))),
                             Box::new(Ty::IO(
                                 BTreeSet::from([IoEffect::Network]),
                                 None,
@@ -4870,18 +4887,18 @@ impl Infer {
             );
         }
 
-        // listenOn : ∀a b u. Text -> Int<u> -> (a -> b) -> IO {network} {}
+        // listenOn : ∀a u. Text -> Int<u> -> (a -> Response) -> IO {network} {}
         // Like `listen`, but binds to the supplied host (e.g. "127.0.0.1",
         // "0.0.0.0", "::1") rather than hardcoding "0.0.0.0".
         {
             let a = self.fresh_var();
-            let b = self.fresh_var();
             let u = self.fresh_unit_var();
             let int_u = Ty::IntUnit(UnitTy::var(u));
+            let response = Ty::Con("Response".into(), vec![]);
             self.bind_top(
                 "listenOn",
                 Scheme {
-                    vars: vec![a, b],
+                    vars: vec![a],
                     unit_vars: vec![u],
                     constraints: vec![],
                     ty: Ty::Fun(
@@ -4889,7 +4906,7 @@ impl Infer {
                         Box::new(Ty::Fun(
                             Box::new(int_u),
                             Box::new(Ty::Fun(
-                                Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
+                                Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(response))),
                                 Box::new(Ty::IO(
                                     BTreeSet::from([IoEffect::Network]),
                                     None,

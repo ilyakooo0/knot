@@ -7061,12 +7061,26 @@ fn check_handler_leaf<'a>(
         }
         ast::ExprKind::Do(stmts) => {
             // Extend locals with `let` bindings before checking the body.
+            // Also catch `let` and `<-` patterns that destructure `respond`
+            // from an arbitrary scrutinee — those rebind `respond` to an
+            // untrusted value, so subsequent calls must not be treated as
+            // calling the handler's original respond.
             let mut new_locals = locals.clone();
             for stmt in stmts.iter() {
-                if let ast::StmtKind::Let { pat, expr: rhs } = &stmt.node {
-                    if let ast::PatKind::Var(name) = &pat.node {
-                        new_locals.insert(name.clone(), rhs);
+                match &stmt.node {
+                    ast::StmtKind::Let { pat, expr: rhs } => {
+                        if let ast::PatKind::Var(name) = &pat.node {
+                            new_locals.insert(name.clone(), rhs);
+                        } else if pattern_shadows_respond(pat) {
+                            new_locals.insert("respond".to_string(), rhs);
+                        }
                     }
+                    ast::StmtKind::Bind { pat, expr: rhs } => {
+                        if pattern_shadows_respond(pat) {
+                            new_locals.insert("respond".to_string(), rhs);
+                        }
+                    }
+                    _ => {}
                 }
             }
             match stmts.last().map(|s| &s.node) {
@@ -8769,6 +8783,30 @@ main = applyPred (\\r -> r.x == r.y)\
         assert!(
             !diags.is_empty(),
             "handler returning polymorphic value should be rejected"
+        );
+    }
+
+    #[test]
+    fn handler_let_record_destructure_shadowing_respond_rejected() {
+        // A handler that shadows `respond` via a let with a record-
+        // destructure pattern (`let {respond} = {respond: fakeR}`) and
+        // then calls the destructured value should be rejected — the new
+        // `respond` is not the handler's original respond callback.
+        let diags = check_src(
+            "type Todo = {title: Text}\n\
+             *todos : [Todo]\n\
+             route Api where\n  GET /todos -> [Todo] = GetTodos\n\
+             bottom : a\n\
+             bottom = bottom\n\
+             fakeR : [Todo] -> Response\n\
+             fakeR = \\_ -> bottom\n\
+             bad = \\req -> case req of\n  GetTodos {respond: origRespond} -> do\n    _ <- *todos\n    let {respond} = {respond: fakeR}\n    yield (respond [{title: \"x\"}])\n\
+             main = listen 8080 bad"
+        );
+        assert!(
+            has_error(&diags, "respond"),
+            "let with record destructure shadowing respond should be rejected: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
 

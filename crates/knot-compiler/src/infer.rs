@@ -7128,19 +7128,22 @@ fn check_handler_leaf<'a>(
             // Also catch `let` and `<-` patterns that destructure `respond`
             // from an arbitrary scrutinee — those rebind `respond` to an
             // untrusted value, so subsequent calls must not be treated as
-            // calling the handler's original respond.
+            // calling the handler's original respond. Use the strict
+            // shadow check here: a `let Just {value: respond} = ...` binds
+            // respond from whatever the user-supplied RHS carries, so a
+            // forged `Just {value: fakeR}` would otherwise sneak past.
             let mut new_locals = locals.clone();
             for stmt in stmts.iter() {
                 match &stmt.node {
                     ast::StmtKind::Let { pat, expr: rhs } => {
                         if let ast::PatKind::Var(name) = &pat.node {
                             new_locals.insert(name.clone(), rhs);
-                        } else if pattern_shadows_respond(pat) {
+                        } else if pattern_shadows_respond_strict(pat) {
                             new_locals.insert("respond".to_string(), rhs);
                         }
                     }
                     ast::StmtKind::Bind { pat, expr: rhs } => {
-                        if pattern_shadows_respond(pat) {
+                        if pattern_shadows_respond_strict(pat) {
                             new_locals.insert("respond".to_string(), rhs);
                         }
                     }
@@ -8961,6 +8964,32 @@ main = applyPred (\\r -> r.x == r.y)\
         assert!(
             has_error(&diags, "respond"),
             "let with record destructure shadowing respond should be rejected: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn handler_let_constructor_pattern_in_do_shadowing_respond_rejected() {
+        // A handler that shadows `respond` via a `let` with a constructor
+        // pattern inside a do block (`let Just {value: respond} = Just
+        // {value: fakeR}`) and then calls the destructured value should
+        // be rejected. The do-block let/bind shadow check must recurse
+        // into constructor patterns — a forged `Just {value: fakeR}`
+        // should not let respond through as if it were the original.
+        let diags = check_src(
+            "type Todo = {title: Text}\n\
+             *todos : [Todo]\n\
+             route Api where\n  GET /todos -> [Todo] = GetTodos\n\
+             bottom : a\n\
+             bottom = bottom\n\
+             fakeR : [Todo] -> Response\n\
+             fakeR = \\_ -> bottom\n\
+             bad = \\req -> case req of\n  GetTodos {respond: origRespond} -> do\n    _ <- *todos\n    let Just {value: respond} = Just {value: fakeR}\n    yield (respond [{title: \"x\"}])\n\
+             main = listen 8080 bad"
+        );
+        assert!(
+            has_error(&diags, "respond"),
+            "let with constructor pattern shadowing respond in do block should be rejected: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }

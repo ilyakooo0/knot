@@ -411,9 +411,13 @@ struct Infer {
     /// `listen` accepts as a handler input). Populated in `pre_register`.
     route_types: HashSet<String>,
 
-    /// `(span, handler_arg_ty)` for each `listen` / `listenOn` call site.
-    /// Validated post-inference: the resolved arg type must be a route ADT.
-    listen_calls: Vec<(Span, Ty)>,
+    /// `(span, handler_arg_ty, handler_expr)` for each `listen` / `listenOn`
+    /// call site. Validated post-inference:
+    /// - The resolved arg type must be a route ADT.
+    /// - Every leaf return position in the handler body must be a `respond`
+    ///   call (or chain to one). This prevents handlers like
+    ///   `\req -> bottom` from collapsing a free type variable to `Response`.
+    listen_calls: Vec<(Span, Ty, ast::Expr)>,
 
     /// Whether we are currently inside an IO do-block. When true, `yield expr`
     /// produces `IO {} expr_type` instead of `[expr_type]`, allowing yield to
@@ -2950,7 +2954,7 @@ impl Infer {
                 // (`\req -> req`) bypass the `Response` constraint by
                 // collapsing the handler's input and output types.
                 if let Some(handler_arg_ty) = self.detect_listen_handler_arg(expr, &arg_ty) {
-                    self.listen_calls.push((expr.span, handler_arg_ty));
+                    self.listen_calls.push((expr.span, handler_arg_ty, (**arg).clone()));
                 }
 
                 result_ty
@@ -6721,14 +6725,20 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
         }
     }
 
-    // Phase 8: Validate `listen` / `listenOn` handler argument types.
-    // The handler must take a route ADT — without this check, an identity
-    // handler `\req -> req` would type-check by collapsing `a = Response`,
-    // and a `\req -> bottom` would type-check with a free type variable.
-    // Case-pattern handlers infer the arg as an open `Ty::Variant`; accept
-    // those when every constructor belongs to a single route ADT.
+    // Phase 8: Validate `listen` / `listenOn` handler argument types and
+    // bodies.
+    //   (a) The handler input type must be a route ADT — without this,
+    //       an identity handler `\req -> req` would type-check by
+    //       collapsing `a = Response`.
+    //   (b) Every leaf return position in the handler body must be a
+    //       `respond` call (or chain to one). Without this, a handler
+    //       like `\req -> bottom` would type-check by collapsing a free
+    //       type variable to `Response`, even though no `Response` value
+    //       is ever produced at runtime.
+    // Case-pattern handlers infer the arg as an open `Ty::Variant`;
+    // accept those when every constructor belongs to a single route ADT.
     let listen_calls = std::mem::take(&mut infer.listen_calls);
-    for (span, arg_ty) in listen_calls {
+    for (span, arg_ty, handler_expr) in listen_calls {
         let resolved = infer.apply(&arg_ty);
         if !is_route_handler_arg(&resolved, &infer) {
             infer.errors.push((
@@ -6737,6 +6747,14 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
                     infer.display_ty(&resolved)
                 ),
                 span,
+            ));
+        }
+        if let Some(bad_span) =
+            find_non_respond_leaf(&handler_expr, module, &mut Vec::new())
+        {
+            infer.errors.push((
+                "listen handler must call `respond` in every branch".into(),
+                bad_span,
             ));
         }
     }
@@ -6781,6 +6799,148 @@ fn is_route_handler_arg(ty: &Ty, infer: &Infer) -> bool {
             })
         }
         _ => false,
+    }
+}
+
+/// Result of structurally checking a `listen` handler body's leaves.
+enum LeafCheck {
+    /// Every path through this expression reaches a `respond` call (or a
+    /// trusted function application).
+    Ok,
+    /// Every path through this expression hits a self-recursive call back
+    /// into a function we're already walking. Legitimate when *some other*
+    /// path through that function reaches `respond`; bad when the entire
+    /// function is just a recursive cycle (e.g. `bottom = bottom`).
+    Cycle,
+    /// A non-respond leaf was found at the given span.
+    Bad(Span),
+}
+
+/// Walk a `listen` handler argument expression and verify that every leaf
+/// is a `respond` call (or chain that reaches one). Returns the span of
+/// the first offending leaf, or `None` if the handler is well-formed.
+///
+/// What counts as a leaf and how it's classified:
+/// - `respond x` (or curried `respond x y` for header responses) — Ok
+/// - Other function applications — Ok (their return type is constrained
+///   by the type system, so a non-`Response` return errors elsewhere)
+/// - `Case` / `If` — recurse into each branch
+/// - `Lambda` / `Atomic` / `Annot` — recurse into the inner expression
+/// - `Do` — recurse into the last statement's expression
+/// - `Var(name)` referencing a top-level function — recurse into its body
+///   so `listen port handler` works when `handler` is defined separately
+/// - Self-recursive `Var(name)` (already in the call stack) — Cycle
+/// - Bare locals, literals, records, etc. — Bad
+///
+/// At the top level, `Cycle` is treated as `Bad`: a function whose every
+/// path is a self-recursion never produces a `Response` value.
+fn find_non_respond_leaf(
+    expr: &ast::Expr,
+    module: &ast::Module,
+    visiting: &mut Vec<String>,
+) -> Option<Span> {
+    match check_handler_leaf(expr, module, visiting) {
+        LeafCheck::Ok => None,
+        LeafCheck::Bad(s) => Some(s),
+        LeafCheck::Cycle => Some(expr.span),
+    }
+}
+
+fn check_handler_leaf(
+    expr: &ast::Expr,
+    module: &ast::Module,
+    visiting: &mut Vec<String>,
+) -> LeafCheck {
+    match &expr.node {
+        ast::ExprKind::App { func, .. } => {
+            // Walk through curried applications to find the root function.
+            let mut f = func.as_ref();
+            loop {
+                match &f.node {
+                    ast::ExprKind::Var(name) if name == "respond" => {
+                        return LeafCheck::Ok;
+                    }
+                    ast::ExprKind::App { func: inner, .. } => {
+                        f = inner.as_ref();
+                    }
+                    _ => break,
+                }
+            }
+            LeafCheck::Ok
+        }
+        ast::ExprKind::Case { arms, .. } => combine_branches(
+            arms.iter().map(|arm| {
+                check_handler_leaf(&arm.body, module, visiting)
+            }),
+        ),
+        ast::ExprKind::If { then_branch, else_branch, .. } => combine_branches(
+            [
+                check_handler_leaf(then_branch, module, visiting),
+                check_handler_leaf(else_branch, module, visiting),
+            ]
+            .into_iter(),
+        ),
+        ast::ExprKind::Lambda { body, .. } => {
+            check_handler_leaf(body, module, visiting)
+        }
+        ast::ExprKind::Atomic(inner) => {
+            check_handler_leaf(inner, module, visiting)
+        }
+        ast::ExprKind::Annot { expr, .. } => {
+            check_handler_leaf(expr, module, visiting)
+        }
+        ast::ExprKind::Do(stmts) => match stmts.last().map(|s| &s.node) {
+            Some(ast::StmtKind::Expr(e)) => {
+                check_handler_leaf(e, module, visiting)
+            }
+            _ => LeafCheck::Bad(expr.span),
+        },
+        ast::ExprKind::Var(name) => {
+            if visiting.iter().any(|n| n == name) {
+                return LeafCheck::Cycle;
+            }
+            for decl in &module.decls {
+                if let ast::DeclKind::Fun {
+                    name: fn_name,
+                    body: Some(body),
+                    ..
+                } = &decl.node
+                {
+                    if fn_name == name {
+                        visiting.push(name.clone());
+                        let r = check_handler_leaf(body, module, visiting);
+                        visiting.pop();
+                        return r;
+                    }
+                }
+            }
+            LeafCheck::Bad(expr.span)
+        }
+        _ => LeafCheck::Bad(expr.span),
+    }
+}
+
+/// Combine sibling branches (case arms, if branches). Bad short-circuits;
+/// any Ok branch makes the whole expression Ok (the recursive path is
+/// well-founded if at least one branch reaches respond); only when *all*
+/// branches are Cycle do we propagate Cycle.
+fn combine_branches(results: impl Iterator<Item = LeafCheck>) -> LeafCheck {
+    let mut has_ok = false;
+    let mut has_cycle = false;
+    for r in results {
+        match r {
+            LeafCheck::Bad(s) => return LeafCheck::Bad(s),
+            LeafCheck::Ok => has_ok = true,
+            LeafCheck::Cycle => has_cycle = true,
+        }
+    }
+    if has_ok {
+        LeafCheck::Ok
+    } else if has_cycle {
+        LeafCheck::Cycle
+    } else {
+        // No branches at all — vacuously Ok.
+        LeafCheck::Ok
     }
 }
 
@@ -8147,6 +8307,26 @@ main = applyPred (\\r -> r.x == r.y)\
             has_error(&diags, "Response"),
             "respond's result should be Response, not polymorphic: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn handler_with_bottom_should_be_rejected() {
+        // A handler that returns a polymorphic value (like bottom) instead
+        // of calling respond should be rejected. Today the free type var
+        // collapses to Response, which is wrong: the handler must produce
+        // a Response by calling respond, not by lifting an arbitrary value.
+        let diags = check_src(
+            "type Todo = {title: Text}\n\
+             route Api where\n  GET /todos -> [Todo] = GetTodos\n\
+             bottom : a\n\
+             bottom = bottom\n\
+             bad = \\req -> case req of\n  GetTodos {respond} -> bottom\n\
+             main = listen 8080 bad"
+        );
+        assert!(
+            !diags.is_empty(),
+            "handler returning polymorphic value should be rejected"
         );
     }
 

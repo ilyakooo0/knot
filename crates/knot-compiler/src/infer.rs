@@ -8131,6 +8131,46 @@ main = applyPred (\\r -> r.x == r.y)\
             diags
         );
     }
+
+    #[test]
+    fn respond_field_returns_response_type() {
+        // The synthetic `respond` field on each route constructor must be
+        // typed as `ResponseType -> Response`, not polymorphic. A handler
+        // that uses respond's result in a non-Response context must error.
+        let diags = check_src(
+            "type Todo = {title: Text}\n\
+             route Api where\n  GET /todos -> [Todo] = GetTodos\n\
+             bad = \\req -> case req of\n  GetTodos {respond} -> respond [{title: \"x\"}] + 1\n\
+             main = listen 8080 bad"
+        );
+        assert!(
+            has_error(&diags, "Response"),
+            "respond's result should be Response, not polymorphic: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn respond_typed_as_response_in_handler() {
+        // The inferred type of a handler body using `respond` should be
+        // `Response`, so a route ADT handler is `Api -> Response`.
+        let info = type_info_for(
+            "type Todo = {title: Text}\n\
+             route Api where\n  GET /todos -> [Todo] = GetTodos\n\
+             handler = \\req -> case req of\n  GetTodos {respond} -> respond [{title: \"x\"}]\n\
+             main = listen 8080 handler"
+        );
+        let ty = info.get("handler").expect("missing handler type");
+        // The handler's return type after `-> ` should be `Response`,
+        // not a free type variable. The argument is an open variant
+        // containing the route's constructors, but the return must be
+        // the synthetic `Response` type produced by `respond`.
+        assert!(
+            ty.ends_with("-> Response"),
+            "handler should return Response, got: {}",
+            ty
+        );
+    }
 }
 
 /// Extract the constructor name from a `fetch url (Ctor {..})` or

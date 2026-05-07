@@ -3407,10 +3407,16 @@ impl Infer {
         handlers: &[ast::ServeHandler],
         span: Span,
     ) -> Ty {
-        // All handlers share a single effect row variable. As each handler
-        // is checked, its IO effect row unifies into this shared row, so the
-        // resulting `Server` carries the union of every handler's effects.
-        let shared_row = self.fresh_var();
+        // Each handler gets its own fresh row variable so the body's
+        // (possibly closed) IO effects can bind it without constraining
+        // sibling handlers. After checking, we resolve each row var,
+        // accumulate the effects into a single set, and chain any leftover
+        // open tails. A single shared row would force all handlers'
+        // effects to be equal: the first handler that closes the row
+        // (which any concrete IO body does) would reject every subsequent
+        // handler with different effects.
+        let mut accumulated: BTreeSet<IoEffect> = BTreeSet::new();
+        let mut tail: Option<TyVar> = None;
         let entries = match self.route_entries_by_api.get(api).cloned() {
             Some(e) => e,
             None => {
@@ -3421,11 +3427,12 @@ impl Infer {
                     let _ = self.infer_expr(&h.body);
                 }
                 let a = self.fresh_var();
+                let r = self.fresh_var();
                 return Ty::Con(
                     "Server".into(),
                     vec![
                         Ty::Var(a),
-                        Ty::EffectRow(BTreeSet::new(), Some(shared_row)),
+                        Ty::EffectRow(BTreeSet::new(), Some(r)),
                     ],
                 );
             }
@@ -3464,8 +3471,23 @@ impl Infer {
                     continue;
                 }
             };
-            let expected = self.serve_handler_type(entry, shared_row);
+            let handler_row = self.fresh_var();
+            let expected = self.serve_handler_type(entry, handler_row);
             self.check_expr(&h.body, &expected);
+            // Pull this handler's effects out of its row var and merge.
+            // Any unresolved tail unifies into the rolling tail var so
+            // later listen-side polymorphism still threads through.
+            let (effects, leftover) =
+                self.resolve_effect_row(BTreeSet::new(), Some(handler_row));
+            accumulated.extend(effects);
+            if let Some(rv) = leftover {
+                match tail {
+                    Some(existing) => {
+                        self.unify(&Ty::Var(existing), &Ty::Var(rv), h.endpoint_span);
+                    }
+                    None => tail = Some(rv),
+                }
+            }
         }
 
         // Missing handlers
@@ -3485,7 +3507,7 @@ impl Infer {
             "Server".into(),
             vec![
                 Ty::Con(api.to_string(), vec![]),
-                Ty::EffectRow(BTreeSet::new(), Some(shared_row)),
+                Ty::EffectRow(accumulated, tail),
             ],
         )
     }
@@ -3493,10 +3515,10 @@ impl Infer {
     /// Build the expected type of a single endpoint handler.
     /// Input is a record of all request fields (path params, query params,
     /// body fields, request headers). Output is the declared response type
-    /// wrapped in `IO {| r} _` where `r` is the row variable shared across
-    /// all handlers in the same `serve` — so each handler's effects flow
-    /// into the resulting `Server`'s effect row.
-    fn serve_handler_type(&mut self, entry: &ast::RouteEntry, shared_row: TyVar) -> Ty {
+    /// wrapped in `IO {| r} _` where `r` is the per-handler row variable
+    /// `infer_serve` allocates — its effects are extracted post-check and
+    /// unioned into the resulting `Server`'s effect row.
+    fn serve_handler_type(&mut self, entry: &ast::RouteEntry, handler_row: TyVar) -> Ty {
         let mut input_fields: BTreeMap<String, Ty> = BTreeMap::new();
         for seg in &entry.path {
             if let ast::PathSegment::Param { name, ty } = seg {
@@ -3536,7 +3558,7 @@ impl Infer {
             }
             None => Ty::Var(self.fresh_var()),
         };
-        let output = Ty::IO(BTreeSet::new(), Some(shared_row), Box::new(response));
+        let output = Ty::IO(BTreeSet::new(), Some(handler_row), Box::new(response));
         Ty::Fun(Box::new(input), Box::new(output))
     }
 
@@ -8299,6 +8321,35 @@ main = applyPred (\\r -> r.x == r.y)\
             !main_ty.contains("console") && !main_ty.contains("fs"),
             "expected no extra effects in pure-handler main, got: {}",
             main_ty
+        );
+    }
+
+    #[test]
+    fn serve_handlers_with_different_effects_unify() {
+        // Regression: when handlers have *different* concrete effect sets
+        // (one calls println, another writes to a relation, a third reads
+        // a different relation), every handler must still type-check. A
+        // single shared row variable would close on the first handler and
+        // reject the rest with "IO effects don't match".
+        let src = "*log : [{msg: Text}]\n\
+             *items : [{name: Text}]\n\
+             route Api where\n  GET /a -> Text = HandlerA\n  POST /b -> Text = HandlerB\n  GET /c -> Text = HandlerC\n\
+             api = serve Api where\n\
+             \x20 HandlerA = \\{} -> do\n    println \"a\"\n    yield \"a\"\n\
+             \x20 HandlerB = \\{} -> do\n    replace *log = [{msg: \"b\"}]\n    yield \"b\"\n\
+             \x20 HandlerC = \\{} -> do\n    items <- *items\n    yield \"c\"\n\
+             main = listen 8080 api";
+        let diags = check_src(src);
+        assert!(diags.is_empty(), "expected clean check, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+        let info = type_info_for(src);
+        let main_ty = info.get("main").expect("missing main type");
+        // The union of all three handlers' effects shows up in main.
+        assert!(
+            main_ty.contains("console") && main_ty.contains("network")
+                && (main_ty.contains("w *log") || main_ty.contains("rw *log"))
+                && main_ty.contains("r *items"),
+            "expected union of effects in main, got: {}", main_ty
         );
     }
 

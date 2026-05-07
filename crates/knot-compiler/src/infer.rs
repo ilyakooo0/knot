@@ -6408,6 +6408,18 @@ fn format_io_effect(e: &IoEffect) -> String {
     }
 }
 
+/// Substitution-free counterpart to `peel_to_effect_row` for the
+/// post-applied types fed to `display_ty_clean`. Returns `None` when the
+/// second `Server` arg is something other than an effect row or a leftover
+/// unification variable, so the caller can fall back to generic rendering.
+fn peel_to_effect_row_clean(ty: &Ty) -> Option<(BTreeSet<IoEffect>, Option<TyVar>)> {
+    match ty {
+        Ty::EffectRow(e, r) => Some((e.clone(), *r)),
+        Ty::Var(v) => Some((BTreeSet::new(), Some(*v))),
+        _ => None,
+    }
+}
+
 fn display_effect_set_clean(
     effects: &BTreeSet<IoEffect>,
     row: Option<TyVar>,
@@ -6591,6 +6603,16 @@ fn display_ty_clean_inner(
         Ty::Con(name, args) => {
             if args.is_empty() {
                 name.clone()
+            } else if name == "Server" && args.len() == 2 {
+                // Mirror `display_ty`: render the effect-row arg as ` {eff | r}`
+                // instead of letting it fall through to the generic
+                // `Ty::EffectRow` formatter which would print `Effects {...}`.
+                let api_str = display_ty_clean(&args[0], names, unit_names);
+                let eff_str = match peel_to_effect_row_clean(&args[1]) {
+                    Some((eff, row)) => display_effect_set_clean(&eff, row, names),
+                    None => format!(" {}", display_ty_clean(&args[1], names, unit_names)),
+                };
+                format!("Server {}{}", api_str, eff_str)
             } else {
                 let args_str: Vec<String> =
                     args.iter().map(|a| display_ty_clean(a, names, unit_names)).collect();

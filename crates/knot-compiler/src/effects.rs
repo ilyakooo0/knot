@@ -545,10 +545,21 @@ impl EffectChecker {
             ast::ExprKind::Annot { expr: inner, .. } => self.infer_effects(inner),
             ast::ExprKind::Refine(inner) => self.infer_effects(inner),
 
-            // A `serve` expression is a value (the Server). Its handlers are
-            // not run here — they execute when the server receives a request.
-            // So evaluating `serve` produces no effects of its own.
-            ast::ExprKind::Serve { .. } => EffectSet::empty(),
+            // A `serve` expression is a value (the Server). Its handlers
+            // do not execute when `serve` is evaluated — they fire when the
+            // server receives a request. But the only way to *use* a Server
+            // is to hand it to `listen`, which will run the handlers, so
+            // the type system attributes the union of handler effects to
+            // the Server's effect row. Mirror that here so explicit
+            // annotations on the decl that calls `listen api` actually
+            // catch missing effects.
+            ast::ExprKind::Serve { handlers, .. } => {
+                let mut effects = EffectSet::empty();
+                for h in handlers {
+                    effects = effects.union(&self.fun_body_effects(&h.body));
+                }
+                effects
+            }
         }
     }
 

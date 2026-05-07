@@ -2440,6 +2440,22 @@ impl Infer {
 
     // ── Type display ─────────────────────────────────────────────
 
+    /// Resolve a `Ty` to an effect row (effects + optional tail) by walking
+    /// substitutions and `Ty::EffectRow` chains. Returns `None` if the type
+    /// doesn't reduce to an effect row — used by Server display to fall back
+    /// to generic rendering when something unexpected is in the row slot.
+    fn peel_to_effect_row(&self, ty: &Ty) -> Option<(BTreeSet<IoEffect>, Option<TyVar>)> {
+        let (effects, row) = match ty {
+            Ty::EffectRow(e, r) => (e.clone(), *r),
+            Ty::Var(v) => match self.subst.get(v) {
+                Some(resolved) => return self.peel_to_effect_row(resolved),
+                None => (BTreeSet::new(), Some(*v)),
+            },
+            _ => return None,
+        };
+        Some(self.resolve_effect_row(effects, row))
+    }
+
     /// Render ` {e1, e2 | r}` for an effect set with optional row tail. An
     /// empty closed set renders as ` {}` — IO and Effects always carry an
     /// effects row, even when empty.
@@ -2554,6 +2570,17 @@ impl Infer {
             Ty::Con(name, args) => {
                 if args.is_empty() {
                     name.clone()
+                } else if name == "Server" && args.len() == 2 {
+                    // Render `Server Api EffectRow(eff, r)` as
+                    // `Server Api {eff | r}`, mirroring how IO renders its
+                    // effect row. The second arg is always an effect row,
+                    // produced by `infer_serve` and consumed by `listen`.
+                    let api_str = self.display_ty(&args[0]);
+                    let eff_str = match self.peel_to_effect_row(&args[1]) {
+                        Some((eff, row)) => self.display_effect_set(&eff, row),
+                        None => format!(" {}", self.display_ty(&args[1])),
+                    };
+                    format!("Server {}{}", api_str, eff_str)
                 } else {
                     let args_str: Vec<String> =
                         args.iter().map(|a| self.display_ty(a)).collect();
@@ -3380,6 +3407,10 @@ impl Infer {
         handlers: &[ast::ServeHandler],
         span: Span,
     ) -> Ty {
+        // All handlers share a single effect row variable. As each handler
+        // is checked, its IO effect row unifies into this shared row, so the
+        // resulting `Server` carries the union of every handler's effects.
+        let shared_row = self.fresh_var();
         let entries = match self.route_entries_by_api.get(api).cloned() {
             Some(e) => e,
             None => {
@@ -3390,7 +3421,13 @@ impl Infer {
                     let _ = self.infer_expr(&h.body);
                 }
                 let a = self.fresh_var();
-                return Ty::Con("Server".into(), vec![Ty::Var(a)]);
+                return Ty::Con(
+                    "Server".into(),
+                    vec![
+                        Ty::Var(a),
+                        Ty::EffectRow(BTreeSet::new(), Some(shared_row)),
+                    ],
+                );
             }
         };
 
@@ -3427,7 +3464,7 @@ impl Infer {
                     continue;
                 }
             };
-            let expected = self.serve_handler_type(entry);
+            let expected = self.serve_handler_type(entry, shared_row);
             self.check_expr(&h.body, &expected);
         }
 
@@ -3444,16 +3481,22 @@ impl Infer {
             }
         }
 
-        Ty::Con("Server".into(), vec![Ty::Con(api.to_string(), vec![])])
+        Ty::Con(
+            "Server".into(),
+            vec![
+                Ty::Con(api.to_string(), vec![]),
+                Ty::EffectRow(BTreeSet::new(), Some(shared_row)),
+            ],
+        )
     }
 
     /// Build the expected type of a single endpoint handler.
     /// Input is a record of all request fields (path params, query params,
     /// body fields, request headers). Output is the declared response type
-    /// wrapped in `IO {| r} _` with an open effect row, so handlers can
-    /// return either an IO action that produces the response value or
-    /// (after lifting) a pure value of that type.
-    fn serve_handler_type(&mut self, entry: &ast::RouteEntry) -> Ty {
+    /// wrapped in `IO {| r} _` where `r` is the row variable shared across
+    /// all handlers in the same `serve` — so each handler's effects flow
+    /// into the resulting `Server`'s effect row.
+    fn serve_handler_type(&mut self, entry: &ast::RouteEntry, shared_row: TyVar) -> Ty {
         let mut input_fields: BTreeMap<String, Ty> = BTreeMap::new();
         for seg in &entry.path {
             if let ast::PathSegment::Param { name, ty } = seg {
@@ -3493,8 +3536,7 @@ impl Infer {
             }
             None => Ty::Var(self.fresh_var()),
         };
-        let r = self.fresh_var();
-        let output = Ty::IO(BTreeSet::new(), Some(r), Box::new(response));
+        let output = Ty::IO(BTreeSet::new(), Some(shared_row), Box::new(response));
         Ty::Fun(Box::new(input), Box::new(output))
     }
 
@@ -5022,20 +5064,30 @@ impl Infer {
         // with polymorphic HKT types: ∀m a b. (a -> m b) -> m a -> m b, etc.
         // This allows do-block desugaring to work with any monad, not just [].
 
-        // listen : ∀a u. Int<u> -> Server a -> IO {network} {}
+        // listen : ∀a u r. Int<u> -> Server a {| r} -> IO {network | r} {}
         // The handler value must be a `Server a`, produced by the
         // `serve a where ...` expression. Each endpoint handler returns
         // its own response type; the runtime serializes the result based
-        // on which endpoint matched.
+        // on which endpoint matched. The shared row variable `r` carries
+        // the union of every handler's IO effects out through the IO type
+        // returned by `listen`, so a server whose handlers do `println` is
+        // visibly typed `IO {network, console} {}`.
         {
             let a = self.fresh_var();
+            let r = self.fresh_var();
             let u = self.fresh_unit_var();
             let int_u = Ty::IntUnit(UnitTy::var(u));
-            let server = Ty::Con("Server".into(), vec![Ty::Var(a)]);
+            let server = Ty::Con(
+                "Server".into(),
+                vec![
+                    Ty::Var(a),
+                    Ty::EffectRow(BTreeSet::new(), Some(r)),
+                ],
+            );
             self.bind_top(
                 "listen",
                 Scheme {
-                    vars: vec![a],
+                    vars: vec![a, r],
                     unit_vars: vec![u],
                     constraints: vec![],
                     ty: Ty::Fun(
@@ -5044,7 +5096,7 @@ impl Infer {
                             Box::new(server),
                             Box::new(Ty::IO(
                                 BTreeSet::from([IoEffect::Network]),
-                                None,
+                                Some(r),
                                 Box::new(Ty::unit()),
                             )),
                         )),
@@ -5053,16 +5105,23 @@ impl Infer {
             );
         }
 
-        // listenOn : ∀a u. Text -> Int<u> -> Server a -> IO {network} {}
+        // listenOn : ∀a u r. Text -> Int<u> -> Server a {| r} -> IO {network | r} {}
         {
             let a = self.fresh_var();
+            let r = self.fresh_var();
             let u = self.fresh_unit_var();
             let int_u = Ty::IntUnit(UnitTy::var(u));
-            let server = Ty::Con("Server".into(), vec![Ty::Var(a)]);
+            let server = Ty::Con(
+                "Server".into(),
+                vec![
+                    Ty::Var(a),
+                    Ty::EffectRow(BTreeSet::new(), Some(r)),
+                ],
+            );
             self.bind_top(
                 "listenOn",
                 Scheme {
-                    vars: vec![a],
+                    vars: vec![a, r],
                     unit_vars: vec![u],
                     constraints: vec![],
                     ty: Ty::Fun(
@@ -5073,7 +5132,7 @@ impl Infer {
                                 Box::new(server),
                                 Box::new(Ty::IO(
                                     BTreeSet::from([IoEffect::Network]),
-                                    None,
+                                    Some(r),
                                     Box::new(Ty::unit()),
                                 )),
                             )),
@@ -8193,6 +8252,96 @@ main = applyPred (\\r -> r.x == r.y)\
             has_error(&diags, "non-exhaustive"),
             "expected non-exhaustive error, got: {:?}",
             diags
+        );
+    }
+
+    // ── serve / listen effect propagation ──────────────────────────
+    //
+    // `serve` returns `Server Api {effects | r}` where the effect row is
+    // shared across every handler. `listen : Int<u> -> Server a {| r} -> IO
+    // {network | r} {}` then unifies its row variable with the server's, so
+    // every handler effect surfaces in the type of the program that calls
+    // `listen`.
+
+    #[test]
+    fn serve_propagates_console_effect() {
+        // A handler that calls `println` makes the surrounding program's
+        // type `IO {network, console} {}` rather than `IO {network} {}`.
+        let info = type_info_for(
+            "route Api where\n  GET / -> Text = Hello\n\
+             api = serve Api where\n  Hello = \\{} -> do\n    println \"hi\"\n    yield \"hello\"\n\
+             main = listen 8080 api"
+        );
+        let main_ty = info.get("main").expect("missing main type");
+        assert!(
+            main_ty.contains("network") && main_ty.contains("console"),
+            "expected main to expose {{network, console}}, got: {}",
+            main_ty
+        );
+    }
+
+    #[test]
+    fn serve_pure_handler_keeps_listen_pure() {
+        // No external IO and no relation access in any handler — `main`
+        // should expose only `network` (from listen itself).
+        let info = type_info_for(
+            "route Api where\n  GET / -> Text = Hello\n\
+             api = serve Api where\n  Hello = \\{} -> \"hi\"\n\
+             main = listen 8080 api"
+        );
+        let main_ty = info.get("main").expect("missing main type");
+        assert!(
+            main_ty.contains("network"),
+            "expected network in main, got: {}",
+            main_ty
+        );
+        assert!(
+            !main_ty.contains("console") && !main_ty.contains("fs"),
+            "expected no extra effects in pure-handler main, got: {}",
+            main_ty
+        );
+    }
+
+    #[test]
+    fn serve_propagates_relation_writes() {
+        // A handler that writes to a relation surfaces `w *foo` through
+        // listen's effect row.
+        let info = type_info_for(
+            "*counter : [{value: Int}]\n\
+             route Api where\n  POST / -> {value: Int} = Bump\n\
+             api = serve Api where\n  Bump = \\{} -> do\n    *counter = [{value: 1}]\n    yield {value: 1}\n\
+             main = listen 8080 api"
+        );
+        let main_ty = info.get("main").expect("missing main type");
+        assert!(
+            main_ty.contains("w *counter") || main_ty.contains("rw *counter"),
+            "expected write effect on counter to propagate, got: {}",
+            main_ty
+        );
+    }
+
+    fn effect_diags(src: &str) -> Vec<Diagnostic> {
+        let mut module = parse(src);
+        crate::desugar::desugar(&mut module);
+        crate::effects::check(&module)
+    }
+
+    #[test]
+    fn listen_rejects_pure_annotation_when_handler_uses_io() {
+        // A handler that does `println` produces a console effect; an
+        // explicit `IO {network} {}` annotation on main must be flagged
+        // because it omits console. The effect checker (parallel to type
+        // inference) is responsible for validating annotations.
+        let diags = effect_diags(
+            "route Api where\n  GET / -> Text = Hello\n\
+             api = serve Api where\n  Hello = \\{} -> do\n    println \"hi\"\n    yield \"hello\"\n\
+             main : IO {network} {}\n\
+             main = listen 8080 api"
+        );
+        assert!(
+            diags.iter().any(|d| d.message.contains("inferred effects exceed declared")),
+            "expected an effect mismatch diagnostic, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
 

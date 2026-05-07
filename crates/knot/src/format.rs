@@ -999,19 +999,25 @@ fn render_type_prec(t: &Type, ctx: TyPrec) -> String {
             }
         }
         TypeKind::IO { effects, rest, ty } => {
-            let mut s = String::from("IO {");
-            let parts = render_effects_coalesced(effects);
-            s.push_str(&parts.join(", "));
-            if let Some(r) = rest {
-                if !effects.is_empty() {
-                    s.push_str(" | ");
-                } else {
-                    s.push_str("| ");
+            let s = if effects.is_empty() {
+                // `IO {| r} T` collapses to the shorthand `IO r T`, and
+                // `IO {} T` stays as `IO {} T` (closed empty effect set).
+                match rest {
+                    Some(r) => format!("IO {} {}", r, render_type_atom(ty)),
+                    None => format!("IO {{}} {}", render_type_atom(ty)),
                 }
-                s.push_str(r);
-            }
-            s.push_str("} ");
-            s.push_str(&render_type_atom(ty));
+            } else {
+                let mut s = String::from("IO {");
+                let parts = render_effects_coalesced(effects);
+                s.push_str(&parts.join(", "));
+                if let Some(r) = rest {
+                    s.push_str(" | ");
+                    s.push_str(r);
+                }
+                s.push_str("} ");
+                s.push_str(&render_type_atom(ty));
+                s
+            };
             if ctx > TyPrec::App {
                 format!("({})", s)
             } else {

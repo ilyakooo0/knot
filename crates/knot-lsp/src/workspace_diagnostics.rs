@@ -583,6 +583,10 @@ fn analyze_unopened_file_inner(
 
         all_diags.extend(knot_compiler::stratify::check(&analysis_module));
 
+        // Unused-definition warnings: use pre-prelude decls so prelude/imported
+        // names are not flagged.
+        all_diags.extend(knot_compiler::unused::check(&module.decls));
+
         let type_env = knot_compiler::types::TypeEnv::from_module(&analysis_module);
         all_diags.extend(knot_compiler::sql_lint::check(&analysis_module, &type_env));
     }

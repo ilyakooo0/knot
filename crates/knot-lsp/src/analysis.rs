@@ -539,6 +539,12 @@ pub fn analyze_document(
 
         all_diags.extend(knot_compiler::stratify::check(&analysis_module));
 
+        // Unused-definition warnings: run on the user's pre-prelude decls so
+        // we don't flag prelude/imported names. Cached as part of
+        // `all_diags[pre_inference_len..]` along with the other inference
+        // diagnostics.
+        all_diags.extend(knot_compiler::unused::check(&module.decls));
+
         let type_env = knot_compiler::types::TypeEnv::from_module(&analysis_module);
         source_refinements = type_env.source_refinements.clone();
 
@@ -1618,6 +1624,58 @@ main = do
 
         drop(tx);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn unused_definition_warning_surfaces_in_lsp() {
+        let uri = fake_uri("file:///tmp/unused.knot");
+        let mut import_cache: ImportCache = HashMap::new();
+        let mut inference_cache: InferenceCache = HashMap::new();
+        let src = "helper = \\x -> x + 1\nmain = println \"hi\"\n";
+        let doc = analyze_document(&uri, src, &mut import_cache, &mut inference_cache);
+        let warnings: Vec<_> = doc
+            .knot_diagnostics
+            .iter()
+            .filter(|d| d.severity == diagnostic::Severity::Warning)
+            .collect();
+        assert!(
+            warnings.iter().any(|d| d.message.contains("helper")),
+            "expected unused-helper warning, got: {:?}",
+            doc.knot_diagnostics
+        );
+    }
+
+    /// Reproduce: user deletes an unused definition, then runs analysis on the
+    /// new source. Any remaining unused warnings must point at the *new*
+    /// (post-delete) byte offsets, not the pre-delete ones.
+    #[test]
+    fn unused_warning_positions_after_deletion() {
+        let uri = fake_uri("file:///tmp/unused_del.knot");
+        let mut import_cache: ImportCache = HashMap::new();
+        let mut inference_cache: InferenceCache = HashMap::new();
+
+        let v1 = "unused1 = 1\nunused2 = 2\nmain = println \"hi\"\n";
+        let doc1 = analyze_document(&uri, v1, &mut import_cache, &mut inference_cache);
+        let warns1: Vec<_> = doc1.knot_diagnostics.iter()
+            .filter(|d| d.severity == diagnostic::Severity::Warning)
+            .collect();
+        assert_eq!(warns1.len(), 2, "v1 should produce two warns; got: {:?}",
+            warns1.iter().map(|d| &d.message).collect::<Vec<_>>());
+
+        // Simulate deleting `unused1 = 1\n` line.
+        let v2 = "unused2 = 2\nmain = println \"hi\"\n";
+        let doc2 = analyze_document(&uri, v2, &mut import_cache, &mut inference_cache);
+        let warns2: Vec<_> = doc2.knot_diagnostics.iter()
+            .filter(|d| d.severity == diagnostic::Severity::Warning)
+            .collect();
+        assert_eq!(warns2.len(), 1, "v2 should produce one warn; got: {:?}",
+            warns2.iter().map(|d| &d.message).collect::<Vec<_>>());
+        let w = warns2[0];
+        let label = w.labels.first().expect("warn must have label");
+        let text = &v2[label.span.start..label.span.end.min(v2.len())];
+        assert_eq!(text, "unused2 = 2",
+            "warn label must point at unused2 in v2; got span [{}..{}] = {:?}",
+            label.span.start, label.span.end, text);
     }
 
     /// Direct test of the panic-recovery fallback: the synthetic state

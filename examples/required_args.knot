@@ -1,0 +1,8 @@
+type Port = Int where \p -> p > 0 && p < 65536
+
+port : Port
+host : Text
+greeting : Text
+
+main = do
+  println (greeting ++ " from " ++ host ++ " on port " ++ show port)

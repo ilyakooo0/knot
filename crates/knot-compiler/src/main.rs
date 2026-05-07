@@ -2,7 +2,7 @@
 //!
 //! Usage: knotc build <file.knot>
 
-use knot_compiler::{base, codegen, desugar, effects, infer, linker, lockfile, modules, stratify, types};
+use knot_compiler::{base, codegen, desugar, effects, infer, linker, lockfile, modules, stratify, types, unused};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -232,6 +232,13 @@ fn cmd_build(source_file: &str, overrides: &HashMap<String, String>) {
         {
             process::exit(1);
         }
+    }
+
+    // Unused-definition warnings (use original_decls to avoid flagging
+    // prelude/imports, and to anchor spans to the user's source text).
+    let unused_diags = unused::check(&original_decls);
+    for diag in &unused_diags {
+        eprintln!("{}", diag.render(&source, &filename));
     }
 
     // Stratification check for recursive derived relations

@@ -1609,6 +1609,61 @@ pub extern "C" fn knot_override_lookup(
     }
 }
 
+/// Look up a CLI override that *must* be supplied (no in-source default).
+/// Behaves like `knot_override_lookup`, but exits with an error if the user
+/// did not pass the flag. Used for body-less top-level constant declarations.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_override_required_lookup(
+    name_ptr: *const u8,
+    name_len: usize,
+    type_tag: i32,
+) -> *mut Value {
+    let result = knot_override_lookup(name_ptr, name_len, type_tag);
+    if !result.is_null() {
+        return result;
+    }
+    let name = unsafe { str_from_raw(name_ptr, name_len) };
+    eprintln!(
+        "Error: missing required argument --{}\n  pass --{}=<value> on the command line, or run --help for usage",
+        name, name
+    );
+    std::process::exit(1);
+}
+
+/// Run a refinement predicate against a CLI-supplied value. Exits if it fails.
+/// `type_label` is the refined type name (or empty for inline refinements).
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_override_refinement_check(
+    db: *mut c_void,
+    value: *mut Value,
+    predicate: *mut Value,
+    name_ptr: *const u8,
+    name_len: usize,
+    type_label_ptr: *const u8,
+    type_label_len: usize,
+) -> *mut Value {
+    let result = knot_value_call(db, predicate, value);
+    match unsafe { as_ref(result) } {
+        Value::Bool(true) => value,
+        _ => {
+            let name = unsafe { str_from_raw(name_ptr, name_len) };
+            let label = unsafe { str_from_raw(type_label_ptr, type_label_len) };
+            if label.is_empty() {
+                eprintln!(
+                    "Error: value supplied for --{} does not satisfy its refinement predicate",
+                    name
+                );
+            } else {
+                eprintln!(
+                    "Error: value supplied for --{} does not satisfy '{}' predicate",
+                    name, label
+                );
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Check for `--help` and print available constant overrides.
 ///
 /// `desc` is a compile-time string like `"port:Int,name:Text"`.
@@ -1623,16 +1678,18 @@ pub extern "C" fn knot_override_check_help(desc_ptr: *const u8, desc_len: usize)
     let desc = unsafe { str_from_raw(desc_ptr, desc_len) };
     let exe = std::env::args().next().unwrap_or_else(|| "program".to_string());
 
-    // Collect overridable constants
-    let mut overrides: Vec<(&str, &str)> = Vec::new();
+    // Each entry is `name:type` (with an in-source default) or `name:type:!` (required).
+    let mut overrides: Vec<(&str, &str, bool)> = Vec::new();
     if !desc.is_empty() {
         for entry in desc.split(',') {
-            if let Some((name, ty)) = entry.split_once(':') {
-                overrides.push((name, ty));
+            let mut parts = entry.splitn(3, ':');
+            if let (Some(name), Some(ty)) = (parts.next(), parts.next()) {
+                let required = parts.next() == Some("!");
+                overrides.push((name, ty, required));
             }
         }
     }
-    let has_debug_override = overrides.iter().any(|(n, _)| *n == "debug");
+    let has_debug_override = overrides.iter().any(|(n, _, _)| *n == "debug");
 
     eprintln!("Usage: {} [OPTIONS]", exe);
     eprintln!();
@@ -1645,8 +1702,9 @@ pub extern "C" fn knot_override_check_help(desc_ptr: *const u8, desc_len: usize)
         "  --http-max-body-bytes=N    Cap HTTP request and response bodies (suffixes: K, M, G; default 16M)"
     );
 
-    for (name, ty) in &overrides {
-        eprintln!("  --{:<24} {} (default from source)", name, ty);
+    for (name, ty, required) in &overrides {
+        let label = if *required { "(required)" } else { "(default from source)" };
+        eprintln!("  --{:<24} {} {}", name, ty, label);
     }
 
     std::process::exit(0);

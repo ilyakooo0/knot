@@ -1876,6 +1876,106 @@ main = do
         assert!(!importers.contains(&dropped_path));
     }
 
+    /// Reproduce: user opens a file with multiple unused-decl warnings,
+    /// then deletes the unused declarations. After analysis catches up, all
+    /// warnings should be gone — and during the in-flight didChange, any
+    /// rebased squiggles must point at the right spans, not "the next lines".
+    #[test]
+    fn deleting_unused_decls_clears_warnings_no_drift() {
+        use lsp_server::Notification as LspNotification;
+        use lsp_types::notification::Notification as _;
+        use lsp_types::{
+            DidChangeTextDocumentParams, DidOpenTextDocumentParams,
+            TextDocumentContentChangeEvent, TextDocumentItem,
+            VersionedTextDocumentIdentifier,
+        };
+
+        let (server, client) = Connection::memory();
+        let mut state = make_state();
+        let uri = Uri::from_str("file:///test/del_unused.knot").unwrap();
+
+        let v1 = "unused1 = 1\nunused2 = 2\nmain = println \"hi\"\n";
+        // Open the file and run analysis so published_lsp_diagnostics holds
+        // the warnings the rebase path will operate on.
+        let open = LspNotification::new(
+            lsp_types::notification::DidOpenTextDocument::METHOD.into(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "knot".into(),
+                    version: 1,
+                    text: v1.into(),
+                },
+            },
+        );
+        handle_notification(&mut state, &server, open);
+        // Worker runs in-band via apply_analysis_in below — `queue_analysis`
+        // has nothing to receive in this test setup since we use a dummy tx.
+        // Drive analysis ourselves and apply the result.
+        apply_analysis_in(&mut state, &server, &uri, v1, Some(1));
+        let _ = drain_messages(&client);
+
+        // Sanity: the published cache should now hold two warnings.
+        let pub_count_v1 = state
+            .published_lsp_diagnostics
+            .get(&uri)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        assert_eq!(
+            pub_count_v1, 2,
+            "expected two published warnings before delete"
+        );
+
+        // Now simulate the user selecting both unused lines and deleting
+        // them — VS Code typically sends one didChange replacing the
+        // selected range with empty text.
+        let change = LspNotification::new(
+            lsp_types::notification::DidChangeTextDocument::METHOD.into(),
+            DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: 2,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: Some(lsp_types::Range {
+                        start: lsp_types::Position::new(0, 0),
+                        end: lsp_types::Position::new(2, 0),
+                    }),
+                    range_length: None,
+                    text: "".into(),
+                }],
+            },
+        );
+        handle_notification(&mut state, &server, change);
+
+        // After the rebase, the published cache must NOT carry warnings
+        // pointing at `main = ...` — both warnings overlapped the deletion
+        // and should have been invalidated.
+        let after_rebase = state.published_lsp_diagnostics.get(&uri).cloned().unwrap_or_default();
+        for d in &after_rebase {
+            // The new source after deletion is just `main = println "hi"\n`.
+            // No warning should land on main.
+            let line0_text = "main = println";
+            assert!(
+                !d.message.contains("unused"),
+                "rebased cache should not still claim an unused warning when \
+                 the unused decl was deleted; got {:?} at {:?} (line0 is {:?})",
+                d.message, d.range, line0_text
+            );
+        }
+
+        // Now run analysis on the post-delete source to make sure the final
+        // state is also clean.
+        let v2 = "main = println \"hi\"\n";
+        apply_analysis_in(&mut state, &server, &uri, v2, Some(2));
+        let final_pubs = state.published_lsp_diagnostics.get(&uri).cloned().unwrap_or_default();
+        assert!(
+            final_pubs.is_empty(),
+            "post-analysis publish should have no warnings; got: {:?}",
+            final_pubs
+        );
+    }
+
     /// Closing a document publishes empty diagnostics and drops the cache,
     /// so a subsequent reopen with the same content actually re-publishes.
     #[test]

@@ -2571,13 +2571,22 @@ impl Infer {
                 if args.is_empty() {
                     name.clone()
                 } else if name == "Server" && args.len() == 2 {
-                    // Render `Server Api EffectRow(eff, r)` as
-                    // `Server Api {eff | r}`, mirroring how IO renders its
-                    // effect row. The second arg is always an effect row,
-                    // produced by `infer_serve` and consumed by `listen`.
+                    // Render `Server Api EffectRow(eff, r)` as `Server Api
+                    // {eff}`. The second arg is always an effect row, but
+                    // unlike IO we hide it when there are no concrete
+                    // effects — a bare row variable would surface as a
+                    // stray third token (`Server Api {| a}`). When there
+                    // are concrete effects, show them but drop the trailing
+                    // `| r` row tail for the same reason.
                     let api_str = self.display_ty(&args[0]);
                     let eff_str = match self.peel_to_effect_row(&args[1]) {
-                        Some((eff, row)) => self.display_effect_set(&eff, row),
+                        Some((eff, _row)) => {
+                            if eff.is_empty() {
+                                String::new()
+                            } else {
+                                self.display_effect_set(&eff, None)
+                            }
+                        }
                         None => format!(" {}", self.display_ty(&args[1])),
                     };
                     format!("Server {}{}", api_str, eff_str)
@@ -6604,12 +6613,20 @@ fn display_ty_clean_inner(
             if args.is_empty() {
                 name.clone()
             } else if name == "Server" && args.len() == 2 {
-                // Mirror `display_ty`: render the effect-row arg as ` {eff | r}`
-                // instead of letting it fall through to the generic
-                // `Ty::EffectRow` formatter which would print `Effects {...}`.
+                // Mirror `display_ty`: hide the effect row when there are
+                // no concrete effects (otherwise a bare row variable shows
+                // as a stray third token, e.g. `Server Api {| a}`). When
+                // concrete effects exist, drop the trailing `| r` row tail
+                // for the same reason.
                 let api_str = display_ty_clean(&args[0], names, unit_names);
                 let eff_str = match peel_to_effect_row_clean(&args[1]) {
-                    Some((eff, row)) => display_effect_set_clean(&eff, row, names),
+                    Some((eff, _row)) => {
+                        if eff.is_empty() {
+                            String::new()
+                        } else {
+                            display_effect_set_clean(&eff, None, names)
+                        }
+                    }
                     None => format!(" {}", display_ty_clean(&args[1], names, unit_names)),
                 };
                 format!("Server {}{}", api_str, eff_str)

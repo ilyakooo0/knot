@@ -799,7 +799,7 @@ api = serve Api where
 main = listen 8080 api
 ```
 
-`serve API where` produces a value of type `Server API`. Each handler receives the request record (path/query/body/header fields) and returns the response type declared on the endpoint. No string routes, no untyped params, no missing handlers.
+`serve API where` produces a value of type `Server API _` (a polymorphic row variable when handlers have no concrete effects) or `Server API {effects}` when handlers carry concrete effects — e.g. `Server API {console}` if a handler calls `println`. Each handler receives the request record (path/query/body/header fields) and returns the response type declared on the endpoint. Handler effects propagate through `listen` into the program's IO type. No string routes, no untyped params, no missing handlers.
 
 #### Typed Responses
 

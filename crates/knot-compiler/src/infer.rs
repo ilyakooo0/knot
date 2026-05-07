@@ -221,7 +221,7 @@ enum Ty {
     /// Type-level application (e.g. `f a` where `f` is a HK variable).
     App(Box<Ty>, Box<Ty>),
     /// IO monad with tracked effects and an optional row variable for
-    /// effect polymorphism: `IO {console, fs} a` or `IO {console | r} a`.
+    /// effect polymorphism: `IO {console, fs} a` or `IO {console | _} a`.
     /// The row tail unifies with whatever extra effects the caller's
     /// context introduces.
     IO(BTreeSet<IoEffect>, Option<TyVar>, Box<Ty>),
@@ -2440,47 +2440,39 @@ impl Infer {
 
     // ── Type display ─────────────────────────────────────────────
 
-    /// Resolve a `Ty` to an effect row (effects + optional tail) by walking
-    /// substitutions and `Ty::EffectRow` chains. Returns `None` if the type
-    /// doesn't reduce to an effect row — used by Server display to fall back
-    /// to generic rendering when something unexpected is in the row slot.
-    fn peel_to_effect_row(&self, ty: &Ty) -> Option<(BTreeSet<IoEffect>, Option<TyVar>)> {
-        let (effects, row) = match ty {
-            Ty::EffectRow(e, r) => (e.clone(), *r),
-            Ty::Var(v) => match self.subst.get(v) {
-                Some(resolved) => return self.peel_to_effect_row(resolved),
-                None => (BTreeSet::new(), Some(*v)),
-            },
-            _ => return None,
-        };
-        Some(self.resolve_effect_row(effects, row))
-    }
-
-    /// Render ` {e1, e2 | r}` for an effect set with optional row tail. An
-    /// empty closed set renders as ` {}` — IO and Effects always carry an
-    /// effects row, even when empty.
+    /// Render an effect set with optional row tail as a standalone string —
+    /// `{e1, e2 | _}`, `{}` for closed empty, `{e1}` when no tail, or just
+    /// `_` when the set is empty and only a row variable is present
+    /// (parser-supported shorthand for `{| _}`). Promoting a bare row var
+    /// to `{| _}` would falsely advertise an explicit empty effect row when
+    /// the user only meant a polymorphic placeholder.
+    ///
+    /// Callers (IO display, Server display via generic `Ty::Con` rendering)
+    /// add their own spacing.
     fn display_effect_set(
         &self,
         effects: &BTreeSet<IoEffect>,
         row: Option<TyVar>,
     ) -> String {
-        let mut parts: Vec<String> =
-            effects.iter().map(format_io_effect).collect();
-        if let Some(rv) = row {
-            let name = match self.subst.get(&rv) {
-                Some(resolved) => self.display_ty(resolved),
-                None => {
-                    let idx = rv as usize;
-                    if idx < 26 {
-                        format!("{}", (b'a' + idx as u8) as char)
-                    } else {
-                        format!("e{}", rv)
-                    }
-                }
+        let row_name = row.map(|rv| match self.subst.get(&rv) {
+            Some(resolved) => self.display_ty(resolved),
+            None => "_".into(),
+        });
+        if effects.is_empty() {
+            return match row_name {
+                Some(name) => name,
+                None => "{}".into(),
             };
-            parts.push(format!("| {}", name));
         }
-        format!(" {{{}}}", parts.join(", "))
+        let effects_str: String = effects
+            .iter()
+            .map(format_io_effect)
+            .collect::<Vec<_>>()
+            .join(", ");
+        match row_name {
+            Some(name) => format!("{{{} | {}}}", effects_str, name),
+            None => format!("{{{}}}", effects_str),
+        }
     }
 
     fn display_ty(&self, ty: &Ty) -> String {
@@ -2570,26 +2562,6 @@ impl Infer {
             Ty::Con(name, args) => {
                 if args.is_empty() {
                     name.clone()
-                } else if name == "Server" && args.len() == 2 {
-                    // Render `Server Api EffectRow(eff, r)` as `Server Api
-                    // {eff}`. The second arg is always an effect row, but
-                    // unlike IO we hide it when there are no concrete
-                    // effects — a bare row variable would surface as a
-                    // stray third token (`Server Api {| a}`). When there
-                    // are concrete effects, show them but drop the trailing
-                    // `| r` row tail for the same reason.
-                    let api_str = self.display_ty(&args[0]);
-                    let eff_str = match self.peel_to_effect_row(&args[1]) {
-                        Some((eff, _row)) => {
-                            if eff.is_empty() {
-                                String::new()
-                            } else {
-                                self.display_effect_set(&eff, None)
-                            }
-                        }
-                        None => format!(" {}", self.display_ty(&args[1])),
-                    };
-                    format!("Server {}{}", api_str, eff_str)
                 } else {
                     let args_str: Vec<String> =
                         args.iter().map(|a| self.display_ty(a)).collect();
@@ -2635,7 +2607,7 @@ impl Infer {
                 let (effects, row) =
                     self.resolve_effect_row(effects.clone(), *row);
                 format!(
-                    "IO{} {}",
+                    "IO {} {}",
                     self.display_effect_set(&effects, row),
                     self.display_ty(inner),
                 )
@@ -2643,7 +2615,7 @@ impl Infer {
             Ty::EffectRow(effects, row) => {
                 let (effects, row) =
                     self.resolve_effect_row(effects.clone(), *row);
-                format!("Effects{}", self.display_effect_set(&effects, row))
+                self.display_effect_set(&effects, row)
             }
             Ty::Forall(vars, inner) => {
                 if vars.is_empty() {
@@ -3398,7 +3370,12 @@ impl Infer {
         }
     }
 
-    /// Type-check a `serve Api where ...` expression, returning `Server Api`.
+    /// Type-check a `serve Api where ...` expression, returning `Server Api _`
+    /// (a row-variable tail when handlers have no concrete effects) or
+    /// `Server Api {effects}` when handlers carry concrete effects.
+    /// Internally the type is `Ty::Con("Server", [api, effect_row])` where
+    /// the effect row collects every handler's IO effects and shares a row
+    /// variable with `listen` for propagation.
     ///
     /// Each handler is checked against the type derived from its route entry:
     ///   - input: a record of (path params, query params, body fields,
@@ -5095,13 +5072,14 @@ impl Infer {
         // with polymorphic HKT types: ∀m a b. (a -> m b) -> m a -> m b, etc.
         // This allows do-block desugaring to work with any monad, not just [].
 
-        // listen : ∀a u r. Int<u> -> Server a {| r} -> IO {network | r} {}
+        // listen : ∀a u r. Int<u> -> Server a r -> IO {network | r} {}
         // The handler value must be a `Server a`, produced by the
         // `serve a where ...` expression. Each endpoint handler returns
         // its own response type; the runtime serializes the result based
-        // on which endpoint matched. The shared row variable `r` carries
-        // the union of every handler's IO effects out through the IO type
-        // returned by `listen`, so a server whose handlers do `println` is
+        // on which endpoint matched. Server's effect-row arg shares the
+        // row variable `r` with `listen`'s IO row, so the union of every
+        // handler's IO effects flows out through the returned IO type — a
+        // server whose handlers do `println` is
         // visibly typed `IO {network, console} {}`.
         {
             let a = self.fresh_var();
@@ -5136,7 +5114,7 @@ impl Infer {
             );
         }
 
-        // listenOn : ∀a u r. Text -> Int<u> -> Server a {| r} -> IO {network | r} {}
+        // listenOn : ∀a u r. Text -> Int<u> -> Server a r -> IO {network | r} {}
         {
             let a = self.fresh_var();
             let r = self.fresh_var();
@@ -6417,31 +6395,23 @@ fn format_io_effect(e: &IoEffect) -> String {
     }
 }
 
-/// Substitution-free counterpart to `peel_to_effect_row` for the
-/// post-applied types fed to `display_ty_clean`. Returns `None` when the
-/// second `Server` arg is something other than an effect row or a leftover
-/// unification variable, so the caller can fall back to generic rendering.
-fn peel_to_effect_row_clean(ty: &Ty) -> Option<(BTreeSet<IoEffect>, Option<TyVar>)> {
-    match ty {
-        Ty::EffectRow(e, r) => Some((e.clone(), *r)),
-        Ty::Var(v) => Some((BTreeSet::new(), Some(*v))),
-        _ => None,
-    }
-}
-
 fn display_effect_set_clean(
     effects: &BTreeSet<IoEffect>,
     row: Option<TyVar>,
-    names: &HashMap<TyVar, usize>,
+    _names: &HashMap<TyVar, usize>,
 ) -> String {
-    let mut parts: Vec<String> = format_io_effects_coalesced(effects);
-    if let Some(rv) = row {
-        parts.push(format!(
-            "| {}",
-            var_letter(names.get(&rv).copied().unwrap_or(rv as usize))
-        ));
+    let row_name = row.map(|_| "_".to_string());
+    if effects.is_empty() {
+        return match row_name {
+            Some(name) => name,
+            None => "{}".into(),
+        };
     }
-    format!(" {{{}}}", parts.join(", "))
+    let effects_str = format_io_effects_coalesced(effects).join(", ");
+    match row_name {
+        Some(name) => format!("{{{} | {}}}", effects_str, name),
+        None => format!("{{{}}}", effects_str),
+    }
 }
 
 fn format_io_effects_coalesced(effects: &BTreeSet<IoEffect>) -> Vec<String> {
@@ -6612,24 +6582,6 @@ fn display_ty_clean_inner(
         Ty::Con(name, args) => {
             if args.is_empty() {
                 name.clone()
-            } else if name == "Server" && args.len() == 2 {
-                // Mirror `display_ty`: hide the effect row when there are
-                // no concrete effects (otherwise a bare row variable shows
-                // as a stray third token, e.g. `Server Api {| a}`). When
-                // concrete effects exist, drop the trailing `| r` row tail
-                // for the same reason.
-                let api_str = display_ty_clean(&args[0], names, unit_names);
-                let eff_str = match peel_to_effect_row_clean(&args[1]) {
-                    Some((eff, _row)) => {
-                        if eff.is_empty() {
-                            String::new()
-                        } else {
-                            display_effect_set_clean(&eff, None, names)
-                        }
-                    }
-                    None => format!(" {}", display_ty_clean(&args[1], names, unit_names)),
-                };
-                format!("Server {}{}", api_str, eff_str)
             } else {
                 let args_str: Vec<String> =
                     args.iter().map(|a| display_ty_clean(a, names, unit_names)).collect();
@@ -6655,10 +6607,10 @@ fn display_ty_clean_inner(
         Ty::IO(effects, row, inner) => {
             let effects_str =
                 display_effect_set_clean(effects, *row, names);
-            format!("IO{} {}", effects_str, display_ty_clean(inner, names, unit_names))
+            format!("IO {} {}", effects_str, display_ty_clean(inner, names, unit_names))
         }
         Ty::EffectRow(effects, row) => {
-            format!("Effects{}", display_effect_set_clean(effects, *row, names))
+            display_effect_set_clean(effects, *row, names)
         }
         Ty::Forall(vars, inner) => {
             if vars.is_empty() {
@@ -8318,11 +8270,12 @@ main = applyPred (\\r -> r.x == r.y)\
 
     // ── serve / listen effect propagation ──────────────────────────
     //
-    // `serve` returns `Server Api {effects | r}` where the effect row is
-    // shared across every handler. `listen : Int<u> -> Server a {| r} -> IO
-    // {network | r} {}` then unifies its row variable with the server's, so
-    // every handler effect surfaces in the type of the program that calls
-    // `listen`.
+    // `serve` returns `Server Api _` (effect-row tail rendered as `_` when
+    // polymorphic, `{effects}` when concrete). Internally Server carries an
+    // effect-row arg shared across every handler. `listen : Int<u> -> Server a
+    // r -> IO {network | r} {}` then unifies its row variable with the
+    // server's row, so every handler effect surfaces in the type of the
+    // program that calls `listen`.
 
     #[test]
     fn serve_propagates_console_effect() {

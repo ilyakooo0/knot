@@ -285,7 +285,9 @@ pub enum ExprKind {
 
     /// `serve Api where E1 = expr1; E2 = expr2; ...` — typed server value.
     /// Each handler is bound to a route endpoint constructor; the whole
-    /// expression has type `Server Api`.
+    /// expression has type `Server Api _` (a row variable when no handler
+    /// has concrete effects) or `Server Api {effects}` when handlers carry
+    /// concrete IO effects.
     Serve {
         api: Name,
         api_span: Span,

@@ -783,28 +783,23 @@ route Api where
   GET                                          /workload                                     = GetWorkload
 ```
 
-Dispatch is pattern matching — the compiler ensures exhaustive handling:
+Handlers are bound per-endpoint with `serve API where` — the compiler ensures every endpoint has exactly one handler:
 
 ```knot
-serve : Api -> Response
-serve = \req -> case req of
-  GetTodos {user, page, limit, respond} -> do
-    result <- pendingFor user page limit
-    respond result
-  AddTodo {title, owner, priority, respond} -> do
+api = serve Api where
+  GetTodos = \{user, page, limit} -> pendingFor user page limit
+  AddTodo = \{title, owner, priority} -> do
     atomic (add title owner priority)
-    respond {ok: True {}}
-  AssignTodo {title, owner, person, respond} -> do
+    yield {ok: True {}}
+  AssignTodo = \{title, owner, person} -> do
     atomic (assign title owner person)
-    respond {ok: True {}}
-  GetWorkload {respond} -> do
-    result <- &workload
-    respond result
+    yield {ok: True {}}
+  GetWorkload = \{} -> &workload
 
-main = listen 8080 serve
+main = listen 8080 api
 ```
 
-No string routes, no untyped params, no missing handlers.
+`serve API where` produces a value of type `Server API`. Each handler receives the request record (path/query/body/header fields) and returns the response type declared on the endpoint. No string routes, no untyped params, no missing handlers.
 
 #### Typed Responses
 
@@ -817,7 +812,7 @@ route Api where
   GET                              /workload           -> [{owner: Text, count: Int}]           = GetWorkload
 ```
 
-The compiler checks that each `serve` branch returns the declared type.
+The compiler checks that each handler returns the declared type.
 
 #### Typed Headers
 
@@ -833,17 +828,17 @@ route Api where
 Request headers become constructor fields, just like body/query/path params. The handler destructures them:
 
 ```knot
-serve = \req -> case req of
-  GetTodos {authorization, respond} ->
+api = serve Api where
+  GetTodos = \{authorization} -> do
     let todos = allTodos
-    respond todos {xTotalCount: length todos, xPage: 1}
-  CreateTodo {title, authorization, xIdempotencyKey, respond} ->
+    yield {body: todos, headers: {xTotalCount: length todos, xPage: 1}}
+  CreateTodo = \{title, authorization, xIdempotencyKey} -> do
     let id = addTodo title
-    respond {id: id} {}
-  HealthCheck {respond} -> respond {status: "ok"}
+    yield {body: {id: id}, headers: {}}
+  HealthCheck = \{} -> yield {status: "ok"}
 ```
 
-When response headers are declared, `respond` takes two arguments — body then headers record. Without response headers, `respond` takes just the body.
+When response headers are declared, the handler returns a `{body: ..., headers: ...}` record. Without response headers, it returns the body directly.
 
 Optional headers use `Maybe`:
 
@@ -913,15 +908,15 @@ route Api = TodoApi | AdminApi
 DB writes within handlers must use `atomic`. IO happens outside `atomic`:
 
 ```knot
-serve = \req -> case req of
-  CreateOrder {item, qty, respond} -> do
+api = serve Api where
+  CreateOrder = \{item, qty} -> do
     orderId <- atomic do
       orders <- *orders
       set *orders = union orders [{item: item, qty: qty}]
       newOrders <- *orders
       yield (count newOrders)
     println ("New order #" ++ show orderId)
-    respond {orderId: orderId}
+    yield {orderId: orderId}
 ```
 
 For sub-transaction boundaries:
@@ -1569,17 +1564,17 @@ type Person = {
 route Api where
   POST {name: Text, age: Int, email: Text}  /users -> {ok: Bool, error: Maybe Text}  = CreateUser
 
-serve = \req -> case req of
-  CreateUser {name, age, email, respond} -> do
+api = serve Api where
+  CreateUser = \{name, age, email} ->
     case refine {name, age, email} of    -- Person inferred from set *people
       Ok {value: person} -> do
         atomic do
           people <- *people
           set *people = union people [person]
-        respond {ok: true, error: Nothing {}}
+        yield {ok: true, error: Nothing {}}
       Err {error} -> do
         let msg = fold (\acc v -> acc ++ v.message ++ "; ") "" error.violations
-        respond {ok: false, error: Just {value: msg}}
+        yield {ok: false, error: Just {value: msg}}
 ```
 
 ### Traits
@@ -1759,23 +1754,18 @@ resolve = \title owner msg -> do
     yield {owner: t.owner, count: count t}
   yield result
 
-serve : Api -> Response
-serve = \req -> case req of
-  GetTodos {user, respond} -> do
-    result <- pendingFor user
-    respond result
-  AddTodo {title, owner, priority, respond} -> do
+api = serve Api where
+  GetTodos = \{user} -> pendingFor user
+  AddTodo = \{title, owner, priority} -> do
     atomic (add title owner priority)
-    respond {ok: True {}}
-  AssignTodo {title, owner, person, respond} -> do
+    yield {ok: True {}}
+  AssignTodo = \{title, owner, person} -> do
     atomic (assign title owner person)
-    respond {ok: True {}}
-  ResolveTodo {title, owner, msg, respond} -> do
+    yield {ok: True {}}
+  ResolveTodo = \{title, owner, msg} -> do
     atomic (resolve title owner msg)
-    respond {ok: True {}}
-  GetWorkload {respond} -> do
-    result <- &workload
-    respond result
+    yield {ok: True {}}
+  GetWorkload = \{} -> &workload
 
-main = listen 8080 serve
+main = listen 8080 api
 ```

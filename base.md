@@ -400,9 +400,9 @@ main = do
 ## Server
 
 ```knot
-listen : Int -> (a -> b) -> {}
+listen : Int -> Server a -> IO {network} {}
 ```
-Start an HTTP server on the given port with a handler function. The handler receives a route ADT value and returns a response. Has the `{network}` effect. See `route` declarations in the language spec for defining typed endpoints.
+Start an HTTP server on the given port. The second argument is a `Server a` value, typically built with the `serve API where ...` expression. Has the `{network}` effect. See `route` declarations in the language spec for defining typed endpoints and the `serve` form for binding handlers.
 
 ## Concurrency
 

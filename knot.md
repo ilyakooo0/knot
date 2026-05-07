@@ -730,21 +730,17 @@ route AdminApi where
 route Api = TodoApi | AdminApi
 
 -- Handler
-serve = \req -> case req of
-  GetTodos {owner, respond} -> do
-    result <- getTodos owner
-    respond result
-  CreateTodo {title, owner, respond} -> do
-    addTodo title owner
-    respond (addTodo title owner)
-  GetCount {respond} -> do
+api = serve Api where
+  GetTodos = \{owner} -> getTodos owner
+  CreateTodo = \{title, owner} -> addTodo title owner
+  GetCount = \{} -> do
     todos <- *todos
-    respond (count todos)
+    yield (count todos)
 
-main = listen 8080 serve
+main = listen 8080 api
 ```
 
-Each route constructor gets a `respond` callback for type-safe responses.
+`serve API where` produces a value of type `Server API`. Each handler takes the request record and returns the response type declared on the endpoint.
 
 ### Typed Headers
 
@@ -762,15 +758,15 @@ route Api where
 
 Field names use camelCase, auto-converted to HTTP-Header-Case: `authorization` → `Authorization`, `contentType` → `Content-Type`, `xRequestId` → `X-Request-Id`.
 
-Request headers become constructor fields. When response headers are declared, `respond` takes two arguments — body then headers:
+Request headers become constructor fields. When response headers are declared, the handler returns a `{body: ..., headers: ...}` record:
 
 ```knot
-serve = \req -> case req of
-  GetTodos {authorization, respond} ->
+api = serve Api where
+  GetTodos = \{authorization} -> do
     let todos = allTodos
-    respond todos {xTotalCount: length todos}
-  CreateTodo {title, authorization, respond} ->
-    respond (addTodo title) {}
+    yield {body: todos, headers: {xTotalCount: length todos}}
+  CreateTodo = \{title, authorization} ->
+    yield {body: addTodo title, headers: {}}
 ```
 
 Optional headers use `Maybe`:

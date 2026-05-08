@@ -28,12 +28,17 @@ getTodos = \owner -> do
   yield result
 
 api = serve Api where
-  GetTodos = \{owner} -> getTodos owner
+  GetTodos = \{owner} -> do
+    todos <- getTodos owner
+    if (count todos) == 0 then
+      yield Err {error: {status: 404, message: "no todos found for owner"}}
+    else
+      yield Ok {value: todos}
   CreateTodo = \{title, owner, priority} -> do
     addTodo title owner priority
-    yield {title: title, owner: owner, priority: Low {}}
+    yield Ok {value: {title: title, owner: owner, priority: Low {}}}
   GetCount = \{} -> do
     todos <- *todos
-    yield (count todos)
+    yield Ok {value: count todos}
 
 main = listen 8080 api

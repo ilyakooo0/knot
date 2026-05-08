@@ -3544,7 +3544,17 @@ impl Infer {
             }
             None => Ty::Var(self.fresh_var()),
         };
-        let output = Ty::IO(BTreeSet::new(), Some(handler_row), Box::new(response));
+        // Handlers return `Result HttpError T` so they can pick custom
+        // HTTP status codes via Err {error: {status, message}}. Use the
+        // record-typed alias (not Ty::Con) so .status / .message access
+        // works inside handler bodies.
+        let http_error = self
+            .aliases
+            .get("HttpError")
+            .cloned()
+            .unwrap_or_else(|| Ty::Con("HttpError".into(), vec![]));
+        let wrapped = Ty::Con("Result".into(), vec![http_error, response]);
+        let output = Ty::IO(BTreeSet::new(), Some(handler_row), Box::new(wrapped));
         Ty::Fun(Box::new(input), Box::new(output))
     }
 
@@ -4878,6 +4888,21 @@ impl Infer {
                         ]),
                         None,
                     )))),
+                ]),
+                None,
+            ),
+        );
+
+        // Built-in type: HttpError = {status: Int, message: Text}
+        // Used as the error type for serve handler return values: every
+        // handler returns `Result HttpError T`, where Err carries a custom
+        // HTTP status code and message.
+        self.aliases.insert(
+            "HttpError".into(),
+            Ty::Record(
+                BTreeMap::from([
+                    ("status".into(), Ty::Int),
+                    ("message".into(), Ty::Text),
                 ]),
                 None,
             ),
@@ -8283,7 +8308,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // type `IO {network, console} {}` rather than `IO {network} {}`.
         let info = type_info_for(
             "route Api where\n  GET / -> Text = Hello\n\
-             api = serve Api where\n  Hello = \\{} -> do\n    println \"hi\"\n    yield \"hello\"\n\
+             api = serve Api where\n  Hello = \\{} -> do\n    println \"hi\"\n    yield Ok {value: \"hello\"}\n\
              main = listen 8080 api"
         );
         let main_ty = info.get("main").expect("missing main type");
@@ -8300,7 +8325,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // should expose only `network` (from listen itself).
         let info = type_info_for(
             "route Api where\n  GET / -> Text = Hello\n\
-             api = serve Api where\n  Hello = \\{} -> \"hi\"\n\
+             api = serve Api where\n  Hello = \\{} -> Ok {value: \"hi\"}\n\
              main = listen 8080 api"
         );
         let main_ty = info.get("main").expect("missing main type");
@@ -8327,9 +8352,9 @@ main = applyPred (\\r -> r.x == r.y)\
              *items : [{name: Text}]\n\
              route Api where\n  GET /a -> Text = HandlerA\n  POST /b -> Text = HandlerB\n  GET /c -> Text = HandlerC\n\
              api = serve Api where\n\
-             \x20 HandlerA = \\{} -> do\n    println \"a\"\n    yield \"a\"\n\
-             \x20 HandlerB = \\{} -> do\n    replace *log = [{msg: \"b\"}]\n    yield \"b\"\n\
-             \x20 HandlerC = \\{} -> do\n    items <- *items\n    yield \"c\"\n\
+             \x20 HandlerA = \\{} -> do\n    println \"a\"\n    yield Ok {value: \"a\"}\n\
+             \x20 HandlerB = \\{} -> do\n    replace *log = [{msg: \"b\"}]\n    yield Ok {value: \"b\"}\n\
+             \x20 HandlerC = \\{} -> do\n    items <- *items\n    yield Ok {value: \"c\"}\n\
              main = listen 8080 api";
         let diags = check_src(src);
         assert!(diags.is_empty(), "expected clean check, got: {:?}",
@@ -8352,7 +8377,7 @@ main = applyPred (\\r -> r.x == r.y)\
         let info = type_info_for(
             "*counter : [{value: Int}]\n\
              route Api where\n  POST / -> {value: Int} = Bump\n\
-             api = serve Api where\n  Bump = \\{} -> do\n    *counter = [{value: 1}]\n    yield {value: 1}\n\
+             api = serve Api where\n  Bump = \\{} -> do\n    *counter = [{value: 1}]\n    yield Ok {value: {value: 1}}\n\
              main = listen 8080 api"
         );
         let main_ty = info.get("main").expect("missing main type");
@@ -8377,7 +8402,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // inference) is responsible for validating annotations.
         let diags = effect_diags(
             "route Api where\n  GET / -> Text = Hello\n\
-             api = serve Api where\n  Hello = \\{} -> do\n    println \"hi\"\n    yield \"hello\"\n\
+             api = serve Api where\n  Hello = \\{} -> do\n    println \"hi\"\n    yield Ok {value: \"hello\"}\n\
              main : IO {network} {}\n\
              main = listen 8080 api"
         );

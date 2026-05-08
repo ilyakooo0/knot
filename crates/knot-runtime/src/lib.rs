@@ -11814,40 +11814,87 @@ fn http_serve_loop(
 
                     match panic_result {
                         Ok(Ok(result)) => {
-                    let has_resp_headers = !entry_response_headers.is_empty();
-                    if has_resp_headers {
-                        let body_val = knot_record_field(result, "body".as_ptr(), 4);
-                        let hdrs_val = knot_record_field(result, "headers".as_ptr(), 7);
-                        let json = json_encode_value(db, body_val);
-                        let mut response = tiny_http::Response::from_string(&json)
+                    // Handlers return `Result HttpError T`. Inspect the
+                    // constructor tag: Ok carries the success body in
+                    // `value`; Err carries `{status, message}` in `error`.
+                    let (status_code, body_val_opt, err_message): (u16, Option<*mut Value>, Option<String>) =
+                        match unsafe { as_ref(result) } {
+                            Value::Constructor(tag, _) if &**tag == "Ok" => {
+                                let value = knot_record_field(result, b"value".as_ptr(), 5);
+                                (200, Some(value), None)
+                            }
+                            Value::Constructor(tag, _) if &**tag == "Err" => {
+                                let err = knot_record_field(result, b"error".as_ptr(), 5);
+                                let status_v = knot_record_field(err, b"status".as_ptr(), 6);
+                                let message_v = knot_record_field(err, b"message".as_ptr(), 7);
+                                let status = match unsafe { as_ref(status_v) } {
+                                    Value::Int(n) => (*n).clamp(100, 599) as u16,
+                                    _ => 500,
+                                };
+                                let message = match unsafe { as_ref(message_v) } {
+                                    Value::Text(s) => s.to_string(),
+                                    _ => String::new(),
+                                };
+                                (status, None, Some(message))
+                            }
+                            _ => {
+                                // Type checker should prevent this, but be
+                                // defensive: serialize whatever the handler
+                                // returned and respond 200.
+                                (200, Some(result), None)
+                            }
+                        };
+
+                    if let Some(msg) = err_message {
+                        log_warn!("[HTTP] --> {} {}", status_code, msg);
+                        let body = format!("{{\"error\":\"{}\"}}", json_escape(&msg));
+                        let response = tiny_http::Response::from_string(&body)
+                            .with_status_code(status_code)
                             .with_header(
                                 "Content-Type: application/json"
                                     .parse::<tiny_http::Header>()
                                     .unwrap(),
                             );
-                        if let Value::Record(hdr_fields) = unsafe { as_ref(hdrs_val) } {
-                            for hf in hdr_fields {
-                                let http_name = camel_to_header_case(&hf.name);
-                                let hdr_value = fetch_value_to_text(hf.value);
-                                if let Ok(header) = format!("{}: {}", http_name, hdr_value)
-                                    .parse::<tiny_http::Header>()
-                                {
-                                    response = response.with_header(header);
-                                }
-                            }
-                        }
-                        log_debug!("[HTTP] --> 200 {}", json);
                         let _ = request.respond(response);
                     } else {
-                        let json = json_encode_value(db, result);
-                        log_debug!("[HTTP] --> 200 {}", json);
-                        let response = tiny_http::Response::from_string(&json)
-                            .with_header(
-                                "Content-Type: application/json"
-                                    .parse::<tiny_http::Header>()
-                                    .unwrap(),
-                            );
-                        let _ = request.respond(response);
+                        let body_val = body_val_opt.unwrap();
+                        let has_resp_headers = !entry_response_headers.is_empty();
+                        if has_resp_headers {
+                            let body_field = knot_record_field(body_val, b"body".as_ptr(), 4);
+                            let hdrs_val = knot_record_field(body_val, b"headers".as_ptr(), 7);
+                            let json = json_encode_value(db, body_field);
+                            let mut response = tiny_http::Response::from_string(&json)
+                                .with_status_code(status_code)
+                                .with_header(
+                                    "Content-Type: application/json"
+                                        .parse::<tiny_http::Header>()
+                                        .unwrap(),
+                                );
+                            if let Value::Record(hdr_fields) = unsafe { as_ref(hdrs_val) } {
+                                for hf in hdr_fields {
+                                    let http_name = camel_to_header_case(&hf.name);
+                                    let hdr_value = fetch_value_to_text(hf.value);
+                                    if let Ok(header) = format!("{}: {}", http_name, hdr_value)
+                                        .parse::<tiny_http::Header>()
+                                    {
+                                        response = response.with_header(header);
+                                    }
+                                }
+                            }
+                            log_debug!("[HTTP] --> {} {}", status_code, json);
+                            let _ = request.respond(response);
+                        } else {
+                            let json = json_encode_value(db, body_val);
+                            log_debug!("[HTTP] --> {} {}", status_code, json);
+                            let response = tiny_http::Response::from_string(&json)
+                                .with_status_code(status_code)
+                                .with_header(
+                                    "Content-Type: application/json"
+                                        .parse::<tiny_http::Header>()
+                                        .unwrap(),
+                                );
+                            let _ = request.respond(response);
+                        }
                     }
                         }
                         Ok(Err((status_code, error_msg))) => {

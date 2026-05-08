@@ -787,19 +787,46 @@ Handlers are bound per-endpoint with `serve API where` — the compiler ensures 
 
 ```knot
 api = serve Api where
-  GetTodos = \{user, page, limit} -> pendingFor user page limit
+  GetTodos = \{user, page, limit} -> do
+    todos <- pendingFor user page limit
+    yield Ok {value: todos}
   AddTodo = \{title, owner, priority} -> do
     atomic (add title owner priority)
-    yield {ok: True {}}
+    yield Ok {value: {ok: True {}}}
   AssignTodo = \{title, owner, person} -> do
     atomic (assign title owner person)
-    yield {ok: True {}}
-  GetWorkload = \{} -> &workload
+    yield Ok {value: {ok: True {}}}
+  GetWorkload = \{} -> do
+    w <- &workload
+    yield Ok {value: w}
 
 main = listen 8080 api
 ```
 
-`serve API where` produces a value of type `Server API _` (a polymorphic row variable when handlers have no concrete effects) or `Server API {effects}` when handlers carry concrete effects — e.g. `Server API {console}` if a handler calls `println`. Each handler receives the request record (path/query/body/header fields) and returns the response type declared on the endpoint. Handler effects propagate through `listen` into the program's IO type. No string routes, no untyped params, no missing handlers.
+`serve API where` produces a value of type `Server API _` (a polymorphic row variable when handlers have no concrete effects) or `Server API {effects}` when handlers carry concrete effects — e.g. `Server API {console}` if a handler calls `println`. Each handler receives the request record (path/query/body/header fields) and returns `Result HttpError T`, where `T` is the response type declared on the endpoint and `HttpError = {status: Int, message: Text}`. Handler effects propagate through `listen` into the program's IO type. No string routes, no untyped params, no missing handlers.
+
+#### HTTP Status Codes
+
+Handlers return `Result HttpError T`. `Ok {value: v}` responds with HTTP 200 and serializes `v` as JSON. `Err {error: {status, message}}` responds with the given status code and a JSON error body:
+
+```knot
+api = serve Api where
+  GetUser = \{id} -> do
+    users <- *people
+    case filter (\u -> u.id == id) users of
+      [] -> yield Err {error: {status: 404, message: "user not found"}}
+      [u | _] -> yield Ok {value: u}
+  CreateUser = \{name, email} -> do
+    if length name == 0 then
+      yield Err {error: {status: 400, message: "name required"}}
+    else do
+      atomic do
+        users <- *people
+        set *people = union users [{name: name, email: email}]
+      yield Ok {value: {name: name, email: email}}
+```
+
+Status codes are clamped to the range `100..=599`. Common codes: `400` (bad request), `401` (unauthorized), `403` (forbidden), `404` (not found), `409` (conflict), `500` (internal error). The runtime emits `400` automatically for path/query/body/header parsing failures and refinement violations, and `404` for unmatched routes — handlers only need to return `Err` for application-level errors.
 
 #### Typed Responses
 
@@ -831,14 +858,14 @@ Request headers become constructor fields, just like body/query/path params. The
 api = serve Api where
   GetTodos = \{authorization} -> do
     let todos = allTodos
-    yield {body: todos, headers: {xTotalCount: length todos, xPage: 1}}
+    yield Ok {value: {body: todos, headers: {xTotalCount: length todos, xPage: 1}}}
   CreateTodo = \{title, authorization, xIdempotencyKey} -> do
     let id = addTodo title
-    yield {body: {id: id}, headers: {}}
-  HealthCheck = \{} -> yield {status: "ok"}
+    yield Ok {value: {body: {id: id}, headers: {}}}
+  HealthCheck = \{} -> yield Ok {value: {status: "ok"}}
 ```
 
-When response headers are declared, the handler returns a `{body: ..., headers: ...}` record. Without response headers, it returns the body directly.
+When response headers are declared, the success branch wraps a `{body: ..., headers: ...}` record inside `Ok {value: ...}`. Without response headers, `Ok` carries the body directly. Error responses (`Err {error: {status, message}}`) never include custom headers — only the status code and JSON error body.
 
 Optional headers use `Maybe`:
 
@@ -916,7 +943,7 @@ api = serve Api where
       newOrders <- *orders
       yield (count newOrders)
     println ("New order #" ++ show orderId)
-    yield {orderId: orderId}
+    yield Ok {value: {orderId: orderId}}
 ```
 
 For sub-transaction boundaries:
@@ -1571,10 +1598,10 @@ api = serve Api where
         atomic do
           people <- *people
           set *people = union people [person]
-        yield {ok: true, error: Nothing {}}
+        yield Ok {value: {ok: true, error: Nothing {}}}
       Err {error} -> do
         let msg = fold (\acc v -> acc ++ v.message ++ "; ") "" error.violations
-        yield {ok: false, error: Just {value: msg}}
+        yield Ok {value: {ok: false, error: Just {value: msg}}}
 ```
 
 ### Traits
@@ -1755,17 +1782,21 @@ resolve = \title owner msg -> do
   yield result
 
 api = serve Api where
-  GetTodos = \{user} -> pendingFor user
+  GetTodos = \{user} -> do
+    todos <- pendingFor user
+    yield Ok {value: todos}
   AddTodo = \{title, owner, priority} -> do
     atomic (add title owner priority)
-    yield {ok: True {}}
+    yield Ok {value: {ok: True {}}}
   AssignTodo = \{title, owner, person} -> do
     atomic (assign title owner person)
-    yield {ok: True {}}
+    yield Ok {value: {ok: True {}}}
   ResolveTodo = \{title, owner, msg} -> do
     atomic (resolve title owner msg)
-    yield {ok: True {}}
-  GetWorkload = \{} -> &workload
+    yield Ok {value: {ok: True {}}}
+  GetWorkload = \{} -> do
+    w <- &workload
+    yield Ok {value: w}
 
 main = listen 8080 api
 ```

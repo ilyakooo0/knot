@@ -731,16 +731,35 @@ route Api = TodoApi | AdminApi
 
 -- Handler
 api = serve Api where
-  GetTodos = \{owner} -> getTodos owner
-  CreateTodo = \{title, owner} -> addTodo title owner
+  GetTodos = \{owner} -> do
+    todos <- getTodos owner
+    yield Ok {value: todos}
+  CreateTodo = \{title, owner} -> do
+    todo <- addTodo title owner
+    yield Ok {value: todo}
   GetCount = \{} -> do
     todos <- *todos
-    yield (count todos)
+    yield Ok {value: count todos}
 
 main = listen 8080 api
 ```
 
-`serve API where` produces a value of type `Server API`. Each handler takes the request record and returns the response type declared on the endpoint.
+`serve API where` produces a value of type `Server API`. Each handler takes the request record and returns `Result HttpError T`, where `T` is the response type declared on the endpoint and `HttpError = {status: Int, message: Text}`.
+
+### HTTP Status Codes
+
+`Ok {value: v}` responds 200 with `v` as JSON. `Err {error: {status, message}}` responds with the given status code and a JSON error body:
+
+```knot
+api = serve Api where
+  GetUser = \{id} -> do
+    users <- *people
+    case filter (\u -> u.id == id) users of
+      [] -> yield Err {error: {status: 404, message: "user not found"}}
+      [u | _] -> yield Ok {value: u}
+```
+
+Status is clamped to `100..=599`. The runtime emits `400` for path/query/body parsing failures and refinement violations, and `404` for unmatched routes — only return `Err` for application-level errors.
 
 ### Typed Headers
 
@@ -764,9 +783,9 @@ Request headers become constructor fields. When response headers are declared, t
 api = serve Api where
   GetTodos = \{authorization} -> do
     let todos = allTodos
-    yield {body: todos, headers: {xTotalCount: length todos}}
+    yield Ok {value: {body: todos, headers: {xTotalCount: length todos}}}
   CreateTodo = \{title, authorization} ->
-    yield {body: addTodo title, headers: {}}
+    yield Ok {value: {body: addTodo title, headers: {}}}
 ```
 
 Optional headers use `Maybe`:

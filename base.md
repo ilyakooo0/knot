@@ -404,6 +404,8 @@ listen : Int -> Server a -> IO {network} {}
 ```
 Start an HTTP server on the given port. The second argument is a `Server a` value, typically built with the `serve API where ...` expression. Has the `{network}` effect. See `route` declarations in the language spec for defining typed endpoints and the `serve` form for binding handlers.
 
+Handlers return `Result HttpError T` where `HttpError = {status: Int, message: Text}` and `T` is the response type declared on the route. `Ok {value: T}` responds with HTTP 200; `Err {error: {status, message}}` responds with the given status code (clamped to 100..=599) and a JSON `{"error": message}` body — use this for application-level errors like 404 not found or 401 unauthorized.
+
 ## Concurrency
 
 ```knot

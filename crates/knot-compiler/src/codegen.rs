@@ -406,9 +406,9 @@ fn classify_required_constant_type(
 
 /// Render a constant's default-value expression as a short string for
 /// `--help` output. Only handles simple, unambiguous shapes: literals,
-/// negated numeric literals, `Nothing {}`, and `Just {value: <literal>}`.
-/// Returns `None` for anything else (the help text will fall back to a
-/// generic placeholder).
+/// negated numeric literals, `True {}`/`False {}`, `Nothing {}`, and
+/// `Just {value: <literal>}`. Returns `None` for anything else (the help
+/// text will fall back to a generic placeholder).
 fn format_default_value_display(expr: &ast::Expr) -> Option<String> {
     match &expr.node {
         ast::ExprKind::Lit(lit) => format_literal_display(lit),
@@ -422,10 +422,19 @@ fn format_default_value_display(expr: &ast::Expr) -> Option<String> {
         ast::ExprKind::Constructor(name) if name == "Nothing" => {
             Some("Nothing".to_string())
         }
+        ast::ExprKind::Constructor(name) if name == "True" => Some("true".to_string()),
+        ast::ExprKind::Constructor(name) if name == "False" => Some("false".to_string()),
         ast::ExprKind::App { func, arg } => {
             if let ast::ExprKind::Constructor(name) = &func.node {
                 if name == "Nothing" {
                     return Some("Nothing".to_string());
+                }
+                if name == "True" || name == "False" {
+                    if let ast::ExprKind::Record(fields) = &arg.node {
+                        if fields.is_empty() {
+                            return Some(if name == "True" { "true" } else { "false" }.to_string());
+                        }
+                    }
                 }
                 if name == "Just" {
                     // `Just {value: <lit>}` — Knot constructors take a record.

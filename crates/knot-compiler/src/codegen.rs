@@ -161,6 +161,13 @@ pub struct Codegen {
     // Overridable constants: name -> type string ("Int", "Float", "Text", "Bool")
     overridable_constants: HashMap<String, String>,
 
+    // Default-value display strings for overridable constants whose body is a
+    // simple, displayable expression (literal, negated literal, Just/Nothing).
+    // Used by `--help` to show the actual default rather than a generic
+    // "default from source" placeholder. Constants with complex bodies are
+    // absent from this map.
+    overridable_defaults: HashMap<String, String>,
+
     // Compile-time constant overrides: name -> raw string value (parsed during codegen)
     compile_time_overrides: HashMap<String, String>,
 
@@ -397,6 +404,58 @@ fn classify_required_constant_type(
     }
 }
 
+/// Render a constant's default-value expression as a short string for
+/// `--help` output. Only handles simple, unambiguous shapes: literals,
+/// negated numeric literals, `Nothing {}`, and `Just {value: <literal>}`.
+/// Returns `None` for anything else (the help text will fall back to a
+/// generic placeholder).
+fn format_default_value_display(expr: &ast::Expr) -> Option<String> {
+    match &expr.node {
+        ast::ExprKind::Lit(lit) => format_literal_display(lit),
+        ast::ExprKind::UnaryOp { op: ast::UnaryOp::Neg, operand } => {
+            if let ast::ExprKind::Lit(lit) = &operand.node {
+                format_literal_display(lit).map(|s| format!("-{}", s))
+            } else {
+                None
+            }
+        }
+        ast::ExprKind::Constructor(name) if name == "Nothing" => {
+            Some("Nothing".to_string())
+        }
+        ast::ExprKind::App { func, arg } => {
+            if let ast::ExprKind::Constructor(name) = &func.node {
+                if name == "Nothing" {
+                    return Some("Nothing".to_string());
+                }
+                if name == "Just" {
+                    // `Just {value: <lit>}` — Knot constructors take a record.
+                    if let ast::ExprKind::Record(fields) = &arg.node {
+                        if fields.len() == 1 && fields[0].name == "value" {
+                            return format_default_value_display(&fields[0].value)
+                                .map(|s| format!("Just {}", s));
+                        }
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn format_literal_display(lit: &ast::Literal) -> Option<String> {
+    match lit {
+        ast::Literal::Int(s) => Some(s.clone()),
+        ast::Literal::Float(f) => Some(format!("{}", f)),
+        ast::Literal::Text(s) => {
+            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            Some(format!("\"{}\"", escaped))
+        }
+        ast::Literal::Bool(b) => Some(if *b { "true" } else { "false" }.to_string()),
+        ast::Literal::Bytes(_) => None,
+    }
+}
+
 // ── Public API ────────────────────────────────────────────────────
 
 pub fn compile(
@@ -502,7 +561,7 @@ pub fn compile(
     }
     // Compute overridable constants: 0-param Fun declarations with scalar types
     for decl in &module.decls {
-        if let ast::DeclKind::Fun { name, body: Some(_), .. } = &decl.node {
+        if let ast::DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
             if name == "main" {
                 continue;
             }
@@ -512,6 +571,9 @@ pub fn compile(
                         "Int" | "Float" | "Text" | "Bool"
                         | "Maybe Int" | "Maybe Float" | "Maybe Text" | "Maybe Bool" => {
                             cg.overridable_constants.insert(name.clone(), ty_str.clone());
+                            if let Some(disp) = format_default_value_display(body) {
+                                cg.overridable_defaults.insert(name.clone(), disp);
+                            }
                         }
                         _ => {}
                     }
@@ -652,6 +714,7 @@ impl Codegen {
             io_functions: HashSet::new(),
             scalar_sources: HashSet::new(),
             overridable_constants: HashMap::new(),
+            overridable_defaults: HashMap::new(),
             compile_time_overrides: HashMap::new(),
             required_constants: Vec::new(),
             in_io_eager: false,
@@ -3440,7 +3503,13 @@ impl Codegen {
             builder.ins().call(http_init_ref, &[]);
 
             // Check --help for overridable constants (exclude compile-time overrides).
-            // Entry format is `name:type` (default-from-source) or `name:type:!` (required).
+            // Entry format:
+            //   `name:type:!`           — required (no default)
+            //   `name:type:=<value>`    — has displayable default (escape `\` and `,`
+            //                             as `\\` and `\c` so the entry separator is
+            //                             unambiguous; colons inside the value are
+            //                             preserved by `splitn(3, ':')` at runtime)
+            //   `name:type`             — has default but not displayable
             let required_names: HashSet<String> = cg
                 .required_constants
                 .iter()
@@ -3452,6 +3521,9 @@ impl Codegen {
                     .map(|(name, ty)| {
                         if required_names.contains(name) {
                             format!("{}:{}:!", name, ty)
+                        } else if let Some(def) = cg.overridable_defaults.get(name) {
+                            let escaped = def.replace('\\', "\\\\").replace(',', "\\c");
+                            format!("{}:{}:={}", name, ty, escaped)
                         } else {
                             format!("{}:{}", name, ty)
                         }

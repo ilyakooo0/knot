@@ -1664,9 +1664,47 @@ pub extern "C" fn knot_override_refinement_check(
     }
 }
 
+/// Decode a default-value string emitted by the compiler.
+///
+/// The compiler escapes `\` as `\\` and `,` as `\c` so the entry
+/// separator stays unambiguous. Anything else passes through.
+fn decode_default_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('\\') => out.push('\\'),
+                Some('c') => out.push(','),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Per-entry kind decoded from the help descriptor.
+enum DefaultKind {
+    /// `name:type:!` — body-less constant; must be supplied on the CLI.
+    Required,
+    /// `name:type:=<value>` — has an in-source default we can display.
+    Default(String),
+    /// `name:type` — has a default but it isn't a literal we can render.
+    OpaqueDefault,
+}
+
 /// Check for `--help` and print available constant overrides.
 ///
-/// `desc` is a compile-time string like `"port:Int,name:Text"`.
+/// `desc` is a compile-time string. Each comma-separated entry is one of:
+///   `name:type:!`           (required CLI arg)
+///   `name:type:=<value>`    (overridable, default from source)
+///   `name:type`             (overridable, default not displayable)
 /// If `--help` is found, prints usage and exits.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_override_check_help(desc_ptr: *const u8, desc_len: usize) {
@@ -1678,14 +1716,19 @@ pub extern "C" fn knot_override_check_help(desc_ptr: *const u8, desc_len: usize)
     let desc = unsafe { str_from_raw(desc_ptr, desc_len) };
     let exe = std::env::args().next().unwrap_or_else(|| "program".to_string());
 
-    // Each entry is `name:type` (with an in-source default) or `name:type:!` (required).
-    let mut overrides: Vec<(&str, &str, bool)> = Vec::new();
+    let mut overrides: Vec<(&str, &str, DefaultKind)> = Vec::new();
     if !desc.is_empty() {
         for entry in desc.split(',') {
             let mut parts = entry.splitn(3, ':');
             if let (Some(name), Some(ty)) = (parts.next(), parts.next()) {
-                let required = parts.next() == Some("!");
-                overrides.push((name, ty, required));
+                let kind = match parts.next() {
+                    Some("!") => DefaultKind::Required,
+                    Some(rest) if rest.starts_with('=') => {
+                        DefaultKind::Default(decode_default_value(&rest[1..]))
+                    }
+                    _ => DefaultKind::OpaqueDefault,
+                };
+                overrides.push((name, ty, kind));
             }
         }
     }
@@ -1702,8 +1745,12 @@ pub extern "C" fn knot_override_check_help(desc_ptr: *const u8, desc_len: usize)
         "  --http-max-body-bytes=N    Cap HTTP request and response bodies (suffixes: K, M, G; default 16M)"
     );
 
-    for (name, ty, required) in &overrides {
-        let label = if *required { "(required)" } else { "(default from source)" };
+    for (name, ty, kind) in &overrides {
+        let label = match kind {
+            DefaultKind::Required => "(required)".to_string(),
+            DefaultKind::Default(v) => format!("(default: {})", v),
+            DefaultKind::OpaqueDefault => "(default from source)".to_string(),
+        };
         eprintln!("  --{:<24} {} {}", name, ty, label);
     }
 

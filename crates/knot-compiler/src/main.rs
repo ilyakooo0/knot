@@ -20,14 +20,39 @@ fn main() {
         "build" => {
             if args.len() < 3 {
                 eprintln!("Error: missing source file");
-                eprintln!("Usage: knotc build <file.knot> [--name=value ...]");
+                eprintln!("Usage: knotc build <file.knot> [-o <path>] [--name=value ...]");
                 process::exit(1);
             }
-            // Parse compile-time overrides from remaining args (--name=value or --name value)
+            // Parse -o/--output and compile-time overrides from remaining args
             let mut overrides = HashMap::new();
+            let mut output: Option<PathBuf> = None;
             let mut i = 3;
             while i < args.len() {
-                if let Some(rest) = args[i].strip_prefix("--") {
+                if args[i] == "-o" {
+                    if i + 1 >= args.len() {
+                        eprintln!("Error: missing value for -o");
+                        process::exit(1);
+                    }
+                    output = Some(PathBuf::from(&args[i + 1]));
+                    i += 2;
+                } else if let Some(val) = args[i].strip_prefix("-o=") {
+                    output = Some(PathBuf::from(val));
+                    i += 1;
+                } else if let Some(rest) = args[i].strip_prefix("--") {
+                    if rest == "output" {
+                        if i + 1 >= args.len() {
+                            eprintln!("Error: missing value for --output");
+                            process::exit(1);
+                        }
+                        output = Some(PathBuf::from(&args[i + 1]));
+                        i += 2;
+                        continue;
+                    }
+                    if let Some(val) = rest.strip_prefix("output=") {
+                        output = Some(PathBuf::from(val));
+                        i += 1;
+                        continue;
+                    }
                     if let Some((name, val)) = rest.split_once('=') {
                         overrides.insert(name.to_string(), val.to_string());
                     } else if i + 1 < args.len() && !args[i + 1].starts_with("--") {
@@ -37,13 +62,13 @@ fn main() {
                         eprintln!("Error: missing value for --{}", rest);
                         process::exit(1);
                     }
+                    i += 1;
                 } else {
                     eprintln!("Error: unexpected argument '{}'", args[i]);
                     process::exit(1);
                 }
-                i += 1;
             }
-            cmd_build(&args[2], &overrides);
+            cmd_build(&args[2], output.as_deref(), &overrides);
         }
         "fmt" => {
             cmd_fmt(&args[2..]);
@@ -61,9 +86,9 @@ fn print_usage() {
     eprintln!("Knot compiler");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  knotc build <file.knot> [--name=value ...]   Compile with optional constant overrides");
-    eprintln!("  knotc fmt [--check] [--stdout] <file.knot>   Format a source file in place");
-    eprintln!("  knotc help                                   Show this help message");
+    eprintln!("  knotc build <file.knot> [-o <path>] [--name=value ...]  Compile with optional output path and constant overrides");
+    eprintln!("  knotc fmt [--check] [--stdout] <file.knot>              Format a source file in place");
+    eprintln!("  knotc help                                              Show this help message");
 }
 
 fn cmd_fmt(args: &[String]) {
@@ -150,7 +175,7 @@ fn cmd_fmt(args: &[String]) {
     }
 }
 
-fn cmd_build(source_file: &str, overrides: &HashMap<String, String>) {
+fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overrides: &HashMap<String, String>) {
     let source_path = PathBuf::from(source_file);
 
     // Read source
@@ -291,7 +316,9 @@ fn cmd_build(source_file: &str, overrides: &HashMap<String, String>) {
     let runtime_path = find_runtime();
 
     // Link
-    let output_path = source_path.with_extension("");
+    let output_path = output_override
+        .map(PathBuf::from)
+        .unwrap_or_else(|| source_path.with_extension(""));
     if let Err(e) = linker::link(&obj_path, &runtime_path, &output_path) {
         eprintln!("Link error: {}", e);
         let _ = std::fs::remove_file(&obj_path);

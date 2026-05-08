@@ -6,7 +6,7 @@ type Todo = {title: Text, owner: Text, priority: Priority}
 
 route TodoApi where
   /todos
-    GET /{owner: Text} -> [Todo] = GetTodos
+    GET /{owner: Text} headers {xForwardedFor: Maybe Text} -> [Todo] = GetTodos
     POST {title: Text, owner: Text, priority: Text} / -> Todo = CreateTodo
 
 route AdminApi where
@@ -28,7 +28,10 @@ getTodos = \owner -> do
   yield result
 
 api = serve Api where
-  GetTodos = \{owner} -> do
+  GetTodos = \{owner, xForwardedFor} -> do
+    case xForwardedFor of
+      Just {value: ip} -> logInfo ("GetTodos from " ++ ip)
+      Nothing {} -> logInfo "GetTodos (no proxy header)"
     todos <- getTodos owner
     if (count todos) == 0 then
       yield Err {error: {status: 404, message: "no todos found for owner"}}

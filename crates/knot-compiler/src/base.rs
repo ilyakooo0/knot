@@ -85,6 +85,11 @@ min = \a b -> if a < b then a else b
 
 max : Ord a => a -> a -> a
 max = \a b -> if a > b then a else b
+
+head : [a] -> Maybe a
+head = \items -> case items of
+  Cons x _ -> Just {value: x}
+  [] -> Nothing {}
 "#;
 
 /// Parse the prelude source and prepend its declarations to the user's module.

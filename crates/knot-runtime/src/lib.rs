@@ -3739,6 +3739,22 @@ pub extern "C" fn knot_relation_sort_by(
     alloc(Value::Relation(sorted))
 }
 
+/// Drop the first element of a relation, returning the rest.
+/// Used by `Cons head tail` pattern matching for the tail binding.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_tail(rel: *mut Value) -> *mut Value {
+    match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => {
+            if rows.is_empty() {
+                alloc(Value::Relation(vec![]))
+            } else {
+                alloc(Value::Relation(rows[1..].to_vec()))
+            }
+        }
+        _ => panic!("knot runtime: expected Relation in tail, got {}", type_name(rel)),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_relation_get(rel: *mut Value, index: usize) -> *mut Value {
     match unsafe { as_ref(rel) } {

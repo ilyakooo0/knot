@@ -193,6 +193,13 @@ fn format_pat_brief_d(pat: &ast::PatKind, depth: usize) -> String {
             let parts: Vec<String> = pats.iter().map(|p| format_pat_brief_d(&p.node, d)).collect();
             format!("[{}]", parts.join(", "))
         }
+        ast::PatKind::Cons { head, tail } => {
+            format!(
+                "Cons {} {}",
+                format_pat_brief_d(&head.node, d),
+                format_pat_brief_d(&tail.node, d)
+            )
+        }
     }
 }
 

@@ -995,6 +995,9 @@ pub(crate) fn pat_to_simple_name(pat: &ast::PatKind) -> String {
             let parts: Vec<String> = pats.iter().map(|p| pat_to_simple_name(&p.node)).collect();
             format!("[{}]", parts.join(", "))
         }
+        ast::PatKind::Cons { head, tail } => {
+            format!("Cons {} {}", pat_to_simple_name(&head.node), pat_to_simple_name(&tail.node))
+        }
         ast::PatKind::Lit(_) => "_".into(),
     }
 }

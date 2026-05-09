@@ -420,6 +420,10 @@ fn walk_pat(p: &Pat, r: &mut Refs) {
                 walk_pat(it, r);
             }
         }
+        PatKind::Cons { head, tail } => {
+            walk_pat(head, r);
+            walk_pat(tail, r);
+        }
     }
 }
 

@@ -3022,6 +3022,23 @@ impl Parser {
             TokenKind::Upper(_) => {
                 let tok = self.advance();
                 let TokenKind::Upper(name) = tok.kind else { unreachable!() };
+                // `Cons head tail` — non-empty relation pattern (reserved name).
+                if name == "Cons" && self.can_start_pat_atom() {
+                    let head = self.parse_pat_atom()?;
+                    if !self.can_start_pat_atom() {
+                        self.error("expected tail pattern after 'Cons head'");
+                        return None;
+                    }
+                    let tail = self.parse_pat_atom()?;
+                    let span = Span::new(start.start, tail.span.end);
+                    return Some(Spanned::new(
+                        PatKind::Cons {
+                            head: Box::new(head),
+                            tail: Box::new(tail),
+                        },
+                        span,
+                    ));
+                }
                 // Constructor pattern: Upper payload
                 // Payload can be a record pattern `{...}` or a variable.
                 let payload = if self.can_start_pat_atom() {

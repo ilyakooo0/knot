@@ -1351,6 +1351,25 @@ fn list_pattern() {
     }
 }
 
+#[test]
+fn cons_pattern() {
+    let src = "x = case xs of\n  [] -> 0\n  Cons h t -> h";
+    match fun_body(src) {
+        ExprKind::Case { arms, .. } => {
+            assert_eq!(arms.len(), 2);
+            assert!(matches!(&arms[0].pat.node, PatKind::List(ps) if ps.is_empty()));
+            match &arms[1].pat.node {
+                PatKind::Cons { head, tail } => {
+                    assert!(matches!(&head.node, PatKind::Var(n) if n == "h"));
+                    assert!(matches!(&tail.node, PatKind::Var(n) if n == "t"));
+                }
+                other => panic!("expected Cons pattern, got {:?}", other),
+            }
+        }
+        other => panic!("expected Case, got {:?}", other),
+    }
+}
+
 // ── Multiple Declarations ───────────────────────────────────────────
 
 #[test]

@@ -294,6 +294,10 @@ impl DefResolver {
                     self.define_pat(p);
                 }
             }
+            ast::PatKind::Cons { head, tail } => {
+                self.define_pat(head);
+                self.define_pat(tail);
+            }
             ast::PatKind::Wildcard | ast::PatKind::Lit(_) => {}
         }
     }

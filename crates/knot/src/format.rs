@@ -1842,6 +1842,9 @@ fn render_pat(p: &Pat) -> String {
             s.push(']');
             s
         }
+        PatKind::Cons { head, tail } => {
+            format!("Cons {} {}", render_pat(head), render_pat(tail))
+        }
     }
 }
 

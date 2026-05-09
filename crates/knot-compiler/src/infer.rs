@@ -3852,6 +3852,13 @@ impl Infer {
                 let list_ty = Ty::Relation(Box::new(elem_ty));
                 self.unify(expected, &list_ty, pat.span);
             }
+            ast::PatKind::Cons { head, tail } => {
+                let elem_ty = self.fresh();
+                let rel_ty = Ty::Relation(Box::new(elem_ty.clone()));
+                self.unify(expected, &rel_ty, pat.span);
+                self.check_pattern(head, &elem_ty);
+                self.check_pattern(tail, &rel_ty);
+            }
         }
     }
 
@@ -4060,6 +4067,34 @@ impl Infer {
                             span,
                         );
                     }
+                }
+            }
+            // Relations: exhaustive iff `[]` and `Cons _ _` are both
+            // covered (or a wildcard is present, handled above).
+            Ty::Relation(_) => {
+                let has_empty = arms.iter().any(|arm| matches!(
+                    &arm.pat.node,
+                    ast::PatKind::List(items) if items.is_empty()
+                ));
+                let has_cons = arms.iter().any(|arm| matches!(
+                    &arm.pat.node,
+                    ast::PatKind::Cons { .. }
+                ));
+                let mut missing: Vec<&str> = Vec::new();
+                if !has_empty {
+                    missing.push("[]");
+                }
+                if !has_cons {
+                    missing.push("Cons head tail");
+                }
+                if !missing.is_empty() {
+                    self.error(
+                        format!(
+                            "non-exhaustive pattern match — missing: {}",
+                            missing.join(", "),
+                        ),
+                        span,
+                    );
                 }
             }
             // Primitives (Int, Text, etc.) have infinite domains.

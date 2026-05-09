@@ -1,0 +1,16 @@
+-- Pattern-matching on relations with `[]` and `Cons head tail`.
+
+sumList = \xs -> case xs of
+  [] -> 0
+  Cons h t -> h + sumList t
+
+firstOr = \xs default -> case xs of
+  [] -> default
+  Cons h _ -> h
+
+main = do
+  println (show (sumList [1, 2, 3, 4]))
+  println (show (sumList []))
+  println (show (firstOr [10, 20, 30] 0))
+  println (show (firstOr [] 99))
+  yield {}

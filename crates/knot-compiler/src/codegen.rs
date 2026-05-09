@@ -777,6 +777,7 @@ impl Codegen {
         self.declare_rt("knot_relation_push", &[p, p], &[]);
         self.declare_rt("knot_relation_len", &[p], &[p]);
         self.declare_rt("knot_relation_get", &[p, p], &[p]);
+        self.declare_rt("knot_relation_tail", &[p], &[p]);
         self.declare_rt("knot_relation_union", &[p, p, p], &[p]);
 
         // Binary operations
@@ -6489,6 +6490,19 @@ impl Codegen {
                         &[],
                     );
                 }
+                ast::PatKind::Cons { .. } => {
+                    // Match any non-empty relation: len > 0.
+                    let len = self.call_rt(builder, "knot_relation_len", &[scrut]);
+                    let is_match =
+                        builder.ins().icmp_imm(IntCC::NotEqual, len, 0);
+                    builder.ins().brif(
+                        is_match,
+                        arm_block,
+                        &[],
+                        next_block,
+                        &[],
+                    );
+                }
                 ast::PatKind::Record(_) => {
                     // Record patterns always match (no top-level guard)
                     builder.ins().jump(arm_block, &[]);
@@ -6578,6 +6592,15 @@ impl Codegen {
                         self.call_rt(builder, "knot_relation_get", &[val, index]);
                     self.bind_case_pattern(builder, elem_pat, elem, env);
                 }
+            }
+            ast::PatKind::Cons { head, tail } => {
+                let zero = builder.ins().iconst(self.ptr_type, 0);
+                let head_val =
+                    self.call_rt(builder, "knot_relation_get", &[val, zero]);
+                let tail_val =
+                    self.call_rt(builder, "knot_relation_tail", &[val]);
+                self.bind_case_pattern(builder, head, head_val, env);
+                self.bind_case_pattern(builder, tail, tail_val, env);
             }
         }
     }
@@ -7184,6 +7207,15 @@ impl Codegen {
                         self.call_rt(builder, "knot_relation_get", &[val, index]);
                     self.bind_io_pattern(builder, elem_pat, elem, env, done_block);
                 }
+            }
+            ast::PatKind::Cons { head, tail } => {
+                let zero = builder.ins().iconst(self.ptr_type, 0);
+                let head_val =
+                    self.call_rt(builder, "knot_relation_get", &[val, zero]);
+                let tail_val =
+                    self.call_rt(builder, "knot_relation_tail", &[val]);
+                self.bind_io_pattern(builder, head, head_val, env, done_block);
+                self.bind_io_pattern(builder, tail, tail_val, env, done_block);
             }
         }
     }
@@ -11074,6 +11106,10 @@ fn collect_pat_binds(pat: &ast::Pat, bound: &mut HashSet<String>) {
                 collect_pat_binds(p, bound);
             }
         }
+        ast::PatKind::Cons { head, tail } => {
+            collect_pat_binds(head, bound);
+            collect_pat_binds(tail, bound);
+        }
         ast::PatKind::Wildcard | ast::PatKind::Lit(_) => {}
     }
 }
@@ -11087,6 +11123,7 @@ fn pat_binds(pat: &ast::Pat, name: &str) -> bool {
             None => f.name == name,
         }),
         ast::PatKind::List(items) => items.iter().any(|p| pat_binds(p, name)),
+        ast::PatKind::Cons { head, tail } => pat_binds(head, name) || pat_binds(tail, name),
         ast::PatKind::Wildcard | ast::PatKind::Lit(_) => false,
     }
 }
@@ -11100,6 +11137,9 @@ fn pat_captures(pat: &ast::Pat, free_vars: &HashSet<String>) -> bool {
             None => free_vars.contains(&f.name),
         }),
         ast::PatKind::List(items) => items.iter().any(|p| pat_captures(p, free_vars)),
+        ast::PatKind::Cons { head, tail } => {
+            pat_captures(head, free_vars) || pat_captures(tail, free_vars)
+        }
         ast::PatKind::Wildcard | ast::PatKind::Lit(_) => false,
     }
 }
@@ -11773,6 +11813,25 @@ fn bind_do_pattern(
                 bind_do_pattern(builder, cg, elem_pat, elem, env, skips);
             }
         }
+        ast::PatKind::Cons { head, tail } => {
+            // Filter: only non-empty relations continue.
+            let len = cg.call_rt(builder, "knot_relation_len", &[val]);
+            let is_match = builder.ins().icmp_imm(IntCC::NotEqual, len, 0);
+
+            let then_block = builder.create_block();
+            let skip_block = builder.create_block();
+            builder.ins().brif(is_match, then_block, &[], skip_block, &[]);
+
+            builder.switch_to_block(then_block);
+            builder.seal_block(then_block);
+            skips.push(skip_block);
+
+            let zero = builder.ins().iconst(cg.ptr_type, 0);
+            let head_val = cg.call_rt(builder, "knot_relation_get", &[val, zero]);
+            let tail_val = cg.call_rt(builder, "knot_relation_tail", &[val]);
+            bind_do_pattern(builder, cg, head, head_val, env, skips);
+            bind_do_pattern(builder, cg, tail, tail_val, env, skips);
+        }
     }
 }
 
@@ -12013,6 +12072,10 @@ fn collect_pat_bindings_set<'a>(pat: &'a ast::Pat, bound: &mut HashSet<&'a str>)
                 collect_pat_bindings_set(p, bound);
             }
         }
+        ast::PatKind::Cons { head, tail } => {
+            collect_pat_bindings_set(head, bound);
+            collect_pat_bindings_set(tail, bound);
+        }
     }
 }
 
@@ -12157,6 +12220,9 @@ fn pretty_pat(pat: &ast::Pat) -> String {
         ast::PatKind::List(pats) => {
             let ps: Vec<String> = pats.iter().map(pretty_pat).collect();
             format!("[{}]", ps.join(", "))
+        }
+        ast::PatKind::Cons { head, tail } => {
+            format!("Cons {} {}", pretty_pat(head), pretty_pat(tail))
         }
     }
 }

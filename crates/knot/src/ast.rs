@@ -375,6 +375,10 @@ pub enum PatKind {
 
     /// `[]`, `[{name: n}]` — relation/list pattern.
     List(Vec<Pat>),
+
+    /// `Cons head tail` — non-empty relation pattern. `head` binds the
+    /// first element, `tail` binds the remainder as a relation.
+    Cons { head: Box<Pat>, tail: Box<Pat> },
 }
 
 /// A field in a record pattern.

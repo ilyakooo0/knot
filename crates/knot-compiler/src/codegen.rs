@@ -938,7 +938,7 @@ impl Codegen {
         self.declare_rt("knot_relation_traverse", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_single", &[p], &[p]);
         self.declare_rt("knot_relation_any", &[p], &[p]);
-        self.declare_rt("knot_relation_all", &[p, p, p], &[p]);
+        self.declare_rt("knot_relation_all", &[p], &[p]);
         self.declare_rt("knot_relation_diff", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_inter", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_sum", &[p, p, p], &[p]);
@@ -2324,6 +2324,7 @@ impl Codegen {
         // 1-param: direct delegation to runtime
         self.define_stdlib_fn_1("single", "knot_relation_single");
         self.define_stdlib_fn_1("any", "knot_relation_any");
+        self.define_stdlib_fn_1("all", "knot_relation_all");
         self.define_stdlib_fn_1("toUpper", "knot_text_to_upper");
         self.define_stdlib_fn_1("toLower", "knot_text_to_lower");
         self.define_stdlib_fn_1("length", "knot_text_length");
@@ -2350,7 +2351,6 @@ impl Codegen {
         self.define_stdlib_fn_2("min", "knot_relation_min", true);
         self.define_stdlib_fn_2("max", "knot_relation_max", true);
         self.define_stdlib_fn_2("countWhere", "knot_relation_count_where", true);
-        self.define_stdlib_fn_2("all", "knot_relation_all", true);
 
         // Bytes: 1-param
         self.define_stdlib_fn_1("bytesLength", "knot_bytes_length");

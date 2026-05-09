@@ -5967,14 +5967,10 @@ fn wrap_ok_or_just(tag: &str, values: Vec<*mut Value>) -> *mut Value {
     alloc(Value::Constructor(tag.into(), rec))
 }
 
-/// all(rel, pred) — returns true if `pred(row)` is true for every row.
+/// all(rel) — returns true if every Bool element in the relation is true.
 /// Empty relation returns true (vacuous truth).
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_all(
-    db: *mut c_void,
-    rel: *mut Value,
-    pred: *mut Value,
-) -> *mut Value {
+pub extern "C" fn knot_relation_all(rel: *mut Value) -> *mut Value {
     let rows = match unsafe { as_ref(rel) } {
         Value::Relation(rows) => rows,
         Value::Unit => return alloc_bool(true),
@@ -5984,11 +5980,13 @@ pub extern "C" fn knot_relation_all(
         ),
     };
     for &row in rows {
-        let v = knot_value_call(db, pred, row);
-        match unsafe { as_ref(v) } {
+        match unsafe { as_ref(row) } {
             Value::Bool(true) => {}
             Value::Bool(false) => return alloc_bool(false),
-            _ => panic!("knot runtime: all predicate must return Bool"),
+            _ => panic!(
+                "knot runtime: all expected Bool elements, got {}",
+                type_name(row)
+            ),
         }
     }
     alloc_bool(true)

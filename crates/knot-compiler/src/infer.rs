@@ -5441,23 +5441,14 @@ impl Infer {
             )),
         );
 
-        // all : ∀a. [a] -> (a -> Bool) -> Bool
-        {
-            let a = self.fresh_var();
-            self.bind_top(
-                "all",
-                Scheme::poly(
-                    vec![a],
-                    Ty::Fun(
-                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                        Box::new(Ty::Fun(
-                            Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Bool))),
-                            Box::new(Ty::Bool),
-                        )),
-                    ),
-                ),
-            );
-        }
+        // all : [Bool] -> Bool
+        self.bind_top(
+            "all",
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Relation(Box::new(Ty::Bool))),
+                Box::new(Ty::Bool),
+            )),
+        );
 
         // toUpper : Text -> Text
         self.bind_top(

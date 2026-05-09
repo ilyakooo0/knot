@@ -1765,6 +1765,55 @@ impl Infer {
         }
     }
 
+    /// Skolemise a scheme's quantified type variables: each `vars` entry
+    /// becomes a fresh rigid TyVar registered in `self.skolems`. Used when
+    /// checking a function body against its explicit type annotation, so the
+    /// body cannot silently narrow the signature's polymorphism by binding
+    /// the quantified variables to concrete types. The returned skolems must
+    /// be removed from `self.skolems` once the body check completes.
+    /// Unit vars are freshened as in `instantiate_at` (no unit-skolem
+    /// mechanism exists yet); deferred constraints follow the new skolems.
+    fn skolemise_scheme(
+        &mut self,
+        scheme: &Scheme,
+        span: Span,
+    ) -> (Ty, Vec<TyVar>) {
+        if scheme.vars.is_empty() && scheme.unit_vars.is_empty() {
+            return (scheme.ty.clone(), Vec::new());
+        }
+        let mut fresh_skolems: Vec<TyVar> = Vec::with_capacity(scheme.vars.len());
+        let mut mapping: HashMap<TyVar, Ty> = HashMap::new();
+        for v in &scheme.vars {
+            let s = self.fresh_var();
+            self.skolems.insert(s);
+            fresh_skolems.push(s);
+            mapping.insert(*v, Ty::Var(s));
+        }
+        for c in &scheme.constraints {
+            let target_var = match mapping.get(&c.type_var) {
+                Some(Ty::Var(new_var)) => *new_var,
+                _ => c.type_var,
+            };
+            self.deferred_constraints.push(DeferredConstraint {
+                trait_name: c.trait_name.clone(),
+                type_var: target_var,
+                span,
+            });
+        }
+        let ty = self.subst_ty(&scheme.ty, &mapping);
+        let ty = if scheme.unit_vars.is_empty() {
+            ty
+        } else {
+            let unit_mapping: HashMap<UnitVar, UnitVar> = scheme
+                .unit_vars
+                .iter()
+                .map(|v| (*v, self.fresh_unit_var()))
+                .collect();
+            self.subst_unit_vars_in_ty(&ty, &unit_mapping)
+        };
+        (ty, fresh_skolems)
+    }
+
     /// Substitute type variables according to a mapping (for instantiation).
     fn subst_ty(&self, ty: &Ty, mapping: &HashMap<TyVar, Ty>) -> Ty {
         match ty {
@@ -2222,11 +2271,6 @@ impl Infer {
             }
         }
         None
-    }
-
-    fn lookup_instantiate(&mut self, name: &str) -> Option<Ty> {
-        let scheme = self.lookup(name)?.clone();
-        Some(self.instantiate(&scheme))
     }
 
     fn lookup_instantiate_at(
@@ -5962,11 +6006,17 @@ impl Infer {
             match &decl.node {
                 ast::DeclKind::Fun { name, body, ty, .. } => {
                     if let Some(body) = body {
-                        let expected =
-                            self.lookup_instantiate(name).unwrap_or_else(|| {
-                                self.fresh()
-                            });
+                        let scheme = self.lookup(name).cloned();
+                        let (expected, fresh_skolems) = match scheme {
+                            Some(scheme) => {
+                                self.skolemise_scheme(&scheme, body.span)
+                            }
+                            None => (self.fresh(), Vec::new()),
+                        };
                         self.check_expr(body, &expected);
+                        for s in &fresh_skolems {
+                            self.skolems.remove(s);
+                        }
                         let inferred = self.apply(&expected);
 
                         // Remove the old monomorphic binding before

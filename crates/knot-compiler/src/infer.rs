@@ -5432,23 +5432,41 @@ impl Infer {
             ),
         );
 
-        // any : [Bool] -> Bool
-        self.bind_top(
-            "any",
-            Scheme::mono(Ty::Fun(
-                Box::new(Ty::Relation(Box::new(Ty::Bool))),
-                Box::new(Ty::Bool),
-            )),
-        );
+        // any : ∀a. (a -> Bool) -> [a] -> Bool
+        {
+            let a = self.fresh_var();
+            self.bind_top(
+                "any",
+                Scheme::poly(
+                    vec![a],
+                    Ty::Fun(
+                        Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Bool))),
+                        Box::new(Ty::Fun(
+                            Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                            Box::new(Ty::Bool),
+                        )),
+                    ),
+                ),
+            );
+        }
 
-        // all : [Bool] -> Bool
-        self.bind_top(
-            "all",
-            Scheme::mono(Ty::Fun(
-                Box::new(Ty::Relation(Box::new(Ty::Bool))),
-                Box::new(Ty::Bool),
-            )),
-        );
+        // all : ∀a. (a -> Bool) -> [a] -> Bool
+        {
+            let a = self.fresh_var();
+            self.bind_top(
+                "all",
+                Scheme::poly(
+                    vec![a],
+                    Ty::Fun(
+                        Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Bool))),
+                        Box::new(Ty::Fun(
+                            Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                            Box::new(Ty::Bool),
+                        )),
+                    ),
+                ),
+            );
+        }
 
         // toUpper : Text -> Text
         self.bind_top(

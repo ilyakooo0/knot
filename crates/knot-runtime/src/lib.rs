@@ -5967,10 +5967,14 @@ fn wrap_ok_or_just(tag: &str, values: Vec<*mut Value>) -> *mut Value {
     alloc(Value::Constructor(tag.into(), rec))
 }
 
-/// all(rel) — returns true if every Bool element in the relation is true.
-/// Empty relation returns true (vacuous truth).
+/// all(pred, rel) — returns true if `pred(row)` is true for every row.
+/// Short-circuits on the first false. Empty relation returns true (vacuous truth).
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_all(rel: *mut Value) -> *mut Value {
+pub extern "C" fn knot_relation_all(
+    db: *mut c_void,
+    pred: *mut Value,
+    rel: *mut Value,
+) -> *mut Value {
     let rows = match unsafe { as_ref(rel) } {
         Value::Relation(rows) => rows,
         Value::Unit => return alloc_bool(true),
@@ -5980,22 +5984,24 @@ pub extern "C" fn knot_relation_all(rel: *mut Value) -> *mut Value {
         ),
     };
     for &row in rows {
-        match unsafe { as_ref(row) } {
+        let v = knot_value_call(db, pred, row);
+        match unsafe { as_ref(v) } {
             Value::Bool(true) => {}
             Value::Bool(false) => return alloc_bool(false),
-            _ => panic!(
-                "knot runtime: all expected Bool elements, got {}",
-                type_name(row)
-            ),
+            _ => panic!("knot runtime: all predicate must return Bool"),
         }
     }
     alloc_bool(true)
 }
 
-/// any(rel) — returns true if any Bool element in the relation is true.
-/// Empty relation returns false.
+/// any(pred, rel) — returns true if `pred(row)` is true for at least one row.
+/// Short-circuits on the first true. Empty relation returns false.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_any(rel: *mut Value) -> *mut Value {
+pub extern "C" fn knot_relation_any(
+    db: *mut c_void,
+    pred: *mut Value,
+    rel: *mut Value,
+) -> *mut Value {
     let rows = match unsafe { as_ref(rel) } {
         Value::Relation(rows) => rows,
         Value::Unit => return alloc_bool(false),
@@ -6005,13 +6011,11 @@ pub extern "C" fn knot_relation_any(rel: *mut Value) -> *mut Value {
         ),
     };
     for &row in rows {
-        match unsafe { as_ref(row) } {
+        let v = knot_value_call(db, pred, row);
+        match unsafe { as_ref(v) } {
             Value::Bool(true) => return alloc_bool(true),
             Value::Bool(false) => {}
-            _ => panic!(
-                "knot runtime: any expected Bool elements, got {}",
-                type_name(row)
-            ),
+            _ => panic!("knot runtime: any predicate must return Bool"),
         }
     }
     alloc_bool(false)

@@ -5414,11 +5414,11 @@ impl Infer {
             );
         }
 
-        // min : ∀a b. (a -> b) -> [a] -> b
+        // minOn : ∀a b. (a -> b) -> [a] -> b
         let a = self.fresh_var();
         let b = self.fresh_var();
         self.bind_top(
-            "min",
+            "minOn",
             Scheme::poly(
                 vec![a, b],
                 Ty::Fun(
@@ -5431,11 +5431,11 @@ impl Infer {
             ),
         );
 
-        // max : ∀a b. (a -> b) -> [a] -> b
+        // maxOn : ∀a b. (a -> b) -> [a] -> b
         let a = self.fresh_var();
         let b = self.fresh_var();
         self.bind_top(
-            "max",
+            "maxOn",
             Scheme::poly(
                 vec![a, b],
                 Ty::Fun(
@@ -7408,17 +7408,17 @@ main = applyPred (\\r -> r.x == r.y)\
 
     #[test]
     fn min_builtin_int() {
-        // min : (a -> b) -> [a] -> b ; numeric projection
+        // minOn : (a -> b) -> [a] -> b ; numeric projection
         assert!(check_src(
-            "type T = {x: Int}\n*ts : [T]\nmain = do\n  ts <- *ts\n  yield (min (\\t -> t.x) ts)"
+            "type T = {x: Int}\n*ts : [T]\nmain = do\n  ts <- *ts\n  yield (minOn (\\t -> t.x) ts)"
         ).is_empty());
     }
 
     #[test]
     fn max_builtin_text() {
-        // max works with Text projections (lexicographic ordering)
+        // maxOn works with Text projections (lexicographic ordering)
         assert!(check_src(
-            "type T = {name: Text}\n*ts : [T]\nmain = do\n  ts <- *ts\n  yield (max (\\t -> t.name) ts)"
+            "type T = {name: Text}\n*ts : [T]\nmain = do\n  ts <- *ts\n  yield (maxOn (\\t -> t.name) ts)"
         ).is_empty());
     }
 

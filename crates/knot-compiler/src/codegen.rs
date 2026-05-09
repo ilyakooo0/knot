@@ -1296,7 +1296,7 @@ impl Codegen {
         // with [] impls registered directly in register_builtin_relation_impls.
         let stdlib_names = [
             "filter", "match", "single", "any", "all", "diff", "inter", "sum", "avg",
-            "min", "max", "countWhere",
+            "minOn", "maxOn", "countWhere",
             "toUpper", "toLower", "sortBy",
             "length", "trim", "contains", "elem", "reverse",
             "chars", "id", "not",
@@ -2346,8 +2346,8 @@ impl Codegen {
         self.define_stdlib_fn_2("inter", "knot_relation_inter", true);
         self.define_stdlib_fn_2("sum", "knot_relation_sum", true);
         self.define_stdlib_fn_2("avg", "knot_relation_avg", true);
-        self.define_stdlib_fn_2("min", "knot_relation_min", true);
-        self.define_stdlib_fn_2("max", "knot_relation_max", true);
+        self.define_stdlib_fn_2("minOn", "knot_relation_min", true);
+        self.define_stdlib_fn_2("maxOn", "knot_relation_max", true);
         self.define_stdlib_fn_2("countWhere", "knot_relation_count_where", true);
         self.define_stdlib_fn_2("any", "knot_relation_any", true);
         self.define_stdlib_fn_2("all", "knot_relation_all", true);
@@ -5337,7 +5337,7 @@ impl Codegen {
                                         let agg_body: &ast::Expr = &agg_body;
                                         if let Some(col_sql) = extract_sql_field_access(&agg_bind, agg_body, "", &schema) {
                                             if let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body) {
-                                                let arg_sql = if matches!(name.as_str(), "min" | "max") {
+                                                let arg_sql = if matches!(name.as_str(), "minOn" | "maxOn") {
                                                     col_sql_for_minmax(&col_sql, &agg_bind, agg_body, &schema)
                                                 } else {
                                                     col_sql
@@ -5367,7 +5367,7 @@ impl Codegen {
                                     .cloned()
                                     .unwrap_or_default();
                                 if let Some(col_sql) = extract_sql_field_access(&agg_bind, agg_body, alias, &schema) {
-                                    let arg_sql = if matches!(name.as_str(), "min" | "max") {
+                                    let arg_sql = if matches!(name.as_str(), "minOn" | "maxOn") {
                                         col_sql_for_minmax(&col_sql, &agg_bind, agg_body, &schema)
                                     } else {
                                         col_sql
@@ -8518,11 +8518,11 @@ impl Codegen {
                     &[db, name_ptr, name_len, schema_ptr, schema_len, where_ptr, where_len, params_rel],
                 ))
             }
-            "sum" | "avg" | "min" | "max" => {
+            "sum" | "avg" | "minOn" | "maxOn" => {
                 // Use unqualified column names for direct SQL aggregate
                 let col_sql = extract_sql_field_access(&bind_var, body, "", schema)?;
                 let (func, rt_fn) = aggregate_sql_func_runtime(fn_name)?;
-                let arg_sql = if matches!(fn_name, "min" | "max") {
+                let arg_sql = if matches!(fn_name, "minOn" | "maxOn") {
                     col_sql_for_minmax(&col_sql, &bind_var, body, schema)
                 } else {
                     col_sql
@@ -10413,14 +10413,14 @@ fn expr_references_var(expr: &ast::Expr, var_name: &str) -> bool {
 
 // ── SQL compilation types ─────────────────────────────────────────
 
-/// Map a 2-arg projection-based aggregate name (`sum`/`avg`/`min`/`max`) to its
-/// SQL aggregate function and the runtime function used to read the result.
+/// Map a 2-arg projection-based aggregate name (`sum`/`avg`/`minimum`/`maximum`)
+/// to its SQL aggregate function and the runtime function used to read the result.
 fn aggregate_sql_func_runtime(name: &str) -> Option<(&'static str, &'static str)> {
     match name {
         "sum" => Some(("SUM", "knot_source_query_sum")),
         "avg" => Some(("AVG", "knot_source_query_float")),
-        "min" => Some(("MIN", "knot_source_query_value")),
-        "max" => Some(("MAX", "knot_source_query_value")),
+        "minOn" => Some(("MIN", "knot_source_query_value")),
+        "maxOn" => Some(("MAX", "knot_source_query_value")),
         _ => None,
     }
 }
@@ -10684,10 +10684,10 @@ fn analyze_pipe_op(
                     "avg" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
                         PipeOp::Avg { bind_var, body }
                     }),
-                    "min" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
+                    "minOn" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
                         PipeOp::Min { bind_var, body }
                     }),
-                    "max" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
+                    "maxOn" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
                         PipeOp::Max { bind_var, body }
                     }),
                     "countWhere" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {

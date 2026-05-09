@@ -14,10 +14,10 @@ case1 = do
   emps <- *employees
   yield (emps |> filter (\e -> isHighEarner e))
 
--- 2. min where the projection lambda body calls a helper.
+-- 2. minOn where the projection lambda body calls a helper.
 case2 = do
   emps <- *employees
-  yield (emps |> min (\e -> salaryOf e))
+  yield (emps |> minOn (\e -> salaryOf e))
 
 -- 3. filter then count, with predicate via helper.
 case3 = do

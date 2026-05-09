@@ -79,6 +79,12 @@ trait ToJSON a where
 
 trait FromJSON a where
   parseJson : Text -> a
+
+min : Ord a => a -> a -> a
+min = \a b -> if a < b then a else b
+
+max : Ord a => a -> a -> a
+max = \a b -> if a > b then a else b
 "#;
 
 /// Parse the prelude source and prepend its declarations to the user's module.

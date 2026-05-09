@@ -408,9 +408,9 @@ fn lint_pipe_chain(
                 if try_sql_column_expr(bind_var, body).is_none() {
                     diags.push(
                         Diagnostic::info(
-                            "pipe min will be evaluated at runtime instead of SQL MIN",
+                            "pipe minOn will be evaluated at runtime instead of SQL MIN",
                         )
-                        .label(*span, "min lambda cannot be compiled to SQL"),
+                        .label(*span, "minOn lambda cannot be compiled to SQL"),
                     );
                 }
             }
@@ -418,9 +418,9 @@ fn lint_pipe_chain(
                 if try_sql_column_expr(bind_var, body).is_none() {
                     diags.push(
                         Diagnostic::info(
-                            "pipe max will be evaluated at runtime instead of SQL MAX",
+                            "pipe maxOn will be evaluated at runtime instead of SQL MAX",
                         )
-                        .label(*span, "max lambda cannot be compiled to SQL"),
+                        .label(*span, "maxOn lambda cannot be compiled to SQL"),
                     );
                 }
             }
@@ -537,28 +537,28 @@ fn lint_app_form(
                     );
                 }
             }
-            "min" => {
+            "minOn" => {
                 if try_sql_column_expr(&bind_var, body).is_none() {
                     diags.push(
                         Diagnostic::info(
-                            "min will be evaluated at runtime instead of SQL MIN",
+                            "minOn will be evaluated at runtime instead of SQL MIN",
                         )
                         .label(
                             lambda_arg.span,
-                            "min lambda cannot be compiled to SQL",
+                            "minOn lambda cannot be compiled to SQL",
                         ),
                     );
                 }
             }
-            "max" => {
+            "maxOn" => {
                 if try_sql_column_expr(&bind_var, body).is_none() {
                     diags.push(
                         Diagnostic::info(
-                            "max will be evaluated at runtime instead of SQL MAX",
+                            "maxOn will be evaluated at runtime instead of SQL MAX",
                         )
                         .label(
                             lambda_arg.span,
-                            "max lambda cannot be compiled to SQL",
+                            "maxOn lambda cannot be compiled to SQL",
                         ),
                     );
                 }
@@ -1038,14 +1038,14 @@ fn analyze_pipe_op(expr: &Expr) -> Option<LintPipeOp<'_>> {
                             span: arg.span,
                         }
                     }),
-                    "min" => extract_single_param_lambda(arg).map(|(bind_var, body)| {
+                    "minOn" => extract_single_param_lambda(arg).map(|(bind_var, body)| {
                         LintPipeOp::Min {
                             bind_var,
                             body,
                             span: arg.span,
                         }
                     }),
-                    "max" => extract_single_param_lambda(arg).map(|(bind_var, body)| {
+                    "maxOn" => extract_single_param_lambda(arg).map(|(bind_var, body)| {
                         LintPipeOp::Max {
                             bind_var,
                             body,
@@ -1420,28 +1420,28 @@ mod tests {
 
     #[test]
     fn no_lint_on_arithmetic_min_max() {
-        // min/max with field access compile to SQL MIN/MAX.
+        // minOn/maxOn with field access compile to SQL MIN/MAX.
         let diags = lint(
             "type T = {salary: Int}\n\
              *items : [T]\n\
              main = do\n\
                items <- *items\n\
-               yield (min (\\i -> i.salary) items)\n",
+               yield (minOn (\\i -> i.salary) items)\n",
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
     }
 
     #[test]
     fn lint_on_complex_min_lambda() {
-        // min with non-SQL-compilable lambda body — falls back to runtime.
+        // minOn with non-SQL-compilable lambda body — falls back to runtime.
         let diags = lint(
             "type T = {salary: Int}\n\
              classify = \\x -> x + 100\n\
              *items : [T]\n\
              main = do\n\
-               yield (*items |> min (\\i -> classify i.salary))\n",
+               yield (*items |> minOn (\\i -> classify i.salary))\n",
         );
-        assert!(!diags.is_empty(), "expected diagnostic for non-SQL min");
+        assert!(!diags.is_empty(), "expected diagnostic for non-SQL minOn");
         assert!(diags.iter().any(|d| d.message.contains("MIN")));
     }
 
@@ -1474,12 +1474,12 @@ mod tests {
 
     #[test]
     fn no_lint_on_pipe_min_max() {
-        // Pipe forms `*items |> min ...` compile to SQL MIN/MAX.
+        // Pipe forms `*items |> maxOn ...` compile to SQL MIN/MAX.
         let diags = lint(
             "type T = {salary: Int}\n\
              *items : [T]\n\
              main = do\n\
-               yield (*items |> max (\\i -> i.salary))\n",
+               yield (*items |> maxOn (\\i -> i.salary))\n",
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
     }

@@ -95,11 +95,11 @@ pipeMap = do
   employees <- *employees
   yield (employees |> map (\e -> {name: e.name, dept: e.dept}))
 
--- 11. min/max projection → SQL MIN/MAX
+-- 11. minOn/maxOn projection → SQL MIN/MAX
 minMaxDemo = do
   employees <- *employees
-  let lo = min (\e -> e.salary) employees
-  let hi = max (\e -> e.salary) employees
+  let lo = minOn (\e -> e.salary) employees
+  let hi = maxOn (\e -> e.salary) employees
   println ("min salary: " ++ show lo ++ ", max salary: " ++ show hi)
 
 -- 12. countWhere predicate → SQL COUNT(*) WHERE
@@ -108,14 +108,14 @@ countWhereDemo = do
   let n = countWhere (\e -> e.dept == "Eng") employees
   println ("eng headcount: " ++ show n)
 
--- 13. Pipe: filter + min/max → SQL aggregate with WHERE
+-- 13. Pipe: filter + minOn/maxOn → SQL aggregate with WHERE
 pipeFilterMin = do
   employees <- *employees
-  yield (employees |> filter (\e -> e.dept == "Eng") |> min (\e -> e.salary))
+  yield (employees |> filter (\e -> e.dept == "Eng") |> minOn (\e -> e.salary))
 
 pipeFilterMax = do
   employees <- *employees
-  yield (employees |> filter (\e -> e.dept == "Eng") |> max (\e -> e.salary))
+  yield (employees |> filter (\e -> e.dept == "Eng") |> maxOn (\e -> e.salary))
 
 pipeCountWhere = do
   employees <- *employees

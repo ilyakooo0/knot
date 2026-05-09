@@ -1,0 +1,10 @@
+-- Test findFirst builtin.
+
+main = do
+  let r1 = findFirst [1, 2, 3, 4, 5] (\x -> x > 3)
+  let r2 = findFirst [1, 2, 3] (\x -> x > 10)
+  let r3 = findFirst [] (\x -> x > 0)
+  println (show r1)
+  println (show r2)
+  println (show r3)
+  yield {}

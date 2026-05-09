@@ -30,3 +30,4 @@ examples/hash
 examples/let_pushdown
 examples/cons_pattern
 examples/required_args
+examples/find_first

@@ -90,6 +90,11 @@ head : [a] -> Maybe a
 head = \items -> case items of
   Cons x _ -> Just {value: x}
   [] -> Nothing {}
+
+findFirst : [a] -> (a -> Bool) -> Maybe a
+findFirst = \items pred -> case items of
+  Cons x rest -> if pred x then Just {value: x} else findFirst rest pred
+  [] -> Nothing {}
 "#;
 
 /// Parse the prelude source and prepend its declarations to the user's module.

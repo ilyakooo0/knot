@@ -936,6 +936,7 @@ impl Codegen {
         self.declare_rt("knot_relation_fold", &[p, p, p, p], &[p]);
         self.declare_rt("knot_relation_traverse", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_single", &[p], &[p]);
+        self.declare_rt("knot_relation_any", &[p], &[p]);
         self.declare_rt("knot_relation_diff", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_inter", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_sum", &[p, p, p], &[p]);
@@ -1292,9 +1293,9 @@ impl Codegen {
         // map and fold are now trait methods (Functor.map, Foldable.fold)
         // with [] impls registered directly in register_builtin_relation_impls.
         let stdlib_names = [
-            "filter", "match", "single", "diff", "inter", "sum", "avg",
+            "filter", "match", "single", "any", "diff", "inter", "sum", "avg",
             "min", "max", "countWhere",
-            "toUpper", "toLower", "take", "drop", "sortBy", "takeRelation", "dropRelation",
+            "toUpper", "toLower", "sortBy",
             "length", "trim", "contains", "elem", "reverse",
             "chars", "id", "not",
             "stripUnit", "withUnit", "stripFloatUnit", "withFloatUnit",
@@ -1736,6 +1737,8 @@ impl Codegen {
             ("Foldable_Relation_fold", "fold", 3),
             ("Traversable_Relation_traverse", "traverse", 2),
             ("Semigroup_Relation_append", "append", 2),
+            ("Sequence_Relation_take", "take", 2),
+            ("Sequence_Relation_drop", "drop", 2),
         ];
         for (mangled, method_name, n_params) in &impls {
             // Don't register if already defined (by user impl or prelude)
@@ -1789,6 +1792,7 @@ impl Codegen {
                     "fold" => "Foldable".to_string(),
                     "traverse" => "Traversable".to_string(),
                     "append" => "Semigroup".to_string(),
+                    "take" | "drop" => "Sequence".to_string(),
                     _ => continue,
                 })
                 .or_default()
@@ -1885,6 +1889,9 @@ impl Codegen {
             ("Num_Float_negate", "negate", "Float", 1, "Num"),
             // Semigroup impls
             ("Semigroup_Text_append", "append", "Text", 2, "Semigroup"),
+            // Sequence impls
+            ("Sequence_Text_take", "take", "Text", 2, "Sequence"),
+            ("Sequence_Text_drop", "drop", "Text", 2, "Sequence"),
         ];
         for (mangled, method_name, type_name, n_params, trait_name) in &impls {
             // Don't register if already defined (by user impl or prelude)
@@ -2088,6 +2095,36 @@ impl Codegen {
                 builder.ins().return_(&[result]);
             });
         });
+
+        // Sequence_Relation_take(db, n, rel) → knot_relation_take(n, rel)
+        define_if_registered!("Sequence_Relation_take", |cg: &mut Self, func_id: FuncId| {
+            let mut sig = cg.module.make_signature();
+            sig.params.push(AbiParam::new(cg.ptr_type)); // db
+            sig.params.push(AbiParam::new(cg.ptr_type)); // n
+            sig.params.push(AbiParam::new(cg.ptr_type)); // rel
+            sig.returns.push(AbiParam::new(cg.ptr_type));
+            cg.build_function(func_id, sig, |cg, builder, entry| {
+                let n = builder.block_params(entry)[1];
+                let rel = builder.block_params(entry)[2];
+                let result = cg.call_rt(builder, "knot_relation_take", &[n, rel]);
+                builder.ins().return_(&[result]);
+            });
+        });
+
+        // Sequence_Relation_drop(db, n, rel) → knot_relation_drop(n, rel)
+        define_if_registered!("Sequence_Relation_drop", |cg: &mut Self, func_id: FuncId| {
+            let mut sig = cg.module.make_signature();
+            sig.params.push(AbiParam::new(cg.ptr_type)); // db
+            sig.params.push(AbiParam::new(cg.ptr_type)); // n
+            sig.params.push(AbiParam::new(cg.ptr_type)); // rel
+            sig.returns.push(AbiParam::new(cg.ptr_type));
+            cg.build_function(func_id, sig, |cg, builder, entry| {
+                let n = builder.block_params(entry)[1];
+                let rel = builder.block_params(entry)[2];
+                let result = cg.call_rt(builder, "knot_relation_drop", &[n, rel]);
+                builder.ins().return_(&[result]);
+            });
+        });
     }
 
     /// Define Cranelift IR bodies for built-in IO impls of HKT traits.
@@ -2223,6 +2260,10 @@ impl Codegen {
 
         // Semigroup impls: append(a, b) → knot_value_concat(a, b)
         define_binop_impl!("Semigroup_Text_append", "knot_value_concat");
+
+        // Sequence impls for Text: take/drop(n, text) → knot_text_take/drop(n, text)
+        define_binop_impl!("Sequence_Text_take", "knot_text_take");
+        define_binop_impl!("Sequence_Text_drop", "knot_text_drop");
     }
 
     // ── Supertrait validation ────────────────────────────────────
@@ -2280,6 +2321,7 @@ impl Codegen {
         // Define standard library functions
         // 1-param: direct delegation to runtime
         self.define_stdlib_fn_1("single", "knot_relation_single");
+        self.define_stdlib_fn_1("any", "knot_relation_any");
         self.define_stdlib_fn_1("toUpper", "knot_text_to_upper");
         self.define_stdlib_fn_1("toLower", "knot_text_to_lower");
         self.define_stdlib_fn_1("length", "knot_text_length");
@@ -2296,11 +2338,7 @@ impl Codegen {
         // 2-param: curried (outer captures arg1, inner calls runtime)
         self.define_stdlib_fn_2("filter", "knot_relation_filter", true);
         self.define_stdlib_fn_2("match", "knot_relation_match", false);
-        self.define_stdlib_fn_2("take", "knot_text_take", false);
-        self.define_stdlib_fn_2("drop", "knot_text_drop", false);
         self.define_stdlib_fn_2("sortBy", "knot_relation_sort_by", true);
-        self.define_stdlib_fn_2("takeRelation", "knot_relation_take", false);
-        self.define_stdlib_fn_2("dropRelation", "knot_relation_drop", false);
         self.define_stdlib_fn_2("contains", "knot_text_contains", false);
         self.define_stdlib_fn_2("elem", "knot_list_elem", false);
         self.define_stdlib_fn_2("diff", "knot_relation_diff", true);

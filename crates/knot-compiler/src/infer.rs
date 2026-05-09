@@ -5262,38 +5262,6 @@ impl Infer {
             ),
         );
 
-        // takeRelation : ∀a. Int -> [a] -> [a]
-        let a = self.fresh_var();
-        self.bind_top(
-            "takeRelation",
-            Scheme::poly(
-                vec![a],
-                Ty::Fun(
-                    Box::new(Ty::Int),
-                    Box::new(Ty::Fun(
-                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                    )),
-                ),
-            ),
-        );
-
-        // dropRelation : ∀a. Int -> [a] -> [a]
-        let a = self.fresh_var();
-        self.bind_top(
-            "dropRelation",
-            Scheme::poly(
-                vec![a],
-                Ty::Fun(
-                    Box::new(Ty::Int),
-                    Box::new(Ty::Fun(
-                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                    )),
-                ),
-            ),
-        );
-
         // diff : ∀a. [a] -> [a] -> [a]
         let a = self.fresh_var();
         self.bind_top(
@@ -5429,6 +5397,15 @@ impl Infer {
             ),
         );
 
+        // any : [Bool] -> Bool
+        self.bind_top(
+            "any",
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Relation(Box::new(Ty::Bool))),
+                Box::new(Ty::Bool),
+            )),
+        );
+
         // toUpper : Text -> Text
         self.bind_top(
             "toUpper",
@@ -5440,42 +5417,6 @@ impl Infer {
             "toLower",
             Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Text))),
         );
-
-        // take : ∀u. Int<u> -> Text -> Text
-        {
-            let u = self.fresh_unit_var();
-            let int_u = Ty::IntUnit(UnitTy::var(u));
-            self.bind_top(
-                "take",
-                Scheme {
-                    vars: vec![],
-                    unit_vars: vec![u],
-                    constraints: vec![],
-                    ty: Ty::Fun(
-                        Box::new(int_u),
-                        Box::new(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Text))),
-                    ),
-                },
-            );
-        }
-
-        // drop : ∀u. Int<u> -> Text -> Text
-        {
-            let u = self.fresh_unit_var();
-            let int_u = Ty::IntUnit(UnitTy::var(u));
-            self.bind_top(
-                "drop",
-                Scheme {
-                    vars: vec![],
-                    unit_vars: vec![u],
-                    constraints: vec![],
-                    ty: Ty::Fun(
-                        Box::new(int_u),
-                        Box::new(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Text))),
-                    ),
-                },
-            );
-        }
 
         // length : ∀u. Text -> Int<u>
         {
@@ -6853,6 +6794,19 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
             .known_impls
             .insert((trait_name.to_string(), "IO".to_string()));
     }
+    // Primitive impls registered intrinsically in codegen
+    for ty in &["Int", "Float", "Text", "Bool"] {
+        infer.known_impls.insert(("Eq".to_string(), ty.to_string()));
+    }
+    for ty in &["Int", "Float", "Text"] {
+        infer.known_impls.insert(("Ord".to_string(), ty.to_string()));
+    }
+    for ty in &["Int", "Float"] {
+        infer.known_impls.insert(("Num".to_string(), ty.to_string()));
+    }
+    infer.known_impls.insert(("Semigroup".to_string(), "Text".to_string()));
+    infer.known_impls.insert(("Sequence".to_string(), "Text".to_string()));
+    infer.known_impls.insert(("Sequence".to_string(), "[]".to_string()));
 
     // Phase 3: Pre-register top-level names (builtins, functions, trait methods)
     infer.pre_register(module);

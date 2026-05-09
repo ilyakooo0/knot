@@ -5951,6 +5951,31 @@ fn wrap_ok_or_just(tag: &str, values: Vec<*mut Value>) -> *mut Value {
     alloc(Value::Constructor(tag.into(), rec))
 }
 
+/// any(rel) — returns true if any Bool element in the relation is true.
+/// Empty relation returns false.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_any(rel: *mut Value) -> *mut Value {
+    let rows = match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => rows,
+        Value::Unit => return alloc_bool(false),
+        _ => panic!(
+            "knot runtime: any expected Relation, got {}",
+            type_name(rel)
+        ),
+    };
+    for &row in rows {
+        match unsafe { as_ref(row) } {
+            Value::Bool(true) => return alloc_bool(true),
+            Value::Bool(false) => {}
+            _ => panic!(
+                "knot runtime: any expected Bool elements, got {}",
+                type_name(row)
+            ),
+        }
+    }
+    alloc_bool(false)
+}
+
 /// single(rel) — extract the single element from a one-element relation.
 /// Returns `Just {value: x}` for a singleton, `Nothing {}` otherwise.
 #[unsafe(no_mangle)]

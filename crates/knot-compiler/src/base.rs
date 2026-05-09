@@ -51,6 +51,10 @@ trait Eq a => Num a where
 trait Semigroup a where
   append : a -> a -> a
 
+trait Sequence s where
+  take : Int -> s -> s
+  drop : Int -> s -> s
+
 trait Display a where
   display : a -> Text
 

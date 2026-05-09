@@ -39,7 +39,7 @@ pub const CONCURRENCY_BUILTINS: &[&str] = &["fork", "retry"];
 /// and so they sort sensibly in completion lists. They have no effects.
 pub const PURE_BUILTINS: &[&str] = &[
     "show", "union", "count", "filter", "match", "map",
-    "fold", "single", "any", "diff", "inter", "sum", "avg",
+    "fold", "single", "any", "all", "diff", "inter", "sum", "avg",
     "toUpper", "toLower", "take", "drop",
     "length", "trim", "contains", "elem", "reverse", "chars",
     "id", "not", "toJson", "parseJson",

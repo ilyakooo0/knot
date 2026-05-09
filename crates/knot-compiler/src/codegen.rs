@@ -938,6 +938,7 @@ impl Codegen {
         self.declare_rt("knot_relation_traverse", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_single", &[p], &[p]);
         self.declare_rt("knot_relation_any", &[p], &[p]);
+        self.declare_rt("knot_relation_all", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_diff", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_inter", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_sum", &[p, p, p], &[p]);
@@ -1294,7 +1295,7 @@ impl Codegen {
         // map and fold are now trait methods (Functor.map, Foldable.fold)
         // with [] impls registered directly in register_builtin_relation_impls.
         let stdlib_names = [
-            "filter", "match", "single", "any", "diff", "inter", "sum", "avg",
+            "filter", "match", "single", "any", "all", "diff", "inter", "sum", "avg",
             "min", "max", "countWhere",
             "toUpper", "toLower", "sortBy",
             "length", "trim", "contains", "elem", "reverse",
@@ -2349,6 +2350,7 @@ impl Codegen {
         self.define_stdlib_fn_2("min", "knot_relation_min", true);
         self.define_stdlib_fn_2("max", "knot_relation_max", true);
         self.define_stdlib_fn_2("countWhere", "knot_relation_count_where", true);
+        self.define_stdlib_fn_2("all", "knot_relation_all", true);
 
         // Bytes: 1-param
         self.define_stdlib_fn_1("bytesLength", "knot_bytes_length");

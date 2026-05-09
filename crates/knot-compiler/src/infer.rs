@@ -395,6 +395,12 @@ struct Infer {
     /// Deferred trait constraint checks, resolved after inference.
     deferred_constraints: Vec<DeferredConstraint>,
 
+    /// Trait constraints declared in an enclosing function signature, keyed
+    /// by the skolem TyVar they apply to. Lets us reject use sites that
+    /// require a constraint not promised by the signature (e.g. using `<` on
+    /// `a -> a -> a` without `Ord a =>`).
+    declared_skolem_constraints: HashMap<TyVar, HashSet<String>>,
+
     /// Trait definitions: trait_name → list of param names.
     trait_params: HashMap<String, Vec<String>>,
 
@@ -490,6 +496,7 @@ impl Infer {
             trait_method_param_vars: HashMap::new(),
             known_impls: HashSet::new(),
             deferred_constraints: Vec::new(),
+            declared_skolem_constraints: HashMap::new(),
             binding_types: Vec::new(),
             trait_params: HashMap::new(),
             fetch_response_types: HashMap::new(),
@@ -1799,6 +1806,10 @@ impl Infer {
                 type_var: target_var,
                 span,
             });
+            self.declared_skolem_constraints
+                .entry(target_var)
+                .or_default()
+                .insert(c.trait_name.clone());
         }
         let ty = self.subst_ty(&scheme.ty, &mapping);
         let ty = if scheme.unit_vars.is_empty() {
@@ -2997,20 +3008,7 @@ impl Infer {
                 let operand_ty = self.infer_expr(operand);
                 match op {
                     ast::UnaryOp::Neg => {
-                        // numeric negation — reject known non-numeric types
-                        let resolved = self.apply(&operand_ty);
-                        match resolved.peel_alias() {
-                            Ty::Int | Ty::Float | Ty::IntUnit(_) | Ty::FloatUnit(_) | Ty::Var(_) | Ty::Error => {}
-                            _ => {
-                                self.error(
-                                    format!(
-                                        "cannot negate value of type {}",
-                                        self.display_ty(&resolved)
-                                    ),
-                                    operand.span,
-                                );
-                            }
-                        }
+                        self.require_trait("Num", &operand_ty, operand.span);
                         operand_ty
                     }
                     ast::UnaryOp::Not => {
@@ -3722,6 +3720,7 @@ impl Infer {
                 let rhs_applied = self.apply(&rhs_ty);
                 // For unit-bearing types, unify normally (which checks unit equality)
                 self.unify(&lhs_applied, &rhs_applied, span);
+                self.require_trait("Num", &lhs_applied, span);
                 lhs_applied
             }
             // Mul/Div: units compose
@@ -3772,18 +3771,20 @@ impl Infer {
                     // No units involved → default behavior
                     _ => {
                         self.unify(&lhs_applied, &rhs_applied, span);
+                        self.require_trait("Num", &lhs_applied, span);
                         lhs_applied
                     }
                 }
             }
             // Comparison: both same type, result Bool
-            ast::BinOp::Eq
-            | ast::BinOp::Neq
-            | ast::BinOp::Lt
-            | ast::BinOp::Gt
-            | ast::BinOp::Le
-            | ast::BinOp::Ge => {
+            ast::BinOp::Eq | ast::BinOp::Neq => {
                 self.unify(&lhs_ty, &rhs_ty, span);
+                self.require_trait("Eq", &lhs_ty, span);
+                Ty::Bool
+            }
+            ast::BinOp::Lt | ast::BinOp::Gt | ast::BinOp::Le | ast::BinOp::Ge => {
+                self.unify(&lhs_ty, &rhs_ty, span);
+                self.require_trait("Ord", &lhs_ty, span);
                 Ty::Bool
             }
             // Boolean: both Bool, result Bool
@@ -3795,6 +3796,7 @@ impl Infer {
             // Concat: both same type (Semigroup), result same type
             ast::BinOp::Concat => {
                 self.unify(&lhs_ty, &rhs_ty, span);
+                self.require_trait("Semigroup", &lhs_ty, span);
                 lhs_ty
             }
             // Pipe: a |> f  =  f a
@@ -6013,9 +6015,16 @@ impl Infer {
                             }
                             None => (self.fresh(), Vec::new()),
                         };
+                        let pre_body_constraints =
+                            self.deferred_constraints.len();
                         self.check_expr(body, &expected);
+                        self.check_skolem_constraints(
+                            &fresh_skolems,
+                            pre_body_constraints,
+                        );
                         for s in &fresh_skolems {
                             self.skolems.remove(s);
+                            self.declared_skolem_constraints.remove(s);
                         }
                         let inferred = self.apply(&expected);
 
@@ -6182,6 +6191,92 @@ impl Infer {
     }
 
     // ── Constraint checking ─────────────────────────────────────
+
+    /// Record a trait requirement for `ty` arising at `span` (e.g. an `Ord`
+    /// constraint at a `<` operator). Concrete types are checked immediately
+    /// against `known_impls`; type variables are deferred — if they later
+    /// resolve to a concrete type, `check_constraints` validates them.
+    /// Skolem variables (signature-quantified) are validated once the
+    /// function body is finished, in `check_skolem_constraints`.
+    fn require_trait(&mut self, trait_name: &str, ty: &Ty, span: Span) {
+        let resolved = self.apply(ty);
+        match resolved.peel_alias() {
+            Ty::Error => return,
+            Ty::Var(v) => {
+                let v = *v;
+                self.deferred_constraints.push(DeferredConstraint {
+                    trait_name: trait_name.to_string(),
+                    type_var: v,
+                    span,
+                });
+                return;
+            }
+            _ => {}
+        }
+        if let Some(type_name) = self.type_name_of(&resolved) {
+            let key = (trait_name.to_string(), type_name.clone());
+            if !self.known_impls.contains(&key) {
+                self.error(
+                    format!(
+                        "no implementation of trait '{}' for type '{}'",
+                        trait_name, type_name
+                    ),
+                    span,
+                );
+            }
+        }
+    }
+
+    /// After a function body is checked, any deferred constraint that
+    /// resolves to one of the function's signature skolems must correspond
+    /// to a constraint declared in the signature. Otherwise the body needs
+    /// a polymorphism the signature didn't promise — e.g. using `<` on
+    /// `a -> a -> a` without `Ord a =>`.
+    fn check_skolem_constraints(
+        &mut self,
+        fresh_skolems: &[TyVar],
+        start: usize,
+    ) {
+        if fresh_skolems.is_empty() {
+            return;
+        }
+        let skolem_set: HashSet<TyVar> = fresh_skolems.iter().copied().collect();
+        let new_constraints: Vec<DeferredConstraint> = self
+            .deferred_constraints
+            .iter()
+            .skip(start)
+            .cloned()
+            .collect();
+        let mut reported: HashSet<(TyVar, String)> = HashSet::new();
+        for dc in &new_constraints {
+            let resolved = self.apply(&Ty::Var(dc.type_var));
+            let v = match resolved {
+                Ty::Var(v) => v,
+                _ => continue,
+            };
+            if !skolem_set.contains(&v) {
+                continue;
+            }
+            let declared = self
+                .declared_skolem_constraints
+                .get(&v)
+                .map_or(false, |s| s.contains(&dc.trait_name));
+            if declared {
+                continue;
+            }
+            if !reported.insert((v, dc.trait_name.clone())) {
+                continue;
+            }
+            self.error(
+                format!(
+                    "use here requires constraint '{} a' on the type variable; \
+                     add '{} a =>' to the function signature",
+                    dc.trait_name, dc.trait_name
+                ),
+                dc.span,
+            );
+        }
+    }
 
     /// Check all deferred constraints after inference is complete.
     /// For each constraint (trait_name, type_var), resolve the type variable
@@ -6917,6 +7012,7 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
         infer.known_impls.insert(("Num".to_string(), ty.to_string()));
     }
     infer.known_impls.insert(("Semigroup".to_string(), "Text".to_string()));
+    infer.known_impls.insert(("Semigroup".to_string(), "[]".to_string()));
     infer.known_impls.insert(("Sequence".to_string(), "Text".to_string()));
     infer.known_impls.insert(("Sequence".to_string(), "[]".to_string()));
 
@@ -7688,6 +7784,82 @@ main = applyPred (\\r -> r.x == r.y)\
              \x20 r <- rel\n\
              \x20 yield (display r)\n\
              main = println 42"
+        ).is_empty());
+    }
+
+    #[test]
+    fn lt_on_polymorphic_param_requires_ord_constraint() {
+        let diags = check_src(
+            "myMin : a -> a -> a\n\
+             myMin = \\a b -> if a < b then a else b\n\
+             main = println (show (myMin 1 2))"
+        );
+        assert!(has_error(&diags, "constraint 'Ord a'"));
+    }
+
+    #[test]
+    fn lt_with_ord_constraint_typechecks() {
+        assert!(check_src(
+            "myMin : Ord a => a -> a -> a\n\
+             myMin = \\a b -> if a < b then a else b\n\
+             main = println (show (myMin 1 2))"
+        ).is_empty());
+    }
+
+    #[test]
+    fn eq_on_polymorphic_param_requires_eq_constraint() {
+        let diags = check_src(
+            "same : a -> a -> Bool\n\
+             same = \\a b -> a == b\n\
+             main = println (show (same 1 1))"
+        );
+        assert!(has_error(&diags, "constraint 'Eq a'"));
+    }
+
+    #[test]
+    fn add_on_polymorphic_param_requires_num_constraint() {
+        let diags = check_src(
+            "double : a -> a\n\
+             double = \\a -> a + a\n\
+             main = println (show (double 3))"
+        );
+        assert!(has_error(&diags, "constraint 'Num a'"));
+    }
+
+    #[test]
+    fn neg_on_polymorphic_param_requires_num_constraint() {
+        let diags = check_src(
+            "flip : a -> a\n\
+             flip = \\a -> -a\n\
+             main = println (show (flip 3))"
+        );
+        assert!(has_error(&diags, "constraint 'Num a'"));
+    }
+
+    #[test]
+    fn concat_on_polymorphic_param_requires_semigroup_constraint() {
+        let diags = check_src(
+            "twice : a -> a\n\
+             twice = \\a -> a ++ a\n\
+             main = println (twice \"hi\")"
+        );
+        assert!(has_error(&diags, "constraint 'Semigroup a'"));
+    }
+
+    #[test]
+    fn lt_on_bool_rejected_at_concrete_call() {
+        let diags = check_src(
+            "myMin : Ord a => a -> a -> a\n\
+             myMin = \\a b -> if a < b then a else b\n\
+             main = println (show (myMin True False))"
+        );
+        assert!(has_error(&diags, "no implementation of trait 'Ord' for type 'Bool'"));
+    }
+
+    #[test]
+    fn list_concat_typechecks_without_annotation() {
+        assert!(check_src(
+            "main = println (show ([1, 2] ++ [3, 4]))"
         ).is_empty());
     }
 

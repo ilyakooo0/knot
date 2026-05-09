@@ -95,6 +95,12 @@ findFirst : [a] -> (a -> Bool) -> Maybe a
 findFirst = \items pred -> case items of
   Cons x rest -> if pred x then Just {value: x} else findFirst rest pred
   [] -> Nothing {}
+
+when : Bool -> IO {| e} {} -> IO {| e} {}
+when = \cond action -> if cond then action else yield {}
+
+unless : Bool -> IO {| e} {} -> IO {| e} {}
+unless = \cond action -> if cond then yield {} else action
 "#;
 
 /// Parse the prelude source and prepend its declarations to the user's module.

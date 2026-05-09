@@ -1,0 +1,14 @@
+-- Test when/unless builtins.
+
+main = do
+  when true (println "when true: runs")
+  when false (println "when false: skipped")
+  unless true (println "unless true: skipped")
+  unless false (println "unless false: runs")
+  let n = 5
+  when (n > 0) do
+    println "block action: n is positive"
+    println (show n)
+  unless (n > 100) do
+    println "block action: n <= 100"
+  yield {}

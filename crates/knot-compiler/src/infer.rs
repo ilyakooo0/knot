@@ -4722,6 +4722,12 @@ impl Infer {
             Ty::Bytes => Some("Bytes".into()),
             Ty::Relation(_) => Some("[]".into()),
             Ty::TyCon(name) => Some(name.clone()),
+            // Refined nullary aliases (`type Nat = Int where ...`) are erased
+            // at runtime, so trait impls on the base type satisfy constraints
+            // on the refined type. Walk the refined chain to the base name.
+            Ty::Con(name, args) if args.is_empty() && self.refined_types.contains_key(name) => {
+                self.refined_base_type_name(name)
+            }
             Ty::Con(name, _) => Some(name.clone()),
             Ty::IO(_, _, _) => Some("IO".into()),
             Ty::Fun(_, _) => Some("Fun".into()),
@@ -4733,6 +4739,26 @@ impl Infer {
             Ty::IntUnit(_) => Some("Int".into()),
             Ty::FloatUnit(_) => Some("Float".into()),
             _ => None,
+        }
+    }
+
+    /// Walk a refined nullary alias chain to its non-refined base, returning
+    /// that base's `type_name_of`. Cycles (already diagnosed by unification)
+    /// produce `None`.
+    fn refined_base_type_name(&self, name: &str) -> Option<String> {
+        let mut visited: Vec<&str> = vec![name];
+        let mut current = &self.refined_types.get(name)?.0;
+        loop {
+            match current {
+                Ty::Con(n, args) if args.is_empty() && self.refined_types.contains_key(n) => {
+                    if visited.iter().any(|v| *v == n.as_str()) {
+                        return None;
+                    }
+                    visited.push(n.as_str());
+                    current = &self.refined_types[n].0;
+                }
+                _ => return self.type_name_of(current),
+            }
         }
     }
 
@@ -8266,6 +8292,36 @@ main = applyPred (\\r -> r.x == r.y)\
         // Cross-field refinement on a record type
         let diags = check_src(
             "type Range = {lo: Int, hi: Int} where \\r -> r.lo <= r.hi\nmain = 1"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn refined_type_uses_base_trait_impl() {
+        // A trait impl on the base type should satisfy a constraint on the
+        // refined type, since refined types are erased at runtime.
+        let diags = check_src(
+            "type Nat = Int where \\x -> x >= 0\n\
+             trait Show_ a where\n  show_ : a -> Text\n\
+             impl Show_ Int where\n  show_ n = \"int\"\n\
+             f : Nat -> Text\n\
+             f = \\n -> show_ n\n\
+             main = 0"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn refined_type_chain_uses_base_trait_impl() {
+        // Stacked refinements should also resolve to the ultimate base type's impl.
+        let diags = check_src(
+            "type Nat = Int where \\x -> x >= 0\n\
+             type Age = Nat where \\x -> x <= 150\n\
+             trait Show_ a where\n  show_ : a -> Text\n\
+             impl Show_ Int where\n  show_ n = \"int\"\n\
+             f : Age -> Text\n\
+             f = \\n -> show_ n\n\
+             main = 0"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }

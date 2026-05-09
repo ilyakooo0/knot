@@ -32,3 +32,4 @@ examples/cons_pattern
 examples/required_args
 examples/find_first
 examples/when_unless
+examples/for_each

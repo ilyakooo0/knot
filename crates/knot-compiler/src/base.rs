@@ -101,6 +101,13 @@ when = \cond action -> if cond then action else yield {}
 
 unless : Bool -> IO {| e} {} -> IO {| e} {}
 unless = \cond action -> if cond then yield {} else action
+
+forEach : [a] -> (a -> IO {| e} {}) -> IO {| e} {}
+forEach = \items action -> case items of
+  [] -> yield {}
+  Cons x rest -> do
+    action x
+    forEach rest action
 "#;
 
 /// Parse the prelude source and prepend its declarations to the user's module.

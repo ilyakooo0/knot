@@ -562,13 +562,16 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &HashSet<String>) -> bool {
         return false;
     }
 
+    // Need at least one Bind/Where (relational comprehension) or multiple
+    // statements (monadic sequencing). A single bare expression doesn't need
+    // desugaring.
     let has_bind_or_where = stmts.iter().any(|s| {
         matches!(
             &s.node,
             StmtKind::Bind { .. } | StmtKind::Where { .. }
         )
     });
-    if !has_bind_or_where {
+    if !has_bind_or_where && stmts.len() < 2 {
         return false;
     }
 
@@ -600,19 +603,17 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &HashSet<String>) -> bool {
         return false;
     }
 
-    // Check that all non-final statements are Bind/Where/Let
+    // Non-final statements must be Bind/Where/Let or a bare Expr (sequenced
+    // monadically as `_ <- e`). Final statement must be a bare Expr — yield
+    // is one option, but any expression of monad type is valid (its value
+    // becomes the do-block's result).
     for stmt in &stmts[..stmts.len() - 1] {
         match &stmt.node {
-            StmtKind::Bind { .. } | StmtKind::Where { .. } | StmtKind::Let { .. } => {}
+            StmtKind::Bind { .. } | StmtKind::Where { .. } | StmtKind::Let { .. } | StmtKind::Expr(_) => {}
             _ => return false,
         }
     }
-
-    // Final statement must be yield
-    match &stmts.last().unwrap().node {
-        StmtKind::Expr(e) => e.node.as_yield_arg().is_some(),
-        _ => false,
-    }
+    matches!(stmts.last().unwrap().node, StmtKind::Expr(_))
 }
 
 /// Check if an expression contains an IO-returning builtin or user-defined IO function.
@@ -776,9 +777,20 @@ fn desugar_stmts(stmts: &[Stmt], span: Span) -> Expr {
             unreachable!("groupBy should not appear in desugared do blocks")
         }
 
-        StmtKind::Expr(_) => {
-            // Shouldn't happen in pure comprehension (non-final bare expr)
-            rest
+        StmtKind::Expr(e) => {
+            // Bare expression in non-final position: monadic sequencing.
+            // `e; rest` => `__bind (\_ -> rest) e` (run e, discard result, then rest).
+            mk_bind(
+                spanned(
+                    ExprKind::Lambda {
+                        params: vec![spanned(PatKind::Wildcard, span)],
+                        body: Box::new(rest),
+                    },
+                    span,
+                ),
+                e.clone(),
+                span,
+            )
         }
     }
 }

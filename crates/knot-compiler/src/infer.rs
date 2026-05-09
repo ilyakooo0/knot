@@ -882,7 +882,30 @@ impl Infer {
         match f {
             Ty::TyCon(ref name) if name == "[]" => Ty::Relation(Box::new(a)),
             Ty::TyCon(ref name) if name == "IO" => {
-                Ty::IO(BTreeSet::new(), None, Box::new(a))
+                // Keep partial-application form when applying to an effect row
+                // so `App(App(IO, EffectRow), val)` normalizes via the next arm
+                // to `IO(effects, row, val)` instead of collapsing the effect
+                // row into the value-type slot.
+                if matches!(&a, Ty::EffectRow(_, _)) {
+                    Ty::App(Box::new(f), Box::new(a))
+                } else {
+                    Ty::IO(BTreeSet::new(), None, Box::new(a))
+                }
+            }
+            // `App(App(TyCon("IO"), EffectRow), a)` — IO partially applied to
+            // an effect row, then applied to a value. Built by the App-vs-IO
+            // unification when binding a monad type variable to IO so that
+            // effect/row information carries through `App(m, _)` instead of
+            // being lost (which would force closed-empty IO).
+            Ty::App(ref inner_f, ref eff) => {
+                if let (Ty::TyCon(name), Ty::EffectRow(effects, row)) =
+                    (inner_f.as_ref(), eff.as_ref())
+                {
+                    if name == "IO" {
+                        return Ty::IO(effects.clone(), *row, Box::new(a));
+                    }
+                }
+                Ty::App(Box::new(f), Box::new(a))
             }
             Ty::TyCon(name) => Ty::Con(name, vec![a]),
             Ty::Con(name, mut args) => {
@@ -1153,10 +1176,19 @@ impl Infer {
                 self.unify(f, &Ty::TyCon("[]".into()), span);
                 self.unify(a, b, span);
             }
-            // App(f, a) vs IO(effects, row, b) → f = IO, a = b
-            (Ty::App(f, a), Ty::IO(_effects, _row, b))
-            | (Ty::IO(_effects, _row, b), Ty::App(f, a)) => {
-                self.unify(f, &Ty::TyCon("IO".into()), span);
+            // App(f, a) vs IO(effects, row, b) → f = App(IO, EffectRow(effects, row)), a = b
+            // Binding f to a partially-applied IO (carrying the effect row)
+            // instead of just TyCon("IO") preserves effect/row info through
+            // monad-type variables — otherwise `App(m, _)` always normalizes
+            // to closed-empty IO, breaking polymorphic-effect code like
+            // `forEach : [a] -> (a -> IO {| e} {}) -> IO {| e} {}`.
+            (Ty::App(f, a), Ty::IO(effects, row, b))
+            | (Ty::IO(effects, row, b), Ty::App(f, a)) => {
+                let io_app = Ty::App(
+                    Box::new(Ty::TyCon("IO".into())),
+                    Box::new(Ty::EffectRow(effects.clone(), *row)),
+                );
+                self.unify(f, &io_app, span);
                 self.unify(a, b, span);
             }
             // App(f, a) vs Con(name, args) — decompose the constructor

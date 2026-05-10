@@ -1278,6 +1278,24 @@ impl Codegen {
     // ── Declaration collection ────────────────────────────────────
 
     fn collect_declarations(&mut self, module: &ast::Module) {
+        // Register built-in ADT constructors so trait dispatchers can find their
+        // ctor lists. Inference treats these as built-in types (see
+        // `register_builtins` in infer.rs), so they don't appear as user-source
+        // `data` decls. Without this, `impl Functor Maybe` etc. would be silently
+        // dropped from the dispatcher lookup at codegen time.
+        self.data_constructors.insert(
+            "Maybe".into(),
+            vec!["Nothing".into(), "Just".into()],
+        );
+        self.data_constructors.insert(
+            "Result".into(),
+            vec!["Err".into(), "Ok".into()],
+        );
+        self.data_constructors.insert(
+            "Bool".into(),
+            vec!["True".into(), "False".into()],
+        );
+
         // __bind/__yield/__empty are desugared do-block operations that dispatch
         // through Monad/Applicative/Alternative trait impls (see compile_app,
         // compile_monadic_yield, compile_monadic_empty). No standalone user

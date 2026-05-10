@@ -3572,13 +3572,10 @@ impl Infer {
         )
     }
 
-    /// Build the expected type of a single endpoint handler.
-    /// Input is a record of all request fields (path params, query params,
-    /// body fields, request headers). Output is the declared response type
-    /// wrapped in `IO {| r} _` where `r` is the per-handler row variable
-    /// `infer_serve` allocates — its effects are extracted post-check and
-    /// unioned into the resulting `Server`'s effect row.
-    fn serve_handler_type(&mut self, entry: &ast::RouteEntry, handler_row: TyVar) -> Ty {
+    /// Build the request-input record type for a route entry. Same record
+    /// the handler receives (path params + query params + body fields +
+    /// request headers) and the rate-limit `key` function's first argument.
+    fn route_input_record_ty(&mut self, entry: &ast::RouteEntry) -> Ty {
         let mut input_fields: BTreeMap<String, Ty> = BTreeMap::new();
         for seg in &entry.path {
             if let ast::PathSegment::Param { name, ty } = seg {
@@ -3594,7 +3591,17 @@ impl Infer {
         for hf in &entry.request_headers {
             input_fields.insert(hf.name.clone(), self.ast_type_to_ty(&hf.value));
         }
-        let input = Ty::Record(input_fields, None);
+        Ty::Record(input_fields, None)
+    }
+
+    /// Build the expected type of a single endpoint handler.
+    /// Input is a record of all request fields (path params, query params,
+    /// body fields, request headers). Output is the declared response type
+    /// wrapped in `IO {| r} _` where `r` is the per-handler row variable
+    /// `infer_serve` allocates — its effects are extracted post-check and
+    /// unioned into the resulting `Server`'s effect row.
+    fn serve_handler_type(&mut self, entry: &ast::RouteEntry, handler_row: TyVar) -> Ty {
+        let input = self.route_input_record_ty(entry);
 
         let response = match &entry.response_ty {
             Some(resp_ty) => {
@@ -5047,6 +5054,26 @@ impl Infer {
             ),
         );
 
+        // Built-in type: RequestCtx — passed to a route's `rateLimit` key
+        // function. Carries client metadata and a header lookup function.
+        self.aliases.insert(
+            "RequestCtx".into(),
+            Ty::Record(
+                BTreeMap::from([
+                    ("clientIp".into(), Ty::Text),
+                    ("receivedAt".into(), Ty::IntUnit(UnitTy::named("Ms"))),
+                    (
+                        "header".into(),
+                        Ty::Fun(
+                            Box::new(Ty::Text),
+                            Box::new(Ty::Con("Maybe".into(), vec![Ty::Text])),
+                        ),
+                    ),
+                ]),
+                None,
+            ),
+        );
+
         // println : ∀a. a -> IO {console} {}
         let a = self.fresh_var();
         self.bind_top(
@@ -6167,9 +6194,60 @@ impl Infer {
                 } => {
                     self.check_impl_items(trait_name, args, items);
                 }
+                ast::DeclKind::Route { entries, .. } => {
+                    for entry in entries {
+                        if let Some(rate_limit_expr) = &entry.rate_limit {
+                            self.check_rate_limit_expr(entry, rate_limit_expr);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
+    }
+
+    /// Type-check a route's `rateLimit <expr>` clause. The expression must
+    /// have type `{key: input -> RequestCtx -> Maybe a, limit: {requests: Int, window: Int<Ms>}}`
+    /// for some `a` constrained by `Ord`, where `input` is the same record
+    /// the handler receives (path/query/body/headers fields). The `Ord a`
+    /// constraint is deferred so it's checked once `a` is concretized.
+    fn check_rate_limit_expr(&mut self, entry: &ast::RouteEntry, expr: &ast::Expr) {
+        let alpha = self.fresh_var();
+        let input_ty = self.route_input_record_ty(entry);
+        let request_ctx = self
+            .aliases
+            .get("RequestCtx")
+            .cloned()
+            .unwrap_or_else(|| Ty::Con("RequestCtx".into(), vec![]));
+        let key_ty = Ty::Fun(
+            Box::new(input_ty),
+            Box::new(Ty::Fun(
+                Box::new(request_ctx),
+                Box::new(Ty::Con("Maybe".into(), vec![Ty::Var(alpha)])),
+            )),
+        );
+        let limit_ty = Ty::Record(
+            BTreeMap::from([
+                ("requests".into(), Ty::Int),
+                ("window".into(), Ty::IntUnit(UnitTy::named("Ms"))),
+            ]),
+            None,
+        );
+        let expected = Ty::Record(
+            BTreeMap::from([
+                ("key".into(), key_ty),
+                ("limit".into(), limit_ty),
+            ]),
+            None,
+        );
+        self.check_expr(expr, &expected);
+        // Require Ord on the key value type so the runtime has a stable
+        // notion of equality / serialization for clients.
+        self.deferred_constraints.push(DeferredConstraint {
+            trait_name: "Ord".into(),
+            type_var: alpha,
+            span: expr.span,
+        });
     }
 
     fn check_impl_items(

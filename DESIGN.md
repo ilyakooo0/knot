@@ -883,6 +883,78 @@ result <- fetch "https://api.example.com" (GetTodos {authorization: "Bearer tok"
 -- result : IO {network} (Result ... {body: [Todo], headers: {xTotalCount: Int, xPage: Int}})
 ```
 
+#### Rate Limiting
+
+Endpoints may declare a per-route token-bucket rate limit with the `rateLimit` clause, placed after the response type (and after response `headers`, if any) and before `=`. The clause takes a single expression of type `RateLimit input a`:
+
+```knot
+type RequestCtx = {
+  clientIp: Text,
+  receivedAt: Int<Ms>,
+  header: Text -> Maybe Text       -- case-insensitive lookup
+}
+
+type RateLimit input a = {
+  key: input -> RequestCtx -> Maybe a,    -- Ord a; Nothing exempts this request
+  limit: {requests: Int, window: Int<Ms>}
+}
+```
+
+The `key` function receives the same input record the handler does (path params, query params, body fields, request headers — combined into one record), plus the runtime-supplied `RequestCtx`. Returning `Nothing` exempts the request from rate limiting; returning `Just k` puts the request into the bucket named by `k`. The key type `a` only has to satisfy `Ord` — the runtime serializes it (via `show`) for the SQLite bucket key, so any `Ord` value works (text, int, tuples, records, ADTs).
+
+```knot
+byClientIp = \input ctx -> Just {value: ctx.clientIp}
+
+byOwner = \{owner} ctx -> Just {value: owner}              -- key by path/query/body field
+
+byApiKey = \input ctx -> case ctx.header "Authorization" of
+  Just {value: k} -> Just {value: k}
+  Nothing {} -> Just {value: ctx.clientIp}                  -- fall back to IP
+
+route Api where
+  GET /hello -> {message: Text}
+    rateLimit {key: byClientIp, limit: {requests: 100, window: 60000<Ms>}}
+    = Hello
+
+  GET /user/{owner: Text} -> {message: Text}
+    rateLimit {key: byOwner, limit: {requests: 10, window: 60000<Ms>}}
+    = User
+
+  POST {body: Text} /upload -> {ok: Bool}
+    rateLimit {key: byApiKey, limit: {requests: 10, window: 60000<Ms>}}
+    = Upload
+
+  GET /open -> {message: Text} = Open       -- no clause = unlimited
+```
+
+The clause accepts any expression of type `RateLimit input a`, so common keying strategies and limits can be extracted into top-level bindings and reused:
+
+```knot
+serverLimit = {key: \input ctx -> Just {value: ctx.clientIp},
+               limit: {requests: 1000, window: 60000<Ms>}}
+
+route Api where
+  POST {events: [Event]} /federation/gossip -> {} rateLimit serverLimit = RecvGossip
+```
+
+**Algorithm.** A token bucket per `(route, key)` pair, refilled lazily on access at rate `limit.requests / limit.window`. A request that finds at least one token consumes one and is dispatched normally; otherwise the runtime responds `429 Too Many Requests` with body `{"error":"Rate limit exceeded"}` and a `Retry-After: <seconds>` header. The handler is not invoked.
+
+**Storage.** Buckets persist in a SQLite table `_knot_rate_limits` created lazily on first use:
+
+```sql
+CREATE TABLE _knot_rate_limits (
+  route       TEXT NOT NULL,    -- endpoint constructor name
+  key         TEXT NOT NULL,    -- show(keyFn(ctx))
+  tokens      REAL NOT NULL,
+  last_refill INTEGER NOT NULL,
+  PRIMARY KEY (route, key)
+) WITHOUT ROWID;
+```
+
+The check runs in a `BEGIN IMMEDIATE` transaction so concurrent requests for the same client serialize correctly; different keys do not contend.
+
+**Effects.** Rate limiting reads and writes a hidden table; these effects are internal and not surfaced in user-visible effect rows.
+
 #### Path Prefixes
 
 Factor out common path prefixes with nesting:

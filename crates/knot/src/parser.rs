@@ -1538,6 +1538,15 @@ impl Parser {
         self.skip_newlines();
         let response_headers = self.parse_route_headers();
 
+        // Optional rate limit: `rateLimit <expr>`
+        self.skip_newlines();
+        let rate_limit = if matches!(self.peek(), TokenKind::Lower(s) if s == "rateLimit") {
+            self.advance();
+            self.parse_expr()
+        } else {
+            None
+        };
+
         // `= ConstructorName`
         self.skip_newlines();
         self.expect(&TokenKind::Eq, "expected '=' before route constructor name")
@@ -1554,6 +1563,7 @@ impl Parser {
             request_headers,
             response_ty,
             response_headers,
+            rate_limit,
             constructor,
         })
     }
@@ -3417,7 +3427,7 @@ impl Parser {
 
     fn can_start_type_atom(&self) -> bool {
         if self.stop_type_at_headers {
-            if matches!(self.peek(), TokenKind::Lower(s) if s == "headers") {
+            if matches!(self.peek(), TokenKind::Lower(s) if s == "headers" || s == "rateLimit") {
                 return false;
             }
         }

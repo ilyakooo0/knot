@@ -10049,6 +10049,244 @@ pub extern "C" fn knot_route_set_field_refinement(
     });
 }
 
+/// Register a rate-limit configuration for a route endpoint.
+/// Called once during program initialization, after the route table is built.
+/// `rate_limit_val` is the compiled Knot value of the `rateLimit` clause:
+/// `{key: RequestCtx -> Maybe a, limit: {requests: Int, window: Int<Ms>}}`.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_route_set_rate_limit(
+    table: *mut c_void,
+    ctor_ptr: *const u8,
+    ctor_len: usize,
+    rate_limit_val: *mut Value,
+) {
+    let ctor = unsafe { str_from_raw(ctor_ptr, ctor_len) }.to_string();
+    let table = unsafe { &mut *(table as *mut RouteTable) };
+
+    let record_field = |v: *mut Value, name: &str| -> Option<*mut Value> {
+        match unsafe { as_ref(v) } {
+            Value::Record(fs) => fs.iter().find(|f| &*f.name == name).map(|f| f.value),
+            _ => None,
+        }
+    };
+
+    let key_fn = match record_field(rate_limit_val, "key") {
+        Some(v) => v,
+        None => {
+            log_warn!("rateLimit value missing 'key' field for {}", ctor);
+            return;
+        }
+    };
+    let limit_val = match record_field(rate_limit_val, "limit") {
+        Some(v) => v,
+        None => {
+            log_warn!("rateLimit value missing 'limit' field for {}", ctor);
+            return;
+        }
+    };
+    let requests = match record_field(limit_val, "requests").map(|v| unsafe { as_ref(v) }) {
+        Some(Value::Int(n)) => *n,
+        _ => {
+            log_warn!("rateLimit.limit.requests must be Int for {}", ctor);
+            return;
+        }
+    };
+    let window_ms = match record_field(limit_val, "window").map(|v| unsafe { as_ref(v) }) {
+        Some(Value::Int(n)) => *n,
+        _ => {
+            log_warn!("rateLimit.limit.window must be Int for {}", ctor);
+            return;
+        }
+    };
+
+    log_debug!(
+        "[ROUTE] rateLimit registered ctor={} requests={} window_ms={}",
+        ctor,
+        requests,
+        window_ms
+    );
+    table.rate_limits.push(RateLimitConfig {
+        constructor: ctor,
+        key_fn,
+        requests,
+        window_ms,
+    });
+}
+
+/// Header lookup function value passed to user code as `RequestCtx.header`.
+/// `env` is a `Value::Record` whose field names are lowercased header names.
+extern "C" fn knot_rate_limit_header_lookup(
+    _db: *mut c_void,
+    env: *mut Value,
+    name_arg: *mut Value,
+) -> *mut Value {
+    let query = match unsafe { as_ref(name_arg) } {
+        Value::Text(s) => s.to_lowercase(),
+        _ => {
+            return alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit)));
+        }
+    };
+    if let Value::Record(fields) = unsafe { as_ref(env) } {
+        for f in fields {
+            if &*f.name == query.as_str() {
+                return alloc(Value::Constructor(
+                    "Just".into(),
+                    alloc(Value::Record(vec![RecordField {
+                        name: "value".into(),
+                        value: f.value,
+                    }])),
+                ));
+            }
+        }
+    }
+    alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit)))
+}
+
+/// Build a `RequestCtx = {clientIp, header, receivedAt}` value to hand
+/// to a route's `rateLimit.key` function. Header field names are
+/// lowercased so the lookup function can do case-insensitive matching.
+fn build_request_ctx(
+    client_ip: &str,
+    received_at_ms: i64,
+    headers: &[(String, String)],
+) -> *mut Value {
+    let header_env_fields: Vec<RecordField> = headers
+        .iter()
+        .map(|(k, v)| RecordField {
+            name: intern_str(&k.to_lowercase()),
+            value: alloc(Value::Text(Arc::from(v.as_str()))),
+        })
+        .collect();
+    let header_env = alloc(Value::Record(header_env_fields));
+    let header_fn = alloc(Value::Function(Box::new(FunctionInner {
+        fn_ptr: knot_rate_limit_header_lookup as *const u8,
+        env: header_env,
+        source: intern_str("RequestCtx.header"),
+    })));
+    let mut fields = vec![
+        RecordField {
+            name: "clientIp".into(),
+            value: alloc(Value::Text(Arc::from(client_ip))),
+        },
+        RecordField {
+            name: "header".into(),
+            value: header_fn,
+        },
+        RecordField {
+            name: "receivedAt".into(),
+            value: alloc_int(received_at_ms),
+        },
+    ];
+    fields.sort_by(|a, b| a.name.cmp(&b.name));
+    alloc(Value::Record(fields))
+}
+
+fn current_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Lazily ensure the `_knot_rate_limits` table exists. Cheap on subsequent
+/// calls thanks to `IF NOT EXISTS`.
+fn ensure_rate_limit_table(db: &KnotDb) {
+    let _ = db.conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _knot_rate_limits (\n             route TEXT NOT NULL,\n             key TEXT NOT NULL,\n             tokens REAL NOT NULL,\n             last_refill INTEGER NOT NULL,\n             PRIMARY KEY (route, key)\n         ) WITHOUT ROWID;",
+    );
+}
+
+/// Token-bucket rate-limit check. Returns `Ok(())` if the request is
+/// allowed (and decrements one token); `Err(retry_after_ms)` if denied.
+/// Buckets are stored per `(route, key)` in `_knot_rate_limits`.
+fn check_rate_limit(
+    db: &KnotDb,
+    route: &str,
+    key: &str,
+    requests: i64,
+    window_ms: i64,
+) -> Result<(), i64> {
+    if requests <= 0 || window_ms <= 0 {
+        return Ok(());
+    }
+    ensure_rate_limit_table(db);
+    let now = current_unix_ms();
+    let _ = db.conn.execute_batch("BEGIN IMMEDIATE;");
+    let row: Option<(f64, i64)> = db
+        .conn
+        .query_row(
+            "SELECT tokens, last_refill FROM _knot_rate_limits WHERE route = ?1 AND key = ?2",
+            rusqlite::params![route, key],
+            |r| Ok((r.get::<_, f64>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .ok();
+    let capacity = requests as f64;
+    let tokens_before = match row {
+        Some((tokens, last_refill)) => {
+            let elapsed = (now - last_refill).max(0) as f64;
+            let refill = elapsed * capacity / (window_ms as f64);
+            (tokens + refill).min(capacity)
+        }
+        None => capacity,
+    };
+    if tokens_before >= 1.0 {
+        let new_tokens = tokens_before - 1.0;
+        let _ = db.conn.execute(
+            "INSERT OR REPLACE INTO _knot_rate_limits (route, key, tokens, last_refill) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![route, key, new_tokens, now],
+        );
+        let _ = db.conn.execute_batch("COMMIT;");
+        Ok(())
+    } else {
+        let needed = 1.0 - tokens_before;
+        let retry_after_ms =
+            (needed * (window_ms as f64) / capacity).ceil() as i64;
+        let _ = db.conn.execute(
+            "INSERT OR REPLACE INTO _knot_rate_limits (route, key, tokens, last_refill) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![route, key, tokens_before, now],
+        );
+        let _ = db.conn.execute_batch("COMMIT;");
+        Err(retry_after_ms.max(1))
+    }
+}
+
+/// Compute the bucket key for a request: invoke the user's `key_fn`,
+/// which is curried `input -> RequestCtx -> Maybe a`. The input record
+/// inside the constructor is the same one the handler will receive.
+/// Returns `Some(key_text)` to enforce a limit, or `None` to skip rate
+/// limiting (when the user returns `Nothing`).
+fn rate_limit_key_for_request(
+    db: *mut c_void,
+    cfg: &RateLimitConfig,
+    client_ip: &str,
+    headers: &[(String, String)],
+    input: *mut Value,
+) -> Option<String> {
+    let ctx = build_request_ctx(client_ip, current_unix_ms(), headers);
+    // key_fn is curried: (input)(ctx)
+    let after_input = knot_value_call(db, cfg.key_fn, input);
+    let result = knot_value_call(db, after_input, ctx);
+    match unsafe { as_ref(result) } {
+        Value::Constructor(tag, payload) if &**tag == "Just" => {
+            let value_field = match unsafe { as_ref(*payload) } {
+                Value::Record(fields) => fields
+                    .iter()
+                    .find(|f| &*f.name == "value")
+                    .map(|f| f.value),
+                _ => None,
+            };
+            value_field.and_then(|v| {
+                let shown = knot_value_show(v);
+                match unsafe { as_ref(shown) } {
+                    Value::Text(s) => Some(s.to_string()),
+                    _ => None,
+                }
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Register a subset constraint. Called at program startup.
 /// Empty field strings mean "no field" (whole relation).
 #[unsafe(no_mangle)]
@@ -11015,10 +11253,36 @@ impl Clone for FieldRefinement {
     }
 }
 
+/// Per-endpoint token-bucket rate-limit configuration. `key_fn` is a Knot
+/// `input -> RequestCtx -> Maybe a` function — its result is shown via
+/// `knot_value_show` to produce the SQLite bucket key. `input` is the
+/// same record the handler receives (path/query/body/headers fields).
+struct RateLimitConfig {
+    constructor: String,
+    key_fn: *mut Value,
+    requests: i64,
+    window_ms: i64,
+}
+
+unsafe impl Send for RateLimitConfig {}
+unsafe impl Sync for RateLimitConfig {}
+
+impl Clone for RateLimitConfig {
+    fn clone(&self) -> Self {
+        Self {
+            constructor: self.constructor.clone(),
+            key_fn: self.key_fn,
+            requests: self.requests,
+            window_ms: self.window_ms,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct RouteTable {
     entries: Vec<RouteTableEntry>,
     field_refinements: Vec<FieldRefinement>,
+    rate_limits: Vec<RateLimitConfig>,
 }
 
 fn parse_descriptor(desc: &str) -> Vec<(String, String)> {
@@ -11057,6 +11321,7 @@ pub extern "C" fn knot_route_table_new() -> *mut c_void {
     let table = Box::new(RouteTable {
         entries: Vec::new(),
         field_refinements: Vec::new(),
+        rate_limits: Vec::new(),
     });
     Box::into_raw(table) as *mut c_void
 }
@@ -11668,6 +11933,18 @@ fn http_serve_loop(
                     .map(|h| (h.field.as_str().as_str().to_string(), h.value.as_str().to_string()))
                     .collect();
 
+                // Capture the client IP for the rate limiter's `RequestCtx`.
+                // tiny_http only exposes the peer address — fine for direct
+                // connections; behind a proxy the user can read the
+                // X-Forwarded-For header from `RequestCtx.header`.
+                let client_ip = request
+                    .remote_addr()
+                    .map(|a| match a {
+                        std::net::SocketAddr::V4(v) => v.ip().to_string(),
+                        std::net::SocketAddr::V6(v) => v.ip().to_string(),
+                    })
+                    .unwrap_or_default();
+
                 // Clone route entry data we need
                 let entry_method = entry.method.clone();
                 let entry_body_fields = entry.body_fields.clone();
@@ -11681,6 +11958,11 @@ fn http_serve_loop(
                     .filter(|r| r.constructor == entry_constructor)
                     .cloned()
                     .collect();
+                let entry_rate_limit: Option<RateLimitConfig> = table
+                    .rate_limits
+                    .iter()
+                    .find(|r| r.constructor == entry_constructor)
+                    .cloned();
 
                 // Deep-clone handler for the worker thread
                 let handler_cloned = deep_clone_value(handler) as usize;
@@ -11692,7 +11974,7 @@ fn http_serve_loop(
                     let db_path = DB_PATH.lock().unwrap().clone();
                     let db = knot_db_open(db_path.as_ptr(), db_path.len());
 
-                    let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<*mut Value, (u16, String)> {
+                    let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<*mut Value, (u16, String, Option<i64>)> {
                     // Build record from path params, query params, and body
                     let mut fields: Vec<RecordField> = Vec::new();
 
@@ -11710,7 +11992,7 @@ fn http_serve_loop(
                             None => return Err((400, format!(
                                 "invalid path parameter '{}': '{}' is not a valid {}",
                                 name, val, ty
-                            ))),
+                            ), None)),
                         };
                         fields.push(RecordField {
                             name: intern_str(name),
@@ -11732,7 +12014,7 @@ fn http_serve_loop(
                                         None => return Err((400, format!(
                                             "invalid query parameter '{}': '{}' is not a valid {}",
                                             qname, v, inner_ty
-                                        ))),
+                                        ), None)),
                                     };
                                     alloc(Value::Constructor(
                                         "Just".into(),
@@ -11750,7 +12032,7 @@ fn http_serve_loop(
                                 None => return Err((400, format!(
                                     "invalid query parameter '{}': '{}' is not a valid {}",
                                     qname, raw, inner_ty
-                                ))),
+                                ), None)),
                             }
                         };
                         fields.push(RecordField {
@@ -11770,7 +12052,7 @@ fn http_serve_loop(
                             Err(e) => {
                                 let msg = format!("invalid JSON body: {}", e);
                                 log_debug!("[HTTP] --> 400 {}", msg);
-                                return Err((400, msg));
+                                return Err((400, msg, None));
                             }
                         };
                         match unsafe { as_ref(body_val) } {
@@ -11862,13 +12144,50 @@ fn http_serve_loop(
                                 return Err((400, format!(
                                     "validation error: field '{}' does not satisfy '{}' constraint",
                                     refinement.field_name, refinement.type_name
-                                )));
+                                ), None));
                             }
                         }
                     }
 
                     fields.sort_by(|a, b| a.name.cmp(&b.name));
                     let record = alloc(Value::Record(fields));
+
+                    // Rate-limit check. The user's `key` function is
+                    // curried `input -> RequestCtx -> Maybe a` and is
+                    // called here with the same input record the handler
+                    // will receive. On rejection respond 429 with a
+                    // Retry-After header (carried as the Err's third
+                    // tuple element).
+                    if let Some(cfg) = entry_rate_limit.as_ref() {
+                        if let Some(key) = rate_limit_key_for_request(
+                            db,
+                            cfg,
+                            &client_ip,
+                            &req_headers,
+                            record,
+                        ) {
+                            let db_ref = unsafe { &*(db as *mut KnotDb) };
+                            if let Err(retry_after_ms) = check_rate_limit(
+                                db_ref,
+                                &cfg.constructor,
+                                &key,
+                                cfg.requests,
+                                cfg.window_ms,
+                            ) {
+                                log_warn!(
+                                    "[HTTP] --> 429 rate limit exceeded (route={}, key={})",
+                                    cfg.constructor,
+                                    key
+                                );
+                                return Err((
+                                    429,
+                                    "Rate limit exceeded".to_string(),
+                                    Some(retry_after_ms),
+                                ));
+                            }
+                        }
+                    }
+
                     let ctor_val = alloc(Value::Constructor(intern_str(&entry_constructor), record));
 
                     // Call handler. The Server value is just a Knot function
@@ -11967,16 +12286,24 @@ fn http_serve_loop(
                         }
                     }
                         }
-                        Ok(Err((status_code, error_msg))) => {
+                        Ok(Err((status_code, error_msg, retry_after_ms))) => {
                             log_warn!("[HTTP] --> {} {}", status_code, error_msg);
                             let body = format!("{{\"error\":\"{}\"}}", json_escape(&error_msg));
-                            let response = tiny_http::Response::from_string(&body)
+                            let mut response = tiny_http::Response::from_string(&body)
                                 .with_status_code(status_code)
                                 .with_header(
                                     "Content-Type: application/json"
                                         .parse::<tiny_http::Header>()
                                         .unwrap(),
                                 );
+                            if let Some(ms) = retry_after_ms {
+                                let secs = (ms + 999) / 1000;
+                                if let Ok(h) = format!("Retry-After: {}", secs.max(1))
+                                    .parse::<tiny_http::Header>()
+                                {
+                                    response = response.with_header(h);
+                                }
+                            }
                             let _ = request.respond(response);
                         }
                         Err(panic_err) => {

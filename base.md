@@ -406,6 +406,29 @@ Start an HTTP server on the given port. The second argument is a `Server a` valu
 
 Handlers return `Result HttpError T` where `HttpError = {status: Int, message: Text}` and `T` is the response type declared on the route. `Ok {value: T}` responds with HTTP 200; `Err {error: {status, message}}` responds with the given status code (clamped to 100..=599) and a JSON `{"error": message}` body — use this for application-level errors like 404 not found or 401 unauthorized.
 
+### Rate limiting
+
+Endpoints can declare a per-route token-bucket rate limit with the `rateLimit <expr>` clause (placed after the response type/headers, before `=`). The expression has type `RateLimit input a = {key: input -> RequestCtx -> Maybe a, limit: {requests: Int, window: Int<Ms>}}` with `Ord a`. `input` is the same record the handler receives (path/query/body/header fields). `RequestCtx = {clientIp: Text, receivedAt: Int<Ms>, header: Text -> Maybe Text}` is supplied by the runtime; `header` does case-insensitive lookup.
+
+The `key` function returns `Just k` to put the request in bucket `k` (any `Ord` value — serialized via `show` for the SQLite key) or `Nothing` to exempt the request from rate limiting. On rejection the runtime responds `429 Too Many Requests` with `{"error":"Rate limit exceeded"}` and a `Retry-After: <seconds>` header; the handler is not invoked.
+
+Buckets persist across restarts in a hidden `_knot_rate_limits` SQLite table; concurrent requests for the same `(route, key)` pair serialize via `BEGIN IMMEDIATE`.
+
+```knot
+byIp = \input ctx -> Just {value: ctx.clientIp}
+
+byOwner = \{owner} ctx -> Just {value: owner}    -- key on a path/body field
+
+route Api where
+  GET /hello -> {message: Text}
+    rateLimit {key: byIp, limit: {requests: 100, window: 60000<Ms>}}
+    = Hello
+
+  GET /user/{owner: Text} -> {message: Text}
+    rateLimit {key: byOwner, limit: {requests: 10, window: 60000<Ms>}}
+    = User
+```
+
 ## Concurrency
 
 ```knot

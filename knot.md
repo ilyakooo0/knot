@@ -804,6 +804,56 @@ result <- fetch "https://api.example.com" (GetTodos {authorization: "Bearer tok"
 -- result : IO {network} (Result ... {body: [Todo], headers: {xTotalCount: Int}})
 ```
 
+### Rate Limiting
+
+Add a per-endpoint token-bucket rate limit with `rateLimit <expr>` (placed after the response type/headers, before `=`). The expression has type `RateLimit input a`:
+
+```knot
+type RequestCtx = {
+  clientIp: Text,
+  receivedAt: Int<Ms>,
+  header: Text -> Maybe Text       -- case-insensitive lookup
+}
+
+type RateLimit input a = {
+  key: input -> RequestCtx -> Maybe a,    -- Ord a; Nothing exempts the request
+  limit: {requests: Int, window: Int<Ms>}
+}
+```
+
+`key` receives the same input record the handler does (path/query/body/header fields, combined) plus the runtime-supplied `RequestCtx`, so you can key on any field of either:
+
+```knot
+byClientIp = \input ctx -> Just {value: ctx.clientIp}
+
+byOwner = \{owner} ctx -> Just {value: owner}             -- key on a path/body field
+
+route Api where
+  GET /hello -> {message: Text}
+    rateLimit {key: byClientIp, limit: {requests: 100, window: 60000<Ms>}}
+    = Hello
+
+  GET /user/{owner: Text} -> {message: Text}
+    rateLimit {key: byOwner, limit: {requests: 10, window: 60000<Ms>}}
+    = User
+
+  GET /open -> {message: Text} = Open                  -- no clause = unlimited
+```
+
+The `key` value can be any `Ord` type — the runtime serializes it via `show` for the SQLite bucket key. Returning `Nothing` from `key` skips rate limiting for that request (e.g. exempt admin requests by reading `ctx.header "Authorization"`).
+
+On rejection the runtime responds `429 Too Many Requests` with body `{"error":"Rate limit exceeded"}` and a `Retry-After: <seconds>` header — the handler is not invoked. Buckets persist in a hidden `_knot_rate_limits` SQLite table; concurrent requests for the same key serialize via `BEGIN IMMEDIATE`.
+
+Common keying strategies are regular expressions, so extract them once and reuse:
+
+```knot
+serverLimit = {key: \input ctx -> Just {value: ctx.clientIp},
+               limit: {requests: 1000, window: 60000<Ms>}}
+
+route Api where
+  POST {events: [Event]} /federation/gossip -> {} rateLimit serverLimit = RecvGossip
+```
+
 ---
 
 ## Schema Evolution

@@ -595,6 +595,7 @@ pub struct RouteEntry {
     pub request_headers: Vec<Field<Type>>,
     pub response_ty: Option<Type>,
     pub response_headers: Vec<Field<Type>>,
+    pub rate_limit: Option<Expr>,
     pub constructor: Name,
 }
 

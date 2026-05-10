@@ -918,6 +918,7 @@ impl Codegen {
         self.declare_rt("knot_result_empty", &[], &[p]);
         self.declare_rt("knot_refinement_validate_relation", &[p, p, p, p, p, p, p], &[]);
         self.declare_rt("knot_route_set_field_refinement", &[p, p, p, p, p, p, p, p], &[]);
+        self.declare_rt("knot_route_set_rate_limit", &[p, p, p, p], &[]);
 
         // Monadic bind for relations (do-desugaring)
         self.declare_rt("knot_relation_bind", &[p, p, p], &[p]);
@@ -3718,6 +3719,24 @@ impl Codegen {
                 }
             }
 
+            // Register rate limit configurations for route entries.
+            // The expression compiles to a `{key, limit}` Value handed
+            // straight to the runtime, which unpacks the fields.
+            for (table, entries) in &route_tables {
+                for route_entry in entries {
+                    if let Some(rate_limit_expr) = &route_entry.rate_limit {
+                        let (ctor_ptr, ctor_len) = cg.string_ptr(builder, &route_entry.constructor);
+                        let mut rl_env = Env::new();
+                        let rl_val = cg.compile_expr(builder, rate_limit_expr, &mut rl_env, db);
+                        cg.call_rt_void(
+                            builder,
+                            "knot_route_set_rate_limit",
+                            &[*table, ctor_ptr, ctor_len, rl_val],
+                        );
+                    }
+                }
+            }
+
             // Call user's main function if it exists.
             //
             // Isolate main's body in a child arena frame so any values it
@@ -5944,6 +5963,24 @@ impl Codegen {
                                 req_hdrs_ptr, req_hdrs_len, resp_hdrs_ptr, resp_hdrs_len,
                             ],
                         );
+                    }
+
+                    // Register rate-limit configurations on this table.
+                    // The compiled `rateLimit` expression is a record value
+                    // `{key, limit}` that the runtime unpacks.
+                    for entry in &entries {
+                        if let Some(rate_limit_expr) = &entry.rate_limit {
+                            let (ctor_ptr, ctor_len) =
+                                self.string_ptr(builder, &entry.constructor);
+                            let mut rl_env = Env::new();
+                            let rl_val =
+                                self.compile_expr(builder, rate_limit_expr, &mut rl_env, db);
+                            self.call_rt_void(
+                                builder,
+                                "knot_route_set_rate_limit",
+                                &[table, ctor_ptr, ctor_len, rl_val],
+                            );
+                        }
                     }
 
                     if is_listen_on {

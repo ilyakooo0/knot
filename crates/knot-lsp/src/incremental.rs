@@ -269,8 +269,8 @@ fn hash_decl_signature(decl: &ast::Decl) -> u64 {
                 }
             }
         }
-        DeclKind::Source { name, ty, history, .. } => {
-            ("source_sig", name, history).hash(&mut h);
+        DeclKind::Source { name, ty, .. } => {
+            ("source_sig", name).hash(&mut h);
             strip_spans(&format!("{:?}", ty.node)).hash(&mut h);
         }
         // Everything else: shape *is* the signature. Reuse the full decl hash.
@@ -295,8 +295,8 @@ fn hash_structure(module: &Module) -> u64 {
                     strip_spans(&format!("{:?}", ts.ty.node)).hash(&mut h);
                 }
             }
-            DeclKind::Source { name, ty, history, .. } => {
-                ("source", name, history).hash(&mut h);
+            DeclKind::Source { name, ty, .. } => {
+                ("source", name).hash(&mut h);
                 strip_spans(&format!("{:?}", ty.node)).hash(&mut h);
             }
             DeclKind::View { name, ty, .. } | DeclKind::Derived { name, ty, .. } => {

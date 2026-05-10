@@ -147,10 +147,6 @@ fn collect_containing_spans(expr: &ast::Expr, offset: usize, spans: &mut Vec<Spa
             collect_containing_spans(target, offset, spans);
             collect_containing_spans(value, offset, spans);
         }
-        ast::ExprKind::At { relation, time } => {
-            collect_containing_spans(relation, offset, spans);
-            collect_containing_spans(time, offset, spans);
-        }
         ast::ExprKind::FieldAccess { expr, .. } => {
             collect_containing_spans(expr, offset, spans);
         }

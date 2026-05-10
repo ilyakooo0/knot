@@ -696,12 +696,6 @@ pub const SNIPPETS: &[(&str, &str, &str, SnippetContext)] = &[
         SnippetContext::TopLevel,
     ),
     (
-        "source-history",
-        "source with history",
-        "*${1:name} : [${2:Type}] with history",
-        SnippetContext::TopLevel,
-    ),
-    (
         "view",
         "view declaration",
         "*${1:name} = do\n  ${2:x} <- *${3:source}\n  yield ${4:x}",

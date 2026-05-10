@@ -229,10 +229,6 @@
         {
           "name": "keyword.operator.lambda.knot",
           "match": "\\\\"
-        },
-        {
-          "name": "keyword.operator.temporal.knot",
-          "match": "@"
         }
       ]
     },

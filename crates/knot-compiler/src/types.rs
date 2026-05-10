@@ -43,8 +43,6 @@ pub struct TypeEnv {
     /// Associated type definitions: assoc_type_name -> definitions from impls
     #[allow(dead_code)]
     pub associated_types: HashMap<String, Vec<AssocTypeDef>>,
-    /// Sources with `with history` enabled
-    pub history_sources: HashSet<String>,
     /// Subset constraints: (sub, sup)
     pub subset_constraints: Vec<(RelationPath, RelationPath)>,
     /// Source refined field info: source_name -> [(field_name_or_none, refined_type_name, predicate_expr)]
@@ -61,7 +59,6 @@ impl TypeEnv {
         let mut source_schemas = HashMap::new();
         let mut migrate_schemas: HashMap<String, Vec<(String, String)>> = HashMap::new();
         let mut associated_types: HashMap<String, Vec<AssocTypeDef>> = HashMap::new();
-        let mut history_sources = HashSet::new();
 
         let mut refined_types: HashMap<String, Expr> = HashMap::new();
         // Original AST types for aliases — used to resolve refinements through aliases
@@ -195,13 +192,10 @@ impl TypeEnv {
         let mut source_refinements: HashMap<String, Vec<(Option<String>, String, Expr)>> = HashMap::new();
         for decl in &module.decls {
             match &decl.node {
-                DeclKind::Source { name, ty, history } => {
+                DeclKind::Source { name, ty } => {
                     let schema =
                         schema_for_source(ty, &aliases, &associated_types);
                     source_schemas.insert(name.clone(), schema);
-                    if *history {
-                        history_sources.insert(name.clone());
-                    }
                     // Collect refined field info from the source type
                     let refinements = collect_source_refinements(ty, &refined_types, &alias_ast_types);
                     if !refinements.is_empty() {
@@ -245,7 +239,6 @@ impl TypeEnv {
             source_schemas,
             migrate_schemas,
             associated_types,
-            history_sources,
             subset_constraints,
             source_refinements,
             refined_types,

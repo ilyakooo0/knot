@@ -248,7 +248,7 @@ addPerson = \name age -> do
   set *people = union people [{name: name, age: age}]
 ```
 
-The compiler detects whether a do block is relational or IO from the types. Relation operations (`*rel`, `&rel`, `set`, `@(timestamp)`) all return `IO {} value` — the empty effect set `{}` distinguishes DB operations from external effects like `{console}` or `{fs}`.
+The compiler detects whether a do block is relational or IO from the types. Relation operations (`*rel`, `&rel`, `set`) all return `IO {} value` — the empty effect set `{}` distinguishes DB operations from external effects like `{console}` or `{fs}`.
 
 ### Pattern Matching in Bind
 
@@ -872,24 +872,6 @@ migrate *people
   from {name: Text, age: Int}
   to   {name: Text, age: Int, email: Text}
   using (\old -> {old | email: old.name ++ "@unknown.com"})
-```
-
----
-
-## Temporal Queries
-
-```knot
-*employees : [{name: Text, salary: Int}]
-  with history
-
--- Query past state
-salaryLastYear = \name -> do
-  t <- now
-  emps <- *employees @(t - 365 days)
-  yield (emps
-    |> filter (\e -> e.name == name)
-    |> map (\e -> e.salary)
-    |> single)
 ```
 
 ---

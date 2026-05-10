@@ -427,10 +427,6 @@ pub fn recurse_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, mut f: F) {
             }
         }
         ast::ExprKind::FieldAccess { expr, .. } => f(expr),
-        ast::ExprKind::At { relation, time } => {
-            f(relation);
-            f(time);
-        }
         ast::ExprKind::Annot { expr, .. } => f(expr),
         ast::ExprKind::UnitLit { value, .. } => f(value),
         _ => {}

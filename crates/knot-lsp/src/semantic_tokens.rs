@@ -450,10 +450,6 @@ impl<'a> TokenCollector<'a> {
                 }
                 self.visit_expr(value);
             }
-            ast::ExprKind::At { relation, time } => {
-                self.visit_expr(relation);
-                self.visit_expr(time);
-            }
             ast::ExprKind::Record(fields) => {
                 for f in fields {
                     self.visit_expr(&f.value);

@@ -75,7 +75,7 @@ fn expr_contains_io(expr: &Expr, builtins: &HashSet<&str>, io_fns: &HashSet<Stri
         ExprKind::Var(name) => builtins.contains(name.as_str()) || io_fns.contains(name.as_str()),
         ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) => true,
         ExprKind::Set { .. } | ExprKind::ReplaceSet { .. } => true,
-        ExprKind::At { .. } | ExprKind::Atomic(_) => true,
+        ExprKind::Atomic(_) => true,
         ExprKind::UnitLit { value, .. } => expr_contains_io(value, builtins, io_fns),
         ExprKind::Annot { expr, .. } => expr_contains_io(expr, builtins, io_fns),
         ExprKind::Refine(inner) => expr_contains_io(inner, builtins, io_fns),
@@ -401,10 +401,6 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &HashSet<String>) {
             desugar_expr(value, io_fns);
         }
         ExprKind::Atomic(inner) => desugar_expr(inner, io_fns),
-        ExprKind::At { relation, time } => {
-            desugar_expr(relation, io_fns);
-            desugar_expr(time, io_fns);
-        }
         ExprKind::UnitLit { value, .. } => desugar_expr(value, io_fns),
         ExprKind::Annot { expr, .. } => desugar_expr(expr, io_fns),
         ExprKind::Refine(inner) => desugar_expr(inner, io_fns),
@@ -633,7 +629,7 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
         }
         ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) => true,
         ExprKind::Set { .. } | ExprKind::ReplaceSet { .. } => true,
-        ExprKind::At { .. } | ExprKind::Atomic(_) => true,
+        ExprKind::Atomic(_) => true,
         ExprKind::BinOp { lhs, rhs, .. } => {
             expr_is_io(lhs, io_fns) || expr_is_io(rhs, io_fns)
         }

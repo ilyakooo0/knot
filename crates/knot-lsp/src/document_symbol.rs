@@ -135,14 +135,10 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                     children: None,
                 });
             }
-            DeclKind::Source { name, ty, history, .. } => {
-                let mut detail_parts = vec![format_type_kind(&ty.node)];
-                if *history {
-                    detail_parts.push("with history".into());
-                }
+            DeclKind::Source { name, ty, .. } => {
                 symbols.push(DocumentSymbol {
                     name: format!("*{name}"),
-                    detail: Some(detail_parts.join(" ")),
+                    detail: Some(format_type_kind(&ty.node)),
                     kind: SymbolKind::VARIABLE,
                     tags: None,
                     deprecated: None,

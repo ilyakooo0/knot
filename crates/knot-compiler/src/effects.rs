@@ -534,13 +534,6 @@ impl EffectChecker {
                 effects
             }
 
-            ast::ExprKind::At { relation, time } => {
-                let mut effects = self.infer_effects(relation);
-                let time_effects = self.infer_effects(time);
-                effects = effects.union(&time_effects);
-                effects
-            }
-
             ast::ExprKind::UnitLit { value, .. } => self.infer_effects(value),
             ast::ExprKind::Annot { expr: inner, .. } => self.infer_effects(inner),
             ast::ExprKind::Refine(inner) => self.infer_effects(inner),
@@ -960,7 +953,6 @@ mod tests {
             ty: spanned(TypeKind::Relation(Box::new(spanned(TypeKind::Named(
                 "T".into(),
             ))))),
-            history: false,
         })
     }
 

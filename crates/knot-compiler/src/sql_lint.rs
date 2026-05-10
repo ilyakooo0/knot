@@ -143,10 +143,6 @@ fn lint_expr(
         ExprKind::Annot { expr: inner, .. } => {
             lint_expr(inner, source_schemas, views, diags);
         }
-        ExprKind::At { relation, time } => {
-            lint_expr(relation, source_schemas, views, diags);
-            lint_expr(time, source_schemas, views, diags);
-        }
         ExprKind::UnitLit { value, .. } => {
             lint_expr(value, source_schemas, views, diags);
         }
@@ -908,9 +904,6 @@ fn references_source(expr: &Expr, source_name: &str) -> bool {
         ExprKind::Annot { expr, .. } => references_source(expr, source_name),
         ExprKind::Atomic(inner) | ExprKind::Refine(inner) => {
             references_source(inner, source_name)
-        }
-        ExprKind::At { relation, time } => {
-            references_source(relation, source_name) || references_source(time, source_name)
         }
         ExprKind::UnitLit { value, .. } => references_source(value, source_name),
         ExprKind::Serve { handlers, .. } => {

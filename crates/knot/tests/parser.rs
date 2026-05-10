@@ -958,11 +958,8 @@ fn type_alias_with_params() {
 #[test]
 fn source_simple() {
     match first_decl("*people : [Person]") {
-        DeclKind::Source {
-            name, history, ..
-        } => {
+        DeclKind::Source { name, .. } => {
             assert_eq!(name, "people");
-            assert!(!history);
         }
         other => panic!("expected Source, got {:?}", other),
     }
@@ -981,28 +978,6 @@ fn source_with_record_type() {
             }
         }
         other => panic!("expected Source, got {:?}", other),
-    }
-}
-
-#[test]
-fn source_with_history() {
-    match first_decl("*employees : [Person] with history") {
-        DeclKind::Source { name, history, .. } => {
-            assert_eq!(name, "employees");
-            assert!(history);
-        }
-        other => panic!("expected Source with history, got {:?}", other),
-    }
-}
-
-#[test]
-fn source_with_history_multiline() {
-    match first_decl("*employees : [Person]\n  with history") {
-        DeclKind::Source { name, history, .. } => {
-            assert_eq!(name, "employees");
-            assert!(history);
-        }
-        other => panic!("expected Source with history, got {:?}", other),
     }
 }
 
@@ -2107,44 +2082,6 @@ fn multiline_expression_continuation() {
     }
 }
 
-// ── Temporal Queries ────────────────────────────────────────────────
-
-#[test]
-fn temporal_at_query() {
-    match fun_body("x = *people @(t)") {
-        ExprKind::At { relation, time } => {
-            assert!(matches!(&relation.node, ExprKind::SourceRef(n) if n == "people"));
-            assert!(matches!(&time.node, ExprKind::Var(n) if n == "t"));
-        }
-        other => panic!("expected At, got {:?}", other),
-    }
-}
-
-#[test]
-fn temporal_at_with_expr() {
-    match fun_body("x = *employees @(now - 365)") {
-        ExprKind::At { relation, time } => {
-            assert!(matches!(&relation.node, ExprKind::SourceRef(n) if n == "employees"));
-            assert!(matches!(&time.node, ExprKind::BinOp { op: BinOp::Sub, .. }));
-        }
-        other => panic!("expected At with subtraction, got {:?}", other),
-    }
-}
-
-#[test]
-fn temporal_at_chained_with_pipe() {
-    match fun_body("x = *people @(t) |> filter f") {
-        ExprKind::BinOp {
-            op: BinOp::Pipe,
-            lhs,
-            ..
-        } => {
-            assert!(matches!(&lhs.node, ExprKind::At { .. }));
-        }
-        other => panic!("expected Pipe(At(..), ..), got {:?}", other),
-    }
-}
-
 // ── Time Units ──────────────────────────────────────────────────────
 
 #[test]
@@ -2210,27 +2147,6 @@ fn time_unit_weeks() {
             assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(n)) if n == "604800000"));
         }
         other => panic!("expected Mul, got {:?}", other),
-    }
-}
-
-#[test]
-fn time_unit_in_temporal_query() {
-    match fun_body("x = *employees @(now - 365 days)") {
-        ExprKind::At { time, .. } => {
-            match &time.node {
-                ExprKind::BinOp { op: BinOp::Sub, rhs, .. } => {
-                    match &rhs.node {
-                        ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
-                            assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(n)) if n == "365"));
-                            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(n)) if n == "86400000"));
-                        }
-                        other => panic!("expected Mul for days, got {:?}", other),
-                    }
-                }
-                other => panic!("expected Sub, got {:?}", other),
-            }
-        }
-        other => panic!("expected At, got {:?}", other),
     }
 }
 

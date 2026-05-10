@@ -539,7 +539,7 @@ Grouping is executed via SQLite — key columns are inserted into a temp table a
 
 All state operations in Knot return IO values. The IO type carries an effect set that distinguishes DB operations from external effects:
 
-- **DB operations** return `IO {} value` — the empty effect set `{}` indicates pure database interaction with no external side effects. Source refs (`*rel`), derived refs (`&rel`), `set`, `replace`, and temporal queries (`@(timestamp)`) all return `IO {} value`.
+- **DB operations** return `IO {} value` — the empty effect set `{}` indicates pure database interaction with no external side effects. Source refs (`*rel`), derived refs (`&rel`), `set`, and `replace` all return `IO {} value`.
 - **External effects** carry specific tags: `IO {console} {}`, `IO {fs} Text`, `IO {network} Result`, `IO {clock} Int`, `IO {random} Float`.
 
 This unified model means all stateful code lives in IO do-blocks, while pure comprehensions over plain values remain non-IO.
@@ -1235,23 +1235,6 @@ After a successful compile, `schema.lock` is updated.
 The runtime stores the compiled schema version in the database. On startup it compares against the stored version and applies any pending migrations in order. Already-applied migrations are skipped.
 
 `migrate` blocks accumulate in source code. The lockfile tracks all migrations — if a migration present in the lockfile is missing from source, the compiler rejects the build. This prevents accidental deletion. Old migrations can be pruned only by explicitly removing them from both source and lockfile.
-
-## Temporal Queries
-
-Optional history tracking:
-
-```knot
-*employees : [{name: Text, salary: Int}]
-  with history
-
-salaryLastYear = \name -> do
-  t <- now
-  employees <- *employees @(t - 365 days)
-  yield (employees
-    |> filter (\e -> e.name == name)
-    |> map (\e -> e.salary)
-    |> single)
-```
 
 ## Type System
 

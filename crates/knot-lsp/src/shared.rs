@@ -652,10 +652,6 @@ pub(crate) fn find_app_in_expr(
         ast::ExprKind::FieldAccess { expr, .. } => {
             find_app_in_expr(expr, source, offset, best);
         }
-        ast::ExprKind::At { relation, time } => {
-            find_app_in_expr(relation, source, offset, best);
-            find_app_in_expr(time, source, offset, best);
-        }
         _ => {}
     }
 }
@@ -769,10 +765,6 @@ pub(crate) fn find_enclosing_atomic_expr(
                 }
             }
             ast::ExprKind::FieldAccess { expr, .. } => walk(expr, source, offset, best),
-            ast::ExprKind::At { relation, time } => {
-                walk(relation, source, offset, best);
-                walk(time, source, offset, best);
-            }
             ast::ExprKind::Annot { expr, .. } => walk(expr, source, offset, best),
             ast::ExprKind::UnitLit { value, .. } => walk(value, source, offset, best),
             _ => {}

@@ -1647,10 +1647,6 @@ fn collect_names_in_expr(expr: &ast::Expr, out: &mut HashSet<String>) {
             }
         }
         ast::ExprKind::FieldAccess { expr, .. } => collect_names_in_expr(expr, out),
-        ast::ExprKind::At { relation, time } => {
-            collect_names_in_expr(relation, out);
-            collect_names_in_expr(time, out);
-        }
         ast::ExprKind::UnitLit { value, .. } => collect_names_in_expr(value, out),
         ast::ExprKind::Annot { expr, ty } => {
             collect_names_in_expr(expr, out);

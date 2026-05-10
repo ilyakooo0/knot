@@ -362,10 +362,6 @@ fn walk_expr(e: &Expr, r: &mut Refs) {
             walk_expr(value, r);
         }
         ExprKind::Atomic(inner) => walk_expr(inner, r),
-        ExprKind::At { relation, time } => {
-            walk_expr(relation, r);
-            walk_expr(time, r);
-        }
         ExprKind::UnitLit { value, .. } => walk_expr(value, r),
         ExprKind::Annot { expr, ty } => {
             walk_expr(expr, r);

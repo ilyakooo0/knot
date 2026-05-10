@@ -110,7 +110,6 @@ pub enum DeclKind {
     Source {
         name: Name,
         ty: Type,
-        history: bool,
     },
 
     /// `*openTodos = expr` — query over sources, settable.
@@ -261,12 +260,6 @@ pub enum ExprKind {
 
     /// `atomic expr` — transactional boundary.
     Atomic(Box<Expr>),
-
-    /// `*employees @(now - 365 days)` — temporal query.
-    At {
-        relation: Box<Expr>,
-        time: Box<Expr>,
-    },
 
     /// `42.0<m>`, `999<usd>` — numeric literal with unit annotation.
     UnitLit {

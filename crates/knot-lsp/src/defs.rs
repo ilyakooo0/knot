@@ -371,10 +371,6 @@ impl DefResolver {
                 self.resolve_expr(target);
                 self.resolve_expr(value);
             }
-            ast::ExprKind::At { relation, time } => {
-                self.resolve_expr(relation);
-                self.resolve_expr(time);
-            }
             ast::ExprKind::Record(fields) => {
                 for f in fields {
                     self.resolve_expr(&f.value);
@@ -473,11 +469,10 @@ pub fn build_details(module: &Module) -> HashMap<String, String> {
                     format!("type {name}{params_str} = {}", format_type_kind(&ty.node)),
                 );
             }
-            DeclKind::Source { name, ty, history } => {
-                let hist = if *history { " with history" } else { "" };
+            DeclKind::Source { name, ty } => {
                 details.insert(
                     name.clone(),
-                    format!("*{name} : [{}]{hist}", format_type_kind(&ty.node)),
+                    format!("*{name} : [{}]", format_type_kind(&ty.node)),
                 );
             }
             DeclKind::View { name, ty, .. } => {

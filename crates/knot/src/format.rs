@@ -407,8 +407,8 @@ fn render_decl(p: &mut Printer, d: &Decl) {
         DeclKind::TypeAlias { name, params, ty } => {
             render_type_alias(p, name, params, ty);
         }
-        DeclKind::Source { name, ty, history } => {
-            render_source(p, name, ty, *history);
+        DeclKind::Source { name, ty } => {
+            render_source(p, name, ty);
         }
         DeclKind::View { name, ty, body } => {
             render_view(p, name, ty.as_ref(), body);
@@ -611,17 +611,11 @@ fn render_type_alias(p: &mut Printer, name: &str, params: &[Name], ty: &Type) {
     }
 }
 
-fn render_source(p: &mut Printer, name: &str, ty: &Type, history: bool) {
+fn render_source(p: &mut Printer, name: &str, ty: &Type) {
     p.write("*");
     p.write(name);
     p.write(" : ");
     p.write(&render_type(ty));
-    if history {
-        p.newline();
-        p.with_indent(|p| {
-            p.write("with history");
-        });
-    }
 }
 
 fn render_view(p: &mut Printer, name: &str, ty: Option<&TypeScheme>, body: &Expr) {
@@ -1344,13 +1338,6 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
         ExprKind::Atomic(inner) => {
             let s = format!("atomic {}", render_expr_inline(inner, Prec::App));
             paren_if(parent > Prec::Lowest, s)
-        }
-        ExprKind::At { relation, time } => {
-            format!(
-                "{} @({})",
-                render_expr_inline(relation, Prec::Atom),
-                render_expr_inline(time, Prec::Lowest)
-            )
         }
         ExprKind::UnitLit { value, unit } => {
             format!(

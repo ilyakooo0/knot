@@ -1532,8 +1532,6 @@ main = do
             ("source_no_type", "*xs :"),
             ("source_no_name", "*"),
             ("derived_no_body", "&xs ="),
-            ("temporal_query_unclosed", "x = *xs @("),
-            ("temporal_query_empty", "x = *xs @()"),
             ("type_annotation_unclosed", "x = (1 :"),
             ("paren_unclosed", "x = (1 + 2"),
             ("nested_paren_unclosed", "x = (((((1"),

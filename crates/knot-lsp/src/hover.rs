@@ -153,11 +153,10 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     // For source/view/derived refs, show the relation schema
     for decl in &doc.module.decls {
         match &decl.node {
-            DeclKind::Source { name, ty, history } if name == word => {
-                let hist = if *history { " (with history)" } else { "" };
+            DeclKind::Source { name, ty, .. } if name == word => {
                 let schema = format_schema_from_type(&ty.node);
                 if !schema.is_empty() {
-                    value.push_str(&format!("\n\n**Schema:**{hist}\n{schema}"));
+                    value.push_str(&format!("\n\n**Schema:**\n{schema}"));
                 }
                 break;
             }

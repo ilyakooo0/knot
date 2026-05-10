@@ -3234,14 +3234,6 @@ impl Infer {
                 }
             }
 
-            ast::ExprKind::At { relation, time } => {
-                let rel_ty = self.infer_expr(relation);
-                let time_ty = self.infer_expr(time);
-                self.unify(&time_ty, &Ty::Int, time.span);
-                // Temporal query is a DB read — preserve IO wrapping
-                rel_ty
-            }
-
             ast::ExprKind::UnitLit { value, unit } => {
                 let val_ty = self.infer_expr(value);
                 let unit_ty = self.ast_unit_to_unit_ty(unit);
@@ -4237,7 +4229,7 @@ impl Infer {
             }
             ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
             ast::ExprKind::Set { .. } | ast::ExprKind::ReplaceSet { .. } => true,
-            ast::ExprKind::At { .. } | ast::ExprKind::Atomic(_) => true,
+            ast::ExprKind::Atomic(_) => true,
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
                 self.expr_is_io_prescan(lhs) || self.expr_is_io_prescan(rhs)
             }
@@ -7083,13 +7075,6 @@ fn value_references_source_inner(
                 inner, source_name, aliases, let_bindings, visited,
             )
         }
-        ast::ExprKind::At { relation, time } => {
-            value_references_source_inner(
-                relation, source_name, aliases, let_bindings, visited,
-            ) || value_references_source_inner(
-                time, source_name, aliases, let_bindings, visited,
-            )
-        }
         ast::ExprKind::UnitLit { value, .. } => value_references_source_inner(
             value, source_name, aliases, let_bindings, visited,
         ),
@@ -7601,23 +7586,6 @@ main = applyPred (\\r -> r.x == r.y)\
         assert!(!check_src("main = now + 1000").is_empty());
         // But using in IO do-block works:
         assert!(check_src("main = do\n  t <- now\n  println t").is_empty());
-    }
-
-    #[test]
-    fn temporal_at_expression() {
-        // @(timestamp) expects Int, now returns IO — need do-block to unwrap
-        assert!(check_src(
-            "*people : [{name: Text, age: Int}]\nmain = do\n  t <- now\n  yield (*people @(t))"
-        ).is_empty());
-    }
-
-    #[test]
-    fn temporal_at_requires_int_time() {
-        // time expression must be Int, not Text
-        let diags = check_src(
-            "*people : [{name: Text}]\nmain = *people @(\"yesterday\")"
-        );
-        assert!(has_error(&diags, "type mismatch"));
     }
 
     // ── Exhaustiveness checking ─────────────────────────────────

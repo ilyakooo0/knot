@@ -144,7 +144,6 @@ module.exports = grammar({
         $.source_ref,
         ":",
         field("type", $._type),
-        optional(seq("with", "history")),
       ),
 
     // ── View ────────────────────────────────────────────────────────
@@ -650,18 +649,12 @@ module.exports = grammar({
       ),
 
     _postfix_expression: ($) =>
-      choice($.field_access_expression, $.temporal_expression, $._atom_expression),
+      choice($.field_access_expression, $._atom_expression),
 
     field_access_expression: ($) =>
       prec.left(
         PREC.FIELD,
         seq($._postfix_expression, ".", $.lower_identifier),
-      ),
-
-    temporal_expression: ($) =>
-      prec.left(
-        PREC.FIELD,
-        seq($._postfix_expression, "@", "(", $._expression, ")"),
       ),
 
     _atom_expression: ($) =>

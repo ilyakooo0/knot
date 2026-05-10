@@ -891,21 +891,9 @@ impl Parser {
                     });
                 }
 
-                // Optional `with history` (may be on the next line)
-                let mut history = false;
-                this.skip_newlines();
-                if this.eat(&TokenKind::With) {
-                    if matches!(this.peek(), TokenKind::Lower(s) if s == "history") {
-                        this.advance();
-                        history = true;
-                    } else {
-                        this.error("expected 'history' after 'with'");
-                        return None;
-                    }
-                }
                 let end = this.prev_span();
                 Some(Decl {
-                    node: DeclKind::Source { name, ty, history },
+                    node: DeclKind::Source { name, ty },
                     span: Span::new(start.start, end.end),
                     exported: false,
                 })
@@ -2147,26 +2135,6 @@ impl Parser {
                     ExprKind::FieldAccess {
                         expr: Box::new(expr),
                         field,
-                    },
-                    span,
-                );
-            } else if self.at(&TokenKind::At) && matches!(self.peek_ahead(1), TokenKind::LParen) {
-                self.advance(); // consume `@`
-                self.advance(); // consume `(`
-                self.delimiter_depth += 1;
-                let Some(time) = self.parse_expr() else {
-                    self.delimiter_depth -= 1;
-                    return None;
-                };
-                self.delimiter_depth -= 1;
-                let end_tok = self
-                    .expect(&TokenKind::RParen, "expected ')' to close temporal query '@(...)'")
-                    .ok()?;
-                let span = Span::new(expr.span.start, end_tok.span.end);
-                expr = Spanned::new(
-                    ExprKind::At {
-                        relation: Box::new(expr),
-                        time: Box::new(time),
                     },
                     span,
                 );
@@ -3991,13 +3959,8 @@ mod tests {
         let (module, diags) = Parser::new(source, tokens).parse_module();
         assert!(diags.is_empty(), "diags: {:?}", diags);
         match &module.decls[0].node {
-            DeclKind::Source {
-                name,
-                ty,
-                history,
-            } => {
+            DeclKind::Source { name, ty } => {
                 assert_eq!(name, "people");
-                assert!(!history);
                 assert!(matches!(&ty.node, TypeKind::Relation(_)));
             }
             other => panic!("expected Source, got {:?}", other),

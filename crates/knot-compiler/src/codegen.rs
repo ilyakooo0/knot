@@ -119,9 +119,6 @@ pub struct Codegen {
     // Track which types implement which trait: trait_name -> [(type_name, impl_span)]
     trait_impl_types: HashMap<String, Vec<(String, knot::ast::Span)>>,
 
-    // Sources with `with history` enabled
-    history_sources: HashSet<String>,
-
     // Subset constraints: (sub, sup) relation paths
     subset_constraints: Vec<(knot::ast::RelationPath, knot::ast::RelationPath)>,
 
@@ -494,7 +491,6 @@ pub fn compile(
     }
     cg.migrate_schemas = type_env.migrate_schemas.clone();
     cg.type_aliases = type_env.aliases.clone();
-    cg.history_sources = type_env.history_sources.clone();
     cg.subset_constraints = type_env.subset_constraints.clone();
     cg.monad_info = monad_info.clone();
     cg.refine_targets = refine_targets.clone();
@@ -710,7 +706,6 @@ impl Codegen {
             derived_methods: Vec::new(),
             trait_supertraits: HashMap::new(),
             trait_impl_types: HashMap::new(),
-            history_sources: HashSet::new(),
             subset_constraints: Vec::new(),
             recursive_derived: HashSet::new(),
             recursive_body_fns: HashMap::new(),
@@ -902,12 +897,7 @@ impl Codegen {
         self.declare_rt("knot_crypto_sign", &[p, p], &[p]);
         self.declare_rt("knot_crypto_verify", &[p, p, p, p], &[p]);
 
-        // Temporal queries (history)
         self.declare_rt("knot_now", &[], &[p]);
-        self.declare_rt("knot_history_init", &[p, p, p, p, p], &[]);
-        self.declare_rt("knot_history_snapshot", &[p, p, p, p, p], &[]);
-        self.declare_rt("knot_source_read_at", &[p, p, p, p, p, p], &[p]);
-        self.declare_rt("knot_view_read_at", &[p, p, p, p, p, p, p, p, p], &[p]);
 
         // Subset constraints
         self.declare_rt("knot_constraint_register", &[p, p, p, p, p, p, p, p, p], &[]);
@@ -3641,7 +3631,6 @@ impl Codegen {
             }
 
             // Initialize source tables
-            let history_sources = cg.history_sources.clone();
             for decl in &decls {
                 if let ast::DeclKind::Source { name, .. } = &decl.node {
                     let schema = cg
@@ -3656,17 +3645,6 @@ impl Codegen {
                         init_ref,
                         &[db, name_ptr, name_len, schema_ptr, schema_len],
                     );
-
-                    // Initialize history table for sources with `with history`
-                    if history_sources.contains(name) {
-                        let (hn_ptr, hn_len) = cg.string_ptr(builder, name);
-                        let (hs_ptr, hs_len) = cg.string_ptr(builder, &schema);
-                        cg.call_rt_void(
-                            builder,
-                            "knot_history_init",
-                            &[db, hn_ptr, hn_len, hs_ptr, hs_len],
-                        );
-                    }
                 }
             }
 
@@ -4260,9 +4238,6 @@ impl Codegen {
                         .cloned()
                         .unwrap_or_default();
 
-                    // Snapshot history before writing (if history-enabled)
-                    self.emit_history_snapshot(builder, db, name, &schema);
-
                     // Scalar source: wrap value as [{_value: val}] and do a full write
                     if self.scalar_sources.contains(name) {
                         let val = self.compile_set_value_expr(builder, value, env, db);
@@ -4498,9 +4473,6 @@ impl Codegen {
                         .cloned()
                         .unwrap_or_default();
 
-                    // Snapshot history before writing (if history-enabled)
-                    self.emit_history_snapshot(builder, db, name, &schema);
-
                     // Scalar source: wrap value as [{_value: val}] and do a full write
                     if self.scalar_sources.contains(name) {
                         let val = self.compile_set_value_expr(builder, value, env, db);
@@ -4666,93 +4638,6 @@ impl Codegen {
                 self.compile_refine(builder, inner, expr.span, env, db)
             }
 
-            ast::ExprKind::At { relation, time } => {
-                // Temporal query: *source @(timestamp) or *view @(timestamp)
-                if let ast::ExprKind::SourceRef(name) = &relation.node {
-                    let view_info = self.views.get(name).cloned();
-                    if let Some(view) = view_info {
-                        // View temporal query — read from underlying source's history
-                        let timestamp = self.compile_expr(builder, time, env, db);
-                        let source_name = &view.source_name;
-                        let (name_ptr, name_len) =
-                            self.string_ptr(builder, source_name);
-
-                        if view.constant_columns.is_empty() && view.source_columns.is_empty() {
-                            // Simple alias view: read all columns from source history
-                            let schema = self
-                                .source_schemas
-                                .get(source_name)
-                                .cloned()
-                                .unwrap_or_default();
-                            let (schema_ptr, schema_len) =
-                                self.string_ptr(builder, &schema);
-                            self.call_rt(
-                                builder,
-                                "knot_source_read_at",
-                                &[db, name_ptr, name_len, schema_ptr, schema_len, timestamp],
-                            )
-                        } else {
-                            // Filtered view: read view columns with constant filter
-                            let view_schema = self.compute_view_schema(&view);
-                            let (src_to_view, _) = Self::compute_view_renames(&view);
-                            let (filter_where, constant_cols) =
-                                self.compute_view_filter(&view);
-                            let filter_params = self.compile_view_filter_params(
-                                builder,
-                                &constant_cols,
-                                env,
-                                db,
-                            );
-
-                            let (schema_ptr, schema_len) =
-                                self.string_ptr(builder, &view_schema);
-                            let (filter_ptr, filter_len) =
-                                self.string_ptr(builder, &filter_where);
-
-                            let result = self.call_rt(
-                                builder,
-                                "knot_view_read_at",
-                                &[
-                                    db,
-                                    name_ptr,
-                                    name_len,
-                                    schema_ptr,
-                                    schema_len,
-                                    filter_ptr,
-                                    filter_len,
-                                    filter_params,
-                                    timestamp,
-                                ],
-                            );
-                            if src_to_view.is_empty() {
-                                result
-                            } else {
-                                let (map_ptr, map_len) = self.string_ptr(builder, &src_to_view);
-                                self.call_rt(builder, "knot_relation_rename_columns", &[result, map_ptr, map_len])
-                            }
-                        }
-                    } else {
-                        // Direct source temporal query
-                        let schema = self
-                            .source_schemas
-                            .get(name)
-                            .cloned()
-                            .unwrap_or_default();
-                        let timestamp = self.compile_expr(builder, time, env, db);
-                        let (name_ptr, name_len) = self.string_ptr(builder, name);
-                        let (schema_ptr, schema_len) =
-                            self.string_ptr(builder, &schema);
-                        self.call_rt(
-                            builder,
-                            "knot_source_read_at",
-                            &[db, name_ptr, name_len, schema_ptr, schema_len, timestamp],
-                        )
-                    }
-                } else {
-                    panic!("codegen: temporal query @(...) is only supported on source relations")
-                }
-            }
-
             ast::ExprKind::Serve { api, handlers, .. } => {
                 self.compile_serve(builder, api, handlers, expr.span, env, db)
             }
@@ -4836,9 +4721,6 @@ impl Codegen {
             .get(&source_name)
             .cloned()
             .unwrap_or_default();
-
-        // Snapshot history before writing (if underlying source has history)
-        self.emit_history_snapshot(builder, db, &source_name, &source_schema);
 
         // Compute the view-filtered schema (only columns the view selects).
         // Uses source column names for correct SQL against the source table.
@@ -6796,7 +6678,7 @@ impl Codegen {
             ast::ExprKind::Var(name) => builtins.contains(name.as_str()) || io_fns.contains(name),
             ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
             ast::ExprKind::Set { .. } | ast::ExprKind::ReplaceSet { .. } => true,
-            ast::ExprKind::At { .. } | ast::ExprKind::Atomic(_) => true,
+            ast::ExprKind::Atomic(_) => true,
             ast::ExprKind::App { func, arg } => {
                 Self::expr_contains_io(func, builtins, io_fns)
                     || Self::expr_contains_io(arg, builtins, io_fns)
@@ -6858,7 +6740,7 @@ impl Codegen {
             }
             ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
             ast::ExprKind::Set { .. } | ast::ExprKind::ReplaceSet { .. } => true,
-            ast::ExprKind::At { .. } | ast::ExprKind::Atomic(_) => true,
+            ast::ExprKind::Atomic(_) => true,
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
                 self.expr_is_io(lhs) || self.expr_is_io(rhs)
             }
@@ -8305,25 +8187,6 @@ impl Codegen {
         data_id
     }
 
-    /// Emit a history snapshot call if the source has `with history`.
-    fn emit_history_snapshot(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        db: Value,
-        name: &str,
-        schema: &str,
-    ) {
-        if self.history_sources.contains(name) {
-            let (name_ptr, name_len) = self.string_ptr(builder, name);
-            let (schema_ptr, schema_len) = self.string_ptr(builder, schema);
-            self.call_rt_void(
-                builder,
-                "knot_history_snapshot",
-                &[db, name_ptr, name_len, schema_ptr, schema_len],
-            );
-        }
-    }
-
     /// Get the pointer and length of a string constant as Cranelift Values.
     fn string_ptr(
         &mut self,
@@ -8455,10 +8318,6 @@ impl Codegen {
                     || Self::references_source(value, source_name)
             }
             ast::ExprKind::Atomic(inner) => Self::references_source(inner, source_name),
-            ast::ExprKind::At { relation, time } => {
-                Self::references_source(relation, source_name)
-                    || Self::references_source(time, source_name)
-            }
             ast::ExprKind::UnitLit { value, .. } => Self::references_source(value, source_name),
             ast::ExprKind::Annot { expr, .. } => Self::references_source(expr, source_name),
             ast::ExprKind::Refine(inner) => Self::references_source(inner, source_name),
@@ -10949,7 +10808,7 @@ fn beta_reduce_inner(
         // we keep them unchanged: SQL pushdown never sees these inside the
         // expressions it analyzes (lambda bodies of filter/map/aggregate).
         Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | Case { .. } | Do(_)
-        | Set { .. } | ReplaceSet { .. } | Atomic(_) | At { .. } | UnitLit { .. }
+        | Set { .. } | ReplaceSet { .. } | Atomic(_) | UnitLit { .. }
         | Annot { .. } | Refine(_) | Serve { .. } => return expr.clone(),
     };
     ast::Spanned { node: new_node, span }
@@ -11050,7 +10909,7 @@ fn substitute_inner(
         Refine(e) => Refine(Box::new(substitute_inner(e, var, value, value_fv)?)),
         // Constructs that introduce binders we don't analyze for SQL: keep
         // unchanged. Inlining doesn't need to look inside.
-        Case { .. } | Do(_) | Set { .. } | ReplaceSet { .. } | Atomic(_) | At { .. }
+        Case { .. } | Do(_) | Set { .. } | ReplaceSet { .. } | Atomic(_)
         | Serve { .. } => {
             return Some(expr.clone())
         }
@@ -11121,7 +10980,7 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
             }
         }
         // Conservative: ignore SQL-irrelevant constructs.
-        Case { .. } | Do(_) | Set { .. } | ReplaceSet { .. } | Atomic(_) | At { .. } => {}
+        Case { .. } | Do(_) | Set { .. } | ReplaceSet { .. } | Atomic(_) => {}
     }
 }
 
@@ -11931,9 +11790,6 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
         ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
             expr_contains_derived_ref(target, name) || expr_contains_derived_ref(value, name)
         }
-        ast::ExprKind::At { relation, time } => {
-            expr_contains_derived_ref(relation, name) || expr_contains_derived_ref(time, name)
-        }
         ast::ExprKind::UnitLit { value, .. } => expr_contains_derived_ref(value, name),
         ast::ExprKind::Annot { expr, .. } => expr_contains_derived_ref(expr, name),
         ast::ExprKind::Refine(inner) => expr_contains_derived_ref(inner, name),
@@ -12067,10 +11923,6 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
         }
         ast::ExprKind::Atomic(inner) => {
             collect_free_vars(inner, bound, free);
-        }
-        ast::ExprKind::At { relation, time } => {
-            collect_free_vars(relation, bound, free);
-            collect_free_vars(time, bound, free);
         }
         ast::ExprKind::UnitLit { value, .. } => {
             collect_free_vars(value, bound, free);
@@ -12219,9 +12071,6 @@ fn pretty_expr(expr: &ast::Expr) -> String {
             )
         }
         ast::ExprKind::Atomic(e) => format!("atomic ({})", pretty_expr(e)),
-        ast::ExprKind::At { relation, time } => {
-            format!("{} @({})", pretty_expr(relation), pretty_expr(time))
-        }
         ast::ExprKind::UnitLit { value, .. } => pretty_expr(value),
         ast::ExprKind::Annot { expr, .. } => pretty_expr(expr),
         ast::ExprKind::Refine(inner) => format!("refine {}", pretty_expr(inner)),

@@ -286,6 +286,9 @@ fn walk_route_entry(e: &RouteEntry, r: &mut Refs) {
     for f in &e.response_headers {
         walk_type(&f.value, r);
     }
+    if let Some(expr) = &e.rate_limit {
+        walk_expr(expr, r);
+    }
 }
 
 // ── Expression walker ────────────────────────────────────────────────

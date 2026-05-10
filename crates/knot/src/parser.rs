@@ -1810,6 +1810,26 @@ impl Parser {
 
 impl Parser {
     fn parse_expr(&mut self) -> Option<Expr> {
+        let expr = self.parse_expr_head()?;
+        // Postfix type annotation: `expr : Type` (without the surrounding
+        // parens that `(expr : Type)` requires). Consumed greedily so a
+        // trailing annotation binds to whatever expression just parsed.
+        if self.at(&TokenKind::Colon) {
+            self.advance();
+            let ty = self.parse_type()?;
+            let span = Span::new(expr.span.start, ty.span.end);
+            return Some(Spanned::new(
+                ExprKind::Annot {
+                    expr: Box::new(expr),
+                    ty,
+                },
+                span,
+            ));
+        }
+        Some(expr)
+    }
+
+    fn parse_expr_head(&mut self) -> Option<Expr> {
         self.skip_newlines();
         match self.peek() {
             TokenKind::Backslash => self.parse_lambda(),

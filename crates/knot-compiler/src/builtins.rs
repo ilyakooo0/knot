@@ -16,7 +16,7 @@ pub const CLOCK_BUILTINS: &[&str] = &["now", "sleep"];
 
 /// Builtins that consume randomness.
 pub const RANDOM_BUILTINS: &[&str] = &[
-    "randomInt", "randomFloat",
+    "randomInt", "randomFloat", "randomUuid",
     "generateKeyPair", "generateSigningKeyPair", "encrypt",
 ];
 
@@ -56,7 +56,7 @@ pub const EFFECTFUL_BUILTINS: &[&str] = &[
     // clock
     "now", "sleep",
     // random
-    "randomInt", "randomFloat",
+    "randomInt", "randomFloat", "randomUuid",
     "generateKeyPair", "generateSigningKeyPair", "encrypt",
     // network
     "listen", "listenOn", "fetch", "fetchWith",
@@ -78,7 +78,7 @@ pub const ATOMIC_DISALLOWED_BUILTINS: &[&str] = &[
     "println", "putLine", "print", "readLine",
     "logInfo", "logWarn", "logError", "logDebug",
     "now", "sleep",
-    "randomInt", "randomFloat",
+    "randomInt", "randomFloat", "randomUuid",
     "generateKeyPair", "generateSigningKeyPair", "encrypt",
     "listen", "listenOn", "fetch", "fetchWith",
     "readFile", "writeFile", "appendFile",

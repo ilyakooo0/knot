@@ -204,6 +204,7 @@ enum Ty {
     Text,
     Bool,
     Bytes,
+    Uuid,
     /// Function type.
     Fun(Box<Ty>, Box<Ty>),
     /// Record with named fields and optional row variable (open record).
@@ -537,7 +538,7 @@ impl Infer {
 
     fn is_sql_pushable_scalar_for_elem(&self, ty: &Ty) -> bool {
         match ty.peel_alias() {
-            Ty::Int | Ty::Text | Ty::Float | Ty::Bool | Ty::IntUnit(_) | Ty::FloatUnit(_) => true,
+            Ty::Int | Ty::Text | Ty::Float | Ty::Bool | Ty::Uuid | Ty::IntUnit(_) | Ty::FloatUnit(_) => true,
             // Refined nominal alias `type Nat = Int where ...` shows up as
             // `Con(name, [])`; recurse to its base type.
             Ty::Con(name, args) if args.is_empty() => {
@@ -1144,7 +1145,8 @@ impl Infer {
             | (Ty::Float, Ty::Float)
             | (Ty::Text, Ty::Text)
             | (Ty::Bool, Ty::Bool)
-            | (Ty::Bytes, Ty::Bytes) => {}
+            | (Ty::Bytes, Ty::Bytes)
+            | (Ty::Uuid, Ty::Uuid) => {}
             (Ty::Fun(p1, r1), Ty::Fun(p2, r2)) => {
                 self.unify(p1, p2, span);
                 self.unify(r1, r2, span);
@@ -2335,6 +2337,7 @@ impl Infer {
                 "Text" => Ty::Text,
                 "Bool" => Ty::Bool,
                 "Bytes" => Ty::Bytes,
+                "Uuid" => Ty::Uuid,
                 "[]" => Ty::TyCon("[]".into()),
                 _ => {
                     if let Some(aliased) = self.aliases.get(name).cloned() {
@@ -2600,6 +2603,7 @@ impl Infer {
             Ty::Text => "Text".into(),
             Ty::Bool => "Bool".into(),
             Ty::Bytes => "Bytes".into(),
+            Ty::Uuid => "Uuid".into(),
             Ty::Fun(p, r) => {
                 let s = format!(
                     "{} -> {}",
@@ -4751,6 +4755,7 @@ impl Infer {
             Ty::Text => Some("Text".into()),
             Ty::Bool => Some("Bool".into()),
             Ty::Bytes => Some("Bytes".into()),
+            Ty::Uuid => Some("Uuid".into()),
             Ty::Relation(_) => Some("[]".into()),
             Ty::TyCon(name) => Some(name.clone()),
             // Refined nullary aliases (`type Nat = Int where ...`) are erased
@@ -5226,6 +5231,11 @@ impl Infer {
                 ty: Ty::IO(BTreeSet::from([IoEffect::Random]), None, Box::new(float_u)),
             });
         }
+
+        // randomUuid : IO {random} Uuid (UUIDv7)
+        self.bind_top("randomUuid", Scheme::mono(
+            Ty::IO(BTreeSet::from([IoEffect::Random]), None, Box::new(Ty::Uuid)),
+        ));
 
         // fork : ∀a r. IO r a -> IO {} {}
         // Argument is any IO action (any effects, any result). The spawned
@@ -6854,6 +6864,7 @@ fn display_ty_clean_inner(
         Ty::Text => "Text".into(),
         Ty::Bool => "Bool".into(),
         Ty::Bytes => "Bytes".into(),
+        Ty::Uuid => "Uuid".into(),
         Ty::Fun(p, r) => {
             let s = format!(
                 "{} -> {}",
@@ -7236,6 +7247,7 @@ fn ty_to_type_name(ty: &Ty) -> Option<String> {
         Ty::Text => Some("Text".to_string()),
         Ty::Bool => Some("Bool".to_string()),
         Ty::Bytes => Some("Bytes".to_string()),
+        Ty::Uuid => Some("Uuid".to_string()),
         Ty::Con(name, _) => Some(name.clone()),
         Ty::Relation(_) => Some("Relation".to_string()),
         Ty::Record(_, _) => Some("Record".to_string()),

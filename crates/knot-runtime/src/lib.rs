@@ -5557,6 +5557,15 @@ pub extern "C" fn knot_random_float_io() -> *mut Value {
     alloc(Value::IO(thunk as *const u8, std::ptr::null_mut()))
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_random_uuid_io() -> *mut Value {
+    extern "C" fn thunk(db: *mut c_void, _env: *mut Value) -> *mut Value {
+        let _ = db;
+        knot_random_uuid()
+    }
+    alloc(Value::IO(thunk as *const u8, std::ptr::null_mut()))
+}
+
 // ── Standard library: relation operations ─────────────────────────
 
 
@@ -9661,6 +9670,46 @@ pub extern "C" fn knot_random_float() -> *mut Value {
     let bits = raw >> 11;
     let result = (bits as f64) * f64::from_bits(0x3CA0_0000_0000_0000); // 2^-53
     alloc_float(result)
+}
+
+/// Generate a UUIDv7 (RFC 9562 §5.7): 48-bit big-endian Unix-ms timestamp,
+/// 4-bit version `0111`, 12 random bits, 2-bit variant `10`, 62 random bits.
+/// Returned as a canonical hyphenated `Value::Text`, so all Text-shaped
+/// operations (compare, hash, JSON, SQLite TEXT) just work.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_random_uuid() -> *mut Value {
+    let ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut rand = [0u8; 10];
+    getrandom::fill(&mut rand).expect("knot runtime: failed to get random bytes");
+
+    let mut bytes = [0u8; 16];
+    // 48-bit timestamp (big-endian).
+    bytes[0] = (ms >> 40) as u8;
+    bytes[1] = (ms >> 32) as u8;
+    bytes[2] = (ms >> 24) as u8;
+    bytes[3] = (ms >> 16) as u8;
+    bytes[4] = (ms >> 8) as u8;
+    bytes[5] = ms as u8;
+    // 4-bit version (0111) + 12-bit rand_a.
+    bytes[6] = 0x70 | (rand[0] & 0x0F);
+    bytes[7] = rand[1];
+    // 2-bit variant (10) + 6 high bits of rand_b.
+    bytes[8] = 0x80 | (rand[2] & 0x3F);
+    bytes[9] = rand[3];
+    bytes[10..16].copy_from_slice(&rand[4..10]);
+
+    let mut s = String::with_capacity(36);
+    use std::fmt::Write;
+    for (i, b) in bytes.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            s.push('-');
+        }
+        let _ = write!(s, "{:02x}", b);
+    }
+    alloc(Value::Text(Arc::from(s.as_str())))
 }
 
 // ── Subset constraints ────────────────────────────────────────────

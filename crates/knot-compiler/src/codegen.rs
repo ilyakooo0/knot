@@ -886,6 +886,7 @@ impl Codegen {
         // Random number generation
         self.declare_rt("knot_random_int", &[p], &[p]);
         self.declare_rt("knot_random_float", &[], &[p]);
+        self.declare_rt("knot_random_uuid", &[], &[p]);
 
         // Elliptic curve cryptography
         self.declare_rt("knot_crypto_generate_key_pair", &[], &[p]);
@@ -1016,6 +1017,7 @@ impl Codegen {
         self.declare_rt("knot_sleep_io", &[p], &[p]);
         self.declare_rt("knot_random_int_io", &[p], &[p]);
         self.declare_rt("knot_random_float_io", &[], &[p]);
+        self.declare_rt("knot_random_uuid_io", &[], &[p]);
 
         // Spawn / threading
         self.declare_rt("knot_fork_io", &[p], &[p]);
@@ -3818,6 +3820,9 @@ impl Codegen {
                 }
                 if name == "randomFloat" {
                     return self.call_rt(builder, "knot_random_float_io", &[]);
+                }
+                if name == "randomUuid" {
+                    return self.call_rt(builder, "knot_random_uuid_io", &[]);
                 }
                 if name == "generateKeyPair" {
                     return self.call_rt(builder, "knot_crypto_generate_key_pair_io", &[]);

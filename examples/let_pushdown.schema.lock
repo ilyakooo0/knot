@@ -4,5 +4,3 @@
 type Item = {name: Text, price: Int}
 
 *items : [Item]
-
-

@@ -132,7 +132,7 @@ fn format_expr_brief_d(expr: &ast::ExprKind, depth: usize) -> String {
         ast::ExprKind::BinOp { op, lhs, rhs } => {
             let op_str = match op {
                 ast::BinOp::Add => "+", ast::BinOp::Sub => "-",
-                ast::BinOp::Mul => "*", ast::BinOp::Div => "/",
+                ast::BinOp::Mul => "*", ast::BinOp::Div => "/", ast::BinOp::Mod => "%",
                 ast::BinOp::Eq => "==", ast::BinOp::Neq => "!=",
                 ast::BinOp::Lt => "<", ast::BinOp::Gt => ">",
                 ast::BinOp::Le => "<=", ast::BinOp::Ge => ">=",

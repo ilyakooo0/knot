@@ -3745,8 +3745,8 @@ impl Infer {
         let rhs_ty = self.infer_expr(rhs);
 
         match op {
-            // Add/Sub: units must match, result has same unit
-            ast::BinOp::Add | ast::BinOp::Sub => {
+            // Add/Sub/Mod: units must match, result has same unit
+            ast::BinOp::Add | ast::BinOp::Sub | ast::BinOp::Mod => {
                 let lhs_applied = self.apply(&lhs_ty);
                 let rhs_applied = self.apply(&rhs_ty);
                 // For unit-bearing types, unify normally (which checks unit equality)

@@ -694,7 +694,7 @@ fn try_sql_atom(bind_var: &str, expr: &Expr) -> Option<()> {
         }
         ExprKind::BinOp { op, lhs, rhs } => {
             match op {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Concat => {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Concat => {
                     try_sql_atom(bind_var, lhs)?;
                     try_sql_atom(bind_var, rhs)
                 }
@@ -1090,7 +1090,7 @@ fn try_sql_column_expr(bind_var: &str, body: &Expr) -> Option<()> {
         },
         ExprKind::BinOp { op, lhs, rhs } => {
             match op {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Concat => {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Concat => {
                     try_sql_column_expr(bind_var, lhs)?;
                     try_sql_column_expr(bind_var, rhs)
                 }

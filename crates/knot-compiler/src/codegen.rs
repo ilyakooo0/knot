@@ -780,6 +780,7 @@ impl Codegen {
         self.declare_rt("knot_value_sub", &[p, p], &[p]);
         self.declare_rt("knot_value_mul", &[p, p], &[p]);
         self.declare_rt("knot_value_div", &[p, p], &[p]);
+        self.declare_rt("knot_value_mod", &[p, p], &[p]);
         self.declare_rt("knot_value_eq", &[p, p], &[p]);
         self.declare_rt("knot_value_neq", &[p, p], &[p]);
         self.declare_rt("knot_value_lt", &[p, p], &[p]);
@@ -1874,11 +1875,13 @@ impl Codegen {
             ("Num_Int_sub", "sub", "Int", 2, "Num"),
             ("Num_Int_mul", "mul", "Int", 2, "Num"),
             ("Num_Int_div", "div", "Int", 2, "Num"),
+            ("Num_Int_mod", "mod", "Int", 2, "Num"),
             ("Num_Int_negate", "negate", "Int", 1, "Num"),
             ("Num_Float_add", "add", "Float", 2, "Num"),
             ("Num_Float_sub", "sub", "Float", 2, "Num"),
             ("Num_Float_mul", "mul", "Float", 2, "Num"),
             ("Num_Float_div", "div", "Float", 2, "Num"),
+            ("Num_Float_mod", "mod", "Float", 2, "Num"),
             ("Num_Float_negate", "negate", "Float", 1, "Num"),
             // Semigroup impls
             ("Semigroup_Text_append", "append", "Text", 2, "Semigroup"),
@@ -2243,12 +2246,14 @@ impl Codegen {
         define_binop_impl!("Num_Int_sub", "knot_value_sub");
         define_binop_impl!("Num_Int_mul", "knot_value_mul");
         define_binop_impl!("Num_Int_div", "knot_value_div");
+        define_binop_impl!("Num_Int_mod", "knot_value_mod");
         define_unop_impl!("Num_Int_negate", "knot_value_negate");
 
         define_binop_impl!("Num_Float_add", "knot_value_add");
         define_binop_impl!("Num_Float_sub", "knot_value_sub");
         define_binop_impl!("Num_Float_mul", "knot_value_mul");
         define_binop_impl!("Num_Float_div", "knot_value_div");
+        define_binop_impl!("Num_Float_mod", "knot_value_mod");
         define_unop_impl!("Num_Float_negate", "knot_value_negate");
 
         // Semigroup impls: append(a, b) → knot_value_concat(a, b)
@@ -4123,6 +4128,7 @@ impl Codegen {
                         ast::BinOp::Sub => self.compile_trait_binop(builder, "sub", l, r, db, "knot_value_sub"),
                         ast::BinOp::Mul => self.compile_trait_binop(builder, "mul", l, r, db, "knot_value_mul"),
                         ast::BinOp::Div => self.compile_trait_binop(builder, "div", l, r, db, "knot_value_div"),
+                        ast::BinOp::Mod => self.compile_trait_binop(builder, "mod", l, r, db, "knot_value_mod"),
                         // Equality: dispatch through Eq trait
                         ast::BinOp::Eq => self.compile_trait_binop(builder, "eq", l, r, db, "knot_value_eq"),
                         ast::BinOp::Neq => {
@@ -8973,13 +8979,14 @@ impl Codegen {
                         })
                 }
                 ast::BinOp::Add | ast::BinOp::Sub | ast::BinOp::Mul | ast::BinOp::Div
-                | ast::BinOp::Concat => {
+                | ast::BinOp::Mod | ast::BinOp::Concat => {
                     // Arithmetic/concat in WHERE: try to compile both sides as SQL atoms
                     let sql_op = match op {
                         ast::BinOp::Add => "+",
                         ast::BinOp::Sub => "-",
                         ast::BinOp::Mul => "*",
                         ast::BinOp::Div => "/",
+                        ast::BinOp::Mod => "%",
                         ast::BinOp::Concat => "||",
                         _ => unreachable!(),
                     };
@@ -9100,6 +9107,7 @@ impl Codegen {
                     ast::BinOp::Sub => "-",
                     ast::BinOp::Mul => "*",
                     ast::BinOp::Div => "/",
+                    ast::BinOp::Mod => "%",
                     ast::BinOp::Concat => "||",
                     _ => return None,
                 };
@@ -9416,6 +9424,7 @@ impl Codegen {
                     ast::BinOp::Sub => "-",
                     ast::BinOp::Mul => "*",
                     ast::BinOp::Div => "/",
+                    ast::BinOp::Mod => "%",
                     ast::BinOp::Concat => "||",
                     _ => return None,
                 };
@@ -11224,6 +11233,7 @@ fn try_sql_arithmetic_expr(
                 ast::BinOp::Sub => "-",
                 ast::BinOp::Mul => "*",
                 ast::BinOp::Div => "/",
+                ast::BinOp::Mod => "%",
                 ast::BinOp::Concat => "||",
                 _ => return None,
             };
@@ -11466,6 +11476,7 @@ fn try_multi_table_arithmetic_expr(
                 ast::BinOp::Sub => "-",
                 ast::BinOp::Mul => "*",
                 ast::BinOp::Div => "/",
+                ast::BinOp::Mod => "%",
                 ast::BinOp::Concat => "||",
                 _ => return None,
             };
@@ -12140,6 +12151,7 @@ fn pretty_binop(op: &ast::BinOp) -> &'static str {
         ast::BinOp::Sub => "-",
         ast::BinOp::Mul => "*",
         ast::BinOp::Div => "/",
+        ast::BinOp::Mod => "%",
         ast::BinOp::Eq => "==",
         ast::BinOp::Neq => "!=",
         ast::BinOp::Lt => "<",
@@ -12227,6 +12239,7 @@ fn trait_method_fallback(method_name: &str) -> Option<&'static str> {
         "sub" => Some("knot_value_sub"),
         "mul" => Some("knot_value_mul"),
         "div" => Some("knot_value_div"),
+        "mod" => Some("knot_value_mod"),
         "negate" => Some("knot_value_negate"),
         "append" => Some("knot_value_concat"),
         "toJson" => Some("knot_json_encode"),

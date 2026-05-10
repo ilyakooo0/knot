@@ -1927,6 +1927,7 @@ impl Parser {
                 TokenKind::Minus => (BinOp::Sub, 13, 14),
                 TokenKind::Star => (BinOp::Mul, 15, 16),
                 TokenKind::Slash => (BinOp::Div, 15, 16),
+                TokenKind::Percent => (BinOp::Mod, 15, 16),
                 _ => {
                     self.restore(saved_pos);
                     break;

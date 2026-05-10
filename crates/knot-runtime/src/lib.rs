@@ -4331,6 +4331,42 @@ pub extern "C" fn knot_value_div(a: *mut Value, b: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn knot_value_mod(a: *mut Value, b: *mut Value) -> *mut Value {
+    let av = unsafe { as_ref(a) };
+    let bv = unsafe { as_ref(b) };
+    match (to_num_view(av), to_num_view(bv)) {
+        (Some(NumView::Int(x)), Some(NumView::Int(y))) => {
+            if y == 0 {
+                panic!("knot runtime: modulo by zero");
+            }
+            match x.checked_rem(y) {
+                Some(r) => alloc_int(r),
+                None => panic!("knot runtime: integer overflow in {} % {}", x, y),
+            }
+        }
+        (Some(NumView::Float(x)), Some(NumView::Float(y))) => {
+            if y == 0.0 {
+                panic!("knot runtime: modulo by zero");
+            }
+            alloc_float(x % y)
+        }
+        (Some(NumView::Int(x)), Some(NumView::Float(y))) => {
+            if y == 0.0 {
+                panic!("knot runtime: modulo by zero");
+            }
+            alloc_float((x as f64) % y)
+        }
+        (Some(NumView::Float(x)), Some(NumView::Int(y))) => {
+            if y == 0 {
+                panic!("knot runtime: modulo by zero");
+            }
+            alloc_float(x % (y as f64))
+        }
+        _ => panic!("knot runtime: cannot modulo {} % {}", type_name(a), type_name(b)),
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn knot_value_eq(a: *mut Value, b: *mut Value) -> *mut Value {
     alloc_bool(values_equal(a, b))
 }

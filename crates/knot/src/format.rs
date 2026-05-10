@@ -1162,7 +1162,7 @@ fn binop_prec(op: BinOp) -> Prec {
         BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => Prec::Cmp,
         BinOp::Concat => Prec::Concat,
         BinOp::Add | BinOp::Sub => Prec::Add,
-        BinOp::Mul | BinOp::Div => Prec::Mul,
+        BinOp::Mul | BinOp::Div | BinOp::Mod => Prec::Mul,
     }
 }
 
@@ -1172,6 +1172,7 @@ fn binop_str(op: BinOp) -> &'static str {
         BinOp::Sub => "-",
         BinOp::Mul => "*",
         BinOp::Div => "/",
+        BinOp::Mod => "%",
         BinOp::Eq => "==",
         BinOp::Neq => "!=",
         BinOp::Lt => "<",

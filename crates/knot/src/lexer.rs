@@ -69,6 +69,7 @@ pub enum TokenKind {
     Minus,
     Star,
     Slash,
+    Percent,
     PlusPlus,
     AndAnd,
     OrOr,
@@ -153,6 +154,7 @@ impl TokenKind {
             TokenKind::Minus => "'-'",
             TokenKind::Star => "'*'",
             TokenKind::Slash => "'/'",
+            TokenKind::Percent => "'%'",
             TokenKind::PlusPlus => "'++'",
             TokenKind::AndAnd => "'&&'",
             TokenKind::OrOr => "'||'",
@@ -765,6 +767,7 @@ impl<'src> Lexer<'src> {
             }
             b'*' => TokenKind::Star,
             b'/' => TokenKind::Slash,
+            b'%' => TokenKind::Percent,
             b'&' => {
                 if self.eat(b'&') {
                     TokenKind::AndAnd

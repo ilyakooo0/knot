@@ -1431,6 +1431,29 @@ impl WriteEvent {
 static TABLE_VERSIONS: std::sync::LazyLock<RwLock<HashMap<String, Arc<AtomicU64>>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// Per-source `RecordSchema` registry, populated by `knot_source_init`.
+/// Write paths that need column metadata to build precise `WriteEvent::Rows`
+/// payloads (e.g. UPDATE/DELETE pre-image SELECTs) look up the schema here
+/// instead of re-parsing the descriptor string.
+static SOURCE_SCHEMAS: std::sync::LazyLock<RwLock<HashMap<String, Arc<RecordSchema>>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+fn register_source_schema(name: &str, schema: Arc<RecordSchema>) {
+    SOURCE_SCHEMAS
+        .write()
+        .unwrap()
+        .insert(name.to_string(), schema);
+}
+
+fn get_source_schema(name: &str) -> Option<Arc<RecordSchema>> {
+    SOURCE_SCHEMAS.read().unwrap().get(name).cloned()
+}
+
+/// Maximum number of rows captured in a single `WriteEvent::Rows`. Beyond
+/// this the event upgrades to `Bulk` to bound notification cost — bulk-style
+/// writes (e.g. resetting an entire table) shouldn't pay per-row tracking.
+const MAX_EVENT_ROWS: usize = 128;
+
 /// Per-thread wake slot for targeted retry notification.
 /// Each retrying thread registers a slot with the tables it read;
 /// `notify_relation_changed_with_event` wakes only slots whose stored
@@ -1710,24 +1733,23 @@ fn rows_event_for_records(rows: &[*mut Value], rec: &RecordSchema) -> WriteEvent
     WriteEvent::Rows(cols)
 }
 
-/// Snapshot the column values of rows matching `where_clause` in `_knot_<name>`,
-/// for use as a pre-image when notifying watchers about an UPDATE/DELETE.
-/// Returns a `WriteEvent::Rows` whose payload is the affected rows' scalar columns.
-/// Falls back to `WriteEvent::Bulk` on any error (best-effort).
+/// Snapshot column values + rowids for rows matching `where_clause` in
+/// `_knot_<name>`, for use as a pre-image when notifying watchers about an
+/// UPDATE/DELETE. Returns `None` if the result exceeds `MAX_EVENT_ROWS` or
+/// on any SQL error — callers fall back to `WriteEvent::Bulk` in that case.
 ///
-/// Not yet wired into `knot_source_update_where` / `knot_source_delete_where` —
-/// those paths don't receive the schema, so they currently emit `Bulk`. Hooking
-/// this up is the next step for row-level write coverage.
-#[allow(dead_code)]
-fn rows_event_select_before(
+/// The returned rowids let UPDATE callers re-SELECT the same rows after the
+/// write to capture a post-image (so watchers filtered by a column the
+/// UPDATE sets to a fresh value still wake correctly).
+fn select_rows_with_rowid(
     conn: &rusqlite::Connection,
     table: &str,
     rec: &RecordSchema,
     where_clause: &str,
     params: &[&dyn rusqlite::types::ToSql],
-) -> WriteEvent {
+) -> Option<(Vec<HashMap<String, SqlVal>>, Vec<i64>)> {
     if rec.columns.is_empty() {
-        return WriteEvent::Bulk;
+        return None;
     }
     let col_list: String = rec
         .columns
@@ -1736,32 +1758,34 @@ fn rows_event_select_before(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT {} FROM {} WHERE {};",
+        "SELECT {}, rowid FROM {} WHERE {};",
         col_list,
         quote_ident(table),
-        where_clause
+        where_clause,
     );
-    let mut stmt = match conn.prepare_cached(&sql) {
-        Ok(s) => s,
-        Err(_) => return WriteEvent::Bulk,
-    };
-    let mut result = match stmt.query(params) {
-        Ok(r) => r,
-        Err(_) => return WriteEvent::Bulk,
-    };
+    let mut stmt = conn.prepare_cached(&sql).ok()?;
+    let mut q = stmt.query(params).ok()?;
+    let n_cols = rec.columns.len();
     let mut rows: Vec<HashMap<String, SqlVal>> = Vec::new();
-    while let Ok(Some(r)) = result.next() {
-        let mut map = HashMap::with_capacity(rec.columns.len());
+    let mut rowids: Vec<i64> = Vec::new();
+    while let Ok(Some(r)) = q.next() {
+        if rows.len() >= MAX_EVENT_ROWS {
+            return None;
+        }
+        let mut map = HashMap::with_capacity(n_cols);
         for (i, col) in rec.columns.iter().enumerate() {
-            let v = match r.get_ref(i) {
-                Ok(vr) => SqlVal::from_value_ref(vr),
-                Err(_) => SqlVal::Null,
-            };
+            let v = r
+                .get_ref(i)
+                .ok()
+                .map(SqlVal::from_value_ref)
+                .unwrap_or(SqlVal::Null);
             map.insert(col.name.clone(), v);
         }
+        let id: i64 = r.get(n_cols).ok()?;
         rows.push(map);
+        rowids.push(id);
     }
-    WriteEvent::Rows(rows)
+    Some((rows, rowids))
 }
 
 /// Record that a table was written inside an atomic block, with an event
@@ -8387,8 +8411,9 @@ pub extern "C" fn knot_source_init(
         db_ref.ensure_index(&format!("_knot_{}", name), "_tag");
     } else {
         // Regular record schema (may include nested relations)
-        let rec = parse_record_schema(schema);
+        let rec = Arc::new(parse_record_schema(schema));
         init_record_table(&db_ref.conn, &format!("_knot_{}", name), &rec);
+        register_source_schema(name, rec);
     }
 
     // Check stored schema against compiled schema
@@ -10068,14 +10093,33 @@ pub extern "C" fn knot_source_delete_where(
     // Rebuild param_refs (moved above)
     let param_refs2: Vec<&dyn rusqlite::types::ToSql> =
         sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+
+    // Capture the pre-image of rows about to be deleted so STM watchers
+    // filtering on column values can decide whether they need to wake.
+    // Same params as the DELETE (only the WHERE branch consumes them).
+    let pre_where = format!("NOT ({})", where_clause);
+    let event = match get_source_schema(name) {
+        Some(rec) => match select_rows_with_rowid(
+            &db_ref.conn,
+            &table,
+            &rec,
+            &pre_where,
+            param_refs2.as_slice(),
+        ) {
+            Some((rows, _)) => WriteEvent::Rows(rows),
+            None => WriteEvent::Bulk,
+        },
+        None => WriteEvent::Bulk,
+    };
+
     db_ref
         .conn
         .execute(&sql, param_refs2.as_slice())
         .unwrap_or_else(|e| panic!("knot runtime: delete_where error: {}\n  SQL: {}", e, sql));
     if db_ref.atomic_depth.get() > 0 {
-        stm_track_write(name);
+        stm_track_write_with_event(name, event);
     } else {
-        notify_relation_changed(name);
+        notify_relation_changed_with_event(name, &event);
     }
 }
 
@@ -10124,15 +10168,80 @@ pub extern "C" fn knot_source_update_where(
     let param_refs: Vec<&dyn rusqlite::types::ToSql> =
         sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
 
+    // Pre-image: snapshot affected rows before the UPDATE so STM watchers
+    // filtering on column values can decide whether to wake. The combined
+    // params start with SET-clause values, then WHERE-clause values, so we
+    // need to split off the SET tail to feed the WHERE-only SELECT.
+    let set_param_count = count_sql_placeholders(set_clause);
+    let where_params: &[&dyn rusqlite::types::ToSql] = if set_param_count <= param_refs.len() {
+        &param_refs[set_param_count..]
+    } else {
+        &[]
+    };
+    let schema_arc = get_source_schema(name);
+    let pre_image = schema_arc.as_ref().and_then(|rec| {
+        select_rows_with_rowid(&db_ref.conn, &table, rec, where_clause, where_params)
+    });
+
     db_ref
         .conn
         .execute(&sql, param_refs.as_slice())
         .unwrap_or_else(|e| panic!("knot runtime: update_where error: {}\n  SQL: {}", e, sql));
+
+    // Post-image: re-SELECT the same rows by rowid. UPDATE may have changed
+    // a column that a watcher filters on — pre-image captures the old value,
+    // post-image captures the new — and we want either to trigger a wake.
+    let event = match (schema_arc, pre_image) {
+        (Some(rec), Some((pre_rows, rowids))) => {
+            if rowids.is_empty() {
+                WriteEvent::Rows(pre_rows)
+            } else {
+                let id_list = rowids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let post_where = format!("rowid IN ({})", id_list);
+                let mut merged = pre_rows;
+                if let Some((post_rows, _)) =
+                    select_rows_with_rowid(&db_ref.conn, &table, &rec, &post_where, &[])
+                {
+                    merged.extend(post_rows);
+                }
+                WriteEvent::Rows(merged)
+            }
+        }
+        _ => WriteEvent::Bulk,
+    };
+
     if db_ref.atomic_depth.get() > 0 {
-        stm_track_write(name);
+        stm_track_write_with_event(name, event);
     } else {
-        notify_relation_changed(name);
+        notify_relation_changed_with_event(name, &event);
     }
+}
+
+/// Count `?` placeholders in a SQL fragment, ignoring those inside `"..."`
+/// quoted identifiers or `'...'` string literals. Knot's codegen always
+/// emits anonymous `?` for parameters, so this is enough to split a
+/// combined parameter list at the SET/WHERE boundary.
+fn count_sql_placeholders(sql: &str) -> usize {
+    let mut count = 0usize;
+    let mut in_double = false;
+    let mut in_single = false;
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'"' if !in_single => in_double = !in_double,
+            b'\'' if !in_double => in_single = !in_single,
+            b'?' if !in_double && !in_single => count += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    count
 }
 
 fn value_to_sql_param(v: *mut Value) -> rusqlite::types::Value {
@@ -13962,6 +14071,18 @@ mod _stm_filter_tests {
         } else {
             panic!("expected Rows after merge");
         }
+    }
+
+    #[test]
+    fn placeholder_counter_skips_quoted_text() {
+        // Plain placeholders
+        assert_eq!(count_sql_placeholders(r#""a" = ?, "b" = ?"#), 2);
+        // Inside double-quoted identifier — not a placeholder
+        assert_eq!(count_sql_placeholders(r#""weird?col" = ?"#), 1);
+        // Inside single-quoted string literal — not a placeholder
+        assert_eq!(count_sql_placeholders(r#""a" = '?' || ?"#), 1);
+        // No placeholders
+        assert_eq!(count_sql_placeholders(r#""a" = "b""#), 0);
     }
 }
 

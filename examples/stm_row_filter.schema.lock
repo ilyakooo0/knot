@@ -1,6 +1,0 @@
--- schema.lock (auto-generated, do not edit)
--- Commit to source control.
-
-type Account = {id: Int, balance: Int}
-
-*accounts : [Account]

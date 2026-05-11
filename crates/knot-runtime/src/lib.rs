@@ -1633,51 +1633,73 @@ fn get_source_schema(name: &str) -> Option<Arc<RecordSchema>> {
 /// writes (e.g. resetting an entire table) shouldn't pay per-row tracking.
 const MAX_EVENT_ROWS: usize = 128;
 
-/// Filter classification for a single (table, [filters]) registration. Drives
-/// which index a wake slot lives in:
-/// - `Broad`: at least one `All` or non-Eq/`In` predicate, OR every Cols filter
-///   contains a non-Eq pred — must go in `TABLE_WATCHERS` and use `matches`.
-/// - `Eq(keys)`: every filter has at least one Eq or In pred we can index by;
-///   `keys` is the per-filter chosen `(col, [SqlValKey])` to register under
-///   `EQ_WATCHERS`. The slot's full filter list still confirms on wake (so
-///   secondary predicates inside the same filter are honored).
-enum Classification {
+/// Where a single `ReadFilter` should be registered for indexed wakeup.
+/// One filter → one `FilterReg`. The slot's full filter list still gates
+/// wakeups via `matches`, so secondary predicates are still honored even
+/// when only one predicate drives indexing.
+enum FilterReg {
+    /// No indexable predicate; slot must live in `TABLE_WATCHERS` (woken on
+    /// any write to the table).
     Broad,
-    Eq(Vec<(String, Vec<SqlValKey>)>),
+    /// Register under `EQ_WATCHERS` for `(col, k)` per key in `keys`.
+    /// `In(...)` produces one entry per element; both Eq and In land here.
+    Eq { col: String, keys: Vec<SqlValKey> },
+    /// Register under `RANGE_WATCHERS[(table, col)]` with a threshold compared
+    /// at wake time against the write event's row values.
+    Range { col: String, op: CmpOp, threshold: SqlVal },
 }
 
-fn classify_filters(filters: &[ReadFilter]) -> Classification {
-    let mut chosen: Vec<(String, Vec<SqlValKey>)> = Vec::with_capacity(filters.len());
-    for f in filters {
-        match f {
-            ReadFilter::All => return Classification::Broad,
-            ReadFilter::Cols(preds) => {
-                let mut indexed = false;
-                for (col, pred) in preds {
-                    match pred {
-                        ColPred::Cmp(CmpOp::Eq, val) => {
-                            chosen.push((col.clone(), vec![val.to_key()]));
-                            indexed = true;
-                            break;
-                        }
-                        ColPred::In(vals) => {
-                            chosen.push((col.clone(), vals.iter().map(SqlVal::to_key).collect()));
-                            indexed = true;
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-                if !indexed {
-                    return Classification::Broad;
-                }
+/// Selectivity rank for choosing the cheapest indexable predicate from a
+/// `Cols` filter. Lower tuple = more selective:
+///   - Eq:      (0, 1)       single-row index entry, exact match
+///   - In(n):   (1, n)       n index entries, fewer = more selective
+///   - Range:   (2, 1)       single range entry, but matches a span
+///
+/// `Neq` and empty `In` are not indexable (return `None` → fall back to broad
+/// if no other indexable pred exists in the filter).
+fn pred_selectivity(pred: &ColPred) -> Option<(u8, usize)> {
+    match pred {
+        ColPred::Cmp(CmpOp::Eq, _) => Some((0, 1)),
+        ColPred::In(vals) if !vals.is_empty() => Some((1, vals.len())),
+        ColPred::Cmp(CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge, _) => Some((2, 1)),
+        _ => None,
+    }
+}
+
+/// Pick the most-selective indexable predicate from a filter and emit its
+/// registration. A filter with no indexable predicate is `Broad`.
+fn classify_filter(filter: &ReadFilter) -> FilterReg {
+    let preds = match filter {
+        ReadFilter::All => return FilterReg::Broad,
+        ReadFilter::Cols(p) => p,
+    };
+    let mut best: Option<(usize, (u8, usize))> = None;
+    for (i, (_, pred)) in preds.iter().enumerate() {
+        if let Some(rank) = pred_selectivity(pred) {
+            if best.map_or(true, |(_, br)| rank < br) {
+                best = Some((i, rank));
             }
         }
     }
-    if chosen.is_empty() {
-        Classification::Broad
-    } else {
-        Classification::Eq(chosen)
+    let Some((idx, _)) = best else {
+        return FilterReg::Broad;
+    };
+    let (col, pred) = &preds[idx];
+    match pred {
+        ColPred::Cmp(CmpOp::Eq, val) => FilterReg::Eq {
+            col: col.clone(),
+            keys: vec![val.to_key()],
+        },
+        ColPred::In(vals) => FilterReg::Eq {
+            col: col.clone(),
+            keys: vals.iter().map(SqlVal::to_key).collect(),
+        },
+        ColPred::Cmp(op @ (CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge), val) => FilterReg::Range {
+            col: col.clone(),
+            op: *op,
+            threshold: val.clone(),
+        },
+        _ => FilterReg::Broad,
     }
 }
 
@@ -1735,29 +1757,158 @@ impl WakeSlot {
 
 impl Drop for WakeSlot {
     fn drop(&mut self) {
-        if let Some(init) = self.init.get() {
-            for c in &init.watcher_counts {
-                c.fetch_sub(1, Ordering::Release);
+        let Some(init) = self.init.get() else { return };
+        for c in &init.watcher_counts {
+            c.fetch_sub(1, Ordering::Release);
+        }
+        // Mirror the increments done in `knot_stm_wait`: walk the stored
+        // filter map and decrement each (table, col) refcount. Removing the
+        // table entry when its cols map empties keeps `filter_cols_for` cheap.
+        let mut cols_reg = TABLE_FILTER_COLS.write().unwrap();
+        for (table, filters) in &init.filters {
+            let Some(state) = cols_reg.get_mut(table) else { continue };
+            for f in filters {
+                if let ReadFilter::Cols(preds) = f {
+                    for (col, _) in preds {
+                        if let Some(c) = state.cols.get_mut(col) {
+                            *c = c.saturating_sub(1);
+                            if *c == 0 {
+                                state.cols.remove(col);
+                            }
+                        }
+                    }
+                }
+            }
+            if state.cols.is_empty() {
+                cols_reg.remove(table);
             }
         }
     }
 }
 
 /// Registry of broad-filter wake slots per table — slots whose filter set
-/// includes an `All` or non-Eq predicate. Eq/In-only slots live exclusively in
-/// `EQ_WATCHERS` to keep `Rows` notification sub-linear in watcher count.
-/// Dead Weak refs are cleaned up lazily during notification.
-static TABLE_WATCHERS: std::sync::LazyLock<Mutex<HashMap<String, Vec<Weak<WakeSlot>>>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+/// includes an `All` or non-indexable predicate. Eq/In/Range-indexed slots
+/// live exclusively in their respective indices to keep `Rows` notification
+/// sub-linear in watcher count.
+///
+/// Held as an `RwLock` so concurrent notification paths can walk the slot
+/// list in parallel (read lock). Dead `Weak` refs accumulate during read-only
+/// walks and are cleaned up by `sweep_dead_watchers`, which runs amortised
+/// every `SWEEP_THRESHOLD` notifications.
+static TABLE_WATCHERS: std::sync::LazyLock<RwLock<HashMap<String, Vec<Weak<WakeSlot>>>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Side index from `(table, column, SqlValKey)` to the slots watching for
 /// equality on that column value. Lets `WriteEvent::Rows` notification jump
 /// directly to interested slots instead of walking every watcher of the table.
 /// Slots indexed here are NOT in `TABLE_WATCHERS` for the same table (avoids
-/// double-walk); broad-filter slots use `TABLE_WATCHERS` only.
+/// double-walk); broad-filter slots use `TABLE_WATCHERS` only. `In(...)` slots
+/// appear under every value in the `In` set so any matching write finds them.
 type EqKey = (String, String, SqlValKey);
-static EQ_WATCHERS: std::sync::LazyLock<Mutex<HashMap<EqKey, Vec<Weak<WakeSlot>>>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static EQ_WATCHERS: std::sync::LazyLock<RwLock<HashMap<EqKey, Vec<Weak<WakeSlot>>>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Entry in the range watcher registry: a comparison threshold + the slot to
+/// wake. On a `WriteEvent::Rows` for `(table, col)`, walks the entry list and
+/// wakes those slots whose `(op, threshold)` is satisfied by the row's value.
+#[derive(Clone)]
+struct RangeEntry {
+    op: CmpOp,
+    threshold: SqlVal,
+    slot: Weak<WakeSlot>,
+}
+
+/// Per-`(table, col)` registry of range-predicate watchers (`<`, `<=`, `>`,
+/// `>=`). Lets writes that change `col` wake only those range watchers whose
+/// threshold actually overlaps the new value, instead of falling back to the
+/// broad list. Stored as `Vec<RangeEntry>` per key — a hash-keyed BTreeMap
+/// would shave the per-write cost for very large entry lists, but a flat
+/// scan is faster for the common low-cardinality case.
+type RangeKey = (String, String);
+static RANGE_WATCHERS: std::sync::LazyLock<RwLock<HashMap<RangeKey, Vec<RangeEntry>>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Per-table refcount of columns that any `Cols`-style watcher filters on.
+/// Lets write paths (UPDATE/DELETE pre-image SELECTs and INSERT row events)
+/// project to only the columns watchers actually care about, instead of
+/// shipping every scalar column. An empty `cols` map means "no Cols watchers
+/// → emit Bulk, skip per-row payload entirely" — broad watchers wake on Bulk
+/// regardless of payload contents.
+#[derive(Default)]
+struct FilterColsState {
+    cols: HashMap<String, usize>,
+}
+
+static TABLE_FILTER_COLS: std::sync::LazyLock<RwLock<HashMap<String, FilterColsState>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Counter for amortised dead-Weak sweeps of the watcher registries. Wake-path
+/// walks no longer mutate the registries (read lock only), so dead Weaks linger
+/// until this counter trips `SWEEP_THRESHOLD` and `sweep_dead_watchers` reclaims
+/// them under a brief write lock.
+static WAKE_OPS_SINCE_SWEEP: AtomicUsize = AtomicUsize::new(0);
+
+/// How many notifications between sweeps. Large enough that sweep cost
+/// amortises to a fraction of a percent of notification cost; small enough
+/// that dead-Weak accumulation stays bounded under churning watcher loads.
+const SWEEP_THRESHOLD: usize = 256;
+
+/// Reclaim dead `Weak<WakeSlot>` entries across all watcher registries.
+/// Called periodically from `wake_matching_watchers`. Takes write locks
+/// briefly; concurrent notifications block until cleanup completes (small
+/// windows; the locks aren't held while waking individual slots).
+fn sweep_dead_watchers() {
+    {
+        let mut w = TABLE_WATCHERS.write().unwrap();
+        for v in w.values_mut() {
+            v.retain(|weak| weak.strong_count() > 0);
+        }
+        w.retain(|_, v| !v.is_empty());
+    }
+    {
+        let mut w = EQ_WATCHERS.write().unwrap();
+        for v in w.values_mut() {
+            v.retain(|weak| weak.strong_count() > 0);
+        }
+        w.retain(|_, v| !v.is_empty());
+    }
+    {
+        let mut w = RANGE_WATCHERS.write().unwrap();
+        for v in w.values_mut() {
+            v.retain(|e| e.slot.strong_count() > 0);
+        }
+        w.retain(|_, v| !v.is_empty());
+    }
+}
+
+/// Increment the per-notification counter and run a dead-Weak sweep if we hit
+/// the threshold. Resets the counter only on actual sweep so concurrent
+/// notifications don't all sweep at once.
+fn maybe_sweep_dead_watchers() {
+    let n = WAKE_OPS_SINCE_SWEEP.fetch_add(1, Ordering::Relaxed);
+    if n + 1 >= SWEEP_THRESHOLD {
+        // Single-flight: only the thread that crosses the boundary sweeps.
+        if WAKE_OPS_SINCE_SWEEP
+            .compare_exchange(n + 1, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            sweep_dead_watchers();
+        }
+    }
+}
+
+/// Read the union of columns that any `Cols`-style watcher filters on for
+/// `name`. Returns `None` when no `Cols` watcher exists for this table (only
+/// broad watchers or no watchers) — callers should emit `WriteEvent::Bulk`
+/// and skip per-row payload construction.
+fn filter_cols_for(name: &str) -> Option<Vec<String>> {
+    let reg = TABLE_FILTER_COLS.read().unwrap();
+    let state = reg.get(name)?;
+    if state.cols.is_empty() {
+        return None;
+    }
+    Some(state.cols.keys().cloned().collect())
+}
 
 /// Per-table live-watcher count. Incremented by `WakeSlot::init` registration;
 /// decremented by `WakeSlot::drop`. Write paths gate expensive event payload
@@ -1905,49 +2056,89 @@ fn bump_table_version(name: &str) {
     }
 }
 
-/// Walk the broad watcher list for `name` and, for `WriteEvent::Rows`, the EQ
-/// index for each row's `(col, val)` pair. A slot lives in exactly ONE of the
-/// two structures per table (decided in `knot_stm_wait` via `classify_filters`)
-/// so no duplicate-wake bookkeeping is needed. `slot.matches` still confirms
-/// the wake against the slot's full filter list — necessary because Eq-indexed
-/// slots may have additional conjunctive predicates the row must satisfy.
+/// Walk the broad watcher list for `name`, then for `WriteEvent::Rows` the EQ
+/// and Range indices for each row's `(col, val)` pair. A slot lives in exactly
+/// one bucket per filter (decided in `knot_stm_wait` via `classify_filter`) so
+/// no duplicate-wake bookkeeping is needed. `slot.matches` still confirms each
+/// wake against the slot's full filter list — necessary because indexed slots
+/// may carry additional conjunctive predicates the row must satisfy.
+///
+/// Reads only — dead `Weak`s linger here and are reclaimed by `sweep_dead_watchers`
+/// on a counter trip via `maybe_sweep_dead_watchers`.
 fn wake_matching_watchers(name: &str, event: &WriteEvent) {
-    // 1) Broad watchers — All filters and complex non-Eq Cols.
+    // 1) Broad watchers — All filters and non-indexable Cols.
     {
-        let mut watchers = TABLE_WATCHERS.lock().unwrap();
-        if let Some(slots) = watchers.get_mut(name) {
-            slots.retain(|weak| match weak.upgrade() {
-                Some(slot) => {
+        let watchers = TABLE_WATCHERS.read().unwrap();
+        if let Some(slots) = watchers.get(name) {
+            for weak in slots {
+                if let Some(slot) = weak.upgrade() {
                     if slot.matches(name, event) {
                         slot.wake();
                     }
-                    true
                 }
-                None => false,
-            });
-        }
-    }
-    // 2) Eq-indexed watchers — only need to scan for Rows events.
-    if let WriteEvent::Rows(rows) = event {
-        if rows.is_empty() {
-            return;
-        }
-        let mut eq = EQ_WATCHERS.lock().unwrap();
-        for row in rows {
-            for (col, val) in row {
-                let key = (name.to_string(), col.clone(), val.to_key());
-                let Some(bucket) = eq.get_mut(&key) else { continue };
-                bucket.retain(|weak| match weak.upgrade() {
-                    Some(slot) => {
-                        if slot.matches(name, event) {
-                            slot.wake();
-                        }
-                        true
-                    }
-                    None => false,
-                });
             }
         }
+    }
+    // 2) Indexed watchers — only meaningful for row-level events.
+    if let WriteEvent::Rows(rows) = event {
+        if !rows.is_empty() {
+            // EQ-indexed: lookup by (table, col, value-key).
+            {
+                let eq = EQ_WATCHERS.read().unwrap();
+                for row in rows {
+                    for (col, val) in row {
+                        let key = (name.to_string(), col.clone(), val.to_key());
+                        let Some(bucket) = eq.get(&key) else { continue };
+                        for weak in bucket {
+                            if let Some(slot) = weak.upgrade() {
+                                if slot.matches(name, event) {
+                                    slot.wake();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Range-indexed: lookup by (table, col), then check each entry's
+            // threshold against the row value.
+            {
+                let range = RANGE_WATCHERS.read().unwrap();
+                for row in rows {
+                    for (col, val) in row {
+                        let key = (name.to_string(), col.clone());
+                        let Some(entries) = range.get(&key) else { continue };
+                        for entry in entries {
+                            if !range_entry_matches(val, entry) {
+                                continue;
+                            }
+                            if let Some(slot) = entry.slot.upgrade() {
+                                if slot.matches(name, event) {
+                                    slot.wake();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    maybe_sweep_dead_watchers();
+}
+
+/// Cheap inline range-predicate check used by the wake path — avoids cloning
+/// the threshold into a `ColPred` just to reuse `col_pred_matches`.
+fn range_entry_matches(row_val: &SqlVal, entry: &RangeEntry) -> bool {
+    use std::cmp::Ordering;
+    match sql_partial_cmp(row_val, &entry.threshold) {
+        Some(ord) => match entry.op {
+            CmpOp::Lt => ord == Ordering::Less,
+            CmpOp::Le => ord != Ordering::Greater,
+            CmpOp::Gt => ord == Ordering::Greater,
+            CmpOp::Ge => ord != Ordering::Less,
+            CmpOp::Eq | CmpOp::Neq => false, // never registered as range
+        },
+        // Unknown comparison (incompatible types) — wake conservatively.
+        None => true,
     }
 }
 
@@ -2129,12 +2320,29 @@ fn select_rows_with_rowid(
     rec: &RecordSchema,
     where_clause: &str,
     params: &[&dyn rusqlite::types::ToSql],
+    project: Option<&[String]>,
 ) -> Option<(Vec<HashMap<String, SqlVal>>, Vec<i64>)> {
     if rec.columns.is_empty() {
         return None;
     }
-    let col_list: String = rec
-        .columns
+    // Resolve the projection against the schema once. Cols requested that
+    // aren't in the schema are silently dropped (defensive — shouldn't happen
+    // for valid Cols filters). If the projection ends up empty, fall back to
+    // shipping all scalar cols so watchers don't miss data.
+    let selected: Vec<&ColumnSpec> = match project {
+        Some(cols) => {
+            let set: std::collections::HashSet<&str> = cols.iter().map(String::as_str).collect();
+            let v: Vec<&ColumnSpec> =
+                rec.columns.iter().filter(|c| set.contains(c.name.as_str())).collect();
+            if v.is_empty() {
+                rec.columns.iter().collect()
+            } else {
+                v
+            }
+        }
+        None => rec.columns.iter().collect(),
+    };
+    let col_list: String = selected
         .iter()
         .map(|c| quote_ident(&c.name))
         .collect::<Vec<_>>()
@@ -2147,7 +2355,7 @@ fn select_rows_with_rowid(
     );
     let mut stmt = conn.prepare_cached(&sql).ok()?;
     let mut q = stmt.query(params).ok()?;
-    let n_cols = rec.columns.len();
+    let n_cols = selected.len();
     let mut rows: Vec<HashMap<String, SqlVal>> = Vec::new();
     let mut rowids: Vec<i64> = Vec::new();
     while let Ok(Some(r)) = q.next() {
@@ -2155,7 +2363,7 @@ fn select_rows_with_rowid(
             return None;
         }
         let mut map = HashMap::with_capacity(n_cols);
-        for (i, col) in rec.columns.iter().enumerate() {
+        for (i, col) in selected.iter().enumerate() {
             let v = r
                 .get_ref(i)
                 .ok()
@@ -6354,13 +6562,25 @@ pub extern "C" fn knot_stm_check_skip_and_clear() -> i32 {
 
 /// Clear per-table read/write tracking to prepare for a new atomic body iteration.
 /// Return value is unused but kept for ABI compatibility with codegen.
+///
+/// Fast-paths the common first-iteration case (and any iteration after a
+/// successful commit, since commit drains `writes` and rollback drains them
+/// too): if the tracking is already empty, skip the `RefCell` mut-borrow
+/// entirely — the borrow_mut itself has a small but non-zero cost we'd rather
+/// not pay every atomic iteration.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_stm_snapshot() -> i64 {
     STM_TRACK.with(|t| {
-        let mut t = t.borrow_mut();
-        t.reads.clear();
-        t.filters.clear();
-        t.writes.clear();
+        let empty = {
+            let b = t.borrow();
+            b.reads.is_empty() && b.filters.is_empty() && b.writes.is_empty()
+        };
+        if !empty {
+            let mut b = t.borrow_mut();
+            b.reads.clear();
+            b.filters.clear();
+            b.writes.clear();
+        }
     });
     0
 }
@@ -6453,25 +6673,39 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
             )
         });
 
-    // Build the slot. Decide per-table whether it goes into the broad
-    // `TABLE_WATCHERS` list or the precise `EQ_WATCHERS` (col, val) index.
+    // Build the slot. Per-filter `classify_filter` decides whether each filter
+    // is registered in the broad `TABLE_WATCHERS` list, the `EQ_WATCHERS`
+    // (col, val) index, or the `RANGE_WATCHERS` (col, threshold) index. If any
+    // filter for a table is broad, the slot only goes into `TABLE_WATCHERS`
+    // for that table (and other filters' registrations are skipped — broad
+    // wakes are a superset anyway).
     let slot = Arc::new(WakeSlot::new());
     let mut watcher_counts: Vec<Arc<AtomicUsize>> = Vec::with_capacity(read_versions.len());
 
-    // Collect EQ registrations first (lock-free build) so we hold the
-    // EQ_WATCHERS / TABLE_WATCHERS locks for as short a time as possible.
+    // Build registrations lock-free first; acquire the registry locks for the
+    // shortest possible window.
     let mut broad_tables: Vec<&str> = Vec::new();
     let mut eq_registrations: Vec<EqKey> = Vec::new();
+    let mut range_registrations: Vec<(RangeKey, CmpOp, SqlVal)> = Vec::new();
     for (table, _) in &read_versions {
         let fs = filter_map.get(table).map(|v| v.as_slice()).unwrap_or(&[]);
-        match classify_filters(fs) {
-            Classification::Broad => {
-                broad_tables.push(table.as_str());
-            }
-            Classification::Eq(keys) => {
-                for (col, vals) in keys {
-                    for k in vals {
-                        eq_registrations.push((table.clone(), col.clone(), k));
+        let regs: Vec<FilterReg> = fs.iter().map(classify_filter).collect();
+        let any_broad = regs.iter().any(|r| matches!(r, FilterReg::Broad));
+        if any_broad || regs.is_empty() {
+            // Defensive: empty filter list shouldn't happen (we only iterate
+            // tables that are in the read set), but treat as broad anyway.
+            broad_tables.push(table.as_str());
+        } else {
+            for r in regs {
+                match r {
+                    FilterReg::Broad => unreachable!("any_broad branch handles this"),
+                    FilterReg::Eq { col, keys } => {
+                        for k in keys {
+                            eq_registrations.push((table.clone(), col.clone(), k));
+                        }
+                    }
+                    FilterReg::Range { col, op, threshold } => {
+                        range_registrations.push(((table.clone(), col), op, threshold));
                     }
                 }
             }
@@ -6483,6 +6717,22 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
         watcher_counts.push(c);
     }
 
+    // Increment per-(table, col) refcounts for any Cols filter so write paths
+    // can project pre/post-image SELECTs to the cols watchers care about.
+    {
+        let mut cols_reg = TABLE_FILTER_COLS.write().unwrap();
+        for (table, filters) in &filter_map {
+            let state = cols_reg.entry(table.clone()).or_default();
+            for f in filters {
+                if let ReadFilter::Cols(preds) = f {
+                    for (col, _) in preds {
+                        *state.cols.entry(col.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+    }
+
     // Freeze the slot's init payload BEFORE publishing weak refs so any
     // notification thread that observes the Weak sees a fully-initialized slot.
     let _ = slot.init.set(WakeSlotInit {
@@ -6491,7 +6741,7 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
     });
 
     if !broad_tables.is_empty() {
-        let mut watchers = TABLE_WATCHERS.lock().unwrap();
+        let mut watchers = TABLE_WATCHERS.write().unwrap();
         for table in &broad_tables {
             watchers
                 .entry((*table).to_string())
@@ -6500,9 +6750,19 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
         }
     }
     if !eq_registrations.is_empty() {
-        let mut eq = EQ_WATCHERS.lock().unwrap();
+        let mut eq = EQ_WATCHERS.write().unwrap();
         for key in eq_registrations {
             eq.entry(key).or_default().push(Arc::downgrade(&slot));
+        }
+    }
+    if !range_registrations.is_empty() {
+        let mut range = RANGE_WATCHERS.write().unwrap();
+        for (key, op, threshold) in range_registrations {
+            range.entry(key).or_default().push(RangeEntry {
+                op,
+                threshold,
+                slot: Arc::downgrade(&slot),
+            });
         }
     }
 
@@ -10692,24 +10952,34 @@ pub extern "C" fn knot_source_delete_where(
     // Capture the pre-image of rows about to be deleted so STM watchers
     // filtering on column values can decide whether they need to wake.
     // Same params as the DELETE (only the WHERE branch consumes them).
-    // Skip the SELECT entirely when nothing is watching this table.
-    let event = if table_has_watchers(name) {
-        let pre_where = format!("NOT ({})", where_clause);
-        match get_source_schema(name) {
-            Some(rec) => match select_rows_with_rowid(
-                &db_ref.conn,
-                &table,
-                &rec,
-                &pre_where,
-                param_refs2.as_slice(),
-            ) {
-                Some((rows, _)) => WriteEvent::Rows(rows),
-                None => WriteEvent::Bulk,
-            },
-            None => WriteEvent::Bulk,
-        }
+    // Skip the SELECT entirely when nothing is watching this table OR when
+    // only broad watchers exist (they wake on Bulk regardless of payload).
+    // Project to the union of cols any Cols-watcher filters on, so wide
+    // tables don't ship every column when watchers care about only a few.
+    let projection = if table_has_watchers(name) {
+        filter_cols_for(name)
     } else {
-        WriteEvent::Bulk
+        None
+    };
+    let event = match projection.as_deref() {
+        Some(cols) => {
+            let pre_where = format!("NOT ({})", where_clause);
+            match get_source_schema(name) {
+                Some(rec) => match select_rows_with_rowid(
+                    &db_ref.conn,
+                    &table,
+                    &rec,
+                    &pre_where,
+                    param_refs2.as_slice(),
+                    Some(cols),
+                ) {
+                    Some((rows, _)) => WriteEvent::Rows(rows),
+                    None => WriteEvent::Bulk,
+                },
+                None => WriteEvent::Bulk,
+            }
+        }
+        None => WriteEvent::Bulk,
     };
 
     db_ref
@@ -10771,18 +11041,35 @@ pub extern "C" fn knot_source_update_where(
     // Pre-image: snapshot affected rows before the UPDATE so STM watchers
     // filtering on column values can decide whether to wake. The combined
     // params start with SET-clause values, then WHERE-clause values, so we
-    // need to split off the SET tail to feed the WHERE-only SELECT.
-    // Skip the pre/post-image SELECTs entirely when nothing is watching.
-    let want_event = table_has_watchers(name);
+    // need to split off the SET tail to feed the WHERE-only SELECT. Skip
+    // the pre/post-image SELECTs entirely when nothing is watching, OR when
+    // only broad watchers exist (they wake on Bulk regardless of payload).
+    // Project to the union of cols any Cols-watcher cares about.
+    let projection = if table_has_watchers(name) {
+        filter_cols_for(name)
+    } else {
+        None
+    };
     let set_param_count = count_sql_placeholders(set_clause);
     let where_params: &[&dyn rusqlite::types::ToSql] = if set_param_count <= param_refs.len() {
         &param_refs[set_param_count..]
     } else {
         &[]
     };
-    let schema_arc = if want_event { get_source_schema(name) } else { None };
+    let schema_arc = if projection.is_some() {
+        get_source_schema(name)
+    } else {
+        None
+    };
     let pre_image = schema_arc.as_ref().and_then(|rec| {
-        select_rows_with_rowid(&db_ref.conn, &table, rec, where_clause, where_params)
+        select_rows_with_rowid(
+            &db_ref.conn,
+            &table,
+            rec,
+            where_clause,
+            where_params,
+            projection.as_deref(),
+        )
     });
 
     db_ref
@@ -10805,9 +11092,14 @@ pub extern "C" fn knot_source_update_where(
                     .join(",");
                 let post_where = format!("rowid IN ({})", id_list);
                 let mut merged = pre_rows;
-                if let Some((post_rows, _)) =
-                    select_rows_with_rowid(&db_ref.conn, &table, &rec, &post_where, &[])
-                {
+                if let Some((post_rows, _)) = select_rows_with_rowid(
+                    &db_ref.conn,
+                    &table,
+                    &rec,
+                    &post_where,
+                    &[],
+                    projection.as_deref(),
+                ) {
                     merged.extend(post_rows);
                 }
                 WriteEvent::Rows(merged)
@@ -14757,6 +15049,138 @@ mod _stm_filter_tests {
             assert_eq!(rs.len(), 2);
         } else {
             panic!("expected Rows after merge");
+        }
+    }
+
+    #[test]
+    fn classify_filter_prefers_eq_over_in_and_range() {
+        // Mixed predicates: Eq on `id` + range on `price` + In on `category`.
+        // Eq has the best selectivity rank (0, 1) so it should drive indexing.
+        let f = ReadFilter::Cols(vec![
+            ("price".into(), ColPred::Cmp(CmpOp::Gt, SqlVal::Int(100))),
+            ("category".into(), ColPred::In(vec![SqlVal::Text("a".into()), SqlVal::Text("b".into())])),
+            ("id".into(), ColPred::Cmp(CmpOp::Eq, SqlVal::Int(42))),
+        ]);
+        match classify_filter(&f) {
+            FilterReg::Eq { col, keys } => {
+                assert_eq!(col, "id");
+                assert_eq!(keys, vec![SqlValKey::Int(42)]);
+            }
+            other => panic!("expected Eq on id, got {:?}", classify_kind(&other)),
+        }
+    }
+
+    #[test]
+    fn classify_filter_picks_smaller_in_over_larger_in() {
+        // Two In predicates: 4-element vs 2-element. Smaller is more selective.
+        let f = ReadFilter::Cols(vec![
+            (
+                "tag".into(),
+                ColPred::In(vec![
+                    SqlVal::Int(1),
+                    SqlVal::Int(2),
+                    SqlVal::Int(3),
+                    SqlVal::Int(4),
+                ]),
+            ),
+            ("status".into(), ColPred::In(vec![SqlVal::Text("a".into()), SqlVal::Text("b".into())])),
+        ]);
+        match classify_filter(&f) {
+            FilterReg::Eq { col, keys } => {
+                assert_eq!(col, "status");
+                assert_eq!(keys.len(), 2);
+            }
+            other => panic!("expected Eq on status, got {:?}", classify_kind(&other)),
+        }
+    }
+
+    #[test]
+    fn classify_filter_falls_back_to_range_when_only_range_indexable() {
+        // Neq + Range — Neq is not indexable, Range is.
+        let f = ReadFilter::Cols(vec![
+            ("status".into(), ColPred::Cmp(CmpOp::Neq, SqlVal::Text("done".into()))),
+            ("price".into(), ColPred::Cmp(CmpOp::Lt, SqlVal::Int(500))),
+        ]);
+        match classify_filter(&f) {
+            FilterReg::Range { col, op, threshold } => {
+                assert_eq!(col, "price");
+                assert!(matches!(op, CmpOp::Lt));
+                assert_eq!(threshold, SqlVal::Int(500));
+            }
+            other => panic!("expected Range on price, got {:?}", classify_kind(&other)),
+        }
+    }
+
+    #[test]
+    fn classify_filter_broad_when_no_indexable_pred() {
+        // Only Neq — falls back to broad watcher.
+        let f = ReadFilter::Cols(vec![(
+            "status".into(),
+            ColPred::Cmp(CmpOp::Neq, SqlVal::Text("done".into())),
+        )]);
+        assert!(matches!(classify_filter(&f), FilterReg::Broad));
+        // ReadFilter::All is always broad.
+        assert!(matches!(classify_filter(&ReadFilter::All), FilterReg::Broad));
+    }
+
+    #[test]
+    fn classify_filter_in_expands_under_every_value() {
+        // In(...) registers under every value — verify all keys come through.
+        let f = ReadFilter::Cols(vec![(
+            "id".into(),
+            ColPred::In(vec![SqlVal::Int(1), SqlVal::Int(2), SqlVal::Int(3)]),
+        )]);
+        match classify_filter(&f) {
+            FilterReg::Eq { col, keys } => {
+                assert_eq!(col, "id");
+                assert_eq!(
+                    keys,
+                    vec![SqlValKey::Int(1), SqlValKey::Int(2), SqlValKey::Int(3)]
+                );
+            }
+            other => panic!("expected Eq, got {:?}", classify_kind(&other)),
+        }
+    }
+
+    #[test]
+    fn range_entry_matches_respects_op() {
+        // Lt: row_val < threshold
+        let e = RangeEntry {
+            op: CmpOp::Lt,
+            threshold: SqlVal::Int(100),
+            slot: std::sync::Weak::new(),
+        };
+        assert!(range_entry_matches(&SqlVal::Int(50), &e));
+        assert!(!range_entry_matches(&SqlVal::Int(100), &e));
+        assert!(!range_entry_matches(&SqlVal::Int(150), &e));
+        // Ge: row_val >= threshold
+        let e = RangeEntry {
+            op: CmpOp::Ge,
+            threshold: SqlVal::Int(100),
+            slot: std::sync::Weak::new(),
+        };
+        assert!(!range_entry_matches(&SqlVal::Int(50), &e));
+        assert!(range_entry_matches(&SqlVal::Int(100), &e));
+        assert!(range_entry_matches(&SqlVal::Int(150), &e));
+    }
+
+    #[test]
+    fn range_entry_matches_unknown_types_wake_conservatively() {
+        // Comparing Int to Blob is unknown — wake conservatively.
+        let e = RangeEntry {
+            op: CmpOp::Lt,
+            threshold: SqlVal::Blob(vec![1, 2, 3]),
+            slot: std::sync::Weak::new(),
+        };
+        assert!(range_entry_matches(&SqlVal::Int(50), &e));
+    }
+
+    /// Debug helper for test panics — `FilterReg` doesn't derive `Debug`.
+    fn classify_kind(r: &FilterReg) -> &'static str {
+        match r {
+            FilterReg::Broad => "Broad",
+            FilterReg::Eq { .. } => "Eq",
+            FilterReg::Range { .. } => "Range",
         }
     }
 

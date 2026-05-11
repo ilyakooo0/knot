@@ -2171,6 +2171,17 @@ impl KnotDb {
             self.ensure_index(table, &col);
         }
     }
+
+    /// Ensure indexes on columns referenced in the WHERE/ORDER BY clauses of a
+    /// full SQL query. Parses `FROM "_knot_<name>" [AS] <alias>` to resolve
+    /// `<alias>."col"` qualified refs to their underlying table. Unqualified
+    /// `"col"` refs are only indexed when the query references exactly one
+    /// `_knot_` table — otherwise their table is ambiguous and we skip them.
+    fn ensure_indexes_for_sql(&self, sql: &str) {
+        for (table, column) in extract_sql_indexable_columns(sql) {
+            self.ensure_index(&table, &column);
+        }
+    }
 }
 
 /// Extract column names from a generated SQL WHERE clause.
@@ -2202,6 +2213,232 @@ fn extract_where_columns(sql: &str) -> Vec<String> {
         }
     }
     columns
+}
+
+/// Walk a generated SQL query and return `(table_with_prefix, column)` pairs
+/// that should be indexed. Only column references inside WHERE / ORDER BY
+/// clauses are returned. Qualified refs (`<alias>."col"`) resolve through the
+/// alias map built from `FROM "_knot_<name>" [AS] <alias>`; unqualified refs
+/// (`"col"`) are attributed to the single `_knot_` table when there is one,
+/// and skipped when the query touches multiple tables.
+fn extract_sql_indexable_columns(sql: &str) -> Vec<(String, String)> {
+    let aliases = parse_table_aliases(sql);
+    if aliases.is_empty() {
+        return Vec::new();
+    }
+    let Some(start) = find_indexable_region_start(sql) else {
+        return Vec::new();
+    };
+
+    // Compute the unique set of underlying tables for single-table detection.
+    let unique_tables: HashSet<&String> = aliases.values().collect();
+    let single_table: Option<String> = if unique_tables.len() == 1 {
+        unique_tables.into_iter().next().cloned()
+    } else {
+        None
+    };
+
+    let region = &sql[start..];
+    let bytes = region.as_bytes();
+
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        let open = i;
+        // Find the closing quote, honoring `""` as an embedded quote.
+        let mut j = open + 1;
+        loop {
+            if j >= bytes.len() {
+                return out; // unterminated literal — bail out safely
+            }
+            if bytes[j] == b'"' {
+                if bytes.get(j + 1) == Some(&b'"') {
+                    j += 2;
+                    continue;
+                }
+                break;
+            }
+            j += 1;
+        }
+        let raw = &region[open + 1..j];
+        i = j + 1;
+
+        // Skip table references; we only want column identifiers.
+        if raw.starts_with("_knot_") || raw.is_empty() {
+            continue;
+        }
+        let column: String = if raw.contains("\"\"") {
+            raw.replace("\"\"", "\"")
+        } else {
+            raw.to_string()
+        };
+
+        // Check for an `<alias>.` qualifier immediately before the opening quote.
+        let table = if open > 0 && bytes[open - 1] == b'.' {
+            let dot = open - 1;
+            let mut k = dot;
+            while k > 0 {
+                let prev = bytes[k - 1];
+                if prev.is_ascii_alphanumeric() || prev == b'_' {
+                    k -= 1;
+                } else {
+                    break;
+                }
+            }
+            if k == dot {
+                None
+            } else {
+                aliases.get(&region[k..dot]).cloned()
+            }
+        } else {
+            single_table.clone()
+        };
+
+        if let Some(table) = table {
+            let key = (table.clone(), column.clone());
+            if seen.insert(key) {
+                out.push((table, column));
+            }
+        }
+    }
+    out
+}
+
+/// Parse a generated SQL query's `FROM` / `JOIN` clauses to build a map from
+/// table alias (or the bare `_knot_<name>` table name when no alias is used)
+/// to the underlying `_knot_<name>` table identifier.
+fn parse_table_aliases(sql: &str) -> HashMap<String, String> {
+    let mut map: HashMap<String, String> = HashMap::new();
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'"' || i + 7 > bytes.len() || &bytes[i + 1..i + 7] != b"_knot_" {
+            i += 1;
+            continue;
+        }
+        // Find the closing quote of the table identifier.
+        let mut j = i + 7;
+        while j < bytes.len() && bytes[j] != b'"' {
+            j += 1;
+        }
+        if j >= bytes.len() {
+            break;
+        }
+        let table = match std::str::from_utf8(&bytes[i + 1..j]) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                i = j + 1;
+                continue;
+            }
+        };
+
+        // Look forward for an optional `AS` keyword and a bare-identifier alias.
+        let mut k = j + 1;
+        while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        let mut had_as = false;
+        if k + 2 < bytes.len()
+            && bytes[k..k + 2].eq_ignore_ascii_case(b"as")
+            && bytes[k + 2].is_ascii_whitespace()
+        {
+            had_as = true;
+            k += 3;
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+        }
+        let alias_start = k;
+        while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+            k += 1;
+        }
+
+        if k > alias_start {
+            let alias = std::str::from_utf8(&bytes[alias_start..k]).unwrap_or("");
+            // Accept the bare identifier as an alias only when `AS` is explicit
+            // or the identifier is not a SQL keyword that legitimately follows
+            // a FROM clause (WHERE, ORDER, GROUP, JOIN, …).
+            if !alias.is_empty() && (had_as || !is_sql_clause_keyword(alias)) {
+                map.insert(alias.to_string(), table);
+                i = k;
+                continue;
+            }
+        }
+        // No alias was provided — record the table under its own name so that
+        // single-table detection still sees one entry.
+        map.entry(table.clone()).or_insert(table);
+        i = j + 1;
+    }
+    map
+}
+
+fn is_sql_clause_keyword(s: &str) -> bool {
+    matches!(
+        s.to_ascii_uppercase().as_str(),
+        "WHERE"
+            | "GROUP"
+            | "ORDER"
+            | "LIMIT"
+            | "OFFSET"
+            | "HAVING"
+            | "JOIN"
+            | "INNER"
+            | "LEFT"
+            | "RIGHT"
+            | "OUTER"
+            | "FULL"
+            | "CROSS"
+            | "ON"
+            | "USING"
+            | "UNION"
+            | "EXCEPT"
+            | "INTERSECT"
+            | "WITH"
+            | "AS"
+    )
+}
+
+/// Locate the byte offset just after the first WHERE / ORDER BY keyword,
+/// matching only at word boundaries. The compiler emits these clauses
+/// upper-case but we match case-insensitively for safety.
+fn find_indexable_region_start(sql: &str) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut best: Option<usize> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let prev_boundary = i == 0
+            || bytes[i - 1].is_ascii_whitespace()
+            || bytes[i - 1] == b'('
+            || bytes[i - 1] == b')';
+        if prev_boundary {
+            if i + 5 < bytes.len()
+                && bytes[i..i + 5].eq_ignore_ascii_case(b"WHERE")
+                && (bytes[i + 5].is_ascii_whitespace() || bytes[i + 5] == b'(')
+            {
+                let pos = i + 5;
+                best = Some(best.map_or(pos, |p| p.min(pos)));
+                // WHERE always precedes ORDER BY in well-formed SQL.
+                return best;
+            }
+            if i + 8 < bytes.len()
+                && bytes[i..i + 5].eq_ignore_ascii_case(b"ORDER")
+                && bytes[i + 5].is_ascii_whitespace()
+                && bytes[i + 6..i + 8].eq_ignore_ascii_case(b"BY")
+                && (bytes[i + 8].is_ascii_whitespace() || bytes[i + 8] == b'"')
+            {
+                let pos = i + 8;
+                best = Some(best.map_or(pos, |p| p.min(pos)));
+                return best;
+            }
+        }
+        i += 1;
+    }
+    best
 }
 
 // ── Helpers ───────────────────────────────────────────────────────
@@ -7989,6 +8226,7 @@ pub extern "C" fn knot_source_query_count(
         sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
 
     debug_sql_params(sql, &sql_params);
+    db_ref.ensure_indexes_for_sql(sql);
 
     let count: i64 = db_ref
         .conn
@@ -8023,6 +8261,7 @@ pub extern "C" fn knot_source_query_float(
         sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
 
     debug_sql_params(sql, &sql_params);
+    db_ref.ensure_indexes_for_sql(sql);
 
     let result: Option<f64> = db_ref
         .conn
@@ -8058,6 +8297,7 @@ pub extern "C" fn knot_source_query_sum(
         sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
 
     debug_sql_params(sql, &sql_params);
+    db_ref.ensure_indexes_for_sql(sql);
 
     db_ref
         .conn
@@ -8108,6 +8348,7 @@ pub extern "C" fn knot_source_query_value(
         sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
 
     debug_sql_params(sql, &sql_params);
+    db_ref.ensure_indexes_for_sql(sql);
 
     db_ref
         .conn
@@ -8348,6 +8589,7 @@ pub extern "C" fn knot_source_query(
         sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
 
     debug_sql_params(sql, &sql_params);
+    db_ref.ensure_indexes_for_sql(sql);
 
     let rec = parse_record_schema(result_schema);
 
@@ -13318,5 +13560,96 @@ mod _size_tests {
         eprintln!("sizeof(RecordField) = {}", std::mem::size_of::<RecordField>());
         eprintln!("sizeof(FunctionInner) = {}", std::mem::size_of::<FunctionInner>());
         eprintln!("sizeof(Arc<str>) = {}", std::mem::size_of::<Arc<str>>());
+    }
+}
+
+#[cfg(test)]
+mod _sql_index_tests {
+    use super::extract_sql_indexable_columns;
+
+    fn pairs(sql: &str) -> Vec<(String, String)> {
+        let mut v = extract_sql_indexable_columns(sql);
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn single_table_where_unqualified() {
+        let sql = r#"SELECT COUNT(*) FROM "_knot_orders" WHERE "status" = ?1 AND "qty" > ?2"#;
+        assert_eq!(
+            pairs(sql),
+            vec![
+                ("_knot_orders".into(), "qty".into()),
+                ("_knot_orders".into(), "status".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn single_table_order_by() {
+        let sql = r#"SELECT "id" FROM "_knot_people" ORDER BY "name""#;
+        assert_eq!(pairs(sql), vec![("_knot_people".into(), "name".into())]);
+    }
+
+    #[test]
+    fn aggregate_with_filter_unqualified() {
+        let sql = r#"SELECT SUM("amount") FROM "_knot_orders" WHERE "status" = ?1"#;
+        assert_eq!(pairs(sql), vec![("_knot_orders".into(), "status".into())]);
+    }
+
+    #[test]
+    fn aliased_aggregate_with_filter() {
+        let sql = r#"SELECT MIN(t0."price") FROM "_knot_orders" AS t0 WHERE t0."status" = ?1"#;
+        assert_eq!(pairs(sql), vec![("_knot_orders".into(), "status".into())]);
+    }
+
+    #[test]
+    fn multi_table_qualified_refs() {
+        let sql = r#"SELECT t0."id", t1."name" FROM "_knot_orders" AS t0, "_knot_customers" AS t1 WHERE t0."customer_id" = t1."id" AND t1."country" = ?1 ORDER BY t0."created_at""#;
+        assert_eq!(
+            pairs(sql),
+            vec![
+                ("_knot_customers".into(), "country".into()),
+                ("_knot_customers".into(), "id".into()),
+                ("_knot_orders".into(), "created_at".into()),
+                ("_knot_orders".into(), "customer_id".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_table_unqualified_ref_is_skipped() {
+        // Unqualified columns cannot be safely attributed when more than one
+        // _knot_ table is in scope — ensure we do not guess.
+        let sql = r#"SELECT t0."id" FROM "_knot_a" AS t0, "_knot_b" AS t1 WHERE "x" = ?1"#;
+        assert!(pairs(sql).is_empty(), "unqualified ref should be skipped");
+    }
+
+    #[test]
+    fn select_only_columns_are_not_indexed() {
+        let sql = r#"SELECT "a", "b" FROM "_knot_t""#;
+        assert!(
+            pairs(sql).is_empty(),
+            "projection-only columns should not be indexed"
+        );
+    }
+
+    #[test]
+    fn no_indexable_clause_returns_empty() {
+        let sql = r#"SELECT COUNT(*) FROM "_knot_t""#;
+        assert!(pairs(sql).is_empty());
+    }
+
+    #[test]
+    fn implicit_alias_after_table() {
+        // `FROM "_knot_t" AS t0` and `FROM "_knot_t" t0` should both work.
+        let sql = r#"SELECT t0."col" FROM "_knot_t" t0 WHERE t0."x" = ?1"#;
+        assert_eq!(pairs(sql), vec![("_knot_t".into(), "x".into())]);
+    }
+
+    #[test]
+    fn dedupes_repeated_refs() {
+        let sql = r#"SELECT t0."x" FROM "_knot_t" t0 WHERE t0."x" > ?1 AND t0."x" < ?2"#;
+        assert_eq!(pairs(sql), vec![("_knot_t".into(), "x".into())]);
     }
 }

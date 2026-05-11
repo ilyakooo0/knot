@@ -3439,7 +3439,10 @@ impl Parser {
                 let tok = self.advance();
                 let TokenKind::Upper(name) = tok.kind else { unreachable!() };
                 if name == "IO" && matches!(self.peek(), TokenKind::LBrace) {
-                    // Parse IO {effects} Type or IO {effects | r} Type or IO {| r} Type
+                    // Parse `IO {effects} Type`, `IO {effects | r} Type`,
+                    // `IO {| r} Type`, or `IO {effects | r1 \/ r2} Type`.
+                    // After `|`, accept one row-variable name (or `_`),
+                    // optionally chained with `\/` to form a row union.
                     self.advance(); // consume '{'
                     self.skip_newlines();
                     let effects = if matches!(self.peek(), TokenKind::RBrace | TokenKind::Pipe) {
@@ -3448,25 +3451,10 @@ impl Parser {
                         self.try_parse_effects().unwrap_or_default()
                     };
                     self.skip_newlines();
-                    let rest = if self.eat(&TokenKind::Pipe) {
-                        self.skip_newlines();
-                        match self.peek() {
-                            TokenKind::Lower(_) => {
-                                let tok = self.advance();
-                                let TokenKind::Lower(n) = tok.kind else { unreachable!() };
-                                Some(n)
-                            }
-                            TokenKind::Underscore => {
-                                self.advance();
-                                Some("_".to_string())
-                            }
-                            _ => {
-                                self.error("expected effect row variable name or '_' after '|'");
-                                None
-                            }
-                        }
+                    let rest: Vec<Name> = if self.eat(&TokenKind::Pipe) {
+                        self.parse_effect_row_tail()
                     } else {
-                        None
+                        Vec::new()
                     };
                     self.skip_newlines();
                     self.expect(&TokenKind::RBrace, "expected '}' to close IO effect set")
@@ -3480,12 +3468,33 @@ impl Parser {
                 } else if name == "IO" && matches!(self.peek(), TokenKind::Lower(_) | TokenKind::Underscore) {
                     // Shorthand: `IO e Type` desugars to `IO {| e} Type`.
                     // `IO _ Type` is the wildcard form — effects are inferred.
+                    // Also support `IO r1 \/ r2 Type` as shorthand for
+                    // `IO {| r1 \/ r2} Type`.
                     let row_tok = self.advance();
-                    let row_name = match row_tok.kind {
+                    let first_name = match row_tok.kind {
                         TokenKind::Lower(n) => n,
                         TokenKind::Underscore => "_".to_string(),
                         _ => unreachable!(),
                     };
+                    let mut rest: Vec<Name> = vec![first_name];
+                    while self.eat(&TokenKind::BackslashSlash) {
+                        self.skip_newlines();
+                        match self.peek() {
+                            TokenKind::Lower(_) => {
+                                let tok = self.advance();
+                                let TokenKind::Lower(n) = tok.kind else { unreachable!() };
+                                rest.push(n);
+                            }
+                            TokenKind::Underscore => {
+                                self.advance();
+                                rest.push("_".to_string());
+                            }
+                            _ => {
+                                self.error("expected effect row variable name or '_' after '\\/'");
+                                break;
+                            }
+                        }
+                    }
                     if !self.enter_recursion() { return None; }
                     let inner = self.parse_type_atom();
                     self.recursion_depth -= 1;
@@ -3494,7 +3503,7 @@ impl Parser {
                     Some(Spanned::new(
                         TypeKind::IO {
                             effects: Vec::new(),
-                            rest: Some(row_name),
+                            rest,
                             ty: Box::new(inner),
                         },
                         span,
@@ -3663,6 +3672,47 @@ impl Parser {
             TypeKind::Record { fields, rest },
             Span::new(start.start, end_tok.span.end),
         ))
+    }
+
+    /// Parse the row-variable tail of an IO type after `|`:
+    /// `r1`, `_`, or `r1 \/ r2 \/ r3`. Returns an empty Vec on parse error.
+    fn parse_effect_row_tail(&mut self) -> Vec<Name> {
+        let mut rest: Vec<Name> = Vec::new();
+        self.skip_newlines();
+        match self.peek() {
+            TokenKind::Lower(_) => {
+                let tok = self.advance();
+                let TokenKind::Lower(n) = tok.kind else { unreachable!() };
+                rest.push(n);
+            }
+            TokenKind::Underscore => {
+                self.advance();
+                rest.push("_".to_string());
+            }
+            _ => {
+                self.error("expected effect row variable name or '_' after '|'");
+                return rest;
+            }
+        }
+        while self.eat(&TokenKind::BackslashSlash) {
+            self.skip_newlines();
+            match self.peek() {
+                TokenKind::Lower(_) => {
+                    let tok = self.advance();
+                    let TokenKind::Lower(n) = tok.kind else { unreachable!() };
+                    rest.push(n);
+                }
+                TokenKind::Underscore => {
+                    self.advance();
+                    rest.push("_".to_string());
+                }
+                _ => {
+                    self.error("expected effect row variable name or '_' after '\\/'");
+                    break;
+                }
+            }
+        }
+        rest
     }
 
     fn try_parse_effects(&mut self) -> Option<Vec<Effect>> {

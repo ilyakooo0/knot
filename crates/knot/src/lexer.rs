@@ -87,6 +87,8 @@ pub enum TokenKind {
     Colon,
     Pipe,
     Backslash,
+    /// `\/` — effect-row union in IO type syntax.
+    BackslashSlash,
     Ampersand,
     At,
     Underscore,
@@ -168,6 +170,7 @@ impl TokenKind {
             TokenKind::Colon => "':'",
             TokenKind::Pipe => "'|'",
             TokenKind::Backslash => "'\\'",
+            TokenKind::BackslashSlash => "'\\/'",
             TokenKind::Ampersand => "'&'",
             TokenKind::At => "'@'",
             TokenKind::Underscore => "'_'",
@@ -787,7 +790,13 @@ impl<'src> Lexer<'src> {
             b'.' => TokenKind::Dot,
             b',' => TokenKind::Comma,
             b':' => TokenKind::Colon,
-            b'\\' => TokenKind::Backslash,
+            b'\\' => {
+                if self.eat(b'/') {
+                    TokenKind::BackslashSlash
+                } else {
+                    TokenKind::Backslash
+                }
+            }
             b'@' => TokenKind::At,
             b';' => TokenKind::Semicolon,
             b'?' => TokenKind::Question,

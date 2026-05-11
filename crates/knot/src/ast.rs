@@ -452,10 +452,12 @@ pub enum TypeKind {
     },
 
     /// `IO {effects} a` or `IO {effects | r} a` — IO monad type with effect set.
-    /// The optional `rest` is a row variable name for effect polymorphism.
+    /// `rest` is the row-variable tail. Empty Vec = closed row. One element =
+    /// single row variable. Multiple elements = `r1 \/ r2 \/ ...` row-union —
+    /// the tail row is the union of each named row variable's effects.
     IO {
         effects: Vec<Effect>,
-        rest: Option<Name>,
+        rest: Vec<Name>,
         ty: Box<Type>,
     },
 

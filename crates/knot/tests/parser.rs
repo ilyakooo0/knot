@@ -2246,7 +2246,7 @@ fn io_type_with_effect_row_var() {
             TypeKind::IO { effects, rest, .. } => {
                 assert_eq!(effects.len(), 1);
                 assert!(matches!(&effects[0], Effect::Console));
-                assert_eq!(rest.as_deref(), Some("e"));
+                assert_eq!(rest, &vec!["e".to_string()]);
             }
             other => panic!("expected IO with rest, got {:?}", other),
         },
@@ -2260,7 +2260,7 @@ fn io_type_with_only_effect_row() {
         DeclKind::TypeAlias { ty, .. } => match &ty.node {
             TypeKind::IO { effects, rest, .. } => {
                 assert!(effects.is_empty());
-                assert_eq!(rest.as_deref(), Some("e"));
+                assert_eq!(rest, &vec!["e".to_string()]);
             }
             other => panic!("expected IO with rest, got {:?}", other),
         },
@@ -2276,7 +2276,7 @@ fn io_type_with_reads_and_row_var() {
                 assert_eq!(effects.len(), 2);
                 assert!(matches!(&effects[0], Effect::Reads(n) if n == "people"));
                 assert!(matches!(&effects[1], Effect::Console));
-                assert_eq!(rest.as_deref(), Some("e"));
+                assert_eq!(rest, &vec!["e".to_string()]);
             }
             other => panic!("expected IO with rest, got {:?}", other),
         },
@@ -2290,7 +2290,7 @@ fn io_type_bare_row_shorthand() {
         DeclKind::TypeAlias { ty, .. } => match &ty.node {
             TypeKind::IO { effects, rest, .. } => {
                 assert!(effects.is_empty());
-                assert_eq!(rest.as_deref(), Some("e"));
+                assert_eq!(rest, &vec!["e".to_string()]);
             }
             other => panic!("expected IO with rest, got {:?}", other),
         },
@@ -2305,7 +2305,7 @@ fn io_type_wildcard_shorthand() {
         DeclKind::TypeAlias { ty, .. } => match &ty.node {
             TypeKind::IO { effects, rest, .. } => {
                 assert!(effects.is_empty());
-                assert_eq!(rest.as_deref(), Some("_"));
+                assert_eq!(rest, &vec!["_".to_string()]);
             }
             other => panic!("expected IO with wildcard rest, got {:?}", other),
         },
@@ -2320,9 +2320,39 @@ fn io_type_wildcard_in_braces() {
         DeclKind::TypeAlias { ty, .. } => match &ty.node {
             TypeKind::IO { effects, rest, .. } => {
                 assert!(effects.is_empty());
-                assert_eq!(rest.as_deref(), Some("_"));
+                assert_eq!(rest, &vec!["_".to_string()]);
             }
             other => panic!("expected IO with wildcard rest, got {:?}", other),
+        },
+        other => panic!("expected TypeAlias, got {:?}", other),
+    }
+}
+
+#[test]
+fn io_type_row_union_in_braces() {
+    // `IO {| r1 \/ r2} T` — row-union of two named effect-row variables.
+    match first_decl(r"type X = IO {| r1 \/ r2} Int") {
+        DeclKind::TypeAlias { ty, .. } => match &ty.node {
+            TypeKind::IO { effects, rest, .. } => {
+                assert!(effects.is_empty());
+                assert_eq!(rest, &vec!["r1".to_string(), "r2".to_string()]);
+            }
+            other => panic!("expected IO with row-union rest, got {:?}", other),
+        },
+        other => panic!("expected TypeAlias, got {:?}", other),
+    }
+}
+
+#[test]
+fn io_type_row_union_shorthand() {
+    // Shorthand form: `IO r1 \/ r2 T` parses the same as `IO {| r1 \/ r2} T`.
+    match first_decl(r"type X = IO r1 \/ r2 Int") {
+        DeclKind::TypeAlias { ty, .. } => match &ty.node {
+            TypeKind::IO { effects, rest, .. } => {
+                assert!(effects.is_empty());
+                assert_eq!(rest, &vec!["r1".to_string(), "r2".to_string()]);
+            }
+            other => panic!("expected IO with row-union shorthand, got {:?}", other),
         },
         other => panic!("expected TypeAlias, got {:?}", other),
     }

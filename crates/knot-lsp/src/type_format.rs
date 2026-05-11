@@ -82,8 +82,8 @@ fn format_type_kind_d(ty: &TypeKind, depth: usize) -> String {
         }
         TypeKind::IO { effects, rest, ty } => {
             let mut parts: Vec<String> = effects.iter().map(format_effect).collect();
-            if let Some(name) = rest {
-                parts.push(format!("| {}", name));
+            if !rest.is_empty() {
+                parts.push(format!("| {}", rest.join(" \\/ ")));
             }
             format!("IO {{{}}} {}", parts.join(", "), format_type_kind_d(&ty.node, d))
         }

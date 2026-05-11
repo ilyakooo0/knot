@@ -283,6 +283,10 @@ struct Scheme {
     vars: Vec<TyVar>,
     unit_vars: Vec<UnitVar>,
     constraints: Vec<TyConstraint>,
+    /// `r3 := r1 \/ r2` row-union constraints captured during generalization.
+    /// Each `EffectUnion`'s vars reference `vars` and get freshened together
+    /// at instantiation.
+    effect_unions: Vec<EffectUnion>,
     ty: Ty,
 }
 
@@ -292,6 +296,7 @@ impl Scheme {
             vars: vec![],
             unit_vars: vec![],
             constraints: vec![],
+            effect_unions: vec![],
             ty,
         }
     }
@@ -301,6 +306,7 @@ impl Scheme {
             vars,
             unit_vars: vec![],
             constraints: vec![],
+            effect_unions: vec![],
             ty,
         }
     }
@@ -313,6 +319,15 @@ struct DeferredConstraint {
     trait_name: String,
     type_var: TyVar,
     span: Span,
+}
+
+/// `result := union(sources)` constraint produced by `r1 \/ r2 \/ ...`
+/// effect-row syntax. The result row variable is bound to the union of each
+/// source row variable's effects once those sources are resolved.
+#[derive(Debug, Clone)]
+struct EffectUnion {
+    result: TyVar,
+    sources: Vec<TyVar>,
 }
 
 // ── Constructor and data type metadata ────────────────────────────
@@ -395,6 +410,12 @@ struct Infer {
 
     /// Deferred trait constraint checks, resolved after inference.
     deferred_constraints: Vec<DeferredConstraint>,
+
+    /// `r3 := r1 \/ r2 \/ ...` row-union constraints produced by `\/`
+    /// syntax in IO type annotations. Resolved after each declaration's
+    /// inference so the result row picks up the union of its sources'
+    /// effects.
+    pending_effect_unions: Vec<EffectUnion>,
 
     /// Trait constraints declared in an enclosing function signature, keyed
     /// by the skolem TyVar they apply to. Lets us reject use sites that
@@ -497,6 +518,7 @@ impl Infer {
             trait_method_param_vars: HashMap::new(),
             known_impls: HashSet::new(),
             deferred_constraints: Vec::new(),
+            pending_effect_unions: Vec::new(),
             declared_skolem_constraints: HashMap::new(),
             binding_types: Vec::new(),
             trait_params: HashMap::new(),
@@ -1094,6 +1116,7 @@ impl Infer {
                     vars: vars.clone(),
                     unit_vars: vec![],
                     constraints: vec![],
+                    effect_unions: vec![],
                     ty: (**body).clone(),
                 };
                 let inst = self.instantiate_at(&scheme, span);
@@ -1105,6 +1128,7 @@ impl Infer {
                     vars: vars.clone(),
                     unit_vars: vec![],
                     constraints: vec![],
+                    effect_unions: vec![],
                     ty: (**body).clone(),
                 };
                 let inst = self.instantiate_at(&scheme, span);
@@ -1792,6 +1816,20 @@ impl Infer {
                 span,
             });
         }
+        // Freshen effect-union constraints alongside the type — each
+        // instantiation gets its own copy so a polymorphic `\/`-typed
+        // function can be called multiple times with distinct rows.
+        for u in &scheme.effect_unions {
+            let fresh_var = |v: TyVar| -> TyVar {
+                match mapping.get(&v) {
+                    Some(Ty::Var(nv)) => *nv,
+                    _ => v,
+                }
+            };
+            let result = fresh_var(u.result);
+            let sources = u.sources.iter().copied().map(fresh_var).collect();
+            self.pending_effect_unions.push(EffectUnion { result, sources });
+        }
         let ty = self.subst_ty(&scheme.ty, &mapping);
         // Freshen unit variables so each instantiation gets independent units
         if scheme.unit_vars.is_empty() {
@@ -1844,6 +1882,19 @@ impl Infer {
                 .entry(target_var)
                 .or_default()
                 .insert(c.trait_name.clone());
+        }
+        // Freshen effect-union constraints to track row-union semantics
+        // through the function body's type check.
+        for u in &scheme.effect_unions {
+            let fresh_var = |v: TyVar| -> TyVar {
+                match mapping.get(&v) {
+                    Some(Ty::Var(nv)) => *nv,
+                    _ => v,
+                }
+            };
+            let result = fresh_var(u.result);
+            let sources = u.sources.iter().copied().map(fresh_var).collect();
+            self.pending_effect_unions.push(EffectUnion { result, sources });
         }
         let ty = self.subst_ty(&scheme.ty, &mapping);
         let ty = if scheme.unit_vars.is_empty() {
@@ -2135,6 +2186,34 @@ impl Infer {
                 }
             }
         }
+        // Drain effect-union constraints whose result var is generalized
+        // here. Anything resolved to a concrete row is resolved now; the
+        // rest is captured by the scheme so each instantiation gets its
+        // own freshened copy.
+        let pending = std::mem::take(&mut self.pending_effect_unions);
+        let mut effect_unions = Vec::new();
+        for u in pending {
+            let result_resolved = self.apply(&Ty::Var(u.result));
+            match result_resolved {
+                Ty::Var(v) if gen_set.contains(&v) => {
+                    effect_unions.push(EffectUnion { result: v, sources: u.sources });
+                }
+                Ty::Var(_) => {
+                    // Result var is env-bound or already moved by another
+                    // path; keep it pending — generalization in an outer
+                    // scope will pick it up, or end-of-inference resolves it.
+                    self.pending_effect_unions.push(EffectUnion {
+                        result: u.result,
+                        sources: u.sources,
+                    });
+                }
+                _ => {
+                    // Result already resolved to a concrete row — resolve
+                    // the union and unify against it now.
+                    self.resolve_effect_union(&u);
+                }
+            }
+        }
         let env_unit_fv = self.free_unit_vars_in_env();
         let unit_vars: Vec<UnitVar> = self
             .free_unit_vars_in_ty(&applied)
@@ -2145,7 +2224,37 @@ impl Infer {
             vars: gen_vars,
             unit_vars,
             constraints: kept,
+            effect_unions,
             ty: applied,
+        }
+    }
+
+    /// Bind a union constraint's result row var to the union of its sources'
+    /// resolved effects. Sources whose tails are still open contribute their
+    /// leftover row var to the result so future growth still flows through.
+    fn resolve_effect_union(&mut self, u: &EffectUnion) {
+        let mut effects: BTreeSet<IoEffect> = BTreeSet::new();
+        let mut leftover: Option<TyVar> = None;
+        for s in &u.sources {
+            let (e, tail) = self.resolve_effect_row(BTreeSet::new(), Some(*s));
+            effects.extend(e);
+            if leftover.is_none() {
+                leftover = tail;
+            }
+        }
+        // Use bind_var so the binding goes through occurs check + unification
+        // — handles the case where `result` has already been narrowed.
+        let span = Span::new(0, 0);
+        self.bind_var(u.result, Ty::EffectRow(effects, leftover), span);
+    }
+
+    /// Final-pass resolution of all remaining effect-union constraints.
+    /// Called after a declaration's body finishes inference, so source row
+    /// vars have been bound by argument-type unification.
+    fn resolve_pending_effect_unions(&mut self) {
+        let pending = std::mem::take(&mut self.pending_effect_unions);
+        for u in pending {
+            self.resolve_effect_union(&u);
         }
     }
 
@@ -2440,16 +2549,32 @@ impl Infer {
                 // `_` (wildcard) gets a fresh row variable per occurrence so
                 // multiple `_`s don't accidentally unify; named variables share
                 // a fresh var across the same annotation scope.
-                let row_var = rest.as_ref().map(|name| {
+                let mut row_var = |name: &str| -> TyVar {
                     if name == "_" {
                         self.fresh_var()
                     } else {
                         self.annotation_var(name)
                     }
-                });
+                };
+                let row_tail = match rest.len() {
+                    0 => None,
+                    1 => Some(row_var(&rest[0])),
+                    _ => {
+                        // `r1 \/ r2 \/ ...` — introduce a fresh result row var
+                        // and register an effect-union constraint so it gets
+                        // bound to the union of the named source rows.
+                        let sources: Vec<TyVar> = rest.iter().map(|n| row_var(n)).collect();
+                        let result = self.fresh_var();
+                        self.pending_effect_unions.push(EffectUnion {
+                            result,
+                            sources,
+                        });
+                        Some(result)
+                    }
+                };
                 Ty::IO(
                     io_effects,
-                    row_var,
+                    row_tail,
                     Box::new(self.ast_type_to_ty(inner_ty)),
                 )
             }
@@ -3871,6 +3996,7 @@ impl Infer {
                         vars,
                         unit_vars: vec![],
                         constraints: vec![],
+                        effect_unions: vec![],
                         ty: *body,
                     },
                     _ => Scheme::mono(expected.clone()),
@@ -4844,7 +4970,7 @@ impl Infer {
                         };
                         self.bind_top(
                             name,
-                            Scheme { vars, unit_vars, constraints, ty },
+                            Scheme { vars, unit_vars, constraints, effect_unions: vec![], ty },
                         );
                     } else {
                         let var = self.fresh();
@@ -5142,6 +5268,7 @@ impl Infer {
                     vars: vec![a],
                     unit_vars: vec![u],
                     constraints: vec![],
+                    effect_unions: vec![],
                     ty: Ty::Fun(
                         Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
                         Box::new(int_u),
@@ -5161,6 +5288,7 @@ impl Infer {
                     vars: vec![a],
                     unit_vars: vec![u],
                     constraints: vec![],
+                    effect_unions: vec![],
                     ty: Ty::Fun(
                         Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Bool))),
                         Box::new(Ty::Fun(
@@ -5212,6 +5340,7 @@ impl Infer {
                     vars: vec![],
                     unit_vars: vec![u],
                     constraints: vec![],
+                    effect_unions: vec![],
                     ty: Ty::Fun(
                         Box::new(int_u.clone()),
                         Box::new(Ty::IO(BTreeSet::from([IoEffect::Random]), None, Box::new(int_u))),
@@ -5228,6 +5357,7 @@ impl Infer {
                 vars: vec![],
                 unit_vars: vec![u],
                 constraints: vec![],
+                effect_unions: vec![],
                 ty: Ty::IO(BTreeSet::from([IoEffect::Random]), None, Box::new(float_u)),
             });
         }
@@ -5257,29 +5387,39 @@ impl Infer {
             );
         }
 
-        // race : ∀a b r. IO r a -> IO r b -> IO r (Result a b)
-        // Both arguments share a single open effect-row variable, so any
-        // effects required by either side flow into the result IO.  The
-        // winner is reported via the built-in `Result a b` ADT — `Err
-        // {error: a}` when the left action wins, `Ok {value: b}` when the
-        // right action wins.
+        // race : ∀a b r1 r2 r3. (r3 := r1 \/ r2) => IO r1 a -> IO r2 b
+        //                                          -> IO r3 (Result a b)
+        // Each arm carries its own effect row; the result's row is the
+        // union of both, propagated through the EffectUnion mechanism so a
+        // call mixing distinct effect sets (e.g. `{console}` vs `{clock}`)
+        // produces an IO whose row includes both. The winner is reported
+        // via the built-in `Result a b` ADT — `Err {error: a}` when the
+        // left action wins, `Ok {value: b}` when the right action wins.
         {
             let a = self.fresh_var();
             let b = self.fresh_var();
-            let r = self.fresh_var();
-            let io_a = Ty::IO(BTreeSet::new(), Some(r), Box::new(Ty::Var(a)));
-            let io_b = Ty::IO(BTreeSet::new(), Some(r), Box::new(Ty::Var(b)));
+            let r1 = self.fresh_var();
+            let r2 = self.fresh_var();
+            let r3 = self.fresh_var();
+            let io_a = Ty::IO(BTreeSet::new(), Some(r1), Box::new(Ty::Var(a)));
+            let io_b = Ty::IO(BTreeSet::new(), Some(r2), Box::new(Ty::Var(b)));
             let result_ty = Ty::Con("Result".into(), vec![Ty::Var(a), Ty::Var(b)]);
-            let io_result = Ty::IO(BTreeSet::new(), Some(r), Box::new(result_ty));
+            let io_result = Ty::IO(BTreeSet::new(), Some(r3), Box::new(result_ty));
             self.bind_top(
                 "race",
-                Scheme::poly(
-                    vec![a, b, r],
-                    Ty::Fun(
+                Scheme {
+                    vars: vec![a, b, r1, r2, r3],
+                    unit_vars: vec![],
+                    constraints: vec![],
+                    effect_unions: vec![EffectUnion {
+                        result: r3,
+                        sources: vec![r1, r2],
+                    }],
+                    ty: Ty::Fun(
                         Box::new(io_a),
                         Box::new(Ty::Fun(Box::new(io_b), Box::new(io_result))),
                     ),
-                ),
+                },
             );
         }
 
@@ -5318,6 +5458,7 @@ impl Infer {
                     vars: vec![a, r],
                     unit_vars: vec![u],
                     constraints: vec![],
+                    effect_unions: vec![],
                     ty: Ty::Fun(
                         Box::new(int_u),
                         Box::new(Ty::Fun(
@@ -5352,6 +5493,7 @@ impl Infer {
                     vars: vec![a, r],
                     unit_vars: vec![u],
                     constraints: vec![],
+                    effect_unions: vec![],
                     ty: Ty::Fun(
                         Box::new(Ty::Text),
                         Box::new(Ty::Fun(
@@ -5516,6 +5658,7 @@ impl Infer {
                     vars: vec![a],
                     unit_vars: vec![u],
                     constraints: vec![],
+                    effect_unions: vec![],
                     ty: Ty::Fun(
                         Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(float_u.clone()))),
                         Box::new(Ty::Fun(
@@ -5649,6 +5792,7 @@ impl Infer {
                     vars: vec![],
                     unit_vars: vec![u],
                     constraints: vec![],
+                    effect_unions: vec![],
                     ty: Ty::Fun(Box::new(Ty::Text), Box::new(int_u)),
                 },
             );
@@ -5716,6 +5860,7 @@ impl Infer {
                     vars: vec![],
                     unit_vars: vec![u],
                     constraints: vec![],
+                    effect_unions: vec![],
                     ty: Ty::Fun(
                         Box::new(Ty::IntUnit(UnitTy::var(u))),
                         Box::new(Ty::Int),
@@ -5733,6 +5878,7 @@ impl Infer {
                     vars: vec![],
                     unit_vars: vec![u],
                     constraints: vec![],
+                    effect_unions: vec![],
                     ty: Ty::Fun(
                         Box::new(Ty::Int),
                         Box::new(Ty::IntUnit(UnitTy::var(u))),
@@ -5750,6 +5896,7 @@ impl Infer {
                     vars: vec![],
                     unit_vars: vec![u],
                     constraints: vec![],
+                    effect_unions: vec![],
                     ty: Ty::Fun(
                         Box::new(Ty::FloatUnit(UnitTy::var(u))),
                         Box::new(Ty::Float),
@@ -5767,6 +5914,7 @@ impl Infer {
                     vars: vec![],
                     unit_vars: vec![u],
                     constraints: vec![],
+                    effect_unions: vec![],
                     ty: Ty::Fun(
                         Box::new(Ty::Float),
                         Box::new(Ty::FloatUnit(UnitTy::var(u))),
@@ -5859,6 +6007,7 @@ impl Infer {
                     vars: vec![],
                     unit_vars: vec![u],
                     constraints: vec![],
+                    effect_unions: vec![],
                     ty: Ty::Fun(Box::new(Ty::Bytes), Box::new(int_u)),
                 },
             );
@@ -5876,6 +6025,7 @@ impl Infer {
                     vars: vec![],
                     unit_vars: vec![u1, u2],
                     constraints: vec![],
+                    effect_unions: vec![],
                     ty: Ty::Fun(
                         Box::new(int_u1),
                         Box::new(Ty::Fun(
@@ -5956,6 +6106,7 @@ impl Infer {
                     vars: vec![],
                     unit_vars: vec![u1, u2],
                     constraints: vec![],
+                    effect_unions: vec![],
                     ty: Ty::Fun(
                         Box::new(int_u1),
                         Box::new(Ty::Fun(Box::new(Ty::Bytes), Box::new(int_u2))),
@@ -6108,7 +6259,7 @@ impl Infer {
 
                 self.bind_top(
                     name,
-                    Scheme { vars, unit_vars, constraints, ty: method_ty },
+                    Scheme { vars, unit_vars, constraints, effect_unions: vec![], ty: method_ty },
                 );
             }
         }
@@ -6188,7 +6339,7 @@ impl Infer {
                                 .collect();
                             self.bind_top(
                                 name,
-                                Scheme { vars, unit_vars, constraints, ty: ann_ty },
+                                Scheme { vars, unit_vars, constraints, effect_unions: vec![], ty: ann_ty },
                             );
                         } else {
                             let applied = self.apply(&inferred);
@@ -7179,6 +7330,10 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
 
     // Phase 4: Infer all declaration bodies
     infer.infer_declarations(module);
+
+    // Phase 4a: Resolve any remaining effect-union (`r1 \/ r2`) constraints
+    // so their result rows get bound to the union of their sources' effects.
+    infer.resolve_pending_effect_unions();
 
     // Phase 4b: Check deferred trait constraints
     infer.check_constraints();

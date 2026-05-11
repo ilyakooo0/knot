@@ -728,9 +728,10 @@ fn head_name(expr: &ast::Expr) -> Option<&str> {
 /// effect-checker analogue of HM's row-polymorphic IO unification.
 fn type_has_effect_row_var(ty: &ast::Type) -> bool {
     match &ty.node {
-        ast::TypeKind::IO { rest: Some(name), ty: inner, .. } => {
+        ast::TypeKind::IO { rest, ty: inner, .. } if !rest.is_empty() => {
             // `_` opts out of effect checking and isn't a row variable.
-            name != "_" || type_has_effect_row_var(inner)
+            // Any non-`_` name (including those joined by `\/`) counts.
+            rest.iter().any(|name| name != "_") || type_has_effect_row_var(inner)
         }
         ast::TypeKind::IO { ty: inner, .. } => type_has_effect_row_var(inner),
         ast::TypeKind::Function { param, result } => {
@@ -771,7 +772,9 @@ fn extract_effects(ty: &ast::Type) -> Option<EffectSet> {
             Some(EffectSet::from_ast_effects(effects))
         }
         ast::TypeKind::IO { effects, rest, .. } => {
-            if rest.as_deref() == Some("_") {
+            // `IO _ a` opts out of effect checking. Any `_` in a union row
+            // makes the row open to anything, so treat it the same way.
+            if rest.iter().any(|n| n == "_") {
                 None
             } else {
                 Some(EffectSet::from_ast_effects(effects))
@@ -1247,7 +1250,7 @@ mod tests {
             constraints: vec![],
             ty: spanned(TypeKind::IO {
                 effects: vec![],
-                rest: None,
+                rest: vec![],
                 ty: Box::new(spanned(TypeKind::Record { fields: vec![], rest: None })),
             }),
         };
@@ -1270,7 +1273,7 @@ mod tests {
             constraints: vec![],
             ty: spanned(TypeKind::IO {
                 effects: vec![Effect::Console],
-                rest: None,
+                rest: vec![],
                 ty: Box::new(spanned(TypeKind::Record { fields: vec![], rest: None })),
             }),
         };
@@ -1286,7 +1289,7 @@ mod tests {
             constraints: vec![],
             ty: spanned(TypeKind::IO {
                 effects: vec![],
-                rest: None,
+                rest: vec![],
                 ty: Box::new(spanned(TypeKind::Relation(Box::new(spanned(
                     TypeKind::Named("T".into()),
                 ))))),
@@ -1308,7 +1311,7 @@ mod tests {
             constraints: vec![],
             ty: spanned(TypeKind::IO {
                 effects: vec![Effect::Reads("people".into())],
-                rest: None,
+                rest: vec![],
                 ty: Box::new(spanned(TypeKind::Relation(Box::new(spanned(
                     TypeKind::Named("T".into()),
                 ))))),
@@ -1331,7 +1334,7 @@ mod tests {
         let io_ty = Spanned::new(
             TypeKind::IO {
                 effects: vec![Effect::Reads("people".into())],
-                rest: None,
+                rest: vec![],
                 ty: Box::new(spanned(TypeKind::Relation(Box::new(spanned(
                     TypeKind::Named("T".into()),
                 ))))),
@@ -1383,13 +1386,13 @@ mod tests {
                     param: Box::new(spanned(TypeKind::Named("Int".into()))),
                     result: Box::new(spanned(TypeKind::IO {
                         effects: vec![],
-                        rest: Some("e".into()),
+                        rest: vec!["e".into()],
                         ty: Box::new(unit_ty()),
                     })),
                 })),
                 result: Box::new(spanned(TypeKind::IO {
                     effects: vec![],
-                    rest: Some("e".into()),
+                    rest: vec!["e".into()],
                     ty: Box::new(unit_ty()),
                 })),
             }),
@@ -1440,13 +1443,13 @@ mod tests {
                     param: Box::new(spanned(TypeKind::Named("Int".into()))),
                     result: Box::new(spanned(TypeKind::IO {
                         effects: vec![],
-                        rest: None,
+                        rest: vec![],
                         ty: Box::new(unit_ty()),
                     })),
                 })),
                 result: Box::new(spanned(TypeKind::IO {
                     effects: vec![],
-                    rest: None,
+                    rest: vec![],
                     ty: Box::new(unit_ty()),
                 })),
             }),

@@ -993,20 +993,23 @@ fn render_type_prec(t: &Type, ctx: TyPrec) -> String {
             }
         }
         TypeKind::IO { effects, rest, ty } => {
+            // `rest` joins one or more row-variable names with ` \/ `; an empty
+            // list means a closed row. `IO {| r \/ s} T` collapses to the
+            // shorthand `IO r \/ s T`.
+            let rest_joined = rest.join(" \\/ ");
             let s = if effects.is_empty() {
-                // `IO {| r} T` collapses to the shorthand `IO r T`, and
-                // `IO {} T` stays as `IO {} T` (closed empty effect set).
-                match rest {
-                    Some(r) => format!("IO {} {}", r, render_type_atom(ty)),
-                    None => format!("IO {{}} {}", render_type_atom(ty)),
+                if rest.is_empty() {
+                    format!("IO {{}} {}", render_type_atom(ty))
+                } else {
+                    format!("IO {} {}", rest_joined, render_type_atom(ty))
                 }
             } else {
                 let mut s = String::from("IO {");
                 let parts = render_effects_coalesced(effects);
                 s.push_str(&parts.join(", "));
-                if let Some(r) = rest {
+                if !rest.is_empty() {
                     s.push_str(" | ");
-                    s.push_str(r);
+                    s.push_str(&rest_joined);
                 }
                 s.push_str("} ");
                 s.push_str(&render_type_atom(ty));

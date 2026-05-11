@@ -16,7 +16,7 @@ use std::slice;
 #[cfg(feature = "gc-stats")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
 // ── Arena allocator ──────────────────────────────────────────────
@@ -1435,6 +1435,35 @@ impl SqlVal {
             _ => SqlVal::Null,
         }
     }
+
+    /// Canonical hashable form for use as an `EQ_WATCHERS` index key.
+    /// Mirrors `PartialEq for SqlVal` so values that compare equal hash equal —
+    /// notably collapses `Text("5")` and `Int(5)` (BigInts stored as TEXT) into
+    /// the same `SqlValKey::Int(5)`. NaN comparisons are exact (different bit
+    /// patterns hash differently), so a watcher keyed on NaN will never wake.
+    fn to_key(&self) -> SqlValKey {
+        match self {
+            SqlVal::Null => SqlValKey::Null,
+            SqlVal::Int(n) => SqlValKey::Int(*n),
+            SqlVal::Real(f) => SqlValKey::RealBits(f.to_bits()),
+            SqlVal::Text(s) => match s.parse::<i64>() {
+                Ok(n) => SqlValKey::Int(n),
+                Err(_) => SqlValKey::Text(s.clone()),
+            },
+            SqlVal::Blob(b) => SqlValKey::Blob(b.clone()),
+        }
+    }
+}
+
+/// Hashable canonical form of `SqlVal` for indexing watchers by equality.
+/// Built via `SqlVal::to_key` — collapses BigInt-as-TEXT into `Int`.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+enum SqlValKey {
+    Null,
+    Int(i64),
+    RealBits(u64),
+    Text(String),
+    Blob(Vec<u8>),
 }
 
 /// Comparison operator used inside a `ColPred::Cmp`. Mirrors SQL semantics.
@@ -1604,16 +1633,71 @@ fn get_source_schema(name: &str) -> Option<Arc<RecordSchema>> {
 /// writes (e.g. resetting an entire table) shouldn't pay per-row tracking.
 const MAX_EVENT_ROWS: usize = 128;
 
+/// Filter classification for a single (table, [filters]) registration. Drives
+/// which index a wake slot lives in:
+/// - `Broad`: at least one `All` or non-Eq/`In` predicate, OR every Cols filter
+///   contains a non-Eq pred — must go in `TABLE_WATCHERS` and use `matches`.
+/// - `Eq(keys)`: every filter has at least one Eq or In pred we can index by;
+///   `keys` is the per-filter chosen `(col, [SqlValKey])` to register under
+///   `EQ_WATCHERS`. The slot's full filter list still confirms on wake (so
+///   secondary predicates inside the same filter are honored).
+enum Classification {
+    Broad,
+    Eq(Vec<(String, Vec<SqlValKey>)>),
+}
+
+fn classify_filters(filters: &[ReadFilter]) -> Classification {
+    let mut chosen: Vec<(String, Vec<SqlValKey>)> = Vec::with_capacity(filters.len());
+    for f in filters {
+        match f {
+            ReadFilter::All => return Classification::Broad,
+            ReadFilter::Cols(preds) => {
+                let mut indexed = false;
+                for (col, pred) in preds {
+                    match pred {
+                        ColPred::Cmp(CmpOp::Eq, val) => {
+                            chosen.push((col.clone(), vec![val.to_key()]));
+                            indexed = true;
+                            break;
+                        }
+                        ColPred::In(vals) => {
+                            chosen.push((col.clone(), vals.iter().map(SqlVal::to_key).collect()));
+                            indexed = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if !indexed {
+                    return Classification::Broad;
+                }
+            }
+        }
+    }
+    if chosen.is_empty() {
+        Classification::Broad
+    } else {
+        Classification::Eq(chosen)
+    }
+}
+
+/// State that's frozen at park time inside a `WakeSlot`. Stored behind a
+/// `OnceLock` so the notify path can read it without a Mutex. `watcher_counts`
+/// holds the per-table count Arcs the slot incremented at register time — Drop
+/// decrements them so `table_has_watchers` reflects only live waiters.
+struct WakeSlotInit {
+    filters: HashMap<String, Vec<ReadFilter>>,
+    watcher_counts: Vec<Arc<AtomicUsize>>,
+}
+
 /// Per-thread wake slot for targeted retry notification.
 /// Each retrying thread registers a slot with the tables it read;
-/// `notify_relation_changed_with_event` wakes only slots whose stored
-/// per-table filters match the write event.
+/// notify paths wake only slots whose stored per-table filters match the
+/// write event.
 struct WakeSlot {
     woken: Mutex<bool>,
     cvar: Condvar,
-    /// Filters captured at park time: table → list of filters. Used by notify
-    /// to decide whether to wake this slot for a given write event.
-    filters: Mutex<HashMap<String, Vec<ReadFilter>>>,
+    init: OnceLock<WakeSlotInit>,
 }
 
 impl WakeSlot {
@@ -1621,7 +1705,7 @@ impl WakeSlot {
         WakeSlot {
             woken: Mutex::new(false),
             cvar: Condvar::new(),
-            filters: Mutex::new(HashMap::new()),
+            init: OnceLock::new(),
         }
     }
     fn wake(&self) {
@@ -1639,18 +1723,87 @@ impl WakeSlot {
     /// Returns true if the slot has no filter for `table` (defensive — shouldn't
     /// happen if registration matches reads), or if any filter matches.
     fn matches(&self, table: &str, event: &WriteEvent) -> bool {
-        let f = self.filters.lock().unwrap();
-        match f.get(table) {
-            Some(fs) => event.matches_filters(fs),
+        match self.init.get() {
+            Some(init) => match init.filters.get(table) {
+                Some(fs) => event.matches_filters(fs),
+                None => true,
+            },
             None => true,
         }
     }
 }
 
-/// Registry of wake slots per table. Only touched on retry (register) and
-/// write (notify). Dead Weak refs are cleaned up lazily during notification.
+impl Drop for WakeSlot {
+    fn drop(&mut self) {
+        if let Some(init) = self.init.get() {
+            for c in &init.watcher_counts {
+                c.fetch_sub(1, Ordering::Release);
+            }
+        }
+    }
+}
+
+/// Registry of broad-filter wake slots per table — slots whose filter set
+/// includes an `All` or non-Eq predicate. Eq/In-only slots live exclusively in
+/// `EQ_WATCHERS` to keep `Rows` notification sub-linear in watcher count.
+/// Dead Weak refs are cleaned up lazily during notification.
 static TABLE_WATCHERS: std::sync::LazyLock<Mutex<HashMap<String, Vec<Weak<WakeSlot>>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Side index from `(table, column, SqlValKey)` to the slots watching for
+/// equality on that column value. Lets `WriteEvent::Rows` notification jump
+/// directly to interested slots instead of walking every watcher of the table.
+/// Slots indexed here are NOT in `TABLE_WATCHERS` for the same table (avoids
+/// double-walk); broad-filter slots use `TABLE_WATCHERS` only.
+type EqKey = (String, String, SqlValKey);
+static EQ_WATCHERS: std::sync::LazyLock<Mutex<HashMap<EqKey, Vec<Weak<WakeSlot>>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Per-table live-watcher count. Incremented by `WakeSlot::init` registration;
+/// decremented by `WakeSlot::drop`. Write paths gate expensive event payload
+/// construction on `table_has_watchers` — when zero, we emit `Bulk` (the safe
+/// conservative event) and skip pre-image SELECTs and per-row column extraction.
+static TABLE_WATCHER_COUNTS: std::sync::LazyLock<RwLock<HashMap<String, Arc<AtomicUsize>>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// True iff any retrying thread currently has a wake slot registered for `table`.
+/// Acquires only a read lock on the steady-state path; the per-table counter
+/// itself is atomic.
+fn table_has_watchers(name: &str) -> bool {
+    TABLE_WATCHER_COUNTS
+        .read()
+        .unwrap()
+        .get(name)
+        .map(|c| c.load(Ordering::Acquire) > 0)
+        .unwrap_or(false)
+}
+
+/// Get-or-create the watcher-count Arc for `name`. Held by both the slot
+/// (for decrement on drop) and read by `table_has_watchers`.
+fn watcher_count_for(name: &str) -> Arc<AtomicUsize> {
+    if let Some(c) = TABLE_WATCHER_COUNTS.read().unwrap().get(name) {
+        return c.clone();
+    }
+    let mut w = TABLE_WATCHER_COUNTS.write().unwrap();
+    w.entry(name.to_string())
+        .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+        .clone()
+}
+
+/// Coalesced per-atomic-block tracking state. Replaces three thread-local
+/// `RefCell<HashMap>`s with one borrow per access. Snapshot/push/pop_merge
+/// all operate on this struct as a unit.
+#[derive(Clone, Default)]
+struct StmTracking {
+    /// Tables read during current atomic block, with version at first-read time.
+    reads: HashMap<String, u64>,
+    /// Per-table read filters captured during the atomic body. Multiple filters
+    /// OR together; presence of `All` means wake on any write.
+    filters: HashMap<String, Vec<ReadFilter>>,
+    /// Per-table write events accumulated during the body. Notification is
+    /// deferred to commit so rolled-back writes never wake watchers.
+    writes: HashMap<String, WriteEvent>,
+}
 
 thread_local! {
     /// Set by `knot_stm_retry`, checked by `knot_stm_check_and_clear` after atomic body.
@@ -1659,21 +1812,11 @@ thread_local! {
     /// bind or false `where` guard. Checked after the body so the surrounding
     /// `atomic` rolls back instead of committing partial writes.
     static STM_SKIP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Tables read during current atomic block, with version at read time.
-    static STM_READ_VERSIONS: RefCell<HashMap<String, u64>> = RefCell::new(HashMap::new());
-    /// Per-table read filters captured during the atomic body. Each table can
-    /// accumulate multiple filters (one per read site); `All` dominates.
-    static STM_READ_FILTERS: RefCell<HashMap<String, Vec<ReadFilter>>> = RefCell::new(HashMap::new());
-    /// Per-table write events accumulated during the atomic body. Notification
-    /// is deferred to commit so rolled-back changes never wake watchers.
-    static STM_WRITTEN_EVENTS: RefCell<HashMap<String, WriteEvent>> = RefCell::new(HashMap::new());
+    /// Coalesced read/write tracking for the current atomic block.
+    static STM_TRACK: RefCell<StmTracking> = RefCell::new(StmTracking::default());
     /// Stack of saved tracking state for nested atomic blocks.
     /// Pushed before inner atomic's loop, popped/merged on inner commit.
-    static STM_TRACKING_STACK: RefCell<Vec<(
-        HashMap<String, u64>,
-        HashMap<String, Vec<ReadFilter>>,
-        HashMap<String, WriteEvent>,
-    )>> = RefCell::new(Vec::new());
+    static STM_TRACKING_STACK: RefCell<Vec<StmTracking>> = RefCell::new(Vec::new());
 }
 
 /// Save current STM read/write tracking onto a stack (for nested atomics).
@@ -1681,12 +1824,8 @@ thread_local! {
 /// doesn't destroy outer tracking state.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_stm_push() {
-    let reads = STM_READ_VERSIONS.with(|rv| rv.borrow().clone());
-    let filters = STM_READ_FILTERS.with(|rf| rf.borrow().clone());
-    let writes = STM_WRITTEN_EVENTS.with(|we| we.borrow().clone());
-    STM_TRACKING_STACK.with(|stack| {
-        stack.borrow_mut().push((reads, filters, writes));
-    });
+    let saved = STM_TRACK.with(|t| t.borrow().clone());
+    STM_TRACKING_STACK.with(|stack| stack.borrow_mut().push(saved));
 }
 
 /// Pop saved STM tracking from the stack and merge inner tracking into it.
@@ -1694,20 +1833,21 @@ pub extern "C" fn knot_stm_push() {
 /// combined with inner reads/writes.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_stm_pop_merge() {
-    let (saved_reads, saved_filters, saved_writes) = STM_TRACKING_STACK.with(|stack| {
+    let saved = STM_TRACKING_STACK.with(|stack| {
         stack
             .borrow_mut()
             .pop()
             .expect("knot runtime: STM tracking stack underflow")
     });
-    // Merge: outer reads + inner reads (keep earliest version per table).
-    // For tables read in both: outer's saved version is older (versions are
-    // monotonic), so it wins — the outer commit must retry on any change
-    // since the earliest observation.
-    STM_READ_VERSIONS.with(|rv| {
-        let mut rv = rv.borrow_mut();
-        for (table, ver) in saved_reads {
-            rv.entry(table)
+    STM_TRACK.with(|t| {
+        let mut t = t.borrow_mut();
+        // Merge: outer reads + inner reads (keep earliest version per table).
+        // For tables read in both: outer's saved version is older (versions are
+        // monotonic), so it wins — the outer commit must retry on any change
+        // since the earliest observation.
+        for (table, ver) in saved.reads {
+            t.reads
+                .entry(table)
                 .and_modify(|v| {
                     if ver < *v {
                         *v = ver;
@@ -1715,19 +1855,14 @@ pub extern "C" fn knot_stm_pop_merge() {
                 })
                 .or_insert(ver);
         }
-    });
-    // Merge: outer filters + inner filters (append; both contribute to the wake decision)
-    STM_READ_FILTERS.with(|rf| {
-        let mut rf = rf.borrow_mut();
-        for (table, mut fs) in saved_filters {
-            rf.entry(table).or_default().append(&mut fs);
+        // Merge: outer filters + inner filters (append; both contribute to the wake decision)
+        for (table, mut fs) in saved.filters {
+            t.filters.entry(table).or_default().append(&mut fs);
         }
-    });
-    // Merge: outer writes + inner writes (`Bulk` dominates per `WriteEvent::merge`)
-    STM_WRITTEN_EVENTS.with(|we| {
-        let mut we = we.borrow_mut();
-        for (table, event) in saved_writes {
-            we.entry(table)
+        // Merge: outer writes + inner writes (`Bulk` dominates per `WriteEvent::merge`)
+        for (table, event) in saved.writes {
+            t.writes
+                .entry(table)
                 .and_modify(|e| e.merge(event.clone()))
                 .or_insert(event);
         }
@@ -1741,6 +1876,17 @@ pub extern "C" fn knot_stm_pop_merge() {
 /// Uses a read lock + atomic increment for existing tables (common case);
 /// falls back to a write lock only for the first write to a new table.
 fn notify_relation_changed_with_event(name: &str, event: &WriteEvent) {
+    bump_table_version(name);
+    if !table_has_watchers(name) {
+        return;
+    }
+    wake_matching_watchers(name, event);
+}
+
+/// Bump the global per-table version counter. Always cheap on the steady-state
+/// path (read lock + atomic increment); writes to the map only on first-ever
+/// write to a new table.
+fn bump_table_version(name: &str) {
     let needs_insert = {
         let versions = TABLE_VERSIONS.read().unwrap();
         if let Some(v) = versions.get(name) {
@@ -1757,17 +1903,51 @@ fn notify_relation_changed_with_event(name: &str, event: &WriteEvent) {
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .fetch_add(1, Ordering::Release);
     }
-    let mut watchers = TABLE_WATCHERS.lock().unwrap();
-    if let Some(slots) = watchers.get_mut(name) {
-        slots.retain(|weak| match weak.upgrade() {
-            Some(slot) => {
-                if slot.matches(name, event) {
-                    slot.wake();
+}
+
+/// Walk the broad watcher list for `name` and, for `WriteEvent::Rows`, the EQ
+/// index for each row's `(col, val)` pair. A slot lives in exactly ONE of the
+/// two structures per table (decided in `knot_stm_wait` via `classify_filters`)
+/// so no duplicate-wake bookkeeping is needed. `slot.matches` still confirms
+/// the wake against the slot's full filter list — necessary because Eq-indexed
+/// slots may have additional conjunctive predicates the row must satisfy.
+fn wake_matching_watchers(name: &str, event: &WriteEvent) {
+    // 1) Broad watchers — All filters and complex non-Eq Cols.
+    {
+        let mut watchers = TABLE_WATCHERS.lock().unwrap();
+        if let Some(slots) = watchers.get_mut(name) {
+            slots.retain(|weak| match weak.upgrade() {
+                Some(slot) => {
+                    if slot.matches(name, event) {
+                        slot.wake();
+                    }
+                    true
                 }
-                true
+                None => false,
+            });
+        }
+    }
+    // 2) Eq-indexed watchers — only need to scan for Rows events.
+    if let WriteEvent::Rows(rows) = event {
+        if rows.is_empty() {
+            return;
+        }
+        let mut eq = EQ_WATCHERS.lock().unwrap();
+        for row in rows {
+            for (col, val) in row {
+                let key = (name.to_string(), col.clone(), val.to_key());
+                let Some(bucket) = eq.get_mut(&key) else { continue };
+                bucket.retain(|weak| match weak.upgrade() {
+                    Some(slot) => {
+                        if slot.matches(name, event) {
+                            slot.wake();
+                        }
+                        true
+                    }
+                    None => false,
+                });
             }
-            None => false,
-        });
+        }
     }
 }
 
@@ -1815,10 +1995,11 @@ pub extern "C" fn knot_stm_track_read_pred(
 }
 
 fn stm_track_read(name: &str) {
-    capture_table_version(name);
-    STM_READ_FILTERS.with(|rf| {
-        let mut rf = rf.borrow_mut();
-        let v = rf.entry(name.to_string()).or_default();
+    let ver = current_table_version(name);
+    STM_TRACK.with(|t| {
+        let mut t = t.borrow_mut();
+        t.reads.entry(name.to_string()).or_insert(ver);
+        let v = t.filters.entry(name.to_string()).or_default();
         // Avoid pushing duplicate `All` entries — they're idempotent
         if !v.iter().any(|f| matches!(f, ReadFilter::All)) {
             v.push(ReadFilter::All);
@@ -1883,10 +2064,11 @@ fn parse_read_pred_spec(spec: &str, params_rel: *mut Value) -> Option<Vec<(Strin
 /// If no `All` is present to downgrade, append. Captures the table version
 /// idempotently so the read shows up in the read set.
 fn stm_specialize_read_pred(name: &str, preds: Vec<(String, ColPred)>) {
-    capture_table_version(name);
-    STM_READ_FILTERS.with(|rf| {
-        let mut rf = rf.borrow_mut();
-        let v = rf.entry(name.to_string()).or_default();
+    let ver = current_table_version(name);
+    STM_TRACK.with(|t| {
+        let mut t = t.borrow_mut();
+        t.reads.entry(name.to_string()).or_insert(ver);
+        let v = t.filters.entry(name.to_string()).or_default();
         if let Some(pos) = v.iter().rposition(|f| matches!(f, ReadFilter::All)) {
             v.remove(pos);
         }
@@ -1894,21 +2076,16 @@ fn stm_specialize_read_pred(name: &str, preds: Vec<(String, ColPred)>) {
     });
 }
 
-/// Record version snapshot for `name`, idempotent per-table.
-fn capture_table_version(name: &str) {
-    let already = STM_READ_VERSIONS.with(|rv| rv.borrow().contains_key(name));
-    if already {
-        return;
-    }
-    let ver = TABLE_VERSIONS
+/// Load the current global version counter for `name`, or 0 if it has never
+/// been bumped. Pure read, no thread-local touch — callers fold the result
+/// into `STM_TRACK.reads` themselves.
+fn current_table_version(name: &str) -> u64 {
+    TABLE_VERSIONS
         .read()
         .unwrap()
         .get(name)
         .map(|v| v.load(Ordering::Acquire))
-        .unwrap_or(0);
-    STM_READ_VERSIONS.with(|rv| {
-        rv.borrow_mut().entry(name.to_string()).or_insert(ver);
-    });
+        .unwrap_or(0)
 }
 
 /// Extract a row's scalar column values as a `HashMap<col_name, SqlVal>` for
@@ -1997,12 +2174,12 @@ fn select_rows_with_rowid(
 /// describing the change. The actual notification is deferred to commit.
 /// Multiple writes to the same table within the atomic body are merged.
 fn stm_track_write_with_event(name: &str, event: WriteEvent) {
-    STM_WRITTEN_EVENTS.with(|we| {
-        let mut we = we.borrow_mut();
-        match we.get_mut(name) {
+    STM_TRACK.with(|t| {
+        let mut t = t.borrow_mut();
+        match t.writes.get_mut(name) {
             Some(existing) => existing.merge(event),
             None => {
-                we.insert(name.to_string(), event);
+                t.writes.insert(name.to_string(), event);
             }
         }
     });
@@ -6179,15 +6356,24 @@ pub extern "C" fn knot_stm_check_skip_and_clear() -> i32 {
 /// Return value is unused but kept for ABI compatibility with codegen.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_stm_snapshot() -> i64 {
-    STM_READ_VERSIONS.with(|rv| rv.borrow_mut().clear());
-    STM_READ_FILTERS.with(|rf| rf.borrow_mut().clear());
-    STM_WRITTEN_EVENTS.with(|we| we.borrow_mut().clear());
+    STM_TRACK.with(|t| {
+        let mut t = t.borrow_mut();
+        t.reads.clear();
+        t.filters.clear();
+        t.writes.clear();
+    });
     0
 }
 
+/// Maximum time to park inside `knot_stm_wait`. Purely a defensive bound
+/// against lost-wakeup bugs — under correct operation the slot is woken by a
+/// notification long before this fires. Sized to be effectively unbounded for
+/// real programs while still giving an escape hatch.
+const STM_WAIT_TIMEOUT: Duration = Duration::from_secs(60 * 5);
+
 /// Wait until a table in the read set has been modified since we read it.
 /// Registers a per-thread wake slot so only writes to watched tables cause a wakeup.
-/// Avoids cloning the read-version map on fast paths (empty / already changed).
+/// Avoids cloning the read map on fast paths (empty / already changed).
 /// The `_snapshot` parameter is unused but kept for ABI compatibility.
 ///
 /// Releases the write lock (if held) before blocking so that other threads
@@ -6205,7 +6391,7 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
         depth
     });
 
-    let is_empty = STM_READ_VERSIONS.with(|rv| rv.borrow().is_empty());
+    let is_empty = STM_TRACK.with(|t| t.borrow().reads.is_empty());
     if is_empty {
         // No read set means there's nothing to wait *on* — the body retried
         // without observing any relation, so no notification will ever fire.
@@ -6227,10 +6413,10 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
     }
 
     // Fast path: check if already changed without cloning the map
-    let already_changed = STM_READ_VERSIONS.with(|rv| {
-        let rv = rv.borrow();
+    let already_changed = STM_TRACK.with(|t| {
+        let t = t.borrow();
         let versions = TABLE_VERSIONS.read().unwrap();
-        rv.iter().any(|(table, ver)| {
+        t.reads.iter().any(|(table, ver)| {
             versions
                 .get(table)
                 .map(|v| v.load(Ordering::Acquire))
@@ -6257,27 +6443,66 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
         return;
     }
 
-    // Need to register — collect into a Vec (cheaper than HashMap clone)
-    let read_versions: Vec<(String, u64)> = STM_READ_VERSIONS.with(|rv| {
-        rv.borrow().iter().map(|(k, v)| (k.clone(), *v)).collect()
+    // Snapshot read versions + filters into local vars (single borrow each)
+    let (read_versions, filter_map): (Vec<(String, u64)>, HashMap<String, Vec<ReadFilter>>) =
+        STM_TRACK.with(|t| {
+            let t = t.borrow();
+            (
+                t.reads.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+                t.filters.clone(),
+            )
+        });
+
+    // Build the slot. Decide per-table whether it goes into the broad
+    // `TABLE_WATCHERS` list or the precise `EQ_WATCHERS` (col, val) index.
+    let slot = Arc::new(WakeSlot::new());
+    let mut watcher_counts: Vec<Arc<AtomicUsize>> = Vec::with_capacity(read_versions.len());
+
+    // Collect EQ registrations first (lock-free build) so we hold the
+    // EQ_WATCHERS / TABLE_WATCHERS locks for as short a time as possible.
+    let mut broad_tables: Vec<&str> = Vec::new();
+    let mut eq_registrations: Vec<EqKey> = Vec::new();
+    for (table, _) in &read_versions {
+        let fs = filter_map.get(table).map(|v| v.as_slice()).unwrap_or(&[]);
+        match classify_filters(fs) {
+            Classification::Broad => {
+                broad_tables.push(table.as_str());
+            }
+            Classification::Eq(keys) => {
+                for (col, vals) in keys {
+                    for k in vals {
+                        eq_registrations.push((table.clone(), col.clone(), k));
+                    }
+                }
+            }
+        }
+        // Bump watcher count for the table either way — `table_has_watchers`
+        // is the gate for expensive event-payload construction at writes.
+        let c = watcher_count_for(table);
+        c.fetch_add(1, Ordering::AcqRel);
+        watcher_counts.push(c);
+    }
+
+    // Freeze the slot's init payload BEFORE publishing weak refs so any
+    // notification thread that observes the Weak sees a fully-initialized slot.
+    let _ = slot.init.set(WakeSlotInit {
+        filters: filter_map,
+        watcher_counts,
     });
 
-    // Publish read filters into the slot so notify can filter wakeups.
-    let slot = Arc::new(WakeSlot::new());
-    STM_READ_FILTERS.with(|rf| {
-        let rf = rf.borrow();
-        let mut slot_filters = slot.filters.lock().unwrap();
-        for (table, filters) in rf.iter() {
-            slot_filters.insert(table.clone(), filters.clone());
-        }
-    });
-    {
+    if !broad_tables.is_empty() {
         let mut watchers = TABLE_WATCHERS.lock().unwrap();
-        for (table, _) in &read_versions {
+        for table in &broad_tables {
             watchers
-                .entry(table.clone())
+                .entry((*table).to_string())
                 .or_default()
                 .push(Arc::downgrade(&slot));
+        }
+    }
+    if !eq_registrations.is_empty() {
+        let mut eq = EQ_WATCHERS.lock().unwrap();
+        for key in eq_registrations {
+            eq.entry(key).or_default().push(Arc::downgrade(&slot));
         }
     }
 
@@ -6294,7 +6519,7 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
     };
 
     if !changed_after_register {
-        slot.wait(Duration::from_secs(30));
+        slot.wait(STM_WAIT_TIMEOUT);
         // slot drops → Weak refs become invalid, cleaned up lazily in notify
     } else {
         // Changed between registration and re-check — yield to prevent
@@ -9986,8 +10211,15 @@ pub extern "C" fn knot_source_append(
             .prepare_cached(&insert_sql)
             .expect("knot runtime: failed to prepare insert");
 
-        // Capture column values for the row-level event payload alongside the INSERT.
-        let mut event_rows: Vec<HashMap<String, SqlVal>> = Vec::with_capacity(rows.len());
+        // Capture column values for the row-level event payload alongside the
+        // INSERT, but only if any watcher could consume it — otherwise emit
+        // `Bulk` and skip per-row map construction entirely.
+        let want_rows_event = table_has_watchers(name);
+        let mut event_rows: Vec<HashMap<String, SqlVal>> = if want_rows_event {
+            Vec::with_capacity(rows.len())
+        } else {
+            Vec::new()
+        };
         for row_ptr in rows {
             let params = adt_row_to_params(*row_ptr, &adt);
             let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -9995,13 +10227,19 @@ pub extern "C" fn knot_source_append(
             stmt.execute(param_refs.as_slice()).unwrap_or_else(|e| {
                 panic!("knot runtime: insert error: {}", e)
             });
-            let mut map = HashMap::with_capacity(col_names.len());
-            for (i, col) in std::iter::once("_tag").chain(adt.all_fields.iter().map(|f| f.name.as_str())).enumerate() {
-                map.insert(col.to_string(), SqlVal::from_rusqlite(&params[i]));
+            if want_rows_event {
+                let mut map = HashMap::with_capacity(col_names.len());
+                for (i, col) in std::iter::once("_tag").chain(adt.all_fields.iter().map(|f| f.name.as_str())).enumerate() {
+                    map.insert(col.to_string(), SqlVal::from_rusqlite(&params[i]));
+                }
+                event_rows.push(map);
             }
-            event_rows.push(map);
         }
-        let event = WriteEvent::Rows(event_rows);
+        let event = if want_rows_event {
+            WriteEvent::Rows(event_rows)
+        } else {
+            WriteEvent::Bulk
+        };
         db_ref
             .conn
             .execute_batch("RELEASE SAVEPOINT knot_set;")
@@ -10014,7 +10252,11 @@ pub extern "C" fn knot_source_append(
     }
     let rec = parse_record_schema(schema);
     write_record_rows(&db_ref.conn, &format!("_knot_{}", name), &rec, rows);
-    let event = rows_event_for_records(rows, &rec);
+    let event = if table_has_watchers(name) {
+        rows_event_for_records(rows, &rec)
+    } else {
+        WriteEvent::Bulk
+    };
     db_ref
         .conn
         .execute_batch("RELEASE SAVEPOINT knot_set;")
@@ -10450,19 +10692,24 @@ pub extern "C" fn knot_source_delete_where(
     // Capture the pre-image of rows about to be deleted so STM watchers
     // filtering on column values can decide whether they need to wake.
     // Same params as the DELETE (only the WHERE branch consumes them).
-    let pre_where = format!("NOT ({})", where_clause);
-    let event = match get_source_schema(name) {
-        Some(rec) => match select_rows_with_rowid(
-            &db_ref.conn,
-            &table,
-            &rec,
-            &pre_where,
-            param_refs2.as_slice(),
-        ) {
-            Some((rows, _)) => WriteEvent::Rows(rows),
+    // Skip the SELECT entirely when nothing is watching this table.
+    let event = if table_has_watchers(name) {
+        let pre_where = format!("NOT ({})", where_clause);
+        match get_source_schema(name) {
+            Some(rec) => match select_rows_with_rowid(
+                &db_ref.conn,
+                &table,
+                &rec,
+                &pre_where,
+                param_refs2.as_slice(),
+            ) {
+                Some((rows, _)) => WriteEvent::Rows(rows),
+                None => WriteEvent::Bulk,
+            },
             None => WriteEvent::Bulk,
-        },
-        None => WriteEvent::Bulk,
+        }
+    } else {
+        WriteEvent::Bulk
     };
 
     db_ref
@@ -10525,13 +10772,15 @@ pub extern "C" fn knot_source_update_where(
     // filtering on column values can decide whether to wake. The combined
     // params start with SET-clause values, then WHERE-clause values, so we
     // need to split off the SET tail to feed the WHERE-only SELECT.
+    // Skip the pre/post-image SELECTs entirely when nothing is watching.
+    let want_event = table_has_watchers(name);
     let set_param_count = count_sql_placeholders(set_clause);
     let where_params: &[&dyn rusqlite::types::ToSql] = if set_param_count <= param_refs.len() {
         &param_refs[set_param_count..]
     } else {
         &[]
     };
-    let schema_arc = get_source_schema(name);
+    let schema_arc = if want_event { get_source_schema(name) } else { None };
     let pre_image = schema_arc.as_ref().and_then(|rec| {
         select_rows_with_rowid(&db_ref.conn, &table, rec, where_clause, where_params)
     });
@@ -11360,7 +11609,7 @@ pub extern "C" fn knot_atomic_commit(db: *mut c_void) {
         .expect("knot runtime: failed to commit atomic");
     db_ref.atomic_depth.set(depth - 1);
     if depth == 1 {
-        let written = STM_WRITTEN_EVENTS.with(|we| std::mem::take(&mut *we.borrow_mut()));
+        let written = STM_TRACK.with(|t| std::mem::take(&mut t.borrow_mut().writes));
         if !written.is_empty() {
             // Batch: read lock + atomic increment for existing tables
             let mut new_tables = Vec::new();
@@ -11384,20 +11633,14 @@ pub extern "C" fn knot_atomic_commit(db: *mut c_void) {
                         .fetch_add(1, Ordering::Release);
                 }
             }
-            // Batch: wake watchers under one lock, filtering by per-slot read filters
-            let mut watchers = TABLE_WATCHERS.lock().unwrap();
+            // Wake matching watchers via the shared path so EQ_WATCHERS gets
+            // scanned for Rows events. Skip the work entirely for tables with
+            // no live watchers.
             for (table, event) in &written {
-                if let Some(slots) = watchers.get_mut(table.as_str()) {
-                    slots.retain(|weak| match weak.upgrade() {
-                        Some(slot) => {
-                            if slot.matches(table, event) {
-                                slot.wake();
-                            }
-                            true
-                        }
-                        None => false,
-                    });
+                if !table_has_watchers(table) {
+                    continue;
                 }
+                wake_matching_watchers(table, event);
             }
         }
     }
@@ -11422,7 +11665,7 @@ pub extern "C" fn knot_atomic_rollback(db: *mut c_void) {
         .expect("knot runtime: failed to rollback atomic");
     db_ref.atomic_depth.set(depth - 1);
     if depth == 1 {
-        STM_WRITTEN_EVENTS.with(|we| we.borrow_mut().clear());
+        STM_TRACK.with(|t| t.borrow_mut().writes.clear());
     }
 }
 

@@ -1,6 +1,6 @@
 //! Knot compiler CLI.
 //!
-//! Usage: knotc build <file.knot>
+//! Usage: knot build <file.knot>
 
 use knot_compiler::{base, codegen, desugar, effects, infer, linker, lockfile, modules, stratify, types, unused};
 
@@ -20,7 +20,7 @@ fn main() {
         "build" => {
             if args.len() < 3 {
                 eprintln!("Error: missing source file");
-                eprintln!("Usage: knotc build <file.knot> [-o <path>] [--name=value ...]");
+                eprintln!("Usage: knot build <file.knot> [-o <path>] [--name=value ...]");
                 process::exit(1);
             }
             // Parse -o/--output and compile-time overrides from remaining args
@@ -86,9 +86,9 @@ fn print_usage() {
     eprintln!("Knot compiler");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  knotc build <file.knot> [-o <path>] [--name=value ...]  Compile with optional output path and constant overrides");
-    eprintln!("  knotc fmt [--check] [--stdout] <file.knot>              Format a source file in place");
-    eprintln!("  knotc help                                              Show this help message");
+    eprintln!("  knot build <file.knot> [-o <path>] [--name=value ...]  Compile with optional output path and constant overrides");
+    eprintln!("  knot fmt [--check] [--stdout] <file.knot>              Format a source file in place");
+    eprintln!("  knot help                                              Show this help message");
 }
 
 fn cmd_fmt(args: &[String]) {
@@ -101,7 +101,7 @@ fn cmd_fmt(args: &[String]) {
             "--stdout" | "-" => to_stdout = true,
             other if other.starts_with("--") => {
                 eprintln!("Error: unknown fmt flag '{}'", other);
-                eprintln!("Usage: knotc fmt [--check] [--stdout] <file.knot>...");
+                eprintln!("Usage: knot fmt [--check] [--stdout] <file.knot>...");
                 process::exit(2);
             }
             other => paths.push(other),
@@ -109,7 +109,7 @@ fn cmd_fmt(args: &[String]) {
     }
     if paths.is_empty() {
         eprintln!("Error: missing source file");
-        eprintln!("Usage: knotc fmt [--check] [--stdout] <file.knot>...");
+        eprintln!("Usage: knot fmt [--check] [--stdout] <file.knot>...");
         process::exit(2);
     }
 

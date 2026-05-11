@@ -1,6 +1,6 @@
 //! AST-based pretty printer for Knot source.
 //!
-//! [`format_module`] is the single public entry point used by both `knotc fmt`
+//! [`format_module`] is the single public entry point used by both `knot fmt`
 //! and the language server's formatting handler. It walks the parsed
 //! [`Module`] in source order, emits each declaration with consistent
 //! indentation and layout, and re-inserts standalone comments that the lexer

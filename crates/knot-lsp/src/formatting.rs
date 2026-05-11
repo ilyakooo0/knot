@@ -2,7 +2,7 @@
 //! `textDocument/onTypeFormatting` handlers.
 //!
 //! Document formatting delegates to [`knot::format::format_module`] — the
-//! same AST-based pretty printer that powers `knotc fmt`. Range formatting
+//! same AST-based pretty printer that powers `knot fmt`. Range formatting
 //! still does the heuristic line-level cleanup (trim trailing whitespace,
 //! collapse consecutive blanks) since rendering an arbitrary subrange would
 //! need expression-level slicing the printer can't currently provide.

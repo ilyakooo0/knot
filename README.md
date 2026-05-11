@@ -28,7 +28,7 @@ cargo run -p knot-compiler -- build examples/hello.knot
 crates/
   knot/              Frontend (lexer, parser, AST, diagnostics)
   knot-runtime/      Runtime library (value representation, SQLite persistence)
-  knot-compiler/     Cranelift-based compiler (CLI: knotc)
+  knot-compiler/     Cranelift-based compiler (CLI: knot)
 examples/            Example .knot programs
 ```
 

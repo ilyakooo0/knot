@@ -1,5 +1,5 @@
 -- Showcase: exercises many data types, ADTs, nested relations, and bulk data
--- Run: knotc build examples/showcase.knot && ./examples/showcase
+-- Run: knot build examples/showcase.knot && ./examples/showcase
 -- Then: ./examples/showcase db
 
 -- ── Types ────────────────────────────────────────────────────────

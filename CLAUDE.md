@@ -12,7 +12,7 @@ Cargo workspace with three crates:
 crates/
   knot/              Frontend library (lexer, parser, AST, diagnostics)
   knot-runtime/      Rust staticlib linked into compiled programs (value representation, SQLite persistence)
-  knot-compiler/     Cranelift-based compiler producing native executables (CLI binary: knotc)
+  knot-compiler/     Cranelift-based compiler producing native executables (CLI binary: knot)
 examples/            Example .knot programs
 ```
 
@@ -31,7 +31,7 @@ cargo run -p knot-compiler -- build examples/hello.knot
 ./examples/hello
 ```
 
-The compiler (`knotc`) looks for `libknot_runtime.a` next to its own executable. In a cargo workspace, both end up in `target/<profile>/`, so this works automatically. Override with `KNOT_RUNTIME_LIB=/path/to/libknot_runtime.a`.
+The compiler (`knot`) looks for `libknot_runtime.a` next to its own executable. In a cargo workspace, both end up in `target/<profile>/`, so this works automatically. Override with `KNOT_RUNTIME_LIB=/path/to/libknot_runtime.a`.
 
 Compiled binaries create a `knot.db` SQLite database in the current directory for persistence.
 
@@ -83,7 +83,7 @@ Compiled as a `staticlib` (with `rlib` for workspace dependency resolution). All
 - **Type resolution** (`types.rs`): Resolves aliases (including multi-variant ADTs to `ResolvedType::Adt`), computes SQLite schemas from Knot type annotations, collects subset constraints; refined type aliases separated during collection — predicates stored in `refined_types: HashMap<String, Expr>`, base types stored in `aliases` for schema resolution; `TypeKind::Refined` transparent for schema — `resolve_type` and `apply_type_subst` recurse into base; `source_refinements: HashMap<String, Vec<(Option<String>, String, Expr)>>` maps source names to their field-level and whole-element refinement predicates (collected by `collect_source_refinements` walking source type ASTs)
 - **Codegen** (`codegen.rs`): Cranelift IR generation — the `build_function` pattern moves `ctx`/`builder_ctx` out of `self` to avoid borrow conflicts while allowing `self.method()` calls during IR building
 - **Linker** (`linker.rs`): Invokes `cc` with platform-appropriate flags
-- **CLI** (`main.rs`): `knotc build <file.knot>` entry point
+- **CLI** (`main.rs`): `knot build <file.knot>` entry point
 
 Key codegen patterns:
 - All values are pointer-typed (`ptr_type`) in Cranelift IR — uniform representation

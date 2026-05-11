@@ -8,7 +8,7 @@ name = "knot_compiler"
 path = "src/lib.rs"
 
 [[bin]]
-name = "knotc"
+name = "knot"
 path = "src/main.rs"
 
 [dependencies]

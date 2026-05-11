@@ -5237,11 +5237,11 @@ impl Infer {
             Ty::IO(BTreeSet::from([IoEffect::Random]), None, Box::new(Ty::Uuid)),
         ));
 
-        // fork : ∀a r. IO r a -> IO {} {}
+        // fork : ∀a r. IO r a -> IO r {}
         // Argument is any IO action (any effects, any result). The spawned
-        // thread runs to completion in the background, so fork's return type
-        // is closed-empty IO {} {} — none of the spawned action's effects
-        // propagate to the caller.
+        // action's effect row propagates through fork to the caller, so a
+        // program that forks an IO performing `println` is visibly typed
+        // with `{console}` in its IO row.
         {
             let a = self.fresh_var();
             let r = self.fresh_var();
@@ -5251,7 +5251,7 @@ impl Infer {
                     vec![a, r],
                     Ty::Fun(
                         Box::new(Ty::IO(BTreeSet::new(), Some(r), Box::new(Ty::Var(a)))),
-                        Box::new(Ty::IO(BTreeSet::new(), None, Box::new(Ty::unit()))),
+                        Box::new(Ty::IO(BTreeSet::new(), Some(r), Box::new(Ty::unit()))),
                     ),
                 ),
             );

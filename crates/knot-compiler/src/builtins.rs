@@ -30,10 +30,10 @@ pub const FS_BUILTINS: &[&str] = &[
 ];
 
 /// Concurrency builtins (`fork`, `retry`, `race`). These do not contribute IO
-/// effects the same way as console/fs/etc.: `fork` returns `IO {} {}` (the
-/// spawned IO is not part of the surrounding transaction), `retry` is the STM
-/// primitive used inside atomic to trigger a retry, and `race` propagates the
-/// effect rows of its arguments through its result.
+/// effects the same way as console/fs/etc.: `fork` propagates the effect row of
+/// its spawned IO through its own result (`IO r {} -> IO r {}`), `retry` is the
+/// STM primitive used inside atomic to trigger a retry, and `race` propagates
+/// the effect rows of its arguments through its result.
 pub const CONCURRENCY_BUILTINS: &[&str] = &["fork", "retry", "race"];
 
 /// Pure builtins. These are listed so the LSP can recognize them as user-callable
@@ -72,9 +72,10 @@ pub const EFFECTFUL_BUILTINS: &[&str] = &[
 /// machinery. The effect checker rejects any of these inside an `atomic` block;
 /// the LSP also filters them from atomic-context completion lists.
 ///
-/// `fork` and `retry` are intentionally absent: `fork` returns `IO {} {}`
-/// (spawned IO is independent of the transaction) and `retry` is the STM
-/// primitive used inside atomic to trigger a retry.
+/// `fork` and `retry` are intentionally absent: `fork`'s spawned IO runs in an
+/// independent transaction (its effects propagate through the type but the work
+/// happens on its own connection), and `retry` is the STM primitive used inside
+/// atomic to trigger a retry.
 pub const ATOMIC_DISALLOWED_BUILTINS: &[&str] = &[
     "println", "putLine", "print", "readLine",
     "logInfo", "logWarn", "logError", "logDebug",

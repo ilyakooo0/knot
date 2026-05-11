@@ -300,10 +300,10 @@ Reverse iteration order of a relation. Like `sortBy`, this controls iteration or
 ### `fork`
 
 ```
-fork : IO r {} -> IO {} {}
+fork : IO r {} -> IO r {}
 ```
 
-Run an IO action on a new OS thread (fire-and-forget). The spawned action may carry any effects (its row variable `r` is unconstrained), but those effects do not propagate back to the caller. Each thread gets its own SQLite connection via WAL mode for safe concurrent access. The main thread waits for all spawned threads before exiting.
+Run an IO action on a new OS thread (fire-and-forget). The spawned action's effect row `r` propagates through `fork` to the caller, so a program that forks an IO performing `println` is visibly typed with `{console}` in its IO row. Each thread gets its own SQLite connection via WAL mode for safe concurrent access. The main thread waits for all spawned threads before exiting.
 
 ```knot
 main = do

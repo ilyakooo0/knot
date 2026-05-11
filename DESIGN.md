@@ -740,13 +740,13 @@ loadConfig = \path -> do
 
 #### `fork`
 
-`fork` runs an IO action on a new OS thread. It is fire-and-forget — the forked action runs independently, and its effects are decoupled from the caller (the spawned IO is not part of the surrounding transaction). Each spawned thread gets its own SQLite connection (WAL mode enables concurrent access). The main thread waits for all spawned threads before exiting.
+`fork` runs an IO action on a new OS thread. It is fire-and-forget — the forked action runs independently, but its effects are still visible in the caller's IO type. Each spawned thread gets its own SQLite connection (WAL mode enables concurrent access). The main thread waits for all spawned threads before exiting.
 
 ```knot
-fork : IO r {} -> IO {} {}
+fork : IO r {} -> IO r {}
 ```
 
-The argument's effect row `r` is unconstrained — `fork` can spawn an IO that reads files, makes network calls, or just touches the database — but those effects do not flow back into the caller's IO. Do blocks can be passed as arguments without parentheses: `fork do ...`.
+The spawned action's effect row `r` propagates through `fork` to the caller — a program that forks an IO that calls `println` is visibly typed with `{console}` in its IO row, so the effect system still reflects what the program can do. Do blocks can be passed as arguments without parentheses: `fork do ...`.
 
 ```knot
 *counter : [{n: Int}]

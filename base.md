@@ -27,9 +27,9 @@ show : a -> Text
 Convert any value to its text representation. Records print as `{field: value, ...}`, relations as `[v1, v2, ...]`, constructors as `Tag {fields}`. This is a pure function (no IO).
 
 ```knot
-fork : IO r {} -> IO {} {}
+fork : IO r {} -> IO r {}
 ```
-Run an IO action on a new OS thread (fire-and-forget). The spawned action's effects are decoupled from the caller's. Each thread gets its own SQLite connection (WAL mode). Main waits for all threads before exiting.
+Run an IO action on a new OS thread (fire-and-forget). The spawned action's effect row propagates through `fork`, so its effects remain visible in the caller's IO row. Each thread gets its own SQLite connection (WAL mode). Main waits for all threads before exiting.
 
 ```knot
 race : IO r a -> IO r b -> IO r (Result a b)
@@ -608,9 +608,9 @@ route Api where
 ## Concurrency
 
 ```knot
-fork : IO r {} -> IO {} {}
+fork : IO r {} -> IO r {}
 ```
-Run an IO action on a new OS thread. Fire-and-forget — the spawned thread runs independently and its effects are decoupled from the caller's. Each thread gets its own SQLite connection (WAL mode). Main waits for all threads before exiting. Do blocks can be passed without parentheses: `fork do ...`.
+Run an IO action on a new OS thread. Fire-and-forget — the spawned thread runs independently, but its effect row propagates through `fork` so the spawned action's effects remain visible in the caller's IO type. Each thread gets its own SQLite connection (WAL mode). Main waits for all threads before exiting. Do blocks can be passed without parentheses: `fork do ...`.
 
 ```knot
 main = do

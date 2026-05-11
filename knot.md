@@ -632,7 +632,7 @@ The body of `atomic` must be an IO expression containing only DB operations. Ext
 Fire-and-forget: runs an IO action on a new OS thread. Each thread gets its own SQLite connection (WAL mode).
 
 ```knot
-fork : IO r {} -> IO {} {}
+fork : IO r {} -> IO r {}
 
 main = do
   fork do
@@ -643,9 +643,10 @@ main = do
   -- main waits for all spawned threads before exiting
 ```
 
-The spawned action's effect row `r` is unconstrained — `fork` can spawn any
-IO — but those effects do not propagate back to the caller. Do blocks can be
-passed directly as arguments: `fork do ...` (no parentheses needed).
+The spawned action's effect row `r` propagates through `fork` to the caller, so
+forking an IO that calls `println` is visibly typed with `{console}` in the
+result's IO row. Do blocks can be passed directly as arguments: `fork do ...`
+(no parentheses needed).
 
 #### `retry`
 
@@ -806,7 +807,7 @@ and the loser unwinds at its next safe point.
 | `randomFloat` | `IO {random} Float<u>` | Random float `[0.0, 1.0)`, unit-polymorphic |
 | `randomUuid` | `IO {random} Uuid` | Generate a RFC 9562 UUIDv7 |
 | `atomic` | `IO {} a -> IO {} a` | Run DB operations in a transaction |
-| `fork` | `IO r {} -> IO {} {}` | Fire-and-forget on new OS thread |
+| `fork` | `IO r {} -> IO r {}` | Fire-and-forget on new OS thread; effects propagate |
 | `race` | `IO r a -> IO r b -> IO r (Result a b)` | Run two IO actions, return the winner |
 | `retry` | `a` | Rollback and wait (inside `atomic` only) |
 | `when` | `Bool -> IO r {} -> IO r {}` | Run action when condition is true |

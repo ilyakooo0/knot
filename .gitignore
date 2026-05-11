@@ -35,3 +35,4 @@ examples/when_unless
 examples/for_each
 examples/stm_row_filter
 examples/uuid
+examples/race

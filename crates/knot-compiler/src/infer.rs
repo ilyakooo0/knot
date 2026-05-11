@@ -4218,7 +4218,7 @@ impl Infer {
                 self.expr_is_io_prescan(func) || self.expr_is_io_prescan(arg)
             }
             ast::ExprKind::Var(name) => {
-                (crate::builtins::is_io_builtin(name) || name == "fork")
+                (crate::builtins::is_io_builtin(name) || name == "fork" || name == "race")
                 || self.lookup(name).map_or(false, |scheme| {
                     fn returns_io(ty: &Ty) -> bool {
                         match ty {
@@ -5252,6 +5252,32 @@ impl Infer {
                     Ty::Fun(
                         Box::new(Ty::IO(BTreeSet::new(), Some(r), Box::new(Ty::Var(a)))),
                         Box::new(Ty::IO(BTreeSet::new(), None, Box::new(Ty::unit()))),
+                    ),
+                ),
+            );
+        }
+
+        // race : ∀a b r. IO r a -> IO r b -> IO r (Result a b)
+        // Both arguments share a single open effect-row variable, so any
+        // effects required by either side flow into the result IO.  The
+        // winner is reported via the built-in `Result a b` ADT — `Err
+        // {error: a}` when the left action wins, `Ok {value: b}` when the
+        // right action wins.
+        {
+            let a = self.fresh_var();
+            let b = self.fresh_var();
+            let r = self.fresh_var();
+            let io_a = Ty::IO(BTreeSet::new(), Some(r), Box::new(Ty::Var(a)));
+            let io_b = Ty::IO(BTreeSet::new(), Some(r), Box::new(Ty::Var(b)));
+            let result_ty = Ty::Con("Result".into(), vec![Ty::Var(a), Ty::Var(b)]);
+            let io_result = Ty::IO(BTreeSet::new(), Some(r), Box::new(result_ty));
+            self.bind_top(
+                "race",
+                Scheme::poly(
+                    vec![a, b, r],
+                    Ty::Fun(
+                        Box::new(io_a),
+                        Box::new(Ty::Fun(Box::new(io_b), Box::new(io_result))),
                     ),
                 ),
             );

@@ -1,0 +1,31 @@
+-- `race` smoke test.
+--
+-- Two IO actions sleep for different durations; the shorter sleep wins
+-- and the loser's sleep is interrupted via its cancel-condvar so the
+-- race returns close to the winner's wall-clock time rather than the
+-- loser's.
+
+slow = do
+  sleep 1000<Ms>
+  yield "slow"
+
+fast = do
+  sleep 50<Ms>
+  yield "fast"
+
+main = do
+  start1 <- now
+  r1 <- race slow fast
+  end1 <- now
+  case r1 of
+    Err {error: a} -> println ("left won: " ++ a)
+    Ok {value: b}  -> println ("right won: " ++ b)
+  println ("  race 1 took " ++ show (stripUnit (end1 - start1)) ++ "ms")
+
+  start2 <- now
+  r2 <- race fast slow
+  end2 <- now
+  case r2 of
+    Err {error: a} -> println ("left won: " ++ a)
+    Ok {value: b}  -> println ("right won: " ++ b)
+  println ("  race 2 took " ++ show (stripUnit (end2 - start2)) ++ "ms")

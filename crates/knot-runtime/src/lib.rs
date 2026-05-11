@@ -1222,6 +1222,73 @@ static ACTIVE_FORKS: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_FORKS_MUTEX: Mutex<()> = Mutex::new(());
 static ACTIVE_FORKS_CVAR: Condvar = Condvar::new();
 
+/// Cancellation token carried by a `race` worker.  The atomic flag is
+/// polled by `knot_io_run` between thunks; the condvar lets long
+/// blocking operations like `sleep` wait on a timeout that can be cut
+/// short the instant the flag is set.
+pub struct CancelToken {
+    flag: AtomicBool,
+    notify: (Mutex<()>, Condvar),
+}
+
+impl CancelToken {
+    fn new() -> Self {
+        Self {
+            flag: AtomicBool::new(false),
+            notify: (Mutex::new(()), Condvar::new()),
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::Acquire)
+    }
+
+    /// Mark cancelled and wake any thread parked in `wait_for_cancel`.
+    /// Locking the mutex before signalling ensures a waiter that has
+    /// just checked the flag and is about to wait cannot miss the
+    /// wake-up.
+    fn cancel(&self) {
+        let _g = self.notify.0.lock().unwrap();
+        self.flag.store(true, Ordering::Release);
+        self.notify.1.notify_all();
+    }
+
+    /// Sleep for `duration`, returning early as soon as `cancel()` is
+    /// called.  Used by `knot_sleep` so a `race` loser stuck in a long
+    /// sleep wakes up immediately when the peer wins.
+    fn wait_for_cancel(&self, duration: Duration) {
+        if self.is_cancelled() {
+            return;
+        }
+        let guard = self.notify.0.lock().unwrap();
+        let _ = self
+            .notify
+            .1
+            .wait_timeout_while(guard, duration, |_| !self.is_cancelled())
+            .unwrap();
+    }
+}
+
+thread_local! {
+    /// Cooperative cancellation token for the current thread.  Installed
+    /// by `race` on each worker; consulted by `knot_io_run` between
+    /// thunks and by blocking primitives like `knot_sleep`.
+    static CANCEL_FLAG: RefCell<Option<Arc<CancelToken>>> = const { RefCell::new(None) };
+}
+
+fn cancel_requested() -> bool {
+    CANCEL_FLAG.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|t| t.is_cancelled())
+            .unwrap_or(false)
+    })
+}
+
+fn current_cancel_token() -> Option<Arc<CancelToken>> {
+    CANCEL_FLAG.with(|c| c.borrow().clone())
+}
+
 // ── Process-level write serialization ────────────────────────────
 //
 // SQLite WAL allows only one writer at a time. We serialize writes in Rust
@@ -5555,6 +5622,11 @@ pub extern "C" fn knot_io_pure(val: *mut Value) -> *mut Value {
 pub extern "C" fn knot_io_run(db: *mut c_void, val: *mut Value) -> *mut Value {
     let mut current = val;
     loop {
+        // Cooperative cancellation: a `race` loser exits its IO chain at the
+        // next thunk boundary so the winner doesn't have to wait for it.
+        if cancel_requested() {
+            return std::ptr::null_mut();
+        }
         if current.is_null() {
             return current;
         }
@@ -5905,6 +5977,149 @@ pub extern "C" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
     }
 
     alloc(Value::IO(spawn_thunk as *const u8, env))
+}
+
+/// Race two IO actions concurrently.  Returns an IO thunk that, when run,
+/// spawns two OS threads (each with its own DB connection), waits for the
+/// first to complete, signals the other thread to stop, and returns
+/// `Err {error: a}` if the left action won or `Ok {value: b}` if the right
+/// action won — reusing the built-in `Result a b` ADT.
+///
+/// Cancellation is cooperative because Rust offers no safe way to abort
+/// an OS thread mid-flight, but it is aggressive within that constraint:
+///   * `knot_io_run` checks the per-thread `CancelToken` between every
+///     thunk, so an IO chain unwinds at the next bind/then.
+///   * `knot_sleep` parks on the token's condvar instead of
+///     `std::thread::sleep`, so a sleeping loser wakes up immediately.
+///   * The parent does *not* `join` either worker; it returns as soon
+///     as a winner is observed.  The loser runs to its next safe point
+///     in the background, tracked by `ACTIVE_FORKS` so `knot_threads_join`
+///     still waits for it before program exit.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mut Value {
+    let env = alloc(Value::Pair(io_a, io_b));
+
+    extern "C" fn race_thunk(_db: *mut c_void, env: *mut Value) -> *mut Value {
+        let (io_a, io_b) = pair_unpack(env);
+
+        // Deep-clone both IO values so each worker thread owns an
+        // independent tree (the parent's arena would otherwise be unsafe
+        // to share).  `as usize` lets the raw pointer cross the Send
+        // boundary into the spawned closure.
+        let io_a_cloned = deep_clone_value(io_a) as *mut u8 as usize;
+        let io_b_cloned = deep_clone_value(io_b) as *mut u8 as usize;
+
+        // Outcome carries `(is_left_winner, deep_cloned_winner_value_ptr)`.
+        // The loser's result, if it ever arrives, is dropped.
+        let outcome: Arc<Mutex<Option<(bool, usize)>>> = Arc::new(Mutex::new(None));
+        let cvar: Arc<Condvar> = Arc::new(Condvar::new());
+
+        let cancel_a = Arc::new(CancelToken::new());
+        let cancel_b = Arc::new(CancelToken::new());
+
+        fn worker(
+            io_raw: usize,
+            is_left: bool,
+            my_cancel: Arc<CancelToken>,
+            peer_cancel: Arc<CancelToken>,
+            outcome: Arc<Mutex<Option<(bool, usize)>>>,
+            cvar: Arc<Condvar>,
+        ) {
+            ACTIVE_FORKS.fetch_add(1, Ordering::SeqCst);
+            std::thread::spawn(move || {
+                struct ForkCounter;
+                impl Drop for ForkCounter {
+                    fn drop(&mut self) {
+                        ACTIVE_FORKS.fetch_sub(1, Ordering::SeqCst);
+                        let _g = ACTIVE_FORKS_MUTEX.lock().unwrap();
+                        ACTIVE_FORKS_CVAR.notify_all();
+                    }
+                }
+                let _counter = ForkCounter;
+
+                CANCEL_FLAG.with(|c| *c.borrow_mut() = Some(my_cancel.clone()));
+
+                let io = io_raw as *mut u8 as *mut Value;
+                let db_path = DB_PATH.lock().unwrap().clone();
+                let db = knot_db_open(db_path.as_ptr(), db_path.len());
+
+                struct CleanupGuard {
+                    db: *mut c_void,
+                    io: *mut Value,
+                }
+                impl Drop for CleanupGuard {
+                    fn drop(&mut self) {
+                        knot_db_close(self.db);
+                        unsafe { deep_drop_value(self.io); }
+                        CANCEL_FLAG.with(|c| *c.borrow_mut() = None);
+                    }
+                }
+                let _guard = CleanupGuard { db, io };
+
+                let result = knot_io_run(db, io);
+
+                // If cancellation already fired, drop the result silently.
+                if my_cancel.is_cancelled() {
+                    return;
+                }
+
+                // Deep-clone the winning value into Box-allocated storage
+                // so it outlives this thread's arena.
+                let cloned = deep_clone_value(result) as *mut u8 as usize;
+
+                let mut g = outcome.lock().unwrap();
+                if g.is_none() {
+                    *g = Some((is_left, cloned));
+                    drop(g);
+                    peer_cancel.cancel();
+                    cvar.notify_all();
+                } else {
+                    // Lost the race after producing a value — discard it.
+                    drop(g);
+                    unsafe { deep_drop_value(cloned as *mut u8 as *mut Value); }
+                }
+            });
+        }
+
+        worker(
+            io_a_cloned,
+            true,
+            cancel_a.clone(),
+            cancel_b.clone(),
+            outcome.clone(),
+            cvar.clone(),
+        );
+        worker(
+            io_b_cloned,
+            false,
+            cancel_b.clone(),
+            cancel_a.clone(),
+            outcome.clone(),
+            cvar.clone(),
+        );
+
+        // Wait for a winner — but don't join the loser.  The loser runs
+        // to its next safe point in the background, tracked by
+        // ACTIVE_FORKS for the program-exit join.
+        let g = outcome.lock().unwrap();
+        let g = cvar.wait_while(g, |o| o.is_none()).unwrap();
+        let (is_left, raw_ptr) = g.as_ref().copied().expect("race winner present");
+        drop(g);
+
+        // Wrap the winner's value in the appropriate Result constructor.
+        // We re-use the value pointer (which came from `deep_clone_value`
+        // and is Box-allocated, so it outlives all worker arenas).
+        let winner_val = raw_ptr as *mut u8 as *mut Value;
+        let field_name = if is_left { "error" } else { "value" };
+        let ctor_name = if is_left { "Err" } else { "Ok" };
+        let record = alloc(Value::Record(vec![RecordField {
+            name: intern_str(field_name),
+            value: winner_val,
+        }]));
+        alloc(Value::Constructor(intern_str(ctor_name), record))
+    }
+
+    alloc(Value::IO(race_thunk as *const u8, env))
 }
 
 /// Wait until all `fork`ed threads have completed.  Called from generated
@@ -10443,13 +10658,23 @@ pub extern "C" fn knot_now() -> *mut Value {
 }
 
 /// Sleep for the given number of milliseconds.
+///
+/// When the current thread is a `race` worker, the sleep parks on the
+/// thread's `CancelToken` condvar so it wakes immediately if the peer
+/// wins the race.  Outside of a race, this is equivalent to
+/// `std::thread::sleep`.
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_sleep(ms_val: *mut Value) -> *mut Value {
     let ms: u64 = match unsafe { as_ref(ms_val) } {
         Value::Int(i) => u64::try_from(*i).expect("knot runtime: sleep duration must be non-negative"),
         _ => panic!("knot runtime: sleep expects Int argument"),
     };
-    std::thread::sleep(std::time::Duration::from_millis(ms));
+    let duration = Duration::from_millis(ms);
+    if let Some(token) = current_cancel_token() {
+        token.wait_for_cancel(duration);
+    } else {
+        std::thread::sleep(duration);
+    }
     alloc(Value::Unit)
 }
 

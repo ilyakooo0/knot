@@ -169,7 +169,7 @@
   (#any-of? @function.builtin
     "println" "print" "show" "readLine"
     "readFile" "writeFile" "appendFile" "fileExists" "removeFile" "listDir"
-    "now" "fork" "retry" "listen"
+    "now" "fork" "race" "retry" "listen"
     "fetch" "fetchWith"
     "randomInt" "randomFloat"
     "toJson" "parseJson"))

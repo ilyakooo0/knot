@@ -29,11 +29,12 @@ pub const FS_BUILTINS: &[&str] = &[
     "fileExists", "removeFile", "listDir",
 ];
 
-/// Concurrency builtins (`fork`, `retry`). These do not contribute IO effects
-/// the same way as console/fs/etc.: `fork` returns `IO {} {}` (the spawned IO
-/// is not part of the surrounding transaction) and `retry` is the STM
-/// primitive used inside atomic to trigger a retry.
-pub const CONCURRENCY_BUILTINS: &[&str] = &["fork", "retry"];
+/// Concurrency builtins (`fork`, `retry`, `race`). These do not contribute IO
+/// effects the same way as console/fs/etc.: `fork` returns `IO {} {}` (the
+/// spawned IO is not part of the surrounding transaction), `retry` is the STM
+/// primitive used inside atomic to trigger a retry, and `race` propagates the
+/// effect rows of its arguments through its result.
+pub const CONCURRENCY_BUILTINS: &[&str] = &["fork", "retry", "race"];
 
 /// Pure builtins. These are listed so the LSP can recognize them as user-callable
 /// and so they sort sensibly in completion lists. They have no effects.
@@ -64,7 +65,7 @@ pub const EFFECTFUL_BUILTINS: &[&str] = &[
     "readFile", "writeFile", "appendFile",
     "fileExists", "removeFile", "listDir",
     // concurrency
-    "fork", "retry",
+    "fork", "retry", "race",
 ];
 
 /// Builtins whose effects cannot be rolled back by the savepoint-based atomic
@@ -83,6 +84,7 @@ pub const ATOMIC_DISALLOWED_BUILTINS: &[&str] = &[
     "listen", "listenOn", "fetch", "fetchWith",
     "readFile", "writeFile", "appendFile",
     "fileExists", "removeFile", "listDir",
+    "race",
 ];
 
 /// Built-in trait method names (Eq.eq, Ord.compare, Num.add, etc.). Resolved
@@ -129,7 +131,8 @@ pub fn is_builtin(name: &str) -> bool {
 
 /// True if `name` is an effectful builtin — i.e. calling it produces an IO
 /// value. Excludes `retry` (no IO) and `fork` (returns `IO {} {}`, but its
-/// argument's effects are decoupled from the caller).
+/// argument's effects are decoupled from the caller).  `race` is included
+/// because the result IO inherits the effect row of its arguments.
 pub fn is_io_builtin(name: &str) -> bool {
     EFFECTFUL_BUILTINS.contains(&name) && !matches!(name, "retry")
 }

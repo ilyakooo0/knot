@@ -188,7 +188,7 @@
         {
           "comment": "Built-in functions",
           "name": "support.function.knot",
-          "match": "\\b(println|print|show|count|union|diff|inter|sum|avg|filter|match|map|fold|single|now|toUpper|toLower|take|drop|length|trim|contains|reverse|chars|id|toJson|parseJson|readFile|writeFile|appendFile|fileExists|removeFile|listDir|readLine|randomInt|randomFloat|fork|retry|listen|fetch|fetchWith)\\b"
+          "match": "\\b(println|print|show|count|union|diff|inter|sum|avg|filter|match|map|fold|single|now|toUpper|toLower|take|drop|length|trim|contains|reverse|chars|id|toJson|parseJson|readFile|writeFile|appendFile|fileExists|removeFile|listDir|readLine|randomInt|randomFloat|fork|race|retry|listen|fetch|fetchWith)\\b"
         }
       ]
     },

@@ -1022,6 +1022,7 @@ impl Codegen {
 
         // Spawn / threading
         self.declare_rt("knot_fork_io", &[p], &[p]);
+        self.declare_rt("knot_race_io", &[p, p], &[p]);
         self.declare_rt("knot_threads_join", &[], &[]);
 
         // STM retry
@@ -1319,7 +1320,7 @@ impl Codegen {
             "bytesGet", "hash",
             "readFile", "writeFile", "appendFile",
             "fileExists", "removeFile", "listDir",
-            "randomInt", "sleep", "fork",
+            "randomInt", "sleep", "fork", "race",
             "encrypt", "decrypt", "sign", "verify",
         ];
         for name in &stdlib_names {
@@ -2393,6 +2394,9 @@ impl Codegen {
 
         // Spawn (IO-returning)
         self.define_stdlib_fn_1("fork", "knot_fork_io");
+
+        // Race two IO actions concurrently (IO-returning).
+        self.define_stdlib_fn_2("race", "knot_race_io", false);
 
         // Crypto: 2-param (curried)
         self.define_stdlib_fn_2("encrypt", "knot_crypto_encrypt_io", false);
@@ -6779,7 +6783,7 @@ impl Codegen {
                 crate::builtins::is_io_builtin(name)
                 || matches!(
                     name.as_str(),
-                    "fork"
+                    "fork" | "race"
                 ) || self.io_functions.contains(name)
             }
             ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,

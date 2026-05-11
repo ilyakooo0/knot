@@ -5387,40 +5387,47 @@ impl Infer {
             );
         }
 
-        // race : ∀a b r1 r2 r3. (r3 := r1 \/ r2) => IO r1 a -> IO r2 b
-        //                                          -> IO r3 (Result a b)
+        // race : ∀a b r1 r2. IO {| r1} a -> IO {| r2} b
+        //                    -> IO {| r1 \/ r2} (Result a b)
         // Each arm carries its own effect row; the result's row is the
-        // union of both, propagated through the EffectUnion mechanism so a
-        // call mixing distinct effect sets (e.g. `{console}` vs `{clock}`)
-        // produces an IO whose row includes both. The winner is reported
-        // via the built-in `Result a b` ADT — `Err {error: a}` when the
-        // left action wins, `Ok {value: b}` when the right action wins.
+        // union of both via the `\/` operator. Built from an AST so the
+        // type is plumbed through the same path user-level `\/` annotations
+        // take: `ast_type_to_ty` registers the effect-union constraint,
+        // `generalize` captures it on the scheme, and each instantiation
+        // freshens the union. The winner is reported via the built-in
+        // `Result a b` ADT — `Err {error: a}` when the left action wins,
+        // `Ok {value: b}` when the right action wins.
         {
-            let a = self.fresh_var();
-            let b = self.fresh_var();
-            let r1 = self.fresh_var();
-            let r2 = self.fresh_var();
-            let r3 = self.fresh_var();
-            let io_a = Ty::IO(BTreeSet::new(), Some(r1), Box::new(Ty::Var(a)));
-            let io_b = Ty::IO(BTreeSet::new(), Some(r2), Box::new(Ty::Var(b)));
-            let result_ty = Ty::Con("Result".into(), vec![Ty::Var(a), Ty::Var(b)]);
-            let io_result = Ty::IO(BTreeSet::new(), Some(r3), Box::new(result_ty));
-            self.bind_top(
-                "race",
-                Scheme {
-                    vars: vec![a, b, r1, r2, r3],
-                    unit_vars: vec![],
-                    constraints: vec![],
-                    effect_unions: vec![EffectUnion {
-                        result: r3,
-                        sources: vec![r1, r2],
-                    }],
-                    ty: Ty::Fun(
-                        Box::new(io_a),
-                        Box::new(Ty::Fun(Box::new(io_b), Box::new(io_result))),
-                    ),
-                },
-            );
+            let sp = Span::new(0, 0);
+            let mk = |node| ast::Type { node, span: sp };
+            let var = |n: &str| mk(ast::TypeKind::Var(n.to_string()));
+            let io = |rest: Vec<String>, ty: ast::Type| mk(ast::TypeKind::IO {
+                effects: vec![],
+                rest,
+                ty: Box::new(ty),
+            });
+            let result_ab = mk(ast::TypeKind::App {
+                func: Box::new(mk(ast::TypeKind::App {
+                    func: Box::new(mk(ast::TypeKind::Named("Result".into()))),
+                    arg: Box::new(var("a")),
+                })),
+                arg: Box::new(var("b")),
+            });
+            let race_ast = mk(ast::TypeKind::Function {
+                param: Box::new(io(vec!["r1".into()], var("a"))),
+                result: Box::new(mk(ast::TypeKind::Function {
+                    param: Box::new(io(vec!["r2".into()], var("b"))),
+                    result: Box::new(io(
+                        vec!["r1".into(), "r2".into()],
+                        result_ab,
+                    )),
+                })),
+            });
+            let saved = std::mem::take(&mut self.annotation_vars);
+            let race_ty = self.ast_type_to_ty(&race_ast);
+            self.annotation_vars = saved;
+            let scheme = self.generalize(&race_ty);
+            self.bind_top("race", scheme);
         }
 
         // retry : ∀a. a (polymorphic bottom — usable in any context inside atomic)

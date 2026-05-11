@@ -2,6 +2,7 @@
 *.db
 *.db-shm
 *.db-wal
+.DS_Store
 examples/hello
 examples/todo
 examples/traits

@@ -110,12 +110,49 @@ fold (\acc p -> acc ++ p.name ++ " ") "" *people
 ```
 
 ```knot
-single : [a] -> a
+single : [a] -> Maybe a
 ```
-Extract the single element from a one-element relation. Panics if the relation is empty or has more than one element.
+Extract the single element from a one-element relation. Returns `Just {value: x}` for a singleton, `Nothing {}` otherwise.
 
 ```knot
-single [{name: "Alice"}]    -- {name: "Alice"}
+single [{name: "Alice"}]    -- Just {value: {name: "Alice"}}
+single []                   -- Nothing {}
+single [1, 2]               -- Nothing {}
+```
+
+```knot
+head : [a] -> Maybe a
+```
+First row of a relation in iteration order, or `Nothing {}` if empty.
+
+```knot
+findFirst : [a] -> (a -> Bool) -> Maybe a
+```
+First row matching the predicate, or `Nothing {}` if none match. Lazy — stops at the first match.
+
+```knot
+findFirst [1, 2, 3, 4, 5] (\x -> x > 3)    -- Just {value: 4}
+findFirst [1, 2, 3] (\x -> x > 10)         -- Nothing {}
+```
+
+```knot
+any : (a -> Bool) -> [a] -> Bool
+all : (a -> Bool) -> [a] -> Bool
+```
+`any` returns `True` if any row satisfies the predicate; `all` returns `True` only when every row does (vacuously `True` on empty).
+
+```knot
+elem : a -> [a] -> Bool
+```
+Membership check by structural equality.
+
+```knot
+sortBy : (a -> b) -> [a] -> [a]
+```
+Reorder rows by a projected key. The key type `b` must be `Ord`. Returns a relation with the rows in ascending key order. Pushes down to SQL `ORDER BY` when applied to a source relation; combined with `take` it becomes `ORDER BY ... LIMIT`.
+
+```knot
+*employees |> sortBy (\e -> e.salary) |> take 5
 ```
 
 ```knot
@@ -209,21 +246,23 @@ toLower : Text -> Text
 Convert text to lowercase.
 
 ```knot
-take : Int -> Text -> Text
+take : Int<u> -> s -> s          -- Sequence trait method
 ```
-First *n* characters of a text value.
+First *n* elements. `Sequence` has built-in impls for `Text` (characters) and `[]` (rows).
 
 ```knot
-take 5 "hello world"    -- "hello"
+take 5 "hello world"          -- "hello"
+take 2 [10, 20, 30, 40]       -- [10, 20]
 ```
 
 ```knot
-drop : Int -> Text -> Text
+drop : Int<u> -> s -> s          -- Sequence trait method
 ```
-Skip the first *n* characters.
+Skip the first *n* elements.
 
 ```knot
-drop 6 "hello world"    -- "world"
+drop 6 "hello world"          -- "world"
+drop 1 [10, 20, 30]           -- [20, 30]
 ```
 
 ```knot
@@ -260,6 +299,61 @@ Convert text into a relation of single-character text values.
 chars "abc"    -- ["a", "b", "c"]
 ```
 
+## Logging
+
+The leveled logging functions write to stderr (so they don't mix with regular
+`println` output). When stderr is a TTY, output is colored; otherwise it's
+emitted as one JSON record per line, suitable for log aggregation.
+
+```knot
+logInfo : a -> IO {console} {}
+logWarn : a -> IO {console} {}
+logError : a -> IO {console} {}
+logDebug : a -> IO {console} {}
+```
+
+`logDebug` is gated on a `--debug` runtime flag — debug records are dropped
+silently when the program is launched without it.
+
+```knot
+main = do
+  logInfo "starting"
+  logWarn {event: "low memory", availableMb: 64}
+  yield {}
+```
+
+## Control Flow
+
+```knot
+when   : Bool -> IO r {} -> IO r {}
+unless : Bool -> IO r {} -> IO r {}
+```
+
+Run an IO action when the condition is `True`/`False` respectively. Both
+return `yield {}` when the action is skipped, so the effect row of the result
+is the row of the supplied action.
+
+```knot
+main = do
+  when (n > 0) (println "positive")
+  unless verbose do
+    println "(quiet mode)"
+  yield {}
+```
+
+```knot
+forEach : [a] -> (a -> IO r {}) -> IO r {}
+```
+
+Iterate a relation and sequence an IO action for each row. Effect row `r`
+propagates from the action.
+
+```knot
+main = do
+  forEach ["a", "b", "c"] (\s -> println s)
+  yield {}
+```
+
 ## Utility
 
 ```knot
@@ -271,6 +365,17 @@ Identity function. Returns its argument unchanged.
 not : Bool -> Bool
 ```
 Boolean negation. Function form of the `!` operator.
+
+```knot
+stripUnit       : Int<u> -> Int
+withUnit        : Int -> Int<u>
+stripFloatUnit  : Float<u> -> Float
+withFloatUnit   : Float -> Float<u>
+```
+
+Drop or attach a unit tag on `Int`/`Float`. All four are identity at
+runtime — they exist only for the type checker. Use them to rebrand a value
+when you need a different concrete unit (e.g. `Ms` → `S`).
 
 ```knot
 now : IO {clock} Int<Ms>
@@ -340,12 +445,12 @@ parseJson json                     -- {name: "Bob"}
 ## Bytes
 
 ```knot
-bytesLength : Bytes -> Int
+bytesLength : Bytes -> Int<u>
 ```
 Number of bytes in a byte string.
 
 ```knot
-bytesSlice : Int -> Int -> Bytes -> Bytes
+bytesSlice : Int<u1> -> Int<u2> -> Bytes -> Bytes
 ```
 Extract a sub-range. `bytesSlice start len bytes` returns `len` bytes starting at offset `start`.
 
@@ -355,7 +460,7 @@ bytesConcat : Bytes -> Bytes -> Bytes
 Concatenate two byte strings.
 
 ```knot
-bytesGet : Int -> Bytes -> Int
+bytesGet : Int<u1> -> Bytes -> Int<u2>
 ```
 Get the byte value (0–255) at the given index.
 
@@ -365,23 +470,34 @@ textToBytes : Text -> Bytes
 UTF-8 encode a text value into bytes.
 
 ```knot
-bytesToText : Bytes -> Text
+bytesToText : Bytes -> Maybe Text
 ```
-UTF-8 decode bytes into text.
+UTF-8 decode bytes into text. Returns `Nothing {}` on invalid UTF-8 (use `case` to handle both branches).
 
 ```knot
 bytesToHex : Bytes -> Text
 ```
-Encode bytes as a hexadecimal text string.
+Encode bytes as a hexadecimal text string. Always succeeds.
 
 ```knot
-bytesFromHex : Text -> Bytes
+bytesFromHex : Text -> Maybe Bytes
 ```
-Decode a hexadecimal text string into bytes.
+Decode a hexadecimal text string into bytes. Returns `Nothing {}` on odd-length, non-hex, or non-ASCII input. `hexDecode` is an alias.
 
 ```knot
 bytesToHex (textToBytes "hi")    -- "6869"
-bytesFromHex "6869" |> bytesToText  -- "hi"
+case bytesFromHex "6869" of
+  Just {value: b} -> bytesToText b  -- Just {value: "hi"}
+  Nothing {} -> Nothing {}
+```
+
+```knot
+hash : a -> Bytes
+```
+SHA-256 hash of any value, returned as 32 bytes. `Bytes` and `Text` hash their raw contents; records, relations, and constructors hash a canonical serialisation, so the same logical value always produces the same digest.
+
+```knot
+bytesToHex (hash "hello")    -- "2cf24dba..."
 ```
 
 ## File System
@@ -453,11 +569,18 @@ main = do
 ## Server
 
 ```knot
-listen : Int -> Server a -> IO {network} {}
+listen   : Int<u> -> Server a r -> IO {network | r} {}
+listenOn : Text  -> Int<u> -> Server a r -> IO {network | r} {}
 ```
-Start an HTTP server on the given port. The second argument is a `Server a` value, typically built with the `serve API where ...` expression. Has the `{network}` effect. See `route` declarations in the language spec for defining typed endpoints and the `serve` form for binding handlers.
+Start an HTTP server. `listen` binds to all interfaces; `listenOn` takes an explicit bind address. The `Server a r` value is built with the `serve API where ...` expression, and its row variable `r` unifies with `listen`'s IO row — so handler effects (e.g. `console` from a handler that calls `println`) propagate into the program's IO type.
 
 Handlers return `Result HttpError T` where `HttpError = {status: Int, message: Text}` and `T` is the response type declared on the route. `Ok {value: T}` responds with HTTP 200; `Err {error: {status, message}}` responds with the given status code (clamped to 100..=599) and a JSON `{"error": message}` body — use this for application-level errors like 404 not found or 401 unauthorized.
+
+```knot
+fetch     : Text -> Endpoint -> IO {network} (Result HttpError T)
+fetchWith : Text -> {headers: [{name: Text, value: Text}]} -> Endpoint -> IO {network} (Result HttpError T)
+```
+Type-safe HTTP client. `Endpoint` is a route constructor (e.g. `GetTodos {owner: "alice"}`) — the response type `T` is inferred from the route declaration. `fetchWith` merges ad-hoc headers with route-declared headers. When response headers are declared on the route, the success body is wrapped as `{body: T, headers: H}` inside `Ok`.
 
 ### Rate limiting
 
@@ -578,10 +701,12 @@ Structural equality as a trait method. Built-in impls for `Int`, `Float`, `Text`
 ### Ord
 
 ```knot
+data Ordering = LT {} | EQ {} | GT {}
+
 trait Eq a => Ord a where
-  compare : a -> a -> Int
+  compare : a -> a -> Ordering
 ```
-Ordering comparison. Returns `-1`, `0`, or `1`. Requires `Eq`. Built-in impls for `Int`, `Float`, `Text`.
+Ordering comparison. Returns `LT {}`, `EQ {}`, or `GT {}`. Requires `Eq`. Built-in impls for `Int`, `Float`, `Text`.
 
 ### Num
 
@@ -671,12 +796,40 @@ trait Applicative f => Alternative (f : Type -> Type) where
 ```
 Built-in impls: `[]` (`empty = []`, `alt = union`) and `Maybe` (`empty = Nothing {}`, `alt` takes the first `Just`).
 
+### Sequence
+
+```knot
+trait Sequence s where
+  take : Int -> s -> s
+  drop : Int -> s -> s
+```
+Built-in impls for `Text` (operates on characters) and `[]` (operates on rows). When the receiver is a source relation, the compiler pushes `take` down to SQL `LIMIT`; combined with `sortBy` it becomes `ORDER BY ... LIMIT`.
+
 ### Foldable
 
 ```knot
 trait Foldable (t : Type -> Type) where
   fold : (b -> a -> b) -> b -> t a -> b
 ```
+
+### Traversable
+
+```knot
+trait Foldable t => Traversable (t : Type -> Type) where
+  traverse : (a -> f b) -> t a -> f (t b)
+```
+Walk a structure left-to-right, sequencing through any `Applicative` `f`. Built-in impl for `[]` over `Maybe` (`Nothing` short-circuits) — useful for validating every row and collecting the result or first failure.
+
+### ToJSON / FromJSON
+
+```knot
+trait ToJSON a where
+  toJson : a -> Text
+
+trait FromJSON a where
+  parseJson : Text -> a
+```
+JSON encode/decode as trait methods. Built-in instances cover records, relations, primitives, ADTs, and `Maybe`/`Result`/`Bool`.
 
 ## Operators
 

@@ -245,7 +245,16 @@ trait Applicative f => Alternative (f : Type -> Type) where
 
 trait Foldable (t : Type -> Type) where
   fold : (b -> a -> b) -> b -> t a -> b
+
+trait Foldable t => Traversable (t : Type -> Type) where
+  traverse : (a -> f b) -> t a -> f (t b)
+
+trait Sequence s where
+  take : Int -> s -> s
+  drop : Int -> s -> s
 ```
+
+`Sequence` has built-in impls for both `Text` (character take/drop) and relations (row take/drop), so the same `take 5 x` works on a string or a relation.
 
 ### `do` Desugaring
 
@@ -497,10 +506,12 @@ scale = \factor -> do
 
 ```knot
 describe = \rel -> case rel of
-  []          -> "empty"
-  [{name: n}] -> "just " ++ n
-  _           -> show (count rel) ++ " rows"
+  []           -> "empty"
+  [{name: n}]  -> "just " ++ n
+  Cons h _     -> "first of many: " ++ show h
 ```
+
+`[]` matches an empty relation. `[p1, p2, ...]` matches a relation with exactly that many rows in any iteration order. `Cons head tail` matches a non-empty relation, binding `head` to the first row and `tail` to the rest (the relation has no inherent order; `Cons` chooses a deterministic iteration order for the match).
 
 ### Grouping
 
@@ -873,7 +884,7 @@ api = serve Api where
     users <- *people
     case filter (\u -> u.id == id) users of
       [] -> yield Err {error: {status: 404, message: "user not found"}}
-      [u | _] -> yield Ok {value: u}
+      Cons u _ -> yield Ok {value: u}
   CreateUser = \{name, email} -> do
     if length name == 0 then
       yield Err {error: {status: 400, message: "name required"}}

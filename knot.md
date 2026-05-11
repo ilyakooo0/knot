@@ -348,7 +348,21 @@ priority = \p -> case p of
 describe = \rel -> case rel of
   [] -> "empty"
   [{name: n}] -> "just " ++ n
-  _ -> show (count rel) ++ " rows"
+  Cons h _ -> "first of many: " ++ show h
+```
+
+| Pattern | Matches |
+|---------|---------|
+| `[]` | empty relation |
+| `[p1, p2, ...]` | relation with exactly that many rows |
+| `Cons head tail` | non-empty relation, `head` is one row, `tail` is the rest |
+
+`Cons` is also useful in recursive functions:
+
+```knot
+sumList = \xs -> case xs of
+  [] -> 0
+  Cons h t -> h + sumList t
 ```
 
 ---
@@ -518,10 +532,13 @@ sortAndShow : Ord a => Display a => [a] -> [Text]
 ```
 Eq          -- ==, !=
 ├── Ord     -- <, >, <=, >= (returns Ordering: LT {} | EQ {} | GT {})
-└── Num     -- +, -, *, /, unary -
+└── Num     -- +, -, *, /, %, unary -
 
 Semigroup   -- ++ (text concat, relation concat)
 Display     -- display : a -> Text
+ToJSON      -- toJson : a -> Text
+FromJSON    -- parseJson : Text -> a
+Sequence    -- take, drop (impls for Text and [a])
 
 Functor (f : Type -> Type)        -- map
 └── Applicative (f : Type -> Type) -- yield, ap
@@ -529,7 +546,13 @@ Functor (f : Type -> Type)        -- map
     └── Alternative (f : Type -> Type) -- empty, alt (enables where)
 
 Foldable (t : Type -> Type)       -- fold
+└── Traversable (t : Type -> Type) -- traverse
 ```
+
+Built-in impls of the Functor/Applicative/Monad/Alternative hierarchy ship
+for `[]`, `Maybe`, `Result`, and `IO`, so do-notation works on all of them.
+`Sequence` ships with impls for `Text` and `[]`, so `take 5 x` works on a
+string or a relation.
 
 ---
 
@@ -543,7 +566,7 @@ Effectful functions return `IO {effects} a` — descriptions of effects, not imm
 -- External effects
 println : a -> IO {console} {}
 readFile : Text -> IO {fs} Text
-now : IO {clock} Int
+now : IO {clock} Int<Ms>
 
 -- DB operations (empty effect set)
 -- *rel : IO {} [T]
@@ -554,10 +577,10 @@ now : IO {clock} Int
 
 | Effect | Functions |
 |--------|-----------|
-| `console` | `println`, `print`, `readLine` |
+| `console` | `println`, `print`, `readLine`, `logInfo`, `logWarn`, `logError`, `logDebug` |
 | `fs` | `readFile`, `writeFile`, `appendFile`, `fileExists`, `removeFile`, `listDir` |
 | `clock` | `now`, `sleep` |
-| `random` | `randomInt`, `randomFloat`, `randomUuid` |
+| `random` | `randomInt`, `randomFloat`, `randomUuid`, `generateKeyPair`, `generateSigningKeyPair`, `encrypt` |
 | `network` | `listen`, `fetch`, `fetchWith` |
 
 ### IO Do Blocks
@@ -609,7 +632,7 @@ The body of `atomic` must be an IO expression containing only DB operations. Ext
 Fire-and-forget: runs an IO action on a new OS thread. Each thread gets its own SQLite connection (WAL mode).
 
 ```knot
-fork : IO {} {} -> IO {} {}
+fork : IO r {} -> IO {} {}
 
 main = do
   fork do
@@ -620,7 +643,9 @@ main = do
   -- main waits for all spawned threads before exiting
 ```
 
-Do blocks can be passed directly as arguments: `fork do ...` (no parentheses needed).
+The spawned action's effect row `r` is unconstrained — `fork` can spawn any
+IO — but those effects do not propagate back to the caller. Do blocks can be
+passed directly as arguments: `fork do ...` (no parentheses needed).
 
 #### `retry`
 
@@ -703,21 +728,30 @@ and the loser unwinds at its next safe point.
 | Function | Type | Description |
 |----------|------|-------------|
 | `filter` | `(a -> Bool) -> [a] -> [a]` | Keep matching rows |
-| `map` | `(a -> b) -> [a] -> [b]` | Transform each row |
+| `map` | `(a -> b) -> [a] -> [b]` | Transform each row (`Functor.map`) |
 | `match` | `Constructor -> [ADT] -> [Payload]` | Filter by variant |
-| `fold` | `(b -> a -> b) -> b -> [a] -> b` | Left fold |
-| `count` | `[a] -> Int` | Number of rows |
-| `countWhere` | `(a -> Bool) -> [a] -> Int` | Filtered count (SQL-pushed when possible) |
+| `fold` | `(b -> a -> b) -> b -> [a] -> b` | Left fold (`Foldable.fold`) |
+| `count` | `[a] -> Int<u>` | Number of rows |
+| `countWhere` | `(a -> Bool) -> [a] -> Int<u>` | Filtered count (SQL-pushed when possible) |
 | `sum` | `(a -> b) -> [a] -> b` | Sum projected field (preserves units) |
 | `avg` | `(a -> Float<u>) -> [a] -> Float<u>` | Average projected field (preserves units) |
 | `minOn` | `(a -> b) -> [a] -> b` | Min of projected field (panics on empty) |
 | `maxOn` | `(a -> b) -> [a] -> b` | Max of projected field (panics on empty) |
 | `min` | `Ord a => a -> a -> a` | Binary min of two values |
 | `max` | `Ord a => a -> a -> a` | Binary max of two values |
-| `single` | `[a] -> Maybe a` | Extract singleton |
+| `head` | `[a] -> Maybe a` | First row, or `Nothing` if empty |
+| `findFirst` | `[a] -> (a -> Bool) -> Maybe a` | First row matching predicate |
+| `single` | `[a] -> Maybe a` | `Just x` for a singleton, `Nothing` otherwise |
+| `any` | `(a -> Bool) -> [a] -> Bool` | True if any row matches |
+| `all` | `(a -> Bool) -> [a] -> Bool` | True if every row matches |
+| `elem` | `a -> [a] -> Bool` | Membership by structural equality |
 | `union` | `[a] -> [a] -> [a]` | Set union |
 | `diff` | `[a] -> [a] -> [a]` | Set difference |
 | `inter` | `[a] -> [a] -> [a]` | Set intersection |
+| `sortBy` | `(a -> b) -> [a] -> [a]` | Reorder rows by projected key (`Ord b`) |
+| `take` | `Int<u> -> [a] -> [a]` | First *n* rows (`Sequence.take`) |
+| `drop` | `Int<u> -> [a] -> [a]` | Drop first *n* rows (`Sequence.drop`) |
+| `reverse` | `[a] -> [a]` | Reverse iteration order |
 
 ### Text
 
@@ -725,21 +759,29 @@ and the loser unwinds at its next safe point.
 |----------|------|-------------|
 | `toUpper` | `Text -> Text` | Uppercase |
 | `toLower` | `Text -> Text` | Lowercase |
-| `length` | `Text -> Int` | Character count |
+| `length` | `Text -> Int<u>` | Character count |
 | `trim` | `Text -> Text` | Strip whitespace |
 | `reverse` | `Text -> Text` | Reverse |
 | `chars` | `Text -> [Text]` | Split to characters |
-| `take` | `Int -> Text -> Text` | First n characters |
-| `drop` | `Int -> Text -> Text` | Drop first n characters |
+| `take` | `Int<u> -> Text -> Text` | First *n* characters (`Sequence.take`) |
+| `drop` | `Int<u> -> Text -> Text` | Drop first *n* characters (`Sequence.drop`) |
 | `contains` | `Text -> Text -> Bool` | Substring check |
+
+`take` and `drop` are `Sequence` trait methods with built-in impls for both
+`Text` and relations.
 
 ### Conversion
 
 | Function | Type | Description |
 |----------|------|-------------|
 | `show` | `a -> Text` | Any value to text |
-| `toJson` | `a -> Text` | Encode as JSON |
-| `parseJson` | `Text -> a` | Decode JSON |
+| `toJson` | `a -> Text` | Encode as JSON (`ToJSON.toJson`) |
+| `parseJson` | `Text -> a` | Decode JSON (`FromJSON.parseJson`) |
+| `display` | `Display a => a -> Text` | Render a value via `Display` |
+| `stripUnit` | `Int<u> -> Int` | Drop unit tag from `Int` |
+| `withUnit` | `Int -> Int<u>` | Attach unit tag to `Int` |
+| `stripFloatUnit` | `Float<u> -> Float` | Drop unit tag from `Float` |
+| `withFloatUnit` | `Float -> Float<u>` | Attach unit tag to `Float` |
 
 ### IO
 
@@ -748,6 +790,10 @@ and the loser unwinds at its next safe point.
 | `println` | `a -> IO {console} {}` | Print with newline |
 | `print` | `a -> IO {console} {}` | Print without newline |
 | `readLine` | `IO {console} Text` | Read stdin line |
+| `logInfo` | `a -> IO {console} {}` | Leveled log to stderr (INFO) |
+| `logWarn` | `a -> IO {console} {}` | Leveled log to stderr (WARN) |
+| `logError` | `a -> IO {console} {}` | Leveled log to stderr (ERROR) |
+| `logDebug` | `a -> IO {console} {}` | DEBUG; only emits when run with `--debug` |
 | `readFile` | `Text -> IO {fs} Text` | Read file |
 | `writeFile` | `Text -> Text -> IO {fs} {}` | Write file (path, content) |
 | `appendFile` | `Text -> Text -> IO {fs} {}` | Append to file |
@@ -763,6 +809,41 @@ and the loser unwinds at its next safe point.
 | `fork` | `IO r {} -> IO {} {}` | Fire-and-forget on new OS thread |
 | `race` | `IO r a -> IO r b -> IO r (Result a b)` | Run two IO actions, return the winner |
 | `retry` | `a` | Rollback and wait (inside `atomic` only) |
+| `when` | `Bool -> IO r {} -> IO r {}` | Run action when condition is true |
+| `unless` | `Bool -> IO r {} -> IO r {}` | Run action when condition is false |
+| `forEach` | `[a] -> (a -> IO r {}) -> IO r {}` | Sequence an action over each row |
+| `listen` | `Int<u> -> Server a r -> IO {network \| r} {}` | Start an HTTP server |
+| `fetch` | `Text -> Endpoint -> IO {network} (Result HttpError T)` | Type-safe HTTP client |
+| `fetchWith` | `Text -> {headers: [..]} -> Endpoint -> IO {network} (Result HttpError T)` | `fetch` with ad-hoc headers |
+
+`listen`'s effect row unifies with the `Server`'s, so handler effects (e.g.
+`console` from a handler that calls `println`) flow into the IO type of the
+program.
+
+### Bytes
+
+| Function | Type | Description |
+|----------|------|-------------|
+| `textToBytes` | `Text -> Bytes` | UTF-8 encode |
+| `bytesToText` | `Bytes -> Maybe Text` | UTF-8 decode (`Nothing` on invalid UTF-8) |
+| `bytesLength` | `Bytes -> Int<u>` | Byte length |
+| `bytesSlice` | `Int<u1> -> Int<u2> -> Bytes -> Bytes` | Sub-range (start, length, bytes) |
+| `bytesConcat` | `Bytes -> Bytes -> Bytes` | Concatenate |
+| `bytesGet` | `Int<u1> -> Bytes -> Int<u2>` | Byte value (0–255) at index |
+| `bytesToHex` | `Bytes -> Text` | Hex encode |
+| `bytesFromHex` | `Text -> Maybe Bytes` | Hex decode (`Nothing` on bad input) |
+| `hash` | `a -> Bytes` | SHA-256 hash (32 bytes) of any value |
+
+### Cryptography
+
+| Function | Type | Description |
+|----------|------|-------------|
+| `generateKeyPair` | `IO {random} {privateKey: Bytes, publicKey: Bytes}` | X25519 keypair |
+| `generateSigningKeyPair` | `IO {random} {privateKey: Bytes, publicKey: Bytes}` | Ed25519 keypair |
+| `encrypt` | `Bytes -> Bytes -> IO {random} Bytes` | Sealed-box (public key, plaintext) |
+| `decrypt` | `Bytes -> Bytes -> Bytes` | Open sealed-box (private key, ciphertext) |
+| `sign` | `Bytes -> Bytes -> Bytes` | Ed25519 sign (private key, message) |
+| `verify` | `Bytes -> Bytes -> Bytes -> Bool` | Verify (public key, message, signature) |
 
 ### Utility
 
@@ -825,7 +906,7 @@ api = serve Api where
     users <- *people
     case filter (\u -> u.id == id) users of
       [] -> yield Err {error: {status: 404, message: "user not found"}}
-      [u | _] -> yield Ok {value: u}
+      Cons u _ -> yield Ok {value: u}
 ```
 
 Status is clamped to `100..=599`. The runtime emits `400` for path/query/body parsing failures and refinement violations, and `404` for unmatched routes — only return `Err` for application-level errors.

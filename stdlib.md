@@ -8,11 +8,13 @@ Complete reference for all built-in functions, traits, and types.
 - [Concurrency](#concurrency)
 - [Text Operations](#text-operations)
 - [Console I/O](#console-io)
+- [Control Flow](#control-flow)
 - [File System](#file-system)
 - [Time](#time)
 - [Random](#random)
 - [JSON](#json)
 - [Bytes](#bytes)
+- [HTTP](#http)
 - [Cryptography](#cryptography)
 - [Utility Functions](#utility-functions)
 - [Built-in Traits](#built-in-traits)
@@ -80,7 +82,13 @@ totalAmount = \rel -> fold (\acc r -> acc + r.amount) 0 rel
 single : [a] -> Maybe a
 ```
 
-Extract the single element of a relation. Returns `Just {value: x}` for a singleton, `Nothing {}` otherwise.
+Extract the single element of a relation. Returns `Just {value: x}` for a singleton, `Nothing {}` for empty or multi-element relations.
+
+```knot
+single [{name: "Alice"}]    -- Just {value: {name: "Alice"}}
+single []                   -- Nothing {}
+single [1, 2]               -- Nothing {}
+```
 
 ### `count`
 
@@ -213,6 +221,77 @@ inter : [a] -> [a] -> [a]
 ```
 
 Set intersection — rows present in both relations.
+
+### `head`
+
+```
+head : [a] -> Maybe a
+```
+
+First row of a relation in iteration order, or `Nothing {}` if empty.
+
+### `findFirst`
+
+```
+findFirst : [a] -> (a -> Bool) -> Maybe a
+```
+
+First row matching the predicate (left-to-right), or `Nothing {}` when no row matches. Stops at the first hit.
+
+```knot
+findFirst [1, 2, 3, 4, 5] (\x -> x > 3)   -- Just {value: 4}
+```
+
+### `any` / `all`
+
+```
+any : (a -> Bool) -> [a] -> Bool
+all : (a -> Bool) -> [a] -> Bool
+```
+
+`any` is `True` when some row matches; `all` is `True` only when every row matches (vacuously `True` on `[]`).
+
+### `elem`
+
+```
+elem : a -> [a] -> Bool
+```
+
+Membership check by structural equality.
+
+### `sortBy`
+
+```
+sortBy : (a -> b) -> [a] -> [a]
+```
+
+Reorder rows by a projected key. The key type `b` must be `Ord`. Returns a new relation with rows in ascending key order. Sets have no inherent order; the result preserves the sorted order for downstream iteration (`fold`, `map`, `forEach`, etc.).
+
+Pushes down to SQL `ORDER BY` when applied to a source relation. Combined with `take` it becomes `ORDER BY ... LIMIT`:
+
+```knot
+&topFive = do
+  employees <- *employees
+  yield (employees |> sortBy (\e -> -e.salary) |> take 5)
+-- SQL: SELECT ... FROM _knot_employees ORDER BY -salary LIMIT 5
+```
+
+### `take` / `drop`
+
+```
+take : Int -> [a] -> [a]      -- Sequence.take
+drop : Int -> [a] -> [a]      -- Sequence.drop
+```
+
+First / drop *n* rows. Both come from the `Sequence` trait, which also has a `Text` impl that operates on characters.
+
+### `reverse`
+
+```
+reverse : [a] -> [a]
+```
+
+Reverse iteration order of a relation. Like `sortBy`, this controls iteration order; the underlying set is unchanged.
 
 ---
 
@@ -370,28 +449,23 @@ chars : Text -> [Text]
 
 Split text into a relation of single characters.
 
-### `take`
+### `take` / `drop`
+
+`take` and `drop` are `Sequence` trait methods with built-in impls for both
+`Text` (characters) and relations (rows):
 
 ```
-take : Int -> Text -> Text
-```
-
-Return the first *n* characters.
-
-```knot
-first3 = take 3 "hello"   -- "hel"
-```
-
-### `drop`
-
-```
+take : Int -> Text -> Text         -- characters
+take : Int -> [a]  -> [a]          -- rows
 drop : Int -> Text -> Text
+drop : Int -> [a]  -> [a]
 ```
 
-Drop the first *n* characters.
-
 ```knot
-rest = drop 3 "hello"   -- "lo"
+take 3 "hello"        -- "hel"
+take 2 [10, 20, 30]   -- [10, 20]
+drop 3 "hello"        -- "lo"
+drop 1 [10, 20, 30]   -- [20, 30]
 ```
 
 ### `contains`
@@ -426,6 +500,24 @@ print : a -> IO {console} {}
 
 Print a value to stdout without a trailing newline.
 
+### `logInfo` / `logWarn` / `logError` / `logDebug`
+
+```
+logInfo  : a -> IO {console} {}
+logWarn  : a -> IO {console} {}
+logError : a -> IO {console} {}
+logDebug : a -> IO {console} {}
+```
+
+Leveled logging to stderr (so output does not mix with `println` on stdout). When stderr is a TTY, output is colored; otherwise each record is written as one JSON line for log aggregators. `logDebug` only emits when the program is launched with `--debug` — debug records are dropped silently otherwise.
+
+```knot
+main = do
+  logInfo "starting"
+  logWarn {event: "low memory", availableMb: 64}
+  yield {}
+```
+
 ### `show`
 
 ```
@@ -441,6 +533,38 @@ readLine : IO {console} Text
 ```
 
 Read a line of input from stdin.
+
+---
+
+## Control Flow
+
+### `when` / `unless`
+
+```
+when   : Bool -> IO r {} -> IO r {}
+unless : Bool -> IO r {} -> IO r {}
+```
+
+Run an IO action conditionally. `when cond a` runs `a` if `cond` is `True {}`; `unless cond a` runs `a` if `cond` is `False {}`. The skipped branch becomes `yield {}`. The action's effect row `r` propagates to the result.
+
+```knot
+when (n > 0) (println "positive")
+
+unless verbose do
+  println "(quiet mode)"
+```
+
+### `forEach`
+
+```
+forEach : [a] -> (a -> IO r {}) -> IO r {}
+```
+
+Sequence an IO action over each row of a relation. Iteration follows the relation's deterministic order (after any `sortBy`).
+
+```knot
+forEach ["a", "b", "c"] (\s -> println s)
+```
 
 ---
 
@@ -594,15 +718,15 @@ Encode text as UTF-8 bytes.
 ### `bytesToText`
 
 ```
-bytesToText : Bytes -> Text
+bytesToText : Bytes -> Maybe Text
 ```
 
-Decode UTF-8 bytes to text.
+UTF-8 decode bytes to text. Returns `Nothing {}` on invalid UTF-8.
 
 ### `bytesLength`
 
 ```
-bytesLength : Bytes -> Int
+bytesLength : Bytes -> Int<u>
 ```
 
 Return the byte length.
@@ -613,15 +737,15 @@ Return the byte length.
 bytesToHex : Bytes -> Text
 ```
 
-Encode bytes as a hexadecimal string.
+Encode bytes as a hexadecimal string. Always succeeds.
 
 ### `bytesFromHex`
 
 ```
-bytesFromHex : Text -> Bytes
+bytesFromHex : Text -> Maybe Bytes
 ```
 
-Decode a hexadecimal string to bytes.
+Decode a hexadecimal string to bytes. Returns `Nothing {}` on odd-length, non-hex, or non-ASCII input. `hexDecode` is an alias.
 
 ### `bytesConcat`
 
@@ -634,7 +758,7 @@ Concatenate two byte strings.
 ### `bytesGet`
 
 ```
-bytesGet : Int -> Bytes -> Int
+bytesGet : Int<u1> -> Bytes -> Int<u2>
 ```
 
 Get the byte value (0–255) at the given index.
@@ -642,10 +766,47 @@ Get the byte value (0–255) at the given index.
 ### `bytesSlice`
 
 ```
-bytesSlice : Int -> Int -> Bytes -> Bytes
+bytesSlice : Int<u1> -> Int<u2> -> Bytes -> Bytes
 ```
 
 Extract a sub-range. Arguments: start index, length, bytes.
+
+### `hash`
+
+```
+hash : a -> Bytes
+```
+
+SHA-256 hash of any value, returned as 32 bytes. `Bytes` and `Text` hash their raw contents; structured values (records, relations, constructors) hash a canonical serialisation, so equal logical values always produce equal digests.
+
+```knot
+bytesToHex (hash "hello")    -- "2cf24dba..."
+```
+
+---
+
+## HTTP
+
+The HTTP types and primitives are defined in the language spec (`DESIGN.md`). The standard library exposes:
+
+### `listen` / `listenOn`
+
+```
+listen   : Int<u> -> Server a r -> IO {network | r} {}
+listenOn : Text   -> Int<u> -> Server a r -> IO {network | r} {}
+```
+
+Start an HTTP server built with `serve API where ...`. `listen` binds to all interfaces; `listenOn` takes an explicit bind address. The `r` row variable unifies with the server's effect row, so handler effects (e.g. `console` from a handler that calls `println`) flow into the program's IO type.
+
+### `fetch` / `fetchWith`
+
+```
+fetch     : Text -> Endpoint -> IO {network} (Result HttpError T)
+fetchWith : Text -> {headers: [{name: Text, value: Text}]}
+                -> Endpoint -> IO {network} (Result HttpError T)
+```
+
+Type-safe HTTP client built from route declarations. `Endpoint` is a route constructor; the response type `T` is inferred from the route. `fetchWith` lets you add ad-hoc headers on top of the route's declared ones. When the route declares response headers, the success body wraps as `{body: T, headers: H}` inside `Ok`.
 
 ---
 
@@ -721,6 +882,19 @@ not : Bool -> Bool
 
 Boolean negation.
 
+### `stripUnit` / `withUnit` / `stripFloatUnit` / `withFloatUnit`
+
+```
+stripUnit      : Int<u> -> Int
+withUnit       : Int -> Int<u>
+stripFloatUnit : Float<u> -> Float
+withFloatUnit  : Float -> Float<u>
+```
+
+Drop or attach a unit tag. Identity at runtime — they only adjust the
+compile-time type. Use them when you need to rebrand a value with a different
+concrete unit (e.g. `Ms` → `S`).
+
 ---
 
 ## Built-in Traits
@@ -775,6 +949,28 @@ trait Display a where
 
 Convert a value to a human-readable text representation. Built-in implementations for `Int`, `Float`, `Text`, `Bool`.
 
+### `Sequence`
+
+```knot
+trait Sequence s where
+  take : Int -> s -> s
+  drop : Int -> s -> s
+```
+
+`take`/`drop` work on any sequenceable type. Built-in implementations for `Text` (characters) and `[]` (rows).
+
+### `ToJSON` / `FromJSON`
+
+```knot
+trait ToJSON a where
+  toJson : a -> Text
+
+trait FromJSON a where
+  parseJson : Text -> a
+```
+
+JSON encode/decode as trait methods. Built-in instances cover records, relations, primitives, ADTs, and `Maybe`/`Result`/`Bool`.
+
 ### `Functor`
 
 ```knot
@@ -782,7 +978,7 @@ trait Functor (f : Type -> Type) where
   map : (a -> b) -> f a -> f b
 ```
 
-Higher-kinded functor. Built-in implementation for `[]`.
+Higher-kinded functor. Built-in implementations for `[]`, `Maybe`, `Result`, `IO`.
 
 ### `Applicative`
 
@@ -792,7 +988,7 @@ trait Functor f => Applicative (f : Type -> Type) where
   ap : f (a -> b) -> f a -> f b
 ```
 
-Higher-kinded applicative functor. `yield` wraps a value; `ap` applies a wrapped function. Built-in implementation for `[]`.
+Higher-kinded applicative functor. `yield` wraps a value; `ap` applies a wrapped function. Built-in implementations for `[]`, `Maybe`, `Result`, `IO`.
 
 ### `Monad`
 
@@ -821,6 +1017,15 @@ trait Foldable (t : Type -> Type) where
 ```
 
 Higher-kinded foldable. Built-in implementation for `[]`.
+
+### `Traversable`
+
+```knot
+trait Foldable t => Traversable (t : Type -> Type) where
+  traverse : (a -> f b) -> t a -> f (t b)
+```
+
+Walk a structure left-to-right and sequence through any `Applicative` `f`. Built-in impl for `[]` over `Maybe` — useful for validating every row and collecting the result or the first `Nothing`.
 
 ---
 

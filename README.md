@@ -52,6 +52,10 @@ main = do
   yield {}
 ```
 
+See [examples/](examples/) for more — HTTP routes, refined types, STM
+transactions, concurrent `fork`/`race`, units of measure, custom monads,
+and more.
+
 ## Tests
 
 ```sh

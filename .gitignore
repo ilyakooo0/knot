@@ -33,3 +33,5 @@ examples/required_args
 examples/find_first
 examples/when_unless
 examples/for_each
+examples/stm_row_filter
+examples/uuid

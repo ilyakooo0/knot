@@ -1,0 +1,40 @@
+-- STM row-level filtering smoke test.
+--
+-- Demonstrates the row-level filtering optimization: workers retrying on
+-- `WHERE id = ?` are only woken when a write affects their specific row.
+-- Verification of selective wakeup behavior is covered in the runtime unit
+-- tests (`_stm_filter_tests` in knot-runtime). This program exists primarily
+-- as an end-to-end compile/run check on the codegen specialization path.
+
+type Account = {id: Int, balance: Int}
+*accounts : [Account]
+
+-- The `single (filter (\a -> a.id == ?) rows)` pattern is what the codegen
+-- recognizes as a `"id" = ?` simple equality; inside an atomic block the
+-- runtime tracks this as a `ColEq` read filter on `accounts.id`.
+findById = \aid rows -> single (filter (\a -> a.id == aid) rows)
+
+setBalance = \aid newBalance rows -> do
+  r <- rows
+  yield (if r.id == aid then {r | balance: newBalance} else r)
+
+credit = \aid amount -> atomic do
+  rows <- *accounts
+  -- The `single (filter ...)` lookup is what the runtime SQL pushdown turns
+  -- into a `WHERE "id" = ?` query — that's the read pattern the codegen
+  -- specializes via `knot_stm_track_read_col_eq`.
+  let lookup = findById aid rows
+  *accounts = setBalance aid amount rows
+
+main = do
+  replace *accounts = [
+    {id: 1, balance: 0},
+    {id: 2, balance: 0},
+    {id: 3, balance: 0}
+  ]
+  credit 1 100
+  credit 2 50
+  credit 3 25
+  rows <- *accounts
+  println ("final: " ++ show rows)
+  yield {}

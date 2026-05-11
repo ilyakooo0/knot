@@ -857,6 +857,7 @@ impl Codegen {
 
         // STM tracking
         self.declare_rt("knot_stm_track_read", &[p, p], &[]);
+        self.declare_rt("knot_stm_track_read_col_eq", &[p, p, p, p, p], &[]);
 
         // Transactions
         self.declare_rt("knot_atomic_begin", &[p], &[]);
@@ -5074,11 +5075,21 @@ impl Codegen {
                                         .collect::<Vec<_>>()
                                         .join(", ");
                                     let sql = format!("SELECT {} FROM {} WHERE {} LIMIT 2", cols, table, frag.sql);
+                                    let col_eq = extract_simple_col_eq(&frag.sql);
                                     let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
                                     let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
                                     let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
                                     let (tn_ptr, tn_len) = self.string_ptr(builder, &source_name);
                                     self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
+                                    if let Some(col) = col_eq {
+                                        if frag.params.len() == 1 {
+                                            let zero = builder.ins().iconst(self.ptr_type, 0);
+                                            let pv = self.call_rt(builder, "knot_relation_get", &[params_rel, zero]);
+                                            let (col_ptr, col_len) = self.string_ptr(builder, &col);
+                                            self.call_rt_void(builder, "knot_stm_track_read_col_eq",
+                                                &[tn_ptr, tn_len, col_ptr, col_len, pv]);
+                                        }
+                                    }
                                     let rel = self.call_rt(
                                         builder,
                                         "knot_source_query",
@@ -10385,6 +10396,26 @@ fn quote_sql_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// Recognize a fragment of shape `"col" = ?` (single column equality, single
+/// `?` placeholder, no AND/OR/operators) and return the column name. Used to
+/// drive STM row-level read tracking — a reader using this pattern only needs
+/// to retry when a write affects a row with that column = value.
+fn extract_simple_col_eq(sql: &str) -> Option<String> {
+    let t = sql.trim();
+    let rest = t.strip_prefix('"')?;
+    let close = rest.find('"')?;
+    let col = &rest[..close];
+    let after = rest[close + 1..].trim_start();
+    let after_eq = after.strip_prefix('=')?.trim_start();
+    if after_eq.trim_end() != "?" {
+        return None;
+    }
+    if col.is_empty() {
+        return None;
+    }
+    Some(col.to_string())
+}
+
 struct SqlFragment {
     sql: String,
     params: Vec<SqlParamSource>,
@@ -12494,6 +12525,22 @@ fn resolved_type_to_descriptor(ty: &ResolvedType) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_simple_col_eq_matches_basic_eq() {
+        assert_eq!(extract_simple_col_eq(r#""id" = ?"#), Some("id".to_string()));
+        assert_eq!(extract_simple_col_eq(r#""email" = ?"#), Some("email".to_string()));
+        assert_eq!(extract_simple_col_eq(r#"  "name"   =  ?  "#), Some("name".to_string()));
+    }
+
+    #[test]
+    fn extract_simple_col_eq_rejects_compound_and_other_ops() {
+        assert_eq!(extract_simple_col_eq(r#""id" = ? AND "name" = ?"#), None);
+        assert_eq!(extract_simple_col_eq(r#""id" > ?"#), None);
+        assert_eq!(extract_simple_col_eq(r#""id" != ?"#), None);
+        assert_eq!(extract_simple_col_eq(r#"id = ?"#), None); // unquoted col
+        assert_eq!(extract_simple_col_eq(r#""id" = 5"#), None); // literal RHS
+    }
 
     fn parse_expr(source: &str) -> ast::Expr {
         // Wrap the source as a top-level binding so it parses as a module

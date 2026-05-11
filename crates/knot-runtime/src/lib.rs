@@ -1370,6 +1370,26 @@ impl SqlVal {
     }
 }
 
+/// Comparison operator used inside a `ColPred::Cmp`. Mirrors SQL semantics.
+#[derive(Clone, Copy, Debug)]
+enum CmpOp {
+    Eq,
+    Neq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// A predicate on a single column. Combined with AND semantics inside a
+/// `ReadFilter::Cols` (a row matches the filter iff every predicate holds).
+#[derive(Clone, Debug)]
+enum ColPred {
+    Cmp(CmpOp, SqlVal),
+    /// `col IN (v1, v2, ...)` — row matches if its value equals any target.
+    In(Vec<SqlVal>),
+}
+
 /// A row-level filter that describes WHICH parts of a table a reader cares about.
 /// Stored per-table in the thread-local read set, and copied into the wake slot
 /// at park time so writes can filter wakeups.
@@ -1377,9 +1397,73 @@ impl SqlVal {
 enum ReadFilter {
     /// Reader observed the entire table (no precise filter). Wakes on any write.
     All,
-    /// Reader observed only rows where `col == value`. Only wakes when an
-    /// affected row's `col` matches `value`, or when the write is `Bulk`.
-    ColEq { col: String, value: SqlVal },
+    /// Reader observed only rows matching a conjunction of column predicates.
+    /// AND semantics within the filter; multiple filters per table OR together
+    /// at the slot level (different read sites are independent).
+    Cols(Vec<(String, ColPred)>),
+}
+
+/// SQLite-compatible partial ordering on `SqlVal`. Returns `None` for incompatible
+/// types so callers can fall back to "wake conservatively". Mirrors the type-coercion
+/// rules already in `PartialEq for SqlVal` (notably Int↔Text for BigInt-as-TEXT).
+fn sql_partial_cmp(a: &SqlVal, b: &SqlVal) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (SqlVal::Int(x), SqlVal::Int(y)) => Some(x.cmp(y)),
+        (SqlVal::Real(x), SqlVal::Real(y)) => x.partial_cmp(y),
+        (SqlVal::Int(x), SqlVal::Real(y)) => (*x as f64).partial_cmp(y),
+        (SqlVal::Real(x), SqlVal::Int(y)) => x.partial_cmp(&(*y as f64)),
+        (SqlVal::Text(x), SqlVal::Text(y)) => Some(x.cmp(y)),
+        // BigInts are stored as TEXT in SQLite — handle Int ↔ Text via numeric parse.
+        (SqlVal::Int(x), SqlVal::Text(y)) => y.parse::<i64>().ok().map(|n| x.cmp(&n)),
+        (SqlVal::Text(x), SqlVal::Int(y)) => x.parse::<i64>().ok().map(|n| n.cmp(y)),
+        // Real ↔ Text via numeric parse on the text side.
+        (SqlVal::Real(x), SqlVal::Text(y)) => y.parse::<f64>().ok().and_then(|n| x.partial_cmp(&n)),
+        (SqlVal::Text(x), SqlVal::Real(y)) => x.parse::<f64>().ok().and_then(|n| n.partial_cmp(y)),
+        // Nulls and incompatible types — unknown.
+        _ => {
+            let _ = Ordering::Equal;
+            None
+        }
+    }
+}
+
+/// True if `row_val` satisfies `pred`. Unknown comparisons (incompatible types)
+/// return `true` to wake conservatively.
+fn col_pred_matches(row_val: &SqlVal, pred: &ColPred) -> bool {
+    use std::cmp::Ordering;
+    match pred {
+        ColPred::Cmp(CmpOp::Eq, target) => row_val == target,
+        ColPred::Cmp(CmpOp::Neq, target) => row_val != target,
+        ColPred::Cmp(op, target) => match sql_partial_cmp(row_val, target) {
+            Some(ord) => match op {
+                CmpOp::Lt => ord == Ordering::Less,
+                CmpOp::Le => ord != Ordering::Greater,
+                CmpOp::Gt => ord == Ordering::Greater,
+                CmpOp::Ge => ord != Ordering::Less,
+                _ => unreachable!("Eq/Neq handled above"),
+            },
+            None => true,
+        },
+        ColPred::In(targets) => targets.iter().any(|t| row_val == t),
+    }
+}
+
+/// True if `row` satisfies every `(col, pred)` in `preds`. A missing column wakes
+/// conservatively — the event payload doesn't contain enough information to filter.
+fn row_matches_preds(row: &HashMap<String, SqlVal>, preds: &[(String, ColPred)]) -> bool {
+    for (col, pred) in preds {
+        match row.get(col.as_str()) {
+            Some(rv) => {
+                if !col_pred_matches(rv, pred) {
+                    return false;
+                }
+            }
+            // Column not in payload — we can't tell, so don't filter out.
+            None => return true,
+        }
+    }
+    true
 }
 
 /// Describes a write to a relation, so notification can selectively wake watchers.
@@ -1402,6 +1486,7 @@ impl WriteEvent {
     }
 
     /// True if the event would wake a watcher with the given filter set for this table.
+    /// AND semantics within a filter, OR across filters.
     fn matches_filters(&self, filters: &[ReadFilter]) -> bool {
         match self {
             WriteEvent::Bulk => true,
@@ -1409,12 +1494,10 @@ impl WriteEvent {
                 for f in filters {
                     match f {
                         ReadFilter::All => return true,
-                        ReadFilter::ColEq { col, value } => {
+                        ReadFilter::Cols(preds) => {
                             for row in rows {
-                                if let Some(rv) = row.get(col.as_str()) {
-                                    if rv == value {
-                                        return true;
-                                    }
+                                if row_matches_preds(row, preds) {
+                                    return true;
                                 }
                             }
                         }
@@ -1637,22 +1720,31 @@ pub extern "C" fn knot_stm_track_read(name_ptr: *const u8, name_len: usize) {
     stm_track_read(name);
 }
 
-/// Specialize the most-recent `All` filter for `name` to a `ColEq { col, value }`.
-/// Called by codegen for `single (filter (\r -> r.col == expr))` and similar
-/// patterns where the filter is a column-equality lookup. The codegen emits
-/// the broad `knot_stm_track_read` first (so the table is on the read set),
-/// then this function downgrades it to a precise filter.
+/// Specialize the most-recent `All` filter for `name` into a richer
+/// `Cols(Vec<(col, pred)>)` filter, built from a compact spec string and the
+/// query's params relation.
+///
+/// Spec format: predicates joined by `;`, each `col:op:idx[,idx,...]`.
+/// `op` ∈ `=`, `!=`, `<`, `<=`, `>`, `>=`, `in`. Indices reference rows in
+/// `params_rel` (the same one passed to `knot_source_query`).
+///
+/// Codegen emits the broad `knot_stm_track_read` first (so the table is on the
+/// read set) and then this call to downgrade. Any parse error or out-of-range
+/// index leaves the `All` filter in place — wake-on-any-write is the safe
+/// fallback.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_stm_track_read_col_eq(
+pub extern "C" fn knot_stm_track_read_pred(
     name_ptr: *const u8,
     name_len: usize,
-    col_ptr: *const u8,
-    col_len: usize,
-    value: *mut Value,
+    spec_ptr: *const u8,
+    spec_len: usize,
+    params_rel: *mut Value,
 ) {
     let name = unsafe { str_from_raw(name_ptr, name_len) };
-    let col = unsafe { str_from_raw(col_ptr, col_len) };
-    stm_specialize_read_col_eq(name, col, SqlVal::from_knot(value));
+    let spec = unsafe { str_from_raw(spec_ptr, spec_len) };
+    if let Some(preds) = parse_read_pred_spec(spec, params_rel) {
+        stm_specialize_read_pred(name, preds);
+    }
 }
 
 fn stm_track_read(name: &str) {
@@ -1667,25 +1759,71 @@ fn stm_track_read(name: &str) {
     });
 }
 
-/// Specialize the most-recently-emitted `All` filter for `name` into a
-/// precise `ColEq { col, value }` filter. Called by SQL query runtime
-/// functions after parsing the WHERE clause. If no `All` is present to
-/// downgrade (e.g. the codegen path didn't emit one), simply appends
-/// the `ColEq` filter.
-fn stm_specialize_read_col_eq(name: &str, col: &str, value: SqlVal) {
+/// Parse a predicate spec string against a runtime params relation, producing
+/// the AND-list that backs a `ReadFilter::Cols`. Returns `None` on any
+/// structural error (bad op, missing index, malformed integer) so the caller
+/// can fall back to the broad `All` filter.
+fn parse_read_pred_spec(spec: &str, params_rel: *mut Value) -> Option<Vec<(String, ColPred)>> {
+    let params: &[*mut Value] = match unsafe { as_ref(params_rel) } {
+        Value::Relation(rows) => rows.as_slice(),
+        _ => return None,
+    };
+    let mut out: Vec<(String, ColPred)> = Vec::new();
+    for pred_str in spec.split(';') {
+        if pred_str.is_empty() {
+            continue;
+        }
+        let mut parts = pred_str.splitn(3, ':');
+        let col = parts.next()?;
+        let op = parts.next()?;
+        let idxs_part = parts.next()?;
+        if col.is_empty() {
+            return None;
+        }
+        match op {
+            "in" => {
+                let mut vs: Vec<SqlVal> = Vec::new();
+                for s in idxs_part.split(',') {
+                    let idx: usize = s.parse().ok()?;
+                    let p = *params.get(idx)?;
+                    vs.push(SqlVal::from_knot(p));
+                }
+                if vs.is_empty() {
+                    return None;
+                }
+                out.push((col.to_string(), ColPred::In(vs)));
+            }
+            _ => {
+                let cmp = match op {
+                    "=" => CmpOp::Eq,
+                    "!=" => CmpOp::Neq,
+                    "<" => CmpOp::Lt,
+                    "<=" => CmpOp::Le,
+                    ">" => CmpOp::Gt,
+                    ">=" => CmpOp::Ge,
+                    _ => return None,
+                };
+                let idx: usize = idxs_part.parse().ok()?;
+                let p = *params.get(idx)?;
+                out.push((col.to_string(), ColPred::Cmp(cmp, SqlVal::from_knot(p))));
+            }
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Replace the most-recent `All` filter for `name` with the given `Cols` filter.
+/// If no `All` is present to downgrade, append. Captures the table version
+/// idempotently so the read shows up in the read set.
+fn stm_specialize_read_pred(name: &str, preds: Vec<(String, ColPred)>) {
     capture_table_version(name);
     STM_READ_FILTERS.with(|rf| {
         let mut rf = rf.borrow_mut();
         let v = rf.entry(name.to_string()).or_default();
-        // Pop the most recent `All` for this table (added by the codegen
-        // `knot_stm_track_read` that immediately precedes this query call).
         if let Some(pos) = v.iter().rposition(|f| matches!(f, ReadFilter::All)) {
             v.remove(pos);
         }
-        v.push(ReadFilter::ColEq {
-            col: col.to_string(),
-            value,
-        });
+        v.push(ReadFilter::Cols(preds));
     });
 }
 
@@ -14016,13 +14154,19 @@ mod _stm_filter_tests {
         pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
     }
 
+    fn col_eq(col: &str, v: SqlVal) -> ReadFilter {
+        ReadFilter::Cols(vec![(col.into(), ColPred::Cmp(CmpOp::Eq, v))])
+    }
+
+    fn col_cmp(col: &str, op: CmpOp, v: SqlVal) -> ReadFilter {
+        ReadFilter::Cols(vec![(col.into(), ColPred::Cmp(op, v))])
+    }
+
     #[test]
     fn bulk_event_wakes_any_filter() {
         let event = WriteEvent::Bulk;
         assert!(event.matches_filters(&[ReadFilter::All]));
-        assert!(event.matches_filters(&[ReadFilter::ColEq {
-            col: "id".into(), value: SqlVal::Int(5),
-        }]));
+        assert!(event.matches_filters(&[col_eq("id", SqlVal::Int(5))]));
         assert!(event.matches_filters(&[]));
     }
 
@@ -14032,27 +14176,102 @@ mod _stm_filter_tests {
             row(&[("id", SqlVal::Int(5)), ("name", SqlVal::Text("a".into()))]),
             row(&[("id", SqlVal::Int(7)), ("name", SqlVal::Text("b".into()))]),
         ]);
-        let f_match = vec![ReadFilter::ColEq { col: "id".into(), value: SqlVal::Int(5) }];
-        let f_miss = vec![ReadFilter::ColEq { col: "id".into(), value: SqlVal::Int(99) }];
-        let f_all = vec![ReadFilter::All];
-        assert!(event.matches_filters(&f_match));
-        assert!(!event.matches_filters(&f_miss));
-        assert!(event.matches_filters(&f_all));
+        assert!(event.matches_filters(&[col_eq("id", SqlVal::Int(5))]));
+        assert!(!event.matches_filters(&[col_eq("id", SqlVal::Int(99))]));
+        assert!(event.matches_filters(&[ReadFilter::All]));
     }
 
     #[test]
     fn col_eq_filter_cross_type_int_text_compare() {
-        // BigInts are stored as TEXT in SQLite; reader's ColEq may compare
+        // BigInts are stored as TEXT in SQLite; reader's filter may compare
         // against SqlVal::Text("5") while the row carries SqlVal::Int(5) or vice versa.
         let event = WriteEvent::Rows(vec![row(&[("id", SqlVal::Text("5".into()))])]);
-        let f = vec![ReadFilter::ColEq { col: "id".into(), value: SqlVal::Int(5) }];
-        assert!(event.matches_filters(&f));
+        assert!(event.matches_filters(&[col_eq("id", SqlVal::Int(5))]));
     }
 
     #[test]
     fn empty_filters_do_not_wake_on_rows() {
         let event = WriteEvent::Rows(vec![row(&[("id", SqlVal::Int(1))])]);
         assert!(!event.matches_filters(&[]));
+    }
+
+    #[test]
+    fn cmp_filter_wakes_only_on_matching_range() {
+        let event = WriteEvent::Rows(vec![
+            row(&[("qty", SqlVal::Int(50))]),
+            row(&[("qty", SqlVal::Int(150))]),
+        ]);
+        // qty > 100 matches the 150 row → wake.
+        assert!(event.matches_filters(&[col_cmp("qty", CmpOp::Gt, SqlVal::Int(100))]));
+        // qty > 200 matches nothing.
+        assert!(!event.matches_filters(&[col_cmp("qty", CmpOp::Gt, SqlVal::Int(200))]));
+        // qty <= 60 matches the 50 row.
+        assert!(event.matches_filters(&[col_cmp("qty", CmpOp::Le, SqlVal::Int(60))]));
+    }
+
+    #[test]
+    fn cmp_filter_real_int_cross_type() {
+        // Reader compares against a float; row carries int.
+        let event = WriteEvent::Rows(vec![row(&[("price", SqlVal::Int(10))])]);
+        assert!(event.matches_filters(&[col_cmp("price", CmpOp::Ge, SqlVal::Real(9.5))]));
+        assert!(!event.matches_filters(&[col_cmp("price", CmpOp::Ge, SqlVal::Real(10.5))]));
+    }
+
+    #[test]
+    fn cols_and_semantics_requires_all_preds_match() {
+        let event = WriteEvent::Rows(vec![row(&[
+            ("status", SqlVal::Text("open".into())),
+            ("qty", SqlVal::Int(150)),
+        ])]);
+        // status=open AND qty > 100 — both match.
+        let both_match = ReadFilter::Cols(vec![
+            ("status".into(), ColPred::Cmp(CmpOp::Eq, SqlVal::Text("open".into()))),
+            ("qty".into(), ColPred::Cmp(CmpOp::Gt, SqlVal::Int(100))),
+        ]);
+        assert!(event.matches_filters(&[both_match]));
+        // status=closed AND qty > 100 — first fails, row doesn't match.
+        let first_fails = ReadFilter::Cols(vec![
+            ("status".into(), ColPred::Cmp(CmpOp::Eq, SqlVal::Text("closed".into()))),
+            ("qty".into(), ColPred::Cmp(CmpOp::Gt, SqlVal::Int(100))),
+        ]);
+        assert!(!event.matches_filters(&[first_fails]));
+    }
+
+    #[test]
+    fn in_filter_wakes_on_any_listed_value() {
+        let event = WriteEvent::Rows(vec![row(&[("id", SqlVal::Int(7))])]);
+        let in_match = ReadFilter::Cols(vec![(
+            "id".into(),
+            ColPred::In(vec![SqlVal::Int(1), SqlVal::Int(7), SqlVal::Int(9)]),
+        )]);
+        let in_miss = ReadFilter::Cols(vec![(
+            "id".into(),
+            ColPred::In(vec![SqlVal::Int(1), SqlVal::Int(2)]),
+        )]);
+        assert!(event.matches_filters(&[in_match]));
+        assert!(!event.matches_filters(&[in_miss]));
+    }
+
+    #[test]
+    fn missing_column_wakes_conservatively() {
+        // Row payload lacks the column referenced by the filter — wake anyway.
+        let event = WriteEvent::Rows(vec![row(&[("qty", SqlVal::Int(1))])]);
+        assert!(event.matches_filters(&[col_eq("status", SqlVal::Text("open".into()))]));
+    }
+
+    #[test]
+    fn multiple_filters_or_together_across_sites() {
+        // Two read sites: one watching status=open, one watching qty > 1000.
+        // A write to a single row should wake if EITHER filter matches it.
+        let event = WriteEvent::Rows(vec![row(&[
+            ("status", SqlVal::Text("closed".into())),
+            ("qty", SqlVal::Int(2000)),
+        ])]);
+        let filters = vec![
+            col_eq("status", SqlVal::Text("open".into())),
+            col_cmp("qty", CmpOp::Gt, SqlVal::Int(1000)),
+        ];
+        assert!(event.matches_filters(&filters));
     }
 
     #[test]

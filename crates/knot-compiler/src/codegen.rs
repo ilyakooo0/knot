@@ -857,7 +857,7 @@ impl Codegen {
 
         // STM tracking
         self.declare_rt("knot_stm_track_read", &[p, p], &[]);
-        self.declare_rt("knot_stm_track_read_col_eq", &[p, p, p, p, p], &[]);
+        self.declare_rt("knot_stm_track_read_pred", &[p, p, p, p, p], &[]);
 
         // Transactions
         self.declare_rt("knot_atomic_begin", &[p], &[]);
@@ -5075,21 +5075,13 @@ impl Codegen {
                                         .collect::<Vec<_>>()
                                         .join(", ");
                                     let sql = format!("SELECT {} FROM {} WHERE {} LIMIT 2", cols, table, frag.sql);
-                                    let col_eq = extract_simple_col_eq(&frag.sql);
+                                    let preds = try_extract_field_preds(&filter_bind, filter_body);
                                     let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
                                     let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
                                     let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
                                     let (tn_ptr, tn_len) = self.string_ptr(builder, &source_name);
                                     self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
-                                    if let Some(col) = col_eq {
-                                        if frag.params.len() == 1 {
-                                            let zero = builder.ins().iconst(self.ptr_type, 0);
-                                            let pv = self.call_rt(builder, "knot_relation_get", &[params_rel, zero]);
-                                            let (col_ptr, col_len) = self.string_ptr(builder, &col);
-                                            self.call_rt_void(builder, "knot_stm_track_read_col_eq",
-                                                &[tn_ptr, tn_len, col_ptr, col_len, pv]);
-                                        }
-                                    }
+                                    self.emit_stm_track_pred(builder, tn_ptr, tn_len, &preds, env, db);
                                     let rel = self.call_rt(
                                         builder,
                                         "knot_source_query",
@@ -5108,10 +5100,14 @@ impl Codegen {
                         let mut sql = plan.build_sql();
                         sql.push_str(" LIMIT 2");
                         let result_schema = plan.build_result_schema();
+                        let preds = try_extract_preds_for_single_table_plan(stmts, &plan);
                         let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
                         for table in &plan.tables {
                             let (tn_ptr, tn_len) = self.string_ptr(builder, &table.source_name);
                             self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
+                            if plan.tables.len() == 1 {
+                                self.emit_stm_track_pred(builder, tn_ptr, tn_len, &preds, env, db);
+                            }
                         }
                         let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
                         let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
@@ -5173,11 +5169,13 @@ impl Codegen {
                                         .collect::<Vec<_>>()
                                         .join(", ");
                                     let sql = format!("SELECT {} FROM {} WHERE {}", cols, table, frag.sql);
+                                    let preds = try_extract_field_preds(&filter_bind, filter_body);
                                     let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
                                     let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
                                     let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
                                     let (tn_ptr, tn_len) = self.string_ptr(builder, &source_name);
                                     self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
+                                    self.emit_stm_track_pred(builder, tn_ptr, tn_len, &preds, env, db);
                                     return self.call_rt(
                                         builder,
                                         "knot_source_query_fold",
@@ -5196,10 +5194,14 @@ impl Codegen {
                         let init = self.compile_expr(builder, &args[1], env, db);
                         let sql = plan.build_sql();
                         let result_schema = plan.build_result_schema();
+                        let preds = try_extract_preds_for_single_table_plan(stmts, &plan);
                         let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
                         for table in &plan.tables {
                             let (tn_ptr, tn_len) = self.string_ptr(builder, &table.source_name);
                             self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
+                            if plan.tables.len() == 1 {
+                                self.emit_stm_track_pred(builder, tn_ptr, tn_len, &preds, env, db);
+                            }
                         }
                         let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
                         let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
@@ -5528,10 +5530,12 @@ impl Codegen {
                                                     plan.limit = Some(n_param);
                                                     let sql = plan.build_sql();
                                                     let result_schema = plan.build_result_schema();
+                                                    let preds = try_extract_preds_for_single_table_plan(do_stmts, &plan);
                                                     // Track reads for STM (so retry wakes on changes)
                                                     for table in &plan.tables {
                                                         let (tn_ptr, tn_len) = self.string_ptr(builder, &table.source_name);
                                                         self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
+                                                        self.emit_stm_track_pred(builder, tn_ptr, tn_len, &preds, env, db);
                                                     }
                                                     // Compile SQL params + the limit value
                                                     let n_val = self.compile_expr(builder, &args[0], env, db);
@@ -9753,6 +9757,35 @@ impl Codegen {
         rel
     }
 
+    /// Emit a runtime `knot_stm_track_read_pred` call refining the most-recent
+    /// `All` filter for this table into a richer `Cols` filter built from
+    /// `preds`. No-op when `preds` is `None` (the broad `knot_stm_track_read`
+    /// the caller already emitted stays the only entry).
+    fn emit_stm_track_pred(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        tn_ptr: Value,
+        tn_len: Value,
+        preds: &Option<Vec<StmFieldPred>>,
+        env: &mut Env,
+        db: Value,
+    ) {
+        let Some(preds) = preds else { return };
+        if preds.is_empty() {
+            return;
+        }
+        let spec = serialize_stm_preds(preds);
+        let value_sources: Vec<SqlParamSource> =
+            preds.iter().flat_map(|p| p.values.clone()).collect();
+        let pred_params_rel = self.compile_sql_params(builder, &value_sources, env, db);
+        let (spec_ptr, spec_len) = self.string_ptr(builder, &spec);
+        self.call_rt_void(
+            builder,
+            "knot_stm_track_read_pred",
+            &[tn_ptr, tn_len, spec_ptr, spec_len, pred_params_rel],
+        );
+    }
+
     /// Check if an expression is statically known to produce a relation,
     /// beyond the simple pattern match in compile_do.
     fn expr_is_known_relation(&self, expr: &ast::Expr) -> bool {
@@ -10396,24 +10429,233 @@ fn quote_sql_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// Recognize a fragment of shape `"col" = ?` (single column equality, single
-/// `?` placeholder, no AND/OR/operators) and return the column name. Used to
-/// drive STM row-level read tracking — a reader using this pattern only needs
-/// to retry when a write affects a row with that column = value.
-fn extract_simple_col_eq(sql: &str) -> Option<String> {
-    let t = sql.trim();
-    let rest = t.strip_prefix('"')?;
-    let close = rest.find('"')?;
-    let col = &rest[..close];
-    let after = rest[close + 1..].trim_start();
-    let after_eq = after.strip_prefix('=')?.trim_start();
-    if after_eq.trim_end() != "?" {
+/// A field-level predicate extracted from a filter body for STM row tracking.
+/// Used by `try_extract_field_preds` to produce inputs for the runtime
+/// `knot_stm_track_read_pred` ABI.
+#[derive(Clone)]
+struct StmFieldPred {
+    col: String,
+    op: StmCmpOp,
+    /// Re-compilable value sources. Restricted to Literal/Var/FieldAccess in
+    /// the extractor so re-evaluation alongside the SQL query is cheap.
+    values: Vec<SqlParamSource>,
+}
+
+#[derive(Clone, Copy)]
+enum StmCmpOp {
+    Eq,
+    Neq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    In,
+}
+
+impl StmCmpOp {
+    fn as_spec(&self) -> &'static str {
+        match self {
+            StmCmpOp::Eq => "=",
+            StmCmpOp::Neq => "!=",
+            StmCmpOp::Lt => "<",
+            StmCmpOp::Le => "<=",
+            StmCmpOp::Gt => ">",
+            StmCmpOp::Ge => ">=",
+            StmCmpOp::In => "in",
+        }
+    }
+}
+
+/// Walk a filter body and produce per-column predicates suitable for the
+/// runtime `Cols` filter. The body must be a conjunction of supported forms:
+/// `bind_var.col {==|!=|<|<=|>|>=} simple_value`, `simple_value op bind_var.col`,
+/// or `elem bind_var.col [simple_value, ...]`. `simple_value` is Literal / Var /
+/// FieldAccess-on-another-var (cheap to re-evaluate as a tracking param).
+/// Returns `None` if the body contains any OR/NOT/arithmetic/function call —
+/// the caller falls back to the broad `All` filter in that case.
+fn try_extract_field_preds(
+    bind_var: &str,
+    expr: &ast::Expr,
+) -> Option<Vec<StmFieldPred>> {
+    let mut out: Vec<StmFieldPred> = Vec::new();
+    extract_preds_walk(bind_var, expr, &mut out)?;
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Same as `try_extract_field_preds` but for the single-table do-block path:
+/// walks all `Where` conditions for a do-block whose single `Bind` names
+/// `bind_var`. Other statement kinds (extra binds, lets, groupBy, …) cause
+/// `None`.
+fn try_extract_field_preds_from_where_stmts(
+    bind_var: &str,
+    stmts: &[ast::Stmt],
+) -> Option<Vec<StmFieldPred>> {
+    let mut out: Vec<StmFieldPred> = Vec::new();
+    let last = stmts.len().checked_sub(1)?;
+    for stmt in &stmts[..last] {
+        match &stmt.node {
+            ast::StmtKind::Bind { .. } => {
+                // Single-table only: the caller already verified one bind.
+                // Re-encountering one means the plan has joins.
+                // Allow only the first bind (the caller's bind_var); reject any further bind.
+                // We rely on the caller to invoke us only for single-bind plans.
+            }
+            ast::StmtKind::Where { cond } => {
+                extract_preds_walk(bind_var, cond, &mut out)?;
+            }
+            ast::StmtKind::Let { .. } => {
+                // Let-bound names appear in Where conditions as Var nodes.
+                // `is_simple_value` accepts Var, and the runtime track-pred
+                // call re-evaluates Vars via env lookup — same as the SQL
+                // params relation. No special handling needed here.
+            }
+            _ => return None,
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn extract_preds_walk(
+    bv: &str,
+    e: &ast::Expr,
+    out: &mut Vec<StmFieldPred>,
+) -> Option<()> {
+    match &e.node {
+        ast::ExprKind::BinOp { op: ast::BinOp::And, lhs, rhs } => {
+            extract_preds_walk(bv, lhs, out)?;
+            extract_preds_walk(bv, rhs, out)?;
+            Some(())
+        }
+        ast::ExprKind::BinOp { op, lhs, rhs } => {
+            let stm_op = match op {
+                ast::BinOp::Eq => StmCmpOp::Eq,
+                ast::BinOp::Neq => StmCmpOp::Neq,
+                ast::BinOp::Lt => StmCmpOp::Lt,
+                ast::BinOp::Le => StmCmpOp::Le,
+                ast::BinOp::Gt => StmCmpOp::Gt,
+                ast::BinOp::Ge => StmCmpOp::Ge,
+                _ => return None,
+            };
+            if let Some(col) = field_access_of(bv, lhs) {
+                let v = simple_value_param(bv, rhs)?;
+                out.push(StmFieldPred { col, op: stm_op, values: vec![v] });
+                return Some(());
+            }
+            if let Some(col) = field_access_of(bv, rhs) {
+                let v = simple_value_param(bv, lhs)?;
+                out.push(StmFieldPred { col, op: reverse_stm_op(stm_op), values: vec![v] });
+                return Some(());
+            }
+            None
+        }
+        // `elem needle haystack` ↦ IN
+        ast::ExprKind::App { func: outer, arg: haystack } => {
+            if let ast::ExprKind::App { func: inner, arg: needle } = &outer.node {
+                if let ast::ExprKind::Var(name) = &inner.node {
+                    if name == "elem" {
+                        let col = field_access_of(bv, needle)?;
+                        if let ast::ExprKind::List(elems) = &haystack.node {
+                            if elems.is_empty() {
+                                return None;
+                            }
+                            let mut values = Vec::with_capacity(elems.len());
+                            for el in elems {
+                                values.push(simple_value_param(bv, el)?);
+                            }
+                            out.push(StmFieldPred { col, op: StmCmpOp::In, values });
+                            return Some(());
+                        }
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn field_access_of(bv: &str, e: &ast::Expr) -> Option<String> {
+    if let ast::ExprKind::FieldAccess { expr, field } = &e.node {
+        if let ast::ExprKind::Var(name) = &expr.node {
+            if name == bv {
+                return Some(field.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Accept the cheap-to-re-evaluate value forms: literal, env var, or a field
+/// access on a non-bind variable. Rejects expressions involving arithmetic,
+/// function calls, or the bind variable itself (would mean the comparison
+/// references the same row on both sides — not a constant filter).
+fn simple_value_param(bv: &str, e: &ast::Expr) -> Option<SqlParamSource> {
+    match &e.node {
+        ast::ExprKind::Lit(lit) => Some(SqlParamSource::Literal(lit.clone())),
+        ast::ExprKind::Var(name) if name != bv => Some(SqlParamSource::Var(name.clone())),
+        ast::ExprKind::FieldAccess { expr, field } => {
+            if let ast::ExprKind::Var(name) = &expr.node {
+                if name != bv {
+                    return Some(SqlParamSource::FieldAccess(name.clone(), field.clone()));
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn reverse_stm_op(op: StmCmpOp) -> StmCmpOp {
+    match op {
+        StmCmpOp::Eq | StmCmpOp::Neq | StmCmpOp::In => op,
+        StmCmpOp::Lt => StmCmpOp::Gt,
+        StmCmpOp::Le => StmCmpOp::Ge,
+        StmCmpOp::Gt => StmCmpOp::Lt,
+        StmCmpOp::Ge => StmCmpOp::Le,
+    }
+}
+
+/// Serialize a list of `StmFieldPred` into the spec string consumed by
+/// `knot_stm_track_read_pred`. Indices are assigned as a flat 0..N enumeration
+/// over each pred's `values` in order, matching the params relation built from
+/// the same flat sequence.
+/// Try to extract STM tracking predicates for a single-table do-block plan.
+/// Returns `None` for multi-table plans (joins) or when any condition uses a
+/// form the extractor can't analyze. Pairs with `analyze_sql_plan` at the
+/// call sites that already emit bare `knot_stm_track_read` per table.
+fn try_extract_preds_for_single_table_plan(
+    stmts: &[ast::Stmt],
+    plan: &SqlQueryPlan,
+) -> Option<Vec<StmFieldPred>> {
+    if plan.tables.len() != 1 {
         return None;
     }
-    if col.is_empty() {
-        return None;
+    let last = stmts.len().checked_sub(1)?;
+    let mut bind_var: Option<String> = None;
+    for stmt in &stmts[..last] {
+        if let ast::StmtKind::Bind { pat, .. } = &stmt.node {
+            if let ast::PatKind::Var(name) = &pat.node {
+                if bind_var.is_some() {
+                    return None;
+                }
+                bind_var = Some(name.clone());
+            }
+        }
     }
-    Some(col.to_string())
+    let bv = bind_var?;
+    try_extract_field_preds_from_where_stmts(&bv, stmts)
+}
+
+fn serialize_stm_preds(preds: &[StmFieldPred]) -> String {
+    let mut next_idx: usize = 0;
+    let mut parts: Vec<String> = Vec::with_capacity(preds.len());
+    for p in preds {
+        let n = p.values.len();
+        let idxs: Vec<String> = (next_idx..next_idx + n).map(|i| i.to_string()).collect();
+        next_idx += n;
+        parts.push(format!("{}:{}:{}", p.col, p.op.as_spec(), idxs.join(",")));
+    }
+    parts.join(";")
 }
 
 struct SqlFragment {
@@ -12526,20 +12768,89 @@ fn resolved_type_to_descriptor(ty: &ResolvedType) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn extract_simple_col_eq_matches_basic_eq() {
-        assert_eq!(extract_simple_col_eq(r#""id" = ?"#), Some("id".to_string()));
-        assert_eq!(extract_simple_col_eq(r#""email" = ?"#), Some("email".to_string()));
-        assert_eq!(extract_simple_col_eq(r#"  "name"   =  ?  "#), Some("name".to_string()));
+    fn preds_for(source: &str, bv: &str) -> Option<Vec<StmFieldPred>> {
+        // Parse a Knot expression and run the STM predicate extractor on it.
+        let expr = parse_expr(source);
+        try_extract_field_preds(bv, &expr)
     }
 
     #[test]
-    fn extract_simple_col_eq_rejects_compound_and_other_ops() {
-        assert_eq!(extract_simple_col_eq(r#""id" = ? AND "name" = ?"#), None);
-        assert_eq!(extract_simple_col_eq(r#""id" > ?"#), None);
-        assert_eq!(extract_simple_col_eq(r#""id" != ?"#), None);
-        assert_eq!(extract_simple_col_eq(r#"id = ?"#), None); // unquoted col
-        assert_eq!(extract_simple_col_eq(r#""id" = 5"#), None); // literal RHS
+    fn stm_preds_extract_single_eq() {
+        let preds = preds_for("r.id == 5", "r").unwrap();
+        assert_eq!(preds.len(), 1);
+        assert_eq!(preds[0].col, "id");
+        assert!(matches!(preds[0].op, StmCmpOp::Eq));
+        assert_eq!(serialize_stm_preds(&preds), "id:=:0");
+    }
+
+    #[test]
+    fn stm_preds_extract_cmp_ops() {
+        for (src, op_str) in &[
+            ("r.qty > 100", ">"),
+            ("r.qty >= 100", ">="),
+            ("r.qty < 100", "<"),
+            ("r.qty <= 100", "<="),
+            ("r.qty != 100", "!="),
+        ] {
+            let preds = preds_for(src, "r").unwrap_or_else(|| panic!("{src}"));
+            assert_eq!(serialize_stm_preds(&preds), format!("qty:{}:0", op_str));
+        }
+    }
+
+    #[test]
+    fn stm_preds_reverse_value_then_field() {
+        // 100 < r.qty  ↦  qty > 100
+        let preds = preds_for("100 < r.qty", "r").unwrap();
+        assert_eq!(serialize_stm_preds(&preds), "qty:>:0");
+    }
+
+    #[test]
+    fn stm_preds_and_chain() {
+        let preds = preds_for(r#"r.status == "open" && r.qty > 100"#, "r").unwrap();
+        assert_eq!(preds.len(), 2);
+        assert_eq!(serialize_stm_preds(&preds), "status:=:0;qty:>:1");
+    }
+
+    #[test]
+    fn stm_preds_or_rejected() {
+        // OR breaks the conjunction model — fall back to All.
+        assert!(preds_for(r#"r.status == "open" || r.qty > 100"#, "r").is_none());
+    }
+
+    #[test]
+    fn stm_preds_arithmetic_value_rejected() {
+        // r.qty > a + b — value side is arithmetic; reject to avoid double-eval.
+        assert!(preds_for("r.qty > a + b", "r").is_none());
+    }
+
+    #[test]
+    fn stm_preds_function_call_rejected() {
+        // length(r.name) > 5 — function call on field side; reject.
+        assert!(preds_for("length r.name > 5", "r").is_none());
+    }
+
+    #[test]
+    fn stm_preds_in_literal_list() {
+        let preds = preds_for("elem r.id [1, 2, 3]", "r").unwrap();
+        assert_eq!(preds.len(), 1);
+        assert!(matches!(preds[0].op, StmCmpOp::In));
+        assert_eq!(preds[0].values.len(), 3);
+        assert_eq!(serialize_stm_preds(&preds), "id:in:0,1,2");
+    }
+
+    #[test]
+    fn stm_preds_in_empty_list_rejected() {
+        assert!(preds_for("elem r.id []", "r").is_none());
+    }
+
+    #[test]
+    fn stm_preds_mixed_indices_match_sql_param_order() {
+        // The walker should produce predicates with indices that align with
+        // try_compile_sql_expr's param ordering — left-to-right, one per
+        // simple comparison.
+        let preds =
+            preds_for(r#"r.a == 1 && r.b == 2 && r.c == 3"#, "r").unwrap();
+        assert_eq!(serialize_stm_preds(&preds), "a:=:0;b:=:1;c:=:2");
     }
 
     fn parse_expr(source: &str) -> ast::Expr {

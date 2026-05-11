@@ -11,7 +11,7 @@ type Account = {id: Int, balance: Int}
 
 -- The `single (filter (\a -> a.id == ?) rows)` pattern is what the codegen
 -- recognizes as a `"id" = ?` simple equality; inside an atomic block the
--- runtime tracks this as a `ColEq` read filter on `accounts.id`.
+-- runtime tracks this as a `Cols([(id, Eq, ?)])` read filter on accounts.
 findById = \aid rows -> single (filter (\a -> a.id == aid) rows)
 
 setBalance = \aid newBalance rows -> do
@@ -21,8 +21,8 @@ setBalance = \aid newBalance rows -> do
 credit = \aid amount -> atomic do
   rows <- *accounts
   -- The `single (filter ...)` lookup is what the runtime SQL pushdown turns
-  -- into a `WHERE "id" = ?` query — that's the read pattern the codegen
-  -- specializes via `knot_stm_track_read_col_eq`.
+  -- into a `WHERE "id" = ?` query — codegen extracts the predicate and the
+  -- runtime calls `knot_stm_track_read_pred` to register a row-level filter.
   let lookup = findById aid rows
   *accounts = setBalance aid amount rows
 

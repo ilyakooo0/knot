@@ -948,6 +948,7 @@ impl Codegen {
         self.declare_rt("knot_relation_min", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_max", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_count_where", &[p, p, p], &[p]);
+        self.declare_rt("knot_relation_upsert_by", &[p, p, p, p], &[p]);
 
         // Standard library: text operations
         self.declare_rt("knot_text_to_upper", &[p], &[p]);
@@ -1330,6 +1331,7 @@ impl Codegen {
             "fileExists", "removeFile", "listDir",
             "randomInt", "sleep", "fork", "race",
             "encrypt", "decrypt", "sign", "verify",
+            "upsertBy",
         ];
         for name in &stdlib_names {
             self.register_stdlib_fn(name);
@@ -2394,6 +2396,9 @@ impl Codegen {
 
         // Bytes: 3-param (double-curried)
         self.define_stdlib_fn_3("bytesSlice", "knot_bytes_slice");
+
+        // 3-param: double-curried (outer captures arg1, middle captures arg2, inner calls runtime)
+        self.define_stdlib_fn_3("upsertBy", "knot_relation_upsert_by");
 
         // Random: 1-param (IO-returning)
         self.define_stdlib_fn_1("randomInt", "knot_random_int_io");

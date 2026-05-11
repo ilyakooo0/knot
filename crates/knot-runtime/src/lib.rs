@@ -7468,6 +7468,42 @@ pub extern "C" fn knot_relation_filter(
     alloc(Value::Relation(result))
 }
 
+/// upsertBy(pred, value, rel) — replace rows matching pred with value, or
+/// append value if none match. Result preserves the order of the input.
+#[unsafe(no_mangle)]
+pub extern "C" fn knot_relation_upsert_by(
+    db: *mut c_void,
+    pred: *mut Value,
+    value: *mut Value,
+    rel: *mut Value,
+) -> *mut Value {
+    let rows: Vec<*mut Value> = match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => rows.clone(),
+        Value::Unit => Vec::new(),
+        _ => panic!(
+            "knot runtime: upsertBy expected Relation, got {}",
+            type_name(rel)
+        ),
+    };
+    let mut result: Vec<*mut Value> = Vec::with_capacity(rows.len() + 1);
+    let mut matched = false;
+    for row in rows {
+        let v = knot_value_call(db, pred, row);
+        match unsafe { as_ref(v) } {
+            Value::Bool(true) => {
+                matched = true;
+                result.push(value);
+            }
+            Value::Bool(false) => result.push(row),
+            _ => panic!("knot runtime: upsertBy predicate must return Bool"),
+        }
+    }
+    if !matched {
+        result.push(value);
+    }
+    alloc(Value::Relation(result))
+}
+
 /// match(ctor, rel) — filter relation to rows matching a constructor tag, extract payloads
 #[unsafe(no_mangle)]
 pub extern "C" fn knot_relation_match(

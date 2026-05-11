@@ -5728,6 +5728,27 @@ impl Infer {
             ),
         );
 
+        // upsertBy : ∀a. (a -> Bool) -> a -> [a] -> [a]
+        // Replace matching elements with the given value, or append it if
+        // none match.
+        let a = self.fresh_var();
+        self.bind_top(
+            "upsertBy",
+            Scheme::poly(
+                vec![a],
+                Ty::Fun(
+                    Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Bool))),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Var(a)),
+                        Box::new(Ty::Fun(
+                            Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                            Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        )),
+                    )),
+                ),
+            ),
+        );
+
         // single : ∀a. [a] -> Maybe a
         let a = self.fresh_var();
         self.bind_top(

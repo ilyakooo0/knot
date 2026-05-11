@@ -1298,8 +1298,17 @@ fn current_cancel_token() -> Option<Arc<CancelToken>> {
 // `atomic` blocks acquire it for their full duration, and individual write
 // functions (replace, set, etc.) inside the block increment the depth
 // without re-acquiring.
+//
+// Parking model: `WRITE_LOCKED` carries the authoritative state (read on the
+// uncontended fast path); `WRITE_LOCK_PARK` is a Mutex<()>+Condvar pair used
+// only when a thread needs to block. Contended acquirers park on the condvar
+// instead of spinning with `yield_now`; the releasing thread wakes one waiter
+// after clearing the flag. This avoids burning a core per parked retrier
+// while keeping the uncontended path lock-free.
 
 static WRITE_LOCKED: AtomicBool = AtomicBool::new(false);
+static WRITE_LOCK_PARK: std::sync::LazyLock<(Mutex<()>, Condvar)> =
+    std::sync::LazyLock::new(|| (Mutex::new(()), Condvar::new()));
 
 thread_local! {
     static WRITE_LOCK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1314,19 +1323,57 @@ impl Drop for WriteLockGuard {
     }
 }
 
+/// Spin a few times before parking on the condvar — most contention windows
+/// are short (a write_lock_guard held just long enough for a single SQL
+/// statement), and a brief CAS retry avoids the mutex/condvar round-trip in
+/// that common case.
+const WRITE_LOCK_SPIN_HINT: usize = 64;
+
 fn write_lock_acquire() {
     let reentrant = WRITE_LOCK_DEPTH.with(|d| {
         let depth = d.get();
         d.set(depth + 1);
         depth > 0
     });
-    if !reentrant {
-        while WRITE_LOCKED
+    if reentrant {
+        return;
+    }
+    // Fast path: uncontended CAS.
+    if WRITE_LOCKED
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_ok()
+    {
+        return;
+    }
+    // Brief spin window — covers the case where the current holder is about
+    // to release in microseconds, so we avoid the mutex round-trip.
+    for _ in 0..WRITE_LOCK_SPIN_HINT {
+        if WRITE_LOCKED
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
+            .is_ok()
         {
-            std::thread::yield_now();
+            return;
         }
+        std::hint::spin_loop();
+    }
+    // Park on the condvar. The release path takes the same mutex briefly and
+    // calls `notify_one`, so a parked waiter is guaranteed to be woken.
+    let (m, cv) = &*WRITE_LOCK_PARK;
+    loop {
+        let mut guard = m.lock().expect("write lock park mutex poisoned");
+        while WRITE_LOCKED.load(Ordering::Acquire) {
+            guard = cv.wait(guard).expect("write lock park condvar poisoned");
+        }
+        // Drop the mutex before attempting CAS so a concurrent releaser can
+        // make progress on its notify path.
+        drop(guard);
+        if WRITE_LOCKED
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+        // Lost the race to another waiter — loop and re-park.
     }
 }
 
@@ -1339,6 +1386,7 @@ fn write_lock_release() {
     });
     if release {
         WRITE_LOCKED.store(false, Ordering::Release);
+        wake_one_write_waiter();
     }
 }
 
@@ -1358,6 +1406,61 @@ fn write_lock_force_release() {
     });
     if had_lock {
         WRITE_LOCKED.store(false, Ordering::Release);
+        wake_one_write_waiter();
+    }
+}
+
+/// Wake a single parked write-lock waiter (if any). Briefly takes the park
+/// mutex so the wake is sequenced relative to the waiter's `while
+/// WRITE_LOCKED` re-check — without it, a concurrent waiter that reads
+/// `WRITE_LOCKED == true` after our store but before our notify would miss
+/// the wakeup and park indefinitely.
+fn wake_one_write_waiter() {
+    let (m, cv) = &*WRITE_LOCK_PARK;
+    let _g = m.lock().expect("write lock park mutex poisoned");
+    cv.notify_one();
+}
+
+/// Re-acquire the write lock at the given depth after a release by
+/// `knot_stm_wait`. Goes through the same parking acquire path as
+/// `write_lock_acquire`, then sets the thread-local depth directly so the
+/// nested reentry counting picks up where it left off.
+fn write_lock_reacquire_at_depth(depth: usize) {
+    if depth == 0 {
+        return;
+    }
+    // Fast path: uncontended CAS.
+    if WRITE_LOCKED
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_ok()
+    {
+        WRITE_LOCK_DEPTH.with(|d| d.set(depth));
+        return;
+    }
+    for _ in 0..WRITE_LOCK_SPIN_HINT {
+        if WRITE_LOCKED
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            WRITE_LOCK_DEPTH.with(|d| d.set(depth));
+            return;
+        }
+        std::hint::spin_loop();
+    }
+    let (m, cv) = &*WRITE_LOCK_PARK;
+    loop {
+        let mut guard = m.lock().expect("write lock park mutex poisoned");
+        while WRITE_LOCKED.load(Ordering::Acquire) {
+            guard = cv.wait(guard).expect("write lock park condvar poisoned");
+        }
+        drop(guard);
+        if WRITE_LOCKED
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            WRITE_LOCK_DEPTH.with(|d| d.set(depth));
+            return;
+        }
     }
 }
 
@@ -1528,7 +1631,8 @@ enum ColPred {
 
 /// A row-level filter that describes WHICH parts of a table a reader cares about.
 /// Stored per-table in the thread-local read set, and copied into the wake slot
-/// at park time so writes can filter wakeups.
+/// at park time so writes can filter wakeups. Column names are interned as
+/// `Arc<str>` so cloning a filter into a wake slot is cheap.
 #[derive(Clone, Debug)]
 enum ReadFilter {
     /// Reader observed the entire table (no precise filter). Wakes on any write.
@@ -1536,7 +1640,7 @@ enum ReadFilter {
     /// Reader observed only rows matching a conjunction of column predicates.
     /// AND semantics within the filter; multiple filters per table OR together
     /// at the slot level (different read sites are independent).
-    Cols(Vec<(String, ColPred)>),
+    Cols(Vec<(Arc<str>, ColPred)>),
 }
 
 /// SQLite-compatible partial ordering on `SqlVal`. Returns `None` for incompatible
@@ -1585,18 +1689,88 @@ fn col_pred_matches(row_val: &SqlVal, pred: &ColPred) -> bool {
     }
 }
 
-/// True if `row` satisfies every `(col, pred)` in `preds`. A missing column wakes
-/// conservatively — the event payload doesn't contain enough information to filter.
-fn row_matches_preds(row: &HashMap<String, SqlVal>, preds: &[(String, ColPred)]) -> bool {
-    for (col, pred) in preds {
-        match row.get(col.as_str()) {
-            Some(rv) => {
+/// Cheap-clone column name. Column identifiers are short, low-cardinality
+/// strings reused across many filter and event payloads — interning them as
+/// `Arc<str>` cuts both allocation and hashing on the wake path.
+type ColName = Arc<str>;
+
+/// Columnar payload for `WriteEvent::Rows`. Shares one header (`Arc<[ColName]>`)
+/// across all rows in this event so cloning the event header is a single
+/// refcount bump, and each row pays only for its `Box<[SqlVal]>` value slots
+/// — not a per-row `HashMap` with cloned column names. Rows are indexed by
+/// position into `columns`; lookups go through `EventRows::col_index`.
+#[derive(Clone, Debug)]
+struct EventRows {
+    columns: Arc<[ColName]>,
+    rows: Vec<Box<[SqlVal]>>,
+}
+
+impl EventRows {
+    fn new(columns: Arc<[ColName]>) -> Self {
+        EventRows { columns, rows: Vec::new() }
+    }
+    fn with_capacity(columns: Arc<[ColName]>, cap: usize) -> Self {
+        EventRows { columns, rows: Vec::with_capacity(cap) }
+    }
+    fn push(&mut self, vals: Vec<SqlVal>) {
+        debug_assert_eq!(
+            vals.len(),
+            self.columns.len(),
+            "EventRows::push value count {} != column count {}",
+            vals.len(),
+            self.columns.len()
+        );
+        self.rows.push(vals.into_boxed_slice());
+    }
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+    /// Position of `col` within `columns`, or `None` if absent.
+    fn col_index(&self, col: &str) -> Option<usize> {
+        self.columns.iter().position(|c| &**c == col)
+    }
+    /// Walk every column with its scalar value across all rows. Used by the
+    /// wake path to drive the `EQ_WATCHERS` / `RANGE_WATCHERS` indices.
+    fn each_col_val<F: FnMut(&str, &SqlVal)>(&self, mut f: F) {
+        for row in &self.rows {
+            for (col, val) in self.columns.iter().zip(row.iter()) {
+                f(col, val);
+            }
+        }
+    }
+    /// Extend with rows from `other`. Returns `true` on success; returns
+    /// `false` if the column headers don't share identity (caller should
+    /// fall back to `Bulk`).
+    fn try_extend(&mut self, other: EventRows) -> bool {
+        if !Arc::ptr_eq(&self.columns, &other.columns) {
+            return false;
+        }
+        self.rows.extend(other.rows);
+        true
+    }
+}
+
+/// True if `row` (indexed into `columns` by position) satisfies every
+/// `(idx, pred)` in `preds_with_idx`. Index resolution is done once per
+/// filter outside the row loop. An `idx` of `None` means the predicate's
+/// column isn't present in the event payload — we wake conservatively in
+/// that case.
+fn row_matches_preds_indexed(row: &[SqlVal], preds_with_idx: &[(Option<usize>, &ColPred)]) -> bool {
+    for (idx, pred) in preds_with_idx {
+        match idx {
+            None => return true, // column missing → wake conservatively
+            Some(i) => {
+                let rv = match row.get(*i) {
+                    Some(v) => v,
+                    None => return true,
+                };
                 if !col_pred_matches(rv, pred) {
                     return false;
                 }
             }
-            // Column not in payload — we can't tell, so don't filter out.
-            None => return true,
         }
     }
     true
@@ -1607,17 +1781,33 @@ fn row_matches_preds(row: &HashMap<String, SqlVal>, preds: &[(String, ColPred)])
 enum WriteEvent {
     /// Nuclear: entire table was replaced or schema-affecting write. Wake all watchers.
     Bulk,
-    /// Specific rows changed. Each entry maps column name → value for that row.
-    Rows(Vec<HashMap<String, SqlVal>>),
+    /// Specific rows changed, represented columnar-ly. See `EventRows`.
+    Rows(EventRows),
 }
 
 impl WriteEvent {
-    /// Merge another event into this one. `Bulk` absorbs everything; `Rows` accumulate.
+    /// Merge another event into this one. `Bulk` absorbs everything; `Rows`
+    /// extend in place when column headers share identity (the common case
+    /// for two writes to the same table); when they diverge, fall back to
+    /// `Bulk` to keep the merge cost bounded. Also enforces
+    /// `EVENT_ROWS_HARD_CAP` — exceeding it upgrades to `Bulk` and stops
+    /// per-row tracking.
     fn merge(&mut self, other: WriteEvent) {
         match (&mut *self, other) {
             (WriteEvent::Bulk, _) => {}
             (_, WriteEvent::Bulk) => *self = WriteEvent::Bulk,
-            (WriteEvent::Rows(a), WriteEvent::Rows(b)) => a.extend(b),
+            (WriteEvent::Rows(a), WriteEvent::Rows(b)) => {
+                let same_header = Arc::ptr_eq(&a.columns, &b.columns);
+                if !same_header {
+                    *self = WriteEvent::Bulk;
+                    return;
+                }
+                if a.rows.len().saturating_add(b.rows.len()) > EVENT_ROWS_HARD_CAP {
+                    *self = WriteEvent::Bulk;
+                    return;
+                }
+                a.rows.extend(b.rows);
+            }
         }
     }
 
@@ -1627,12 +1817,22 @@ impl WriteEvent {
         match self {
             WriteEvent::Bulk => true,
             WriteEvent::Rows(rows) => {
+                if rows.is_empty() {
+                    return false;
+                }
                 for f in filters {
                     match f {
                         ReadFilter::All => return true,
                         ReadFilter::Cols(preds) => {
-                            for row in rows {
-                                if row_matches_preds(row, preds) {
+                            // Pre-resolve column indices once for this filter
+                            // across every row in the event. `None` means
+                            // "column missing"; handled inside the matcher.
+                            let preds_with_idx: Vec<(Option<usize>, &ColPred)> = preds
+                                .iter()
+                                .map(|(c, p)| (rows.col_index(c), p))
+                                .collect();
+                            for row in &rows.rows {
+                                if row_matches_preds_indexed(row, &preds_with_idx) {
                                     return true;
                                 }
                             }
@@ -1652,6 +1852,29 @@ impl WriteEvent {
 static TABLE_VERSIONS: std::sync::LazyLock<DashMap<String, Arc<AtomicU64>>> =
     std::sync::LazyLock::new(DashMap::new);
 
+/// Small global interner for column names. Column identifiers across a
+/// program have very low cardinality (usually < 100 unique names total) and
+/// they appear in nearly every hot-path data structure: filters, write event
+/// rows, watcher index keys. Caching as `Arc<str>` lets all those structures
+/// share a single allocation per unique name and turns column-name cloning
+/// into a refcount bump. New entries take a brief write lock; the steady-
+/// state lookup is a read lock + hash.
+static COL_INTERN: std::sync::LazyLock<RwLock<HashMap<String, Arc<str>>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+fn intern_col(name: &str) -> Arc<str> {
+    if let Some(v) = COL_INTERN.read().unwrap().get(name) {
+        return v.clone();
+    }
+    let mut w = COL_INTERN.write().unwrap();
+    if let Some(v) = w.get(name) {
+        return v.clone();
+    }
+    let arc: Arc<str> = Arc::from(name);
+    w.insert(name.to_string(), arc.clone());
+    arc
+}
+
 /// Per-source `RecordSchema` registry, populated by `knot_source_init`.
 /// Write paths that need column metadata to build precise `WriteEvent::Rows`
 /// payloads (e.g. UPDATE/DELETE pre-image SELECTs) look up the schema here
@@ -1670,10 +1893,13 @@ fn get_source_schema(name: &str) -> Option<Arc<RecordSchema>> {
     SOURCE_SCHEMAS.read().unwrap().get(name).cloned()
 }
 
-/// Maximum number of rows captured in a single `WriteEvent::Rows`. Beyond
-/// this the event upgrades to `Bulk` to bound notification cost — bulk-style
-/// writes (e.g. resetting an entire table) shouldn't pay per-row tracking.
-const MAX_EVENT_ROWS: usize = 128;
+/// Hard ceiling on the number of rows captured in a single `WriteEvent::Rows`.
+/// Beyond this we upgrade to `Bulk` to bound notification cost: bulk-style
+/// writes (resetting an entire table, full-table migrations) shouldn't pay
+/// for per-row payload construction or wake-time filter evaluation. Sized so
+/// that batched UPDATE/DELETE on moderate-size relations stays precise where
+/// the old 128-row cap would have escalated to a full-table wake.
+const EVENT_ROWS_HARD_CAP: usize = 4096;
 
 /// Where a single `ReadFilter` should be registered for indexed wakeup.
 /// One filter → one `FilterReg`. The slot's full filter list still gates
@@ -1727,17 +1953,18 @@ fn classify_filter(filter: &ReadFilter) -> FilterReg {
         return FilterReg::Broad;
     };
     let (col, pred) = &preds[idx];
+    let col_str = col.to_string();
     match pred {
         ColPred::Cmp(CmpOp::Eq, val) => FilterReg::Eq {
-            col: col.clone(),
+            col: col_str,
             keys: vec![val.to_key()],
         },
         ColPred::In(vals) => FilterReg::Eq {
-            col: col.clone(),
+            col: col_str,
             keys: vals.iter().map(SqlVal::to_key).collect(),
         },
         ColPred::Cmp(op @ (CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge), val) => FilterReg::Range {
-            col: col.clone(),
+            col: col_str,
             op: *op,
             threshold: val.clone(),
         },
@@ -1812,10 +2039,11 @@ impl Drop for WakeSlot {
                 for f in filters {
                     if let ReadFilter::Cols(preds) = f {
                         for (col, _) in preds {
-                            if let Some(c) = state.cols.get_mut(col) {
+                            let key = col.as_ref();
+                            if let Some(c) = state.cols.get_mut(key) {
                                 *c = c.saturating_sub(1);
                                 if *c == 0 {
-                                    state.cols.remove(col);
+                                    state.cols.remove(key);
                                 }
                             }
                         }
@@ -1993,10 +2221,15 @@ fn watcher_count_for(name: &str) -> Arc<AtomicUsize> {
 /// Coalesced per-atomic-block tracking state. Replaces three thread-local
 /// `RefCell<HashMap>`s with one borrow per access. Snapshot/push/pop_merge
 /// all operate on this struct as a unit.
+///
+/// `reads` stores the version Arc alongside the captured version so the
+/// `knot_stm_wait` pre-check and post-register re-check both turn into a
+/// single atomic load per table — no DashMap shard lookup, no string hash.
 #[derive(Clone, Default)]
 struct StmTracking {
-    /// Tables read during current atomic block, with version at first-read time.
-    reads: HashMap<String, u64>,
+    /// Tables read during current atomic block. Value is `(Arc to live
+    /// counter, version observed at first-read time)`.
+    reads: HashMap<String, (Arc<AtomicU64>, u64)>,
     /// Per-table read filters captured during the atomic body. Multiple filters
     /// OR together; presence of `All` means wake on any write.
     filters: HashMap<String, Vec<ReadFilter>>,
@@ -2045,15 +2278,15 @@ pub extern "C" fn knot_stm_pop_merge() {
         // For tables read in both: outer's saved version is older (versions are
         // monotonic), so it wins — the outer commit must retry on any change
         // since the earliest observation.
-        for (table, ver) in saved.reads {
+        for (table, entry) in saved.reads {
             t.reads
                 .entry(table)
-                .and_modify(|v| {
-                    if ver < *v {
-                        *v = ver;
+                .and_modify(|cur| {
+                    if entry.1 < cur.1 {
+                        cur.1 = entry.1;
                     }
                 })
-                .or_insert(ver);
+                .or_insert(entry);
         }
         // Merge: outer filters + inner filters (append; both contribute to the wake decision)
         for (table, mut fs) in saved.filters {
@@ -2077,10 +2310,54 @@ pub extern "C" fn knot_stm_pop_merge() {
 /// falls back to a write lock only for the first write to a new table.
 fn notify_relation_changed_with_event(name: &str, event: &WriteEvent) {
     bump_table_version(name);
+    bump_global_writes();
     if !table_has_watchers(name) {
         return;
     }
     wake_matching_watchers(name, event);
+}
+
+// ── Global write event counter ───────────────────────────────────
+//
+// Bumped on every write to any relation; parked-without-reads atomic blocks
+// (and any future "wait for any write" callers) use this to avoid the previous
+// fixed 50 ms polling sleep. The `GLOBAL_WRITE_CV` mutex is taken only briefly
+// to sequence the notify with the waiter's pre-check.
+
+static GLOBAL_WRITES: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_WRITE_CV: std::sync::LazyLock<(Mutex<()>, Condvar)> =
+    std::sync::LazyLock::new(|| (Mutex::new(()), Condvar::new()));
+
+fn bump_global_writes() {
+    GLOBAL_WRITES.fetch_add(1, Ordering::Release);
+    // Only wake if anyone is parked — checked via a separate atomic so the
+    // common case is a single atomic add with no mutex touch.
+    if GLOBAL_WRITE_WAITERS.load(Ordering::Acquire) > 0 {
+        let (m, cv) = &*GLOBAL_WRITE_CV;
+        let _g = m.lock().expect("global write cv mutex poisoned");
+        cv.notify_all();
+    }
+}
+
+static GLOBAL_WRITE_WAITERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Park the calling thread until the global write counter changes or
+/// `timeout` elapses, whichever comes first. Used by `knot_stm_wait` when
+/// the atomic body retried without observing any relation — there's nothing
+/// specific to wait on, but any write somewhere might unblock the retry's
+/// implicit dependency.
+fn wait_for_any_write(timeout: Duration) {
+    let baseline = GLOBAL_WRITES.load(Ordering::Acquire);
+    if GLOBAL_WRITES.load(Ordering::Acquire) != baseline {
+        return;
+    }
+    GLOBAL_WRITE_WAITERS.fetch_add(1, Ordering::AcqRel);
+    let (m, cv) = &*GLOBAL_WRITE_CV;
+    let guard = m.lock().expect("global write cv mutex poisoned");
+    let _ = cv.wait_timeout_while(guard, timeout, |_| {
+        GLOBAL_WRITES.load(Ordering::Acquire) == baseline
+    });
+    GLOBAL_WRITE_WAITERS.fetch_sub(1, Ordering::AcqRel);
 }
 
 /// Bump the global per-table version counter. Steady-state: one shard read
@@ -2126,27 +2403,25 @@ fn wake_matching_watchers(name: &str, event: &WriteEvent) {
         if !rows.is_empty() {
             // EQ-indexed: lookup by (table, col, value-key). The index proves
             // the equality predicate holds, so skip slot.matches re-check.
-            for row in rows {
-                for (col, val) in row {
-                    let key = (name.to_string(), col.clone(), val.to_key());
-                    let Some(bucket) = EQ_WATCHERS.get(&key) else { continue };
+            rows.each_col_val(|col, val| {
+                let key = (name.to_string(), col.to_string(), val.to_key());
+                if let Some(bucket) = EQ_WATCHERS.get(&key) {
                     for weak in bucket.iter() {
                         if let Some(slot) = weak.upgrade() {
                             slot.wake();
                         }
                     }
                 }
-            }
+            });
             // Range-indexed: BTreeMap probes per direction. Each direction's
             // range query already enforces the threshold check, so we just
             // wake the slots found in the matching key range.
-            for row in rows {
-                for (col, val) in row {
-                    let key = (name.to_string(), col.clone());
-                    let Some(idx) = RANGE_WATCHERS.get(&key) else { continue };
+            rows.each_col_val(|col, val| {
+                let key = (name.to_string(), col.to_string());
+                if let Some(idx) = RANGE_WATCHERS.get(&key) {
                     wake_range_index(&idx, val);
                 }
-            }
+            });
         }
     }
     maybe_sweep_dead_watchers();
@@ -2287,16 +2562,16 @@ pub extern "C" fn knot_stm_track_read_pred(
 ) {
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     let spec = unsafe { str_from_raw(spec_ptr, spec_len) };
-    if let Some(preds) = parse_read_pred_spec(spec, params_rel) {
+    if let Some(preds) = parse_read_pred_spec(spec_ptr, spec_len, spec, params_rel) {
         stm_specialize_read_pred(name, preds);
     }
 }
 
 fn stm_track_read(name: &str) {
-    let ver = current_table_version(name);
+    let (arc, ver) = table_version_arc_and_value(name);
     STM_TRACK.with(|t| {
         let mut t = t.borrow_mut();
-        t.reads.entry(name.to_string()).or_insert(ver);
+        t.reads.entry(name.to_string()).or_insert((arc, ver));
         let v = t.filters.entry(name.to_string()).or_default();
         // Avoid pushing duplicate `All` entries — they're idempotent
         if !v.iter().any(|f| matches!(f, ReadFilter::All)) {
@@ -2305,16 +2580,45 @@ fn stm_track_read(name: &str) {
     });
 }
 
-/// Parse a predicate spec string against a runtime params relation, producing
-/// the AND-list that backs a `ReadFilter::Cols`. Returns `None` on any
-/// structural error (bad op, missing index, malformed integer) so the caller
-/// can fall back to the broad `All` filter.
-fn parse_read_pred_spec(spec: &str, params_rel: *mut Value) -> Option<Vec<(String, ColPred)>> {
-    let params: &[*mut Value] = match unsafe { as_ref(params_rel) } {
-        Value::Relation(rows) => rows.as_slice(),
-        _ => return None,
-    };
-    let mut out: Vec<(String, ColPred)> = Vec::new();
+/// Pre-parsed shape of a predicate spec: per-clause column name, op kind, and
+/// the indices into the runtime params relation that supply the value(s).
+/// Stored in `SPEC_CACHE` keyed by the spec string pointer (codegen emits
+/// these as static constants, so the pointer is a stable identity) so each
+/// static call site parses exactly once for the whole program run.
+#[derive(Clone)]
+enum SpecOp {
+    Cmp(CmpOp, usize),
+    In(Vec<usize>),
+}
+
+#[derive(Clone)]
+struct ParsedSpec {
+    clauses: Vec<(String, SpecOp)>,
+}
+
+/// Cache from `(spec_ptr, spec_len)` → parsed structure. Spec strings come
+/// from compiler-emitted static memory, so two calls with the same pointer
+/// describe the same spec. Wrap entries in `Arc` so concurrent readers can
+/// clone cheaply without re-locking. `Some(Arc)` means "parses cleanly";
+/// `None` is cached negative-result so malformed specs aren't re-parsed.
+static SPEC_CACHE: std::sync::LazyLock<RwLock<HashMap<(usize, usize), Option<Arc<ParsedSpec>>>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+fn lookup_or_parse_spec(spec_ptr: *const u8, spec_len: usize, spec: &str) -> Option<Arc<ParsedSpec>> {
+    let key = (spec_ptr as usize, spec_len);
+    if let Some(entry) = SPEC_CACHE.read().unwrap().get(&key) {
+        return entry.clone();
+    }
+    let parsed = parse_spec_structure(spec).map(Arc::new);
+    SPEC_CACHE.write().unwrap().insert(key, parsed.clone());
+    parsed
+}
+
+/// Parse only the structural part of the spec — column names, ops, indices.
+/// No `*mut Value` access here so the parsed result can be cached globally
+/// and shared across threads.
+fn parse_spec_structure(spec: &str) -> Option<ParsedSpec> {
+    let mut clauses: Vec<(String, SpecOp)> = Vec::new();
     for pred_str in spec.split(';') {
         if pred_str.is_empty() {
             continue;
@@ -2326,46 +2630,78 @@ fn parse_read_pred_spec(spec: &str, params_rel: *mut Value) -> Option<Vec<(Strin
         if col.is_empty() {
             return None;
         }
-        match op {
+        let op = match op {
             "in" => {
-                let mut vs: Vec<SqlVal> = Vec::new();
+                let mut idxs: Vec<usize> = Vec::new();
                 for s in idxs_part.split(',') {
-                    let idx: usize = s.parse().ok()?;
-                    let p = *params.get(idx)?;
-                    vs.push(SqlVal::from_knot(p));
+                    idxs.push(s.parse().ok()?);
                 }
-                if vs.is_empty() {
+                if idxs.is_empty() {
                     return None;
                 }
-                out.push((col.to_string(), ColPred::In(vs)));
+                SpecOp::In(idxs)
             }
-            _ => {
-                let cmp = match op {
-                    "=" => CmpOp::Eq,
-                    "!=" => CmpOp::Neq,
-                    "<" => CmpOp::Lt,
-                    "<=" => CmpOp::Le,
-                    ">" => CmpOp::Gt,
-                    ">=" => CmpOp::Ge,
-                    _ => return None,
-                };
-                let idx: usize = idxs_part.parse().ok()?;
-                let p = *params.get(idx)?;
-                out.push((col.to_string(), ColPred::Cmp(cmp, SqlVal::from_knot(p))));
-            }
-        }
+            "=" => SpecOp::Cmp(CmpOp::Eq, idxs_part.parse().ok()?),
+            "!=" => SpecOp::Cmp(CmpOp::Neq, idxs_part.parse().ok()?),
+            "<" => SpecOp::Cmp(CmpOp::Lt, idxs_part.parse().ok()?),
+            "<=" => SpecOp::Cmp(CmpOp::Le, idxs_part.parse().ok()?),
+            ">" => SpecOp::Cmp(CmpOp::Gt, idxs_part.parse().ok()?),
+            ">=" => SpecOp::Cmp(CmpOp::Ge, idxs_part.parse().ok()?),
+            _ => return None,
+        };
+        clauses.push((col.to_string(), op));
     }
-    if out.is_empty() { None } else { Some(out) }
+    if clauses.is_empty() {
+        None
+    } else {
+        Some(ParsedSpec { clauses })
+    }
+}
+
+/// Parse a predicate spec string against a runtime params relation, producing
+/// the AND-list that backs a `ReadFilter::Cols`. Returns `None` on any
+/// structural error (bad op, missing index, malformed integer) so the caller
+/// can fall back to the broad `All` filter.
+fn parse_read_pred_spec(
+    spec_ptr: *const u8,
+    spec_len: usize,
+    spec: &str,
+    params_rel: *mut Value,
+) -> Option<Vec<(Arc<str>, ColPred)>> {
+    let params: &[*mut Value] = match unsafe { as_ref(params_rel) } {
+        Value::Relation(rows) => rows.as_slice(),
+        _ => return None,
+    };
+    let parsed = lookup_or_parse_spec(spec_ptr, spec_len, spec)?;
+    let mut out: Vec<(Arc<str>, ColPred)> = Vec::with_capacity(parsed.clauses.len());
+    for (col, op) in &parsed.clauses {
+        let pred = match op {
+            SpecOp::Cmp(cmp, idx) => {
+                let p = *params.get(*idx)?;
+                ColPred::Cmp(*cmp, SqlVal::from_knot(p))
+            }
+            SpecOp::In(idxs) => {
+                let mut vs: Vec<SqlVal> = Vec::with_capacity(idxs.len());
+                for idx in idxs {
+                    let p = *params.get(*idx)?;
+                    vs.push(SqlVal::from_knot(p));
+                }
+                ColPred::In(vs)
+            }
+        };
+        out.push((intern_col(col), pred));
+    }
+    Some(out)
 }
 
 /// Replace the most-recent `All` filter for `name` with the given `Cols` filter.
 /// If no `All` is present to downgrade, append. Captures the table version
 /// idempotently so the read shows up in the read set.
-fn stm_specialize_read_pred(name: &str, preds: Vec<(String, ColPred)>) {
-    let ver = current_table_version(name);
+fn stm_specialize_read_pred(name: &str, preds: Vec<(Arc<str>, ColPred)>) {
+    let (arc, ver) = table_version_arc_and_value(name);
     STM_TRACK.with(|t| {
         let mut t = t.borrow_mut();
-        t.reads.entry(name.to_string()).or_insert(ver);
+        t.reads.entry(name.to_string()).or_insert((arc, ver));
         let v = t.filters.entry(name.to_string()).or_default();
         if let Some(pos) = v.iter().rposition(|f| matches!(f, ReadFilter::All)) {
             v.remove(pos);
@@ -2374,14 +2710,23 @@ fn stm_specialize_read_pred(name: &str, preds: Vec<(String, ColPred)>) {
     });
 }
 
-/// Load the current global version counter for `name`, or 0 if it has never
-/// been bumped. Pure read, no thread-local touch — callers fold the result
-/// into `STM_TRACK.reads` themselves.
-fn current_table_version(name: &str) -> u64 {
-    TABLE_VERSIONS
-        .get(name)
-        .map(|v| v.load(Ordering::Acquire))
-        .unwrap_or(0)
+/// Get or create the version-counter `Arc` for `name` and read its current
+/// value. The Arc is cached into `STM_TRACK.reads` so subsequent recheck loops
+/// can load the counter directly without re-entering the `TABLE_VERSIONS`
+/// DashMap. Pre-populated by `preregister_table_meta` for declared sources,
+/// so the entry-miss branch is essentially dead at steady-state.
+fn table_version_arc_and_value(name: &str) -> (Arc<AtomicU64>, u64) {
+    if let Some(v) = TABLE_VERSIONS.get(name) {
+        let arc = v.clone();
+        let val = arc.load(Ordering::Acquire);
+        return (arc, val);
+    }
+    let arc = TABLE_VERSIONS
+        .entry(name.to_string())
+        .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+        .clone();
+    let val = arc.load(Ordering::Acquire);
+    (arc, val)
 }
 
 /// Pre-populate `TABLE_VERSIONS` and `TABLE_WATCHER_COUNTS` for a source so
@@ -2400,33 +2745,52 @@ fn preregister_table_meta(name: &str) {
 /// use in a `WriteEvent::Rows` payload. Only scalar columns from the schema
 /// are included (nested relation fields are skipped — they can't be filtered
 /// on by `ColEq` anyway). Returns None for non-Record rows.
-fn record_row_to_col_map(row: *mut Value, rec: &RecordSchema) -> Option<HashMap<String, SqlVal>> {
+/// Per-record-schema cache of column headers used to build `EventRows`. The
+/// header is shared across every event built against the same schema so
+/// `Arc::ptr_eq` checks in `WriteEvent::merge` short-circuit happily, and so
+/// notification payloads share storage.
+fn schema_columns_header(rec: &RecordSchema) -> Arc<[ColName]> {
+    rec.columns
+        .iter()
+        .map(|c| intern_col(&c.name))
+        .collect::<Vec<_>>()
+        .into()
+}
+
+/// Project a record value into the value-slot vector for a given schema's
+/// columns. Missing fields fall back to `SqlVal::Null` so the row-slot count
+/// always matches the header length.
+fn record_row_to_event_row(row: *mut Value, rec: &RecordSchema) -> Option<Vec<SqlVal>> {
     let fields = match unsafe { as_ref(row) } {
         Value::Record(fs) => fs,
         _ => return None,
     };
-    let mut map = HashMap::with_capacity(rec.columns.len());
+    let mut vals = Vec::with_capacity(rec.columns.len());
     for col in &rec.columns {
-        if let Some(f) = fields.iter().find(|f| &*f.name == col.name.as_str()) {
-            map.insert(col.name.clone(), SqlVal::from_knot(f.value));
+        match fields.iter().find(|f| &*f.name == col.name.as_str()) {
+            Some(f) => vals.push(SqlVal::from_knot(f.value)),
+            None => vals.push(SqlVal::Null),
         }
     }
-    Some(map)
+    Some(vals)
 }
 
 /// Build a `WriteEvent::Rows` from inserted records.
 fn rows_event_for_records(rows: &[*mut Value], rec: &RecordSchema) -> WriteEvent {
-    let cols: Vec<HashMap<String, SqlVal>> = rows
-        .iter()
-        .filter_map(|r| record_row_to_col_map(*r, rec))
-        .collect();
-    WriteEvent::Rows(cols)
+    let header = schema_columns_header(rec);
+    let mut ev = EventRows::with_capacity(header, rows.len());
+    for r in rows {
+        if let Some(vals) = record_row_to_event_row(*r, rec) {
+            ev.push(vals);
+        }
+    }
+    WriteEvent::Rows(ev)
 }
 
 /// Snapshot column values + rowids for rows matching `where_clause` in
 /// `_knot_<name>`, for use as a pre-image when notifying watchers about an
-/// UPDATE/DELETE. Returns `None` if the result exceeds `MAX_EVENT_ROWS` or
-/// on any SQL error — callers fall back to `WriteEvent::Bulk` in that case.
+/// UPDATE/DELETE. Returns `None` if the result exceeds `EVENT_ROWS_HARD_CAP`
+/// or on any SQL error — callers fall back to `WriteEvent::Bulk` in that case.
 ///
 /// The returned rowids let UPDATE callers re-SELECT the same rows after the
 /// write to capture a post-image (so watchers filtered by a column the
@@ -2438,7 +2802,7 @@ fn select_rows_with_rowid(
     where_clause: &str,
     params: &[&dyn rusqlite::types::ToSql],
     project: Option<&[String]>,
-) -> Option<(Vec<HashMap<String, SqlVal>>, Vec<i64>)> {
+) -> Option<(EventRows, Vec<i64>)> {
     if rec.columns.is_empty() {
         return None;
     }
@@ -2473,26 +2837,31 @@ fn select_rows_with_rowid(
     let mut stmt = conn.prepare_cached(&sql).ok()?;
     let mut q = stmt.query(params).ok()?;
     let n_cols = selected.len();
-    let mut rows: Vec<HashMap<String, SqlVal>> = Vec::new();
+    let header: Arc<[ColName]> = selected
+        .iter()
+        .map(|c| intern_col(&c.name))
+        .collect::<Vec<_>>()
+        .into();
+    let mut ev = EventRows::new(header);
     let mut rowids: Vec<i64> = Vec::new();
     while let Ok(Some(r)) = q.next() {
-        if rows.len() >= MAX_EVENT_ROWS {
+        if ev.len() >= EVENT_ROWS_HARD_CAP {
             return None;
         }
-        let mut map = HashMap::with_capacity(n_cols);
-        for (i, col) in selected.iter().enumerate() {
+        let mut vals = Vec::with_capacity(n_cols);
+        for i in 0..n_cols {
             let v = r
                 .get_ref(i)
                 .ok()
                 .map(SqlVal::from_value_ref)
                 .unwrap_or(SqlVal::Null);
-            map.insert(col.name.clone(), v);
+            vals.push(v);
         }
         let id: i64 = r.get(n_cols).ok()?;
-        rows.push(map);
+        ev.push(vals);
         rowids.push(id);
     }
-    Some((rows, rowids))
+    Some((ev, rowids))
 }
 
 /// Record that a table was written inside an atomic block, with an event
@@ -6732,32 +7101,20 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
     if is_empty {
         // No read set means there's nothing to wait *on* — the body retried
         // without observing any relation, so no notification will ever fire.
-        // Yield briefly so other threads can run, then return; the previous
-        // 1-second sleep stalled retry loops for an entire second per
-        // iteration in this corner case.
-        std::thread::sleep(Duration::from_millis(50));
-        // Re-acquire write lock if we held it
-        if saved_lock_depth > 0 {
-            while WRITE_LOCKED
-                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                std::thread::yield_now();
-            }
-            WRITE_LOCK_DEPTH.with(|d| d.set(saved_lock_depth));
-        }
+        // Park on the global write-event condvar so we wake on any write
+        // anywhere in the system instead of burning a 50 ms tick.
+        wait_for_any_write(Duration::from_millis(50));
+        write_lock_reacquire_at_depth(saved_lock_depth);
         return;
     }
 
-    // Fast path: check if already changed without cloning the map
+    // Fast path: check if already changed without cloning the map. Uses the
+    // cached Arc inside each reads entry — one atomic load per table, no
+    // DashMap shard lookup.
     let already_changed = STM_TRACK.with(|t| {
         let t = t.borrow();
-        t.reads.iter().any(|(table, ver)| {
-            TABLE_VERSIONS
-                .get(table)
-                .map(|v| v.load(Ordering::Acquire))
-                .unwrap_or(0)
-                > *ver
+        t.reads.iter().any(|(_, (arc, ver))| {
+            arc.load(Ordering::Acquire) > *ver
         })
     });
     if already_changed {
@@ -6767,27 +7124,29 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
         // spin-starve writers that would satisfy the retry condition,
         // causing unbounded memory growth from repeated SQL reads.
         std::thread::yield_now();
-        if saved_lock_depth > 0 {
-            while WRITE_LOCKED
-                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                std::thread::yield_now();
-            }
-            WRITE_LOCK_DEPTH.with(|d| d.set(saved_lock_depth));
-        }
+        write_lock_reacquire_at_depth(saved_lock_depth);
         return;
     }
 
-    // Snapshot read versions + filters into local vars (single borrow each)
-    let (read_versions, filter_map): (Vec<(String, u64)>, HashMap<String, Vec<ReadFilter>>) =
-        STM_TRACK.with(|t| {
-            let t = t.borrow();
-            (
-                t.reads.iter().map(|(k, v)| (k.clone(), *v)).collect(),
-                t.filters.clone(),
-            )
-        });
+    // Snapshot read versions + filters into local vars (single borrow each).
+    // `filter_map` is moved out of `STM_TRACK` rather than cloned — it gets
+    // re-allocated on the next `knot_stm_snapshot` clear anyway, so taking
+    // ownership saves the clone allocation on every park.
+    // `read_versions` carries the cached version Arc per table so the
+    // post-register re-check below is a memory load, not a DashMap lookup.
+    let (read_versions, filter_map): (
+        Vec<(String, Arc<AtomicU64>, u64)>,
+        HashMap<String, Vec<ReadFilter>>,
+    ) = STM_TRACK.with(|t| {
+        let mut t = t.borrow_mut();
+        (
+            t.reads
+                .iter()
+                .map(|(k, v)| (k.clone(), v.0.clone(), v.1))
+                .collect(),
+            std::mem::take(&mut t.filters),
+        )
+    });
 
     // Build the slot. Per-filter `classify_filter` decides whether each filter
     // is registered in the broad `TABLE_WATCHERS` list, the `EQ_WATCHERS`
@@ -6803,7 +7162,7 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
     let mut broad_tables: Vec<&str> = Vec::new();
     let mut eq_registrations: Vec<EqKey> = Vec::new();
     let mut range_registrations: Vec<(RangeKey, CmpOp, SqlVal)> = Vec::new();
-    for (table, _) in &read_versions {
+    for (table, _, _) in &read_versions {
         let fs = filter_map.get(table).map(|v| v.as_slice()).unwrap_or(&[]);
         let regs: Vec<FilterReg> = fs.iter().map(classify_filter).collect();
         let any_broad = regs.iter().any(|r| matches!(r, FilterReg::Broad));
@@ -6841,7 +7200,7 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
         for f in filters {
             if let ReadFilter::Cols(preds) = f {
                 for (col, _) in preds {
-                    *state.cols.entry(col.clone()).or_insert(0) += 1;
+                    *state.cols.entry(col.to_string()).or_insert(0) += 1;
                 }
             }
         }
@@ -6876,14 +7235,11 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
         bucket.entry(threshold.to_key()).or_default().push(weak);
     }
 
-    // Re-check after registration to prevent lost wakeups
-    let changed_after_register = read_versions.iter().any(|(table, ver)| {
-        TABLE_VERSIONS
-            .get(table)
-            .map(|v| v.load(Ordering::Acquire))
-            .unwrap_or(0)
-            > *ver
-    });
+    // Re-check after registration to prevent lost wakeups. Uses cached Arcs —
+    // one atomic load per table, no DashMap traffic.
+    let changed_after_register = read_versions
+        .iter()
+        .any(|(_, arc, ver)| arc.load(Ordering::Acquire) > *ver);
 
     if !changed_after_register {
         slot.wait(STM_WAIT_TIMEOUT);
@@ -6895,15 +7251,7 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
     }
 
     // Re-acquire write lock if we held it before waiting
-    if saved_lock_depth > 0 {
-        while WRITE_LOCKED
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            std::thread::yield_now();
-        }
-        WRITE_LOCK_DEPTH.with(|d| d.set(saved_lock_depth));
-    }
+    write_lock_reacquire_at_depth(saved_lock_depth);
 }
 
 // ── IO wrappers for effectful functions ──────────────────────────
@@ -10584,12 +10932,20 @@ pub extern "C" fn knot_source_append(
 
         // Capture column values for the row-level event payload alongside the
         // INSERT, but only if any watcher could consume it — otherwise emit
-        // `Bulk` and skip per-row map construction entirely.
+        // `Bulk` and skip per-row payload construction entirely.
         let want_rows_event = table_has_watchers(name);
-        let mut event_rows: Vec<HashMap<String, SqlVal>> = if want_rows_event {
-            Vec::with_capacity(rows.len())
+        let event_header: Arc<[ColName]> = if want_rows_event {
+            std::iter::once(intern_col("_tag"))
+                .chain(adt.all_fields.iter().map(|f| intern_col(&f.name)))
+                .collect::<Vec<_>>()
+                .into()
         } else {
-            Vec::new()
+            Arc::from(Vec::<ColName>::new())
+        };
+        let mut event_rows: EventRows = if want_rows_event {
+            EventRows::with_capacity(event_header.clone(), rows.len())
+        } else {
+            EventRows::new(event_header.clone())
         };
         for row_ptr in rows {
             let params = adt_row_to_params(*row_ptr, &adt);
@@ -10599,11 +10955,11 @@ pub extern "C" fn knot_source_append(
                 panic!("knot runtime: insert error: {}", e)
             });
             if want_rows_event {
-                let mut map = HashMap::with_capacity(col_names.len());
-                for (i, col) in std::iter::once("_tag").chain(adt.all_fields.iter().map(|f| f.name.as_str())).enumerate() {
-                    map.insert(col.to_string(), SqlVal::from_rusqlite(&params[i]));
+                let mut vals = Vec::with_capacity(event_header.len());
+                for i in 0..event_header.len() {
+                    vals.push(SqlVal::from_rusqlite(&params[i]));
                 }
-                event_rows.push(map);
+                event_rows.push(vals);
             }
         }
         let event = if want_rows_event {
@@ -11203,17 +11559,27 @@ pub extern "C" fn knot_source_update_where(
                     .join(",");
                 let post_where = format!("rowid IN ({})", id_list);
                 let mut merged = pre_rows;
-                if let Some((post_rows, _)) = select_rows_with_rowid(
+                let post = select_rows_with_rowid(
                     &db_ref.conn,
                     &table,
                     &rec,
                     &post_where,
                     &[],
                     projection.as_deref(),
-                ) {
-                    merged.extend(post_rows);
+                );
+                match post {
+                    Some((post_rows, _)) => {
+                        if merged.try_extend(post_rows) {
+                            WriteEvent::Rows(merged)
+                        } else {
+                            // Headers diverged (shouldn't happen for same
+                            // table/projection, but defensive). Bulk is the
+                            // safe wake.
+                            WriteEvent::Bulk
+                        }
+                    }
+                    None => WriteEvent::Rows(merged),
                 }
-                WriteEvent::Rows(merged)
             }
         }
         _ => WriteEvent::Bulk,
@@ -12012,24 +12378,26 @@ pub extern "C" fn knot_atomic_commit(db: *mut c_void) {
         .expect("knot runtime: failed to commit atomic");
     db_ref.atomic_depth.set(depth - 1);
     if depth == 1 {
-        let written = STM_TRACK.with(|t| std::mem::take(&mut t.borrow_mut().writes));
-        if !written.is_empty() {
-            // Bump per-table versions via DashMap shard reads + atomic
-            // increments. `preregister_table_meta` populated these at
-            // source init, so the entry-miss path almost never fires.
-            for table in written.keys() {
-                bump_table_version(table);
+        // Drain in place to preserve the HashMap's allocation across retry
+        // iterations / repeated atomic blocks. `std::mem::take` would reset
+        // capacity to zero — the next atomic on this thread would re-grow.
+        STM_TRACK.with(|t| {
+            let mut t = t.borrow_mut();
+            if t.writes.is_empty() {
+                return;
             }
-            // Wake matching watchers via the shared path so EQ_WATCHERS gets
-            // scanned for Rows events. Skip the work entirely for tables with
-            // no live watchers.
-            for (table, event) in &written {
-                if !table_has_watchers(table) {
+            // Bump versions first (cheap atomic adds) so any thread reading
+            // the counter after wake sees the new value, then wake watchers.
+            // Iterate once via drain to avoid a second pass over keys.
+            for (table, event) in t.writes.drain() {
+                bump_table_version(&table);
+                bump_global_writes();
+                if !table_has_watchers(&table) {
                     continue;
                 }
-                wake_matching_watchers(table, event);
+                wake_matching_watchers(&table, &event);
             }
-        }
+        });
     }
 }
 
@@ -15005,16 +15373,37 @@ mod _size_tests {
 mod _stm_filter_tests {
     use super::*;
 
-    fn row(pairs: &[(&str, SqlVal)]) -> HashMap<String, SqlVal> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    /// Build a single-row `EventRows` from `(col, value)` pairs. Used to keep
+    /// the test bodies terse — the production code goes through the columnar
+    /// builder API but tests can stay HashMap-ish.
+    fn rows_with(pairs: &[(&str, SqlVal)]) -> EventRows {
+        let cols: Arc<[ColName]> =
+            pairs.iter().map(|(k, _)| intern_col(k)).collect::<Vec<_>>().into();
+        let mut ev = EventRows::new(cols);
+        ev.push(pairs.iter().map(|(_, v)| v.clone()).collect());
+        ev
+    }
+
+    /// Build a multi-row `EventRows` from per-row `(col, value)` slices. The
+    /// header is taken from the first slice; every other row must share the
+    /// same columns in the same order.
+    fn rows_many(rows: &[&[(&str, SqlVal)]]) -> EventRows {
+        let first = rows.first().expect("rows_many: need at least one row");
+        let cols: Arc<[ColName]> =
+            first.iter().map(|(k, _)| intern_col(k)).collect::<Vec<_>>().into();
+        let mut ev = EventRows::new(cols);
+        for r in rows {
+            ev.push(r.iter().map(|(_, v)| v.clone()).collect());
+        }
+        ev
     }
 
     fn col_eq(col: &str, v: SqlVal) -> ReadFilter {
-        ReadFilter::Cols(vec![(col.into(), ColPred::Cmp(CmpOp::Eq, v))])
+        ReadFilter::Cols(vec![(intern_col(col), ColPred::Cmp(CmpOp::Eq, v))])
     }
 
     fn col_cmp(col: &str, op: CmpOp, v: SqlVal) -> ReadFilter {
-        ReadFilter::Cols(vec![(col.into(), ColPred::Cmp(op, v))])
+        ReadFilter::Cols(vec![(intern_col(col), ColPred::Cmp(op, v))])
     }
 
     #[test]
@@ -15027,10 +15416,10 @@ mod _stm_filter_tests {
 
     #[test]
     fn rows_event_wakes_only_matching_col_eq() {
-        let event = WriteEvent::Rows(vec![
-            row(&[("id", SqlVal::Int(5)), ("name", SqlVal::Text("a".into()))]),
-            row(&[("id", SqlVal::Int(7)), ("name", SqlVal::Text("b".into()))]),
-        ]);
+        let event = WriteEvent::Rows(rows_many(&[
+            &[("id", SqlVal::Int(5)), ("name", SqlVal::Text("a".into()))],
+            &[("id", SqlVal::Int(7)), ("name", SqlVal::Text("b".into()))],
+        ]));
         assert!(event.matches_filters(&[col_eq("id", SqlVal::Int(5))]));
         assert!(!event.matches_filters(&[col_eq("id", SqlVal::Int(99))]));
         assert!(event.matches_filters(&[ReadFilter::All]));
@@ -15040,22 +15429,22 @@ mod _stm_filter_tests {
     fn col_eq_filter_cross_type_int_text_compare() {
         // BigInts are stored as TEXT in SQLite; reader's filter may compare
         // against SqlVal::Text("5") while the row carries SqlVal::Int(5) or vice versa.
-        let event = WriteEvent::Rows(vec![row(&[("id", SqlVal::Text("5".into()))])]);
+        let event = WriteEvent::Rows(rows_with(&[("id", SqlVal::Text("5".into()))]));
         assert!(event.matches_filters(&[col_eq("id", SqlVal::Int(5))]));
     }
 
     #[test]
     fn empty_filters_do_not_wake_on_rows() {
-        let event = WriteEvent::Rows(vec![row(&[("id", SqlVal::Int(1))])]);
+        let event = WriteEvent::Rows(rows_with(&[("id", SqlVal::Int(1))]));
         assert!(!event.matches_filters(&[]));
     }
 
     #[test]
     fn cmp_filter_wakes_only_on_matching_range() {
-        let event = WriteEvent::Rows(vec![
-            row(&[("qty", SqlVal::Int(50))]),
-            row(&[("qty", SqlVal::Int(150))]),
-        ]);
+        let event = WriteEvent::Rows(rows_many(&[
+            &[("qty", SqlVal::Int(50))],
+            &[("qty", SqlVal::Int(150))],
+        ]));
         // qty > 100 matches the 150 row → wake.
         assert!(event.matches_filters(&[col_cmp("qty", CmpOp::Gt, SqlVal::Int(100))]));
         // qty > 200 matches nothing.
@@ -15067,40 +15456,40 @@ mod _stm_filter_tests {
     #[test]
     fn cmp_filter_real_int_cross_type() {
         // Reader compares against a float; row carries int.
-        let event = WriteEvent::Rows(vec![row(&[("price", SqlVal::Int(10))])]);
+        let event = WriteEvent::Rows(rows_with(&[("price", SqlVal::Int(10))]));
         assert!(event.matches_filters(&[col_cmp("price", CmpOp::Ge, SqlVal::Real(9.5))]));
         assert!(!event.matches_filters(&[col_cmp("price", CmpOp::Ge, SqlVal::Real(10.5))]));
     }
 
     #[test]
     fn cols_and_semantics_requires_all_preds_match() {
-        let event = WriteEvent::Rows(vec![row(&[
+        let event = WriteEvent::Rows(rows_with(&[
             ("status", SqlVal::Text("open".into())),
             ("qty", SqlVal::Int(150)),
-        ])]);
+        ]));
         // status=open AND qty > 100 — both match.
         let both_match = ReadFilter::Cols(vec![
-            ("status".into(), ColPred::Cmp(CmpOp::Eq, SqlVal::Text("open".into()))),
-            ("qty".into(), ColPred::Cmp(CmpOp::Gt, SqlVal::Int(100))),
+            (intern_col("status"), ColPred::Cmp(CmpOp::Eq, SqlVal::Text("open".into()))),
+            (intern_col("qty"), ColPred::Cmp(CmpOp::Gt, SqlVal::Int(100))),
         ]);
         assert!(event.matches_filters(&[both_match]));
         // status=closed AND qty > 100 — first fails, row doesn't match.
         let first_fails = ReadFilter::Cols(vec![
-            ("status".into(), ColPred::Cmp(CmpOp::Eq, SqlVal::Text("closed".into()))),
-            ("qty".into(), ColPred::Cmp(CmpOp::Gt, SqlVal::Int(100))),
+            (intern_col("status"), ColPred::Cmp(CmpOp::Eq, SqlVal::Text("closed".into()))),
+            (intern_col("qty"), ColPred::Cmp(CmpOp::Gt, SqlVal::Int(100))),
         ]);
         assert!(!event.matches_filters(&[first_fails]));
     }
 
     #[test]
     fn in_filter_wakes_on_any_listed_value() {
-        let event = WriteEvent::Rows(vec![row(&[("id", SqlVal::Int(7))])]);
+        let event = WriteEvent::Rows(rows_with(&[("id", SqlVal::Int(7))]));
         let in_match = ReadFilter::Cols(vec![(
-            "id".into(),
+            intern_col("id"),
             ColPred::In(vec![SqlVal::Int(1), SqlVal::Int(7), SqlVal::Int(9)]),
         )]);
         let in_miss = ReadFilter::Cols(vec![(
-            "id".into(),
+            intern_col("id"),
             ColPred::In(vec![SqlVal::Int(1), SqlVal::Int(2)]),
         )]);
         assert!(event.matches_filters(&[in_match]));
@@ -15110,7 +15499,7 @@ mod _stm_filter_tests {
     #[test]
     fn missing_column_wakes_conservatively() {
         // Row payload lacks the column referenced by the filter — wake anyway.
-        let event = WriteEvent::Rows(vec![row(&[("qty", SqlVal::Int(1))])]);
+        let event = WriteEvent::Rows(rows_with(&[("qty", SqlVal::Int(1))]));
         assert!(event.matches_filters(&[col_eq("status", SqlVal::Text("open".into()))]));
     }
 
@@ -15118,10 +15507,10 @@ mod _stm_filter_tests {
     fn multiple_filters_or_together_across_sites() {
         // Two read sites: one watching status=open, one watching qty > 1000.
         // A write to a single row should wake if EITHER filter matches it.
-        let event = WriteEvent::Rows(vec![row(&[
+        let event = WriteEvent::Rows(rows_with(&[
             ("status", SqlVal::Text("closed".into())),
             ("qty", SqlVal::Int(2000)),
-        ])]);
+        ]));
         let filters = vec![
             col_eq("status", SqlVal::Text("open".into())),
             col_cmp("qty", CmpOp::Gt, SqlVal::Int(1000)),
@@ -15131,20 +15520,39 @@ mod _stm_filter_tests {
 
     #[test]
     fn merge_promotes_to_bulk() {
-        let mut e = WriteEvent::Rows(vec![row(&[("id", SqlVal::Int(1))])]);
+        let mut e = WriteEvent::Rows(rows_with(&[("id", SqlVal::Int(1))]));
         e.merge(WriteEvent::Bulk);
         assert!(matches!(e, WriteEvent::Bulk));
     }
 
     #[test]
     fn merge_concatenates_rows() {
-        let mut e = WriteEvent::Rows(vec![row(&[("id", SqlVal::Int(1))])]);
-        e.merge(WriteEvent::Rows(vec![row(&[("id", SqlVal::Int(2))])]));
+        // Build both events from the same shared header so `Arc::ptr_eq`
+        // succeeds and the merge extends in place rather than upgrading.
+        let cols: Arc<[ColName]> = Arc::from(vec![intern_col("id")]);
+        let mut a = EventRows::new(cols.clone());
+        a.push(vec![SqlVal::Int(1)]);
+        let mut b = EventRows::new(cols);
+        b.push(vec![SqlVal::Int(2)]);
+        let mut e = WriteEvent::Rows(a);
+        e.merge(WriteEvent::Rows(b));
         if let WriteEvent::Rows(rs) = e {
             assert_eq!(rs.len(), 2);
         } else {
             panic!("expected Rows after merge");
         }
+    }
+
+    #[test]
+    fn merge_upgrades_to_bulk_on_header_mismatch() {
+        // Two events built from separately-allocated headers — Arc identity
+        // differs even if the columns are nominally equal — so merge falls
+        // back to Bulk rather than reshaping the rows.
+        let a = rows_with(&[("id", SqlVal::Int(1))]);
+        let b = rows_with(&[("id", SqlVal::Int(2))]);
+        let mut e = WriteEvent::Rows(a);
+        e.merge(WriteEvent::Rows(b));
+        assert!(matches!(e, WriteEvent::Bulk));
     }
 
     #[test]

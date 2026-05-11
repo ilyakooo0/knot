@@ -151,6 +151,13 @@ pub struct Codegen {
     // User-defined functions whose bodies (transitively) produce IO values
     io_functions: HashSet<String>,
 
+    // User-defined functions whose bodies (transitively) perform a relation
+    // write (Set/ReplaceSet or a nested call to another writing function).
+    // Used to skip the SAVEPOINT in read-only `atomic` blocks — the version-
+    // snapshot retry machinery doesn't need transactional rollback when no
+    // SQL writes can happen.
+    write_functions: HashSet<String>,
+
     // Scalar sources: source names whose type is a bare primitive (e.g. `*counter : Int`)
     // rather than a relation of records. These get automatic wrap/unwrap of `_value` field.
     scalar_sources: HashSet<String>,
@@ -716,6 +723,7 @@ impl Codegen {
             registered_builtin_impls: HashSet::new(),
             nullable_ctors: HashMap::new(),
             io_functions: HashSet::new(),
+            write_functions: HashSet::new(),
             scalar_sources: HashSet::new(),
             overridable_constants: HashMap::new(),
             overridable_defaults: HashMap::new(),
@@ -1624,6 +1632,7 @@ impl Codegen {
 
         // Detect user functions that produce IO values (fixed-point iteration)
         self.detect_io_functions(&module.decls);
+        self.detect_write_functions(&module.decls);
 
         // Process deriving clauses: auto-generate impl methods from trait defaults
         for decl in &module.decls {
@@ -4544,6 +4553,12 @@ impl Codegen {
 
             ast::ExprKind::Atomic(inner) => {
                 let is_nested = self.atomic_retry_block.is_some();
+                // Whether the body might issue a SQL write (Set/ReplaceSet,
+                // direct or via a user fn). If not, the SAVEPOINT can be
+                // skipped — the version-snapshot retry machinery already
+                // provides the consistency guarantees we need for a
+                // read-only body, and skipping avoids a WAL write per retry.
+                let body_writes = Self::expr_contains_writes(inner, &self.write_functions);
 
                 // For nested atomics, save outer STM tracking before the loop
                 // so inner snapshot/retry doesn't destroy outer read/write sets.
@@ -4568,7 +4583,9 @@ impl Codegen {
 
                 // Snapshot change counter before executing the body
                 let snapshot = self.call_rt(builder, "knot_stm_snapshot", &[]);
-                self.call_rt_void(builder, "knot_atomic_begin", &[db]);
+                if body_writes {
+                    self.call_rt_void(builder, "knot_atomic_begin", &[db]);
+                }
 
                 // Set retry block so `retry` keyword can jump directly here,
                 // short-circuiting execution instead of using a flag.
@@ -4610,7 +4627,9 @@ impl Codegen {
                 // (1) Retry path
                 builder.switch_to_block(retry_block);
                 builder.seal_block(retry_block);
-                self.call_rt_void(builder, "knot_atomic_rollback", &[db]);
+                if body_writes {
+                    self.call_rt_void(builder, "knot_atomic_rollback", &[db]);
+                }
                 self.call_rt_void(builder, "knot_arena_pop_frame", &[]);
                 self.call_rt_void(builder, "knot_stm_wait", &[snapshot]);
                 builder.ins().jump(loop_block, &[]);
@@ -4629,7 +4648,9 @@ impl Codegen {
                 // jump to done with unit so the surrounding IO continues.
                 builder.switch_to_block(skip_block);
                 builder.seal_block(skip_block);
-                self.call_rt_void(builder, "knot_atomic_rollback", &[db]);
+                if body_writes {
+                    self.call_rt_void(builder, "knot_atomic_rollback", &[db]);
+                }
                 self.call_rt_void(builder, "knot_arena_pop_frame", &[]);
                 let unit_after_skip = self.call_rt(builder, "knot_value_unit", &[]);
                 builder.ins().jump(done_block, &[unit_after_skip.into()]);
@@ -4639,7 +4660,9 @@ impl Codegen {
                 builder.switch_to_block(commit_block);
                 builder.seal_block(commit_block);
                 let promoted = self.call_rt(builder, "knot_arena_pop_frame_promote", &[post_val]);
-                self.call_rt_void(builder, "knot_atomic_commit", &[db]);
+                if body_writes {
+                    self.call_rt_void(builder, "knot_atomic_commit", &[db]);
+                }
                 builder.ins().jump(done_block, &[promoted.into()]);
 
                 // Done: both skip and commit paths converge here.
@@ -6768,6 +6791,98 @@ impl Codegen {
             | ast::ExprKind::RecordUpdate { .. }
             | ast::ExprKind::FieldAccess { .. }
             | ast::ExprKind::List(_) => false,
+            _ => false,
+        }
+    }
+
+    /// Detect user functions whose bodies (transitively) perform a relation
+    /// write. Mirror of `detect_io_functions`. The result lets `compile_atomic`
+    /// skip the SAVEPOINT entirely for read-only atomic bodies — the version-
+    /// snapshot retry machinery doesn't need transactional rollback when no
+    /// SQL write can occur.
+    fn detect_write_functions(&mut self, decls: &[ast::Decl]) {
+        let mut fun_bodies: Vec<(String, &ast::Expr)> = Vec::new();
+        for decl in decls {
+            if let ast::DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
+                fun_bodies.push((name.clone(), body));
+            }
+        }
+        loop {
+            let mut changed = false;
+            for (name, body) in &fun_bodies {
+                if self.write_functions.contains(name) {
+                    continue;
+                }
+                if Self::expr_contains_writes(body, &self.write_functions) {
+                    self.write_functions.insert(name.clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    /// True if `expr` may perform a relation write at runtime. Used to decide
+    /// whether an `atomic` body needs a `SAVEPOINT`.
+    ///
+    /// Pessimistic on lambdas: we treat any Lambda body as potentially
+    /// containing writes only if its body literally does, since the lambda
+    /// itself is a value (no side effects on construction); but applications
+    /// of an unknown function (e.g. through a parameter) are conservatively
+    /// treated as writes by the App fallthrough. A nested `Atomic` is treated
+    /// as writing because we can't rule out writes within it without re-running
+    /// the analysis on the inner body — and even a read-only inner atomic
+    /// gates on the same SAVEPOINT decision at the outer level: the inner
+    /// retry machinery is self-contained either way.
+    fn expr_contains_writes(expr: &ast::Expr, write_fns: &HashSet<String>) -> bool {
+        match &expr.node {
+            ast::ExprKind::Set { .. } | ast::ExprKind::ReplaceSet { .. } => true,
+            ast::ExprKind::Atomic(inner) => Self::expr_contains_writes(inner, write_fns),
+            ast::ExprKind::Var(name) => write_fns.contains(name),
+            ast::ExprKind::App { func, arg } => {
+                Self::expr_contains_writes(func, write_fns)
+                    || Self::expr_contains_writes(arg, write_fns)
+            }
+            ast::ExprKind::BinOp { lhs, rhs, .. } => {
+                Self::expr_contains_writes(lhs, write_fns)
+                    || Self::expr_contains_writes(rhs, write_fns)
+            }
+            ast::ExprKind::UnaryOp { operand, .. } => Self::expr_contains_writes(operand, write_fns),
+            ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
+                ast::StmtKind::Bind { expr, .. }
+                | ast::StmtKind::Expr(expr)
+                | ast::StmtKind::Let { expr, .. } => Self::expr_contains_writes(expr, write_fns),
+                ast::StmtKind::Where { cond } => Self::expr_contains_writes(cond, write_fns),
+                ast::StmtKind::GroupBy { key } => Self::expr_contains_writes(key, write_fns),
+            }),
+            ast::ExprKind::Lambda { body, .. } => Self::expr_contains_writes(body, write_fns),
+            ast::ExprKind::If { cond, then_branch, else_branch, .. } => {
+                Self::expr_contains_writes(cond, write_fns)
+                    || Self::expr_contains_writes(then_branch, write_fns)
+                    || Self::expr_contains_writes(else_branch, write_fns)
+            }
+            ast::ExprKind::Case { scrutinee, arms, .. } => {
+                Self::expr_contains_writes(scrutinee, write_fns)
+                    || arms.iter().any(|arm| Self::expr_contains_writes(&arm.body, write_fns))
+            }
+            ast::ExprKind::UnitLit { value, .. } => Self::expr_contains_writes(value, write_fns),
+            ast::ExprKind::Annot { expr, .. } => Self::expr_contains_writes(expr, write_fns),
+            ast::ExprKind::Refine(inner) => Self::expr_contains_writes(inner, write_fns),
+            ast::ExprKind::Record(fields) => fields
+                .iter()
+                .any(|f| Self::expr_contains_writes(&f.value, write_fns)),
+            ast::ExprKind::RecordUpdate { base, fields } => {
+                Self::expr_contains_writes(base, write_fns)
+                    || fields.iter().any(|f| Self::expr_contains_writes(&f.value, write_fns))
+            }
+            ast::ExprKind::FieldAccess { expr, .. } => {
+                Self::expr_contains_writes(expr, write_fns)
+            }
+            ast::ExprKind::List(items) => {
+                items.iter().any(|e| Self::expr_contains_writes(e, write_fns))
+            }
             _ => false,
         }
     }

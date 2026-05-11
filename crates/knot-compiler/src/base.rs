@@ -98,6 +98,11 @@ impl Alternative Maybe where
     Nothing {} -> b
     Just {} -> a
 
+impl Foldable Maybe where
+  fold f z m = case m of
+    Nothing {} -> z
+    Just {value} -> f z value
+
 trait ToJSON a where
   toJson : a -> Text
 

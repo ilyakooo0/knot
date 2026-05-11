@@ -133,10 +133,10 @@ avg : (a -> Float<u>) -> [a] -> Float<u>
 
 Average of a projected numeric field over a relation. Returns `Float`. Preserves units from the projection function — if the projection returns `Float<M>`, the average is `Float<M>`.
 
-### `min`
+### `minOn`
 
 ```
-min : (a -> b) -> [a] -> b
+minOn : (a -> b) -> [a] -> b
 ```
 
 Minimum of a projected field over a relation. The projection can return any orderable type — `Int`, `Float`, or `Text` (lexicographic ordering). Panics if the relation is empty.
@@ -144,27 +144,42 @@ Minimum of a projected field over a relation. The projection can return any orde
 ```knot
 lowestSalary = do
   employees <- *employees
-  yield (min (\e -> e.salary) employees)
+  yield (minOn (\e -> e.salary) employees)
 
 firstName = do
   employees <- *employees
-  yield (min (\e -> e.name) employees)
+  yield (minOn (\e -> e.name) employees)
 ```
 
 When applied to a source (or bound source variable), it pushes down to `SELECT MIN(col) FROM ...`. Combined with `filter` it becomes `SELECT MIN(col) FROM ... WHERE ...`.
 
-### `max`
+### `maxOn`
 
 ```
-max : (a -> b) -> [a] -> b
+maxOn : (a -> b) -> [a] -> b
 ```
 
-Maximum of a projected field over a relation. Like `min`, works with any orderable type. Panics if the relation is empty. Pushes down to `SELECT MAX(col) FROM ...`.
+Maximum of a projected field over a relation. Like `minOn`, works with any orderable type. Panics if the relation is empty. Pushes down to `SELECT MAX(col) FROM ...`.
 
 ```knot
 highestSalary = do
   employees <- *employees
-  yield (max (\e -> e.salary) employees)
+  yield (maxOn (\e -> e.salary) employees)
+```
+
+### `min` / `max`
+
+```
+min : Ord a => a -> a -> a
+max : Ord a => a -> a -> a
+```
+
+Binary minimum and maximum of two values. Use `minOn`/`maxOn` to aggregate
+over a relation; `min`/`max` operate on two single values.
+
+```knot
+min 3 7         -- 3
+max "a" "b"     -- "b"
 ```
 
 ### `union`
@@ -206,10 +221,10 @@ Set intersection — rows present in both relations.
 ### `fork`
 
 ```
-fork : IO {} {} -> IO {} {}
+fork : IO r {} -> IO {} {}
 ```
 
-Run an IO action on a new OS thread (fire-and-forget). Each thread gets its own SQLite connection via WAL mode for safe concurrent access. The main thread waits for all spawned threads before exiting.
+Run an IO action on a new OS thread (fire-and-forget). The spawned action may carry any effects (its row variable `r` is unconstrained), but those effects do not propagate back to the caller. Each thread gets its own SQLite connection via WAL mode for safe concurrent access. The main thread waits for all spawned threads before exiting.
 
 ```knot
 main = do
@@ -221,6 +236,37 @@ main = do
 ```
 
 Do blocks can be passed directly as arguments without parentheses.
+
+### `race`
+
+```
+race : IO r a -> IO r b -> IO r (Result a b)
+```
+
+Run two IO actions concurrently and return the winner. Both arguments share a single effect row, so any effects required by either side flow into the result IO.
+
+The winner is reported via the built-in `Result a b` ADT — `Err {error: a}` when the left action wins, `Ok {value: b}` when the right action wins.
+
+```knot
+slow = do
+  sleep 1000<Ms>
+  yield "slow"
+
+fast = do
+  sleep 50<Ms>
+  yield "fast"
+
+main = do
+  r <- race slow fast
+  case r of
+    Err {error: a} -> println ("left won: " ++ a)
+    Ok {value: b}  -> println ("right won: " ++ b)
+  yield {}
+```
+
+Cancellation is cooperative but aggressive: the loser's `knot_io_run` checks its cancel token between every IO thunk, and `sleep` parks on a condvar that's signalled on cancel — so a loser stuck in a long sleep wakes immediately when the peer wins. The parent does not wait for the loser; it returns as soon as a winner is observed, and the loser unwinds at its next safe point (tracked for the final program-exit join).
+
+`race` cannot be used inside `atomic` — its effects are not rollback-safe.
 
 ### `atomic`
 
@@ -262,6 +308,15 @@ waitForTask = \id -> atomic do
 ```
 
 The compiler enforces that `retry` is only used inside `atomic`.
+
+**Row-level wakeup filtering.** The runtime tracks which rows the atomic block
+actually read by inspecting `WHERE`/`single (filter ...)` patterns and the
+predicates inside them (equality, inequality, ordered comparisons, and `IN`
+sets). A parked retry is only woken when an UPDATE, DELETE, or INSERT touches
+a matching row. So a worker retrying on `WHERE id = 1` is not woken by writes
+to `id = 2`, and a worker retrying on `status IN ("queued", "running")` is
+unaffected by writes that leave the status outside that set. Bulk
+replacements (`set *rel = ...`) wake all watchers conservatively.
 
 ---
 
@@ -454,10 +509,18 @@ main = do
 ### `now`
 
 ```
-now : IO {clock} Int
+now : IO {clock} Int<Ms>
 ```
 
-Return the current Unix timestamp in milliseconds.
+Return the current Unix timestamp in milliseconds. The result is tagged with the built-in `Ms` unit; use `stripUnit` if you need a plain `Int`.
+
+### `sleep`
+
+```
+sleep : Int<Ms> -> IO {clock} {}
+```
+
+Pause the current thread for the given number of milliseconds. Inside a `race` worker, `sleep` parks on the worker's cancel condvar and wakes immediately if the peer wins.
 
 ---
 
@@ -466,18 +529,35 @@ Return the current Unix timestamp in milliseconds.
 ### `randomInt`
 
 ```
-randomInt : Int -> IO {random} Int
+randomInt : Int<u> -> IO {random} Int<u>
 ```
 
-Generate a random integer in the range [0, *bound*).
+Generate a random integer in the range `[0, bound)`. Unit-polymorphic — the bound's unit is preserved in the result, so `randomInt 100<Usd>` returns `Int<Usd>`.
 
 ### `randomFloat`
 
 ```
-randomFloat : IO {random} Float
+randomFloat : IO {random} Float<u>
 ```
 
-Generate a random float in the range [0.0, 1.0).
+Generate a random float in the range `[0.0, 1.0)`. Unit-polymorphic — the unit is inferred from context.
+
+### `randomUuid`
+
+```
+randomUuid : IO {random} Uuid
+```
+
+Generate a fresh UUID. The output is a RFC 9562 UUIDv7 — time-ordered, so values sort chronologically and are well-suited as primary keys.
+
+```knot
+main = do
+  u <- randomUuid
+  println u
+  yield {}
+```
+
+`Uuid` values are stored as TEXT in SQLite and compare by their canonical string representation.
 
 ---
 
@@ -671,10 +751,11 @@ trait Eq a => Num a where
   sub : a -> a -> a
   mul : a -> a -> a
   div : a -> a -> a
+  mod : a -> a -> a
   negate : a -> a
 ```
 
-Numeric operations. Built-in implementations for `Int`, `Float`. Used by `+`, `-`, `*`, `/` operators and unary negation.
+Numeric operations. Built-in implementations for `Int`, `Float`. Used by `+`, `-`, `*`, `/`, `%` operators and unary negation. Modulo on `Int` is the remainder (sign follows the dividend); on `Float` it is `fmod`. Modulo by zero panics. The `%` operator pushes down into SQLite as `%` when used inside a SQL-compilable comprehension.
 
 ### `Semigroup`
 
@@ -720,7 +801,7 @@ trait Applicative m => Monad (m : Type -> Type) where
   bind : (a -> m b) -> m a -> m b
 ```
 
-Higher-kinded monad. Enables `do` notation with `<-`. Built-in implementation for `[]` and `IO`.
+Higher-kinded monad. Enables `do` notation with `<-`. Built-in implementations for `[]`, `IO`, `Maybe`, and `Result`.
 
 ### `Alternative`
 
@@ -730,7 +811,7 @@ trait Applicative f => Alternative (f : Type -> Type) where
   alt : f a -> f a -> f a
 ```
 
-Higher-kinded alternative. `empty` is the identity; `alt` combines alternatives. Built-in implementation for `[]` (where `empty = []` and `alt = union`).
+Higher-kinded alternative. `empty` is the identity; `alt` combines alternatives. Built-in implementations for `[]` (where `empty = []` and `alt = union`) and `Maybe` (where `empty = Nothing {}` and `alt` takes the first `Just`).
 
 ### `Foldable`
 
@@ -754,9 +835,12 @@ Higher-kinded foldable. Built-in implementation for `[]`.
 | `Text` | Unicode string |
 | `Bool` | `True {}` or `False {}` |
 | `Bytes` | Byte string |
+| `Uuid` | RFC 9562 UUIDv7 identifier (TEXT in SQLite) |
 | `[a]` | Relation (set of values of type `a`) |
 | `IO {effects} a` | IO action with tracked effects |
 | `Ordering` | `LT {}`, `EQ {}`, or `GT {}` |
+| `Maybe a` | `Nothing {}` or `Just {value: a}` (built-in monad) |
+| `Result e a` | `Err {error: e}` or `Ok {value: a}` (built-in monad) |
 
 ### Units of Measure
 
@@ -808,13 +892,13 @@ double = \x -> x + x
 
 #### Unit-Preserving Functions
 
-`sum`, `avg`, `min`, and `max` preserve units from their projection function:
+`sum`, `avg`, `minOn`, and `maxOn` preserve units from their projection function:
 
 ```knot
-avg (\t -> t.distance) *trips   -- Float<M> if distance : Float<M>
-sum (\t -> t.distance) *trips   -- Float<M> if distance : Float<M>
-min (\t -> t.distance) *trips   -- Float<M> if distance : Float<M>
-max (\t -> t.distance) *trips   -- Float<M> if distance : Float<M>
+avg   (\t -> t.distance) *trips   -- Float<M> if distance : Float<M>
+sum   (\t -> t.distance) *trips   -- Float<M> if distance : Float<M>
+minOn (\t -> t.distance) *trips   -- Float<M> if distance : Float<M>
+maxOn (\t -> t.distance) *trips   -- Float<M> if distance : Float<M>
 ```
 
 ---
@@ -827,6 +911,7 @@ max (\t -> t.distance) *trips   -- Float<M> if distance : Float<M>
 | `-` | `Num` | `sub` |
 | `*` | `Num` | `mul` |
 | `/` | `Num` | `div` |
+| `%` | `Num` | `mod` |
 | unary `-` | `Num` | `negate` |
 | `==` | `Eq` | `eq` |
 | `!=` | `Eq` | `eq` (negated) |

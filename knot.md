@@ -40,6 +40,7 @@ cargo run -p knot-compiler -- build file.knot
 | `Text` | Unicode string | `"hello"`, `"line\n"` |
 | `Bool` | Boolean | `True {}`, `False {}` |
 | `Bytes` | Byte string | `b"hello"` |
+| `Uuid` | UUIDv7 identifier | (constructed via `randomUuid`) |
 | `{}` | Unit / empty record | `{}` |
 
 ### Units of Measure
@@ -198,6 +199,20 @@ people
   |> filter (\p -> p.age > 30)
   |> map (\p -> p.name)
 ```
+
+### Inline Type Annotations
+
+Any expression can carry a postfix type annotation, both with and without
+surrounding parens:
+
+```knot
+n = 0 : Int<Usd>                -- bare postfix annotation
+m = (x + y) : Float<M>          -- parenthesized
+distance = 42.0 : Float<M / S>  -- units on a literal
+```
+
+Annotations are common with units of measure where the literal alone is
+unit-agnostic.
 
 ---
 
@@ -541,8 +556,9 @@ now : IO {clock} Int
 |--------|-----------|
 | `console` | `println`, `print`, `readLine` |
 | `fs` | `readFile`, `writeFile`, `appendFile`, `fileExists`, `removeFile`, `listDir` |
-| `clock` | `now` |
-| `random` | `randomInt`, `randomFloat` |
+| `clock` | `now`, `sleep` |
+| `random` | `randomInt`, `randomFloat`, `randomUuid` |
+| `network` | `listen`, `fetch`, `fetchWith` |
 
 ### IO Do Blocks
 
@@ -619,6 +635,50 @@ waitFor = \condition -> atomic do
 
 The compiler enforces that `retry` is only used inside `atomic`.
 
+The runtime tracks which rows the atomic block actually read (via row-level
+read filters extracted from `WHERE`/`single (filter ...)` patterns) and only
+wakes a parked `retry` when a write affects a matching row. So a worker
+retrying on `WHERE id = 1` is not woken by writes to `id = 2`, and a worker
+retrying on `status IN ("queued", "running")` is not woken by writes that
+leave the status outside that set. Bulk replacements wake all watchers
+conservatively.
+
+#### `race`
+
+```knot
+race : IO r a -> IO r b -> IO r (Result a b)
+```
+
+Run two IO actions concurrently and return the winner. Both arguments share a
+single effect row, so any effects required by either side flow into the result
+IO. The winner is reported using the built-in `Result` ADT — `Err {error: a}`
+when the left action wins, `Ok {value: b}` when the right action wins.
+
+```knot
+slow = do
+  sleep 1000<Ms>
+  yield "slow"
+
+fast = do
+  sleep 50<Ms>
+  yield "fast"
+
+main = do
+  r <- race slow fast
+  case r of
+    Err {error: a} -> println ("left won: " ++ a)
+    Ok {value: b}  -> println ("right won: " ++ b)
+  yield {}
+```
+
+Cancellation is cooperative but aggressive: `knot_io_run` checks the loser's
+cancel token between every IO thunk, and `sleep` parks on a condvar that's
+signalled on cancel — so a loser stuck in a long `sleep` wakes immediately.
+The parent does not join the loser; it returns as soon as a winner is observed
+and the loser unwinds at its next safe point.
+
+`race` cannot be used inside `atomic` (its effects are not rollback-safe).
+
 ---
 
 ## Operators
@@ -626,6 +686,7 @@ The compiler enforces that `retry` is only used inside `atomic`.
 | Operator | Meaning | Trait |
 |----------|---------|-------|
 | `+` `-` `*` `/` | Arithmetic | `Num` |
+| `%` | Modulo (remainder) | `Num` |
 | unary `-` | Negation | `Num` |
 | `==` `!=` | Equality | `Eq` |
 | `<` `>` `<=` `>=` | Comparison | `Ord` |
@@ -646,8 +707,13 @@ The compiler enforces that `retry` is only used inside `atomic`.
 | `match` | `Constructor -> [ADT] -> [Payload]` | Filter by variant |
 | `fold` | `(b -> a -> b) -> b -> [a] -> b` | Left fold |
 | `count` | `[a] -> Int` | Number of rows |
+| `countWhere` | `(a -> Bool) -> [a] -> Int` | Filtered count (SQL-pushed when possible) |
 | `sum` | `(a -> b) -> [a] -> b` | Sum projected field (preserves units) |
 | `avg` | `(a -> Float<u>) -> [a] -> Float<u>` | Average projected field (preserves units) |
+| `minOn` | `(a -> b) -> [a] -> b` | Min of projected field (panics on empty) |
+| `maxOn` | `(a -> b) -> [a] -> b` | Max of projected field (panics on empty) |
+| `min` | `Ord a => a -> a -> a` | Binary min of two values |
+| `max` | `Ord a => a -> a -> a` | Binary max of two values |
 | `single` | `[a] -> Maybe a` | Extract singleton |
 | `union` | `[a] -> [a] -> [a]` | Set union |
 | `diff` | `[a] -> [a] -> [a]` | Set difference |
@@ -688,12 +754,15 @@ The compiler enforces that `retry` is only used inside `atomic`.
 | `fileExists` | `Text -> IO {fs} Bool` | Check file exists |
 | `removeFile` | `Text -> IO {fs} {}` | Delete file |
 | `listDir` | `Text -> IO {fs} [Text]` | List directory |
-| `now` | `IO {clock} Int` | Unix timestamp (ms) |
-| `randomInt` | `Int -> IO {random} Int` | Random int [0, bound) |
-| `randomFloat` | `IO {random} Float` | Random float [0, 1) |
+| `now` | `IO {clock} Int<Ms>` | Unix timestamp (milliseconds) |
+| `sleep` | `Int<Ms> -> IO {clock} {}` | Pause the current thread |
+| `randomInt` | `Int<u> -> IO {random} Int<u>` | Random int `[0, bound)`, preserves unit |
+| `randomFloat` | `IO {random} Float<u>` | Random float `[0.0, 1.0)`, unit-polymorphic |
+| `randomUuid` | `IO {random} Uuid` | Generate a RFC 9562 UUIDv7 |
 | `atomic` | `IO {} a -> IO {} a` | Run DB operations in a transaction |
-| `fork` | `IO {} {} -> IO {} {}` | Fire-and-forget on new OS thread |
-| `retry` | `IO {} a` | Rollback and wait (inside `atomic` only) |
+| `fork` | `IO r {} -> IO {} {}` | Fire-and-forget on new OS thread |
+| `race` | `IO r a -> IO r b -> IO r (Result a b)` | Run two IO actions, return the winner |
+| `retry` | `a` | Rollback and wait (inside `atomic` only) |
 
 ### Utility
 
@@ -958,41 +1027,38 @@ Refined types are subtypes of their base type. `Nat` is compatible with `Int` in
 
 ## Custom Monads
 
-Any type implementing `Monad` gets `do`/`<-`/`yield` syntax:
+Any type implementing `Monad` gets `do`/`<-`/`yield` syntax. The prelude ships
+with built-in monad instances for `[]`, `Maybe`, and `Result`, so you can use
+do-blocks directly with them:
 
 ```knot
-data Maybe a = Nothing {} | Just {value: a}
-
-impl Functor Maybe where
-  map f m = case m of
-    Nothing {} -> Nothing {}
-    Just {value} -> Just {value: f value}
-
-impl Applicative Maybe where
-  yield x = Just {value: x}
-  ap fs xs = case fs of
-    Nothing {} -> Nothing {}
-    Just {value: f} -> case xs of
-      Nothing {} -> Nothing {}
-      Just {value: x} -> Just {value: f x}
-
-impl Monad Maybe where
-  bind f m = case m of
-    Nothing {} -> Nothing {}
-    Just {value} -> f value
-
-impl Alternative Maybe where
-  empty = Nothing {}
-  alt a b = case a of
-    Nothing {} -> b
-    Just {} -> a
-
--- Now do blocks work with Maybe:
+-- Maybe — short-circuits on Nothing
 result = do
   a <- Just {value: 10}
   b <- Just {value: 2}
   where b != 0
   yield (a / b)
+
+-- Result — short-circuits on Err
+parseConfig = \text -> do
+  json <- parseJson text
+  name <- getField "name" json
+  yield name
+```
+
+To add `do` support to a user-defined type, provide its `Functor`,
+`Applicative`, `Monad`, and (optionally) `Alternative` impls:
+
+```knot
+data Tree a = Leaf {} | Node {left: Tree a, value: a, right: Tree a}
+
+impl Functor Tree where
+  map f t = case t of
+    Leaf {} -> Leaf {}
+    Node {left, value, right} ->
+      Node {left: map f left, value: f value, right: map f right}
+
+-- (Applicative, Monad, Alternative omitted for brevity)
 ```
 
 ---

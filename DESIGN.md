@@ -86,7 +86,7 @@ Constructors are the interface for building values, inserting, and querying. The
 
 Every constructor requires `{}` — even those with no fields. This keeps the syntax uniform: a constructor is always `Name {fields}`, whether it has fields or not. There is no distinction between "a constructor" and "a constructor applied to a record."
 
-`Bool`, `Maybe`, and `Result` are built-in — their constructors (`True`/`False`, `Nothing`/`Just`, `Ok`/`Err`) are always available without a `data` declaration. `True {}` and `False {}` are interchangeable with the `true`/`false` literals and can be used in `case` patterns.
+`Bool`, `Maybe`, and `Result` are built-in — their constructors (`True`/`False`, `Nothing`/`Just`, `Ok`/`Err`) are always available without a `data` declaration. `True {}` and `False {}` are interchangeable with the `true`/`false` literals and can be used in `case` patterns. The prelude provides `Functor`, `Applicative`, `Monad`, and `Alternative` impls for `Maybe`, and `Functor`/`Applicative`/`Monad`/`Alternative` for `Result`, so `do`-notation works on both out of the box.
 
 ```knot
 data Maybe a = Nothing {} | Just {value: a}
@@ -540,7 +540,7 @@ Grouping is executed via SQLite — key columns are inserted into a temp table a
 All state operations in Knot return IO values. The IO type carries an effect set that distinguishes DB operations from external effects:
 
 - **DB operations** return `IO {} value` — the empty effect set `{}` indicates pure database interaction with no external side effects. Source refs (`*rel`), derived refs (`&rel`), `set`, and `replace` all return `IO {} value`.
-- **External effects** carry specific tags: `IO {console} {}`, `IO {fs} Text`, `IO {network} Result`, `IO {clock} Int`, `IO {random} Float`.
+- **External effects** carry specific tags: `IO {console} {}`, `IO {fs} Text`, `IO {network} Result`, `IO {clock} Int<Ms>`, `IO {random} Float`.
 
 This unified model means all stateful code lives in IO do-blocks, while pure comprehensions over plain values remain non-IO.
 
@@ -559,8 +559,8 @@ println : a -> IO {console} {}
 -- readFile returns an IO action with fs effect
 readFile : Text -> IO {fs} Text
 
--- now returns an IO action with clock effect
-now : IO {clock} Int
+-- now returns an IO action with clock effect, tagged with the built-in Ms unit
+now : IO {clock} Int<Ms>
 ```
 
 ### IO Do-Blocks
@@ -572,7 +572,7 @@ main = do
   people <- *people                  -- IO {} [Person] → binds [Person]
   content <- readFile "input.txt"    -- IO {fs} Text → binds Text
   println content                     -- IO {console} {}
-  t <- now                            -- IO {clock} Int → binds Int
+  t <- now                            -- IO {clock} Int<Ms> → binds Int<Ms>
   println ("time: " ++ show t)
   yield {}
 -- overall type: IO {fs, console, clock} {}
@@ -666,6 +666,30 @@ waitForReady = atomic do
   retry
 ```
 
+##### Row-Level Invalidation
+
+A naive STM implementation wakes every parked watcher on every commit. Knot
+narrows wakeups to rows the atomic block actually read:
+
+- Codegen inspects each `WHERE`/`single (filter (\r -> r.col OP expr) rows)`
+  pattern in the atomic body and, for the SQL-pushed-down query path,
+  registers a row-level read filter alongside the broad table read. Supported
+  column predicates are equality (`==`/`!=`), ordered comparison
+  (`<`/`<=`/`>`/`>=`), and membership (`r.col == a || r.col == b`, treated as
+  `IN (a, b)`).
+- Each write — INSERT, UPDATE, or DELETE — emits a `WriteEvent` carrying the
+  affected rows' column values. The runtime evaluates each watcher's filter
+  against the event; only matching watchers wake.
+- A bulk replacement (`set *rel = ...`) emits `WriteEvent::Bulk` which wakes
+  every watcher on that table conservatively, since the row deltas are not
+  enumerated.
+
+This means a worker retrying on `WHERE id = 1` is unaffected by writes to
+`id = 2`, and a worker retrying on `status IN ("queued", "running")` is
+unaffected by writes that leave the status outside that set. The end result is
+the contention pattern of a fine-grained lock manager but expressed as
+ordinary functional code.
+
 ### File System
 
 Built-in functions for file I/O. All return `IO {fs}` values.
@@ -705,13 +729,13 @@ loadConfig = \path -> do
 
 #### `fork`
 
-`fork` runs an IO action on a new OS thread. It is fire-and-forget — the forked action runs independently. Each spawned thread gets its own SQLite connection (WAL mode enables concurrent access). The main thread waits for all spawned threads before exiting.
+`fork` runs an IO action on a new OS thread. It is fire-and-forget — the forked action runs independently, and its effects are decoupled from the caller (the spawned IO is not part of the surrounding transaction). Each spawned thread gets its own SQLite connection (WAL mode enables concurrent access). The main thread waits for all spawned threads before exiting.
 
 ```knot
-fork : IO {} {} -> IO {} {}
+fork : IO r {} -> IO {} {}
 ```
 
-Do blocks can be passed as arguments without parentheses: `fork do ...`.
+The argument's effect row `r` is unconstrained — `fork` can spawn an IO that reads files, makes network calls, or just touches the database — but those effects do not flow back into the caller's IO. Do blocks can be passed as arguments without parentheses: `fork do ...`.
 
 ```knot
 *counter : [{n: Int}]
@@ -760,6 +784,40 @@ main = do
 ```
 
 SQLite WAL mode ensures that concurrent readers and writers do not block each other. Each thread operates on its own connection, and `atomic` provides transaction isolation within a thread.
+
+#### `race`
+
+`race` runs two IO actions concurrently and returns as soon as one wins. Both arguments share an effect row so any effects required by either side propagate into the result IO. The winner is reported via the built-in `Result a b` ADT — `Err {error: a}` when the left action wins, `Ok {value: b}` when the right action wins.
+
+```knot
+race : IO r a -> IO r b -> IO r (Result a b)
+```
+
+```knot
+slow = do
+  sleep 1000<Ms>
+  yield "slow"
+
+fast = do
+  sleep 50<Ms>
+  yield "fast"
+
+main = do
+  r <- race slow fast
+  case r of
+    Err {error: a} -> println ("left won: " ++ a)
+    Ok {value: b}  -> println ("right won: " ++ b)
+  yield {}
+```
+
+Cancellation is **cooperative but aggressive**:
+
+- The parent never joins the loser. It returns as soon as it observes a winner, so the loser does not block program progress.
+- Each worker carries a thread-local `CancelToken`. `knot_io_run` checks the token between every IO thunk, so the loser unwinds at its next bind/then boundary instead of running to completion.
+- Blocking primitives like `sleep` park on the token's condvar instead of `std::thread::sleep`, so a loser stuck in a long sleep wakes immediately when the peer wins.
+- The loser is still tracked for the final program-exit join (the runtime waits for every spawned thread before closing the database), so cancellation is best-effort progress rather than thread termination.
+
+`race` is not permitted inside `atomic` blocks — its effects are not part of the savepoint and cannot be rolled back.
 
 ### Routes
 
@@ -1069,6 +1127,10 @@ No surrogate IDs, no key declarations. Data identifies itself.
 
 Automatic. The runtime observes query patterns and indexes accordingly. No `CREATE INDEX`, no key declarations.
 
+ADT tables get an index on the discriminator (`_tag`) at table creation time. Columns referenced in `DELETE WHERE`, `UPDATE WHERE`, and `READ WHERE` clauses are auto-indexed on first use. Columns inside the `WHERE` and `ORDER BY` clauses of pushed-down SELECT and aggregate queries — including filtered counts, `sortBy`, and multi-table join keys (`where e.dept == d.name` indexes both join columns) — are auto-indexed as well. The compiler emits `CREATE INDEX IF NOT EXISTS` and per-session bookkeeping deduplicates redundant DDL.
+
+For UUIDv7 primary keys, time-ordered values mean inserts append to the right edge of the index — no random hot-page churn.
+
 ## Views
 
 A `*`-prefixed relation with a body is a **view** — a bidirectional query over source relations. Reads compute the query; writes propagate back to the underlying sources.
@@ -1238,6 +1300,23 @@ The runtime stores the compiled schema version in the database. On startup it co
 
 ## Type System
 
+### Primitive Types
+
+| Type | Description |
+|------|-------------|
+| `Int` | Unbounded integer (arbitrary precision via `BigInt`) |
+| `Float` | 64-bit float |
+| `Int<u>` | Integer tagged with a compile-time unit (`Int<Usd>`) |
+| `Float<u>` | Float tagged with a compile-time unit (`Float<M>`, `Float<M/S^2>`) |
+| `Text` | Unicode string |
+| `Bool` | `True {}` / `False {}` (interchangeable with `true`/`false` literals) |
+| `Bytes` | Opaque byte string |
+| `Uuid` | RFC 9562 UUIDv7 identifier — generated by `randomUuid`, stored as TEXT in SQLite |
+| `Maybe a` | `Nothing {}` / `Just {value: a}` |
+| `Result e a` | `Err {error: e}` / `Ok {value: a}` |
+
+`Uuid` is a primitive (not an ADT) so it can be the column type of a source relation without any wrapper constructor. UUIDv7 values are time-ordered, which makes them well-suited as primary keys — inserts append to the right edge of any index built on the column.
+
 ### Row Polymorphism
 
 Functions can be generic over records and relations with specific fields:
@@ -1360,15 +1439,24 @@ toMiles = \d -> withFloatUnit (stripFloatUnit d * 0.621371)
 
 Plain `Int`/`Float` are unit-agnostic and unify with any `Int<u>`/`Float<u>`, so passing a unit-tagged value where plain numeric is expected (or vice versa) needs no conversion. These helpers are only needed when you must rebrand a value with a *different* concrete unit.
 
-#### Unit-Preserving Stdlib
-
-Functions like `abs`, `min`, `max`, `sum`, `avg` preserve units:
+For explicit unit ascription you can put a type annotation on any expression, either inside parens or as a bare postfix:
 
 ```knot
-abs : Float<u> -> Float<u>
-min : Float<u> -> Float<u> -> Float<u>
-sum : (a -> Float<u>) -> [a] -> Float<u>
-avg : (a -> Float<u>) -> [a] -> Float<u>
+count = 0 : Int<Usd>            -- bare postfix annotation
+total = (acc + delta) : Float<M>  -- parenthesized form
+```
+
+#### Unit-Preserving Stdlib
+
+`sum`, `avg`, `minOn`, `maxOn`, and binary `min`/`max` preserve units:
+
+```knot
+sum   : (a -> Float<u>) -> [a] -> Float<u>
+avg   : (a -> Float<u>) -> [a] -> Float<u>
+minOn : (a -> b) -> [a] -> b           -- units flow through via b
+maxOn : (a -> b) -> [a] -> b
+min   : Ord a => a -> a -> a            -- binary
+max   : Ord a => a -> a -> a            -- binary
 ```
 
 #### `show` and Units

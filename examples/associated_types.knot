@@ -1,21 +1,25 @@
--- Associated types: type-level functions defined per impl
+-- Associated types: type-level functions defined per impl.
+-- `Elem c` is computed from the container type at each instance.
 
 trait Container c where
   type Elem c
-  empty : c
-  insert : c -> Elem c -> c
   size : c -> Int
   toList : c -> [Elem c]
 
 impl Container [a] where
   type Elem [a] = a
-  empty = []
-  insert xs x = union xs (yield x)
   size xs = count xs
   toList xs = xs
 
+nums : [Int]
+nums = [1, 2, 3]
+
+words : [Text]
+words = ["alpha", "beta", "gamma"]
+
 main = do
-  let xs = insert (insert (insert empty 1) 2) 3
-  println (size xs)
-  println (toList xs)
+  println (size nums)
+  println (toList nums)
+  println (size words)
+  println (toList words)
   yield {}

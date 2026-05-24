@@ -5,7 +5,4 @@ type Person = {name: Text, age: Int, email: Text}
 
 *people : [Person]
 
-
 *orders : [{customer: Text, amount: Int}]
-
-

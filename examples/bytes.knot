@@ -5,16 +5,25 @@ main = do
   let raw = b"hello"
   println (bytesLength raw)        -- 5
 
-  -- Convert text <-> bytes
+  -- Convert text -> bytes (always succeeds)
   let encoded = textToBytes "world"
   println (bytesLength encoded)    -- 5
-  println (bytesToText encoded)    -- world
 
-  -- Hex encoding/decoding
+  -- Convert bytes -> text — Maybe, returns Nothing on invalid UTF-8
+  case bytesToText encoded of
+    Just {value: t} -> println t   -- world
+    Nothing {} -> println "<invalid utf-8>"
+
+  -- Hex encoding always succeeds
   let hex = bytesToHex raw
   println hex                      -- 68656c6c6f
-  let decoded = bytesFromHex hex
-  println (bytesToText decoded)    -- hello
+
+  -- Hex decoding is Maybe — returns Nothing on odd-length / non-hex input
+  case bytesFromHex hex of
+    Just {value: decoded} -> case bytesToText decoded of
+      Just {value: t} -> println t -- hello
+      Nothing {} -> println "<invalid utf-8>"
+    Nothing {} -> println "<invalid hex>"
 
   -- Concatenation
   let combined = bytesConcat raw encoded
@@ -22,17 +31,21 @@ main = do
 
   -- Slicing
   let slice = bytesSlice 0 5 combined
-  println (bytesToText slice)      -- hello
+  case bytesToText slice of
+    Just {value: t} -> println t   -- hello
+    Nothing {} -> println "<invalid utf-8>"
 
   -- Byte access
   println (bytesGet 0 raw)         -- 104 (ascii 'h')
 
   -- Hex escapes in literals
   let withHex = b"\x48\x49"
-  println (bytesToText withHex)    -- HI
+  case bytesToText withHex of
+    Just {value: t} -> println t   -- HI
+    Nothing {} -> println "<invalid utf-8>"
 
-  -- JSON encoding (base64)
-  println (toJson raw)             -- "aGVsbG8="
-  println (toJson {payload: raw})   -- {"payload":"aGVsbG8="}
+  -- JSON encoding wraps bytes so they round-trip through parseJson.
+  println (toJson raw)             -- {"__knot_bytes":"aGVsbG8="}
+  println (toJson {payload: raw})  -- {"payload":{"__knot_bytes":"aGVsbG8="}}
 
   yield {}

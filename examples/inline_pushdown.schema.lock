@@ -4,5 +4,3 @@
 type Employee = {name: Text, dept: Text, salary: Int}
 
 *employees : [Employee]
-
-

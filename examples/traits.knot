@@ -12,9 +12,6 @@ data Color
 
 trait Describe a where
   describe : a -> Text
-  describe x = show x
-  detailed : a -> Text
-  detailed x = describe x
 
 trait Area a where
   area : a -> Int
@@ -29,30 +26,26 @@ impl Describe Shape where
   describe s = case s of
     Circle {radius} -> "a circle"
     Rect {width, height} -> "a rectangle"
-  detailed s = case s of
-    Circle {radius} -> "circle with radius " ++ show radius
-    Rect {width, height} -> show width ++ "x" ++ show height ++ " rectangle"
+
+impl Describe Color where
+  describe c = case c of
+    Red {} -> "red"
+    Green {} -> "green"
+    Blue {} -> "blue"
 
 impl Area Shape where
   area s = case s of
     Circle {radius} -> radius * radius * 3
     Rect {width, height} -> width * height
 
-showInfo = \x -> describe x
-
 main = do
   println (describe 42)
   println (describe "hello")
   println (describe (Circle {radius: 5}))
   println (describe (Rect {width: 3, height: 4}))
-  println (detailed 42)
-  println (detailed "hello")
-  println (detailed (Circle {radius: 5}))
-  println (detailed (Rect {width: 3, height: 4}))
   println (area (Circle {radius: 5}))
   println (area (Rect {width: 3, height: 4}))
-  println (showInfo "world")
   println (describe (Red {}))
   println (describe (Green {}))
-  println (detailed (Blue {}))
+  println (describe (Blue {}))
   yield {}

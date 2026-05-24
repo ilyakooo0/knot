@@ -7,7 +7,4 @@ type Department = {name: Text, budget: Int}
 
 *employees : [Employee]
 
-
 *departments : [Department]
-
-

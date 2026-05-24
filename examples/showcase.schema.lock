@@ -63,28 +63,18 @@ type Metric = {name: Text, value: Float, tags: Text}
 
 *employees : [Employee]
 
-
 *projects : [Project]
-
 
 *tickets : [Ticket]
 
-
 *customers : [Customer]
-
 
 *orders : [Order]
 
-
 *products : [Product]
-
 
 *teams : [Team]
 
-
 *logs : [LogEntry]
 
-
 *metrics : [Metric]
-
-

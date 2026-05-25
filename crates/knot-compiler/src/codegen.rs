@@ -1243,7 +1243,7 @@ impl Codegen {
             // Build new env with both args (keys "0","1" are pre-sorted)
             let ptr_bytes = cg.ptr_type.bytes() as i32;
             let slot = builder.create_sized_stack_slot(
-                StackSlotData::new(StackSlotKind::ExplicitSlot, (6 * ptr_bytes) as u32, 0),
+                StackSlotData::new(StackSlotKind::ExplicitSlot, (6 * ptr_bytes) as u32, 3),
             );
             let (k0_ptr, k0_len) = cg.string_ptr(builder, "0");
             builder.ins().stack_store(k0_ptr, slot, 0);
@@ -3409,7 +3409,7 @@ impl Codegen {
                         // Going from 1 captured arg (env=arg1) + new_arg to record of 2
                         let ptr_bytes = cg.ptr_type.bytes() as i32;
                         let slot = builder.create_sized_stack_slot(
-                            StackSlotData::new(StackSlotKind::ExplicitSlot, (6 * ptr_bytes) as u32, 0),
+                            StackSlotData::new(StackSlotKind::ExplicitSlot, (6 * ptr_bytes) as u32, 3),
                         );
                         let (k0_ptr, k0_len) = cg.string_ptr(builder, "0");
                         builder.ins().stack_store(k0_ptr, slot, 0);
@@ -3429,7 +3429,7 @@ impl Codegen {
                         let ptr_bytes = cg.ptr_type.bytes() as i32;
                         let slot_size = (3 * new_count as u32) * ptr_bytes as u32;
                         let slot = builder.create_sized_stack_slot(
-                            StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 0),
+                            StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 3),
                         );
                         // Copy existing fields
                         for i in 0..prev_count {
@@ -4029,7 +4029,7 @@ impl Codegen {
                     let ptr_bytes = self.ptr_type.bytes() as i32;
                     let slot_size = (3 * n as u32) * ptr_bytes as u32;
                     let slot = builder.create_sized_stack_slot(
-                        StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 0),
+                        StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 3),
                     );
                     for (i, (name, val)) in compiled.iter().enumerate() {
                         let (key_ptr, key_len) = self.string_ptr(builder, name);
@@ -4058,7 +4058,7 @@ impl Codegen {
                 let ptr_bytes = self.ptr_type.bytes() as i32;
                 let slot_size = (3 * n as u32) * ptr_bytes as u32;
                 let slot = builder.create_sized_stack_slot(
-                    StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 0),
+                    StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 3),
                 );
                 for (i, (name, val)) in compiled.iter().enumerate() {
                     let (key_ptr, key_len) = self.string_ptr(builder, name);
@@ -7010,7 +7010,7 @@ impl Codegen {
             let ptr_bytes = self.ptr_type.bytes() as i32;
             let slot_size = (3 * n as u32) * ptr_bytes as u32;
             let slot = builder.create_sized_stack_slot(
-                StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 0),
+                StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 3),
             );
             for (i, var_name) in sorted_vars.iter().enumerate() {
                 let val = env.get(var_name);
@@ -8181,7 +8181,7 @@ impl Codegen {
             let ptr_bytes = self.ptr_type.bytes() as i32;
             let slot_size = (3 * n as u32) * ptr_bytes as u32;
             let slot = builder.create_sized_stack_slot(
-                StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 0),
+                StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 3),
             );
             for (i, var_name) in sorted_vars.iter().enumerate() {
                 let val = env.get(var_name);
@@ -8406,7 +8406,11 @@ impl Codegen {
                 .declare_data(&name, Linkage::Local, true, false)
                 .unwrap();
             let mut desc = DataDescription::new();
-            // Zero-initialized 8-byte slot (holds a `*mut Value`).
+            // Zero-initialized 8-byte slot (holds a `*mut Value`). Aligned to
+            // pointer size so `knot_value_text_intern`'s atomic load (`ldar`
+            // on aarch64) doesn't SIGBUS — `ldar`/`stlr` strictly require
+            // natural alignment.
+            desc.set_align(std::mem::align_of::<*mut u8>() as u64);
             desc.define_zeroinit(std::mem::size_of::<*mut u8>());
             self.module.define_data(id, &desc).unwrap();
             self.text_literal_slots.insert(s.to_string(), id);

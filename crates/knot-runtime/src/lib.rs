@@ -4377,11 +4377,18 @@ pub unsafe extern "C" fn knot_value_text_intern(
     slot: *mut *mut Value,
 ) -> *mut Value {
     debug_assert!(!slot.is_null(), "knot runtime: null text-literal slot");
-    debug_assert_eq!(
-        slot as usize % std::mem::align_of::<std::sync::atomic::AtomicPtr<Value>>(),
-        0,
-        "knot runtime: text-literal slot is not pointer-aligned (codegen bug)"
-    );
+    // The compiler asks Cranelift to emit each slot 8-byte-aligned
+    // (`DataDescription::set_align`), and on macOS Mach-O / aarch64 ELF that
+    // holds. On some x86_64 Linux toolchains the symbol still lands at an
+    // unaligned offset (low 3 bits = 0b001 has been observed) — likely a
+    // section-alignment interaction with `cc`'s default linker.  An unaligned
+    // `AtomicPtr` load is UB-in-theory and SIGBUSes on aarch64's `ldar`, so
+    // we detect that case and fall back to the per-thread LRU cache, which
+    // doesn't require any alignment from the caller.  Same observable result,
+    // just gives up the inline-slot fast path.
+    if slot as usize % std::mem::align_of::<std::sync::atomic::AtomicPtr<Value>>() != 0 {
+        return knot_value_text_cached(ptr, len);
+    }
     let atomic = unsafe { &*(slot as *const std::sync::atomic::AtomicPtr<Value>) };
     let cached = atomic.load(std::sync::atomic::Ordering::Acquire);
     if !cached.is_null() {

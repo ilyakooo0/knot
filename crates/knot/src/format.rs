@@ -888,6 +888,10 @@ fn render_route_entry(p: &mut Printer, e: &RouteEntry) {
         }
         p.write("}");
     }
+    if let Some(rl) = &e.rate_limit {
+        p.write(" rateLimit ");
+        render_expr(p, rl, Prec::App);
+    }
     p.write(" = ");
     p.write(&e.constructor);
 }

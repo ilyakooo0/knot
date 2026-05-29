@@ -100,6 +100,30 @@ fn check(path: &Path) {
     );
 }
 
+fn check_str(label: &str, source: &str) {
+    let m1 = parse(source).unwrap_or_else(|e| panic!("parse {}: {}", label, e));
+    let f1 = knot::format::format_module(source, &m1);
+    let m2 = parse(&f1).unwrap_or_else(|e| {
+        panic!(
+            "{}: formatted output failed to parse:\n--- output ---\n{}\n--- error ---\n{}",
+            label, f1, e
+        )
+    });
+    let n1 = normalize(&m1);
+    let n2 = normalize(&m2);
+    assert_eq!(n1, n2, "{}: AST changed after formatting\n--- output ---\n{}", label, f1);
+    let f2 = knot::format::format_module(&f1, &m2);
+    assert_eq!(f1, f2, "{}: formatter is not idempotent", label);
+}
+
+#[test]
+fn round_trip_route_rate_limit() {
+    let src = r#"route API where
+  GET {} /ping -> Text rateLimit {key: \i ctx -> Just ctx.clientIp, limit: {requests: 10, window: 1000<Ms>}} = Ping
+"#;
+    check_str("rate_limit_route", src);
+}
+
 #[test]
 fn round_trip_examples() {
     let dir = examples_dir();

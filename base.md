@@ -27,12 +27,12 @@ show : a -> Text
 Convert any value to its text representation. Records print as `{field: value, ...}`, relations as `[v1, v2, ...]`, constructors as `Tag {fields}`. This is a pure function (no IO).
 
 ```knot
-fork : IO r {} -> IO r {}
+fork : IO {| r} a -> IO {| r} {}
 ```
 Run an IO action on a new OS thread (fire-and-forget). The spawned action's effect row propagates through `fork`, so its effects remain visible in the caller's IO row. Each thread gets its own SQLite connection (WAL mode). Main waits for all threads before exiting.
 
 ```knot
-race : IO r a -> IO r b -> IO r (Result a b)
+race : IO {| r1} a -> IO {| r2} b -> IO {| r1 \/ r2} (Result a b)
 ```
 Run two IO actions concurrently and return the winner. The result is `Err {error: a}` if the left action wins, `Ok {value: b}` if the right wins. Both arguments share an effect row, so effects from either side propagate to the caller. Cancellation is cooperative but aggressive — the loser unwinds at its next IO thunk boundary and `sleep` wakes immediately on a cancel signal.
 
@@ -494,7 +494,7 @@ case bytesFromHex "6869" of
 ```knot
 hash : a -> Bytes
 ```
-SHA-256 hash of any value, returned as 32 bytes. `Bytes` and `Text` hash their raw contents; records, relations, and constructors hash a canonical serialisation, so the same logical value always produces the same digest.
+BLAKE3 hash of any value, returned as 32 bytes. `Bytes` and `Text` hash their raw contents; records, relations, and constructors hash a canonical serialisation, so the same logical value always produces the same digest.
 
 ```knot
 bytesToHex (hash "hello")    -- "2cf24dba..."
@@ -608,7 +608,7 @@ route Api where
 ## Concurrency
 
 ```knot
-fork : IO r {} -> IO r {}
+fork : IO {| r} a -> IO {| r} {}
 ```
 Run an IO action on a new OS thread. Fire-and-forget — the spawned thread runs independently, but its effect row propagates through `fork` so the spawned action's effects remain visible in the caller's IO type. Each thread gets its own SQLite connection (WAL mode). Main waits for all threads before exiting. Do blocks can be passed without parentheses: `fork do ...`.
 
@@ -621,7 +621,7 @@ main = do
 ```
 
 ```knot
-race : IO r a -> IO r b -> IO r (Result a b)
+race : IO {| r1} a -> IO {| r2} b -> IO {| r1 \/ r2} (Result a b)
 ```
 Run two IO actions concurrently and return the winner. The arguments share an effect row so effects from either side flow through to the caller's IO. The winner is reported via the built-in `Result` ADT — `Err {error: a}` when the left action wins, `Ok {value: b}` when the right wins.
 

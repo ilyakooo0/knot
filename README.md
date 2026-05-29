@@ -131,6 +131,23 @@ declarations. See `examples/modules/`.
 JSON encode/decode, file I/O, leveled logging (`logInfo`/`logWarn`/...),
 crypto (`generateKeyPair`/`encrypt`/`sign`/`verify`).
 
+**Runtime CLI.** Every compiled program accepts a common set of flags and
+subcommands for free:
+
+```sh
+./my_program                     # run main
+./my_program --debug             # turn on logDebug output
+./my_program --help              # print usage + any compile-time overrides
+./my_program --http-max-body-bytes=32M
+./my_program db                  # browse the .db file in a TUI
+./my_program api MyRouteName     # print OpenAPI 3.0 spec for a `route`
+./my_program --my-flag=value     # override a compile-time constant
+```
+
+Constant overrides can also be supplied at build time
+(`knot build foo.knot --my-flag=value`). The compiler also ships with
+`knot fmt [--check] [--stdout] <file.knot>` for in-place formatting.
+
 ## Project Structure
 
 ```

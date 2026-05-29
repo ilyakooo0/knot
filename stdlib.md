@@ -293,6 +293,23 @@ reverse : [a] -> [a]
 
 Reverse iteration order of a relation. Like `sortBy`, this controls iteration order; the underlying set is unchanged.
 
+### `upsertBy`
+
+```
+upsertBy : (a -> Bool) -> a -> [a] -> [a]
+```
+
+Replace every element matching the predicate with the supplied value. If no
+element matches, append the value. Useful for "insert or update" patterns on
+source relations.
+
+```knot
+-- Bump or insert a per-user counter
+bump = \user counters -> upsertBy (\c -> c.user == user)
+                                   {user: user, count: lookup user counters + 1}
+                                   counters
+```
+
 ---
 
 ## Concurrency
@@ -300,10 +317,15 @@ Reverse iteration order of a relation. Like `sortBy`, this controls iteration or
 ### `fork`
 
 ```
-fork : IO r {} -> IO r {}
+fork : IO {| r} a -> IO {| r} {}
 ```
 
-Run an IO action on a new OS thread (fire-and-forget). The spawned action's effect row `r` propagates through `fork` to the caller, so a program that forks an IO performing `println` is visibly typed with `{console}` in its IO row. Each thread gets its own SQLite connection via WAL mode for safe concurrent access. The main thread waits for all spawned threads before exiting.
+Run an IO action on a new OS thread (fire-and-forget). The spawned action can
+return any value `a` (it is discarded) and may have any effect row `r`. That
+effect row propagates through `fork` to the caller, so a program that forks an
+IO performing `println` is visibly typed with `{console}` in its IO row. Each
+thread gets its own SQLite connection via WAL mode for safe concurrent access.
+The main thread waits for all spawned threads before exiting.
 
 ```knot
 main = do
@@ -319,10 +341,12 @@ Do blocks can be passed directly as arguments without parentheses.
 ### `race`
 
 ```
-race : IO r a -> IO r b -> IO r (Result a b)
+race : IO {| r1} a -> IO {| r2} b -> IO {| r1 \/ r2} (Result a b)
 ```
 
-Run two IO actions concurrently and return the winner. Both arguments share a single effect row, so any effects required by either side flow into the result IO.
+Run two IO actions concurrently and return the winner. Each argument carries
+its own effect row; the result IO's row is the union of both (written
+`r1 \/ r2`). Effects required by either side flow into the result IO.
 
 The winner is reported via the built-in `Result a b` ADT — `Err {error: a}` when the left action wins, `Ok {value: b}` when the right action wins.
 
@@ -490,7 +514,7 @@ has = contains "ell" "hello"   -- True
 println : a -> IO {console} {}
 ```
 
-Print a value to stdout followed by a newline.
+Print a value to stdout followed by a newline. `putLine` is an alias.
 
 ### `print`
 
@@ -509,7 +533,12 @@ logError : a -> IO {console} {}
 logDebug : a -> IO {console} {}
 ```
 
-Leveled logging to stderr (so output does not mix with `println` on stdout). When stderr is a TTY, output is colored; otherwise each record is written as one JSON line for log aggregators. `logDebug` only emits when the program is launched with `--debug` — debug records are dropped silently otherwise.
+Leveled logging to stderr (so output does not mix with `println` on stdout).
+When stderr is a TTY, output is colored; otherwise each record is written as
+one JSON line for log aggregators. `logDebug` only emits when the program is
+launched with `--debug` — debug records are dropped silently otherwise. (Every
+compiled Knot program accepts `--debug` automatically; see
+[Runtime CLI](#runtime-cli).)
 
 ```knot
 main = do
@@ -777,10 +806,12 @@ Extract a sub-range. Arguments: start index, length, bytes.
 hash : a -> Bytes
 ```
 
-SHA-256 hash of any value, returned as 32 bytes. `Bytes` and `Text` hash their raw contents; structured values (records, relations, constructors) hash a canonical serialisation, so equal logical values always produce equal digests.
+BLAKE3 hash of any value, returned as 32 bytes. `Bytes` and `Text` hash their
+raw contents; structured values (records, relations, constructors) hash a
+canonical serialisation, so equal logical values always produce equal digests.
 
 ```knot
-bytesToHex (hash "hello")    -- "2cf24dba..."
+bytesToHex (hash "hello")    -- "ea8f163..."
 ```
 
 ---
@@ -1125,3 +1156,27 @@ maxOn (\t -> t.distance) *trips   -- Float<M> if distance : Float<M>
 | `&&` | — | Boolean AND (direct) |
 | `\|\|` | — | Boolean OR (direct) |
 | `\|>` | — | Pipe-forward (`x \|> f` = `f x`) |
+
+---
+
+## Runtime CLI
+
+Every compiled Knot program accepts a common set of runtime flags and
+subcommands without any user wiring:
+
+| Argument | Description |
+|----------|-------------|
+| `--debug` | Enable `logDebug` output; without this flag, `logDebug` calls are dropped silently. |
+| `--help` | Print usage including any compile-time overrides exposed by the program. |
+| `--http-max-body-bytes=N` | Cap HTTP request and response bodies. Suffixes: `K`, `M`, `G`. Default `16M`. Applies to both `listen` and `fetch`. |
+| `--<name>=<value>` | Override a compile-time constant. The compiler exposes top-level constants annotated for override; see the program's own `--help`. The same flags may be set at build time via `knot build … --<name>=<value>`. |
+| `<program> db` | Launch a terminal-UI database explorer over the program's `<name>.db` SQLite file. Browses every source relation, paginates rows, and lets you drill into individual records. |
+| `<program> api <RouteName>` | Print an OpenAPI 3.0 JSON specification for the named `route` declaration. Useful for generating client SDKs or feeding into Swagger UI. |
+
+The compiler itself (`knot`) supports:
+
+| Command | Description |
+|---------|-------------|
+| `knot build <file.knot> [-o <path>] [--<name>=<value> …]` | Compile to a native executable. Overrides supply compile-time constants. |
+| `knot fmt [--check] [--stdout] <file.knot> …` | Format source files in place. `--check` exits non-zero when files are unformatted; `--stdout` prints to stdout instead of rewriting. |
+| `knot help` | Show CLI usage. |

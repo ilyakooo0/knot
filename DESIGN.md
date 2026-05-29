@@ -740,10 +740,10 @@ loadConfig = \path -> do
 
 #### `fork`
 
-`fork` runs an IO action on a new OS thread. It is fire-and-forget — the forked action runs independently, but its effects are still visible in the caller's IO type. Each spawned thread gets its own SQLite connection (WAL mode enables concurrent access). The main thread waits for all spawned threads before exiting.
+`fork` runs an IO action on a new OS thread. It is fire-and-forget — the forked action runs independently, but its effects are still visible in the caller's IO type. The spawned action can return any value (the result is discarded). Each spawned thread gets its own SQLite connection (WAL mode enables concurrent access). The main thread waits for all spawned threads before exiting.
 
 ```knot
-fork : IO r {} -> IO r {}
+fork : IO {| r} a -> IO {| r} {}
 ```
 
 The spawned action's effect row `r` propagates through `fork` to the caller — a program that forks an IO that calls `println` is visibly typed with `{console}` in its IO row, so the effect system still reflects what the program can do. Do blocks can be passed as arguments without parentheses: `fork do ...`.
@@ -798,10 +798,15 @@ SQLite WAL mode ensures that concurrent readers and writers do not block each ot
 
 #### `race`
 
-`race` runs two IO actions concurrently and returns as soon as one wins. Both arguments share an effect row so any effects required by either side propagate into the result IO. The winner is reported via the built-in `Result a b` ADT — `Err {error: a}` when the left action wins, `Ok {value: b}` when the right action wins.
+`race` runs two IO actions concurrently and returns as soon as one wins. Each
+argument carries its own effect row; the result IO's row is the union of both,
+written `r1 \/ r2`. Any effects required by either side propagate into the
+result IO. The winner is reported via the built-in `Result a b` ADT —
+`Err {error: a}` when the left action wins, `Ok {value: b}` when the right
+action wins.
 
 ```knot
-race : IO r a -> IO r b -> IO r (Result a b)
+race : IO {| r1} a -> IO {| r2} b -> IO {| r1 \/ r2} (Result a b)
 ```
 
 ```knot
@@ -1564,39 +1569,37 @@ data Shape
 
 #### Relation Constraints
 
-Source declarations support both value predicates and relational predicates:
+Source declarations carry refinement predicates for each field; cross-relation
+constraints (referential integrity, uniqueness) are written as top-level
+**subset constraints** with `<=`:
 
 ```knot
 *people : [{
   name: Text where \s -> length s > 0,
-  age: Int where \x -> x >= 0
+  age: Int where \x -> x >= 0,
+  email: Text where \s -> contains "@" s
 }]
-  where \p -> p.age >= 13 || p.email == ""     -- cross-field value predicate
 
 *orders : [{customer: Text, amount: Int where \x -> x > 0}]
-  where .customer in *people.email              -- relational membership
-  where unique .email                           -- uniqueness
-  where \o -> o.amount <= 1000000               -- value predicate
+
+-- Referential integrity: every orders.customer must appear in people.email
+*orders.customer <= *people.email
+
+-- Uniqueness: people.email values must not duplicate (relation-on-itself form)
+*people <= *people.email
 ```
 
-Two relational constraint forms:
+Two subset-constraint shapes:
 
-- `.field in *rel.field` — every value of `.field` must appear in the referenced relation's field (referential integrity)
-- `unique .field` — field values must be unique across all rows
+| Form | Meaning |
+|------|---------|
+| `*sub.field <= *sup.field` | Every value of `sub.field` must appear in `sup.field` (foreign key) |
+| `*rel <= *rel.field` | Field values are unique within `rel` |
 
-These replace the old subset constraint syntax:
-
-```knot
--- Old (removed):
-*orders.customer <= *people.name
-*users <= *users.email
-
--- New:
-*orders : [...] where .customer in *people.name
-*users : [...] where unique .email
-```
-
-All constraints — field, cross-field, relational — are enforced by the Knot runtime at `set` boundaries. Nothing is pushed to SQLite. The runtime mediates all writes, so there is no escape hatch.
+Field-level and cross-field refinements are enforced row-by-row before each
+`set` commits. Subset constraints are enforced by runtime triggers maintained
+on the underlying SQLite tables. Either failure mode panics with a refinement
+error or a constraint-violation message.
 
 #### Subtyping
 
@@ -1697,7 +1700,7 @@ trySet : *[a] -> [a] -> IO {} (Result RefinementError {})
 
 Predicates in type-level refinements must be **pure** — no IO, no relation references. They are ordinary Knot functions with no restrictions on what pure operations they use (recursion, pattern matching, higher-order functions, etc.).
 
-Predicates in relation `where` clauses follow the same rule — they are pure functions over individual rows. Relational constraints (`.field in`, `unique`) are separate syntactic forms, not predicates.
+Predicates in relation `where` clauses follow the same rule — they are pure functions over individual rows. Relational constraints (subset and uniqueness via `<=`) are separate top-level declarations, not predicates.
 
 #### Interaction with Units
 

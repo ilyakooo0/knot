@@ -632,7 +632,7 @@ The body of `atomic` must be an IO expression containing only DB operations. Ext
 Fire-and-forget: runs an IO action on a new OS thread. Each thread gets its own SQLite connection (WAL mode).
 
 ```knot
-fork : IO r {} -> IO r {}
+fork : IO {| r} a -> IO {| r} {}
 
 main = do
   fork do
@@ -672,7 +672,7 @@ conservatively.
 #### `race`
 
 ```knot
-race : IO r a -> IO r b -> IO r (Result a b)
+race : IO {| r1} a -> IO {| r2} b -> IO {| r1 \/ r2} (Result a b)
 ```
 
 Run two IO actions concurrently and return the winner. Both arguments share a
@@ -807,8 +807,8 @@ and the loser unwinds at its next safe point.
 | `randomFloat` | `IO {random} Float<u>` | Random float `[0.0, 1.0)`, unit-polymorphic |
 | `randomUuid` | `IO {random} Uuid` | Generate a RFC 9562 UUIDv7 |
 | `atomic` | `IO {} a -> IO {} a` | Run DB operations in a transaction |
-| `fork` | `IO r {} -> IO r {}` | Fire-and-forget on new OS thread; effects propagate |
-| `race` | `IO r a -> IO r b -> IO r (Result a b)` | Run two IO actions, return the winner |
+| `fork` | `IO {\| r} a -> IO {\| r} {}` | Fire-and-forget on new OS thread; effects propagate |
+| `race` | `IO {\| r1} a -> IO {\| r2} b -> IO {\| r1 \/ r2} (Result a b)` | Run two IO actions, return the winner; effect rows union |
 | `retry` | `a` | Rollback and wait (inside `atomic` only) |
 | `when` | `Bool -> IO r {} -> IO r {}` | Run action when condition is true |
 | `unless` | `Bool -> IO r {} -> IO r {}` | Run action when condition is false |
@@ -833,7 +833,7 @@ program.
 | `bytesGet` | `Int<u1> -> Bytes -> Int<u2>` | Byte value (0–255) at index |
 | `bytesToHex` | `Bytes -> Text` | Hex encode |
 | `bytesFromHex` | `Text -> Maybe Bytes` | Hex decode (`Nothing` on bad input) |
-| `hash` | `a -> Bytes` | SHA-256 hash (32 bytes) of any value |
+| `hash` | `a -> Bytes` | BLAKE3 hash (32 bytes) of any value |
 
 ### Cryptography
 

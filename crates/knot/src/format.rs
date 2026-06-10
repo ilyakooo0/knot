@@ -314,7 +314,13 @@ fn render_decl_with_fallback(source: &str, d: &Decl, comments: &[Comment<'_>]) -
         .iter()
         .any(|c| c.span.start > d.span.start && c.span.end <= d.span.end);
     if has_internal {
-        return normalize_source_slice(&source[d.span.start..d.span.end]);
+        // `d.span` starts at the declaration keyword, not at a preceding
+        // `export`, so the prefix must be re-attached to the verbatim copy.
+        let verbatim = normalize_source_slice(&source[d.span.start..d.span.end]);
+        if d.exported {
+            return format!("export {}", verbatim);
+        }
+        return verbatim;
     }
     let mut p = Printer::new();
     render_decl(&mut p, d);
@@ -400,6 +406,12 @@ impl Printer {
 // ── Declarations ───────────────────────────────────────────────────
 
 fn render_decl(p: &mut Printer, d: &Decl) {
+    // The parser accepts `export` before any declaration form and records it
+    // on the `Decl` (the decl's span starts *after* the keyword), so the
+    // prefix must be re-emitted here for every declaration kind.
+    if d.exported {
+        p.write("export ");
+    }
     match &d.node {
         DeclKind::Data { name, params, constructors, deriving } => {
             render_data(p, name, params, constructors, deriving);
@@ -440,14 +452,24 @@ fn render_decl(p: &mut Printer, d: &Decl) {
             }
         }
         DeclKind::Migrate { relation, from_ty, to_ty, using_fn } => {
+            // Always use the multi-line layout: on a single line,
+            // `parse_type_app` would greedily consume the `to`/`using` clause
+            // keywords as type-variable applications. With each clause on its
+            // own line at one indent, the parser's migrate `block_indent`
+            // guard stops type continuation at the sibling clause keywords.
             p.write("migrate *");
             p.write(relation);
-            p.write(" from ");
-            p.write(&render_type(from_ty));
-            p.write(" to ");
-            p.write(&render_type(to_ty));
-            p.write(" using ");
-            render_expr(p, using_fn, Prec::App);
+            p.newline();
+            p.with_indent(|p| {
+                p.write("from ");
+                p.write(&render_type(from_ty));
+                p.newline();
+                p.write("to ");
+                p.write(&render_type(to_ty));
+                p.newline();
+                p.write("using ");
+                render_expr(p, using_fn, Prec::Lowest);
+            });
         }
         DeclKind::SubsetConstraint { sub, sup } => {
             render_relpath(p, sub);
@@ -1390,18 +1412,23 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             format!("({})", s)
         }
         ExprKind::Set { target, value } => {
-            format!(
+            // A set expression only parses at expression-head position or
+            // inside parens — parenthesize in any tighter context (function
+            // argument, operand, ...), like other lowest-precedence forms.
+            let s = format!(
                 "{} = {}",
                 render_expr_inline(target, Prec::App),
                 render_expr_inline(value, Prec::Lowest)
-            )
+            );
+            paren_if(parent > Prec::Lowest, s)
         }
         ExprKind::ReplaceSet { target, value } => {
-            format!(
+            let s = format!(
                 "replace {} = {}",
                 render_expr_inline(target, Prec::App),
                 render_expr_inline(value, Prec::Lowest)
-            )
+            );
+            paren_if(parent > Prec::Lowest, s)
         }
         ExprKind::Atomic(inner) => {
             let s = format!("atomic {}", render_expr_inline(inner, Prec::App));
@@ -1473,6 +1500,20 @@ fn render_literal(l: &Literal) -> String {
     match l {
         Literal::Int(s) => s.clone(),
         Literal::Float(f) => {
+            // Knot has no literal syntax for non-finite floats (`inf.0` would
+            // reparse as a field access on an identifier). The lexer rejects
+            // overflowing literals, so this only arises from
+            // programmatically-built ASTs — render the nearest finite value
+            // so the output stays parseable.
+            if !f.is_finite() {
+                return if f.is_nan() {
+                    "0.0".into()
+                } else if *f > 0.0 {
+                    format!("{}.0", f64::MAX)
+                } else {
+                    format!("-{}.0", f64::MAX)
+                };
+            }
             // Preserve `.0` for whole floats so we don't change them to integers.
             let s = format!("{}", f);
             if s.contains('.') || s.contains('e') || s.contains('E') {
@@ -1585,15 +1626,31 @@ fn render_expr_block(p: &mut Printer, e: &Expr, parent: Prec) {
         ExprKind::App { .. } => render_app_block(p, e, parent),
         ExprKind::BinOp { op, lhs, rhs } => render_binop_block(p, *op, lhs, rhs, parent),
         ExprKind::Set { target, value } => {
+            // Same parenthesization rule as the inline form: a set expression
+            // only parses at expression-head position or inside parens.
+            let need_parens = parent > Prec::Lowest;
+            if need_parens {
+                p.write("(");
+            }
             render_expr(p, target, Prec::App);
             p.write(" = ");
             render_expr(p, value, Prec::Lowest);
+            if need_parens {
+                p.write(")");
+            }
         }
         ExprKind::ReplaceSet { target, value } => {
+            let need_parens = parent > Prec::Lowest;
+            if need_parens {
+                p.write("(");
+            }
             p.write("replace ");
             render_expr(p, target, Prec::App);
             p.write(" = ");
             render_expr(p, value, Prec::Lowest);
+            if need_parens {
+                p.write(")");
+            }
         }
         ExprKind::Atomic(inner) => {
             let need_parens = parent > Prec::Lowest;
@@ -1871,11 +1928,10 @@ fn render_pat(p: &Pat) -> String {
         PatKind::Var(n) => n.clone(),
         PatKind::Wildcard => "_".into(),
         PatKind::Constructor { name, payload } => {
-            let pl = render_pat(payload);
             // `Ctor {}` for empty record; otherwise `Ctor {fields}` or `Ctor pat`.
             match &payload.node {
                 PatKind::Record(fields) if fields.is_empty() => format!("{} {{}}", name),
-                _ => format!("{} {}", name, pl),
+                _ => format!("{} {}", name, render_pat_atom(payload)),
             }
         }
         PatKind::Record(fields) => {
@@ -1906,8 +1962,21 @@ fn render_pat(p: &Pat) -> String {
             s
         }
         PatKind::Cons { head, tail } => {
-            format!("Cons {} {}", render_pat(head), render_pat(tail))
+            format!("Cons {} {}", render_pat_atom(head), render_pat_atom(tail))
         }
+    }
+}
+
+/// Render a pattern in atom position (constructor payloads, `Cons` head/tail).
+/// The grammar's `parse_pat_atom` does not accept constructor or `Cons`
+/// patterns — those only parse at atom position inside parens — so they must
+/// be parenthesized here. All other pattern forms are atoms already.
+fn render_pat_atom(p: &Pat) -> String {
+    match &p.node {
+        PatKind::Constructor { .. } | PatKind::Cons { .. } => {
+            format!("({})", render_pat(p))
+        }
+        _ => render_pat(p),
     }
 }
 
@@ -1941,6 +2010,22 @@ mod tests {
         let once = fmt(input);
         let twice = fmt(&once);
         assert_eq!(once, twice, "formatter is not idempotent:\n--- once ---\n{}\n--- twice ---\n{}\n", once, twice);
+    }
+
+    #[test]
+    fn non_finite_float_literals_render_parseable() {
+        // No literal syntax exists for inf/NaN; the renderer must fall back
+        // to finite values that re-lex as plain float literals.
+        let pos = render_literal(&Literal::Float(f64::INFINITY));
+        assert!(!pos.contains("inf"), "rendered: {}", pos);
+        assert_eq!(pos.parse::<f64>().unwrap(), f64::MAX);
+
+        let neg = render_literal(&Literal::Float(f64::NEG_INFINITY));
+        assert!(!neg.contains("inf"), "rendered: {}", neg);
+        assert_eq!(neg.parse::<f64>().unwrap(), -f64::MAX);
+
+        let nan = render_literal(&Literal::Float(f64::NAN));
+        assert_eq!(nan, "0.0");
     }
 
     #[test]

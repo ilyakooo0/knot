@@ -481,6 +481,18 @@ impl<'src> Lexer<'src> {
             let slice = self.slice(start, self.pos);
             let raw = if slice.contains('_') { slice.replace('_', "") } else { slice.to_string() };
             let value = match raw.parse::<f64>() {
+                Ok(v) if !v.is_finite() => {
+                    // `parse::<f64>` saturates oversized literals to infinity;
+                    // there is no literal syntax for non-finite floats, so
+                    // report the overflow and recover with the largest finite
+                    // value (keeps downstream output parseable).
+                    let span = self.span_from(start);
+                    self.diagnostics.push(
+                        Diagnostic::error("float literal is too large")
+                            .label(span, "overflows the range of a 64-bit float"),
+                    );
+                    f64::MAX
+                }
                 Ok(v) => v,
                 Err(_) => {
                     let span = self.span_from(start);

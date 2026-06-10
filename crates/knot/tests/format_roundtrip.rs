@@ -347,6 +347,218 @@ fn lexer_byte_string_valid_hex_still_works() {
     }
 }
 
+// ── 7. `export` prefix must survive formatting ──
+
+#[test]
+fn export_fun_round_trips() {
+    let out = check_str("export_fun", "export add = \\x y -> x + y\n");
+    assert!(out.contains("export add"), "output: {}", out);
+}
+
+#[test]
+fn export_various_decl_kinds_round_trip() {
+    let src = "export type Person = {name: Text}\n\
+               export data Color = Red {} | Blue {}\n\
+               export *users : [{name: Text}]\n\
+               export add = \\x y -> x + y\n\
+               nonExported = 1\n";
+    let out = check_str("export_kinds", src);
+    assert!(out.contains("export type Person"), "output: {}", out);
+    assert!(out.contains("export data Color"), "output: {}", out);
+    assert!(out.contains("export *users"), "output: {}", out);
+    assert!(out.contains("export add"), "output: {}", out);
+    assert!(out.contains("\nnonExported"), "output: {}", out);
+}
+
+#[test]
+fn export_survives_verbatim_comment_fallback() {
+    // A decl containing an inline comment takes the verbatim-copy path,
+    // whose span starts after `export` — the prefix must be re-attached.
+    let src = "export add = \\x y ->\n  -- inline comment\n  x + y\n";
+    let m = parse(src).unwrap();
+    let out = knot::format::format_module(src, &m);
+    assert!(out.contains("export add"), "output: {}", out);
+    let m2 = parse(&out).unwrap_or_else(|e| panic!("reparse failed:\n{}\n{}", out, e));
+    assert!(m2.decls[0].exported, "exported flag lost: {}", out);
+}
+
+// ── 8. Set/ReplaceSet keep parens in non-head positions ──
+
+#[test]
+fn set_as_function_argument_keeps_parens() {
+    let out = check_str(
+        "set_arg",
+        "*counters : [{n: Int}]\nmain = fork (*counters = [{n: 1}])\n",
+    );
+    assert!(out.contains("fork (*counters = [{n: 1}])"), "output: {}", out);
+}
+
+#[test]
+fn replace_set_as_function_argument_keeps_parens() {
+    let out = check_str(
+        "replace_set_arg",
+        "*counters : [{n: Int}]\nmain = fork (replace *counters = [{n: 1}])\n",
+    );
+    assert!(
+        out.contains("fork (replace *counters = [{n: 1}])"),
+        "output: {}",
+        out
+    );
+}
+
+#[test]
+fn set_with_multiline_value_keeps_parens() {
+    // The set's do-block value forces the block rendering path.
+    let src = "*counters : [{n: Int}]\nmain = fork (*counters = do\n  c <- *counters\n  yield c)\n";
+    let out = check_str("set_arg_block", src);
+    assert!(out.contains("fork (*counters ="), "output: {}", out);
+}
+
+#[test]
+fn set_at_statement_head_stays_bare() {
+    let src = "*counters : [{n: Int}]\nmain = do\n  *counters = [{n: 1}]\n  yield 1\n";
+    let out = check_str("set_head", src);
+    assert!(out.contains("  *counters = [{n: 1}]"), "output: {}", out);
+    assert!(!out.contains("(*counters"), "unnecessary parens: {}", out);
+}
+
+// ── 9. Nested constructor / Cons sub-patterns keep parens ──
+
+#[test]
+fn nested_constructor_pattern_keeps_parens() {
+    let src = "f = \\m -> case m of\n  Just (Just x) -> x\n  _ -> 0\n";
+    let out = check_str("nested_ctor_pat", src);
+    assert!(out.contains("Just (Just x)"), "output: {}", out);
+}
+
+#[test]
+fn cons_with_constructor_head_keeps_parens() {
+    let src = "g = \\l -> case l of\n  Cons (Just h) t -> 1\n  _ -> 0\n";
+    let out = check_str("cons_ctor_head", src);
+    assert!(out.contains("Cons (Just h) t"), "output: {}", out);
+}
+
+#[test]
+fn deeply_nested_pattern_keeps_parens() {
+    let src = "h = \\l -> case l of\n  Just (Cons (Just x) (Cons y t)) -> x\n  _ -> 0\n";
+    let out = check_str("deep_pat", src);
+    assert!(
+        out.contains("Just (Cons (Just x) (Cons y t))"),
+        "output: {}",
+        out
+    );
+}
+
+#[test]
+fn simple_patterns_stay_minimal() {
+    // Atom payloads (vars, records, literals, lists) must not gain parens.
+    let src = "f = \\m -> case m of\n  Just x -> x\n  Nothing {} -> 0\ng = \\l -> case l of\n  Cons h t -> 1\n  _ -> 0\n";
+    let out = check_str("simple_pats", src);
+    assert!(out.contains("Just x ->"), "output: {}", out);
+    assert!(out.contains("Cons h t ->"), "output: {}", out);
+}
+
+// ── 10. migrate formats to the multi-line layout that reparses ──
+
+#[test]
+fn migrate_round_trips_multiline() {
+    let src = "migrate *orders\n  from [{customer: Text}]\n  to [{customer: Text, amount: Int}]\n  using \\o -> {customer: o.customer, amount: 0}\n";
+    let out = check_str("migrate", src);
+    assert!(out.contains("migrate *orders\n"), "output: {}", out);
+    assert!(out.contains("\n  from "), "output: {}", out);
+    assert!(out.contains("\n  to "), "output: {}", out);
+    assert!(out.contains("\n  using "), "output: {}", out);
+}
+
+#[test]
+fn migrate_single_line_parses_and_reformats() {
+    // The parser now stops type application at the `to`/`using` clause
+    // keywords, so the single-line form parses; the formatter normalizes
+    // it to the multi-line layout.
+    let src = "migrate *orders from [{customer: Text}] to [{customer: Text, amount: Int}] using \\o -> {customer: o.customer, amount: 0}\n";
+    let out = check_str("migrate_single_line", src);
+    assert!(out.contains("migrate *orders\n  from"), "output: {}", out);
+}
+
+// ── 11. Float literal overflow is a lex error, not silent `inf` ──
+
+#[test]
+fn lexer_float_overflow_diagnostic() {
+    let src = format!("x = 1{}.0\n", "0".repeat(309));
+    let (tokens, diags) = knot::lexer::Lexer::new(&src).tokenize();
+    let errs: Vec<_> = diags
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .collect();
+    assert_eq!(errs.len(), 1, "diags: {:?}", diags);
+    assert!(
+        errs[0].message.contains("too large"),
+        "diags: {:?}",
+        diags
+    );
+    // Recovered value is finite, so downstream output stays parseable.
+    match tokens
+        .iter()
+        .find_map(|t| match t.kind {
+            TokenKind::Float(f) => Some(f),
+            _ => None,
+        }) {
+        Some(f) => assert_eq!(f, f64::MAX, "recovered value should be f64::MAX"),
+        None => panic!("expected a Float token, got: {:?}", tokens),
+    }
+}
+
+#[test]
+fn lexer_float_max_round_trips() {
+    // f64::MAX itself is finite: no diagnostic, and the formatted output
+    // reparses to the identical value.
+    let src = format!("x = {}.0\n", f64::MAX);
+    let out = check_str("float_max", &src);
+    let (tokens, diags) = knot::lexer::Lexer::new(&out).tokenize();
+    assert!(
+        diags.iter().all(|d| d.severity != Severity::Error),
+        "diags: {:?}",
+        diags
+    );
+    let f = tokens
+        .iter()
+        .find_map(|t| match t.kind {
+            TokenKind::Float(f) => Some(f),
+            _ => None,
+        })
+        .expect("float token");
+    assert_eq!(f, f64::MAX);
+}
+
+// ── Examples sweep: every example formats, reparses to the same AST, ──
+// ── and is idempotent ──
+
+#[test]
+fn examples_round_trip() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    if !root.exists() {
+        return; // examples not present in this checkout
+    }
+    let mut files = Vec::new();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read examples dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "knot") {
+                files.push(path);
+            }
+        }
+    }
+    assert!(!files.is_empty(), "no .knot examples found");
+    files.sort();
+    for f in files {
+        let src = std::fs::read_to_string(&f).expect("read example");
+        check_str(&f.display().to_string(), &src);
+    }
+}
+
 // ── Combined stress: everything at once still round-trips ──
 
 #[test]

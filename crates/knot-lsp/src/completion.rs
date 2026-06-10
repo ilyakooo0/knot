@@ -33,13 +33,30 @@ pub(crate) fn handle_completion(
     let doc = state.documents.get(uri)?;
     let pos = params.text_document_position.position;
 
-    // Detect trigger context
-    let offset = position_to_offset(&doc.source, pos);
-    let trigger_char = if offset > 0 {
-        doc.source.as_bytes().get(offset - 1).copied()
-    } else {
-        None
-    };
+    // Clients fire completion immediately on a keystroke, while `doc` lags
+    // behind by the analysis debounce window. Resolve the cursor and all
+    // textual context against the freshest text we have, and trust the
+    // client-reported trigger character over inspecting bytes that may not
+    // contain the just-typed character yet. Analysis-derived data (module,
+    // types) stays best-effort against the older text.
+    let latest_source: &str = state
+        .pending_sources
+        .get(uri)
+        .map(|p| p.source.as_str())
+        .unwrap_or(&doc.source);
+    let offset = position_to_offset(latest_source, pos);
+    let trigger_char = params
+        .context
+        .as_ref()
+        .and_then(|c| c.trigger_character.as_deref())
+        .and_then(|s| s.as_bytes().first().copied())
+        .or_else(|| {
+            if offset > 0 {
+                latest_source.as_bytes().get(offset - 1).copied()
+            } else {
+                None
+            }
+        });
 
     // Atomic-block context: when the cursor is inside `atomic { ... }`, the
     // type checker forbids any IO effects (console/fs/network/clock/random).
@@ -92,8 +109,8 @@ pub(crate) fn handle_completion(
 
     // Context-aware: after `/` in an import line, suggest file paths
     if trigger_char == Some(b'/') {
-        let line_start = doc.source[..offset].rfind('\n').map(|p| p + 1).unwrap_or(0);
-        let line_text = &doc.source[line_start..offset];
+        let line_start = latest_source[..offset].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let line_text = &latest_source[line_start..offset];
         if line_text.trim_start().starts_with("import ") {
             if let Some(source_path) = uri_to_path(uri) {
                 if let Some(base_dir) = source_path.parent() {
@@ -108,14 +125,14 @@ pub(crate) fn handle_completion(
     // Context-aware: after `.` suggest record field names from known types
     if trigger_char == Some(b'.') {
         // Try to find the expression before the dot and its type
-        let expr_end = offset - 1; // position of the `.`
-        let fields = resolve_dot_fields(doc, expr_end);
+        let expr_end = offset.saturating_sub(1); // position of the `.`
+        let fields = resolve_dot_fields(doc, latest_source, expr_end);
         if !fields.is_empty() {
             // If the receiver before the dot is a `Var` bound from a `*source`,
             // attach the source's field refinement (when present) as completion
             // detail/documentation so the user sees the predicate without
             // having to open the source declaration.
-            let receiver_var = receiver_ident_before_dot(&doc.source, expr_end);
+            let receiver_var = receiver_ident_before_dot(latest_source, expr_end);
             let owner_source = receiver_var
                 .as_deref()
                 .and_then(|name| resolve_var_to_source(&doc.module, name));
@@ -187,7 +204,7 @@ pub(crate) fn handle_completion(
     // Context detection: if cursor is in a type annotation position (after `:` or `[`),
     // only suggest types and type constructors
     let in_type_context = {
-        let before = &doc.source[..offset];
+        let before = &latest_source[..offset];
         let trimmed = before.trim_end();
         trimmed.ends_with(':') || trimmed.ends_with('[')
             || trimmed.ends_with("->")
@@ -1003,13 +1020,14 @@ fn receiver_ident_before_dot(source: &str, dot_pos: usize) -> Option<String> {
 }
 
 /// Try to resolve field names for dot completion by finding the type of the
-/// expression before the dot.
-fn resolve_dot_fields(doc: &DocumentState, dot_pos: usize) -> Vec<String> {
-    let bytes = doc.source.as_bytes();
+/// expression before the dot. `source` is the freshest text the client has
+/// sent (it may be newer than `doc.source`); `dot_pos` is an offset into it.
+fn resolve_dot_fields(doc: &DocumentState, source: &str, dot_pos: usize) -> Vec<String> {
+    let bytes = source.as_bytes();
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
 
     // Find the identifier immediately before the dot
-    let mut end = dot_pos;
+    let mut end = dot_pos.min(bytes.len());
     while end > 0 && bytes[end - 1] == b' ' {
         end -= 1;
     }
@@ -1021,7 +1039,7 @@ fn resolve_dot_fields(doc: &DocumentState, dot_pos: usize) -> Vec<String> {
         return Vec::new();
     }
 
-    let var_name = &doc.source[end..ident_end];
+    let var_name = &source[end..ident_end];
 
     // Look up the variable's type
     let type_str = find_type_for_name(doc, var_name, end);
@@ -1140,24 +1158,36 @@ pub(crate) fn handle_resolve_completion_item(
             if !import_path.is_empty() && !source_uri.is_empty() {
                 if let Ok(uri) = source_uri.parse::<Uri>() {
                     if let Some(doc) = state.documents.get(&uri) {
-                        // Shared with the code-action quickfix path: anchors
-                        // to the byte offset after the last import's newline
-                        // (or EOF with a leading `\n` when the file lacks a
-                        // trailing newline), instead of a possibly-nonexistent
-                        // `line + 1` position that clients clamp into the
-                        // middle of the last line.
-                        let (import_insert_pos, import_line) =
-                            crate::code_action::import_insert_position_and_text(
-                                doc,
-                                import_path,
-                            );
-                        item.additional_text_edits = Some(vec![TextEdit {
-                            range: Range {
-                                start: import_insert_pos,
-                                end: import_insert_pos,
-                            },
-                            new_text: import_line,
-                        }]);
+                        // The insert position is computed against the analyzed
+                        // text; if the buffer has newer pending edits the
+                        // position could land mid-edit and corrupt the file.
+                        // Skip the lazy import edit in that window — the item
+                        // still completes, just without auto-import.
+                        let is_stale = state
+                            .pending_sources
+                            .get(&uri)
+                            .is_some_and(|p| p.source != doc.source);
+                        if !is_stale {
+                            // Shared with the code-action quickfix path:
+                            // anchors to the byte offset after the last
+                            // import's newline (or EOF with a leading `\n`
+                            // when the file lacks a trailing newline), instead
+                            // of a possibly-nonexistent `line + 1` position
+                            // that clients clamp into the middle of the last
+                            // line.
+                            let (import_insert_pos, import_line) =
+                                crate::code_action::import_insert_position_and_text(
+                                    doc,
+                                    import_path,
+                                );
+                            item.additional_text_edits = Some(vec![TextEdit {
+                                range: Range {
+                                    start: import_insert_pos,
+                                    end: import_insert_pos,
+                                },
+                                new_text: import_line,
+                            }]);
+                        }
                     }
                 }
             }
@@ -1566,6 +1596,68 @@ mod tests {
             })),
             ..Default::default()
         }
+    }
+
+    /// Regression: completion derived its trigger character from the last
+    /// *analyzed* text. During the analysis debounce window the just-typed
+    /// `.` isn't in that text yet, so dot completion silently degraded to
+    /// the generic identifier list. The handler must trust the
+    /// client-reported trigger character and resolve the cursor against the
+    /// pending (freshest) text.
+    #[test]
+    fn completion_uses_client_trigger_and_pending_text() {
+        use crate::state::PendingSource;
+        let mut ws = TestWorkspace::new();
+        let analyzed = "*users : [{name: Text, age: Int}]\nmain = do\n  u <- *users\n  yield u";
+        let uri = ws.open("main", analyzed);
+        // The editor buffer is ahead: the user just typed `.` after the final
+        // `u`. The analyzed text doesn't contain the dot yet.
+        let pending = format!("{analyzed}.");
+        ws.state.pending_sources.insert(
+            uri.clone(),
+            PendingSource {
+                source: pending.clone(),
+                version: Some(2),
+            },
+        );
+        let dot_off = pending.len();
+        let pos = offset_to_position(&pending, dot_off);
+        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, Some(".")))
+            .expect("completion response");
+        let labels = item_labels(resp);
+        assert!(
+            labels.iter().any(|l| l == "name"),
+            "dot completion must surface field names; got: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|l| l == "do"),
+            "dot completion must not fall back to the generic keyword list; got: {labels:?}"
+        );
+    }
+
+    /// The lazy auto-import edit is computed against the analyzed text; when
+    /// newer text is pending the insert position may no longer be valid, so
+    /// the resolve path must skip the edit rather than risk corrupting the
+    /// buffer.
+    #[test]
+    fn auto_import_resolve_skips_edit_when_doc_is_stale() {
+        use crate::state::PendingSource;
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "import ./a\nmain = helper 1\n");
+        ws.state.pending_sources.insert(
+            uri.clone(),
+            PendingSource {
+                source: "import ./a\nimport ./b\nmain = helper 1\n".into(),
+                version: Some(2),
+            },
+        );
+        let resolved =
+            handle_resolve_completion_item(&ws.state, auto_import_item(&uri, "./helpers"));
+        assert!(
+            resolved.additional_text_edits.is_none(),
+            "stale doc must not produce auto-import edits; got: {:?}",
+            resolved.additional_text_edits
+        );
     }
 
     /// Regression: the resolve path inserted the auto-import line at

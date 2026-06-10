@@ -1084,6 +1084,23 @@ impl Infer {
         self.subst.insert(v, ty);
     }
 
+    /// Follow a substitution chain of `Var → Var → …` links to its last
+    /// variable (the union-find representative). Rebinding must happen
+    /// *there* — inserting at an interior var would orphan every alias
+    /// further down the chain.
+    fn var_chain_end(&self, v: TyVar) -> TyVar {
+        let mut cur = v;
+        let mut steps = 0usize;
+        while let Some(Ty::Var(next)) = self.subst.get(&cur) {
+            if *next == cur || steps > 10_000 {
+                break;
+            }
+            cur = *next;
+            steps += 1;
+        }
+        cur
+    }
+
     // ── Unification ──────────────────────────────────────────────
 
     fn unify(&mut self, t1: &Ty, t2: &Ty, span: Span) {
@@ -1323,11 +1340,19 @@ impl Infer {
                     let unified_inner = self.apply(&a);
                     let merged_io =
                         Ty::IO(merged, None, Box::new(unified_inner));
+                    // Bind at the *end* of each var's substitution chain
+                    // (via bind_var, which checks skolems/occurs) so any
+                    // aliases along the chain keep seeing the widened IO —
+                    // a raw insert at the root var would orphan them.
                     if let Some(v) = var1 {
-                        self.subst.insert(v, merged_io.clone());
+                        let root = self.var_chain_end(v);
+                        self.bind_var(root, merged_io.clone(), span);
                     }
                     if let Some(v) = var2 {
-                        self.subst.insert(v, merged_io);
+                        let root = self.var_chain_end(v);
+                        if Some(root) != var1.map(|v1| self.var_chain_end(v1)) {
+                            self.bind_var(root, merged_io, span);
+                        }
                     }
                 } else {
                     self.unify_io_effects(&e1, r1, &e2, r2, span);
@@ -1342,10 +1367,18 @@ impl Infer {
             }
             // In IO do blocks, allow Relation types to unify with IO or
             // Unit types. Route handlers mix relational operations and
-            // their declared response type in if/case branches.
-            (Ty::Relation(a), Ty::IO(_, _, b))
-            | (Ty::IO(_, _, b), Ty::Relation(a)) if self.in_io_do => {
-                self.unify(a, b, span);
+            // their declared response type in if/case branches. The plain
+            // relation `[T]` stands for the *whole* result of the IO side,
+            // so it unifies with the IO's inner type — not the relation's
+            // element type with the inner (which produced nonsense
+            // "expected {x: Int}, found [{x: Int}]" mismatches).
+            (Ty::Relation(_), Ty::IO(_, _, b)) if self.in_io_do => {
+                let b = (**b).clone();
+                self.unify(&t1, &b, span);
+            }
+            (Ty::IO(_, _, b), Ty::Relation(_)) if self.in_io_do => {
+                let b = (**b).clone();
+                self.unify(&b, &t2, span);
             }
             (Ty::Relation(_), Ty::Record(fields, None)) | (Ty::Record(fields, None), Ty::Relation(_))
                 if self.in_io_do && fields.is_empty() => {}
@@ -1749,6 +1782,20 @@ impl Infer {
                         );
                     }
                 } else if only1.is_empty() && only2.is_empty() {
+                    // Two *rigid* rows can never unify — but if the user's
+                    // annotation declared their union (`IO {| r1 \/ r2}`),
+                    // a pending effect-union constraint mentions them and
+                    // the clash is sanctioned: sequencing `IO {| r1}` with
+                    // `IO {| r2}` (desugared `__bind` forces both through
+                    // one monad row) yields a row covered by `r1 \/ r2`,
+                    // and a body row matching one source is subsumed by the
+                    // declared union result. Accept without binding.
+                    if self.skolems.contains(&rv1)
+                        && self.skolems.contains(&rv2)
+                        && self.effect_union_sanctions(rv1, rv2)
+                    {
+                        return;
+                    }
                     self.unify(&Ty::Var(rv1), &Ty::Var(rv2), span);
                 } else {
                     let rv1_skolem = self.skolems.contains(&rv1);
@@ -1785,6 +1832,30 @@ impl Infer {
                 }
             }
         }
+    }
+
+    /// Whether a pending `\/` effect-union constraint sanctions treating
+    /// the two rigid rows `a` and `b` as compatible: either both are
+    /// sources of the same union (sequencing them produces the union),
+    /// or one is the union's declared result and the other one of its
+    /// sources (a single source is subsumed by the union).
+    fn effect_union_sanctions(&self, a: TyVar, b: TyVar) -> bool {
+        let root = |v: TyVar| -> TyVar {
+            match self.apply(&Ty::Var(v)) {
+                Ty::Var(x) => x,
+                _ => v,
+            }
+        };
+        let a = root(a);
+        let b = root(b);
+        self.pending_effect_unions.iter().any(|u| {
+            let result = root(u.result);
+            let sources: Vec<TyVar> =
+                u.sources.iter().map(|&s| root(s)).collect();
+            (sources.contains(&a) && sources.contains(&b))
+                || (result == a && sources.contains(&b))
+                || (result == b && sources.contains(&a))
+        })
     }
 
     /// Expand a nominal ADT (`Con(name, args)`) to a structural `Variant`.
@@ -2217,6 +2288,36 @@ impl Infer {
         let gen_vars: Vec<TyVar> =
             ty_fv.difference(&env_fv).copied().collect();
         let gen_set: HashSet<TyVar> = gen_vars.iter().copied().collect();
+        // Deferred trait constraints (pushed by `require_trait` when the
+        // body used e.g. `<` or a trait method on a still-polymorphic type)
+        // whose variables are being quantified here must travel with the
+        // scheme — `check_constraints` skips unresolved vars on the
+        // assumption that the obligation is checked at the use site, which
+        // only happens if instantiation re-registers it. Constraints on
+        // vars NOT quantified here stay in the deferred list (their order
+        // is preserved so `check_skolem_constraints` indices stay valid).
+        let mut all_constraints = all_constraints;
+        let mut captured: HashSet<(String, TyVar)> = all_constraints
+            .iter()
+            .map(|c| (c.trait_name.clone(), c.type_var))
+            .collect();
+        let deferred = std::mem::take(&mut self.deferred_constraints);
+        let mut remaining = Vec::with_capacity(deferred.len());
+        for dc in deferred {
+            match self.apply(&Ty::Var(dc.type_var)) {
+                Ty::Var(v) if gen_set.contains(&v) => {
+                    if captured.insert((dc.trait_name.clone(), v)) {
+                        all_constraints.push(TyConstraint {
+                            trait_name: dc.trait_name,
+                            type_var: v,
+                            span: dc.span,
+                        });
+                    }
+                }
+                _ => remaining.push(dc),
+            }
+        }
+        self.deferred_constraints = remaining;
         // Only keep constraints on generalized variables; immediately
         // validate constraints that resolved to concrete types.
         let mut kept = Vec::new();
@@ -3246,9 +3347,17 @@ impl Infer {
             } => {
                 let cond_ty = self.infer_expr(cond);
                 self.unify(&cond_ty, &Ty::Bool, cond.span);
+                // Unify each branch against a fresh result var (the same
+                // shape `case` uses) rather than unifying the branches
+                // directly: when both branches are *concrete* `Ty::IO`s
+                // with different closed effect sets (e.g. `*a` vs `*b`),
+                // the var-rooted merge path in `unify` widens the result
+                // to the union instead of rejecting the mismatch.
+                let result_ty = self.fresh();
                 let then_ty = self.infer_expr(then_branch);
+                self.unify(&then_ty, &result_ty, then_branch.span);
                 let else_ty = self.infer_expr(else_branch);
-                self.unify(&then_ty, &else_ty, else_branch.span);
+                self.unify(&else_ty, &result_ty, else_branch.span);
                 // Merge IO effects from both branches — unify only checks
                 // inner types and discards effect sets.
                 let applied_then = self.apply(&then_ty);
@@ -3266,7 +3375,7 @@ impl Infer {
                     | (Ty::Relation(_), Ty::IO(e, r, inner)) => {
                         Ty::IO(e.clone(), *r, inner.clone())
                     }
-                    _ => then_ty,
+                    _ => result_ty,
                 }
             }
 
@@ -4020,12 +4129,20 @@ impl Infer {
                         // square. Reject conservatively and ask for an
                         // annotation rather than silently inferring an
                         // unsound unit.
-                        let concrete_unit = |t: &Ty| match t {
+                        // A unit is "known to be unit-bearing" when, after
+                        // resolving unit variables, it still has concrete
+                        // bases OR an unresolved unit variable. A bare unit
+                        // variable (e.g. the `u` in `Float<u> -> Float<u>`)
+                        // is just as unit-bearing as a concrete unit: typing
+                        // `x<u> * y` with `y` unresolved would unify `y`
+                        // with `x` and produce `u` where `u^2` is correct.
+                        let concrete_unit = |slf: &Self, t: &Ty| match t {
                             Ty::IntUnit(u) | Ty::FloatUnit(u) => {
-                                if u.bases.is_empty() {
+                                let applied = slf.apply_unit(u);
+                                if applied.is_dimensionless() {
                                     None
                                 } else {
-                                    Some(u.display())
+                                    Some(applied.display())
                                 }
                             }
                             _ => None,
@@ -4033,9 +4150,9 @@ impl Infer {
                         let lhs_is_var = matches!(&lhs_applied, Ty::Var(_));
                         let rhs_is_var = matches!(&rhs_applied, Ty::Var(_));
                         let unit_side = if lhs_is_var {
-                            concrete_unit(&rhs_applied)
+                            concrete_unit(self, &rhs_applied)
                         } else if rhs_is_var {
-                            concrete_unit(&lhs_applied)
+                            concrete_unit(self, &lhs_applied)
                         } else {
                             None
                         };
@@ -4533,6 +4650,85 @@ impl Infer {
         }
     }
 
+    /// Merge an IO statement's effect-row tail into the do-block's
+    /// accumulated row. Ordinarily the rows are unified into a single
+    /// polymorphic tail, but when both rows are *rigid* (signature
+    /// skolems, e.g. `r1` and `r2` in
+    /// `IO {| r1} {} -> IO {| r2} {} -> IO {| r1 \/ r2} {}`) the
+    /// sequenced block's row is their *union*, not an equality —
+    /// forcing them equal rejects every user-annotated `\/` function.
+    /// Mirror the way `race`'s builtin registration types `\/`: a fresh
+    /// result row bound by a pending effect-union constraint.
+    fn merge_do_io_row(
+        &mut self,
+        io_row: &mut Option<TyVar>,
+        rv: TyVar,
+        span: Span,
+    ) {
+        let existing = match *io_row {
+            None => {
+                *io_row = Some(rv);
+                return;
+            }
+            Some(e) => e,
+        };
+        if existing == rv {
+            return;
+        }
+        let root_of = |slf: &Self, v: TyVar| -> Option<TyVar> {
+            match slf.apply(&Ty::Var(v)) {
+                Ty::Var(x) => Some(x),
+                _ => None,
+            }
+        };
+        if let (Some(e), Some(r)) =
+            (root_of(self, existing), root_of(self, rv))
+        {
+            if e != r {
+                let e_rigid = self.skolems.contains(&e);
+                let r_rigid = self.skolems.contains(&r);
+                if e_rigid && r_rigid {
+                    let result = self.fresh_var();
+                    self.pending_effect_unions.push(EffectUnion {
+                        result,
+                        sources: vec![e, r],
+                    });
+                    *io_row = Some(result);
+                    return;
+                }
+                // The accumulated row may already be a union result var;
+                // fold further rigid rows into its sources rather than
+                // aliasing the union var to a skolem.
+                if r_rigid {
+                    if let Some(u) = self
+                        .pending_effect_unions
+                        .iter_mut()
+                        .find(|u| u.result == e)
+                    {
+                        if !u.sources.contains(&r) {
+                            u.sources.push(r);
+                        }
+                        return;
+                    }
+                }
+                if e_rigid {
+                    if let Some(u) = self
+                        .pending_effect_unions
+                        .iter_mut()
+                        .find(|u| u.result == r)
+                    {
+                        if !u.sources.contains(&e) {
+                            u.sources.push(e);
+                        }
+                        *io_row = Some(rv);
+                        return;
+                    }
+                }
+            }
+        }
+        self.unify(&Ty::Var(existing), &Ty::Var(rv), span);
+    }
+
     fn infer_do(&mut self, stmts: &[ast::Stmt], _span: Span) -> Ty {
         self.push_scope();
         let mut yield_ty: Option<Ty> = None;
@@ -4569,17 +4765,8 @@ impl Infer {
                         is_io = true;
                         io_effects.extend(effects.iter().cloned());
                         if let Some(rv) = row {
-                            match io_row {
-                                None => io_row = Some(*rv),
-                                Some(existing) if existing != *rv => {
-                                    self.unify(
-                                        &Ty::Var(existing),
-                                        &Ty::Var(*rv),
-                                        expr.span,
-                                    );
-                                }
-                                _ => {}
-                            }
+                            let rv = *rv;
+                            self.merge_do_io_row(&mut io_row, rv, expr.span);
                         }
                         self.check_pattern(pat, inner);
                     } else if self.in_io_do && matches!(&resolved, Ty::Var(_)) {
@@ -4626,17 +4813,8 @@ impl Infer {
                         is_io = true;
                         io_effects.extend(effects.iter().cloned());
                         if let Some(rv) = row {
-                            match io_row {
-                                None => io_row = Some(*rv),
-                                Some(existing) if existing != *rv => {
-                                    self.unify(
-                                        &Ty::Var(existing),
-                                        &Ty::Var(*rv),
-                                        expr.span,
-                                    );
-                                }
-                                _ => {}
-                            }
+                            let rv = *rv;
+                            self.merge_do_io_row(&mut io_row, rv, expr.span);
                         }
                     }
                     // Let-generalization: for simple variable patterns,
@@ -4708,17 +4886,8 @@ impl Infer {
                             is_io = true;
                             io_effects.extend(effects.iter().cloned());
                             if let Some(rv) = row {
-                                match io_row {
-                                    None => io_row = Some(*rv),
-                                    Some(existing) if existing != *rv => {
-                                        self.unify(
-                                            &Ty::Var(existing),
-                                            &Ty::Var(*rv),
-                                            expr.span,
-                                        );
-                                    }
-                                    _ => {}
-                                }
+                                let rv = *rv;
+                                self.merge_do_io_row(&mut io_row, rv, expr.span);
                             }
                             last_expr_ty = Some(*inner.clone());
                         } else if self.in_io_do {
@@ -5148,6 +5317,7 @@ impl Infer {
                                 }
                             }
                         }
+                        let unions_before = self.pending_effect_unions.len();
                         let raw_ty = self.ast_type_to_ty(&scheme.ty);
                         self.in_type_annotation = false;
                         let mut vars: Vec<TyVar> =
@@ -5165,9 +5335,27 @@ impl Infer {
                             }
                             other => other,
                         };
+                        // `\/` effect unions registered while converting the
+                        // annotation belong to this scheme, not the global
+                        // pending list — otherwise every instantiation shares
+                        // the annotation's original row vars. The union's
+                        // result var (and any `_`-wildcard sources) are fresh
+                        // vars outside annotation_vars, so quantify them too.
+                        let effect_unions: Vec<EffectUnion> =
+                            self.pending_effect_unions.split_off(unions_before);
+                        for u in &effect_unions {
+                            if !vars.contains(&u.result) {
+                                vars.push(u.result);
+                            }
+                            for s in &u.sources {
+                                if !vars.contains(s) {
+                                    vars.push(*s);
+                                }
+                            }
+                        }
                         self.bind_top(
                             name,
-                            Scheme { vars, unit_vars, constraints, effect_unions: vec![], ty },
+                            Scheme { vars, unit_vars, constraints, effect_unions, ty },
                         );
                     } else {
                         let var = self.fresh();
@@ -6606,9 +6794,11 @@ impl Infer {
                                     }
                                 }
                             }
+                            let unions_before =
+                                self.pending_effect_unions.len();
                             let ann_ty = self.ast_type_to_ty(&ts.ty);
                             self.in_type_annotation = false;
-                            let vars: Vec<TyVar> = self
+                            let mut vars: Vec<TyVar> = self
                                 .annotation_vars
                                 .values()
                                 .copied()
@@ -6618,9 +6808,24 @@ impl Infer {
                                 .values()
                                 .copied()
                                 .collect();
+                            // Capture `\/` effect unions from the annotation
+                            // into the scheme (see pre_register).
+                            let effect_unions: Vec<EffectUnion> = self
+                                .pending_effect_unions
+                                .split_off(unions_before);
+                            for u in &effect_unions {
+                                if !vars.contains(&u.result) {
+                                    vars.push(u.result);
+                                }
+                                for s in &u.sources {
+                                    if !vars.contains(s) {
+                                        vars.push(*s);
+                                    }
+                                }
+                            }
                             self.bind_top(
                                 name,
-                                Scheme { vars, unit_vars, constraints, effect_unions: vec![], ty: ann_ty },
+                                Scheme { vars, unit_vars, constraints, effect_unions, ty: ann_ty },
                             );
                         } else {
                             let applied = self.apply(&inferred);

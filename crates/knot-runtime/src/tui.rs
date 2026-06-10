@@ -154,11 +154,18 @@ fn load_relations(conn: &Connection) -> Vec<RelationInfo> {
     relations
 }
 
-/// Column headers for a relation
+/// Column headers for a relation. Nested-relation fields (`[...]` types) live
+/// in child tables and are excluded from the row query in `load_rows`, so
+/// they must be excluded here too — otherwise data cells shift under the
+/// wrong headers.
 fn column_headers(schema: &SchemaKind) -> Vec<String> {
     match schema {
         SchemaKind::Unit => vec!["value".to_string()],
-        SchemaKind::Record(fields) => fields.iter().map(|(n, _)| n.clone()).collect(),
+        SchemaKind::Record(fields) => fields
+            .iter()
+            .filter(|(_, ty)| !ty.starts_with('['))
+            .map(|(n, _)| n.clone())
+            .collect(),
         SchemaKind::Adt(_) => vec!["value".to_string()],
     }
 }

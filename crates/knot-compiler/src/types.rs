@@ -305,13 +305,21 @@ fn collect_source_refinements_inner(
                             (**predicate).clone(),
                         ));
                     }
-                    // Field references a refined type alias: age: Nat
-                    TypeKind::Named(name) if refined_types.contains_key(name) => {
-                        result.push((
-                            Some(field.name.clone()),
-                            name.clone(),
-                            refined_types[name].clone(),
-                        ));
+                    // Field references a refined type alias, either directly
+                    // (`age: Nat`) or through a chain of plain aliases
+                    // (`type Age = Nat; age: Age`).
+                    TypeKind::Named(name) => {
+                        if let Some(refined) = follow_alias_to_refined(
+                            name,
+                            refined_types,
+                            alias_ast_types,
+                        ) {
+                            result.push((
+                                Some(field.name.clone()),
+                                refined.clone(),
+                                refined_types[&refined].clone(),
+                            ));
+                        }
                     }
                     _ => {}
                 }
@@ -328,6 +336,32 @@ fn collect_source_refinements_inner(
         _ => {}
     }
     result
+}
+
+/// Follow a chain of plain (non-refined) aliases — `type Age = Nat`,
+/// `type A = B; type B = Nat` — until reaching a refined type alias or a
+/// non-alias. Returns the refined alias's name (the key whose predicate in
+/// `refined_types` applies). Cycle-protected: `type A = B; type B = A`
+/// yields `None` (the cycle itself is diagnosed by type inference).
+fn follow_alias_to_refined(
+    name: &str,
+    refined_types: &HashMap<String, Expr>,
+    alias_ast_types: &HashMap<String, Type>,
+) -> Option<String> {
+    let mut current = name.to_string();
+    let mut seen: HashSet<String> = HashSet::new();
+    loop {
+        if refined_types.contains_key(&current) {
+            return Some(current);
+        }
+        if !seen.insert(current.clone()) {
+            return None; // alias cycle
+        }
+        match alias_ast_types.get(&current).map(|t| &t.node) {
+            Some(TypeKind::Named(next)) => current = next.clone(),
+            _ => return None,
+        }
+    }
 }
 
 fn resolve_type(

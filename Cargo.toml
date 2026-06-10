@@ -6,11 +6,13 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 
-[profile.release]
-panic = "abort"
-
-[profile.dev]
-panic = "abort"
+# panic = "unwind" (the default) is load-bearing: the runtime's catch_unwind
+# recovery sites (HTTP worker 500 responses, race-loser cancellation, atomic
+# rollback on handler panic) depend on it. Unwinding across the FFI boundary
+# into Cranelift-generated code is sound because (a) every runtime function
+# callable from generated code is `extern "C-unwind"`, and (b) the compiler
+# emits .eh_frame unwind info for every generated function (knot-compiler's
+# unwind.rs), so the system unwinder can walk those frames.
 
 [workspace.dependencies]
 knot = { path = "crates/knot" }

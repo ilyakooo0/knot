@@ -16,6 +16,11 @@ pub struct Parser {
     /// Used in route entry parsing to prevent the type parser from consuming
     /// the `headers` keyword.
     stop_type_at_headers: bool,
+    /// When true, `can_start_type_atom` returns false for `Lower("to")` and
+    /// `Lower("using")`. Used while parsing the `from`/`to` types of a
+    /// `migrate` declaration so a single-line migrate doesn't have its clause
+    /// keywords consumed as type-variable applications.
+    stop_type_at_migrate_clauses: bool,
     /// Indentation level of the current block (set by `parse_block`).
     /// Used by `parse_application` to allow multi-line function application
     /// when continuation lines are indented past the block indent.
@@ -42,6 +47,7 @@ impl Parser {
             diagnostics: Vec::new(),
             context: Vec::new(),
             stop_type_at_headers: false,
+            stop_type_at_migrate_clauses: false,
             block_indent: usize::MAX,
             delimiter_depth: 0,
             recursion_depth: 0,
@@ -1713,18 +1719,38 @@ impl Parser {
             }
             this.advance();
 
-            let from_ty = this.parse_type()?;
+            // Stop type application at the `to`/`using` clause keywords so
+            // the single-line form `migrate *r from T to U using f` parses
+            // (otherwise `parse_type_app` consumes them as type variables).
+            this.stop_type_at_migrate_clauses = true;
+            let from_ty = match this.parse_type() {
+                Some(t) => t,
+                None => {
+                    this.stop_type_at_migrate_clauses = false;
+                    this.block_indent = prev_block_indent;
+                    return None;
+                }
+            };
 
             this.skip_newlines();
             // `to`
             if !matches!(this.peek(), TokenKind::Lower(s) if s == "to") {
                 this.error("expected 'to' in migrate declaration");
+                this.stop_type_at_migrate_clauses = false;
                 this.block_indent = prev_block_indent;
                 return None;
             }
             this.advance();
 
-            let to_ty = this.parse_type()?;
+            let to_ty = match this.parse_type() {
+                Some(t) => t,
+                None => {
+                    this.stop_type_at_migrate_clauses = false;
+                    this.block_indent = prev_block_indent;
+                    return None;
+                }
+            };
+            this.stop_type_at_migrate_clauses = false;
 
             this.skip_newlines();
             // `using`
@@ -3417,6 +3443,11 @@ impl Parser {
     fn can_start_type_atom(&self) -> bool {
         if self.stop_type_at_headers {
             if matches!(self.peek(), TokenKind::Lower(s) if s == "headers" || s == "rateLimit") {
+                return false;
+            }
+        }
+        if self.stop_type_at_migrate_clauses {
+            if matches!(self.peek(), TokenKind::Lower(s) if s == "to" || s == "using") {
                 return false;
             }
         }

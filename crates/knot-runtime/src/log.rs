@@ -9,7 +9,7 @@ pub fn debug_enabled() -> bool {
 
 /// Scan `--debug` in process arguments and enable debug logging.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_debug_init() {
+pub extern "C-unwind" fn knot_debug_init() {
     for arg in std::env::args() {
         if arg == "--debug" {
             DEBUG.store(true, Ordering::Relaxed);

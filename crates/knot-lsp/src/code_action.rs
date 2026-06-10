@@ -867,13 +867,14 @@ pub(crate) fn handle_code_action(
     // the boilerplate of unwrapping it.
     if let Some((refine_span, target_name)) = find_refine_at(doc, range_start) {
         let inner_text = safe_slice(&doc.source, refine_span).to_string();
+        let indent = indent_for_expr_start(&doc.source, refine_span.start);
         let mut changes = HashMap::new();
         changes.insert(
             uri.clone(),
             vec![TextEdit {
                 range: span_to_range(refine_span, &doc.source),
                 new_text: format!(
-                    "case {inner_text} of\n  Ok {{value: x}} -> x\n  Err {{error: e}} -> e"
+                    "case {inner_text} of{indent}Ok {{value: x}} -> x{indent}Err {{error: e}} -> e"
                 ),
             }],
         );
@@ -1185,6 +1186,13 @@ fn find_if_negate_at(
             let cond_text = source.get(cond.span.start..cond.span.end)?;
             let then_text = source.get(then_branch.span.start..then_branch.span.end)?;
             let else_text = source.get(else_branch.span.start..else_branch.span.end)?;
+            // Multi-line branches carry indentation tied to their original
+            // position; swapping them onto one line (or into each other's
+            // columns) breaks the layout-sensitive parse. Only offer the
+            // action when the whole rewrite stays on a single line.
+            if cond_text.contains('\n') || then_text.contains('\n') || else_text.contains('\n') {
+                return None;
+            }
             // Strip a leading `not ` if present so the negation cancels out.
             let new_cond = if let Some(rest) = cond_text.strip_prefix("not ") {
                 rest.to_string()
@@ -2280,6 +2288,20 @@ fn count_function_arity(ty: &ast::Type) -> usize {
 
 /// Compute the indentation prefix for a new case arm, matching the existing arms
 /// or falling back to a default indent relative to the case expression.
+/// Newline + indentation for synthesized case arms when rewriting the
+/// expression starting at `span_start` into a `case`. Arms are indented two
+/// columns past the rewritten expression's own column, which keeps them
+/// strictly deeper than the enclosing layout context (do-block statements,
+/// let bindings) so the layout-sensitive parser accepts the result.
+fn indent_for_expr_start(source: &str, span_start: usize) -> String {
+    let line_start = source[..span_start.min(source.len())]
+        .rfind('\n')
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    let col = span_start - line_start;
+    format!("\n{}", " ".repeat(col + 2))
+}
+
 fn arm_indentation(case_expr: &ast::Expr, arms: &[ast::CaseArm], source: &str) -> String {
     // Prefer the indentation of an existing arm
     if let Some(arm) = arms.first() {
@@ -2902,8 +2924,9 @@ fn find_if_to_case_at(
                 let cond_text = safe_slice(source, cond.span);
                 let then_text = safe_slice(source, then_branch.span);
                 let else_text = safe_slice(source, else_branch.span);
+                let indent = indent_for_expr_start(source, expr.span.start);
                 let replacement = format!(
-                    "case {cond_text} of\n  True {{}} -> {then_text}\n  False {{}} -> {else_text}"
+                    "case {cond_text} of{indent}True {{}} -> {then_text}{indent}False {{}} -> {else_text}"
                 );
                 *best = Some((expr.span, replacement));
             }
@@ -3001,6 +3024,7 @@ fn find_pipe_conversion_at(
         source: &str,
         offset: usize,
         best: &mut Option<(Span, String)>,
+        is_app_head: bool,
     ) {
         if expr.span.start > offset || offset > expr.span.end {
             return;
@@ -3009,11 +3033,17 @@ fn find_pipe_conversion_at(
             // Only convert applications whose function is a simple identifier
             // (`f x` rather than `(g h) x`). Piping a curried partial
             // application reads strangely.
+            //
+            // `is_app_head` guards the multi-arg case: the inner `App(f, x)`
+            // of `f x y` is the head of the enclosing application, and
+            // rewriting it to `x |> f` would produce `x |> f y`, which
+            // parses as `f y x` — arguments silently swapped. Only offer
+            // the action when the whole chain has exactly one argument.
             let is_simple = matches!(
                 &func.node,
                 ast::ExprKind::Var(_) | ast::ExprKind::Constructor(_)
             );
-            if is_simple {
+            if is_simple && !is_app_head {
                 let size = expr.span.end - expr.span.start;
                 if best.as_ref().map_or(true, |b| size < b.0.end - b.0.start) {
                     let func_text = safe_slice(source, func.span);
@@ -3031,19 +3061,24 @@ fn find_pipe_conversion_at(
                     *best = Some((expr.span, replacement));
                 }
             }
+            // Recurse manually so the function side knows it is an
+            // application head.
+            walk(func, source, offset, best, true);
+            walk(arg, source, offset, best, false);
+            return;
         }
-        crate::utils::recurse_expr(expr, |e| walk(e, source, offset, best));
+        crate::utils::recurse_expr(expr, |e| walk(e, source, offset, best, false));
     }
     let mut best = None;
     for decl in &module.decls {
         match &decl.node {
             DeclKind::Fun { body: Some(body), .. }
             | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => walk(body, source, offset, &mut best),
+            | DeclKind::Derived { body, .. } => walk(body, source, offset, &mut best, false),
             DeclKind::Impl { items, .. } => {
                 for item in items {
                     if let ast::ImplItem::Method { body, .. } = item {
-                        walk(body, source, offset, &mut best);
+                        walk(body, source, offset, &mut best, false);
                     }
                 }
             }
@@ -3064,6 +3099,75 @@ mod tests {
             message: format!("unknown variable: {name}"),
             severity: Some(DiagnosticSeverity::ERROR),
             ..Default::default()
+        }
+    }
+
+    fn parse_module(src: &str) -> Module {
+        let (tokens, lex_diags) = knot::lexer::Lexer::new(src).tokenize();
+        assert!(lex_diags.is_empty(), "lex errors in test source: {lex_diags:?}");
+        let (module, parse_diags) = knot::parser::Parser::new(src.to_string(), tokens).parse_module();
+        assert!(parse_diags.is_empty(), "parse errors in test source: {parse_diags:?}");
+        module
+    }
+
+    fn parses_cleanly(src: &str) -> bool {
+        let (tokens, lex_diags) = knot::lexer::Lexer::new(src).tokenize();
+        let (_, parse_diags) = knot::parser::Parser::new(src.to_string(), tokens).parse_module();
+        lex_diags.is_empty() && parse_diags.is_empty()
+    }
+
+    #[test]
+    fn pipe_conversion_not_offered_inside_multi_arg_application() {
+        // Regression: with the cursor inside `f x` of `f x y`, the action used
+        // to rewrite the inner application to `x |> f`, producing `x |> f y`
+        // which parses as `f y x` — arguments silently swapped.
+        let src = "g = \\f x y -> f x y\n";
+        let module = parse_module(src);
+        let off = src.find("f x y").expect("application") + 2; // on `x`
+        assert!(
+            find_pipe_conversion_at(&module, src, off).is_none(),
+            "no pipe action may be offered anywhere in a multi-arg application"
+        );
+    }
+
+    #[test]
+    fn pipe_conversion_still_offered_for_single_arg_application() {
+        let src = "h = \\x -> show x\n";
+        let module = parse_module(src);
+        let off = src.find("show x").expect("application") + 1;
+        let (_, replacement) =
+            find_pipe_conversion_at(&module, src, off).expect("single-arg app offers pipe");
+        assert_eq!(replacement, "x |> show");
+    }
+
+    #[test]
+    fn if_to_case_inside_do_block_keeps_layout_parseable() {
+        // Regression: arms were emitted at a hard-coded 2-space indent, which
+        // collided with the do-block statement column and failed to reparse.
+        let src = "main = do\n  x <- *items\n  let y = if x > 1 then 1 else 2\n  yield y\n";
+        let module = parse_module(src);
+        let off = src.find("if x").expect("if expr");
+        let (span, replacement) =
+            find_if_to_case_at(&module, src, off).expect("if-to-case offered");
+        let mut out = src.to_string();
+        out.replace_range(span.start..span.end, &replacement);
+        assert!(
+            parses_cleanly(&out),
+            "if-to-case rewrite must reparse cleanly; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn if_negate_not_offered_for_multiline_branches() {
+        // Swapping multi-line branches inline breaks layout-sensitive parses;
+        // the action is suppressed instead.
+        let src = "f = \\x -> if x > 1\n  then do\n    yield 1\n  else do\n    yield 2\n";
+        if let Ok(module) = std::panic::catch_unwind(|| parse_module(src)) {
+            let off = src.find("if x").expect("if expr");
+            assert!(
+                find_if_negate_at(&module, src, off).is_none(),
+                "negate action must not be offered for multi-line branches"
+            );
         }
     }
 

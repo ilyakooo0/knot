@@ -1038,8 +1038,10 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "cranelift-object",
+ "gimli",
  "knot",
  "knot-runtime",
+ "object",
  "target-lexicon",
 ]
 

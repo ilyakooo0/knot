@@ -535,7 +535,7 @@ static GC_STATS: GcStats = GcStats::new();
 /// programs/tests that want to observe allocator behaviour in-process.
 /// Safe to call from any thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn knot_gc_stats_snapshot(out: *mut GcStatsSnapshot) {
+pub unsafe extern "C-unwind" fn knot_gc_stats_snapshot(out: *mut GcStatsSnapshot) {
     if out.is_null() { return; }
     unsafe { std::ptr::write(out, GC_STATS.snapshot()); }
 }
@@ -543,7 +543,7 @@ pub unsafe extern "C" fn knot_gc_stats_snapshot(out: *mut GcStatsSnapshot) {
 /// Print a human-readable dump of the current GC counters to stderr.
 /// Intended for diagnostics (`--gc-stats` style invocations or panics).
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_gc_stats_dump() {
+pub extern "C-unwind" fn knot_gc_stats_dump() {
     let s = GC_STATS.snapshot();
     eprintln!("[gc] allocs={} pinned_allocs={} resets={}", s.allocs, s.pinned_allocs, s.resets);
     eprintln!("[gc] chunks: allocated={} pool_hits={} returned={} dropped={}",
@@ -1285,6 +1285,29 @@ fn cancel_requested() -> bool {
             .map(|t| t.is_cancelled())
             .unwrap_or(false)
     })
+}
+
+/// Panic payload used to unwind a cancelled `race` loser out of its IO chain.
+/// `knot_io_run` raises it at the next cancellation checkpoint; the race
+/// worker's `catch_unwind` recognizes it and treats it as a silent loss (not
+/// an error), and the process panic hook suppresses its output. This is the
+/// mechanism that stops a cancelled loser from running its continuation on a
+/// dangling/absent result.
+struct Cancelled;
+
+/// Install (once, process-wide) a panic hook that stays silent for the
+/// `Cancelled` sentinel and defers to the previous hook for real panics.
+fn install_cancel_panic_hook() {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if info.payload().downcast_ref::<Cancelled>().is_some() {
+                return;
+            }
+            prev(info);
+        }));
+    });
 }
 
 fn current_cancel_token() -> Option<Arc<CancelToken>> {
@@ -2265,7 +2288,7 @@ thread_local! {
 /// Called before a nested atomic's retry loop so inner snapshot/retry
 /// doesn't destroy outer tracking state.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_stm_push() {
+pub extern "C-unwind" fn knot_stm_push() {
     let saved = STM_TRACK.with(|t| t.borrow().clone());
     STM_TRACKING_STACK.with(|stack| stack.borrow_mut().push(saved));
     // Entering a nested atomic: any "fresh All" flags belong to the outer
@@ -2277,7 +2300,7 @@ pub extern "C" fn knot_stm_push() {
 /// Called after a nested atomic commits to restore outer read/write sets
 /// combined with inner reads/writes.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_stm_pop_merge() {
+pub extern "C-unwind" fn knot_stm_pop_merge() {
     let saved = STM_TRACKING_STACK.with(|stack| {
         stack
             .borrow_mut()
@@ -2591,7 +2614,7 @@ fn notify_relation_changed(name: &str) {
 /// and registers an `All` read filter (woken by any write to the table).
 /// Exported wrapper for codegen-emitted SQL queries that need STM tracking.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_stm_track_read(name_ptr: *const u8, name_len: usize) {
+pub extern "C-unwind" fn knot_stm_track_read(name_ptr: *const u8, name_len: usize) {
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     stm_track_read(name);
 }
@@ -2609,7 +2632,7 @@ pub extern "C" fn knot_stm_track_read(name_ptr: *const u8, name_len: usize) {
 /// index leaves the `All` filter in place — wake-on-any-write is the safe
 /// fallback.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_stm_track_read_pred(
+pub extern "C-unwind" fn knot_stm_track_read_pred(
     name_ptr: *const u8,
     name_len: usize,
     spec_ptr: *const u8,
@@ -2996,7 +3019,7 @@ fn debug_sql_params(sql: &str, params: &[rusqlite::types::Value]) {
 /// Returns a boxed `Value` if found, or null if absent.
 /// On parse error, prints a message and exits.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_override_lookup(
+pub extern "C-unwind" fn knot_override_lookup(
     name_ptr: *const u8,
     name_len: usize,
     type_tag: i32,
@@ -3101,7 +3124,7 @@ pub extern "C" fn knot_override_lookup(
 /// Behaves like `knot_override_lookup`, but exits with an error if the user
 /// did not pass the flag. Used for body-less top-level constant declarations.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_override_required_lookup(
+pub extern "C-unwind" fn knot_override_required_lookup(
     name_ptr: *const u8,
     name_len: usize,
     type_tag: i32,
@@ -3121,7 +3144,7 @@ pub extern "C" fn knot_override_required_lookup(
 /// Run a refinement predicate against a CLI-supplied value. Exits if it fails.
 /// `type_label` is the refined type name (or empty for inline refinements).
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_override_refinement_check(
+pub extern "C-unwind" fn knot_override_refinement_check(
     db: *mut c_void,
     value: *mut Value,
     predicate: *mut Value,
@@ -3195,7 +3218,7 @@ enum DefaultKind {
 ///   `name:type`             (overridable, default not displayable)
 /// If `--help` is found, prints usage and exits.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_override_check_help(desc_ptr: *const u8, desc_len: usize) {
+pub extern "C-unwind" fn knot_override_check_help(desc_ptr: *const u8, desc_len: usize) {
     let has_help = std::env::args().any(|a| a == "--help");
     if !has_help {
         return;
@@ -3986,24 +4009,24 @@ fn alloc_float(n: f64) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_arena_mark() -> usize {
+pub extern "C-unwind" fn knot_arena_mark() -> usize {
     ARENA.with(|a| a.borrow().mark())
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_arena_reset_to(mark: usize) {
+pub extern "C-unwind" fn knot_arena_reset_to(mark: usize) {
     ARENA.with(|a| a.borrow_mut().reset_to(mark));
 }
 
 /// Push a new arena frame for call-site isolation.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_arena_push_frame() {
+pub extern "C-unwind" fn knot_arena_push_frame() {
     ARENA.with(|a| a.borrow_mut().push_frame());
 }
 
 /// Pop the current arena frame, freeing all its allocations.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_arena_pop_frame() {
+pub extern "C-unwind" fn knot_arena_pop_frame() {
     if log::debug_enabled() {
         ARENA.with(|a| {
             let arena = a.borrow();
@@ -4018,7 +4041,7 @@ pub extern "C" fn knot_arena_pop_frame() {
 /// Returns the promoted pointer. Used at function return boundaries
 /// to preserve the return value while freeing the callee's temporaries.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_arena_pop_frame_promote(val: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_arena_pop_frame_promote(val: *mut Value) -> *mut Value {
     ARENA.with(|a| a.borrow_mut().pop_frame_promote(val))
 }
 
@@ -4026,7 +4049,7 @@ pub extern "C" fn knot_arena_pop_frame_promote(val: *mut Value) -> *mut Value {
 /// `knot_arena_reset_to`. Used before `knot_relation_push` in do-block
 /// loops to preserve yielded values across per-iteration resets.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_arena_promote(val: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_arena_promote(val: *mut Value) -> *mut Value {
     ARENA.with(|a| a.borrow_mut().promote(val))
 }
 
@@ -4100,7 +4123,7 @@ unsafe fn str_from_raw(ptr: *const u8, len: usize) -> &'static str {
 
 /// Runtime error for missing trait implementations.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_trait_no_impl(
+pub extern "C-unwind" fn knot_trait_no_impl(
     method_ptr: *const u8,
     method_len: usize,
     value: *mut Value,
@@ -4367,19 +4390,19 @@ thread_local! {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_int(n: i64) -> *mut Value {
+pub extern "C-unwind" fn knot_value_int(n: i64) -> *mut Value {
     alloc_int(n)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_int_from_str(ptr: *const u8, len: usize) -> *mut Value {
+pub extern "C-unwind" fn knot_value_int_from_str(ptr: *const u8, len: usize) -> *mut Value {
     let s = unsafe { str_from_raw(ptr, len) };
     let n = s.parse::<i64>().unwrap_or_else(|e| panic!("knot runtime: invalid integer literal '{}': {}", s, e));
     alloc_int(n)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_float(n: f64) -> *mut Value {
+pub extern "C-unwind" fn knot_value_float(n: f64) -> *mut Value {
     if n.to_bits() == 0.0_f64.to_bits() {
         SINGLETONS.with(|s| s.float_zero)
     } else if n == 1.0 {
@@ -4390,7 +4413,7 @@ pub extern "C" fn knot_value_float(n: f64) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_text(ptr: *const u8, len: usize) -> *mut Value {
+pub extern "C-unwind" fn knot_value_text(ptr: *const u8, len: usize) -> *mut Value {
     let s = unsafe { str_from_raw(ptr, len) };
     alloc(Value::Text(Arc::from(s)))
 }
@@ -4407,7 +4430,7 @@ pub extern "C" fn knot_value_text(ptr: *const u8, len: usize) -> *mut Value {
 /// resets — pathological dynamic-pointer callers degrade to standard arena
 /// lifetime rather than corrupting memory.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_text_cached(ptr: *const u8, len: usize) -> *mut Value {
+pub extern "C-unwind" fn knot_value_text_cached(ptr: *const u8, len: usize) -> *mut Value {
     TEXT_LITERAL_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(val) = cache.get(ptr) {
@@ -4449,7 +4472,7 @@ pub extern "C" fn knot_value_text_cached(ptr: *const u8, len: usize) -> *mut Val
 /// callers that don't go through the inline slot path, but the common
 /// case (compiled-code-emitted literals) stays entirely out of it.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn knot_value_text_intern(
+pub unsafe extern "C-unwind" fn knot_value_text_intern(
     ptr: *const u8,
     len: usize,
     slot: *mut *mut Value,
@@ -4492,17 +4515,17 @@ pub unsafe extern "C" fn knot_value_text_intern(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_bool(b: i32) -> *mut Value {
+pub extern "C-unwind" fn knot_value_bool(b: i32) -> *mut Value {
     encode_bool(b != 0)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_unit() -> *mut Value {
+pub extern "C-unwind" fn knot_value_unit() -> *mut Value {
     encode_unit()
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_function(
+pub extern "C-unwind" fn knot_value_function(
     fn_ptr: *const u8,
     env: *mut Value,
     src_ptr: *const u8,
@@ -4513,7 +4536,7 @@ pub extern "C" fn knot_value_function(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_constructor(
+pub extern "C-unwind" fn knot_value_constructor(
     tag_ptr: *const u8,
     tag_len: usize,
     payload: *mut Value,
@@ -4523,7 +4546,7 @@ pub extern "C" fn knot_value_constructor(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_bytes(ptr: *const u8, len: usize) -> *mut Value {
+pub extern "C-unwind" fn knot_value_bytes(ptr: *const u8, len: usize) -> *mut Value {
     let bytes: Arc<[u8]> = if ptr.is_null() || len == 0 {
         Arc::from(&[][..])
     } else {
@@ -4536,7 +4559,7 @@ pub extern "C" fn knot_value_bytes(ptr: *const u8, len: usize) -> *mut Value {
 // ── Value accessors ───────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_get_int(v: *mut Value) -> i64 {
+pub extern "C-unwind" fn knot_value_get_int(v: *mut Value) -> i64 {
     match unsafe { as_ref(v) } {
         Value::Int(n) => *n,
         _ => panic!("knot runtime: expected Int, got {}", brief_value(v)),
@@ -4544,7 +4567,7 @@ pub extern "C" fn knot_value_get_int(v: *mut Value) -> i64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_get_float(v: *mut Value) -> f64 {
+pub extern "C-unwind" fn knot_value_get_float(v: *mut Value) -> f64 {
     match unsafe { as_ref(v) } {
         Value::Float(n) => *n,
         _ => panic!("knot runtime: expected Float, got {}", brief_value(v)),
@@ -4552,7 +4575,7 @@ pub extern "C" fn knot_value_get_float(v: *mut Value) -> f64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_get_bool(v: *mut Value) -> i32 {
+pub extern "C-unwind" fn knot_value_get_bool(v: *mut Value) -> i32 {
     match unsafe { as_ref(v) } {
         Value::Bool(b) => *b as i32,
         _ => panic!("knot runtime: expected Bool, got {}", brief_value(v)),
@@ -4560,7 +4583,7 @@ pub extern "C" fn knot_value_get_bool(v: *mut Value) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_get_tag(v: *mut Value) -> i32 {
+pub extern "C-unwind" fn knot_value_get_tag(v: *mut Value) -> i32 {
     if v.is_null() {
         return 9; // Nullable none (null pointer)
     }
@@ -4583,12 +4606,12 @@ pub extern "C" fn knot_value_get_tag(v: *mut Value) -> i32 {
 // ── Record operations ─────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_record_empty(capacity: usize) -> *mut Value {
+pub extern "C-unwind" fn knot_record_empty(capacity: usize) -> *mut Value {
     alloc(Value::Record(take_record_vec(capacity)))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_record_set_field(
+pub extern "C-unwind" fn knot_record_set_field(
     record: *mut Value,
     key_ptr: *const u8,
     key_len: usize,
@@ -4617,7 +4640,7 @@ pub extern "C" fn knot_record_set_field(
 /// lowerings).  `debug_assert` catches invariant violations during
 /// development; release builds trust codegen and skip the O(n) scan.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_record_from_pairs(data: *const usize, count: usize) -> *mut Value {
+pub extern "C-unwind" fn knot_record_from_pairs(data: *const usize, count: usize) -> *mut Value {
     let mut fields = take_record_vec(count);
     for i in 0..count {
         let offset = i * 3;
@@ -4635,7 +4658,7 @@ pub extern "C" fn knot_record_from_pairs(data: *const usize, count: usize) -> *m
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_record_field(
+pub extern "C-unwind" fn knot_record_field(
     record: *mut Value,
     key_ptr: *const u8,
     key_len: usize,
@@ -4682,7 +4705,7 @@ pub extern "C" fn knot_record_field(
 /// Direct index-based field access for closure environments.
 /// Index corresponds to the field's position in sorted order.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_record_field_by_index(record: *mut Value, index: usize) -> *mut Value {
+pub extern "C-unwind" fn knot_record_field_by_index(record: *mut Value, index: usize) -> *mut Value {
     match unsafe { as_ref(record) } {
         Value::Record(fields) => {
             if index < fields.len() {
@@ -5321,17 +5344,17 @@ fn sql_relations_equal(conn: &Connection, a: &[*mut Value], b: &[*mut Value]) ->
 // ── Relation operations ───────────────────────────────────────────
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_empty() -> *mut Value {
+pub extern "C-unwind" fn knot_relation_empty() -> *mut Value {
     alloc(Value::Relation(take_relation_vec(0)))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_with_capacity(cap: usize) -> *mut Value {
+pub extern "C-unwind" fn knot_relation_with_capacity(cap: usize) -> *mut Value {
     alloc(Value::Relation(take_relation_vec(cap)))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_singleton(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_relation_singleton(v: *mut Value) -> *mut Value {
     let mut buf = take_relation_vec(1);
     buf.push(v);
     alloc(Value::Relation(buf))
@@ -5340,7 +5363,7 @@ pub extern "C" fn knot_relation_singleton(v: *mut Value) -> *mut Value {
 /// Unwrap a scalar source relation: extract the `_value` field from the first row.
 /// Returns a default (Int 0) if the relation is empty.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_scalar_source_unwrap(rel: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_scalar_source_unwrap(rel: *mut Value) -> *mut Value {
     match unsafe { as_ref(rel) } {
         Value::Relation(rows) => {
             if rows.is_empty() {
@@ -5355,7 +5378,7 @@ pub extern "C" fn knot_scalar_source_unwrap(rel: *mut Value) -> *mut Value {
 
 /// Wrap a scalar value as a singleton relation with a `_value` field: [{_value: val}]
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_scalar_source_wrap(val: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_scalar_source_wrap(val: *mut Value) -> *mut Value {
     let record = alloc(Value::Record(vec![
         RecordField { name: "_value".into(), value: val },
     ]));
@@ -5363,7 +5386,7 @@ pub extern "C" fn knot_scalar_source_wrap(val: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_push(rel: *mut Value, row: *mut Value) {
+pub extern "C-unwind" fn knot_relation_push(rel: *mut Value, row: *mut Value) {
     let r = unsafe { &mut *rel };
     match r {
         Value::Relation(rows) => rows.push(row),
@@ -5375,7 +5398,7 @@ pub extern "C" fn knot_relation_push(rel: *mut Value, row: *mut Value) {
 /// Otherwise, wrap it in a singleton relation.
 /// Null (nullable none) wraps as a singleton containing null.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_ensure_relation(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_ensure_relation(v: *mut Value) -> *mut Value {
     if v.is_null() {
         return alloc(Value::Relation(vec![v]));
     }
@@ -5386,7 +5409,7 @@ pub extern "C" fn knot_ensure_relation(v: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_len(rel: *mut Value) -> usize {
+pub extern "C-unwind" fn knot_relation_len(rel: *mut Value) -> usize {
     match unsafe { as_ref(rel) } {
         Value::Relation(rows) => rows.len(),
         _ => panic!("knot runtime: expected Relation in len, got {}", type_name(rel)),
@@ -5395,7 +5418,7 @@ pub extern "C" fn knot_relation_len(rel: *mut Value) -> usize {
 
 /// Take the first `n` elements from a relation.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_take(
+pub extern "C-unwind" fn knot_relation_take(
     n_val: *mut Value,
     rel: *mut Value,
 ) -> *mut Value {
@@ -5414,7 +5437,7 @@ pub extern "C" fn knot_relation_take(
 
 /// Drop the first `n` elements from a relation.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_drop(
+pub extern "C-unwind" fn knot_relation_drop(
     n_val: *mut Value,
     rel: *mut Value,
 ) -> *mut Value {
@@ -5433,7 +5456,7 @@ pub extern "C" fn knot_relation_drop(
 
 /// Sort a relation by a key function, returning a new relation.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_sort_by(
+pub extern "C-unwind" fn knot_relation_sort_by(
     db: *mut c_void,
     key_fn: *mut Value,
     rel: *mut Value,
@@ -5465,7 +5488,7 @@ pub extern "C" fn knot_relation_sort_by(
 /// Drop the first element of a relation, returning the rest.
 /// Used by `Cons head tail` pattern matching for the tail binding.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_tail(rel: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_relation_tail(rel: *mut Value) -> *mut Value {
     match unsafe { as_ref(rel) } {
         Value::Relation(rows) => {
             if rows.is_empty() {
@@ -5479,7 +5502,7 @@ pub extern "C" fn knot_relation_tail(rel: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_get(rel: *mut Value, index: usize) -> *mut Value {
+pub extern "C-unwind" fn knot_relation_get(rel: *mut Value, index: usize) -> *mut Value {
     match unsafe { as_ref(rel) } {
         Value::Relation(rows) => {
             if index < rows.len() {
@@ -5493,7 +5516,7 @@ pub extern "C" fn knot_relation_get(rel: *mut Value, index: usize) -> *mut Value
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_union(
+pub extern "C-unwind" fn knot_relation_union(
     db: *mut c_void,
     a: *mut Value,
     b: *mut Value,
@@ -5565,7 +5588,7 @@ pub extern "C" fn knot_relation_union(
 /// union all resulting relations into one.
 /// Signature: (db, func, rel) -> rel
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_bind(
+pub extern "C-unwind" fn knot_relation_bind(
     db: *mut c_void,
     func: *mut Value,
     rel: *mut Value,
@@ -5617,7 +5640,7 @@ pub extern "C" fn knot_relation_bind(
 /// then groups consecutive rows with matching keys in O(n).
 /// Signature: (db, rel, schema_ptr, schema_len, key_cols_ptr, key_cols_len) -> [[row]]
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_group_by(
+pub extern "C-unwind" fn knot_relation_group_by(
     db: *mut c_void,
     rel: *mut Value,
     schema_ptr: *const u8,
@@ -5985,7 +6008,7 @@ fn to_num_view(v: &Value) -> Option<NumView> {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_add(a: *mut Value, b: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_value_add(a: *mut Value, b: *mut Value) -> *mut Value {
     let av = unsafe { as_ref(a) };
     let bv = unsafe { as_ref(b) };
     match (to_num_view(av), to_num_view(bv)) {
@@ -6001,7 +6024,7 @@ pub extern "C" fn knot_value_add(a: *mut Value, b: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_sub(a: *mut Value, b: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_value_sub(a: *mut Value, b: *mut Value) -> *mut Value {
     let av = unsafe { as_ref(a) };
     let bv = unsafe { as_ref(b) };
     match (to_num_view(av), to_num_view(bv)) {
@@ -6017,7 +6040,7 @@ pub extern "C" fn knot_value_sub(a: *mut Value, b: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_mul(a: *mut Value, b: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_value_mul(a: *mut Value, b: *mut Value) -> *mut Value {
     let av = unsafe { as_ref(a) };
     let bv = unsafe { as_ref(b) };
     match (to_num_view(av), to_num_view(bv)) {
@@ -6033,7 +6056,7 @@ pub extern "C" fn knot_value_mul(a: *mut Value, b: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_div(a: *mut Value, b: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_value_div(a: *mut Value, b: *mut Value) -> *mut Value {
     let av = unsafe { as_ref(a) };
     let bv = unsafe { as_ref(b) };
     match (to_num_view(av), to_num_view(bv)) {
@@ -6069,7 +6092,7 @@ pub extern "C" fn knot_value_div(a: *mut Value, b: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_mod(a: *mut Value, b: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_value_mod(a: *mut Value, b: *mut Value) -> *mut Value {
     let av = unsafe { as_ref(a) };
     let bv = unsafe { as_ref(b) };
     match (to_num_view(av), to_num_view(bv)) {
@@ -6105,23 +6128,23 @@ pub extern "C" fn knot_value_mod(a: *mut Value, b: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_eq(a: *mut Value, b: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_value_eq(a: *mut Value, b: *mut Value) -> *mut Value {
     alloc_bool(values_equal(a, b))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_neq(a: *mut Value, b: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_value_neq(a: *mut Value, b: *mut Value) -> *mut Value {
     alloc_bool(!values_equal(a, b))
 }
 
 // Unboxed variants returning i32 (0/1) — avoid Bool allocation when result feeds a branch
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_eq_i32(a: *mut Value, b: *mut Value) -> i32 {
+pub extern "C-unwind" fn knot_value_eq_i32(a: *mut Value, b: *mut Value) -> i32 {
     values_equal(a, b) as i32
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_neq_i32(a: *mut Value, b: *mut Value) -> i32 {
+pub extern "C-unwind" fn knot_value_neq_i32(a: *mut Value, b: *mut Value) -> i32 {
     !values_equal(a, b) as i32
 }
 
@@ -6168,56 +6191,56 @@ fn compare_gt(a: *mut Value, b: *mut Value) -> bool {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_lt(a: *mut Value, b: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_value_lt(a: *mut Value, b: *mut Value) -> *mut Value {
     if a.is_null() || b.is_null() { return alloc_bool(false); }
     alloc_bool(compare_lt(a, b))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_gt(a: *mut Value, b: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_value_gt(a: *mut Value, b: *mut Value) -> *mut Value {
     if a.is_null() || b.is_null() { return alloc_bool(false); }
     alloc_bool(compare_gt(a, b))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_le(a: *mut Value, b: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_value_le(a: *mut Value, b: *mut Value) -> *mut Value {
     if a.is_null() || b.is_null() { return alloc_bool(false); }
     alloc_bool(!compare_gt(a, b))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_ge(a: *mut Value, b: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_value_ge(a: *mut Value, b: *mut Value) -> *mut Value {
     if a.is_null() || b.is_null() { return alloc_bool(false); }
     alloc_bool(!compare_lt(a, b))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_lt_i32(a: *mut Value, b: *mut Value) -> i32 {
+pub extern "C-unwind" fn knot_value_lt_i32(a: *mut Value, b: *mut Value) -> i32 {
     if a.is_null() || b.is_null() { return 0; }
     compare_lt(a, b) as i32
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_gt_i32(a: *mut Value, b: *mut Value) -> i32 {
+pub extern "C-unwind" fn knot_value_gt_i32(a: *mut Value, b: *mut Value) -> i32 {
     if a.is_null() || b.is_null() { return 0; }
     compare_gt(a, b) as i32
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_le_i32(a: *mut Value, b: *mut Value) -> i32 {
+pub extern "C-unwind" fn knot_value_le_i32(a: *mut Value, b: *mut Value) -> i32 {
     if a.is_null() || b.is_null() { return 0; }
     !compare_gt(a, b) as i32
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_ge_i32(a: *mut Value, b: *mut Value) -> i32 {
+pub extern "C-unwind" fn knot_value_ge_i32(a: *mut Value, b: *mut Value) -> i32 {
     if a.is_null() || b.is_null() { return 0; }
     !compare_lt(a, b) as i32
 }
 
 // Unboxed boolean operations returning i32 (0/1) — avoid Bool allocation in conditions
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_and_i32(a: *mut Value, b: *mut Value) -> i32 {
+pub extern "C-unwind" fn knot_value_and_i32(a: *mut Value, b: *mut Value) -> i32 {
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Bool(x), Value::Bool(y)) => (*x && *y) as i32,
         _ => panic!("knot runtime: && requires Bool operands, got {} && {}", type_name(a), type_name(b)),
@@ -6225,7 +6248,7 @@ pub extern "C" fn knot_value_and_i32(a: *mut Value, b: *mut Value) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_or_i32(a: *mut Value, b: *mut Value) -> i32 {
+pub extern "C-unwind" fn knot_value_or_i32(a: *mut Value, b: *mut Value) -> i32 {
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Bool(x), Value::Bool(y)) => (*x || *y) as i32,
         _ => panic!("knot runtime: || requires Bool operands, got {} || {}", type_name(a), type_name(b)),
@@ -6233,7 +6256,7 @@ pub extern "C" fn knot_value_or_i32(a: *mut Value, b: *mut Value) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_and(a: *mut Value, b: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_value_and(a: *mut Value, b: *mut Value) -> *mut Value {
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Bool(x), Value::Bool(y)) => alloc_bool(*x && *y),
         _ => panic!("knot runtime: && requires Bool operands, got {} && {}", type_name(a), type_name(b)),
@@ -6241,7 +6264,7 @@ pub extern "C" fn knot_value_and(a: *mut Value, b: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_or(a: *mut Value, b: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_value_or(a: *mut Value, b: *mut Value) -> *mut Value {
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Bool(x), Value::Bool(y)) => alloc_bool(*x || *y),
         _ => panic!("knot runtime: || requires Bool operands, got {} || {}", type_name(a), type_name(b)),
@@ -6249,7 +6272,7 @@ pub extern "C" fn knot_value_or(a: *mut Value, b: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_concat(a: *mut Value, b: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_value_concat(a: *mut Value, b: *mut Value) -> *mut Value {
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Text(x), Value::Text(y)) => {
             let mut s = String::with_capacity(x.len() + y.len());
@@ -6280,7 +6303,7 @@ pub extern "C" fn knot_value_concat(a: *mut Value, b: *mut Value) -> *mut Value 
 // ── Comparison (returns Ordering ADT) ─────────────────────────────
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_compare(a: *mut Value, b: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_value_compare(a: *mut Value, b: *mut Value) -> *mut Value {
     let ordering = compare_values(a, b);
     let tag = match ordering {
         std::cmp::Ordering::Less => "LT",
@@ -6296,7 +6319,7 @@ pub extern "C" fn knot_value_compare(a: *mut Value, b: *mut Value) -> *mut Value
 /// Compare two values and return a raw i32: -1 (LT), 0 (EQ), 1 (GT).
 /// Avoids allocating an Ordering constructor for use in comparison operators.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_compare_ord(a: *mut Value, b: *mut Value) -> i32 {
+pub extern "C-unwind" fn knot_value_compare_ord(a: *mut Value, b: *mut Value) -> i32 {
     match compare_values(a, b) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
@@ -6326,7 +6349,7 @@ fn compare_values(a: *mut Value, b: *mut Value) -> std::cmp::Ordering {
 /// Extract Ordering constructor tag as i32: 0=LT, 1=EQ, 2=GT.
 /// Avoids string comparison when checking comparison results.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_ordering_tag_i32(v: *mut Value) -> i32 {
+pub extern "C-unwind" fn knot_ordering_tag_i32(v: *mut Value) -> i32 {
     match unsafe { as_ref(v) } {
         Value::Constructor(tag, _) => match &**tag {
             "LT" => 0,
@@ -6341,7 +6364,7 @@ pub extern "C" fn knot_ordering_tag_i32(v: *mut Value) -> i32 {
 // ── Unary operations ──────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_negate(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_value_negate(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Int(n) => match n.checked_neg() {
             Some(r) => alloc_int(r),
@@ -6353,7 +6376,7 @@ pub extern "C" fn knot_value_negate(v: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_not(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_value_not(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Bool(b) => alloc_bool(!b),
         _ => panic!("knot runtime: 'not' requires Bool, got {}", type_name(v)),
@@ -6364,14 +6387,14 @@ pub extern "C" fn knot_value_not(v: *mut Value) -> *mut Value {
 
 /// Call a function value: fn_ptr(db, env, arg) -> result
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_call(
+pub extern "C-unwind" fn knot_value_call(
     db: *mut c_void,
     func: *mut Value,
     arg: *mut Value,
 ) -> *mut Value {
     match unsafe { as_ref(func) } {
         Value::Function(f) => {
-            let fun: extern "C" fn(*mut c_void, *mut Value, *mut Value) -> *mut Value =
+            let fun: extern "C-unwind" fn(*mut c_void, *mut Value, *mut Value) -> *mut Value =
                 unsafe { std::mem::transmute(f.fn_ptr) };
             fun(db, f.env, arg)
         }
@@ -6441,7 +6464,7 @@ fn format_value(v: *mut Value) -> String {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_read_line() -> *mut Value {
+pub extern "C-unwind" fn knot_read_line() -> *mut Value {
     let mut line = String::new();
     std::io::stdin()
         .read_line(&mut line)
@@ -6457,37 +6480,37 @@ pub extern "C" fn knot_read_line() -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_print(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_print(v: *mut Value) -> *mut Value {
     print!("{}", format_value(v));
     alloc(Value::Unit)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_println(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_println(v: *mut Value) -> *mut Value {
     println!("{}", format_value(v));
     alloc(Value::Unit)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_log_info(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_log_info(v: *mut Value) -> *mut Value {
     log::log_info(&format_value(v));
     alloc(Value::Unit)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_log_warn(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_log_warn(v: *mut Value) -> *mut Value {
     log::log_warn(&format_value(v));
     alloc(Value::Unit)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_log_error(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_log_error(v: *mut Value) -> *mut Value {
     log::log_error(&format_value(v));
     alloc(Value::Unit)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_log_debug(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_log_debug(v: *mut Value) -> *mut Value {
     log::log_debug(&format_value(v));
     alloc(Value::Unit)
 }
@@ -6495,12 +6518,12 @@ pub extern "C" fn knot_log_debug(v: *mut Value) -> *mut Value {
 /// Convert a value to its text representation (returned as a Value::Text).
 /// Panic when a `where` guard fails inside an IO do-block.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_guard_failed() {
+pub extern "C-unwind" fn knot_guard_failed() {
     panic!("knot runtime: where guard failed in IO do-block");
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_show(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_value_show(v: *mut Value) -> *mut Value {
     fn show_inner(v: *mut Value) -> String {
         if v.is_null() {
             return "null".to_string();
@@ -6560,20 +6583,20 @@ pub extern "C" fn knot_value_show(v: *mut Value) -> *mut Value {
 
 /// Create an IO value wrapping a thunk function pointer and captured environment.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_io_wrap(fn_ptr: *const u8, env: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_io_wrap(fn_ptr: *const u8, env: *mut Value) -> *mut Value {
     alloc(Value::IO(fn_ptr, env))
 }
 
 /// Create an IO thunk from a function pointer and captured environment.
 /// Used by codegen to defer IO do-block execution until knot_io_run.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_io_new(fn_ptr: *const u8, env: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_io_new(fn_ptr: *const u8, env: *mut Value) -> *mut Value {
     alloc(Value::IO(fn_ptr, env))
 }
 
 /// Wrap a pure value in an IO thunk (IO.pure / return).
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_io_pure(val: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_io_pure(val: *mut Value) -> *mut Value {
     // Create a thunk that just returns val.
     // We encode this as IO with null fn_ptr — knot_io_run checks for this.
     alloc(Value::IO(std::ptr::null(), val))
@@ -6581,13 +6604,16 @@ pub extern "C" fn knot_io_pure(val: *mut Value) -> *mut Value {
 
 /// Execute an IO thunk. If the value is not IO, return it as-is.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_io_run(db: *mut c_void, val: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_io_run(db: *mut c_void, val: *mut Value) -> *mut Value {
     let mut current = val;
     loop {
         // Cooperative cancellation: a `race` loser exits its IO chain at the
         // next thunk boundary so the winner doesn't have to wait for it.
+        // Unwinding (rather than returning null) guarantees no further user
+        // code runs — a null fed into the next bind's continuation would be
+        // dereferenced by the first accessor it reaches.
         if cancel_requested() {
-            return std::ptr::null_mut();
+            std::panic::panic_any(Cancelled);
         }
         if current.is_null() {
             return current;
@@ -6599,7 +6625,7 @@ pub extern "C" fn knot_io_run(db: *mut c_void, val: *mut Value) -> *mut Value {
                 if fn_ptr.is_null() {
                     return env;
                 }
-                let thunk: extern "C" fn(*mut c_void, *mut Value) -> *mut Value =
+                let thunk: extern "C-unwind" fn(*mut c_void, *mut Value) -> *mut Value =
                     unsafe { std::mem::transmute(fn_ptr) };
                 // Trampoline: if the thunk returns another IO value,
                 // loop instead of returning.  This prevents stack overflow
@@ -6637,10 +6663,10 @@ fn pair_unpack(env: *mut Value) -> (*mut Value, *mut Value) {
 /// Over a long-running program with many IO chains that's millions of
 /// avoided allocations.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_io_bind(io: *mut Value, f: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_io_bind(io: *mut Value, f: *mut Value) -> *mut Value {
     let env = alloc(Value::Pair(io, f));
 
-    extern "C" fn bind_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+    extern "C-unwind" fn bind_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let (io, f) = pair_unpack(env);
         let a = knot_io_run(db, io);
         let io2 = knot_value_call(db, f, a);
@@ -6652,10 +6678,10 @@ pub extern "C" fn knot_io_bind(io: *mut Value, f: *mut Value) -> *mut Value {
 
 /// Sequence two IO actions, discarding the first result: knot_io_then(io1, io2) -> IO
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_io_then(io1: *mut Value, io2: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_io_then(io1: *mut Value, io2: *mut Value) -> *mut Value {
     let env = alloc(Value::Pair(io1, io2));
 
-    extern "C" fn then_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+    extern "C-unwind" fn then_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let (io1, io2) = pair_unpack(env);
         knot_io_run(db, io1);
         knot_io_run(db, io2)
@@ -6666,10 +6692,10 @@ pub extern "C" fn knot_io_then(io1: *mut Value, io2: *mut Value) -> *mut Value {
 
 /// map(f, io) — apply f to the result of an IO action
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_io_map(f: *mut Value, io: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_io_map(f: *mut Value, io: *mut Value) -> *mut Value {
     let env = alloc(Value::Pair(io, f));
 
-    extern "C" fn map_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+    extern "C-unwind" fn map_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let (io, f) = pair_unpack(env);
         let a = knot_io_run(db, io);
         knot_value_call(db, f, a)
@@ -6696,6 +6722,17 @@ pub extern "C" fn knot_io_map(f: *mut Value, io: *mut Value) -> *mut Value {
 /// (recording src→dst in a per-call map), then patch each shell's
 /// children using the map.  Shared subtrees are cloned exactly once.
 fn deep_clone_value(val: *mut Value) -> *mut Value {
+    deep_clone_with(val, |shell| Box::into_raw(Box::new(shell)))
+}
+
+/// Deep-copy a value tree into the current thread's arena. Used to bring a
+/// Box-allocated tree (from `deep_clone_value`) into arena lifetime so the
+/// Box tree can be freed without dangling — e.g. a race winner's result.
+fn deep_clone_into_arena(val: *mut Value) -> *mut Value {
+    deep_clone_with(val, alloc)
+}
+
+fn deep_clone_with(val: *mut Value, mut alloc_node: impl FnMut(Value) -> *mut Value) -> *mut Value {
     if val.is_null() { return val; }
     if is_tagged(val) { return val; }
 
@@ -6765,7 +6802,7 @@ fn deep_clone_value(val: *mut Value) -> *mut Value {
                 Value::Pair(std::ptr::null_mut(), std::ptr::null_mut())
             }
         };
-        let dst = Box::into_raw(Box::new(shell));
+        let dst = alloc_node(shell);
         map.insert(src, dst);
         to_patch.push(src);
     }
@@ -6882,11 +6919,11 @@ unsafe fn deep_drop_value(val: *mut Value) {
 /// Fork an IO action onto a new OS thread.
 /// Takes an IO value, returns an IO thunk that spawns the thread.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
     // Capture the IO value in the thunk's environment
     let env = io_val;
 
-    extern "C" fn spawn_thunk(_db: *mut c_void, env: *mut Value) -> *mut Value {
+    extern "C-unwind" fn spawn_thunk(_db: *mut c_void, env: *mut Value) -> *mut Value {
         // Deep-clone the IO value on the parent thread before sending.
         // Convert to usize to satisfy Send (deep_clone produces an independent tree).
         let cloned_io = deep_clone_value(env) as *mut u8 as usize;
@@ -6958,7 +6995,7 @@ pub extern "C" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
 ///     in the background, tracked by `ACTIVE_FORKS` so `knot_threads_join`
 ///     still waits for it before program exit.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mut Value {
     let env = alloc(Value::Pair(io_a, io_b));
 
     /// How a race concluded. `Winner` carries `(is_left, deep-cloned value
@@ -6980,7 +7017,7 @@ pub extern "C" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mut Value
         panic_msgs: Vec<String>,
     }
 
-    extern "C" fn race_thunk(_db: *mut c_void, env: *mut Value) -> *mut Value {
+    extern "C-unwind" fn race_thunk(_db: *mut c_void, env: *mut Value) -> *mut Value {
         let (io_a, io_b) = pair_unpack(env);
 
         // Deep-clone both IO values so each worker thread owns an
@@ -6992,6 +7029,9 @@ pub extern "C" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mut Value
 
         let state: Arc<Mutex<RaceState>> = Arc::new(Mutex::new(RaceState::default()));
         let cvar: Arc<Condvar> = Arc::new(Condvar::new());
+
+        // Losers unwind with the `Cancelled` sentinel; keep its output silent.
+        install_cancel_panic_hook();
 
         let cancel_a = Arc::new(CancelToken::new());
         let cancel_b = Arc::new(CancelToken::new());
@@ -7045,6 +7085,13 @@ pub extern "C" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mut Value
                 let result = match run {
                     Ok(v) => v,
                     Err(payload) => {
+                        // Cooperative cancellation surfaces as a `Cancelled`
+                        // panic raised by `knot_io_run`. It is not an error:
+                        // the peer already produced the outcome, so this side
+                        // just stops quietly.
+                        if payload.downcast_ref::<Cancelled>().is_some() {
+                            return;
+                        }
                         // Release any write locks the panicking body may have
                         // held so other threads aren't deadlocked (no-op when
                         // none are held).
@@ -7138,9 +7185,12 @@ pub extern "C" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mut Value
         };
 
         // Wrap the winner's value in the appropriate Result constructor.
-        // We re-use the value pointer (which came from `deep_clone_value`
-        // and is Box-allocated, so it outlives all worker arenas).
-        let winner_val = raw_ptr as *mut u8 as *mut Value;
+        // The worker handed us a Box-allocated tree (so it outlives the
+        // worker's arena); copy it into this thread's arena and free the
+        // Box tree — otherwise every race leaks its winner's result.
+        let winner_box = raw_ptr as *mut u8 as *mut Value;
+        let winner_val = deep_clone_into_arena(winner_box);
+        unsafe { deep_drop_value(winner_box); }
         let field_name = if is_left { "error" } else { "value" };
         let ctor_name = if is_left { "Err" } else { "Ok" };
         let record = alloc(Value::Record(vec![RecordField {
@@ -7161,7 +7211,7 @@ pub extern "C" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mut Value
 /// this keeps constant memory overhead regardless of how many threads have
 /// been forked.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_threads_join() {
+pub extern "C-unwind" fn knot_threads_join() {
     let lock = ACTIVE_FORKS_MUTEX.lock().unwrap();
     let _guard = ACTIVE_FORKS_CVAR
         .wait_while(lock, |_| ACTIVE_FORKS.load(Ordering::SeqCst) > 0)
@@ -7172,14 +7222,14 @@ pub extern "C" fn knot_threads_join() {
 
 /// Called by `retry` in Knot. Sets thread-local flag and returns a dummy value.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_stm_retry() -> *mut Value {
+pub extern "C-unwind" fn knot_stm_retry() -> *mut Value {
     STM_RETRY.with(|r| r.set(true));
     alloc(Value::Unit)
 }
 
 /// Check if retry was requested, and clear the flag. Returns 1 if retry, 0 otherwise.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_stm_check_and_clear() -> i32 {
+pub extern "C-unwind" fn knot_stm_check_and_clear() -> i32 {
     STM_RETRY.with(|r| {
         let val = r.get();
         r.set(false);
@@ -7191,14 +7241,14 @@ pub extern "C" fn knot_stm_check_and_clear() -> i32 {
 /// or false `where` guard). The surrounding `atomic` will rollback instead of
 /// committing.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_stm_skip() -> *mut Value {
+pub extern "C-unwind" fn knot_stm_skip() -> *mut Value {
     STM_SKIP.with(|s| s.set(true));
     alloc(Value::Unit)
 }
 
 /// Check if the atomic body skipped, and clear the flag. Returns 1 on skip.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_stm_check_skip_and_clear() -> i32 {
+pub extern "C-unwind" fn knot_stm_check_skip_and_clear() -> i32 {
     STM_SKIP.with(|s| {
         let v = s.get();
         s.set(false);
@@ -7215,7 +7265,7 @@ pub extern "C" fn knot_stm_check_skip_and_clear() -> i32 {
 /// entirely — the borrow_mut itself has a small but non-zero cost we'd rather
 /// not pay every atomic iteration.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_stm_snapshot() -> i64 {
+pub extern "C-unwind" fn knot_stm_snapshot() -> i64 {
     STM_TRACK.with(|t| {
         let empty = {
             let b = t.borrow();
@@ -7249,7 +7299,7 @@ const STM_WAIT_TIMEOUT: Duration = Duration::from_secs(60 * 5);
 /// Releases the write lock (if held) before blocking so that other threads
 /// can perform writes during the wait. Re-acquires after waking.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_stm_wait(_snapshot: i64) {
+pub extern "C-unwind" fn knot_stm_wait(_snapshot: i64) {
     // Release the write lock before any potential blocking so nested atomic
     // retries don't prevent other threads from writing.
     let saved_lock_depth = WRITE_LOCK_DEPTH.with(|d| {
@@ -7426,9 +7476,9 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
 // ── IO wrappers for effectful functions ──────────────────────────
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_println_io(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_println_io(v: *mut Value) -> *mut Value {
     let env = v;
-    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+    extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let _ = db;
         knot_println(env)
     }
@@ -7436,9 +7486,9 @@ pub extern "C" fn knot_println_io(v: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_print_io(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_print_io(v: *mut Value) -> *mut Value {
     let env = v;
-    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+    extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let _ = db;
         knot_print(env)
     }
@@ -7446,8 +7496,8 @@ pub extern "C" fn knot_print_io(v: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_log_info_io(v: *mut Value) -> *mut Value {
-    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_log_info_io(v: *mut Value) -> *mut Value {
+    extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let _ = db;
         knot_log_info(env)
     }
@@ -7455,8 +7505,8 @@ pub extern "C" fn knot_log_info_io(v: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_log_warn_io(v: *mut Value) -> *mut Value {
-    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_log_warn_io(v: *mut Value) -> *mut Value {
+    extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let _ = db;
         knot_log_warn(env)
     }
@@ -7464,8 +7514,8 @@ pub extern "C" fn knot_log_warn_io(v: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_log_error_io(v: *mut Value) -> *mut Value {
-    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_log_error_io(v: *mut Value) -> *mut Value {
+    extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let _ = db;
         knot_log_error(env)
     }
@@ -7473,8 +7523,8 @@ pub extern "C" fn knot_log_error_io(v: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_log_debug_io(v: *mut Value) -> *mut Value {
-    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_log_debug_io(v: *mut Value) -> *mut Value {
+    extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let _ = db;
         knot_log_debug(env)
     }
@@ -7482,8 +7532,8 @@ pub extern "C" fn knot_log_debug_io(v: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_read_line_io() -> *mut Value {
-    extern "C" fn thunk(db: *mut c_void, _env: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_read_line_io() -> *mut Value {
+    extern "C-unwind" fn thunk(db: *mut c_void, _env: *mut Value) -> *mut Value {
         let _ = db;
         knot_read_line()
     }
@@ -7491,9 +7541,9 @@ pub extern "C" fn knot_read_line_io() -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_fs_read_file_io(path: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_fs_read_file_io(path: *mut Value) -> *mut Value {
     let env = path;
-    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+    extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let _ = db;
         knot_fs_read_file(env)
     }
@@ -7501,12 +7551,12 @@ pub extern "C" fn knot_fs_read_file_io(path: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_fs_write_file_io(path: *mut Value, contents: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_fs_write_file_io(path: *mut Value, contents: *mut Value) -> *mut Value {
     let env = alloc(Value::Record(vec![
         RecordField { name: "_c".into(), value: contents },
         RecordField { name: "_p".into(), value: path },
     ]));
-    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+    extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let _ = db;
         let p = knot_record_field(env, "_p\0".as_ptr(), 2);
         let c = knot_record_field(env, "_c\0".as_ptr(), 2);
@@ -7516,12 +7566,12 @@ pub extern "C" fn knot_fs_write_file_io(path: *mut Value, contents: *mut Value) 
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_fs_append_file_io(path: *mut Value, contents: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_fs_append_file_io(path: *mut Value, contents: *mut Value) -> *mut Value {
     let env = alloc(Value::Record(vec![
         RecordField { name: "_c".into(), value: contents },
         RecordField { name: "_p".into(), value: path },
     ]));
-    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+    extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let _ = db;
         let p = knot_record_field(env, "_p\0".as_ptr(), 2);
         let c = knot_record_field(env, "_c\0".as_ptr(), 2);
@@ -7531,9 +7581,9 @@ pub extern "C" fn knot_fs_append_file_io(path: *mut Value, contents: *mut Value)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_fs_file_exists_io(path: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_fs_file_exists_io(path: *mut Value) -> *mut Value {
     let env = path;
-    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+    extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let _ = db;
         knot_fs_file_exists(env)
     }
@@ -7541,9 +7591,9 @@ pub extern "C" fn knot_fs_file_exists_io(path: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_fs_remove_file_io(path: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_fs_remove_file_io(path: *mut Value) -> *mut Value {
     let env = path;
-    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+    extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let _ = db;
         knot_fs_remove_file(env)
     }
@@ -7551,9 +7601,9 @@ pub extern "C" fn knot_fs_remove_file_io(path: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_fs_list_dir_io(path: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_fs_list_dir_io(path: *mut Value) -> *mut Value {
     let env = path;
-    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+    extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let _ = db;
         knot_fs_list_dir(env)
     }
@@ -7561,8 +7611,8 @@ pub extern "C" fn knot_fs_list_dir_io(path: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_now_io() -> *mut Value {
-    extern "C" fn thunk(db: *mut c_void, _env: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_now_io() -> *mut Value {
+    extern "C-unwind" fn thunk(db: *mut c_void, _env: *mut Value) -> *mut Value {
         let _ = db;
         knot_now()
     }
@@ -7570,9 +7620,9 @@ pub extern "C" fn knot_now_io() -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_sleep_io(ms_val: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_sleep_io(ms_val: *mut Value) -> *mut Value {
     let env = ms_val;
-    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+    extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let _ = db;
         knot_sleep(env)
     }
@@ -7580,9 +7630,9 @@ pub extern "C" fn knot_sleep_io(ms_val: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_random_int_io(bound: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_random_int_io(bound: *mut Value) -> *mut Value {
     let env = bound;
-    extern "C" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+    extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let _ = db;
         knot_random_int(env)
     }
@@ -7590,8 +7640,8 @@ pub extern "C" fn knot_random_int_io(bound: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_random_float_io() -> *mut Value {
-    extern "C" fn thunk(db: *mut c_void, _env: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_random_float_io() -> *mut Value {
+    extern "C-unwind" fn thunk(db: *mut c_void, _env: *mut Value) -> *mut Value {
         let _ = db;
         knot_random_float()
     }
@@ -7599,8 +7649,8 @@ pub extern "C" fn knot_random_float_io() -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_random_uuid_io() -> *mut Value {
-    extern "C" fn thunk(db: *mut c_void, _env: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_random_uuid_io() -> *mut Value {
+    extern "C-unwind" fn thunk(db: *mut c_void, _env: *mut Value) -> *mut Value {
         let _ = db;
         knot_random_uuid()
     }
@@ -7612,7 +7662,7 @@ pub extern "C" fn knot_random_uuid_io() -> *mut Value {
 
 /// filter(pred, rel) — keep rows where pred returns true
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_filter(
+pub extern "C-unwind" fn knot_relation_filter(
     db: *mut c_void,
     pred: *mut Value,
     rel: *mut Value,
@@ -7640,7 +7690,7 @@ pub extern "C" fn knot_relation_filter(
 /// upsertBy(pred, value, rel) — replace rows matching pred with value, or
 /// append value if none match. Result preserves the order of the input.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_upsert_by(
+pub extern "C-unwind" fn knot_relation_upsert_by(
     db: *mut c_void,
     pred: *mut Value,
     value: *mut Value,
@@ -7675,7 +7725,7 @@ pub extern "C" fn knot_relation_upsert_by(
 
 /// match(ctor, rel) — filter relation to rows matching a constructor tag, extract payloads
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_match(
+pub extern "C-unwind" fn knot_relation_match(
     ctor: *mut Value,
     rel: *mut Value,
 ) -> *mut Value {
@@ -7707,7 +7757,7 @@ pub extern "C" fn knot_relation_match(
 
 /// map(f, rel) — apply f to each row, collect results (deduplicating)
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_map(
+pub extern "C-unwind" fn knot_relation_map(
     db: *mut c_void,
     func: *mut Value,
     rel: *mut Value,
@@ -7740,7 +7790,7 @@ pub extern "C" fn knot_relation_map(
 
 /// ap(fs, xs) — applicative apply: apply each function in fs to each value in xs
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_ap(
+pub extern "C-unwind" fn knot_relation_ap(
     db: *mut c_void,
     fs: *mut Value,
     xs: *mut Value,
@@ -7784,7 +7834,7 @@ pub extern "C" fn knot_relation_ap(
 
 /// fold(f, init, rel) — left fold over a relation
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_fold(
+pub extern "C-unwind" fn knot_relation_fold(
     db: *mut c_void,
     func: *mut Value,
     init: *mut Value,
@@ -7814,7 +7864,7 @@ pub extern "C" fn knot_relation_fold(
 /// relations, no ADT) — those are excluded by the compiler so they fall
 /// back to `knot_relation_fold`.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_source_fold(
+pub extern "C-unwind" fn knot_source_fold(
     db: *mut c_void,
     func: *mut Value,
     init: *mut Value,
@@ -7872,7 +7922,7 @@ pub extern "C" fn knot_source_fold(
 /// Used by the compiler when fold is applied to `filter f *src` or to a
 /// `do { ... }` block that maps to a flat SQL plan.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_source_query_fold(
+pub extern "C-unwind" fn knot_source_query_fold(
     db: *mut c_void,
     func: *mut Value,
     init: *mut Value,
@@ -7933,7 +7983,7 @@ pub extern "C" fn knot_source_query_fold(
 /// and sequence the results. Determines the applicative type (IO, Maybe, Result, [])
 /// by inspecting the first result.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_traverse(
+pub extern "C-unwind" fn knot_relation_traverse(
     db: *mut c_void,
     func: *mut Value,
     rel: *mut Value,
@@ -7982,7 +8032,7 @@ fn traverse_sequence_io(db: *mut c_void, ios: Vec<*mut Value>) -> *mut Value {
     let _ = db;
     let actions_rel = alloc(Value::Relation(ios));
 
-    extern "C" fn run_sequence(db: *mut c_void, env: *mut Value) -> *mut Value {
+    extern "C-unwind" fn run_sequence(db: *mut c_void, env: *mut Value) -> *mut Value {
         let actions = match unsafe { as_ref(env) } {
             Value::Relation(rows) => rows,
             _ => unreachable!(),
@@ -8083,7 +8133,7 @@ fn wrap_ok_or_just(tag: &str, values: Vec<*mut Value>) -> *mut Value {
 /// all(pred, rel) — returns true if `pred(row)` is true for every row.
 /// Short-circuits on the first false. Empty relation returns true (vacuous truth).
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_all(
+pub extern "C-unwind" fn knot_relation_all(
     db: *mut c_void,
     pred: *mut Value,
     rel: *mut Value,
@@ -8110,7 +8160,7 @@ pub extern "C" fn knot_relation_all(
 /// any(pred, rel) — returns true if `pred(row)` is true for at least one row.
 /// Short-circuits on the first true. Empty relation returns false.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_any(
+pub extern "C-unwind" fn knot_relation_any(
     db: *mut c_void,
     pred: *mut Value,
     rel: *mut Value,
@@ -8137,7 +8187,7 @@ pub extern "C" fn knot_relation_any(
 /// single(rel) — extract the single element from a one-element relation.
 /// Returns `Just {value: x}` for a singleton, `Nothing {}` otherwise.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_single(rel: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_relation_single(rel: *mut Value) -> *mut Value {
     let rows = match unsafe { as_ref(rel) } {
         Value::Relation(rows) => rows,
         _ => panic!(
@@ -8157,7 +8207,7 @@ pub extern "C" fn knot_relation_single(rel: *mut Value) -> *mut Value {
 
 /// diff(a, b) — rows in a but not in b
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_diff(
+pub extern "C-unwind" fn knot_relation_diff(
     db: *mut c_void,
     a: *mut Value,
     b: *mut Value,
@@ -8214,7 +8264,7 @@ pub extern "C" fn knot_relation_diff(
 
 /// inter(a, b) — rows in both a and b
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_inter(
+pub extern "C-unwind" fn knot_relation_inter(
     db: *mut c_void,
     a: *mut Value,
     b: *mut Value,
@@ -8265,7 +8315,7 @@ pub extern "C" fn knot_relation_inter(
 
 /// sum(f, rel) — sum of f(x) for each x in rel
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_sum(
+pub extern "C-unwind" fn knot_relation_sum(
     db: *mut c_void,
     f: *mut Value,
     rel: *mut Value,
@@ -8287,7 +8337,7 @@ pub extern "C" fn knot_relation_sum(
 
 /// avg(f, rel) — average of f(x) for each x in rel (returns Float)
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_avg(
+pub extern "C-unwind" fn knot_relation_avg(
     db: *mut c_void,
     f: *mut Value,
     rel: *mut Value,
@@ -8331,7 +8381,7 @@ pub extern "C" fn knot_relation_avg(
 
 /// countWhere(pred, rel) — count rows where pred(row) is True.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_count_where(
+pub extern "C-unwind" fn knot_relation_count_where(
     db: *mut c_void,
     pred: *mut Value,
     rel: *mut Value,
@@ -8361,7 +8411,7 @@ pub extern "C" fn knot_relation_count_where(
 /// min(f, rel) — minimum of f(x) for each x in rel.
 /// Panics on empty relation.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_min(
+pub extern "C-unwind" fn knot_relation_min(
     db: *mut c_void,
     f: *mut Value,
     rel: *mut Value,
@@ -8389,7 +8439,7 @@ pub extern "C" fn knot_relation_min(
 /// max(f, rel) — maximum of f(x) for each x in rel.
 /// Panics on empty relation.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_max(
+pub extern "C-unwind" fn knot_relation_max(
     db: *mut c_void,
     f: *mut Value,
     rel: *mut Value,
@@ -8418,7 +8468,7 @@ pub extern "C" fn knot_relation_max(
 
 /// toUpper(text) — convert text to uppercase
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_text_to_upper(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_text_to_upper(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Text(s) => alloc(Value::Text(Arc::from(s.to_uppercase()))),
         _ => panic!("knot runtime: toUpper expected Text, got {}", type_name(v)),
@@ -8427,7 +8477,7 @@ pub extern "C" fn knot_text_to_upper(v: *mut Value) -> *mut Value {
 
 /// toLower(text) — convert text to lowercase
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_text_to_lower(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_text_to_lower(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Text(s) => alloc(Value::Text(Arc::from(s.to_lowercase()))),
         _ => panic!("knot runtime: toLower expected Text, got {}", type_name(v)),
@@ -8436,7 +8486,7 @@ pub extern "C" fn knot_text_to_lower(v: *mut Value) -> *mut Value {
 
 /// take(n, text) — first n characters
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_text_take(n: *mut Value, text: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_text_take(n: *mut Value, text: *mut Value) -> *mut Value {
     let n_idx = int_as_usize(unsafe { as_ref(n) })
         .unwrap_or_else(|| panic!("knot runtime: take expected Int as first arg, got {}", type_name(n)));
     match unsafe { as_ref(text) } {
@@ -8450,7 +8500,7 @@ pub extern "C" fn knot_text_take(n: *mut Value, text: *mut Value) -> *mut Value 
 
 /// drop(n, text) — skip first n characters
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_text_drop(n: *mut Value, text: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_text_drop(n: *mut Value, text: *mut Value) -> *mut Value {
     let n_idx = int_as_usize(unsafe { as_ref(n) })
         .unwrap_or_else(|| panic!("knot runtime: drop expected Int as first arg, got {}", type_name(n)));
     match unsafe { as_ref(text) } {
@@ -8464,7 +8514,7 @@ pub extern "C" fn knot_text_drop(n: *mut Value, text: *mut Value) -> *mut Value 
 
 /// length(text) — character count of a text value
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_text_length(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_text_length(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Text(s) => knot_value_int(s.chars().count() as i64),
         _ => panic!("knot runtime: length expected Text, got {}", type_name(v)),
@@ -8473,7 +8523,7 @@ pub extern "C" fn knot_text_length(v: *mut Value) -> *mut Value {
 
 /// trim(text) — strip leading and trailing whitespace
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_text_trim(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_text_trim(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Text(s) => alloc(Value::Text(Arc::from(s.trim()))),
         _ => panic!("knot runtime: trim expected Text, got {}", type_name(v)),
@@ -8482,7 +8532,7 @@ pub extern "C" fn knot_text_trim(v: *mut Value) -> *mut Value {
 
 /// contains(needle, haystack) — check if text contains a substring
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_text_contains(needle: *mut Value, haystack: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_text_contains(needle: *mut Value, haystack: *mut Value) -> *mut Value {
     let needle: &str = match unsafe { as_ref(needle) } {
         Value::Text(s) => &**s,
         _ => panic!("knot runtime: contains expected Text as first arg"),
@@ -8495,7 +8545,7 @@ pub extern "C" fn knot_text_contains(needle: *mut Value, haystack: *mut Value) -
 
 /// elem(needle, haystack) — check if a list contains a value (by structural equality)
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_list_elem(needle: *mut Value, haystack: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_list_elem(needle: *mut Value, haystack: *mut Value) -> *mut Value {
     match unsafe { as_ref(haystack) } {
         Value::Relation(rows) => {
             for row in rows.iter() {
@@ -8514,7 +8564,7 @@ pub extern "C" fn knot_list_elem(needle: *mut Value, haystack: *mut Value) -> *m
 
 /// reverse(text) — reverse a text value
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_text_reverse(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_text_reverse(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Text(s) => {
             let result: String = s.chars().rev().collect();
@@ -8526,7 +8576,7 @@ pub extern "C" fn knot_text_reverse(v: *mut Value) -> *mut Value {
 
 /// chars(text) — convert text to a relation of single characters
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_text_chars(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_text_chars(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Text(s) => {
             let mut seen = HashSet::new();
@@ -8547,7 +8597,7 @@ pub extern "C" fn knot_text_chars(v: *mut Value) -> *mut Value {
 
 /// bytesLength(bytes) — byte count
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_bytes_length(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_bytes_length(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Bytes(b) => knot_value_int(b.len() as i64),
         _ => panic!("knot runtime: bytesLength expected Bytes, got {}", type_name(v)),
@@ -8556,7 +8606,7 @@ pub extern "C" fn knot_bytes_length(v: *mut Value) -> *mut Value {
 
 /// bytesConcat(a, b) — concatenate two byte strings
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_bytes_concat(a: *mut Value, b: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_bytes_concat(a: *mut Value, b: *mut Value) -> *mut Value {
     let a_bytes = match unsafe { as_ref(a) } {
         Value::Bytes(b) => b,
         _ => panic!("knot runtime: bytesConcat expected Bytes as first arg, got {}", type_name(a)),
@@ -8573,7 +8623,7 @@ pub extern "C" fn knot_bytes_concat(a: *mut Value, b: *mut Value) -> *mut Value 
 
 /// bytesSlice(start, len, bytes) — extract a sub-range of bytes
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_bytes_slice(
+pub extern "C-unwind" fn knot_bytes_slice(
     _db: *mut c_void,
     start: *mut Value,
     len: *mut Value,
@@ -8595,7 +8645,7 @@ pub extern "C" fn knot_bytes_slice(
 
 /// textToBytes(text) — encode text as UTF-8 bytes
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_text_to_bytes(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_text_to_bytes(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Text(s) => alloc(Value::Bytes(Arc::from(s.as_bytes()))),
         _ => panic!("knot runtime: textToBytes expected Text, got {}", type_name(v)),
@@ -8624,7 +8674,7 @@ fn make_nothing() -> *mut Value {
 /// UTF-8. Wrong-type input (caller bug — should be unreachable from
 /// well-typed Knot code) still panics.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_bytes_to_text(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_bytes_to_text(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Bytes(b) => match std::str::from_utf8(b) {
             Ok(s) => make_just(alloc(Value::Text(Arc::from(s)))),
@@ -8636,7 +8686,7 @@ pub extern "C" fn knot_bytes_to_text(v: *mut Value) -> *mut Value {
 
 /// bytesToHex(bytes) — encode bytes as hex string
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_bytes_to_hex(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_bytes_to_hex(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Bytes(b) => {
             let mut hex = String::with_capacity(b.len() * 2);
@@ -8654,7 +8704,7 @@ pub extern "C" fn knot_bytes_to_hex(v: *mut Value) -> *mut Value {
 /// `Just {value: bytes}` on success, `Nothing {}` if the input is non-ASCII,
 /// odd-length, or contains non-hex characters. Wrong-type input still panics.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_bytes_from_hex(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_bytes_from_hex(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Text(s) => {
             let s = s.trim();
@@ -8679,7 +8729,7 @@ pub extern "C" fn knot_bytes_from_hex(v: *mut Value) -> *mut Value {
 /// relations) hash their canonical byte serialization (the same one used
 /// for set dedup), so two values that are `==` produce the same digest.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_hash(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_hash(v: *mut Value) -> *mut Value {
     let digest = match unsafe { as_ref(v) } {
         Value::Bytes(b) => blake3::hash(b.as_ref()),
         Value::Text(s) => blake3::hash(s.as_bytes()),
@@ -8694,7 +8744,7 @@ pub extern "C" fn knot_hash(v: *mut Value) -> *mut Value {
 
 /// bytesGet(index, bytes) — get byte at index as Int (0-255)
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_bytes_get(index: *mut Value, bytes: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_bytes_get(index: *mut Value, bytes: *mut Value) -> *mut Value {
     let i = int_as_usize(unsafe { as_ref(index) })
         .unwrap_or_else(|| panic!("knot runtime: bytesGet expected Int as first arg"));
     match unsafe { as_ref(bytes) } {
@@ -8713,7 +8763,7 @@ pub extern "C" fn knot_bytes_get(index: *mut Value, bytes: *mut Value) -> *mut V
 /// Register the compiled toJson trait dispatcher so the runtime can use
 /// custom ToJSON impls for JSON encoding (e.g. HTTP responses).
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_register_to_json(fn_ptr: *const u8) {
+pub extern "C-unwind" fn knot_register_to_json(fn_ptr: *const u8) {
     TO_JSON_FN.store(fn_ptr as usize, Ordering::Release);
 }
 
@@ -8729,7 +8779,7 @@ fn json_encode_value(db: *mut c_void, v: *mut Value) -> String {
 
 /// toJson(value) — convert any Knot value to its JSON text representation
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_json_encode(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_json_encode(v: *mut Value) -> *mut Value {
     alloc(Value::Text(Arc::from(value_to_json(v))))
 }
 
@@ -8737,7 +8787,7 @@ pub extern "C" fn knot_json_encode(v: *mut Value) -> *mut Value {
 /// through the trait dispatcher for nested values, so custom ToJSON impls
 /// are respected for elements inside records, relations, and constructors.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_json_encode_with(
+pub extern "C-unwind" fn knot_json_encode_with(
     db: *mut c_void,
     v: *mut Value,
     to_json_fn: *const u8,
@@ -8755,7 +8805,7 @@ pub extern "C" fn knot_json_encode_with(
 ///   JSON boolean → Bool
 ///   JSON null    → Unit
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_json_decode(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_json_decode(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Text(s) => {
             match serde_json::from_str::<serde_json::Value>(s) {
@@ -8823,13 +8873,13 @@ fn json_to_value(json: &serde_json::Value) -> *mut Value {
 
 /// id(x) — identity function, returns its argument unchanged
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_id(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_value_id(v: *mut Value) -> *mut Value {
     v
 }
 
 /// not(bool) — boolean negation (function form of !)
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_not_fn(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_value_not_fn(v: *mut Value) -> *mut Value {
     knot_value_not(v)
 }
 
@@ -8837,7 +8887,7 @@ pub extern "C" fn knot_value_not_fn(v: *mut Value) -> *mut Value {
 
 /// readFile(path) — read entire file contents as Text
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_fs_read_file(path: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_fs_read_file(path: *mut Value) -> *mut Value {
     match unsafe { as_ref(path) } {
         Value::Text(p) => match std::fs::read_to_string(&**p) {
             Ok(contents) => alloc(Value::Text(Arc::from(contents))),
@@ -8852,7 +8902,7 @@ pub extern "C" fn knot_fs_read_file(path: *mut Value) -> *mut Value {
 
 /// writeFile(path, contents) — write Text to a file (creates or overwrites)
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_fs_write_file(path: *mut Value, contents: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_fs_write_file(path: *mut Value, contents: *mut Value) -> *mut Value {
     let p: &str = match unsafe { as_ref(path) } {
         Value::Text(s) => &**s,
         _ => panic!(
@@ -8875,7 +8925,7 @@ pub extern "C" fn knot_fs_write_file(path: *mut Value, contents: *mut Value) -> 
 
 /// appendFile(path, contents) — append Text to a file
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_fs_append_file(path: *mut Value, contents: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_fs_append_file(path: *mut Value, contents: *mut Value) -> *mut Value {
     use std::io::Write;
     let p: &str = match unsafe { as_ref(path) } {
         Value::Text(s) => &**s,
@@ -8903,7 +8953,7 @@ pub extern "C" fn knot_fs_append_file(path: *mut Value, contents: *mut Value) ->
 
 /// fileExists(path) — check whether a file exists
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_fs_file_exists(path: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_fs_file_exists(path: *mut Value) -> *mut Value {
     match unsafe { as_ref(path) } {
         Value::Text(p) => alloc_bool(std::path::Path::new(&**p).exists()),
         _ => panic!(
@@ -8915,7 +8965,7 @@ pub extern "C" fn knot_fs_file_exists(path: *mut Value) -> *mut Value {
 
 /// removeFile(path) — delete a file
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_fs_remove_file(path: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_fs_remove_file(path: *mut Value) -> *mut Value {
     match unsafe { as_ref(path) } {
         Value::Text(p) => match std::fs::remove_file(&**p) {
             Ok(()) => alloc(Value::Unit),
@@ -8930,7 +8980,7 @@ pub extern "C" fn knot_fs_remove_file(path: *mut Value) -> *mut Value {
 
 /// listDir(path) — list directory entries as a relation of Text
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_fs_list_dir(path: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_fs_list_dir(path: *mut Value) -> *mut Value {
     match unsafe { as_ref(path) } {
         Value::Text(p) => {
             let entries: Vec<*mut Value> = match std::fs::read_dir(&**p) {
@@ -8952,7 +9002,7 @@ pub extern "C" fn knot_fs_list_dir(path: *mut Value) -> *mut Value {
 // ── Database operations ───────────────────────────────────────────
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_db_open(path_ptr: *const u8, path_len: usize) -> *mut c_void {
+pub extern "C-unwind" fn knot_db_open(path_ptr: *const u8, path_len: usize) -> *mut c_void {
     let path = unsafe { str_from_raw(path_ptr, path_len) };
     // Store path globally so spawned threads can open their own connections
     *DB_PATH.lock().unwrap() = path.to_string();
@@ -8977,7 +9027,7 @@ pub extern "C" fn knot_db_open(path_ptr: *const u8, path_len: usize) -> *mut c_v
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_db_close(db: *mut c_void) {
+pub extern "C-unwind" fn knot_db_close(db: *mut c_void) {
     if !db.is_null() {
         let _ = unsafe { Box::from_raw(db as *mut KnotDb) };
     }
@@ -8985,7 +9035,7 @@ pub extern "C" fn knot_db_close(db: *mut c_void) {
 
 /// Execute a SQL statement (e.g., CREATE TABLE).
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_db_exec(db: *mut c_void, sql_ptr: *const u8, sql_len: usize) {
+pub extern "C-unwind" fn knot_db_exec(db: *mut c_void, sql_ptr: *const u8, sql_len: usize) {
     let db = unsafe { &*(db as *mut KnotDb) };
     let sql = unsafe { str_from_raw(sql_ptr, sql_len) };
     debug_sql(sql);
@@ -8998,7 +9048,7 @@ pub extern "C" fn knot_db_exec(db: *mut c_void, sql_ptr: *const u8, sql_len: usi
 
 /// Create the schema metadata table that tracks each source's column layout.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_schema_init(db: *mut c_void) {
+pub extern "C-unwind" fn knot_schema_init(db: *mut c_void) {
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let sql =
         "CREATE TABLE IF NOT EXISTS _knot_schema (name TEXT PRIMARY KEY, schema TEXT NOT NULL);";
@@ -9018,7 +9068,7 @@ pub extern "C" fn knot_schema_init(db: *mut c_void) {
 /// - If no stored schema: new table, skip.
 /// - Otherwise: error (unexpected schema).
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_source_migrate(
+pub extern "C-unwind" fn knot_source_migrate(
     db: *mut c_void,
     name_ptr: *const u8,
     name_len: usize,
@@ -9448,7 +9498,12 @@ fn read_sql_column(row: &rusqlite::Row, i: usize, ty: ColType) -> *mut Value {
                 ValueRef::Integer(n) => alloc_int(n),
                 ValueRef::Text(s) => {
                     let s = std::str::from_utf8(s).expect("knot runtime: invalid UTF-8 in int column");
-                    let n: i64 = s.parse().expect("knot runtime: invalid integer in column");
+                    let n: i64 = s.parse().unwrap_or_else(|_| panic!(
+                        "knot runtime: integer value '{}' in column {} does not fit in a 64-bit Int. \
+                         This database was likely written by an older Knot build with unbounded \
+                         integers; values beyond ±9223372036854775807 cannot be read.",
+                        s, i
+                    ));
                     alloc_int(n)
                 }
                 other => panic!("knot runtime: unexpected SQLite type for Int column {}: {:?}", i, other),
@@ -9857,7 +9912,7 @@ fn auto_apply_record_change(
 
 /// Initialize a source table. Creates it if it doesn't exist.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_source_init(
+pub extern "C-unwind" fn knot_source_init(
     db: *mut c_void,
     name_ptr: *const u8,
     name_len: usize,
@@ -9954,7 +10009,7 @@ pub extern "C" fn knot_source_init(
 
 /// Read all rows from a source relation.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_source_read(
+pub extern "C-unwind" fn knot_source_read(
     db: *mut c_void,
     name_ptr: *const u8,
     name_len: usize,
@@ -10049,7 +10104,7 @@ pub extern "C" fn knot_source_read(
 /// Execute an arbitrary SQL query that returns COUNT(*), with bind parameters.
 /// Returns a boxed Int value.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_source_query_count(
+pub extern "C-unwind" fn knot_source_query_count(
     db: *mut c_void,
     sql_ptr: *const u8,
     sql_len: usize,
@@ -10084,7 +10139,7 @@ pub extern "C" fn knot_source_query_count(
 /// Returns a boxed Float value. Returns 0.0 when the result is NULL
 /// (e.g. AVG on an empty table).
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_source_query_float(
+pub extern "C-unwind" fn knot_source_query_float(
     db: *mut c_void,
     sql_ptr: *const u8,
     sql_len: usize,
@@ -10120,7 +10175,7 @@ pub extern "C" fn knot_source_query_float(
 /// Float when it produces a real result (SUM on float columns).
 /// Returns Int 0 when the result is NULL (SUM on an empty table).
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_source_query_sum(
+pub extern "C-unwind" fn knot_source_query_sum(
     db: *mut c_void,
     sql_ptr: *const u8,
     sql_len: usize,
@@ -10171,7 +10226,7 @@ pub extern "C" fn knot_source_query_sum(
 /// as an Int, Float, or Text Value matching the SQLite column type.
 /// Panics if the result is NULL (e.g. min/max on an empty table).
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_source_query_value(
+pub extern "C-unwind" fn knot_source_query_value(
     db: *mut c_void,
     sql_ptr: *const u8,
     sql_len: usize,
@@ -10219,7 +10274,7 @@ pub extern "C" fn knot_source_query_value(
 /// Count rows in a source relation via SQL COUNT(*).
 /// Returns a boxed Int value.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_source_count(
+pub extern "C-unwind" fn knot_source_count(
     db: *mut c_void,
     name_ptr: *const u8,
     name_len: usize,
@@ -10239,7 +10294,7 @@ pub extern "C" fn knot_source_count(
 /// Read rows from a source relation with a WHERE clause.
 /// Params is a Relation of bind parameter values (?1, ?2, ...).
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_source_read_where(
+pub extern "C-unwind" fn knot_source_read_where(
     db: *mut c_void,
     name_ptr: *const u8,
     name_len: usize,
@@ -10409,7 +10464,7 @@ pub extern "C" fn knot_source_read_where(
 /// (e.g., `"name:text,dept:text,budget:int"`).
 /// `params` is a Relation of parameter values to bind to `?` placeholders.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_source_query(
+pub extern "C-unwind" fn knot_source_query(
     db: *mut c_void,
     sql_ptr: *const u8,
     sql_len: usize,
@@ -10465,7 +10520,7 @@ pub extern "C" fn knot_source_query(
 /// Read rows from a source ADT relation matching a specific constructor tag.
 /// Executes `SELECT <ctor_fields> FROM table WHERE _tag = ?` at the SQL level.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_source_match(
+pub extern "C-unwind" fn knot_source_match(
     db: *mut c_void,
     name_ptr: *const u8,
     name_len: usize,
@@ -10478,6 +10533,13 @@ pub extern "C" fn knot_source_match(
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     let schema = unsafe { str_from_raw(schema_ptr, schema_len) };
     let tag = unsafe { str_from_raw(tag_ptr, tag_len) };
+
+    // Inside `atomic`, this read must join the STM read set like every other
+    // source-read entry point — otherwise a `retry` watching `*src |> match
+    // Ctor` misses wakeups until the defensive timeout.
+    if db_ref.atomic_depth.get() > 0 {
+        stm_track_read(name);
+    }
 
     let table = quote_ident(&format!("_knot_{}", name));
     let adt = parse_adt_schema(schema);
@@ -10995,7 +11057,7 @@ fn write_child_rows(
 
 /// Write a relation to a source (replaces all rows).
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_source_write(
+pub extern "C-unwind" fn knot_source_write(
     db: *mut c_void,
     name_ptr: *const u8,
     name_len: usize,
@@ -11081,7 +11143,7 @@ pub extern "C" fn knot_source_write(
 /// Append rows to a source relation (INSERT only, no DELETE).
 /// Used when the compiler detects `set *rel = union *rel <new_rows>`.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_source_append(
+pub extern "C-unwind" fn knot_source_append(
     db: *mut c_void,
     name_ptr: *const u8,
     name_len: usize,
@@ -11208,7 +11270,7 @@ pub extern "C" fn knot_source_append(
 /// Diff-based write: compute minimal INSERT/DELETE against the existing table.
 /// Used when the value expression reads from the same source relation.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_source_diff_write(
+pub extern "C-unwind" fn knot_source_diff_write(
     db: *mut c_void,
     name_ptr: *const u8,
     name_len: usize,
@@ -11514,7 +11576,7 @@ pub extern "C" fn knot_source_diff_write(
 /// Used for `set *rel = do { t <- *rel; where cond; yield t }`.
 /// The where_clause is the *keep* condition; rows NOT matching are deleted.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_source_delete_where(
+pub extern "C-unwind" fn knot_source_delete_where(
     db: *mut c_void,
     name_ptr: *const u8,
     name_len: usize,
@@ -11674,7 +11736,7 @@ pub extern "C" fn knot_source_delete_where(
 /// Used for `set *rel = do { t <- *rel; yield (if cond then {t | ...} else t) }`.
 /// Params relation contains SET values first, then WHERE values.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_source_update_where(
+pub extern "C-unwind" fn knot_source_update_where(
     db: *mut c_void,
     name_ptr: *const u8,
     name_len: usize,
@@ -11875,7 +11937,7 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
 
 /// Return current time as milliseconds since Unix epoch.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_now() -> *mut Value {
+pub extern "C-unwind" fn knot_now() -> *mut Value {
     let ms: i64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -11892,7 +11954,7 @@ pub extern "C" fn knot_now() -> *mut Value {
 /// wins the race.  Outside of a race, this is equivalent to
 /// `std::thread::sleep`.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_sleep(ms_val: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_sleep(ms_val: *mut Value) -> *mut Value {
     let ms: u64 = match unsafe { as_ref(ms_val) } {
         Value::Int(i) => u64::try_from(*i).expect("knot runtime: sleep duration must be non-negative"),
         _ => panic!("knot runtime: sleep expects Int argument"),
@@ -11910,7 +11972,7 @@ pub extern "C" fn knot_sleep(ms_val: *mut Value) -> *mut Value {
 
 /// Return a random integer in [0, bound).
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_random_int(bound: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_random_int(bound: *mut Value) -> *mut Value {
     let n: u64 = match unsafe { as_ref(bound) } {
         Value::Int(i) => u64::try_from(*i).expect("knot runtime: randomInt bound must be positive"),
         _ => panic!(
@@ -11934,7 +11996,7 @@ pub extern "C" fn knot_random_int(bound: *mut Value) -> *mut Value {
 
 /// Return a random Float in [0.0, 1.0).
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_random_float() -> *mut Value {
+pub extern "C-unwind" fn knot_random_float() -> *mut Value {
     let mut buf = [0u8; 8];
     getrandom::fill(&mut buf).expect("knot runtime: failed to get random bytes");
     let raw = u64::from_le_bytes(buf);
@@ -11953,7 +12015,7 @@ pub extern "C" fn knot_random_float() -> *mut Value {
 /// Returned as a canonical hyphenated `Value::Text`, so all Text-shaped
 /// operations (compare, hash, JSON, SQLite TEXT) just work.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_random_uuid() -> *mut Value {
+pub extern "C-unwind" fn knot_random_uuid() -> *mut Value {
     let ms: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -11995,7 +12057,7 @@ pub extern "C" fn knot_random_uuid() -> *mut Value {
 /// Result.bind: (a -> Result e b) -> Result e a -> Result e b
 /// If Ok, apply function to value. If Err, propagate.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_result_bind(
+pub extern "C-unwind" fn knot_result_bind(
     db: *mut c_void,
     func: *mut Value,
     result: *mut Value,
@@ -12017,7 +12079,7 @@ pub extern "C" fn knot_result_bind(
 /// Result.yield (pure/return): a -> Result e a
 /// Wraps value in Ok {value: a}
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_result_yield(value: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_result_yield(value: *mut Value) -> *mut Value {
     let rec = alloc(Value::Record(vec![
         RecordField { name: "value".into(), value },
     ]));
@@ -12027,7 +12089,7 @@ pub extern "C" fn knot_result_yield(value: *mut Value) -> *mut Value {
 /// Result.empty: Result e a (always Err)
 /// Returns Err {error: {typeName: "", violations: []}}
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_result_empty() -> *mut Value {
+pub extern "C-unwind" fn knot_result_empty() -> *mut Value {
     let violations = alloc(Value::Relation(Vec::new()));
     let error_rec = alloc(Value::Record(vec![
         RecordField { name: "typeName".into(), value: alloc(Value::Text(Arc::from(""))) },
@@ -12045,7 +12107,7 @@ pub extern "C" fn knot_result_empty() -> *mut Value {
 /// Panics with a descriptive error if any row fails.
 /// `field_ptr`/`field_len` = field name (empty string if whole-element check).
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_refinement_validate_relation(
+pub extern "C-unwind" fn knot_refinement_validate_relation(
     db: *mut c_void,
     relation: *mut Value,
     predicate: *mut Value,
@@ -12102,7 +12164,7 @@ pub extern "C" fn knot_refinement_validate_relation(
 /// Validate that a single value (from JSON decode) satisfies a predicate.
 /// Returns 1 if valid, 0 if not.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_refinement_check_value(
+pub extern "C-unwind" fn knot_refinement_check_value(
     db: *mut c_void,
     value: *mut Value,
     predicate: *mut Value,
@@ -12117,7 +12179,7 @@ pub extern "C" fn knot_refinement_check_value(
 /// Register a refinement predicate for a route body field.
 /// Called during program initialization after route table is set up.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_route_set_field_refinement(
+pub extern "C-unwind" fn knot_route_set_field_refinement(
     table: *mut c_void,
     ctor_ptr: *const u8,
     ctor_len: usize,
@@ -12144,7 +12206,7 @@ pub extern "C" fn knot_route_set_field_refinement(
 /// `rate_limit_val` is the compiled Knot value of the `rateLimit` clause:
 /// `{key: RequestCtx -> Maybe a, limit: {requests: Int, window: Int<Ms>}}`.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_route_set_rate_limit(
+pub extern "C-unwind" fn knot_route_set_rate_limit(
     table: *mut c_void,
     ctor_ptr: *const u8,
     ctor_len: usize,
@@ -12205,7 +12267,7 @@ pub extern "C" fn knot_route_set_rate_limit(
 
 /// Header lookup function value passed to user code as `RequestCtx.header`.
 /// `env` is a `Value::Record` whose field names are lowercased header names.
-extern "C" fn knot_rate_limit_header_lookup(
+extern "C-unwind" fn knot_rate_limit_header_lookup(
     _db: *mut c_void,
     env: *mut Value,
     name_arg: *mut Value,
@@ -12380,7 +12442,7 @@ fn rate_limit_key_for_request(
 /// Register a subset constraint. Called at program startup.
 /// Empty field strings mean "no field" (whole relation).
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_constraint_register(
+pub extern "C-unwind" fn knot_constraint_register(
     db: *mut c_void,
     sub_rel_ptr: *const u8,
     sub_rel_len: usize,
@@ -12555,7 +12617,7 @@ pub extern "C" fn knot_constraint_register(
 // ── Atomic (transactions) ─────────────────────────────────────────
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_atomic_begin(db: *mut c_void) {
+pub extern "C-unwind" fn knot_atomic_begin(db: *mut c_void) {
     let _guard = write_lock_guard();
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let depth = db_ref.atomic_depth.get() + 1;
@@ -12572,7 +12634,7 @@ pub extern "C" fn knot_atomic_begin(db: *mut c_void) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_atomic_commit(db: *mut c_void) {
+pub extern "C-unwind" fn knot_atomic_commit(db: *mut c_void) {
     // RAII guard: the lock was acquired in knot_atomic_begin; this guard
     // ensures it is released even if code below panics during unwinding.
     let _guard = WriteLockGuard;
@@ -12612,7 +12674,7 @@ pub extern "C" fn knot_atomic_commit(db: *mut c_void) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_atomic_rollback(db: *mut c_void) {
+pub extern "C-unwind" fn knot_atomic_rollback(db: *mut c_void) {
     // RAII guard: the lock was acquired in knot_atomic_begin; this guard
     // ensures it is released even if code below panics during unwinding.
     let _guard = WriteLockGuard;
@@ -12639,7 +12701,7 @@ pub extern "C" fn knot_atomic_rollback(db: *mut c_void) {
 /// Create a new record by copying `base` and overriding fields.
 /// This implements `{base | field1: val1, field2: val2}`.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_record_update(base: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_record_update(base: *mut Value) -> *mut Value {
     match unsafe { as_ref(base) } {
         Value::Record(fields) => {
             let new_fields: Vec<RecordField> = fields
@@ -12659,7 +12721,7 @@ pub extern "C" fn knot_record_update(base: *mut Value) -> *mut Value {
 /// `data` points to a flat array of triples: [key_ptr, key_len, value, ...]
 /// Fields MUST be pre-sorted by name. O(n+m) merge vs O(m log n) repeated insert.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_record_update_batch(
+pub extern "C-unwind" fn knot_record_update_batch(
     base: *mut Value,
     data: *const usize,
     count: usize,
@@ -12739,7 +12801,7 @@ pub extern "C" fn knot_record_update_batch(
 /// `filter_where` is the WHERE clause for constant column filtering.
 /// `filter_params` is a flat relation of values for the WHERE placeholders.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_view_read(
+pub extern "C-unwind" fn knot_view_read(
     db: *mut c_void,
     name_ptr: *const u8,
     name_len: usize,
@@ -12826,7 +12888,7 @@ pub extern "C" fn knot_view_read(
 /// Add fields from `extra_fields` record to each row in `relation`.
 /// Returns a new relation with augmented rows.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_add_fields(
+pub extern "C-unwind" fn knot_relation_add_fields(
     relation: *mut Value,
     extra_fields: *mut Value,
 ) -> *mut Value {
@@ -12869,7 +12931,7 @@ pub extern "C" fn knot_relation_add_fields(
 /// `mapping` is a comma-separated string of `old_name>new_name` pairs.
 /// Fields not mentioned in the mapping are kept unchanged.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_rename_columns(
+pub extern "C-unwind" fn knot_relation_rename_columns(
     relation: *mut Value,
     mapping_ptr: *const u8,
     mapping_len: usize,
@@ -12924,7 +12986,7 @@ pub extern "C" fn knot_relation_rename_columns(
 /// `filter_params` is a flat relation of values for the WHERE clause placeholders.
 /// `new_relation` has ALL columns (including constants that were added back).
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_view_write(
+pub extern "C-unwind" fn knot_view_write(
     db: *mut c_void,
     name_ptr: *const u8,
     name_len: usize,
@@ -13044,7 +13106,7 @@ pub extern "C" fn knot_view_write(
 
 /// Apply a function value to an argument: `arg |> func`
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_value_pipe(
+pub extern "C-unwind" fn knot_value_pipe(
     db: *mut c_void,
     arg: *mut Value,
     func: *mut Value,
@@ -13056,7 +13118,7 @@ pub extern "C" fn knot_value_pipe(
 
 /// Check if a value is a constructor with the given tag.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_constructor_matches(
+pub extern "C-unwind" fn knot_constructor_matches(
     v: *mut Value,
     tag_ptr: *const u8,
     tag_len: usize,
@@ -13076,7 +13138,7 @@ pub extern "C" fn knot_constructor_matches(
 /// Return a pointer to the constructor tag string data.
 /// Used to extract the tag once and compare multiple times.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_constructor_tag_ptr(v: *mut Value) -> *const u8 {
+pub extern "C-unwind" fn knot_constructor_tag_ptr(v: *mut Value) -> *const u8 {
     match unsafe { as_ref(v) } {
         Value::Constructor(t, _) => t.as_ptr(),
         // Text values can appear as implicit nullary constructors (e.g. from JSON deserialization)
@@ -13087,7 +13149,7 @@ pub extern "C" fn knot_constructor_tag_ptr(v: *mut Value) -> *const u8 {
 
 /// Return the length of the constructor tag string.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_constructor_tag_len(v: *mut Value) -> usize {
+pub extern "C-unwind" fn knot_constructor_tag_len(v: *mut Value) -> usize {
     match unsafe { as_ref(v) } {
         Value::Constructor(t, _) => t.len(),
         // Text values can appear as implicit nullary constructors (e.g. from JSON deserialization)
@@ -13099,7 +13161,7 @@ pub extern "C" fn knot_constructor_tag_len(v: *mut Value) -> usize {
 /// Pure string equality comparison (no Value deref needed).
 /// Used for comparing extracted constructor tags against static strings.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_str_eq(
+pub extern "C-unwind" fn knot_str_eq(
     a_ptr: *const u8,
     a_len: usize,
     b_ptr: *const u8,
@@ -13116,7 +13178,7 @@ pub extern "C" fn knot_str_eq(
 /// Get the payload of a constructor value.
 /// For nullable-encoded types, the value IS the payload (or null for none).
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_constructor_payload(v: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_constructor_payload(v: *mut Value) -> *mut Value {
     if v.is_null() {
         return v; // Nullable none: return null
     }
@@ -13134,12 +13196,12 @@ pub extern "C" fn knot_constructor_payload(v: *mut Value) -> *mut Value {
 /// `body` is a raw function pointer: `extern "C" fn(db, current) -> new_result`.
 /// Starts with `initial` and calls body repeatedly until the result stabilizes.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_fixpoint(
+pub extern "C-unwind" fn knot_relation_fixpoint(
     db: *mut c_void,
     body: *const u8,
     initial: *mut Value,
 ) -> *mut Value {
-    let body_fn: extern "C" fn(*mut c_void, *mut Value) -> *mut Value =
+    let body_fn: extern "C-unwind" fn(*mut c_void, *mut Value) -> *mut Value =
         unsafe { std::mem::transmute(body) };
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let mut current = initial;
@@ -13269,7 +13331,7 @@ fn parse_path_pattern(path: &str) -> Vec<PathPart> {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_route_table_new() -> *mut c_void {
+pub extern "C-unwind" fn knot_route_table_new() -> *mut c_void {
     let table = Box::new(RouteTable {
         entries: Vec::new(),
         field_refinements: Vec::new(),
@@ -13279,7 +13341,7 @@ pub extern "C" fn knot_route_table_new() -> *mut c_void {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_route_table_add(
+pub extern "C-unwind" fn knot_route_table_add(
     table: *mut c_void,
     method_ptr: *const u8,
     method_len: usize,
@@ -13345,7 +13407,9 @@ fn match_route<'a>(
                     }
                 }
                 PathPart::Param(name, _ty) => {
-                    params.push((name.clone(), url_decode(seg)));
+                    // In a path segment `+` is a literal character (RFC 3986);
+                    // the `+`-as-space rule applies only to query strings.
+                    params.push((name.clone(), url_decode(seg, false)));
                 }
             }
         }
@@ -13366,14 +13430,17 @@ fn parse_query_string(qs: &str) -> HashMap<String, String> {
             let key = split.next()?;
             let val = split.next().unwrap_or("");
             Some((
-                url_decode(key),
-                url_decode(val),
+                url_decode(key, true),
+                url_decode(val, true),
             ))
         })
         .collect()
 }
 
-fn url_decode(s: &str) -> String {
+/// Percent-decode a URL component. `plus_as_space` applies the
+/// `application/x-www-form-urlencoded` rule (`+` → space), which is correct
+/// for query-string keys/values only — in path segments `+` is literal.
+fn url_decode(s: &str, plus_as_space: bool) -> String {
     let mut bytes = Vec::with_capacity(s.len());
     let raw = s.as_bytes();
     let mut i = 0;
@@ -13385,7 +13452,7 @@ fn url_decode(s: &str) -> String {
                 continue;
             }
         }
-        if raw[i] == b'+' {
+        if raw[i] == b'+' && plus_as_space {
             bytes.push(b' ');
         } else {
             bytes.push(raw[i]);
@@ -13569,7 +13636,7 @@ fn value_to_serde_json(v: *mut Value) -> serde_json::Value {
 
 /// Call the compiled toJson dispatcher for a sub-value, returning the JSON string.
 fn call_to_json_dispatcher(db: *mut c_void, v: *mut Value, to_json_fn: *const u8) -> String {
-    let f: extern "C" fn(*mut c_void, *mut Value) -> *mut Value =
+    let f: extern "C-unwind" fn(*mut c_void, *mut Value) -> *mut Value =
         unsafe { std::mem::transmute(to_json_fn) };
     let result = f(db, v);
     match unsafe { as_ref(result) } {
@@ -13684,7 +13751,7 @@ fn http_max_body_bytes() -> u64 {
 /// env-or-default resolution path. Exposed through the C ABI so generated
 /// Knot code (or an embedder) can configure the runtime.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_set_http_max_body_bytes(bytes: u64) {
+pub extern "C-unwind" fn knot_set_http_max_body_bytes(bytes: u64) {
     HTTP_MAX_BODY_BYTES_CELL.store(bytes, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -13712,7 +13779,7 @@ fn parse_byte_size(s: &str) -> Option<u64> {
 /// startup so embedders don't need to do anything for the flag to work.
 /// Invalid values exit with a clear error, matching `knot_override_lookup`.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_http_config_init() {
+pub extern "C-unwind" fn knot_http_config_init() {
     const FLAG: &str = "--http-max-body-bytes";
     let args: Vec<String> = std::env::args().collect();
     let mut value: Option<String> = None;
@@ -13759,7 +13826,7 @@ fn parse_port_value(port_val: *mut Value, fn_name: &str) -> u16 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_http_listen(
+pub extern "C-unwind" fn knot_http_listen(
     _db: *mut c_void,
     port_val: *mut Value,
     route_table: *mut c_void,
@@ -13769,11 +13836,69 @@ pub extern "C" fn knot_http_listen(
     http_serve_loop(format!("0.0.0.0:{}", port), route_table, handler)
 }
 
+/// IO-thunk builder for `listen`. `listen : Int<u> -> Server a r -> IO ... {}`
+/// is an IO *value* — building it must not start the server, or
+/// `fork (listen port api)` would run the accept loop on the calling thread
+/// and never reach `fork`. The route-table pointer rides in the env as an
+/// address-carrying Int (the table is built once at the call site and leaked,
+/// so sharing the raw pointer across threads is fine).
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_http_listen_io(
+    _db: *mut c_void,
+    port_val: *mut Value,
+    route_table: *mut c_void,
+    handler: *mut Value,
+) -> *mut Value {
+    let table_addr = alloc(Value::Int(route_table as usize as i64));
+    let env = alloc(Value::Pair(port_val, alloc(Value::Pair(table_addr, handler))));
+
+    extern "C-unwind" fn listen_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let (port_val, rest) = pair_unpack(env);
+        let (table_addr, handler) = pair_unpack(rest);
+        let route_table = match unsafe { as_ref(table_addr) } {
+            Value::Int(addr) => *addr as usize as *mut c_void,
+            _ => panic!("knot runtime: listen thunk env corrupted"),
+        };
+        knot_http_listen(db, port_val, route_table, handler)
+    }
+
+    alloc(Value::IO(listen_thunk as *const u8, env))
+}
+
+/// IO-thunk builder for `listenOn` — see `knot_http_listen_io`.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_http_listen_on_io(
+    _db: *mut c_void,
+    host_val: *mut Value,
+    port_val: *mut Value,
+    route_table: *mut c_void,
+    handler: *mut Value,
+) -> *mut Value {
+    let table_addr = alloc(Value::Int(route_table as usize as i64));
+    let env = alloc(Value::Pair(
+        host_val,
+        alloc(Value::Pair(port_val, alloc(Value::Pair(table_addr, handler)))),
+    ));
+
+    extern "C-unwind" fn listen_on_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let (host_val, rest) = pair_unpack(env);
+        let (port_val, rest2) = pair_unpack(rest);
+        let (table_addr, handler) = pair_unpack(rest2);
+        let route_table = match unsafe { as_ref(table_addr) } {
+            Value::Int(addr) => *addr as usize as *mut c_void,
+            _ => panic!("knot runtime: listenOn thunk env corrupted"),
+        };
+        knot_http_listen_on(db, host_val, port_val, route_table, handler)
+    }
+
+    alloc(Value::IO(listen_on_thunk as *const u8, env))
+}
+
 /// Like `knot_http_listen`, but binds to the supplied host. If `host` looks
 /// like a bare IPv6 address (contains `:` and isn't already bracketed), wrap
 /// it in `[...]` so `tiny_http` parses the `host:port` correctly.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_http_listen_on(
+pub extern "C-unwind" fn knot_http_listen_on(
     _db: *mut c_void,
     host_val: *mut Value,
     port_val: *mut Value,
@@ -13820,7 +13945,7 @@ fn http_serve_loop(
         // thread-local arenas (spawned below).
         ARENA.with(|a| a.borrow_mut().push_frame());
 
-        let mut request = match server.recv() {
+        let request = match server.recv() {
             Ok(req) => req,
             Err(e) => {
                 eprintln!("knot runtime: error receiving request: {}", e);
@@ -13851,34 +13976,13 @@ fn http_serve_loop(
 
         match matched {
             Some((entry, path_params)) => {
-                // Read the body on the main thread before moving the request
-                // GET and DELETE requests don't have bodies — skip reading even
-                // if the route entry happens to declare body_fields.
+                // GET and HEAD requests don't have bodies — skip reading even
+                // if the route entry happens to declare body_fields. The read
+                // itself happens in the worker thread: reading on the accept
+                // loop let one slow client (slowloris) stall every other
+                // request for the duration of its upload.
                 let has_body = !entry.body_fields.is_empty()
                     && entry.method != "GET" && entry.method != "HEAD";
-                let body_bytes = if has_body {
-                    use std::io::Read;
-                    let mut buf = Vec::new();
-                    // Cap body size to prevent OOM from oversized requests.
-                    let max = http_max_body_bytes();
-                    let mut limited = request.as_reader().take(max + 1);
-                    let _ = limited.read_to_end(&mut buf);
-                    if buf.len() as u64 > max {
-                        eprintln!(
-                            "knot runtime: request body exceeds {} byte limit; rejecting",
-                            max
-                        );
-                        let response = tiny_http::Response::from_string("{\"error\":\"payload too large\"}")
-                            .with_status_code(413)
-                            .with_header("Content-Type: application/json".parse::<tiny_http::Header>().unwrap());
-                        let _ = request.respond(response);
-                        ARENA.with(|a| a.borrow_mut().pop_frame());
-                        continue;
-                    }
-                    buf
-                } else {
-                    Vec::new()
-                };
 
                 // Collect request headers as owned strings
                 let req_headers: Vec<(String, String)> = request.headers().iter()
@@ -13921,6 +14025,33 @@ fn http_serve_loop(
 
                 let handle = std::thread::spawn(move || {
                     let handler = handler_cloned as *mut Value;
+                    let mut request = request;
+
+                    // Read the body here in the worker, capped to prevent OOM
+                    // from oversized requests. The accept loop must never
+                    // block on a client's upload pace.
+                    let body_bytes = if has_body {
+                        use std::io::Read;
+                        let mut buf = Vec::new();
+                        let max = http_max_body_bytes();
+                        let mut limited = request.as_reader().take(max + 1);
+                        let _ = limited.read_to_end(&mut buf);
+                        if buf.len() as u64 > max {
+                            eprintln!(
+                                "knot runtime: request body exceeds {} byte limit; rejecting",
+                                max
+                            );
+                            let response = tiny_http::Response::from_string("{\"error\":\"payload too large\"}")
+                                .with_status_code(413)
+                                .with_header("Content-Type: application/json".parse::<tiny_http::Header>().unwrap());
+                            let _ = request.respond(response);
+                            unsafe { deep_drop_value(handler); }
+                            return;
+                        }
+                        buf
+                    } else {
+                        Vec::new()
+                    };
 
                     // Open a DB connection for this thread
                     let db_path = DB_PATH.lock().unwrap().clone();
@@ -14063,7 +14194,9 @@ fn http_serve_loop(
                         }
                     }
 
-                    // Request headers
+                    // Request headers. Parse strictly like path/query params:
+                    // a declared `Int` header carrying garbage is a client
+                    // error (400), not a silent zero.
                     for (hname, hty) in &entry_request_headers {
                         let http_name = camel_to_header_case(hname);
                         let is_maybe = hty.starts_with('?');
@@ -14074,7 +14207,13 @@ fn http_serve_loop(
                         let value = if is_maybe {
                             match raw_val {
                                 Some(v) => {
-                                    let inner = string_to_value(&v, inner_ty);
+                                    let inner = match try_string_to_value(&v, inner_ty) {
+                                        Some(iv) => iv,
+                                        None => return Err((400, format!(
+                                            "invalid header '{}': '{}' is not a valid {}",
+                                            http_name, v, inner_ty
+                                        ), None)),
+                                    };
                                     alloc(Value::Constructor(
                                         "Just".into(),
                                         alloc(Value::Record(vec![
@@ -14085,8 +14224,19 @@ fn http_serve_loop(
                                 None => alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit))),
                             }
                         } else {
-                            let v = raw_val.unwrap_or_default();
-                            string_to_value(&v, inner_ty)
+                            match raw_val {
+                                Some(v) => match try_string_to_value(&v, inner_ty) {
+                                    Some(iv) => iv,
+                                    None => return Err((400, format!(
+                                        "invalid header '{}': '{}' is not a valid {}",
+                                        http_name, v, inner_ty
+                                    ), None)),
+                                },
+                                None => return Err((400, format!(
+                                    "missing required header '{}'",
+                                    http_name
+                                ), None)),
+                            }
                         };
                         fields.push(RecordField {
                             name: intern_str(hname),
@@ -14355,7 +14505,7 @@ fn http_serve_loop(
 // ── HTTP client (fetch) ─────────────────────────────────────────
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_http_fetch_io(
+pub extern "C-unwind" fn knot_http_fetch_io(
     base_url: *mut Value,
     method_ptr: *const u8,
     method_len: usize,
@@ -14412,7 +14562,7 @@ pub extern "C" fn knot_http_fetch_io(
         RecordField { name: "resp_hdrs_desc".into(), value: resp_hdrs_desc },
     ]));
 
-    extern "C" fn fetch_thunk(_db: *mut c_void, env: *mut Value) -> *mut Value {
+    extern "C-unwind" fn fetch_thunk(_db: *mut c_void, env: *mut Value) -> *mut Value {
         let base_url = knot_record_field_by_index(env, 0);
         let body_desc = knot_record_field_by_index(env, 1);
         let headers = knot_record_field_by_index(env, 2);
@@ -14532,16 +14682,29 @@ pub extern "C" fn knot_http_fetch_io(
         // Send request — split by method type since ureq 3 uses different
         // builder types for methods with/without body
         let result = match method_str.as_str() {
-            "GET" | "HEAD" | "DELETE" => {
+            "GET" | "HEAD" => {
                 let mut req = match method_str.as_str() {
                     "GET" => agent.get(&full_url),
-                    "HEAD" => agent.head(&full_url),
-                    _ => agent.delete(&full_url),
+                    _ => agent.head(&full_url),
                 };
                 for (k, v) in &req_headers {
                     req = req.header(k.as_str(), v.as_str());
                 }
                 req.call()
+            }
+            "DELETE" => {
+                // DELETE routes may declare body fields; the server reads and
+                // JSON-parses the body for every non-GET/HEAD method, so the
+                // client must actually send it (ureq's DELETE builder is
+                // bodyless by default).
+                let mut req = agent.delete(&full_url);
+                for (k, v) in &req_headers {
+                    req = req.header(k.as_str(), v.as_str());
+                }
+                match &body_json {
+                    Some(json) => req.force_send_body().send(json.as_str()),
+                    None => req.call(),
+                }
             }
             _ => {
                 let mut req = match method_str.as_str() {
@@ -14840,7 +15003,7 @@ unsafe impl Send for SendPtr {}
 static API_REGISTRY: Mutex<Vec<(String, SendPtr)>> = Mutex::new(Vec::new());
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_api_register(
+pub extern "C-unwind" fn knot_api_register(
     name_ptr: *const u8,
     name_len: usize,
     table: *mut c_void,
@@ -14854,7 +15017,7 @@ pub extern "C" fn knot_api_register(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_api_handle(argc: i32, argv: *const *const u8) -> i32 {
+pub extern "C-unwind" fn knot_api_handle(argc: i32, argv: *const *const u8) -> i32 {
     if argc < 2 {
         return 0;
     }
@@ -14908,7 +15071,7 @@ pub extern "C" fn knot_api_handle(argc: i32, argv: *const *const u8) -> i32 {
 /// Handle `<program> db` subcommand: launch TUI database explorer.
 /// Returns 1 if handled (caller should exit), 0 otherwise.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_db_handle(
+pub extern "C-unwind" fn knot_db_handle(
     argc: i32,
     argv: *const *const u8,
     db_path_ptr: *const u8,
@@ -15294,7 +15457,7 @@ fn serialize_value_for_hash_into(v: *mut Value, buf: &mut Vec<u8>) {
 /// Build a hash index over a relation on a given field.
 /// Returns an opaque pointer to a heap-allocated HashIndex.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_build_index(
+pub extern "C-unwind" fn knot_relation_build_index(
     rel: *mut Value,
     field_ptr: *const u8,
     field_len: usize,
@@ -15325,7 +15488,7 @@ pub extern "C" fn knot_relation_build_index(
 /// Look up matching rows in a hash index by key value.
 /// Returns a Relation of matching rows (empty if no match).
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_index_lookup(
+pub extern "C-unwind" fn knot_relation_index_lookup(
     index: *mut c_void,
     key: *mut Value,
 ) -> *mut Value {
@@ -15339,7 +15502,7 @@ pub extern "C" fn knot_relation_index_lookup(
 
 /// Free a hash index.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_relation_index_free(index: *mut c_void) {
+pub extern "C-unwind" fn knot_relation_index_free(index: *mut c_void) {
     if index.is_null() {
         return;
     }
@@ -15353,7 +15516,7 @@ pub extern "C" fn knot_relation_index_free(index: *mut c_void) {
 /// Generate an X25519 key pair for encryption.
 /// Returns Record {privateKey: Bytes, publicKey: Bytes}.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_crypto_generate_key_pair() -> *mut Value {
+pub extern "C-unwind" fn knot_crypto_generate_key_pair() -> *mut Value {
     let mut secret_bytes = [0u8; 32];
     getrandom::fill(&mut secret_bytes).expect("knot runtime: failed to generate random bytes");
     let secret = x25519_dalek::StaticSecret::from(secret_bytes);
@@ -15370,7 +15533,7 @@ pub extern "C" fn knot_crypto_generate_key_pair() -> *mut Value {
 /// Generate an Ed25519 key pair for signing.
 /// Returns Record {privateKey: Bytes, publicKey: Bytes}.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_crypto_generate_signing_key_pair() -> *mut Value {
+pub extern "C-unwind" fn knot_crypto_generate_signing_key_pair() -> *mut Value {
     let mut secret_bytes = [0u8; 32];
     getrandom::fill(&mut secret_bytes).expect("knot runtime: failed to generate random bytes");
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret_bytes);
@@ -15388,7 +15551,7 @@ pub extern "C" fn knot_crypto_generate_signing_key_pair() -> *mut Value {
 /// Takes (publicKey: Bytes, plaintext: Bytes), returns ciphertext Bytes.
 /// Format: [ephemeral_pub: 32][nonce: 12][encrypted + tag: len+16]
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_crypto_encrypt(public_key: *mut Value, plaintext: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_crypto_encrypt(public_key: *mut Value, plaintext: *mut Value) -> *mut Value {
     use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
     use chacha20poly1305::aead::Aead;
 
@@ -15435,7 +15598,7 @@ pub extern "C" fn knot_crypto_encrypt(public_key: *mut Value, plaintext: *mut Va
 /// Sealed-box decryption: reverse of encrypt.
 /// Takes (privateKey: Bytes, ciphertext: Bytes), returns plaintext Bytes.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_crypto_decrypt(private_key: *mut Value, ciphertext: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_crypto_decrypt(private_key: *mut Value, ciphertext: *mut Value) -> *mut Value {
     use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
     use chacha20poly1305::aead::Aead;
 
@@ -15474,7 +15637,7 @@ pub extern "C" fn knot_crypto_decrypt(private_key: *mut Value, ciphertext: *mut 
 
 /// Ed25519 signing. Takes (privateKey: Bytes, message: Bytes), returns signature Bytes.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_crypto_sign(private_key: *mut Value, message: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_crypto_sign(private_key: *mut Value, message: *mut Value) -> *mut Value {
     use ed25519_dalek::Signer;
 
     let priv_bytes = match unsafe { as_ref(private_key) } {
@@ -15495,7 +15658,7 @@ pub extern "C" fn knot_crypto_sign(private_key: *mut Value, message: *mut Value)
 
 /// Ed25519 verification. Takes (db, publicKey: Bytes, message: Bytes, signature: Bytes), returns Bool.
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_crypto_verify(
+pub extern "C-unwind" fn knot_crypto_verify(
     _db: *mut c_void,
     public_key: *mut Value,
     message: *mut Value,
@@ -15532,29 +15695,29 @@ pub extern "C" fn knot_crypto_verify(
 // IO wrappers for effectful crypto builtins
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_crypto_generate_key_pair_io() -> *mut Value {
-    extern "C" fn thunk(_db: *mut c_void, _env: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_crypto_generate_key_pair_io() -> *mut Value {
+    extern "C-unwind" fn thunk(_db: *mut c_void, _env: *mut Value) -> *mut Value {
         knot_crypto_generate_key_pair()
     }
     alloc(Value::IO(thunk as *const u8, std::ptr::null_mut()))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_crypto_generate_signing_key_pair_io() -> *mut Value {
-    extern "C" fn thunk(_db: *mut c_void, _env: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_crypto_generate_signing_key_pair_io() -> *mut Value {
+    extern "C-unwind" fn thunk(_db: *mut c_void, _env: *mut Value) -> *mut Value {
         knot_crypto_generate_signing_key_pair()
     }
     alloc(Value::IO(thunk as *const u8, std::ptr::null_mut()))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn knot_crypto_encrypt_io(public_key: *mut Value, plaintext: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_crypto_encrypt_io(public_key: *mut Value, plaintext: *mut Value) -> *mut Value {
     let env = knot_record_empty(2);
     let k = b"a";
     knot_record_set_field(env, k.as_ptr(), k.len(), public_key);
     let k = b"b";
     knot_record_set_field(env, k.as_ptr(), k.len(), plaintext);
-    extern "C" fn thunk(_db: *mut c_void, env: *mut Value) -> *mut Value {
+    extern "C-unwind" fn thunk(_db: *mut c_void, env: *mut Value) -> *mut Value {
         let a = b"a";
         let public_key = knot_record_field(env, a.as_ptr(), a.len());
         let b = b"b";
@@ -15586,6 +15749,26 @@ mod _size_tests {
         eprintln!("sizeof(RecordField) = {}", std::mem::size_of::<RecordField>());
         eprintln!("sizeof(FunctionInner) = {}", std::mem::size_of::<FunctionInner>());
         eprintln!("sizeof(Arc<str>) = {}", std::mem::size_of::<Arc<str>>());
+    }
+}
+
+#[cfg(test)]
+mod _url_decode_tests {
+    use super::*;
+
+    /// `+`-as-space is a query-string (form-urlencoded) rule; in path
+    /// segments RFC 3986 says `+` is a literal character.
+    #[test]
+    fn plus_is_literal_in_path_segments() {
+        assert_eq!(url_decode("a+b", false), "a+b");
+        assert_eq!(url_decode("a%20b", false), "a b");
+        assert_eq!(url_decode("a%2Bb", false), "a+b");
+    }
+
+    #[test]
+    fn plus_is_space_in_query_strings() {
+        assert_eq!(url_decode("a+b", true), "a b");
+        assert_eq!(url_decode("a%2Bb", true), "a+b");
     }
 }
 

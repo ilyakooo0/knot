@@ -18,6 +18,7 @@ pub fn resolve_definitions(
     source: &str,
 ) -> (HashMap<String, Span>, Vec<(Span, Span)>, Vec<(Span, String)>) {
     let mut resolver = DefResolver {
+        source,
         scopes: vec![HashMap::new()],
         refs: Vec::new(),
         literals: Vec::new(),
@@ -193,13 +194,14 @@ pub fn resolve_definitions(
     (name_map, resolver.refs, resolver.literals)
 }
 
-struct DefResolver {
+struct DefResolver<'a> {
+    source: &'a str,
     scopes: Vec<HashMap<String, Span>>,
     refs: Vec<(Span, Span)>,
     literals: Vec<(Span, String)>,
 }
 
-impl DefResolver {
+impl<'a> DefResolver<'a> {
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
     }
@@ -277,15 +279,32 @@ impl DefResolver {
         match &pat.node {
             ast::PatKind::Var(name) => self.define(name, pat.span),
             ast::PatKind::Constructor { name, payload } => {
-                self.add_ref(pat.span, name);
+                // The reference must cover only the constructor name, not the
+                // payload — rename replaces usage spans verbatim, so a
+                // whole-pattern span would delete the payload binder. The
+                // name leads the pattern span; `name.len()` is bytes,
+                // matching the byte-indexed span representation.
+                self.add_ref(Span::new(pat.span.start, pat.span.start + name.len()), name);
                 self.define_pat(payload);
             }
             ast::PatKind::Record(fields) => {
+                // Fields appear sequentially in source order; a running
+                // cursor keeps each pun-token search confined to its slot.
+                let mut search_start = pat.span.start;
                 for f in fields {
                     if let Some(p) = &f.pattern {
                         self.define_pat(p);
+                        search_start = p.span.end;
                     } else {
-                        self.define(&f.name, pat.span);
+                        let span = find_word_in_source(
+                            self.source,
+                            &f.name,
+                            search_start,
+                            pat.span.end,
+                        )
+                        .unwrap_or(pat.span);
+                        self.define(&f.name, span);
+                        search_start = span.end;
                     }
                 }
             }

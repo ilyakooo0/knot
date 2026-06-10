@@ -307,6 +307,28 @@ fn name_span_within(source: &str, decl_span: Span, name: &str) -> Option<Span> {
     None
 }
 
+/// Replacement text for a rename edit at `span`, expanding record puns. A
+/// bare identifier sitting directly between `{`/`,`/`|` and `,`/`}` is a pun
+/// — `{name}` in a pattern binds a variable *and* selects a field; in an
+/// expression it reads a variable *and* names a field. Renaming the variable
+/// must not change which field is matched/built, so the pun expands to
+/// `name: newName` instead of being rewritten in place.
+fn pun_aware_new_text(source: &str, span: Span, old_name: &str, new_name: &str) -> String {
+    let before = source
+        .get(..span.start)
+        .and_then(|s| s.trim_end().chars().next_back());
+    let after = source
+        .get(span.end..)
+        .and_then(|s| s.trim_start().chars().next());
+    let opens = matches!(before, Some('{') | Some(',') | Some('|'));
+    let closes = matches!(after, Some(',') | Some('}'));
+    if opens && closes {
+        format!("{old_name}: {new_name}")
+    } else {
+        new_name.to_string()
+    }
+}
+
 /// Resolve a URI to a stable canonical path, falling back to the URI-as-path
 /// when canonicalize fails (e.g. synthetic test URIs that don't hit disk).
 /// The fallback must mirror `resolve_canonical_owner`'s fallback so equality
@@ -379,7 +401,7 @@ fn emit_edits_for_open_doc(
             .unwrap_or(owner.name_span);
         changes.entry(uri.clone()).or_default().push(TextEdit {
             range: span_to_range(name_span, &doc.source),
-            new_text: new_name.to_string(),
+            new_text: pun_aware_new_text(&doc.source, name_span, old_name, new_name),
         });
         // Rename every local usage that resolves to the canonical decl.
         //
@@ -394,7 +416,7 @@ fn emit_edits_for_open_doc(
             if *target_span == owner.decl_span || *target_span == name_span {
                 changes.entry(uri.clone()).or_default().push(TextEdit {
                     range: span_to_range(*usage_span, &doc.source),
-                    new_text: new_name.to_string(),
+                    new_text: pun_aware_new_text(&doc.source, *usage_span, old_name, new_name),
                 });
             }
         }
@@ -413,12 +435,15 @@ fn emit_edits_for_open_doc(
             collect_name_uses_in_decl(decl, old_name, &mut sites);
         }
         // Selective import items: `import foo {bar, baz}` — if the rename
-        // targets `bar`, the import line itself needs updating.
+        // targets `bar`, the import line itself needs updating. These sit
+        // inside braces but are NOT record puns, so they must bypass the
+        // pun expansion below.
+        let mut import_sites: Vec<Span> = Vec::new();
         for imp in &doc.module.imports {
             if let Some(items) = &imp.items {
                 for item in items {
                     if item.name == old_name {
-                        sites.push(item.span);
+                        import_sites.push(item.span);
                     }
                 }
             }
@@ -426,6 +451,12 @@ fn emit_edits_for_open_doc(
         sites.sort_by_key(|s| s.start);
         sites.dedup_by_key(|s| s.start);
         for span in sites {
+            changes.entry(uri.clone()).or_default().push(TextEdit {
+                range: span_to_range(span, &doc.source),
+                new_text: pun_aware_new_text(&doc.source, span, old_name, new_name),
+            });
+        }
+        for span in import_sites {
             changes.entry(uri.clone()).or_default().push(TextEdit {
                 range: span_to_range(span, &doc.source),
                 new_text: new_name.to_string(),
@@ -702,13 +733,13 @@ fn apply_owner_disk_edits(
         let name_span = name_span_within(source, *decl_span, old_name).unwrap_or(*decl_span);
         changes.entry(uri.clone()).or_default().push(TextEdit {
             range: span_to_range(name_span, source),
-            new_text: new_name.to_string(),
+            new_text: pun_aware_new_text(source, name_span, old_name, new_name),
         });
         for (usage_span, target_span) in &refs {
             if target_span == decl_span {
                 changes.entry(uri.clone()).or_default().push(TextEdit {
                     range: span_to_range(*usage_span, source),
-                    new_text: new_name.to_string(),
+                    new_text: pun_aware_new_text(source, *usage_span, old_name, new_name),
                 });
             }
         }
@@ -734,11 +765,14 @@ fn apply_importer_disk_edits(
     for decl in &module.decls {
         collect_name_uses_in_decl(decl, old_name, &mut sites);
     }
+    // Import items live inside braces but are not record puns — plain
+    // replacement, no pun expansion.
+    let mut import_sites: Vec<Span> = Vec::new();
     for imp in &module.imports {
         if let Some(items) = &imp.items {
             for item in items {
                 if item.name == old_name {
-                    sites.push(item.span);
+                    import_sites.push(item.span);
                 }
             }
         }
@@ -748,10 +782,15 @@ fn apply_importer_disk_edits(
     for span in sites {
         changes.entry(uri.clone()).or_default().push(TextEdit {
             range: span_to_range(span, source),
+            new_text: pun_aware_new_text(source, span, old_name, new_name),
+        });
+    }
+    for span in import_sites {
+        changes.entry(uri.clone()).or_default().push(TextEdit {
+            range: span_to_range(span, source),
             new_text: new_name.to_string(),
         });
     }
-    let _ = source;
 }
 
 /// Quick check: does `module` import `owner_path` and does that import surface
@@ -1243,6 +1282,101 @@ mod tests {
             out.replace_range(start..end, text);
         }
         out
+    }
+
+    #[test]
+    fn rename_constructor_preserves_pattern_payload() {
+        // Regression: constructor-pattern references used to span the whole
+        // pattern (`Circle c`), so renaming the constructor deleted the
+        // payload binder.
+        let mut ws = TestWorkspace::new();
+        let src = "data Shape = Circle {radius: Int} | Square {side: Int}\n\
+                   area = \\s -> case s of\n  Circle c -> c.radius\n  Square q -> q.side\n";
+        let uri = ws.open("main", src);
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("Circle").expect("ctor def");
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "Round"))
+            .expect("rename emits edit");
+        let changes = edit.changes.expect("changes present");
+        let edits = changes.get(&uri).expect("owner file edited");
+        let out = apply_edits(&doc.source, edits);
+        assert!(
+            out.contains("Round c -> c.radius"),
+            "payload binder must survive constructor rename; got:\n{out}"
+        );
+        assert!(
+            out.contains("data Shape = Round {radius: Int}"),
+            "data declaration should be renamed; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn rename_payload_var_does_not_touch_constructor() {
+        // Regression: the whole-pattern reference span made a payload-variable
+        // cursor resolve to the constructor's definition, corrupting the
+        // `data` declaration.
+        let mut ws = TestWorkspace::new();
+        let src = "data Shape = Circle {radius: Int} | Square {side: Int}\n\
+                   area = \\s -> case s of\n  Circle c -> c.radius\n  Square q -> q.side\n";
+        let uri = ws.open("main", src);
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("c.radius").expect("payload usage");
+        let pos = offset_to_position(&doc.source, off);
+        if let Some(edit) = handle_rename(&ws.state, &rename_params(&uri, pos, "circ")) {
+            let changes = edit.changes.expect("changes present");
+            let edits = changes.get(&uri).expect("owner file edited");
+            let out = apply_edits(&doc.source, edits);
+            assert!(
+                out.contains("data Shape = Circle {radius: Int}"),
+                "data declaration must not be touched by payload-var rename; got:\n{out}"
+            );
+            assert!(
+                out.contains("Circle circ -> circ.radius"),
+                "binder and usage should be renamed together; got:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn rename_punned_pattern_binder_expands_pun() {
+        // Regression: renaming the binder of a punned record pattern `{name}`
+        // used to rewrite the pun token itself, silently changing which field
+        // is matched. The pun must expand to `name: newName`.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "getName = \\{name} -> name\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("> name").expect("body usage") + 2;
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "fullName"))
+            .expect("rename emits edit");
+        let changes = edit.changes.expect("changes present");
+        let edits = changes.get(&uri).expect("owner file edited");
+        let out = apply_edits(&doc.source, edits);
+        assert_eq!(
+            out, "getName = \\{name: fullName} -> fullName\n",
+            "pun must expand so the matched field is preserved"
+        );
+    }
+
+    #[test]
+    fn rename_through_expression_pun_expands_pun() {
+        // Expression puns have the same hazard: `{name}` builds `{name: name}`,
+        // so renaming the variable must expand the pun to keep the field name.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "mk = \\name -> {name}\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("{name}").expect("expr pun") + 1;
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "label"))
+            .expect("rename emits edit");
+        let changes = edit.changes.expect("changes present");
+        let edits = changes.get(&uri).expect("owner file edited");
+        let out = apply_edits(&doc.source, edits);
+        assert_eq!(
+            out, "mk = \\label -> {name: label}\n",
+            "expression pun must expand so the built record keeps its field"
+        );
     }
 
     #[test]

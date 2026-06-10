@@ -10,4 +10,5 @@ pub mod modules;
 pub mod sql_lint;
 pub mod stratify;
 pub mod types;
+pub(crate) mod unwind;
 pub mod unused;

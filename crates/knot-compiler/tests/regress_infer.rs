@@ -398,3 +398,305 @@ fn route_composition_cycle_is_an_error() {
         diags
     );
 }
+
+// ── 8. Trait constraints must survive let-generalization ──
+
+#[test]
+fn unannotated_fn_constraint_checked_at_use_site() {
+    // `callGreet` is unannotated; the `Greet` obligation from its body must
+    // be captured by generalization and re-checked when applied to Bool.
+    let src = r#"trait Greet a where
+  greet : a -> Text
+impl Greet Int where
+  greet n = "int"
+callGreet = \x -> greet x
+main = println (callGreet true)
+"#;
+    let diags = check_src(src);
+    assert!(
+        has_error(&diags, "no implementation of trait 'Greet' for type 'Bool'"),
+        "dropped constraint must resurface at the use site: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn unannotated_fn_ord_constraint_checked_at_use_site() {
+    let src = r#"myMin = \a b -> if a < b then a else b
+main = println (show (myMin true false))
+"#;
+    let diags = check_src(src);
+    assert!(
+        has_error(&diags, "no implementation of trait 'Ord' for type 'Bool'"),
+        "Ord obligation must follow the generalized scheme: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn unannotated_fn_constraint_satisfied_use_accepted() {
+    // The same generalized function applied at a type WITH the impl is fine.
+    let src = r#"trait Greet a where
+  greet : a -> Text
+impl Greet Int where
+  greet n = "int"
+callGreet = \x -> greet x
+main = println (callGreet 1)
+"#;
+    let diags = check_src(src);
+    assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
+}
+
+#[test]
+fn do_let_generalized_constraint_checked_at_use_site() {
+    // The do-`let` generalization path must capture constraints too.
+    let src = r#"main = do
+  let cmp = \a b -> a < b
+  println (show (cmp true false))
+"#;
+    let diags = check_src(src);
+    assert!(
+        has_error(&diags, "no implementation of trait 'Ord' for type 'Bool'"),
+        "do-let generalization dropped the Ord constraint: {:?}",
+        diags
+    );
+}
+
+// ── 9. `if` over two concrete IO values with different effects ──
+
+#[test]
+fn if_branches_with_different_io_effects_merge() {
+    // `*a` and `*b` produce concrete `Ty::IO` values with different
+    // read-effect sets; `if` must widen to the union like `case` does.
+    let src = r#"*a : [{x: Int}]
+*b : [{x: Int}]
+main = do
+  rows <- if true then *a else *b
+  println (show (count rows))
+"#;
+    let diags = check_src(src);
+    assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
+}
+
+#[test]
+fn annotated_io_effects_still_strict() {
+    // Widening branch merges must not weaken explicit annotations: a body
+    // with fs effects can't claim `IO {console}`.
+    let src = r#"f : IO {console} {}
+f = do
+  writeFile "x.txt" "y"
+main = f
+"#;
+    let diags = check_src(src);
+    assert!(
+        has_error(&diags, "IO effects don't match"),
+        "explicit annotation must still reject extra effects: {:?}",
+        diags
+    );
+}
+
+// ── 10. Unit-composition guard must cover polymorphic unit variables ──
+
+#[test]
+fn unit_var_times_unknown_operand_is_rejected() {
+    // `x : Float<u>` (a unit VARIABLE) multiplied by an unresolved lambda
+    // param must hit the same conservative guard as a concrete unit —
+    // unifying them would type `x * y` as `u` instead of `u^2`.
+    let src = r#"sq : Float<u> -> Float<u>
+sq = \x -> (\y -> x * y) x
+main = println (show (sq 2.0))
+"#;
+    let diags = check_src(src);
+    assert!(
+        has_error(&diags, "cannot infer the unit of an operand"),
+        "polymorphic unit times unknown operand must be rejected: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn concrete_unit_times_unknown_operand_still_rejected() {
+    let src = r#"unit M
+f = \y -> 2.0<M> * y
+main = println (show (f 3.0))
+"#;
+    let diags = check_src(src);
+    assert!(
+        has_error(&diags, "cannot infer the unit of an operand"),
+        "got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn unitless_float_arithmetic_still_compiles() {
+    let src = r#"f = \x y -> x * y
+main = println (show (f 2.0 3.0))
+"#;
+    let diags = check_src(src);
+    assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
+}
+
+// ── 11. User-annotated `\/` effect-union rows ──
+
+#[test]
+fn user_annotated_effect_union_sequencing_accepted() {
+    // Sequencing both row-polymorphic args inside a do block must satisfy
+    // the declared union `r1 \/ r2` instead of forcing r1 = r2.
+    let src = r#"combine : IO {| r1} {} -> IO {| r2} {} -> IO {| r1 \/ r2} {}
+combine = \a b -> do
+  a
+  b
+main = combine (println "left") (println "right")
+"#;
+    let diags = check_src(src);
+    assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
+}
+
+#[test]
+fn user_annotated_effect_union_with_io_builtin_accepted() {
+    // Variant with a recognizable IO builtin (do block is NOT desugared,
+    // exercising the infer_do row-merge path).
+    let src = r#"combine : IO {| r1} {} -> IO {| r2} {} -> IO {console | r1 \/ r2} {}
+combine = \a b -> do
+  println "seq"
+  a
+  b
+main = combine (println "left") (println "right")
+"#;
+    let diags = check_src(src);
+    assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
+}
+
+#[test]
+fn effect_row_equality_without_union_still_rejected() {
+    // Without a declared `\/` union, sequencing two distinct rigid rows
+    // into a single-row result must keep failing.
+    let src = r#"combine : IO {| r1} {} -> IO {| r2} {} -> IO {| r1} {}
+combine = \a b -> do
+  a
+  b
+main = combine (println "left") (println "right")
+"#;
+    let diags = check_src(src);
+    assert!(
+        has_error(&diags, "cannot unify rigid type variables"),
+        "rigid rows must not silently merge without a `\\/` union: {:?}",
+        diags
+    );
+}
+
+// ── 12. IO-vs-Relation unification in IO do blocks ──
+
+#[test]
+fn io_relation_and_plain_relation_branches_unify() {
+    // `*items` is `IO {} [T]`; the else branch is a plain `[T]` literal.
+    // The relation must unify with the IO's *inner* type, not the
+    // relation's element with the inner (which produced nonsense
+    // "expected {x: Int}, found [{x: Int}]" mismatches).
+    let src = r#"*items : [{x: Int}]
+main = do
+  rows <- if true then *items else [{x: 1}]
+  println (show (count rows))
+"#;
+    let diags = check_src(src);
+    assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
+}
+
+// ── 13. Refinement collection must follow plain alias chains ──
+
+fn refinements_for(src: &str, source: &str) -> Vec<(Option<String>, String)> {
+    let module = parse(src);
+    let env = knot_compiler::types::TypeEnv::from_module(&module);
+    env.source_refinements
+        .get(source)
+        .map(|v| {
+            v.iter()
+                .map(|(field, name, _)| (field.clone(), name.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn refinement_direct_field_alias_collected() {
+    let src = r#"type Nat = Int where \x -> x >= 0
+*people : [{age: Nat}]
+main = 1
+"#;
+    let refs = refinements_for(src, "people");
+    assert_eq!(refs, vec![(Some("age".to_string()), "Nat".to_string())]);
+}
+
+#[test]
+fn refinement_field_alias_to_refined_collected() {
+    // `Age` is a plain alias to the refined `Nat` — the predicate must
+    // still be registered for the field (previously bypassed).
+    let src = r#"type Nat = Int where \x -> x >= 0
+type Age = Nat
+*people : [{age: Age}]
+main = 1
+"#;
+    let refs = refinements_for(src, "people");
+    assert_eq!(refs, vec![(Some("age".to_string()), "Nat".to_string())]);
+}
+
+#[test]
+fn refinement_multi_step_alias_chain_collected() {
+    let src = r#"type Nat = Int where \x -> x >= 0
+type B = Nat
+type A = B
+*people : [{age: A}]
+main = 1
+"#;
+    let refs = refinements_for(src, "people");
+    assert_eq!(refs, vec![(Some("age".to_string()), "Nat".to_string())]);
+}
+
+#[test]
+fn refinement_whole_element_alias_collected() {
+    let src = r#"type Nat = Int where \x -> x >= 0
+type Age = Nat
+*scores : [Age]
+main = 1
+"#;
+    let refs = refinements_for(src, "scores");
+    assert_eq!(refs, vec![(None, "Nat".to_string())]);
+}
+
+#[test]
+fn refinement_aliased_record_with_aliased_field_collected() {
+    // Record alias containing a field whose type is an alias chain to a
+    // refined type.
+    let src = r#"type Nat = Int where \x -> x >= 0
+type Age = Nat
+type Person = {age: Age}
+*people : [Person]
+main = 1
+"#;
+    let refs = refinements_for(src, "people");
+    assert_eq!(refs, vec![(Some("age".to_string()), "Nat".to_string())]);
+}
+
+#[test]
+fn refinement_alias_cycle_does_not_hang() {
+    // `type A = B; type B = A` — cycle is diagnosed elsewhere; the
+    // refinement walk must just terminate without predicates.
+    let src = r#"type A = B
+type B = A
+*xs : [{v: A}]
+main = 1
+"#;
+    let refs = refinements_for(src, "xs");
+    assert!(refs.is_empty(), "got: {:?}", refs);
+}
+
+#[test]
+fn refinement_plain_alias_to_unrefined_not_collected() {
+    let src = r#"type Name = Text
+*people : [{name: Name}]
+main = 1
+"#;
+    let refs = refinements_for(src, "people");
+    assert!(refs.is_empty(), "got: {:?}", refs);
+}

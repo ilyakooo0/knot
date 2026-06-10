@@ -21,10 +21,29 @@ use std::collections::{HashMap, HashSet};
 
 // ── Codegen state ─────────────────────────────────────────────────
 
+/// One invalidation event for the `source_var_binds` map (see the field
+/// docs on [`Codegen`]). Logged in statement order so nested do-block
+/// scopes can replay invalidations onto their restored snapshots.
+#[derive(Clone)]
+enum SourceBindInvalidation {
+    /// A variable was rebound by a later `let`/bind — drop its entry.
+    Rebind(String),
+    /// A specific source table was written — drop entries reading it.
+    SourceWrite(String),
+    /// A write happened whose target couldn't be identified statically
+    /// (view target, or a call into possibly-writing code) — drop all.
+    AllSources,
+}
+
 pub struct Codegen {
     module: ObjectModule,
     ctx: Context,
     builder_ctx: FunctionBuilderContext,
+    /// Accumulates .eh_frame entries for every generated function so the
+    /// system unwinder can walk Cranelift frames — required for the
+    /// runtime's catch_unwind recovery (HTTP 500s, race cancellation) to
+    /// work when a panic crosses generated code. See crate::unwind.
+    unwind: crate::unwind::UnwindContext,
     ptr_type: types::Type,
 
     // Interned string constants
@@ -54,6 +73,15 @@ pub struct Codegen {
     /// Populated by compile_io_do_eager when it processes `x <- *source`.
     /// Enables SQL optimization for `do { m <- x; where ...; yield m }`.
     source_var_binds: HashMap<String, String>,
+    /// Invalidations applied to `source_var_binds` (and `let_bindings`)
+    /// during the current function body, in statement order. Do-block
+    /// compilers snapshot the log length on entry and replay the suffix
+    /// after restoring their saved maps, so an invalidation that happened
+    /// inside a nested scope (e.g. a write inside an `atomic` body) still
+    /// kills stale entries in the enclosing scope. Without this, a
+    /// pushed-down `count xs` after `*items = ...` would re-query the
+    /// table instead of using the pre-write binding.
+    source_bind_invalidations: Vec<SourceBindInvalidation>,
 
     /// User function bodies: name → AST body.
     /// Enables cross-function-boundary SQL optimization by resolving named
@@ -190,6 +218,13 @@ pub struct Codegen {
     // this is the block that `retry` jumps to (rollback + wait + loop).
     // Used to short-circuit execution on retry instead of flag-based checking.
     atomic_retry_block: Option<cranelift_codegen::ir::Block>,
+    // Number of arena frames pushed (and not yet popped) since the innermost
+    // atomic loop head. The direct `retry` jump to atomic_retry_block must
+    // emit this many extra knot_arena_pop_frame calls first: retry_block
+    // itself pops only the atomic's own frame, so frames opened by nested
+    // do-blocks (or bind-expression frame isolation) between the loop head
+    // and the `retry` would otherwise leak one frame per retry iteration.
+    atomic_arena_frames: usize,
 
     // Refined type predicates: type_name -> predicate AST expression
     refined_types: HashMap<String, knot::ast::Expr>,
@@ -670,8 +705,17 @@ impl Codegen {
     fn new() -> Self {
         let mut flag_builder = settings::builder();
         flag_builder.set("is_pic", "true").unwrap();
-        let isa_builder =
+        let mut isa_builder =
             cranelift_native::builder().expect("failed to detect host CPU");
+        // cranelift-native enables return-address signing (PAC) on Apple
+        // Silicon. The resulting RA_SIGN_STATE DWARF expressions in our
+        // .eh_frame are rejected by Apple's libunwind when it steps through
+        // generated frames, turning every panic that crosses generated code
+        // into a fatal "failed to initiate panic" abort — which defeats the
+        // runtime's catch_unwind recovery (HTTP 500s, race cancellation).
+        // Plain arm64 macOS binaries don't sign return addresses anyway.
+        let _ = isa_builder.set("sign_return_address", "false");
+        let _ = isa_builder.set("sign_return_address_with_bkey", "false");
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
             .expect("failed to build ISA");
@@ -683,12 +727,15 @@ impl Codegen {
             cranelift_module::default_libcall_names(),
         )
         .expect("failed to create ObjectBuilder");
-        let module = ObjectModule::new(builder);
+        let mut module = ObjectModule::new(builder);
+        // is_pic is set above, so .eh_frame pointers use PC-relative encoding.
+        let unwind = crate::unwind::UnwindContext::new(&mut module, true);
 
         Self {
             ctx: module.make_context(),
             module,
             builder_ctx: FunctionBuilderContext::new(),
+            unwind,
             ptr_type,
             strings: HashMap::new(),
             string_counter: 0,
@@ -698,6 +745,7 @@ impl Codegen {
             stdlib_fns: HashSet::new(),
             source_schemas: HashMap::new(),
             source_var_binds: HashMap::new(),
+            source_bind_invalidations: Vec::new(),
             fun_bodies: HashMap::new(),
             let_bindings: HashMap::new(),
             constructors: HashMap::new(),
@@ -736,6 +784,7 @@ impl Codegen {
             required_constants: Vec::new(),
             in_io_eager: false,
             atomic_retry_block: None,
+            atomic_arena_frames: 0,
             refined_types: HashMap::new(),
             refine_targets: HashMap::new(),
             refined_predicate_fns: HashMap::new(),
@@ -1062,6 +1111,10 @@ impl Codegen {
         self.declare_rt("knot_http_listen", &[p, p, p, p], &[p]);
         // (db, host_value, port_value, route_table, handler) — host is a Value::Text.
         self.declare_rt("knot_http_listen_on", &[p, p, p, p, p], &[p]);
+        // IO-thunk builders: same shapes, but return an IO value instead of
+        // entering the serve loop (so `fork (listen ...)` works).
+        self.declare_rt("knot_http_listen_io", &[p, p, p, p], &[p]);
+        self.declare_rt("knot_http_listen_on_io", &[p, p, p, p, p], &[p]);
 
         // HTTP client (fetch)
         // (base_url, method_ptr, method_len, path_ptr, path_len, payload,
@@ -1341,6 +1394,10 @@ impl Codegen {
         for name in &stdlib_names {
             self.register_stdlib_fn(name);
         }
+
+        // Composite route declarations (`route Name = A | B`), resolved to a
+        // fixpoint after the declaration loop (see below).
+        let mut composite_routes: Vec<(String, Vec<String>)> = Vec::new();
 
         for decl in &module.decls {
             match &decl.node {
@@ -1625,16 +1682,49 @@ impl Codegen {
                     self.route_entries.insert(name.clone(), entries.clone());
                 }
                 ast::DeclKind::RouteComposite { name, components } => {
-                    let mut all = Vec::new();
-                    for comp in components {
-                        if let Some(entries) = self.route_entries.get(comp) {
-                            all.extend_from_slice(entries);
-                        }
-                    }
-                    self.route_entries.insert(name.clone(), all);
+                    // Deferred: resolved to a fixpoint after the loop so
+                    // composition is order-independent (a composite may
+                    // reference a route declared later in the file).
+                    composite_routes.push((name.clone(), components.clone()));
                 }
                 _ => {}
             }
+        }
+
+        // Resolve composite routes to a fixpoint. The type checker already
+        // rejects unknown components and cycles; the bounded loop below
+        // simply stops when no further composite can be expanded.
+        let mut passes = composite_routes.len() + 1;
+        while !composite_routes.is_empty() && passes > 0 {
+            passes -= 1;
+            let mut still_pending = Vec::new();
+            for (name, components) in composite_routes {
+                if components
+                    .iter()
+                    .all(|c| self.route_entries.contains_key(c))
+                {
+                    let mut all = Vec::new();
+                    for comp in &components {
+                        all.extend_from_slice(&self.route_entries[comp]);
+                    }
+                    self.route_entries.insert(name, all);
+                } else {
+                    still_pending.push((name, components));
+                }
+            }
+            composite_routes = still_pending;
+        }
+        // Anything left references unknown or cyclic routes (already
+        // diagnosed by inference) — register what resolves so downstream
+        // lookups don't panic.
+        for (name, components) in composite_routes {
+            let mut all = Vec::new();
+            for comp in &components {
+                if let Some(entries) = self.route_entries.get(comp) {
+                    all.extend_from_slice(entries);
+                }
+            }
+            self.route_entries.insert(name, all);
         }
 
         // Detect user functions that produce IO values (fixed-point iteration)
@@ -2950,6 +3040,8 @@ impl Codegen {
         }
 
         self.module.define_function(func_id, &mut ctx).unwrap();
+        // Record unwind info while ctx still holds the compiled code.
+        self.unwind.add_function(&mut self.module, func_id, &ctx);
         self.builder_ctx = fb_ctx;
         self.ctx = ctx;
         self.module.clear_context(&mut self.ctx);
@@ -3818,7 +3910,8 @@ impl Codegen {
     // ── Finish ────────────────────────────────────────────────────
 
     fn finish(self) -> Vec<u8> {
-        let product = self.module.finish();
+        let mut product = self.module.finish();
+        self.unwind.emit(&mut product);
         product.emit().unwrap()
     }
 
@@ -3859,6 +3952,14 @@ impl Codegen {
                 }
                 if name == "retry" {
                     if let Some(retry_block) = self.atomic_retry_block {
+                        // Pop any arena frames opened since the atomic loop
+                        // head (nested do-block frames, bind-expression
+                        // isolation frames). retry_block only pops the
+                        // atomic's own frame — skipping these pops would
+                        // leak one frame per retry iteration.
+                        for _ in 0..self.atomic_arena_frames {
+                            self.call_rt_void(builder, "knot_arena_pop_frame", &[]);
+                        }
                         // Jump directly to the retry path, short-circuiting
                         // all subsequent code in the atomic body.
                         builder.ins().jump(retry_block, &[]);
@@ -4618,6 +4719,10 @@ impl Codegen {
                 // short-circuiting execution instead of using a flag.
                 let prev_retry_block = self.atomic_retry_block;
                 self.atomic_retry_block = Some(retry_block);
+                // Frames pushed inside the body are counted relative to THIS
+                // atomic's loop head (its own frame is popped by retry_block).
+                let prev_atomic_arena_frames = self.atomic_arena_frames;
+                self.atomic_arena_frames = 0;
 
                 // Compile inner IO eagerly so side effects run inside the transaction.
                 // If the inner is an IO do-block, we must run it inline rather than
@@ -4636,6 +4741,7 @@ impl Codegen {
                 };
 
                 self.atomic_retry_block = prev_retry_block;
+                self.atomic_arena_frames = prev_atomic_arena_frames;
 
                 // After the body completes without an explicit retry, three
                 // outcomes are possible:
@@ -4996,6 +5102,204 @@ impl Codegen {
     }
 
     // ── Application compilation ───────────────────────────────────
+
+    /// Apply one invalidation to the live `source_var_binds` map (and, for
+    /// rebinds, the `let_bindings` map) and append it to the log so
+    /// enclosing scopes replay it after restoring their snapshots.
+    fn apply_source_bind_invalidation(&mut self, inv: SourceBindInvalidation) {
+        Self::replay_source_bind_invalidation(
+            &inv,
+            &mut self.source_var_binds,
+            &mut self.let_bindings,
+        );
+        self.source_bind_invalidations.push(inv);
+    }
+
+    fn replay_source_bind_invalidation(
+        inv: &SourceBindInvalidation,
+        source_var_binds: &mut HashMap<String, String>,
+        let_bindings: &mut HashMap<String, ast::Expr>,
+    ) {
+        match inv {
+            SourceBindInvalidation::Rebind(name) => {
+                source_var_binds.remove(name);
+                let_bindings.remove(name);
+            }
+            SourceBindInvalidation::SourceWrite(src) => {
+                source_var_binds.retain(|_, s| s != src);
+            }
+            SourceBindInvalidation::AllSources => {
+                source_var_binds.clear();
+            }
+        }
+    }
+
+    /// Replay invalidations logged since `mark` onto the (just-restored)
+    /// `source_var_binds`/`let_bindings` maps. Called when a do-block scope
+    /// exits: the scope restored its entry snapshots, but writes and
+    /// rebinds that happened inside the scope must still kill matching
+    /// outer-scope entries.
+    fn replay_source_bind_invalidations_since(&mut self, mark: usize) {
+        let suffix: Vec<SourceBindInvalidation> =
+            self.source_bind_invalidations[mark..].to_vec();
+        for inv in &suffix {
+            Self::replay_source_bind_invalidation(
+                inv,
+                &mut self.source_var_binds,
+                &mut self.let_bindings,
+            );
+        }
+    }
+
+    /// Invalidate `source_var_binds` entries for every name bound by `pat`:
+    /// a rebind means the variable no longer holds the rows read from its
+    /// previous source, so SQL pushdown must not re-query the table for it.
+    fn invalidate_rebound_pattern(&mut self, pat: &ast::Pat) {
+        for name in pat_bound_names(pat) {
+            if self.source_var_binds.contains_key(&name)
+                || self.let_bindings.contains_key(&name)
+            {
+                self.apply_source_bind_invalidation(
+                    SourceBindInvalidation::Rebind(name),
+                );
+            }
+        }
+    }
+
+    /// Collect the write targets inside `expr` into `out`. Returns `false`
+    /// when some write cannot be attributed to a plain source — a view or
+    /// dynamic `Set` target, a reference to a possibly-writing user
+    /// function, or a call through an unknown callee. The conservatism
+    /// mirrors `expr_contains_writes` exactly: whenever that function
+    /// reports "may write" for a reason other than a direct
+    /// `Set`/`ReplaceSet`, this returns `false` so the caller invalidates
+    /// every source binding.
+    fn collect_direct_write_targets(
+        &self,
+        expr: &ast::Expr,
+        out: &mut Vec<String>,
+    ) -> bool {
+        use ast::ExprKind::*;
+        let name_is_known_write_free = |name: &str| -> bool {
+            !self.write_functions.contains(name)
+                && (self.top_fn_names.contains(name)
+                    || is_builtin_name(name)
+                    || matches!(name, "yield" | "__bind" | "__yield" | "__empty"))
+        };
+        match &expr.node {
+            Set { target, value } | ReplaceSet { target, value } => {
+                let target_ok = match &target.node {
+                    SourceRef(name) if !self.views.contains_key(name) => {
+                        out.push(name.clone());
+                        true
+                    }
+                    _ => false,
+                };
+                target_ok && self.collect_direct_write_targets(value, out)
+            }
+            // A bare reference to a possibly-writing function: it may be
+            // invoked later through a value we can't track.
+            Var(name) => !self.write_functions.contains(name),
+            Atomic(inner) | Refine(inner) => {
+                self.collect_direct_write_targets(inner, out)
+            }
+            UnaryOp { operand, .. } => self.collect_direct_write_targets(operand, out),
+            UnitLit { value, .. } => self.collect_direct_write_targets(value, out),
+            Annot { expr: e, .. } => self.collect_direct_write_targets(e, out),
+            FieldAccess { expr: e, .. } => self.collect_direct_write_targets(e, out),
+            App { func, arg } => {
+                // Mirror `expr_contains_writes`: a call through an unknown
+                // callee (parameter, do-local lambda, trait dispatcher,
+                // computed expression) may write anything.
+                let (head, _) = uncurry_app(expr);
+                let head_attributable = match &strip_expr_wrappers(head).node {
+                    Var(name) => name_is_known_write_free(name),
+                    Constructor(_) => true,
+                    Lambda { .. } => true, // body covered by recursion below
+                    _ => false,
+                };
+                head_attributable
+                    && self.collect_direct_write_targets(func, out)
+                    && self.collect_direct_write_targets(arg, out)
+            }
+            BinOp { lhs, rhs, .. } => {
+                self.collect_direct_write_targets(lhs, out)
+                    && self.collect_direct_write_targets(rhs, out)
+            }
+            If { cond, then_branch, else_branch } => {
+                self.collect_direct_write_targets(cond, out)
+                    && self.collect_direct_write_targets(then_branch, out)
+                    && self.collect_direct_write_targets(else_branch, out)
+            }
+            Case { scrutinee, arms } => {
+                self.collect_direct_write_targets(scrutinee, out)
+                    && arms
+                        .iter()
+                        .all(|a| self.collect_direct_write_targets(&a.body, out))
+            }
+            Do(stmts) => stmts.iter().all(|s| match &s.node {
+                // Bind/expression statements RUN their value when it is an
+                // IO action — an IO value of unknown provenance may write
+                // anything (mirrors `expr_contains_writes`).
+                ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Expr(expr) => {
+                    let unknown_io = matches!(
+                        &strip_expr_wrappers(expr).node,
+                        Var(name) if !name_is_known_write_free(name)
+                    );
+                    !unknown_io && self.collect_direct_write_targets(expr, out)
+                }
+                ast::StmtKind::Let { expr, .. } => {
+                    self.collect_direct_write_targets(expr, out)
+                }
+                ast::StmtKind::Where { cond } => {
+                    self.collect_direct_write_targets(cond, out)
+                }
+                ast::StmtKind::GroupBy { key } => {
+                    self.collect_direct_write_targets(key, out)
+                }
+            }),
+            Record(fields) => fields
+                .iter()
+                .all(|f| self.collect_direct_write_targets(&f.value, out)),
+            RecordUpdate { base, fields } => {
+                self.collect_direct_write_targets(base, out)
+                    && fields
+                        .iter()
+                        .all(|f| self.collect_direct_write_targets(&f.value, out))
+            }
+            List(items) => items
+                .iter()
+                .all(|e| self.collect_direct_write_targets(e, out)),
+            Lambda { body, .. } => self.collect_direct_write_targets(body, out),
+            Serve { handlers, .. } => handlers
+                .iter()
+                .all(|h| self.collect_direct_write_targets(&h.body, out)),
+            Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) => true,
+        }
+    }
+
+    /// After compiling a do-block statement, invalidate any
+    /// `source_var_binds` entries whose source the statement may have
+    /// written. Direct `*src = ...` writes invalidate just that source;
+    /// writes we can't attribute (view writes, calls into possibly-writing
+    /// functions) invalidate everything. Invalidation only disables the
+    /// SQL pushdown optimization — the general in-memory path stays
+    /// correct — so being conservative here is safe.
+    fn invalidate_after_possible_writes(&mut self, expr: &ast::Expr) {
+        if !Self::expr_contains_writes(expr, &self.write_functions, &self.top_fn_names) {
+            return;
+        }
+        let mut direct: Vec<String> = Vec::new();
+        if self.collect_direct_write_targets(expr, &mut direct) {
+            for name in direct {
+                self.apply_source_bind_invalidation(
+                    SourceBindInvalidation::SourceWrite(name),
+                );
+            }
+        } else {
+            self.apply_source_bind_invalidation(SourceBindInvalidation::AllSources);
+        }
+    }
 
     /// Resolve an expression to a source relation name.
     /// Handles both `*source` (SourceRef) and bound variables from `x <- *source`.
@@ -5963,14 +6267,54 @@ impl Codegen {
                     // Build route table from known route declarations
                     let table = self.call_rt(builder, "knot_route_table_new", &[]);
 
-                    // Collect all unique route entries across all declarations,
-                    // deduplicating by constructor name.
+                    // Identify which API this server actually serves so only
+                    // that API's route entries are registered on its table.
+                    // Registering every declared route would dispatch requests
+                    // for unserved routes into `compile_serve`'s case (which
+                    // has no arm for them) — a 500/abort instead of a 404.
+                    // The server value is the last argument: either a literal
+                    // `serve Api where ...` or a name resolving to one.
+                    let server_arg = &args[expected_arity - 1];
+                    let served_api: Option<String> = {
+                        let reduced = beta_reduce(
+                            server_arg,
+                            &self.fun_bodies,
+                            &self.let_bindings,
+                        );
+                        match &strip_expr_wrappers(&reduced).node {
+                            ast::ExprKind::Serve { api, .. } => Some(api.clone()),
+                            _ => None,
+                        }
+                    };
+
+                    // Collect the served API's route entries (composed
+                    // `route Name = A | B` declarations are already flattened
+                    // in route_entries), deduplicating by constructor name.
+                    // If the server value can't be traced to a `serve`
+                    // expression statically (e.g. it came through a function
+                    // parameter), fall back to registering every declared
+                    // route — over-registration only risks 500s on unserved
+                    // routes, never missed dispatch of served ones.
                     let mut seen = std::collections::HashSet::new();
                     let mut entries: Vec<ast::RouteEntry> = Vec::new();
-                    for route_entries in self.route_entries.values() {
-                        for entry in route_entries {
-                            if seen.insert(entry.constructor.clone()) {
-                                entries.push(entry.clone());
+                    match served_api
+                        .as_ref()
+                        .and_then(|api| self.route_entries.get(api))
+                    {
+                        Some(api_entries) => {
+                            for entry in api_entries {
+                                if seen.insert(entry.constructor.clone()) {
+                                    entries.push(entry.clone());
+                                }
+                            }
+                        }
+                        None => {
+                            for route_entries in self.route_entries.values() {
+                                for entry in route_entries {
+                                    if seen.insert(entry.constructor.clone()) {
+                                        entries.push(entry.clone());
+                                    }
+                                }
                             }
                         }
                     }
@@ -6043,16 +6387,22 @@ impl Codegen {
                         }
                     }
 
+                    // `listen` produces an IO *value*; starting the server
+                    // happens when the value is run (knot_io_run for a bare
+                    // statement, or on the spawned thread for
+                    // `fork (listen port api)`). Calling the serve loop
+                    // directly here would block the evaluating thread before
+                    // `fork` ever saw the value.
                     if is_listen_on {
                         self.call_rt(
                             builder,
-                            "knot_http_listen_on",
+                            "knot_http_listen_on_io",
                             &[db, compiled_args[0], compiled_args[1], table, compiled_args[2]],
                         )
                     } else {
                         self.call_rt(
                             builder,
-                            "knot_http_listen",
+                            "knot_http_listen_io",
                             &[db, compiled_args[0], table, compiled_args[1]],
                         )
                     }
@@ -7200,6 +7550,9 @@ impl Codegen {
         // (via the saved snapshot) but keep outer-scope entries visible
         // while compiling inner do-blocks.
         let prev_let_bindings = self.let_bindings.clone();
+        // Mark the invalidation log so writes/rebinds inside this scope are
+        // replayed onto the restored snapshots when the scope exits.
+        let invalidation_mark = self.source_bind_invalidations.len();
         let mut last_val = self.call_rt(builder, "knot_value_unit", &[]);
 
         // Create a done block for early exit on guard/pattern failures.
@@ -7210,6 +7563,9 @@ impl Codegen {
         for stmt in stmts {
             match &stmt.node {
                 ast::StmtKind::Bind { pat, expr } => {
+                    // A bind shadows any previous source/let tracking for the
+                    // names it binds — drop stale entries before (re)inserting.
+                    self.invalidate_rebound_pattern(pat);
                     // Track source read bindings for SQL optimization:
                     // `x <- *source` records x → source so inner do-blocks
                     // like `do { m <- x; where ...; yield m }` can compile to SQL.
@@ -7223,9 +7579,14 @@ impl Codegen {
                     let result = self.call_rt(builder, "knot_io_run", &[db, io_val]);
                     // Bind the result to the pattern
                     self.bind_io_pattern(builder, pat, result, env, Some(done_block));
+                    // Running the bound action may have written relations —
+                    // variables bound from those sources are now stale.
+                    self.invalidate_after_possible_writes(expr);
                     last_val = result;
                 }
                 ast::StmtKind::Let { pat, expr } => {
+                    // A let rebinding a name drops its source/let tracking.
+                    self.invalidate_rebound_pattern(pat);
                     // Track let-bound expressions so SQL pushdown matchers
                     // can fold through them when matching set/replace shapes
                     // later in the do-block.
@@ -7234,6 +7595,7 @@ impl Codegen {
                     }
                     let val = self.compile_expr(builder, expr, env, db);
                     self.bind_io_pattern(builder, pat, val, env, Some(done_block));
+                    self.invalidate_after_possible_writes(expr);
                     last_val = val;
                 }
                 ast::StmtKind::Where { cond } => {
@@ -7243,6 +7605,7 @@ impl Codegen {
                     // skip so the surrounding `atomic` rolls back.
                     let cond_i32 =
                         self.compile_condition(builder, cond, env, db);
+                    self.invalidate_after_possible_writes(cond);
                     let is_true =
                         builder.ins().icmp_imm(IntCC::NotEqual, cond_i32, 0);
                     let pass_block = builder.create_block();
@@ -7262,6 +7625,9 @@ impl Codegen {
                 }
                 ast::StmtKind::Expr(expr) => {
                     last_val = self.compile_io_expr_eager(builder, expr, env, db);
+                    // A bare statement that writes (e.g. `*items = ...`)
+                    // invalidates source-bound variables read before it.
+                    self.invalidate_after_possible_writes(expr);
                 }
                 ast::StmtKind::GroupBy { .. } => {
                     // groupBy doesn't make sense in IO do-blocks
@@ -7277,6 +7643,8 @@ impl Codegen {
         self.in_io_eager = prev_io_eager;
         self.source_var_binds = prev_source_var_binds;
         self.let_bindings = prev_let_bindings;
+        // Writes/rebinds inside this scope still invalidate outer entries.
+        self.replay_source_bind_invalidations_since(invalidation_mark);
         done_param
     }
 
@@ -7474,6 +7842,10 @@ impl Codegen {
         // Save let_bindings for restoration on exit; new entries inserted
         // below are visible only inside this do-block's scope.
         let prev_let_bindings = self.let_bindings.clone();
+        // Save source_var_binds too: binds in this block shadow outer
+        // source-read tracking for the duration of the block.
+        let prev_source_var_binds = self.source_var_binds.clone();
+        let invalidation_mark = self.source_bind_invalidations.len();
 
         // Wrap the do-block in a dedicated arena frame.  Every yielded value
         // is `knot_arena_promote`d into pinned, which survives the
@@ -7486,6 +7858,9 @@ impl Codegen {
         // deep-cloned into the parent by `pop_frame_promote`, and the
         // child frame (including its pinned set) is dropped.
         self.call_rt_void(builder, "knot_arena_push_frame", &[]);
+        // Count the open frame so a direct `retry` jump inside this
+        // do-block (when nested in an atomic body) pops it first.
+        self.atomic_arena_frames += 1;
 
         let result = self.call_rt(builder, "knot_relation_empty", &[]);
         let mut loop_stack: Vec<LoopInfo> = Vec::new();
@@ -7619,6 +7994,10 @@ impl Codegen {
         for (stmt_idx, stmt) in stmts.iter().enumerate() {
             match &stmt.node {
                 ast::StmtKind::Bind { pat, expr } => {
+                    // A bind shadows any outer source/let tracking for the
+                    // names it binds (the bound variable is now a row, not
+                    // the source-read it may have referred to outside).
+                    self.invalidate_rebound_pattern(pat);
                     // ── Hash join path: use pre-built index for lookup ──
                     if let Some(plan) = hash_join_plans.get(&stmt_idx) {
                         let idx_val = prebuilt_indices[&stmt_idx];
@@ -7800,6 +8179,9 @@ impl Codegen {
 
                     if needs_frame {
                         self.call_rt_void(builder, "knot_arena_push_frame", &[]);
+                        // Count the open frame for direct `retry` jumps
+                        // emitted while compiling the bind expression.
+                        self.atomic_arena_frames += 1;
                     }
 
                     let val = if let Some(pushed_val) = use_filter_pushdown {
@@ -7810,6 +8192,7 @@ impl Codegen {
 
                     // Promote return value to parent frame, freeing callee temporaries
                     let val = if needs_frame {
+                        self.atomic_arena_frames -= 1;
                         self.call_rt(builder, "knot_arena_pop_frame_promote", &[val])
                     } else {
                         val
@@ -7953,6 +8336,8 @@ impl Codegen {
                 }
 
                 ast::StmtKind::Let { pat, expr } => {
+                    // A let rebinding a name drops its source/let tracking.
+                    self.invalidate_rebound_pattern(pat);
                     // Track let-bound expressions so SQL pushdown matchers
                     // can fold through them when matching set/replace shapes
                     // later in the do-block.
@@ -7960,6 +8345,7 @@ impl Codegen {
                         self.let_bindings.insert(var_name.clone(), expr.clone());
                     }
                     let val = self.compile_expr(builder, expr, env, db);
+                    self.invalidate_after_possible_writes(expr);
 
                     // Track schema of Let-bound relation variables for groupBy support.
                     // If the expression is a known relation (source, derived, or var),
@@ -8069,20 +8455,63 @@ impl Codegen {
                             panic!("{}", hint)
                         });
 
-                    // Extract key column names from the key record expression
+                    // Extract key column names from the key record expression.
+                    // Only plain field accesses (`t.owner`) are supported as
+                    // keys: anything else has no corresponding schema column,
+                    // so generating code for it would abort at runtime with
+                    // "key column not found in schema". Reject it here with a
+                    // proper compile-time diagnostic instead.
                     let key_cols: Vec<String> = match &key.node {
                         ast::ExprKind::Record(fields) => fields
                             .iter()
                             .map(|f| match &f.value.node {
                                 ast::ExprKind::FieldAccess { field, .. } => {
+                                    // Verify the column exists in the schema
+                                    // (skip ADT schemas, whose descriptor
+                                    // format the lookup doesn't parse).
+                                    if !schema.starts_with('#')
+                                        && lookup_col_type_from_schema(&schema, field).is_none()
+                                    {
+                                        self.diagnostics.push(
+                                            knot::diagnostic::Diagnostic::error(format!(
+                                                "groupBy key '{}' refers to field '{}', \
+                                                 which is not a column of the grouped relation",
+                                                f.name, field
+                                            ))
+                                            .label(f.value.span, "not a relation column"),
+                                        );
+                                    }
                                     field.clone()
                                 }
-                                _ => f.name.clone(),
+                                _ => {
+                                    self.diagnostics.push(
+                                        knot::diagnostic::Diagnostic::error(format!(
+                                            "groupBy key '{}' is a computed expression; \
+                                             groupBy keys must be plain field accesses \
+                                             like t.owner",
+                                            f.name
+                                        ))
+                                        .label(f.value.span, "computed key expression")
+                                        .note(
+                                            "bind the computed value with a yield into an \
+                                             intermediate relation first, then group on \
+                                             that field",
+                                        ),
+                                    );
+                                    f.name.clone()
+                                }
                             })
                             .collect(),
-                        _ => panic!(
-                            "groupBy key must be a record expression"
-                        ),
+                        _ => {
+                            self.diagnostics.push(
+                                knot::diagnostic::Diagnostic::error(
+                                    "groupBy key must be a record expression, \
+                                     e.g. groupBy {owner: t.owner}",
+                                )
+                                .label(key.span, "expected a record of field accesses"),
+                            );
+                            Vec::new()
+                        }
                     };
                     let key_cols_str = key_cols.join(",");
 
@@ -8180,9 +8609,12 @@ impl Codegen {
                     } else if matches!(&expr.node, ast::ExprKind::Set { .. } | ast::ExprKind::ReplaceSet { .. }) {
                         // Compile set inside do block
                         let _ = self.compile_expr(builder, expr, env, db);
+                        // Variables bound from the written source are stale now.
+                        self.invalidate_after_possible_writes(expr);
                     } else {
                         let val =
                             self.compile_expr(builder, expr, env, db);
+                        self.invalidate_after_possible_writes(expr);
                         if is_last && loop_stack.is_empty() {
                             // Last expression in a non-looping do block
                             // — push as result
@@ -8235,7 +8667,11 @@ impl Codegen {
         // This frees every per-iteration pinned yield that would otherwise
         // live until the caller returned.
         let promoted = self.call_rt(builder, "knot_arena_pop_frame_promote", &[result]);
+        self.atomic_arena_frames -= 1;
         self.let_bindings = prev_let_bindings;
+        self.source_var_binds = prev_source_var_binds;
+        // Writes/rebinds inside this scope still invalidate outer entries.
+        self.replay_source_bind_invalidations_since(invalidation_mark);
         promoted
     }
 
@@ -11782,14 +12218,79 @@ fn substitute_inner(
             ty: ty.clone(),
         },
         Refine(e) => Refine(Box::new(substitute_inner(e, var, value, value_fv)?)),
-        // Constructs that introduce binders we don't analyze for SQL: keep
-        // unchanged. Inlining doesn't need to look inside.
+        // Constructs that introduce binders the substituter doesn't rewrite.
+        // If the substituted variable never occurs inside, the expression is
+        // unaffected and can be kept as-is. Otherwise the substitution FAILS
+        // (caller falls back to the non-beta-reduced expression). Returning
+        // the expression unchanged here used to leave the lambda parameter
+        // unsubstituted inside e.g. `case` bodies — downstream shape
+        // matchers then compiled the broken AST, panicking with
+        // "codegen: undefined variable" or silently capturing a same-named
+        // in-scope variable.
         Case { .. } | Do(_) | Set { .. } | ReplaceSet { .. } | Atomic(_)
         | Serve { .. } => {
-            return Some(expr.clone())
+            if expr_mentions_var(expr, var) {
+                return None;
+            }
+            return Some(expr.clone());
         }
     };
     Some(ast::Spanned { node: new_node, span })
+}
+
+/// Conservative occurs check: does `var` appear as a `Var` node anywhere
+/// inside `expr`? Shadowing is deliberately ignored (a shadowed occurrence
+/// still counts), so `true` over-approximates "occurs free" — safe for
+/// deciding whether a substitution can skip a subtree.
+fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
+    use ast::ExprKind::*;
+    let in_stmts = |stmts: &[ast::Stmt]| -> bool {
+        stmts.iter().any(|s| match &s.node {
+            ast::StmtKind::Bind { expr, .. }
+            | ast::StmtKind::Let { expr, .. }
+            | ast::StmtKind::Expr(expr) => expr_mentions_var(expr, var),
+            ast::StmtKind::Where { cond } => expr_mentions_var(cond, var),
+            ast::StmtKind::GroupBy { key } => expr_mentions_var(key, var),
+        })
+    };
+    match &expr.node {
+        Var(name) => name == var,
+        Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) => false,
+        Record(fields) => fields.iter().any(|f| expr_mentions_var(&f.value, var)),
+        RecordUpdate { base, fields } => {
+            expr_mentions_var(base, var)
+                || fields.iter().any(|f| expr_mentions_var(&f.value, var))
+        }
+        FieldAccess { expr: e, .. } => expr_mentions_var(e, var),
+        List(items) => items.iter().any(|e| expr_mentions_var(e, var)),
+        Lambda { body, .. } => expr_mentions_var(body, var),
+        App { func, arg } => {
+            expr_mentions_var(func, var) || expr_mentions_var(arg, var)
+        }
+        BinOp { lhs, rhs, .. } => {
+            expr_mentions_var(lhs, var) || expr_mentions_var(rhs, var)
+        }
+        UnaryOp { operand, .. } => expr_mentions_var(operand, var),
+        If { cond, then_branch, else_branch } => {
+            expr_mentions_var(cond, var)
+                || expr_mentions_var(then_branch, var)
+                || expr_mentions_var(else_branch, var)
+        }
+        Case { scrutinee, arms } => {
+            expr_mentions_var(scrutinee, var)
+                || arms.iter().any(|a| expr_mentions_var(&a.body, var))
+        }
+        Do(stmts) => in_stmts(stmts),
+        Set { target, value } | ReplaceSet { target, value } => {
+            expr_mentions_var(target, var) || expr_mentions_var(value, var)
+        }
+        Atomic(inner) | Refine(inner) => expr_mentions_var(inner, var),
+        UnitLit { value, .. } => expr_mentions_var(value, var),
+        Annot { expr: e, .. } => expr_mentions_var(e, var),
+        Serve { handlers, .. } => {
+            handlers.iter().any(|h| expr_mentions_var(&h.body, var))
+        }
+    }
 }
 
 fn compute_free_vars(expr: &ast::Expr) -> HashSet<String> {

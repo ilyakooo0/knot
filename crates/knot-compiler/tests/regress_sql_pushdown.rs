@@ -413,3 +413,232 @@ main = do
     // 5 % 2 == 1 (true), 1 % 2 == 1 (true) → 2.
     assert!(stdout.contains("q: 2"), "got: {stdout}");
 }
+
+// ── Stale source_var_binds invalidation ───────────────────────────
+// A variable bound from `xs <- *source` must not be SQL-pushed-down to a
+// fresh table query once (a) the table has been written, or (b) the
+// variable has been rebound to something else.
+
+#[test]
+fn count_of_bound_var_ignores_later_write() {
+    let (stdout, stderr, ok) = compile_and_run(
+        "stale_bind_write",
+        r#"type Item = {n: Int}
+*items : [Item]
+
+main = do
+  replace *items = []
+  xs <- *items
+  *items = union xs [{n: 5}]
+  let c = count xs
+  println (show c)
+"#,
+    );
+    assert!(ok, "program failed: {stderr}");
+    // xs was bound before the write — count xs must be 0, not a fresh
+    // COUNT(*) over the post-write table (which would be 1).
+    assert!(stdout.contains("\"0\""), "got: {stdout}");
+}
+
+#[test]
+fn count_of_rebound_var_uses_rebound_value() {
+    let (stdout, stderr, ok) = compile_and_run(
+        "stale_bind_rebind",
+        r#"type Item = {n: Int}
+*items : [Item]
+
+main = do
+  replace *items = [{n: 1}, {n: 2}, {n: 3}]
+  xs <- *items
+  let xs = filter (\x -> x.n > 2) xs
+  let c = count xs
+  println (show c)
+"#,
+    );
+    assert!(ok, "program failed: {stderr}");
+    // The let rebinds xs to the filtered relation — count must be 1,
+    // not COUNT(*) over the whole table (3).
+    assert!(stdout.contains("\"1\""), "got: {stdout}");
+}
+
+#[test]
+fn write_inside_atomic_invalidates_outer_binding() {
+    let (stdout, stderr, ok) = compile_and_run(
+        "stale_bind_atomic",
+        r#"type Item = {n: Int}
+*items : [Item]
+
+main = do
+  replace *items = []
+  xs <- *items
+  atomic do
+    cur <- *items
+    *items = union cur [{n: 9}]
+  let c = count xs
+  println (show c)
+"#,
+    );
+    assert!(ok, "program failed: {stderr}");
+    // The write happened in a nested (atomic) scope — the outer xs
+    // binding is still pre-write, so count xs must be 0.
+    assert!(stdout.contains("\"0\""), "got: {stdout}");
+}
+
+#[test]
+fn write_via_user_function_invalidates_binding() {
+    let (stdout, stderr, ok) = compile_and_run(
+        "stale_bind_write_fn",
+        r#"type Item = {n: Int}
+*items : [Item]
+
+addItem = \x -> replace *items = [{n: x}]
+
+main = do
+  replace *items = []
+  xs <- *items
+  _ <- addItem 7
+  let c = count xs
+  println (show c)
+"#,
+    );
+    assert!(ok, "program failed: {stderr}");
+    // addItem writes *items behind a function call — xs is stale, so
+    // count xs must be 0, not 1.
+    assert!(stdout.contains("\"0\""), "got: {stdout}");
+}
+
+// ── Beta-reduction must not skip substitution inside case bodies ──
+
+#[test]
+fn lambda_param_inside_case_under_set_matcher() {
+    let (stdout, stderr, ok) = compile_and_run(
+        "subst_case_param",
+        r#"type Item = {n: Int}
+*items : [Item]
+
+main = do
+  replace *items = []
+  xs <- *items
+  let addRows = \flag -> union xs (case flag of
+    true -> [{n: 1}]
+    _ -> [{n: 2}])
+  *items = addRows true
+  ys <- *items
+  println (show ys)
+"#,
+    );
+    // Previously an ICE: substitute_inner returned `case flag of ...`
+    // UNCHANGED during beta-reduction, so match_union_append accepted a
+    // broken AST and codegen panicked with "undefined variable 'flag'".
+    assert!(ok, "program failed: {stderr}");
+    assert!(stdout.contains("[{n: 1}]"), "got: {stdout}");
+}
+
+// ── groupBy computed keys must be a compile-time error ────────────
+
+/// Compile `source` expecting failure; returns the compiler's stderr.
+fn compile_expect_error(test_name: &str, source: &str) -> String {
+    let dir = std::env::temp_dir().join(format!(
+        "knot_regress_{}_{}",
+        test_name,
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let src_path = dir.join("prog.knot");
+    fs::write(&src_path, source).unwrap();
+
+    let knot = env!("CARGO_BIN_EXE_knot");
+    let out = Command::new(knot)
+        .arg("build")
+        .arg(&src_path)
+        .current_dir(&dir)
+        .output()
+        .expect("failed to spawn knot compiler");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        !out.status.success(),
+        "knot build unexpectedly succeeded for {test_name}:\nstderr: {stderr}"
+    );
+    stderr
+}
+
+#[test]
+fn group_by_computed_key_is_compile_error() {
+    let stderr = compile_expect_error(
+        "groupby_computed_key",
+        r#"type Todo = {owner: Text, title: Text}
+*todos : [Todo]
+
+main = do
+  replace *todos = [{owner: "a", title: "x"}]
+  r <- do
+    t <- *todos
+    groupBy {k: t.owner ++ "x"}
+    yield {k: t.owner, cnt: count t}
+  println (show r)
+"#,
+    );
+    // Previously compiled fine and aborted at runtime with
+    // "key column 'k' not found in schema".
+    assert!(
+        stderr.contains("plain field accesses"),
+        "expected groupBy key diagnostic, got: {stderr}"
+    );
+}
+
+#[test]
+fn group_by_plain_field_key_still_works() {
+    let (stdout, stderr, ok) = compile_and_run(
+        "groupby_plain_key",
+        r#"type Todo = {owner: Text, title: Text}
+*todos : [Todo]
+
+main = do
+  replace *todos = [{owner: "a", title: "x"}, {owner: "a", title: "y"}, {owner: "b", title: "z"}]
+  r <- do
+    t <- *todos
+    groupBy {k: t.owner}
+    yield {k: t.owner, cnt: count t}
+  println (show r)
+"#,
+    );
+    assert!(ok, "program failed: {stderr}");
+    assert!(stdout.contains("{cnt: 2, k: a}"), "got: {stdout}");
+    assert!(stdout.contains("{cnt: 1, k: b}"), "got: {stdout}");
+}
+
+// ── retry inside a relational sub-do within atomic ─────────────────
+
+#[test]
+fn retry_inside_relational_sub_do_completes() {
+    // `retry` fires from inside a relational do-block (which has its own
+    // arena frame open) nested in the atomic body. The direct jump to the
+    // retry block must pop that frame — previously it leaked one frame per
+    // retry iteration. Functionally: the program must still wake up on the
+    // writer's update and terminate with the new row.
+    let (stdout, stderr, ok) = compile_and_run(
+        "retry_sub_do",
+        r#"type Item = {n: Int}
+*items : [Item]
+
+writer = do
+  sleep 300
+  replace *items = [{n: 42}]
+
+main = do
+  replace *items = [{n: 1}]
+  fork writer
+  v <- atomic do
+    rows <- *items
+    r <- do
+      t <- rows
+      yield (if t.n == 42 then t else retry)
+    yield r
+  println ("got: " ++ show v)
+"#,
+    );
+    assert!(ok, "program failed: {stderr}");
+    assert!(stdout.contains("got: [{n: 42}]"), "got: {stdout}");
+}

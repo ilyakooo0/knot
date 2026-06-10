@@ -1,0 +1,159 @@
+//! End-to-end regression tests for runtime fixes:
+//!
+//! - `take`/`drop` on Text clamp negative counts (matching the Relation
+//!   versions) instead of panicking with a misleading "expected Int" message.
+//! - SQL-pushed `minOn`/`maxOn` on an Int column (stored as TEXT COLLATE
+//!   KNOT_INT) must parse the result back to an Int so subsequent arithmetic
+//!   works, instead of returning a Text value that panics on `+ 1`.
+//!
+//! Each test compiles a small Knot program with the real `knot` binary into
+//! its own scratch directory (so `knot.db` lands there) and asserts on the
+//! program's output / exit status.
+
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+
+struct Compiled {
+    dir: PathBuf,
+    exe: PathBuf,
+}
+
+impl Drop for Compiled {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Compile `source` into a fresh scratch directory and return paths.
+fn compile(test_name: &str, source: &str) -> Compiled {
+    let dir = std::env::temp_dir().join(format!(
+        "knot_regress_rt_{}_{}",
+        test_name,
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let src_path = dir.join("prog.knot");
+    fs::write(&src_path, source).unwrap();
+
+    let knot = env!("CARGO_BIN_EXE_knot");
+    let out = Command::new(knot)
+        .arg("build")
+        .arg(&src_path)
+        .current_dir(&dir)
+        .output()
+        .expect("failed to spawn knot compiler");
+    assert!(
+        out.status.success(),
+        "knot build failed for {test_name}:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let exe = dir.join("prog");
+    Compiled { dir, exe }
+}
+
+/// Compile and run; returns (stdout, stderr, success).
+fn compile_and_run(test_name: &str, source: &str) -> (String, String, bool) {
+    let c = compile(test_name, source);
+    let out = Command::new(&c.exe)
+        .current_dir(&c.dir)
+        .output()
+        .expect("failed to run compiled program");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.success(),
+    )
+}
+
+// ── Text take/drop: negative counts clamp instead of panicking ──────
+
+#[test]
+fn text_take_drop_negative_counts_clamp() {
+    let (stdout, stderr, ok) = compile_and_run(
+        "text_take_drop_neg",
+        r#"main = do
+  let n = 0 - 2
+  println ("take_neg: [" ++ take n "hello" ++ "]")
+  println ("drop_neg: [" ++ drop n "hello" ++ "]")
+  println ("take_pos: [" ++ take 2 "hello" ++ "]")
+  println ("drop_pos: [" ++ drop 2 "hello" ++ "]")
+  yield {}
+"#,
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("take_neg: []"),
+        "take with negative count should clamp to empty text:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("drop_neg: [hello]"),
+        "drop with negative count should be identity:\n{stdout}"
+    );
+    assert!(stdout.contains("take_pos: [he]"), "{stdout}");
+    assert!(stdout.contains("drop_pos: [llo]"), "{stdout}");
+}
+
+// ── SQL-pushed minOn/maxOn on Int column: result must be numeric ────
+
+#[test]
+fn min_max_on_int_column_supports_arithmetic() {
+    let (stdout, stderr, ok) = compile_and_run(
+        "minon_int_arith",
+        r#"type Employee = {name: Text, salary: Int}
+*employees : [Employee]
+
+main = do
+  replace *employees = [
+    {name: "a", salary: 50},
+    {name: "b", salary: 30},
+    {name: "c", salary: 70}
+  ]
+  employees <- *employees
+  let lo = minOn (\e -> e.salary) employees
+  let hi = maxOn (\e -> e.salary) employees
+  println ("lo_plus_one: " ++ show (lo + 1))
+  println ("hi_plus_one: " ++ show (hi + 1))
+  yield {}
+"#,
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("lo_plus_one: 31"),
+        "minOn on an Int column must yield an Int usable in arithmetic:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("hi_plus_one: 71"),
+        "maxOn on an Int column must yield an Int usable in arithmetic:\n{stdout}\n{stderr}"
+    );
+}
+
+// ── Pipe form: filter + minOn pushdown also parses back to Int ──────
+
+#[test]
+fn pipe_filter_min_on_int_column_supports_arithmetic() {
+    let (stdout, stderr, ok) = compile_and_run(
+        "pipe_minon_int_arith",
+        r#"type Employee = {name: Text, dept: Text, salary: Int}
+*employees : [Employee]
+
+main = do
+  replace *employees = [
+    {name: "a", dept: "Eng", salary: 50},
+    {name: "b", dept: "Eng", salary: 30},
+    {name: "c", dept: "Sales", salary: 10}
+  ]
+  employees <- *employees
+  let lo = employees |> filter (\e -> e.dept == "Eng") |> minOn (\e -> e.salary)
+  println ("eng_lo_plus_one: " ++ show (lo + 1))
+  yield {}
+"#,
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("eng_lo_plus_one: 31"),
+        "filtered minOn pushdown must yield an Int:\n{stdout}\n{stderr}"
+    );
+}

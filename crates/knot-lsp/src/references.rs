@@ -11,7 +11,8 @@ use crate::rename::{collect_name_uses_in_decl, file_imports_owner, module_define
 use crate::shared::scan_knot_files_in_roots;
 use crate::state::ServerState;
 use crate::utils::{
-    path_to_uri, position_to_offset, span_to_range, uri_to_path, word_at_position,
+    ident_lookup_offset, path_to_uri, position_to_offset, span_to_range, uri_to_path,
+    word_at_position,
 };
 
 /// Cap on the number of locations returned by a single `textDocument/references`
@@ -32,16 +33,21 @@ pub(crate) fn handle_references(
     let uri = &params.text_document_position.text_document.uri;
     let pos = params.text_document_position.position;
     let doc = state.documents.get(uri)?;
-    let offset = position_to_offset(&doc.source, pos);
+    let offset = ident_lookup_offset(&doc.source, position_to_offset(&doc.source, pos));
 
-    // Find the symbol name and definition span in current document
+    // Find the symbol name and definition span in current document. The
+    // definition resolution is strictly position-based: a recorded reference
+    // covering
+    // the cursor, or the cursor sitting on a definition's name token. A
+    // name-keyed fallback would misfire — on a record field (or any other
+    // token) that merely *shares its name* with a top-level symbol, it
+    // returned that unrelated symbol's references.
     let word = word_at_position(&doc.source, pos)?;
     let def_span = doc
         .references
         .iter()
         .find(|(usage, _)| usage.start <= offset && offset < usage.end)
         .map(|(_, def)| *def)
-        .or_else(|| doc.definitions.get(word).copied())
         .or_else(|| {
             doc.definitions.values().find(|span| span.start <= offset && offset < span.end).copied()
         })?;
@@ -79,10 +85,21 @@ pub(crate) fn handle_references(
     // - a local binding (lambda param, let, do-bind) → nowhere else; other
     //   files can't reference it, so cross-file matching is skipped.
     let current_path = uri_to_path(uri).and_then(|p| p.canonicalize().ok());
+    // Local definition takes priority over an import of the same name
+    // (mirrors `rename.rs::resolve_canonical_owner`): when this file both
+    // declares `parse` and imports a module exporting `parse`, references
+    // here resolve to the local declaration — merging the unrelated
+    // imported symbol's references would be wrong.
+    //
+    // When the resolved definition is a *local binding* (lambda param,
+    // do-bind, case pattern), it is invisible to other files, so cross-file
+    // matching is skipped entirely. Consulting `import_defs` by name here
+    // would misattribute a shadowing local binder to the unrelated imported
+    // symbol. (Usages of imported symbols never resolve a `def_span` at all
+    // — `doc.references` only covers module-local declarations — so there
+    // is no legitimate import-owner case on this path.)
     let owner_path: Option<PathBuf> =
-        if let Some((p, _)) = doc.import_defs.get(&symbol_name) {
-            Some(p.clone())
-        } else if doc.definitions.get(&symbol_name) == Some(&def_span) {
+        if doc.definitions.values().any(|s| *s == def_span) {
             current_path.clone()
         } else {
             None
@@ -136,7 +153,7 @@ pub(crate) fn handle_references(
                 // so walk the AST — scope-aware, skipping shadowed locals.
                 let mut sites = Vec::new();
                 for decl in &other_doc.module.decls {
-                    collect_name_uses_in_decl(decl, &symbol_name, &mut sites);
+                    collect_name_uses_in_decl(decl, &symbol_name, &other_doc.source, &mut sites);
                 }
                 for imp in &other_doc.module.imports {
                     if let Some(items) = &imp.items {
@@ -228,7 +245,7 @@ pub(crate) fn handle_references(
             {
                 let mut sites = Vec::new();
                 for decl in &module.decls {
-                    collect_name_uses_in_decl(decl, &symbol_name, &mut sites);
+                    collect_name_uses_in_decl(decl, &symbol_name, &source, &mut sites);
                 }
                 for imp in &module.imports {
                     if let Some(items) = &imp.items {

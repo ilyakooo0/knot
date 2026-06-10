@@ -56,15 +56,27 @@ fn lint_expr(
     match &expr.node {
         ExprKind::Set { target, value } => {
             if let ExprKind::SourceRef(name) = &target.node {
-                let schema = source_schemas.get(name).cloned();
-                if let Some(ref schema) = schema {
+                if let Some(schema) = source_schemas.get(name) {
                     lint_set_expr(name, schema, value, source_schemas, views, diags);
                 }
-                // Don't recurse into the value's do-block — lint_set_expr
-                // already provides more specific diagnostics for missed SQL
-                // optimizations. Recursing would double-report where clauses
-                // both as missed DELETE WHERE and as missed filter pushdown.
                 lint_expr(target, source_schemas, views, diags);
+                // Recurse into the value so sub-expressions referencing
+                // OTHER sources (e.g. `set *a = (*b |> filter f)`) are still
+                // linted. For a top-level do-block value, lint_set_expr
+                // already provides the more specific diagnostics for where
+                // clauses on binds from the target source itself (missed
+                // DELETE WHERE / UPDATE WHERE), so the generic where-pushdown
+                // lint skips that source to avoid double-reporting — but
+                // still covers binds from other sources and all nested
+                // sub-expressions.
+                if let ExprKind::Do(stmts) = &value.node {
+                    lint_do_block_skipping(stmts, Some(name), source_schemas, views, diags);
+                    for stmt in stmts {
+                        lint_stmt(stmt, source_schemas, views, diags);
+                    }
+                } else {
+                    lint_expr(value, source_schemas, views, diags);
+                }
             } else {
                 lint_expr(target, source_schemas, views, diags);
                 lint_expr(value, source_schemas, views, diags);
@@ -192,6 +204,21 @@ fn lint_do_block(
     views: &HashSet<&str>,
     diags: &mut Vec<Diagnostic>,
 ) {
+    lint_do_block_skipping(stmts, None, source_schemas, views, diags);
+}
+
+/// Like [`lint_do_block`], but binds from `skip_source` are not checked.
+/// Used for `set *src = do { ... }` values, where `lint_set_expr` already
+/// reports where-clause misses on the target source with more specific
+/// messages (DELETE WHERE / UPDATE WHERE) — re-checking them here would
+/// double-report.
+fn lint_do_block_skipping(
+    stmts: &[Stmt],
+    skip_source: Option<&str>,
+    source_schemas: &HashMap<String, String>,
+    views: &HashSet<&str>,
+    diags: &mut Vec<Diagnostic>,
+) {
     for (i, stmt) in stmts.iter().enumerate() {
         if let StmtKind::Bind { pat, expr } = &stmt.node {
             let bind_var = match &pat.node {
@@ -202,6 +229,9 @@ fn lint_do_block(
                 ExprKind::SourceRef(name) => name,
                 _ => continue,
             };
+            if skip_source == Some(source_name.as_str()) {
+                continue;
+            }
             if views.contains(source_name.as_str()) {
                 continue;
             }
@@ -657,12 +687,24 @@ fn try_compile_sql_expr(bind_var: &str, expr: &Expr, schema: &str) -> Option<()>
                     }
                     if name == "elem" {
                         try_sql_atom(bind_var, first_arg)?;
-                        // The list arg must be a literal list; each element must
-                        // be a sql-pushable atom.
+                        // Literal list: each element must be a sql-pushable atom
+                        // (codegen emits `IN (?, ?, ...)`).
                         if let ExprKind::List(elems) = &arg.node {
                             for e in elems {
                                 try_sql_atom(bind_var, e)?;
                             }
+                            return Some(());
+                        }
+                        // Dynamic haystack: codegen also pushes this down via
+                        // `IN (SELECT value FROM json_each(?))` as long as the
+                        // haystack doesn't reference the row variable (it is
+                        // evaluated outside the SQL row scope) and inference
+                        // proves the element type is a SQL scalar. The lint
+                        // has no type info, so mirror the syntactic half and
+                        // stay quiet otherwise — for an informational lint a
+                        // false negative beats warning about a query that
+                        // does get pushed down.
+                        if !expr_refs_var(arg, bind_var) {
                             return Some(());
                         }
                         return None;
@@ -1407,6 +1449,50 @@ mod tests {
     }
 
     #[test]
+    fn lint_on_set_value_pipe_over_other_source() {
+        // `set *a = (*b |> filter complex)` — the value's pipe chain over a
+        // DIFFERENT source must still be linted (previously the Set arm never
+        // recursed into the value).
+        let diags = lint(
+            "type T = {name: Text, score: Int}\n\
+             isGood = \\x -> x.score > 50\n\
+             *a : [T]\n\
+             *b : [T]\n\
+             sync = do\n\
+               *a = (*b |> filter (\\i -> isGood i))\n",
+        );
+        assert!(
+            !diags.is_empty(),
+            "expected diagnostic for non-SQL filter over other source in set value"
+        );
+        assert!(diags.iter().any(|d| d.message.contains("runtime")));
+    }
+
+    #[test]
+    fn lint_on_set_value_do_over_other_source() {
+        // A set value do-block binding from a DIFFERENT source gets the
+        // where-pushdown lint exactly once (no lint_set_expr overlap).
+        let diags = lint(
+            "type T = {name: Text, score: Int}\n\
+             isGood = \\x -> x > 50\n\
+             *a : [T]\n\
+             *b : [T]\n\
+             move = do\n\
+               *a = do\n\
+                 x <- *b\n\
+                 where isGood x.score\n\
+                 yield x\n",
+        );
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected exactly one diagnostic, got: {:?}",
+            diags
+        );
+        assert!(diags[0].message.contains("runtime"));
+    }
+
+    #[test]
     fn lint_on_pipe_filter_complex() {
         // Pipe filter with function call — can't be SQL WHERE.
         let diags = lint(
@@ -1461,8 +1547,10 @@ mod tests {
     }
 
     #[test]
-    fn lint_on_elem_non_literal_list_in_where() {
-        // elem against a non-literal list cannot be pushed to SQL IN.
+    fn no_lint_on_elem_non_literal_list_in_where() {
+        // elem against a dynamic haystack that doesn't reference the row
+        // variable IS pushed down by codegen via
+        // `IN (SELECT value FROM json_each(?))` — no warning.
         let diags = lint(
             "type T = {name: Text, status: Text}\n\
              *items : [T]\n\
@@ -1472,7 +1560,28 @@ mod tests {
                where elem i.status allowed\n\
                yield i\n",
         );
-        assert!(!diags.is_empty(), "expected diagnostic for non-literal list");
+        assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
+    }
+
+    #[test]
+    fn lint_on_elem_haystack_referencing_bind_var() {
+        // A dynamic haystack that references the row variable cannot be
+        // bound as a single SQL parameter — codegen falls back to runtime,
+        // so the lint warns.
+        let diags = lint(
+            "type T = {name: Text, status: Text}\n\
+             pick = \\x -> [x]\n\
+             *items : [T]\n\
+             main = do\n\
+               i <- *items\n\
+               where elem i.status (pick i.name)\n\
+               yield i\n",
+        );
+        assert!(
+            !diags.is_empty(),
+            "expected diagnostic for haystack referencing the bind var"
+        );
+        assert!(diags.iter().any(|d| d.message.contains("runtime")));
     }
 
     #[test]

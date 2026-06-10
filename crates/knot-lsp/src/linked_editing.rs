@@ -7,7 +7,9 @@ use lsp_types::*;
 use knot::ast::{self, DeclKind, Span};
 
 use crate::state::ServerState;
-use crate::utils::{find_word_in_source, position_to_offset, span_to_range, word_at_position};
+use crate::utils::{
+    find_word_in_source, position_to_offset, recurse_expr, span_to_range, word_at_position,
+};
 
 // ── Linked Editing Range ────────────────────────────────────────────
 
@@ -84,12 +86,10 @@ fn collect_field_name_spans(
                         ranges.push(span_to_range(span, source));
                     }
                 }
-                collect_field_name_spans(&f.value, field_name, source, ranges);
                 search_start = f.value.span.end;
             }
         }
         ast::ExprKind::RecordUpdate { base, fields } => {
-            collect_field_name_spans(base, field_name, source, ranges);
             let mut search_start = base.span.end;
             for f in fields {
                 if f.name == field_name {
@@ -99,73 +99,30 @@ fn collect_field_name_spans(
                         ranges.push(span_to_range(span, source));
                     }
                 }
-                collect_field_name_spans(&f.value, field_name, source, ranges);
                 search_start = f.value.span.end;
             }
         }
         ast::ExprKind::FieldAccess {
             expr: inner, field, ..
         } => {
-            if field == field_name {
-                let field_start = expr.span.end - field.len();
-                ranges.push(span_to_range(
-                    Span::new(field_start, expr.span.end),
-                    source,
-                ));
-            }
-            collect_field_name_spans(inner, field_name, source, ranges);
-        }
-        ast::ExprKind::App { func, arg } => {
-            collect_field_name_spans(func, field_name, source, ranges);
-            collect_field_name_spans(arg, field_name, source, ranges);
-        }
-        ast::ExprKind::Lambda { body, .. } => {
-            collect_field_name_spans(body, field_name, source, ranges);
-        }
-        ast::ExprKind::BinOp { lhs, rhs, .. } => {
-            collect_field_name_spans(lhs, field_name, source, ranges);
-            collect_field_name_spans(rhs, field_name, source, ranges);
-        }
-        ast::ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            collect_field_name_spans(cond, field_name, source, ranges);
-            collect_field_name_spans(then_branch, field_name, source, ranges);
-            collect_field_name_spans(else_branch, field_name, source, ranges);
-        }
-        ast::ExprKind::Case { scrutinee, arms } => {
-            collect_field_name_spans(scrutinee, field_name, source, ranges);
-            for arm in arms {
-                collect_field_name_spans(&arm.body, field_name, source, ranges);
-            }
-        }
-        ast::ExprKind::Do(stmts) => {
-            for stmt in stmts {
-                match &stmt.node {
-                    ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Let { expr, .. } => {
-                        collect_field_name_spans(expr, field_name, source, ranges);
-                    }
-                    ast::StmtKind::Expr(e) | ast::StmtKind::Where { cond: e } => {
-                        collect_field_name_spans(e, field_name, source, ranges);
-                    }
-                    ast::StmtKind::GroupBy { key } => {
-                        collect_field_name_spans(key, field_name, source, ranges);
-                    }
+            // The field token is the suffix of the access expression. Guard
+            // against underflow on malformed/stale spans, against the
+            // computed start overlapping the receiver expression, and
+            // against the slice not actually holding the field name —
+            // mirroring `rename.rs::field_sites_in_expr`.
+            if field == field_name && expr.span.end >= field.len() {
+                let start = expr.span.end - field.len();
+                if start >= inner.span.end
+                    && source.get(start..expr.span.end) == Some(field.as_str())
+                {
+                    ranges.push(span_to_range(Span::new(start, expr.span.end), source));
                 }
-            }
-        }
-        ast::ExprKind::Atomic(e) | ast::ExprKind::Refine(e) => collect_field_name_spans(e, field_name, source, ranges),
-        ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
-            collect_field_name_spans(target, field_name, source, ranges);
-            collect_field_name_spans(value, field_name, source, ranges);
-        }
-        ast::ExprKind::List(elems) => {
-            for e in elems {
-                collect_field_name_spans(e, field_name, source, ranges);
             }
         }
         _ => {}
     }
+    // Recurse into all sub-expressions via the shared walker — the manual
+    // recursion this replaces missed UnaryOp/Annot/UnitLit/Serve, leaving
+    // field occurrences inside them unlinked.
+    recurse_expr(expr, |e| collect_field_name_spans(e, field_name, source, ranges));
 }

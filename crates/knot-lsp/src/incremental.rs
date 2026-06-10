@@ -246,6 +246,10 @@ fn hash_decl_signature(decl: &ast::Decl) -> u64 {
             match ty {
                 Some(ts) => {
                     strip_spans(&format!("{:?}", ts.ty.node)).hash(&mut h);
+                    // Trait bounds are part of the externally-visible
+                    // signature: adding/removing `Display a =>` changes what
+                    // call sites must satisfy, so dependents need re-checking.
+                    strip_spans(&format!("{:?}", ts.constraints)).hash(&mut h);
                 }
                 None => {
                     // No declared type — body change can shift the inferred
@@ -262,6 +266,7 @@ fn hash_decl_signature(decl: &ast::Decl) -> u64 {
             match ty {
                 Some(ts) => {
                     strip_spans(&format!("{:?}", ts.ty.node)).hash(&mut h);
+                    strip_spans(&format!("{:?}", ts.constraints)).hash(&mut h);
                 }
                 None => {
                     "untyped".hash(&mut h);

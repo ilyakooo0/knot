@@ -277,7 +277,14 @@ impl<'a> DefResolver<'a> {
 
     fn define_pat(&mut self, pat: &ast::Pat) {
         match &pat.node {
-            ast::PatKind::Var(name) => self.define(name, pat.span),
+            ast::PatKind::Var(name) => {
+                self.define(name, pat.span);
+                // Record the binder token itself as a self-reference so
+                // position-based resolution (rename/references/highlight)
+                // finds the local symbol when the cursor sits on the binder
+                // — local binders have no entry in the top-level name map.
+                self.refs.push((pat.span, pat.span));
+            }
             ast::PatKind::Constructor { name, payload } => {
                 // The reference must cover only the constructor name, not the
                 // payload — rename replaces usage spans verbatim, so a
@@ -304,6 +311,9 @@ impl<'a> DefResolver<'a> {
                         )
                         .unwrap_or(pat.span);
                         self.define(&f.name, span);
+                        // Self-reference for the pun binder token (see
+                        // `PatKind::Var` above).
+                        self.refs.push((span, span));
                         search_start = span.end;
                     }
                 }

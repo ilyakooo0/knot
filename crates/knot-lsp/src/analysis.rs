@@ -159,6 +159,17 @@ pub fn analysis_worker(
                 .map(|(k, e)| (k.clone(), e.content_hash))
                 .collect();
 
+            // Snapshot the inference-cache keys present *before* this task
+            // runs. At merge time only keys absent from this snapshot — i.e.
+            // entries the worker actually computed fresh during THIS task —
+            // are written back. Blanket-merging the whole clone (the old
+            // `or_insert` loop) resurrected entries the main thread
+            // deliberately evicted while we were running (see
+            // `requeue_dependents_for_changed_decls`), handing re-queued
+            // dependents exact-key stale cache hits.
+            let inference_keys_before: std::collections::HashSet<(PathBuf, u64)> =
+                inf_cache_local.keys().cloned().collect();
+
             // Run the compiler pipeline behind a panic boundary. If any
             // stage (parser, inference, effect check, stratify, sql_lint)
             // panics on malformed input, recover and emit a synthetic
@@ -216,7 +227,17 @@ pub fn analysis_worker(
                 }
                 if let Ok(mut shared) = inference_cache.lock() {
                     for (k, v) in inf_cache_local.into_iter() {
-                        shared.entry(k).or_insert(v);
+                        // Only insert keys this task computed fresh. Keys
+                        // that were already in the pre-task clone must not
+                        // be re-inserted: the main thread may have evicted
+                        // them mid-flight to force re-inference of a
+                        // dependent, and resurrecting them would serve that
+                        // dependent a stale snapshot. (Entries are content-
+                        // addressed, so a fresh key can't conflict with a
+                        // newer shared value.)
+                        if !inference_keys_before.contains(&k) {
+                            shared.entry(k).or_insert(v);
+                        }
                     }
                 }
             }

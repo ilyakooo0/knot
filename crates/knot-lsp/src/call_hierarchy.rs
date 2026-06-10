@@ -36,10 +36,20 @@ pub(crate) fn handle_call_hierarchy_prepare(
         if name != word {
             continue;
         }
-        // Check if cursor is on or references this declaration
+        // Check if cursor is on or references this declaration. Reference
+        // target spans recorded by `defs.rs` are *name-token* spans, so
+        // compare against `doc.definitions[name]` (falling back to the decl
+        // span, which `defs.rs` itself uses when the name token can't be
+        // found) — comparing to the whole `decl.span` never matches, which
+        // made prepare fail from every call site.
+        let def_span = doc
+            .definitions
+            .get(name.as_str())
+            .copied()
+            .unwrap_or(decl.span);
         let on_def = decl.span.start <= offset && offset < decl.span.end;
         let on_ref = doc.references.iter().any(|(usage, def)| {
-            usage.start <= offset && offset < usage.end && *def == decl.span
+            usage.start <= offset && offset < usage.end && *def == def_span
         });
         if !on_def && !on_ref {
             continue;

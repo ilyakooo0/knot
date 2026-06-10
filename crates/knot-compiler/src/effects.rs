@@ -468,16 +468,12 @@ impl EffectChecker {
                 // The authoritative list is `builtins::ATOMIC_DISALLOWED_BUILTINS`
                 // (its IO members are already covered by the effect check above;
                 // `fork` is intentionally permitted, see builtins.rs).
+                // The walk is scope-aware: a lambda param, do-bind, let, or
+                // case binder named `race` shadows the builtin, so references
+                // under that binder are local values, not the primitive.
                 let mut disallowed: Vec<(String, Span)> = Vec::new();
-                walk_expr(inner, &mut |e| {
-                    if let ast::ExprKind::Var(name) = &e.node {
-                        if crate::builtins::ATOMIC_DISALLOWED_BUILTINS.contains(&name.as_str())
-                            && crate::builtins::CONCURRENCY_BUILTINS.contains(&name.as_str())
-                        {
-                            disallowed.push((name.clone(), e.span));
-                        }
-                    }
-                });
+                let mut shadowed: Vec<String> = Vec::new();
+                collect_unshadowed_disallowed(inner, &mut shadowed, &mut disallowed);
                 for (name, span) in disallowed {
                     self.diagnostics.push(
                         Diagnostic::error(format!(
@@ -875,6 +871,153 @@ fn walk_expr(expr: &ast::Expr, f: &mut impl FnMut(&ast::Expr)) {
     }
 }
 
+/// Collect every variable name bound by a pattern (for shadow tracking).
+fn collect_pat_binders(pat: &ast::Pat, out: &mut Vec<String>) {
+    match &pat.node {
+        ast::PatKind::Var(name) => out.push(name.clone()),
+        ast::PatKind::Wildcard | ast::PatKind::Lit(_) => {}
+        ast::PatKind::Constructor { payload, .. } => collect_pat_binders(payload, out),
+        ast::PatKind::Record(fields) => {
+            for f in fields {
+                match &f.pattern {
+                    Some(p) => collect_pat_binders(p, out),
+                    None => out.push(f.name.clone()),
+                }
+            }
+        }
+        ast::PatKind::List(pats) => {
+            for p in pats {
+                collect_pat_binders(p, out);
+            }
+        }
+        ast::PatKind::Cons { head, tail } => {
+            collect_pat_binders(head, out);
+            collect_pat_binders(tail, out);
+        }
+    }
+}
+
+/// Scope-aware version of the disallowed-concurrency-builtin scan used on
+/// atomic bodies: flags references to names in both
+/// `ATOMIC_DISALLOWED_BUILTINS` and `CONCURRENCY_BUILTINS`, but skips
+/// references that are shadowed by an enclosing lambda param, do-bind,
+/// let binding, or case pattern binder of the same name.
+fn collect_unshadowed_disallowed(
+    expr: &ast::Expr,
+    shadowed: &mut Vec<String>,
+    out: &mut Vec<(String, Span)>,
+) {
+    match &expr.node {
+        ast::ExprKind::Var(name) => {
+            if crate::builtins::ATOMIC_DISALLOWED_BUILTINS.contains(&name.as_str())
+                && crate::builtins::CONCURRENCY_BUILTINS.contains(&name.as_str())
+                && !shadowed.iter().any(|s| s == name)
+            {
+                out.push((name.clone(), expr.span));
+            }
+        }
+        ast::ExprKind::Lit(_)
+        | ast::ExprKind::Constructor(_)
+        | ast::ExprKind::SourceRef(_)
+        | ast::ExprKind::DerivedRef(_) => {}
+        ast::ExprKind::Record(fields) => {
+            for field in fields {
+                collect_unshadowed_disallowed(&field.value, shadowed, out);
+            }
+        }
+        ast::ExprKind::RecordUpdate { base, fields } => {
+            collect_unshadowed_disallowed(base, shadowed, out);
+            for field in fields {
+                collect_unshadowed_disallowed(&field.value, shadowed, out);
+            }
+        }
+        ast::ExprKind::FieldAccess { expr: inner, .. } => {
+            collect_unshadowed_disallowed(inner, shadowed, out);
+        }
+        ast::ExprKind::List(elems) => {
+            for elem in elems {
+                collect_unshadowed_disallowed(elem, shadowed, out);
+            }
+        }
+        ast::ExprKind::Lambda { params, body } => {
+            let mark = shadowed.len();
+            for p in params {
+                collect_pat_binders(p, shadowed);
+            }
+            collect_unshadowed_disallowed(body, shadowed, out);
+            shadowed.truncate(mark);
+        }
+        ast::ExprKind::App { func, arg } => {
+            collect_unshadowed_disallowed(func, shadowed, out);
+            collect_unshadowed_disallowed(arg, shadowed, out);
+        }
+        ast::ExprKind::BinOp { lhs, rhs, .. } => {
+            collect_unshadowed_disallowed(lhs, shadowed, out);
+            collect_unshadowed_disallowed(rhs, shadowed, out);
+        }
+        ast::ExprKind::UnaryOp { operand, .. } => {
+            collect_unshadowed_disallowed(operand, shadowed, out);
+        }
+        ast::ExprKind::If { cond, then_branch, else_branch } => {
+            collect_unshadowed_disallowed(cond, shadowed, out);
+            collect_unshadowed_disallowed(then_branch, shadowed, out);
+            collect_unshadowed_disallowed(else_branch, shadowed, out);
+        }
+        ast::ExprKind::Case { scrutinee, arms } => {
+            collect_unshadowed_disallowed(scrutinee, shadowed, out);
+            for arm in arms {
+                let mark = shadowed.len();
+                collect_pat_binders(&arm.pat, shadowed);
+                collect_unshadowed_disallowed(&arm.body, shadowed, out);
+                shadowed.truncate(mark);
+            }
+        }
+        ast::ExprKind::Do(stmts) => {
+            let mark = shadowed.len();
+            for stmt in stmts {
+                match &stmt.node {
+                    ast::StmtKind::Bind { pat, expr } => {
+                        // The bound expression is evaluated before the
+                        // binder comes into scope.
+                        collect_unshadowed_disallowed(expr, shadowed, out);
+                        collect_pat_binders(pat, shadowed);
+                    }
+                    ast::StmtKind::Let { pat, expr } => {
+                        collect_unshadowed_disallowed(expr, shadowed, out);
+                        collect_pat_binders(pat, shadowed);
+                    }
+                    ast::StmtKind::Where { cond } => {
+                        collect_unshadowed_disallowed(cond, shadowed, out);
+                    }
+                    ast::StmtKind::GroupBy { key } => {
+                        collect_unshadowed_disallowed(key, shadowed, out);
+                    }
+                    ast::StmtKind::Expr(expr) => {
+                        collect_unshadowed_disallowed(expr, shadowed, out);
+                    }
+                }
+            }
+            shadowed.truncate(mark);
+        }
+        ast::ExprKind::Set { target, value }
+        | ast::ExprKind::ReplaceSet { target, value } => {
+            collect_unshadowed_disallowed(target, shadowed, out);
+            collect_unshadowed_disallowed(value, shadowed, out);
+        }
+        ast::ExprKind::Atomic(inner) => collect_unshadowed_disallowed(inner, shadowed, out),
+        ast::ExprKind::UnitLit { value, .. } => collect_unshadowed_disallowed(value, shadowed, out),
+        ast::ExprKind::Annot { expr: inner, .. } => {
+            collect_unshadowed_disallowed(inner, shadowed, out);
+        }
+        ast::ExprKind::Refine(inner) => collect_unshadowed_disallowed(inner, shadowed, out),
+        ast::ExprKind::Serve { handlers, .. } => {
+            for h in handlers {
+                collect_unshadowed_disallowed(&h.body, shadowed, out);
+            }
+        }
+    }
+}
+
 /// Whether the expression syntactically contains any relation operation
 /// (source/derived reference or relation write) anywhere, including inside
 /// lambdas that effect inference may not see being called.
@@ -916,6 +1059,8 @@ fn head_name(expr: &ast::Expr) -> Option<&str> {
         ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::Annot { expr: value, .. } => {
             head_name(value)
         }
+        // Match the wrapper set unwrapped by is_lambda_arg/fun_body_effects.
+        ast::ExprKind::Refine(inner) => head_name(inner),
         _ => None,
     }
 }

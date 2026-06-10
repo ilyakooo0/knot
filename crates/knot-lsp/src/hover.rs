@@ -512,11 +512,15 @@ fn unit_aware_section(ty: &str) -> Option<String> {
     let unit = value.unit()?;
     let unit_str = unit.trim();
     // Distinguish Int from Float here — the runtime exposes two pairs of
-    // conversion helpers and the user has to pick the right one.
-    let is_float = match value {
-        crate::parsed_type::ParsedType::Named(name, _) => name == "Float",
-        _ => ty.contains("Float"),
-    };
+    // conversion helpers and the user has to pick the right one. `unit()`
+    // only returns `Some` for `UnitAnnotated`, so discriminate on its base
+    // type — a substring scan of the WHOLE type string would give Float
+    // advice for `g : Float -> Int<Ms>`.
+    let is_float = matches!(
+        value,
+        crate::parsed_type::ParsedType::UnitAnnotated { base, .. }
+            if matches!(&**base, crate::parsed_type::ParsedType::Named(n, _) if n == "Float")
+    );
     let (strip, with) = if is_float {
         ("stripFloatUnit", "withFloatUnit")
     } else {
@@ -636,13 +640,20 @@ fn format_schema_from_type_str(type_str: &str) -> String {
         let mut lines = Vec::new();
         lines.push("| Field | Type |".to_string());
         lines.push("|-------|------|".to_string());
-        // Parse field:type pairs from inner
+        // Parse field:type pairs from inner. The `>` of `->`/`=>` is an
+        // arrow, not a closing bracket — skipping it keeps the depth from
+        // going negative after a function-typed field (which would merge
+        // the remaining rows into one).
         let mut depth = 0i32;
         let mut current = String::new();
+        let mut prev = '\0';
         for ch in inner.chars() {
             match ch {
                 '{' | '[' | '(' | '<' => {
                     depth += 1;
+                    current.push(ch);
+                }
+                '>' if prev == '-' || prev == '=' => {
                     current.push(ch);
                 }
                 '}' | ']' | ')' | '>' => {
@@ -658,6 +669,7 @@ fn format_schema_from_type_str(type_str: &str) -> String {
                 '|' if depth == 0 => break,
                 _ => current.push(ch),
             }
+            prev = ch;
         }
         if let Some((name, ty)) = current.trim().split_once(':') {
             lines.push(format!("| `{}` | `{}` |", name.trim(), ty.trim()));
@@ -829,3 +841,45 @@ show2 = \x -> display x
     }
 }
 
+
+// Regression tests for the 2026-06 LSP bug-fix batch (hover group).
+#[cfg(test)]
+mod regress_fixes_tests {
+    use super::*;
+
+    /// Item 12: Int<unit> results must get Int conversion advice even when
+    /// the type string mentions Float elsewhere (e.g. in a parameter).
+    #[test]
+    fn unit_section_discriminates_on_annotated_component() {
+        let section = unit_aware_section("Float -> Int<Ms>").expect("unit section");
+        assert!(
+            section.contains("stripUnit") && section.contains("withUnit"),
+            "expected Int advice for Int<Ms> result, got: {section}"
+        );
+        assert!(
+            !section.contains("stripFloatUnit"),
+            "Float advice leaked from a Float parameter: {section}"
+        );
+
+        let f = unit_aware_section("Int -> Float<M>").expect("unit section");
+        assert!(
+            f.contains("stripFloatUnit") && f.contains("withFloatUnit"),
+            "expected Float advice for Float<M> result, got: {f}"
+        );
+    }
+
+    /// Item 17: the schema field splitter must not treat the `>` of `->` as
+    /// a closing bracket (function-typed fields would merge later rows).
+    #[test]
+    fn schema_table_survives_function_typed_fields() {
+        let table = format_schema_from_type_str("{f: Int -> Text, age: Int}");
+        assert!(
+            table.contains("| `f` | `Int -> Text` |"),
+            "missing function field row: {table}"
+        );
+        assert!(
+            table.contains("| `age` | `Int` |"),
+            "row after function-typed field was merged/lost: {table}"
+        );
+    }
+}

@@ -201,13 +201,17 @@ pub(crate) fn handle_completion(
 
     // General completion: keywords + snippets + declarations + builtins
 
-    // Context detection: if cursor is in a type annotation position (after `:` or `[`),
-    // only suggest types and type constructors
+    // Context detection: if the cursor is in a type annotation position,
+    // only suggest types and type constructors. The trigger characters
+    // (`:`, `[`, `->`) are each ambiguous in Knot — `\x -> `, case-arm
+    // `->`, record-literal `{name: `, and list literals `[` are all
+    // expression positions — so a token scanner over the current
+    // declaration decides (see `cursor_in_type_context` for the rules).
     let in_type_context = {
-        let before = &latest_source[..offset];
+        let before = &latest_source[..offset.min(latest_source.len())];
         let trimmed = before.trim_end();
-        trimmed.ends_with(':') || trimmed.ends_with('[')
-            || trimmed.ends_with("->")
+        (trimmed.ends_with(':') || trimmed.ends_with('[') || trimmed.ends_with("->"))
+            && cursor_in_type_context(before)
     };
 
     if in_type_context {
@@ -408,6 +412,7 @@ pub(crate) fn handle_completion(
         const MAX_AUTO_IMPORT_ITEMS: usize = 500;
 
         let source_path = uri_to_path(uri);
+        let current_canonical = source_path.as_ref().and_then(|p| p.canonicalize().ok());
         let existing_imports: HashSet<String> = doc.module.imports.iter().map(|i| i.path.clone()).collect();
         let local_names: HashSet<&str> = doc.definitions.keys().map(|s| s.as_str()).collect();
 
@@ -429,15 +434,19 @@ pub(crate) fn handle_completion(
                 Err(_) => continue,
             };
             // Skip current file
-            if source_path.as_ref().and_then(|p| p.canonicalize().ok()) == Some(canonical.clone()) {
+            if current_canonical.as_ref() == Some(&canonical) {
                 continue;
             }
-            // Compute the import path relative to the current file
-            let import_path = match source_path.as_ref().and_then(|p| p.parent()) {
-                Some(base) => {
-                    match canonical.strip_prefix(base) {
-                        Ok(rel) => rel.with_extension("").to_string_lossy().to_string(),
-                        Err(_) => continue,
+            // Compute the import path relative to the current file. Use the
+            // same `./`-prefixed form the parser stores for imports
+            // (`./helpers`, `../shared/x`) — a bare `helpers` would never
+            // match `existing_imports` (so already-imported files keep being
+            // offered) and produces a parse error when accepted.
+            let import_path = match current_canonical.as_ref() {
+                Some(cur) => {
+                    match crate::code_action::relative_import_path(cur, &canonical) {
+                        Some(rel) => rel,
+                        None => continue,
                     }
                 }
                 None => continue,
@@ -979,7 +988,21 @@ fn type_matches_monad(ty: &str, monad: &MonadKind) -> bool {
 fn monad_head_matches(t: &str, monad: &MonadKind) -> bool {
     match monad {
         MonadKind::Relation => {
-            t.starts_with('[') || t.contains(" [") || t.contains("IO ")
+            // A relation-monad value is a list `[T]` or an IO-wrapped list
+            // (relation reads are typed `IO {} [T]`). Inspect the parsed
+            // head — substring scans over the full type string would rank
+            // functions that merely *take* IO/list parameters as matches.
+            if t.starts_with('[') {
+                return true;
+            }
+            if t.starts_with("IO") {
+                let parsed = crate::parsed_type::ParsedType::parse(t);
+                return matches!(
+                    parsed.strip_io(),
+                    crate::parsed_type::ParsedType::Relation(_)
+                );
+            }
+            false
         }
         MonadKind::IO => t.starts_with("IO ") || t.starts_with("IO{") || t == "IO",
         MonadKind::Adt(name) => {
@@ -991,6 +1014,148 @@ fn monad_head_matches(t: &str, monad: &MonadKind) -> bool {
             prefix_eq || prefix_app
         }
     }
+}
+
+/// Decide whether a cursor placed immediately after `before` sits in a *type*
+/// position. Scans the current top-level declaration (from the last line that
+/// starts at column 0) with a small state machine. Rules implemented:
+///
+/// - `:` enters type position when it is an annotation colon — at the top
+///   level of a declaration (`name : …`), inside parens/brackets (postfix
+///   annotation `(x : Int)`), or inside a record TYPE / constructor field
+///   block (a `{` that itself opened in type position). A `:` inside a
+///   record LITERAL (`p = {name: …}`, where the `{` opened in expression
+///   position) is the field VALUE position, not a type.
+/// - A plain `=` (not `==`/`=>`/`<=`/`>=`/`!=`) leaves type position — the
+///   value follows — except in `type X = …` / `data X = …` declarations
+///   where the RHS is type-level. The constraint arrow `=>` keeps the
+///   current position.
+/// - `\` starts a lambda: the next `->` is the lambda's arrow and leaves
+///   type position (the body is an expression). Any other `->` keeps the
+///   current position, so signature arrows stay type-level while a case
+///   arm's `->` (already expression-level after `of`) stays
+///   expression-level.
+/// - The expression keywords `case`/`of`/`if`/`then`/`else`/`do`/`let`/
+///   `yield`/`where` (refinement predicates and serve handlers are
+///   expressions) leave type position.
+/// - `(`/`[`/`{` push the current position and `)`/`]`/`}` restore it, so
+///   `[`/`{` contents inherit the opener's position (element type vs. list
+///   literal, record type vs. record literal).
+/// - String literals and `--` line comments are skipped.
+fn cursor_in_type_context(before: &str) -> bool {
+    // Start of the current top-level declaration: the last line whose first
+    // character is non-whitespace (Knot decls start at column 0).
+    let bytes_all = before.as_bytes();
+    let mut decl_start = 0;
+    let mut line_start = 0;
+    for (i, &c) in bytes_all.iter().enumerate() {
+        if c == b'\n' {
+            line_start = i + 1;
+        } else if i == line_start && c != b' ' && c != b'\t' && c != b'\r' {
+            decl_start = line_start;
+        }
+    }
+    let text = &before[decl_start..];
+    let head = text.trim_start();
+    // In `type`/`data` declarations the RHS of `=` is type-level.
+    let eq_introduces_type = head.starts_with("type ") || head.starts_with("data ");
+
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut ty = false; // current position is type-level?
+    let mut lambda_arrows = 0usize; // `\`s whose `->` hasn't been seen yet
+    let mut stack: Vec<(u8, bool)> = Vec::new(); // (bracket, ty at open)
+    let mut word_start: Option<usize> = None;
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if is_ident(c) {
+            if word_start.is_none() {
+                word_start = Some(i);
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(ws) = word_start.take() {
+            if matches!(
+                &text[ws..i],
+                "case" | "of" | "if" | "then" | "else" | "do" | "let" | "yield" | "where"
+            ) {
+                ty = false;
+            }
+        }
+        match c {
+            b'"' => {
+                // Skip string literal (with escapes).
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            b'-' if i + 1 < b.len() && b[i + 1] == b'>' => {
+                if lambda_arrows > 0 {
+                    lambda_arrows -= 1;
+                    ty = false;
+                }
+                i += 2;
+                continue;
+            }
+            b'-' if i + 1 < b.len() && b[i + 1] == b'-' => {
+                // Line comment: skip to end of line.
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'=' if i + 1 < b.len() && b[i + 1] == b'>' => {
+                // Constraint arrow: stay in the current position.
+                i += 2;
+                continue;
+            }
+            b'=' if i + 1 < b.len() && b[i + 1] == b'=' => {
+                i += 2;
+                continue;
+            }
+            b'<' if i + 1 < b.len() && (b[i + 1] == b'=' || b[i + 1] == b'-') => {
+                // `<=` comparison / `<-` do-bind.
+                i += 2;
+                continue;
+            }
+            b'>' if i + 1 < b.len() && b[i + 1] == b'=' => {
+                i += 2;
+                continue;
+            }
+            b'!' if i + 1 < b.len() && b[i + 1] == b'=' => {
+                i += 2;
+                continue;
+            }
+            b'=' => {
+                ty = eq_introduces_type;
+                lambda_arrows = 0;
+            }
+            b'\\' => {
+                lambda_arrows += 1;
+                ty = false;
+            }
+            b'(' | b'[' | b'{' => stack.push((c, ty)),
+            b')' | b']' | b'}' => ty = stack.pop().map(|(_, t)| t).unwrap_or(false),
+            b':' => {
+                ty = match stack.last() {
+                    // Inside a record: type only when the record itself is
+                    // a record type (constructor fields, annotations).
+                    Some((b'{', opened_in_ty)) => *opened_in_ty,
+                    // Top level, parens, lists: annotation colon.
+                    _ => true,
+                };
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    ty
 }
 
 /// Return the bare identifier immediately preceding the dot at `dot_pos`, if
@@ -1482,13 +1647,24 @@ fn arrow_arity(ty: &str) -> usize {
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'(' | b'[' | b'{' | b'<' => depth += 1,
-            b')' | b']' | b'}' | b'>' => depth -= 1,
-            b'-' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'>' => {
-                count += 1;
+            // Skip `->` at ANY depth (counting only depth-0 ones) — the `>`
+            // of a nested arrow must never reach the bracket logic below, or
+            // it would decrement depth and corrupt the count (e.g.
+            // `(a -> Bool) -> [a] -> [a]` would compute arity 0).
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'>' => {
+                if depth == 0 {
+                    count += 1;
+                }
                 i += 2;
                 continue;
             }
+            // Same for the constraint arrow `=>` (`Ord a => a -> a -> a`).
+            b'=' if i + 1 < bytes.len() && bytes[i + 1] == b'>' => {
+                i += 2;
+                continue;
+            }
+            b'(' | b'[' | b'{' | b'<' => depth += 1,
+            b')' | b']' | b'}' | b'>' => depth -= 1,
             _ => {}
         }
         i += 1;
@@ -1829,5 +2005,65 @@ main = atomic do
             !labels.contains(&"println".to_string()),
             "println leaked into atomic-context completion; labels: {labels:?}"
         );
+    }
+}
+
+// Regression tests for the 2026-06 LSP bug-fix batch (completion group).
+#[cfg(test)]
+mod regress_fixes_tests {
+    use super::*;
+
+    /// Item 8: `->` must be skipped at any depth so its `>` never reaches
+    /// the bracket-depth logic.
+    #[test]
+    fn arrow_arity_handles_parenthesized_function_params() {
+        assert_eq!(arrow_arity("(a -> Bool) -> [a] -> [a]"), 2);
+        assert_eq!(arrow_arity("(a -> b) -> [a] -> [b]"), 2);
+        assert_eq!(arrow_arity("(b -> a -> b) -> b -> [a] -> b"), 3);
+        assert_eq!(arrow_arity("Int -> Text"), 1);
+        assert_eq!(arrow_arity("Int"), 0);
+        // Constraint arrows don't corrupt the count either.
+        assert_eq!(arrow_arity("Ord a => a -> a -> a"), 2);
+        // Units and effect rows unaffected.
+        assert_eq!(arrow_arity("Int<Ms> -> IO {clock} {}"), 1);
+    }
+
+    /// Item 9: type-context detection must not fire after lambda arrows,
+    /// case-arm arrows, record-literal field colons, or list literals.
+    #[test]
+    fn type_context_rules() {
+        // Type positions.
+        assert!(cursor_in_type_context("f : "));
+        assert!(cursor_in_type_context("f : Int -> "));
+        assert!(cursor_in_type_context("f : ["));
+        assert!(cursor_in_type_context("f : {name: "));
+        assert!(cursor_in_type_context("type X = "));
+        assert!(cursor_in_type_context("data Shape = Circle {radius: "));
+        assert!(cursor_in_type_context("g = (x : "));
+        assert!(cursor_in_type_context("f : Display a => a -> "));
+        assert!(cursor_in_type_context("source users : [{name: "));
+        // Expression positions.
+        assert!(!cursor_in_type_context("f = \\x -> "));
+        assert!(!cursor_in_type_context("f = case x of\n  Red {} -> "));
+        assert!(!cursor_in_type_context("p = {name: "));
+        assert!(!cursor_in_type_context("xs = ["));
+        assert!(!cursor_in_type_context("f : Int -> Int = \\x -> "));
+        // A signature arrow followed by a lambda body arrow: the lambda wins.
+        assert!(!cursor_in_type_context("nums = do\n  n <- *numbers\n  let y = "));
+    }
+
+    /// Item 10: relation-monad ranking must inspect the head of the type,
+    /// not substring-scan the whole string.
+    #[test]
+    fn monad_head_matches_relation_inspects_head() {
+        let rel = MonadKind::Relation;
+        assert!(monad_head_matches("[Int]", &rel));
+        assert!(monad_head_matches("IO {} [Int]", &rel));
+        assert!(monad_head_matches("IO {r *users} [{name: Text}]", &rel));
+        // Not relations: plain IO, and types merely mentioning IO / lists.
+        assert!(!monad_head_matches("IO {} Int", &rel));
+        assert!(!monad_head_matches("Int -> IO {} Int", &rel));
+        assert!(!monad_head_matches("Map Text [Int]", &rel));
+        assert!(!monad_head_matches("Text", &rel));
     }
 }

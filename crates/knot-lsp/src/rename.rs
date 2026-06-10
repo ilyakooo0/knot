@@ -12,8 +12,8 @@ use crate::defs::resolve_definitions;
 use crate::shared::scan_knot_files_in_roots;
 use crate::state::{builtins, DocumentState, ServerState, KEYWORDS};
 use crate::utils::{
-    find_word_in_source, path_to_uri, position_to_offset, recurse_expr, safe_slice,
-    span_to_range, uri_to_path, word_at_position,
+    find_word_in_source, ident_lookup_offset, path_to_uri, position_to_offset, recurse_expr,
+    safe_slice, span_to_range, uri_to_path, word_at_position,
 };
 
 // ── Rename ──────────────────────────────────────────────────────────
@@ -33,7 +33,7 @@ pub(crate) fn handle_prepare_rename(
         return None;
     }
     let pos = params.position;
-    let offset = position_to_offset(&doc.source, pos);
+    let offset = ident_lookup_offset(&doc.source, position_to_offset(&doc.source, pos));
 
     // Check if cursor is on a renameable symbol
     let word = word_at_position(&doc.source, pos)?;
@@ -65,7 +65,16 @@ pub(crate) fn handle_prepare_rename(
     // stdlib symbol like `println` would only edit local references and leave
     // the binding broken. We keep the rename if a user-declared symbol with
     // the same name shadows the builtin, since that's the canonical owner.
-    if builtins().any(|b| b == word) && !is_def && !is_imported {
+    // The shadowing exemption is by NAME (a top-level definition anywhere in
+    // the file) or by position (a resolved reference to a local/top-level
+    // def) — not by whether the cursor happens to sit on the definition
+    // token, otherwise F2 on a *usage* of a user symbol that shadows a
+    // builtin is refused even though `handle_rename` would succeed.
+    if builtins().any(|b| b == word)
+        && !is_ref
+        && !doc.definitions.contains_key(word)
+        && !is_imported
+    {
         return None;
     }
 
@@ -108,6 +117,13 @@ fn is_valid_identifier(name: &str) -> bool {
     !KEYWORDS.iter().any(|kw| *kw == name)
 }
 
+/// Whether `name` is uppercase-initial — i.e. lexes as a constructor/type
+/// name rather than a variable. Used to reject renames that would move an
+/// identifier across lexical namespaces.
+fn starts_uppercase(name: &str) -> bool {
+    name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+}
+
 pub(crate) fn handle_rename(
     state: &ServerState,
     params: &RenameParams,
@@ -126,7 +142,7 @@ pub(crate) fn handle_rename(
     {
         return None;
     }
-    let offset = position_to_offset(&doc.source, pos);
+    let offset = ident_lookup_offset(&doc.source, position_to_offset(&doc.source, pos));
     let new_name = &params.new_name;
     let old_name = word_at_position(&doc.source, pos)?.to_string();
 
@@ -134,6 +150,16 @@ pub(crate) fn handle_rename(
     // with digits. The LSP spec lets us return null when a rename would
     // produce an invalid result.
     if !is_valid_identifier(new_name) || old_name == *new_name {
+        return None;
+    }
+
+    // Reject case-class changes. Knot's lexer assigns identifiers to
+    // namespaces by their first character: uppercase-initial names lex as
+    // constructors/types, lowercase-initial (or `_`) as variables. Renaming
+    // `Circle` to `round` would re-lex every occurrence as a variable and
+    // break parsing, so refuse the rename up front (the LSP rename protocol
+    // has no error channel here beyond returning null).
+    if starts_uppercase(&old_name) != starts_uppercase(new_name) {
         return None;
     }
 
@@ -307,25 +333,195 @@ fn name_span_within(source: &str, decl_span: Span, name: &str) -> Option<Span> {
     None
 }
 
-/// Replacement text for a rename edit at `span`, expanding record puns. A
-/// bare identifier sitting directly between `{`/`,`/`|` and `,`/`}` is a pun
-/// — `{name}` in a pattern binds a variable *and* selects a field; in an
+/// Replacement text for a rename edit at `span`, expanding record puns.
+/// `{name}` in a pattern binds a variable *and* selects a field; in an
 /// expression it reads a variable *and* names a field. Renaming the variable
 /// must not change which field is matched/built, so the pun expands to
-/// `name: newName` instead of being rewritten in place.
-fn pun_aware_new_text(source: &str, span: Span, old_name: &str, new_name: &str) -> String {
-    let before = source
-        .get(..span.start)
-        .and_then(|s| s.trim_end().chars().next_back());
-    let after = source
-        .get(span.end..)
-        .and_then(|s| s.trim_start().chars().next());
-    let opens = matches!(before, Some('{') | Some(',') | Some('|'));
-    let closes = matches!(after, Some(',') | Some('}'));
-    if opens && closes {
+/// `name: newName` instead of being rewritten in place. Pun detection is
+/// AST-driven (is the span actually a record-literal/pattern pun token?) —
+/// a textual neighbor check misfires on list elements like `[a, x, b]`.
+fn pun_aware_new_text(
+    module: &Module,
+    source: &str,
+    span: Span,
+    old_name: &str,
+    new_name: &str,
+) -> String {
+    if span_is_record_pun(module, source, span) {
         format!("{old_name}: {new_name}")
     } else {
         new_name.to_string()
+    }
+}
+
+/// True when `span` is exactly the token of a punned record field — either
+/// an expression pun (`{name}` building `{name: name}`) or a pattern pun
+/// (`{name}` matching field `name` and binding a variable). Explicit
+/// `{name: name}` fields are NOT puns: their field-name token sits before
+/// the value, so the field-name search window is non-empty.
+fn span_is_record_pun(module: &Module, source: &str, span: Span) -> bool {
+    fn pun_in_pat(pat: &ast::Pat, source: &str, span: Span) -> bool {
+        match &pat.node {
+            ast::PatKind::Record(fields) => {
+                let mut search_start = pat.span.start;
+                for f in fields {
+                    match &f.pattern {
+                        Some(p) => {
+                            if pun_in_pat(p, source, span) {
+                                return true;
+                            }
+                            search_start = p.span.end;
+                        }
+                        None => {
+                            // Punned field: the token both names the field
+                            // and binds the variable.
+                            if let Some(s) = find_word_in_source(
+                                source,
+                                &f.name,
+                                search_start,
+                                pat.span.end,
+                            ) {
+                                if s == span {
+                                    return true;
+                                }
+                                search_start = s.end;
+                            }
+                        }
+                    }
+                }
+                false
+            }
+            ast::PatKind::Constructor { payload, .. } => pun_in_pat(payload, source, span),
+            ast::PatKind::List(pats) => pats.iter().any(|p| pun_in_pat(p, source, span)),
+            ast::PatKind::Cons { head, tail } => {
+                pun_in_pat(head, source, span) || pun_in_pat(tail, source, span)
+            }
+            _ => false,
+        }
+    }
+    fn pun_field_in_fields(
+        fields: &[ast::Field<ast::Expr>],
+        mut search_start: usize,
+        source: &str,
+        span: Span,
+    ) -> bool {
+        for f in fields {
+            // A pun field's value span IS the field-name token; an explicit
+            // field has its name token (in the window before the value).
+            let named = find_word_in_source(source, &f.name, search_start, f.value.span.start)
+                .is_some();
+            if !named
+                && f.value.span == span
+                && matches!(&f.value.node, ast::ExprKind::Var(n) if *n == f.name)
+            {
+                return true;
+            }
+            search_start = f.value.span.end;
+        }
+        false
+    }
+    fn pun_in_expr(expr: &ast::Expr, source: &str, span: Span, found: &mut bool) {
+        if *found {
+            return;
+        }
+        match &expr.node {
+            ast::ExprKind::Record(fields) => {
+                if pun_field_in_fields(fields, expr.span.start, source, span) {
+                    *found = true;
+                    return;
+                }
+            }
+            ast::ExprKind::RecordUpdate { base, fields } => {
+                if pun_field_in_fields(fields, base.span.end, source, span) {
+                    *found = true;
+                    return;
+                }
+            }
+            ast::ExprKind::Lambda { params, .. } => {
+                if params.iter().any(|p| pun_in_pat(p, source, span)) {
+                    *found = true;
+                    return;
+                }
+            }
+            ast::ExprKind::Case { arms, .. } => {
+                if arms.iter().any(|a| pun_in_pat(&a.pat, source, span)) {
+                    *found = true;
+                    return;
+                }
+            }
+            ast::ExprKind::Do(stmts) => {
+                for stmt in stmts {
+                    if let ast::StmtKind::Bind { pat, .. } | ast::StmtKind::Let { pat, .. } =
+                        &stmt.node
+                    {
+                        if pun_in_pat(pat, source, span) {
+                            *found = true;
+                            return;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        recurse_expr(expr, |e| pun_in_expr(e, source, span, found));
+    }
+
+    let mut found = false;
+    for decl in &module.decls {
+        if decl.span.start > span.start || span.end > decl.span.end {
+            continue;
+        }
+        match &decl.node {
+            DeclKind::Fun { body: Some(body), .. }
+            | DeclKind::View { body, .. }
+            | DeclKind::Derived { body, .. } => pun_in_expr(body, source, span, &mut found),
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { params, body, .. } = item {
+                        if params.iter().any(|p| pun_in_pat(p, source, span)) {
+                            found = true;
+                        }
+                        pun_in_expr(body, source, span, &mut found);
+                    }
+                }
+            }
+            DeclKind::Trait { items, .. } => {
+                for item in items {
+                    if let ast::TraitItem::Method {
+                        default_params,
+                        default_body,
+                        ..
+                    } = item
+                    {
+                        if default_params.iter().any(|p| pun_in_pat(p, source, span)) {
+                            found = true;
+                        }
+                        if let Some(body) = default_body {
+                            pun_in_expr(body, source, span, &mut found);
+                        }
+                    }
+                }
+            }
+            DeclKind::Migrate { using_fn, .. } => pun_in_expr(using_fn, source, span, &mut found),
+            _ => {}
+        }
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
+/// Narrow a reference span to its editable name token. `SourceRef` /
+/// `DerivedRef` expression spans include the leading `*`/`&` sigil (the
+/// parser builds them from the sigil token's start), and identifiers can
+/// never begin with those bytes — so a rename edit must skip the sigil or
+/// it gets deleted along with the old name. Reference *display* (find-
+/// references, highlight) keeps the full span; only edits are narrowed.
+fn edit_span(source: &str, span: Span) -> Span {
+    match source.as_bytes().get(span.start) {
+        Some(b'*') | Some(b'&') => Span::new(span.start + 1, span.end),
+        _ => span,
     }
 }
 
@@ -401,7 +597,7 @@ fn emit_edits_for_open_doc(
             .unwrap_or(owner.name_span);
         changes.entry(uri.clone()).or_default().push(TextEdit {
             range: span_to_range(name_span, &doc.source),
-            new_text: pun_aware_new_text(&doc.source, name_span, old_name, new_name),
+            new_text: pun_aware_new_text(&doc.module, &doc.source, name_span, old_name, new_name),
         });
         // Rename every local usage that resolves to the canonical decl.
         //
@@ -414,9 +610,12 @@ fn emit_edits_for_open_doc(
         // the old name and the rename breaks the code.
         for (usage_span, target_span) in &doc.references {
             if *target_span == owner.decl_span || *target_span == name_span {
+                // `SourceRef`/`DerivedRef` usage spans include the `*`/`&`
+                // sigil — the edit must only replace the name.
+                let span = edit_span(&doc.source, *usage_span);
                 changes.entry(uri.clone()).or_default().push(TextEdit {
-                    range: span_to_range(*usage_span, &doc.source),
-                    new_text: pun_aware_new_text(&doc.source, *usage_span, old_name, new_name),
+                    range: span_to_range(span, &doc.source),
+                    new_text: pun_aware_new_text(&doc.module, &doc.source, span, old_name, new_name),
                 });
             }
         }
@@ -432,7 +631,7 @@ fn emit_edits_for_open_doc(
         // ref/derived-ref site that names the symbol, and rewrite each.
         let mut sites: Vec<Span> = Vec::new();
         for decl in &doc.module.decls {
-            collect_name_uses_in_decl(decl, old_name, &mut sites);
+            collect_name_uses_in_decl(decl, old_name, &doc.source, &mut sites);
         }
         // Selective import items: `import foo {bar, baz}` — if the rename
         // targets `bar`, the import line itself needs updating. These sit
@@ -451,9 +650,10 @@ fn emit_edits_for_open_doc(
         sites.sort_by_key(|s| s.start);
         sites.dedup_by_key(|s| s.start);
         for span in sites {
+            let span = edit_span(&doc.source, span);
             changes.entry(uri.clone()).or_default().push(TextEdit {
                 range: span_to_range(span, &doc.source),
-                new_text: pun_aware_new_text(&doc.source, span, old_name, new_name),
+                new_text: pun_aware_new_text(&doc.module, &doc.source, span, old_name, new_name),
             });
         }
         for span in import_sites {
@@ -513,16 +713,24 @@ fn pat_binds_name(pat: &ast::Pat, name: &str) -> bool {
 }
 
 /// Walk `decl` and collect every span where `name` appears as a value-level
-/// reference (Var / Constructor / SourceRef / DerivedRef). This is the
-/// importer-file rename oracle: the inferencer doesn't track cross-file
-/// references in `doc.references`, so we walk the AST directly.
+/// reference (Var / Constructor / SourceRef / DerivedRef), a type-level
+/// reference (`Named` types in annotations, aliases, source/data decls,
+/// routes), or an impl method-name token. This is the importer-file
+/// rename oracle: the inferencer doesn't track cross-file references in
+/// `doc.references`, so we walk the AST directly — mirroring what
+/// `doc.references` covers for owner files.
 ///
 /// Scope-aware: a local binder (lambda param, do-bind, do-let, case pattern,
 /// `let … in`) with the same name shadows the imported symbol, so `Var`
 /// occurrences underneath that binder refer to the local and are skipped.
-/// Constructor / SourceRef / DerivedRef occurrences live in namespaces value
-/// binders can't shadow and are always collected.
-pub(crate) fn collect_name_uses_in_decl(decl: &ast::Decl, name: &str, out: &mut Vec<Span>) {
+/// Constructor / SourceRef / DerivedRef / type occurrences live in
+/// namespaces value binders can't shadow and are always collected.
+pub(crate) fn collect_name_uses_in_decl(
+    decl: &ast::Decl,
+    name: &str,
+    source: &str,
+    out: &mut Vec<Span>,
+) {
     // Collect constructor-pattern name tokens (`Ctor pat <- …`, `case … of
     // Ctor …`) — these reference the renamed symbol when it's a constructor.
     fn walk_pat_ctors(pat: &ast::Pat, name: &str, out: &mut Vec<Span>) {
@@ -554,7 +762,63 @@ pub(crate) fn collect_name_uses_in_decl(decl: &ast::Decl, name: &str, out: &mut 
             _ => {}
         }
     }
-    fn walk_expr(expr: &ast::Expr, name: &str, shadowed: bool, out: &mut Vec<Span>) {
+    // Type-level references: `Named` nodes matching `name`. The recorded
+    // span is just the name token (recovered via word search inside the
+    // type node's span), so edits don't clobber surrounding syntax.
+    fn walk_type(ty: &ast::Type, name: &str, source: &str, out: &mut Vec<Span>) {
+        match &ty.node {
+            ast::TypeKind::Named(n) => {
+                if n == name {
+                    if let Some(span) =
+                        find_word_in_source(source, name, ty.span.start, ty.span.end)
+                    {
+                        out.push(span);
+                    } else if safe_slice(source, ty.span) == name {
+                        out.push(ty.span);
+                    }
+                }
+            }
+            ast::TypeKind::Var(_) | ast::TypeKind::Hole => {}
+            ast::TypeKind::App { func, arg } => {
+                walk_type(func, name, source, out);
+                walk_type(arg, name, source, out);
+            }
+            ast::TypeKind::Record { fields, .. } => {
+                for f in fields {
+                    walk_type(&f.value, name, source, out);
+                }
+            }
+            ast::TypeKind::Relation(inner) => walk_type(inner, name, source, out),
+            ast::TypeKind::Function { param, result } => {
+                walk_type(param, name, source, out);
+                walk_type(result, name, source, out);
+            }
+            ast::TypeKind::Variant { constructors, .. } => {
+                for ctor in constructors {
+                    for f in &ctor.fields {
+                        walk_type(&f.value, name, source, out);
+                    }
+                }
+            }
+            ast::TypeKind::Effectful { ty: inner, .. }
+            | ast::TypeKind::IO { ty: inner, .. } => walk_type(inner, name, source, out),
+            ast::TypeKind::UnitAnnotated { base, .. } => walk_type(base, name, source, out),
+            ast::TypeKind::Refined { base, predicate } => {
+                walk_type(base, name, source, out);
+                walk_expr(predicate, name, source, false, out);
+            }
+            ast::TypeKind::Forall { ty: inner, .. } => walk_type(inner, name, source, out),
+        }
+    }
+    fn walk_scheme(scheme: &ast::TypeScheme, name: &str, source: &str, out: &mut Vec<Span>) {
+        walk_type(&scheme.ty, name, source, out);
+        for c in &scheme.constraints {
+            for arg in &c.args {
+                walk_type(arg, name, source, out);
+            }
+        }
+    }
+    fn walk_expr(expr: &ast::Expr, name: &str, source: &str, shadowed: bool, out: &mut Vec<Span>) {
         match &expr.node {
             ast::ExprKind::Var(n) => {
                 if !shadowed && n == name {
@@ -575,15 +839,15 @@ pub(crate) fn collect_name_uses_in_decl(decl: &ast::Decl, name: &str, out: &mut 
                     walk_pat_ctors(p, name, out);
                 }
                 let sh = shadowed || params.iter().any(|p| pat_binds_name(p, name));
-                walk_expr(body, name, sh, out);
+                walk_expr(body, name, source, sh, out);
                 return;
             }
             ast::ExprKind::Case { scrutinee, arms } => {
-                walk_expr(scrutinee, name, shadowed, out);
+                walk_expr(scrutinee, name, source, shadowed, out);
                 for arm in arms {
                     walk_pat_ctors(&arm.pat, name, out);
                     let sh = shadowed || pat_binds_name(&arm.pat, name);
-                    walk_expr(&arm.body, name, sh, out);
+                    walk_expr(&arm.body, name, source, sh, out);
                 }
                 return;
             }
@@ -595,57 +859,151 @@ pub(crate) fn collect_name_uses_in_decl(decl: &ast::Decl, name: &str, out: &mut 
                         | ast::StmtKind::Let { pat, expr } => {
                             // The RHS is evaluated before the pattern binds,
                             // so it sees the pre-bind shadow status.
-                            walk_expr(expr, name, sh, out);
+                            walk_expr(expr, name, source, sh, out);
                             walk_pat_ctors(pat, name, out);
                             if pat_binds_name(pat, name) {
                                 sh = true;
                             }
                         }
                         ast::StmtKind::Where { cond } | ast::StmtKind::Expr(cond) => {
-                            walk_expr(cond, name, sh, out);
+                            walk_expr(cond, name, source, sh, out);
                         }
-                        ast::StmtKind::GroupBy { key } => walk_expr(key, name, sh, out),
+                        ast::StmtKind::GroupBy { key } => walk_expr(key, name, source, sh, out),
                     }
+                }
+                return;
+            }
+            ast::ExprKind::Annot { expr: inner, ty } => {
+                // Type annotations reference type names — `(x : Shape)` must
+                // be rewritten when `Shape` is renamed.
+                walk_type(ty, name, source, out);
+                walk_expr(inner, name, source, shadowed, out);
+                return;
+            }
+            ast::ExprKind::Serve { api, api_span, handlers } => {
+                if api == name {
+                    out.push(*api_span);
+                }
+                for h in handlers {
+                    // Endpoint names reference route endpoint constructors.
+                    if h.endpoint == name {
+                        out.push(h.endpoint_span);
+                    }
+                    walk_expr(&h.body, name, source, shadowed, out);
                 }
                 return;
             }
             _ => {}
         }
-        recurse_expr(expr, |e| walk_expr(e, name, shadowed, out));
+        recurse_expr(expr, |e| walk_expr(e, name, source, shadowed, out));
     }
     match &decl.node {
-        DeclKind::Fun { body: Some(body), .. }
-        | DeclKind::View { body, .. }
-        | DeclKind::Derived { body, .. } => walk_expr(body, name, false, out),
-        DeclKind::Impl { items, .. } => {
-            for item in items {
-                if let ast::ImplItem::Method { params, body, .. } = item {
-                    for p in params {
-                        walk_pat_ctors(p, name, out);
-                    }
-                    let sh = params.iter().any(|p| pat_binds_name(p, name));
-                    walk_expr(body, name, sh, out);
+        DeclKind::Fun { ty, body, .. } => {
+            if let Some(scheme) = ty {
+                walk_scheme(scheme, name, source, out);
+            }
+            if let Some(body) = body {
+                walk_expr(body, name, source, false, out);
+            }
+        }
+        DeclKind::View { ty, body, .. } | DeclKind::Derived { ty, body, .. } => {
+            if let Some(scheme) = ty {
+                walk_scheme(scheme, name, source, out);
+            }
+            walk_expr(body, name, source, false, out);
+        }
+        DeclKind::Source { ty, .. } | DeclKind::TypeAlias { ty, .. } => {
+            walk_type(ty, name, source, out);
+        }
+        DeclKind::Data { constructors, .. } => {
+            for ctor in constructors {
+                for f in &ctor.fields {
+                    walk_type(&f.value, name, source, out);
                 }
             }
         }
-        DeclKind::Trait { items, .. } => {
+        DeclKind::Impl { args, constraints, items, .. } => {
+            for arg in args {
+                walk_type(arg, name, source, out);
+            }
+            for c in constraints {
+                for arg in &c.args {
+                    walk_type(arg, name, source, out);
+                }
+            }
+            for item in items {
+                match item {
+                    ast::ImplItem::Method { name: m, name_span, params, body } => {
+                        // The method-name token references the trait's
+                        // method declaration.
+                        if m == name {
+                            out.push(*name_span);
+                        }
+                        for p in params {
+                            walk_pat_ctors(p, name, out);
+                        }
+                        let sh = params.iter().any(|p| pat_binds_name(p, name));
+                        walk_expr(body, name, source, sh, out);
+                    }
+                    ast::ImplItem::AssociatedType { args, ty, .. } => {
+                        for a in args {
+                            walk_type(a, name, source, out);
+                        }
+                        walk_type(ty, name, source, out);
+                    }
+                }
+            }
+        }
+        DeclKind::Trait { items, supertraits, .. } => {
+            for c in supertraits {
+                for arg in &c.args {
+                    walk_type(arg, name, source, out);
+                }
+            }
             for item in items {
                 if let ast::TraitItem::Method {
-                    default_body: Some(body),
+                    ty,
+                    default_body,
                     default_params,
                     ..
                 } = item
                 {
-                    for p in default_params {
-                        walk_pat_ctors(p, name, out);
+                    walk_scheme(ty, name, source, out);
+                    if let Some(body) = default_body {
+                        for p in default_params {
+                            walk_pat_ctors(p, name, out);
+                        }
+                        let sh = default_params.iter().any(|p| pat_binds_name(p, name));
+                        walk_expr(body, name, source, sh, out);
                     }
-                    let sh = default_params.iter().any(|p| pat_binds_name(p, name));
-                    walk_expr(body, name, sh, out);
                 }
             }
         }
-        DeclKind::Migrate { using_fn, .. } => {
-            walk_expr(using_fn, name, false, out);
+        DeclKind::Migrate { from_ty, to_ty, using_fn, .. } => {
+            walk_type(from_ty, name, source, out);
+            walk_type(to_ty, name, source, out);
+            walk_expr(using_fn, name, source, false, out);
+        }
+        DeclKind::Route { entries, .. } => {
+            for entry in entries {
+                for f in entry
+                    .body_fields
+                    .iter()
+                    .chain(&entry.query_params)
+                    .chain(&entry.request_headers)
+                    .chain(&entry.response_headers)
+                {
+                    walk_type(&f.value, name, source, out);
+                }
+                if let Some(resp) = &entry.response_ty {
+                    walk_type(resp, name, source, out);
+                }
+                for seg in &entry.path {
+                    if let ast::PathSegment::Param { ty, .. } = seg {
+                        walk_type(ty, name, source, out);
+                    }
+                }
+            }
         }
         _ => {}
     }
@@ -733,13 +1091,15 @@ fn apply_owner_disk_edits(
         let name_span = name_span_within(source, *decl_span, old_name).unwrap_or(*decl_span);
         changes.entry(uri.clone()).or_default().push(TextEdit {
             range: span_to_range(name_span, source),
-            new_text: pun_aware_new_text(source, name_span, old_name, new_name),
+            new_text: pun_aware_new_text(module, source, name_span, old_name, new_name),
         });
         for (usage_span, target_span) in &refs {
             if target_span == decl_span {
+                // Skip the `*`/`&` sigil on relation references.
+                let span = edit_span(source, *usage_span);
                 changes.entry(uri.clone()).or_default().push(TextEdit {
-                    range: span_to_range(*usage_span, source),
-                    new_text: pun_aware_new_text(source, *usage_span, old_name, new_name),
+                    range: span_to_range(span, source),
+                    new_text: pun_aware_new_text(module, source, span, old_name, new_name),
                 });
             }
         }
@@ -763,7 +1123,7 @@ fn apply_importer_disk_edits(
     }
     let mut sites: Vec<Span> = Vec::new();
     for decl in &module.decls {
-        collect_name_uses_in_decl(decl, old_name, &mut sites);
+        collect_name_uses_in_decl(decl, old_name, source, &mut sites);
     }
     // Import items live inside braces but are not record puns — plain
     // replacement, no pun expansion.
@@ -780,9 +1140,10 @@ fn apply_importer_disk_edits(
     sites.sort_by_key(|s| s.start);
     sites.dedup_by_key(|s| s.start);
     for span in sites {
+        let span = edit_span(source, span);
         changes.entry(uri.clone()).or_default().push(TextEdit {
             range: span_to_range(span, source),
-            new_text: pun_aware_new_text(source, span, old_name, new_name),
+            new_text: pun_aware_new_text(module, source, span, old_name, new_name),
         });
     }
     for span in import_sites {
@@ -914,8 +1275,16 @@ fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::Decl, source: &str, f: 
         DeclKind::Data { constructors, .. } => {
             // Constructor fields appear sequentially in source order, so a
             // single running cursor across all constructors keeps each
-            // field-name search confined to its own slot.
-            let mut search_start = decl.span.start;
+            // field-name search confined to its own slot. The search starts
+            // after the `=` — the header (`data Pair a = …`) contains type
+            // parameter tokens that can collide with field names (renaming
+            // field `a` in `data Pair a = Pair {a: Int}` must not match the
+            // type parameter `a`).
+            let decl_text = safe_slice(source, decl.span);
+            let mut search_start = decl_text
+                .find('=')
+                .map(|i| decl.span.start + i + 1)
+                .unwrap_or(decl.span.start);
             for ctor in constructors {
                 for fld in &ctor.fields {
                     if let Some(span) = find_word_in_source(
@@ -1552,5 +1921,455 @@ mod tests {
         // Decl + one usage = 2 edits at minimum.
         assert!(edits.len() >= 2, "got: {edits:?}");
         assert!(edits.iter().all(|e| e.new_text == "doubled"));
+    }
+}
+
+/// Regression tests for the rename/references/highlight fix batch (sigil
+/// preservation, AST-driven pun detection, builtin-shadowing prepare,
+/// data-field search windows, local binder resolution, case-class guard,
+/// references origin discipline, linked-editing recursion).
+#[cfg(test)]
+mod regress_rename_fixes_tests {
+    use super::*;
+    use crate::test_support::TestWorkspace;
+    use crate::utils::offset_to_position;
+
+    fn rename_params(uri: &Uri, position: Position, new_name: &str) -> RenameParams {
+        RenameParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position,
+            },
+            new_name: new_name.to_string(),
+            work_done_progress_params: Default::default(),
+        }
+    }
+
+    fn prepare_params(uri: &Uri, position: Position) -> TextDocumentPositionParams {
+        TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            position,
+        }
+    }
+
+    /// Apply `TextEdit`s to `source`, back-to-front so offsets stay valid.
+    fn apply_edits(source: &str, edits: &[TextEdit]) -> String {
+        let mut spans: Vec<(usize, usize, &str)> = edits
+            .iter()
+            .map(|e| {
+                (
+                    position_to_offset(source, e.range.start),
+                    position_to_offset(source, e.range.end),
+                    e.new_text.as_str(),
+                )
+            })
+            .collect();
+        spans.sort_by_key(|(s, _, _)| std::cmp::Reverse(*s));
+        let mut out = source.to_string();
+        for (start, end, text) in spans {
+            out.replace_range(start..end, text);
+        }
+        out
+    }
+
+    // ── Finding 3: relation sigils survive rename ───────────────────
+
+    #[test]
+    fn rename_source_relation_keeps_star_sigil() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            "*todos : [{title: Text}]\nallTodos = *todos\n",
+        );
+        let doc = ws.doc(&uri);
+        // Cursor on the usage's name (after the sigil).
+        let off = doc.source.find("= *todos").expect("usage") + 3;
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "items"))
+            .expect("rename emits edit");
+        let changes = edit.changes.expect("changes present");
+        let edits = changes.get(&uri).expect("edits for main");
+        let out = apply_edits(&doc.source, edits);
+        assert_eq!(
+            out, "*items : [{title: Text}]\nallTodos = *items\n",
+            "the `*` sigil must survive the rename; edits: {edits:?}"
+        );
+    }
+
+    #[test]
+    fn rename_derived_relation_keeps_ampersand_sigil() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            "*todos : [{title: Text}]\n&open = *todos\nmain = &open\n",
+        );
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("&open\n").expect("usage") + 1;
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "pending"))
+            .expect("rename emits edit");
+        let changes = edit.changes.expect("changes present");
+        let edits = changes.get(&uri).expect("edits for main");
+        let out = apply_edits(&doc.source, edits);
+        assert_eq!(
+            out,
+            "*todos : [{title: Text}]\n&pending = *todos\nmain = &pending\n",
+            "the `&` sigil must survive the rename; edits: {edits:?}"
+        );
+    }
+
+    // ── Finding 4: pun detection must not misfire on list elements ──
+
+    #[test]
+    fn rename_list_element_is_not_treated_as_pun() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "f = \\x -> [1, x, 2]\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find(", x,").expect("list element") + 2;
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "y"))
+            .expect("rename emits edit");
+        let changes = edit.changes.expect("changes present");
+        let edits = changes.get(&uri).expect("edits for main");
+        let out = apply_edits(&doc.source, edits);
+        assert_eq!(
+            out, "f = \\y -> [1, y, 2]\n",
+            "a list element between commas is not a record pun; edits: {edits:?}"
+        );
+    }
+
+    #[test]
+    fn rename_real_expression_pun_still_expands() {
+        // The AST-driven check must keep the correct pun expansion.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "mk = \\name -> {name}\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("{name}").expect("expr pun") + 1;
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "label"))
+            .expect("rename emits edit");
+        let changes = edit.changes.expect("changes present");
+        let edits = changes.get(&uri).expect("edits for main");
+        let out = apply_edits(&doc.source, edits);
+        assert_eq!(out, "mk = \\label -> {name: label}\n");
+    }
+
+    #[test]
+    fn rename_explicit_same_named_field_value_is_not_a_pun() {
+        // `{name: name}` written out explicitly: the value var renames in
+        // place; expanding it again would corrupt the record.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "mk = \\name -> {name: name}\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("name}").expect("value var");
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "label"))
+            .expect("rename emits edit");
+        let changes = edit.changes.expect("changes present");
+        let edits = changes.get(&uri).expect("edits for main");
+        let out = apply_edits(&doc.source, edits);
+        assert_eq!(out, "mk = \\label -> {name: label}\n");
+    }
+
+    // ── Finding 5: prepare_rename on usages of builtin-shadowing symbols ──
+
+    #[test]
+    fn prepare_rename_accepts_usage_of_user_symbol_shadowing_builtin() {
+        // `count` is a stdlib builtin, but this file declares its own.
+        // F2 on a *usage* (not the definition token) must be accepted —
+        // handle_rename would succeed, so prepare must not refuse.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "count = \\x -> x\nmain = count 1\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("count 1").expect("usage");
+        let pos = offset_to_position(&doc.source, off);
+        let resp = handle_prepare_rename(&ws.state, &prepare_params(&uri, pos))
+            .expect("prepare accepts usage of shadowing user symbol");
+        match resp {
+            PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. } => {
+                assert_eq!(placeholder, "count");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prepare_rename_still_rejects_unshadowed_builtin_usage() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "main = count [1]\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("count").expect("builtin usage");
+        let pos = offset_to_position(&doc.source, off);
+        let resp = handle_prepare_rename(&ws.state, &prepare_params(&uri, pos));
+        assert!(resp.is_none(), "unshadowed builtin must be refused: {resp:?}");
+    }
+
+    // ── Finding 9: data-decl field rename skips the type-parameter header ──
+
+    #[test]
+    fn data_field_rename_does_not_hit_type_parameter() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            "data Pair a = Pair {a: Int, b: a}\nmk = Pair {a: 1, b: 2}\n",
+        );
+        let doc = ws.doc(&uri);
+        // Cursor on the FIELD `a` inside the constructor record.
+        let off = doc.source.find("{a: Int").expect("field a") + 1;
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "first"))
+            .expect("rename emits edit");
+        let changes = edit.changes.expect("changes present");
+        let edits = changes.get(&uri).expect("edits for main");
+        let out = apply_edits(&doc.source, edits);
+        assert_eq!(
+            out,
+            "data Pair a = Pair {first: Int, b: a}\nmk = Pair {first: 1, b: 2}\n",
+            "the type parameter `a` (header and field type) must be untouched; edits: {edits:?}"
+        );
+    }
+
+    // ── Finding 11: case-class changes are rejected ─────────────────
+
+    #[test]
+    fn rename_rejects_constructor_to_lowercase() {
+        let mut ws = TestWorkspace::new();
+        let src = "data Shape = Circle {radius: Int}\n\
+                   area = \\s -> case s of\n  Circle c -> c.radius\n  _ -> 0\n";
+        let uri = ws.open("main", src);
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("Circle").expect("ctor");
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "round"));
+        assert!(
+            edit.is_none(),
+            "lowercase-initial name for a constructor would re-lex as a variable: {edit:?}"
+        );
+    }
+
+    #[test]
+    fn rename_rejects_function_to_uppercase() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "double = \\x -> x * 2\nmain = double 1\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("double =").expect("def");
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "Double"));
+        assert!(
+            edit.is_none(),
+            "uppercase-initial name for a variable would re-lex as a constructor: {edit:?}"
+        );
+    }
+
+    // ── Finding 13: local binders resolve from their definition token ──
+
+    #[test]
+    fn rename_local_binder_from_its_definition_token() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "f = \\total -> total + 1\n");
+        let doc = ws.doc(&uri);
+        // Cursor ON the binder token itself.
+        let off = doc.source.find("\\total").expect("binder") + 1;
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "amount"))
+            .expect("rename resolves the binder from its definition token");
+        let changes = edit.changes.expect("changes present");
+        let edits = changes.get(&uri).expect("edits for main");
+        let out = apply_edits(&doc.source, edits);
+        assert_eq!(out, "f = \\amount -> amount + 1\n");
+    }
+
+    #[test]
+    fn references_resolve_from_local_binder_token() {
+        use crate::references::handle_references;
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "f = \\total -> total + 1\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("\\total").expect("binder") + 1;
+        let pos = offset_to_position(&doc.source, off);
+        let params = ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: pos,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: ReferenceContext {
+                include_declaration: false,
+            },
+        };
+        let locs = handle_references(&ws.state, &params)
+            .expect("references resolve from the binder token");
+        // At least the body usage `total + 1`.
+        let usage_off = doc.source.find("total + 1").expect("usage");
+        let usage_pos = offset_to_position(&doc.source, usage_off);
+        assert!(
+            locs.iter().any(|l| l.range.start == usage_pos),
+            "body usage must be reported; got: {locs:?}"
+        );
+    }
+
+    #[test]
+    fn document_highlight_resolves_from_local_binder_token() {
+        use crate::document_highlight::handle_document_highlight;
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "f = \\total -> total + 1\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("\\total").expect("binder") + 1;
+        let pos = offset_to_position(&doc.source, off);
+        let params = DocumentHighlightParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: pos,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let highlights = handle_document_highlight(&ws.state, &params)
+            .expect("highlight resolves from the binder token");
+        assert_eq!(
+            highlights.len(),
+            2,
+            "binder (write) + one usage (read); got: {highlights:?}"
+        );
+    }
+
+    // ── Finding 7: no name-keyed retargeting in references ──────────
+
+    #[test]
+    fn references_on_field_does_not_retarget_same_named_top_level() {
+        use crate::references::handle_references;
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "count = \\x -> x\ng = {count: 2}\n");
+        let doc = ws.doc(&uri);
+        // Cursor on the record FIELD named `count`.
+        let off = doc.source.find("{count").expect("field") + 1;
+        let pos = offset_to_position(&doc.source, off);
+        let params = ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: pos,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: ReferenceContext {
+                include_declaration: true,
+            },
+        };
+        let locs = handle_references(&ws.state, &params);
+        assert!(
+            locs.is_none(),
+            "a field token must not resolve to the unrelated top-level symbol: {locs:?}"
+        );
+    }
+
+    // ── Finding 2: caret immediately after an identifier ────────────
+
+    #[test]
+    fn prepare_rename_accepts_caret_after_identifier() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "double = \\x -> x * 2\nmain = double 1\n");
+        let doc = ws.doc(&uri);
+        // Caret right AFTER the last char of `double` at the call site.
+        let off = doc.source.find("double 1").expect("usage") + "double".len();
+        let pos = offset_to_position(&doc.source, off);
+        let resp = handle_prepare_rename(&ws.state, &prepare_params(&uri, pos))
+            .expect("caret-after-word must resolve the identifier");
+        match resp {
+            PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. } => {
+                assert_eq!(placeholder, "double");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    // ── Finding 12: linked editing recursion through UnaryOp ────────
+
+    #[test]
+    fn linked_editing_finds_fields_under_unary_op() {
+        use crate::linked_editing::handle_linked_editing_range;
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "g = \\p -> {amt: -p.amt}\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("p.amt").expect("access") + 2;
+        let pos = offset_to_position(&doc.source, off);
+        let params = LinkedEditingRangeParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: pos,
+            },
+            work_done_progress_params: Default::default(),
+        };
+        let resp = handle_linked_editing_range(&ws.state, &params)
+            .expect("field under unary negation must be linked");
+        assert_eq!(resp.ranges.len(), 2, "field name + access; got: {:?}", resp.ranges);
+    }
+
+    // ── Finding 6: local declaration outranks a same-named import ──
+
+    #[test]
+    fn references_prefer_local_definition_over_import() {
+        use crate::references::handle_references;
+        use crate::test_support::TempWorkspace;
+        let mut tw = TempWorkspace::new();
+        let owner_uri = tw.write_and_open("owner.knot", "parse = \\x -> x\nmain = parse 9\n");
+        let consumer_uri = tw.write_and_open(
+            "consumer.knot",
+            "import ./owner\n\nparse = \\y -> y\nrun = parse 1\n",
+        );
+        let consumer_doc = tw.workspace.doc(&consumer_uri);
+        let off = consumer_doc.source.find("parse 1").expect("local usage");
+        let pos = offset_to_position(&consumer_doc.source, off);
+        let params = ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: consumer_uri.clone(),
+                },
+                position: pos,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: ReferenceContext {
+                include_declaration: true,
+            },
+        };
+        let locs = handle_references(&tw.workspace.state, &params)
+            .expect("references found");
+        assert!(
+            locs.iter().all(|l| l.uri == consumer_uri),
+            "the local `parse` must not merge the imported module's references; got: {locs:?}"
+        );
+        let _ = owner_uri;
+    }
+
+    // ── Finding 10: importer-side rename rewrites type annotations ──
+
+    #[test]
+    fn rename_type_updates_importer_annotations() {
+        use crate::test_support::TempWorkspace;
+        let mut tw = TempWorkspace::new();
+        let owner_uri = tw.write_and_open("owner.knot", "type Shape = {radius: Int}\n");
+        let consumer_uri = tw.write_and_open(
+            "consumer.knot",
+            "import ./owner\n\nf : Shape -> Int\nf = \\s -> 1\n",
+        );
+        let owner_doc = tw.workspace.doc(&owner_uri);
+        let off = owner_doc.source.find("Shape").expect("type def");
+        let pos = offset_to_position(&owner_doc.source, off);
+        let edit = handle_rename(
+            &tw.workspace.state,
+            &rename_params(&owner_uri, pos, "Form"),
+        )
+        .expect("rename emits edit");
+        let changes = edit.changes.expect("changes present");
+        let consumer_doc = tw.workspace.doc(&consumer_uri);
+        let consumer_edits = changes
+            .get(&consumer_uri)
+            .expect("consumer annotation must be edited");
+        let out = apply_edits(&consumer_doc.source, consumer_edits);
+        assert_eq!(
+            out, "import ./owner\n\nf : Form -> Int\nf = \\s -> 1\n",
+            "the importer's type annotation must be rewritten; edits: {consumer_edits:?}"
+        );
     }
 }

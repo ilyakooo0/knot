@@ -1935,11 +1935,19 @@ impl Parser {
             let saved_pos = self.save();
             self.skip_newlines();
 
-            // If the next token is at column 0 and we're NOT inside delimiters,
-            // it's a new declaration — don't consume it as a binary operator.
-            if self.delimiter_depth == 0 && self.column_of(&self.span()) == 0 {
-                self.restore(saved_pos);
-                break;
+            // If the next token starts a new line and we're NOT inside
+            // delimiters, it only continues this expression as a binary
+            // operator when it is indented PAST the enclosing block's indent
+            // — the same rule parse_application uses for multi-line
+            // continuation. A token at column 0 is a new declaration; a token
+            // at (or before) the block indent starts a new block item (a do
+            // statement like `-1`, a case arm like `-1 -> ...`, etc.).
+            if self.delimiter_depth == 0 && self.pos != saved_pos.0 {
+                let col = self.column_of(&self.span());
+                if col == 0 || (self.block_indent != usize::MAX && col <= self.block_indent) {
+                    self.restore(saved_pos);
+                    break;
+                }
             }
 
             // If `*` is immediately adjacent to a lowercase identifier with no

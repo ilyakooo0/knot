@@ -89,7 +89,10 @@ pub(crate) fn handle_signature_help(
         })
         .collect();
 
-    let active = (active_param as u32).min(param_infos.len().saturating_sub(1) as u32);
+    // `param_infos` includes the trailing return type as its last entry, so
+    // clamp to len-2 — over-applied calls must highlight the last *parameter*,
+    // not the return type (mirrors hover's guard).
+    let active = (active_param as u32).min(param_infos.len().saturating_sub(2) as u32);
 
     // Function-level documentation: doc comment + effects
     let mut doc_parts: Vec<String> = Vec::new();

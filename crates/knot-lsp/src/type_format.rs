@@ -33,7 +33,31 @@ fn format_type_kind_d(ty: &TypeKind, depth: usize) -> String {
         TypeKind::Named(n) => n.clone(),
         TypeKind::Var(n) => n.clone(),
         TypeKind::App { func, arg } => {
-            format!("{} {}", format_type_kind_d(&func.node, d), format_type_kind_d(&arg.node, d))
+            // Parenthesize non-atomic components so nesting stays
+            // unambiguous: `Maybe (Maybe Int)` must not render as
+            // `Maybe Maybe Int`, nor `Maybe (Int -> Text)` as
+            // `Maybe Int -> Text` (mirrors the compiler's Ty::App display).
+            let f = format_type_kind_d(&func.node, d);
+            let f = if matches!(func.node, TypeKind::Function { .. } | TypeKind::Forall { .. }) {
+                format!("({f})")
+            } else {
+                f
+            };
+            let a = format_type_kind_d(&arg.node, d);
+            let a = if matches!(
+                arg.node,
+                TypeKind::App { .. }
+                    | TypeKind::Function { .. }
+                    | TypeKind::IO { .. }
+                    | TypeKind::Effectful { .. }
+                    | TypeKind::Refined { .. }
+                    | TypeKind::Forall { .. }
+            ) {
+                format!("({a})")
+            } else {
+                a
+            };
+            format!("{f} {a}")
         }
         TypeKind::Record { fields, rest } => {
             let fs: Vec<String> = fields
@@ -81,11 +105,17 @@ fn format_type_kind_d(ty: &TypeKind, depth: usize) -> String {
             format!("{{{}}} {}", effs.join(", "), format_type_kind_d(&ty.node, d))
         }
         TypeKind::IO { effects, rest, ty } => {
-            let mut parts: Vec<String> = effects.iter().map(format_effect).collect();
-            if !rest.is_empty() {
-                parts.push(format!("| {}", rest.join(" \\/ ")));
-            }
-            format!("IO {{{}}} {}", parts.join(", "), format_type_kind_d(&ty.node, d))
+            // Open rows render `{fs | r}` / `{| r}` — the row tail is
+            // separated by `|`, never preceded by a comma.
+            let effs: Vec<String> = effects.iter().map(format_effect).collect();
+            let row = if rest.is_empty() {
+                effs.join(", ")
+            } else if effs.is_empty() {
+                format!("| {}", rest.join(" \\/ "))
+            } else {
+                format!("{} | {}", effs.join(", "), rest.join(" \\/ "))
+            };
+            format!("IO {{{row}}} {}", format_type_kind_d(&ty.node, d))
         }
         TypeKind::Hole => "_".into(),
         TypeKind::UnitAnnotated { base, unit } => {
@@ -130,21 +160,16 @@ fn format_expr_brief_d(expr: &ast::ExprKind, depth: usize) -> String {
             }
         }
         ast::ExprKind::BinOp { op, lhs, rhs } => {
-            let op_str = match op {
-                ast::BinOp::Add => "+", ast::BinOp::Sub => "-",
-                ast::BinOp::Mul => "*", ast::BinOp::Div => "/", ast::BinOp::Mod => "%",
-                ast::BinOp::Eq => "==", ast::BinOp::Neq => "!=",
-                ast::BinOp::Lt => "<", ast::BinOp::Gt => ">",
-                ast::BinOp::Le => "<=", ast::BinOp::Ge => ">=",
-                ast::BinOp::And => "&&", ast::BinOp::Or => "||",
-                ast::BinOp::Concat => "++", ast::BinOp::Pipe => "|>",
-            };
-            format!(
-                "{} {} {}",
-                format_expr_brief_d(&lhs.node, d),
-                op_str,
-                format_expr_brief_d(&rhs.node, d)
-            )
+            let op_str = bin_op_str(*op);
+            // Precedence-aware parens so nested operations round-trip:
+            // `(x + 1) * 2 <= 10` must not display as `x + 1 * 2 <= 10`.
+            // A child needs parens when it binds looser than its parent
+            // (lower precedence), or equally on the right of a left-assoc
+            // operator (`a - (b - c)`).
+            let prec = bin_op_prec(*op);
+            let l = format_binop_operand(&lhs.node, d, prec, false);
+            let r = format_binop_operand(&rhs.node, d, prec, true);
+            format!("{l} {op_str} {r}")
         }
         ast::ExprKind::UnaryOp { op, operand } => {
             let op_str = match op {
@@ -157,6 +182,54 @@ fn format_expr_brief_d(expr: &ast::ExprKind, depth: usize) -> String {
             format!("{}.{}", format_expr_brief_d(&expr.node, d), field)
         }
         _ => "...".into(),
+    }
+}
+
+fn bin_op_str(op: ast::BinOp) -> &'static str {
+    match op {
+        ast::BinOp::Add => "+", ast::BinOp::Sub => "-",
+        ast::BinOp::Mul => "*", ast::BinOp::Div => "/", ast::BinOp::Mod => "%",
+        ast::BinOp::Eq => "==", ast::BinOp::Neq => "!=",
+        ast::BinOp::Lt => "<", ast::BinOp::Gt => ">",
+        ast::BinOp::Le => "<=", ast::BinOp::Ge => ">=",
+        ast::BinOp::And => "&&", ast::BinOp::Or => "||",
+        ast::BinOp::Concat => "++", ast::BinOp::Pipe => "|>",
+    }
+}
+
+/// Binding strength for display purposes (higher binds tighter).
+fn bin_op_prec(op: ast::BinOp) -> u8 {
+    match op {
+        ast::BinOp::Pipe => 1,
+        ast::BinOp::Or => 2,
+        ast::BinOp::And => 3,
+        ast::BinOp::Eq
+        | ast::BinOp::Neq
+        | ast::BinOp::Lt
+        | ast::BinOp::Gt
+        | ast::BinOp::Le
+        | ast::BinOp::Ge => 4,
+        ast::BinOp::Add | ast::BinOp::Sub | ast::BinOp::Concat => 5,
+        ast::BinOp::Mul | ast::BinOp::Div | ast::BinOp::Mod => 6,
+    }
+}
+
+/// Render a BinOp operand, adding parens when the child would re-associate
+/// differently on re-parse.
+fn format_binop_operand(expr: &ast::ExprKind, depth: usize, parent_prec: u8, is_rhs: bool) -> String {
+    let rendered = format_expr_brief_d(expr, depth);
+    let needs_parens = match expr {
+        ast::ExprKind::BinOp { op, .. } => {
+            let child_prec = bin_op_prec(*op);
+            child_prec < parent_prec || (child_prec == parent_prec && is_rhs)
+        }
+        ast::ExprKind::Lambda { .. } | ast::ExprKind::If { .. } => true,
+        _ => false,
+    };
+    if needs_parens {
+        format!("({rendered})")
+    } else {
+        rendered
     }
 }
 
@@ -230,5 +303,116 @@ pub fn format_effect(eff: &ast::Effect) -> String {
         ast::Effect::Fs => "fs".into(),
         ast::Effect::Clock => "clock".into(),
         ast::Effect::Random => "random".into(),
+    }
+}
+
+// Regression tests for the 2026-06 LSP bug-fix batch (type-format group).
+#[cfg(test)]
+mod regress_fixes_tests {
+    use super::*;
+    use knot::ast::{Span, Spanned};
+
+    fn t(k: TypeKind) -> ast::Type {
+        Spanned {
+            node: k,
+            span: Span::new(0, 0),
+        }
+    }
+
+    fn named(n: &str) -> ast::Type {
+        t(TypeKind::Named(n.to_string()))
+    }
+
+    fn app(f: ast::Type, a: ast::Type) -> TypeKind {
+        TypeKind::App {
+            func: Box::new(f),
+            arg: Box::new(a),
+        }
+    }
+
+    /// Item 14: non-atomic App arguments must be parenthesized.
+    #[test]
+    fn app_args_parenthesized() {
+        // Maybe (Maybe Int)
+        let inner = t(app(named("Maybe"), named("Int")));
+        let outer = app(named("Maybe"), inner);
+        assert_eq!(format_type_kind(&outer), "Maybe (Maybe Int)");
+
+        // Maybe (Int -> Text)
+        let f = t(TypeKind::Function {
+            param: Box::new(named("Int")),
+            result: Box::new(named("Text")),
+        });
+        let outer2 = app(named("Maybe"), f);
+        assert_eq!(format_type_kind(&outer2), "Maybe (Int -> Text)");
+
+        // Plain application unchanged.
+        let plain = app(named("Maybe"), named("Int"));
+        assert_eq!(format_type_kind(&plain), "Maybe Int");
+    }
+
+    /// Item 15: nested BinOps in refinement predicates keep their parens.
+    #[test]
+    fn refined_predicate_binop_parens_preserved() {
+        use knot::ast::{BinOp, ExprKind, Literal};
+        fn e(k: ExprKind) -> ast::Expr {
+            Spanned {
+                node: k,
+                span: Span::new(0, 0),
+            }
+        }
+        fn bin(op: BinOp, l: ast::Expr, r: ast::Expr) -> ast::Expr {
+            e(ExprKind::BinOp {
+                op,
+                lhs: Box::new(l),
+                rhs: Box::new(r),
+            })
+        }
+        let var_x = || e(ExprKind::Var("x".into()));
+        let int = |s: &str| e(ExprKind::Lit(Literal::Int(s.into())));
+        // (x + 1) * 2 <= 10
+        let expr = bin(
+            BinOp::Le,
+            bin(
+                BinOp::Mul,
+                bin(BinOp::Add, var_x(), int("1")),
+                int("2"),
+            ),
+            int("10"),
+        );
+        assert_eq!(format_expr_brief_d(&expr.node, 0), "(x + 1) * 2 <= 10");
+        // Right-associated subtraction keeps parens: a - (b - c).
+        let expr2 = bin(
+            BinOp::Sub,
+            var_x(),
+            bin(BinOp::Sub, int("1"), int("2")),
+        );
+        assert_eq!(format_expr_brief_d(&expr2.node, 0), "x - (1 - 2)");
+        // Flat same-precedence chains don't gain parens on the left.
+        let expr3 = bin(BinOp::Add, bin(BinOp::Add, var_x(), int("1")), int("2"));
+        assert_eq!(format_expr_brief_d(&expr3.node, 0), "x + 1 + 2");
+    }
+
+    /// Item 16: open IO effect rows render `{fs | r}` / `{| r}`.
+    #[test]
+    fn io_open_row_renders_without_stray_comma() {
+        let io = TypeKind::IO {
+            effects: vec![ast::Effect::Fs],
+            rest: vec!["r".to_string()],
+            ty: Box::new(named("Text")),
+        };
+        assert_eq!(format_type_kind(&io), "IO {fs | r} Text");
+        let io2 = TypeKind::IO {
+            effects: vec![],
+            rest: vec!["r".to_string()],
+            ty: Box::new(named("Text")),
+        };
+        assert_eq!(format_type_kind(&io2), "IO {| r} Text");
+        let io3 = TypeKind::IO {
+            effects: vec![ast::Effect::Fs],
+            rest: vec![],
+            ty: Box::new(named("Text")),
+        };
+        assert_eq!(format_type_kind(&io3), "IO {fs} Text");
     }
 }

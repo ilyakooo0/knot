@@ -247,9 +247,13 @@ impl<'a> TokenCollector<'a> {
                     modifiers,
                 });
             } else {
-                // Split multi-line tokens into per-line tokens
+                // Split multi-line tokens into per-line tokens. CRLF files
+                // leave a trailing '\r' on every non-final segment — strip it
+                // from the emitted token length (it's part of the line break,
+                // not a visible column), but keep it in the offset advance.
                 let mut offset = span.start;
-                for line in text.split('\n') {
+                for raw_line in text.split('\n') {
+                    let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
                     if !line.is_empty() {
                         self.tokens.push(RawToken {
                             start: offset,
@@ -258,7 +262,7 @@ impl<'a> TokenCollector<'a> {
                             modifiers,
                         });
                     }
-                    offset += line.len() + 1; // +1 for the '\n'
+                    offset += raw_line.len() + 1; // +1 for the '\n'
                 }
             }
         }
@@ -280,12 +284,29 @@ impl<'a> TokenCollector<'a> {
             DeclKind::Data {
                 name, constructors, ..
             } => {
-                if let Some(s) = find_word_in_source(self.source, name, decl.span.start, decl.span.end) {
+                let name_span =
+                    find_word_in_source(self.source, name, decl.span.start, decl.span.end);
+                if let Some(s) = name_span {
                     self.add(s, TOK_STRUCT, MOD_DECLARATION);
                 }
+                // Constructors appear after the `=`. Searching from the decl
+                // start would match the TYPE name first for self-named
+                // constructors (`data Person = Person {…}`), emitting an
+                // overlapping token on the type name and none on the actual
+                // constructor. Advance past each hit so a constructor name
+                // appearing in a previous constructor's field types doesn't
+                // steal a later constructor's token either.
+                let mut search_from = self
+                    .source
+                    .get(decl.span.start..decl.span.end.min(self.source.len()))
+                    .and_then(|t| t.find('='))
+                    .map(|p| decl.span.start + p + 1)
+                    .or_else(|| name_span.map(|s| s.end))
+                    .unwrap_or(decl.span.start);
                 for ctor in constructors {
-                    if let Some(s) = find_word_in_source(self.source, &ctor.name, decl.span.start, decl.span.end) {
+                    if let Some(s) = find_word_in_source(self.source, &ctor.name, search_from, decl.span.end) {
                         self.add(s, TOK_ENUM_MEMBER, MOD_DECLARATION);
+                        search_from = s.end;
                     }
                     for f in &ctor.fields {
                         self.visit_type(&f.value);
@@ -767,4 +788,56 @@ fn delta_encode_tokens(tokens: &[RawToken], source: &str) -> Vec<SemanticToken> 
     }
 
     result
+}
+
+// Regression tests for the 2026-06 LSP bug-fix batch (semantic tokens).
+#[cfg(test)]
+mod regress_fixes_tests {
+    use super::*;
+    use crate::test_support::TestWorkspace;
+
+    /// Item 18: for `data Person = Person {…}` the constructor token must
+    /// land on the SECOND `Person` (after the `=`), not overlap the type
+    /// name token.
+    #[test]
+    fn self_named_constructor_gets_its_own_token() {
+        let mut ws = TestWorkspace::new();
+        let src = "data Person = Person {name: Text}\n";
+        let uri = ws.open("main", src);
+        let doc = ws.doc(&uri);
+        let tokens = collect_tokens(doc, None);
+        let type_name_start = src.find("Person").unwrap();
+        let ctor_start = src.rfind("Person").unwrap();
+        assert_ne!(type_name_start, ctor_start);
+        let struct_tok = tokens
+            .iter()
+            .find(|t| t.token_type == crate::legend::TOK_STRUCT && t.start == type_name_start);
+        assert!(struct_tok.is_some(), "type-name token missing");
+        let ctor_tok = tokens
+            .iter()
+            .find(|t| t.token_type == crate::legend::TOK_ENUM_MEMBER);
+        let ctor_tok = ctor_tok.expect("constructor token missing");
+        assert_eq!(
+            ctor_tok.start, ctor_start,
+            "constructor token must sit on the constructor, not the type name"
+        );
+    }
+
+    /// Item 19: CRLF sources must not count the `\r` in per-line token
+    /// lengths when a multi-line token is split.
+    #[test]
+    fn multiline_token_split_strips_carriage_return() {
+        let mut tokens = Vec::new();
+        let source = "abc\r\ndef\r\n";
+        let mut collector = TokenCollector {
+            tokens: &mut tokens,
+            source,
+        };
+        collector.add(Span::new(0, 8), 0, 0); // "abc\r\ndef"
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].start, 0);
+        assert_eq!(tokens[0].length, 3, "CRLF \\r counted in token length");
+        assert_eq!(tokens[1].start, 5);
+        assert_eq!(tokens[1].length, 3);
+    }
 }

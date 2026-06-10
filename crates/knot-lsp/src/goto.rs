@@ -69,11 +69,17 @@ pub(crate) fn handle_goto_type_definition(
     let offset = position_to_offset(&doc.source, pos);
     let word = word_at_position(&doc.source, pos)?;
 
-    // Get the type string for the symbol at cursor
+    // Get the type string for the symbol at cursor. Multiple recorded spans
+    // can contain the offset (a binding inside a larger pattern, a lambda
+    // param inside its body span); iterating the HashMap and taking the
+    // first hit returns an arbitrary one (hash-order nondeterminism). Use
+    // the sorted vec and pick the *smallest* containing span — the
+    // innermost binding is what the cursor is actually on.
     let type_str = doc
-        .local_type_info
+        .local_type_info_sorted
         .iter()
-        .find(|(span, _)| span.start <= offset && offset < span.end)
+        .filter(|(span, _)| span.start <= offset && offset < span.end)
+        .min_by_key(|(span, _)| span.end - span.start)
         .map(|(_, ty)| ty.clone())
         .or_else(|| {
             doc.references

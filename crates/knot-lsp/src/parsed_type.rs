@@ -159,11 +159,15 @@ impl ParsedType {
             }
             ParsedType::Relation(t) => format!("[{}]", t.render()),
             ParsedType::Io { effects, rest, ty } => {
-                let mut parts: Vec<String> = effects.clone();
-                if let Some(r) = rest {
-                    parts.push(format!("| {r}"));
-                }
-                format!("IO {{{}}} {}", parts.join(", "), ty.render_atomic())
+                // Open rows render `{fs | r}` / `{| r}` — the row variable is
+                // separated by `|`, never preceded by a comma.
+                let row = match (effects.is_empty(), rest) {
+                    (true, None) => String::new(),
+                    (true, Some(r)) => format!("| {r}"),
+                    (false, None) => effects.join(", "),
+                    (false, Some(r)) => format!("{} | {r}", effects.join(", ")),
+                };
+                format!("IO {{{row}}} {}", ty.render_atomic())
             }
             ParsedType::UnitAnnotated { base, unit } => {
                 format!("{}<{unit}>", base.render_atomic())
@@ -218,15 +222,14 @@ impl<'a> Parser<'a> {
                 return Some(ParsedType::Forall(vars, Box::new(body)));
             }
         }
-        // Constraint prefix `Display a => T` — drop it for now (the LSP
-        // doesn't need to introspect constraints structurally yet).
-        let snapshot = self.pos;
-        if self.try_skip_constraints() {
+        // Constraint prefixes `Display a => Show a => T` — drop ALL of them
+        // (the LSP doesn't need to introspect constraints structurally yet).
+        // Multi-bound signatures chain `=>`, so loop until no constraint
+        // prefix remains; `try_skip_constraints` leaves `pos` untouched on
+        // failure.
+        while self.try_skip_constraints() {
             self.skip_ws();
-            // Successful constraint skip — parse the body.
-            return self.parse_function();
         }
-        self.pos = snapshot;
         self.parse_function()
     }
 
@@ -807,5 +810,45 @@ mod tests {
             }
             other => panic!("expected Variant, got {other:?}"),
         }
+    }
+}
+
+// Regression tests for the 2026-06 LSP bug-fix batch (type-rendering group).
+#[cfg(test)]
+mod regress_fixes_tests {
+    use super::*;
+
+    /// Item 11: ALL chained `=>` constraint prefixes must be stripped, not
+    /// just the first one.
+    #[test]
+    fn multiple_constraint_prefixes_dropped() {
+        let t = ParsedType::parse("Display a => Show a => a -> Text");
+        assert_eq!(t.arity(), 1, "got {t:?}");
+        match t.result() {
+            ParsedType::Named(n, _) => assert_eq!(n, "Text"),
+            other => panic!("expected Text result, got {other:?}"),
+        }
+        let t3 = ParsedType::parse("Eq a => Ord a => Show a => a -> a -> Bool");
+        assert_eq!(t3.arity(), 2, "got {t3:?}");
+    }
+
+    /// Item 16: open effect rows round-trip without a stray comma.
+    #[test]
+    fn open_effect_rows_render_without_stray_comma() {
+        assert_eq!(
+            ParsedType::parse("IO {fs | r} Text").render(),
+            "IO {fs | r} Text"
+        );
+        assert_eq!(
+            ParsedType::parse("IO {| r} Text").render(),
+            "IO {| r} Text"
+        );
+        assert_eq!(
+            ParsedType::parse("IO {fs, clock | r} Text").render(),
+            "IO {fs, clock | r} Text"
+        );
+        // Closed rows unchanged.
+        assert_eq!(ParsedType::parse("IO {fs} Text").render(), "IO {fs} Text");
+        assert_eq!(ParsedType::parse("IO {} Text").render(), "IO {} Text");
     }
 }

@@ -47,22 +47,32 @@ pub(crate) fn handle_code_lens(
     }
 
     for decl in &doc.module.decls {
-        match &decl.node {
-            DeclKind::Fun { .. }
-            | DeclKind::Source { .. }
-            | DeclKind::View { .. }
-            | DeclKind::Derived { .. }
-            | DeclKind::Data { .. }
-            | DeclKind::Trait { .. }
-            | DeclKind::Route { .. } => {}
+        let decl_name = match &decl.node {
+            DeclKind::Fun { name, .. }
+            | DeclKind::Source { name, .. }
+            | DeclKind::View { name, .. }
+            | DeclKind::Derived { name, .. }
+            | DeclKind::Data { name, .. }
+            | DeclKind::Trait { name, .. }
+            | DeclKind::Route { name, .. } => name.as_str(),
             _ => continue,
-        }
+        };
 
-        // Collect reference locations for this declaration
+        // Collect reference locations for this declaration. Reference target
+        // spans recorded by `defs.rs` are the declaration's *name-token*
+        // span (with the whole decl span only as a fallback when the name
+        // can't be located in source), so compare against the span stored in
+        // `doc.definitions` rather than `decl.span` — the latter never
+        // matches and would show "0 references" for everything.
+        let def_span = doc
+            .definitions
+            .get(decl_name)
+            .copied()
+            .unwrap_or(decl.span);
         let ref_locations: Vec<Location> = doc
             .references
             .iter()
-            .filter(|(_, def)| *def == decl.span)
+            .filter(|(_, def)| *def == def_span)
             .map(|(usage, _)| Location {
                 uri: uri.clone(),
                 range: span_to_range(*usage, &doc.source),

@@ -331,6 +331,12 @@ struct TraitMethodInfo {
 struct ImplEntry {
     type_name: String,
     func_id: FuncId,
+    /// True for intrinsic codegen impls registered by the compiler itself
+    /// (primitive Eq/Ord/Num/…, built-in []/IO HKT impls). These delegate to
+    /// the same runtime functions the operator fast paths call, so operators
+    /// only need to dispatch through the trait when a non-builtin (user or
+    /// prelude) impl exists.
+    is_builtin: bool,
 }
 
 /// Default method definition from a trait declaration.
@@ -1514,8 +1520,17 @@ impl Codegen {
                                 default_body,
                                 ..
                             } => {
-                                let param_count = if default_body.is_some() {
-                                    default_params.len()
+                                // Defaults written as `m = \a b -> ...` carry
+                                // their params on the lambda — unwrap so the
+                                // dispatcher signature matches call sites.
+                                let norm_default: Option<(Vec<ast::Pat>, ast::Expr)> =
+                                    default_body.as_ref().map(|body| {
+                                        let (p, b) =
+                                            method_params_body(default_params, body);
+                                        (p.to_vec(), b.clone())
+                                    });
+                                let param_count = if let Some((p, _)) = &norm_default {
+                                    p.len()
                                 } else {
                                     count_fn_params(&ty.ty)
                                 };
@@ -1535,13 +1550,10 @@ impl Codegen {
                                         dispatch_index,
                                         impls: Vec::new(),
                                     });
-                                if let Some(body) = default_body {
+                                if let Some((params, body)) = norm_default {
                                     defaults.insert(
                                         method_name.clone(),
-                                        DefaultMethod {
-                                            params: default_params.clone(),
-                                            body: body.clone(),
-                                        },
+                                        DefaultMethod { params, body },
                                     );
                                 }
                             }
@@ -1583,9 +1595,14 @@ impl Codegen {
                             if let ast::ImplItem::Method {
                                 name: method_name,
                                 params,
+                                body,
                                 ..
                             } = item
                             {
+                                // Methods written as constants bound to
+                                // lambdas (`eq = \a b -> ...`) must count the
+                                // lambda's params, mirroring top-level Funs.
+                                let (params, _) = method_params_body(params, body);
                                 let n_params = params.len();
                                 let mangled = format!(
                                     "{}_{}_{}", trait_name, type_name, method_name
@@ -1619,6 +1636,7 @@ impl Codegen {
                                     .push(ImplEntry {
                                         type_name: type_name.clone(),
                                         func_id,
+                                        is_builtin: false,
                                     });
                             }
                         }
@@ -1667,6 +1685,7 @@ impl Codegen {
                                     .push(ImplEntry {
                                         type_name: type_name.clone(),
                                         func_id,
+                                        is_builtin: false,
                                     });
                             }
                         }
@@ -1779,6 +1798,7 @@ impl Codegen {
                                 .push(ImplEntry {
                                     type_name: type_name.clone(),
                                     func_id,
+                                    is_builtin: false,
                                 });
 
                             self.derived_methods.push(DerivedMethodDef {
@@ -1902,6 +1922,7 @@ impl Codegen {
                 .push(ImplEntry {
                     type_name: "Relation".to_string(),
                     func_id,
+                    is_builtin: true,
                 });
 
             // Track for supertrait validation
@@ -1970,6 +1991,7 @@ impl Codegen {
                 .push(ImplEntry {
                     type_name: "IO".to_string(),
                     func_id,
+                    is_builtin: true,
                 });
 
             self.trait_impl_types
@@ -2057,6 +2079,7 @@ impl Codegen {
                 .push(ImplEntry {
                     type_name: type_name.to_string(),
                     func_id,
+                    is_builtin: true,
                 });
 
             // Track for supertrait validation
@@ -2586,6 +2609,9 @@ impl Codegen {
                                 let mangled = format!(
                                     "{}_{}_{}", trait_name, type_name, name
                                 );
+                                // Unwrap lambda-bodied methods the same way
+                                // the collection pass counted their params.
+                                let (params, body) = method_params_body(params, body);
                                 self.define_user_function(&mangled, params, body);
                             }
                         }
@@ -3508,11 +3534,11 @@ impl Codegen {
                         let slot = builder.create_sized_stack_slot(
                             StackSlotData::new(StackSlotKind::ExplicitSlot, (6 * ptr_bytes) as u32, 3),
                         );
-                        let (k0_ptr, k0_len) = cg.string_ptr(builder, "0");
+                        let (k0_ptr, k0_len) = cg.string_ptr(builder, &tramp_arg_key(0));
                         builder.ins().stack_store(k0_ptr, slot, 0);
                         builder.ins().stack_store(k0_len, slot, ptr_bytes);
                         builder.ins().stack_store(env, slot, 2 * ptr_bytes);
-                        let (k1_ptr, k1_len) = cg.string_ptr(builder, "1");
+                        let (k1_ptr, k1_len) = cg.string_ptr(builder, &tramp_arg_key(1));
                         builder.ins().stack_store(k1_ptr, slot, 3 * ptr_bytes);
                         builder.ins().stack_store(k1_len, slot, 4 * ptr_bytes);
                         builder.ins().stack_store(new_arg, slot, 5 * ptr_bytes);
@@ -3536,7 +3562,7 @@ impl Codegen {
                                 "knot_record_field_by_index",
                                 &[env, idx],
                             );
-                            let key_str = i.to_string();
+                            let key_str = tramp_arg_key(i);
                             let (kp, kl) = cg.string_ptr(builder, &key_str);
                             let base = (i as i32) * (3 * ptr_bytes);
                             builder.ins().stack_store(kp, slot, base);
@@ -3544,7 +3570,7 @@ impl Codegen {
                             builder.ins().stack_store(val, slot, base + 2 * ptr_bytes);
                         }
                         // Add new arg
-                        let key_str = prev_count.to_string();
+                        let key_str = tramp_arg_key(prev_count);
                         let (kp, kl) = cg.string_ptr(builder, &key_str);
                         let base = (prev_count as i32) * (3 * ptr_bytes);
                         builder.ins().stack_store(kp, slot, base);
@@ -7177,8 +7203,35 @@ impl Codegen {
         // Collect function bodies for analysis
         let mut fun_bodies: Vec<(String, &ast::Expr)> = Vec::new();
         for decl in decls {
-            if let ast::DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
-                fun_bodies.push((name.clone(), body));
+            match &decl.node {
+                ast::DeclKind::Fun { name, body: Some(body), .. } => {
+                    fun_bodies.push((name.clone(), body));
+                }
+                // Trait methods are called by bare name (through the
+                // dispatcher) — if any impl body produces IO, calls of the
+                // method do too, so `tick 1; tick 2` in a do-block must be
+                // classified as IO sequencing rather than a comprehension.
+                ast::DeclKind::Impl { items, .. } => {
+                    for item in items {
+                        if let ast::ImplItem::Method { name, body, .. } = item {
+                            fun_bodies.push((name.clone(), body));
+                        }
+                    }
+                }
+                // Same for trait default method bodies.
+                ast::DeclKind::Trait { items, .. } => {
+                    for item in items {
+                        if let ast::TraitItem::Method {
+                            name,
+                            default_body: Some(body),
+                            ..
+                        } = item
+                        {
+                            fun_bodies.push((name.clone(), body));
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -7435,6 +7488,84 @@ impl Codegen {
         }
     }
 
+    /// Check whether a do-block has relation-comprehension shape: every
+    /// statement before the last is a Bind/Where/Let and the last statement
+    /// is a `yield`. Such blocks have per-row loop semantics (`where` is a
+    /// row filter, `yield` accumulates) rather than sequential IO semantics
+    /// (`where` is a guard).
+    fn do_block_is_comprehension(stmts: &[ast::Stmt]) -> bool {
+        let Some((last, init)) = stmts.split_last() else {
+            return false;
+        };
+        let last_is_yield = matches!(
+            &last.node,
+            ast::StmtKind::Expr(e) if e.node.as_yield_arg().is_some()
+        );
+        last_is_yield
+            && init.iter().all(|s| {
+                matches!(
+                    &s.node,
+                    ast::StmtKind::Bind { .. }
+                        | ast::StmtKind::Where { .. }
+                        | ast::StmtKind::Let { .. }
+                )
+            })
+    }
+
+    /// Check whether an expression's IO-ness involves *external* effects
+    /// (console/fs/network/clock/random builtins, fork/race, atomic blocks,
+    /// relation writes, user IO functions) rather than plain relation reads.
+    /// Relation-only IO (`IO {} [T]` produced by SourceRef/DerivedRef
+    /// comprehensions) is treated by inference as the underlying relation
+    /// when let-bound, so codegen must run it eagerly; external-effect IO
+    /// bound by `let` must stay deferred and run at its use sites.
+    /// Mirrors the traversal of `expr_is_io`.
+    fn expr_has_external_io(&self, expr: &ast::Expr) -> bool {
+        match &expr.node {
+            ast::ExprKind::App { func, arg } => {
+                self.expr_has_external_io(func) || self.expr_has_external_io(arg)
+            }
+            ast::ExprKind::Var(name) => {
+                crate::builtins::is_io_builtin(name)
+                    || matches!(name.as_str(), "fork" | "race")
+                    || self.io_functions.contains(name)
+            }
+            // Relation reads are the "pure DB" IO that inference lets flow
+            // as the relation value itself.
+            ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => false,
+            // Writes and atomic blocks must not run at `let` time.
+            ast::ExprKind::Set { .. } | ast::ExprKind::ReplaceSet { .. } => true,
+            ast::ExprKind::Atomic(_) => true,
+            ast::ExprKind::BinOp { lhs, rhs, .. } => {
+                self.expr_has_external_io(lhs) || self.expr_has_external_io(rhs)
+            }
+            ast::ExprKind::UnaryOp { operand, .. } => self.expr_has_external_io(operand),
+            ast::ExprKind::If { cond, then_branch, else_branch, .. } => {
+                self.expr_has_external_io(cond)
+                    || self.expr_has_external_io(then_branch)
+                    || self.expr_has_external_io(else_branch)
+            }
+            ast::ExprKind::Case { scrutinee, arms, .. } => {
+                self.expr_has_external_io(scrutinee)
+                    || arms.iter().any(|arm| self.expr_has_external_io(&arm.body))
+            }
+            ast::ExprKind::Do(stmts) => {
+                stmts.iter().any(|s| match &s.node {
+                    ast::StmtKind::Bind { expr, .. } => self.expr_has_external_io(expr),
+                    ast::StmtKind::Expr(expr) => self.expr_has_external_io(expr),
+                    ast::StmtKind::Let { expr, .. } => self.expr_has_external_io(expr),
+                    ast::StmtKind::Where { cond } => self.expr_has_external_io(cond),
+                    ast::StmtKind::GroupBy { key } => self.expr_has_external_io(key),
+                })
+            }
+            ast::ExprKind::Lambda { body, .. } => self.expr_has_external_io(body),
+            ast::ExprKind::UnitLit { value, .. } => self.expr_has_external_io(value),
+            ast::ExprKind::Annot { expr, .. } => self.expr_has_external_io(expr),
+            ast::ExprKind::Refine(inner) => self.expr_has_external_io(inner),
+            _ => false,
+        }
+    }
+
     /// Compile an IO do-block: builds IO thunk that sequences actions.
     /// Inside the thunk, IO binds run their action and bind the result.
     fn compile_io_do(
@@ -7560,12 +7691,35 @@ impl Codegen {
         let done_block = builder.create_block();
         let done_param = builder.append_block_param(done_block, self.ptr_type);
 
-        for stmt in stmts {
+        for (stmt_idx, stmt) in stmts.iter().enumerate() {
             match &stmt.node {
                 ast::StmtKind::Bind { pat, expr } => {
                     // A bind shadows any previous source/let tracking for the
                     // names it binds — drop stale entries before (re)inserting.
                     self.invalidate_rebound_pattern(pat);
+                    // Comprehension-style bind over a plain (non-IO) relation
+                    // value (`b <- [1, 2]; tick b`): inference types this as
+                    // iteration (b : element), so run the remaining
+                    // statements once per row — IO actions execute per
+                    // element. Restricted to expressions statically known to
+                    // be relations; other non-IO binds (single-value pattern
+                    // matches like `InProgress ip <- t.status`) keep
+                    // bind-the-value semantics.
+                    if !self.expr_is_io(expr)
+                        && (matches!(&expr.node, ast::ExprKind::List(_))
+                            || self.expr_is_known_relation(expr))
+                    {
+                        last_val = self.compile_io_bind_loop(
+                            builder,
+                            pat,
+                            expr,
+                            &stmts[stmt_idx + 1..],
+                            env,
+                            db,
+                        );
+                        // The remaining statements were consumed by the loop.
+                        break;
+                    }
                     // Track source read bindings for SQL optimization:
                     // `x <- *source` records x → source so inner do-blocks
                     // like `do { m <- x; where ...; yield m }` can compile to SQL.
@@ -7593,7 +7747,35 @@ impl Codegen {
                     if let ast::PatKind::Var(var_name) = &pat.node {
                         self.let_bindings.insert(var_name.clone(), expr.clone());
                     }
-                    let val = self.compile_expr(builder, expr, env, db);
+                    // A let-bound relation comprehension (`let xs = do { t <-
+                    // *rel; where ...; yield t }`) is typed by inference as
+                    // the relation itself (`[T]`) — its IO-ness is only
+                    // relation reads, no external effects. Compile it through
+                    // the relational loop path (per-row iteration, `where` as
+                    // filter) and bind the resulting rows, instead of leaving
+                    // an unexecuted IO thunk with guard semantics. Other
+                    // relation-only IO expressions are run eagerly with
+                    // `knot_io_run` (identity on non-IO values). External-
+                    // effect IO (`let action = println "x"`) stays deferred
+                    // and runs at its use sites.
+                    let relation_only_io =
+                        self.expr_is_io(expr) && !self.expr_has_external_io(expr);
+                    let val = match &expr.node {
+                        ast::ExprKind::Do(stmts)
+                            if relation_only_io
+                                && Self::do_block_is_comprehension(stmts) =>
+                        {
+                            self.compile_do(builder, stmts, env, db)
+                        }
+                        _ => {
+                            let v = self.compile_expr(builder, expr, env, db);
+                            if relation_only_io {
+                                self.call_rt(builder, "knot_io_run", &[db, v])
+                            } else {
+                                v
+                            }
+                        }
+                    };
                     self.bind_io_pattern(builder, pat, val, env, Some(done_block));
                     self.invalidate_after_possible_writes(expr);
                     last_val = val;
@@ -7646,6 +7828,69 @@ impl Codegen {
         // Writes/rebinds inside this scope still invalidate outer entries.
         self.replay_source_bind_invalidations_since(invalidation_mark);
         done_param
+    }
+
+    /// Compile a comprehension-style bind inside an IO do-block:
+    /// `pat <- expr` where `expr` is a plain (non-IO) relation value.
+    /// Iterates the relation, binding `pat` to each row and running the
+    /// remaining statements per row (IO actions execute per element, `where`
+    /// guards and constructor-pattern mismatches skip the current row).
+    /// Returns a relation of the per-row results.
+    fn compile_io_bind_loop(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        pat: &ast::Pat,
+        expr: &ast::Expr,
+        rest: &[ast::Stmt],
+        env: &mut Env,
+        db: Value,
+    ) -> Value {
+        let rel = self.compile_expr(builder, expr, env, db);
+        let result = self.call_rt(builder, "knot_relation_empty", &[]);
+        let len = self.call_rt(builder, "knot_relation_len", &[rel]);
+
+        let header = builder.create_block();
+        let body = builder.create_block();
+        let continue_blk = builder.create_block();
+        // The continue block receives the per-row value; bind_io_pattern's
+        // mismatch skips also jump here (passing unit).
+        merge_block_param(builder, continue_blk, self.ptr_type);
+        let exit = builder.create_block();
+
+        let zero = builder.ins().iconst(self.ptr_type, 0);
+        builder.ins().jump(header, &[zero.into()]);
+
+        builder.switch_to_block(header);
+        let i = builder.append_block_param(header, self.ptr_type);
+        let cond = builder.ins().icmp(IntCC::UnsignedLessThan, i, len);
+        builder.ins().brif(cond, body, &[], exit, &[]);
+
+        builder.switch_to_block(body);
+        builder.seal_block(body);
+        let row = self.call_rt(builder, "knot_relation_get", &[rel, i]);
+        // Bind into a per-iteration env clone so loop-local SSA values never
+        // leak into code emitted after the loop exits.
+        let mut body_env = env.clone();
+        self.bind_io_pattern(builder, pat, row, &mut body_env, Some(continue_blk));
+        let row_val = if rest.is_empty() {
+            row
+        } else {
+            self.compile_io_do_eager(builder, rest, &mut body_env, db)
+        };
+        builder.ins().jump(continue_blk, &[row_val.into()]);
+
+        builder.switch_to_block(continue_blk);
+        builder.seal_block(continue_blk);
+        let cont_val = builder.block_params(continue_blk)[0];
+        self.call_rt_void(builder, "knot_relation_push", &[result, cont_val]);
+        let one = builder.ins().iconst(self.ptr_type, 1);
+        let next = builder.ins().iadd(i, one);
+        builder.ins().jump(header, &[next.into()]);
+        builder.seal_block(header);
+
+        builder.switch_to_block(exit);
+        builder.seal_block(exit);
+        result
     }
 
     /// Compile an expression eagerly in IO do-block context.
@@ -10557,9 +10802,32 @@ impl Codegen {
         for param in params {
             let val = match param {
                 SqlParamSource::Literal(lit) => self.compile_lit(builder, lit),
-                SqlParamSource::Var(name) => env.get(name),
+                // Var/FieldAccess names that aren't local bindings are
+                // top-level constants — resolve them through compile_expr
+                // (env → user_fns), matching the Expr-style fallback that
+                // try_compile_sql_atom uses, instead of panicking in
+                // `Env::get`.
+                SqlParamSource::Var(name) => {
+                    if let Some(&v) = env.bindings.get(name.as_str()) {
+                        v
+                    } else {
+                        let var_expr = ast::Spanned::new(
+                            ast::ExprKind::Var(name.clone()),
+                            ast::Span::new(0, 0),
+                        );
+                        self.compile_expr(builder, &var_expr, env, db)
+                    }
+                }
                 SqlParamSource::FieldAccess(var, field) => {
-                    let record = env.get(var);
+                    let record = if let Some(&v) = env.bindings.get(var.as_str()) {
+                        v
+                    } else {
+                        let var_expr = ast::Spanned::new(
+                            ast::ExprKind::Var(var.clone()),
+                            ast::Span::new(0, 0),
+                        );
+                        self.compile_expr(builder, &var_expr, env, db)
+                    };
                     let (fptr, flen) = self.string_ptr(builder, field);
                     self.call_rt(builder, "knot_record_field", &[record, fptr, flen])
                 }
@@ -10610,9 +10878,25 @@ impl Codegen {
         if preds.is_empty() {
             return;
         }
-        let spec = serialize_stm_preds(preds);
         let value_sources: Vec<SqlParamSource> =
             preds.iter().flat_map(|p| p.values.clone()).collect();
+        // Every value source must be resolvable here: locals via `env`,
+        // top-level constants via `user_fns`. Do-local `let` names from a
+        // pushed-down SQL plan are neither — the plan substituted their
+        // defining expressions, but the pred extractor still emits the raw
+        // `Var`. Skip the precision upgrade and keep the broad `All` filter
+        // (safe fallback, same policy as runtime spec parse errors) instead
+        // of panicking in codegen.
+        let resolvable = value_sources.iter().all(|p| match p {
+            SqlParamSource::Literal(_) | SqlParamSource::Expr(_) => true,
+            SqlParamSource::Var(v) | SqlParamSource::FieldAccess(v, _) => {
+                env.bindings.contains_key(v) || self.user_fns.contains_key(v)
+            }
+        });
+        if !resolvable {
+            return;
+        }
+        let spec = serialize_stm_preds(preds);
         let pred_params_rel = self.compile_sql_params(builder, &value_sources, env, db);
         let (spec_ptr, spec_len) = self.string_ptr(builder, &spec);
         self.call_rt_void(
@@ -10655,10 +10939,26 @@ impl Codegen {
 
     // ── Operator trait dispatch helpers ────────────────────────────
 
-    /// Check if a trait method has any non-primitive (ADT) implementations.
-    fn has_adt_impls(&self, method: &str) -> bool {
+    /// Check if a trait method has any non-builtin implementation (a user or
+    /// prelude `impl`, on any type — ADTs *or* primitives like Int/Text).
+    /// Operators must dispatch through the trait method whenever one exists;
+    /// the intrinsic registrations delegate to the same runtime functions as
+    /// the operator fast paths, so they alone never require dispatch.
+    fn has_user_impls(&self, method: &str) -> bool {
         self.trait_methods.get(method).map_or(false, |info| {
-            info.impls.iter().any(|e| type_name_to_tag(&e.type_name).is_none())
+            info.impls.iter().any(|e| !e.is_builtin)
+        })
+    }
+
+    /// Check if a trait method has a non-builtin implementation on a
+    /// primitive type (Int/Float/Text/Bool/…). When true, tag-based operator
+    /// fast paths must be skipped entirely — a primitive value would
+    /// otherwise bypass the user's impl.
+    fn has_user_primitive_impl(&self, method: &str) -> bool {
+        self.trait_methods.get(method).map_or(false, |info| {
+            info.impls
+                .iter()
+                .any(|e| !e.is_builtin && type_name_to_tag(&e.type_name).is_some())
         })
     }
 
@@ -10674,7 +10974,7 @@ impl Codegen {
         db: Value,
         fallback_rt: &str,
     ) -> Value {
-        if self.has_adt_impls(method) {
+        if self.has_user_impls(method) {
             if let Some(&func_id) = self.trait_dispatcher_fns.get(method) {
                 let func_ref = self.module.declare_func_in_func(func_id, builder.func);
                 let call = builder.ins().call(func_ref, &[db, l, r]);
@@ -10694,7 +10994,7 @@ impl Codegen {
         db: Value,
         fallback_rt: &str,
     ) -> Value {
-        if self.has_adt_impls(method) {
+        if self.has_user_impls(method) {
             if let Some(&func_id) = self.trait_dispatcher_fns.get(method) {
                 let func_ref = self.module.declare_func_in_func(func_id, builder.func);
                 let call = builder.ins().call(func_ref, &[db, val]);
@@ -10721,9 +11021,7 @@ impl Codegen {
         negate: bool,
     ) -> Value {
         // Check if any non-primitive Ord impls exist (ADT types)
-        let has_adt_ord_impls = self.trait_methods.get("compare").map_or(false, |info| {
-            info.impls.iter().any(|e| type_name_to_tag(&e.type_name).is_none())
-        });
+        let has_adt_ord_impls = self.has_user_impls("compare");
 
         if has_adt_ord_impls {
             // ADT path: compute i32 result via compile_comparison_i32, then box
@@ -10753,9 +11051,7 @@ impl Codegen {
         match_tag: &str,
         negate: bool,
     ) -> Value {
-        let has_adt_ord_impls = self.trait_methods.get("compare").map_or(false, |info| {
-            info.impls.iter().any(|e| type_name_to_tag(&e.type_name).is_none())
-        });
+        let has_adt_ord_impls = self.has_user_impls("compare");
 
         if has_adt_ord_impls {
             if let Some(&func_id) = self.trait_dispatcher_fns.get("compare") {
@@ -10824,7 +11120,13 @@ impl Codegen {
                     ast::BinOp::Eq => {
                         let l = self.compile_expr(builder, lhs, env, db);
                         let r = self.compile_expr(builder, rhs, env, db);
-                        if self.trait_dispatcher_fns.contains_key("eq") {
+                        if self.has_user_primitive_impl("eq") {
+                            // A user impl of Eq on a primitive type exists —
+                            // the tag-based fast path below would bypass it,
+                            // so every == goes through trait dispatch.
+                            let boxed = self.compile_trait_binop(builder, "eq", l, r, db, "knot_value_eq");
+                            self.call_rt_typed(builder, "knot_value_get_bool", &[boxed], types::I32)
+                        } else if self.trait_dispatcher_fns.contains_key("eq") {
                             // Fast path: non-constructor types use direct unboxed comparison
                             let tag = self.call_rt_typed(builder, "knot_value_get_tag", &[l], types::I32);
                             let is_non_ctor = builder.ins().icmp_imm(IntCC::NotEqual, tag, 7);
@@ -10857,7 +11159,14 @@ impl Codegen {
                     ast::BinOp::Neq => {
                         let l = self.compile_expr(builder, lhs, env, db);
                         let r = self.compile_expr(builder, rhs, env, db);
-                        if self.trait_dispatcher_fns.contains_key("eq") {
+                        if self.has_user_primitive_impl("eq") {
+                            // See == above: user Eq impl on a primitive type
+                            // disables the tag-based fast path.
+                            let boxed = self.compile_trait_binop(builder, "eq", l, r, db, "knot_value_eq");
+                            let eq_i32 = self.call_rt_typed(builder, "knot_value_get_bool", &[boxed], types::I32);
+                            let one = builder.ins().iconst(types::I32, 1);
+                            builder.ins().isub(one, eq_i32)
+                        } else if self.trait_dispatcher_fns.contains_key("eq") {
                             // Fast path: non-constructor types use direct unboxed comparison
                             let tag = self.call_rt_typed(builder, "knot_value_get_tag", &[l], types::I32);
                             let is_non_ctor = builder.ins().icmp_imm(IntCC::NotEqual, tag, 7);
@@ -11341,9 +11650,12 @@ fn try_extract_field_preds_from_where_stmts(
             }
             ast::StmtKind::Let { .. } => {
                 // Let-bound names appear in Where conditions as Var nodes.
-                // `is_simple_value` accepts Var, and the runtime track-pred
-                // call re-evaluates Vars via env lookup — same as the SQL
-                // params relation. No special handling needed here.
+                // `simple_value_param` accepts them as `Var` params, but
+                // they are NOT in the Cranelift env at the call site (the
+                // SQL plan substitutes their defining expressions instead of
+                // compiling the lets). `emit_stm_track_pred` detects such
+                // unresolvable params and skips the precision upgrade,
+                // leaving the broad `All` filter in place.
             }
             _ => return None,
         }
@@ -13940,6 +14252,32 @@ fn impl_type_name(args: &[ast::Type]) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Key for argument `i` in a trampoline curry-chain environment record.
+/// Zero-padded to a fixed width so the runtime's lexicographic field order
+/// matches numeric argument order — `knot_record_from_pairs` requires sorted
+/// keys and `knot_record_field_by_index(env, i)` assumes index `i` ↔ arg `i`,
+/// both of which break with plain decimal keys once "10" sorts before "2".
+fn tramp_arg_key(i: usize) -> String {
+    format!("{:04}", i)
+}
+
+/// Effective (params, body) for a trait/impl method definition. A method
+/// written as a constant bound to a lambda (`eq = \a b -> true`) is
+/// equivalent to one with explicit params (`eq a b = true`) — unwrap the
+/// lambda exactly like top-level Funs do (one level; nested lambdas curry
+/// through closure-returning bodies the same way Fun bodies do).
+fn method_params_body<'a>(
+    params: &'a [ast::Pat],
+    body: &'a ast::Expr,
+) -> (&'a [ast::Pat], &'a ast::Expr) {
+    if params.is_empty() {
+        if let ast::ExprKind::Lambda { params: lambda_params, body: lambda_body } = &body.node {
+            return (lambda_params, lambda_body);
+        }
+    }
+    (params, body)
 }
 
 /// Map a type name to its runtime Value tag (as used by knot_value_get_tag).

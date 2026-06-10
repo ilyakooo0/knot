@@ -467,6 +467,12 @@ struct Infer {
     /// Whether we are currently inside an `atomic` block.
     in_atomic: bool,
 
+    /// Whether we are typing a view body. View bodies are relation
+    /// comprehensions (mirrors codegen's `analyze_view`): a do-block bind
+    /// from an IO-wrapped relation iterates the relation's ELEMENTS, and
+    /// the block's result is the relation of yielded values — not an IO.
+    in_view_comprehension: bool,
+
     // ── Units of measure ──────────────────────────────────────────
     /// Next unit variable ID.
     next_unit_var: UnitVar,
@@ -528,6 +534,7 @@ impl Infer {
             route_types: HashSet::new(),
             in_io_do: false,
             in_atomic: false,
+            in_view_comprehension: false,
             source_var_binds: HashMap::new(),
             let_bindings: HashMap::new(),
             next_unit_var: 0,
@@ -1249,7 +1256,7 @@ impl Infer {
                 self.unify_dir(r1, r2, span, t1_provided);
             }
             (Ty::Relation(a), Ty::Relation(b)) => {
-                self.unify(a, b, span);
+                self.unify_dir(a, b, span, t1_provided);
             }
             (Ty::Con(n1, a1), Ty::Con(n2, a2))
                 if n1 == n2 && a1.len() == a2.len() =>
@@ -1257,17 +1264,17 @@ impl Infer {
                 let a1 = a1.clone();
                 let a2 = a2.clone();
                 for (a, b) in a1.iter().zip(a2.iter()) {
-                    self.unify(a, b, span);
+                    self.unify_dir(a, b, span, t1_provided);
                 }
             }
             (Ty::Record(f1, r1), Ty::Record(f2, r2)) => {
-                self.unify_records(f1, *r1, f2, *r2, span);
+                self.unify_records(f1, *r1, f2, *r2, span, t1_provided);
             }
             // ── Higher-kinded type support ─────────────────────
             (Ty::TyCon(a), Ty::TyCon(b)) if a == b => {}
             (Ty::App(f1, a1), Ty::App(f2, a2)) => {
-                self.unify(f1, f2, span);
-                self.unify(a1, a2, span);
+                self.unify_dir(f1, f2, span, t1_provided);
+                self.unify_dir(a1, a2, span, t1_provided);
             }
             // App(f, a) vs Relation(b) → f = [], a = b
             (Ty::App(f, a), Ty::Relation(b))
@@ -1296,10 +1303,14 @@ impl Infer {
                 if args.is_empty() {
                     let d1 = self.display_ty(&t1);
                     let d2 = self.display_ty(&t2);
+                    // `t1` is the provided/actual side when `t1_provided`
+                    // (see `unify`), so the expected type is `t2` then.
+                    let (exp, fnd) =
+                        if t1_provided { (d2, d1) } else { (d1, d2) };
                     self.error(
                         format!(
                             "type mismatch: expected {}, found {}",
-                            d1, d2
+                            exp, fnd
                         ),
                         span,
                     );
@@ -1324,7 +1335,7 @@ impl Infer {
                 let r2 = *r2;
                 let a = a.clone();
                 let b = b.clone();
-                self.unify(&a, &b, span);
+                self.unify_dir(&a, &b, span, t1_provided);
                 // If at least one side started as a `Ty::Var` (an inferred
                 // IO from a case-arm or if-branch), widen its effect set to
                 // the union instead of running strict row unification —
@@ -1374,18 +1385,18 @@ impl Infer {
             // "expected {x: Int}, found [{x: Int}]" mismatches).
             (Ty::Relation(_), Ty::IO(_, _, b)) if self.in_io_do => {
                 let b = (**b).clone();
-                self.unify(&t1, &b, span);
+                self.unify_dir(&t1, &b, span, t1_provided);
             }
             (Ty::IO(_, _, b), Ty::Relation(_)) if self.in_io_do => {
                 let b = (**b).clone();
-                self.unify(&b, &t2, span);
+                self.unify_dir(&b, &t2, span, t1_provided);
             }
             (Ty::Relation(_), Ty::Record(fields, None)) | (Ty::Record(fields, None), Ty::Relation(_))
                 if self.in_io_do && fields.is_empty() => {}
 
             // ── Row-polymorphic variants ────────────────────────
             (Ty::Variant(c1, r1), Ty::Variant(c2, r2)) => {
-                self.unify_variants(c1, *r1, c2, *r2, span);
+                self.unify_variants(c1, *r1, c2, *r2, span, t1_provided);
             }
             (Ty::Con(name, args), Ty::Variant(c2, r2)) => {
                 if let Some(expanded) = self.con_to_variant(name, args) {
@@ -1393,14 +1404,16 @@ impl Infer {
                         Ty::Variant(c, r) => (c, r),
                         _ => unreachable!(),
                     };
-                    self.unify_variants(&ec, er, c2, *r2, span);
+                    self.unify_variants(&ec, er, c2, *r2, span, t1_provided);
                 } else {
                     let d1 = self.display_ty(&t1);
                     let d2 = self.display_ty(&t2);
+                    let (exp, fnd) =
+                        if t1_provided { (d2, d1) } else { (d1, d2) };
                     self.error(
                         format!(
                             "type mismatch: expected {}, found {}",
-                            d1, d2
+                            exp, fnd
                         ),
                         span,
                     );
@@ -1412,14 +1425,16 @@ impl Infer {
                         Ty::Variant(c, r) => (c, r),
                         _ => unreachable!(),
                     };
-                    self.unify_variants(c1, *r1, &ec, er, span);
+                    self.unify_variants(c1, *r1, &ec, er, span, t1_provided);
                 } else {
                     let d1 = self.display_ty(&t1);
                     let d2 = self.display_ty(&t2);
+                    let (exp, fnd) =
+                        if t1_provided { (d2, d1) } else { (d1, d2) };
                     self.error(
                         format!(
                             "type mismatch: expected {}, found {}",
-                            d1, d2
+                            exp, fnd
                         ),
                         span,
                     );
@@ -1447,7 +1462,7 @@ impl Infer {
                         Ty::Variant(c, r) => (c, r),
                         _ => unreachable!(),
                     };
-                    self.unify_variants(&ec, er, c2, *r2, span);
+                    self.unify_variants(&ec, er, c2, *r2, span, t1_provided);
                 }
             }
             (Ty::Variant(c1, r1), Ty::Bool) => {
@@ -1456,7 +1471,7 @@ impl Infer {
                         Ty::Variant(c, r) => (c, r),
                         _ => unreachable!(),
                     };
-                    self.unify_variants(c1, *r1, &ec, er, span);
+                    self.unify_variants(c1, *r1, &ec, er, span, t1_provided);
                 }
             }
             // Refined type subsumption: Con("Nat", []) ↔ Int, etc. Resolve the
@@ -1469,7 +1484,7 @@ impl Infer {
                 match self.resolve_refined_base(name, span) {
                     Some(base_ty) => {
                         let other = other.clone();
-                        self.unify(&base_ty, &other, span);
+                        self.unify_dir(&base_ty, &other, span, t1_provided);
                     }
                     None => {} // cycle already reported
                 }
@@ -1480,7 +1495,7 @@ impl Infer {
                 match self.resolve_refined_base(name, span) {
                     Some(base_ty) => {
                         let other = other.clone();
-                        self.unify(&other, &base_ty, span);
+                        self.unify_dir(&other, &base_ty, span, t1_provided);
                     }
                     None => {} // cycle already reported
                 }
@@ -1488,8 +1503,13 @@ impl Infer {
             _ => {
                 let d1 = self.display_ty(&t1);
                 let d2 = self.display_ty(&t2);
+                // `t1` is the provided/actual side when `t1_provided` (see
+                // `unify`), so the expected type is `t2` then — and vice
+                // versa after a contravariant flip or a check-mode call.
+                let (exp, fnd) =
+                    if t1_provided { (d2, d1) } else { (d1, d2) };
                 self.error(
-                    format!("type mismatch: expected {}, found {}", d1, d2),
+                    format!("type mismatch: expected {}, found {}", exp, fnd),
                     span,
                 );
             }
@@ -1503,11 +1523,12 @@ impl Infer {
         f2: &BTreeMap<String, Ty>,
         r2: Option<TyVar>,
         span: Span,
+        t1_provided: bool,
     ) {
         // Unify common fields (BTreeMap lookup is O(log n), no HashSet needed)
         for (key, ty1) in f1 {
             if let Some(ty2) = f2.get(key) {
-                self.unify(ty1, ty2, span);
+                self.unify_dir(ty1, ty2, span, t1_provided);
             }
         }
 
@@ -1612,11 +1633,12 @@ impl Infer {
         c2: &BTreeMap<String, Ty>,
         r2: Option<TyVar>,
         span: Span,
+        t1_provided: bool,
     ) {
         // Unify common constructors' field types (BTreeMap lookup is O(log n))
         for (key, ty1) in c1 {
             if let Some(ty2) = c2.get(key) {
-                self.unify(ty1, ty2, span);
+                self.unify_dir(ty1, ty2, span, t1_provided);
             }
         }
 
@@ -2392,16 +2414,39 @@ impl Infer {
     fn resolve_effect_union(&mut self, u: &EffectUnion) {
         let mut effects: BTreeSet<IoEffect> = BTreeSet::new();
         let mut leftover: Option<TyVar> = None;
+        let span = Span::new(0, 0);
         for s in &u.sources {
             let (e, tail) = self.resolve_effect_row(BTreeSet::new(), Some(*s));
             effects.extend(e);
-            if leftover.is_none() {
-                leftover = tail;
+            let Some(t) = tail else { continue };
+            match leftover {
+                None => leftover = Some(t),
+                Some(kept) if kept == t => {}
+                Some(kept) => {
+                    // `EffectRow` has a single tail slot, so a union of
+                    // several still-open sources can't keep each tail
+                    // separately. Chain the extra tail into the kept one
+                    // (unify them) so effects flowing into ANY source later
+                    // still propagate to the union result. This may share
+                    // effects between the sources' rows — a sound
+                    // over-approximation given the representation.
+                    let t_rigid = self.skolems.contains(&t);
+                    let k_rigid = self.skolems.contains(&kept);
+                    if t_rigid && k_rigid {
+                        // Both tails are rigid signature vars (e.g. `r1`/`r2`
+                        // in a user-annotated `\/` type): they can't be
+                        // unified. Keep the first; the scheme-captured union
+                        // constraint is re-registered with freshened
+                        // (flexible) vars at every instantiation, so callers
+                        // still see the full union.
+                        continue;
+                    }
+                    self.unify(&Ty::Var(t), &Ty::Var(kept), span);
+                }
             }
         }
         // Use bind_var so the binding goes through occurs check + unification
         // — handles the case where `result` has already been narrowed.
-        let span = Span::new(0, 0);
         self.bind_var(u.result, Ty::EffectRow(effects, leftover), span);
     }
 
@@ -4760,6 +4805,25 @@ impl Infer {
                     let is_ctor_pat =
                         matches!(&pat.node, ast::PatKind::Constructor { .. });
 
+                    // In a view body the do-block is a relation
+                    // comprehension (codegen's `analyze_view`): a bind from
+                    // an IO-wrapped relation iterates its ELEMENTS, so peel
+                    // the IO wrapper and fall through to the relation-bind
+                    // path below instead of treating it as an IO bind.
+                    let (expr_ty, resolved) =
+                        if self.in_view_comprehension {
+                            match resolved {
+                                Ty::IO(_, _, inner) => {
+                                    let inner = (*inner).clone();
+                                    let applied = self.apply(&inner);
+                                    (inner, applied)
+                                }
+                                other => (expr_ty, other),
+                            }
+                        } else {
+                            (expr_ty, resolved)
+                        };
+
                     if let Ty::IO(ref effects, ref row, ref inner) = resolved {
                         // IO bind: x <- ioAction
                         is_io = true;
@@ -4768,7 +4832,25 @@ impl Infer {
                             let rv = *rv;
                             self.merge_do_io_row(&mut io_row, rv, expr.span);
                         }
-                        self.check_pattern(pat, inner);
+                        let inner_applied = self.apply(inner);
+                        if is_ctor_pat {
+                            if let Ty::Relation(elem) =
+                                inner_applied.peel_alias()
+                            {
+                                // `Ctor pat <- *rel` filters the relation to
+                                // matching constructors and destructures each
+                                // element — the pattern matches ELEMENTS, not
+                                // the whole relation (same semantics as the
+                                // two-step `rows <- *rel; Ctor pat <- rows`).
+                                has_relation_bind = true;
+                                let elem = (**elem).clone();
+                                self.check_pattern(pat, &elem);
+                            } else {
+                                self.check_pattern(pat, &inner_applied);
+                            }
+                        } else {
+                            self.check_pattern(pat, inner);
+                        }
                     } else if self.in_io_do && matches!(&resolved, Ty::Var(_)) {
                         // In an IO do-block with an unresolved type variable —
                         // assume IO so we don't incorrectly unify with Relation.
@@ -6536,7 +6618,7 @@ impl Infer {
             Scheme::mono(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Text))),
         );
 
-        // hash : ∀a. a -> Bytes  (SHA-256, returns 32 bytes; Bytes/Text hash
+        // hash : ∀a. a -> Bytes  (BLAKE3, returns 32 bytes; Bytes/Text hash
         // their raw contents, structured values hash a canonical serialization)
         {
             let a = self.fresh_var();
@@ -6839,8 +6921,22 @@ impl Infer {
                         self.source_types.get(name).cloned().unwrap_or_else(
                             || self.fresh(),
                         );
+                    // View bodies are relation comprehensions (codegen's
+                    // `analyze_view`): `*view = *src` aliases the source
+                    // relation and `*view = do ...` iterates its elements.
+                    // Relation reads are IO-typed everywhere else, so type
+                    // the body in comprehension mode (do-binds iterate
+                    // elements) and peel any remaining IO wrapper before
+                    // unifying with the view's relation type `[T]`.
+                    let prev = self.in_view_comprehension;
+                    self.in_view_comprehension = true;
                     let inferred = self.infer_expr(body);
-                    self.unify(&expected, &inferred, body.span);
+                    self.in_view_comprehension = prev;
+                    let inferred = match self.apply(&inferred) {
+                        Ty::IO(_, _, inner) => (*inner).clone(),
+                        other => other,
+                    };
+                    self.unify(&inferred, &expected, body.span);
                 }
                 ast::DeclKind::Derived { name, body, .. } => {
                     let expected = self
@@ -6849,7 +6945,19 @@ impl Infer {
                         .cloned()
                         .unwrap_or_else(|| self.fresh());
                     let inferred = self.infer_expr(body);
-                    self.unify(&expected, &inferred, body.span);
+                    // The body computes the relation via IO-typed reads, but
+                    // the derived relation itself IS the resulting relation
+                    // (`&name` references re-wrap it in IO at each use, see
+                    // `ExprKind::DerivedRef`) — peel the IO wrapper before
+                    // unifying. For un-annotated deriveds this also binds
+                    // the fresh var from `collect_sources` to the plain
+                    // `[T]` instead of `IO {} [T]` (which made `&name`
+                    // produce a nested `IO (IO [T])`).
+                    let inferred = match self.apply(&inferred) {
+                        Ty::IO(_, _, inner) => (*inner).clone(),
+                        other => other,
+                    };
+                    self.unify(&inferred, &expected, body.span);
                 }
                 ast::DeclKind::Impl {
                     trait_name,
@@ -7839,6 +7947,11 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
             Ty::IO(_, _, _) => MonadKind::IO,
             // Partially applied type constructor, e.g. Result e (App(TyCon("Result"), e))
             Ty::App(f, _) => match f.as_ref() {
+                // IO applied to an effect row (App(TyCon("IO"), EffectRow))
+                // is still the IO monad — classifying it as Adt("IO") would
+                // dispatch to a nonexistent `Monad_IO_bind`.
+                Ty::TyCon(name) if name == "IO" => MonadKind::IO,
+                Ty::TyCon(name) if name == "[]" => MonadKind::Relation,
                 Ty::TyCon(name) => MonadKind::Adt(name.clone()),
                 _ => MonadKind::Relation,
             },

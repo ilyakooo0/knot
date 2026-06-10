@@ -1089,40 +1089,25 @@ fn render_effect(e: &Effect) -> String {
     }
 }
 
-/// Render an effect list, coalescing matching `r *x` and `w *x` pairs into
-/// `rw *x`. Preserves the original ordering for non-coalesced effects.
+/// Render an effect list, coalescing an *adjacent* `r *x` followed by `w *x`
+/// into `rw *x`. The parser expands `rw *x` to exactly `[Reads(x), Writes(x)]`
+/// in place, so only that pattern may be coalesced — anything looser (e.g.
+/// merging `w *x, r *x` or a non-adjacent pair) would reorder the effect list
+/// on reparse and break the formatter's AST round-trip invariant. Pairs in
+/// any other order or position are printed uncoalesced.
 fn render_effects_coalesced(effects: &[Effect]) -> Vec<String> {
-    use std::collections::BTreeSet;
-    let mut reads: BTreeSet<&str> = BTreeSet::new();
-    let mut writes: BTreeSet<&str> = BTreeSet::new();
-    for e in effects {
-        match e {
-            Effect::Reads(n) => {
-                reads.insert(n.as_str());
-            }
-            Effect::Writes(n) => {
-                writes.insert(n.as_str());
-            }
-            _ => {}
-        }
-    }
-    let both: BTreeSet<&str> = reads.intersection(&writes).copied().collect();
-    let mut emitted_rw: BTreeSet<&str> = BTreeSet::new();
     let mut out = Vec::with_capacity(effects.len());
-    for e in effects {
-        match e {
-            Effect::Reads(n) if both.contains(n.as_str()) => {
-                if emitted_rw.insert(n.as_str()) {
-                    out.push(format!("rw *{}", n));
-                }
+    let mut i = 0;
+    while i < effects.len() {
+        if let Effect::Reads(n) = &effects[i] {
+            if matches!(effects.get(i + 1), Some(Effect::Writes(m)) if m == n) {
+                out.push(format!("rw *{}", n));
+                i += 2;
+                continue;
             }
-            Effect::Writes(n) if both.contains(n.as_str()) => {
-                if emitted_rw.insert(n.as_str()) {
-                    out.push(format!("rw *{}", n));
-                }
-            }
-            _ => out.push(render_effect(e)),
         }
+        out.push(render_effect(&effects[i]));
+        i += 1;
     }
     out
 }
@@ -1304,13 +1289,13 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
                 if i > 0 {
                     s.push_str(", ");
                 }
-                if let Some(p) = punned_form(f) {
-                    s.push_str(&p);
-                } else {
-                    s.push_str(&f.name);
-                    s.push_str(": ");
-                    s.push_str(&render_expr_inline(&f.value, Prec::Lowest));
-                }
+                // NOTE: never pun record-update fields. The parser only
+                // accepts punning in record LITERALS; update fields must
+                // always be written `name: value` (`{t | age}` is a parse
+                // error and `{t | u.name}` is unparseable).
+                s.push_str(&f.name);
+                s.push_str(": ");
+                s.push_str(&render_expr_inline(&f.value, Prec::Lowest));
             }
             s.push('}');
             s
@@ -1442,11 +1427,11 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             )
         }
         ExprKind::Annot { expr, ty } => {
-            format!(
-                "({} : {})",
-                render_expr_inline(expr, Prec::Lowest),
-                render_type(ty)
-            )
+            let mut inner = render_expr_inline(expr, Prec::Lowest);
+            if annot_inner_needs_parens(expr, true) {
+                inner = format!("({})", inner);
+            }
+            format!("({} : {})", inner, render_type(ty))
         }
         ExprKind::Refine(inner) => {
             let s = format!("refine {}", render_expr_inline(inner, Prec::App));
@@ -1592,6 +1577,33 @@ fn punned_form(f: &Field<Expr>) -> Option<String> {
     }
 }
 
+/// Does an expression's parse end with a greedy `parse_expr` tail?
+///
+/// `parse_expr` greedily consumes a trailing `: Type` postfix annotation, so
+/// when one of these expressions is the inner of an `Annot`, it must be
+/// parenthesized — otherwise `(\x -> x) : Int -> Int` would reformat to
+/// `(\x -> x : Int -> Int)` and the annotation would silently reattach to
+/// the lambda body on reparse. `inline` distinguishes the single-line
+/// renderers: inline `case`/`do`/`serve` always self-parenthesize, but their
+/// multi-line renderings at `Prec::Lowest` do not.
+fn annot_inner_needs_parens(e: &Expr, inline: bool) -> bool {
+    match &e.node {
+        // Tail is `parse_expr`: lambda body, else-branch, atomic/refine
+        // operand, set/replace value.
+        ExprKind::Lambda { .. }
+        | ExprKind::If { .. }
+        | ExprKind::Atomic(_)
+        | ExprKind::Refine(_)
+        | ExprKind::Set { .. }
+        | ExprKind::ReplaceSet { .. } => true,
+        // Last case arm body / do statement / serve handler is also parsed
+        // with `parse_expr`, but the inline renderers already wrap these in
+        // parens unconditionally.
+        ExprKind::Case { .. } | ExprKind::Do(_) | ExprKind::Serve { .. } => !inline,
+        _ => false,
+    }
+}
+
 // ── Multi-line expression rendering ─────────────────────────────────
 
 fn render_expr_block(p: &mut Printer, e: &Expr, parent: Prec) {
@@ -1676,7 +1688,14 @@ fn render_expr_block(p: &mut Printer, e: &Expr, parent: Prec) {
         }
         ExprKind::Annot { expr, ty } => {
             p.write("(");
+            let inner_parens = annot_inner_needs_parens(expr, false);
+            if inner_parens {
+                p.write("(");
+            }
             render_expr(p, expr, Prec::Lowest);
+            if inner_parens {
+                p.write(")");
+            }
             p.write(" : ");
             p.write(&render_type(ty));
             p.write(")");
@@ -1846,13 +1865,12 @@ fn render_record_update_block(p: &mut Printer, base: &Expr, fields: &[Field<Expr
     p.newline();
     p.with_indent(|p| {
         for (i, f) in fields.iter().enumerate() {
-            if let Some(s) = punned_form(f) {
-                p.write(&s);
-            } else {
-                p.write(&f.name);
-                p.write(": ");
-                render_expr(p, &f.value, Prec::Lowest);
-            }
+            // NOTE: never pun record-update fields — the parser only accepts
+            // punning in record literals (see render_expr_inline's
+            // RecordUpdate arm).
+            p.write(&f.name);
+            p.write(": ");
+            render_expr(p, &f.value, Prec::Lowest);
             if i + 1 < fields.len() {
                 p.write(",");
             }

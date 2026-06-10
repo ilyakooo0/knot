@@ -360,17 +360,40 @@ fn add_record_pattern_field_hints(
     /// and an optional constructor name for ADT cases like `Person {name}`.
     fn walk_pat_for_records(pat: &ast::Pat, out: &mut Vec<(Span, Option<String>)>) {
         match &pat.node {
-            ast::PatKind::Record(_) => out.push((pat.span, None)),
-            ast::PatKind::Constructor { name, payload } => {
-                if matches!(&payload.node, ast::PatKind::Record(_)) {
-                    out.push((pat.span, Some(name.clone())));
+            ast::PatKind::Record(fields) => {
+                out.push((pat.span, None));
+                // Recurse into field sub-patterns so nested record
+                // destructures (`{addr: {city}}`) get hints too.
+                for f in fields {
+                    if let Some(p) = &f.pattern {
+                        walk_pat_for_records(p, out);
+                    }
                 }
-                walk_pat_for_records(payload, out);
+            }
+            ast::PatKind::Constructor { name, payload } => {
+                // A constructor-record pattern is collected ONCE, as the
+                // constructor entry; recursing into the payload Record would
+                // push the same record again and duplicate every per-field
+                // hint. Only the payload's field SUB-patterns are recursed.
+                if let ast::PatKind::Record(fields) = &payload.node {
+                    out.push((pat.span, Some(name.clone())));
+                    for f in fields {
+                        if let Some(p) = &f.pattern {
+                            walk_pat_for_records(p, out);
+                        }
+                    }
+                } else {
+                    walk_pat_for_records(payload, out);
+                }
             }
             ast::PatKind::List(pats) => {
                 for p in pats {
                     walk_pat_for_records(p, out);
                 }
+            }
+            ast::PatKind::Cons { head, tail } => {
+                walk_pat_for_records(head, out);
+                walk_pat_for_records(tail, out);
             }
             _ => {}
         }
@@ -634,15 +657,25 @@ fn add_unit_literal_hints(
     }
 
     fn walk_for_unit_bindings(expr: &ast::Expr, out: &mut Vec<(Span, ast::Expr)>) {
+        // Handle Do blocks entirely here and return — falling through to
+        // `recurse_expr` afterwards would visit every binding RHS a second
+        // time (its Do arm also yields Bind/Let RHS), duplicating unit hints
+        // (and multiplying them with nesting).
         if let ast::ExprKind::Do(stmts) = &expr.node {
             for stmt in stmts {
-                if let ast::StmtKind::Let { pat, expr: rhs } | ast::StmtKind::Bind { pat, expr: rhs } =
-                    &stmt.node
-                {
-                    out.push((pat.span, rhs.clone()));
-                    walk_for_unit_bindings(rhs, out);
+                match &stmt.node {
+                    ast::StmtKind::Let { pat, expr: rhs }
+                    | ast::StmtKind::Bind { pat, expr: rhs } => {
+                        out.push((pat.span, rhs.clone()));
+                        walk_for_unit_bindings(rhs, out);
+                    }
+                    ast::StmtKind::Expr(e) | ast::StmtKind::Where { cond: e } => {
+                        walk_for_unit_bindings(e, out);
+                    }
+                    ast::StmtKind::GroupBy { key } => walk_for_unit_bindings(key, out),
                 }
             }
+            return;
         }
         recurse_expr(expr, |e| walk_for_unit_bindings(e, out));
     }
@@ -719,24 +752,36 @@ fn add_parameter_name_hints(
     fn walk_apps(
         expr: &ast::Expr,
         doc: &DocumentState,
+        shadowed: &std::collections::HashSet<String>,
         range_start: usize,
         range_end: usize,
         hints: &mut Vec<InlayHint>,
     ) {
         // When we hit an App chain, flatten it and emit hints for the whole
-        // chain — but recurse only into the args (not the head), so we don't
-        // re-process inner Apps from the same chain.
+        // chain, then recurse into the head and the args. The head is non-App
+        // (flatten goes to the bottom of the chain), so recursing into it
+        // doesn't re-process inner Apps — but it does reach hints inside
+        // non-Var heads like `(if c then f else g) a b` or lambda/case heads.
         if matches!(expr.node, ast::ExprKind::App { .. }) {
             let (callee, args) = flatten_app_chain(expr);
             if let ast::ExprKind::Var(name) = &callee.node {
-                emit_arg_hints(doc, name, &args, range_start, range_end, hints);
+                // Param names are resolved by NAME against top-level decls.
+                // When a local binder in this declaration shadows that name
+                // (`\add v -> add v 1`), the top-level decl's param names
+                // don't apply — suppress conservatively.
+                if !shadowed.contains(name.as_str()) {
+                    emit_arg_hints(doc, name, &args, range_start, range_end, hints);
+                }
             }
+            walk_apps(callee, doc, shadowed, range_start, range_end, hints);
             for arg in args {
-                walk_apps(arg, doc, range_start, range_end, hints);
+                walk_apps(arg, doc, shadowed, range_start, range_end, hints);
             }
             return;
         }
-        recurse_expr(expr, |e| walk_apps(e, doc, range_start, range_end, hints));
+        recurse_expr(expr, |e| {
+            walk_apps(e, doc, shadowed, range_start, range_end, hints)
+        });
     }
 
     fn walk_decl(
@@ -752,12 +797,19 @@ fn add_parameter_name_hints(
             }
             | DeclKind::View { body, .. }
             | DeclKind::Derived { body, .. } => {
-                walk_apps(body, doc, range_start, range_end, hints);
+                let mut shadowed = std::collections::HashSet::new();
+                collect_binder_names(body, &mut shadowed);
+                walk_apps(body, doc, &shadowed, range_start, range_end, hints);
             }
             DeclKind::Impl { items, .. } => {
                 for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item {
-                        walk_apps(body, doc, range_start, range_end, hints);
+                    if let ast::ImplItem::Method { params, body, .. } = item {
+                        let mut shadowed = std::collections::HashSet::new();
+                        for p in params {
+                            collect_pat_binder_names(&p.node, &mut shadowed);
+                        }
+                        collect_binder_names(body, &mut shadowed);
+                        walk_apps(body, doc, &shadowed, range_start, range_end, hints);
                     }
                 }
             }
@@ -770,6 +822,70 @@ fn add_parameter_name_hints(
             continue;
         }
         walk_decl(decl, doc, range_start, range_end, hints);
+    }
+}
+
+/// Collect every name bound by a local binder (lambda params, case-arm
+/// patterns, do-block bind/let patterns) anywhere inside `expr`. Used to
+/// conservatively suppress parameter-name hints whose callee name is
+/// shadowed somewhere in the declaration — name-based top-level resolution
+/// can't tell which binding a shadowed call site refers to.
+fn collect_binder_names(expr: &ast::Expr, out: &mut std::collections::HashSet<String>) {
+    match &expr.node {
+        ast::ExprKind::Lambda { params, .. } => {
+            for p in params {
+                collect_pat_binder_names(&p.node, out);
+            }
+        }
+        ast::ExprKind::Case { arms, .. } => {
+            for arm in arms {
+                collect_pat_binder_names(&arm.pat.node, out);
+            }
+        }
+        ast::ExprKind::Do(stmts) => {
+            for stmt in stmts {
+                if let ast::StmtKind::Bind { pat, .. } | ast::StmtKind::Let { pat, .. } =
+                    &stmt.node
+                {
+                    collect_pat_binder_names(&pat.node, out);
+                }
+            }
+        }
+        _ => {}
+    }
+    recurse_expr(expr, |e| collect_binder_names(e, out));
+}
+
+/// Names bound by a single pattern.
+fn collect_pat_binder_names(pat: &ast::PatKind, out: &mut std::collections::HashSet<String>) {
+    match pat {
+        ast::PatKind::Var(name) => {
+            out.insert(name.clone());
+        }
+        ast::PatKind::Record(fields) => {
+            for f in fields {
+                match &f.pattern {
+                    Some(p) => collect_pat_binder_names(&p.node, out),
+                    // Shorthand `{name}` binds the field name itself.
+                    None => {
+                        out.insert(f.name.clone());
+                    }
+                }
+            }
+        }
+        ast::PatKind::Constructor { payload, .. } => {
+            collect_pat_binder_names(&payload.node, out);
+        }
+        ast::PatKind::List(pats) => {
+            for p in pats {
+                collect_pat_binder_names(&p.node, out);
+            }
+        }
+        ast::PatKind::Cons { head, tail } => {
+            collect_pat_binder_names(&head.node, out);
+            collect_pat_binder_names(&tail.node, out);
+        }
+        _ => {}
     }
 }
 
@@ -970,6 +1086,10 @@ fn add_constraint_hints(
                     }
                 }
             }
+            // Recurse into the head too — it can be a non-Var expression
+            // (`(if c then f else g) a b`, lambda/case heads) containing
+            // further call chains. The head is non-App, so no re-processing.
+            walk(callee, doc, range_start, range_end, hints);
             for arg in args {
                 walk(arg, doc, range_start, range_end, hints);
             }

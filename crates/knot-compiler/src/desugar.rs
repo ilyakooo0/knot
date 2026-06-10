@@ -29,14 +29,42 @@ use std::collections::HashSet;
 pub fn desugar(module: &mut Module) {
     desugar_routes(module);
     let io_fns = detect_io_functions(&module.decls);
+    let no_source_vars = HashSet::new();
     for decl in &mut module.decls {
-        desugar_decl(&mut decl.node, &io_fns);
+        desugar_decl(&mut decl.node, &io_fns, &no_source_vars);
     }
+}
+
+/// IO-producing function names, split by how they were detected.
+///
+/// `base` mirrors codegen's `detect_io_functions` exactly (DeclKind::Fun
+/// bodies plus impl/trait-default method bodies + IO builtins fixpoint):
+/// names in this set are also recognized by codegen's `is_io_do_block`, so
+/// excluding a do-block because of them routes it to the dedicated
+/// `compile_io_do` path.
+///
+/// `all` additionally contains trait-method names whose declared signature
+/// returns `IO ...` (in any trait — the signature is the most reliable
+/// signal since impls must conform to it, and the impl body may not
+/// syntactically reveal IO). Codegen cannot see these, so do-blocks whose
+/// IO-ness comes only from `all − base` must be handled by the
+/// `__bind`/IO monadic path, not by exclusion (see `is_pure_comprehension`).
+///
+/// The trait scan is deliberately name-based and conservative in the
+/// "flag as IO" direction: a pure function sharing a name with an IO trait
+/// method would also be treated as IO, which mirrors the treatment already
+/// applied to IO builtins (a lambda param named `println` is likewise
+/// treated as IO today). The opposite direction (missing a genuinely IO
+/// method) desugars an IO do-block as a pure comprehension, which fails to
+/// type-check.
+pub(crate) struct IoFns {
+    base: HashSet<String>,
+    all: HashSet<String>,
 }
 
 /// Detect user functions whose bodies (transitively) produce IO values.
 /// Uses fixed-point iteration to handle transitive IO (e.g., genToken calls randomInt).
-fn detect_io_functions(decls: &[Decl]) -> HashSet<String> {
+fn detect_io_functions(decls: &[Decl]) -> IoFns {
     let io_builtins: HashSet<&str> = crate::builtins::EFFECTFUL_BUILTINS
         .iter()
         .filter(|n| **n != "retry")
@@ -44,29 +72,93 @@ fn detect_io_functions(decls: &[Decl]) -> HashSet<String> {
         .collect();
 
     let mut fun_bodies: Vec<(&str, &Expr)> = Vec::new();
+    let mut method_bodies: Vec<(&str, &Expr)> = Vec::new();
+    let mut trait_sig_io: HashSet<String> = HashSet::new();
     for decl in decls {
-        if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
-            fun_bodies.push((name, body));
+        match &decl.node {
+            DeclKind::Fun { name, body: Some(body), .. } => {
+                fun_bodies.push((name, body));
+            }
+            DeclKind::Trait { items, .. } => {
+                for item in items {
+                    if let TraitItem::Method {
+                        name,
+                        ty,
+                        default_body,
+                        ..
+                    } = item
+                    {
+                        if type_returns_io(&ty.ty) {
+                            trait_sig_io.insert(name.clone());
+                        }
+                        if let Some(body) = default_body {
+                            method_bodies.push((name, body));
+                        }
+                    }
+                }
+            }
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ImplItem::Method { name, body, .. } = item {
+                        method_bodies.push((name, body));
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
-    let mut io_fns = HashSet::new();
-    loop {
-        let mut changed = false;
-        for (name, body) in &fun_bodies {
-            if io_fns.contains(*name) {
-                continue;
+    fn fixpoint(
+        bodies: &[(&str, &Expr)],
+        io_builtins: &HashSet<&str>,
+        io_fns: &mut HashSet<String>,
+    ) {
+        loop {
+            let mut changed = false;
+            for (name, body) in bodies {
+                if io_fns.contains(*name) {
+                    continue;
+                }
+                if expr_contains_io(body, io_builtins, io_fns) {
+                    io_fns.insert(name.to_string());
+                    changed = true;
+                }
             }
-            if expr_contains_io(body, &io_builtins, &io_fns) {
-                io_fns.insert(name.to_string());
-                changed = true;
+            if !changed {
+                break;
             }
-        }
-        if !changed {
-            break;
         }
     }
-    io_fns
+
+    // Base set: Fun bodies plus impl/trait-default method bodies — mirrors
+    // codegen's detect_io_functions (which scans the same body kinds), so
+    // exclusion driven by this set always lines up with codegen's
+    // is_io_do_block routing to compile_io_do.
+    let mut all_bodies = fun_bodies;
+    all_bodies.extend(method_bodies);
+    let mut base = HashSet::new();
+    fixpoint(&all_bodies, &io_builtins, &mut base);
+
+    // Full set: additionally seeded with trait-signature IO methods (a
+    // declared `IO ...` return type is authoritative even when no impl body
+    // in this module syntactically reveals IO), then re-fixpointed so
+    // functions calling such methods are recognized too.
+    let mut all = base.clone();
+    all.extend(trait_sig_io);
+    fixpoint(&all_bodies, &io_builtins, &mut all);
+
+    IoFns { base, all }
+}
+
+/// Whether a declared type's final return type is `IO ...` (walking through
+/// curried function arrows). Used to flag trait methods as IO-returning from
+/// their signatures alone.
+fn type_returns_io(ty: &Type) -> bool {
+    match &ty.node {
+        TypeKind::Function { result, .. } => type_returns_io(result),
+        TypeKind::IO { .. } => true,
+        _ => false,
+    }
 }
 
 /// Check if an expression contains IO calls (builtins or known IO user functions).
@@ -273,9 +365,9 @@ fn route_entries_to_constructors(entries: &[RouteEntry]) -> Vec<ConstructorDef> 
         .collect()
 }
 
-fn desugar_decl(decl: &mut DeclKind, io_fns: &HashSet<String>) {
+fn desugar_decl(decl: &mut DeclKind, io_fns: &IoFns, source_vars: &HashSet<String>) {
     match decl {
-        DeclKind::Fun { body: Some(body), .. } => desugar_expr(body, io_fns),
+        DeclKind::Fun { body: Some(body), .. } => desugar_expr(body, io_fns, source_vars),
         DeclKind::Fun { body: None, .. } => {},
         DeclKind::View { body, .. } => {
             // Don't desugar the top-level do block of a view body
@@ -283,19 +375,17 @@ fn desugar_decl(decl: &mut DeclKind, io_fns: &HashSet<String>) {
             // Unwrap wrappers in case the body is annotated.
             let inner = unwrap_wrappers_mut(body);
             if let ExprKind::Do(stmts) = &mut inner.node {
-                for stmt in stmts.iter_mut() {
-                    desugar_stmt(stmt, io_fns);
-                }
+                desugar_do_stmts(stmts, io_fns, source_vars);
             } else {
-                desugar_expr(body, io_fns);
+                desugar_expr(body, io_fns, source_vars);
             }
         }
-        DeclKind::Derived { body, .. } => desugar_expr(body, io_fns),
-        DeclKind::Migrate { using_fn, .. } => desugar_expr(using_fn, io_fns),
+        DeclKind::Derived { body, .. } => desugar_expr(body, io_fns, source_vars),
+        DeclKind::Migrate { using_fn, .. } => desugar_expr(using_fn, io_fns, source_vars),
         DeclKind::Impl { items, .. } => {
             for item in items {
                 if let ImplItem::Method { body, .. } = item {
-                    desugar_expr(body, io_fns);
+                    desugar_expr(body, io_fns, source_vars);
                 }
             }
         }
@@ -306,7 +396,7 @@ fn desugar_decl(decl: &mut DeclKind, io_fns: &HashSet<String>) {
                     ..
                 } = item
                 {
-                    desugar_expr(body, io_fns);
+                    desugar_expr(body, io_fns, source_vars);
                 }
             }
         }
@@ -316,45 +406,48 @@ fn desugar_decl(decl: &mut DeclKind, io_fns: &HashSet<String>) {
 
 /// Recursively desugar expressions. The `Do` nodes that qualify as
 /// pure comprehensions are replaced with nested App/Lambda/Yield nodes.
-fn desugar_expr(expr: &mut Expr, io_fns: &HashSet<String>) {
+///
+/// `source_vars` tracks variables bound from `*source` reads in enclosing
+/// do-blocks (mirroring codegen's `source_var_binds`), so the SQL-compilable
+/// check only treats `x <- someVar` as a relation read when `someVar` is
+/// provably source-bound — a bind over a Maybe/Result/lambda-param variable
+/// must desugar through `__bind` instead.
+fn desugar_expr(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<String>) {
     // First, recurse into sub-expressions (bottom-up).
     // We handle Set/ReplaceSet specially to avoid desugaring their value do blocks.
     match &mut expr.node {
         ExprKind::Set { target, value } | ExprKind::ReplaceSet { target, value } => {
-            desugar_expr(target, io_fns);
+            desugar_expr(target, io_fns, source_vars);
             // Don't desugar the top-level do block of a set value,
             // but DO recurse into its sub-expressions.
             // Unwrap Annot/UnitLit/Refine wrappers to find the Do block
             // (e.g. `set *rel = (do { ... } : [T])`).
             let inner = unwrap_wrappers_mut(value);
             if let ExprKind::Do(stmts) = &mut inner.node {
-                for stmt in stmts.iter_mut() {
-                    desugar_stmt(stmt, io_fns);
-                }
+                desugar_do_stmts(stmts, io_fns, source_vars);
             } else {
-                desugar_expr(value, io_fns);
+                desugar_expr(value, io_fns, source_vars);
             }
             return; // Don't fall through to the Do check below
         }
-        _ => recurse_into_children(expr, io_fns),
+        _ => recurse_into_children(expr, io_fns, source_vars),
     }
 
     // Now check if this expression is a desugaring-eligible Do block.
     // Check eligibility with immutable borrows first to avoid borrow conflicts.
     let (sql_compilable, pure_comp) = if let ExprKind::Do(stmts) = &expr.node {
-        (is_sql_compilable(stmts), is_pure_comprehension(stmts, io_fns))
+        (
+            is_sql_compilable(stmts, source_vars),
+            is_pure_comprehension(stmts, io_fns),
+        )
     } else {
         (false, false)
     };
 
     if sql_compilable {
         // SQL-compilable do-blocks are preserved for codegen to compile
-        // to a single SQL query. Still recurse into sub-expressions.
-        if let ExprKind::Do(stmts) = &mut expr.node {
-            for stmt in stmts.iter_mut() {
-                desugar_stmt(stmt, io_fns);
-            }
-        }
+        // to a single SQL query. Sub-expressions were already desugared by
+        // recurse_into_children above.
         return;
     }
     if pure_comp {
@@ -368,29 +461,45 @@ fn desugar_expr(expr: &mut Expr, io_fns: &HashSet<String>) {
 
 /// Recurse into all child expressions of a node (except Do blocks handled
 /// by the caller).
-fn recurse_into_children(expr: &mut Expr, io_fns: &HashSet<String>) {
+fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<String>) {
     match &mut expr.node {
         ExprKind::Lit(_) | ExprKind::Var(_) | ExprKind::Constructor(_)
         | ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) => {}
 
         ExprKind::Record(fields) => {
             for f in fields {
-                desugar_expr(&mut f.value, io_fns);
+                desugar_expr(&mut f.value, io_fns, source_vars);
             }
         }
         ExprKind::RecordUpdate { base, fields } => {
-            desugar_expr(base, io_fns);
+            desugar_expr(base, io_fns, source_vars);
             for f in fields {
-                desugar_expr(&mut f.value, io_fns);
+                desugar_expr(&mut f.value, io_fns, source_vars);
             }
         }
-        ExprKind::FieldAccess { expr: e, .. } => desugar_expr(e, io_fns),
+        ExprKind::FieldAccess { expr: e, .. } => desugar_expr(e, io_fns, source_vars),
         ExprKind::List(elems) => {
             for e in elems {
-                desugar_expr(e, io_fns);
+                desugar_expr(e, io_fns, source_vars);
             }
         }
-        ExprKind::Lambda { body, .. } => desugar_expr(body, io_fns),
+        ExprKind::Lambda { params, body } => {
+            // Lambda params shadow any same-named source-bound variables
+            // from the enclosing scope.
+            let mut bound: Vec<String> = Vec::new();
+            for p in params.iter() {
+                pat_bound_names(p, &mut bound);
+            }
+            if bound.iter().any(|n| source_vars.contains(n)) {
+                let mut inner_vars = source_vars.clone();
+                for n in &bound {
+                    inner_vars.remove(n);
+                }
+                desugar_expr(body, io_fns, &inner_vars);
+            } else {
+                desugar_expr(body, io_fns, source_vars);
+            }
+        }
         ExprKind::App { func, arg } => {
             // Preserve do-block arguments to sortBy/takeRelation so codegen
             // can compile them to SQL ORDER BY + LIMIT.
@@ -399,55 +508,62 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &HashSet<String>) {
             } else {
                 false
             };
-            desugar_expr(func, io_fns);
+            desugar_expr(func, io_fns, source_vars);
             if protect_do {
                 if let ExprKind::Do(stmts) = &mut arg.node {
-                    for stmt in stmts.iter_mut() {
-                        desugar_stmt(stmt, io_fns);
-                    }
+                    desugar_do_stmts(stmts, io_fns, source_vars);
                 } else {
-                    desugar_expr(arg, io_fns);
+                    desugar_expr(arg, io_fns, source_vars);
                 }
             } else {
-                desugar_expr(arg, io_fns);
+                desugar_expr(arg, io_fns, source_vars);
             }
         }
         ExprKind::BinOp { lhs, rhs, .. } => {
-            desugar_expr(lhs, io_fns);
-            desugar_expr(rhs, io_fns);
+            desugar_expr(lhs, io_fns, source_vars);
+            desugar_expr(rhs, io_fns, source_vars);
         }
-        ExprKind::UnaryOp { operand, .. } => desugar_expr(operand, io_fns),
+        ExprKind::UnaryOp { operand, .. } => desugar_expr(operand, io_fns, source_vars),
         ExprKind::If {
             cond,
             then_branch,
             else_branch,
         } => {
-            desugar_expr(cond, io_fns);
-            desugar_expr(then_branch, io_fns);
-            desugar_expr(else_branch, io_fns);
+            desugar_expr(cond, io_fns, source_vars);
+            desugar_expr(then_branch, io_fns, source_vars);
+            desugar_expr(else_branch, io_fns, source_vars);
         }
         ExprKind::Case { scrutinee, arms } => {
-            desugar_expr(scrutinee, io_fns);
+            desugar_expr(scrutinee, io_fns, source_vars);
             for arm in arms {
-                desugar_expr(&mut arm.body, io_fns);
+                // Case-arm pattern binders shadow source-bound variables.
+                let mut bound: Vec<String> = Vec::new();
+                pat_bound_names(&arm.pat, &mut bound);
+                if bound.iter().any(|n| source_vars.contains(n)) {
+                    let mut inner_vars = source_vars.clone();
+                    for n in &bound {
+                        inner_vars.remove(n);
+                    }
+                    desugar_expr(&mut arm.body, io_fns, &inner_vars);
+                } else {
+                    desugar_expr(&mut arm.body, io_fns, source_vars);
+                }
             }
         }
         ExprKind::Do(stmts) => {
-            for stmt in stmts {
-                desugar_stmt(stmt, io_fns);
-            }
+            desugar_do_stmts(stmts, io_fns, source_vars);
         }
         ExprKind::Set { target, value } | ExprKind::ReplaceSet { target, value } => {
-            desugar_expr(target, io_fns);
-            desugar_expr(value, io_fns);
+            desugar_expr(target, io_fns, source_vars);
+            desugar_expr(value, io_fns, source_vars);
         }
-        ExprKind::Atomic(inner) => desugar_expr(inner, io_fns),
-        ExprKind::UnitLit { value, .. } => desugar_expr(value, io_fns),
-        ExprKind::Annot { expr, .. } => desugar_expr(expr, io_fns),
-        ExprKind::Refine(inner) => desugar_expr(inner, io_fns),
+        ExprKind::Atomic(inner) => desugar_expr(inner, io_fns, source_vars),
+        ExprKind::UnitLit { value, .. } => desugar_expr(value, io_fns, source_vars),
+        ExprKind::Annot { expr, .. } => desugar_expr(expr, io_fns, source_vars),
+        ExprKind::Refine(inner) => desugar_expr(inner, io_fns, source_vars),
         ExprKind::Serve { handlers, .. } => {
             for h in handlers {
-                desugar_expr(&mut h.body, io_fns);
+                desugar_expr(&mut h.body, io_fns, source_vars);
             }
         }
     }
@@ -473,13 +589,74 @@ fn unwrap_wrappers_mut(expr: &mut Expr) -> &mut Expr {
     }
 }
 
-fn desugar_stmt(stmt: &mut Stmt, io_fns: &HashSet<String>) {
+fn desugar_stmt(stmt: &mut Stmt, io_fns: &IoFns, source_vars: &HashSet<String>) {
     match &mut stmt.node {
-        StmtKind::Bind { expr, .. } => desugar_expr(expr, io_fns),
-        StmtKind::Let { expr, .. } => desugar_expr(expr, io_fns),
-        StmtKind::Where { cond } => desugar_expr(cond, io_fns),
-        StmtKind::GroupBy { key } => desugar_expr(key, io_fns),
-        StmtKind::Expr(e) => desugar_expr(e, io_fns),
+        StmtKind::Bind { expr, .. } => desugar_expr(expr, io_fns, source_vars),
+        StmtKind::Let { expr, .. } => desugar_expr(expr, io_fns, source_vars),
+        StmtKind::Where { cond } => desugar_expr(cond, io_fns, source_vars),
+        StmtKind::GroupBy { key } => desugar_expr(key, io_fns, source_vars),
+        StmtKind::Expr(e) => desugar_expr(e, io_fns, source_vars),
+    }
+}
+
+/// Desugar the statements of a do-block whose top-level structure is being
+/// preserved, threading the source-bound variable context: statements are
+/// processed in order, and each `x <- *source` bind extends the set (while
+/// any other binding of `x` shadows/removes it), mirroring codegen's
+/// `source_var_binds` bookkeeping.
+fn desugar_do_stmts(stmts: &mut [Stmt], io_fns: &IoFns, source_vars: &HashSet<String>) {
+    let mut local = source_vars.clone();
+    for stmt in stmts.iter_mut() {
+        desugar_stmt(stmt, io_fns, &local);
+        match &stmt.node {
+            StmtKind::Bind { pat, expr } => {
+                let mut bound: Vec<String> = Vec::new();
+                pat_bound_names(pat, &mut bound);
+                let is_source_read = matches!(&expr.node, ExprKind::SourceRef(_));
+                if let (PatKind::Var(name), true) = (&pat.node, is_source_read) {
+                    local.insert(name.clone());
+                } else {
+                    for n in &bound {
+                        local.remove(n);
+                    }
+                }
+            }
+            StmtKind::Let { pat, .. } => {
+                let mut bound: Vec<String> = Vec::new();
+                pat_bound_names(pat, &mut bound);
+                for n in &bound {
+                    local.remove(n);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Collect every variable name bound by a pattern.
+fn pat_bound_names(pat: &Pat, out: &mut Vec<String>) {
+    match &pat.node {
+        PatKind::Var(name) => out.push(name.clone()),
+        PatKind::Wildcard | PatKind::Lit(_) => {}
+        PatKind::Constructor { payload, .. } => pat_bound_names(payload, out),
+        PatKind::Record(fields) => {
+            for f in fields {
+                match &f.pattern {
+                    Some(p) => pat_bound_names(p, out),
+                    // Punned: `{name}` binds `name`.
+                    None => out.push(f.name.clone()),
+                }
+            }
+        }
+        PatKind::List(pats) => {
+            for p in pats {
+                pat_bound_names(p, out);
+            }
+        }
+        PatKind::Cons { head, tail } => {
+            pat_bound_names(head, out);
+            pat_bound_names(tail, out);
+        }
     }
 }
 
@@ -496,7 +673,14 @@ fn desugar_stmt(stmt: &mut Stmt, io_fns: &HashSet<String>) {
 /// This is a purely syntactic check. The codegen does additional validation
 /// (schema shape, views, etc.) and falls back to loop-based compilation
 /// if the SQL path is not viable.
-fn is_sql_compilable(stmts: &[Stmt]) -> bool {
+///
+/// `source_vars` is the set of variables bound from `*source` reads in
+/// enclosing do-blocks. A `x <- someVar` bind only counts as a relation
+/// read (SQL-compilable) when `someVar` is in that set — codegen resolves
+/// exactly those via `source_var_binds`. Binds over arbitrary variables
+/// (lambda params, Maybe/Result values, ...) must NOT be preserved as raw
+/// Do nodes: they desugar through `__bind` so non-relation monads work.
+fn is_sql_compilable(stmts: &[Stmt], source_vars: &HashSet<String>) -> bool {
     if stmts.len() < 2 {
         return false;
     }
@@ -507,9 +691,15 @@ fn is_sql_compilable(stmts: &[Stmt]) -> bool {
         match &stmt.node {
             StmtKind::Bind { pat, expr } => {
                 if let PatKind::Var(name) = &pat.node {
-                    // Accept SourceRef (direct source read) and Var (may be
-                    // a source-bound variable — codegen resolves via source_var_binds).
-                    if matches!(&expr.node, ExprKind::SourceRef(_) | ExprKind::Var(_)) {
+                    // Accept SourceRef (direct source read) and Var when it is
+                    // provably a source-bound variable from an enclosing
+                    // do-block (codegen resolves these via source_var_binds).
+                    let ok = match &expr.node {
+                        ExprKind::SourceRef(_) => true,
+                        ExprKind::Var(v) => source_vars.contains(v),
+                        _ => false,
+                    };
+                    if ok {
                         bind_vars.insert(name.as_str());
                     } else {
                         return false;
@@ -594,7 +784,7 @@ fn is_bound_field_access(expr: &Expr, bind_vars: &std::collections::HashSet<&str
 /// 1. It contains at least one Bind or Where statement
 /// 2. All non-final statements are Bind, Where, or Let
 /// 3. The final statement is Expr(Yield(..))
-fn is_pure_comprehension(stmts: &[Stmt], io_fns: &HashSet<String>) -> bool {
+fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
     if stmts.is_empty() {
         return false;
     }
@@ -622,11 +812,39 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &HashSet<String>) -> bool {
     // would use IO's monadic bind (sequencing) instead, which is wrong when
     // the intent is to iterate over relation elements.
     if stmts.iter().any(|s| match &s.node {
-        StmtKind::Bind { expr, .. } | StmtKind::Let { expr, .. } | StmtKind::Expr(expr) => expr_is_io(expr, io_fns),
-        StmtKind::Where { cond } => expr_is_io(cond, io_fns),
+        StmtKind::Bind { expr, .. } | StmtKind::Let { expr, .. } | StmtKind::Expr(expr) => expr_is_io(expr, &io_fns.base),
+        StmtKind::Where { cond } => expr_is_io(cond, &io_fns.base),
         _ => false,
     }) {
         return false;
+    }
+
+    // Trait-method IO is invisible to codegen's `is_io_do_block` (it scans
+    // Fun bodies only), so excluding such a block would route it to the
+    // relational `compile_do` path which discards bare IO values. The
+    // desugared `__bind`/IO chain is the only path that actually runs
+    // trait-method IO — so desugar when that chain is well-typed as a pure
+    // IO chain (every bind binds from an IO expression, no `where` guards —
+    // IO has no Alternative instance), and exclude otherwise (e.g. a bind
+    // from a relation/Maybe would force a different monad and make the
+    // desugared chain ill-typed).
+    let has_trait_only_io = stmts.iter().any(|s| match &s.node {
+        StmtKind::Bind { expr, .. } | StmtKind::Let { expr, .. } | StmtKind::Expr(expr) => {
+            expr_is_io(expr, &io_fns.all)
+        }
+        StmtKind::Where { cond } => expr_is_io(cond, &io_fns.all),
+        _ => false,
+    });
+    if has_trait_only_io {
+        if stmts.iter().any(|s| matches!(&s.node, StmtKind::Where { .. })) {
+            return false;
+        }
+        if stmts.iter().any(|s| matches!(
+            &s.node,
+            StmtKind::Bind { expr, .. } if !expr_is_io(expr, &io_fns.all)
+        )) {
+            return false;
+        }
     }
 
     // Constructor pattern binds may be value pattern matches (not monadic
@@ -1124,6 +1342,168 @@ mod tests {
                     assert!(
                         matches!(&body.node, ExprKind::Do(_)),
                         "multi-table sql-compilable do block should be preserved"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn var_bind_without_source_context_desugars() {
+        // `u <- m` over a lambda param (e.g. a Maybe) with `yield u` must
+        // desugar through __bind — it is NOT a SQL-compilable relation read
+        // even though the yield shape matches (regression: the Var-bind
+        // acceptance used to win unconditionally and the block was preserved
+        // as a raw Do node, breaking non-relation monads).
+        let src = r#"
+            firstAdult = \m -> do
+              u <- m
+              where u.age >= 18
+              yield u
+        "#;
+        let mut module = parse(src);
+        desugar(&mut module);
+        for decl in &module.decls {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
+                if name == "firstAdult" {
+                    assert!(has_bind_var(body), "expected __bind in desugared body");
+                    assert!(!has_do_block(body), "expected no Do block after desugaring");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn var_bind_with_source_context_preserved() {
+        // `p <- rows` where `rows <- *people` in the enclosing do-block IS
+        // a source-bound variable — codegen resolves it via source_var_binds
+        // and compiles the inner do to a single SQL query, so it must be
+        // preserved as a raw Do node.
+        let src = r#"
+            *people : [{name: Text, age: Int}]
+            main = do
+              rows <- *people
+              let adults = do
+                    p <- rows
+                    where p.age >= 18
+                    yield p
+              println (show (count adults))
+        "#;
+        let mut module = parse(src);
+        desugar(&mut module);
+        for decl in &module.decls {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
+                if name == "main" {
+                    // outer block is mixed/IO → preserved; the let-bound
+                    // inner do must also still be a Do node.
+                    let stmts = match &body.node {
+                        ExprKind::Do(stmts) => stmts,
+                        other => panic!("expected outer Do, got {:?}", other),
+                    };
+                    let inner = stmts.iter().find_map(|s| match &s.node {
+                        StmtKind::Let { expr, .. } => Some(expr),
+                        _ => None,
+                    });
+                    let inner = inner.expect("expected let stmt");
+                    assert!(
+                        matches!(&inner.node, ExprKind::Do(_)),
+                        "inner do over source-bound var should be preserved"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn var_bind_shadowed_by_lambda_param_desugars() {
+        // A lambda param shadows a source-bound variable of the same name:
+        // inside the lambda, `u <- rows` is no longer a source read.
+        let src = r#"
+            *people : [{name: Text, age: Int}]
+            main = do
+              rows <- *people
+              let f = \rows -> do
+                    u <- rows
+                    where u.age >= 18
+                    yield u
+              println (show (f (Just {value: {age: 1}})))
+        "#;
+        let mut module = parse(src);
+        desugar(&mut module);
+        for decl in &module.decls {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
+                if name == "main" {
+                    let stmts = match &body.node {
+                        ExprKind::Do(stmts) => stmts,
+                        other => panic!("expected outer Do, got {:?}", other),
+                    };
+                    let lambda = stmts.iter().find_map(|s| match &s.node {
+                        StmtKind::Let { expr, .. } => Some(expr),
+                        _ => None,
+                    });
+                    let lambda = lambda.expect("expected let stmt");
+                    assert!(
+                        has_bind_var(lambda),
+                        "shadowed var bind should desugar through __bind"
+                    );
+                    assert!(
+                        !has_do_block(lambda),
+                        "shadowed var bind should not be preserved as Do"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn io_trait_method_do_block_not_desugared() {
+        // A do-block calling a trait method whose signature returns IO must
+        // be excluded from pure-comprehension desugaring, exactly like a
+        // do-block calling a plain IO function.
+        let src = r#"
+            trait Ticker a where
+              tick : a -> IO {console} {}
+            impl Ticker Int where
+              tick = \v -> println (show v)
+            main = do
+              b <- [1, 2]
+              tick b
+        "#;
+        let mut module = parse(src);
+        desugar(&mut module);
+        for decl in &module.decls {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
+                if name == "main" {
+                    assert!(
+                        matches!(&body.node, ExprKind::Do(_)),
+                        "IO trait-method do block should not be desugared"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn io_impl_body_only_method_not_desugared() {
+        // The trait signature is polymorphic (no IO), but an impl body does
+        // IO — the fixpoint over impl bodies flags the method name.
+        let src = r#"
+            trait Runner a where
+              run : a -> a
+            impl Runner Int where
+              run = \v -> println (show v)
+            main = do
+              b <- [1, 2]
+              run b
+        "#;
+        let mut module = parse(src);
+        desugar(&mut module);
+        for decl in &module.decls {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
+                if name == "main" {
+                    assert!(
+                        matches!(&body.node, ExprKind::Do(_)),
+                        "do block calling an IO-bodied impl method should not be desugared"
                     );
                 }
             }

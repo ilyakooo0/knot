@@ -136,12 +136,18 @@ pub(crate) fn handle_type_hierarchy_supertypes(
                         trait_name, args, ..
                     } = &decl.node
                     {
-                        let arg_names: Vec<String> = args
-                            .iter()
-                            .map(|t| crate::type_format::format_type_kind(&t.node))
-                            .collect();
-                        let arg_str = arg_names.join(" ");
-                        if arg_str.contains(name) {
+                        // Whole-token comparison: a substring `contains`
+                        // would make `impl Display UserId` register Display
+                        // as a supertype of an unrelated type `Id`
+                        // ("UserId".contains("Id")). Split the formatted
+                        // impl args into identifier tokens and require an
+                        // exact token match.
+                        let matches_token = args.iter().any(|t| {
+                            crate::type_format::format_type_kind(&t.node)
+                                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                                .any(|tok| tok == name)
+                        });
+                        if matches_token {
                             push_trait_item(trait_name, state, &mut out);
                         }
                     }

@@ -42,33 +42,55 @@ pub(crate) fn render_signature_with_effects(inferred: &str, effects: &EffectSet)
     format!("{}{}{}", &inferred[..row_start], merged, &inferred[row_end..])
 }
 
-/// Find the byte range of the contents (between `{` and `}`) of the *last*
-/// `IO { … }` row in the rendered type — the result-position one for a
-/// function type. Returns `None` when no IO row is present.
+/// Find the byte range of the contents (between `{` and `}`) of the
+/// *outermost* (top-level result position) `IO { … }` row in the rendered
+/// type. Only `IO {` occurrences at nesting depth 0 count — taking the
+/// textually-last row regardless of nesting picks the wrong one for curried
+/// IO-returning results (`Int -> IO {} (Int -> IO {fs} Text)`, where the
+/// outermost row is the FIRST). Among depth-0 rows, the last along the arrow
+/// spine (`IO {a} Int -> IO {b} Text`) is the result row. Returns `None`
+/// when no top-level IO row is present.
 fn find_outermost_io_row(ty: &str) -> Option<(usize, usize)> {
     let bytes = ty.as_bytes();
     let mut last: Option<(usize, usize)> = None;
-    let mut search_from = 0;
-    while let Some(io_pos) = ty[search_from..].find("IO {") {
-        let row_start = search_from + io_pos + 4;
-        let mut depth: i32 = 1;
-        let mut i = row_start;
-        while i < bytes.len() && depth > 0 {
-            match bytes[i] {
-                b'{' => depth += 1,
-                b'}' => depth -= 1,
-                _ => {}
+    let mut depth: i32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'I' if depth == 0 && ty[i..].starts_with("IO {") => {
+                // Whole-word check: don't match the tail of an identifier.
+                let left_ok = i == 0
+                    || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+                if left_ok {
+                    let row_start = i + 4;
+                    let mut row_depth: i32 = 1;
+                    let mut j = row_start;
+                    while j < bytes.len() {
+                        match bytes[j] {
+                            b'{' => row_depth += 1,
+                            b'}' => {
+                                row_depth -= 1;
+                                if row_depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    if row_depth != 0 {
+                        return None;
+                    }
+                    last = Some((row_start, j));
+                    i = j + 1;
+                    continue;
+                }
             }
-            if depth == 0 {
-                break;
-            }
-            i += 1;
+            _ => {}
         }
-        if depth != 0 {
-            return None;
-        }
-        last = Some((row_start, i));
-        search_from = i + 1;
+        i += 1;
     }
     last
 }
@@ -651,6 +673,12 @@ pub(crate) fn find_app_in_expr(
         }
         ast::ExprKind::FieldAccess { expr, .. } => {
             find_app_in_expr(expr, source, offset, best);
+        }
+        ast::ExprKind::Annot { expr, .. } => {
+            find_app_in_expr(expr, source, offset, best);
+        }
+        ast::ExprKind::UnitLit { value, .. } => {
+            find_app_in_expr(value, source, offset, best);
         }
         _ => {}
     }
@@ -1534,5 +1562,36 @@ mod tests {
         foreign.push_str("\\other -> other < 99");
         let rendered = predicate_to_source(&pred, &foreign);
         assert_eq!(rendered, "\\x -> x >= 0");
+    }
+}
+
+// Regression tests for the 2026-06 LSP bug-fix batch (shared helpers).
+#[cfg(test)]
+mod regress_fixes_tests {
+    use super::*;
+
+    /// Item 25: the IO row picked for effect merging must be the top-level
+    /// result row, not a nested row inside parens.
+    #[test]
+    fn outermost_io_row_respects_nesting() {
+        // Curried IO-returning result: the outermost row is the FIRST.
+        let ty = "Int -> IO {} (Int -> IO {fs} Text)";
+        let (s, e) = find_outermost_io_row(ty).expect("row found");
+        assert_eq!(&ty[s..e], "");
+        assert!(s < ty.find('(').unwrap(), "picked a nested row: {}", &ty[s..e]);
+
+        // Along a flat arrow spine the last depth-0 row is the result row.
+        let ty2 = "IO {a} Int -> IO {b} Text";
+        let (s2, e2) = find_outermost_io_row(ty2).expect("row found");
+        assert_eq!(&ty2[s2..e2], "b");
+
+        // A function whose only IO row sits inside a parenthesized parameter
+        // has no top-level row at all.
+        assert_eq!(find_outermost_io_row("(Int -> IO {fs} Text) -> Int"), None);
+
+        // Simple result row still found.
+        let ty3 = "Int -> IO {console} {}";
+        let (s3, e3) = find_outermost_io_row(ty3).expect("row found");
+        assert_eq!(&ty3[s3..e3], "console");
     }
 }

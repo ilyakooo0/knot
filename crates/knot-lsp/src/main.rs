@@ -21,6 +21,8 @@ mod legend;
 mod linked_editing;
 mod parsed_type;
 mod references;
+#[cfg(test)]
+mod regress_sync_nav_fixes_tests;
 mod rename;
 mod selection_range;
 mod semantic_tokens;
@@ -551,7 +553,30 @@ fn handle_will_rename_files(
                 Some(p) => p,
                 None => continue,
             };
-            for imp in &doc.module.imports {
+            // Build edits against the freshest text the client knows about.
+            // `doc.source`/`doc.module` reflect the last *analyzed* state; if
+            // the user has in-flight edits (pending source mid-debounce),
+            // spans computed against the analyzed text would land in the
+            // wrong place once the client applies the WorkspaceEdit to its
+            // live buffer. Re-parse the pending source so import spans match
+            // the text the edit will be applied to.
+            let pending_reparsed = state
+                .pending_sources
+                .get(importer_uri)
+                .filter(|p| p.source != doc.source)
+                .map(|p| {
+                    let lexer = knot::lexer::Lexer::new(&p.source);
+                    let (tokens, _) = lexer.tokenize();
+                    let parser = knot::parser::Parser::new(p.source.clone(), tokens);
+                    let (module, _) = parser.parse_module();
+                    (p.source.clone(), module.imports)
+                });
+            let (live_source, live_imports): (&str, &[knot::ast::Import]) =
+                match &pending_reparsed {
+                    Some((src, imports)) => (src.as_str(), imports.as_slice()),
+                    None => (doc.source.as_str(), doc.module.imports.as_slice()),
+                };
+            for imp in live_imports {
                 let resolved = importer_dir.join(format!("{}.knot", imp.path));
                 let canonical = match resolved.canonicalize() {
                     Ok(p) => p,
@@ -574,7 +599,7 @@ fn handle_will_rename_files(
                 // just the path portion. Compute it by finding the first
                 // non-whitespace after `import`.
                 let span = imp.span;
-                let span_text = match doc.source.get(span.start..span.end) {
+                let span_text = match live_source.get(span.start..span.end) {
                     Some(s) => s,
                     None => continue,
                 };
@@ -589,8 +614,8 @@ fn handle_will_rename_files(
                         .take_while(|c| c.is_whitespace())
                         .map(|c| c.len_utf8())
                         .sum::<usize>();
-                let path_start_pos = offset_to_position(&doc.source, path_start);
-                let path_end_pos = offset_to_position(&doc.source, span.end);
+                let path_start_pos = offset_to_position(live_source, path_start);
+                let path_end_pos = offset_to_position(live_source, span.end);
                 changes
                     .entry(importer_uri.clone())
                     .or_default()
@@ -653,11 +678,31 @@ fn apply_analysis_result(state: &mut ServerState, conn: &Connection, result: Ana
 
     // If a newer edit was applied while analysis was running, drop the result.
     // The newer edit will already have queued a fresh task.
-    if let Some(pending) = state.pending_sources.get(&result.uri) {
-        if pending.source != result.doc.source {
-            return;
+    match state.pending_sources.get(&result.uri) {
+        Some(pending) => {
+            if pending.source != result.doc.source {
+                return;
+            }
+            state.pending_sources.remove(&result.uri);
         }
-        state.pending_sources.remove(&result.uri);
+        None => {
+            // No pending edit means the live editor buffer matches the
+            // last *analyzed* source. A result carrying different source
+            // text is stale — e.g. the user edited (queueing a task) and
+            // then undid back to the analyzed text before the worker
+            // finished: the undo's didChange takes the `unchanged` early
+            // return, which removes the pending entry without queueing a
+            // fresh task. Applying the in-flight result here would make
+            // `documents[uri].source` diverge from the editor buffer, so
+            // every subsequent didChange range (computed by the client
+            // against its own buffer) would be applied to the wrong text —
+            // persistent corruption. Drop it instead.
+            if let Some(current) = state.documents.get(&result.uri) {
+                if current.source != result.doc.source {
+                    return;
+                }
+            }
+        }
     }
 
     // Compute the LSP-shaped diagnostics from the freshly analyzed doc *before*
@@ -1275,6 +1320,14 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
             return;
         };
         let uri = params.text_document.uri;
+        // When a pending (newer) source exists, the analyzed `doc.source` is
+        // stale relative to the editor buffer: republishing diagnostics
+        // rendered against it would clobber the rebased positions didChange
+        // already pushed. Skip the backstop — the in-flight analysis will
+        // publish fresh diagnostics for the pending text shortly.
+        if state.pending_sources.contains_key(&uri) {
+            return;
+        }
         if let Some(doc) = state.documents.get(&uri) {
             let lsp_diags: Vec<Diagnostic> = doc
                 .knot_diagnostics

@@ -40,11 +40,17 @@ pub fn offset_to_position(source: &str, offset: usize) -> Position {
     }
     // \r immediately before \n is part of the CRLF line break (LSP spec
     // says it counts as one character together), so strip it from the
-    // column count. Stray \r in the middle of a line still counts — the
-    // matching `position_to_offset` only strips the *trailing* \r too,
-    // and the round-trip needs to be symmetric.
+    // column count — but only when it actually terminates the line, i.e.
+    // the byte at `safe_offset` is the '\n' of this CRLF pair. A stray \r
+    // in the middle of a line is an ordinary character and must count as
+    // a column, matching `position_to_offset`, which only strips the
+    // line-*trailing* \r.
     let line_slice = &source[line_start..safe_offset];
-    let line_slice = line_slice.strip_suffix('\r').unwrap_or(line_slice);
+    let line_slice = if bytes.get(safe_offset) == Some(&b'\n') {
+        line_slice.strip_suffix('\r').unwrap_or(line_slice)
+    } else {
+        line_slice
+    };
     let character: u32 = line_slice.chars().map(|c| c.len_utf16() as u32).sum();
     Position::new(line, character)
 }
@@ -88,15 +94,20 @@ pub fn word_span_at_offset(source: &str, offset: usize) -> Option<Span> {
 
 fn word_bounds_at_offset(source: &str, offset: usize) -> Option<(usize, usize)> {
     let bytes = source.as_bytes();
-    if offset >= bytes.len() {
-        return None;
-    }
-
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
 
-    if !is_ident(bytes[offset]) {
+    // The caret immediately after the last char of an identifier (the
+    // standard post-typing cursor position) should still resolve that
+    // identifier: when the byte at `offset` isn't an ident byte (or we're
+    // at EOF) but the byte before it is, fall back to the word ending at
+    // `offset`.
+    let offset = if offset < bytes.len() && is_ident(bytes[offset]) {
+        offset
+    } else if offset > 0 && offset <= bytes.len() && is_ident(bytes[offset - 1]) {
+        offset - 1
+    } else {
         return None;
-    }
+    };
 
     let start = (0..offset)
         .rev()
@@ -109,6 +120,18 @@ fn word_bounds_at_offset(source: &str, offset: usize) -> Option<(usize, usize)> 
         .unwrap_or(bytes.len());
 
     Some((start, end))
+}
+
+/// Effective cursor offset for identifier span-containment lookups
+/// (`usage.start <= offset && offset < usage.end`). When the caret sits
+/// immediately after the last char of an identifier, nudge it back inside
+/// the word so position-keyed resolution (rename/references/highlight)
+/// matches the same identifier `word_at_position` reports.
+pub fn ident_lookup_offset(source: &str, offset: usize) -> usize {
+    match word_bounds_at_offset(source, offset) {
+        Some((start, end)) if end > start => offset.clamp(start, end - 1),
+        _ => offset,
+    }
 }
 
 /// Slice `source` by `span` without panicking on stale or out-of-bounds spans.
@@ -429,7 +452,19 @@ pub fn recurse_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, mut f: F) {
         ast::ExprKind::FieldAccess { expr, .. } => f(expr),
         ast::ExprKind::Annot { expr, .. } => f(expr),
         ast::ExprKind::UnitLit { value, .. } => f(value),
-        _ => {}
+        ast::ExprKind::Serve { handlers, .. } => {
+            // `api` is a Name (no sub-expression); handler bodies are the
+            // only expression children.
+            for h in handlers {
+                f(&h.body);
+            }
+        }
+        // Leaves: Lit, Var, Constructor, SourceRef, DerivedRef.
+        ast::ExprKind::Lit(_)
+        | ast::ExprKind::Var(_)
+        | ast::ExprKind::Constructor(_)
+        | ast::ExprKind::SourceRef(_)
+        | ast::ExprKind::DerivedRef(_) => {}
     }
 }
 
@@ -495,5 +530,74 @@ mod tests {
         // Byte offset 5 is just after 😀 — should be UTF-16 column 3.
         let pos = offset_to_position(src, 5);
         assert_eq!(pos, Position::new(0, 3));
+    }
+}
+
+#[cfg(test)]
+mod regress_fixes_tests {
+    use super::*;
+
+    #[test]
+    fn offset_to_position_counts_midline_stray_cr_as_column() {
+        // A stray \r that does NOT terminate the line is an ordinary
+        // character: offset 3 in "ab\rcd" is column 3, not 2.
+        let src = "ab\rcd";
+        assert_eq!(offset_to_position(src, 3), Position::new(0, 3));
+        assert_eq!(offset_to_position(src, 5), Position::new(0, 5));
+    }
+
+    #[test]
+    fn offset_to_position_still_strips_crlf_terminator() {
+        // Offset 3 points at the '\n' of the CRLF pair — the \r is part of
+        // the line break and must not contribute a column.
+        let src = "ab\r\ncd";
+        assert_eq!(offset_to_position(src, 3), Position::new(0, 2));
+        assert_eq!(offset_to_position(src, 4), Position::new(1, 0));
+    }
+
+    #[test]
+    fn word_at_position_resolves_caret_after_identifier() {
+        // Caret immediately after the last char of `total` (standard
+        // post-typing position) must still resolve the identifier.
+        let src = "total + 1";
+        assert_eq!(word_at_position(src, Position::new(0, 5)), Some("total"));
+        // Caret at EOF right after an identifier.
+        let src2 = "total";
+        assert_eq!(word_at_position(src2, Position::new(0, 5)), Some("total"));
+        // Caret between two non-ident chars still resolves nothing.
+        assert_eq!(word_at_position(src, Position::new(0, 7)), None);
+    }
+
+    #[test]
+    fn ident_lookup_offset_nudges_caret_back_into_word() {
+        let src = "total + 1";
+        assert_eq!(ident_lookup_offset(src, 5), 4); // after `total`
+        assert_eq!(ident_lookup_offset(src, 3), 3); // inside word — unchanged
+        assert_eq!(ident_lookup_offset(src, 6), 6); // not adjacent — unchanged
+    }
+
+    #[test]
+    fn recurse_expr_visits_serve_handler_bodies() {
+        use knot::ast::{ExprKind, ServeHandler, Span, Spanned};
+        let body = Spanned::new(ExprKind::Var("handler1".into()), Span::new(20, 28));
+        let serve = Spanned::new(
+            ExprKind::Serve {
+                api: "Api".into(),
+                api_span: Span::new(6, 9),
+                handlers: vec![ServeHandler {
+                    endpoint: "GetThing".into(),
+                    endpoint_span: Span::new(16, 24),
+                    body,
+                }],
+            },
+            Span::new(0, 30),
+        );
+        let mut seen = Vec::new();
+        recurse_expr(&serve, |e| {
+            if let ExprKind::Var(n) = &e.node {
+                seen.push(n.clone());
+            }
+        });
+        assert_eq!(seen, vec!["handler1".to_string()]);
     }
 }

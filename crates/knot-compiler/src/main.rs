@@ -55,11 +55,18 @@ fn main() {
                     }
                     if let Some((name, val)) = rest.split_once('=') {
                         overrides.insert(name.to_string(), val.to_string());
-                    } else if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    } else if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                        // Space-separated form: the next token is the value.
+                        // Any token starting with '-' (e.g. `-o`, another
+                        // `--flag`, or a negative number) is NOT consumed as
+                        // the value — use the `--name=value` form for those.
                         overrides.insert(rest.to_string(), args[i + 1].clone());
                         i += 1;
                     } else {
-                        eprintln!("Error: missing value for --{}", rest);
+                        eprintln!(
+                            "Error: missing value for --{} (for values starting with '-', use --{}=<value>)",
+                            rest, rest
+                        );
                         process::exit(1);
                     }
                     i += 1;
@@ -87,7 +94,7 @@ fn print_usage() {
     eprintln!();
     eprintln!("Usage:");
     eprintln!("  knot build <file.knot> [-o <path>] [--name=value ...]  Compile with optional output path and constant overrides");
-    eprintln!("  knot fmt [--check] [--stdout] <file.knot>              Format a source file in place");
+    eprintln!("  knot fmt [--check] [--stdout] <file.knot>              Format a source file in place ('-' reads stdin, writes stdout)");
     eprintln!("  knot help                                              Show this help message");
 }
 
@@ -98,10 +105,13 @@ fn cmd_fmt(args: &[String]) {
     for a in args {
         match a.as_str() {
             "--check" => check = true,
-            "--stdout" | "-" => to_stdout = true,
+            "--stdout" => to_stdout = true,
+            // Conventional stdin marker: read source from stdin and write
+            // the formatted output to stdout (or just diff with --check).
+            "-" => paths.push("-"),
             other if other.starts_with("--") => {
                 eprintln!("Error: unknown fmt flag '{}'", other);
-                eprintln!("Usage: knot fmt [--check] [--stdout] <file.knot>...");
+                eprintln!("Usage: knot fmt [--check] [--stdout] <file.knot>... (use '-' for stdin)");
                 process::exit(2);
             }
             other => paths.push(other),
@@ -109,24 +119,39 @@ fn cmd_fmt(args: &[String]) {
     }
     if paths.is_empty() {
         eprintln!("Error: missing source file");
-        eprintln!("Usage: knot fmt [--check] [--stdout] <file.knot>...");
+        eprintln!("Usage: knot fmt [--check] [--stdout] <file.knot>... (use '-' for stdin)");
         process::exit(2);
     }
 
     let mut any_diff = false;
     for path_str in &paths {
+        let from_stdin = *path_str == "-";
         let source_path = PathBuf::from(path_str);
-        let source = match std::fs::read_to_string(&source_path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Error reading {}: {}", source_path.display(), e);
+        let source = if from_stdin {
+            use std::io::Read;
+            let mut buf = String::new();
+            if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+                eprintln!("Error reading stdin: {}", e);
                 process::exit(1);
+            }
+            buf
+        } else {
+            match std::fs::read_to_string(&source_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading {}: {}", source_path.display(), e);
+                    process::exit(1);
+                }
             }
         };
 
         let lexer = knot::lexer::Lexer::new(&source);
         let (tokens, lex_diags) = lexer.tokenize();
-        let filename = source_path.display().to_string();
+        let filename = if from_stdin {
+            "<stdin>".to_string()
+        } else {
+            source_path.display().to_string()
+        };
         let lex_errs: Vec<_> = lex_diags
             .iter()
             .filter(|d| d.severity == knot::diagnostic::Severity::Error)
@@ -145,7 +170,7 @@ fn cmd_fmt(args: &[String]) {
             .filter(|d| d.severity == knot::diagnostic::Severity::Error)
             .collect();
         if !parse_errs.is_empty() {
-            eprintln!("Cannot format {}: parse errors", source_path.display());
+            eprintln!("Cannot format {}: parse errors", filename);
             for d in &parse_errs {
                 eprintln!("{}", d.render(&source, &filename));
             }
@@ -156,10 +181,11 @@ fn cmd_fmt(args: &[String]) {
 
         if check {
             if formatted != source {
-                eprintln!("{}: not formatted", source_path.display());
+                eprintln!("{}: not formatted", filename);
                 any_diff = true;
             }
-        } else if to_stdout {
+        } else if to_stdout || from_stdin {
+            // stdin input has no file to rewrite — always format to stdout.
             print!("{}", formatted);
         } else if formatted != source {
             if let Err(e) = std::fs::write(&source_path, &formatted) {

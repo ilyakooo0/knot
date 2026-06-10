@@ -191,6 +191,17 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                     .iter()
                     .filter_map(|item| {
                         if let ast::TraitItem::Method { name: method_name, ty, .. } = item {
+                            // Anchor the child on its own name token (like
+                            // constructors above) so "go to symbol" lands on
+                            // the method instead of the trait header.
+                            let name_range = find_word_in_source(
+                                source,
+                                method_name,
+                                decl.span.start,
+                                decl.span.end,
+                            )
+                            .map(|s| span_to_range(s, source))
+                            .unwrap_or(range);
                             Some(DocumentSymbol {
                                 name: method_name.clone(),
                                 detail: Some(format_type_scheme(ty)),
@@ -198,7 +209,7 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                                 tags: None,
                                 deprecated: None,
                                 range,
-                                selection_range: range,
+                                selection_range: name_range,
                                 children: None,
                             })
                         } else {
@@ -236,6 +247,14 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                     .iter()
                     .filter_map(|item| {
                         if let ast::ImplItem::Method { name, .. } = item {
+                            let name_range = find_word_in_source(
+                                source,
+                                name,
+                                decl.span.start,
+                                decl.span.end,
+                            )
+                            .map(|s| span_to_range(s, source))
+                            .unwrap_or(range);
                             Some(DocumentSymbol {
                                 name: name.clone(),
                                 detail: None,
@@ -243,7 +262,7 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                                 tags: None,
                                 deprecated: None,
                                 range,
-                                selection_range: range,
+                                selection_range: name_range,
                                 children: None,
                             })
                         } else {
@@ -285,6 +304,14 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                             ast::HttpMethod::Delete => "DELETE",
                             ast::HttpMethod::Patch => "PATCH",
                         };
+                        let name_range = find_word_in_source(
+                            source,
+                            &e.constructor,
+                            decl.span.start,
+                            decl.span.end,
+                        )
+                        .map(|s| span_to_range(s, source))
+                        .unwrap_or(range);
                         DocumentSymbol {
                             name: e.constructor.clone(),
                             detail: Some(format!("{method} {path_str}")),
@@ -292,7 +319,7 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                             tags: None,
                             deprecated: None,
                             range,
-                            selection_range: range,
+                            selection_range: name_range,
                             children: None,
                         }
                     })

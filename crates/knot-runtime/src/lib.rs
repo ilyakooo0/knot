@@ -15,8 +15,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
 use std::ffi::c_void;
 use std::slice;
-#[cfg(feature = "gc-stats")]
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::time::Duration;
@@ -2945,7 +2943,15 @@ fn select_rows_with_rowid(
         .into();
     let mut ev = EventRows::new(header);
     let mut rowids: Vec<i64> = Vec::new();
-    while let Ok(Some(r)) = q.next() {
+    loop {
+        // A mid-iteration error must return None (not a truncated row set):
+        // callers treat the rows as a complete pre/post-image, and a partial
+        // set would make STM watchers on the missing rows miss wakeups.
+        let r = match q.next() {
+            Ok(Some(r)) => r,
+            Ok(None) => break,
+            Err(_) => return None,
+        };
         if ev.len() >= EVENT_ROWS_HARD_CAP {
             return None;
         }
@@ -5922,8 +5928,14 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
             buf.extend_from_slice(f.source.as_bytes());
             value_to_hash_bytes(f.env, buf);
         }
-        Value::IO(_, _) => {
+        Value::IO(fn_ptr, env) => {
+            // Mirror `values_equal`: two IO values are equal iff they share
+            // the same fn pointer AND equal environments. Hashing only the
+            // tag byte collapsed distinct IO actions in dedup paths
+            // (union/concat/bind), silently dropping actions.
             buf.push(11);
+            buf.extend_from_slice(&(*fn_ptr as usize).to_le_bytes());
+            value_to_hash_bytes(*env, buf);
         }
         Value::Pair(a, b) => {
             // Pair is an internal-only variant for IO thunk envs; it should
@@ -8487,8 +8499,11 @@ pub extern "C-unwind" fn knot_text_to_lower(v: *mut Value) -> *mut Value {
 /// take(n, text) — first n characters
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_text_take(n: *mut Value, text: *mut Value) -> *mut Value {
-    let n_idx = int_as_usize(unsafe { as_ref(n) })
-        .unwrap_or_else(|| panic!("knot runtime: take expected Int as first arg, got {}", type_name(n)));
+    // Clamp negative counts to 0, matching `knot_relation_take`.
+    let n_idx = match unsafe { as_ref(n) } {
+        Value::Int(i) => (*i).max(0) as usize,
+        _ => panic!("knot runtime: take expected Int as first arg, got {}", type_name(n)),
+    };
     match unsafe { as_ref(text) } {
         Value::Text(s) => {
             let result: String = s.chars().take(n_idx).collect();
@@ -8501,8 +8516,11 @@ pub extern "C-unwind" fn knot_text_take(n: *mut Value, text: *mut Value) -> *mut
 /// drop(n, text) — skip first n characters
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_text_drop(n: *mut Value, text: *mut Value) -> *mut Value {
-    let n_idx = int_as_usize(unsafe { as_ref(n) })
-        .unwrap_or_else(|| panic!("knot runtime: drop expected Int as first arg, got {}", type_name(n)));
+    // Clamp negative counts to 0, matching `knot_relation_drop`.
+    let n_idx = match unsafe { as_ref(n) } {
+        Value::Int(i) => (*i).max(0) as usize,
+        _ => panic!("knot runtime: drop expected Int as first arg, got {}", type_name(n)),
+    };
     match unsafe { as_ref(text) } {
         Value::Text(s) => {
             let result: String = s.chars().skip(n_idx).collect();
@@ -10258,9 +10276,19 @@ pub extern "C-unwind" fn knot_source_query_value(
                 ValueRef::Integer(n) => Ok(alloc_int(n)),
                 ValueRef::Real(f) => Ok(alloc_float(f)),
                 ValueRef::Text(s) => {
+                    // Int columns are stored as TEXT COLLATE KNOT_INT, so a
+                    // MIN/MAX over an Int column comes back as Text. Parse it
+                    // back to a numeric value (same logic as query_sum); only
+                    // genuinely textual results stay Text.
                     let s = std::str::from_utf8(s)
                         .expect("knot runtime: invalid UTF-8 in aggregate result");
-                    Ok(alloc(Value::Text(Arc::from(s))))
+                    if let Ok(n) = s.parse::<i64>() {
+                        Ok(alloc_int(n))
+                    } else if let Ok(f) = s.parse::<f64>() {
+                        Ok(alloc_float(f))
+                    } else {
+                        Ok(alloc(Value::Text(Arc::from(s))))
+                    }
                 }
                 ValueRef::Blob(_) => panic!(
                     "knot runtime: aggregate result is BLOB, expected Int/Float/Text\n  SQL: {}",
@@ -11606,6 +11634,24 @@ pub extern "C-unwind" fn knot_source_delete_where(
     let param_refs: Vec<&dyn rusqlite::types::ToSql> =
         sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
 
+    // Run the child-table cascade and the parent DELETE in a single
+    // savepoint (like every sibling write path) so a parent DELETE failure
+    // (subset-constraint trigger, SQLITE_BUSY) doesn't leave child rows
+    // already-deleted with no parent rows gone.
+    db_ref
+        .conn
+        .execute_batch("SAVEPOINT knot_delete_where;")
+        .expect("knot runtime: failed to begin transaction");
+
+    // On any error inside the savepoint, roll it back before panicking so
+    // the cascade isn't half-applied and the (possibly long-lived) connection
+    // isn't left with an open savepoint.
+    fn rollback_delete_where(db_ref: &KnotDb) {
+        let _ = db_ref.conn.execute_batch(
+            "ROLLBACK TO SAVEPOINT knot_delete_where; RELEASE SAVEPOINT knot_delete_where;",
+        );
+    }
+
     // Cascade delete to child tables (nested relation fields) before
     // deleting parent rows.  Discover ALL descendant tables by querying
     // SQLite metadata for tables matching the `{parent}__{...}` pattern
@@ -11660,7 +11706,10 @@ pub extern "C-unwind" fn knot_source_delete_where(
                             ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",")
                         );
                         debug_sql(&del);
-                        let _ = db_ref.conn.execute_batch(&del);
+                        if let Err(e) = db_ref.conn.execute_batch(&del) {
+                            rollback_delete_where(db_ref);
+                            panic!("knot runtime: delete_where cascade error: {}\n  SQL: {}", e, del);
+                        }
                     } else {
                         // Grandchild+: find its immediate parent table and delete rows
                         // whose _parent_id no longer exists in the parent table.
@@ -11671,7 +11720,10 @@ pub extern "C-unwind" fn knot_source_delete_where(
                             quote_ident(parent_table)
                         );
                         debug_sql(&del);
-                        let _ = db_ref.conn.execute_batch(&del);
+                        if let Err(e) = db_ref.conn.execute_batch(&del) {
+                            rollback_delete_where(db_ref);
+                            panic!("knot runtime: delete_where cascade error: {}\n  SQL: {}", e, del);
+                        }
                     }
                 }
             }
@@ -11721,10 +11773,17 @@ pub extern "C-unwind" fn knot_source_delete_where(
         None => WriteEvent::Bulk,
     };
 
+    if let Err(e) = db_ref.conn.execute(&sql, param_refs2.as_slice()) {
+        // Roll back the cascade so child rows aren't lost when the parent
+        // DELETE fails (e.g. subset-constraint BEFORE DELETE trigger).
+        rollback_delete_where(db_ref);
+        panic!("knot runtime: delete_where error: {}\n  SQL: {}", e, sql);
+    }
+
     db_ref
         .conn
-        .execute(&sql, param_refs2.as_slice())
-        .unwrap_or_else(|e| panic!("knot runtime: delete_where error: {}\n  SQL: {}", e, sql));
+        .execute_batch("RELEASE SAVEPOINT knot_delete_where;")
+        .expect("knot runtime: failed to commit transaction");
     if db_ref.atomic_depth.get() > 0 {
         stm_track_write_with_event(name, event);
     } else {
@@ -11819,6 +11878,15 @@ pub extern "C-unwind" fn knot_source_update_where(
     // Post-image: re-SELECT the same rows by rowid. UPDATE may have changed
     // a column that a watcher filters on — pre-image captures the old value,
     // post-image captures the new — and we want either to trigger a wake.
+    //
+    // OR REPLACE note: the UPDATE can delete a victim row that collides on
+    // the table's unique index. That index spans ALL schema columns (set
+    // semantics — see init_record_table / knot_source_init), so a victim is
+    // column-identical to the surviving row's post-image; watchers filtered
+    // on the victim's values are woken by the post-image row. This makes
+    // per-row events safe ONLY when the post-image capture succeeds — if it
+    // fails we must fall back to Bulk, not pre-image-only Rows, or watchers
+    // on the new values / replaced victims miss their wakeup.
     let event = match (schema_arc, pre_image) {
         (Some(rec), Some((pre_rows, rowids))) => {
             if rowids.is_empty() {
@@ -11850,7 +11918,11 @@ pub extern "C-unwind" fn knot_source_update_where(
                             WriteEvent::Bulk
                         }
                     }
-                    None => WriteEvent::Rows(merged),
+                    // Post-image capture failed: the event would miss the
+                    // updated rows' new values and any OR REPLACE victims.
+                    // Bulk is the safe wake (matches select_rows_with_rowid's
+                    // documented fallback contract).
+                    None => WriteEvent::Bulk,
                 }
             }
         }
@@ -12816,6 +12888,14 @@ pub extern "C-unwind" fn knot_view_read(
     let view_schema = unsafe { str_from_raw(schema_ptr, schema_len) };
     let filter_where = unsafe { str_from_raw(filter_ptr, filter_len) };
     let cols = parse_schema(view_schema);
+
+    // Inside `atomic`, register the view's UNDERLYING SOURCE table in the
+    // STM read set (codegen passes `view.source_name` as `name` here), so a
+    // `retry` watcher reading through a view wakes when the source changes.
+    // A broad `All` filter is the conservative choice for filtered views.
+    if db_ref.atomic_depth.get() > 0 {
+        stm_track_read(name);
+    }
 
     let filter_values = match unsafe { as_ref(filter_params) } {
         Value::Relation(rows) => rows,
@@ -14244,28 +14324,17 @@ fn http_serve_loop(
                         });
                     }
 
-                    // Validate refined body fields
-                    for refinement in &entry_refinements {
-                        if let Some(field) = fields.iter().find(|f| &*f.name == refinement.field_name.as_str()) {
-                            let check = knot_refinement_check_value(db, field.value, refinement.predicate);
-                            if check == 0 {
-                                return Err((400, format!(
-                                    "validation error: field '{}' does not satisfy '{}' constraint",
-                                    refinement.field_name, refinement.type_name
-                                ), None));
-                            }
-                        }
-                    }
-
                     fields.sort_by(|a, b| a.name.cmp(&b.name));
                     let record = alloc(Value::Record(fields));
 
                     // Rate-limit check. The user's `key` function is
                     // curried `input -> RequestCtx -> Maybe a` and is
                     // called here with the same input record the handler
-                    // will receive. On rejection respond 429 with a
-                    // Retry-After header (carried as the Err's third
-                    // tuple element).
+                    // will receive. Runs after the input record is built
+                    // but BEFORE refinement validation, so invalid-payload
+                    // spam still consumes tokens and gets 429. On rejection
+                    // respond 429 with a Retry-After header (carried as the
+                    // Err's third tuple element).
                     if let Some(cfg) = entry_rate_limit.as_ref() {
                         if let Some(key) = rate_limit_key_for_request(
                             db,
@@ -14292,6 +14361,22 @@ fn http_serve_loop(
                                     "Rate limit exceeded".to_string(),
                                     Some(retry_after_ms),
                                 ));
+                            }
+                        }
+                    }
+
+                    // Validate refined body fields (after the rate-limit
+                    // check — see above).
+                    if let Value::Record(rec_fields) = unsafe { as_ref(record) } {
+                        for refinement in &entry_refinements {
+                            if let Some(field) = rec_fields.iter().find(|f| &*f.name == refinement.field_name.as_str()) {
+                                let check = knot_refinement_check_value(db, field.value, refinement.predicate);
+                                if check == 0 {
+                                    return Err((400, format!(
+                                        "validation error: field '{}' does not satisfy '{}' constraint",
+                                        refinement.field_name, refinement.type_name
+                                    ), None));
+                                }
                             }
                         }
                     }
@@ -15443,8 +15528,12 @@ fn serialize_value_for_hash_into(v: *mut Value, buf: &mut Vec<u8>) {
             buf.extend_from_slice(f.source.as_bytes());
             serialize_value_for_hash_into(f.env, buf);
         }
-        Value::IO(_, _) => {
+        Value::IO(fn_ptr, env) => {
+            // Match `value_to_hash_bytes`: include the fn pointer and env so
+            // distinct IO actions don't collide (consistent with `values_equal`).
             buf.push(11);
+            buf.extend_from_slice(&(*fn_ptr as usize).to_le_bytes());
+            serialize_value_for_hash_into(*env, buf);
         }
         Value::Pair(a, b) => {
             buf.push(12);
@@ -16443,5 +16532,98 @@ mod _regress_runtime_tests {
         EQ_WATCHERS.entry(key).or_default().push(Arc::downgrade(&slot));
         wake_matching_watchers("t_fix2_unrelated_table", &WriteEvent::Bulk);
         assert!(!*slot.woken.lock().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod _regress_runtime_fixes_tests {
+    use super::*;
+
+    fn text(s: &str) -> *mut Value {
+        alloc(Value::Text(Arc::from(s)))
+    }
+
+    fn as_text(v: *mut Value) -> String {
+        match unsafe { as_ref(v) } {
+            Value::Text(s) => s.to_string(),
+            other => panic!("expected Text, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    /// Negative counts clamp to 0, matching `knot_relation_take`/`_drop`
+    /// (take negative → "", drop negative → identity) instead of panicking.
+    #[test]
+    fn text_take_drop_clamp_negative_counts() {
+        let t = text("hello");
+        assert_eq!(as_text(knot_text_take(alloc_int(-3), t)), "");
+        assert_eq!(as_text(knot_text_drop(alloc_int(-3), t)), "hello");
+        // Sanity: non-negative behavior unchanged.
+        assert_eq!(as_text(knot_text_take(alloc_int(2), t)), "he");
+        assert_eq!(as_text(knot_text_drop(alloc_int(2), t)), "llo");
+        assert_eq!(as_text(knot_text_take(alloc_int(99), t)), "hello");
+        assert_eq!(as_text(knot_text_drop(alloc_int(99), t)), "");
+    }
+
+    fn hash_bytes(v: *mut Value) -> Vec<u8> {
+        let mut buf = Vec::new();
+        value_to_hash_bytes(v, &mut buf);
+        buf
+    }
+
+    /// `value_to_hash_bytes` must agree with `values_equal` for IO values:
+    /// distinct fn pointers or distinct envs ⇒ distinct hash bytes, so
+    /// dedup paths (union/concat/bind) don't collapse distinct IO actions.
+    #[test]
+    fn io_hash_distinguishes_distinct_actions() {
+        extern "C" fn thunk_a(_db: *mut c_void, env: *mut Value) -> *mut Value {
+            env
+        }
+        extern "C" fn thunk_b(_db: *mut c_void, env: *mut Value) -> *mut Value {
+            env
+        }
+        let env1 = alloc_int(1);
+        let env2 = alloc_int(2);
+
+        let io_a1 = alloc(Value::IO(thunk_a as *const u8, env1));
+        let io_a1_dup = alloc(Value::IO(thunk_a as *const u8, env1));
+        let io_a2 = alloc(Value::IO(thunk_a as *const u8, env2));
+        let io_b1 = alloc(Value::IO(thunk_b as *const u8, env1));
+
+        // Equal actions hash equal (and compare equal).
+        assert_eq!(hash_bytes(io_a1), hash_bytes(io_a1_dup));
+        assert!(values_equal(io_a1, io_a1_dup));
+
+        // Same fn, different env: must NOT collide.
+        assert_ne!(hash_bytes(io_a1), hash_bytes(io_a2));
+        assert!(!values_equal(io_a1, io_a2));
+
+        // Different fn, same env: must NOT collide.
+        assert_ne!(hash_bytes(io_a1), hash_bytes(io_b1));
+        assert!(!values_equal(io_a1, io_b1));
+
+        // The join hash-index serializer must distinguish them the same way.
+        assert_ne!(
+            serialize_value_for_hash(io_a1),
+            serialize_value_for_hash(io_a2)
+        );
+        assert_eq!(
+            serialize_value_for_hash(io_a1),
+            serialize_value_for_hash(io_a1_dup)
+        );
+    }
+
+    /// Relation set-dedup must not merge rows whose only difference is an
+    /// embedded IO action (regression for `++` union collapsing actions).
+    #[test]
+    fn relation_dedup_keeps_distinct_io_rows() {
+        extern "C" fn thunk(_db: *mut c_void, env: *mut Value) -> *mut Value {
+            env
+        }
+        let io1 = alloc(Value::IO(thunk as *const u8, alloc_int(1)));
+        let io2 = alloc(Value::IO(thunk as *const u8, alloc_int(2)));
+        let r1 = alloc(Value::Relation(vec![io1, io2]));
+        let r2 = alloc(Value::Relation(vec![io1]));
+        // Set-semantics equality must see these as different relations.
+        assert!(!values_equal(r1, r2));
     }
 }

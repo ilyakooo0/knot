@@ -3,7 +3,7 @@
 use lsp_types::*;
 
 use crate::state::ServerState;
-use crate::utils::{position_to_offset, span_to_range};
+use crate::utils::{ident_lookup_offset, position_to_offset, span_to_range};
 
 // ── Document Highlights ─────────────────────────────────────────────
 
@@ -14,7 +14,7 @@ pub(crate) fn handle_document_highlight(
     let uri = &params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
     let doc = state.documents.get(uri)?;
-    let offset = position_to_offset(&doc.source, pos);
+    let offset = ident_lookup_offset(&doc.source, position_to_offset(&doc.source, pos));
 
     // Find the definition span for the symbol at cursor
     let def_span = doc
@@ -37,8 +37,13 @@ pub(crate) fn handle_document_highlight(
         kind: Some(DocumentHighlightKind::WRITE),
     });
 
-    // Highlight all usages
+    // Highlight all usages. Local binders record a self-reference
+    // (usage == def) so position-based resolution works from the binder
+    // token; skip it here — the definition was already pushed above.
     for (usage_span, target_span) in &doc.references {
+        if *usage_span == def_span {
+            continue;
+        }
         if *target_span == def_span {
             highlights.push(DocumentHighlight {
                 range: span_to_range(*usage_span, &doc.source),

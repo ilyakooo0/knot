@@ -422,6 +422,40 @@ pub(crate) fn handle_workspace_diagnostics(
         }
     }
 
+    // Previously-reported URIs that produced no report this pull — typically
+    // files that were deleted or became unreadable (their `canonicalize()`/
+    // read fails, so the loops above `continue` past them without emitting
+    // anything). Clients treat absent URIs as "unchanged", so without an
+    // explicit empty-items report the stale errors stay in the gutter for
+    // the rest of the session. Emit the clearing report once; the URI is not
+    // added to `now_reported`, so subsequent pulls won't re-emit it.
+    {
+        let emitted: HashSet<&Uri> = items
+            .iter()
+            .map(|r| match r {
+                WorkspaceDocumentDiagnosticReport::Full(f) => &f.uri,
+                WorkspaceDocumentDiagnosticReport::Unchanged(u) => &u.uri,
+            })
+            .collect();
+        let to_clear: Vec<Uri> = prev_reported
+            .iter()
+            .filter(|u| !emitted.contains(u))
+            .cloned()
+            .collect();
+        for uri in to_clear {
+            items.push(WorkspaceDocumentDiagnosticReport::Full(
+                WorkspaceFullDocumentDiagnosticReport {
+                    uri,
+                    version: None,
+                    full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                        result_id: None,
+                        items: Vec::new(),
+                    },
+                },
+            ));
+        }
+    }
+
     state.workspace_diag_reported = now_reported;
 
     // Belt-and-suspenders: a workspace pull can mass-insert cache entries

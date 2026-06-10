@@ -58,29 +58,36 @@ pub(crate) fn handle_code_action(
                     Some(eff) => render_signature_with_effects(inferred, eff),
                     None => inferred.clone(),
                 };
-                let insert_pos = offset_to_position(&doc.source, decl.span.start);
+                // Insert the annotation inline on the definition
+                // (`name : Sig = body`), mirroring the View/Derived branch
+                // below — not as a separate standalone signature line.
+                let decl_text = safe_slice(&doc.source, decl.span);
+                if let Some(eq_pos) = decl_text.find('=') {
+                    let insert_offset = decl.span.start + eq_pos;
+                    let insert_pos = offset_to_position(&doc.source, insert_offset);
 
-                let mut changes = HashMap::new();
-                changes.insert(
-                    uri.clone(),
-                    vec![TextEdit {
-                        range: Range {
-                            start: insert_pos,
-                            end: insert_pos,
-                        },
-                        new_text: format!("{name} : {signature}\n"),
-                    }],
-                );
+                    let mut changes = HashMap::new();
+                    changes.insert(
+                        uri.clone(),
+                        vec![TextEdit {
+                            range: Range {
+                                start: insert_pos,
+                                end: insert_pos,
+                            },
+                            new_text: format!(": {signature} "),
+                        }],
+                    );
 
-                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                    title: format!("Add type annotation: {signature}"),
-                    kind: Some(CodeActionKind::QUICKFIX),
-                    edit: Some(WorkspaceEdit {
-                        changes: Some(changes),
+                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                        title: format!("Add type annotation: {signature}"),
+                        kind: Some(CodeActionKind::QUICKFIX),
+                        edit: Some(WorkspaceEdit {
+                            changes: Some(changes),
+                            ..Default::default()
+                        }),
                         ..Default::default()
-                    }),
-                    ..Default::default()
-                }));
+                    }));
+                }
             }
         }
 
@@ -691,62 +698,86 @@ pub(crate) fn handle_code_action(
             .map(|imp| imp.path.clone())
             .collect();
 
-        let original_paths: Vec<String> =
-            doc.module.imports.iter().map(|i| i.path.clone()).collect();
-
-        let mut kept_paths: Vec<String> = original_paths
-            .iter()
-            .filter(|p| !unused_imports.contains(p.as_str()))
-            .cloned()
-            .collect();
-        kept_paths.sort();
-        kept_paths.dedup();
+        // Merge kept imports by path, preserving selective item lists.
+        // `None` items = import-all. Deduping rules: if any duplicate of a
+        // path is an import-all, the merged import is import-all; otherwise
+        // the merged import is the union of the selective item lists.
+        // BTreeMap keeps the rewritten list sorted by path.
+        let mut merged: std::collections::BTreeMap<
+            String,
+            Option<std::collections::BTreeSet<String>>,
+        > = std::collections::BTreeMap::new();
+        for imp in &doc.module.imports {
+            if unused_imports.contains(&imp.path) {
+                continue;
+            }
+            let entry = merged
+                .entry(imp.path.clone())
+                .or_insert_with(|| Some(std::collections::BTreeSet::new()));
+            match (&imp.items, entry.as_mut()) {
+                // This occurrence (or an earlier one) imports everything.
+                (None, _) => *entry = None,
+                (Some(_), None) => {}
+                (Some(items), Some(set)) => {
+                    for item in items {
+                        set.insert(item.name.clone());
+                    }
+                }
+            }
+        }
 
         // Only emit the action if something would change. Both `first` and
         // `last` are guaranteed to be `Some` here because the outer
         // `!doc.module.imports.is_empty()` check holds, but defensively
         // pattern-match anyway — the cost of a single `if let` is nothing
         // compared to a panic in the LSP loop.
-        let changed = kept_paths != original_paths;
-        if let (true, Some(first_import), Some(last_import)) =
-            (changed, doc.module.imports.first(), doc.module.imports.last())
+        if let (Some(first_import), Some(last_import)) =
+            (doc.module.imports.first(), doc.module.imports.last())
         {
             let import_range = Range {
                 start: offset_to_position(&doc.source, first_import.span.start),
                 end: offset_to_position(&doc.source, last_import.span.end),
             };
 
-            let new_text = if kept_paths.is_empty() {
-                String::new()
-            } else {
-                kept_paths
-                    .iter()
-                    .map(|p| format!("import {p}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
+            let new_text = merged
+                .iter()
+                .map(|(path, items)| match items {
+                    None => format!("import {path}"),
+                    Some(set) => format!(
+                        "import {path} ({})",
+                        set.iter().cloned().collect::<Vec<_>>().join(", ")
+                    ),
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
 
-            let mut changes = HashMap::new();
-            changes.insert(uri.clone(), vec![TextEdit { range: import_range, new_text }]);
+            // Compare against the current import block's text so the action
+            // only appears when the rewrite actually changes something.
+            let original_text =
+                safe_slice(&doc.source, Span::new(first_import.span.start, last_import.span.end));
+            if new_text != original_text {
+                let mut changes = HashMap::new();
+                changes.insert(uri.clone(), vec![TextEdit { range: import_range, new_text }]);
 
-            let title = if !unused_imports.is_empty() {
-                format!(
-                    "Organize imports (remove {} unused)",
-                    unused_imports.len()
-                )
-            } else {
-                "Organize imports".to_string()
-            };
+                let title = if !unused_imports.is_empty() {
+                    format!(
+                        "Organize imports (remove {} unused)",
+                        unused_imports.len()
+                    )
+                } else {
+                    "Organize imports".to_string()
+                };
 
-            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                title,
-                kind: Some(CodeActionKind::SOURCE_ORGANIZE_IMPORTS),
-                edit: Some(WorkspaceEdit {
-                    changes: Some(changes),
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title,
+                    kind: Some(CodeActionKind::SOURCE_ORGANIZE_IMPORTS),
+                    edit: Some(WorkspaceEdit {
+                        changes: Some(changes),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            }));
+                }));
+            }
         }
 
         // Also offer per-import "Remove unused import" actions for each unused
@@ -1067,22 +1098,18 @@ fn find_add_wildcard_arm_at(
                 return None;
             }
 
-            // Compute the indentation of the last arm so the new arm aligns.
-            let last = arms.last()?;
-            let last_line_start = source[..last.pat.span.start]
-                .rfind('\n')
-                .map(|p| p + 1)
-                .unwrap_or(0);
-            let indent: String = source[last_line_start..last.pat.span.start]
-                .chars()
-                .take_while(|c| c.is_whitespace())
-                .collect();
+            // Compute the indentation for the new arm. `arm_indentation`
+            // prefers an existing arm's own-line indentation and falls back
+            // to the case expression's column + 2 — the fallback matters for
+            // single-line cases (`v = case x of A {} -> 1`), where naively
+            // taking the arm's line-leading whitespace yields an empty
+            // indent that would terminate the layout-sensitive case block.
+            let indent = arm_indentation(expr, arms, source);
 
             let case_text = source.get(expr.span.start..expr.span.end)?;
             let mut rewritten = case_text.to_string();
             // Append the new arm. `todo` is intentionally an undefined name so
             // the user gets a clear "fill me in" diagnostic.
-            rewritten.push('\n');
             rewritten.push_str(&indent);
             rewritten.push_str("_ -> todo");
             return Some((expr.span, rewritten));
@@ -1279,36 +1306,32 @@ fn find_wrap_in_err_at(
     range_end: usize,
 ) -> Option<(Span, String)> {
     fn walk(expr: &ast::Expr, range_start: usize, range_end: usize) -> Option<Span> {
-        if expr.span.start > range_end || expr.span.end < range_start {
+        // Only expressions that FULLY CONTAIN the selection are candidates.
+        // Descending into merely-overlapping children would wrap a fragment
+        // of the selection (e.g. selecting `x + 1` in `\x -> x + 1` would
+        // wrap just `x`, producing `Err {error: x} + 1`).
+        if !(expr.span.start <= range_start && range_end <= expr.span.end) {
             return None;
+        }
+        // Prefer the smallest child that still contains the whole selection.
+        let mut inner = None;
+        crate::utils::recurse_expr(expr, |child| {
+            if inner.is_none() {
+                if let Some(s) = walk(child, range_start, range_end) {
+                    inner = Some(s);
+                }
+            }
+        });
+        if inner.is_some() {
+            return inner;
         }
         // Skip wrapping bindings/lambdas/blocks — only wrap leaf-ish exprs.
         match &expr.node {
             ast::ExprKind::Lambda { .. }
             | ast::ExprKind::Do(_)
             | ast::ExprKind::Case { .. }
-            | ast::ExprKind::If { .. } => {
-                let mut found = None;
-                crate::utils::recurse_expr(expr, |child| {
-                    if found.is_none() {
-                        if let Some(s) = walk(child, range_start, range_end) {
-                            found = Some(s);
-                        }
-                    }
-                });
-                found
-            }
-            _ => {
-                let mut inner = None;
-                crate::utils::recurse_expr(expr, |child| {
-                    if inner.is_none() {
-                        if let Some(s) = walk(child, range_start, range_end) {
-                            inner = Some(s);
-                        }
-                    }
-                });
-                inner.or(Some(expr.span))
-            }
+            | ast::ExprKind::If { .. } => None,
+            _ => Some(expr.span),
         }
     }
     // Only fire when the user has an explicit selection — wrapping every
@@ -1357,14 +1380,31 @@ fn find_case_actions(
     }
 
     if let ast::ExprKind::Case { scrutinee, arms } = &expr.node {
-        // Try to find the ADT type of the scrutinee
+        // Try to find the ADT type of the scrutinee. Resolve the scrutinee
+        // expression's *own span* against the local-type table (innermost
+        // containing span, via the deterministic sorted vec) rather than
+        // text-matching binding spans against the variable name — text
+        // matching is scope-blind and HashMap-iteration-order
+        // nondeterministic when several bindings share the name.
         let scrutinee_type = match &scrutinee.node {
-            ast::ExprKind::Var(name) => doc
-                .local_type_info
-                .iter()
-                .find(|(span, _)| safe_slice(&doc.source, **span) == name.as_str())
-                .map(|(_, ty)| ty.clone())
-                .or_else(|| doc.type_info.get(name).cloned()),
+            ast::ExprKind::Var(name) => {
+                let offset = scrutinee.span.start;
+                doc.local_type_info_sorted
+                    .iter()
+                    .filter(|(span, _)| span.start <= offset && offset < span.end)
+                    .min_by_key(|(span, _)| span.end - span.start)
+                    .map(|(_, ty)| ty.clone())
+                    .or_else(|| {
+                        // Use-site → definition-site lookup via references.
+                        doc.references
+                            .iter()
+                            .find(|(usage, _)| usage.start <= offset && offset < usage.end)
+                            .and_then(|(_, def_span)| {
+                                doc.local_type_info.get(def_span).cloned()
+                            })
+                    })
+                    .or_else(|| doc.type_info.get(name).cloned())
+            }
             _ => None,
         };
 
@@ -2128,8 +2168,9 @@ fn build_deriving_action(
         _ => return None,
     };
     // `data_decl.span.end` covers everything up to (but not including) the
-    // start of the next decl. If the file already has `deriving (...)` we
-    // bailed above, so the span ends at the last constructor.
+    // start of the next decl — including any existing `deriving (...)`
+    // clause, which is why the non-empty case below edits the clause in
+    // place instead of appending at the end.
     let data_decl_end = data_decl.span.end;
     if existing_deriving.iter().any(|n| n == trait_name) {
         return None;
@@ -2175,9 +2216,11 @@ fn build_deriving_action(
         return None;
     }
 
-    // Build the edit: insert `\n  deriving (Trait)` after the last constructor
-    // of the data decl, and remove the impl decl entirely.
-    let insert_pos = offset_to_position(&doc.source, data_decl_end);
+    // Build the edit: either insert `\n  deriving (Trait)` after the last
+    // constructor (no existing clause), or rewrite the existing
+    // `deriving (...)` clause in place with the combined trait list — the
+    // decl span includes the clause, so appending at span.end would produce
+    // a duplicate `deriving` and a parse error. Then remove the impl decl.
 
     // Compute the impl removal range — include the trailing newline so we
     // don't leave a blank gap behind.
@@ -2190,25 +2233,39 @@ fn build_deriving_action(
         .map(|p| p + 1)
         .unwrap_or(impl_decl.span.start);
 
-    let new_deriving = if existing_deriving.is_empty() {
-        format!("\n  deriving ({trait_name})")
+    let deriving_edit = if existing_deriving.is_empty() {
+        let insert_pos = offset_to_position(&doc.source, data_decl_end);
+        TextEdit {
+            range: Range {
+                start: insert_pos,
+                end: insert_pos,
+            },
+            new_text: format!("\n  deriving ({trait_name})"),
+        }
     } else {
+        // Replace the existing clause (`deriving` keyword through its
+        // closing paren) with the combined list.
+        let decl_text = safe_slice(&doc.source, data_decl.span);
+        let deriving_pos = decl_text.rfind("deriving")?;
+        let close_rel = decl_text[deriving_pos..].find(')')?;
+        let clause_start = data_decl.span.start + deriving_pos;
+        let clause_end = data_decl.span.start + deriving_pos + close_rel + 1;
         let mut all = existing_deriving.clone();
         all.push(trait_name.to_string());
-        format!("\n  deriving ({})", all.join(", "))
+        TextEdit {
+            range: Range {
+                start: offset_to_position(&doc.source, clause_start),
+                end: offset_to_position(&doc.source, clause_end),
+            },
+            new_text: format!("deriving ({})", all.join(", ")),
+        }
     };
 
     let mut changes = HashMap::new();
     changes.insert(
         uri.clone(),
         vec![
-            TextEdit {
-                range: Range {
-                    start: insert_pos,
-                    end: insert_pos,
-                },
-                new_text: new_deriving,
-            },
+            deriving_edit,
             TextEdit {
                 range: Range {
                     start: offset_to_position(&doc.source, impl_line_start),
@@ -3749,6 +3806,270 @@ impl Describe Color where
         assert!(
             actions.is_none(),
             "code actions against stale analysis must bail; got: {actions:?}"
+        );
+    }
+}
+
+// Regression tests for the 2026-06 LSP bug-fix batch (code-action group).
+// Kept in a separate module from `tests` above so the original test file
+// content stays untouched.
+#[cfg(test)]
+mod regress_fixes_tests {
+    use super::*;
+    use crate::test_support::{TempWorkspace, TestWorkspace};
+
+    fn params_for(uri: &Uri, range: Range) -> CodeActionParams {
+        CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range,
+            context: CodeActionContext {
+                diagnostics: Vec::new(),
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }
+    }
+
+    fn action_titled<'a>(
+        actions: &'a [CodeActionOrCommand],
+        pred: impl Fn(&str) -> bool,
+    ) -> Option<&'a CodeAction> {
+        actions.iter().find_map(|a| match a {
+            CodeActionOrCommand::CodeAction(ca) if pred(&ca.title) => Some(ca),
+            _ => None,
+        })
+    }
+
+    fn edits_for<'a>(action: &'a CodeAction, uri: &Uri) -> &'a [TextEdit] {
+        action
+            .edit
+            .as_ref()
+            .and_then(|e| e.changes.as_ref())
+            .and_then(|c| c.get(uri))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Item 1: "Add type annotation" for functions must produce the inline
+    /// form `name : Sig = body`, not a standalone signature line.
+    #[test]
+    fn add_type_annotation_is_inline_on_definition() {
+        let mut tw = TestWorkspace::new();
+        let src = "double = \\x -> x * 2\n";
+        let uri = tw.open("main", src);
+        let pos = tw.position_of(&uri, "double");
+        let actions = handle_code_action(
+            &tw.state,
+            &params_for(&uri, Range { start: pos, end: pos }),
+        )
+        .unwrap_or_default();
+        let action = action_titled(&actions, |t| t.starts_with("Add type annotation"))
+            .expect("annotation action offered");
+        let edits = edits_for(action, &uri);
+        assert_eq!(edits.len(), 1);
+        let edit = &edits[0];
+        // Inserted inline before the `=`, like the View/Derived branch.
+        assert!(
+            edit.new_text.starts_with(": ") && edit.new_text.ends_with(' '),
+            "expected inline `: Sig ` insertion, got {:?}",
+            edit.new_text
+        );
+        assert!(
+            !edit.new_text.contains('\n'),
+            "annotation must not be a standalone line: {:?}",
+            edit.new_text
+        );
+        // Insertion point is exactly at the `=`.
+        let eq_col = src.find('=').unwrap() as u32;
+        assert_eq!(edit.range.start.line, 0);
+        assert_eq!(edit.range.start.character, eq_col);
+        assert_eq!(edit.range.start, edit.range.end);
+    }
+
+    /// Item 2: "Convert to deriving" with an existing `deriving (...)` clause
+    /// must rewrite that clause with the combined list, not append a second
+    /// clause after it.
+    #[test]
+    fn convert_to_deriving_merges_existing_clause() {
+        let mut tw = TestWorkspace::new();
+        let src = "trait Greet a where\n  greet : a -> Text\n  greet x = \"hello\"\n\ndata Person = MkPerson {name: Text}\n  deriving (Eq)\n\nimpl Greet Person where\n";
+        let uri = tw.open("main", src);
+        let pos = tw.position_of(&uri, "impl Greet");
+        let actions = handle_code_action(
+            &tw.state,
+            &params_for(&uri, Range { start: pos, end: pos }),
+        )
+        .unwrap_or_default();
+        let action = action_titled(&actions, |t| t.contains("deriving (Greet)"))
+            .expect("deriving action offered");
+        let edits = edits_for(action, &uri);
+        let deriving_edit = edits
+            .iter()
+            .find(|e| e.new_text.contains("deriving"))
+            .expect("deriving edit present");
+        assert_eq!(deriving_edit.new_text, "deriving (Eq, Greet)");
+        assert_ne!(
+            deriving_edit.range.start, deriving_edit.range.end,
+            "must replace the existing clause in place, not insert a second one"
+        );
+        // Applying the deriving edit must leave exactly one `deriving` clause.
+        let doc = tw.doc(&uri);
+        let start = crate::utils::position_to_offset(&doc.source, deriving_edit.range.start);
+        let end = crate::utils::position_to_offset(&doc.source, deriving_edit.range.end);
+        let mut applied = doc.source.clone();
+        applied.replace_range(start..end, &deriving_edit.new_text);
+        assert_eq!(
+            applied.matches("deriving").count(),
+            1,
+            "duplicate deriving clause after edit:\n{applied}"
+        );
+    }
+
+    /// Item 3: "Organize imports" must preserve selective item lists and
+    /// merge duplicate selective imports of the same path.
+    #[test]
+    fn organize_imports_preserves_and_merges_selective_items() {
+        let mut tws = TempWorkspace::new();
+        tws.write_and_open("helpers.knot", "foo = 1\n\nbar = 2\n");
+        let uri = tws.write_and_open(
+            "main.knot",
+            "import ./helpers (foo)\nimport ./helpers (bar)\n\nmain = foo + bar\n",
+        );
+        let range = Range {
+            start: Position::new(0, 0),
+            end: Position::new(0, 0),
+        };
+        let actions =
+            handle_code_action(&tws.workspace.state, &params_for(&uri, range))
+                .unwrap_or_default();
+        let organize = action_titled(&actions, |t| t.starts_with("Organize imports"))
+            .expect("organize action offered for duplicate selective imports");
+        let edits = edits_for(organize, &uri);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(
+            edits[0].new_text, "import ./helpers (bar, foo)",
+            "selective item lists must be preserved and merged"
+        );
+    }
+
+    /// Item 3 (cont.): an import-all duplicate wins over a selective one.
+    #[test]
+    fn organize_imports_import_all_wins_over_selective() {
+        let mut tws = TempWorkspace::new();
+        tws.write_and_open("helpers.knot", "foo = 1\n\nbar = 2\n");
+        let uri = tws.write_and_open(
+            "main2.knot",
+            "import ./helpers (foo)\nimport ./helpers\n\nmain = foo + bar\n",
+        );
+        let range = Range {
+            start: Position::new(0, 0),
+            end: Position::new(0, 0),
+        };
+        let actions =
+            handle_code_action(&tws.workspace.state, &params_for(&uri, range))
+                .unwrap_or_default();
+        let organize = action_titled(&actions, |t| t.starts_with("Organize imports"))
+            .expect("organize action offered");
+        let edits = edits_for(organize, &uri);
+        assert_eq!(edits[0].new_text, "import ./helpers");
+    }
+
+    /// Item 5: "Wrap in Err" with a selection covering `x + 1` inside
+    /// `\x -> x + 1` must wrap the whole BinOp, not just `x`.
+    #[test]
+    fn wrap_in_err_wraps_smallest_expr_containing_selection() {
+        let mut tw = TestWorkspace::new();
+        let src = "f = \\x -> x + 1\n";
+        let uri = tw.open("main", src);
+        let start = tw.position_of(&uri, "x + 1");
+        let end = tw.position_after(&uri, "x + 1");
+        let actions = handle_code_action(
+            &tw.state,
+            &params_for(&uri, Range { start, end }),
+        )
+        .unwrap_or_default();
+        let action =
+            action_titled(&actions, |t| t == "Wrap in `Err`").expect("wrap action offered");
+        let edits = edits_for(action, &uri);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "Err {error: x + 1}");
+    }
+
+    /// Item 6: adding a wildcard arm to a single-line case must not emit the
+    /// new arm at column 0 (which would terminate the layout block).
+    #[test]
+    fn add_wildcard_arm_single_line_case_keeps_indentation() {
+        let mut tw = TestWorkspace::new();
+        let src = "data Color = Red {} | Blue {}\n\nf = \\c -> case c of Red {} -> 1\n";
+        let uri = tw.open("main", src);
+        let pos = tw.position_of(&uri, "case c of");
+        let actions = handle_code_action(
+            &tw.state,
+            &params_for(&uri, Range { start: pos, end: pos }),
+        )
+        .unwrap_or_default();
+        let action = action_titled(&actions, |t| t.contains("wildcard"))
+            .expect("wildcard-arm action offered");
+        let edits = edits_for(action, &uri);
+        let new_text = &edits[0].new_text;
+        let last_line = new_text.lines().last().unwrap_or("");
+        assert!(
+            last_line.starts_with(' '),
+            "wildcard arm must be indented past column 0, got {new_text:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod regress_case_arm_tests {
+    use super::*;
+    use crate::test_support::TestWorkspace;
+
+    fn params_at(uri: &Uri, pos: Position) -> CodeActionParams {
+        CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range: Range { start: pos, end: pos },
+            context: CodeActionContext {
+                diagnostics: Vec::new(),
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }
+    }
+
+    /// Item 4: scrutinee type resolution must be span-based (innermost
+    /// binding at the scrutinee), not text-matching across all bindings.
+    /// Two same-named bindings with different types in different scopes
+    /// must each resolve to their own type deterministically.
+    #[test]
+    fn fill_case_arms_resolves_scrutinee_by_span() {
+        let mut tw = TestWorkspace::new();
+        let src = "data Color = Red {} | Blue {} | Green {}\n\ndata Shape = Circle {} | Square {}\n\nuseShape : Shape -> Int\nuseShape = \\v -> 0\n\nother = \\v -> useShape v\n\npick : Color -> Int\npick = \\v -> case v of\n  Red {} -> 1\n";
+        let uri = tw.open("main", src);
+        let pos = tw.position_of(&uri, "case v of");
+        let actions = handle_code_action(&tw.state, &params_at(&uri, pos)).unwrap_or_default();
+        let fill = actions.iter().find_map(|a| match a {
+            CodeActionOrCommand::CodeAction(ca)
+                if ca.title.starts_with("Add missing case arms") =>
+            {
+                Some(ca)
+            }
+            _ => None,
+        });
+        let fill = fill.expect("fill-case-arms action offered");
+        assert!(
+            fill.title.contains("Blue") && fill.title.contains("Green"),
+            "expected Color arms, got: {}",
+            fill.title
+        );
+        assert!(
+            !fill.title.contains("Circle"),
+            "scrutinee resolved to the wrong same-named binding: {}",
+            fill.title
         );
     }
 }

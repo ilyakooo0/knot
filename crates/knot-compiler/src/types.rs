@@ -254,6 +254,15 @@ fn collect_source_refinements(
     refined_types: &HashMap<String, Expr>,
     alias_ast_types: &HashMap<String, Type>,
 ) -> Vec<(Option<String>, String, Expr)> {
+    collect_source_refinements_inner(ty, refined_types, alias_ast_types, &mut HashSet::new())
+}
+
+fn collect_source_refinements_inner(
+    ty: &Type,
+    refined_types: &HashMap<String, Expr>,
+    alias_ast_types: &HashMap<String, Type>,
+    seen_aliases: &mut HashSet<String>,
+) -> Vec<(Option<String>, String, Expr)> {
     let mut result = Vec::new();
     // Unwrap [T] to get to the element type
     let elem_ty = match &ty.node {
@@ -268,14 +277,20 @@ fn collect_source_refinements(
         // Element type is a type alias: *people : [Person]
         // Resolve through the alias to find refined fields in the underlying record.
         TypeKind::Named(name) if alias_ast_types.contains_key(name) => {
-            let alias_ty = &alias_ast_types[name];
-            // If the alias already resolves to a Relation type (e.g. `type People = [{name: Nat}]`),
-            // recurse directly to avoid double-wrapping Relation(Relation(...)).
-            if matches!(&alias_ty.node, TypeKind::Relation(_)) {
-                result.extend(collect_source_refinements(alias_ty, refined_types, alias_ast_types));
-            } else {
-                let inner_ty = Spanned::new(TypeKind::Relation(Box::new(alias_ty.clone())), ty.span);
-                result.extend(collect_source_refinements(&inner_ty, refined_types, alias_ast_types));
+            // Guard against cyclic aliases (`type A = B; type B = A`):
+            // without a seen-set this recursion never terminates. The cycle
+            // itself is reported as a diagnostic by type inference.
+            if seen_aliases.insert(name.clone()) {
+                let alias_ty = &alias_ast_types[name];
+                // If the alias already resolves to a Relation type (e.g. `type People = [{name: Nat}]`),
+                // recurse directly to avoid double-wrapping Relation(Relation(...)).
+                if matches!(&alias_ty.node, TypeKind::Relation(_)) {
+                    result.extend(collect_source_refinements_inner(alias_ty, refined_types, alias_ast_types, seen_aliases));
+                } else {
+                    let inner_ty = Spanned::new(TypeKind::Relation(Box::new(alias_ty.clone())), ty.span);
+                    result.extend(collect_source_refinements_inner(&inner_ty, refined_types, alias_ast_types, seen_aliases));
+                }
+                seen_aliases.remove(name);
             }
         }
         // Element type is a record: check each field
@@ -308,7 +323,7 @@ fn collect_source_refinements(
             result.push((None, "record".into(), (**predicate).clone()));
             // Recurse into the base to collect field-level refinements
             let inner_ty = Spanned::new(TypeKind::Relation(base.clone()), ty.span);
-            result.extend(collect_source_refinements(&inner_ty, refined_types, alias_ast_types));
+            result.extend(collect_source_refinements_inner(&inner_ty, refined_types, alias_ast_types, seen_aliases));
         }
         _ => {}
     }

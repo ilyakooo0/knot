@@ -1087,6 +1087,36 @@ impl Infer {
     // ── Unification ──────────────────────────────────────────────
 
     fn unify(&mut self, t1: &Ty, t2: &Ty, span: Span) {
+        // By convention `t1` is the actual/provided type and `t2` the
+        // expected/required type (most call sites follow this order).
+        self.unify_dir(t1, t2, span, true);
+    }
+
+    /// Skolemise the body of a `Ty::Forall`: each quantified var becomes a
+    /// fresh rigid TyVar registered in `self.skolems`. Used when a Forall
+    /// appears on the *required* side of unification — the polymorphic
+    /// interface must hold for every instantiation, so the quantified vars
+    /// must stay rigid rather than being instantiated at a single witness.
+    fn skolemise_forall_body(&mut self, vars: &[TyVar], body: &Ty) -> (Ty, Vec<TyVar>) {
+        let mut fresh_skolems: Vec<TyVar> = Vec::with_capacity(vars.len());
+        let mut mapping: HashMap<TyVar, Ty> = HashMap::new();
+        for v in vars {
+            let s = self.fresh_var();
+            self.skolems.insert(s);
+            fresh_skolems.push(s);
+            mapping.insert(*v, Ty::Var(s));
+        }
+        (self.subst_ty(body, &mapping), fresh_skolems)
+    }
+
+    /// Directed unification. `t1_provided` records which side currently
+    /// plays the "provided/actual" role: it starts as `t1` and flips each
+    /// time we descend into a function parameter (contravariance). The
+    /// polarity only matters for `Ty::Forall`: a polymorphic type that is
+    /// *provided* may be instantiated at any witness, while a polymorphic
+    /// type that is *required* must be skolemised so the requirement can't
+    /// be silently narrowed to a single instantiation (rank-2 soundness).
+    fn unify_dir(&mut self, t1: &Ty, t2: &Ty, span: Span, t1_provided: bool) {
         // Capture root vars before apply shadows them — needed to propagate
         // merged IO effects back into the substitution.
         let var1 = if let Ty::Var(v) = t1 { Some(*v) } else { None };
@@ -1099,40 +1129,64 @@ impl Infer {
             // Peel alias wrappers — they're transparent to unification.
             (Ty::Alias(_, inner), _) => {
                 let inner = (**inner).clone();
-                self.unify(&inner, &t2, span);
+                self.unify_dir(&inner, &t2, span, t1_provided);
                 return;
             }
             (_, Ty::Alias(_, inner)) => {
                 let inner = (**inner).clone();
-                self.unify(&t1, &inner, span);
+                self.unify_dir(&t1, &inner, span, t1_provided);
                 return;
             }
-            // Forall types: instantiate with fresh vars and unify the body.
-            // Two Forall types with the same shape unify by α-renaming both
-            // sides to fresh vars; a Forall vs. a non-Forall type instantiates
-            // the polymorphic side at the monomorphic side's witness.
+            // Forall types. A Forall on the provided side is instantiated
+            // with fresh unification vars (the value is polymorphic, so it
+            // can be used at whatever witness the other side demands). A
+            // Forall on the required side is skolemised: the requirement
+            // must hold for *all* instantiations, so its quantified vars
+            // stay rigid and only unify with themselves. Forall-vs-Forall
+            // instantiates the provided side against the skolemised
+            // required side — standard polytype subsumption.
             (Ty::Forall(vars, body), _) => {
-                let scheme = Scheme {
-                    vars: vars.clone(),
-                    unit_vars: vec![],
-                    constraints: vec![],
-                    effect_unions: vec![],
-                    ty: (**body).clone(),
-                };
-                let inst = self.instantiate_at(&scheme, span);
-                self.unify(&inst, &t2, span);
+                if t1_provided {
+                    let scheme = Scheme {
+                        vars: vars.clone(),
+                        unit_vars: vec![],
+                        constraints: vec![],
+                        effect_unions: vec![],
+                        ty: (**body).clone(),
+                    };
+                    let inst = self.instantiate_at(&scheme, span);
+                    self.unify_dir(&inst, &t2, span, t1_provided);
+                } else {
+                    let (skolemised, fresh_skolems) =
+                        self.skolemise_forall_body(vars, body);
+                    self.unify_dir(&skolemised, &t2, span, t1_provided);
+                    for s in fresh_skolems {
+                        self.skolems.remove(&s);
+                    }
+                }
                 return;
             }
             (_, Ty::Forall(vars, body)) => {
-                let scheme = Scheme {
-                    vars: vars.clone(),
-                    unit_vars: vec![],
-                    constraints: vec![],
-                    effect_unions: vec![],
-                    ty: (**body).clone(),
-                };
-                let inst = self.instantiate_at(&scheme, span);
-                self.unify(&t1, &inst, span);
+                if t1_provided {
+                    // t2 is the required side — skolemise.
+                    let (skolemised, fresh_skolems) =
+                        self.skolemise_forall_body(vars, body);
+                    self.unify_dir(&t1, &skolemised, span, t1_provided);
+                    for s in fresh_skolems {
+                        self.skolems.remove(&s);
+                    }
+                } else {
+                    // t2 is the provided side — instantiate.
+                    let scheme = Scheme {
+                        vars: vars.clone(),
+                        unit_vars: vec![],
+                        constraints: vec![],
+                        effect_unions: vec![],
+                        ty: (**body).clone(),
+                    };
+                    let inst = self.instantiate_at(&scheme, span);
+                    self.unify_dir(&t1, &inst, span, t1_provided);
+                }
                 return;
             }
             (Ty::Var(a), Ty::Var(b)) if a == b => {}
@@ -1172,8 +1226,10 @@ impl Infer {
             | (Ty::Bytes, Ty::Bytes)
             | (Ty::Uuid, Ty::Uuid) => {}
             (Ty::Fun(p1, r1), Ty::Fun(p2, r2)) => {
-                self.unify(p1, p2, span);
-                self.unify(r1, r2, span);
+                // Parameters are contravariant: the provided/required roles
+                // swap when descending into the argument position.
+                self.unify_dir(p1, p2, span, !t1_provided);
+                self.unify_dir(r1, r2, span, t1_provided);
             }
             (Ty::Relation(a), Ty::Relation(b)) => {
                 self.unify(a, b, span);
@@ -3389,9 +3445,15 @@ impl Infer {
             ast::ExprKind::Refine(inner) => {
                 let inner_ty = self.infer_expr(inner);
                 let alpha = self.fresh();
-                // Unify alpha with inner_ty so the Result type is fully determined.
-                // Context may further constrain alpha to a refined type via subsumption.
-                self.unify(&inner_ty, &alpha, expr.span);
+                // Deliberately do NOT unify alpha with inner_ty here: alpha
+                // must stay free so the *context* can name the refined type
+                // (e.g. a `Result RefinementError Nat` annotation binds
+                // alpha to `Nat`). Eagerly unifying would collapse alpha to
+                // the base type and lose the contextual target. Phase 6
+                // (post-inference) resolves alpha — using the contextual
+                // binding when present, falling back to a deterministic
+                // base-type lookup otherwise — and checks the refined
+                // value's type against the target's base type.
                 let alpha_var = match &alpha {
                     Ty::Var(v) => *v,
                     _ => unreachable!(),
@@ -3477,7 +3539,9 @@ impl Infer {
                     self.pop_scope();
                 } else {
                     let inferred = self.infer_expr(expr);
-                    self.unify(expected, &inferred, expr.span);
+                    // `expected` is on the required side here (t1), so pass
+                    // t1_provided=false for correct Forall polarity.
+                    self.unify_dir(expected, &inferred, expr.span, false);
                 }
             }
             ast::ExprKind::Do(stmts) => {
@@ -3494,7 +3558,7 @@ impl Infer {
                 }
                 let inferred = self.infer_do(stmts, expr.span);
                 self.in_io_do = prev_in_io_do;
-                self.unify(expected, &inferred, do_result_span(stmts, expr.span));
+                self.unify_dir(expected, &inferred, do_result_span(stmts, expr.span), false);
             }
             ast::ExprKind::Record(fields) if !fields.is_empty() => {
                 // Bidirectional record checking: when the expected type is a
@@ -3514,10 +3578,12 @@ impl Infer {
                             field_tys.insert(f.name.clone(), val_ty);
                         }
                     }
-                    self.unify(expected, &Ty::Record(field_tys, None), expr.span);
+                    self.unify_dir(expected, &Ty::Record(field_tys, None), expr.span, false);
                 } else {
                     let inferred = self.infer_expr(expr);
-                    self.unify(expected, &inferred, expr.span);
+                    // `expected` is on the required side here (t1), so pass
+                    // t1_provided=false for correct Forall polarity.
+                    self.unify_dir(expected, &inferred, expr.span, false);
                 }
             }
             ast::ExprKind::If { cond, then_branch, else_branch } => {
@@ -3526,9 +3592,9 @@ impl Infer {
                 let cond_ty = self.infer_expr(cond);
                 self.unify(&cond_ty, &Ty::Bool, cond.span);
                 let then_ty = self.infer_expr(then_branch);
-                self.unify(expected, &then_ty, then_branch.span);
+                self.unify_dir(expected, &then_ty, then_branch.span, false);
                 let else_ty = self.infer_expr(else_branch);
-                self.unify(expected, &else_ty, else_branch.span);
+                self.unify_dir(expected, &else_ty, else_branch.span, false);
             }
             ast::ExprKind::Case { scrutinee, arms } => {
                 // Push expected into each arm body so a mismatch lights up
@@ -3538,7 +3604,7 @@ impl Infer {
                     self.push_scope();
                     self.check_pattern(&arm.pat, &scrut_ty);
                     let body_ty = self.infer_expr(&arm.body);
-                    self.unify(expected, &body_ty, arm.body.span);
+                    self.unify_dir(expected, &body_ty, arm.body.span, false);
                     self.pop_scope();
                 }
                 self.check_exhaustiveness(&scrut_ty, arms, expr.span);
@@ -3555,12 +3621,16 @@ impl Infer {
                     }
                 } else {
                     let inferred = self.infer_expr(expr);
-                    self.unify(expected, &inferred, expr.span);
+                    // `expected` is on the required side here (t1), so pass
+                    // t1_provided=false for correct Forall polarity.
+                    self.unify_dir(expected, &inferred, expr.span, false);
                 }
             }
             _ => {
                 let inferred = self.infer_expr(expr);
-                self.unify(expected, &inferred, expr.span);
+                // `expected` is on the required side here (t1), so pass
+                // t1_provided=false for correct Forall polarity.
+                self.unify_dir(expected, &inferred, expr.span, false);
             }
         }
     }
@@ -3881,7 +3951,17 @@ impl Infer {
                 // For unit-bearing types, unify normally (which checks unit equality)
                 self.unify(&lhs_applied, &rhs_applied, span);
                 self.require_trait("Num", &lhs_applied, span);
-                lhs_applied
+                // Plain Int/Float are unit-agnostic, so `unitless + unit`
+                // unifies without binding either side. Return the more
+                // specific (unit-bearing) operand so the unit isn't
+                // silently stripped when it appears on the RHS.
+                let lhs_final = self.apply(&lhs_applied);
+                let rhs_final = self.apply(&rhs_applied);
+                match (&lhs_final, &rhs_final) {
+                    (Ty::IntUnit(_), _) | (Ty::FloatUnit(_), _) => lhs_final,
+                    (_, Ty::IntUnit(_)) | (_, Ty::FloatUnit(_)) => rhs_final,
+                    _ => lhs_final,
+                }
             }
             // Mul/Div: units compose
             ast::BinOp::Mul | ast::BinOp::Div => {
@@ -3930,6 +4010,46 @@ impl Infer {
                     }
                     // No units involved → default behavior
                     _ => {
+                        // Unit soundness: `*`/`/` *compose* units, but
+                        // composition is only computable when both operands'
+                        // units are known. If one side carries a concrete
+                        // unit while the other is still an unresolved type
+                        // variable (e.g. an unannotated lambda parameter),
+                        // unifying them would force both to the *same* unit
+                        // and type the product with that unit instead of its
+                        // square. Reject conservatively and ask for an
+                        // annotation rather than silently inferring an
+                        // unsound unit.
+                        let concrete_unit = |t: &Ty| match t {
+                            Ty::IntUnit(u) | Ty::FloatUnit(u) => {
+                                if u.bases.is_empty() {
+                                    None
+                                } else {
+                                    Some(u.display())
+                                }
+                            }
+                            _ => None,
+                        };
+                        let lhs_is_var = matches!(&lhs_applied, Ty::Var(_));
+                        let rhs_is_var = matches!(&rhs_applied, Ty::Var(_));
+                        let unit_side = if lhs_is_var {
+                            concrete_unit(&rhs_applied)
+                        } else if rhs_is_var {
+                            concrete_unit(&lhs_applied)
+                        } else {
+                            None
+                        };
+                        if let Some(unit) = unit_side {
+                            let op_name = if op == ast::BinOp::Mul { "*" } else { "/" };
+                            self.error(
+                                format!(
+                                    "cannot infer the unit of an operand of `{}`: one side has unit <{}> but the other side's type is not yet known — units compose under `{}`, so the unresolved operand needs an explicit annotation (e.g. `(x : Float<{}>)`, or `(x : Float)` for a dimensionless value)",
+                                    op_name, unit, op_name, unit
+                                ),
+                                span,
+                            );
+                            return Ty::Error;
+                        }
                         self.unify(&lhs_applied, &rhs_applied, span);
                         self.require_trait("Num", &lhs_applied, span);
                         lhs_applied
@@ -4148,68 +4268,91 @@ impl Infer {
                 if let Some(rv) = row {
                     // Open variant — check if the covered constructors
                     // exhaust a known data type; if so, close the row.
-                    let mut data_type_name = None;
-                    let mut all_same = true;
-                    for ctor_name in ctors.keys() {
-                        if let Some(info) =
-                            self.constructors.get(ctor_name)
-                        {
-                            match &data_type_name {
-                                None => {
-                                    data_type_name =
-                                        Some(info.data_type.clone())
-                                }
-                                Some(dt)
-                                    if *dt == info.data_type => {}
-                                _ => {
-                                    all_same = false;
-                                    break;
+                    //
+                    // Constructor names may legally be shared across ADTs,
+                    // so resolution must be set-valued: a candidate ADT is
+                    // one whose constructor set contains EVERY covered
+                    // constructor. (Looking each name up individually in
+                    // `self.constructors` would resolve to whichever ADT
+                    // registered the name last — declaring an unrelated
+                    // `data B = X {} | Z {}` after `data A = X {} | Y {}`
+                    // must not break matches on A.)
+                    if !covered.is_empty() {
+                        let mut candidates: Vec<String> = self
+                            .data_types
+                            .iter()
+                            .filter(|(_, info)| {
+                                covered.iter().all(|c| {
+                                    info.ctors
+                                        .iter()
+                                        .any(|(n, _)| n.as_str() == *c)
+                                })
+                            })
+                            .map(|(name, _)| name.clone())
+                            .collect();
+                        // Sort for deterministic candidate selection.
+                        candidates.sort();
+                        for dt in &candidates {
+                            let dt_info = match self.data_types.get(dt) {
+                                Some(info) => info.clone(),
+                                None => continue,
+                            };
+                            let all_ctors: HashSet<&str> = dt_info
+                                .ctors
+                                .iter()
+                                .map(|(n, _)| n.as_str())
+                                .collect();
+                            if covered == all_ctors {
+                                // All constructors of a known type are
+                                // covered — close the row var.
+                                let rv = *rv;
+                                self.subst.insert(
+                                    rv,
+                                    Ty::Variant(BTreeMap::new(), None),
+                                );
+                                return;
+                            }
+                        }
+                        // No candidate is fully covered. If at least one
+                        // ADT contains all covered constructors, report the
+                        // one with the fewest missing constructors (ties
+                        // broken by name order — deterministic).
+                        let mut best: Option<(usize, &String)> = None;
+                        for dt in &candidates {
+                            if let Some(dt_info) = self.data_types.get(dt) {
+                                let missing_count = dt_info
+                                    .ctors
+                                    .iter()
+                                    .filter(|(n, _)| {
+                                        !covered.contains(n.as_str())
+                                    })
+                                    .count();
+                                if best
+                                    .map(|(c, _)| missing_count < c)
+                                    .unwrap_or(true)
+                                {
+                                    best = Some((missing_count, dt));
                                 }
                             }
                         }
-                    }
-
-                    if all_same {
-                        if let Some(dt) = &data_type_name {
-                            if let Some(dt_info) =
-                                self.data_types.get(dt).cloned()
-                            {
-                                let all_ctors: HashSet<&str> = dt_info
-                                    .ctors
-                                    .iter()
-                                    .map(|(n, _)| n.as_str())
-                                    .collect();
-                                if covered == all_ctors {
-                                    // All constructors of a known type
-                                    // are covered — close the row var.
-                                    let rv = *rv;
-                                    self.subst.insert(
-                                        rv,
-                                        Ty::Variant(
-                                            BTreeMap::new(),
-                                            None,
-                                        ),
-                                    );
-                                    return;
-                                }
-                                // Some constructors of the type are
-                                // missing — report which ones.
-                                let missing: Vec<&str> = all_ctors
-                                    .iter()
-                                    .copied()
-                                    .filter(|c| !covered.contains(c))
-                                    .collect();
-                                if !missing.is_empty() {
-                                    self.error(
-                                        format!(
-                                            "non-exhaustive pattern \
-                                             match — missing: {}",
-                                            missing.join(", "),
-                                        ),
-                                        span,
-                                    );
-                                    return;
-                                }
+                        if let Some((_, dt)) = best {
+                            let dt_info = self.data_types[dt].clone();
+                            let missing: Vec<&str> = dt_info
+                                .ctors
+                                .iter()
+                                .map(|(n, _)| n.as_str())
+                                .filter(|c| !covered.contains(c))
+                                .collect();
+                            if !missing.is_empty() {
+                                self.error(
+                                    format!(
+                                        "non-exhaustive pattern \
+                                         match — missing: {}",
+                                        missing.join(", "),
+                                    ),
+                                    span,
+                                );
+                                return;
                             }
                         }
                     }
@@ -4666,7 +4809,7 @@ impl Infer {
     fn collect_types(&mut self, module: &ast::Module) {
         // First pass: type aliases (multi-pass to handle forward references)
         // Separate refined type aliases from regular ones.
-        let mut alias_decls: Vec<(String, ast::Type)> = Vec::new();
+        let mut alias_decls: Vec<(String, ast::Type, Span)> = Vec::new();
         let mut refined_alias_decls: Vec<(String, ast::Type, ast::Expr)> = Vec::new();
         for decl in &module.decls {
             if let ast::DeclKind::TypeAlias { name, params, ty } = &decl.node {
@@ -4678,9 +4821,55 @@ impl Infer {
                             (**predicate).clone(),
                         ));
                     } else {
-                        alias_decls.push((name.clone(), ty.clone()));
+                        alias_decls.push((name.clone(), ty.clone(), decl.span));
                     }
                 }
+            }
+        }
+        // Detect cyclic alias definitions (e.g. `type A = B; type B = A`)
+        // before the fixpoint loop: each iteration would wrap another
+        // `Ty::Alias` layer and never converge (stack overflow). A name is
+        // cyclic when it can reach itself through alias references.
+        let alias_names: HashSet<String> =
+            alias_decls.iter().map(|(n, _, _)| n.clone()).collect();
+        let mut alias_deps: HashMap<String, HashSet<String>> = HashMap::new();
+        for (name, ty, _) in &alias_decls {
+            let mut refs = HashSet::new();
+            collect_alias_refs(ty, &alias_names, &mut refs);
+            alias_deps.entry(name.clone()).or_default().extend(refs);
+        }
+        let mut cyclic_names: HashSet<String> = HashSet::new();
+        for (name, _, span) in &alias_decls {
+            if cyclic_names.contains(name) {
+                continue;
+            }
+            let mut stack: Vec<String> =
+                alias_deps[name].iter().cloned().collect();
+            let mut visited: HashSet<String> = HashSet::new();
+            let mut found = false;
+            while let Some(n) = stack.pop() {
+                if &n == name {
+                    found = true;
+                    break;
+                }
+                if visited.insert(n.clone()) {
+                    if let Some(ds) = alias_deps.get(&n) {
+                        stack.extend(ds.iter().cloned());
+                    }
+                }
+            }
+            if found {
+                cyclic_names.insert(name.clone());
+                self.error(
+                    format!(
+                        "cyclic type alias '{}' — a type alias cannot refer to itself, directly or through other aliases",
+                        name
+                    ),
+                    *span,
+                );
+                // Register an error type so dependents resolve to something
+                // stable instead of diverging.
+                self.aliases.insert(name.clone(), Ty::Error);
             }
         }
         // Iterate until alias resolutions stabilize (fixpoint).
@@ -4689,16 +4878,24 @@ impl Infer {
         // iterations — clearing inside would allocate fresh vars each time,
         // preventing convergence.
         self.annotation_vars.clear();
+        // Safety bound: acyclic alias chains resolve in at most one pass per
+        // alias; anything beyond that indicates an undetected divergence.
+        let max_passes = alias_decls.len() + 1;
+        let mut passes = 0;
         loop {
             let mut changed = false;
-            for (name, ty) in &alias_decls {
+            for (name, ty, _) in &alias_decls {
+                if cyclic_names.contains(name) {
+                    continue;
+                }
                 let resolved = self.ast_type_to_ty(ty);
                 if self.aliases.get(name) != Some(&resolved) {
                     self.aliases.insert(name.clone(), resolved);
                     changed = true;
                 }
             }
-            if !changed {
+            passes += 1;
+            if !changed || passes > max_passes {
                 break;
             }
         }
@@ -5009,23 +5206,79 @@ impl Infer {
 
         // Resolve composite routes: flatten their components' entries into
         // `route_entries_by_api` so `serve` can find them by composite name.
-        let composites: Vec<(String, Vec<String>)> = module
+        // Composites may reference other composites declared in any order,
+        // so resolve to a fixpoint: a composite is flattened once all of its
+        // components have entries. Anything left after the fixpoint either
+        // references an unknown route or participates in a cycle — both get
+        // a diagnostic instead of silently dropping endpoints.
+        let composites: Vec<(String, Vec<String>, Span)> = module
             .decls
             .iter()
             .filter_map(|d| match &d.node {
                 ast::DeclKind::RouteComposite { name, components } => {
-                    Some((name.clone(), components.clone()))
+                    Some((name.clone(), components.clone(), d.span))
                 }
                 _ => None,
             })
             .collect();
-        for (name, components) in composites {
-            let mut combined = Vec::new();
-            for comp in &components {
-                if let Some(entries) = self.route_entries_by_api.get(comp) {
-                    combined.extend(entries.iter().cloned());
+        let composite_names: HashSet<String> =
+            composites.iter().map(|(n, _, _)| n.clone()).collect();
+        let mut pending = composites;
+        loop {
+            let mut progressed = false;
+            let mut still_pending = Vec::new();
+            for (name, components, span) in pending {
+                if components
+                    .iter()
+                    .all(|c| self.route_entries_by_api.contains_key(c))
+                {
+                    let mut combined = Vec::new();
+                    for comp in &components {
+                        if let Some(entries) =
+                            self.route_entries_by_api.get(comp)
+                        {
+                            combined.extend(entries.iter().cloned());
+                        }
+                    }
+                    self.route_entries_by_api.insert(name, combined);
+                    progressed = true;
+                } else {
+                    still_pending.push((name, components, span));
                 }
             }
+            pending = still_pending;
+            if !progressed || pending.is_empty() {
+                break;
+            }
+        }
+        for (name, components, span) in pending {
+            let mut combined = Vec::new();
+            for comp in &components {
+                match self.route_entries_by_api.get(comp) {
+                    Some(entries) => combined.extend(entries.iter().cloned()),
+                    None => {
+                        if composite_names.contains(comp) || *comp == name {
+                            self.error(
+                                format!(
+                                    "cyclic route composition: route '{}' refers to '{}', which (directly or indirectly) refers back to it",
+                                    name, comp
+                                ),
+                                span,
+                            );
+                        } else {
+                            self.error(
+                                format!(
+                                    "route '{}' refers to '{}', which is not a declared route",
+                                    name, comp
+                                ),
+                                span,
+                            );
+                        }
+                    }
+                }
+            }
+            // Register the entries we could resolve so downstream `serve`
+            // checks produce fewer cascading errors.
             self.route_entries_by_api.insert(name, combined);
         }
 
@@ -7391,36 +7644,72 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
         monad_info.insert(*span, kind);
     }
 
-    // Phase 6: Resolve refine expression targets
+    // Phase 6: Resolve refine expression targets.
+    // The contextual binding of alpha (from an annotation or call site) wins;
+    // otherwise fall back to matching the refined expression's type against
+    // the declared refined types' base types — deterministically (sorted by
+    // name) and erroring when several refined types share the base.
     let mut refine_targets = RefineTargets::new();
-    for (span, var, _inner_ty) in &infer.refine_vars {
+    let refine_vars = infer.refine_vars.clone();
+    for (span, var, inner_ty) in &refine_vars {
         let resolved = infer.apply(&Ty::Var(*var));
         if let Ty::Con(name, args) = &resolved {
+            if args.is_empty() && infer.refined_types.contains_key(name) {
+                // Context named the refined type — check the refined value
+                // against its base type, then record the target.
+                let base = infer.refined_types[name].0.clone();
+                let name = name.clone();
+                infer.unify(inner_ty, &base, *span);
+                refine_targets.insert(*span, name);
+                continue;
+            }
+        }
+        // Alpha is unconstrained or resolved to a base type (e.g. Int via
+        // do-block subsumption). Match against refined types' base types.
+        let key_ty = match &resolved {
+            Ty::Var(_) => infer.apply(inner_ty),
+            other => other.clone(),
+        };
+        // The refined expression may itself already have the refined type
+        // (e.g. `refine (x : Nat)`).
+        if let Ty::Con(name, args) = &key_ty {
             if args.is_empty() && infer.refined_types.contains_key(name) {
                 refine_targets.insert(*span, name.clone());
                 continue;
             }
         }
-        // Alpha resolved to a base type (e.g. Int). Search for a refined type
-        // whose base matches — this handles the do-block case where subsumption
-        // unified alpha with the base type rather than the refined type.
-        let mut found = None;
-        for (name, (base_ty, _)) in &infer.refined_types {
-            if *base_ty == resolved {
-                found = Some(name.clone());
-                break;
+        let mut candidates: Vec<String> = infer
+            .refined_types
+            .iter()
+            .filter(|(_, (base_ty, _))| *base_ty == key_ty)
+            .map(|(name, _)| name.clone())
+            .collect();
+        candidates.sort();
+        match candidates.len() {
+            1 => {
+                let name = candidates.remove(0);
+                refine_targets.insert(*span, name);
             }
-        }
-        if let Some(name) = found {
-            refine_targets.insert(*span, name);
-        } else {
-            infer.errors.push((
-                format!(
-                    "cannot infer refined type target for refine expression (got {}); use a context that constrains the type (e.g., pass to a function expecting a refined type)",
-                    infer.display_ty(&resolved)
-                ),
-                *span,
-            ));
+            0 => {
+                infer.errors.push((
+                    format!(
+                        "cannot infer refined type target for refine expression (got {}); use a context that constrains the type (e.g., pass to a function expecting a refined type)",
+                        infer.display_ty(&resolved)
+                    ),
+                    *span,
+                ));
+            }
+            _ => {
+                infer.errors.push((
+                    format!(
+                        "ambiguous refined type target for refine expression: {} all refine {} — add a type annotation to pick one (e.g. `refine x : Result RefinementError {}`)",
+                        candidates.join(", "),
+                        infer.display_ty(&key_ty),
+                        candidates[0]
+                    ),
+                    *span,
+                ));
+            }
         }
     }
 
@@ -7447,6 +7736,61 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
     (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok)
 }
 
+
+/// Collect the names of type aliases referenced by an AST type. Used for
+/// cyclic-alias detection: only names present in `alias_names` are recorded.
+fn collect_alias_refs(
+    ty: &ast::Type,
+    alias_names: &HashSet<String>,
+    out: &mut HashSet<String>,
+) {
+    match &ty.node {
+        ast::TypeKind::Named(name) => {
+            if alias_names.contains(name) {
+                out.insert(name.clone());
+            }
+        }
+        ast::TypeKind::Var(_) | ast::TypeKind::Hole => {}
+        ast::TypeKind::App { func, arg } => {
+            collect_alias_refs(func, alias_names, out);
+            collect_alias_refs(arg, alias_names, out);
+        }
+        ast::TypeKind::Record { fields, .. } => {
+            for f in fields {
+                collect_alias_refs(&f.value, alias_names, out);
+            }
+        }
+        ast::TypeKind::Relation(inner) => {
+            collect_alias_refs(inner, alias_names, out);
+        }
+        ast::TypeKind::Function { param, result } => {
+            collect_alias_refs(param, alias_names, out);
+            collect_alias_refs(result, alias_names, out);
+        }
+        ast::TypeKind::Variant { constructors, .. } => {
+            for c in constructors {
+                for f in &c.fields {
+                    collect_alias_refs(&f.value, alias_names, out);
+                }
+            }
+        }
+        ast::TypeKind::Effectful { ty, .. } => {
+            collect_alias_refs(ty, alias_names, out);
+        }
+        ast::TypeKind::IO { ty, .. } => {
+            collect_alias_refs(ty, alias_names, out);
+        }
+        ast::TypeKind::UnitAnnotated { base, .. } => {
+            collect_alias_refs(base, alias_names, out);
+        }
+        ast::TypeKind::Refined { base, .. } => {
+            collect_alias_refs(base, alias_names, out);
+        }
+        ast::TypeKind::Forall { ty, .. } => {
+            collect_alias_refs(ty, alias_names, out);
+        }
+    }
+}
 
 /// Extract a simple type name from a resolved type for trait dispatch purposes.
 fn ty_to_type_name(ty: &Ty) -> Option<String> {

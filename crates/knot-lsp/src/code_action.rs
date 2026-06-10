@@ -25,6 +25,17 @@ pub(crate) fn handle_code_action(
 ) -> Option<CodeActionResponse> {
     let uri = &params.text_document.uri;
     let doc = state.documents.get(uri)?;
+    // Staleness guard: code actions compute edits from spans in the last
+    // *analyzed* source. If the editor holds newer (pending) text, those
+    // edits would land at the wrong offsets — bail and let the client
+    // re-request once analysis catches up.
+    if state
+        .pending_sources
+        .get(uri)
+        .is_some_and(|p| p.source != doc.source)
+    {
+        return None;
+    }
     let mut actions = Vec::new();
 
     let range_start = position_to_offset(&doc.source, params.range.start);
@@ -533,49 +544,57 @@ pub(crate) fn handle_code_action(
             && trimmed.len() > 1
             && !trimmed.chars().all(|c| c.is_alphanumeric() || c == '_')
         {
-            // Find the line where the selection starts to determine indentation
-            let line_start = doc.source[..range_start]
-                .rfind('\n')
-                .map(|p| p + 1)
-                .unwrap_or(0);
-            let current_line = &doc.source[line_start..];
-            let indent = current_line.len() - current_line.trim_start().len();
-            let indent_str = " ".repeat(indent);
-
             // Pick fresh names that don't collide with anything in scope. Stable
             // numbering keeps the result deterministic and easy to test.
             let let_name = fresh_extract_name(doc, "extracted");
             let fn_name = fresh_extract_name(doc, "extracted_fn");
 
-            let mut changes = HashMap::new();
-            changes.insert(
-                uri.clone(),
-                vec![
-                    // Insert let binding before the current line
-                    TextEdit {
-                        range: Range {
-                            start: offset_to_position(&doc.source, line_start),
-                            end: offset_to_position(&doc.source, line_start),
-                        },
-                        new_text: format!("{indent_str}let {let_name} = {trimmed}\n"),
-                    },
-                    // Replace the selected expression with the variable name
-                    TextEdit {
-                        range: params.range,
-                        new_text: let_name.clone(),
-                    },
-                ],
-            );
+            // Statement-form `let x = e` only parses inside `do` blocks, so
+            // the let-extraction is offered only when the selection sits
+            // inside a do-block statement. The binding is inserted before
+            // the START of that enclosing statement (not the cursor's line)
+            // so multi-line statements aren't split mid-expression.
+            if let Some(stmt_start) =
+                enclosing_do_stmt_start(&doc.module, range_start, range_end)
+            {
+                let line_start = doc.source[..stmt_start]
+                    .rfind('\n')
+                    .map(|p| p + 1)
+                    .unwrap_or(0);
+                let stmt_line = &doc.source[line_start..];
+                let indent = stmt_line.len() - stmt_line.trim_start().len();
+                let indent_str = " ".repeat(indent);
 
-            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                title: format!("Extract to let `{let_name}`"),
-                kind: Some(CodeActionKind::REFACTOR_EXTRACT),
-                edit: Some(WorkspaceEdit {
-                    changes: Some(changes),
+                let mut changes = HashMap::new();
+                changes.insert(
+                    uri.clone(),
+                    vec![
+                        // Insert let binding before the enclosing do-statement
+                        TextEdit {
+                            range: Range {
+                                start: offset_to_position(&doc.source, line_start),
+                                end: offset_to_position(&doc.source, line_start),
+                            },
+                            new_text: format!("{indent_str}let {let_name} = {trimmed}\n"),
+                        },
+                        // Replace the selected expression with the variable name
+                        TextEdit {
+                            range: params.range,
+                            new_text: let_name.clone(),
+                        },
+                    ],
+                );
+
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: format!("Extract to let `{let_name}`"),
+                    kind: Some(CodeActionKind::REFACTOR_EXTRACT),
+                    edit: Some(WorkspaceEdit {
+                        changes: Some(changes),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            }));
+                }));
+            }
 
             // Extract function: wrap selected expression in a named function
             let mut fn_changes = HashMap::new();
@@ -2753,19 +2772,80 @@ fn path_diff(target: &std::path::Path, base: &std::path::Path) -> Option<std::pa
     Some(out)
 }
 
+/// Byte offset of the start of the innermost do-block *statement* containing
+/// the selection `[sel_start, sel_end]`. Returns `None` when the selection
+/// isn't inside a do-block statement — i.e. when statement-form `let` isn't
+/// valid at that position.
+pub(crate) fn enclosing_do_stmt_start(
+    module: &Module,
+    sel_start: usize,
+    sel_end: usize,
+) -> Option<usize> {
+    fn walk(expr: &ast::Expr, sel_start: usize, sel_end: usize, best: &mut Option<usize>) {
+        if let ast::ExprKind::Do(stmts) = &expr.node {
+            for stmt in stmts {
+                if stmt.span.start <= sel_start && sel_end <= stmt.span.end {
+                    // Recursion visits parents before children, so the last
+                    // assignment wins — the innermost matching statement.
+                    *best = Some(stmt.span.start);
+                }
+            }
+        }
+        crate::utils::recurse_expr(expr, |e| walk(e, sel_start, sel_end, best));
+    }
+    let mut best = None;
+    for decl in &module.decls {
+        if decl.span.start > sel_start || sel_end > decl.span.end {
+            continue;
+        }
+        match &decl.node {
+            DeclKind::Fun {
+                body: Some(body), ..
+            }
+            | DeclKind::View { body, .. }
+            | DeclKind::Derived { body, .. } => walk(body, sel_start, sel_end, &mut best),
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { body, .. } = item {
+                        walk(body, sel_start, sel_end, &mut best);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    best
+}
+
 /// Compute where to insert a new `import` line and what text to use. We
 /// always insert at column 0 and append a newline. Position depends on
-/// whether the file already has imports.
-fn import_insert_position_and_text(doc: &DocumentState, import_path: &str) -> (Position, String) {
+/// whether the file already has imports. Shared with the auto-import
+/// completion-resolve path so both compute the position the same (correct)
+/// way.
+pub(crate) fn import_insert_position_and_text(
+    doc: &DocumentState,
+    import_path: &str,
+) -> (Position, String) {
     if let Some(last) = doc.module.imports.last() {
         // Insert after the last existing import line. We anchor to the end of
         // the line containing `last.span.end` so the new line is a sibling.
-        let after = doc.source[last.span.end..]
-            .find('\n')
-            .map(|p| last.span.end + p + 1)
-            .unwrap_or(doc.source.len());
-        let pos = offset_to_position(&doc.source, after);
-        (pos, format!("import {import_path}\n"))
+        match doc.source[last.span.end.min(doc.source.len())..].find('\n') {
+            Some(p) => {
+                let after = last.span.end + p + 1;
+                let pos = offset_to_position(&doc.source, after);
+                (pos, format!("import {import_path}\n"))
+            }
+            None => {
+                // The last import is the final line and the file has no
+                // trailing newline. Inserting "import …" at a line that
+                // doesn't exist would get clamped by the client to the end
+                // of the document, gluing the two imports together
+                // (`import ./aimport foo`). Insert at EOF with a leading
+                // newline instead.
+                let pos = offset_to_position(&doc.source, doc.source.len());
+                (pos, format!("\nimport {import_path}\n"))
+            }
+        }
     } else {
         // No imports: insert at the very top of the file. If the first line
         // is a comment or whitespace, we still insert above it — keeps the
@@ -3416,5 +3496,155 @@ impl Describe Color where
         assert_eq!(edit.range.start.line, 1);
         assert_eq!(edit.range.start.character, 0);
         assert!(edit.new_text.contains("import ./other"));
+    }
+
+    fn plain_params(uri: &Uri, range: Range) -> CodeActionParams {
+        CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range,
+            context: CodeActionContext {
+                diagnostics: Vec::new(),
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }
+    }
+
+    fn selection_range(source: &str, needle: &str) -> Range {
+        let off = source.find(needle).expect("needle found");
+        Range {
+            start: crate::utils::offset_to_position(source, off),
+            end: crate::utils::offset_to_position(source, off + needle.len()),
+        }
+    }
+
+    fn action_titles(actions: &[CodeActionOrCommand]) -> Vec<String> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                CodeActionOrCommand::CodeAction(ca) => Some(ca.title.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Regression: statement-form `let x = e` only parses inside `do`
+    /// blocks. The action used to be offered everywhere, producing parse
+    /// errors when applied in plain expression bodies.
+    #[test]
+    fn extract_to_let_not_offered_outside_do_block() {
+        use crate::test_support::TestWorkspace;
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "f = \\x -> x * 2 + 1\n");
+        let doc_source = ws.doc(&uri).source.clone();
+        let range = selection_range(&doc_source, "x * 2");
+        let actions = handle_code_action(&ws.state, &plain_params(&uri, range))
+            .expect("code action response");
+        let titles = action_titles(&actions);
+        assert!(
+            titles.iter().all(|t| !t.starts_with("Extract to let")),
+            "let-extraction must not be offered outside a do block; got: {titles:?}"
+        );
+        // The function-extraction variant works in expression position and
+        // should still be offered.
+        assert!(
+            titles.iter().any(|t| t.starts_with("Extract to function")),
+            "function extraction should remain available; got: {titles:?}"
+        );
+    }
+
+    #[test]
+    fn extract_to_let_offered_inside_do_block() {
+        use crate::test_support::TestWorkspace;
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "main = do\n  x <- [1, 2]\n  yield (x * 2)\n");
+        let doc_source = ws.doc(&uri).source.clone();
+        let range = selection_range(&doc_source, "x * 2");
+        let actions = handle_code_action(&ws.state, &plain_params(&uri, range))
+            .expect("code action response");
+        let titles = action_titles(&actions);
+        assert!(
+            titles.iter().any(|t| t.starts_with("Extract to let")),
+            "let-extraction should be offered inside a do block; got: {titles:?}"
+        );
+    }
+
+    /// Regression: the let binding used to be inserted before the *cursor's*
+    /// line, splitting multi-line do-statements mid-expression. It must be
+    /// inserted before the START of the enclosing statement.
+    #[test]
+    fn extract_to_let_inserts_before_enclosing_do_stmt() {
+        use crate::test_support::TestWorkspace;
+        let mut ws = TestWorkspace::new();
+        // The `yield` statement starts on line 2 and continues onto line 3.
+        let source = "main = do\n  x <- [1, 2]\n  yield (x +\n    (x * 2))\n";
+        let uri = ws.open("main", source);
+        let doc_source = ws.doc(&uri).source.clone();
+        // Selection sits on the continuation line (line 3).
+        let range = selection_range(&doc_source, "(x * 2)");
+        let actions = handle_code_action(&ws.state, &plain_params(&uri, range))
+            .expect("code action response");
+        let let_action = actions
+            .iter()
+            .find_map(|a| match a {
+                CodeActionOrCommand::CodeAction(ca)
+                    if ca.title.starts_with("Extract to let") =>
+                {
+                    Some(ca)
+                }
+                _ => None,
+            })
+            .expect("let extraction offered inside do block");
+        let edits = let_action
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .get(&uri)
+            .unwrap();
+        let insert = edits
+            .iter()
+            .find(|e| e.new_text.contains("let "))
+            .expect("let insertion edit");
+        assert_eq!(
+            insert.range.start.line, 2,
+            "must insert before the `yield` statement's line, not the \
+             continuation line; edits: {edits:?}"
+        );
+        assert_eq!(insert.range.start.character, 0);
+        assert!(
+            insert.new_text.starts_with("  let "),
+            "indent must match the statement's line; got: {:?}",
+            insert.new_text
+        );
+    }
+
+    /// Staleness guard: when the editor holds newer (pending) text than the
+    /// analyzed doc, span-derived edits would corrupt the buffer. The
+    /// handler must bail.
+    #[test]
+    fn code_action_bails_when_pending_text_is_newer() {
+        use crate::state::PendingSource;
+        use crate::test_support::TestWorkspace;
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "main = do\n  x <- [1, 2]\n  yield (x * 2)\n");
+        let doc_source = ws.doc(&uri).source.clone();
+        let range = selection_range(&doc_source, "x * 2");
+        ws.state.pending_sources.insert(
+            uri.clone(),
+            PendingSource {
+                source: format!("-- edited\n{doc_source}"),
+                version: Some(2),
+            },
+        );
+        let actions = handle_code_action(&ws.state, &plain_params(&uri, range));
+        assert!(
+            actions.is_none(),
+            "code actions against stale analysis must bail; got: {actions:?}"
+        );
     }
 }

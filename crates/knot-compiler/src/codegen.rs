@@ -157,6 +157,10 @@ pub struct Codegen {
     // snapshot retry machinery doesn't need transactional rollback when no
     // SQL writes can happen.
     write_functions: HashSet<String>,
+    /// Names of all top-level function declarations (used by the
+    /// write-analysis: calls to anything NOT in this set and not a builtin
+    /// are conservatively treated as possibly-writing).
+    top_fn_names: HashSet<String>,
 
     // Scalar sources: source names whose type is a bare primitive (e.g. `*counter : Int`)
     // rather than a relation of records. These get automatic wrap/unwrap of `_value` field.
@@ -724,6 +728,7 @@ impl Codegen {
             nullable_ctors: HashMap::new(),
             io_functions: HashSet::new(),
             write_functions: HashSet::new(),
+            top_fn_names: HashSet::new(),
             scalar_sources: HashSet::new(),
             overridable_constants: HashMap::new(),
             overridable_defaults: HashMap::new(),
@@ -4131,10 +4136,19 @@ impl Codegen {
                     if let Some(val) = self.try_compile_pipe_sql(builder, expr, env, db) {
                         return val;
                     }
-                    // lhs |> rhs  =>  rhs(lhs)
-                    let arg = self.compile_expr(builder, lhs, env, db);
-                    let func = self.compile_expr(builder, rhs, env, db);
-                    self.call_rt(builder, "knot_value_call", &[db, func, arg])
+                    // lhs |> rhs  =>  rhs(lhs); route through compile_app so
+                    // application-form special cases (bare `count`, stdlib
+                    // aggregates, per-op SQL pushdown) apply on the fallback
+                    // path too — a raw knot_value_call can't resolve names
+                    // like `count` that only exist as compile_app intrinsics.
+                    let app = ast::Spanned::new(
+                        ast::ExprKind::App {
+                            func: rhs.clone(),
+                            arg: lhs.clone(),
+                        },
+                        expr.span,
+                    );
+                    self.compile_app(builder, &app, env, db)
                 } else if matches!(op, ast::BinOp::And | ast::BinOp::Or) {
                     // Short-circuit boolean ops: don't evaluate RHS if LHS determines result
                     let l = self.compile_expr(builder, lhs, env, db);
@@ -4314,10 +4328,14 @@ impl Codegen {
                     let match_value: &ast::Expr = &inlined;
 
                     if let Some(new_rows_expr) = self.match_union_append(name, match_value) {
-                        // 1. Append: union *rel <new> → INSERT only
-                        // Skip refinement checks: appended data was already validated
-                        // at the route handler boundary (HTTP body field validation).
+                        // 1. Append: union *rel <new> → INSERT only.
+                        // Refinement checks must run here too: appended data
+                        // is only pre-validated when it came through a route
+                        // handler (HTTP body fields) — locally constructed
+                        // rows (e.g. `union rows [{v: -5}]`) would otherwise
+                        // bypass refined-type validation entirely.
                         let new_rows = self.compile_expr(builder, new_rows_expr, env, db);
+                        self.emit_refinement_checks(builder, name, new_rows, env, db);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
                         let (schema_ptr, schema_len) =
                             self.string_ptr(builder, &schema);
@@ -4346,7 +4364,7 @@ impl Codegen {
                         // 3. Conditional update: do { t <- *rel; yield (if cond then {t | ...} else t) }
                         //    Try SQL UPDATE WHERE (skip for nested relations — child tables need full rewrite)
                         //    Skip when source has refinements — SQL bypasses Knot-level validation
-                        let where_frag = self.try_compile_sql_expr(&bind_var, cond);
+                        let where_frag = self.try_compile_sql_expr(&bind_var, cond, &schema);
                         let set_frag = where_frag.as_ref().and_then(|_| {
                             let mut parts = Vec::new();
                             let mut params = Vec::new();
@@ -4425,7 +4443,7 @@ impl Codegen {
                             let mut all_ok = true;
                             for cond in &conditions {
                                 if let Some(f) =
-                                    self.try_compile_sql_expr(&bind_var, cond)
+                                    self.try_compile_sql_expr(&bind_var, cond, &schema)
                                 {
                                     frags.push(f);
                                 } else {
@@ -4563,7 +4581,11 @@ impl Codegen {
                 // skipped — the version-snapshot retry machinery already
                 // provides the consistency guarantees we need for a
                 // read-only body, and skipping avoids a WAL write per retry.
-                let body_writes = Self::expr_contains_writes(inner, &self.write_functions);
+                let body_writes = Self::expr_contains_writes(
+                    inner,
+                    &self.write_functions,
+                    &self.top_fn_names,
+                );
 
                 // For nested atomics, save outer STM tracking before the loop
                 // so inner snapshot/retry doesn't destroy outer read/write sets.
@@ -5003,6 +5025,7 @@ impl Codegen {
                     if !self.views.contains_key(&source_name)
                         && self.source_schemas.contains_key(&source_name)
                     {
+                        self.emit_stm_track_read(builder, &source_name);
                         let (name_ptr, name_len) =
                             self.string_ptr(builder, &source_name);
                         return self.call_rt(
@@ -5022,9 +5045,10 @@ impl Codegen {
                     if !self.views.contains_key(source_name) {
                         if let Some(schema) = self.source_schemas.get(source_name).cloned() {
                             if !schema.starts_with('#') && !schema.contains('[') {
-                                if let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body) {
+                                if let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body, &schema) {
                                     let table = quote_sql_ident(&format!("_knot_{}", source_name));
                                     let sql = format!("SELECT COUNT(*) FROM {} WHERE {}", table, frag.sql);
+                                    self.emit_stm_track_read(builder, source_name);
                                     let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
                                     let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
                                     return self.call_rt(
@@ -5050,6 +5074,7 @@ impl Codegen {
                         } else {
                             format!("SELECT COUNT(*) FROM {} WHERE {}", from, plan.conditions.join(" AND "))
                         };
+                        self.emit_stm_track_reads_for_plan(builder, &plan);
                         let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
                         let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
                         return self.call_rt(
@@ -5100,7 +5125,7 @@ impl Codegen {
                     if !self.views.contains_key(&source_name) {
                         if let Some(schema) = self.source_schemas.get(&source_name).cloned() {
                             if !schema.starts_with('#') && !schema.contains('[') {
-                                if let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body) {
+                                if let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body, &schema) {
                                     let table = quote_sql_ident(&format!("_knot_{}", source_name));
                                     let cols = parse_schema_columns(&schema).iter()
                                         .map(|(name, _)| quote_sql_ident(name))
@@ -5192,7 +5217,7 @@ impl Codegen {
                     if !self.views.contains_key(&source_name) {
                         if let Some(schema) = self.source_schemas.get(&source_name).cloned() {
                             if !schema.starts_with('#') && !schema.contains('[') {
-                                if let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body) {
+                                if let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body, &schema) {
                                     let f = self.compile_expr(builder, &args[0], env, db);
                                     let init = self.compile_expr(builder, &args[1], env, db);
                                     let table = quote_sql_ident(&format!("_knot_{}", source_name));
@@ -5253,8 +5278,10 @@ impl Codegen {
                 if let ast::ExprKind::Constructor(ctor_name) = &args[0].node {
                     if let ast::ExprKind::SourceRef(source_name) = &args[1].node {
                         if let Some(schema) = self.source_schemas.get(source_name).cloned() {
+                            let source_name = source_name.clone();
+                            self.emit_stm_track_read(builder, &source_name);
                             let (name_ptr, name_len) =
-                                self.string_ptr(builder, source_name);
+                                self.string_ptr(builder, &source_name);
                             let (schema_ptr, schema_len) =
                                 self.string_ptr(builder, &schema);
                             let (tag_ptr, tag_len) =
@@ -5311,7 +5338,7 @@ impl Codegen {
                                     if let Some((agg_bind, agg_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies, &self.let_bindings) {
                                         let agg_body: &ast::Expr = &agg_body;
                                         if let Some(col_sql) = extract_sql_field_access(&agg_bind, agg_body, "", &schema) {
-                                            if let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body) {
+                                            if let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body, &schema) {
                                                 let arg_sql = if matches!(name.as_str(), "minOn" | "maxOn") {
                                                     col_sql_for_minmax(&col_sql, &agg_bind, agg_body, &schema)
                                                 } else {
@@ -5319,6 +5346,7 @@ impl Codegen {
                                                 };
                                                 let table = quote_sql_ident(&format!("_knot_{}", source_name));
                                                 let sql = format!("SELECT {}({}) FROM {} WHERE {}", sql_func, arg_sql, table, frag.sql);
+                                                self.emit_stm_track_read(builder, source_name);
                                                 let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
                                                 let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
                                                 return self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]);
@@ -5330,20 +5358,49 @@ impl Codegen {
                         }
                     }
 
-                    // sum/avg/min/max lambda (do { ... }) → SQL aggregate from plan
+                    // sum/avg/min/max lambda (do { ... }) → SQL aggregate from plan.
+                    // The lambda sees the do-block's *projected* rows, so its
+                    // field must be resolved through the yield projection —
+                    // `sum (\x -> x.amt) (do i <- *t; yield {amt: i.qty})`
+                    // aggregates the underlying `qty` column. Computed or
+                    // unmappable projections fall back to in-memory.
                     if let ast::ExprKind::Do(stmts) = &args[1].node {
                         if let Some(plan) = self.analyze_sql_plan(stmts, env) {
                             if let Some((agg_bind, agg_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies, &self.let_bindings) {
                                 let agg_body: &ast::Expr = &agg_body;
-                                // Use first table's alias and schema for the aggregate column
-                                let alias = if plan.tables.len() == 1 { &plan.tables[0].alias } else { "" };
-                                let schema = plan.tables.first()
-                                    .and_then(|t| self.source_schemas.get(&t.source_name))
-                                    .cloned()
-                                    .unwrap_or_default();
-                                if let Some(col_sql) = extract_sql_field_access(&agg_bind, agg_body, alias, &schema) {
-                                    let arg_sql = if matches!(name.as_str(), "minOn" | "maxOn") {
-                                        col_sql_for_minmax(&col_sql, &agg_bind, agg_body, &schema)
+                                // Resolve the aggregate column: a plain
+                                // `\x -> x.field` maps through the projection;
+                                // arithmetic bodies are only allowed when the
+                                // projection is the identity (single table).
+                                let col_info: Option<(String, String)> = match &agg_body.node {
+                                    ast::ExprKind::FieldAccess { expr: fa_inner, field }
+                                        if matches!(&fa_inner.node, ast::ExprKind::Var(v) if v == &agg_bind) =>
+                                    {
+                                        plan_projection_column(&plan, field)
+                                    }
+                                    _ if plan.tables.len() == 1
+                                        && plan_projection_is_identity(&plan) =>
+                                    {
+                                        let alias = &plan.tables[0].alias;
+                                        let schema = self
+                                            .source_schemas
+                                            .get(&plan.tables[0].source_name)
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        extract_sql_field_access(&agg_bind, agg_body, alias, &schema)
+                                            .map(|col_sql| {
+                                                let ty = infer_sql_expr_type(&agg_bind, agg_body, &schema)
+                                                    .unwrap_or_else(|| "float".to_string());
+                                                (col_sql, ty)
+                                            })
+                                    }
+                                    _ => None,
+                                };
+                                if let Some((col_sql, col_ty)) = col_info {
+                                    let arg_sql = if matches!(name.as_str(), "minOn" | "maxOn")
+                                        && col_ty == "int"
+                                    {
+                                        format!("{} COLLATE KNOT_INT", col_sql)
                                     } else {
                                         col_sql
                                     };
@@ -5356,6 +5413,7 @@ impl Codegen {
                                     } else {
                                         format!("SELECT {}({}) FROM {} WHERE {}", sql_func, arg_sql, from, plan.conditions.join(" AND "))
                                     };
+                                    self.emit_stm_track_reads_for_plan(builder, &plan);
                                     let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
                                     let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
                                     return self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]);
@@ -5377,8 +5435,8 @@ impl Codegen {
                                 if !schema.starts_with('#') && !schema.contains('[') {
                                     if let Some((pred_bind, pred_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies, &self.let_bindings) {
                                         let pred_body: &ast::Expr = &pred_body;
-                                        if let Some(pred_frag) = self.try_compile_sql_expr(&pred_bind, pred_body) {
-                                            if let Some(filter_frag) = self.try_compile_sql_expr(&filter_bind, filter_body) {
+                                        if let Some(pred_frag) = self.try_compile_sql_expr(&pred_bind, pred_body, &schema) {
+                                            if let Some(filter_frag) = self.try_compile_sql_expr(&filter_bind, filter_body, &schema) {
                                                 let table = quote_sql_ident(&format!("_knot_{}", source_name));
                                                 let sql = format!(
                                                     "SELECT COUNT(*) FROM {} WHERE {} AND {}",
@@ -5386,6 +5444,7 @@ impl Codegen {
                                                 );
                                                 let mut all_params = filter_frag.params;
                                                 all_params.extend(pred_frag.params);
+                                                self.emit_stm_track_read(builder, source_name);
                                                 let params_rel = self.compile_sql_params(builder, &all_params, env, db);
                                                 let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
                                                 return self.call_rt(
@@ -5401,45 +5460,65 @@ impl Codegen {
                         }
                     }
 
-                    // countWhere predicate (do { ... }) → SELECT COUNT(*) FROM plan WHERE pred
+                    // countWhere predicate (do { ... }) → SELECT COUNT(*) FROM plan WHERE pred.
+                    // The predicate sees the do-block's *projected* rows, so
+                    // its field references must be rewritten through the
+                    // yield projection before compiling against the base
+                    // table; multi-table plans and computed projections fall
+                    // back to in-memory evaluation.
                     if let ast::ExprKind::Do(stmts) = &args[1].node {
                         if let Some(plan) = self.analyze_sql_plan(stmts, env) {
-                            if let Some((pred_bind, pred_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies, &self.let_bindings) {
-                                let pred_body: &ast::Expr = &pred_body;
-                                let mut bind_aliases: HashMap<String, String> = HashMap::new();
-                                if plan.tables.len() == 1 {
-                                    bind_aliases.insert(pred_bind.clone(), plan.tables[0].alias.clone());
-                                }
-                                if let Some(pred_frag) = Self::try_compile_multi_table_sql_expr(
-                                    &bind_aliases, pred_body, env, &HashMap::new(),
-                                ) {
-                                    let tables_sql: Vec<String> = plan.tables.iter().map(|t| {
-                                        format!("{} AS {}", quote_sql_ident(&format!("_knot_{}", t.source_name)), t.alias)
-                                    }).collect();
-                                    let from = tables_sql.join(", ");
-                                    let mut all_conditions = plan.conditions.clone();
-                                    all_conditions.push(pred_frag.sql);
-                                    let sql = format!(
-                                        "SELECT COUNT(*) FROM {} WHERE {}",
-                                        from,
-                                        all_conditions.join(" AND "),
-                                    );
-                                    let mut all_params = plan.params.clone();
-                                    all_params.extend(pred_frag.params);
-                                    let params_rel = self.compile_sql_params(builder, &all_params, env, db);
-                                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                                    return self.call_rt(
-                                        builder,
-                                        "knot_source_query_count",
-                                        &[db, sql_ptr, sql_len, params_rel],
-                                    );
+                            if plan.tables.len() == 1 {
+                                if let Some((pred_bind, pred_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies, &self.let_bindings) {
+                                    let pred_body: &ast::Expr = &pred_body;
+                                    if let Some(rewritten) =
+                                        rewrite_body_through_projection(&plan, &pred_bind, pred_body)
+                                    {
+                                        let mut bind_aliases: HashMap<String, String> = HashMap::new();
+                                        bind_aliases.insert(pred_bind.clone(), plan.tables[0].alias.clone());
+                                        let mut bind_schemas: HashMap<String, String> = HashMap::new();
+                                        if let Some(schema) =
+                                            self.source_schemas.get(&plan.tables[0].source_name)
+                                        {
+                                            bind_schemas.insert(pred_bind.clone(), schema.clone());
+                                        }
+                                        if let Some(pred_frag) = Self::try_compile_multi_table_sql_expr(
+                                            &bind_aliases, &bind_schemas, &rewritten, env, &HashMap::new(),
+                                        ) {
+                                            let tables_sql: Vec<String> = plan.tables.iter().map(|t| {
+                                                format!("{} AS {}", quote_sql_ident(&format!("_knot_{}", t.source_name)), t.alias)
+                                            }).collect();
+                                            let from = tables_sql.join(", ");
+                                            let mut all_conditions = plan.conditions.clone();
+                                            all_conditions.push(pred_frag.sql);
+                                            let sql = format!(
+                                                "SELECT COUNT(*) FROM {} WHERE {}",
+                                                from,
+                                                all_conditions.join(" AND "),
+                                            );
+                                            self.emit_stm_track_reads_for_plan(builder, &plan);
+                                            let mut all_params = plan.params.clone();
+                                            all_params.extend(pred_frag.params);
+                                            let params_rel = self.compile_sql_params(builder, &all_params, env, db);
+                                            let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                                            return self.call_rt(
+                                                builder,
+                                                "knot_source_query_count",
+                                                &[db, sql_ptr, sql_len, params_rel],
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
 
-                // filter/sortBy lambda (do { ... }) → merge into SQL plan
+                // filter/sortBy lambda (do { ... }) → merge into SQL plan.
+                // The lambda sees the do-block's *projected* rows, so its
+                // field references are rewritten through the yield
+                // projection before being compiled against the base table;
+                // computed projections fall back to in-memory evaluation.
                 if matches!(name.as_str(), "filter" | "sortBy") {
                     if let ast::ExprKind::Do(stmts) = &args[1].node {
                         if let Some(mut plan) = self.analyze_sql_plan(stmts, env) {
@@ -5447,55 +5526,65 @@ impl Codegen {
                                 let body: &ast::Expr = &body;
                                 match name.as_str() {
                                     "filter" => {
-                                        // Merge WHERE condition into the plan
-                                        let bind_aliases: HashMap<String, String> = plan.tables.iter()
-                                            .enumerate()
-                                            .map(|(i, t)| (format!("__yield_row_{}", i), t.alias.clone()))
-                                            .collect();
                                         // For single-table plans, the bind var maps to the table alias
                                         if plan.tables.len() == 1 {
-                                            let mut ba = HashMap::new();
-                                            ba.insert(bind_var.clone(), plan.tables[0].alias.clone());
-                                            if let Some(frag) = Self::try_compile_multi_table_sql_expr(
-                                                &ba, body, env, &HashMap::new(),
-                                            ) {
-                                                plan.conditions.push(frag.sql);
-                                                plan.params.extend(frag.params);
-                                                let sql = plan.build_sql();
-                                                let result_schema = plan.build_result_schema();
-                                                let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
-                                                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                                                let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
-                                                return self.call_rt(
-                                                    builder,
-                                                    "knot_source_query",
-                                                    &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
-                                                );
+                                            if let Some(rewritten) =
+                                                rewrite_body_through_projection(&plan, &bind_var, body)
+                                            {
+                                                let mut ba = HashMap::new();
+                                                ba.insert(bind_var.clone(), plan.tables[0].alias.clone());
+                                                let mut bs = HashMap::new();
+                                                if let Some(schema) =
+                                                    self.source_schemas.get(&plan.tables[0].source_name)
+                                                {
+                                                    bs.insert(bind_var.clone(), schema.clone());
+                                                }
+                                                if let Some(frag) = Self::try_compile_multi_table_sql_expr(
+                                                    &ba, &bs, &rewritten, env, &HashMap::new(),
+                                                ) {
+                                                    plan.conditions.push(frag.sql);
+                                                    plan.params.extend(frag.params);
+                                                    let sql = plan.build_sql();
+                                                    let result_schema = plan.build_result_schema();
+                                                    self.emit_stm_track_reads_for_plan(builder, &plan);
+                                                    let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
+                                                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                                                    let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
+                                                    return self.call_rt(
+                                                        builder,
+                                                        "knot_source_query",
+                                                        &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                                                    );
+                                                }
                                             }
                                         }
-                                        let _ = bind_aliases;
                                     }
                                     "sortBy" => {
                                         if plan.tables.len() == 1 {
-                                            let alias = &plan.tables[0].alias;
+                                            let alias = plan.tables[0].alias.clone();
                                             let schema = self.source_schemas
                                                 .get(&plan.tables[0].source_name)
                                                 .cloned()
                                                 .unwrap_or_default();
-                                            if let Some(col_sql) = extract_sql_field_access(
-                                                &bind_var, body, alias, &schema,
-                                            ) {
-                                                plan.order_by.push(col_sql);
-                                                let sql = plan.build_sql();
-                                                let result_schema = plan.build_result_schema();
-                                                let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
-                                                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                                                let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
-                                                return self.call_rt(
-                                                    builder,
-                                                    "knot_source_query",
-                                                    &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
-                                                );
+                                            if let Some(rewritten) =
+                                                rewrite_body_through_projection(&plan, &bind_var, body)
+                                            {
+                                                if let Some(col_sql) = extract_sql_field_access(
+                                                    &bind_var, &rewritten, &alias, &schema,
+                                                ) {
+                                                    plan.order_by.push(col_sql);
+                                                    let sql = plan.build_sql();
+                                                    let result_schema = plan.build_result_schema();
+                                                    self.emit_stm_track_reads_for_plan(builder, &plan);
+                                                    let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
+                                                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                                                    let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
+                                                    return self.call_rt(
+                                                        builder,
+                                                        "knot_source_query",
+                                                        &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -5530,6 +5619,8 @@ impl Codegen {
                                                             .collect::<Vec<_>>()
                                                             .join(", ");
                                                         let sql = format!("SELECT {} FROM {} ORDER BY {} LIMIT ?", cols, table, col_sql);
+                                                        let source_name = source_name.clone();
+                                                        self.emit_stm_track_read(builder, &source_name);
                                                         let n_val = self.compile_expr(builder, &args[0], env, db);
                                                         let params_rel = self.call_rt(builder, "knot_relation_singleton", &[n_val]);
                                                         let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
@@ -5549,14 +5640,19 @@ impl Codegen {
                                     if let ast::ExprKind::Do(do_stmts) = &sort_source.node {
                                         if let Some(mut plan) = self.analyze_sql_plan(do_stmts, env) {
                                             if plan.tables.len() == 1 {
-                                                let alias = &plan.tables[0].alias;
+                                                let alias = plan.tables[0].alias.clone();
                                                 let schema = self.source_schemas
                                                     .get(&plan.tables[0].source_name)
                                                     .cloned()
                                                     .unwrap_or_default();
-                                                if let Some(col_sql) = extract_sql_field_access(
-                                                    &sort_bind, sort_body, alias, &schema,
-                                                ) {
+                                                // Sort lambda sees projected rows: map its field
+                                                // refs through the yield projection (fall back on
+                                                // computed projections).
+                                                let rewritten_sort =
+                                                    rewrite_body_through_projection(&plan, &sort_bind, sort_body);
+                                                if let Some(col_sql) = rewritten_sort.as_ref().and_then(|rb| {
+                                                    extract_sql_field_access(&sort_bind, rb, &alias, &schema)
+                                                }) {
                                                     plan.order_by.push(col_sql);
                                                     let n_param = SqlParamSource::Var("__limit__".into());
                                                     plan.limit = Some(n_param);
@@ -5596,6 +5692,7 @@ impl Codegen {
                     if !self.views.contains_key(&source_name) {
                         if let Some(schema) = self.source_schemas.get(&source_name).cloned() {
                             if !schema.starts_with('#') && !schema.contains('[') {
+                                self.emit_stm_track_read(builder, &source_name);
                                 let table = quote_sql_ident(&format!("_knot_{}", source_name));
                                 let cols = parse_schema_columns(&schema).iter()
                                     .map(|(n, _)| quote_sql_ident(n))
@@ -5625,13 +5722,14 @@ impl Codegen {
                     if !self.views.contains_key(source_name) {
                         if let Some(schema) = self.source_schemas.get(source_name).cloned() {
                             if !schema.starts_with('#') && !schema.contains('[') {
-                                if let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body) {
+                                if let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body, &schema) {
                                     let table = quote_sql_ident(&format!("_knot_{}", source_name));
                                     let cols = parse_schema_columns(&schema).iter()
                                         .map(|(n, _)| quote_sql_ident(n))
                                         .collect::<Vec<_>>()
                                         .join(", ");
                                     let sql = format!("SELECT {} FROM {} WHERE {} LIMIT ?", cols, table, frag.sql);
+                                    self.emit_stm_track_read(builder, source_name);
                                     let n_val = self.compile_expr(builder, &args[0], env, db);
                                     let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
                                     self.call_rt_void(builder, "knot_relation_push", &[params_rel, n_val]);
@@ -5667,6 +5765,10 @@ impl Codegen {
                     ) {
                         let sql = format!("{} {} {}", sub_a.sql, sql_op, sub_b.sql);
                         let result_schema = sub_a.schema;
+                        for table in sub_a.tables.iter().chain(sub_b.tables.iter()) {
+                            let table = table.clone();
+                            self.emit_stm_track_read(builder, &table);
+                        }
                         let mut all_params = sub_a.params;
                         all_params.extend(sub_b.params);
                         let params_rel = self.compile_sql_params(builder, &all_params, env, db);
@@ -6812,13 +6914,14 @@ impl Codegen {
                 fun_bodies.push((name.clone(), body));
             }
         }
+        self.top_fn_names = fun_bodies.iter().map(|(n, _)| n.clone()).collect();
         loop {
             let mut changed = false;
             for (name, body) in &fun_bodies {
                 if self.write_functions.contains(name) {
                     continue;
                 }
-                if Self::expr_contains_writes(body, &self.write_functions) {
+                if Self::expr_contains_writes(body, &self.write_functions, &self.top_fn_names) {
                     self.write_functions.insert(name.clone());
                     changed = true;
                 }
@@ -6841,52 +6944,95 @@ impl Codegen {
     /// the analysis on the inner body — and even a read-only inner atomic
     /// gates on the same SAVEPOINT decision at the outer level: the inner
     /// retry machinery is self-contained either way.
-    fn expr_contains_writes(expr: &ast::Expr, write_fns: &HashSet<String>) -> bool {
+    fn expr_contains_writes(
+        expr: &ast::Expr,
+        write_fns: &HashSet<String>,
+        known_fns: &HashSet<String>,
+    ) -> bool {
+        // A callee/IO-value name is "known write-free" only when it is a
+        // top-level function (the fixed-point analysis covers it) or a
+        // builtin. Anything else — a parameter, a do-local lambda binding,
+        // a trait-method dispatcher — could perform a write at runtime, so
+        // it must be treated as possibly-writing (emitting the SAVEPOINT is
+        // always safe; skipping it is not).
+        let name_is_known_write_free = |name: &str| -> bool {
+            !write_fns.contains(name)
+                && (known_fns.contains(name)
+                    || is_builtin_name(name)
+                    || matches!(name, "yield" | "__bind" | "__yield" | "__empty"))
+        };
+        // True when evaluating/running `e` could write through a value of
+        // unknown provenance (e.g. an IO action received as a parameter).
+        let unknown_io_value = |e: &ast::Expr| -> bool {
+            match &strip_expr_wrappers(e).node {
+                ast::ExprKind::Var(name) => !name_is_known_write_free(name),
+                _ => false,
+            }
+        };
         match &expr.node {
             ast::ExprKind::Set { .. } | ast::ExprKind::ReplaceSet { .. } => true,
-            ast::ExprKind::Atomic(inner) => Self::expr_contains_writes(inner, write_fns),
+            ast::ExprKind::Atomic(inner) => Self::expr_contains_writes(inner, write_fns, known_fns),
             ast::ExprKind::Var(name) => write_fns.contains(name),
             ast::ExprKind::App { func, arg } => {
-                Self::expr_contains_writes(func, write_fns)
-                    || Self::expr_contains_writes(arg, write_fns)
+                // Conservatively treat applications of unknown callees as
+                // possibly-writing: a lambda received as a parameter
+                // (`runAtomic = \act -> atomic (do rows <- *t; act rows)`)
+                // can perform a write the static analysis can't see.
+                let (head, _) = uncurry_app(expr);
+                let head_unknown = match &strip_expr_wrappers(head).node {
+                    ast::ExprKind::Var(name) => !name_is_known_write_free(name),
+                    ast::ExprKind::Constructor(_) => false,
+                    // A literal lambda's body is covered by recursion below.
+                    ast::ExprKind::Lambda { .. } => false,
+                    // Computed callee (field access, case result, ...) —
+                    // can't tell what it does.
+                    _ => true,
+                };
+                head_unknown
+                    || Self::expr_contains_writes(func, write_fns, known_fns)
+                    || Self::expr_contains_writes(arg, write_fns, known_fns)
             }
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
-                Self::expr_contains_writes(lhs, write_fns)
-                    || Self::expr_contains_writes(rhs, write_fns)
+                Self::expr_contains_writes(lhs, write_fns, known_fns)
+                    || Self::expr_contains_writes(rhs, write_fns, known_fns)
             }
-            ast::ExprKind::UnaryOp { operand, .. } => Self::expr_contains_writes(operand, write_fns),
+            ast::ExprKind::UnaryOp { operand, .. } => Self::expr_contains_writes(operand, write_fns, known_fns),
             ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
-                ast::StmtKind::Bind { expr, .. }
-                | ast::StmtKind::Expr(expr)
-                | ast::StmtKind::Let { expr, .. } => Self::expr_contains_writes(expr, write_fns),
-                ast::StmtKind::Where { cond } => Self::expr_contains_writes(cond, write_fns),
-                ast::StmtKind::GroupBy { key } => Self::expr_contains_writes(key, write_fns),
+                // Bind/expression statements RUN their value when it is an
+                // IO action — a bare `io` of unknown provenance may write.
+                ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Expr(expr) => {
+                    unknown_io_value(expr)
+                        || Self::expr_contains_writes(expr, write_fns, known_fns)
+                }
+                ast::StmtKind::Let { expr, .. } => Self::expr_contains_writes(expr, write_fns, known_fns),
+                ast::StmtKind::Where { cond } => Self::expr_contains_writes(cond, write_fns, known_fns),
+                ast::StmtKind::GroupBy { key } => Self::expr_contains_writes(key, write_fns, known_fns),
             }),
-            ast::ExprKind::Lambda { body, .. } => Self::expr_contains_writes(body, write_fns),
+            ast::ExprKind::Lambda { body, .. } => Self::expr_contains_writes(body, write_fns, known_fns),
             ast::ExprKind::If { cond, then_branch, else_branch, .. } => {
-                Self::expr_contains_writes(cond, write_fns)
-                    || Self::expr_contains_writes(then_branch, write_fns)
-                    || Self::expr_contains_writes(else_branch, write_fns)
+                Self::expr_contains_writes(cond, write_fns, known_fns)
+                    || Self::expr_contains_writes(then_branch, write_fns, known_fns)
+                    || Self::expr_contains_writes(else_branch, write_fns, known_fns)
             }
             ast::ExprKind::Case { scrutinee, arms, .. } => {
-                Self::expr_contains_writes(scrutinee, write_fns)
-                    || arms.iter().any(|arm| Self::expr_contains_writes(&arm.body, write_fns))
+                Self::expr_contains_writes(scrutinee, write_fns, known_fns)
+                    || arms.iter().any(|arm| Self::expr_contains_writes(&arm.body, write_fns, known_fns))
             }
-            ast::ExprKind::UnitLit { value, .. } => Self::expr_contains_writes(value, write_fns),
-            ast::ExprKind::Annot { expr, .. } => Self::expr_contains_writes(expr, write_fns),
-            ast::ExprKind::Refine(inner) => Self::expr_contains_writes(inner, write_fns),
+            ast::ExprKind::UnitLit { value, .. } => Self::expr_contains_writes(value, write_fns, known_fns),
+            ast::ExprKind::Annot { expr, .. } => Self::expr_contains_writes(expr, write_fns, known_fns),
+            ast::ExprKind::Refine(inner) => Self::expr_contains_writes(inner, write_fns, known_fns),
             ast::ExprKind::Record(fields) => fields
                 .iter()
-                .any(|f| Self::expr_contains_writes(&f.value, write_fns)),
+                .any(|f| Self::expr_contains_writes(&f.value, write_fns, known_fns)),
             ast::ExprKind::RecordUpdate { base, fields } => {
-                Self::expr_contains_writes(base, write_fns)
-                    || fields.iter().any(|f| Self::expr_contains_writes(&f.value, write_fns))
+                Self::expr_contains_writes(base, write_fns, known_fns)
+                    || fields.iter().any(|f| Self::expr_contains_writes(&f.value, write_fns, known_fns))
             }
             ast::ExprKind::FieldAccess { expr, .. } => {
-                Self::expr_contains_writes(expr, write_fns)
+                Self::expr_contains_writes(expr, write_fns, known_fns)
             }
             ast::ExprKind::List(items) => {
-                items.iter().any(|e| Self::expr_contains_writes(e, write_fns))
+                items.iter().any(|e| Self::expr_contains_writes(e, write_fns, known_fns))
             }
             _ => false,
         }
@@ -6971,9 +7117,13 @@ impl Codegen {
         // Find free variables in the do-block statements
         let dummy_span = ast::Span::new(0, 0);
         let do_expr = ast::Spanned::new(ast::ExprKind::Do(stmts.to_vec()), dummy_span);
+        // Capture everything bound in the enclosing local scope — including
+        // names that shadow top-level functions/constants or builtins (the
+        // local binding wins; the previous user_fns filter silently resolved
+        // such names to the global inside the thunk). Names not in env are
+        // unshadowed globals/builtins, resolved inside the thunk body.
         let free_vars: Vec<String> = find_free_vars(&do_expr, &[])
             .into_iter()
-            .filter(|v| !self.user_fns.contains_key(v))
             .filter(|v| env.bindings.contains_key(v))
             .collect();
 
@@ -7580,7 +7730,8 @@ impl Codegen {
                                     if let ast::StmtKind::Where { cond } = &stmts[wi].node {
                                         // Check all param sources are in scope
                                         if let Some(frag) =
-                                            self.try_compile_sql_expr(bind_var, cond)
+                                            self.source_schemas.get(source_name).and_then(
+                                                |schema| self.try_compile_sql_expr(bind_var, cond, schema))
                                         {
                                             let params_ok = frag.params.iter().all(|p| match p {
                                                 SqlParamSource::Literal(_) | SqlParamSource::Expr(_) => true,
@@ -8138,9 +8289,16 @@ impl Codegen {
             .iter()
             .flat_map(|p| pat_bound_names(p))
             .collect();
+        // Capture decisions respect lexical scope: a name bound in the
+        // enclosing local scope (env) shadows any same-named top-level
+        // function/constant or builtin and MUST be captured; only
+        // unshadowed globals/builtins are resolved inside the lambda body.
         let free_vars: Vec<String> = find_free_vars(body, &param_names)
             .into_iter()
-            .filter(|v| !self.user_fns.contains_key(v))
+            .filter(|v| {
+                env.bindings.contains_key(v)
+                    || (!self.user_fns.contains_key(v) && !is_builtin_name(v))
+            })
             .collect();
 
         // Declare the lambda function: (db, env, arg) -> result
@@ -8547,6 +8705,7 @@ impl Codegen {
         let sql = plan.build_sql();
         let result_schema = plan.build_result_schema();
 
+        self.emit_stm_track_reads_for_plan(builder, &plan);
         let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
         let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
         let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
@@ -8575,7 +8734,7 @@ impl Codegen {
         match fn_name {
             "filter" => {
                 // Use unqualified column names for knot_source_read_where
-                let frag = self.try_compile_sql_expr(&bind_var, body)?;
+                let frag = self.try_compile_sql_expr(&bind_var, body, schema)?;
                 let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
                 let (name_ptr, name_len) = self.string_ptr(builder, source_name);
                 let (schema_ptr, schema_len) = self.string_ptr(builder, schema);
@@ -8596,13 +8755,15 @@ impl Codegen {
                     col_sql
                 };
                 let sql = format!("SELECT {}({}) FROM {}", func, arg_sql, table);
+                self.emit_stm_track_read(builder, source_name);
                 let params_rel = self.compile_sql_params(builder, &[], env, db);
                 let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
                 Some(self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]))
             }
             "countWhere" => {
-                let frag = self.try_compile_sql_expr(&bind_var, body)?;
+                let frag = self.try_compile_sql_expr(&bind_var, body, schema)?;
                 let sql = format!("SELECT COUNT(*) FROM {} WHERE {}", table, frag.sql);
+                self.emit_stm_track_read(builder, source_name);
                 let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
                 let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
                 Some(self.call_rt(
@@ -8619,6 +8780,7 @@ impl Codegen {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let sql = format!("SELECT {} FROM {} ORDER BY {}", cols, table, col_sql);
+                self.emit_stm_track_read(builder, source_name);
                 let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
                 let (schema_ptr, schema_len) = self.string_ptr(builder, schema);
                 let params_rel = self.compile_sql_params(builder, &[], env, db);
@@ -8659,8 +8821,21 @@ impl Codegen {
             return None;
         }
 
+        // ── Operation-order check ─────────────────────────────────
+        // The pipeline collapses into ONE SQL query with the fixed clause
+        // order WHERE → SELECT → ORDER BY → LIMIT/OFFSET. That only matches
+        // the in-memory semantics when the pipe ops appear in the canonical
+        // order filter* → sortBy? → map? → drop? → take? → aggregate?.
+        // Out-of-order pipelines (e.g. `take 5 |> drop 2`, `take 3 |>
+        // filter f`) have different semantics and must fall back to the
+        // general in-memory path.
+        if !pipe_ops_order_pushable(&ops) {
+            return None;
+        }
+
         let alias = "t0".to_string();
         let mut bind_aliases: HashMap<String, String> = HashMap::new();
+        let mut bind_schemas: HashMap<String, String> = HashMap::new();
         let mut conditions: Vec<String> = Vec::new();
         let mut params: Vec<SqlParamSource> = Vec::new();
         let mut select_override: Option<Vec<SqlSelectColumn>> = None;
@@ -8677,8 +8852,9 @@ impl Codegen {
                         return None;
                     }
                     bind_aliases.insert(bind_var.clone(), alias.clone());
+                    bind_schemas.insert(bind_var.clone(), schema.clone());
                     let frag = Self::try_compile_multi_table_sql_expr(
-                        &bind_aliases, body, env, &HashMap::new(),
+                        &bind_aliases, &bind_schemas, body, env, &HashMap::new(),
                     )?;
                     conditions.push(frag.sql);
                     params.extend(frag.params);
@@ -8719,7 +8895,7 @@ impl Codegen {
                     order_by_cols.push(col_sql);
                 }
                 PipeOp::Sum { bind_var, body } => {
-                    if is_count || aggregate.is_some() {
+                    if is_count || aggregate.is_some() || select_override.is_some() {
                         return None;
                     }
                     bind_aliases.insert(bind_var.clone(), alias.clone());
@@ -8727,7 +8903,7 @@ impl Codegen {
                     aggregate = Some(("SUM", col_sql));
                 }
                 PipeOp::Avg { bind_var, body } => {
-                    if is_count || aggregate.is_some() {
+                    if is_count || aggregate.is_some() || select_override.is_some() {
                         return None;
                     }
                     bind_aliases.insert(bind_var.clone(), alias.clone());
@@ -8735,7 +8911,7 @@ impl Codegen {
                     aggregate = Some(("AVG", col_sql));
                 }
                 PipeOp::Min { bind_var, body } => {
-                    if is_count || aggregate.is_some() {
+                    if is_count || aggregate.is_some() || select_override.is_some() {
                         return None;
                     }
                     bind_aliases.insert(bind_var.clone(), alias.clone());
@@ -8744,7 +8920,7 @@ impl Codegen {
                     aggregate = Some(("MIN", arg_sql));
                 }
                 PipeOp::Max { bind_var, body } => {
-                    if is_count || aggregate.is_some() {
+                    if is_count || aggregate.is_some() || select_override.is_some() {
                         return None;
                     }
                     bind_aliases.insert(bind_var.clone(), alias.clone());
@@ -8753,12 +8929,13 @@ impl Codegen {
                     aggregate = Some(("MAX", arg_sql));
                 }
                 PipeOp::CountWhere { bind_var, body } => {
-                    if is_count || aggregate.is_some() {
+                    if is_count || aggregate.is_some() || select_override.is_some() {
                         return None;
                     }
                     bind_aliases.insert(bind_var.clone(), alias.clone());
+                    bind_schemas.insert(bind_var.clone(), schema.clone());
                     let frag = Self::try_compile_multi_table_sql_expr(
-                        &bind_aliases, body, env, &HashMap::new(),
+                        &bind_aliases, &bind_schemas, body, env, &HashMap::new(),
                     )?;
                     conditions.push(frag.sql);
                     params.extend(frag.params);
@@ -8768,6 +8945,12 @@ impl Codegen {
         }
 
         if let Some((func, col_sql)) = aggregate {
+            // An aggregate after take/drop would have to apply AFTER the
+            // LIMIT, but aggregate SQL has no LIMIT — fall back. (The order
+            // check already rejects this; keep the guard as belt-and-braces.)
+            if limit.is_some() || offset.is_some() {
+                return None;
+            }
             let table = quote_sql_ident(&format!("_knot_{}", source_name));
             let sql = if conditions.is_empty() {
                 format!("SELECT {}({}) FROM {} AS {}", func, col_sql, table, alias)
@@ -8777,6 +8960,7 @@ impl Codegen {
                     func, col_sql, table, alias, conditions.join(" AND ")
                 )
             };
+            self.emit_stm_track_read(builder, &source_name);
             let params_rel = self.compile_sql_params(builder, &params, env, db);
             let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
             let rt_fn = match func {
@@ -8791,6 +8975,11 @@ impl Codegen {
                 &[db, sql_ptr, sql_len, params_rel],
             ))
         } else if is_count {
+            // COUNT(*) ignores LIMIT/OFFSET — a count after take/drop must
+            // fall back. (Also rejected by the order check.)
+            if limit.is_some() || offset.is_some() {
+                return None;
+            }
             let table = quote_sql_ident(&format!("_knot_{}", source_name));
             let sql = if conditions.is_empty() {
                 format!("SELECT COUNT(*) FROM {}", table)
@@ -8800,6 +8989,7 @@ impl Codegen {
                     table, alias, conditions.join(" AND ")
                 )
             };
+            self.emit_stm_track_read(builder, &source_name);
             let params_rel = self.compile_sql_params(builder, &params, env, db);
             let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
             Some(self.call_rt(
@@ -8839,6 +9029,7 @@ impl Codegen {
 
             let sql = plan.build_sql();
             let result_schema = plan.build_result_schema();
+            self.emit_stm_track_reads_for_plan(builder, &plan);
             let mut all_params = plan.params;
             if let Some(lim) = &plan.limit {
                 all_params.push(lim.clone());
@@ -8882,6 +9073,7 @@ impl Codegen {
                 sql: format!("SELECT {} FROM {}", cols, table),
                 schema: schema.clone(),
                 params: vec![],
+                tables: vec![source_name.clone()],
             });
         }
 
@@ -8898,7 +9090,7 @@ impl Codegen {
             if schema.starts_with('#') || schema.contains('[') {
                 return None;
             }
-            let frag = self.try_compile_sql_expr(&filter_bind, filter_body)?;
+            let frag = self.try_compile_sql_expr(&filter_bind, filter_body, schema)?;
             let table = quote_sql_ident(&format!("_knot_{}", source_name));
             let cols = parse_schema_columns(schema).iter()
                 .map(|(name, _)| quote_sql_ident(name))
@@ -8908,16 +9100,19 @@ impl Codegen {
                 sql: format!("SELECT {} FROM {} WHERE {}", cols, table, frag.sql),
                 schema: schema.clone(),
                 params: frag.params,
+                tables: vec![source_name.to_string()],
             });
         }
 
         // Case 3: do-block → full SQL plan
         if let ast::ExprKind::Do(stmts) = &expr.node {
             let plan = self.analyze_sql_plan(stmts, env)?;
+            let tables = plan.tables.iter().map(|t| t.source_name.clone()).collect();
             return Some(SetOpSubquery {
                 sql: plan.build_sql(),
                 schema: plan.build_result_schema(),
                 params: plan.params,
+                tables,
             });
         }
 
@@ -8988,7 +9183,7 @@ impl Codegen {
                 }
                 ast::StmtKind::Where { cond } => {
                     let frag = Self::try_compile_multi_table_sql_expr(
-                        &bind_to_alias, cond, env, &let_binds,
+                        &bind_to_alias, &bind_to_schema, cond, env, &let_binds,
                     )?;
                     conditions.push(frag.sql);
                     params.extend(frag.params);
@@ -9090,8 +9285,12 @@ impl Codegen {
     /// Compile a multi-table Where condition to a SQL fragment.
     /// Handles both join conditions (field = field) and filter conditions (field op ?).
     /// `let_binds` maps let-bound variable names to their expressions for SQL parameter compilation.
+    /// `bind_schemas` maps bind variables to their source schemas (used to
+    /// type-check arithmetic comparisons so float arithmetic doesn't get the
+    /// integer text-cast treatment).
     fn try_compile_multi_table_sql_expr(
         bind_aliases: &HashMap<String, String>,
+        bind_schemas: &HashMap<String, String>,
         expr: &ast::Expr,
         env: &Env,
         let_binds: &HashMap<String, ast::Expr>,
@@ -9099,8 +9298,8 @@ impl Codegen {
         match &expr.node {
             ast::ExprKind::BinOp { op, lhs, rhs } => match op {
                 ast::BinOp::And => {
-                    let l = Self::try_compile_multi_table_sql_expr(bind_aliases, lhs, env, let_binds)?;
-                    let r = Self::try_compile_multi_table_sql_expr(bind_aliases, rhs, env, let_binds)?;
+                    let l = Self::try_compile_multi_table_sql_expr(bind_aliases, bind_schemas, lhs, env, let_binds)?;
+                    let r = Self::try_compile_multi_table_sql_expr(bind_aliases, bind_schemas, rhs, env, let_binds)?;
                     let mut params = l.params;
                     params.extend(r.params);
                     Some(SqlFragment {
@@ -9109,8 +9308,8 @@ impl Codegen {
                     })
                 }
                 ast::BinOp::Or => {
-                    let l = Self::try_compile_multi_table_sql_expr(bind_aliases, lhs, env, let_binds)?;
-                    let r = Self::try_compile_multi_table_sql_expr(bind_aliases, rhs, env, let_binds)?;
+                    let l = Self::try_compile_multi_table_sql_expr(bind_aliases, bind_schemas, lhs, env, let_binds)?;
+                    let r = Self::try_compile_multi_table_sql_expr(bind_aliases, bind_schemas, rhs, env, let_binds)?;
                     let mut params = l.params;
                     params.extend(r.params);
                     Some(SqlFragment {
@@ -9129,7 +9328,7 @@ impl Codegen {
                         ast::BinOp::Ge => ">=",
                         _ => unreachable!(),
                     };
-                    Self::try_compile_multi_table_comparison(bind_aliases, lhs, rhs, sql_op, env, let_binds)
+                    Self::try_compile_multi_table_comparison(bind_aliases, bind_schemas, lhs, rhs, sql_op, env, let_binds)
                         .or_else(|| {
                             let rev = match sql_op {
                                 "=" | "!=" => sql_op,
@@ -9140,7 +9339,7 @@ impl Codegen {
                                 _ => return None,
                             };
                             Self::try_compile_multi_table_comparison(
-                                bind_aliases, rhs, lhs, rev, env, let_binds,
+                                bind_aliases, bind_schemas, rhs, lhs, rev, env, let_binds,
                             )
                         })
                 }
@@ -9171,7 +9370,7 @@ impl Codegen {
                 op: ast::UnaryOp::Not,
                 operand,
             } => {
-                let inner = Self::try_compile_multi_table_sql_expr(bind_aliases, operand, env, let_binds)?;
+                let inner = Self::try_compile_multi_table_sql_expr(bind_aliases, bind_schemas, operand, env, let_binds)?;
                 Some(SqlFragment {
                     sql: format!("NOT ({})", inner.sql),
                     params: inner.params,
@@ -9181,7 +9380,7 @@ impl Codegen {
             ast::ExprKind::App { func, arg } => {
                 if let ast::ExprKind::Var(name) = &func.node {
                     if name == "not" {
-                        let inner = Self::try_compile_multi_table_sql_expr(bind_aliases, arg, env, let_binds)?;
+                        let inner = Self::try_compile_multi_table_sql_expr(bind_aliases, bind_schemas, arg, env, let_binds)?;
                         return Some(SqlFragment {
                             sql: format!("NOT ({})", inner.sql),
                             params: inner.params,
@@ -9272,8 +9471,14 @@ impl Codegen {
                     ast::BinOp::Add => "+",
                     ast::BinOp::Sub => "-",
                     ast::BinOp::Mul => "*",
-                    ast::BinOp::Div => "/",
-                    ast::BinOp::Mod => "%",
+                    // `/` and `%` may only be pushed down with a provably
+                    // nonzero literal divisor (SQLite yields NULL on division
+                    // by zero; the runtime panics). `%` additionally requires
+                    // integer operands (SQLite `%` truncates to INTEGER while
+                    // the runtime does float fmod) — an integer-literal
+                    // divisor proves this through type checking.
+                    ast::BinOp::Div if divisor_is_nonzero_literal(rhs) => "/",
+                    ast::BinOp::Mod if divisor_is_nonzero_int_literal(rhs) => "%",
                     ast::BinOp::Concat => "||",
                     _ => return None,
                 };
@@ -9289,10 +9494,11 @@ impl Codegen {
             // Built-in functions: length, toUpper, toLower, trim
             ast::ExprKind::App { func, arg } => {
                 if let ast::ExprKind::Var(name) = &func.node {
+                    // NOTE: toUpper/toLower are deliberately NOT pushed
+                    // down — SQLite's UPPER/LOWER are ASCII-only while the
+                    // runtime does full Unicode case mapping.
                     let sql_fn = match name.as_str() {
                         "length" => "LENGTH",
-                        "toUpper" => "UPPER",
-                        "toLower" => "LOWER",
                         "trim" => "TRIM",
                         _ => return None,
                     };
@@ -9313,21 +9519,44 @@ impl Codegen {
     /// literals, variables, or arithmetic expressions.
     fn try_compile_multi_table_comparison(
         bind_aliases: &HashMap<String, String>,
+        bind_schemas: &HashMap<String, String>,
         lhs: &ast::Expr,
         rhs: &ast::Expr,
         op: &str,
         env: &Env,
         let_binds: &HashMap<String, ast::Expr>,
     ) -> Option<SqlFragment> {
+        // Type-witness gate: ints are stored as TEXT (and need the KNOT_INT
+        // cast around arithmetic) while floats are stored as REAL (and must
+        // NOT get the text cast — it would compare floats byte-wise). Fall
+        // back entirely when the comparison can't be typed.
+        let mode = sql_comparison_cast_mode(lhs, rhs, &|v, f| {
+            bind_schemas
+                .get(v)
+                .and_then(|schema| lookup_col_type_from_schema(schema, f))
+        })?;
         let l = Self::try_compile_sql_atom(bind_aliases, lhs, env, let_binds)?;
         let r = Self::try_compile_sql_atom(bind_aliases, rhs, env, let_binds)?;
-        let mut params = l.params;
-        params.extend(r.params);
         // Wrap arithmetic atoms in CAST for correct TEXT/INTEGER comparison:
         // SQLite arithmetic on TEXT columns produces INTEGER, but params are TEXT;
         // without CAST, INTEGER vs TEXT comparison always puts INTEGER before TEXT.
-        let l_sql = cast_arithmetic_for_where(&l.sql);
-        let r_sql = cast_arithmetic_for_where(&r.sql);
+        let (l_sql, r_sql) = match mode {
+            SqlCastMode::CastInt => (
+                cast_arithmetic_for_where(&l.sql),
+                cast_arithmetic_for_where(&r.sql),
+            ),
+            SqlCastMode::Plain => (l.sql.clone(), r.sql.clone()),
+            SqlCastMode::NoArith => {
+                if cast_arithmetic_for_where(&l.sql) != l.sql
+                    || cast_arithmetic_for_where(&r.sql) != r.sql
+                {
+                    return None;
+                }
+                (l.sql.clone(), r.sql.clone())
+            }
+        };
+        let mut params = l.params;
+        params.extend(r.params);
         Some(SqlFragment {
             sql: format!("{} {} {}", l_sql, op, r_sql),
             params,
@@ -9337,19 +9566,23 @@ impl Codegen {
     // ── SQL expression compilation ──────────────────────────────────
 
     /// Try to compile a Knot condition to a SQL WHERE fragment.
-    /// `bind_var` is the loop variable (e.g., "t" in `t <- *rel`).
+    /// `bind_var` is the loop variable (e.g., "t" in `t <- *rel`);
+    /// `schema` is the bound source's column schema (used to type-check
+    /// arithmetic comparisons so float arithmetic doesn't get the
+    /// integer text-cast treatment).
     /// Field accesses on bind_var become column references;
     /// literals and free variables become bind parameters (?).
     fn try_compile_sql_expr(
         &self,
         bind_var: &str,
         expr: &ast::Expr,
+        schema: &str,
     ) -> Option<SqlFragment> {
         match &expr.node {
             ast::ExprKind::BinOp { op, lhs, rhs } => match op {
                 ast::BinOp::And => {
-                    let l = self.try_compile_sql_expr(bind_var, lhs)?;
-                    let r = self.try_compile_sql_expr(bind_var, rhs)?;
+                    let l = self.try_compile_sql_expr(bind_var, lhs, schema)?;
+                    let r = self.try_compile_sql_expr(bind_var, rhs, schema)?;
                     let mut params = l.params;
                     params.extend(r.params);
                     Some(SqlFragment {
@@ -9358,8 +9591,8 @@ impl Codegen {
                     })
                 }
                 ast::BinOp::Or => {
-                    let l = self.try_compile_sql_expr(bind_var, lhs)?;
-                    let r = self.try_compile_sql_expr(bind_var, rhs)?;
+                    let l = self.try_compile_sql_expr(bind_var, lhs, schema)?;
+                    let r = self.try_compile_sql_expr(bind_var, rhs, schema)?;
                     let mut params = l.params;
                     params.extend(r.params);
                     Some(SqlFragment {
@@ -9393,12 +9626,36 @@ impl Codegen {
                             Self::try_compile_sql_comparison(bind_var, rhs, lhs, rev)
                         })
                         .or_else(|| {
+                            // Type-witness gate: decide between the KNOT_INT
+                            // text-cast (ints stored as TEXT) and plain numeric
+                            // SQL (floats stored as REAL); fall back entirely
+                            // when the comparison can't be typed.
+                            let mode = sql_comparison_cast_mode(lhs, rhs, &|v, f| {
+                                if v == bind_var {
+                                    lookup_col_type_from_schema(schema, f)
+                                } else {
+                                    None
+                                }
+                            })?;
                             let l = Self::try_compile_single_table_atom(bind_var, lhs)?;
                             let r = Self::try_compile_single_table_atom(bind_var, rhs)?;
+                            let (l_sql, r_sql) = match mode {
+                                SqlCastMode::CastInt => (
+                                    cast_arithmetic_for_where(&l.sql),
+                                    cast_arithmetic_for_where(&r.sql),
+                                ),
+                                SqlCastMode::Plain => (l.sql.clone(), r.sql.clone()),
+                                SqlCastMode::NoArith => {
+                                    if cast_arithmetic_for_where(&l.sql) != l.sql
+                                        || cast_arithmetic_for_where(&r.sql) != r.sql
+                                    {
+                                        return None;
+                                    }
+                                    (l.sql.clone(), r.sql.clone())
+                                }
+                            };
                             let mut params = l.params;
                             params.extend(r.params);
-                            let l_sql = cast_arithmetic_for_where(&l.sql);
-                            let r_sql = cast_arithmetic_for_where(&r.sql);
                             Some(SqlFragment {
                                 sql: format!("{} {} {}", l_sql, sql_op, r_sql),
                                 params,
@@ -9411,7 +9668,7 @@ impl Codegen {
                 op: ast::UnaryOp::Not,
                 operand,
             } => {
-                let inner = self.try_compile_sql_expr(bind_var, operand)?;
+                let inner = self.try_compile_sql_expr(bind_var, operand, schema)?;
                 Some(SqlFragment {
                     sql: format!("NOT ({})", inner.sql),
                     params: inner.params,
@@ -9422,7 +9679,7 @@ impl Codegen {
             ast::ExprKind::App { func, arg } => {
                 if let ast::ExprKind::Var(name) = &func.node {
                     if name == "not" {
-                        let inner = self.try_compile_sql_expr(bind_var, arg)?;
+                        let inner = self.try_compile_sql_expr(bind_var, arg, schema)?;
                         return Some(SqlFragment {
                             sql: format!("NOT ({})", inner.sql),
                             params: inner.params,
@@ -9589,8 +9846,10 @@ impl Codegen {
                     ast::BinOp::Add => "+",
                     ast::BinOp::Sub => "-",
                     ast::BinOp::Mul => "*",
-                    ast::BinOp::Div => "/",
-                    ast::BinOp::Mod => "%",
+                    // See try_compile_sql_atom: `/`/`%` need a provably
+                    // nonzero literal divisor; `%` must be integer-typed.
+                    ast::BinOp::Div if divisor_is_nonzero_literal(rhs) => "/",
+                    ast::BinOp::Mod if divisor_is_nonzero_int_literal(rhs) => "%",
                     ast::BinOp::Concat => "||",
                     _ => return None,
                 };
@@ -9606,10 +9865,11 @@ impl Codegen {
             // Built-in functions: length, toUpper, toLower, trim
             ast::ExprKind::App { func, arg } => {
                 if let ast::ExprKind::Var(name) = &func.node {
+                    // NOTE: toUpper/toLower are deliberately NOT pushed
+                    // down — SQLite's UPPER/LOWER are ASCII-only while the
+                    // runtime does full Unicode case mapping.
                     let sql_fn = match name.as_str() {
                         "length" => "LENGTH",
-                        "toUpper" => "UPPER",
-                        "toLower" => "LOWER",
                         "trim" => "TRIM",
                         _ => return None,
                     };
@@ -9645,18 +9905,7 @@ impl Codegen {
 
     /// Check if an expression references a specific variable.
     fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
-        match &expr.node {
-            ast::ExprKind::Var(name) => name == var,
-            ast::ExprKind::FieldAccess { expr: e, .. } => Self::expr_refs_var(e, var),
-            ast::ExprKind::App { func, arg } => Self::expr_refs_var(func, var) || Self::expr_refs_var(arg, var),
-            ast::ExprKind::BinOp { lhs, rhs, .. } => Self::expr_refs_var(lhs, var) || Self::expr_refs_var(rhs, var),
-            ast::ExprKind::UnaryOp { operand, .. } => Self::expr_refs_var(operand, var),
-            ast::ExprKind::If { cond, then_branch, else_branch } => {
-                Self::expr_refs_var(cond, var) || Self::expr_refs_var(then_branch, var) || Self::expr_refs_var(else_branch, var)
-            }
-            ast::ExprKind::Lambda { body, .. } => Self::expr_refs_var(body, var),
-            _ => false,
-        }
+        expr_refs_var(expr, var)
     }
 
     /// Match an equi-join pattern: `a.f == b.g` where a and b are two different
@@ -9889,6 +10138,29 @@ impl Codegen {
     /// `All` filter for this table into a richer `Cols` filter built from
     /// `preds`. No-op when `preds` is `None` (the broad `knot_stm_track_read`
     /// the caller already emitted stays the only entry).
+    /// Emit a `knot_stm_track_read` call for a pushed-down SQL read of
+    /// `source_name`. The `knot_source_query*` runtime functions do NOT
+    /// track reads internally (unlike `knot_source_read`/`read_where`), so
+    /// every codegen path that emits one of them must call this for every
+    /// table the query touches — otherwise an STM `retry` watching the
+    /// table is never woken by writes to it.
+    fn emit_stm_track_read(&mut self, builder: &mut FunctionBuilder, source_name: &str) {
+        let (tn_ptr, tn_len) = self.string_ptr(builder, source_name);
+        self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
+    }
+
+    /// Emit `knot_stm_track_read` for every table of a SQL plan.
+    fn emit_stm_track_reads_for_plan(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        plan: &SqlQueryPlan,
+    ) {
+        let names: Vec<String> = plan.tables.iter().map(|t| t.source_name.clone()).collect();
+        for name in names {
+            self.emit_stm_track_read(builder, &name);
+        }
+    }
+
     fn emit_stm_track_pred(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -10796,6 +11068,8 @@ struct SetOpSubquery {
     sql: String,
     schema: String,
     params: Vec<SqlParamSource>,
+    /// Source tables read by this subquery (for STM read tracking).
+    tables: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -10893,6 +11167,113 @@ impl SqlQueryPlan {
     }
 }
 
+/// True when the plan's yield projection is the identity: every select
+/// column is a plain (non-computed) base-table column whose result field
+/// name equals the underlying source column.
+fn plan_projection_is_identity(plan: &SqlQueryPlan) -> bool {
+    plan.select_columns
+        .iter()
+        .all(|c| c.sql_expr.is_none() && c.result_field == c.source_col)
+}
+
+/// Look up `field` in the plan's yield projection. Returns the qualified
+/// column SQL (`alias."source_col"`) and the column's schema type when the
+/// result field maps to a plain (non-computed) base-table column; `None`
+/// for computed projections — callers must fall back to in-memory
+/// evaluation in that case.
+fn plan_projection_column(plan: &SqlQueryPlan, field: &str) -> Option<(String, String)> {
+    let c = plan
+        .select_columns
+        .iter()
+        .find(|c| c.result_field == field)?;
+    if c.sql_expr.is_some() {
+        return None;
+    }
+    Some((
+        format!("{}.{}", c.alias, quote_sql_ident(&c.source_col)),
+        c.type_str.clone(),
+    ))
+}
+
+/// Rewrite `body`'s field accesses on `bind_var` through the plan's yield
+/// projection (result field name → underlying source column name), so that
+/// a lambda written against the *projected* rows can be compiled against
+/// the *base* table. Returns `None` when a referenced field doesn't map to
+/// a plain base-table column (computed projections must fall back).
+/// Identity projections return the body unchanged.
+fn rewrite_body_through_projection(
+    plan: &SqlQueryPlan,
+    bind_var: &str,
+    body: &ast::Expr,
+) -> Option<ast::Expr> {
+    if plan_projection_is_identity(plan) {
+        return Some(body.clone());
+    }
+
+    fn rewrite(plan: &SqlQueryPlan, bind_var: &str, e: &ast::Expr) -> Option<ast::Expr> {
+        let mk = |node: ast::ExprKind| ast::Spanned::new(node, e.span);
+        match &e.node {
+            ast::ExprKind::FieldAccess { expr: inner, field } => {
+                if let ast::ExprKind::Var(v) = &inner.node {
+                    if v == bind_var {
+                        let c = plan
+                            .select_columns
+                            .iter()
+                            .find(|c| c.result_field == *field)?;
+                        if c.sql_expr.is_some() {
+                            return None; // computed column — fall back
+                        }
+                        return Some(mk(ast::ExprKind::FieldAccess {
+                            expr: inner.clone(),
+                            field: c.source_col.clone(),
+                        }));
+                    }
+                }
+                let new_inner = rewrite(plan, bind_var, inner)?;
+                Some(mk(ast::ExprKind::FieldAccess {
+                    expr: Box::new(new_inner),
+                    field: field.clone(),
+                }))
+            }
+            ast::ExprKind::Lit(_) | ast::ExprKind::Var(_) | ast::ExprKind::Constructor(_) => {
+                Some(e.clone())
+            }
+            ast::ExprKind::BinOp { op, lhs, rhs } => Some(mk(ast::ExprKind::BinOp {
+                op: *op,
+                lhs: Box::new(rewrite(plan, bind_var, lhs)?),
+                rhs: Box::new(rewrite(plan, bind_var, rhs)?),
+            })),
+            ast::ExprKind::UnaryOp { op, operand } => Some(mk(ast::ExprKind::UnaryOp {
+                op: *op,
+                operand: Box::new(rewrite(plan, bind_var, operand)?),
+            })),
+            ast::ExprKind::App { func, arg } => Some(mk(ast::ExprKind::App {
+                func: Box::new(rewrite(plan, bind_var, func)?),
+                arg: Box::new(rewrite(plan, bind_var, arg)?),
+            })),
+            ast::ExprKind::If { cond, then_branch, else_branch } => {
+                Some(mk(ast::ExprKind::If {
+                    cond: Box::new(rewrite(plan, bind_var, cond)?),
+                    then_branch: Box::new(rewrite(plan, bind_var, then_branch)?),
+                    else_branch: Box::new(rewrite(plan, bind_var, else_branch)?),
+                }))
+            }
+            ast::ExprKind::List(elems) => {
+                let new_elems = elems
+                    .iter()
+                    .map(|el| rewrite(plan, bind_var, el))
+                    .collect::<Option<Vec<_>>>()?;
+                Some(mk(ast::ExprKind::List(new_elems)))
+            }
+            // Anything else (case, do, records, ...) isn't SQL-pushable
+            // anyway — refuse so callers fall back.
+            _ => None,
+        }
+    }
+
+    rewrite(plan, bind_var, body)
+}
+
 fn lookup_col_type_from_schema(schema: &str, col_name: &str) -> Option<String> {
     for part in split_schema_fields(schema) {
         let colon = part.find(':')?;
@@ -10939,6 +11320,67 @@ fn split_schema_fields(s: &str) -> Vec<&str> {
 }
 
 // ── Pipe chain analysis ───────────────────────────────────────────
+
+
+/// Check that a pipe chain's operations appear in an order that is
+/// equivalent to a single SQL query's fixed clause order
+/// (WHERE -> SELECT -> ORDER BY -> LIMIT/OFFSET).
+///
+/// Accepted (non-decreasing) stage order:
+///   filter* -> sortBy? -> map? -> drop? -> take? -> terminal aggregate?
+///
+/// Notes:
+/// - `drop M |> take N` maps to `LIMIT N OFFSET M` exactly; the reverse
+///   (`take N |> drop M`) does NOT (it means elements [M..N)), so `drop`
+///   gets a lower stage than `take`.
+/// - filter/sortBy after take/drop apply AFTER the truncation in-memory
+///   but would apply BEFORE the LIMIT in SQL — rejected.
+/// - filter/sortBy after map would resolve fields against the base schema
+///   instead of the mapped projection — rejected.
+/// - at most one sortBy: `sortBy f |> sortBy g` re-sorts by g in-memory,
+///   while `ORDER BY f, g` sorts primarily by f — rejected.
+/// - aggregates/count are only valid as the final op (enforced by the
+///   per-op guards in try_compile_pipe_sql) and never after take/drop
+///   (their stage is highest, but the LIMIT would be silently dropped —
+///   also re-checked at SQL-build time).
+fn pipe_ops_order_pushable(ops: &[PipeOp]) -> bool {
+    fn stage(op: &PipeOp) -> u8 {
+        match op {
+            PipeOp::Filter { .. } => 1,
+            PipeOp::SortBy { .. } => 2,
+            PipeOp::Map { .. } => 3,
+            PipeOp::Drop { .. } => 4,
+            PipeOp::Take { .. } | PipeOp::TakeRelation { .. } => 5,
+            PipeOp::Count
+            | PipeOp::CountWhere { .. }
+            | PipeOp::Sum { .. }
+            | PipeOp::Avg { .. }
+            | PipeOp::Min { .. }
+            | PipeOp::Max { .. } => 6,
+        }
+    }
+    let mut last_stage = 0u8;
+    let mut sort_seen = false;
+    for op in ops {
+        let st = stage(op);
+        if st < last_stage {
+            return false;
+        }
+        if matches!(op, PipeOp::SortBy { .. }) {
+            if sort_seen {
+                return false;
+            }
+            sort_seen = true;
+        }
+        // Aggregates/count must not follow a take/drop: the single-query
+        // form has no way to apply the LIMIT before aggregating.
+        if st == 6 && last_stage >= 4 {
+            return false;
+        }
+        last_stage = st;
+    }
+    true
+}
 
 enum PipeOp {
     Filter { bind_var: String, body: ast::Expr },
@@ -11656,8 +12098,11 @@ fn try_sql_arithmetic_expr(
                 ast::BinOp::Add => "+",
                 ast::BinOp::Sub => "-",
                 ast::BinOp::Mul => "*",
-                ast::BinOp::Div => "/",
-                ast::BinOp::Mod => "%",
+                // `/`/`%` only push down with a provably nonzero literal
+                // divisor (SQLite NULLs on /0, the runtime panics); `%` must
+                // be integer-typed (int-literal divisor proves it).
+                ast::BinOp::Div if divisor_is_nonzero_literal(rhs) => "/",
+                ast::BinOp::Mod if divisor_is_nonzero_int_literal(rhs) => "%",
                 ast::BinOp::Concat => "||",
                 _ => return None,
             };
@@ -11674,10 +12119,10 @@ fn try_sql_arithmetic_expr(
         // Built-in functions: length, toUpper, toLower, trim
         ast::ExprKind::App { func, arg } => {
             if let ast::ExprKind::Var(name) = &func.node {
+                // toUpper/toLower deliberately not pushed down (SQLite
+                // UPPER/LOWER are ASCII-only; the runtime is Unicode-aware).
                 let sql_fn = match name.as_str() {
                     "length" => "LENGTH",
-                    "toUpper" => "UPPER",
-                    "toLower" => "LOWER",
                     "trim" => "TRIM",
                     _ => return None,
                 };
@@ -11789,7 +12234,7 @@ fn infer_sql_expr_type(bind_var: &str, expr: &ast::Expr, schema: &str) -> Option
             if let ast::ExprKind::Var(name) = &func.node {
                 match name.as_str() {
                     "length" => Some("int".to_string()),
-                    "toUpper" | "toLower" | "trim" => Some("text".to_string()),
+                    "trim" => Some("text".to_string()),
                     _ => None,
                 }
             } else {
@@ -11899,8 +12344,9 @@ fn try_multi_table_arithmetic_expr(
                 ast::BinOp::Add => "+",
                 ast::BinOp::Sub => "-",
                 ast::BinOp::Mul => "*",
-                ast::BinOp::Div => "/",
-                ast::BinOp::Mod => "%",
+                // See try_sql_arithmetic_expr for the `/`/`%` pushdown rules.
+                ast::BinOp::Div if divisor_is_nonzero_literal(rhs) => "/",
+                ast::BinOp::Mod if divisor_is_nonzero_int_literal(rhs) => "%",
                 ast::BinOp::Concat => "||",
                 _ => return None,
             };
@@ -11917,10 +12363,10 @@ fn try_multi_table_arithmetic_expr(
         // Built-in functions: length, toUpper, toLower, trim
         ast::ExprKind::App { func, arg } => {
             if let ast::ExprKind::Var(name) = &func.node {
+                // toUpper/toLower deliberately not pushed down (SQLite
+                // UPPER/LOWER are ASCII-only; the runtime is Unicode-aware).
                 let sql_fn = match name.as_str() {
                     "length" => "LENGTH",
-                    "toUpper" => "UPPER",
-                    "toLower" => "LOWER",
                     "trim" => "TRIM",
                     _ => return None,
                 };
@@ -11980,7 +12426,7 @@ fn infer_multi_table_sql_expr_type(
             if let ast::ExprKind::Var(name) = &func.node {
                 match name.as_str() {
                     "length" => Some("int".to_string()),
-                    "toUpper" | "toLower" | "trim" => Some("text".to_string()),
+                    "trim" => Some("text".to_string()),
                     _ => None,
                 }
             } else {
@@ -12267,7 +12713,11 @@ fn find_free_vars(expr: &ast::Expr, bound: &[String]) -> Vec<String> {
 fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<String>) {
     match &expr.node {
         ast::ExprKind::Var(name) => {
-            if !bound.contains(name.as_str()) && !is_builtin_name(name) {
+            // Builtin/top-level names are included here too: the call sites
+            // (compile_lambda_inner / compile_io_do_as_thunk) keep them only
+            // when a local binding of the same name is in scope — i.e. the
+            // global is shadowed and the LOCAL value must be captured.
+            if !bound.contains(name.as_str()) {
                 free.push(name.clone());
             }
         }
@@ -12407,6 +12857,270 @@ fn collect_pat_bindings_set<'a>(pat: &'a ast::Pat, bound: &mut HashSet<&'a str>)
 
 fn is_builtin_name(name: &str) -> bool {
     crate::builtins::is_builtin(name)
+}
+
+/// Check whether an expression references a specific variable.
+///
+/// Used by the SQL pushdown machinery to decide whether a value-side
+/// expression can be evaluated *outside* row scope (as a bind parameter).
+/// The match is deliberately exhaustive (no catch-all) so that new AST
+/// variants are forced through here at compile time — a missed variant
+/// previously let bind-var-referencing `case` expressions be hoisted out
+/// of row scope, causing a codegen ICE ("undefined variable").
+///
+/// Scope-aware: bindings introduced by lambdas, case arms, and do
+/// statements shadow `var` for the sub-expressions they cover.
+pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
+    let pat_binds_var = |pat: &ast::Pat| pat_bound_names(pat).iter().any(|n| n == var);
+    match &expr.node {
+        ast::ExprKind::Var(name) => name == var,
+        ast::ExprKind::Lit(_)
+        | ast::ExprKind::Constructor(_)
+        | ast::ExprKind::SourceRef(_)
+        | ast::ExprKind::DerivedRef(_) => false,
+        ast::ExprKind::FieldAccess { expr: e, .. } => expr_refs_var(e, var),
+        ast::ExprKind::App { func, arg } => expr_refs_var(func, var) || expr_refs_var(arg, var),
+        ast::ExprKind::BinOp { lhs, rhs, .. } => expr_refs_var(lhs, var) || expr_refs_var(rhs, var),
+        ast::ExprKind::UnaryOp { operand, .. } => expr_refs_var(operand, var),
+        ast::ExprKind::If { cond, then_branch, else_branch } => {
+            expr_refs_var(cond, var)
+                || expr_refs_var(then_branch, var)
+                || expr_refs_var(else_branch, var)
+        }
+        ast::ExprKind::Lambda { params, body } => {
+            if params.iter().any(pat_binds_var) {
+                false // shadowed
+            } else {
+                expr_refs_var(body, var)
+            }
+        }
+        ast::ExprKind::Case { scrutinee, arms } => {
+            expr_refs_var(scrutinee, var)
+                || arms.iter().any(|arm| {
+                    !pat_binds_var(&arm.pat) && expr_refs_var(&arm.body, var)
+                })
+        }
+        ast::ExprKind::Record(fields) => fields.iter().any(|f| expr_refs_var(&f.value, var)),
+        ast::ExprKind::RecordUpdate { base, fields } => {
+            expr_refs_var(base, var) || fields.iter().any(|f| expr_refs_var(&f.value, var))
+        }
+        ast::ExprKind::List(elems) => elems.iter().any(|e| expr_refs_var(e, var)),
+        ast::ExprKind::Do(stmts) => {
+            for stmt in stmts {
+                match &stmt.node {
+                    ast::StmtKind::Bind { pat, expr: e } | ast::StmtKind::Let { pat, expr: e } => {
+                        if expr_refs_var(e, var) {
+                            return true;
+                        }
+                        if pat_binds_var(pat) {
+                            return false; // shadowed for remaining stmts
+                        }
+                    }
+                    ast::StmtKind::Where { cond } => {
+                        if expr_refs_var(cond, var) {
+                            return true;
+                        }
+                    }
+                    ast::StmtKind::GroupBy { key } => {
+                        if expr_refs_var(key, var) {
+                            return true;
+                        }
+                    }
+                    ast::StmtKind::Expr(e) => {
+                        if expr_refs_var(e, var) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+        ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
+            expr_refs_var(target, var) || expr_refs_var(value, var)
+        }
+        ast::ExprKind::Atomic(inner) | ast::ExprKind::Refine(inner) => expr_refs_var(inner, var),
+        ast::ExprKind::UnitLit { value, .. } => expr_refs_var(value, var),
+        ast::ExprKind::Annot { expr: e, .. } => expr_refs_var(e, var),
+        ast::ExprKind::Serve { handlers, .. } => {
+            handlers.iter().any(|h| expr_refs_var(&h.body, var))
+        }
+    }
+}
+
+// ── SQL pushdown type witnesses (shared with sql_lint) ───────────
+
+/// Scalar type witness for SQL-pushable expressions, derived from column
+/// schema types and literal shapes. Knot's type checker guarantees that
+/// both operands of an arithmetic/comparison operator have the same type,
+/// so a single witness anywhere in the expression types the whole tree.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SqlScalarKind {
+    Int,
+    Float,
+    Text,
+    Other,
+}
+
+/// How a pushed-down comparison over (possibly arithmetic) atoms must be
+/// emitted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SqlCastMode {
+    /// Integer (or text) comparison: arithmetic atoms get the
+    /// `CAST(... AS TEXT) COLLATE KNOT_INT` wrapper (Knot Ints are stored
+    /// as TEXT in SQLite).
+    CastInt,
+    /// Float comparison: emit plain numeric SQL — floats are stored as
+    /// REAL and params bind as REAL, so native numeric comparison is
+    /// correct. The KNOT_INT text-cast would compare floats byte-wise.
+    Plain,
+    /// No type witness found: only safe to push down when no atom would
+    /// have received the cast wrapper (i.e. no arithmetic involved).
+    NoArith,
+}
+
+/// Strip wrappers that don't affect the runtime value.
+fn strip_expr_wrappers(expr: &ast::Expr) -> &ast::Expr {
+    match &expr.node {
+        ast::ExprKind::Annot { expr: inner, .. } => strip_expr_wrappers(inner),
+        ast::ExprKind::UnitLit { value, .. } => strip_expr_wrappers(value),
+        _ => expr,
+    }
+}
+
+/// True if `expr` is a numeric literal (possibly negated/annotated) that is
+/// provably nonzero. `/` and `%` may only be pushed down to SQLite with a
+/// provably nonzero divisor: SQLite yields NULL on division by zero
+/// (silently dropping rows) while the Knot runtime panics.
+pub(crate) fn divisor_is_nonzero_literal(expr: &ast::Expr) -> bool {
+    let e = strip_expr_wrappers(expr);
+    match &e.node {
+        ast::ExprKind::UnaryOp { op: ast::UnaryOp::Neg, operand } => {
+            divisor_is_nonzero_literal(operand)
+        }
+        ast::ExprKind::Lit(ast::Literal::Int(n)) => n.bytes().any(|c| (b'1'..=b'9').contains(&c)),
+        ast::ExprKind::Lit(ast::Literal::Float(f)) => *f != 0.0,
+        _ => false,
+    }
+}
+
+/// True if `expr` is a provably nonzero *integer* literal. `%` may only be
+/// pushed down for integer operands (SQLite `%` truncates to INTEGER while
+/// the runtime does float fmod); an integer-literal divisor forces both
+/// operands to Int through type checking.
+pub(crate) fn divisor_is_nonzero_int_literal(expr: &ast::Expr) -> bool {
+    let e = strip_expr_wrappers(expr);
+    match &e.node {
+        ast::ExprKind::UnaryOp { op: ast::UnaryOp::Neg, operand } => {
+            divisor_is_nonzero_int_literal(operand)
+        }
+        ast::ExprKind::Lit(ast::Literal::Int(n)) => n.bytes().any(|c| (b'1'..=b'9').contains(&c)),
+        _ => false,
+    }
+}
+
+fn join_sql_kinds(
+    a: Option<SqlScalarKind>,
+    b: Option<SqlScalarKind>,
+) -> Result<Option<SqlScalarKind>, ()> {
+    match (a, b) {
+        (None, x) | (x, None) => Ok(x),
+        (Some(x), Some(y)) if x == y => Ok(Some(x)),
+        _ => Err(()), // conflicting witnesses — don't push down
+    }
+}
+
+/// Compute a scalar type witness for a SQL-pushable expression.
+/// `col_ty` maps `(var, field)` to the schema column type when the field
+/// access resolves to a column of a bound row.
+///
+/// Returns `Err(())` when the expression must not be pushed down at all
+/// (conflicting witnesses, or `/`/`%` without a provably nonzero literal
+/// divisor). `Ok(None)` means no witness was found (params only).
+pub(crate) fn sql_scalar_kind(
+    expr: &ast::Expr,
+    col_ty: &dyn Fn(&str, &str) -> Option<String>,
+) -> Result<Option<SqlScalarKind>, ()> {
+    let e = strip_expr_wrappers(expr);
+    match &e.node {
+        ast::ExprKind::FieldAccess { expr: inner, field } => {
+            if let ast::ExprKind::Var(v) = &inner.node {
+                Ok(match col_ty(v, field).as_deref() {
+                    Some("int") => Some(SqlScalarKind::Int),
+                    Some("float") => Some(SqlScalarKind::Float),
+                    Some("text") => Some(SqlScalarKind::Text),
+                    Some(_) => Some(SqlScalarKind::Other),
+                    None => None, // not a column — runtime param
+                })
+            } else {
+                Ok(None)
+            }
+        }
+        ast::ExprKind::Lit(lit) => Ok(Some(match lit {
+            ast::Literal::Int(_) => SqlScalarKind::Int,
+            ast::Literal::Float(_) => SqlScalarKind::Float,
+            ast::Literal::Text(_) => SqlScalarKind::Text,
+            _ => SqlScalarKind::Other,
+        })),
+        ast::ExprKind::Var(_) => Ok(None),
+        ast::ExprKind::UnaryOp { op: ast::UnaryOp::Neg, operand } => {
+            sql_scalar_kind(operand, col_ty)
+        }
+        ast::ExprKind::BinOp { op, lhs, rhs } => match op {
+            ast::BinOp::Concat => Ok(Some(SqlScalarKind::Text)),
+            ast::BinOp::Add | ast::BinOp::Sub | ast::BinOp::Mul => join_sql_kinds(
+                sql_scalar_kind(lhs, col_ty)?,
+                sql_scalar_kind(rhs, col_ty)?,
+            ),
+            ast::BinOp::Div => {
+                if !divisor_is_nonzero_literal(rhs) {
+                    return Err(());
+                }
+                join_sql_kinds(sql_scalar_kind(lhs, col_ty)?, sql_scalar_kind(rhs, col_ty)?)
+            }
+            ast::BinOp::Mod => {
+                if !divisor_is_nonzero_int_literal(rhs) {
+                    return Err(());
+                }
+                join_sql_kinds(
+                    join_sql_kinds(
+                        sql_scalar_kind(lhs, col_ty)?,
+                        sql_scalar_kind(rhs, col_ty)?,
+                    )?,
+                    Some(SqlScalarKind::Int),
+                )
+            }
+            _ => Ok(None),
+        },
+        ast::ExprKind::App { func, .. } => {
+            if let ast::ExprKind::Var(name) = &func.node {
+                Ok(match name.as_str() {
+                    "length" => Some(SqlScalarKind::Int),
+                    "trim" => Some(SqlScalarKind::Text),
+                    _ => None,
+                })
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Decide how a pushed-down comparison between `lhs` and `rhs` must be
+/// emitted, or `None` when it must fall back to in-memory evaluation.
+pub(crate) fn sql_comparison_cast_mode(
+    lhs: &ast::Expr,
+    rhs: &ast::Expr,
+    col_ty: &dyn Fn(&str, &str) -> Option<String>,
+) -> Option<SqlCastMode> {
+    let l = sql_scalar_kind(lhs, col_ty).ok()?;
+    let r = sql_scalar_kind(rhs, col_ty).ok()?;
+    let joined = join_sql_kinds(l, r).ok()?;
+    Some(match joined {
+        Some(SqlScalarKind::Float) => SqlCastMode::Plain,
+        Some(_) => SqlCastMode::CastInt,
+        None => SqlCastMode::NoArith,
+    })
 }
 
 // ── AST pretty-printer (for function source display) ─────────────

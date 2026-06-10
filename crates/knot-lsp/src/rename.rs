@@ -12,8 +12,8 @@ use crate::defs::resolve_definitions;
 use crate::shared::scan_knot_files_in_roots;
 use crate::state::{builtins, DocumentState, ServerState, KEYWORDS};
 use crate::utils::{
-    path_to_uri, position_to_offset, recurse_expr, safe_slice, span_to_range, uri_to_path,
-    word_at_position,
+    find_word_in_source, path_to_uri, position_to_offset, recurse_expr, safe_slice,
+    span_to_range, uri_to_path, word_at_position,
 };
 
 // ── Rename ──────────────────────────────────────────────────────────
@@ -23,6 +23,15 @@ pub(crate) fn handle_prepare_rename(
     params: &TextDocumentPositionParams,
 ) -> Option<PrepareRenameResponse> {
     let doc = state.documents.get(&params.text_document.uri)?;
+    // Mirror `handle_rename`'s staleness guard: ranges computed from the
+    // last-analyzed source don't line up with newer pending editor text.
+    if state
+        .pending_sources
+        .get(&params.text_document.uri)
+        .is_some_and(|p| p.source != doc.source)
+    {
+        return None;
+    }
     let pos = params.position;
     let offset = position_to_offset(&doc.source, pos);
 
@@ -106,6 +115,17 @@ pub(crate) fn handle_rename(
     let uri = &params.text_document_position.text_document.uri;
     let pos = params.text_document_position.position;
     let doc = state.documents.get(uri)?;
+    // Staleness guard: when the editor holds newer text than the last
+    // analyzed source, every span we'd compute here indexes into the *old*
+    // bytes — applying those edits to the new buffer corrupts it. Bail and
+    // let the client retry once analysis catches up.
+    if state
+        .pending_sources
+        .get(uri)
+        .is_some_and(|p| p.source != doc.source)
+    {
+        return None;
+    }
     let offset = position_to_offset(&doc.source, pos);
     let new_name = &params.new_name;
     let old_name = word_at_position(&doc.source, pos)?.to_string();
@@ -163,6 +183,22 @@ pub(crate) fn handle_rename(
     // parse cost.
     scan_disk_files(state, &owner, &old_name, new_name, &scanned, &mut changes);
 
+    // Defensive de-duplication: the owner-file path can discover the same
+    // name-token span through both the declaration edit and a reference
+    // whose target equals it. Clients reject workspace edits with
+    // overlapping ranges, so collapse exact duplicates here.
+    for edits in changes.values_mut() {
+        edits.sort_by_key(|e| {
+            (
+                e.range.start.line,
+                e.range.start.character,
+                e.range.end.line,
+                e.range.end.character,
+            )
+        });
+        edits.dedup_by(|a, b| a.range == b.range);
+    }
+
     Some(WorkspaceEdit {
         changes: Some(changes),
         ..Default::default()
@@ -179,6 +215,11 @@ struct CanonicalOwner {
     decl_span: Span,
     /// Span of just the symbol's name token within the declaration.
     name_span: Span,
+    /// Whether the resolved definition is a top-level declaration of the
+    /// owner file (and therefore visible to importers). Local bindings —
+    /// lambda params, do-binds, let-binds, case patterns — set this to
+    /// `false`, restricting the rename strictly to the owner file.
+    is_top_level: bool,
 }
 
 fn resolve_canonical_owner(
@@ -205,10 +246,16 @@ fn resolve_canonical_owner(
             .and_then(|p| p.canonicalize().ok())
             .unwrap_or_else(|| PathBuf::from(uri.as_str()));
         let name_span = name_span_within(&doc.source, decl_span, name).unwrap_or(decl_span);
+        // Top-level definitions are registered (by name) in `doc.definitions`
+        // with their name-token span; if the resolved span matches one of
+        // those, the symbol is an export. Otherwise it's a local binding and
+        // the rename must not leak into importers.
+        let is_top_level = doc.definitions.values().any(|s| *s == decl_span);
         return Some(CanonicalOwner {
             canonical_path,
             decl_span,
             name_span,
+            is_top_level,
         });
     }
 
@@ -229,6 +276,7 @@ fn resolve_canonical_owner(
             canonical_path: other_path.clone(),
             decl_span: *decl_span,
             name_span,
+            is_top_level: true,
         });
     }
     None
@@ -282,11 +330,25 @@ fn scan_workspace_files(
     for (other_uri, other_doc) in &state.documents {
         let other_path = canonical_for_uri(other_uri);
         let is_owner = other_path.as_ref() == Some(&owner.canonical_path);
-        let imports_owner = other_doc
-            .import_defs
-            .get(old_name)
-            .map(|(p, span)| *p == owner.canonical_path && *span == owner.decl_span)
-            .unwrap_or(false);
+        // Span comparison must be containment-tolerant: when the rename
+        // starts in the owner file (Case A), `owner.decl_span` is the
+        // name-token span, while `import_defs` stores whole-declaration
+        // spans. Exact equality would silently skip open importers and
+        // push them onto the disk-scan path, which computes edits against
+        // the on-disk bytes instead of their (possibly unsaved) buffers.
+        let imports_owner = owner.is_top_level
+            && other_doc
+                .import_defs
+                .get(old_name)
+                .map(|(p, span)| {
+                    *p == owner.canonical_path
+                        && (*span == owner.decl_span
+                            || (span.start <= owner.decl_span.start
+                                && owner.decl_span.end <= span.end)
+                            || (owner.decl_span.start <= span.start
+                                && span.end <= owner.decl_span.end))
+                })
+                .unwrap_or(false);
         if !is_owner && !imports_owner {
             continue;
         }
@@ -320,8 +382,16 @@ fn emit_edits_for_open_doc(
             new_text: new_name.to_string(),
         });
         // Rename every local usage that resolves to the canonical decl.
+        //
+        // `owner.decl_span` can be either the name-token span (rename started
+        // in this file — Case A) or the *whole-declaration* span (rename
+        // started at an importer's call site — Case B resolves via
+        // `import_defs`, which stores whole-decl spans). The open doc's
+        // `references` always target name-token spans, so compare against the
+        // resolved name token too; otherwise the owner's internal usages keep
+        // the old name and the rename breaks the code.
         for (usage_span, target_span) in &doc.references {
-            if *target_span == owner.decl_span {
+            if *target_span == owner.decl_span || *target_span == name_span {
                 changes.entry(uri.clone()).or_default().push(TextEdit {
                     range: span_to_range(*usage_span, &doc.source),
                     new_text: new_name.to_string(),
@@ -329,7 +399,14 @@ fn emit_edits_for_open_doc(
             }
         }
     } else {
-        // Importer file. Walk the AST to find every Var/Constructor/source-
+        // Importer file. If the file declares its own top-level symbol with
+        // the same name, every local reference resolves to that declaration
+        // — not to the import — so renaming the owner's export must leave
+        // this file untouched.
+        if module_defines_name(&doc.module, old_name) {
+            return;
+        }
+        // Walk the AST to find every Var/Constructor/source-
         // ref/derived-ref site that names the symbol, and rewrite each.
         let mut sites: Vec<Span> = Vec::new();
         for decl in &doc.module.decls {
@@ -357,87 +434,166 @@ fn emit_edits_for_open_doc(
     }
 }
 
+/// Whether `module` declares `name` at top level (function, type alias,
+/// source, view, derived, data type or its constructors, trait or its
+/// methods, route). Used to decide that an importer's local references
+/// resolve to its own declaration rather than the imported symbol.
+pub(crate) fn module_defines_name(module: &Module, name: &str) -> bool {
+    module.decls.iter().any(|d| match &d.node {
+        DeclKind::Fun { name: n, .. }
+        | DeclKind::TypeAlias { name: n, .. }
+        | DeclKind::Source { name: n, .. }
+        | DeclKind::View { name: n, .. }
+        | DeclKind::Derived { name: n, .. }
+        | DeclKind::Route { name: n, .. }
+        | DeclKind::RouteComposite { name: n, .. } => n == name,
+        DeclKind::Data {
+            name: n,
+            constructors,
+            ..
+        } => n == name || constructors.iter().any(|c| c.name == name),
+        DeclKind::Trait { name: n, items, .. } => {
+            n == name
+                || items.iter().any(|item| {
+                    matches!(item, ast::TraitItem::Method { name: m, .. } if m == name)
+                })
+        }
+        _ => false,
+    })
+}
+
+/// True if binding `pat` introduces a local variable called `name` —
+/// shadowing any imported symbol of the same name within the pattern's scope.
+fn pat_binds_name(pat: &ast::Pat, name: &str) -> bool {
+    match &pat.node {
+        ast::PatKind::Var(n) => n == name,
+        ast::PatKind::Wildcard | ast::PatKind::Lit(_) => false,
+        ast::PatKind::Constructor { payload, .. } => pat_binds_name(payload, name),
+        ast::PatKind::Record(fields) => fields.iter().any(|f| match &f.pattern {
+            Some(p) => pat_binds_name(p, name),
+            // Punned `{name}` binds a variable called `name`.
+            None => f.name == name,
+        }),
+        ast::PatKind::List(pats) => pats.iter().any(|p| pat_binds_name(p, name)),
+        ast::PatKind::Cons { head, tail } => {
+            pat_binds_name(head, name) || pat_binds_name(tail, name)
+        }
+    }
+}
+
 /// Walk `decl` and collect every span where `name` appears as a value-level
 /// reference (Var / Constructor / SourceRef / DerivedRef). This is the
 /// importer-file rename oracle: the inferencer doesn't track cross-file
 /// references in `doc.references`, so we walk the AST directly.
-fn collect_name_uses_in_decl(decl: &ast::Decl, name: &str, out: &mut Vec<Span>) {
-    fn walk_expr(expr: &ast::Expr, name: &str, out: &mut Vec<Span>) {
+///
+/// Scope-aware: a local binder (lambda param, do-bind, do-let, case pattern,
+/// `let … in`) with the same name shadows the imported symbol, so `Var`
+/// occurrences underneath that binder refer to the local and are skipped.
+/// Constructor / SourceRef / DerivedRef occurrences live in namespaces value
+/// binders can't shadow and are always collected.
+pub(crate) fn collect_name_uses_in_decl(decl: &ast::Decl, name: &str, out: &mut Vec<Span>) {
+    // Collect constructor-pattern name tokens (`Ctor pat <- …`, `case … of
+    // Ctor …`) — these reference the renamed symbol when it's a constructor.
+    fn walk_pat_ctors(pat: &ast::Pat, name: &str, out: &mut Vec<Span>) {
+        match &pat.node {
+            ast::PatKind::Constructor { name: n, payload } => {
+                if n == name {
+                    // Constructor names lead the pattern span; `n.len()` is
+                    // bytes, matching the byte-indexed span representation.
+                    out.push(Span::new(pat.span.start, pat.span.start + n.len()));
+                }
+                walk_pat_ctors(payload, name, out);
+            }
+            ast::PatKind::Record(fields) => {
+                for f in fields {
+                    if let Some(p) = &f.pattern {
+                        walk_pat_ctors(p, name, out);
+                    }
+                }
+            }
+            ast::PatKind::List(pats) => {
+                for p in pats {
+                    walk_pat_ctors(p, name, out);
+                }
+            }
+            ast::PatKind::Cons { head, tail } => {
+                walk_pat_ctors(head, name, out);
+                walk_pat_ctors(tail, name, out);
+            }
+            _ => {}
+        }
+    }
+    fn walk_expr(expr: &ast::Expr, name: &str, shadowed: bool, out: &mut Vec<Span>) {
         match &expr.node {
-            ast::ExprKind::Var(n)
-            | ast::ExprKind::Constructor(n)
+            ast::ExprKind::Var(n) => {
+                if !shadowed && n == name {
+                    out.push(expr.span);
+                }
+                return;
+            }
+            ast::ExprKind::Constructor(n)
             | ast::ExprKind::SourceRef(n)
             | ast::ExprKind::DerivedRef(n) => {
                 if n == name {
                     out.push(expr.span);
                 }
+                return;
+            }
+            ast::ExprKind::Lambda { params, body } => {
+                for p in params {
+                    walk_pat_ctors(p, name, out);
+                }
+                let sh = shadowed || params.iter().any(|p| pat_binds_name(p, name));
+                walk_expr(body, name, sh, out);
+                return;
+            }
+            ast::ExprKind::Case { scrutinee, arms } => {
+                walk_expr(scrutinee, name, shadowed, out);
+                for arm in arms {
+                    walk_pat_ctors(&arm.pat, name, out);
+                    let sh = shadowed || pat_binds_name(&arm.pat, name);
+                    walk_expr(&arm.body, name, sh, out);
+                }
+                return;
+            }
+            ast::ExprKind::Do(stmts) => {
+                let mut sh = shadowed;
+                for stmt in stmts {
+                    match &stmt.node {
+                        ast::StmtKind::Bind { pat, expr }
+                        | ast::StmtKind::Let { pat, expr } => {
+                            // The RHS is evaluated before the pattern binds,
+                            // so it sees the pre-bind shadow status.
+                            walk_expr(expr, name, sh, out);
+                            walk_pat_ctors(pat, name, out);
+                            if pat_binds_name(pat, name) {
+                                sh = true;
+                            }
+                        }
+                        ast::StmtKind::Where { cond } | ast::StmtKind::Expr(cond) => {
+                            walk_expr(cond, name, sh, out);
+                        }
+                        ast::StmtKind::GroupBy { key } => walk_expr(key, name, sh, out),
+                    }
+                }
+                return;
             }
             _ => {}
         }
-        recurse_expr(expr, |e| walk_expr(e, name, out));
-    }
-    fn walk_pat(pat: &ast::Pat, name: &str, out: &mut Vec<Span>) {
-        if let ast::PatKind::Constructor { name: n, payload } = &pat.node {
-            if n == name {
-                // Constructor names lead the pattern span; `n.len()` is bytes,
-                // matching the byte-indexed span representation.
-                out.push(Span::new(pat.span.start, pat.span.start + n.len()));
-            }
-            walk_pat(payload, name, out);
-        }
-        if let ast::PatKind::Record(fields) = &pat.node {
-            for f in fields {
-                if let Some(p) = &f.pattern {
-                    walk_pat(p, name, out);
-                }
-            }
-        }
-        if let ast::PatKind::List(pats) = &pat.node {
-            for p in pats {
-                walk_pat(p, name, out);
-            }
-        }
-    }
-    fn walk_stmt(stmt: &ast::Stmt, name: &str, out: &mut Vec<Span>) {
-        match &stmt.node {
-            ast::StmtKind::Bind { pat, expr } | ast::StmtKind::Let { pat, expr } => {
-                walk_pat(pat, name, out);
-                walk_expr(expr, name, out);
-            }
-            ast::StmtKind::Where { cond } | ast::StmtKind::Expr(cond) => {
-                walk_expr(cond, name, out);
-            }
-            ast::StmtKind::GroupBy { key } => walk_expr(key, name, out),
-        }
-    }
-    fn walk_pat_recursive_with_arms(expr: &ast::Expr, name: &str, out: &mut Vec<Span>) {
-        if let ast::ExprKind::Case { scrutinee: _, arms } = &expr.node {
-            for arm in arms {
-                walk_pat(&arm.pat, name, out);
-            }
-        }
-        if let ast::ExprKind::Do(stmts) = &expr.node {
-            for stmt in stmts {
-                walk_stmt(stmt, name, out);
-            }
-        }
-        recurse_expr(expr, |e| walk_pat_recursive_with_arms(e, name, out));
-    }
-    fn visit_body(body: &ast::Expr, name: &str, out: &mut Vec<Span>) {
-        walk_expr(body, name, out);
-        walk_pat_recursive_with_arms(body, name, out);
+        recurse_expr(expr, |e| walk_expr(e, name, shadowed, out));
     }
     match &decl.node {
         DeclKind::Fun { body: Some(body), .. }
         | DeclKind::View { body, .. }
-        | DeclKind::Derived { body, .. } => visit_body(body, name, out),
+        | DeclKind::Derived { body, .. } => walk_expr(body, name, false, out),
         DeclKind::Impl { items, .. } => {
             for item in items {
                 if let ast::ImplItem::Method { params, body, .. } = item {
                     for p in params {
-                        walk_pat(p, name, out);
+                        walk_pat_ctors(p, name, out);
                     }
-                    visit_body(body, name, out);
+                    let sh = params.iter().any(|p| pat_binds_name(p, name));
+                    walk_expr(body, name, sh, out);
                 }
             }
         }
@@ -450,14 +606,15 @@ fn collect_name_uses_in_decl(decl: &ast::Decl, name: &str, out: &mut Vec<Span>) 
                 } = item
                 {
                     for p in default_params {
-                        walk_pat(p, name, out);
+                        walk_pat_ctors(p, name, out);
                     }
-                    visit_body(body, name, out);
+                    let sh = default_params.iter().any(|p| pat_binds_name(p, name));
+                    walk_expr(body, name, sh, out);
                 }
             }
         }
         DeclKind::Migrate { using_fn, .. } => {
-            walk_expr(using_fn, name, out);
+            walk_expr(using_fn, name, false, out);
         }
         _ => {}
     }
@@ -471,6 +628,13 @@ fn scan_disk_files(
     already_scanned: &HashSet<PathBuf>,
     changes: &mut HashMap<Uri, Vec<TextEdit>>,
 ) {
+    // A local binding (lambda param, do-bind, let, case pattern) is invisible
+    // outside its scope in the owner file — which is necessarily open, since
+    // the rename started there. Touching any other file would rewrite
+    // unrelated same-named identifiers.
+    if !owner.is_top_level {
+        return;
+    }
     // Narrow to "files that could plausibly reference the owner" using the
     // reverse-import graph. The graph lists every file that imports the
     // owner directly or transitively, which is all we need — if a file
@@ -560,6 +724,12 @@ fn apply_importer_disk_edits(
     new_name: &str,
     changes: &mut HashMap<Uri, Vec<TextEdit>>,
 ) {
+    // Same shadowing discipline as the open-doc importer path: a file that
+    // declares its own top-level `old_name` resolves references locally,
+    // so the imported symbol's rename must not rewrite anything here.
+    if module_defines_name(module, old_name) {
+        return;
+    }
     let mut sites: Vec<Span> = Vec::new();
     for decl in &module.decls {
         collect_name_uses_in_decl(decl, old_name, &mut sites);
@@ -586,7 +756,7 @@ fn apply_importer_disk_edits(
 
 /// Quick check: does `module` import `owner_path` and does that import surface
 /// `old_name`? Used to filter disk files before doing any AST walking.
-fn file_imports_owner(
+pub(crate) fn file_imports_owner(
     module: &Module,
     file_path: &Path,
     owner_path: &Path,
@@ -637,226 +807,14 @@ fn field_position_at(
         if decl.span.start > offset || offset > decl.span.end {
             continue;
         }
-        scan_decl_for_field(decl, source, offset, &mut found);
+        field_sites_in_decl(decl, source, &mut |name, span| {
+            if found.is_none() && span.start <= offset && offset < span.end {
+                found = Some((name.to_string(), span));
+            }
+        });
         if found.is_some() {
             return found;
         }
-    }
-    None
-}
-
-fn scan_decl_for_field(
-    decl: &ast::Decl,
-    source: &str,
-    offset: usize,
-    found: &mut Option<(String, Span)>,
-) {
-    match &decl.node {
-        DeclKind::Fun {
-            body: Some(body), ..
-        } => scan_expr_for_field(body, source, offset, found),
-        DeclKind::View { body, .. } | DeclKind::Derived { body, .. } => {
-            scan_expr_for_field(body, source, offset, found)
-        }
-        DeclKind::Impl { items, .. } => {
-            for item in items {
-                if let ast::ImplItem::Method { body, .. } = item {
-                    scan_expr_for_field(body, source, offset, found);
-                    if found.is_some() {
-                        return;
-                    }
-                }
-            }
-        }
-        DeclKind::Data { constructors, .. } => {
-            for ctor in constructors {
-                for f in &ctor.fields {
-                    if let Some(span) =
-                        find_field_name_span(source, decl.span, &f.name, offset)
-                    {
-                        *found = Some((f.name.clone(), span));
-                        return;
-                    }
-                }
-            }
-        }
-        DeclKind::TypeAlias { ty, .. } => {
-            scan_type_for_field(ty, source, offset, found);
-        }
-        DeclKind::Source { ty, .. } => {
-            scan_type_for_field(ty, source, offset, found);
-        }
-        _ => {}
-    }
-}
-
-fn scan_expr_for_field(
-    expr: &ast::Expr,
-    source: &str,
-    offset: usize,
-    found: &mut Option<(String, Span)>,
-) {
-    if found.is_some() {
-        return;
-    }
-    if expr.span.start > offset || offset > expr.span.end {
-        return;
-    }
-    match &expr.node {
-        ast::ExprKind::Record(fields) => {
-            for f in fields {
-                if let Some(span) = find_field_name_span(source, expr.span, &f.name, offset)
-                {
-                    *found = Some((f.name.clone(), span));
-                    return;
-                }
-            }
-        }
-        ast::ExprKind::RecordUpdate { fields, .. } => {
-            for f in fields {
-                if let Some(span) = find_field_name_span(source, expr.span, &f.name, offset)
-                {
-                    *found = Some((f.name.clone(), span));
-                    return;
-                }
-            }
-        }
-        ast::ExprKind::FieldAccess { field, expr: rec } => {
-            // Only the field-name suffix is renameable; the receiver is
-            // its own thing. Search for the field token after the receiver.
-            let after_recv = rec.span.end.min(expr.span.end);
-            if let Some(span) = find_field_name_span(
-                source,
-                Span::new(after_recv, expr.span.end),
-                field,
-                offset,
-            ) {
-                *found = Some((field.clone(), span));
-                return;
-            }
-        }
-        ast::ExprKind::Case { arms, .. } => {
-            for arm in arms {
-                scan_pat_for_field(&arm.pat, source, offset, found);
-                if found.is_some() {
-                    return;
-                }
-            }
-        }
-        ast::ExprKind::Do(stmts) => {
-            for stmt in stmts {
-                match &stmt.node {
-                    ast::StmtKind::Bind { pat, .. } | ast::StmtKind::Let { pat, .. } => {
-                        scan_pat_for_field(pat, source, offset, found);
-                        if found.is_some() {
-                            return;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
-    }
-    crate::utils::recurse_expr(expr, |e| scan_expr_for_field(e, source, offset, found));
-}
-
-fn scan_pat_for_field(
-    pat: &ast::Pat,
-    source: &str,
-    offset: usize,
-    found: &mut Option<(String, Span)>,
-) {
-    if found.is_some() {
-        return;
-    }
-    if pat.span.start > offset || offset > pat.span.end {
-        return;
-    }
-    if let ast::PatKind::Record(fields) = &pat.node {
-        for f in fields {
-            if let Some(span) = find_field_name_span(source, pat.span, &f.name, offset) {
-                *found = Some((f.name.clone(), span));
-                return;
-            }
-            if let Some(inner) = &f.pattern {
-                scan_pat_for_field(inner, source, offset, found);
-                if found.is_some() {
-                    return;
-                }
-            }
-        }
-    }
-    if let ast::PatKind::Constructor { payload, .. } = &pat.node {
-        scan_pat_for_field(payload, source, offset, found);
-    }
-    if let ast::PatKind::List(pats) = &pat.node {
-        for p in pats {
-            scan_pat_for_field(p, source, offset, found);
-            if found.is_some() {
-                return;
-            }
-        }
-    }
-}
-
-fn scan_type_for_field(
-    ty: &ast::Type,
-    source: &str,
-    offset: usize,
-    found: &mut Option<(String, Span)>,
-) {
-    if found.is_some() {
-        return;
-    }
-    if ty.span.start > offset || offset > ty.span.end {
-        return;
-    }
-    if let ast::TypeKind::Record { fields, .. } = &ty.node {
-        for f in fields {
-            if let Some(span) = find_field_name_span(source, ty.span, &f.name, offset) {
-                *found = Some((f.name.clone(), span));
-                return;
-            }
-            scan_type_for_field(&f.value, source, offset, found);
-            if found.is_some() {
-                return;
-            }
-        }
-    }
-}
-
-/// Locate `name` as a whole-word token within the source slice covering
-/// `outer`, picking the occurrence whose span contains `offset`. Returns the
-/// absolute span of the match, or `None` if `offset` doesn't land on a
-/// whole-word `name` inside `outer`.
-fn find_field_name_span(
-    source: &str,
-    outer: Span,
-    name: &str,
-    offset: usize,
-) -> Option<Span> {
-    if name.is_empty() || outer.end > source.len() || outer.start >= outer.end {
-        return None;
-    }
-    let text = &source[outer.start..outer.end];
-    let bytes = text.as_bytes();
-    let needle = name.as_bytes();
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    let mut i = 0;
-    while i + needle.len() <= bytes.len() {
-        if &bytes[i..i + needle.len()] == needle {
-            let left_ok = i == 0 || !is_ident(bytes[i - 1]);
-            let right_ok = i + needle.len() >= bytes.len() || !is_ident(bytes[i + needle.len()]);
-            if left_ok && right_ok {
-                let abs_start = outer.start + i;
-                let abs_end = abs_start + needle.len();
-                if abs_start <= offset && offset < abs_end {
-                    return Some(Span::new(abs_start, abs_end));
-                }
-            }
-        }
-        i += 1;
     }
     None
 }
@@ -873,7 +831,11 @@ fn collect_field_rename_sites(
 ) -> Vec<Span> {
     let mut out: Vec<Span> = Vec::new();
     for decl in &module.decls {
-        collect_field_sites_in_decl(decl, source, name, &mut out);
+        field_sites_in_decl(decl, source, &mut |n, span| {
+            if n == name {
+                out.push(span);
+            }
+        });
     }
     // Dedupe in case the AST walk visits the same span via two branches.
     out.sort_by_key(|s| (s.start, s.end));
@@ -881,160 +843,224 @@ fn collect_field_rename_sites(
     out
 }
 
-fn collect_field_sites_in_decl(
-    decl: &ast::Decl,
-    source: &str,
-    name: &str,
-    out: &mut Vec<Span>,
-) {
+// ── Field-name site enumeration ─────────────────────────────────────
+//
+// The AST stores field names as bare strings without their own spans, so
+// the token position has to be recovered from source text. Searching the
+// whole containing span for the first whole-word match is wrong — a value
+// subexpression holding an identifier with the same name hijacks the
+// location (`{a: count, count: 2}` resolves `count` to the *variable* in
+// `a: count`). Mirroring `linked_editing.rs`, each field name is searched
+// only in its syntactic field-name position: the slice between the previous
+// field's value (or the container's opening token) and this field's value.
+
+/// Invoke `f(name, span)` for every record-field-name token in `decl`.
+fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::Decl, source: &str, f: &mut F) {
     match &decl.node {
         DeclKind::Fun {
             body: Some(body), ..
-        } => collect_field_sites_in_expr(body, source, name, out),
-        DeclKind::View { body, .. } | DeclKind::Derived { body, .. } => {
-            collect_field_sites_in_expr(body, source, name, out);
         }
+        | DeclKind::View { body, .. }
+        | DeclKind::Derived { body, .. } => field_sites_in_expr(body, source, f),
         DeclKind::Impl { items, .. } => {
             for item in items {
-                if let ast::ImplItem::Method { body, .. } = item {
-                    collect_field_sites_in_expr(body, source, name, out);
+                if let ast::ImplItem::Method { params, body, .. } = item {
+                    for p in params {
+                        field_sites_in_pat(p, source, f);
+                    }
+                    field_sites_in_expr(body, source, f);
                 }
             }
         }
         DeclKind::Data { constructors, .. } => {
+            // Constructor fields appear sequentially in source order, so a
+            // single running cursor across all constructors keeps each
+            // field-name search confined to its own slot.
+            let mut search_start = decl.span.start;
             for ctor in constructors {
-                for f in &ctor.fields {
-                    if f.name == name {
-                        if let Some(span) = find_first_field_name_span(source, decl.span, name) {
-                            out.push(span);
-                        }
+                for fld in &ctor.fields {
+                    if let Some(span) = find_word_in_source(
+                        source,
+                        &fld.name,
+                        search_start,
+                        fld.value.span.start,
+                    ) {
+                        f(&fld.name, span);
                     }
+                    field_sites_in_type(&fld.value, source, f);
+                    search_start = fld.value.span.end;
                 }
             }
         }
         DeclKind::TypeAlias { ty, .. } | DeclKind::Source { ty, .. } => {
-            collect_field_sites_in_type(ty, source, name, out);
+            field_sites_in_type(ty, source, f);
         }
         _ => {}
     }
 }
 
-fn collect_field_sites_in_expr(
-    expr: &ast::Expr,
-    source: &str,
-    name: &str,
-    out: &mut Vec<Span>,
-) {
+fn field_sites_in_expr<F: FnMut(&str, Span)>(expr: &ast::Expr, source: &str, f: &mut F) {
     match &expr.node {
-        ast::ExprKind::Record(fields) | ast::ExprKind::RecordUpdate { fields, .. } => {
-            for f in fields {
-                if f.name == name {
-                    if let Some(span) = find_first_field_name_span(source, expr.span, name) {
-                        out.push(span);
-                    }
+        ast::ExprKind::Record(fields) => {
+            let mut search_start = expr.span.start;
+            for fld in fields {
+                // Punned fields (`{name}`) have their value span on the very
+                // token that names the field; the between-fields window is
+                // empty and no site is reported. That's deliberate — the
+                // token doubles as a variable reference and is handled by
+                // the symbol-rename path instead.
+                if let Some(span) =
+                    find_word_in_source(source, &fld.name, search_start, fld.value.span.start)
+                {
+                    f(&fld.name, span);
                 }
+                search_start = fld.value.span.end;
+            }
+        }
+        ast::ExprKind::RecordUpdate { base, fields } => {
+            let mut search_start = base.span.end;
+            for fld in fields {
+                if let Some(span) =
+                    find_word_in_source(source, &fld.name, search_start, fld.value.span.start)
+                {
+                    f(&fld.name, span);
+                }
+                search_start = fld.value.span.end;
             }
         }
         ast::ExprKind::FieldAccess { field, expr: rec } => {
-            if field == name {
-                let after_recv = rec.span.end.min(expr.span.end);
-                if let Some(span) =
-                    find_first_field_name_span(source, Span::new(after_recv, expr.span.end), name)
+            // The field token is the suffix of the access expression.
+            if expr.span.end >= field.len() {
+                let start = expr.span.end - field.len();
+                if start >= rec.span.end
+                    && source.get(start..expr.span.end) == Some(field.as_str())
                 {
-                    out.push(span);
+                    f(field, Span::new(start, expr.span.end));
                 }
             }
         }
         ast::ExprKind::Case { arms, .. } => {
             for arm in arms {
-                collect_field_sites_in_pat(&arm.pat, source, name, out);
+                field_sites_in_pat(&arm.pat, source, f);
             }
         }
         ast::ExprKind::Do(stmts) => {
             for stmt in stmts {
                 match &stmt.node {
                     ast::StmtKind::Bind { pat, .. } | ast::StmtKind::Let { pat, .. } => {
-                        collect_field_sites_in_pat(pat, source, name, out);
+                        field_sites_in_pat(pat, source, f);
                     }
                     _ => {}
                 }
             }
         }
+        ast::ExprKind::Lambda { params, .. } => {
+            for p in params {
+                field_sites_in_pat(p, source, f);
+            }
+        }
         _ => {}
     }
-    crate::utils::recurse_expr(expr, |e| collect_field_sites_in_expr(e, source, name, out));
+    recurse_expr(expr, |e| field_sites_in_expr(e, source, f));
 }
 
-fn collect_field_sites_in_pat(
-    pat: &ast::Pat,
-    source: &str,
-    name: &str,
-    out: &mut Vec<Span>,
-) {
-    if let ast::PatKind::Record(fields) = &pat.node {
-        for f in fields {
-            if f.name == name {
-                if let Some(span) = find_first_field_name_span(source, pat.span, name) {
-                    out.push(span);
+fn field_sites_in_pat<F: FnMut(&str, Span)>(pat: &ast::Pat, source: &str, f: &mut F) {
+    match &pat.node {
+        ast::PatKind::Record(fields) => {
+            let mut search_start = pat.span.start;
+            for fp in fields {
+                match &fp.pattern {
+                    Some(inner) => {
+                        if let Some(span) = find_word_in_source(
+                            source,
+                            &fp.name,
+                            search_start,
+                            inner.span.start,
+                        ) {
+                            f(&fp.name, span);
+                        }
+                        field_sites_in_pat(inner, source, f);
+                        search_start = inner.span.end;
+                    }
+                    None => {
+                        // Punned `{name}` pattern: the token both names the
+                        // field and binds the variable. Renaming it would
+                        // silently rebind every use in the body, so it is
+                        // not reported as a field site; the symbol-rename
+                        // path owns it. Still advance the cursor past it.
+                        if let Some(span) = find_word_in_source(
+                            source,
+                            &fp.name,
+                            search_start,
+                            pat.span.end,
+                        ) {
+                            search_start = span.end;
+                        }
+                    }
                 }
             }
-            if let Some(inner) = &f.pattern {
-                collect_field_sites_in_pat(inner, source, name, out);
+        }
+        ast::PatKind::Constructor { payload, .. } => field_sites_in_pat(payload, source, f),
+        ast::PatKind::List(pats) => {
+            for p in pats {
+                field_sites_in_pat(p, source, f);
             }
         }
-    }
-    if let ast::PatKind::Constructor { payload, .. } = &pat.node {
-        collect_field_sites_in_pat(payload, source, name, out);
-    }
-    if let ast::PatKind::List(pats) = &pat.node {
-        for p in pats {
-            collect_field_sites_in_pat(p, source, name, out);
+        ast::PatKind::Cons { head, tail } => {
+            field_sites_in_pat(head, source, f);
+            field_sites_in_pat(tail, source, f);
         }
+        _ => {}
     }
 }
 
-fn collect_field_sites_in_type(
-    ty: &ast::Type,
-    source: &str,
-    name: &str,
-    out: &mut Vec<Span>,
-) {
-    if let ast::TypeKind::Record { fields, .. } = &ty.node {
-        for f in fields {
-            if f.name == name {
-                if let Some(span) = find_first_field_name_span(source, ty.span, name) {
-                    out.push(span);
+fn field_sites_in_type<F: FnMut(&str, Span)>(ty: &ast::Type, source: &str, f: &mut F) {
+    match &ty.node {
+        ast::TypeKind::Record { fields, .. } => {
+            let mut search_start = ty.span.start;
+            for fld in fields {
+                if let Some(span) =
+                    find_word_in_source(source, &fld.name, search_start, fld.value.span.start)
+                {
+                    f(&fld.name, span);
+                }
+                field_sites_in_type(&fld.value, source, f);
+                search_start = fld.value.span.end;
+            }
+        }
+        ast::TypeKind::Variant { constructors, .. } => {
+            let mut search_start = ty.span.start;
+            for ctor in constructors {
+                for fld in &ctor.fields {
+                    if let Some(span) = find_word_in_source(
+                        source,
+                        &fld.name,
+                        search_start,
+                        fld.value.span.start,
+                    ) {
+                        f(&fld.name, span);
+                    }
+                    field_sites_in_type(&fld.value, source, f);
+                    search_start = fld.value.span.end;
                 }
             }
-            collect_field_sites_in_type(&f.value, source, name, out);
         }
-    }
-}
-
-/// Locate the first whole-word occurrence of `name` inside `outer`, returning
-/// its absolute span. Used when we know a field with that name appears within
-/// a span and want to find its source position.
-fn find_first_field_name_span(source: &str, outer: Span, name: &str) -> Option<Span> {
-    if name.is_empty() || outer.end > source.len() || outer.start >= outer.end {
-        return None;
-    }
-    let text = &source[outer.start..outer.end];
-    let bytes = text.as_bytes();
-    let needle = name.as_bytes();
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    let mut i = 0;
-    while i + needle.len() <= bytes.len() {
-        if &bytes[i..i + needle.len()] == needle {
-            let left_ok = i == 0 || !is_ident(bytes[i - 1]);
-            let right_ok = i + needle.len() >= bytes.len() || !is_ident(bytes[i + needle.len()]);
-            if left_ok && right_ok {
-                let abs_start = outer.start + i;
-                return Some(Span::new(abs_start, abs_start + needle.len()));
-            }
+        ast::TypeKind::Relation(inner) => field_sites_in_type(inner, source, f),
+        ast::TypeKind::App { func, arg } => {
+            field_sites_in_type(func, source, f);
+            field_sites_in_type(arg, source, f);
         }
-        i += 1;
+        ast::TypeKind::Function { param, result } => {
+            field_sites_in_type(param, source, f);
+            field_sites_in_type(result, source, f);
+        }
+        ast::TypeKind::Effectful { ty: inner, .. }
+        | ast::TypeKind::IO { ty: inner, .. } => field_sites_in_type(inner, source, f),
+        ast::TypeKind::UnitAnnotated { base, .. } => field_sites_in_type(base, source, f),
+        ast::TypeKind::Refined { base, .. } => field_sites_in_type(base, source, f),
+        ast::TypeKind::Forall { ty: inner, .. } => field_sites_in_type(inner, source, f),
+        _ => {}
     }
-    None
 }
 
 /// BFS over `state.reverse_imports` to collect every file that transitively
@@ -1194,6 +1220,184 @@ mod tests {
         assert!(
             !changes.contains_key(&unrelated_uri),
             "unrelated file with same-name local was renamed; got: {changes:?}"
+        );
+    }
+
+    /// Apply a list of `TextEdit`s to `source` (positions resolved against
+    /// `source`). Edits are applied back-to-front so earlier offsets stay
+    /// valid.
+    fn apply_edits(source: &str, edits: &[TextEdit]) -> String {
+        let mut spans: Vec<(usize, usize, &str)> = edits
+            .iter()
+            .map(|e| {
+                (
+                    position_to_offset(source, e.range.start),
+                    position_to_offset(source, e.range.end),
+                    e.new_text.as_str(),
+                )
+            })
+            .collect();
+        spans.sort_by_key(|(s, _, _)| std::cmp::Reverse(*s));
+        let mut out = source.to_string();
+        for (start, end, text) in spans {
+            out.replace_range(start..end, text);
+        }
+        out
+    }
+
+    #[test]
+    fn field_rename_targets_field_token_not_variable() {
+        // `count` appears both as a lambda-bound variable (value position in
+        // `a: count`) and as a field name (`count: 2`). Renaming the *field*
+        // must touch only the field token — the old first-whole-word scan
+        // rewrote the variable and left the field untouched.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "f = \\count -> {a: count, count: 2}\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("count: 2").expect("field position");
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "total"))
+            .expect("rename emits edit");
+        let changes = edit.changes.expect("changes present");
+        let edits = changes.get(&uri).expect("edits for main");
+        assert_eq!(edits.len(), 1, "exactly the field token; got: {edits:?}");
+        let new_src = apply_edits(&doc.source, edits);
+        assert_eq!(new_src, "f = \\count -> {a: count, total: 2}\n");
+    }
+
+    #[test]
+    fn field_rename_rewrites_same_named_fields_in_separate_records() {
+        // Two records in one expression, each with a field `n`. The old
+        // implementation found the same (first) span twice and deduped to a
+        // single wrong edit.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "g = [{n: 1}, {n: 2}]\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("n: 1").expect("first field");
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "m"))
+            .expect("rename emits edit");
+        let changes = edit.changes.expect("changes present");
+        let edits = changes.get(&uri).expect("edits for main");
+        assert_eq!(edits.len(), 2, "one edit per record; got: {edits:?}");
+        let new_src = apply_edits(&doc.source, edits);
+        assert_eq!(new_src, "g = [{m: 1}, {m: 2}]\n");
+    }
+
+    #[test]
+    fn rename_from_importer_rewrites_owner_internal_usages() {
+        use crate::test_support::TempWorkspace;
+        let mut tw = TempWorkspace::new();
+        // The owner uses `parse` internally; the rename starts at the
+        // consumer's call site. The owner's declaration AND its internal
+        // usage must both be rewritten — previously only the declaration
+        // token changed because the whole-decl span from `import_defs`
+        // never matched the owner doc's name-token reference targets.
+        let owner_uri = tw.write_and_open("owner.knot", "parse = \\x -> x\nmain = parse 5\n");
+        let consumer_uri =
+            tw.write_and_open("consumer.knot", "import ./owner\n\nrun = parse 1\n");
+        let consumer_doc = tw.workspace.doc(&consumer_uri);
+        let off = consumer_doc.source.find("parse 1").expect("call site");
+        let pos = offset_to_position(&consumer_doc.source, off);
+        let edit = handle_rename(
+            &tw.workspace.state,
+            &rename_params(&consumer_uri, pos, "parsed"),
+        )
+        .expect("rename emits edit");
+        let changes = edit.changes.expect("changes present");
+        let owner_doc = tw.workspace.doc(&owner_uri);
+        let owner_edits = changes.get(&owner_uri).expect("owner file edited");
+        let new_owner = apply_edits(&owner_doc.source, owner_edits);
+        assert_eq!(
+            new_owner, "parsed = \\x -> x\nmain = parsed 5\n",
+            "owner declaration AND internal usage must be renamed; edits: {owner_edits:?}"
+        );
+        let consumer_edits = changes.get(&consumer_uri).expect("consumer file edited");
+        let new_consumer = apply_edits(&consumer_doc.source, consumer_edits);
+        assert_eq!(new_consumer, "import ./owner\n\nrun = parsed 1\n");
+    }
+
+    #[test]
+    fn rename_skips_shadowed_locals_in_importer() {
+        use crate::test_support::TempWorkspace;
+        let mut tw = TempWorkspace::new();
+        let owner_uri = tw.write_and_open("owner.knot", "parse = \\x -> x\n");
+        let consumer_uri = tw.write_and_open(
+            "consumer.knot",
+            "import ./owner\n\nuse1 = parse 2\nshadow = \\parse -> parse 1\n",
+        );
+        let owner_doc = tw.workspace.doc(&owner_uri);
+        let off = owner_doc.source.find("parse =").expect("def");
+        let pos = offset_to_position(&owner_doc.source, off);
+        let edit = handle_rename(
+            &tw.workspace.state,
+            &rename_params(&owner_uri, pos, "parsed"),
+        )
+        .expect("rename emits edit");
+        let changes = edit.changes.expect("changes present");
+        let consumer_doc = tw.workspace.doc(&consumer_uri);
+        let consumer_edits = changes.get(&consumer_uri).expect("consumer file edited");
+        let new_consumer = apply_edits(&consumer_doc.source, consumer_edits);
+        assert_eq!(
+            new_consumer,
+            "import ./owner\n\nuse1 = parsed 2\nshadow = \\parse -> parse 1\n",
+            "the lambda-bound `parse` and its scoped use refer to the local — \
+             they must not be rewritten; edits: {consumer_edits:?}"
+        );
+    }
+
+    #[test]
+    fn renaming_local_binding_does_not_touch_unopened_importers() {
+        use crate::test_support::TempWorkspace;
+        let mut tw = TempWorkspace::new();
+        let owner_uri = tw.write_and_open("owner.knot", "f = \\count -> count + 1\n");
+        // An unopened file on disk that imports the owner and mentions the
+        // same identifier. A *local* rename in the owner must never reach it.
+        let other_path = tw.root.join("other.knot");
+        std::fs::write(&other_path, "import ./owner\ng = \\x -> count\n").unwrap();
+
+        let owner_doc = tw.workspace.doc(&owner_uri);
+        // Start the rename at the local *usage* so it resolves to the lambda
+        // binder.
+        let off = owner_doc.source.find("count + 1").expect("usage");
+        let pos = offset_to_position(&owner_doc.source, off);
+        let edit = handle_rename(
+            &tw.workspace.state,
+            &rename_params(&owner_uri, pos, "total"),
+        )
+        .expect("rename emits edit");
+        let changes = edit.changes.expect("changes present");
+        assert_eq!(
+            changes.len(),
+            1,
+            "local rename must stay in the owner file; got: {changes:?}"
+        );
+        let owner_edits = changes.get(&owner_uri).expect("owner file edited");
+        let new_owner = apply_edits(&owner_doc.source, owner_edits);
+        assert_eq!(new_owner, "f = \\total -> total + 1\n");
+    }
+
+    #[test]
+    fn rename_bails_when_pending_text_is_newer() {
+        use crate::state::PendingSource;
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "double = \\x -> x * 2\nmain = double 1\n");
+        let doc_source = ws.doc(&uri).source.clone();
+        let off = doc_source.find("double =").expect("def");
+        let pos = offset_to_position(&doc_source, off);
+        // Simulate an edit that hasn't been analyzed yet: spans computed from
+        // the analyzed source would corrupt the editor's newer buffer.
+        ws.state.pending_sources.insert(
+            uri.clone(),
+            PendingSource {
+                source: "-- new line\ndouble = \\x -> x * 2\nmain = double 1\n".into(),
+                version: Some(2),
+            },
+        );
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "doubled"));
+        assert!(
+            edit.is_none(),
+            "rename against stale analysis must bail; got: {edit:?}"
         );
     }
 

@@ -6,11 +6,12 @@ use std::path::PathBuf;
 use lsp_types::*;
 
 use crate::analysis::get_or_parse_file_shared;
+use crate::defs::resolve_definitions;
+use crate::rename::{collect_name_uses_in_decl, file_imports_owner, module_defines_name};
 use crate::shared::scan_knot_files_in_roots;
 use crate::state::ServerState;
 use crate::utils::{
-    offset_to_position, path_to_uri, position_to_offset, safe_slice, span_to_range, uri_to_path,
-    word_at_position,
+    path_to_uri, position_to_offset, span_to_range, uri_to_path, word_at_position,
 };
 
 /// Cap on the number of locations returned by a single `textDocument/references`
@@ -69,97 +70,186 @@ pub(crate) fn handle_references(
         }
     }
 
-    // Determine the canonical file that defines this symbol (for scoped matching)
-    let defining_file = doc.import_origins.get(&symbol_name);
-    let _current_file = uri_to_path(uri).and_then(|p| p.canonicalize().ok());
+    // Origin discipline (mirrors the rename path): cross-file usages count
+    // only when the other file imports the symbol from its owning file and
+    // doesn't declare a same-named symbol of its own. First resolve where
+    // the symbol's canonical definition lives:
+    // - imported into the current doc → the imported file;
+    // - declared at top level in the current doc → the current file;
+    // - a local binding (lambda param, let, do-bind) → nowhere else; other
+    //   files can't reference it, so cross-file matching is skipped.
+    let current_path = uri_to_path(uri).and_then(|p| p.canonicalize().ok());
+    let owner_path: Option<PathBuf> =
+        if let Some((p, _)) = doc.import_defs.get(&symbol_name) {
+            Some(p.clone())
+        } else if doc.definitions.get(&symbol_name) == Some(&def_span) {
+            current_path.clone()
+        } else {
+            None
+        };
 
-    // Cross-file: search all other open documents for references to the same name
-    'open_docs: for (other_uri, other_doc) in &state.documents {
-        if locations.len() >= MAX_REFERENCE_LOCATIONS {
-            break;
-        }
-        if other_uri == uri {
-            continue;
-        }
-        // Scope check: if the symbol is imported, only match in documents that import
-        // from the same origin, or that define the symbol themselves
-        let _other_file = uri_to_path(other_uri).and_then(|p| p.canonicalize().ok());
-        let is_defining_file = defining_file.is_some()
-            && other_doc.import_defs.get(&symbol_name)
-                .map(|(path, _)| Some(path.clone()) == doc.import_defs.get(&symbol_name).map(|(p, _)| p.clone()))
-                .unwrap_or(false);
-        let is_local_def = other_doc.definitions.contains_key(&symbol_name);
-        let shares_origin = defining_file.is_none() // locally defined — match by name
-            || is_defining_file
-            || is_local_def
-            || other_doc.import_origins.get(&symbol_name) == defining_file;
-
-        if !shares_origin {
-            continue;
-        }
-
-        for (usage_span, target_span) in &other_doc.references {
+    // Cross-file: search all other open documents for references that resolve
+    // to the same origin.
+    if let Some(owner_path) = &owner_path {
+        'open_docs: for (other_uri, other_doc) in &state.documents {
             if locations.len() >= MAX_REFERENCE_LOCATIONS {
-                break 'open_docs;
+                break;
             }
-            let target_name = safe_slice(&other_doc.source, *target_span);
-            if other_doc.definitions.get(&symbol_name) == Some(target_span) {
-                locations.push(Location {
-                    uri: other_uri.clone(),
-                    range: span_to_range(*usage_span, &other_doc.source),
-                });
-            } else if target_name == symbol_name {
-                locations.push(Location {
-                    uri: other_uri.clone(),
-                    range: span_to_range(*usage_span, &other_doc.source),
-                });
+            if other_uri == uri {
+                continue;
             }
-        }
-        // Also check if the other doc has a definition of this name (for include_declaration)
-        if params.context.include_declaration && locations.len() < MAX_REFERENCE_LOCATIONS {
-            if let Some(other_def) = other_doc.definitions.get(&symbol_name) {
-                locations.push(Location {
-                    uri: other_uri.clone(),
-                    range: span_to_range(*other_def, &other_doc.source),
-                });
+            let other_path = uri_to_path(other_uri).and_then(|p| p.canonicalize().ok());
+            if other_path.as_ref() == Some(owner_path) {
+                // The owning file itself (open while we started from an
+                // importer): its own references to the definition count.
+                if let Some(other_def) = other_doc.definitions.get(&symbol_name).copied() {
+                    if params.context.include_declaration {
+                        locations.push(Location {
+                            uri: other_uri.clone(),
+                            range: span_to_range(other_def, &other_doc.source),
+                        });
+                    }
+                    for (usage_span, target_span) in &other_doc.references {
+                        if locations.len() >= MAX_REFERENCE_LOCATIONS {
+                            break 'open_docs;
+                        }
+                        if *target_span == other_def {
+                            locations.push(Location {
+                                uri: other_uri.clone(),
+                                range: span_to_range(*usage_span, &other_doc.source),
+                            });
+                        }
+                    }
+                }
+            } else if other_doc.definitions.contains_key(&symbol_name) {
+                // The other file declares its own, unrelated symbol with the
+                // same name — every reference there resolves locally.
+                continue;
+            } else if other_doc
+                .import_defs
+                .get(&symbol_name)
+                .map(|(p, _)| p == owner_path)
+                .unwrap_or(false)
+            {
+                // Importer of the same origin. Imported-symbol usages don't
+                // appear in `references` (which only resolves local decls),
+                // so walk the AST — scope-aware, skipping shadowed locals.
+                let mut sites = Vec::new();
+                for decl in &other_doc.module.decls {
+                    collect_name_uses_in_decl(decl, &symbol_name, &mut sites);
+                }
+                for imp in &other_doc.module.imports {
+                    if let Some(items) = &imp.items {
+                        for item in items {
+                            if item.name == symbol_name {
+                                sites.push(item.span);
+                            }
+                        }
+                    }
+                }
+                for site in sites {
+                    if locations.len() >= MAX_REFERENCE_LOCATIONS {
+                        break 'open_docs;
+                    }
+                    locations.push(Location {
+                        uri: other_uri.clone(),
+                        range: span_to_range(site, &other_doc.source),
+                    });
+                }
             }
         }
     }
 
     // Cross-file: scan workspace files that are not currently open. Cheap when
     // they're already cached in `import_cache`; falls back to a one-shot parse
-    // otherwise. Limited to a name-equality match (we can't share the open
-    // doc's `references` table for unopened files).
-    let open_paths: HashSet<PathBuf> = state
-        .documents
-        .keys()
-        .filter_map(|u| uri_to_path(u))
-        .filter_map(|p| p.canonicalize().ok())
-        .collect();
-    let workspace_files =
-        scan_knot_files_in_roots(&state.workspace_roots, state.workspace_root.as_deref());
-    for file_path in workspace_files {
-        if locations.len() >= MAX_REFERENCE_LOCATIONS {
-            break;
+    // otherwise. The same origin discipline applies: a file only contributes
+    // usages when it imports the owner (and doesn't define its own same-named
+    // symbol); the unopened owner file contributes its declaration + local
+    // references.
+    if let Some(owner_path) = &owner_path {
+        let open_paths: HashSet<PathBuf> = state
+            .documents
+            .keys()
+            .filter_map(|u| uri_to_path(u))
+            .filter_map(|p| p.canonicalize().ok())
+            .collect();
+        let workspace_files =
+            scan_knot_files_in_roots(&state.workspace_roots, state.workspace_root.as_deref());
+        for file_path in workspace_files {
+            if locations.len() >= MAX_REFERENCE_LOCATIONS {
+                break;
+            }
+            let canonical = match file_path.canonicalize() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if open_paths.contains(&canonical) {
+                continue;
+            }
+            let (module, source) =
+                match get_or_parse_file_shared(&canonical, &state.import_cache) {
+                    Some(p) => p,
+                    None => continue,
+                };
+            // Quick rejection before any AST walk.
+            if !source.contains(symbol_name.as_str()) {
+                continue;
+            }
+            // Skip files whose path can't be encoded as a URI rather than
+            // emitting a junk `file:///` location — locations with nonsense
+            // URIs would silently mislead the editor's references pane.
+            let Some(other_uri) = path_to_uri(&canonical) else {
+                continue;
+            };
+            if canonical == *owner_path {
+                // Unopened owner: recompute defs/refs from the disk copy.
+                let (defs, refs, _) = resolve_definitions(&module, &source);
+                if let Some(def) = defs.get(&symbol_name).copied() {
+                    if params.context.include_declaration {
+                        locations.push(Location {
+                            uri: other_uri.clone(),
+                            range: span_to_range(def, &source),
+                        });
+                    }
+                    for (usage_span, target_span) in &refs {
+                        if locations.len() >= MAX_REFERENCE_LOCATIONS {
+                            break;
+                        }
+                        if *target_span == def {
+                            locations.push(Location {
+                                uri: other_uri.clone(),
+                                range: span_to_range(*usage_span, &source),
+                            });
+                        }
+                    }
+                }
+            } else if !module_defines_name(&module, &symbol_name)
+                && file_imports_owner(&module, &canonical, owner_path, &symbol_name)
+            {
+                let mut sites = Vec::new();
+                for decl in &module.decls {
+                    collect_name_uses_in_decl(decl, &symbol_name, &mut sites);
+                }
+                for imp in &module.imports {
+                    if let Some(items) = &imp.items {
+                        for item in items {
+                            if item.name == symbol_name {
+                                sites.push(item.span);
+                            }
+                        }
+                    }
+                }
+                for site in sites {
+                    if locations.len() >= MAX_REFERENCE_LOCATIONS {
+                        break;
+                    }
+                    locations.push(Location {
+                        uri: other_uri.clone(),
+                        range: span_to_range(site, &source),
+                    });
+                }
+            }
         }
-        let canonical = match file_path.canonicalize() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        if open_paths.contains(&canonical) {
-            continue;
-        }
-        let (_module, source) = match get_or_parse_file_shared(&canonical, &state.import_cache) {
-            Some(p) => p,
-            None => continue,
-        };
-        // Skip files whose path can't be encoded as a URI rather than
-        // emitting a junk `file:///` location — locations with nonsense URIs
-        // would silently mislead the editor's "Find References" pane.
-        let Some(other_uri) = path_to_uri(&canonical) else {
-            continue;
-        };
-        scan_word_occurrences(&source, &symbol_name, &other_uri, &mut locations);
     }
 
     if locations.is_empty() {
@@ -178,44 +268,6 @@ pub(crate) fn handle_references(
             seen.insert(key)
         });
         Some(locations)
-    }
-}
-
-/// Append every whole-word occurrence of `name` in `source` as a Location, up
-/// to the global `MAX_REFERENCE_LOCATIONS` cap. The cap is checked against the
-/// caller-provided `out` so per-file scans don't independently fill the buffer
-/// — instead we stop as soon as the workspace-wide total is reached.
-fn scan_word_occurrences(source: &str, name: &str, uri: &Uri, out: &mut Vec<Location>) {
-    let bytes = source.as_bytes();
-    let needle = name.as_bytes();
-    if needle.is_empty() || bytes.len() < needle.len() {
-        return;
-    }
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    let mut i = 0;
-    while i + needle.len() <= bytes.len() {
-        if out.len() >= MAX_REFERENCE_LOCATIONS {
-            return;
-        }
-        if &bytes[i..i + needle.len()] == needle {
-            let left_ok = i == 0 || !is_ident(bytes[i - 1]);
-            let right_ok =
-                i + needle.len() >= bytes.len() || !is_ident(bytes[i + needle.len()]);
-            if left_ok && right_ok {
-                let start_pos = offset_to_position(source, i);
-                let end_pos = offset_to_position(source, i + needle.len());
-                out.push(Location {
-                    uri: uri.clone(),
-                    range: Range {
-                        start: start_pos,
-                        end: end_pos,
-                    },
-                });
-                i += needle.len();
-                continue;
-            }
-        }
-        i += 1;
     }
 }
 
@@ -260,28 +312,94 @@ main = println (show (double 3))
     }
 
     #[test]
-    fn scan_word_occurrences_respects_cap() {
-        // Pre-fill the buffer near the cap and scan a source dense with
-        // matches; only the slots up to the cap should be appended.
-        let uri: Uri = "file:///tmp/scan.knot".parse().unwrap();
-        let source = "x ".repeat(MAX_REFERENCE_LOCATIONS + 100);
-        let mut out = Vec::with_capacity(MAX_REFERENCE_LOCATIONS);
-        // Seed with enough entries that only a handful of room remains —
-        // exercising the boundary check without allocating the full cap.
-        for _ in 0..(MAX_REFERENCE_LOCATIONS - 5) {
-            out.push(Location {
-                uri: uri.clone(),
-                range: Range {
-                    start: Position::new(0, 0),
-                    end: Position::new(0, 0),
-                },
-            });
-        }
-        scan_word_occurrences(&source, "x", &uri, &mut out);
+    fn references_excludes_unrelated_same_named_symbol_in_other_open_files() {
+        use crate::test_support::TempWorkspace;
+        let mut tw = TempWorkspace::new();
+        let owner_uri = tw.write_and_open("owner.knot", "parse = \\x -> x\nmain = parse 5\n");
+        let unrelated_uri = tw.write_and_open(
+            "unrelated.knot",
+            "parse = \\y -> y\nrun = parse 1\n",
+        );
+        let owner_doc = tw.workspace.doc(&owner_uri);
+        let pos = offset_to_position(
+            &owner_doc.source,
+            owner_doc.source.find("parse =").expect("def"),
+        );
+        let locs = handle_references(&tw.workspace.state, &ref_params(&owner_uri, pos, false))
+            .expect("references found");
+        assert!(
+            locs.iter().all(|l| l.uri == owner_uri),
+            "usages of the unrelated same-named local must be excluded; got: {locs:?}"
+        );
+        let _ = unrelated_uri;
+    }
+
+    #[test]
+    fn references_includes_importer_usages_but_not_shadowed_locals() {
+        use crate::test_support::TempWorkspace;
+        let mut tw = TempWorkspace::new();
+        let owner_uri = tw.write_and_open("owner.knot", "parse = \\x -> x\n");
+        let consumer_uri = tw.write_and_open(
+            "consumer.knot",
+            "import ./owner\n\nrun = parse 1\nshadow = \\parse -> parse 2\n",
+        );
+        let owner_doc = tw.workspace.doc(&owner_uri);
+        let pos = offset_to_position(
+            &owner_doc.source,
+            owner_doc.source.find("parse =").expect("def"),
+        );
+        let locs = handle_references(&tw.workspace.state, &ref_params(&owner_uri, pos, false))
+            .expect("references found");
+        let consumer_doc = tw.workspace.doc(&consumer_uri);
+        let consumer_locs: Vec<_> = locs.iter().filter(|l| l.uri == consumer_uri).collect();
         assert_eq!(
-            out.len(),
-            MAX_REFERENCE_LOCATIONS,
-            "scan should stop exactly at the cap"
+            consumer_locs.len(),
+            1,
+            "only the import-resolved call site counts; got: {locs:?}"
+        );
+        let expected = offset_to_position(
+            &consumer_doc.source,
+            consumer_doc.source.find("parse 1").expect("call site"),
+        );
+        assert_eq!(
+            consumer_locs[0].range.start, expected,
+            "the included usage must be `parse 1`, not the shadowed lambda body"
+        );
+    }
+
+    #[test]
+    fn references_disk_scan_respects_origin() {
+        use crate::test_support::TempWorkspace;
+        let mut tw = TempWorkspace::new();
+        let owner_uri = tw.write_and_open("owner.knot", "parse = \\x -> x\n");
+        // Unopened files on disk: one imports the owner (its usage counts),
+        // one declares its own same-named symbol (must be excluded).
+        std::fs::write(
+            tw.root.join("importer.knot"),
+            "import ./owner\nrun = parse 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tw.root.join("unrelated.knot"),
+            "parse = \\y -> y\nz = parse 3\n",
+        )
+        .unwrap();
+        let owner_doc = tw.workspace.doc(&owner_uri);
+        let pos = offset_to_position(
+            &owner_doc.source,
+            owner_doc.source.find("parse =").expect("def"),
+        );
+        let locs = handle_references(&tw.workspace.state, &ref_params(&owner_uri, pos, false))
+            .expect("references found");
+        assert!(
+            locs.iter()
+                .any(|l| l.uri.as_str().ends_with("importer.knot")),
+            "the unopened importer's usage must be included; got: {locs:?}"
+        );
+        assert!(
+            locs.iter()
+                .all(|l| !l.uri.as_str().ends_with("unrelated.knot")),
+            "the unopened file with its own `parse` must be excluded; got: {locs:?}"
         );
     }
 

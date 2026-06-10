@@ -1146,16 +1146,29 @@ fn render_unit_expr_prec(u: &UnitExpr, ctx: u8) -> String {
 
 // ── Expression precedence ───────────────────────────────────────────
 
+/// Mirrors the parser's Pratt binding powers (`parse_expr_bp`): each binary
+/// operator level has a left value (`X`) and a right value (`XRhs`, one
+/// tighter). All operators are left-associative except `++`, which the
+/// parser treats as right-associative (equal binding powers 11/11).
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum Prec {
     Lowest = 0,
     Pipe = 1,
+    PipeRhs = 2,
     Or = 3,
+    OrRhs = 4,
     And = 5,
+    AndRhs = 6,
     Cmp = 7,
+    CmpRhs = 8,
+    Rel = 9,
+    RelRhs = 10,
     Concat = 11,
+    ConcatLhs = 12,
     Add = 13,
+    AddRhs = 14,
     Mul = 15,
+    MulRhs = 16,
     Unary = 17,
     App = 18,
     Atom = 19,
@@ -1166,10 +1179,41 @@ fn binop_prec(op: BinOp) -> Prec {
         BinOp::Pipe => Prec::Pipe,
         BinOp::Or => Prec::Or,
         BinOp::And => Prec::And,
-        BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => Prec::Cmp,
+        BinOp::Eq | BinOp::Neq => Prec::Cmp,
+        BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => Prec::Rel,
         BinOp::Concat => Prec::Concat,
         BinOp::Add | BinOp::Sub => Prec::Add,
         BinOp::Mul | BinOp::Div | BinOp::Mod => Prec::Mul,
+    }
+}
+
+/// Context to use when rendering the left operand of `op`. For
+/// left-associative operators a same-precedence left child needs no parens
+/// (`a - b - c` parses as `(a - b) - c`). For right-associative `++` a
+/// same-precedence left child must be parenthesized so `(a ++ b) ++ c`
+/// doesn't reparse as `a ++ (b ++ c)`.
+fn binop_lhs_prec(op: BinOp) -> Prec {
+    match op {
+        BinOp::Concat => Prec::ConcatLhs,
+        _ => binop_prec(op),
+    }
+}
+
+/// Context to use when rendering the right operand of `op`. For
+/// left-associative operators a same-precedence right child must be
+/// parenthesized: `10 - (5 - 2)` would otherwise print as `10 - 5 - 2`,
+/// silently changing semantics. Right-associative `++` keeps same-precedence
+/// right children unparenthesized (`a ++ b ++ c` already parses right-nested).
+fn binop_rhs_prec(op: BinOp) -> Prec {
+    match op {
+        BinOp::Pipe => Prec::PipeRhs,
+        BinOp::Or => Prec::OrRhs,
+        BinOp::And => Prec::AndRhs,
+        BinOp::Eq | BinOp::Neq => Prec::CmpRhs,
+        BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => Prec::RelRhs,
+        BinOp::Concat => Prec::Concat,
+        BinOp::Add | BinOp::Sub => Prec::AddRhs,
+        BinOp::Mul | BinOp::Div | BinOp::Mod => Prec::MulRhs,
     }
 }
 
@@ -1285,16 +1329,23 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
         }
         ExprKind::BinOp { op, lhs, rhs } => {
             let prec = binop_prec(*op);
-            // For right-assoc operators (`++`), keep parens off the right side
-            // when same precedence.
-            let l = render_expr_inline(lhs, if *op == BinOp::Concat { Prec::Concat } else { prec });
-            let r = render_expr_inline(rhs, prec);
+            let l = render_expr_inline(lhs, binop_lhs_prec(*op));
+            let r = render_expr_inline(rhs, binop_rhs_prec(*op));
             let s = format!("{} {} {}", l, binop_str(*op), r);
             paren_if(parent > prec, s)
         }
         ExprKind::UnaryOp { op, operand } => {
             let s = match op {
-                UnaryOp::Neg => format!("-{}", render_expr_inline(operand, Prec::Unary)),
+                UnaryOp::Neg => {
+                    let inner = render_expr_inline(operand, Prec::Unary);
+                    // A nested negation must be parenthesized: `--x` lexes
+                    // as a line comment, not double negation.
+                    if inner.starts_with('-') {
+                        format!("-({})", inner)
+                    } else {
+                        format!("-{}", inner)
+                    }
+                }
                 UnaryOp::Not => format!("not {}", render_expr_inline(operand, Prec::App)),
             };
             paren_if(parent > Prec::Unary, s)
@@ -1310,13 +1361,18 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
         }
         ExprKind::Case { scrutinee, arms } => {
             let mut s = format!("case {} of", render_expr_inline(scrutinee, Prec::Lowest));
-            for arm in arms {
-                s.push_str("; ");
+            // The first arm follows `of` directly; `;` only separates arms.
+            // A leading `;` would make the output unparseable.
+            for (i, arm) in arms.iter().enumerate() {
+                s.push_str(if i == 0 { " " } else { "; " });
                 s.push_str(&render_pat(&arm.pat));
                 s.push_str(" -> ");
                 s.push_str(&render_expr_inline(&arm.body, Prec::Lowest));
             }
-            paren_if(parent > Prec::Lowest, s)
+            // Always parenthesize an inline case: in positions like list
+            // elements or record fields the last arm would otherwise swallow
+            // the following `,`/`]`/`}` tokens on reparse.
+            format!("({})", s)
         }
         ExprKind::Do(stmts) => {
             // Inline `do {s1; s2}` form is rarely useful; keep it for one-liners.
@@ -1327,7 +1383,11 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
                 }
                 s.push_str(&render_stmt_inline(st));
             }
-            paren_if(parent > Prec::Lowest, s)
+            // Always parenthesize an inline do-block: in positions like list
+            // elements, record fields, or if-branches a bare `do` would
+            // swallow the following `,`/`]`/`}` tokens on reparse
+            // (e.g. `[do yield 1, 2]`).
+            format!("({})", s)
         }
         ExprKind::Set { target, value } => {
             format!(
@@ -1367,13 +1427,18 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
         }
         ExprKind::Serve { api, handlers, .. } => {
             let mut s = format!("serve {} where", api);
-            for h in handlers {
-                s.push_str("; ");
+            // The first handler follows `where` directly; `;` only separates
+            // handlers. A leading `;` would make the output unparseable.
+            for (i, h) in handlers.iter().enumerate() {
+                s.push_str(if i == 0 { " " } else { "; " });
                 s.push_str(&h.endpoint);
                 s.push_str(" = ");
                 s.push_str(&render_expr_inline(&h.body, Prec::Lowest));
             }
-            paren_if(parent > Prec::Lowest, s)
+            // Always parenthesize an inline serve, for the same reason as
+            // inline case/do: the last handler would otherwise swallow
+            // following `,`/`]`/`}` tokens on reparse.
+            format!("({})", s)
         }
     }
 }
@@ -1431,6 +1496,7 @@ fn escape_text(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            '\0' => out.push_str("\\0"),
             c if (c as u32) < 0x20 => out.push_str(&format!("\\x{:02x}", c as u32)),
             c => out.push(c),
         }
@@ -1785,12 +1851,14 @@ fn render_binop_block(p: &mut Printer, op: BinOp, lhs: &Expr, rhs: &Expr, parent
     if need_parens {
         p.write("(");
     }
-    // Render left side with binop precedence.
-    render_expr(p, lhs, prec);
+    // Associativity-aware contexts: a same-precedence right child of a
+    // left-associative operator (and the mirror case for right-associative
+    // `++`) must keep its parentheses — see `binop_lhs_prec`/`binop_rhs_prec`.
+    render_expr(p, lhs, binop_lhs_prec(op));
     p.write(" ");
     p.write(binop_str(op));
     p.write(" ");
-    render_expr(p, rhs, prec);
+    render_expr(p, rhs, binop_rhs_prec(op));
     if need_parens {
         p.write(")");
     }

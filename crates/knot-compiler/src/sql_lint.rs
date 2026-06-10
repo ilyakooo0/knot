@@ -9,6 +9,10 @@ use std::collections::{HashMap, HashSet};
 use knot::ast::*;
 use knot::diagnostic::Diagnostic;
 
+use crate::codegen::{
+    divisor_is_nonzero_int_literal, divisor_is_nonzero_literal, expr_refs_var,
+    sql_comparison_cast_mode, SqlCastMode,
+};
 use crate::types::TypeEnv;
 
 /// Run the SQL lint analysis on a module and return informational diagnostics.
@@ -222,7 +226,7 @@ fn lint_do_block(
 
             for wi in (i + 1)..search_end {
                 if let StmtKind::Where { cond } = &stmts[wi].node {
-                    if try_compile_sql_expr(bind_var, cond).is_none() {
+                    if try_compile_sql_expr(bind_var, cond, schema).is_none() {
                         diags.push(
                             Diagnostic::info("where clause will be evaluated at runtime")
                                 .label(
@@ -268,7 +272,7 @@ fn lint_set_expr(
     if let Some((bind_var, cond, update_fields)) =
         match_conditional_update(source_name, value)
     {
-        let where_ok = try_compile_sql_expr(&bind_var, cond).is_some();
+        let where_ok = try_compile_sql_expr(&bind_var, cond, schema).is_some();
         let set_ok = where_ok
             && update_fields.iter().all(|(_, val)| {
                 matches!(val.node, ExprKind::Lit(_) | ExprKind::Var(_))
@@ -305,7 +309,7 @@ fn lint_set_expr(
     if let Some((bind_var, conditions)) = match_filter_only(source_name, value) {
         let mut any_failed = false;
         for cond in &conditions {
-            if try_compile_sql_expr(&bind_var, cond).is_none() {
+            if try_compile_sql_expr(&bind_var, cond, schema).is_none() {
                 any_failed = true;
                 diags.push(
                     Diagnostic::info(
@@ -358,10 +362,27 @@ fn lint_pipe_chain(
         return;
     }
 
+    // Mirror codegen's pipe operation-order check: out-of-order chains
+    // (e.g. `take 5 |> drop 2`, `take 3 |> filter f`) cannot be collapsed
+    // into one SQL query and fall back to runtime evaluation entirely.
+    if !lint_pipe_order_pushable(&ops) {
+        diags.push(
+            Diagnostic::info(
+                "pipe chain will be evaluated at runtime instead of SQL",
+            )
+            .label(
+                expr.span,
+                "operation order doesn't match SQL clause order \
+                 (filter, then sortBy, then map, then drop, then take)",
+            ),
+        );
+        return;
+    }
+
     for op in &ops {
         match op {
             LintPipeOp::Filter { bind_var, body, span } => {
-                if try_compile_sql_expr(bind_var, body).is_none() {
+                if try_compile_sql_expr(bind_var, body, schema).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "pipe filter will be evaluated at runtime instead of SQL WHERE",
@@ -421,7 +442,7 @@ fn lint_pipe_chain(
                 }
             }
             LintPipeOp::CountWhere { bind_var, body, span } => {
-                if try_compile_sql_expr(bind_var, body).is_none() {
+                if try_compile_sql_expr(bind_var, body, schema).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "pipe countWhere will be evaluated at runtime instead of SQL COUNT",
@@ -482,7 +503,7 @@ fn lint_app_form(
 
         match fn_name {
             "filter" => {
-                if try_compile_sql_expr(&bind_var, body).is_none() {
+                if try_compile_sql_expr(&bind_var, body, schema).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "filter will be evaluated at runtime instead of SQL WHERE",
@@ -560,7 +581,7 @@ fn lint_app_form(
                 }
             }
             "countWhere" => {
-                if try_compile_sql_expr(&bind_var, body).is_none() {
+                if try_compile_sql_expr(&bind_var, body, schema).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "countWhere will be evaluated at runtime instead of SQL COUNT",
@@ -581,12 +602,12 @@ fn lint_app_form(
 // Mirrors the logic in codegen.rs `try_compile_sql_expr` but without
 // any Cranelift dependencies.
 
-fn try_compile_sql_expr(bind_var: &str, expr: &Expr) -> Option<()> {
+fn try_compile_sql_expr(bind_var: &str, expr: &Expr, schema: &str) -> Option<()> {
     match &expr.node {
         ExprKind::BinOp { op, lhs, rhs } => match op {
             BinOp::And | BinOp::Or => {
-                try_compile_sql_expr(bind_var, lhs)?;
-                try_compile_sql_expr(bind_var, rhs)?;
+                try_compile_sql_expr(bind_var, lhs, schema)?;
+                try_compile_sql_expr(bind_var, rhs, schema)?;
                 Some(())
             }
             BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
@@ -594,6 +615,22 @@ fn try_compile_sql_expr(bind_var: &str, expr: &Expr) -> Option<()> {
                 try_sql_comparison(bind_var, lhs, rhs)
                     .or_else(|| try_sql_comparison(bind_var, rhs, lhs))
                     .or_else(|| {
+                        // Mirror codegen's type-witness gate: arithmetic
+                        // comparisons only push down when they can be typed
+                        // (int → KNOT_INT cast, float → plain SQL); untypable
+                        // arithmetic falls back to runtime.
+                        let mode = sql_comparison_cast_mode(lhs, rhs, &|v, f| {
+                            if v == bind_var {
+                                lookup_col_type(schema, f)
+                            } else {
+                                None
+                            }
+                        })?;
+                        if matches!(mode, SqlCastMode::NoArith)
+                            && (atom_would_need_cast(lhs) || atom_would_need_cast(rhs))
+                        {
+                            return None;
+                        }
                         try_sql_atom(bind_var, lhs)?;
                         try_sql_atom(bind_var, rhs)
                     })
@@ -603,13 +640,13 @@ fn try_compile_sql_expr(bind_var: &str, expr: &Expr) -> Option<()> {
         ExprKind::UnaryOp {
             op: UnaryOp::Not,
             operand,
-        } => try_compile_sql_expr(bind_var, operand),
+        } => try_compile_sql_expr(bind_var, operand, schema),
         // `not expr` function application → NOT (...)
         // `contains needle haystack` → INSTR(haystack, needle) > 0
         ExprKind::App { func, arg } => {
             if let ExprKind::Var(name) = &func.node {
                 if name == "not" {
-                    return try_compile_sql_expr(bind_var, arg);
+                    return try_compile_sql_expr(bind_var, arg, schema);
                 }
             }
             if let ExprKind::App { func: inner_func, arg: first_arg } = &func.node {
@@ -694,18 +731,31 @@ fn try_sql_atom(bind_var: &str, expr: &Expr) -> Option<()> {
         }
         ExprKind::BinOp { op, lhs, rhs } => {
             match op {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Concat => {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Concat => {
+                    try_sql_atom(bind_var, lhs)?;
+                    try_sql_atom(bind_var, rhs)
+                }
+                // Mirror codegen: `/`/`%` only push down with a provably
+                // nonzero literal divisor (SQLite NULLs on division by zero
+                // while the runtime panics); `%` must be integer-typed.
+                BinOp::Div if divisor_is_nonzero_literal(rhs) => {
+                    try_sql_atom(bind_var, lhs)?;
+                    try_sql_atom(bind_var, rhs)
+                }
+                BinOp::Mod if divisor_is_nonzero_int_literal(rhs) => {
                     try_sql_atom(bind_var, lhs)?;
                     try_sql_atom(bind_var, rhs)
                 }
                 _ => None,
             }
         }
-        // Built-in functions: length, toUpper, toLower, trim
+        // Built-in functions: length, trim (toUpper/toLower are NOT pushed
+        // down — SQLite UPPER/LOWER are ASCII-only, the runtime is
+        // Unicode-aware)
         ExprKind::App { func, arg } => {
             if let ExprKind::Var(name) = &func.node {
                 match name.as_str() {
-                    "length" | "toUpper" | "toLower" | "trim" => {
+                    "length" | "trim" => {
                         try_sql_atom(bind_var, arg)
                     }
                     _ => None,
@@ -724,31 +774,35 @@ fn try_sql_atom(bind_var: &str, expr: &Expr) -> Option<()> {
     }
 }
 
-/// Check if an expression references a given variable.
-fn expr_refs_var(expr: &Expr, var: &str) -> bool {
+/// Mirror of codegen's `cast_arithmetic_for_where` applicability: an atom
+/// would receive the KNOT_INT text-cast when it compiles to a parenthesized
+/// arithmetic expression or a LENGTH() call.
+fn atom_would_need_cast(expr: &Expr) -> bool {
     match &expr.node {
-        ExprKind::Var(name) => name == var,
-        ExprKind::FieldAccess { expr: inner, .. } => expr_refs_var(inner, var),
-        ExprKind::BinOp { lhs, rhs, .. } => {
-            expr_refs_var(lhs, var) || expr_refs_var(rhs, var)
-        }
-        ExprKind::UnaryOp { operand, .. } => expr_refs_var(operand, var),
-        ExprKind::App { func, arg } => {
-            expr_refs_var(func, var) || expr_refs_var(arg, var)
-        }
-        ExprKind::If { cond, then_branch, else_branch } => {
-            expr_refs_var(cond, var)
-                || expr_refs_var(then_branch, var)
-                || expr_refs_var(else_branch, var)
-        }
-        ExprKind::Lambda { body, .. } => expr_refs_var(body, var),
-        ExprKind::Record(fields) => fields.iter().any(|f| expr_refs_var(&f.value, var)),
-        ExprKind::RecordUpdate { base, fields } => {
-            expr_refs_var(base, var) || fields.iter().any(|f| expr_refs_var(&f.value, var))
+        ExprKind::BinOp {
+            op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Concat,
+            ..
+        } => true,
+        ExprKind::App { func, .. } => {
+            matches!(&func.node, ExprKind::Var(name) if name == "length")
         }
         _ => false,
     }
 }
+
+/// Look up a column's schema type (schema format: "name:text,age:int").
+fn lookup_col_type(schema: &str, col_name: &str) -> Option<String> {
+    for part in schema.split(',') {
+        let (name, ty) = part.split_once(':')?;
+        if name == col_name {
+            return Some(ty.to_string());
+        }
+    }
+    None
+}
+
+// `expr_refs_var` is shared with codegen (crate::codegen::expr_refs_var) so
+// the lint can never diverge from the compiler's actual pushdown behavior.
 
 // ── Pattern matchers (mirror codegen.rs) ───────────────────────────
 
@@ -1090,7 +1144,17 @@ fn try_sql_column_expr(bind_var: &str, body: &Expr) -> Option<()> {
         },
         ExprKind::BinOp { op, lhs, rhs } => {
             match op {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Concat => {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Concat => {
+                    try_sql_column_expr(bind_var, lhs)?;
+                    try_sql_column_expr(bind_var, rhs)
+                }
+                // Mirror codegen: `/`/`%` only push down with a provably
+                // nonzero literal divisor; `%` must be integer-typed.
+                BinOp::Div if divisor_is_nonzero_literal(rhs) => {
+                    try_sql_column_expr(bind_var, lhs)?;
+                    try_sql_column_expr(bind_var, rhs)
+                }
+                BinOp::Mod if divisor_is_nonzero_int_literal(rhs) => {
                     try_sql_column_expr(bind_var, lhs)?;
                     try_sql_column_expr(bind_var, rhs)
                 }
@@ -1102,10 +1166,11 @@ fn try_sql_column_expr(bind_var: &str, body: &Expr) -> Option<()> {
             try_sql_column_expr(bind_var, then_branch)?;
             try_sql_column_expr(bind_var, else_branch)
         }
+        // toUpper/toLower are NOT pushed down (ASCII-only in SQLite).
         ExprKind::App { func, arg } => {
             if let ExprKind::Var(name) = &func.node {
                 match name.as_str() {
-                    "length" | "toUpper" | "toLower" | "trim" => {
+                    "length" | "trim" => {
                         try_sql_column_expr(bind_var, arg)
                     }
                     _ => None,
@@ -1116,6 +1181,46 @@ fn try_sql_column_expr(bind_var: &str, body: &Expr) -> Option<()> {
         }
         _ => None,
     }
+}
+
+/// Mirror of codegen's `pipe_ops_order_pushable`: stages must be
+/// non-decreasing (filter=1, sortBy=2, map=3, drop=4, take=5, aggregate=6),
+/// at most one sortBy, and no aggregate after take/drop.
+fn lint_pipe_order_pushable(ops: &[LintPipeOp]) -> bool {
+    fn stage(op: &LintPipeOp) -> u8 {
+        match op {
+            LintPipeOp::Filter { .. } => 1,
+            LintPipeOp::SortBy { .. } => 2,
+            LintPipeOp::Map { .. } => 3,
+            LintPipeOp::Drop { .. } => 4,
+            LintPipeOp::Take { .. } => 5,
+            LintPipeOp::Count { .. }
+            | LintPipeOp::CountWhere { .. }
+            | LintPipeOp::Sum { .. }
+            | LintPipeOp::Avg { .. }
+            | LintPipeOp::Min { .. }
+            | LintPipeOp::Max { .. } => 6,
+        }
+    }
+    let mut last_stage = 0u8;
+    let mut sort_seen = false;
+    for op in ops {
+        let st = stage(op);
+        if st < last_stage {
+            return false;
+        }
+        if matches!(op, LintPipeOp::SortBy { .. }) {
+            if sort_seen {
+                return false;
+            }
+            sort_seen = true;
+        }
+        if st == 6 && last_stage >= 4 {
+            return false;
+        }
+        last_stage = st;
+    }
+    true
 }
 
 /// Check if a condition can be compiled to an inline SQL condition (for CASE WHEN).
@@ -1371,8 +1476,10 @@ mod tests {
     }
 
     #[test]
-    fn no_lint_on_toupper_in_where() {
-        // toUpper compiles to SQL UPPER().
+    fn lint_on_toupper_in_where() {
+        // toUpper is NOT pushed down to SQL UPPER(): SQLite UPPER is
+        // ASCII-only while the runtime does Unicode case mapping, so the
+        // where clause is evaluated at runtime (and the lint reports it).
         let diags = lint(
             "type T = {name: Text, age: Int}\n\
              *people : [T]\n\
@@ -1381,7 +1488,8 @@ mod tests {
                where toUpper p.name == \"ALICE\"\n\
                yield p\n",
         );
-        assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
+        assert_eq!(diags.len(), 1, "expected runtime-fallback diagnostic, got: {:?}", diags);
+        assert!(diags[0].message.contains("runtime"));
     }
 
     #[test]

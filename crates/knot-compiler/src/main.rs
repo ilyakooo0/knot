@@ -175,6 +175,29 @@ fn cmd_fmt(args: &[String]) {
     }
 }
 
+/// Compare two paths for filesystem identity. Nonexistent paths are
+/// normalized against their (canonicalized) parent directory so that
+/// e.g. `./prog` and `prog` compare equal even before `prog`'s output
+/// twin exists.
+fn same_file_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    fn normalize(p: &std::path::Path) -> PathBuf {
+        if let Ok(c) = p.canonicalize() {
+            return c;
+        }
+        let parent = p
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map(|d| d.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let parent = parent.canonicalize().unwrap_or(parent);
+        match p.file_name() {
+            Some(name) => parent.join(name),
+            None => parent,
+        }
+    }
+    normalize(a) == normalize(b)
+}
+
 fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overrides: &HashMap<String, String>) {
     let source_path = PathBuf::from(source_file);
 
@@ -183,6 +206,43 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
         eprintln!("Error reading {}: {}", source_path.display(), e);
         process::exit(1);
     });
+
+    // Determine the output path up front so we can refuse to overwrite the
+    // source file (e.g. `knot build prog` on an extensionless source would
+    // otherwise silently replace `prog` with the linked binary).
+    let output_path: PathBuf = match output_override {
+        Some(p) => {
+            if same_file_path(p, &source_path) {
+                eprintln!(
+                    "Error: output path '{}' is the same as the source file; pass a different path to -o",
+                    p.display()
+                );
+                process::exit(1);
+            }
+            p.to_path_buf()
+        }
+        None => {
+            let default = source_path.with_extension("");
+            if same_file_path(&default, &source_path) {
+                // Extensionless source: emit `<name>.out` instead of clobbering it.
+                source_path.with_extension("out")
+            } else {
+                default
+            }
+        }
+    };
+
+    // Pick an intermediate object path that collides with neither the source
+    // (e.g. a source named `foo.o`) nor the output executable.
+    let obj_path: PathBuf = {
+        let mut candidate = source_path.with_extension("o");
+        let mut n = 0u32;
+        while same_file_path(&candidate, &source_path) || same_file_path(&candidate, &output_path) {
+            n += 1;
+            candidate = source_path.with_extension(format!("knot{}.o", n));
+        }
+        candidate
+    };
 
     // Lex
     let lexer = knot::lexer::Lexer::new(&source);
@@ -215,12 +275,15 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     let original_decls = module.decls.clone();
 
     // Resolve imports — load, parse, and merge imported modules
-    if let Err(diags) = modules::resolve_imports(&mut module, &source_path) {
-        for diag in &diags {
-            eprintln!("{}", diag);
+    let imported_type_snippets = match modules::resolve_imports(&mut module, &source_path) {
+        Ok(snippets) => snippets,
+        Err(diags) => {
+            for diag in &diags {
+                eprintln!("{}", diag);
+            }
+            process::exit(1);
         }
-        process::exit(1);
-    }
+    };
 
     // Inject built-in trait declarations and primitive impls
     base::inject_prelude(&mut module);
@@ -305,8 +368,7 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
         }
     };
 
-    // Write object file
-    let obj_path = source_path.with_extension("o");
+    // Write object file (path chosen above so it never clobbers the source)
     std::fs::write(&obj_path, &obj_bytes).unwrap_or_else(|e| {
         eprintln!("Error writing object file: {}", e);
         process::exit(1);
@@ -315,10 +377,7 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     // Find runtime
     let runtime_path = find_runtime();
 
-    // Link
-    let output_path = output_override
-        .map(PathBuf::from)
-        .unwrap_or_else(|| source_path.with_extension(""));
+    // Link (output path computed and collision-checked above)
     if let Err(e) = linker::link(&obj_path, &runtime_path, &output_path) {
         eprintln!("Link error: {}", e);
         let _ = std::fs::remove_file(&obj_path);
@@ -343,7 +402,7 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
         imports: vec![],
         decls: original_decls,
     };
-    if let Err(e) = lockfile::update(&source_path, &source, &lockfile_module) {
+    if let Err(e) = lockfile::update(&source_path, &source, &lockfile_module, &imported_type_snippets) {
         eprintln!("Warning: {}", e);
     }
 

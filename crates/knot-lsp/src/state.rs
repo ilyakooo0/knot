@@ -41,6 +41,11 @@ pub struct InferenceSnapshot {
     pub refine_targets: HashMap<Span, String>,
     pub source_refinements: HashMap<String, Vec<(Option<String>, String, ast::Expr)>>,
     pub monad_info: HashMap<Span, MonadKind>,
+    /// Per-binding unit annotations derived from `local_type_info`. Stored on
+    /// the snapshot so cache hits don't silently drop unit tooltips/inlay
+    /// hints (the cache-hit path skips the fresh-inference pass that would
+    /// otherwise repopulate this map).
+    pub unit_info: HashMap<Span, String>,
     /// Per-decl AST hash + dependency graph for the snapshot's source.
     /// When a fresh edit produces a structurally-equal fingerprint
     /// (whitespace/comment-only changes), the snapshot can be reused even
@@ -313,6 +318,16 @@ pub struct ServerState {
     /// the next analysis run will see. Subsequent didChange edits stack on top
     /// of this rather than the (stale) analyzed source.
     pub pending_sources: HashMap<Uri, PendingSource>,
+    /// Analysis tasks dropped because the bounded task channel was full.
+    /// Without a retry, the dropped URI stays permanently stale: its
+    /// `pending_sources` entry never matches any in-flight result (the
+    /// `pending.source != result.doc.source` guard discards older results),
+    /// so diagnostics/hover freeze until the next edit. Entries are
+    /// re-queued opportunistically after each completed analysis (the worker
+    /// has drained at least one slot by then). Stores the dropped task's
+    /// source + version as a fallback; the retry prefers the freshest
+    /// `pending_sources` text when available.
+    pub dropped_analysis_retry: HashMap<Uri, (String, Option<i32>)>,
     /// Sender side of the analysis-task channel. Cloned per outgoing task.
     pub analysis_tx: Sender<AnalysisTask>,
     /// Reverse-import graph: importer → set of imported files. Built from the

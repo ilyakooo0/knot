@@ -132,18 +132,64 @@ fn expr_contains_io(expr: &Expr, builtins: &HashSet<&str>, io_fns: &HashSet<Stri
 fn desugar_routes(module: &mut Module) {
     let mut new_decls: Vec<Decl> = Vec::new();
 
-    // Collect route entries by name for RouteComposite lookup
-    let route_map: std::collections::HashMap<&str, &Vec<RouteEntry>> = module
-        .decls
-        .iter()
-        .filter_map(|d| {
-            if let DeclKind::Route { name, entries } = &d.node {
-                Some((name.as_str(), entries))
-            } else {
-                None
+    // Resolve route entries by name. Plain `route ... where` declarations are
+    // known immediately; composites (`route All = A | B`) resolve to the
+    // concatenation of their components' entries. Composites may reference
+    // other composites in any declaration order, so iterate to a fixpoint
+    // instead of doing a single pass over plain routes only.
+    let mut resolved: std::collections::HashMap<String, Vec<RouteEntry>> =
+        std::collections::HashMap::new();
+    let mut pending: Vec<(String, Vec<Name>)> = Vec::new();
+    for d in &module.decls {
+        match &d.node {
+            DeclKind::Route { name, entries } => {
+                resolved.insert(name.clone(), entries.clone());
             }
-        })
-        .collect();
+            DeclKind::RouteComposite { name, components } => {
+                pending.push((name.clone(), components.clone()));
+            }
+            _ => {}
+        }
+    }
+    let composite_names: HashSet<String> = pending.iter().map(|(n, _)| n.clone()).collect();
+    // First, resolve composites in dependency order. A component name that is
+    // neither a route nor a composite resolves to nothing here; desugar has no
+    // diagnostics channel, so type inference reports unknown components.
+    loop {
+        let mut progressed = false;
+        pending.retain(|(name, components)| {
+            let blocked = components
+                .iter()
+                .any(|c| composite_names.contains(c) && !resolved.contains_key(c));
+            if blocked {
+                return true;
+            }
+            let mut all_entries: Vec<RouteEntry> = Vec::new();
+            for comp in components {
+                if let Some(entries) = resolved.get(comp) {
+                    all_entries.extend(entries.iter().cloned());
+                }
+            }
+            resolved.insert(name.clone(), all_entries);
+            progressed = true;
+            false
+        });
+        if pending.is_empty() || !progressed {
+            break;
+        }
+    }
+    // Anything still pending is part of a reference cycle — resolve it with
+    // whatever entries are available so every composite has a (possibly
+    // partial) entry set; inference reports the underlying error.
+    for (name, components) in &pending {
+        let mut all_entries: Vec<RouteEntry> = Vec::new();
+        for comp in components {
+            if let Some(entries) = resolved.get(comp) {
+                all_entries.extend(entries.iter().cloned());
+            }
+        }
+        resolved.insert(name.clone(), all_entries);
+    }
 
     for decl in &module.decls {
         match &decl.node {
@@ -160,13 +206,8 @@ fn desugar_routes(module: &mut Module) {
                     exported: decl.exported,
                 });
             }
-            DeclKind::RouteComposite { name, components } => {
-                let mut all_entries = Vec::new();
-                for comp in components {
-                    if let Some(entries) = route_map.get(comp.as_str()) {
-                        all_entries.extend(entries.iter().cloned());
-                    }
-                }
+            DeclKind::RouteComposite { name, .. } => {
+                let all_entries = resolved.get(name).cloned().unwrap_or_default();
                 let ctors = route_entries_to_constructors(&all_entries);
                 new_decls.push(Decl {
                     node: DeclKind::Data {

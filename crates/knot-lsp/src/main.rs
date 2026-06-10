@@ -283,6 +283,7 @@ fn main() {
         workspace_diag_clock: 0,
         workspace_symbol_cache: Arc::new(Mutex::new(WorkspaceSymbolCache::default())),
         pending_sources: HashMap::new(),
+        dropped_analysis_retry: HashMap::new(),
         analysis_tx,
         reverse_imports: HashMap::new(),
         inference_cache,
@@ -743,6 +744,10 @@ fn apply_analysis_result(state: &mut ServerState, conn: &Connection, result: Ana
         // visible in the gutter until the user triggers another pull.
         request_workspace_diagnostic_refresh(state, conn);
     }
+
+    // The worker just drained (at least) one task — re-queue anything that
+    // was dropped on channel overflow so no file stays permanently stale.
+    retry_dropped_analysis(state);
 }
 
 /// Re-queue analysis for open documents whose imports reference any of the
@@ -1471,27 +1476,61 @@ fn shift_byte_ranges_for_edit(
 /// (`ANALYSIS_QUEUE_CAPACITY`); we use `try_send` so a runaway client can't
 /// block the main event loop on a full queue. Two distinct failure modes:
 ///
-/// - `Full`: the worker is behind. Drop the task with a one-line warning.
-///   The worker coalesces by URI internally, so a fresher copy of this
-///   file's source will follow shortly via the next didChange (or, in the
-///   worst case, the user's next keystroke); silently dropping an
-///   already-stale snapshot is the right call.
+/// - `Full`: the worker is behind. The task is parked in
+///   `dropped_analysis_retry` and re-queued after the next analysis
+///   completes (the worker has freed at least one slot by then). Without
+///   the retry, the file stayed permanently stale: `pending_sources` keeps
+///   the new text, so any older in-flight result for the URI is discarded
+///   by the `pending.source != result.doc.source` guard and diagnostics/
+///   hover freeze until the next edit.
 /// - `Disconnected`: the worker thread has died. Other features still work
 ///   against the last good analysis, so log and continue rather than crash.
-fn queue_analysis(state: &ServerState, uri: Uri, source: String, version: Option<i32>) {
+fn queue_analysis(state: &mut ServerState, uri: Uri, source: String, version: Option<i32>) {
     use crossbeam_channel::TrySendError;
+    // Anything parked from an earlier overflow is superseded by the fresher
+    // task we're about to enqueue (and re-parked below if this one is
+    // dropped too).
+    state.dropped_analysis_retry.remove(&uri);
     match state.analysis_tx.try_send(AnalysisTask { uri, source, version }) {
         Ok(()) => {}
         Err(TrySendError::Full(task)) => {
             eprintln!(
-                "knot-lsp: analysis queue full ({} tasks); dropping task for `{}`",
+                "knot-lsp: analysis queue full ({} tasks); will re-queue `{}` after the next analysis completes",
                 state::ANALYSIS_QUEUE_CAPACITY,
                 task.uri.as_str()
+            );
+            state
+                .dropped_analysis_retry
+                .insert(task.uri, (task.source, task.version));
+            crate::state::enforce_uri_cache_cap(
+                &mut state.dropped_analysis_retry,
+                &state.documents,
+                crate::state::MAX_PENDING_SOURCES,
             );
         }
         Err(TrySendError::Disconnected(_)) => {
             eprintln!("knot-lsp: analysis worker channel closed");
         }
+    }
+}
+
+/// Re-queue analysis tasks that were dropped on channel overflow. Called
+/// after each completed analysis (the worker has drained at least one slot,
+/// so there's room again). Prefers the freshest `pending_sources` text over
+/// the snapshot captured at drop time. If the queue fills again mid-drain,
+/// the remaining entries are parked back for the next completion.
+fn retry_dropped_analysis(state: &mut ServerState) {
+    if state.dropped_analysis_retry.is_empty() {
+        return;
+    }
+    let entries: Vec<(Uri, (String, Option<i32>))> =
+        state.dropped_analysis_retry.drain().collect();
+    for (uri, (source, version)) in entries {
+        let (src, ver) = match state.pending_sources.get(&uri) {
+            Some(p) => (p.source.clone(), p.version),
+            None => (source, version),
+        };
+        queue_analysis(state, uri, src, ver);
     }
 }
 
@@ -1613,6 +1652,7 @@ mod tests {
             workspace_diag_clock: 0,
             workspace_symbol_cache: Arc::new(Mutex::new(WorkspaceSymbolCache::default())),
             pending_sources: HashMap::new(),
+            dropped_analysis_retry: HashMap::new(),
             analysis_tx,
             reverse_imports: HashMap::new(),
             inference_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -1623,6 +1663,75 @@ mod tests {
             diagnostic_refresh_counter: 0,
             workspace_diag_reported: HashSet::new(),
         }
+    }
+
+    /// Regression: a task dropped on analysis-queue overflow was never
+    /// retried, leaving the file permanently stale (`pending_sources` kept
+    /// the new text, so any older in-flight result for that URI was
+    /// discarded by the `pending.source != result.doc.source` guard).
+    /// The dropped task must be parked and re-queued once the queue drains.
+    #[test]
+    fn dropped_analysis_task_is_requeued_after_drain() {
+        let mut state = make_state();
+        // Replace the throwaway unbounded channel with a 1-slot bounded one
+        // so we can force the overflow path deterministically.
+        let (tx, rx) = crossbeam_channel::bounded::<AnalysisTask>(1);
+        state.analysis_tx = tx;
+
+        let uri_a: Uri = Uri::from_str("file:///test/a.knot").unwrap();
+        let uri_b: Uri = Uri::from_str("file:///test/b.knot").unwrap();
+        queue_analysis(&mut state, uri_a.clone(), "a = 1".into(), Some(1));
+        queue_analysis(&mut state, uri_b.clone(), "b = 2".into(), Some(1));
+        assert!(
+            state.dropped_analysis_retry.contains_key(&uri_b),
+            "overflowed task must be parked for retry"
+        );
+
+        // Newer text arrives for the dropped URI while it waits.
+        state.pending_sources.insert(
+            uri_b.clone(),
+            PendingSource {
+                source: "b = 3".into(),
+                version: Some(2),
+            },
+        );
+
+        // The worker drains a slot; the retry hook re-queues the parked task
+        // with the freshest pending text.
+        let first = rx.recv().expect("first task queued");
+        assert_eq!(first.uri, uri_a);
+        retry_dropped_analysis(&mut state);
+        assert!(
+            state.dropped_analysis_retry.is_empty(),
+            "retry must clear the parked set"
+        );
+        let retried = rx.try_recv().expect("dropped task re-queued");
+        assert_eq!(retried.uri, uri_b);
+        assert_eq!(
+            retried.source, "b = 3",
+            "retry must prefer the freshest pending source"
+        );
+        assert_eq!(retried.version, Some(2));
+    }
+
+    /// If the queue is still full when the retry fires, the task must be
+    /// parked again instead of silently lost.
+    #[test]
+    fn retry_reparks_task_when_queue_still_full() {
+        let mut state = make_state();
+        let (tx, _rx_keepalive) = crossbeam_channel::bounded::<AnalysisTask>(1);
+        state.analysis_tx = tx;
+        let uri_a: Uri = Uri::from_str("file:///test/a.knot").unwrap();
+        let uri_b: Uri = Uri::from_str("file:///test/b.knot").unwrap();
+        queue_analysis(&mut state, uri_a, "a = 1".into(), Some(1));
+        queue_analysis(&mut state, uri_b.clone(), "b = 2".into(), Some(1));
+        assert!(state.dropped_analysis_retry.contains_key(&uri_b));
+        // Nothing drained — the retry should re-park rather than drop.
+        retry_dropped_analysis(&mut state);
+        assert!(
+            state.dropped_analysis_retry.contains_key(&uri_b),
+            "task must survive a failed retry attempt"
+        );
     }
 
     /// Drain all queued publishDiagnostics notifications from the client side

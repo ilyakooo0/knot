@@ -795,17 +795,160 @@ pub(crate) fn find_enclosing_atomic_expr(
 
 // ── Hover-only helpers used by completion-resolve too ───────────────
 
-/// Render a predicate expression as its source text. Falls back to a placeholder
-/// when the span is empty or out of bounds (defensive: predicates always have
-/// real spans, but the LSP is also fed by the import cache, which can outlive
-/// edits to the source).
+/// Render a predicate expression as its source text.
+///
+/// Caution: refined types can be *imported* — inference runs on the
+/// post-import-inlining module, so the predicate's spans may index into the
+/// imported file's bytes, not the current document's. Blindly slicing
+/// `source` then displays arbitrary text from the wrong file. We only trust
+/// the slice when it plausibly is the predicate (refinement predicates are
+/// always lambdas, so the text must start with `\`); otherwise we fall back
+/// to pretty-printing the AST, which is always correct.
 pub(crate) fn predicate_to_source(expr: &ast::Expr, source: &str) -> String {
     let span = expr.span;
     if span.start < span.end && span.end <= source.len() {
-        source[span.start..span.end].to_string()
-    } else {
-        "<predicate>".to_string()
+        if let Some(text) = source.get(span.start..span.end) {
+            if slice_matches_predicate(text, expr) {
+                return text.to_string();
+            }
+        }
     }
+    render_predicate_expr(expr)
+}
+
+/// Sanity-check that a source slice plausibly *is* the given predicate
+/// expression: it must start with the lambda's `\` and the first parameter
+/// token must follow. A span pointing into the wrong file's bytes virtually
+/// never passes both checks.
+fn slice_matches_predicate(text: &str, expr: &ast::Expr) -> bool {
+    let ast::ExprKind::Lambda { params, .. } = &expr.node else {
+        return false;
+    };
+    let trimmed = text.trim_start();
+    let Some(rest) = trimmed.strip_prefix('\\') else {
+        return false;
+    };
+    match params.first().map(|p| &p.node) {
+        Some(ast::PatKind::Var(n)) => rest.trim_start().starts_with(n.as_str()),
+        Some(ast::PatKind::Wildcard) => rest.trim_start().starts_with('_'),
+        Some(ast::PatKind::Record(_)) => rest.trim_start().starts_with('{'),
+        _ => true,
+    }
+}
+
+/// Minimal AST pretty-printer for refinement predicates. Covers the shapes
+/// predicates actually take (lambdas over comparisons, field accesses,
+/// arithmetic, boolean connectives); anything more exotic degrades to a
+/// `<predicate>` placeholder rather than arbitrary text.
+fn render_predicate_expr(expr: &ast::Expr) -> String {
+    fn pat(p: &ast::Pat) -> String {
+        match &p.node {
+            ast::PatKind::Var(n) => n.clone(),
+            ast::PatKind::Wildcard => "_".to_string(),
+            ast::PatKind::Record(fields) => {
+                let inner: Vec<String> = fields
+                    .iter()
+                    .map(|f| match &f.pattern {
+                        Some(inner) => format!("{}: {}", f.name, pat(inner)),
+                        None => f.name.clone(),
+                    })
+                    .collect();
+                format!("{{{}}}", inner.join(", "))
+            }
+            ast::PatKind::Constructor { name, payload } => {
+                format!("{name} {}", pat(payload))
+            }
+            _ => "_".to_string(),
+        }
+    }
+    fn bin_op(op: ast::BinOp) -> &'static str {
+        match op {
+            ast::BinOp::Add => "+",
+            ast::BinOp::Sub => "-",
+            ast::BinOp::Mul => "*",
+            ast::BinOp::Div => "/",
+            ast::BinOp::Mod => "%",
+            ast::BinOp::Eq => "==",
+            ast::BinOp::Neq => "!=",
+            ast::BinOp::Lt => "<",
+            ast::BinOp::Gt => ">",
+            ast::BinOp::Le => "<=",
+            ast::BinOp::Ge => ">=",
+            ast::BinOp::And => "&&",
+            ast::BinOp::Or => "||",
+            ast::BinOp::Concat => "++",
+            ast::BinOp::Pipe => "|>",
+        }
+    }
+    /// Render `expr`; `nested` adds parens around compound results so the
+    /// output stays readable without a precedence table.
+    fn go(expr: &ast::Expr, nested: bool) -> Option<String> {
+        let s = match &expr.node {
+            ast::ExprKind::Lit(lit) => match lit {
+                ast::Literal::Int(s) => s.clone(),
+                ast::Literal::Float(f) => format!("{f}"),
+                ast::Literal::Text(t) => format!("{t:?}"),
+                ast::Literal::Bool(b) => b.to_string(),
+                ast::Literal::Bytes(_) => return None,
+            },
+            ast::ExprKind::Var(n) | ast::ExprKind::Constructor(n) => n.clone(),
+            ast::ExprKind::SourceRef(n) => format!("*{n}"),
+            ast::ExprKind::DerivedRef(n) => format!("&{n}"),
+            ast::ExprKind::FieldAccess { expr: recv, field } => {
+                format!("{}.{field}", go(recv, true)?)
+            }
+            ast::ExprKind::Lambda { params, body } => {
+                let ps: Vec<String> = params.iter().map(pat).collect();
+                let rendered = format!("\\{} -> {}", ps.join(" "), go(body, false)?);
+                return Some(if nested {
+                    format!("({rendered})")
+                } else {
+                    rendered
+                });
+            }
+            ast::ExprKind::App { func, arg } => {
+                let rendered = format!("{} {}", go(func, true)?, go(arg, true)?);
+                return Some(if nested {
+                    format!("({rendered})")
+                } else {
+                    rendered
+                });
+            }
+            ast::ExprKind::BinOp { op, lhs, rhs } => {
+                let rendered =
+                    format!("{} {} {}", go(lhs, true)?, bin_op(*op), go(rhs, true)?);
+                return Some(if nested {
+                    format!("({rendered})")
+                } else {
+                    rendered
+                });
+            }
+            ast::ExprKind::UnaryOp { op, operand } => match op {
+                ast::UnaryOp::Neg => format!("-{}", go(operand, true)?),
+                ast::UnaryOp::Not => format!("not {}", go(operand, true)?),
+            },
+            ast::ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                let rendered = format!(
+                    "if {} then {} else {}",
+                    go(cond, false)?,
+                    go(then_branch, false)?,
+                    go(else_branch, false)?
+                );
+                return Some(if nested {
+                    format!("({rendered})")
+                } else {
+                    rendered
+                });
+            }
+            _ => return None,
+        };
+        Some(s)
+    }
+    go(expr, false).unwrap_or_else(|| "<predicate>".to_string())
 }
 
 /// Find a route entry by its constructor name and render a hover summary
@@ -1315,3 +1458,81 @@ fn type_mentions_var(ty: &ast::Type, var: &str) -> bool {
     }
 }
 
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse a module declaring a refined type alias and pull out the
+    /// predicate expression.
+    fn parse_refined_predicate(source: &str) -> ast::Expr {
+        let (tokens, lex_diags) = knot::lexer::Lexer::new(source).tokenize();
+        assert!(lex_diags.is_empty(), "lex errors: {lex_diags:?}");
+        let parser = knot::parser::Parser::new(source.to_string(), tokens);
+        let (module, parse_diags) = parser.parse_module();
+        assert!(parse_diags.is_empty(), "parse errors: {parse_diags:?}");
+        for decl in &module.decls {
+            if let DeclKind::TypeAlias { ty, .. } = &decl.node {
+                if let ast::TypeKind::Refined { predicate, .. } = &ty.node {
+                    return (**predicate).clone();
+                }
+            }
+        }
+        panic!("no refined type alias found in: {source}");
+    }
+
+    #[test]
+    fn predicate_to_source_slices_matching_source() {
+        let source = "type Nat = Int where \\x -> x >= 0\n";
+        let pred = parse_refined_predicate(source);
+        let rendered = predicate_to_source(&pred, source);
+        assert_eq!(rendered, "\\x -> x >= 0");
+    }
+
+    /// Regression: refined types imported from another file carry spans that
+    /// index into the IMPORTED file's bytes. Slicing the current document at
+    /// those offsets displayed arbitrary text. The renderer must detect the
+    /// mismatch and pretty-print the AST instead.
+    #[test]
+    fn predicate_to_source_does_not_slice_foreign_source() {
+        let owner_source = "type Nat = Int where \\x -> x >= 0\n";
+        let pred = parse_refined_predicate(owner_source);
+        // A "current document" whose bytes have nothing to do with the
+        // predicate's spans, but is long enough that the slice is in range.
+        let foreign = "main = doSomethingElse 1 2 3 -- entirely unrelated content\n";
+        assert!(pred.span.end <= foreign.len(), "test setup: span in range");
+        let rendered = predicate_to_source(&pred, foreign);
+        assert_eq!(
+            rendered, "\\x -> x >= 0",
+            "must pretty-print the AST, never display unrelated file text"
+        );
+    }
+
+    /// When the span is out of range entirely, the renderer still produces
+    /// the predicate (or a placeholder) — never panics, never garbage.
+    #[test]
+    fn predicate_to_source_handles_out_of_range_span() {
+        let owner_source = "type Nat = Int where \\x -> x >= 0\n";
+        let pred = parse_refined_predicate(owner_source);
+        let rendered = predicate_to_source(&pred, "");
+        assert_eq!(rendered, "\\x -> x >= 0");
+    }
+
+    /// A foreign slice that happens to start with a lambda must still be
+    /// rejected when the parameter doesn't match the predicate's.
+    #[test]
+    fn predicate_to_source_rejects_lookalike_lambda_slice() {
+        let owner_source = "type Nat = Int where \\x -> x >= 0\n";
+        let pred = parse_refined_predicate(owner_source);
+        // Bytes at the predicate's span hold a *different* lambda.
+        let mut foreign = String::new();
+        while foreign.len() < pred.span.start {
+            foreign.push(' ');
+        }
+        foreign.push_str("\\other -> other < 99");
+        let rendered = predicate_to_source(&pred, &foreign);
+        assert_eq!(rendered, "\\x -> x >= 0");
+    }
+}

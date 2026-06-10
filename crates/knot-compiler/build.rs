@@ -4,13 +4,41 @@ fn is_valid_lib(p: &Path) -> bool {
     p.exists() && std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false)
 }
 
-/// Check that `lib` is at least as new as the runtime source file.
+/// Max mtime across all runtime source files: every `*.rs` under
+/// `crates/knot-runtime/src` (recursively — the crate has lib.rs, log.rs,
+/// tui.rs and may gain more) plus the runtime crate's Cargo.toml.
+fn runtime_src_mtime(workspace_root: &Path) -> Option<std::time::SystemTime> {
+    fn consider(p: &Path, newest: &mut Option<std::time::SystemTime>) {
+        if let Ok(m) = std::fs::metadata(p).and_then(|m| m.modified()) {
+            if newest.map(|n| m > n).unwrap_or(true) {
+                *newest = Some(m);
+            }
+        }
+    }
+    fn walk(dir: &Path, newest: &mut Option<std::time::SystemTime>) {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    walk(&p, newest);
+                } else if p.extension().map(|e| e == "rs").unwrap_or(false) {
+                    consider(&p, newest);
+                }
+            }
+        }
+    }
+    let mut newest = None;
+    walk(&workspace_root.join("crates/knot-runtime/src"), &mut newest);
+    consider(&workspace_root.join("crates/knot-runtime/Cargo.toml"), &mut newest);
+    newest
+}
+
+/// Check that `lib` is at least as new as every runtime source file.
 fn is_fresh_lib(lib: &Path, workspace_root: &Path) -> bool {
     if !is_valid_lib(lib) {
         return false;
     }
-    let src = workspace_root.join("crates/knot-runtime/src/lib.rs");
-    let src_mtime = std::fs::metadata(&src).and_then(|m| m.modified()).ok();
+    let src_mtime = runtime_src_mtime(workspace_root);
     let lib_mtime = std::fs::metadata(lib).and_then(|m| m.modified()).ok();
     match (src_mtime, lib_mtime) {
         (Some(s), Some(l)) => l >= s,
@@ -66,7 +94,11 @@ fn main() {
     }
 
     println!("cargo:rustc-check-cfg=cfg(has_embedded_runtime)");
-    println!("cargo:rerun-if-changed=../knot-runtime/src/lib.rs");
+    // Watch the whole runtime source tree (cargo tracks directories
+    // recursively), not just lib.rs — log.rs/tui.rs edits must also
+    // refresh the embedded runtime.
+    println!("cargo:rerun-if-changed=../knot-runtime/src");
+    println!("cargo:rerun-if-changed=../knot-runtime/Cargo.toml");
 }
 
 fn try_build_runtime(workspace_root: &Path, out_path: &Path) -> Option<PathBuf> {

@@ -554,6 +554,58 @@ impl<'src> Lexer<'src> {
                             self.advance();
                             value.push('\0');
                         }
+                        Some(b'x') => {
+                            self.advance();
+                            // Hex escape: \xHH — mirrors the byte-string
+                            // lexer so control characters round-trip through
+                            // the formatter. The value is the Unicode code
+                            // point U+00HH (Latin-1 mapping).
+                            let h1 = self.peek().and_then(|b| (b as char).to_digit(16));
+                            if let Some(d1) = h1 {
+                                let first_hex_byte = self.bytes[self.pos];
+                                self.advance();
+                                let h2 = self.peek().and_then(|b| (b as char).to_digit(16));
+                                if let Some(d2) = h2 {
+                                    self.advance();
+                                    value.push(((d1 * 16 + d2) as u8) as char);
+                                } else {
+                                    let span = Span::new(self.pos - 3, self.pos);
+                                    self.diagnostics.push(
+                                        Diagnostic::error("invalid hex escape in string")
+                                            .label(span, "expected two hex digits after \\x"),
+                                    );
+                                    // Error recovery: emit the literal hex char
+                                    // (e.g. '5' for `\x5`) rather than the digit
+                                    // *value* so the recovered text resembles
+                                    // what the user typed.
+                                    value.push(first_hex_byte as char);
+                                }
+                            } else {
+                                let bad_end = if self.pos < self.source.len() {
+                                    self.pos + self.source[self.pos..].chars().next().map_or(1, |c| c.len_utf8())
+                                } else {
+                                    self.pos
+                                };
+                                let span = Span::new(self.pos - 2, bad_end);
+                                self.diagnostics.push(
+                                    Diagnostic::error("invalid hex escape in string")
+                                        .label(span, "expected two hex digits after \\x"),
+                                );
+                                // Error recovery: emit the bad character as a
+                                // literal so the string isn't silently
+                                // shortened — but never consume a closing `"`
+                                // or a line break; those must terminate the
+                                // string via the normal branches.
+                                match self.peek() {
+                                    Some(b'"') | Some(b'\n') | Some(b'\r') | None => {}
+                                    Some(_) => {
+                                        let ch = self.source[self.pos..].chars().next().unwrap();
+                                        self.pos += ch.len_utf8();
+                                        value.push(ch);
+                                    }
+                                }
+                            }
+                        }
                         Some(_) => {
                             let esc_start = self.pos - 1;
                             // Advance by one full UTF-8 character (not just one byte)
@@ -676,11 +728,18 @@ impl<'src> Lexer<'src> {
                                 // Error recovery: advance past the bad character
                                 // and emit it as a literal byte so the byte string
                                 // isn't silently shortened (consistent with other
-                                // escape error recovery paths).
-                                if self.pos < self.source.len() {
-                                    let b = self.source.as_bytes()[self.pos];
-                                    self.advance();
-                                    value.push(b);
+                                // escape error recovery paths) — but never consume
+                                // a closing `"` or a line break; those must
+                                // terminate the byte string via the normal
+                                // branches, otherwise one bad escape cascades
+                                // into a bogus "unterminated" diagnostic that
+                                // swallows the rest of the line.
+                                match self.peek() {
+                                    Some(b'"') | Some(b'\n') | Some(b'\r') | None => {}
+                                    Some(b) => {
+                                        self.advance();
+                                        value.push(b);
+                                    }
                                 }
                             }
                         }

@@ -2250,6 +2250,15 @@ thread_local! {
     /// Stack of saved tracking state for nested atomic blocks.
     /// Pushed before inner atomic's loop, popped/merged on inner commit.
     static STM_TRACKING_STACK: RefCell<Vec<StmTracking>> = RefCell::new(Vec::new());
+    /// Per-table flag recording whether the most recent `stm_track_read` for
+    /// that table freshly INSERTED an `All` filter (true) or was deduped
+    /// against a pre-existing broad read (false). Codegen always emits
+    /// `knot_stm_track_read(table)` immediately followed by
+    /// `knot_stm_track_read_pred(...)` for the same table; the pred call may
+    /// only downgrade the `All` it itself just created — removing an `All`
+    /// that belongs to an earlier whole-table read would incorrectly narrow
+    /// the transaction's dependency and lose wakeups.
+    static STM_FRESH_ALL: RefCell<HashMap<String, bool>> = RefCell::new(HashMap::new());
 }
 
 /// Save current STM read/write tracking onto a stack (for nested atomics).
@@ -2259,6 +2268,9 @@ thread_local! {
 pub extern "C" fn knot_stm_push() {
     let saved = STM_TRACK.with(|t| t.borrow().clone());
     STM_TRACKING_STACK.with(|stack| stack.borrow_mut().push(saved));
+    // Entering a nested atomic: any "fresh All" flags belong to the outer
+    // body's adjacent track_read/track_read_pred pairs and must not leak in.
+    STM_FRESH_ALL.with(|m| m.borrow_mut().clear());
 }
 
 /// Pop saved STM tracking from the stack and merge inner tracking into it.
@@ -2300,6 +2312,9 @@ pub extern "C" fn knot_stm_pop_merge() {
                 .or_insert(event);
         }
     });
+    // The merged filter set may now contain `All`s from the outer body; any
+    // inner-body freshness flags are no longer trustworthy.
+    STM_FRESH_ALL.with(|m| m.borrow_mut().clear());
 }
 
 /// Notify waiting `retry` callers that a specific relation has changed.
@@ -2398,33 +2413,74 @@ fn wake_matching_watchers(name: &str, event: &WriteEvent) {
             }
         }
     }
-    // 2) Indexed watchers — only meaningful for row-level events.
-    if let WriteEvent::Rows(rows) = event {
-        if !rows.is_empty() {
-            // EQ-indexed: lookup by (table, col, value-key). The index proves
-            // the equality predicate holds, so skip slot.matches re-check.
-            rows.each_col_val(|col, val| {
-                let key = (name.to_string(), col.to_string(), val.to_key());
-                if let Some(bucket) = EQ_WATCHERS.get(&key) {
+    // 2) Indexed watchers.
+    match event {
+        WriteEvent::Rows(rows) => {
+            if !rows.is_empty() {
+                // EQ-indexed: lookup by (table, col, value-key). The index proves
+                // the equality predicate holds, so skip slot.matches re-check.
+                rows.each_col_val(|col, val| {
+                    let key = (name.to_string(), col.to_string(), val.to_key());
+                    if let Some(bucket) = EQ_WATCHERS.get(&key) {
+                        for weak in bucket.iter() {
+                            if let Some(slot) = weak.upgrade() {
+                                slot.wake();
+                            }
+                        }
+                    }
+                });
+                // Range-indexed: BTreeMap probes per direction. Each direction's
+                // range query already enforces the threshold check, so we just
+                // wake the slots found in the matching key range.
+                rows.each_col_val(|col, val| {
+                    let key = (name.to_string(), col.to_string());
+                    if let Some(idx) = RANGE_WATCHERS.get(&key) {
+                        wake_range_index(&idx, val);
+                    }
+                });
+            }
+        }
+        WriteEvent::Bulk => {
+            // Bulk means "anything in this table may have changed" — slots
+            // that registered exclusively in the EQ/Range indices (they are
+            // NOT in TABLE_WATCHERS) must be woken conservatively too,
+            // otherwise full-replace writes never wake filtered watchers.
+            wake_all_indexed_watchers(name);
+        }
+    }
+    maybe_sweep_dead_watchers();
+}
+
+/// Conservatively wake every EQ- and Range-indexed watcher registered for
+/// `table`. Used for `WriteEvent::Bulk` events, which carry no row payload:
+/// any value may have changed, so every indexed predicate may now hold.
+/// Bulk events are emitted on full-replace paths (and various fallbacks),
+/// which are rare relative to row-level writes, so a full walk of the
+/// indices filtered by table name is acceptable here.
+fn wake_all_indexed_watchers(table: &str) {
+    for entry in EQ_WATCHERS.iter() {
+        if entry.key().0 == table {
+            for weak in entry.value().iter() {
+                if let Some(slot) = weak.upgrade() {
+                    slot.wake();
+                }
+            }
+        }
+    }
+    for entry in RANGE_WATCHERS.iter() {
+        if entry.key().0 == table {
+            let idx = entry.value();
+            for dir in [&idx.lt, &idx.le, &idx.gt, &idx.ge] {
+                for bucket in dir.values() {
                     for weak in bucket.iter() {
                         if let Some(slot) = weak.upgrade() {
                             slot.wake();
                         }
                     }
                 }
-            });
-            // Range-indexed: BTreeMap probes per direction. Each direction's
-            // range query already enforces the threshold check, so we just
-            // wake the slots found in the matching key range.
-            rows.each_col_val(|col, val| {
-                let key = (name.to_string(), col.to_string());
-                if let Some(idx) = RANGE_WATCHERS.get(&key) {
-                    wake_range_index(&idx, val);
-                }
-            });
+            }
         }
     }
-    maybe_sweep_dead_watchers();
 }
 
 /// Walk the range index for a single row value, waking every slot whose
@@ -2569,14 +2625,24 @@ pub extern "C" fn knot_stm_track_read_pred(
 
 fn stm_track_read(name: &str) {
     let (arc, ver) = table_version_arc_and_value(name);
-    STM_TRACK.with(|t| {
+    let fresh = STM_TRACK.with(|t| {
         let mut t = t.borrow_mut();
         t.reads.entry(name.to_string()).or_insert((arc, ver));
         let v = t.filters.entry(name.to_string()).or_default();
         // Avoid pushing duplicate `All` entries — they're idempotent
         if !v.iter().any(|f| matches!(f, ReadFilter::All)) {
             v.push(ReadFilter::All);
+            true
+        } else {
+            false
         }
+    });
+    // Record whether this call inserted a fresh `All` so an immediately
+    // following `stm_specialize_read_pred` knows whether the `All` is its
+    // own to downgrade (fresh) or belongs to an earlier whole-table read
+    // (deduped — must be left in place).
+    STM_FRESH_ALL.with(|m| {
+        m.borrow_mut().insert(name.to_string(), fresh);
     });
 }
 
@@ -2694,17 +2760,29 @@ fn parse_read_pred_spec(
     Some(out)
 }
 
-/// Replace the most-recent `All` filter for `name` with the given `Cols` filter.
-/// If no `All` is present to downgrade, append. Captures the table version
+/// Replace the most-recent `All` filter for `name` with the given `Cols`
+/// filter — but only if that `All` was freshly inserted by the immediately
+/// preceding `stm_track_read` for this table (per `STM_FRESH_ALL`). If the
+/// preceding track_read was deduped against a pre-existing broad read, that
+/// broad dependency is real (an earlier whole-table read) and must stay; the
+/// `Cols` filter is appended alongside it (harmless — filters OR together).
+/// If no `All` is present at all, append. Captures the table version
 /// idempotently so the read shows up in the read set.
 fn stm_specialize_read_pred(name: &str, preds: Vec<(Arc<str>, ColPred)>) {
+    // Consume the freshness flag so a second specialize for the same table
+    // (without an intervening track_read) can't remove anything.
+    let fresh = STM_FRESH_ALL
+        .with(|m| m.borrow_mut().insert(name.to_string(), false))
+        .unwrap_or(false);
     let (arc, ver) = table_version_arc_and_value(name);
     STM_TRACK.with(|t| {
         let mut t = t.borrow_mut();
         t.reads.entry(name.to_string()).or_insert((arc, ver));
         let v = t.filters.entry(name.to_string()).or_default();
-        if let Some(pos) = v.iter().rposition(|f| matches!(f, ReadFilter::All)) {
-            v.remove(pos);
+        if fresh {
+            if let Some(pos) = v.iter().rposition(|f| matches!(f, ReadFilter::All)) {
+                v.remove(pos);
+            }
         }
         v.push(ReadFilter::Cols(preds));
     });
@@ -5793,8 +5871,12 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
         }
         Value::Relation(rows) => {
             buf.push(8);
-            buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
-            // Sort serialized rows for order-independent comparison
+            // Hash as a canonical *set*: serialize each row, sort, and dedup
+            // before writing count + rows. `values_equal` compares relations
+            // with set semantics (duplicates ignored), so hash equality must
+            // match — including the row count, which is the deduped count.
+            // Rows may themselves be relations; the recursion canonicalizes
+            // them the same way before this level sorts/dedups.
             let mut row_bytes: Vec<Vec<u8>> = rows
                 .iter()
                 .map(|r| {
@@ -5804,6 +5886,8 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
                 })
                 .collect();
             row_bytes.sort_unstable();
+            row_bytes.dedup();
+            buf.extend_from_slice(&(row_bytes.len() as u32).to_le_bytes());
             for rb in &row_bytes {
                 buf.extend_from_slice(&(rb.len() as u32).to_le_bytes());
                 buf.extend_from_slice(rb);
@@ -6877,6 +6961,25 @@ pub extern "C" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
 pub extern "C" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mut Value {
     let env = alloc(Value::Pair(io_a, io_b));
 
+    /// How a race concluded. `Winner` carries `(is_left, deep-cloned value
+    /// ptr as usize)`. `BothPanicked` carries the collected panic messages —
+    /// the parent re-raises them so the program aborts like any other panic
+    /// instead of hanging forever on the outcome condvar.
+    #[derive(Clone)]
+    enum RaceOutcome {
+        Winner(bool, usize),
+        BothPanicked(String),
+    }
+
+    /// Shared race state. A worker that panics records a loss (it never sets
+    /// `Winner`); when the *second* panic arrives with no winner present, the
+    /// last side standing sets `BothPanicked` and wakes the parent.
+    #[derive(Default)]
+    struct RaceState {
+        outcome: Option<RaceOutcome>,
+        panic_msgs: Vec<String>,
+    }
+
     extern "C" fn race_thunk(_db: *mut c_void, env: *mut Value) -> *mut Value {
         let (io_a, io_b) = pair_unpack(env);
 
@@ -6887,9 +6990,7 @@ pub extern "C" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mut Value
         let io_a_cloned = deep_clone_value(io_a) as *mut u8 as usize;
         let io_b_cloned = deep_clone_value(io_b) as *mut u8 as usize;
 
-        // Outcome carries `(is_left_winner, deep_cloned_winner_value_ptr)`.
-        // The loser's result, if it ever arrives, is dropped.
-        let outcome: Arc<Mutex<Option<(bool, usize)>>> = Arc::new(Mutex::new(None));
+        let state: Arc<Mutex<RaceState>> = Arc::new(Mutex::new(RaceState::default()));
         let cvar: Arc<Condvar> = Arc::new(Condvar::new());
 
         let cancel_a = Arc::new(CancelToken::new());
@@ -6900,7 +7001,7 @@ pub extern "C" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mut Value
             is_left: bool,
             my_cancel: Arc<CancelToken>,
             peer_cancel: Arc<CancelToken>,
-            outcome: Arc<Mutex<Option<(bool, usize)>>>,
+            state: Arc<Mutex<RaceState>>,
             cvar: Arc<Condvar>,
         ) {
             ACTIVE_FORKS.fetch_add(1, Ordering::SeqCst);
@@ -6934,7 +7035,50 @@ pub extern "C" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mut Value
                 }
                 let _guard = CleanupGuard { db, io };
 
-                let result = knot_io_run(db, io);
+                // Run the user IO under catch_unwind: a panicking side must
+                // record a loss instead of silently unwinding — otherwise two
+                // panicking sides leave the parent parked on the outcome
+                // condvar forever.
+                let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    knot_io_run(db, io)
+                }));
+                let result = match run {
+                    Ok(v) => v,
+                    Err(payload) => {
+                        // Release any write locks the panicking body may have
+                        // held so other threads aren't deadlocked (no-op when
+                        // none are held).
+                        write_lock_force_release();
+                        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else if let Some(s) = payload.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "unknown panic".to_string()
+                        };
+                        let mut g = state.lock().unwrap();
+                        g.panic_msgs.push(format!(
+                            "{} side panicked: {}",
+                            if is_left { "left" } else { "right" },
+                            msg
+                        ));
+                        // Do NOT set an outcome for a single panic — the
+                        // other side keeps running and may still win. Only
+                        // when both sides have terminated without producing
+                        // a winner do we report "both panicked".
+                        let both_dead = g.outcome.is_none() && g.panic_msgs.len() >= 2;
+                        if both_dead {
+                            g.outcome =
+                                Some(RaceOutcome::BothPanicked(g.panic_msgs.join("; ")));
+                        }
+                        drop(g);
+                        if both_dead {
+                            peer_cancel.cancel();
+                            cvar.notify_all();
+                        }
+                        return;
+                    }
+                };
 
                 // If cancellation already fired, drop the result silently.
                 if my_cancel.is_cancelled() {
@@ -6945,9 +7089,9 @@ pub extern "C" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mut Value
                 // so it outlives this thread's arena.
                 let cloned = deep_clone_value(result) as *mut u8 as usize;
 
-                let mut g = outcome.lock().unwrap();
-                if g.is_none() {
-                    *g = Some((is_left, cloned));
+                let mut g = state.lock().unwrap();
+                if g.outcome.is_none() {
+                    g.outcome = Some(RaceOutcome::Winner(is_left, cloned));
                     drop(g);
                     peer_cancel.cancel();
                     cvar.notify_all();
@@ -6964,7 +7108,7 @@ pub extern "C" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mut Value
             true,
             cancel_a.clone(),
             cancel_b.clone(),
-            outcome.clone(),
+            state.clone(),
             cvar.clone(),
         );
         worker(
@@ -6972,17 +7116,26 @@ pub extern "C" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mut Value
             false,
             cancel_b.clone(),
             cancel_a.clone(),
-            outcome.clone(),
+            state.clone(),
             cvar.clone(),
         );
 
-        // Wait for a winner — but don't join the loser.  The loser runs
+        // Wait for an outcome — but don't join the loser.  The loser runs
         // to its next safe point in the background, tracked by
         // ACTIVE_FORKS for the program-exit join.
-        let g = outcome.lock().unwrap();
-        let g = cvar.wait_while(g, |o| o.is_none()).unwrap();
-        let (is_left, raw_ptr) = g.as_ref().copied().expect("race winner present");
+        let g = state.lock().unwrap();
+        let g = cvar.wait_while(g, |s| s.outcome.is_none()).unwrap();
+        let outcome = g.outcome.as_ref().cloned().expect("race outcome present");
         drop(g);
+
+        let (is_left, raw_ptr) = match outcome {
+            RaceOutcome::Winner(is_left, raw_ptr) => (is_left, raw_ptr),
+            RaceOutcome::BothPanicked(msgs) => {
+                // Re-raise so the program aborts with the original panic
+                // message(s), matching Knot's normal abort behavior.
+                panic!("knot runtime: race: {}", msgs);
+            }
+        };
 
         // Wrap the winner's value in the appropriate Result constructor.
         // We re-use the value pointer (which came from `deep_clone_value`
@@ -7075,6 +7228,10 @@ pub extern "C" fn knot_stm_snapshot() -> i64 {
             b.writes.clear();
         }
     });
+    // Filters were cleared — any recorded "fresh All" flags refer to filters
+    // that no longer exist. Stale `true` entries could let a later specialize
+    // remove an `All` it doesn't own.
+    STM_FRESH_ALL.with(|m| m.borrow_mut().clear());
     0
 }
 
@@ -7103,6 +7260,11 @@ pub extern "C" fn knot_stm_wait(_snapshot: i64) {
         }
         depth
     });
+    if saved_lock_depth > 0 {
+        // Mirror `write_lock_release`: a writer parked on `WRITE_LOCK_PARK`'s
+        // condvar (no timeout) must be notified or it sleeps forever.
+        wake_one_write_waiter();
+    }
 
     let is_empty = STM_TRACK.with(|t| t.borrow().reads.is_empty());
     if is_empty {
@@ -11019,6 +11181,11 @@ pub extern "C" fn knot_source_append(
         } else {
             notify_relation_changed_with_event(name, &event);
         }
+        // The ADT path has already committed the savepoint and emitted its
+        // write event; falling through to the record-schema path below would
+        // both fail to parse the ADT descriptor and release the savepoint a
+        // second time.
+        return;
     }
     let rec = parse_record_schema(schema);
     write_record_rows(&db_ref.conn, &format!("_knot_{}", name), &rec, rows);
@@ -13850,7 +14017,13 @@ fn http_serve_loop(
                                         .map(|f| f.value);
                                     let value = if is_maybe {
                                         match raw_val {
-                                            Some(v) => {
+                                            // JSON `null` decodes to `Value::Unit` via
+                                            // `json_to_value`; for a Maybe-typed body
+                                            // field both `null` and an absent field
+                                            // mean `Nothing` — wrapping the Unit as
+                                            // `Just {value: Unit}` corrupted the
+                                            // fetch↔listen round-trip.
+                                            Some(v) if !matches!(unsafe { as_ref(v) }, Value::Unit) => {
                                                 let coerced = coerce_json_field(v, inner_ty);
                                                 alloc(Value::Constructor(
                                                     "Just".into(),
@@ -13859,7 +14032,7 @@ fn http_serve_loop(
                                                     ])),
                                                 ))
                                             }
-                                            None => alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit))),
+                                            _ => alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit))),
                                         }
                                     } else {
                                         match raw_val {
@@ -14572,7 +14745,11 @@ fn fetch_build_body(body_desc: &str, payload: *mut Value) -> String {
         if is_maybe {
             match unwrap_maybe(field_val) {
                 Some(inner) => { map.insert(name.to_string(), value_to_serde_json(inner)); }
-                None => { map.insert(name.to_string(), serde_json::Value::Null); }
+                // Omit Nothing fields entirely (consistent with how fetch
+                // skips Nothing headers and query params). Servers treat an
+                // absent Maybe field as Nothing; serializing `null` made the
+                // server decode it as `Just Unit`.
+                None => {}
             }
         } else {
             map.insert(name.to_string(), value_to_serde_json(field_val));
@@ -15847,5 +16024,241 @@ mod _sql_index_tests {
     fn dedupes_repeated_refs() {
         let sql = r#"SELECT t0."x" FROM "_knot_t" t0 WHERE t0."x" > ?1 AND t0."x" < ?2"#;
         assert_eq!(pairs(sql), vec![("_knot_t".into(), "x".into())]);
+    }
+}
+
+
+#[cfg(test)]
+mod _regress_runtime_tests {
+    use super::*;
+
+    fn hash_bytes(v: *mut Value) -> Vec<u8> {
+        let mut buf = Vec::new();
+        value_to_hash_bytes(v, &mut buf);
+        buf
+    }
+
+    fn rec(fields: &[(&str, *mut Value)]) -> *mut Value {
+        let mut fs: Vec<RecordField> = fields
+            .iter()
+            .map(|(n, v)| RecordField {
+                name: intern_str(n),
+                value: *v,
+            })
+            .collect();
+        fs.sort_by(|a, b| a.name.cmp(&b.name));
+        alloc(Value::Record(fs))
+    }
+
+    fn int(n: i64) -> *mut Value {
+        alloc(Value::Int(n))
+    }
+
+    // ── Fix 7: relation hashing must match set-semantics equality ──
+
+    #[test]
+    fn relation_hash_ignores_duplicates_and_order() {
+        let a1 = rec(&[("id", int(1))]);
+        let a2 = rec(&[("id", int(1))]);
+        let b = rec(&[("id", int(2))]);
+
+        // {a, a, b} vs {b, a} — logically equal sets.
+        let r1 = alloc(Value::Relation(vec![a1, a2, b]));
+        let b2 = rec(&[("id", int(2))]);
+        let a3 = rec(&[("id", int(1))]);
+        let r2 = alloc(Value::Relation(vec![b2, a3]));
+
+        assert!(values_equal(r1, r2), "set equality should hold");
+        assert_eq!(hash_bytes(r1), hash_bytes(r2), "hash must match equality");
+    }
+
+    #[test]
+    fn nested_relation_hash_matches_equality_with_duplicates() {
+        // Rows that are themselves relations containing duplicates.
+        let inner1 = alloc(Value::Relation(vec![
+            rec(&[("x", int(1))]),
+            rec(&[("x", int(1))]),
+            rec(&[("x", int(2))]),
+        ]));
+        let inner2 = alloc(Value::Relation(vec![
+            rec(&[("x", int(2))]),
+            rec(&[("x", int(1))]),
+        ]));
+        let outer1 = alloc(Value::Relation(vec![inner1]));
+        let outer2 = alloc(Value::Relation(vec![inner2]));
+
+        assert!(values_equal(outer1, outer2));
+        assert_eq!(hash_bytes(outer1), hash_bytes(outer2));
+    }
+
+    #[test]
+    fn relation_hash_still_distinguishes_different_sets() {
+        let r1 = alloc(Value::Relation(vec![rec(&[("id", int(1))])]));
+        let r2 = alloc(Value::Relation(vec![rec(&[("id", int(2))])]));
+        assert!(!values_equal(r1, r2));
+        assert_ne!(hash_bytes(r1), hash_bytes(r2));
+
+        // {1} vs {1, 2}: subset, not equal.
+        let r3 = alloc(Value::Relation(vec![
+            rec(&[("id", int(1))]),
+            rec(&[("id", int(2))]),
+        ]));
+        assert!(!values_equal(r1, r3));
+        assert_ne!(hash_bytes(r1), hash_bytes(r3));
+    }
+
+    // ── Fix 5: fetch body serialization of Maybe fields ──
+
+    fn nothing() -> *mut Value {
+        alloc(Value::Constructor(intern_str("Nothing"), alloc(Value::Unit)))
+    }
+
+    fn just(v: *mut Value) -> *mut Value {
+        alloc(Value::Constructor(
+            intern_str("Just"),
+            alloc(Value::Record(vec![RecordField {
+                name: intern_str("value"),
+                value: v,
+            }])),
+        ))
+    }
+
+    #[test]
+    fn fetch_body_omits_nothing_fields() {
+        let payload = rec(&[("note", nothing()), ("x", int(7))]);
+        let body = fetch_build_body("note:?text,x:int", payload);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(
+            !obj.contains_key("note"),
+            "Nothing field must be omitted, got {}",
+            body
+        );
+        assert_eq!(obj.get("x").and_then(|v| v.as_i64()), Some(7));
+    }
+
+    #[test]
+    fn fetch_body_includes_just_fields() {
+        let payload = rec(&[("note", just(alloc(Value::Text(Arc::from("hi")))))]);
+        let body = fetch_build_body("note:?text", payload);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["note"].as_str(), Some("hi"));
+    }
+
+    // ── Fix 4: specialize must not delete a pre-existing broad read ──
+
+    fn filters_for(table: &str) -> Vec<ReadFilter> {
+        STM_TRACK.with(|t| t.borrow().filters.get(table).cloned().unwrap_or_default())
+    }
+
+    fn eq_pred() -> Vec<(Arc<str>, ColPred)> {
+        vec![(intern_col("id"), ColPred::Cmp(CmpOp::Eq, SqlVal::Int(1)))]
+    }
+
+    #[test]
+    fn specialize_downgrades_its_own_fresh_all() {
+        knot_stm_snapshot(); // clear thread-local tracking
+        stm_track_read("t_fix4_fresh");
+        stm_specialize_read_pred("t_fix4_fresh", eq_pred());
+        let fs = filters_for("t_fix4_fresh");
+        assert!(
+            !fs.iter().any(|f| matches!(f, ReadFilter::All)),
+            "fresh All should have been downgraded"
+        );
+        assert_eq!(
+            fs.iter().filter(|f| matches!(f, ReadFilter::Cols(_))).count(),
+            1
+        );
+        knot_stm_snapshot();
+    }
+
+    #[test]
+    fn specialize_keeps_all_from_earlier_whole_table_read() {
+        knot_stm_snapshot();
+        // Whole-table read first (e.g. `rows <- *t`): broad All.
+        stm_track_read("t_fix4_broad");
+        // Later filtered read: codegen emits track_read (dedup no-op) then
+        // track_read_pred. The All belongs to the FIRST read and must stay.
+        stm_track_read("t_fix4_broad");
+        stm_specialize_read_pred("t_fix4_broad", eq_pred());
+        let fs = filters_for("t_fix4_broad");
+        assert!(
+            fs.iter().any(|f| matches!(f, ReadFilter::All)),
+            "pre-existing broad read filter must be preserved, got {} filters",
+            fs.len()
+        );
+        assert!(fs.iter().any(|f| matches!(f, ReadFilter::Cols(_))));
+        knot_stm_snapshot();
+    }
+
+    #[test]
+    fn second_specialize_without_track_read_does_not_remove_all() {
+        knot_stm_snapshot();
+        stm_track_read("t_fix4_double");
+        stm_specialize_read_pred("t_fix4_double", eq_pred());
+        stm_track_read("t_fix4_double"); // fresh All again (none present)
+        stm_specialize_read_pred("t_fix4_double", eq_pred());
+        // A stray extra specialize (no intervening track_read) must not
+        // remove anything (the freshness flag was already consumed).
+        stm_specialize_read_pred("t_fix4_double", eq_pred());
+        let fs = filters_for("t_fix4_double");
+        assert!(
+            !fs.iter().any(|f| matches!(f, ReadFilter::All)),
+            "both fresh Alls were paired with specializes"
+        );
+        assert_eq!(
+            fs.iter().filter(|f| matches!(f, ReadFilter::Cols(_))).count(),
+            3
+        );
+        knot_stm_snapshot();
+    }
+
+    // ── Fix 2: Bulk events must wake EQ/Range-indexed watchers ──
+
+    #[test]
+    fn bulk_event_wakes_eq_indexed_watcher() {
+        let slot = Arc::new(WakeSlot::new());
+        let key: EqKey = (
+            "t_fix2_eq_unique".to_string(),
+            "id".to_string(),
+            SqlVal::Int(1).to_key(),
+        );
+        EQ_WATCHERS.entry(key).or_default().push(Arc::downgrade(&slot));
+        wake_matching_watchers("t_fix2_eq_unique", &WriteEvent::Bulk);
+        assert!(
+            *slot.woken.lock().unwrap(),
+            "Bulk write must conservatively wake EQ-indexed watchers"
+        );
+    }
+
+    #[test]
+    fn bulk_event_wakes_range_indexed_watcher() {
+        let slot = Arc::new(WakeSlot::new());
+        let key: RangeKey = ("t_fix2_range_unique".to_string(), "qty".to_string());
+        RANGE_WATCHERS
+            .entry(key)
+            .or_default()
+            .gt
+            .entry(SqlVal::Int(100).to_key())
+            .or_default()
+            .push(Arc::downgrade(&slot));
+        wake_matching_watchers("t_fix2_range_unique", &WriteEvent::Bulk);
+        assert!(
+            *slot.woken.lock().unwrap(),
+            "Bulk write must conservatively wake Range-indexed watchers"
+        );
+    }
+
+    #[test]
+    fn bulk_event_does_not_wake_other_tables_indexed_watchers() {
+        let slot = Arc::new(WakeSlot::new());
+        let key: EqKey = (
+            "t_fix2_other_table".to_string(),
+            "id".to_string(),
+            SqlVal::Int(1).to_key(),
+        );
+        EQ_WATCHERS.entry(key).or_default().push(Arc::downgrade(&slot));
+        wake_matching_watchers("t_fix2_unrelated_table", &WriteEvent::Bulk);
+        assert!(!*slot.woken.lock().unwrap());
     }
 }

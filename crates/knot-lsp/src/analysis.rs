@@ -477,7 +477,6 @@ pub fn analyze_document(
                     import_origins,
                     doc_comments,
                     keyword_tokens,
-                    unit_info,
                     all_diags,
                     changed_decl_names,
                     signature_changed_decl_names,
@@ -576,6 +575,7 @@ pub fn analyze_document(
                 refine_targets: refine_targets.clone(),
                 source_refinements: source_refinements.clone(),
                 monad_info: monad_info.clone(),
+                unit_info: unit_info.clone(),
                 fingerprint: new_fingerprint.clone(),
                 access_clock: next_access_clock(inference_cache),
             };
@@ -648,7 +648,6 @@ fn reuse_snapshot(
     import_origins: HashMap<String, String>,
     doc_comments: HashMap<String, String>,
     keyword_tokens: Vec<(Span, u32)>,
-    unit_info: HashMap<Span, String>,
     mut all_diags: Vec<diagnostic::Diagnostic>,
     changed_decl_names: Vec<String>,
     signature_changed_decl_names: Vec<String>,
@@ -678,7 +677,7 @@ fn reuse_snapshot(
         refine_targets: snap.refine_targets.clone(),
         source_refinements: snap.source_refinements.clone(),
         monad_info: snap.monad_info.clone(),
-        unit_info,
+        unit_info: snap.unit_info.clone(),
         changed_decl_names,
         signature_changed_decl_names,
         dirty_decl_closure,
@@ -1010,6 +1009,7 @@ mod tests {
                     refine_targets: HashMap::new(),
                     source_refinements: HashMap::new(),
                     monad_info: HashMap::new(),
+                    unit_info: HashMap::new(),
                     fingerprint: ModuleFingerprint {
                         decl_hashes: HashMap::new(),
                         decl_signature_hashes: HashMap::new(),
@@ -1238,6 +1238,47 @@ mod tests {
             v2_y_span,
             prefix.len(),
             v1_y_span.start + prefix.len()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: `unit_info` was only populated by the fresh-inference
+    /// path. The snapshot cache didn't store it, so a cache hit (undo/redo,
+    /// re-open, format round-trip) silently dropped every unit annotation —
+    /// unit tooltips on inlay hints disappeared until a real edit forced a
+    /// fresh inference pass.
+    #[test]
+    fn snapshot_cache_hit_preserves_unit_info() {
+        let dir = std::env::temp_dir().join(format!(
+            "knot-lsp-unit-info-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("u.knot");
+        let src = "unit M\nf : Float<M> -> Float<M>\nf = \\x -> x\n";
+        std::fs::write(&path, src).unwrap();
+        let canonical = path.canonicalize().unwrap();
+        let uri = fake_uri(&format!("file://{}", canonical.display()));
+
+        let mut import_cache: ImportCache = HashMap::new();
+        let mut inference_cache: InferenceCache = HashMap::new();
+
+        let doc1 = analyze_document(&uri, src, &mut import_cache, &mut inference_cache);
+        assert!(
+            !doc1.unit_info.is_empty(),
+            "fresh inference should record unit info; local types: {:?}",
+            doc1.local_type_info
+        );
+
+        // Second analysis of identical bytes hits the inference snapshot.
+        let doc2 = analyze_document(&uri, src, &mut import_cache, &mut inference_cache);
+        assert_eq!(
+            doc2.unit_info, doc1.unit_info,
+            "snapshot reuse must restore unit_info, not drop it"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

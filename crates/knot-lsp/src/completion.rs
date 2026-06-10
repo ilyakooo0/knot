@@ -21,9 +21,7 @@ use crate::state::{
     builtins as state_builtins, DocumentState, ServerState, SnippetContext, KEYWORDS, SNIPPETS,
 };
 use crate::type_format::format_type_kind;
-use crate::utils::{
-    offset_to_position, position_to_offset, recurse_expr, uri_to_path,
-};
+use crate::utils::{position_to_offset, recurse_expr, uri_to_path};
 
 // ── Completion ──────────────────────────────────────────────────────
 
@@ -1142,17 +1140,17 @@ pub(crate) fn handle_resolve_completion_item(
             if !import_path.is_empty() && !source_uri.is_empty() {
                 if let Ok(uri) = source_uri.parse::<Uri>() {
                     if let Some(doc) = state.documents.get(&uri) {
-                        let import_insert_pos = if let Some(last_import) = doc.module.imports.last() {
-                            let end = offset_to_position(&doc.source, last_import.span.end);
-                            Position::new(end.line + 1, 0)
-                        } else {
-                            Position::new(0, 0)
-                        };
-                        let import_line = if doc.module.imports.is_empty() {
-                            format!("import {import_path}\n\n")
-                        } else {
-                            format!("import {import_path}\n")
-                        };
+                        // Shared with the code-action quickfix path: anchors
+                        // to the byte offset after the last import's newline
+                        // (or EOF with a leading `\n` when the file lacks a
+                        // trailing newline), instead of a possibly-nonexistent
+                        // `line + 1` position that clients clamp into the
+                        // middle of the last line.
+                        let (import_insert_pos, import_line) =
+                            crate::code_action::import_insert_position_and_text(
+                                doc,
+                                import_path,
+                            );
                         item.additional_text_edits = Some(vec![TextEdit {
                             range: Range {
                                 start: import_insert_pos,
@@ -1556,6 +1554,68 @@ mod tests {
             CompletionResponse::Array(items) => items.into_iter().map(|i| i.label).collect(),
             CompletionResponse::List(list) => list.items.into_iter().map(|i| i.label).collect(),
         }
+    }
+
+    fn auto_import_item(uri: &Uri, import_path: &str) -> CompletionItem {
+        CompletionItem {
+            label: "helper".into(),
+            data: Some(serde_json::json!({
+                "kind": "auto_import",
+                "import_path": import_path,
+                "source_uri": uri.as_str(),
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// Regression: the resolve path inserted the auto-import line at
+    /// `Position::new(last_import_end.line + 1, 0)`. When the last import is
+    /// the final line with no trailing newline, that position doesn't exist
+    /// and clients clamp it to end-of-document, gluing the text onto the
+    /// previous import (`import ./aimport foo`). The insert must land at EOF
+    /// with a leading newline instead.
+    #[test]
+    fn auto_import_resolve_no_trailing_newline_at_eof() {
+        let mut ws = TestWorkspace::new();
+        let source = "import ./a"; // final line, no trailing newline
+        let uri = ws.open("main", source);
+        let resolved =
+            handle_resolve_completion_item(&ws.state, auto_import_item(&uri, "./helpers"));
+        let edits = resolved
+            .additional_text_edits
+            .expect("auto-import edit resolved");
+        assert_eq!(edits.len(), 1);
+        let edit = &edits[0];
+        // Insert position must exist in the document (clamping target = EOF).
+        let eof = offset_to_position(source, source.len());
+        assert_eq!(
+            edit.range.start, eof,
+            "insert position must be end-of-document, not a nonexistent line"
+        );
+        assert_eq!(
+            edit.new_text, "\nimport ./helpers\n",
+            "a leading newline must separate the new import from the last line"
+        );
+        // Applying the edit yields well-formed imports, not glued text.
+        let mut applied = source.to_string();
+        applied.insert_str(source.len(), &edit.new_text);
+        assert!(applied.contains("import ./a\nimport ./helpers\n"), "got: {applied:?}");
+    }
+
+    /// The common case (imports followed by more lines) still inserts right
+    /// after the last import line.
+    #[test]
+    fn auto_import_resolve_inserts_after_last_import_line() {
+        let mut ws = TestWorkspace::new();
+        let source = "import ./a\n\nmain = 1\n";
+        let uri = ws.open("main", source);
+        let resolved =
+            handle_resolve_completion_item(&ws.state, auto_import_item(&uri, "./helpers"));
+        let edits = resolved
+            .additional_text_edits
+            .expect("auto-import edit resolved");
+        assert_eq!(edits[0].range.start, Position::new(1, 0));
+        assert_eq!(edits[0].new_text, "import ./helpers\n");
     }
 
     #[test]

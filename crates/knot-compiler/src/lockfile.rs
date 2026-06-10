@@ -328,7 +328,15 @@ pub fn check(source_path: &Path, module: &Module, type_env: &TypeEnv) -> Vec<Dia
 
 /// Write the lockfile after a successful compile.
 /// Only writes if the module has source declarations.
-pub fn update(source_path: &Path, source_text: &str, module: &Module) -> Result<(), String> {
+/// `imported_type_snippets` carries type alias / data declarations from
+/// imported modules (sliced from their own source files), so types referenced
+/// by source declarations still resolve when the lockfile is parsed alone.
+pub fn update(
+    source_path: &Path,
+    source_text: &str,
+    module: &Module,
+    imported_type_snippets: &[String],
+) -> Result<(), String> {
     let has_sources = module
         .decls
         .iter()
@@ -338,7 +346,7 @@ pub fn update(source_path: &Path, source_text: &str, module: &Module) -> Result<
     }
 
     let lock_path = lockfile_path(source_path);
-    let content = generate(module, source_text);
+    let content = generate(module, source_text, imported_type_snippets);
     std::fs::write(&lock_path, content)
         .map_err(|e| format!("cannot write {}: {}", lock_path.display(), e))
 }
@@ -366,10 +374,17 @@ fn find_migrate_span(module: &Module, name: &str) -> Span {
 }
 
 /// Generate lockfile content by extracting declarations from source text.
-fn generate(module: &Module, source_text: &str) -> String {
+fn generate(module: &Module, source_text: &str, imported_type_snippets: &[String]) -> String {
     let mut out = String::new();
     out.push_str("-- schema.lock (auto-generated, do not edit)\n");
     out.push_str("-- Commit to source control.\n");
+
+    // Type declarations from imported modules (sliced from their own sources)
+    for snippet in imported_type_snippets {
+        out.push('\n');
+        out.push_str(snippet);
+        out.push('\n');
+    }
 
     // Type aliases (non-parameterized) and data declarations
     for decl in &module.decls {

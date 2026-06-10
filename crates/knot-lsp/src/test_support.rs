@@ -43,6 +43,7 @@ impl TestWorkspace {
             workspace_diag_clock: 0,
             workspace_symbol_cache: Arc::new(Mutex::new(WorkspaceSymbolCache::default())),
             pending_sources: HashMap::new(),
+            dropped_analysis_retry: HashMap::new(),
             analysis_tx,
             reverse_imports: HashMap::new(),
             inference_cache: Arc::new(Mutex::new(HashMap::new())),

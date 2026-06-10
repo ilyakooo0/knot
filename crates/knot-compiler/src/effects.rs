@@ -195,6 +195,11 @@ struct EffectChecker {
     /// (e.g. `forEach : (a -> IO {} {}) -> IO {} {}`), the callback's effects
     /// are absorbed by the declared row, so we don't propagate.
     row_poly_decls: HashSet<String>,
+    /// Stack of local scopes mapping let-bound (or immediately-applied-
+    /// lambda-bound) function names to the effects of their bodies. Lets the
+    /// checker see effects of calls through local bindings, e.g.
+    /// `do { let f = \u -> *items; rows <- f {} }` reads `items`.
+    local_fn_effects: Vec<HashMap<String, EffectSet>>,
     /// Accumulated diagnostics.
     diagnostics: Vec<Diagnostic>,
 }
@@ -245,6 +250,7 @@ impl EffectChecker {
             builtin_effects,
             source_names: HashSet::new(),
             row_poly_decls: HashSet::new(),
+            local_fn_effects: Vec::new(),
             diagnostics: Vec::new(),
         }
     }
@@ -273,8 +279,8 @@ impl EffectChecker {
             }
         }
 
-        // Process derived relations first, then views, then funs.
-        // This ensures callees are processed before callers when possible.
+        // Group declarations so the final diagnostic pass keeps a stable
+        // order (derived, then views, then funs).
         let mut derived = Vec::new();
         let mut views = Vec::new();
         let mut funs = Vec::new();
@@ -288,62 +294,45 @@ impl EffectChecker {
             }
         }
 
-        // Fixpoint loop for derived relations and views: forward references
-        // between derived relations (e.g. &d2 reads &d1 which reads *source,
-        // but &d2 is declared before &d1) need multiple passes to propagate
-        // transitive effects.
+        // Single global fixpoint over derived relations, views, AND funs:
+        // a derived relation/view may call a user function (and vice versa),
+        // so iterating them in separate fixpoints leaves stale empty effect
+        // sets behind (e.g. `&d = readsB {}` where `readsB = \u -> *b` —
+        // the derived loop ran before funs and never saw `r *b`). Forward
+        // references and mutual recursion also need multiple passes.
+        // Suppress diagnostics during the fixpoint since intermediate
+        // states may be incomplete.
         loop {
             let mut changed = false;
-            for decl in &derived {
-                if let ast::DeclKind::Derived { name, body, .. } = &decl.node {
-                    let effects = self.infer_effects(body);
-                    let old = self.decl_effects.get(name);
-                    if old.map_or(true, |o| *o != effects) {
-                        self.decl_effects.insert(name.clone(), effects);
-                        changed = true;
+            let saved_diags = std::mem::take(&mut self.diagnostics);
+            for decl in &module.decls {
+                let (name, effects) = match &decl.node {
+                    ast::DeclKind::Derived { name, body, .. }
+                    | ast::DeclKind::View { name, body, .. } => {
+                        (name, self.infer_effects(body))
                     }
+                    ast::DeclKind::Fun { name, body: Some(body), .. } => {
+                        (name, self.fun_body_effects(body))
+                    }
+                    _ => continue,
+                };
+                let old = self.decl_effects.get(name);
+                if old.map_or(true, |o| *o != effects) {
+                    self.decl_effects.insert(name.clone(), effects);
+                    changed = true;
                 }
             }
-            for decl in &views {
-                if let ast::DeclKind::View { name, body, .. } = &decl.node {
-                    let effects = self.infer_effects(body);
-                    let old = self.decl_effects.get(name);
-                    if old.map_or(true, |o| *o != effects) {
-                        self.decl_effects.insert(name.clone(), effects);
-                        changed = true;
-                    }
-                }
-            }
+            self.diagnostics = saved_diags;
             if !changed { break; }
         }
-        // Final pass for derived/views: emit diagnostics with converged effects
+
+        // Final pass: emit diagnostics and check annotations with converged effects
         for decl in derived {
             self.process_decl(decl);
         }
         for decl in views {
             self.process_decl(decl);
         }
-
-        // Fixpoint loop: forward references and mutual recursion need
-        // multiple passes until effects stabilize.  Suppress diagnostics
-        // during the fixpoint since intermediate states may be incomplete.
-        loop {
-            let mut changed = false;
-            let saved_diags = std::mem::take(&mut self.diagnostics);
-            for decl in &funs {
-                if let ast::DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
-                    let effects = self.fun_body_effects(body);
-                    let old = self.decl_effects.get(name);
-                    if old.map_or(true, |o| *o != effects) {
-                        self.decl_effects.insert(name.clone(), effects);
-                        changed = true;
-                    }
-                }
-            }
-            self.diagnostics = saved_diags;
-            if !changed { break; }
-        }
-        // Final pass: emit diagnostics and check annotations with converged effects
         for decl in &funs {
             self.process_decl(decl);
         }
@@ -407,17 +396,26 @@ impl EffectChecker {
                 EffectSet::empty()
             }
 
-            ast::ExprKind::App { func, arg } => {
-                let propagate_lambda = head_name(func)
+            ast::ExprKind::App { .. } => {
+                // Walk the whole application spine so lambda arguments in
+                // *every* position contribute their effects — previously only
+                // the syntactically last (outermost) argument was considered,
+                // so `withCb2 (\u -> println "hi") 1` lost the console effect.
+                let (head, args) = app_spine(expr);
+                let propagate_lambda = head_name(head)
                     .map(|n| self.row_poly_decls.contains(n))
                     .unwrap_or(false);
-                let arg_effects = if propagate_lambda {
-                    self.arg_effects(arg)
-                } else {
-                    self.infer_effects(arg)
-                };
-                let call_effects = self.callee_effects(func);
-                arg_effects.union(&call_effects)
+                let mut effects = EffectSet::empty();
+                for arg in &args {
+                    let arg_effects = if propagate_lambda {
+                        self.arg_effects(arg)
+                    } else {
+                        self.infer_effects(arg)
+                    };
+                    effects = effects.union(&arg_effects);
+                }
+                let call_effects = self.head_call_effects(head, &args);
+                effects.union(&call_effects)
             }
 
             ast::ExprKind::BinOp { op, lhs, rhs } => {
@@ -464,9 +462,45 @@ impl EffectChecker {
                             ),
                     );
                 }
+                // Concurrency builtins that cannot be rolled back (`race`)
+                // are rejected by a syntactic walk of the whole body — this
+                // also catches indirect usage through locally-bound lambdas.
+                // The authoritative list is `builtins::ATOMIC_DISALLOWED_BUILTINS`
+                // (its IO members are already covered by the effect check above;
+                // `fork` is intentionally permitted, see builtins.rs).
+                let mut disallowed: Vec<(String, Span)> = Vec::new();
+                walk_expr(inner, &mut |e| {
+                    if let ast::ExprKind::Var(name) = &e.node {
+                        if crate::builtins::ATOMIC_DISALLOWED_BUILTINS.contains(&name.as_str())
+                            && crate::builtins::CONCURRENCY_BUILTINS.contains(&name.as_str())
+                        {
+                            disallowed.push((name.clone(), e.span));
+                        }
+                    }
+                });
+                for (name, span) in disallowed {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "`{}` cannot be used inside atomic blocks",
+                            name
+                        ))
+                        .label(span, "used inside an atomic block")
+                        .note(
+                            "`race` spawns worker threads with independent database \
+                             connections; their work cannot be rolled back by the \
+                             enclosing transaction",
+                        ),
+                    );
+                }
+                // "Must interact with relations" is a hard error, so stay
+                // conservative: only flag bodies that provably contain no
+                // relation operations anywhere syntactically (including
+                // inside local lambdas) — effect inference can miss reads
+                // performed through bindings it cannot resolve.
                 if !inner_effects.has_io()
                     && inner_effects.reads.is_empty()
                     && inner_effects.writes.is_empty()
+                    && !touches_relations(inner)
                 {
                     self.diagnostics.push(
                         Diagnostic::error("atomic block must interact with relations")
@@ -477,11 +511,27 @@ impl EffectChecker {
             }
 
             ast::ExprKind::Do(stmts) => {
+                self.local_fn_effects.push(HashMap::new());
                 let mut effects = EffectSet::empty();
                 for stmt in stmts {
+                    // Track let-bound lambdas so later calls through the
+                    // local name see the lambda body's effects (e.g.
+                    // `let f = \u -> *items; rows <- f {}` reads `items`).
+                    if let ast::StmtKind::Let { pat, expr } = &stmt.node {
+                        if let ast::PatKind::Var(name) = &pat.node {
+                            if is_lambda_arg(expr) {
+                                let fn_effects = self.fun_body_effects(expr);
+                                self.local_fn_effects
+                                    .last_mut()
+                                    .unwrap()
+                                    .insert(name.clone(), fn_effects);
+                            }
+                        }
+                    }
                     let stmt_effects = self.infer_stmt_effects(stmt);
                     effects = effects.union(&stmt_effects);
                 }
+                self.local_fn_effects.pop();
                 effects
             }
 
@@ -585,9 +635,15 @@ impl EffectChecker {
     fn callee_effects(&mut self, func_expr: &ast::Expr) -> EffectSet {
         match &func_expr.node {
             ast::ExprKind::Var(name) => {
-                // Check builtins first, then user declarations
+                // Check builtins first, then local let-bound lambdas
+                // (innermost scope first), then user declarations.
                 if let Some(effects) = self.builtin_effects.get(name) {
                     return effects.clone();
+                }
+                for scope in self.local_fn_effects.iter().rev() {
+                    if let Some(effects) = scope.get(name) {
+                        return effects.clone();
+                    }
                 }
                 if let Some(effects) = self.decl_effects.get(name) {
                     return effects.clone();
@@ -601,11 +657,14 @@ impl EffectChecker {
                 self.infer_effects(body)
             }
 
-            ast::ExprKind::App { func, arg } => {
-                // Curried call: e.g. `(f x) y` — the callee is `f x` partially applied
-                let func_effects = self.callee_effects(func);
-                let arg_effects = self.infer_effects(arg);
-                func_effects.union(&arg_effects)
+            ast::ExprKind::App { .. } => {
+                // Curried call: e.g. `(f x) y` — the callee is `f x` partially
+                // applied. The effects of evaluating the application expression
+                // already cover the head plus all arguments (spine walk in
+                // `infer_effects`), so delegate there. This also propagates
+                // lambda-argument effects of row-polymorphic callees reached
+                // through pipes (`x |> withCb (\u -> ...)`).
+                self.infer_effects(func_expr)
             }
 
             ast::ExprKind::If { cond, then_branch, else_branch, .. } => {
@@ -638,6 +697,36 @@ impl EffectChecker {
                 let _ = other;
                 self.infer_effects(func_expr)
             }
+        }
+    }
+
+    /// Effects of invoking the head of an application spine with the given
+    /// argument expressions. Lambdas applied immediately — including the
+    /// shape `let pat = e` desugars to (`(\pat -> rest) e`) — bind their
+    /// lambda-valued arguments into a local scope so that calls through the
+    /// bound name inside the body see the callback's effects.
+    fn head_call_effects(&mut self, head: &ast::Expr, args: &[&ast::Expr]) -> EffectSet {
+        match &head.node {
+            ast::ExprKind::Lambda { params, body } => {
+                let mut scope = HashMap::new();
+                for (param, arg) in params.iter().zip(args.iter()) {
+                    if let ast::PatKind::Var(name) = &param.node {
+                        if is_lambda_arg(arg) {
+                            let fn_effects = self.fun_body_effects(arg);
+                            scope.insert(name.clone(), fn_effects);
+                        }
+                    }
+                }
+                self.local_fn_effects.push(scope);
+                let effects = self.infer_effects(body);
+                self.local_fn_effects.pop();
+                effects
+            }
+            // Wrappers: unwrap to find the lambda (if any) inside.
+            ast::ExprKind::UnitLit { value, .. } => self.head_call_effects(value, args),
+            ast::ExprKind::Annot { expr, .. } => self.head_call_effects(expr, args),
+            ast::ExprKind::Refine(inner) => self.head_call_effects(inner, args),
+            _ => self.callee_effects(head),
         }
     }
 
@@ -709,6 +798,115 @@ fn is_lambda_arg(arg: &ast::Expr) -> bool {
     }
 }
 
+/// Visit every expression node in `expr` (pre-order), including lambda
+/// bodies, do-block statements, case arms, and serve handlers. Used for
+/// conservative syntactic checks on atomic bodies.
+fn walk_expr(expr: &ast::Expr, f: &mut impl FnMut(&ast::Expr)) {
+    f(expr);
+    match &expr.node {
+        ast::ExprKind::Lit(_)
+        | ast::ExprKind::Var(_)
+        | ast::ExprKind::Constructor(_)
+        | ast::ExprKind::SourceRef(_)
+        | ast::ExprKind::DerivedRef(_) => {}
+        ast::ExprKind::Record(fields) => {
+            for field in fields {
+                walk_expr(&field.value, f);
+            }
+        }
+        ast::ExprKind::RecordUpdate { base, fields } => {
+            walk_expr(base, f);
+            for field in fields {
+                walk_expr(&field.value, f);
+            }
+        }
+        ast::ExprKind::FieldAccess { expr: inner, .. } => walk_expr(inner, f),
+        ast::ExprKind::List(elems) => {
+            for elem in elems {
+                walk_expr(elem, f);
+            }
+        }
+        ast::ExprKind::Lambda { body, .. } => walk_expr(body, f),
+        ast::ExprKind::App { func, arg } => {
+            walk_expr(func, f);
+            walk_expr(arg, f);
+        }
+        ast::ExprKind::BinOp { lhs, rhs, .. } => {
+            walk_expr(lhs, f);
+            walk_expr(rhs, f);
+        }
+        ast::ExprKind::UnaryOp { operand, .. } => walk_expr(operand, f),
+        ast::ExprKind::If { cond, then_branch, else_branch } => {
+            walk_expr(cond, f);
+            walk_expr(then_branch, f);
+            walk_expr(else_branch, f);
+        }
+        ast::ExprKind::Case { scrutinee, arms } => {
+            walk_expr(scrutinee, f);
+            for arm in arms {
+                walk_expr(&arm.body, f);
+            }
+        }
+        ast::ExprKind::Do(stmts) => {
+            for stmt in stmts {
+                match &stmt.node {
+                    ast::StmtKind::Bind { expr, .. }
+                    | ast::StmtKind::Let { expr, .. } => walk_expr(expr, f),
+                    ast::StmtKind::Where { cond } => walk_expr(cond, f),
+                    ast::StmtKind::GroupBy { key } => walk_expr(key, f),
+                    ast::StmtKind::Expr(expr) => walk_expr(expr, f),
+                }
+            }
+        }
+        ast::ExprKind::Set { target, value }
+        | ast::ExprKind::ReplaceSet { target, value } => {
+            walk_expr(target, f);
+            walk_expr(value, f);
+        }
+        ast::ExprKind::Atomic(inner) => walk_expr(inner, f),
+        ast::ExprKind::UnitLit { value, .. } => walk_expr(value, f),
+        ast::ExprKind::Annot { expr: inner, .. } => walk_expr(inner, f),
+        ast::ExprKind::Refine(inner) => walk_expr(inner, f),
+        ast::ExprKind::Serve { handlers, .. } => {
+            for h in handlers {
+                walk_expr(&h.body, f);
+            }
+        }
+    }
+}
+
+/// Whether the expression syntactically contains any relation operation
+/// (source/derived reference or relation write) anywhere, including inside
+/// lambdas that effect inference may not see being called.
+fn touches_relations(expr: &ast::Expr) -> bool {
+    let mut found = false;
+    walk_expr(expr, &mut |e| {
+        if matches!(
+            &e.node,
+            ast::ExprKind::SourceRef(_)
+                | ast::ExprKind::DerivedRef(_)
+                | ast::ExprKind::Set { .. }
+                | ast::ExprKind::ReplaceSet { .. }
+        ) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Unwind a (possibly curried) application into its head and argument list.
+/// `f x y z` → `(f, [x, y, z])`.
+fn app_spine(expr: &ast::Expr) -> (&ast::Expr, Vec<&ast::Expr>) {
+    let mut args = Vec::new();
+    let mut cur = expr;
+    while let ast::ExprKind::App { func, arg } = &cur.node {
+        args.push(arg.as_ref());
+        cur = func;
+    }
+    args.reverse();
+    (cur, args)
+}
+
 /// Resolve the head name of a (possibly curried) function expression.
 /// `f x y z` → `Some("f")`. Returns `None` for non-named callees.
 fn head_name(expr: &ast::Expr) -> Option<&str> {
@@ -751,8 +949,10 @@ fn type_has_effect_row_var(ty: &ast::Type) -> bool {
 fn effects_span(ty: &ast::Type) -> Option<Span> {
     match &ty.node {
         ast::TypeKind::Effectful { .. } | ast::TypeKind::IO { .. } => Some(ty.span),
-        ast::TypeKind::Function { param, result } => {
-            effects_span(result).or_else(|| effects_span(param))
+        ast::TypeKind::Function { result, .. } => {
+            // Mirror `extract_effects`: declared effects come only from the
+            // result side, so the label should point there too.
+            effects_span(result)
         }
         _ => None,
     }
@@ -780,13 +980,13 @@ fn extract_effects(ty: &ast::Type) -> Option<EffectSet> {
                 Some(EffectSet::from_ast_effects(effects))
             }
         }
-        ast::TypeKind::Function { param, result } => {
-            // Effects can appear on either side of the arrow.
-            match (extract_effects(param), extract_effects(result)) {
-                (Some(a), Some(b)) => Some(a.union(&b)),
-                (a @ Some(_), None) => a,
-                (None, b) => b,
-            }
+        ast::TypeKind::Function { result, .. } => {
+            // Only the RESULT side of the arrow declares the function's own
+            // effects. Effect rows on parameter types (e.g. the callback in
+            // `(Int -> IO {console} {}) -> IO {} {}`) describe what the
+            // *callback* may do — unioning them in would let a function's
+            // body launder its own effects through a parameter annotation.
+            extract_effects(result)
         }
         _ => None,
     }

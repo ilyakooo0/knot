@@ -499,17 +499,64 @@ main = f
 
 #[test]
 fn unit_var_times_unknown_operand_is_rejected() {
-    // `x : Float<u>` (a unit VARIABLE) multiplied by an unresolved lambda
-    // param must hit the same conservative guard as a concrete unit —
-    // unifying them would type `x * y` as `u` instead of `u^2`.
+    // `x : Float<u>` (a unit VARIABLE) multiplied by a lambda param that is
+    // unresolved at the `*` node must still be rejected — typing `x * y` as
+    // `u` instead of `u^2` would be unsound. The composition check is
+    // deferred until the operand resolves (here `y` unifies with `x` via
+    // the application), so the rejection surfaces as a precise mismatch
+    // between the annotated result `u` and the composed product `u^2`.
     let src = r#"sq : Float<u> -> Float<u>
 sq = \x -> (\y -> x * y) x
 main = println (show (sq 2.0))
 "#;
     let diags = check_src(src);
     assert!(
-        has_error(&diags, "cannot infer the unit of an operand"),
-        "polymorphic unit times unknown operand must be rejected: {:?}",
+        has_error(&diags, "unit mismatch"),
+        "polymorphic unit times its own square must be rejected: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn scalar_mul_with_late_resolved_field_operand_compiles() {
+    // Scalar (dimensionless) multiplication must work even when the
+    // dimensionless operand is a record-field access on an un-annotated
+    // lambda parameter whose record type is only pinned AFTER the `*` node
+    // (here by `any`'s second argument). The composition check defers
+    // instead of demanding an annotation; `f.failures` resolves to `Int`
+    // and `base * f.failures` is `Int<Ms>`.
+    let src = r#"unit Ms
+base : Int<Ms>
+base = 30000
+cap : Int<Ms>
+cap = 480000
+shouldRetry : Text -> Int<Ms> -> [{server: Text, failedAt: Int<Ms>, failures: Int}] -> Bool
+shouldRetry = \server t failures ->
+  not (any (\f -> f.server == server && t - f.failedAt < base * f.failures) failures)
+main = println (show (shouldRetry "x" 1000 []))
+"#;
+    let diags = check_src(src);
+    assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
+}
+
+#[test]
+fn deferred_operand_resolving_to_unit_composes_soundly() {
+    // When the late-resolved operand turns out to be unit-bearing, the
+    // deferred check must compose units (Ms * Ms = Ms^2), not preserve one
+    // side's unit — comparing the product against Int<Ms> is a mismatch.
+    let src = r#"unit Ms
+base : Int<Ms>
+base = 30000
+cap : Int<Ms>
+cap = 480000
+check : [{dur: Int<Ms>}] -> Bool
+check = \rows -> any (\f -> cap < base * f.dur) rows
+main = println (show (check []))
+"#;
+    let diags = check_src(src);
+    assert!(
+        has_error(&diags, "unit mismatch"),
+        "Ms * Ms compared against Ms must be rejected: {:?}",
         diags
     );
 }

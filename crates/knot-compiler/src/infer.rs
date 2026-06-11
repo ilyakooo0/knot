@@ -321,6 +321,22 @@ struct DeferredConstraint {
     span: Span,
 }
 
+/// A deferred unit-composition check for `*`/`/`: one operand carried a
+/// concrete unit while the other was still an unresolved type variable at
+/// the binop node (e.g. a field access on a lambda parameter whose record
+/// type is only pinned later, when the lambda unifies with its call site).
+/// Re-checked after inference completes, when the operand may have resolved;
+/// `result` is the fresh variable returned as the binop's type, unified with
+/// the composed unit once both sides are known.
+#[derive(Debug, Clone)]
+struct DeferredUnitBinop {
+    op: knot::ast::BinOp,
+    lhs: Ty,
+    rhs: Ty,
+    result: TyVar,
+    span: Span,
+}
+
 /// `result := union(sources)` constraint produced by `r1 \/ r2 \/ ...`
 /// effect-row syntax. The result row variable is bound to the union of each
 /// source row variable's effects once those sources are resolved.
@@ -495,6 +511,10 @@ struct Infer {
     /// Refine expression type vars: (span, alpha_var, inner_ty) for post-inference resolution.
     refine_vars: Vec<(Span, TyVar, Ty)>,
 
+    /// Unit-composition checks for `*`/`/` deferred because one operand was
+    /// still an unresolved type variable when the binop was inferred.
+    deferred_unit_binops: Vec<DeferredUnitBinop>,
+
     /// Spans of `elem` haystack args whose element type is SQL-pushable
     /// (Text/Float/Bool). Recorded during App inference, exported for codegen.
     elem_pushdown_ok: ElemPushdownOk,
@@ -545,6 +565,7 @@ impl Infer {
             show_unit_strings: HashMap::new(),
             refined_types: HashMap::new(),
             refine_vars: Vec::new(),
+            deferred_unit_binops: Vec::new(),
             elem_pushdown_ok: HashSet::new(),
         }
     }
@@ -4214,102 +4235,7 @@ impl Infer {
             ast::BinOp::Mul | ast::BinOp::Div => {
                 let lhs_applied = self.apply(&lhs_ty);
                 let rhs_applied = self.apply(&rhs_ty);
-                match (&lhs_applied, &rhs_applied) {
-                    // Both have units → compose
-                    (Ty::IntUnit(u1), Ty::IntUnit(u2)) => {
-                        let result_unit = if op == ast::BinOp::Mul {
-                            u1.mul(u2)
-                        } else {
-                            u1.div(u2)
-                        };
-                        if result_unit.is_dimensionless() { Ty::Int } else { Ty::IntUnit(result_unit) }
-                    }
-                    (Ty::FloatUnit(u1), Ty::FloatUnit(u2)) => {
-                        let result_unit = if op == ast::BinOp::Mul {
-                            u1.mul(u2)
-                        } else {
-                            u1.div(u2)
-                        };
-                        if result_unit.is_dimensionless() { Ty::Float } else { Ty::FloatUnit(result_unit) }
-                    }
-                    // One unit, one dimensionless → preserve unit
-                    (Ty::IntUnit(u), Ty::Int) | (Ty::Int, Ty::IntUnit(u)) => {
-                        if op == ast::BinOp::Div && matches!(&rhs_applied, Ty::IntUnit(_)) {
-                            // x / y<u> → x<1/u>
-                            let inv = u.pow(-1);
-                            if inv.is_dimensionless() { Ty::Int } else { Ty::IntUnit(inv) }
-                        } else if op == ast::BinOp::Div && matches!(&lhs_applied, Ty::IntUnit(_)) {
-                            // x<u> / y → x<u>
-                            Ty::IntUnit(u.clone())
-                        } else {
-                            Ty::IntUnit(u.clone())
-                        }
-                    }
-                    (Ty::FloatUnit(u), Ty::Float) | (Ty::Float, Ty::FloatUnit(u)) => {
-                        if op == ast::BinOp::Div && matches!(&rhs_applied, Ty::FloatUnit(_)) {
-                            let inv = u.pow(-1);
-                            if inv.is_dimensionless() { Ty::Float } else { Ty::FloatUnit(inv) }
-                        } else if op == ast::BinOp::Div && matches!(&lhs_applied, Ty::FloatUnit(_)) {
-                            Ty::FloatUnit(u.clone())
-                        } else {
-                            Ty::FloatUnit(u.clone())
-                        }
-                    }
-                    // No units involved → default behavior
-                    _ => {
-                        // Unit soundness: `*`/`/` *compose* units, but
-                        // composition is only computable when both operands'
-                        // units are known. If one side carries a concrete
-                        // unit while the other is still an unresolved type
-                        // variable (e.g. an unannotated lambda parameter),
-                        // unifying them would force both to the *same* unit
-                        // and type the product with that unit instead of its
-                        // square. Reject conservatively and ask for an
-                        // annotation rather than silently inferring an
-                        // unsound unit.
-                        // A unit is "known to be unit-bearing" when, after
-                        // resolving unit variables, it still has concrete
-                        // bases OR an unresolved unit variable. A bare unit
-                        // variable (e.g. the `u` in `Float<u> -> Float<u>`)
-                        // is just as unit-bearing as a concrete unit: typing
-                        // `x<u> * y` with `y` unresolved would unify `y`
-                        // with `x` and produce `u` where `u^2` is correct.
-                        let concrete_unit = |slf: &Self, t: &Ty| match t {
-                            Ty::IntUnit(u) | Ty::FloatUnit(u) => {
-                                let applied = slf.apply_unit(u);
-                                if applied.is_dimensionless() {
-                                    None
-                                } else {
-                                    Some(applied.display())
-                                }
-                            }
-                            _ => None,
-                        };
-                        let lhs_is_var = matches!(&lhs_applied, Ty::Var(_));
-                        let rhs_is_var = matches!(&rhs_applied, Ty::Var(_));
-                        let unit_side = if lhs_is_var {
-                            concrete_unit(self, &rhs_applied)
-                        } else if rhs_is_var {
-                            concrete_unit(self, &lhs_applied)
-                        } else {
-                            None
-                        };
-                        if let Some(unit) = unit_side {
-                            let op_name = if op == ast::BinOp::Mul { "*" } else { "/" };
-                            self.error(
-                                format!(
-                                    "cannot infer the unit of an operand of `{}`: one side has unit <{}> but the other side's type is not yet known — units compose under `{}`, so the unresolved operand needs an explicit annotation (e.g. `(x : Float<{}>)`, or `(x : Float)` for a dimensionless value)",
-                                    op_name, unit, op_name, unit
-                                ),
-                                span,
-                            );
-                            return Ty::Error;
-                        }
-                        self.unify(&lhs_applied, &rhs_applied, span);
-                        self.require_trait("Num", &lhs_applied, span);
-                        lhs_applied
-                    }
-                }
+                self.unit_mul_div_ty(op, &lhs_applied, &rhs_applied, span, true)
             }
             // Comparison: both same type, result Bool
             ast::BinOp::Eq | ast::BinOp::Neq => {
@@ -4343,6 +4269,152 @@ impl Infer {
                 );
                 self.unify(&rhs_ty, &fun_ty, span);
                 result_ty
+            }
+        }
+    }
+
+    /// Result type of a `*`/`/` binop under unit composition. Both operand
+    /// types must already be substitution-applied. When one side carries a
+    /// concrete unit and the other is still an unresolved type variable,
+    /// `allow_defer` controls the outcome: at the binop node (true) the
+    /// check is deferred — the operand may resolve later, e.g. a field
+    /// access on a lambda parameter whose record type is only pinned when
+    /// the lambda unifies with its call site — and a fresh variable stands
+    /// in for the result; at post-inference resolution (false) a still-
+    /// unresolved operand is an error demanding an annotation.
+    fn unit_mul_div_ty(
+        &mut self,
+        op: ast::BinOp,
+        lhs_applied: &Ty,
+        rhs_applied: &Ty,
+        span: Span,
+        allow_defer: bool,
+    ) -> Ty {
+        match (lhs_applied, rhs_applied) {
+            // Both have units → compose
+            (Ty::IntUnit(u1), Ty::IntUnit(u2)) => {
+                let result_unit = if op == ast::BinOp::Mul {
+                    u1.mul(u2)
+                } else {
+                    u1.div(u2)
+                };
+                if result_unit.is_dimensionless() { Ty::Int } else { Ty::IntUnit(result_unit) }
+            }
+            (Ty::FloatUnit(u1), Ty::FloatUnit(u2)) => {
+                let result_unit = if op == ast::BinOp::Mul {
+                    u1.mul(u2)
+                } else {
+                    u1.div(u2)
+                };
+                if result_unit.is_dimensionless() { Ty::Float } else { Ty::FloatUnit(result_unit) }
+            }
+            // One unit, one dimensionless → preserve unit
+            (Ty::IntUnit(u), Ty::Int) | (Ty::Int, Ty::IntUnit(u)) => {
+                if op == ast::BinOp::Div && matches!(rhs_applied, Ty::IntUnit(_)) {
+                    // x / y<u> → x<1/u>
+                    let inv = u.pow(-1);
+                    if inv.is_dimensionless() { Ty::Int } else { Ty::IntUnit(inv) }
+                } else if op == ast::BinOp::Div && matches!(lhs_applied, Ty::IntUnit(_)) {
+                    // x<u> / y → x<u>
+                    Ty::IntUnit(u.clone())
+                } else {
+                    Ty::IntUnit(u.clone())
+                }
+            }
+            (Ty::FloatUnit(u), Ty::Float) | (Ty::Float, Ty::FloatUnit(u)) => {
+                if op == ast::BinOp::Div && matches!(rhs_applied, Ty::FloatUnit(_)) {
+                    let inv = u.pow(-1);
+                    if inv.is_dimensionless() { Ty::Float } else { Ty::FloatUnit(inv) }
+                } else if op == ast::BinOp::Div && matches!(lhs_applied, Ty::FloatUnit(_)) {
+                    Ty::FloatUnit(u.clone())
+                } else {
+                    Ty::FloatUnit(u.clone())
+                }
+            }
+            // No units involved → default behavior
+            _ => {
+                // Unit soundness: `*`/`/` *compose* units, but
+                // composition is only computable when both operands'
+                // units are known. If one side carries a concrete
+                // unit while the other is still an unresolved type
+                // variable (e.g. an unannotated lambda parameter),
+                // unifying them would force both to the *same* unit
+                // and type the product with that unit instead of its
+                // square. Defer the check (the operand's type may be
+                // pinned by a later unification), and at end of
+                // inference reject conservatively rather than silently
+                // inferring an unsound unit.
+                // A unit is "known to be unit-bearing" when, after
+                // resolving unit variables, it still has concrete
+                // bases OR an unresolved unit variable. A bare unit
+                // variable (e.g. the `u` in `Float<u> -> Float<u>`)
+                // is just as unit-bearing as a concrete unit: typing
+                // `x<u> * y` with `y` unresolved would unify `y`
+                // with `x` and produce `u` where `u^2` is correct.
+                let concrete_unit = |slf: &Self, t: &Ty| match t {
+                    Ty::IntUnit(u) | Ty::FloatUnit(u) => {
+                        let applied = slf.apply_unit(u);
+                        if applied.is_dimensionless() {
+                            None
+                        } else {
+                            Some(applied.display())
+                        }
+                    }
+                    _ => None,
+                };
+                let lhs_is_var = matches!(lhs_applied, Ty::Var(_));
+                let rhs_is_var = matches!(rhs_applied, Ty::Var(_));
+                let unit_side = if lhs_is_var {
+                    concrete_unit(self, rhs_applied)
+                } else if rhs_is_var {
+                    concrete_unit(self, lhs_applied)
+                } else {
+                    None
+                };
+                if let Some(unit) = unit_side {
+                    if allow_defer {
+                        let result = self.fresh_var();
+                        self.deferred_unit_binops.push(DeferredUnitBinop {
+                            op,
+                            lhs: lhs_applied.clone(),
+                            rhs: rhs_applied.clone(),
+                            result,
+                            span,
+                        });
+                        return Ty::Var(result);
+                    }
+                    let op_name = if op == ast::BinOp::Mul { "*" } else { "/" };
+                    self.error(
+                        format!(
+                            "cannot infer the unit of an operand of `{}`: one side has unit <{}> but the other side's type is not yet known — units compose under `{}`, so the unresolved operand needs an explicit annotation (e.g. `(x : Float<{}>)`, or `(x : Float)` for a dimensionless value)",
+                            op_name, unit, op_name, unit
+                        ),
+                        span,
+                    );
+                    return Ty::Error;
+                }
+                self.unify(lhs_applied, rhs_applied, span);
+                self.require_trait("Num", lhs_applied, span);
+                lhs_applied.clone()
+            }
+        }
+    }
+
+    /// Resolve unit-composition checks deferred at `*`/`/` nodes. Runs after
+    /// all declaration bodies are inferred, when an operand that was a bare
+    /// type variable at the binop (e.g. a record field on a lambda param)
+    /// may have been pinned to a concrete type. Re-running the composition
+    /// with `allow_defer = false` either computes the result type — unified
+    /// with the placeholder variable the binop returned — or emits the
+    /// annotation-demanding error for operands that never resolved.
+    fn resolve_deferred_unit_binops(&mut self) {
+        let deferred = std::mem::take(&mut self.deferred_unit_binops);
+        for d in &deferred {
+            let lhs = self.apply(&d.lhs);
+            let rhs = self.apply(&d.rhs);
+            let result_ty = self.unit_mul_div_ty(d.op, &lhs, &rhs, d.span, false);
+            if !matches!(result_ty, Ty::Error) {
+                self.unify(&Ty::Var(d.result), &result_ty, d.span);
             }
         }
     }
@@ -8202,6 +8274,13 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
             }
         }
     }
+
+    // Phase 4b2: Resolve unit-composition checks deferred at `*`/`/` nodes
+    // (one operand was an unresolved type variable at the binop — e.g. a
+    // record field on a lambda param pinned later by its call site). Must
+    // run before check_constraints so the Num constraints it registers are
+    // still checked.
+    infer.resolve_deferred_unit_binops();
 
     // Phase 4c: Check deferred trait constraints
     infer.check_constraints();

@@ -252,8 +252,9 @@ pub struct Codegen {
     // Compiled predicate function values: type_name -> func_id
     #[allow(dead_code)]
     refined_predicate_fns: HashMap<String, FuncId>,
-    // parseJson call targets: app_span -> resolved return type name (for compile-time FromJSON dispatch)
-    from_json_targets: HashMap<knot::ast::Span, String>,
+    // parseJson call targets: app_span -> resolved type name (for compile-time
+    // FromJSON dispatch) + wire schema (for Maybe-aware decoding)
+    from_json_targets: crate::infer::FromJsonTargets,
 
     // Spans of `elem` haystack args whose element type is SQL-pushable
     // (Text/Float/Bool). Codegen emits `IN (SELECT value FROM json_each(?))`
@@ -1050,6 +1051,7 @@ impl Codegen {
         self.declare_rt("knot_json_encode", &[p], &[p]);
         self.declare_rt("knot_json_encode_with", &[p, p, p], &[p]);
         self.declare_rt("knot_json_decode", &[p], &[p]);
+        self.declare_rt("knot_json_decode_typed", &[p, p, p], &[p]);
         self.declare_rt("knot_register_to_json", &[p], &[]);
 
         // Bytes value constructor and standard library
@@ -6276,7 +6278,8 @@ impl Codegen {
             // Compile-time FromJSON dispatch: parseJson(text) → FromJSON_Type_parseJson
             // when the return type is known and a FromJSON impl exists for that type
             ast::ExprKind::Var(name) if name == "parseJson" && compiled_args.len() == 1 => {
-                if let Some(type_name) = self.from_json_targets.get(&expr.span) {
+                let target = self.from_json_targets.get(&expr.span).cloned();
+                if let Some(type_name) = target.as_ref().and_then(|t| t.type_name.as_deref()) {
                     let impl_fn = format!("FromJSON_{}_parseJson", type_name);
                     if let Some(&(func_id, _)) = self.user_fns.get(&impl_fn) {
                         let func_ref = self
@@ -6288,6 +6291,17 @@ impl Codegen {
                         );
                         return builder.inst_results(call)[0];
                     }
+                }
+                // Maybe-aware decode: when the inferred target type has Maybe
+                // positions, pass the wire schema so `null`/absent decodes to
+                // Nothing and present values are Just-wrapped.
+                if let Some(schema) = target.as_ref().and_then(|t| t.wire_schema.as_deref()) {
+                    let (sptr, slen) = self.string_ptr(builder, schema);
+                    return self.call_rt(
+                        builder,
+                        "knot_json_decode_typed",
+                        &[compiled_args[0], sptr, slen],
+                    );
                 }
                 // Fall through to generic parseJson (dispatcher or runtime)
                 if let Some(&(func_id, expected_params)) = self.user_fns.get("parseJson") {
@@ -15351,6 +15365,19 @@ fn ast_type_to_descriptor_type(
                 "text".to_string()
             }
         }
+        // Structural descriptors for nested records/relations so the runtime
+        // can normalize Maybe positions inside request bodies (`null`/absent
+        // → Nothing, present → Just) via `apply_wire_type`.
+        ast::TypeKind::Record { fields, .. } => {
+            let inner: Vec<String> = fields
+                .iter()
+                .map(|f| format!("{}:{}", f.name, ast_type_to_descriptor_type(&f.value, aliases)))
+                .collect();
+            format!("{{{}}}", inner.join(","))
+        }
+        ast::TypeKind::Relation(inner) => {
+            format!("[{}]", ast_type_to_descriptor_type(inner, aliases))
+        }
         ast::TypeKind::UnitAnnotated { base, .. } => ast_type_to_descriptor_type(base, aliases),
         _ => "text".to_string(),
     }
@@ -15403,6 +15430,21 @@ fn resolve_type_for_descriptor(
                 resolve_type_for_descriptor(inner, aliases),
             ))
         }
+        ast::TypeKind::App { func, arg } => {
+            // Inline `Maybe T` — resolve to the built-in Maybe ADT shape so
+            // the descriptor marks the position as `?<inner>` (wire `null`).
+            if matches!(&func.node, ast::TypeKind::Named(n) if n == "Maybe") {
+                ResolvedType::Adt(vec![
+                    ("Nothing".into(), vec![]),
+                    (
+                        "Just".into(),
+                        vec![("value".into(), resolve_type_for_descriptor(arg, aliases))],
+                    ),
+                ])
+            } else {
+                ResolvedType::Text
+            }
+        }
         ast::TypeKind::UnitAnnotated { base, .. } => resolve_type_for_descriptor(base, aliases),
         _ => ResolvedType::Text,
     }
@@ -15426,6 +15468,22 @@ fn resolved_type_to_descriptor(ty: &ResolvedType) -> String {
             format!("[{}]", resolved_type_to_descriptor(inner))
         }
         ResolvedType::Adt(ctors) => {
+            // The built-in Maybe shape encodes as `null`/bare value on the
+            // wire — descriptor `?<inner>` so the client can Just-wrap.
+            if let [(a, af), (b, bf)] = ctors.as_slice() {
+                let maybe_inner = match (a.as_str(), b.as_str()) {
+                    ("Nothing", "Just") if af.is_empty() => Some(bf),
+                    ("Just", "Nothing") if bf.is_empty() => Some(af),
+                    _ => None,
+                };
+                if let Some(just_fields) = maybe_inner {
+                    if let [(fname, fty)] = just_fields.as_slice() {
+                        if fname == "value" {
+                            return format!("?{}", resolved_type_to_descriptor(fty));
+                        }
+                    }
+                }
+            }
             // Represent ADT as object with _tag + all constructor fields
             let mut fields: Vec<String> = vec!["_tag:text".to_string()];
             let mut seen = std::collections::HashSet::<String>::new();

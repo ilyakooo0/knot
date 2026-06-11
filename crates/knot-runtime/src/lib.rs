@@ -9046,7 +9046,7 @@ pub extern "C-unwind" fn knot_json_encode_with(
 ///   JSON string  → Text
 ///   JSON number  → Int (if no decimal point) or Float
 ///   JSON boolean → Bool
-///   JSON null    → Unit
+///   JSON null    → Nothing (Maybe decodes from `null`)
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_json_decode(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
@@ -9060,10 +9060,30 @@ pub extern "C-unwind" fn knot_json_decode(v: *mut Value) -> *mut Value {
     }
 }
 
-/// Convert a serde_json::Value into a Knot *mut Value.
+/// Convert a serde_json::Value into a Knot *mut Value (wire decoding).
+/// JSON `null` decodes to `Nothing` — the inverse of the wire encoding where
+/// `Nothing` serializes as `null`. Bare values stay bare; type-directed
+/// `Just`-wrapping happens via `apply_wire_type` where a descriptor is known.
 fn json_to_value(json: &serde_json::Value) -> *mut Value {
+    json_to_value_impl(json, true)
+}
+
+/// Storage decoding for SQLite JSON columns: `null` decodes to Unit, matching
+/// the storage encoding where only Unit produces `null` (Maybe constructors
+/// are stored with the `__knot_ctor` marker).
+fn json_to_value_db(json: &serde_json::Value) -> *mut Value {
+    json_to_value_impl(json, false)
+}
+
+fn json_to_value_impl(json: &serde_json::Value, wire: bool) -> *mut Value {
     match json {
-        serde_json::Value::Null => alloc(Value::Unit),
+        serde_json::Value::Null => {
+            if wire {
+                make_nothing()
+            } else {
+                alloc(Value::Unit)
+            }
+        }
         serde_json::Value::Bool(b) => alloc_bool(*b),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
@@ -9076,7 +9096,8 @@ fn json_to_value(json: &serde_json::Value) -> *mut Value {
         }
         serde_json::Value::String(s) => alloc(Value::Text(Arc::from(s.as_str()))),
         serde_json::Value::Array(arr) => {
-            let items: Vec<*mut Value> = arr.iter().map(json_to_value).collect();
+            let items: Vec<*mut Value> =
+                arr.iter().map(|v| json_to_value_impl(v, wire)).collect();
             alloc(Value::Relation(items))
         }
         serde_json::Value::Object(obj) => {
@@ -9098,18 +9119,103 @@ fn json_to_value(json: &serde_json::Value) -> *mut Value {
                     if let (Some(serde_json::Value::String(tag)), Some(val)) =
                         (inner.get("tag"), inner.get("value"))
                     {
-                        return alloc(Value::Constructor(intern_str(tag), json_to_value(val)));
+                        return alloc(Value::Constructor(
+                            intern_str(tag),
+                            json_to_value_impl(val, wire),
+                        ));
                     }
                 }
             }
             let mut fields: Vec<RecordField> = obj
                 .iter()
-                .map(|(k, v)| RecordField { name: intern_str(k), value: json_to_value(v) })
+                .map(|(k, v)| RecordField {
+                    name: intern_str(k),
+                    value: json_to_value_impl(v, wire),
+                })
                 .collect();
             fields.sort_by(|a, b| a.name.cmp(&b.name));
             alloc(Value::Record(fields))
         }
     }
+}
+
+/// Normalize a wire-decoded JSON value against a type descriptor, fixing up
+/// Maybe positions: at a `?`-marked position `null`/absent stays `Nothing`
+/// and any present value is wrapped in `Just`. Descriptor grammar matches
+/// route/response descriptors: `?<inner>`, `[<inner>]`, `{name:type,...}`,
+/// and scalar tokens (`int`, `float`, `bool`, `text`, `tag`, `unit`, ...).
+/// Scalar positions go through `coerce_json_field` (e.g. `tag` re-tags
+/// enum-like ADT strings); unknown descriptors leave the value unchanged.
+fn apply_wire_type(v: *mut Value, desc: &str) -> *mut Value {
+    let desc = desc.trim();
+    if desc.is_empty() {
+        return v;
+    }
+    if let Some(inner) = desc.strip_prefix('?') {
+        if v.is_null() {
+            return make_nothing();
+        }
+        return match unsafe { as_ref(v) } {
+            // `null` wire-decodes to Nothing already; Unit covers values
+            // decoded by the storage path or built by older clients.
+            Value::Unit => make_nothing(),
+            Value::Constructor(tag, payload) if is_nothing_ctor(tag, *payload) => v,
+            Value::Constructor(tag, payload) => match just_ctor_value(tag, *payload) {
+                // Already Just-wrapped (legacy `__knot_ctor` encoding):
+                // keep the wrapper, normalize the payload.
+                Some(jv) => make_just(apply_wire_type(jv, inner)),
+                None => make_just(apply_wire_type(v, inner)),
+            },
+            _ => make_just(apply_wire_type(v, inner)),
+        };
+    }
+    if desc.starts_with('{') && desc.ends_with('}') {
+        if let Value::Record(fields) = unsafe { as_ref(v) } {
+            let descs = parse_response_fields(&desc[1..desc.len() - 1]);
+            let mut out: Vec<RecordField> = fields
+                .iter()
+                .map(|f| match descs.iter().find(|(n, _)| n.as_str() == &*f.name) {
+                    Some((_, fty)) => RecordField {
+                        name: f.name.clone(),
+                        value: apply_wire_type(f.value, fty),
+                    },
+                    None => RecordField { name: f.name.clone(), value: f.value },
+                })
+                .collect();
+            // Absent Maybe fields decode to Nothing.
+            for (n, fty) in &descs {
+                if fty.starts_with('?') && !fields.iter().any(|f| &*f.name == n.as_str()) {
+                    out.push(RecordField { name: intern_str(n), value: make_nothing() });
+                }
+            }
+            out.sort_by(|a, b| a.name.cmp(&b.name));
+            return alloc(Value::Record(out));
+        }
+        return v;
+    }
+    if desc.starts_with('[') && desc.ends_with(']') {
+        if let Value::Relation(rows) = unsafe { as_ref(v) } {
+            let inner = &desc[1..desc.len() - 1];
+            let mapped: Vec<*mut Value> =
+                rows.iter().map(|r| apply_wire_type(*r, inner)).collect();
+            return alloc(Value::Relation(mapped));
+        }
+        return v;
+    }
+    coerce_json_field(v, desc)
+}
+
+/// parseJson with a compile-time type descriptor: wire-decodes the JSON,
+/// then normalizes Maybe positions per the descriptor so `null`/absent
+/// fields become `Nothing` and present values are `Just`-wrapped.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_json_decode_typed(
+    v: *mut Value,
+    desc_ptr: *const u8,
+    desc_len: usize,
+) -> *mut Value {
+    let desc = unsafe { str_from_raw(desc_ptr, desc_len) };
+    apply_wire_type(knot_json_decode(v), desc)
 }
 
 // ── Standard library: utility operations ──────────────────────
@@ -9767,7 +9873,7 @@ fn read_sql_column(row: &rusqlite::Row, i: usize, ty: ColType) -> *mut Value {
             // Read TEXT and parse as JSON back into a Knot value (typically a relation)
             let s: String = row.get(i).unwrap_or_else(|_| panic!("{}", mismatch()));
             match serde_json::from_str::<serde_json::Value>(&s) {
-                Ok(json) => json_to_value(&json),
+                Ok(json) => json_to_value_db(&json),
                 Err(_) => alloc(Value::Text(Arc::from(s))),
             }
         }
@@ -12207,7 +12313,7 @@ fn value_to_sql_param(v: *mut Value) -> rusqlite::types::Value {
         Value::Bytes(b) => rusqlite::types::Value::Blob((**b).to_vec()),
         Value::Constructor(tag, _) => rusqlite::types::Value::Text(tag.to_string()),
         Value::Relation(_) | Value::Record(_) => {
-            rusqlite::types::Value::Text(value_to_json(v))
+            rusqlite::types::Value::Text(value_to_json_db(v))
         }
         _ => panic!(
             "knot runtime: cannot use {} as SQL parameter",
@@ -12230,7 +12336,7 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
             rusqlite::types::Value::Text(tag.to_string())
         }
         (Value::Constructor(_, _), ColType::Json) => {
-            rusqlite::types::Value::Text(value_to_json(v))
+            rusqlite::types::Value::Text(value_to_json_db(v))
         }
         (Value::Constructor(tag, _), _) => rusqlite::types::Value::Text(tag.to_string()),
         (Value::Relation(rows), ColType::Json) => {
@@ -12238,10 +12344,10 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
             // dedup rows before serializing, mirroring the INSERT OR IGNORE
             // dedup that child-table storage gets from its UNIQUE index.
             let deduped = in_memory_dedup(rows.clone());
-            rusqlite::types::Value::Text(value_to_json(alloc(Value::Relation(deduped))))
+            rusqlite::types::Value::Text(value_to_json_db(alloc(Value::Relation(deduped))))
         }
         (Value::Record(_), ColType::Json) => {
-            rusqlite::types::Value::Text(value_to_json(v))
+            rusqlite::types::Value::Text(value_to_json_db(v))
         }
         _ => panic!("knot runtime: cannot convert {} to SQL", brief_value(v)),
     }
@@ -13670,14 +13776,34 @@ fn parse_descriptor(desc: &str) -> Vec<(String, String)> {
     if desc.is_empty() {
         return Vec::new();
     }
-    desc.split(',')
-        .map(|part| {
-            let mut split = part.splitn(2, ':');
-            let name = split.next().unwrap_or("").to_string();
-            let ty = split.next().unwrap_or("text").to_string();
-            (name, ty)
-        })
-        .collect()
+    // Field types can be structural (`addr:{city:text,zip:?text}` or
+    // `tags:[text]`), so split on commas only at bracket depth zero.
+    let mut fields = Vec::new();
+    let mut push_part = |part: &str| {
+        if part.is_empty() {
+            return;
+        }
+        let mut split = part.splitn(2, ':');
+        let name = split.next().unwrap_or("").to_string();
+        let ty = split.next().unwrap_or("text").to_string();
+        fields.push((name, ty));
+    };
+    let mut depth = 0i32;
+    let mut start = 0;
+    let bytes = desc.as_bytes();
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'[' | b'{' => depth += 1,
+            b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                push_part(&desc[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    push_part(&desc[start..]);
+    fields
 }
 
 fn parse_path_pattern(path: &str) -> Vec<PathPart> {
@@ -13949,12 +14075,51 @@ fn base64_decode(s: &str) -> Vec<u8> {
     out
 }
 
+/// Wire JSON encoding: `Maybe` follows the standard JSON convention —
+/// `Nothing` serializes as `null`, `Just x` serializes as `x`'s JSON.
+/// Used for everything user-facing (toJson, HTTP request/response bodies).
 fn value_to_json(v: *mut Value) -> String {
     serde_json::to_string(&value_to_serde_json(v)).unwrap_or_else(|_| "null".to_string())
 }
 
-/// Convert a Knot *mut Value into a serde_json::Value.
+/// Storage JSON encoding: `Maybe` keeps the `__knot_ctor` marker so SQLite
+/// JSON columns round-trip constructors faithfully (the schema-less DB read
+/// path can't Just-wrap bare values, and existing databases hold the marker).
+fn value_to_json_db(v: *mut Value) -> String {
+    serde_json::to_string(&value_to_serde_json_impl(v, false))
+        .unwrap_or_else(|_| "null".to_string())
+}
+
+/// Convert a Knot *mut Value into a serde_json::Value (wire encoding).
 fn value_to_serde_json(v: *mut Value) -> serde_json::Value {
+    value_to_serde_json_impl(v, true)
+}
+
+/// True when a constructor value is the built-in `Nothing {}` (nullary tag
+/// "Nothing"). A user constructor named `Nothing` carrying fields is not
+/// treated as the Maybe constructor.
+fn is_nothing_ctor(tag: &str, payload: *mut Value) -> bool {
+    tag == "Nothing"
+        && (payload.is_null()
+            || matches!(unsafe { as_ref(payload) }, Value::Unit)
+            || matches!(unsafe { as_ref(payload) }, Value::Record(fs) if fs.is_empty()))
+}
+
+/// For a `Just`-tagged constructor, return its `value` payload field (the
+/// built-in Maybe shape is `Just {value: x}`). None for other shapes.
+fn just_ctor_value(tag: &str, payload: *mut Value) -> Option<*mut Value> {
+    if tag != "Just" || payload.is_null() {
+        return None;
+    }
+    match unsafe { as_ref(payload) } {
+        Value::Record(fields) if fields.len() == 1 && &*fields[0].name == "value" => {
+            Some(fields[0].value)
+        }
+        _ => None,
+    }
+}
+
+fn value_to_serde_json_impl(v: *mut Value, wire: bool) -> serde_json::Value {
     if v.is_null() {
         return serde_json::Value::Null;
     }
@@ -13978,19 +14143,30 @@ fn value_to_serde_json(v: *mut Value) -> serde_json::Value {
         Value::Record(fields) => {
             let mut map = serde_json::Map::with_capacity(fields.len());
             for f in fields {
-                map.insert(f.name.to_string(), value_to_serde_json(f.value));
+                map.insert(f.name.to_string(), value_to_serde_json_impl(f.value, wire));
             }
             serde_json::Value::Object(map)
         }
         Value::Relation(rows) => {
-            serde_json::Value::Array(rows.iter().map(|r| value_to_serde_json(*r)).collect())
+            serde_json::Value::Array(rows.iter().map(|r| value_to_serde_json_impl(*r, wire)).collect())
         }
         Value::Constructor(tag, payload) => {
+            // Wire encoding maps the built-in Maybe to JSON's native optional:
+            // Nothing → null, Just x → x. (`Just Nothing` collapses to null —
+            // the usual lossiness of this convention.)
+            if wire {
+                if is_nothing_ctor(tag, *payload) {
+                    return serde_json::Value::Null;
+                }
+                if let Some(inner) = just_ctor_value(tag, *payload) {
+                    return value_to_serde_json_impl(inner, wire);
+                }
+            }
             // Wrap in `__knot_ctor` so parseJson can reconstruct without
             // colliding with user records that happen to use `tag`/`value` keys.
             let mut inner = serde_json::Map::with_capacity(2);
             inner.insert("tag".into(), serde_json::Value::String(tag.to_string()));
-            inner.insert("value".into(), value_to_serde_json(*payload));
+            inner.insert("value".into(), value_to_serde_json_impl(*payload, wire));
             let mut map = serde_json::Map::with_capacity(1);
             map.insert("__knot_ctor".into(), serde_json::Value::Object(inner));
             serde_json::Value::Object(map)
@@ -14041,6 +14217,13 @@ fn value_to_json_with(db: *mut c_void, v: *mut Value, to_json_fn: *const u8) -> 
             json
         }
         Value::Constructor(tag, payload) => {
+            // Maybe follows the wire convention: Nothing → null, Just x → x.
+            if is_nothing_ctor(tag, *payload) {
+                return "null".to_string();
+            }
+            if let Some(inner) = just_ctor_value(tag, *payload) {
+                return call_to_json_dispatcher(db, inner, to_json_fn);
+            }
             // Match value_to_serde_json's `__knot_ctor` wrapper so reconstruction
             // round-trips and user records with `tag`/`value` keys aren't shadowed.
             let mut json = String::from("{\"__knot_ctor\":{\"tag\":");
@@ -14525,42 +14708,26 @@ fn http_serve_loop(
                             Value::Record(body_fields) => {
                                 for (bname, bty) in &entry_body_fields {
                                     let is_maybe = bty.starts_with('?');
-                                    let inner_ty = if is_maybe { &bty[1..] } else { bty.as_str() };
                                     let raw_val = body_fields.iter()
                                         .find(|f| &*f.name == bname.as_str())
                                         .map(|f| f.value);
-                                    let value = if is_maybe {
-                                        match raw_val {
-                                            // JSON `null` decodes to `Value::Unit` via
-                                            // `json_to_value`; for a Maybe-typed body
-                                            // field both `null` and an absent field
-                                            // mean `Nothing` — wrapping the Unit as
-                                            // `Just {value: Unit}` corrupted the
-                                            // fetch↔listen round-trip.
-                                            Some(v) if !matches!(unsafe { as_ref(v) }, Value::Unit) => {
-                                                let coerced = coerce_json_field(v, inner_ty);
-                                                alloc(Value::Constructor(
-                                                    "Just".into(),
-                                                    alloc(Value::Record(vec![
-                                                        RecordField { name: "value".into(), value: coerced },
-                                                    ])),
-                                                ))
-                                            }
-                                            _ => alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit))),
-                                        }
-                                    } else {
-                                        match raw_val {
-                                            Some(v) => coerce_json_field(v, inner_ty),
-                                            // A missing required field is a
-                                            // client error — defaulting to
-                                            // 0/""/false silently corrupts
-                                            // data (path/query/headers
-                                            // already 400 on bad input).
-                                            None => return Err((400, format!(
-                                                "missing required body field '{}'",
-                                                bname
-                                            ), None)),
-                                        }
+                                    // `apply_wire_type` normalizes Maybe per the
+                                    // wire convention: JSON `null` (and absent
+                                    // fields) decode to `Nothing`, present values
+                                    // are `Just`-wrapped — including nested Maybe
+                                    // positions inside record/relation fields.
+                                    let value = match raw_val {
+                                        Some(v) => apply_wire_type(v, bty),
+                                        None if is_maybe => make_nothing(),
+                                        // A missing required field is a
+                                        // client error — defaulting to
+                                        // 0/""/false silently corrupts
+                                        // data (path/query/headers
+                                        // already 400 on bad input).
+                                        None => return Err((400, format!(
+                                            "missing required body field '{}'",
+                                            bname
+                                        ), None)),
                                     };
                                     fields.push(RecordField {
                                         name: intern_str(bname),
@@ -15201,10 +15368,16 @@ pub extern "C-unwind" fn knot_http_fetch_io(
                 if status >= 400 {
                     fetch_build_err(status, &body_text)
                 } else {
-                    let has_resp_schema = matches!(unsafe { as_ref(resp_desc) }, Value::Text(s) if !s.is_empty());
-                    let parsed_body = if has_resp_schema {
+                    let resp_schema: String = match unsafe { as_ref(resp_desc) } {
+                        Value::Text(s) => (**s).to_string(),
+                        _ => String::new(),
+                    };
+                    let parsed_body = if !resp_schema.is_empty() {
                         match serde_json::from_str::<serde_json::Value>(&body_text) {
-                            Ok(json) => json_to_value(&json),
+                            // Normalize Maybe positions per the response
+                            // descriptor: `null`/absent → Nothing, present
+                            // values → Just.
+                            Ok(json) => apply_wire_type(json_to_value(&json), &resp_schema),
                             Err(e) => return fetch_build_err(
                                 status,
                                 &format!("invalid JSON in response: {}", e),
@@ -15323,20 +15496,17 @@ fn fetch_build_url(base: &str, path_pattern: &str, payload: *mut Value) -> Strin
 /// Build a JSON body string from a field descriptor and record payload.
 fn fetch_build_body(body_desc: &str, payload: *mut Value) -> String {
     let mut map = serde_json::Map::new();
-    for field_desc in body_desc.split(',') {
-        if field_desc.is_empty() {
-            continue;
-        }
-        let (name, ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
+    // Bracket-aware split: field types can be structural (`addr:{city:text}`).
+    for (name, ty) in parse_descriptor(body_desc) {
         let is_maybe = ty.starts_with('?');
         let field_val = knot_record_field(payload, name.as_ptr(), name.len());
         if is_maybe {
             match unwrap_maybe(field_val) {
                 Some(inner) => { map.insert(name.to_string(), value_to_serde_json(inner)); }
                 // Omit Nothing fields entirely (consistent with how fetch
-                // skips Nothing headers and query params). Servers treat an
-                // absent Maybe field as Nothing; serializing `null` made the
-                // server decode it as `Just Unit`.
+                // skips Nothing headers and query params). Servers decode
+                // both an absent Maybe field and an explicit `null` as
+                // Nothing, so omission is the lighter equivalent.
                 None => {}
             }
         } else {
@@ -15349,11 +15519,7 @@ fn fetch_build_body(body_desc: &str, payload: *mut Value) -> String {
 /// Build a query string from a field descriptor and record payload.
 fn fetch_build_query(query_desc: &str, payload: *mut Value) -> String {
     let mut parts = Vec::new();
-    for field_desc in query_desc.split(',') {
-        if field_desc.is_empty() {
-            continue;
-        }
-        let (name, _ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
+    for (name, _ty) in parse_descriptor(query_desc) {
         let field_val = knot_record_field(payload, name.as_ptr(), name.len());
         // `fetch_value_to_text_opt` unwraps Just and returns None for
         // Nothing — Nothing query params are omitted from the URL.
@@ -15755,6 +15921,14 @@ fn response_type_to_schema(desc: &str) -> String {
     let desc = desc.trim();
     if desc.is_empty() {
         return "{}".to_string();
+    }
+    // `?` marks Maybe — serialized as the inner type or `null`.
+    if let Some(inner) = desc.strip_prefix('?') {
+        let inner_schema = response_type_to_schema(inner);
+        return match inner_schema.strip_prefix('{') {
+            Some(rest) if rest.trim() != "}" => format!("{{ \"nullable\": true,{}", rest),
+            _ => "{ \"nullable\": true }".to_string(),
+        };
     }
     match desc {
         "int" => "{ \"type\": \"integer\" }".to_string(),
@@ -16268,6 +16442,134 @@ mod _size_tests {
         eprintln!("sizeof(RecordField) = {}", std::mem::size_of::<RecordField>());
         eprintln!("sizeof(FunctionInner) = {}", std::mem::size_of::<FunctionInner>());
         eprintln!("sizeof(Arc<str>) = {}", std::mem::size_of::<Arc<str>>());
+    }
+}
+
+#[cfg(test)]
+mod _maybe_json_tests {
+    use super::*;
+
+    fn record(fields: Vec<(&str, *mut Value)>) -> *mut Value {
+        let mut fs: Vec<RecordField> = fields
+            .into_iter()
+            .map(|(n, v)| RecordField { name: intern_str(n), value: v })
+            .collect();
+        fs.sort_by(|a, b| a.name.cmp(&b.name));
+        alloc(Value::Record(fs))
+    }
+
+    fn field<'a>(v: *mut Value, name: &str) -> *mut Value {
+        knot_record_field(v, name.as_ptr(), name.len())
+    }
+
+    #[test]
+    fn wire_encode_maybe_as_null_and_bare() {
+        let just = make_just(alloc_int(5));
+        assert_eq!(value_to_json(just), "5");
+        assert_eq!(value_to_json(make_nothing()), "null");
+        let rec = record(vec![("a", make_nothing()), ("b", make_just(alloc_int(1)))]);
+        assert_eq!(value_to_json(rec), r#"{"a":null,"b":1}"#);
+    }
+
+    #[test]
+    fn db_encode_keeps_constructor_marker() {
+        let just = make_just(alloc_int(5));
+        assert_eq!(
+            value_to_json_db(just),
+            r#"{"__knot_ctor":{"tag":"Just","value":{"value":5}}}"#
+        );
+        assert!(value_to_json_db(make_nothing()).contains("__knot_ctor"));
+    }
+
+    #[test]
+    fn db_decode_round_trips_marker_and_keeps_null_as_unit() {
+        let json: serde_json::Value =
+            serde_json::from_str(r#"{"__knot_ctor":{"tag":"Just","value":{"value":5}}}"#)
+                .unwrap();
+        let v = json_to_value_db(&json);
+        match unsafe { as_ref(v) } {
+            Value::Constructor(tag, payload) => {
+                assert_eq!(&**tag, "Just");
+                match unsafe { as_ref(field(*payload, "value")) } {
+                    Value::Int(5) => {}
+                    _ => panic!("expected Int 5"),
+                }
+            }
+            _ => panic!("expected Constructor"),
+        }
+        let null = serde_json::Value::Null;
+        assert!(matches!(unsafe { as_ref(json_to_value_db(&null)) }, Value::Unit));
+        // Wire decode maps null to Nothing instead.
+        match unsafe { as_ref(json_to_value(&null)) } {
+            Value::Constructor(tag, _) => assert_eq!(&**tag, "Nothing"),
+            _ => panic!("expected Nothing"),
+        }
+    }
+
+    #[test]
+    fn apply_wire_type_wraps_present_and_fills_absent() {
+        // {a:?int, b:text} against {"a": 7, "b": "x"} — a gets Just-wrapped.
+        let rec = record(vec![("a", alloc_int(7)), ("b", alloc(Value::Text(Arc::from("x"))))]);
+        let fixed = apply_wire_type(rec, "{a:?int,b:text}");
+        match unsafe { as_ref(field(fixed, "a")) } {
+            Value::Constructor(tag, payload) => {
+                assert_eq!(&**tag, "Just");
+                assert!(matches!(unsafe { as_ref(field(*payload, "value")) }, Value::Int(7)));
+            }
+            _ => panic!("expected Just"),
+        }
+        assert!(matches!(unsafe { as_ref(field(fixed, "b")) }, Value::Text(_)));
+
+        // Absent `?` field decodes to Nothing.
+        let rec = record(vec![("b", alloc(Value::Text(Arc::from("x"))))]);
+        let fixed = apply_wire_type(rec, "{a:?int,b:text}");
+        match unsafe { as_ref(field(fixed, "a")) } {
+            Value::Constructor(tag, _) => assert_eq!(&**tag, "Nothing"),
+            _ => panic!("expected Nothing"),
+        }
+    }
+
+    #[test]
+    fn apply_wire_type_keeps_nothing_and_normalizes_nested() {
+        // A wire-decoded null (already Nothing) stays Nothing — no
+        // double-wrapping into Just Nothing.
+        let fixed = apply_wire_type(make_nothing(), "?int");
+        match unsafe { as_ref(fixed) } {
+            Value::Constructor(tag, _) => assert_eq!(&**tag, "Nothing"),
+            _ => panic!("expected Nothing"),
+        }
+
+        // Nested: [{a:?int}] normalizes each row.
+        let rows = alloc(Value::Relation(vec![
+            record(vec![("a", make_nothing())]),
+            record(vec![("a", alloc_int(3))]),
+        ]));
+        let fixed = apply_wire_type(rows, "[{a:?int}]");
+        let rows = match unsafe { as_ref(fixed) } {
+            Value::Relation(r) => r.clone(),
+            _ => panic!("expected Relation"),
+        };
+        match unsafe { as_ref(field(rows[0], "a")) } {
+            Value::Constructor(tag, _) => assert_eq!(&**tag, "Nothing"),
+            _ => panic!("expected Nothing"),
+        }
+        match unsafe { as_ref(field(rows[1], "a")) } {
+            Value::Constructor(tag, _) => assert_eq!(&**tag, "Just"),
+            _ => panic!("expected Just"),
+        }
+    }
+
+    #[test]
+    fn parse_descriptor_is_bracket_aware() {
+        let fields = parse_descriptor("addr:{city:text,zip:?text},tags:[text],n:?int");
+        assert_eq!(
+            fields,
+            vec![
+                ("addr".to_string(), "{city:text,zip:?text}".to_string()),
+                ("tags".to_string(), "[text]".to_string()),
+                ("n".to_string(), "?int".to_string()),
+            ]
+        );
     }
 }
 

@@ -51,8 +51,18 @@ pub type TypeInfo = HashMap<String, String>;
 /// Maps binding spans (local variables, params, patterns) to their inferred type strings.
 pub type LocalTypeInfo = HashMap<Span, String>;
 
-/// Maps parseJson call-site spans to the resolved target type name for compile-time FromJSON dispatch.
-pub type FromJsonTargets = HashMap<Span, String>;
+/// Resolved parseJson call-site info: the simple type name (for compile-time
+/// FromJSON impl dispatch) and a wire type descriptor (for Maybe
+/// normalization in the generic decoder — `null`/absent → Nothing, present
+/// value → Just at `?`-marked positions).
+#[derive(Debug, Clone, Default)]
+pub struct FromJsonTarget {
+    pub type_name: Option<String>,
+    pub wire_schema: Option<String>,
+}
+
+/// Maps parseJson call-site spans to their resolved target info.
+pub type FromJsonTargets = HashMap<Span, FromJsonTarget>;
 
 /// Spans of `elem needle haystack` haystack arguments whose element type is a
 /// SQL-pushable scalar (Int/Text/Float/Bool, peeling aliases & refined types).
@@ -8487,12 +8497,18 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
         .map(|(name, (_, pred))| (name.clone(), pred.clone()))
         .collect();
 
-    // Phase 7: Resolve parseJson call targets for compile-time FromJSON dispatch
+    // Phase 7: Resolve parseJson call targets for compile-time FromJSON
+    // dispatch and Maybe-aware wire decoding.
     let mut from_json_targets = FromJsonTargets::new();
     for (span, var) in &infer.from_json_calls {
         let resolved = infer.apply(&Ty::Var(*var));
-        if let Some(name) = ty_to_type_name(&resolved) {
-            from_json_targets.insert(*span, name);
+        let type_name = ty_to_type_name(&resolved);
+        // Only carry a schema when it has Maybe positions to normalize —
+        // the generic decoder is correct for everything else.
+        let wire_schema =
+            Some(ty_to_wire_descriptor(&resolved)).filter(|d| d.contains('?'));
+        if type_name.is_some() || wire_schema.is_some() {
+            from_json_targets.insert(*span, FromJsonTarget { type_name, wire_schema });
         }
     }
 
@@ -8581,6 +8597,44 @@ fn collect_alias_refs(
         ast::TypeKind::Forall { ty, .. } => {
             collect_alias_refs(ty, alias_names, out);
         }
+    }
+}
+
+/// Build a wire type descriptor from a resolved type for Maybe-aware JSON
+/// decoding: `?<inner>` marks Maybe positions (wire `null`/absent →
+/// Nothing, present value → Just), `{name:ty,...}` records, `[ty]`
+/// relations, scalar tokens for primitives, and `*` (leave unchanged) for
+/// anything the decoder shouldn't touch.
+fn ty_to_wire_descriptor(ty: &Ty) -> String {
+    match ty.peel_alias() {
+        Ty::Int | Ty::IntUnit(_) => "int".to_string(),
+        Ty::Float | Ty::FloatUnit(_) => "float".to_string(),
+        Ty::Text => "text".to_string(),
+        Ty::Bool => "bool".to_string(),
+        Ty::Con(name, args) if name == "Maybe" && args.len() == 1 => {
+            format!("?{}", ty_to_wire_descriptor(&args[0]))
+        }
+        // Open Maybe variants from case-pattern unification name the
+        // constructors rather than the ADT; the inner type lives in Just's
+        // payload record under `value`.
+        Ty::Variant(ctors, _)
+            if !ctors.is_empty() && ctors.keys().all(|k| k == "Just" || k == "Nothing") =>
+        {
+            let inner = ctors.get("Just").and_then(|payload| match payload.peel_alias() {
+                Ty::Record(fields, _) => fields.get("value").map(ty_to_wire_descriptor),
+                _ => None,
+            });
+            format!("?{}", inner.unwrap_or_else(|| "*".to_string()))
+        }
+        Ty::Record(fields, _) => {
+            let inner: Vec<String> = fields
+                .iter()
+                .map(|(n, t)| format!("{}:{}", n, ty_to_wire_descriptor(t)))
+                .collect();
+            format!("{{{}}}", inner.join(","))
+        }
+        Ty::Relation(inner) => format!("[{}]", ty_to_wire_descriptor(inner)),
+        _ => "*".to_string(),
     }
 }
 

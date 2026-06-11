@@ -11,7 +11,7 @@ use knot::diagnostic::Diagnostic;
 
 use crate::codegen::{
     divisor_is_nonzero_int_literal, divisor_is_nonzero_literal, expr_refs_var,
-    sql_comparison_cast_mode, SqlCastMode,
+    minmax_pushdown_type_ok, sql_comparison_cast_mode, SqlCastMode,
 };
 use crate::types::TypeEnv;
 
@@ -452,7 +452,7 @@ fn lint_pipe_chain(
                 }
             }
             LintPipeOp::Min { bind_var, body, span } => {
-                if try_sql_column_expr(bind_var, body).is_none() {
+                if try_sql_minmax_expr(bind_var, body, schema).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "pipe minOn will be evaluated at runtime instead of SQL MIN",
@@ -462,7 +462,7 @@ fn lint_pipe_chain(
                 }
             }
             LintPipeOp::Max { bind_var, body, span } => {
-                if try_sql_column_expr(bind_var, body).is_none() {
+                if try_sql_minmax_expr(bind_var, body, schema).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "pipe maxOn will be evaluated at runtime instead of SQL MAX",
@@ -585,7 +585,7 @@ fn lint_app_form(
                 }
             }
             "minOn" => {
-                if try_sql_column_expr(&bind_var, body).is_none() {
+                if try_sql_minmax_expr(&bind_var, body, schema).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "minOn will be evaluated at runtime instead of SQL MIN",
@@ -598,7 +598,7 @@ fn lint_app_form(
                 }
             }
             "maxOn" => {
-                if try_sql_column_expr(&bind_var, body).is_none() {
+                if try_sql_minmax_expr(&bind_var, body, schema).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "maxOn will be evaluated at runtime instead of SQL MAX",
@@ -642,8 +642,8 @@ fn try_compile_sql_expr(bind_var: &str, expr: &Expr, schema: &str) -> Option<()>
             }
             BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
                 // Try simple field op value, then atom-based (handles arithmetic)
-                try_sql_comparison(bind_var, lhs, rhs)
-                    .or_else(|| try_sql_comparison(bind_var, rhs, lhs))
+                try_sql_comparison(bind_var, lhs, rhs, schema)
+                    .or_else(|| try_sql_comparison(bind_var, rhs, lhs, schema))
                     .or_else(|| {
                         // Mirror codegen's type-witness gate: arithmetic
                         // comparisons only push down when they can be typed
@@ -718,11 +718,22 @@ fn try_compile_sql_expr(bind_var: &str, expr: &Expr, schema: &str) -> Option<()>
 }
 
 /// Check if `field_side op value_side` can be a SQL comparison.
-fn try_sql_comparison(bind_var: &str, field_side: &Expr, value_side: &Expr) -> Option<()> {
+fn try_sql_comparison(
+    bind_var: &str,
+    field_side: &Expr,
+    value_side: &Expr,
+    schema: &str,
+) -> Option<()> {
     // field_side must be bind_var.field
-    if let ExprKind::FieldAccess { expr, .. } = &field_side.node {
+    if let ExprKind::FieldAccess { expr, field } = &field_side.node {
         if let ExprKind::Var(name) = &expr.node {
             if name != bind_var {
+                return None;
+            }
+            // Mirror codegen: json columns (payload-bearing ADTs, nested
+            // records) are never pushed down — the runtime binds the
+            // compared value differently than it is stored.
+            if lookup_col_type(schema, field).as_deref() == Some("json") {
                 return None;
             }
         } else {
@@ -1169,6 +1180,19 @@ fn extract_single_param_lambda(expr: &Expr) -> Option<(String, &Expr)> {
     None
 }
 
+/// Mirror of codegen's minOn/maxOn pushdown approval: the lambda body must
+/// compile to a SQL column expression AND its Knot type must be numeric
+/// (Int/Float) — the MIN/MAX runtime re-parses TEXT results as Int, so
+/// Text projections fall back to in-memory evaluation.
+fn try_sql_minmax_expr(bind_var: &str, body: &Expr, schema: &str) -> Option<()> {
+    try_sql_column_expr(bind_var, body)?;
+    if minmax_pushdown_type_ok(bind_var, body, schema) {
+        Some(())
+    } else {
+        None
+    }
+}
+
 /// Check if a lambda body can be compiled to a SQL expression.
 /// Mirrors codegen's `extract_sql_field_access` which handles simple field access,
 /// arithmetic expressions (including ++), CASE WHEN, and built-in functions.
@@ -1344,9 +1368,9 @@ mod tests {
         let diags = lint(
             "type T = {name: Text, age: Int}\n\
              *people : [T]\n\
-             main = do\n\
-               p <- *people\n\
-               where p.age > 30\n\
+             main = do\n  \
+               p <- *people\n  \
+               where p.age > 30\n  \
                yield p\n",
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
@@ -1358,9 +1382,9 @@ mod tests {
         let diags = lint(
             "type T = {name: Text, age: Int}\n\
              *people : [T]\n\
-             main = do\n\
-               p <- *people\n\
-               where length p.name > 3\n\
+             main = do\n  \
+               p <- *people\n  \
+               where length p.name > 3\n  \
                yield p\n",
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
@@ -1372,11 +1396,11 @@ mod tests {
         let diags = lint(
             "type T = {name: Text, active: Int}\n\
              *items : [T]\n\
-             process = \\target -> do\n\
-               *items = do\n\
-                 i <- *items\n\
-                 yield (if contains target i.name\n\
-                   then {i | active: 0}\n\
+             process = \\target -> do\n  \
+               *items = do\n    \
+                 i <- *items\n    \
+                 yield (if contains target i.name\n      \
+                   then {i | active: 0}\n      \
                    else i)\n",
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
@@ -1389,9 +1413,9 @@ mod tests {
             "type T = {name: Text, age: Int}\n\
              *people : [T]\n\
              isLong = \\t -> length t > 10\n\
-             main = do\n\
-               p <- *people\n\
-               where isLong p.name\n\
+             main = do\n  \
+               p <- *people\n  \
+               where isLong p.name\n  \
                yield p\n",
         );
         assert_eq!(diags.len(), 1);
@@ -1405,11 +1429,11 @@ mod tests {
         let diags = lint(
             "type T = {name: Text, active: Int}\n\
              *items : [T]\n\
-             process = \\target -> do\n\
-               *items = do\n\
-                 i <- *items\n\
-                 yield (if i.name == target\n\
-                   then {i | active: 0}\n\
+             process = \\target -> do\n  \
+               *items = do\n    \
+                 i <- *items\n    \
+                 yield (if i.name == target\n      \
+                   then {i | active: 0}\n      \
                    else i)\n",
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
@@ -1422,10 +1446,10 @@ mod tests {
             "type T = {name: Text, score: Int}\n\
              isGood = \\x -> x > 50\n\
              *items : [T]\n\
-             cleanup = do\n\
-               *items = do\n\
-                 i <- *items\n\
-                 where isGood i.score\n\
+             cleanup = do\n  \
+               *items = do\n    \
+                 i <- *items\n    \
+                 where isGood i.score\n    \
                  yield i\n",
         );
         assert_eq!(diags.len(), 1);
@@ -1439,10 +1463,10 @@ mod tests {
         let diags = lint(
             "type T = {name: Text, score: Int}\n\
              *items : [T]\n\
-             cleanup = do\n\
-               *items = do\n\
-                 i <- *items\n\
-                 where i.score > 50\n\
+             cleanup = do\n  \
+               *items = do\n    \
+                 i <- *items\n    \
+                 where i.score > 50\n    \
                  yield i\n",
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
@@ -1458,7 +1482,7 @@ mod tests {
              isGood = \\x -> x.score > 50\n\
              *a : [T]\n\
              *b : [T]\n\
-             sync = do\n\
+             sync = do\n  \
                *a = (*b |> filter (\\i -> isGood i))\n",
         );
         assert!(
@@ -1477,10 +1501,10 @@ mod tests {
              isGood = \\x -> x > 50\n\
              *a : [T]\n\
              *b : [T]\n\
-             move = do\n\
-               *a = do\n\
-                 x <- *b\n\
-                 where isGood x.score\n\
+             move = do\n  \
+               *a = do\n    \
+                 x <- *b\n    \
+                 where isGood x.score\n    \
                  yield x\n",
         );
         assert_eq!(
@@ -1499,7 +1523,7 @@ mod tests {
             "type T = {name: Text, score: Int}\n\
              isGood = \\x -> x.score > 50\n\
              *items : [T]\n\
-             main = do\n\
+             main = do\n  \
                yield (*items |> filter (\\i -> isGood i))\n",
         );
         assert!(!diags.is_empty(), "expected diagnostics for complex pipe filter");
@@ -1512,7 +1536,7 @@ mod tests {
         let diags = lint(
             "type T = {name: Text, score: Int}\n\
              *items : [T]\n\
-             main = do\n\
+             main = do\n  \
                yield (*items |> filter (\\i -> i.score > 50))\n",
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
@@ -1524,9 +1548,9 @@ mod tests {
         let diags = lint(
             "type T = {name: Text, age: Int}\n\
              *people : [T]\n\
-             main = do\n\
-               p <- *people\n\
-               where contains \"test\" p.name\n\
+             main = do\n  \
+               p <- *people\n  \
+               where contains \"test\" p.name\n  \
                yield p\n",
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
@@ -1538,9 +1562,9 @@ mod tests {
         let diags = lint(
             "type T = {name: Text, status: Text}\n\
              *items : [T]\n\
-             main = do\n\
-               i <- *items\n\
-               where elem i.status [\"open\", \"pending\"]\n\
+             main = do\n  \
+               i <- *items\n  \
+               where elem i.status [\"open\", \"pending\"]\n  \
                yield i\n",
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
@@ -1555,9 +1579,9 @@ mod tests {
             "type T = {name: Text, status: Text}\n\
              *items : [T]\n\
              allowed = [\"open\", \"pending\"]\n\
-             main = do\n\
-               i <- *items\n\
-               where elem i.status allowed\n\
+             main = do\n  \
+               i <- *items\n  \
+               where elem i.status allowed\n  \
                yield i\n",
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
@@ -1572,9 +1596,9 @@ mod tests {
             "type T = {name: Text, status: Text}\n\
              pick = \\x -> [x]\n\
              *items : [T]\n\
-             main = do\n\
-               i <- *items\n\
-               where elem i.status (pick i.name)\n\
+             main = do\n  \
+               i <- *items\n  \
+               where elem i.status (pick i.name)\n  \
                yield i\n",
         );
         assert!(
@@ -1592,9 +1616,9 @@ mod tests {
         let diags = lint(
             "type T = {name: Text, age: Int}\n\
              *people : [T]\n\
-             main = do\n\
-               p <- *people\n\
-               where toUpper p.name == \"ALICE\"\n\
+             main = do\n  \
+               p <- *people\n  \
+               where toUpper p.name == \"ALICE\"\n  \
                yield p\n",
         );
         assert_eq!(diags.len(), 1, "expected runtime-fallback diagnostic, got: {:?}", diags);
@@ -1607,9 +1631,9 @@ mod tests {
         let diags = lint(
             "type T = {name: Text, active: Int}\n\
              *items : [T]\n\
-             main = do\n\
-               i <- *items\n\
-               where not (i.active == 1)\n\
+             main = do\n  \
+               i <- *items\n  \
+               where not (i.active == 1)\n  \
                yield i\n",
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
@@ -1621,8 +1645,8 @@ mod tests {
         let diags = lint(
             "type T = {price: Int, qty: Int}\n\
              *items : [T]\n\
-             main = do\n\
-               items <- *items\n\
+             main = do\n  \
+               items <- *items\n  \
                yield (sum (\\i -> i.price * i.qty) items)\n",
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
@@ -1634,8 +1658,8 @@ mod tests {
         let diags = lint(
             "type T = {salary: Int}\n\
              *items : [T]\n\
-             main = do\n\
-               items <- *items\n\
+             main = do\n  \
+               items <- *items\n  \
                yield (minOn (\\i -> i.salary) items)\n",
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
@@ -1648,7 +1672,7 @@ mod tests {
             "type T = {salary: Int}\n\
              classify = \\x -> x + 100\n\
              *items : [T]\n\
-             main = do\n\
+             main = do\n  \
                yield (*items |> minOn (\\i -> classify i.salary))\n",
         );
         assert!(!diags.is_empty(), "expected diagnostic for non-SQL minOn");
@@ -1661,8 +1685,8 @@ mod tests {
         let diags = lint(
             "type T = {salary: Int, dept: Text}\n\
              *items : [T]\n\
-             main = do\n\
-               items <- *items\n\
+             main = do\n  \
+               items <- *items\n  \
                yield (countWhere (\\i -> i.salary > 75) items)\n",
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
@@ -1675,7 +1699,7 @@ mod tests {
             "type T = {salary: Int}\n\
              isHigh = \\x -> x.salary > 50\n\
              *items : [T]\n\
-             main = do\n\
+             main = do\n  \
                yield (*items |> countWhere (\\i -> isHigh i))\n",
         );
         assert!(!diags.is_empty(), "expected diagnostic for non-SQL countWhere");
@@ -1688,7 +1712,7 @@ mod tests {
         let diags = lint(
             "type T = {salary: Int}\n\
              *items : [T]\n\
-             main = do\n\
+             main = do\n  \
                yield (*items |> maxOn (\\i -> i.salary))\n",
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
@@ -1700,7 +1724,7 @@ mod tests {
         let diags = lint(
             "type T = {salary: Int}\n\
              *items : [T]\n\
-             main = do\n\
+             main = do\n  \
                yield (*items |> countWhere (\\i -> i.salary > 75))\n",
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
@@ -1712,9 +1736,9 @@ mod tests {
         let diags = lint(
             "type T = {first: Text, last: Text}\n\
              *people : [T]\n\
-             main = do\n\
-               p <- *people\n\
-               where p.first ++ \" \" ++ p.last == \"Alice Smith\"\n\
+             main = do\n  \
+               p <- *people\n  \
+               where p.first ++ \" \" ++ p.last == \"Alice Smith\"\n  \
                yield p\n",
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);

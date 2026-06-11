@@ -1073,6 +1073,7 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "tiny_http",
+ "unicode-width",
  "ureq",
  "x25519-dalek",
 ]

@@ -537,6 +537,23 @@ pub fn analyze_document(
         refine_targets = rt;
         monad_info = mi;
 
+        // Inference ran on `analysis_module` — the prelude-injected,
+        // import-inlined module. Binding spans recorded for prelude and
+        // imported decls are byte offsets into OTHER sources; treating them
+        // as offsets into this document produces ghost inlay hints and wrong
+        // hover types at unrelated positions (comments, mid-token, …).
+        // Keep only span-keyed entries that fall inside one of the *user's*
+        // own decl spans (`module` is the pre-injection parse of this file).
+        let user_decl_spans: Vec<Span> = module.decls.iter().map(|d| d.span).collect();
+        let in_user_decl = |s: &Span| {
+            user_decl_spans
+                .iter()
+                .any(|d| d.start <= s.start && s.end <= d.end)
+        };
+        local_type_info.retain(|s, _| in_user_decl(s));
+        refine_targets.retain(|s, _| in_user_decl(s));
+        monad_info.retain(|s, _| in_user_decl(s));
+
         // Populate `unit_info` from the formatted local type strings — every
         // binding whose type carries a `<unit>` annotation gets an entry. The
         // inlay-hint handler reads this directly to surface unit annotations
@@ -1758,5 +1775,56 @@ main = do
         assert!(state.references.is_empty());
         assert!(state.type_info.is_empty());
         assert!(state.local_type_info.is_empty());
+    }
+
+    /// Inference runs on the prelude-injected, import-inlined module, so it
+    /// records binding spans for prelude/imported binders — byte offsets
+    /// into OTHER sources. Those used to flow unfiltered into
+    /// `local_type_info` and render as ghost inlay hints / wrong hover types
+    /// at arbitrary positions in the user's document (reproduced inside
+    /// comment blocks). Every surviving span must now fall inside one of the
+    /// user's own decl spans.
+    #[test]
+    fn local_type_info_excludes_prelude_and_import_spans() {
+        use crate::test_support::TestWorkspace;
+        // A large leading comment block (> 1.1KB) guarantees that any
+        // leaked prelude span (small byte offsets into PRELUDE_SOURCE)
+        // would land inside the comment region — outside every decl span.
+        let comment_block = "-- padding comment line to push decls far into the file\n".repeat(24);
+        let src = format!("{comment_block}\nf = \\x -> x + 1\n\nmain = f 2\n");
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", &src);
+        let doc = ws.doc(&uri);
+        assert!(
+            !doc.local_type_info.is_empty(),
+            "user bindings should still be recorded"
+        );
+        let decl_spans: Vec<Span> = doc.module.decls.iter().map(|d| d.span).collect();
+        for span in doc.local_type_info.keys() {
+            assert!(
+                decl_spans
+                    .iter()
+                    .any(|d| d.start <= span.start && span.end <= d.end),
+                "leaked binding span {span:?} (text {:?}) outside every user decl",
+                doc.source.get(span.start..span.end)
+            );
+        }
+        // Specifically: nothing inside the leading comment block.
+        let first_decl_start = decl_spans.iter().map(|s| s.start).min().unwrap_or(0);
+        assert!(
+            doc.local_type_info
+                .keys()
+                .all(|s| s.start >= first_decl_start),
+            "ghost hint span inside the comment block"
+        );
+        // monad_info spans are filtered by the same provenance rule.
+        for span in doc.monad_info.keys() {
+            assert!(
+                decl_spans
+                    .iter()
+                    .any(|d| d.start <= span.start && span.end <= d.end),
+                "leaked monad_info span {span:?}"
+            );
+        }
     }
 }

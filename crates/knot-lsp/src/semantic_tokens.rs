@@ -734,8 +734,13 @@ fn delta_encode_tokens(tokens: &[RawToken], source: &str) -> Vec<SemanticToken> 
                 byte_cursor += 1;
                 line_start_byte = byte_cursor;
                 col_utf16 = 0;
-            } else if bytes[byte_cursor] == b'\r' {
-                // Skip \r in CRLF — it doesn't contribute a UTF-16 column.
+            } else if bytes[byte_cursor] == b'\r'
+                && bytes.get(byte_cursor + 1) == Some(&b'\n')
+            {
+                // Skip the \r of a CRLF pair — it's part of the line break
+                // and doesn't contribute a UTF-16 column. A stray mid-line
+                // \r is an ordinary character and must count as a column,
+                // matching `utils::offset_to_position`.
                 byte_cursor += 1;
             } else {
                 let mut next = byte_cursor + 1;
@@ -839,5 +844,33 @@ mod regress_fixes_tests {
         assert_eq!(tokens[0].length, 3, "CRLF \\r counted in token length");
         assert_eq!(tokens[1].start, 5);
         assert_eq!(tokens[1].length, 3);
+    }
+
+    /// A stray mid-line `\r` (not part of CRLF) is an ordinary character:
+    /// `delta_encode_tokens` must count it as a column, exactly like
+    /// `utils::offset_to_position` does — otherwise token columns drift by
+    /// one for every stray \r earlier in the line.
+    #[test]
+    fn delta_encode_counts_stray_cr_as_column() {
+        let source = "ab\rcd\r\nxy\n";
+        // Token on `cd` (byte 3..5) and on `xy` (byte 7..9).
+        let tokens = vec![
+            RawToken { start: 3, length: 2, token_type: 0, modifiers: 0 },
+            RawToken { start: 7, length: 2, token_type: 0, modifiers: 0 },
+        ];
+        let encoded = delta_encode_tokens(&tokens, source);
+        assert_eq!(encoded.len(), 2);
+        // `cd` starts at UTF-16 column 3 (a, b, stray \r all count) —
+        // matching offset_to_position.
+        let expected = crate::utils::offset_to_position(source, 3);
+        assert_eq!(encoded[0].delta_line, expected.line);
+        assert_eq!(
+            encoded[0].delta_start, expected.character,
+            "stray \\r must count as a column"
+        );
+        // `xy` is on the next line, column 0 — the CRLF \r is still part of
+        // the line break and contributes nothing.
+        assert_eq!(encoded[1].delta_line, 1);
+        assert_eq!(encoded[1].delta_start, 0);
     }
 }

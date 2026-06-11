@@ -18,6 +18,7 @@ rusqlite = { workspace = true }
 tiny_http = { workspace = true }
 ratatui = "0.30"
 crossterm = "0.29"
+unicode-width = "0.2"
 getrandom = "0.4"
 ed25519-dalek = { version = "2", default-features = false }
 x25519-dalek = { version = "2", features = ["static_secrets"] }

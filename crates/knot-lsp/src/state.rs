@@ -540,10 +540,15 @@ impl ServerConfig {
 
 // ── Completion / token grab-bag constants ───────────────────────────
 
+/// Reserved words that can never be user identifiers. Mirrors the lexer's
+/// keyword table in `knot::lexer::lex_identifier` exactly (plus the
+/// contextual `yield`, which the parser treats specially inside do-blocks):
+/// `true`/`false` lex as `Bool` literals and are included because renaming a
+/// symbol *to* them would re-lex as a literal.
 pub const KEYWORDS: &[&str] = &[
-    "import", "data", "type", "trait", "impl", "route", "migrate", "where", "do", "yield",
-    "if", "then", "else", "case", "of", "let", "in", "not", "replace", "atomic", "deriving", "with",
-    "export",
+    "import", "data", "type", "trait", "impl", "route", "serve", "migrate", "where", "do",
+    "yield", "if", "then", "else", "case", "of", "let", "in", "not", "replace", "atomic",
+    "deriving", "with", "export", "unit", "refine", "forall", "true", "false",
 ];
 
 /// Context tag for a snippet — used by `handle_completion` to filter snippets

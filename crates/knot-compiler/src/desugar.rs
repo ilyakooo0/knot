@@ -876,7 +876,9 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
 fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
     match &expr.node {
         ExprKind::App { func, arg } => {
-            expr_is_io(func, io_fns) || expr_is_io(arg, io_fns)
+            expr_is_io(func, io_fns)
+                || expr_is_io(arg, io_fns)
+                || applied_lambda_body_is_io(func, io_fns)
         }
         ExprKind::Var(name) => {
             // `retry` is in EFFECTFUL_BUILTINS but isn't an IO-producing
@@ -922,6 +924,24 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
         // they don't produce IO even if they contain IO values as
         // subexpressions. Only direct IO-producing expressions (calls to
         // IO functions, relation ops, etc.) should flag a do-block as IO.
+        _ => false,
+    }
+}
+
+/// Whether the function position of an application is a lambda (possibly
+/// curried or wrapped in annotations) whose body performs IO. An *applied*
+/// lambda runs its body immediately, so IO inside the body makes the whole
+/// application an IO expression — mirroring codegen's `expr_is_io`, which
+/// recurses into lambda bodies. Bare lambda VALUES (not applied) remain
+/// non-IO; only the `App { func: Lambda, .. }` shape reaches here.
+fn applied_lambda_body_is_io(func: &Expr, io_fns: &HashSet<String>) -> bool {
+    match &func.node {
+        ExprKind::Lambda { body, .. } => expr_is_io(body, io_fns),
+        // Curried application: `(\a b -> body) x y` — keep peeling.
+        ExprKind::App { func, .. } => applied_lambda_body_is_io(func, io_fns),
+        ExprKind::UnitLit { value, .. }
+        | ExprKind::Annot { expr: value, .. }
+        | ExprKind::Refine(value) => applied_lambda_body_is_io(value, io_fns),
         _ => false,
     }
 }

@@ -15,6 +15,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap},
 };
 use rusqlite::Connection;
+use unicode_width::UnicodeWidthStr;
 
 // ── Schema types (mirrors lib.rs internal types) ─────────────────
 
@@ -495,15 +496,17 @@ fn ui(frame: &mut Frame, app: &mut App) {
         let w: Vec<Constraint> = hdrs
             .iter()
             .map(|h| {
-                // Calculate width from header + data
+                // Calculate width from header + data. Use display width
+                // (terminal columns), not byte length — multi-byte UTF-8 and
+                // wide (CJK/emoji) characters would otherwise mis-size columns.
                 let max_data = app
                     .data_rows
                     .iter()
                     .filter_map(|row| row.get(hdrs.iter().position(|x| x == h)?))
-                    .map(|s| s.len())
+                    .map(|s| s.width())
                     .max()
                     .unwrap_or(0);
-                let w = h.len().max(max_data).min(40) + 2;
+                let w = h.width().max(max_data).min(40) + 2;
                 Constraint::Length(w as u16)
             })
             .collect();
@@ -616,6 +619,18 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 
 // ── Entry point ──────────────────────────────────────────────────
 
+/// Restores the terminal on drop, so panics and early returns inside the
+/// event loop can't leave the user's shell stuck in raw mode / the
+/// alternate screen. Created immediately after entering raw mode below.
+struct TerminalRestoreGuard;
+
+impl Drop for TerminalRestoreGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = stdout().execute(LeaveAlternateScreen);
+    }
+}
+
 pub fn run_db_explorer(db_path: &str) -> io::Result<()> {
     let conn = Connection::open(db_path).map_err(|e| {
         io::Error::new(io::ErrorKind::Other, format!("Failed to open database: {}", e))
@@ -626,6 +641,9 @@ pub fn run_db_explorer(db_path: &str) -> io::Result<()> {
 
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
+    // From here on the terminal is in raw mode + alternate screen; the guard
+    // restores it on every exit path, including panics inside the loop.
+    let _restore = TerminalRestoreGuard;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     let result = (|| -> io::Result<()> {
@@ -698,8 +716,7 @@ pub fn run_db_explorer(db_path: &str) -> io::Result<()> {
         Ok(())
     })();
 
-    // Always restore terminal, even if the loop returned an error
-    let _ = disable_raw_mode();
-    let _ = stdout().execute(LeaveAlternateScreen);
+    // Terminal restoration is handled by `_restore`'s Drop (covers the
+    // normal return, the `?` error paths, and panics alike).
     result
 }

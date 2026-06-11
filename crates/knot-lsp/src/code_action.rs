@@ -192,10 +192,17 @@ pub(crate) fn handle_code_action(
                 .collect();
 
             if !missing.is_empty() {
-                let insert_pos = offset_to_position(&doc.source, decl.span.end);
+                // Insert after the last non-whitespace byte of the impl —
+                // the decl span includes the trailing newline run, and the
+                // stubs must attach to the impl block, not the next decl.
+                let insert_pos =
+                    offset_to_position(&doc.source, decl_text_end(&doc.source, decl.span));
+                // Match the impl block's existing indentation instead of
+                // hardcoding two spaces.
+                let indent = impl_block_indent(&doc.source, decl.span);
                 let stubs: String = missing
                     .iter()
-                    .map(|item| build_trait_method_stub(item))
+                    .map(|item| build_trait_method_stub(item, &indent))
                     .collect();
 
                 let mut changes = HashMap::new();
@@ -605,12 +612,15 @@ pub(crate) fn handle_code_action(
 
             // Extract function: wrap selected expression in a named function
             let mut fn_changes = HashMap::new();
-            // Find free variables in the selected text that are bound in scope
+            // Find free variables in the selected text that are bound in scope.
+            // Top-level Knot functions take parameters via lambdas
+            // (`name = \x y -> body`), NOT via parameters on the left-hand
+            // side — `name x = body` is a parse error at top level.
             let free_vars = find_free_vars_in_selection(doc, range_start, range_end);
-            let params_str = if free_vars.is_empty() {
-                String::new()
+            let helper_decl = if free_vars.is_empty() {
+                format!("{fn_name} = {trimmed}\n\n")
             } else {
-                format!(" {}", free_vars.join(" "))
+                format!("{fn_name} = \\{} -> {trimmed}\n\n", free_vars.join(" "))
             };
             let call_args = if free_vars.is_empty() {
                 String::new()
@@ -618,13 +628,17 @@ pub(crate) fn handle_code_action(
                 format!(" {}", free_vars.join(" "))
             };
 
-            // Find the enclosing top-level declaration to place the function before it
+            // Find the enclosing top-level declaration to place the function
+            // before it. An exported decl's span EXCLUDES the consumed
+            // `export` keyword — inserting at span.start would splice the
+            // helper between `export` and its decl, so scan back over a
+            // preceding `export` token.
             let fn_insert_offset = doc
                 .module
                 .decls
                 .iter()
                 .find(|d| d.span.start <= range_start && range_end <= d.span.end)
-                .map(|d| d.span.start)
+                .map(|d| include_export_prefix(&doc.source, d.span.start))
                 .unwrap_or(0);
             let fn_insert_pos = offset_to_position(&doc.source, fn_insert_offset);
 
@@ -637,9 +651,7 @@ pub(crate) fn handle_code_action(
                             start: fn_insert_pos,
                             end: fn_insert_pos,
                         },
-                        new_text: format!(
-                            "{fn_name}{params_str} = {trimmed}\n\n"
-                        ),
+                        new_text: helper_decl,
                     },
                     // Replace the selected expression with a call
                     TextEdit {
@@ -739,7 +751,7 @@ pub(crate) fn handle_code_action(
                 end: offset_to_position(&doc.source, last_import.span.end),
             };
 
-            let new_text = merged
+            let sorted_imports = merged
                 .iter()
                 .map(|(path, items)| match items {
                     None => format!("import {path}"),
@@ -755,6 +767,20 @@ pub(crate) fn handle_code_action(
             // only appears when the rewrite actually changes something.
             let original_text =
                 safe_slice(&doc.source, Span::new(first_import.span.start, last_import.span.end));
+
+            // Comment lines interleaved between imports would be wiped by the
+            // block rewrite. Preserve them (in original order) above the
+            // sorted import block — the simplest placement that never loses
+            // user text.
+            let comment_lines: Vec<&str> = original_text
+                .lines()
+                .filter(|l| l.trim_start().starts_with("--"))
+                .collect();
+            let new_text = if comment_lines.is_empty() {
+                sorted_imports
+            } else {
+                format!("{}\n{sorted_imports}", comment_lines.join("\n"))
+            };
             if new_text != original_text {
                 let mut changes = HashMap::new();
                 changes.insert(uri.clone(), vec![TextEdit { range: import_range, new_text }]);
@@ -1263,6 +1289,15 @@ fn find_if_negate_at(
     None
 }
 
+/// Byte offset just past the last non-whitespace character of a declaration.
+/// Decl spans include the trailing newline run the parser consumed, so
+/// "insert at the end of the decl" anchors must trim that whitespace first —
+/// otherwise inserted text glues onto the start of the next declaration.
+fn decl_text_end(source: &str, span: Span) -> usize {
+    let text = safe_slice(source, span);
+    span.start.min(source.len()) + text.trim_end().len()
+}
+
 /// Locate a `data Name = ...` declaration at the cursor that has no `deriving`
 /// clause. Returns the decl span, the data type name, and the position to
 /// insert the deriving clause (immediately after the last constructor).
@@ -1286,10 +1321,11 @@ fn find_deriving_insertion_at(
                 return None;
             }
             let _ = constructors;
-            // Insert at the very end of the data declaration's span. Cleanest
-            // anchor that doesn't require constructor-level spans, and matches
-            // the syntax `data Foo = A | B deriving (Eq, Show)`.
-            let pos = offset_to_position(source, decl.span.end);
+            // Insert at the end of the declaration's TEXT, not its span —
+            // data decl spans include the trailing newline run (the parser's
+            // skip_newlines collapses them into the decl), so inserting at
+            // `span.end` would glue the clause onto the NEXT declaration.
+            let pos = offset_to_position(source, decl_text_end(source, decl.span));
             return Some((decl.span, name.clone(), pos));
         }
     }
@@ -1945,39 +1981,44 @@ fn build_effect_widen_edit(decl: &ast::Decl, source: &str, target_effects: &str)
     let decl_text = source.get(decl.span.start..decl.span.end.min(source.len()))?;
     // Find `: ` after the function name to locate the start of the type signature
     let colon = decl_text.find(": ")?;
-    let after_colon = &decl_text[colon + 2..];
-    // Find an existing IO effect set: `IO {...}`
-    let abs_after_colon = decl.span.start + colon + 2;
-    if let Some(io_pos) = after_colon.find("IO {") {
-        let abs_io = abs_after_colon + io_pos;
-        // Find the matching `}`
-        let depth_start = abs_io + 3; // position of `{`
-        let bytes = source.as_bytes();
-        let mut depth = 0i32;
-        for i in depth_start..source.len() {
-            match bytes[i] {
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        // Replace `{...}` with target effects (which already
-                        // includes braces).
-                        return Some(TextEdit {
-                            range: Range {
-                                start: offset_to_position(source, depth_start),
-                                end: offset_to_position(source, i + 1),
-                            },
-                            new_text: target_effects.to_string(),
-                        });
-                    }
-                }
-                _ => {}
+    let after_colon_off = colon + 2;
+    // Bound the search to the SIGNATURE text: the signature ends where the
+    // next column-0 line begins (the body line `name = …`). Continuation
+    // lines of a multi-line signature are indented and stay included.
+    let sig_end = {
+        let bytes = decl_text.as_bytes();
+        let mut end = decl_text.len();
+        let mut i = after_colon_off;
+        while i < bytes.len() {
+            if bytes[i] == b'\n'
+                && bytes
+                    .get(i + 1)
+                    .map_or(true, |b| *b != b' ' && *b != b'\t' && *b != b'\r')
+            {
+                end = i;
+                break;
             }
+            i += 1;
         }
-    }
-    // No existing IO effects: insert IO before the result type. We just append
-    // a comment hint at the end of the signature line so the user can review.
-    None
+        end
+    };
+    let sig = &decl_text[after_colon_off..sig_end];
+    // The declared row to widen is the RESULT row — the outermost top-level
+    // `IO { … }` along the arrow spine. Taking the first textual `IO {`
+    // would mutate a callback parameter's row in signatures like
+    // `(Int -> IO {} {}) -> IO {} {}`. `find_outermost_io_row` already
+    // implements the depth-aware spine walk.
+    let (row_start, row_end) = crate::shared::find_outermost_io_row(sig)?;
+    // Replace the row INCLUDING braces (target_effects carries its own).
+    let abs_open = decl.span.start + after_colon_off + row_start - 1;
+    let abs_close = decl.span.start + after_colon_off + row_end + 1;
+    Some(TextEdit {
+        range: Range {
+            start: offset_to_position(source, abs_open),
+            end: offset_to_position(source, abs_close),
+        },
+        new_text: target_effects.to_string(),
+    })
 }
 
 /// A wrap-in-constructor suggestion derived from a type mismatch.
@@ -2169,9 +2210,10 @@ fn build_deriving_action(
     };
     // `data_decl.span.end` covers everything up to (but not including) the
     // start of the next decl — including any existing `deriving (...)`
-    // clause, which is why the non-empty case below edits the clause in
-    // place instead of appending at the end.
-    let data_decl_end = data_decl.span.end;
+    // clause (which is why the non-empty case below edits the clause in
+    // place) AND the trailing newline run, which must be trimmed so the
+    // inserted clause attaches to the data decl rather than the next one.
+    let data_decl_end = decl_text_end(&doc.source, data_decl.span);
     if existing_deriving.iter().any(|n| n == trait_name) {
         return None;
     }
@@ -2287,10 +2329,31 @@ fn build_deriving_action(
     }))
 }
 
-/// Build a trait method stub `name p1 p2 = todo` from a trait method declaration.
+/// Leading indentation for method lines inside an impl block. Prefers the
+/// indentation of an existing item line (any indented non-empty line after
+/// the header); falls back to two spaces for empty impls.
+fn impl_block_indent(source: &str, decl_span: Span) -> String {
+    let text = safe_slice(source, decl_span);
+    for line in text.lines().skip(1) {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let indent = &line[..line.len() - trimmed.len()];
+        if !indent.is_empty() {
+            return indent.to_string();
+        }
+    }
+    "  ".to_string()
+}
+
+/// Build a trait method stub `name p1 p2 = todo` from a trait method
+/// declaration, indented with `indent` to match the impl block. Impl methods
+/// take parameters on the left-hand side (`method x = body` — see
+/// `ImplItem::Method { params, .. }`), unlike top-level functions.
 /// Counts arrows in the type signature to determine arity, then synthesizes
 /// fresh `a`, `b`, `c`... parameter names.
-fn build_trait_method_stub(item: &ast::TraitItem) -> String {
+fn build_trait_method_stub(item: &ast::TraitItem, indent: &str) -> String {
     let (name, arity) = match item {
         ast::TraitItem::Method { name, ty, .. } => {
             let arity = count_function_arity(&ty.ty);
@@ -2319,7 +2382,7 @@ fn build_trait_method_stub(item: &ast::TraitItem) -> String {
     } else {
         format!(" {}", params.join(" "))
     };
-    format!("\n  {name}{params_str} = todo")
+    format!("\n{indent}{name}{params_str} = todo")
 }
 
 /// Count the arity of a function type by walking the arrow spine.
@@ -2449,6 +2512,30 @@ fn fresh_extract_name(doc: &DocumentState, base: &str) -> String {
     base.to_string()
 }
 
+/// If the declaration starting at `decl_start` is preceded by an `export`
+/// keyword (which the parser consumes — decl spans start AFTER it), return
+/// the offset of the start of that `export` line instead, so insertions land
+/// before the whole exported declaration.
+fn include_export_prefix(source: &str, decl_start: usize) -> usize {
+    let before = &source[..decl_start.min(source.len())];
+    let trimmed = before.trim_end();
+    if !trimmed.ends_with("export") {
+        return decl_start;
+    }
+    let kw_start = trimmed.len() - "export".len();
+    // Whole-word check: `myexport` must not match.
+    let boundary_ok = kw_start == 0
+        || !{
+            let b = trimmed.as_bytes()[kw_start - 1];
+            b.is_ascii_alphanumeric() || b == b'_' || b == b'\''
+        };
+    if boundary_ok {
+        kw_start
+    } else {
+        decl_start
+    }
+}
+
 fn find_free_vars_in_selection(
     doc: &DocumentState,
     start: usize,
@@ -2478,6 +2565,66 @@ fn find_free_vars_in_selection(
     }
 
     free_vars
+}
+
+/// Conservative syntactic check: is `s` an ATOMIC expression that can be
+/// spliced into any operand position without parentheses? Accepts single
+/// identifiers, numeric literals, simple string literals, and fully-wrapped
+/// `( … )` / `{ … }` / `[ … ]` forms whose outer delimiters actually match.
+/// Anything else (operators, applications, field accesses with arguments…)
+/// reports `false` so the caller parenthesizes — over-parenthesizing is
+/// safe, under-parenthesizing changes semantics.
+fn is_atomic_expr_text(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let bytes = t.as_bytes();
+    // Single identifier (incl. primes) — also covers `true`, `Nothing`, etc.
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'';
+    if (bytes[0].is_ascii_alphabetic() || bytes[0] == b'_') && bytes.iter().all(|b| is_ident(*b)) {
+        return true;
+    }
+    // Numeric literal: digits with optional `.`, `_` separators, and a
+    // trailing `<Unit>` annotation (`42.0<M>`).
+    if bytes[0].is_ascii_digit() {
+        let (num, unit) = match t.find('<') {
+            Some(p) if t.ends_with('>') => (&t[..p], Some(&t[p + 1..t.len() - 1])),
+            _ => (t, None),
+        };
+        let num_ok = num
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b == b'.' || b == b'_');
+        let unit_ok = unit.map_or(true, |u| {
+            !u.is_empty() && u.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        });
+        if num_ok && unit_ok {
+            return true;
+        }
+    }
+    // Simple string literal with no internal quotes.
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') && !t[1..t.len() - 1].contains('"') {
+        return true;
+    }
+    // Fully-delimited: the opening bracket must match the LAST closing one.
+    let pairs: &[(u8, u8)] = &[(b'(', b')'), (b'{', b'}'), (b'[', b']')];
+    for (open, close) in pairs {
+        if bytes[0] == *open && bytes[bytes.len() - 1] == *close {
+            let mut depth = 0i32;
+            for (i, b) in bytes.iter().enumerate() {
+                if *b == *open {
+                    depth += 1;
+                } else if *b == *close {
+                    depth -= 1;
+                    if depth == 0 && i != bytes.len() - 1 {
+                        return false; // `(a) (b)` — outer delimiters don't wrap
+                    }
+                }
+            }
+            return depth == 0;
+        }
+    }
+    false
 }
 
 /// Find inline variable opportunities in do-block let bindings.
@@ -2534,11 +2681,16 @@ fn find_inline_actions(
                                 new_text: String::new(),
                             });
 
-                            // Replace each usage with the value (parenthesized if complex)
-                            let replacement = if value_text.contains(' ') && use_count > 0 {
-                                format!("({value_text})")
-                            } else {
+                            // Replace each usage with the value. Parenthesize
+                            // unless the text is syntactically atomic — a
+                            // whitespace check misses operators without
+                            // spaces (`n-1` inlined into `2 * y` becomes
+                            // `2 * n-1`, changing semantics). Over-
+                            // parenthesizing is harmless; under is not.
+                            let replacement = if is_atomic_expr_text(value_text) {
                                 value_text.to_string()
+                            } else {
+                                format!("({value_text})")
                             };
 
                             for (usage_span, def_span) in &doc.references {
@@ -2981,11 +3133,21 @@ fn find_if_to_case_at(
                 let cond_text = safe_slice(source, cond.span);
                 let then_text = safe_slice(source, then_branch.span);
                 let else_text = safe_slice(source, else_branch.span);
-                let indent = indent_for_expr_start(source, expr.span.start);
-                let replacement = format!(
-                    "case {cond_text} of{indent}True {{}} -> {then_text}{indent}False {{}} -> {else_text}"
-                );
-                *best = Some((expr.span, replacement));
+                // Multi-line branch/condition text carries indentation tied
+                // to its original column; splicing it after a case arm's
+                // `->` at a new column breaks the layout-sensitive parse.
+                // Same guard as `find_if_negate_at`. (Recursion below may
+                // still find a single-line inner `if`.)
+                let multi_line = cond_text.contains('\n')
+                    || then_text.contains('\n')
+                    || else_text.contains('\n');
+                if !multi_line {
+                    let indent = indent_for_expr_start(source, expr.span.start);
+                    let replacement = format!(
+                        "case {cond_text} of{indent}True {{}} -> {then_text}{indent}False {{}} -> {else_text}"
+                    );
+                    *best = Some((expr.span, replacement));
+                }
             }
         }
         crate::utils::recurse_expr(expr, |e| walk(e, source, offset, best));
@@ -4018,6 +4180,321 @@ mod regress_fixes_tests {
         assert!(
             last_line.starts_with(' '),
             "wildcard arm must be indented past column 0, got {new_text:?}"
+        );
+    }
+
+    /// Apply `TextEdit`s to `source`, back-to-front so offsets stay valid.
+    fn apply_edits_to(source: &str, edits: &[TextEdit]) -> String {
+        let mut spans: Vec<(usize, usize, &str)> = edits
+            .iter()
+            .map(|e| {
+                (
+                    crate::utils::position_to_offset(source, e.range.start),
+                    crate::utils::position_to_offset(source, e.range.end),
+                    e.new_text.as_str(),
+                )
+            })
+            .collect();
+        spans.sort_by_key(|(s, _, _)| std::cmp::Reverse(*s));
+        let mut out = source.to_string();
+        for (start, end, text) in spans {
+            out.replace_range(start..end, text);
+        }
+        out
+    }
+
+    fn selection(source: &str, needle: &str) -> Range {
+        let off = source.find(needle).expect("needle found");
+        Range {
+            start: crate::utils::offset_to_position(source, off),
+            end: crate::utils::offset_to_position(source, off + needle.len()),
+        }
+    }
+
+    /// "Extract to function" must emit the lambda form for parameters —
+    /// `helper = \x -> body` — since `helper x = body` doesn't parse at
+    /// top level.
+    #[test]
+    fn extract_function_emits_lambda_form_for_free_vars() {
+        let mut tw = TestWorkspace::new();
+        let src = "f = \\n -> n * 2 + 1\n";
+        let uri = tw.open("main", src);
+        let range = selection(src, "n * 2");
+        let actions = handle_code_action(&tw.state, &params_for(&uri, range))
+            .unwrap_or_default();
+        let action = action_titled(&actions, |t| t.starts_with("Extract to function"))
+            .expect("extract-to-function offered");
+        let edits = edits_for(action, &uri);
+        let helper = edits
+            .iter()
+            .find(|e| e.new_text.contains("= "))
+            .expect("helper insertion edit");
+        assert!(
+            helper.new_text.contains("= \\n -> n * 2"),
+            "helper must use the lambda form, got: {:?}",
+            helper.new_text
+        );
+        // The whole result must round-trip through the parser cleanly.
+        let out = apply_edits_to(src, edits);
+        let lexer = knot::lexer::Lexer::new(&out);
+        let (tokens, _) = lexer.tokenize();
+        let parser = knot::parser::Parser::new(out.clone(), tokens);
+        let (_, diags) = parser.parse_module();
+        assert!(
+            diags.iter().all(|d| !matches!(d.severity, knot::diagnostic::Severity::Error)),
+            "extracted result must parse; got {diags:?}\nsource:\n{out}"
+        );
+    }
+
+    /// The helper must be inserted BEFORE the `export` keyword of an
+    /// exported declaration, not between `export` and its decl.
+    #[test]
+    fn extract_function_inserts_before_export_keyword() {
+        let mut tw = TestWorkspace::new();
+        let src = "export f = \\n -> n * 2 + 1\n";
+        let uri = tw.open("main", src);
+        let range = selection(src, "n * 2");
+        let actions = handle_code_action(&tw.state, &params_for(&uri, range))
+            .unwrap_or_default();
+        let action = action_titled(&actions, |t| t.starts_with("Extract to function"))
+            .expect("extract-to-function offered");
+        let edits = edits_for(action, &uri);
+        let out = apply_edits_to(src, edits);
+        assert!(
+            !out.contains("export extracted"),
+            "helper spliced between `export` and its decl:\n{out}"
+        );
+        assert!(
+            out.contains("\nexport f"),
+            "exported decl must keep its `export` prefix:\n{out}"
+        );
+    }
+
+    /// "Add deriving" must attach to the data decl itself — decl spans
+    /// include the trailing newline run, so inserting at span.end used to
+    /// glue the clause onto the NEXT declaration.
+    #[test]
+    fn add_deriving_attaches_to_data_decl_not_next_decl() {
+        let mut tw = TestWorkspace::new();
+        let src = "data Color = Red {} | Blue {}\n\nnext = 1\n";
+        let uri = tw.open("main", src);
+        let pos = tw.position_of(&uri, "Color");
+        let actions = handle_code_action(
+            &tw.state,
+            &params_for(&uri, Range { start: pos, end: pos }),
+        )
+        .unwrap_or_default();
+        let action = action_titled(&actions, |t| t.starts_with("Add `deriving"))
+            .expect("add-deriving offered");
+        let edits = edits_for(action, &uri);
+        let out = apply_edits_to(src, edits);
+        assert_eq!(
+            out, "data Color = Red {} | Blue {} deriving (Eq, Show)\n\nnext = 1\n",
+            "deriving clause must end the data decl line"
+        );
+    }
+
+    /// "Convert to deriving" has the same span-end pitfall.
+    #[test]
+    fn convert_to_deriving_attaches_to_data_decl_not_next_decl() {
+        let mut tw = TestWorkspace::new();
+        let src = "trait Greet a where\n  greet : a -> Text\n  greet x = \"hi\"\n\ndata Color = Red {} | Blue {}\n\nimpl Greet Color where\n\nnext = 1\n";
+        let uri = tw.open("main", src);
+        let pos = tw.position_of(&uri, "impl Greet");
+        let actions = handle_code_action(
+            &tw.state,
+            &params_for(&uri, Range { start: pos, end: pos }),
+        )
+        .unwrap_or_default();
+        let action = action_titled(&actions, |t| t.starts_with("Convert to `deriving"))
+            .expect("convert-to-deriving offered for empty impl of defaulted trait");
+        let edits = edits_for(action, &uri);
+        let deriving_edit = edits
+            .iter()
+            .find(|e| e.new_text.contains("deriving"))
+            .expect("deriving edit");
+        // The insertion must land at the end of the data decl's TEXT
+        // (line 4, right after `Blue {}`), not at the start of a later decl.
+        assert_eq!(
+            deriving_edit.range.start.line, 4,
+            "deriving must attach to the data decl line; edits: {edits:?}"
+        );
+    }
+
+    /// "Widen declared effects" must rewrite the RESULT row, not the first
+    /// textual `IO {` (which can be a callback parameter's row).
+    #[test]
+    fn widen_effects_targets_result_row_not_callback_param() {
+        let src = "runCb : (Int -> IO {} {}) -> IO {} {}\nrunCb = \\cb -> cb 1\n";
+        let lexer = knot::lexer::Lexer::new(src);
+        let (tokens, _) = lexer.tokenize();
+        let parser = knot::parser::Parser::new(src.to_string(), tokens);
+        let (module, _) = parser.parse_module();
+        let decl = module
+            .decls
+            .iter()
+            .find(|d| matches!(&d.node, DeclKind::Fun { name, .. } if name == "runCb"))
+            .expect("runCb decl");
+        let edit = build_effect_widen_edit(decl, src, "{console}")
+            .expect("widen edit produced");
+        let start = crate::utils::position_to_offset(src, edit.range.start);
+        let result_row = src.find("-> IO {} {}\n").expect("result row") + 3 + 3;
+        assert_eq!(
+            start, result_row,
+            "edit must target the result row's braces; got offset {start} \
+             (text {:?})",
+            &src[start..start + 4.min(src.len() - start)]
+        );
+        let end = crate::utils::position_to_offset(src, edit.range.end);
+        let mut out = src.to_string();
+        out.replace_range(start..end, &edit.new_text);
+        assert_eq!(
+            out,
+            "runCb : (Int -> IO {} {}) -> IO {console} {}\nrunCb = \\cb -> cb 1\n"
+        );
+    }
+
+    /// "Inline variable" must parenthesize non-atomic values even without
+    /// spaces — `let y = n-1` into `2 * y` is `2 * (n-1)`, not `2 * n-1`.
+    #[test]
+    fn inline_variable_parenthesizes_operator_value_without_spaces() {
+        let mut tw = TestWorkspace::new();
+        let src = "f = \\n -> do\n  let y = n-1\n  yield (2 * y)\n";
+        let uri = tw.open("main", src);
+        let pos = tw.position_of(&uri, "y = n-1");
+        let actions = handle_code_action(
+            &tw.state,
+            &params_for(&uri, Range { start: pos, end: pos }),
+        )
+        .unwrap_or_default();
+        let action = action_titled(&actions, |t| t.starts_with("Inline"))
+            .expect("inline action offered");
+        let edits = edits_for(action, &uri);
+        let out = apply_edits_to(src, edits);
+        assert!(
+            out.contains("2 * (n-1)"),
+            "inlined operator expression must be parenthesized:\n{out}"
+        );
+    }
+
+    /// Atomic values (bare identifiers/literals) stay unparenthesized.
+    #[test]
+    fn inline_variable_leaves_atomic_values_bare() {
+        let mut tw = TestWorkspace::new();
+        let src = "f = \\n -> do\n  let y = n\n  yield (2 * y)\n";
+        let uri = tw.open("main", src);
+        let pos = tw.position_of(&uri, "y = n");
+        let actions = handle_code_action(
+            &tw.state,
+            &params_for(&uri, Range { start: pos, end: pos }),
+        )
+        .unwrap_or_default();
+        let action = action_titled(&actions, |t| t.starts_with("Inline"))
+            .expect("inline action offered");
+        let edits = edits_for(action, &uri);
+        let out = apply_edits_to(src, edits);
+        assert!(
+            out.contains("2 * n") && !out.contains("(n)"),
+            "atomic value must inline without parens:\n{out}"
+        );
+    }
+
+    #[test]
+    fn is_atomic_expr_text_classification() {
+        assert!(is_atomic_expr_text("n"));
+        assert!(is_atomic_expr_text("x'"));
+        assert!(is_atomic_expr_text("42"));
+        assert!(is_atomic_expr_text("1_000.5"));
+        assert!(is_atomic_expr_text("\"hello\""));
+        assert!(is_atomic_expr_text("(a + b)"));
+        assert!(is_atomic_expr_text("{a: 1, b: 2}"));
+        assert!(is_atomic_expr_text("[1, 2]"));
+        assert!(!is_atomic_expr_text("n-1"));
+        assert!(!is_atomic_expr_text("n - 1"));
+        assert!(!is_atomic_expr_text("f x"));
+        assert!(!is_atomic_expr_text("(a) (b)"));
+        assert!(!is_atomic_expr_text("p.x"));
+        assert!(!is_atomic_expr_text(""));
+    }
+
+    /// "Convert if to case" must refuse multi-line branches — splicing
+    /// indented branch text at a new column breaks the layout parse.
+    #[test]
+    fn convert_if_to_case_refuses_multiline_branches() {
+        let mut tw = TestWorkspace::new();
+        let src = "f = \\x -> if x > 1\n  then do\n    yield 1\n  else do\n    yield 2\n";
+        let uri = tw.open("main", src);
+        let pos = tw.position_of(&uri, "if x > 1");
+        let actions = handle_code_action(
+            &tw.state,
+            &params_for(&uri, Range { start: pos, end: pos }),
+        )
+        .unwrap_or_default();
+        assert!(
+            action_titled(&actions, |t| t.contains("if") && t.contains("case")).is_none(),
+            "if-to-case must not be offered for multi-line branches"
+        );
+    }
+
+    /// "Organize imports" must not delete comment lines interleaved between
+    /// imports — they're preserved above the sorted block.
+    #[test]
+    fn organize_imports_preserves_interleaved_comments() {
+        let mut tw = TempWorkspace::new();
+        tw.write_and_open("b.knot", "helperB = 1\n");
+        tw.write_and_open("a.knot", "helperA = 1\n");
+        let src = "import ./b\n-- keep me\nimport ./a\n\nmain = helperA + helperB\n";
+        let uri = tw.write_and_open("main.knot", src);
+        let pos = tw.workspace.position_of(&uri, "import ./b");
+        let actions = handle_code_action(
+            &tw.workspace.state,
+            &params_for(&uri, Range { start: pos, end: pos }),
+        )
+        .unwrap_or_default();
+        let Some(action) = action_titled(&actions, |t| t.starts_with("Organize imports")) else {
+            // Already organized → no action → nothing can be lost. But the
+            // imports above are unsorted, so the action should exist.
+            panic!("organize-imports action expected for unsorted imports");
+        };
+        let edits = edits_for(action, &uri);
+        let out = apply_edits_to(src, edits);
+        assert!(
+            out.contains("-- keep me"),
+            "comment between imports was deleted:\n{out}"
+        );
+        assert!(
+            out.contains("import ./a\nimport ./b"),
+            "imports must be sorted:\n{out}"
+        );
+    }
+
+    /// "Add missing methods" must match the impl block's actual indentation
+    /// and attach to the impl text, not after its trailing newline run.
+    #[test]
+    fn add_missing_methods_matches_impl_indentation() {
+        let mut tw = TestWorkspace::new();
+        let src = "trait Shape a where\n  area : a -> Int\n  name : a -> Text\n\ndata Sq = Sq {s: Int}\n\nimpl Shape Sq where\n    area x = 1\n\nnext = 1\n";
+        let uri = tw.open("main", src);
+        let pos = tw.position_of(&uri, "impl Shape");
+        let actions = handle_code_action(
+            &tw.state,
+            &params_for(&uri, Range { start: pos, end: pos }),
+        )
+        .unwrap_or_default();
+        let action = action_titled(&actions, |t| t.starts_with("Add missing methods"))
+            .expect("add-missing-methods offered");
+        let edits = edits_for(action, &uri);
+        assert_eq!(edits.len(), 1);
+        assert!(
+            edits[0].new_text.starts_with("\n    name"),
+            "stub must reuse the impl's 4-space indent; got: {:?}",
+            edits[0].new_text
+        );
+        // Insertion anchors at the end of `area x = 1` (line 7), before the
+        // blank line — not glued onto `next = 1`.
+        assert_eq!(
+            edits[0].range.start.line, 7,
+            "stub must attach to the impl block; edits: {edits:?}"
         );
     }
 }

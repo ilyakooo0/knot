@@ -43,13 +43,27 @@ pub fn resolve_definitions(
                 resolver.define(name, name_span(name));
             }
             DeclKind::Source { name, .. } | DeclKind::View { name, .. } => {
-                resolver.define(name, name_span(name));
+                let span = name_span(name);
+                resolver.define(name, span);
+                resolver.register_extra_definition_tokens(decl.span, name, span);
             }
             DeclKind::Derived { name, .. } => {
-                resolver.define(name, name_span(name));
+                let span = name_span(name);
+                resolver.define(name, span);
+                resolver.register_extra_definition_tokens(decl.span, name, span);
             }
             DeclKind::Fun { name, .. } => {
-                resolver.define(name, name_span(name));
+                let span = name_span(name);
+                resolver.define(name, span);
+                // The parser merges a separate type signature and the body
+                // line (`f : T` ⏎ `f = body`) into ONE `DeclKind::Fun`
+                // spanning both lines. `name_span` finds only the FIRST
+                // whole-word occurrence (the signature line), so the
+                // body-line definition token would otherwise be invisible to
+                // rename/references/highlight — register every additional
+                // line-start occurrence as a self-reference to the canonical
+                // definition span.
+                resolver.register_extra_definition_tokens(decl.span, name, span);
             }
             DeclKind::Trait { name, items, .. } => {
                 resolver.define(name, name_span(name));
@@ -228,6 +242,46 @@ impl<'a> DefResolver<'a> {
     fn add_ref(&mut self, usage: Span, name: &str) {
         if let Some(def) = self.lookup(name) {
             self.refs.push((usage, def));
+        }
+    }
+
+    /// Register every *additional* definition-name token of a top-level
+    /// declaration as a self-reference to its canonical (first) name span.
+    ///
+    /// Multi-line declarations repeat their name at the start of each
+    /// defining line — most importantly `f : T` ⏎ `f = body`, which the
+    /// parser merges into a single decl. Top-level decls start at column 0,
+    /// so any line inside the decl span that begins with the name (after an
+    /// optional `*`/`&` relation sigil) is a definition token, never a body
+    /// expression (body lines are layout-indented).
+    fn register_extra_definition_tokens(&mut self, decl_span: Span, name: &str, primary: Span) {
+        let end = decl_span.end.min(self.source.len());
+        let start = decl_span.start.min(end);
+        let text = &self.source[start..end];
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'';
+        let mut rel = 0usize;
+        for line in text.split('\n') {
+            // Optional relation sigil before the name (views/derived).
+            let cand = if line.starts_with('*') || line.starts_with('&') {
+                1
+            } else {
+                0
+            };
+            let rest = &line[cand.min(line.len())..];
+            if rest.starts_with(name) {
+                let tok_end = cand + name.len();
+                let boundary_ok = line
+                    .as_bytes()
+                    .get(tok_end)
+                    .map_or(true, |b| !is_ident(*b));
+                if boundary_ok {
+                    let span = Span::new(start + rel + cand, start + rel + tok_end);
+                    if span != primary {
+                        self.refs.push((span, primary));
+                    }
+                }
+            }
+            rel += line.len() + 1;
         }
     }
 

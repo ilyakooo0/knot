@@ -1229,6 +1229,11 @@ static ACTIVE_FORKS_CVAR: Condvar = Condvar::new();
 pub struct CancelToken {
     flag: AtomicBool,
     notify: (Mutex<()>, Condvar),
+    /// `WakeSlot` registered by `knot_stm_wait` while this thread is parked
+    /// in an STM retry, so `cancel()` can cut that park short too — without
+    /// this, a cancelled `race` loser blocked in `retry` would sleep out the
+    /// full `STM_WAIT_TIMEOUT` and stall `knot_threads_join` at program exit.
+    stm_slot: Mutex<Option<Weak<WakeSlot>>>,
 }
 
 impl CancelToken {
@@ -1236,6 +1241,7 @@ impl CancelToken {
         Self {
             flag: AtomicBool::new(false),
             notify: (Mutex::new(()), Condvar::new()),
+            stm_slot: Mutex::new(None),
         }
     }
 
@@ -1248,9 +1254,30 @@ impl CancelToken {
     /// just checked the flag and is about to wait cannot miss the
     /// wake-up.
     fn cancel(&self) {
-        let _g = self.notify.0.lock().unwrap();
-        self.flag.store(true, Ordering::Release);
-        self.notify.1.notify_all();
+        {
+            let _g = self.notify.0.lock().unwrap();
+            self.flag.store(true, Ordering::Release);
+            self.notify.1.notify_all();
+        }
+        // Also wake an STM wait slot if the thread is parked in retry.
+        // Race-free pairing with `knot_stm_wait`: the waiter registers its
+        // slot here BEFORE checking `is_cancelled()` — so either we see the
+        // registered slot (and wake it), or the waiter's check sees the flag
+        // (the `stm_slot` mutex orders the two paths).
+        let slot = self.stm_slot.lock().unwrap().take();
+        if let Some(slot) = slot.and_then(|w| w.upgrade()) {
+            slot.wake();
+        }
+    }
+
+    /// Register the current STM wake slot so `cancel()` can wake it.
+    fn set_stm_wake_slot(&self, slot: &Arc<WakeSlot>) {
+        *self.stm_slot.lock().unwrap() = Some(Arc::downgrade(slot));
+    }
+
+    /// Clear the registered STM wake slot after the wait completes.
+    fn clear_stm_wake_slot(&self) {
+        *self.stm_slot.lock().unwrap() = None;
     }
 
     /// Sleep for `duration`, returning early as soon as `cancel()` is
@@ -1674,7 +1701,22 @@ fn sql_partial_cmp(a: &SqlVal, b: &SqlVal) -> Option<std::cmp::Ordering> {
         (SqlVal::Real(x), SqlVal::Real(y)) => x.partial_cmp(y),
         (SqlVal::Int(x), SqlVal::Real(y)) => (*x as f64).partial_cmp(y),
         (SqlVal::Real(x), SqlVal::Int(y)) => x.partial_cmp(&(*y as f64)),
-        (SqlVal::Text(x), SqlVal::Text(y)) => Some(x.cmp(y)),
+        (SqlVal::Text(x), SqlVal::Text(y)) => {
+            // Int columns are stored as TEXT (`SqlVal::from_knot` serializes
+            // Int as Text), so numeric texts must compare numerically —
+            // "5" < "10" — not lexicographically. Mirrors `SqlVal::to_key`'s
+            // i64-parse collapse: i64 first, then f64; plain string order
+            // only when NEITHER side parses as a number. Mixed numeric /
+            // non-numeric is unknown → None (callers wake conservatively).
+            match (x.parse::<i64>(), y.parse::<i64>()) {
+                (Ok(a), Ok(b)) => Some(a.cmp(&b)),
+                _ => match (x.parse::<f64>(), y.parse::<f64>()) {
+                    (Ok(a), Ok(b)) => a.partial_cmp(&b),
+                    (Err(_), Err(_)) => Some(x.cmp(y)),
+                    _ => None,
+                },
+            }
+        }
         // BigInts are stored as TEXT in SQLite — handle Int ↔ Text via numeric parse.
         (SqlVal::Int(x), SqlVal::Text(y)) => y.parse::<i64>().ok().map(|n| x.cmp(&n)),
         (SqlVal::Text(x), SqlVal::Int(y)) => x.parse::<i64>().ok().map(|n| n.cmp(y)),
@@ -2402,12 +2444,19 @@ fn wait_for_any_write(timeout: Duration) {
 fn bump_table_version(name: &str) {
     if let Some(v) = TABLE_VERSIONS.get(name) {
         v.fetch_add(1, Ordering::Release);
-        return;
+    } else {
+        TABLE_VERSIONS
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .fetch_add(1, Ordering::Release);
     }
-    TABLE_VERSIONS
-        .entry(name.to_string())
-        .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-        .fetch_add(1, Ordering::Release);
+    // TOCTOU guard (Dekker pattern), paired with the fence in
+    // `knot_stm_wait`: order the version bump before this writer's
+    // subsequent reads of watcher-registration state (`table_has_watchers`,
+    // `TABLE_FILTER_COLS` in `wake_matching_watchers`, the watcher indices).
+    // A watcher registering concurrently either gets seen by those reads or
+    // observes this bump in its post-registration re-check.
+    std::sync::atomic::fence(Ordering::SeqCst);
 }
 
 /// Walk the broad watcher list for `name`, then for `WriteEvent::Rows` the EQ
@@ -2424,6 +2473,23 @@ fn bump_table_version(name: &str) {
 /// Reads only — dead `Weak`s linger here and are reclaimed by `sweep_dead_watchers`
 /// on a counter trip via `maybe_sweep_dead_watchers`.
 fn wake_matching_watchers(name: &str, event: &WriteEvent) {
+    // TOCTOU guard: a `Rows` payload was projected to the filter-column
+    // union read at WRITE time (`filter_cols_for`); a watcher that
+    // registered a filter on a NEW column between that projection and this
+    // notify would never be probed — indexed slots are only discovered via
+    // payload columns, and `row_matches_preds_indexed`'s missing-column
+    // fallback only helps slots that get probed at all. Re-read the current
+    // filter-column set here: if it references a column absent from the
+    // payload, fall back to a conservative `Bulk` wake. Paired with the
+    // SeqCst fences in `bump_table_version` (runs just before this on every
+    // notify path) and `knot_stm_wait` (between registration and the version
+    // re-check), at least one side always observes the other.
+    let event: &WriteEvent = match event {
+        WriteEvent::Rows(rows) if filter_cols_missing_from_payload(name, rows) => {
+            &WriteEvent::Bulk
+        }
+        e => e,
+    };
     // 1) Broad watchers — All filters and non-indexable Cols.
     if let Some(slots) = TABLE_WATCHERS.get(name) {
         for weak in slots.iter() {
@@ -2470,6 +2536,17 @@ fn wake_matching_watchers(name: &str, event: &WriteEvent) {
         }
     }
     maybe_sweep_dead_watchers();
+}
+
+/// True if any column currently registered in `TABLE_FILTER_COLS` for
+/// `table` is missing from the event payload — i.e. the payload's projection
+/// is stale relative to the live watcher set and per-row filtering can no
+/// longer be trusted. See the TOCTOU comment in `wake_matching_watchers`.
+fn filter_cols_missing_from_payload(table: &str, rows: &EventRows) -> bool {
+    match TABLE_FILTER_COLS.get(table) {
+        Some(state) => state.cols.keys().any(|c| rows.col_index(c).is_none()),
+        None => false,
+    }
 }
 
 /// Conservatively wake every EQ- and Range-indexed watcher registered for
@@ -3119,8 +3196,10 @@ pub extern "C-unwind" fn knot_override_lookup(
     };
 
     if wrap_maybe {
-        let tag = intern_str("Just");
-        alloc(Value::Constructor(tag, inner))
+        // `Just`'s payload is always the record `{value: ...}` — a bare
+        // scalar payload would not match the shape pattern-matching and
+        // `unwrap_maybe` expect.
+        make_just(inner)
     } else {
         inner
     }
@@ -4789,17 +4868,63 @@ fn infer_temp_schema(rows: &[*mut Value]) -> Option<TempSchema> {
         return Some(TempSchema::Scalar(ColType::Text));
     }
     match unsafe { as_ref(first) } {
-        Value::Record(fields) => {
-            let mut cols = Vec::with_capacity(fields.len());
-            for f in fields {
-                if !f.value.is_null() {
+        Value::Record(first_fields) => {
+            // Scan ALL rows, not just the first: a first-row-only guess
+            // corrupts data when later rows disagree — e.g. a Maybe field
+            // whose first row is `Nothing` (nullary → Tag column) silently
+            // drops the payload of a later `Just {value: ...}` row, and a
+            // first-row NULL types the column Text, mis-reading later Ints.
+            // Any inconsistency (mixed nullary/payload constructors, NULL vs
+            // typed, conflicting scalar types, differing field sets) returns
+            // None so callers take the safe in-memory fallback.
+            let names: Vec<Arc<str>> = first_fields.iter().map(|f| f.name.clone()).collect();
+            // Per-field type, refined across rows. `None` = only NULLs so far.
+            let mut types: Vec<Option<ColType>> = vec![None; names.len()];
+            let mut saw_null: Vec<bool> = vec![false; names.len()];
+            for row in rows {
+                if row.is_null() {
+                    return None;
+                }
+                let fields = match unsafe { as_ref(*row) } {
+                    Value::Record(fields) => fields,
+                    _ => return None,
+                };
+                if fields.len() != names.len() {
+                    return None;
+                }
+                for (i, f) in fields.iter().enumerate() {
+                    if f.name != names[i] {
+                        return None;
+                    }
+                    if f.value.is_null() {
+                        saw_null[i] = true;
+                        continue;
+                    }
                     match unsafe { as_ref(f.value) } {
                         Value::Relation(_) | Value::Function(_) => return None,
                         _ => {}
                     }
+                    let ty = infer_col_type(f.value)?;
+                    match types[i] {
+                        None => types[i] = Some(ty),
+                        Some(prev) if prev == ty => {}
+                        Some(_) => return None,
+                    }
                 }
-                let ty = infer_col_type(f.value)?;
-                cols.push((f.name.to_string(), ty));
+            }
+            let mut cols = Vec::with_capacity(names.len());
+            for (i, name) in names.iter().enumerate() {
+                let ty = match types[i] {
+                    // NULL and typed values mixed in one column: SQLite
+                    // would conflate "no value" with the column's affinity
+                    // games — bail to the in-memory path.
+                    Some(_) if saw_null[i] => return None,
+                    Some(ty) => ty,
+                    // Every row NULL: Text (matches `infer_col_type`'s
+                    // historical null handling).
+                    None => ColType::Text,
+                };
+                cols.push((name.to_string(), ty));
             }
             Some(TempSchema::Record(cols))
         }
@@ -5367,16 +5492,20 @@ pub extern "C-unwind" fn knot_relation_singleton(v: *mut Value) -> *mut Value {
 }
 
 /// Unwrap a scalar source relation: extract the `_value` field from the first row.
-/// Returns a default (Int 0) if the relation is empty.
+/// Panics if the relation is empty — a scalar source must hold exactly one
+/// row, so an empty backing table means the database is corrupted (returning
+/// a wrong-typed default like Int 0 would silently corrupt downstream data).
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_scalar_source_unwrap(rel: *mut Value) -> *mut Value {
     match unsafe { as_ref(rel) } {
         Value::Relation(rows) => {
             if rows.is_empty() {
-                alloc_int(0)
-            } else {
-                knot_record_field(rows[0], "_value".as_ptr(), 6)
+                panic!(
+                    "knot runtime: scalar source has no row — database corrupted? \
+                     (expected exactly one row holding the scalar value)"
+                );
             }
+            knot_record_field(rows[0], "_value".as_ptr(), 6)
         }
         _ => rel,
     }
@@ -6160,11 +6289,19 @@ pub extern "C-unwind" fn knot_value_neq_i32(a: *mut Value, b: *mut Value) -> i32
     !values_equal(a, b) as i32
 }
 
+/// Diagnostic for null operands in ordered comparisons. Shared by the
+/// `<`/`>` paths (via `compare_lt`/`compare_gt`) and the `<=`/`>=` wrappers,
+/// which must short-circuit BEFORE the negated compare call (a silent
+/// `!compare_gt(null, ..)` would otherwise return a wrong `true`).
+fn warn_null_comparison(a: *mut Value, b: *mut Value) {
+    eprintln!("knot runtime: comparison with null value (a={}, b={})",
+        if a.is_null() { "null".to_string() } else { brief_value(a) },
+        if b.is_null() { "null".to_string() } else { brief_value(b) });
+}
+
 fn compare_lt(a: *mut Value, b: *mut Value) -> bool {
     if a.is_null() || b.is_null() {
-        eprintln!("knot runtime: comparison with null value (a={}, b={})",
-            if a.is_null() { "null".to_string() } else { brief_value(a) },
-            if b.is_null() { "null".to_string() } else { brief_value(b) });
+        warn_null_comparison(a, b);
         return false;
     }
     let av = unsafe { as_ref(a) };
@@ -6183,9 +6320,7 @@ fn compare_lt(a: *mut Value, b: *mut Value) -> bool {
 
 fn compare_gt(a: *mut Value, b: *mut Value) -> bool {
     if a.is_null() || b.is_null() {
-        eprintln!("knot runtime: comparison with null value (a={}, b={})",
-            if a.is_null() { "null".to_string() } else { brief_value(a) },
-            if b.is_null() { "null".to_string() } else { brief_value(b) });
+        warn_null_comparison(a, b);
         return false;
     }
     let av = unsafe { as_ref(a) };
@@ -6216,13 +6351,19 @@ pub extern "C-unwind" fn knot_value_gt(a: *mut Value, b: *mut Value) -> *mut Val
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_value_le(a: *mut Value, b: *mut Value) -> *mut Value {
-    if a.is_null() || b.is_null() { return alloc_bool(false); }
+    if a.is_null() || b.is_null() {
+        warn_null_comparison(a, b);
+        return alloc_bool(false);
+    }
     alloc_bool(!compare_gt(a, b))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_value_ge(a: *mut Value, b: *mut Value) -> *mut Value {
-    if a.is_null() || b.is_null() { return alloc_bool(false); }
+    if a.is_null() || b.is_null() {
+        warn_null_comparison(a, b);
+        return alloc_bool(false);
+    }
     alloc_bool(!compare_lt(a, b))
 }
 
@@ -6240,13 +6381,19 @@ pub extern "C-unwind" fn knot_value_gt_i32(a: *mut Value, b: *mut Value) -> i32 
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_value_le_i32(a: *mut Value, b: *mut Value) -> i32 {
-    if a.is_null() || b.is_null() { return 0; }
+    if a.is_null() || b.is_null() {
+        warn_null_comparison(a, b);
+        return 0;
+    }
     !compare_gt(a, b) as i32
 }
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_value_ge_i32(a: *mut Value, b: *mut Value) -> i32 {
-    if a.is_null() || b.is_null() { return 0; }
+    if a.is_null() || b.is_null() {
+        warn_null_comparison(a, b);
+        return 0;
+    }
     !compare_lt(a, b) as i32
 }
 
@@ -6980,8 +7127,17 @@ pub extern "C-unwind" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
             }
             let _guard = CleanupGuard { db, io };
 
-            // Run the IO action
-            knot_io_run(db, io);
+            // Run the IO action under catch_unwind so a panicking body (e.g.
+            // inside an `atomic` block, which holds the global write lock
+            // across begin/commit) releases the write lock instead of leaking
+            // it and deadlocking every other writer in the process. The panic
+            // hook has already reported the panic; the thread then exits.
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                knot_io_run(db, io);
+            }));
+            if run.is_err() {
+                write_lock_force_release();
+            }
         });
 
         alloc(Value::Unit)
@@ -7097,6 +7253,16 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
                 let result = match run {
                     Ok(v) => v,
                     Err(payload) => {
+                        // Release any write locks the unwinding body may have
+                        // held so other threads aren't deadlocked (no-op when
+                        // none are held). This MUST run for `Cancelled`
+                        // unwinds too: a loser cancelled inside an `atomic`
+                        // block still holds the global write lock acquired by
+                        // `knot_atomic_begin` (the guard was `mem::forget`-en)
+                        // — skipping the release would deadlock every writer
+                        // in the process. The connection (and its open
+                        // savepoints) is discarded by `CleanupGuard` below.
+                        write_lock_force_release();
                         // Cooperative cancellation surfaces as a `Cancelled`
                         // panic raised by `knot_io_run`. It is not an error:
                         // the peer already produced the outcome, so this side
@@ -7104,10 +7270,6 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
                         if payload.downcast_ref::<Cancelled>().is_some() {
                             return;
                         }
-                        // Release any write locks the panicking body may have
-                        // held so other threads aren't deadlocked (no-op when
-                        // none are held).
-                        write_lock_force_release();
                         let msg = if let Some(s) = payload.downcast_ref::<&str>() {
                             s.to_string()
                         } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -7466,19 +7628,47 @@ pub extern "C-unwind" fn knot_stm_wait(_snapshot: i64) {
         bucket.entry(threshold.to_key()).or_default().push(weak);
     }
 
+    // Cancellation-awareness: register the slot with this thread's
+    // CancelToken (if it is a `race` worker) BEFORE checking `is_cancelled`
+    // below — a `cancel()` arriving at any point either finds the registered
+    // slot (and wakes it) or is observed by the check; no ordering window
+    // loses the wakeup.
+    let cancel_token = current_cancel_token();
+    if let Some(tok) = &cancel_token {
+        tok.set_stm_wake_slot(&slot);
+    }
+
+    // TOCTOU guard (Dekker pattern), paired with the fence in
+    // `bump_table_version`: order this thread's registration stores
+    // (watcher counts, TABLE_FILTER_COLS, watcher indices) before the
+    // version re-check load below. Together the fences guarantee that a
+    // concurrent writer either sees our registration when it projects /
+    // notifies, or we see its version bump here — a wakeup cannot be lost
+    // in both directions.
+    std::sync::atomic::fence(Ordering::SeqCst);
+
     // Re-check after registration to prevent lost wakeups. Uses cached Arcs —
     // one atomic load per table, no DashMap traffic.
     let changed_after_register = read_versions
         .iter()
         .any(|(_, arc, ver)| arc.load(Ordering::Acquire) > *ver);
 
-    if !changed_after_register {
+    let cancelled = cancel_token
+        .as_ref()
+        .map(|t| t.is_cancelled())
+        .unwrap_or(false);
+
+    if !changed_after_register && !cancelled {
         slot.wait(STM_WAIT_TIMEOUT);
         // slot drops → Weak refs become invalid, cleaned up lazily in notify
     } else {
         // Changed between registration and re-check — yield to prevent
         // spin-starvation (same rationale as the already_changed path).
         std::thread::yield_now();
+    }
+
+    if let Some(tok) = &cancel_token {
+        tok.clear_stm_wake_slot();
     }
 
     // Re-acquire write lock if we held it before waiting
@@ -9297,10 +9487,13 @@ enum ColType {
     Bytes,
     /// Stored as TEXT, reconstructed as Constructor on read
     Tag,
-    /// Nested relation stored as JSON text in SQLite. In practice this variant
-    /// never appears in `RecordSchema::columns`/`NestedField::columns` because
-    /// `parse_record_schema` routes `[...]` types into the `nested` channel
-    /// instead — but it remains for ADT field schemas (`parse_adt_schema`).
+    /// Value stored as JSON text in SQLite. Used for:
+    /// - record-valued fields (`{x: Float, y: Float}` inside a row),
+    /// - payload-bearing ADT fields,
+    /// - nested relations of *non-record* element type (e.g. `tags: [Text]`,
+    ///   `shapes: [Shape]`) — the whole relation is serialized as one JSON
+    ///   column (descriptor `field:json`); only record-element nested
+    ///   relations take the `field:[child_schema]` child-table form.
     Json,
 }
 
@@ -9362,6 +9555,10 @@ fn parse_adt_schema(spec: &str) -> AdtSpec {
                         "bool" => ColType::Bool,
                         "bytes" => ColType::Bytes,
                         "tag" => ColType::Tag,
+                        // Record / payload-ADT constructor fields round-trip
+                        // through JSON (the compiler's `col_type_str` emits
+                        // "json" for them).
+                        "json" => ColType::Json,
                         s if s.starts_with('[') => ColType::Json,
                         other => panic!("knot runtime: unknown ADT field type '{}'", other),
                     };
@@ -9568,7 +9765,13 @@ fn init_record_table(conn: &rusqlite::Connection, table_name: &str, schema: &Rec
 
     for c in &schema.columns {
         col_defs.push(format!("{} {}", quote_ident(&c.name), sql_type(c.ty)));
-        unique_cols.push(quote_ident(&c.name));
+        // NULL-coalesced so rows containing NULLs still dedupe under
+        // INSERT OR IGNORE (SQLite treats raw NULLs as distinct in UNIQUE
+        // indexes) — same sentinel scheme as the ADT path. Existing DBs
+        // keep their old raw-column index under the same name (IF NOT
+        // EXISTS no-ops), matching how the ADT init path handles upgrades;
+        // schema migrations (`auto_apply_record_change`) drop + recreate.
+        unique_cols.push(null_safe_coalesce(&quote_ident(&c.name), c.ty));
     }
 
     if col_defs.is_empty() {
@@ -9613,7 +9816,10 @@ fn init_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &Nested
 
     for c in &nf.columns {
         col_defs.push(format!("{} {}", quote_ident(&c.name), sql_type(c.ty)));
-        unique_cols.push(quote_ident(&c.name));
+        // NULL-coalesced for set semantics with NULL-bearing rows — see
+        // the matching comment in `init_record_table`. `_parent_id` stays
+        // raw (NOT NULL by definition).
+        unique_cols.push(null_safe_coalesce(&quote_ident(&c.name), c.ty));
     }
 
     let sql = format!("CREATE TABLE IF NOT EXISTS {} ({});", child_table, col_defs.join(", "));
@@ -9795,7 +10001,8 @@ fn auto_apply_child_change(
 
     let mut unique_cols = vec![quote_ident("_parent_id")];
     for c in &new_nf.columns {
-        unique_cols.push(quote_ident(&c.name));
+        // NULL-coalesced — same scheme as `init_child_table`.
+        unique_cols.push(null_safe_coalesce(&quote_ident(&c.name), c.ty));
     }
     if unique_cols.len() > 1 {
         let idx_sql = format!(
@@ -9890,7 +10097,12 @@ fn auto_apply_record_change(
     debug_sql(&drop_idx);
     let _ = conn.execute_batch(&drop_idx);
 
-    let unique_cols: Vec<String> = new_rec.columns.iter().map(|c| quote_ident(&c.name)).collect();
+    // NULL-coalesced — same scheme as `init_record_table` / the ADT path.
+    let unique_cols: Vec<String> = new_rec
+        .columns
+        .iter()
+        .map(|c| null_safe_coalesce(&quote_ident(&c.name), c.ty))
+        .collect();
     if !unique_cols.is_empty() {
         let idx_sql = format!(
             "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({});",
@@ -11997,8 +12209,12 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
             rusqlite::types::Value::Text(value_to_json(v))
         }
         (Value::Constructor(tag, _), _) => rusqlite::types::Value::Text(tag.to_string()),
-        (Value::Relation(_), ColType::Json) => {
-            rusqlite::types::Value::Text(value_to_json(v))
+        (Value::Relation(rows), ColType::Json) => {
+            // Nested relations stored as JSON columns keep set semantics:
+            // dedup rows before serializing, mirroring the INSERT OR IGNORE
+            // dedup that child-table storage gets from its UNIQUE index.
+            let deduped = in_memory_dedup(rows.clone());
+            rusqlite::types::Value::Text(value_to_json(alloc(Value::Relation(deduped))))
         }
         (Value::Record(_), ColType::Json) => {
             rusqlite::types::Value::Text(value_to_json(v))
@@ -12435,15 +12651,39 @@ fn check_rate_limit(
     }
     ensure_rate_limit_table(db);
     let now = current_unix_ms();
-    let _ = db.conn.execute_batch("BEGIN IMMEDIATE;");
-    let row: Option<(f64, i64)> = db
-        .conn
-        .query_row(
-            "SELECT tokens, last_refill FROM _knot_rate_limits WHERE route = ?1 AND key = ?2",
-            rusqlite::params![route, key],
-            |r| Ok((r.get::<_, f64>(0)?, r.get::<_, i64>(1)?)),
-        )
-        .ok();
+    // BEGIN IMMEDIATE serializes concurrent same-key checks. If it fails
+    // (e.g. SQLITE_BUSY under contention), fail OPEN without touching the
+    // bucket: allowing a request through under transient DB pressure beats
+    // 429ing legitimate traffic, and skipping the accounting write keeps
+    // the stored token counts intact.
+    if let Err(e) = db.conn.execute_batch("BEGIN IMMEDIATE;") {
+        log_warn!(
+            "[HTTP] rate limiter: BEGIN failed ({}); allowing request without accounting",
+            e
+        );
+        return Ok(());
+    }
+    let row: Option<(f64, i64)> = match db.conn.query_row(
+        "SELECT tokens, last_refill FROM _knot_rate_limits WHERE route = ?1 AND key = ?2",
+        rusqlite::params![route, key],
+        |r| Ok((r.get::<_, f64>(0)?, r.get::<_, i64>(1)?)),
+    ) {
+        Ok(r) => Some(r),
+        // Genuinely no bucket yet — start a fresh one at full capacity.
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        // Real error (I/O, corruption, busy): do NOT conflate with "no
+        // bucket" — that would reset the bucket to full capacity and let
+        // an attacker leverage DB pressure to bypass the limit. Fail open
+        // for this one request and leave the stored bucket untouched.
+        Err(e) => {
+            log_warn!(
+                "[HTTP] rate limiter: bucket read failed ({}); allowing request without accounting",
+                e
+            );
+            let _ = db.conn.execute_batch("ROLLBACK;");
+            return Ok(());
+        }
+    };
     let capacity = requests as f64;
     let tokens_before = match row {
         Some((tokens, last_refill)) => {
@@ -12453,23 +12693,27 @@ fn check_rate_limit(
         }
         None => capacity,
     };
-    if tokens_before >= 1.0 {
-        let new_tokens = tokens_before - 1.0;
-        let _ = db.conn.execute(
+    // Persist the updated bucket. Write failures are logged and rolled
+    // back; the allow/deny decision (computed from the read above) stands.
+    let write_bucket = |tokens: f64| {
+        let write = db.conn.execute(
             "INSERT OR REPLACE INTO _knot_rate_limits (route, key, tokens, last_refill) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![route, key, new_tokens, now],
+            rusqlite::params![route, key, tokens, now],
         );
-        let _ = db.conn.execute_batch("COMMIT;");
+        let result = write.and_then(|_| db.conn.execute_batch("COMMIT;"));
+        if let Err(e) = result {
+            log_warn!("[HTTP] rate limiter: bucket write failed ({})", e);
+            let _ = db.conn.execute_batch("ROLLBACK;");
+        }
+    };
+    if tokens_before >= 1.0 {
+        write_bucket(tokens_before - 1.0);
         Ok(())
     } else {
         let needed = 1.0 - tokens_before;
         let retry_after_ms =
             (needed * (window_ms as f64) / capacity).ceil() as i64;
-        let _ = db.conn.execute(
-            "INSERT OR REPLACE INTO _knot_rate_limits (route, key, tokens, last_refill) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![route, key, tokens_before, now],
-        );
-        let _ = db.conn.execute_batch("COMMIT;");
+        write_bucket(tokens_before);
         Err(retry_after_ms.max(1))
     }
 }
@@ -14114,7 +14358,8 @@ fn http_serve_loop(
                         use std::io::Read;
                         let mut buf = Vec::new();
                         let max = http_max_body_bytes();
-                        let mut limited = request.as_reader().take(max + 1);
+                        // saturating: `max` may be u64::MAX (env override).
+                        let mut limited = request.as_reader().take(max.saturating_add(1));
                         let _ = limited.read_to_end(&mut buf);
                         if buf.len() as u64 > max {
                             eprintln!(
@@ -14150,13 +14395,20 @@ fn http_serve_loop(
                                 _ => None,
                             })
                             .unwrap_or("text");
-                        let value = match try_string_to_value(val, ty) {
+                        // `?`-typed (Maybe) path params: a matched path
+                        // segment is always present, so absence (Nothing)
+                        // can't occur — but the handler's declared type is
+                        // `Maybe T`, so the value must be Just-wrapped.
+                        let is_maybe = ty.starts_with('?');
+                        let inner_ty = if is_maybe { &ty[1..] } else { ty };
+                        let value = match try_string_to_value(val, inner_ty) {
                             Some(v) => v,
                             None => return Err((400, format!(
                                 "invalid path parameter '{}': '{}' is not a valid {}",
-                                name, val, ty
+                                name, val, inner_ty
                             ), None)),
                         };
+                        let value = if is_maybe { make_just(value) } else { value };
                         fields.push(RecordField {
                             name: intern_str(name),
                             value,
@@ -14248,7 +14500,15 @@ fn http_serve_loop(
                                     } else {
                                         match raw_val {
                                             Some(v) => coerce_json_field(v, inner_ty),
-                                            None => string_to_value("", inner_ty),
+                                            // A missing required field is a
+                                            // client error — defaulting to
+                                            // 0/""/false silently corrupts
+                                            // data (path/query/headers
+                                            // already 400 on bad input).
+                                            None => return Err((400, format!(
+                                                "missing required body field '{}'",
+                                                bname
+                                            ), None)),
                                         }
                                     };
                                     fields.push(RecordField {
@@ -14258,12 +14518,17 @@ fn http_serve_loop(
                                 }
                             }
                             _ => {
+                                // Body parsed but isn't a JSON object: every
+                                // required (non-Maybe) field is missing.
                                 for (bname, bty) in &entry_body_fields {
                                     let is_maybe = bty.starts_with('?');
                                     let value = if is_maybe {
                                         alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit)))
                                     } else {
-                                        string_to_value("", bty)
+                                        return Err((400, format!(
+                                            "missing required body field '{}' (request body must be a JSON object)",
+                                            bname
+                                        ), None));
                                     };
                                     fields.push(RecordField {
                                         name: intern_str(bname),
@@ -14455,7 +14720,29 @@ fn http_serve_loop(
                             if let Value::Record(hdr_fields) = unsafe { as_ref(hdrs_val) } {
                                 for hf in hdr_fields {
                                     let http_name = camel_to_header_case(&hf.name);
-                                    let hdr_value = fetch_value_to_text(hf.value);
+                                    // This loop runs OUTSIDE the worker's
+                                    // catch_unwind — a conversion panic here
+                                    // would kill the response path entirely.
+                                    // Catch it and drop the offending header
+                                    // (the body still goes out); `Nothing`
+                                    // header values are omitted, mirroring
+                                    // how fetch skips Nothing request headers.
+                                    let converted = std::panic::catch_unwind(
+                                        std::panic::AssertUnwindSafe(|| {
+                                            fetch_value_to_text_opt(hf.value)
+                                        }),
+                                    );
+                                    let hdr_value = match converted {
+                                        Ok(Some(s)) => s,
+                                        Ok(None) => continue, // Nothing → omit header
+                                        Err(_) => {
+                                            log_warn!(
+                                                "[HTTP] dropping response header '{}': value not convertible to text",
+                                                http_name
+                                            );
+                                            continue;
+                                        }
+                                    };
                                     if let Ok(header) = format!("{}: {}", http_name, hdr_value)
                                         .parse::<tiny_http::Header>()
                                     {
@@ -14708,25 +14995,18 @@ pub extern "C-unwind" fn knot_http_fetch_io(
         if !req_hdrs_str.is_empty() {
             for field_desc in req_hdrs_str.split(',') {
                 if field_desc.is_empty() { continue; }
-                let (name, ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
-                let is_maybe = ty.starts_with('?');
+                let (name, _ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
                 let http_name = camel_to_header_case(name);
                 if http_name.eq_ignore_ascii_case("Content-Type") {
                     has_content_type = true;
                 }
                 let field_val = knot_record_field(payload, name.as_ptr(), name.len());
-                if is_maybe {
-                    // Maybe type: skip Nothing, extract Just value
-                    if !field_val.is_null() {
-                        if let Value::Constructor(tag, inner) = unsafe { as_ref(field_val) } {
-                            if &**tag == "Just" {
-                                let v = knot_record_field(*inner, "value".as_ptr(), 5);
-                                req_headers.push((http_name, fetch_value_to_text(v)));
-                            }
-                        }
-                    }
-                } else {
-                    req_headers.push((http_name, fetch_value_to_text(field_val)));
+                // `fetch_value_to_text_opt` unwraps Just and returns None
+                // for Nothing — covers both Maybe (`?`-typed) and plain
+                // header fields (a `None` on a non-Maybe field can't occur
+                // by typing, and omitting it is safe regardless).
+                if let Some(text) = fetch_value_to_text_opt(field_val) {
+                    req_headers.push((http_name, text));
                 }
             }
         }
@@ -14946,7 +15226,8 @@ fn fetch_read_capped_body(body: &mut ureq::Body) -> Result<String, String> {
     let max = http_max_body_bytes();
     let mut buf = Vec::new();
     body.as_reader()
-        .take(max + 1)
+        // saturating: `max` may be u64::MAX (env override).
+        .take(max.saturating_add(1))
         .read_to_end(&mut buf)
         .map_err(|e| format!("response read error: {}", e))?;
     if buf.len() as u64 > max {
@@ -14973,7 +15254,15 @@ fn fetch_build_url(base: &str, path_pattern: &str, payload: *mut Value) -> Strin
         let param = &remaining[start + 1..end];
         let (name, _ty) = param.split_once(':').unwrap_or((param, "text"));
         let field_val = knot_record_field(payload, name.as_ptr(), name.len());
-        url.push_str(&percent_encode(&fetch_value_to_text(field_val)));
+        let text = fetch_value_to_text_opt(field_val).unwrap_or_else(|| {
+            // Path segments cannot be omitted — a Nothing here is a caller
+            // bug the type checker should have prevented.
+            panic!(
+                "knot runtime: path parameter '{}' is Nothing — path parameters cannot be omitted",
+                name
+            )
+        });
+        url.push_str(&percent_encode(&text));
         remaining = &remaining[end + 1..];
     }
     url.push_str(remaining);
@@ -15013,35 +15302,62 @@ fn fetch_build_query(query_desc: &str, payload: *mut Value) -> String {
         if field_desc.is_empty() {
             continue;
         }
-        let (name, ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
-        let is_maybe = ty.starts_with('?');
+        let (name, _ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
         let field_val = knot_record_field(payload, name.as_ptr(), name.len());
-        let val = if is_maybe {
-            match unwrap_maybe(field_val) {
-                Some(inner) => inner,
-                None => continue, // Skip Nothing query params
-            }
-        } else {
-            field_val
+        // `fetch_value_to_text_opt` unwraps Just and returns None for
+        // Nothing — Nothing query params are omitted from the URL.
+        let val_str = match fetch_value_to_text_opt(field_val) {
+            Some(s) => s,
+            None => continue,
         };
-        let val_str = fetch_value_to_text(val);
         parts.push(format!("{}={}", name, percent_encode(&val_str)));
     }
     parts.join("&")
 }
 
-/// Convert a Knot value to its text representation for URL params.
-fn fetch_value_to_text(v: *mut Value) -> String {
+/// Convert a Knot value to its text representation for URL params and
+/// HTTP headers. Returns `None` for `Nothing` — callers must OMIT the
+/// parameter/header entirely (mirroring how fetch skips `Nothing` request
+/// headers). `Just {value: v}` unwraps and recurses on `v`; nullary
+/// constructors (Unit or empty-record payload) render as their bare tag,
+/// matching the server-side `tag` column decode for enum-like ADTs.
+fn fetch_value_to_text_opt(v: *mut Value) -> Option<String> {
     if v.is_null() {
-        return String::new();
+        return Some(String::new());
     }
     match unsafe { as_ref(v) } {
-        Value::Int(n) => n.to_string(),
-        Value::Float(n) => n.to_string(),
-        Value::Text(s) => (**s).to_string(),
-        Value::Bool(b) => b.to_string(),
+        Value::Int(n) => Some(n.to_string()),
+        Value::Float(n) => Some(n.to_string()),
+        Value::Text(s) => Some((**s).to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Constructor(tag, payload) => {
+            if &**tag == "Nothing" {
+                return None;
+            }
+            if &**tag == "Just" {
+                return fetch_value_to_text_opt(knot_record_field(
+                    *payload,
+                    "value".as_ptr(),
+                    5,
+                ));
+            }
+            let nullary = (*payload).is_null()
+                || match unsafe { as_ref(*payload) } {
+                    Value::Unit => true,
+                    Value::Record(fs) => fs.is_empty(),
+                    _ => false,
+                };
+            if nullary {
+                Some(tag.to_string())
+            } else {
+                panic!(
+                    "knot runtime: cannot convert constructor '{}' (with fields) to text for URL parameter or header",
+                    tag
+                )
+            }
+        }
         _ => panic!(
-            "knot runtime: cannot convert {} to text for URL parameter",
+            "knot runtime: cannot convert {} to text for URL parameter or header",
             type_name(v)
         ),
     }
@@ -15207,6 +15523,14 @@ fn generate_openapi(name: &str, table: &RouteTable) -> String {
 
     for (i, (path, entries)) in paths.iter().enumerate() {
         out.push_str(&format!("    \"{}\": {{\n", json_escape(path)));
+        // Methods are JSON keys within a path object — two route entries
+        // sharing method+path would emit duplicate keys (invalid JSON).
+        // Keep the first entry per method.
+        let mut seen_methods: HashSet<String> = HashSet::new();
+        let entries: Vec<&&RouteTableEntry> = entries
+            .iter()
+            .filter(|e| seen_methods.insert(e.method.to_lowercase()))
+            .collect();
         for (j, entry) in entries.iter().enumerate() {
             let method = entry.method.to_lowercase();
             out.push_str(&format!("      \"{}\": {{\n", method));
@@ -15227,9 +15551,12 @@ fn generate_openapi(name: &str, table: &RouteTable) -> String {
                 }
             }
             for (qname, qty) in &entry.query_fields {
+                // `?`-typed (Maybe) query params are optional; all others
+                // are required (the server 400s when they're absent).
                 params.push(format!(
-                    "{{ \"name\": \"{}\", \"in\": \"query\", \"required\": false, \"schema\": {} }}",
+                    "{{ \"name\": \"{}\", \"in\": \"query\", \"required\": {}, \"schema\": {} }}",
                     json_escape(qname),
+                    !qty.starts_with('?'),
                     type_to_openapi_schema(qty)
                 ));
             }
@@ -15274,14 +15601,18 @@ fn generate_openapi(name: &str, table: &RouteTable) -> String {
                     out.push('\n');
                 }
                 out.push_str("                },\n");
-                out.push_str("                \"required\": [");
-                for (k, (fname, _)) in entry.body_fields.iter().enumerate() {
-                    out.push_str(&format!("\"{}\"", json_escape(fname)));
-                    if k + 1 < entry.body_fields.len() {
-                        out.push_str(", ");
-                    }
-                }
-                out.push_str("]\n");
+                // `?`-typed (Maybe) body fields are optional — exclude them
+                // from the `required` array.
+                let required: Vec<String> = entry
+                    .body_fields
+                    .iter()
+                    .filter(|(_, fty)| !fty.starts_with('?'))
+                    .map(|(fname, _)| format!("\"{}\"", json_escape(fname)))
+                    .collect();
+                out.push_str(&format!(
+                    "                \"required\": [{}]\n",
+                    required.join(", ")
+                ));
                 out.push_str("              }\n");
                 out.push_str("            }\n");
                 out.push_str("          }\n");
@@ -15350,6 +15681,9 @@ fn openapi_path(parts: &[PathPart]) -> String {
 }
 
 fn type_to_openapi_schema(ty: &str) -> &'static str {
+    // `?` marks Maybe-typed (optional) fields — optionality is expressed via
+    // the `required` flag/array, not the schema, so strip it before mapping.
+    let ty = ty.strip_prefix('?').unwrap_or(ty);
     match ty {
         "int" => "{ \"type\": \"integer\" }",
         "float" => "{ \"type\": \"number\" }",
@@ -15507,7 +15841,10 @@ fn serialize_value_for_hash_into(v: *mut Value, buf: &mut Vec<u8>) {
         }
         Value::Relation(rows) => {
             buf.push(8);
-            buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+            // Canonical *set* form: sort + dedup, then write the DEDUPED
+            // count — must match `value_to_hash_bytes` exactly, otherwise a
+            // relation key containing duplicate rows hashes differently
+            // across the two paths and equal join keys miss each other.
             let mut row_bytes: Vec<Vec<u8>> = rows
                 .iter()
                 .map(|r| {
@@ -15517,6 +15854,8 @@ fn serialize_value_for_hash_into(v: *mut Value, buf: &mut Vec<u8>) {
                 })
                 .collect();
             row_bytes.sort_unstable();
+            row_bytes.dedup();
+            buf.extend_from_slice(&(row_bytes.len() as u32).to_le_bytes());
             for rb in &row_bytes {
                 buf.extend_from_slice(&(rb.len() as u32).to_le_bytes());
                 buf.extend_from_slice(rb);
@@ -15636,7 +15975,30 @@ pub extern "C-unwind" fn knot_crypto_generate_signing_key_pair() -> *mut Value {
     record
 }
 
-/// Sealed-box encryption: X25519 ECDH + ChaCha20-Poly1305.
+/// Derive the sealed-box AEAD key: BLAKE3 `derive_key` over
+/// `shared_secret || ephemeral_pub || recipient_pub` with a fixed,
+/// domain-separating context string. Using a KDF instead of the raw ECDH
+/// output (a) binds both public keys into the key, preventing cross-keypair
+/// ciphertext malleability, and (b) hides any structure of the raw curve
+/// point from the cipher.
+///
+/// NOTE: ciphertexts produced by builds that used the raw shared secret as
+/// the key cannot be decrypted by current builds (accepted pre-1.0 format
+/// change).
+fn derive_sealed_box_key(
+    shared: &[u8; 32],
+    eph_pub: &[u8; 32],
+    recipient_pub: &[u8; 32],
+) -> [u8; 32] {
+    const CONTEXT: &str = "knot-runtime sealed-box v2 ChaCha20-Poly1305 key";
+    let mut material = [0u8; 96];
+    material[..32].copy_from_slice(shared);
+    material[32..64].copy_from_slice(eph_pub);
+    material[64..].copy_from_slice(recipient_pub);
+    blake3::derive_key(CONTEXT, &material)
+}
+
+/// Sealed-box encryption: X25519 ECDH + BLAKE3 KDF + ChaCha20-Poly1305.
 /// Takes (publicKey: Bytes, plaintext: Bytes), returns ciphertext Bytes.
 /// Format: [ephemeral_pub: 32][nonce: 12][encrypted + tag: len+16]
 #[unsafe(no_mangle)]
@@ -15663,9 +16025,15 @@ pub extern "C-unwind" fn knot_crypto_encrypt(public_key: *mut Value, plaintext: 
     let eph_secret = x25519_dalek::StaticSecret::from(eph_secret_bytes);
     let eph_public = x25519_dalek::PublicKey::from(&eph_secret);
 
-    // ECDH shared secret
+    // ECDH shared secret. Reject non-contributory exchanges (low-order /
+    // identity points): an attacker-chosen public key would otherwise force
+    // a predictable all-zero secret.
     let shared = eph_secret.diffie_hellman(&recipient_public);
-    let key = chacha20poly1305::Key::from_slice(shared.as_bytes());
+    if !shared.was_contributory() {
+        panic!("knot runtime: encrypt publicKey is a low-order point (non-contributory X25519 exchange)");
+    }
+    let key_bytes = derive_sealed_box_key(shared.as_bytes(), eph_public.as_bytes(), &recipient_pub);
+    let key = chacha20poly1305::Key::from_slice(&key_bytes);
     let cipher = ChaCha20Poly1305::new(key);
 
     // Random nonce
@@ -15714,8 +16082,19 @@ pub extern "C-unwind" fn knot_crypto_decrypt(private_key: *mut Value, ciphertext
     let encrypted = &ct[44..];
 
     let eph_public = x25519_dalek::PublicKey::from(eph_pub_bytes);
+    // Reject non-contributory exchanges — a low-order ephemeral point in the
+    // ciphertext header would force a predictable key (see encrypt).
     let shared = secret.diffie_hellman(&eph_public);
-    let key = chacha20poly1305::Key::from_slice(shared.as_bytes());
+    if !shared.was_contributory() {
+        panic!("knot runtime: decryption failed (non-contributory X25519 exchange — low-order ephemeral point)");
+    }
+    let recipient_public = x25519_dalek::PublicKey::from(&secret);
+    let key_bytes = derive_sealed_box_key(
+        shared.as_bytes(),
+        &eph_pub_bytes,
+        recipient_public.as_bytes(),
+    );
+    let key = chacha20poly1305::Key::from_slice(&key_bytes);
     let cipher = ChaCha20Poly1305::new(key);
     let nonce = chacha20poly1305::Nonce::from_slice(&nonce_bytes);
 
@@ -16625,5 +17004,363 @@ mod _regress_runtime_fixes_tests {
         let r2 = alloc(Value::Relation(vec![io1]));
         // Set-semantics equality must see these as different relations.
         assert!(!values_equal(r1, r2));
+    }
+}
+
+#[cfg(test)]
+mod _bugfix_batch_tests {
+    use super::*;
+
+    fn int(n: i64) -> *mut Value {
+        alloc(Value::Int(n))
+    }
+
+    fn text(s: &str) -> *mut Value {
+        alloc(Value::Text(Arc::from(s)))
+    }
+
+    fn rec(fields: &[(&str, *mut Value)]) -> *mut Value {
+        let mut fs: Vec<RecordField> = fields
+            .iter()
+            .map(|(n, v)| RecordField {
+                name: intern_str(n),
+                value: *v,
+            })
+            .collect();
+        fs.sort_by(|a, b| a.name.cmp(&b.name));
+        alloc(Value::Record(fs))
+    }
+
+    fn nothing() -> *mut Value {
+        // Unit-payload shape, as produced by the DB `tag` column decode —
+        // this is the shape `infer_col_type` classifies as a Tag column.
+        alloc(Value::Constructor(intern_str("Nothing"), alloc(Value::Unit)))
+    }
+
+    fn just(v: *mut Value) -> *mut Value {
+        make_just(v)
+    }
+
+    // ── Fix: sql_partial_cmp must compare numeric texts numerically ──
+
+    #[test]
+    fn sql_partial_cmp_numeric_texts_compare_numerically() {
+        use std::cmp::Ordering;
+        // "5" < "10" numerically (lexicographic order would say Greater).
+        assert_eq!(
+            sql_partial_cmp(&SqlVal::Text("5".into()), &SqlVal::Text("10".into())),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            sql_partial_cmp(&SqlVal::Text("100".into()), &SqlVal::Text("99".into())),
+            Some(Ordering::Greater)
+        );
+        // Float-as-text compares numerically too.
+        assert_eq!(
+            sql_partial_cmp(&SqlVal::Text("2.5".into()), &SqlVal::Text("10".into())),
+            Some(Ordering::Less)
+        );
+        // Non-numeric texts keep lexicographic order.
+        assert_eq!(
+            sql_partial_cmp(&SqlVal::Text("apple".into()), &SqlVal::Text("banana".into())),
+            Some(Ordering::Less)
+        );
+        // Mixed numeric / non-numeric is unknown → None (wake conservatively).
+        assert_eq!(
+            sql_partial_cmp(&SqlVal::Text("5".into()), &SqlVal::Text("apple".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn stm_ordered_pred_on_int_as_text_row() {
+        // STM watcher on `qty < 10`: write payload carries Int-as-TEXT "5"
+        // (SqlVal::from_knot serializes Int that way) — must match.
+        let pred = ColPred::Cmp(CmpOp::Lt, SqlVal::Text("10".into()));
+        assert!(col_pred_matches(&SqlVal::Text("5".into()), &pred));
+        assert!(!col_pred_matches(&SqlVal::Text("50".into()), &pred));
+    }
+
+    // ── Fix: infer_temp_schema must scan all rows ──
+
+    #[test]
+    fn temp_schema_mixed_maybe_returns_none() {
+        // First row `Nothing` (nullary → Tag column), later row carries a
+        // `Just {value: 1}` payload — a Tag column would silently drop it.
+        let rows = vec![
+            rec(&[("m", nothing()), ("x", int(1))]),
+            rec(&[("m", just(int(2))), ("x", int(3))]),
+        ];
+        assert!(infer_temp_schema(&rows).is_none());
+        // Same in the opposite order.
+        let rows_rev = vec![
+            rec(&[("m", just(int(2))), ("x", int(3))]),
+            rec(&[("m", nothing()), ("x", int(1))]),
+        ];
+        assert!(infer_temp_schema(&rows_rev).is_none());
+    }
+
+    #[test]
+    fn temp_schema_null_then_typed_returns_none() {
+        // First-row SQL NULL used to type the column Text, mis-typing the
+        // later Int rows.
+        let rows = vec![
+            rec(&[("x", std::ptr::null_mut())]),
+            rec(&[("x", int(7))]),
+        ];
+        assert!(infer_temp_schema(&rows).is_none());
+    }
+
+    #[test]
+    fn temp_schema_conflicting_scalar_types_returns_none() {
+        let rows = vec![rec(&[("x", int(1))]), rec(&[("x", text("a"))])];
+        assert!(infer_temp_schema(&rows).is_none());
+    }
+
+    #[test]
+    fn temp_schema_consistent_rows_still_infer() {
+        let rows = vec![
+            rec(&[("name", text("a")), ("x", int(1))]),
+            rec(&[("name", text("b")), ("x", int(2))]),
+        ];
+        match infer_temp_schema(&rows) {
+            Some(TempSchema::Record(cols)) => {
+                assert_eq!(cols.len(), 2);
+                assert!(cols.contains(&("name".to_string(), ColType::Text)));
+                assert!(cols.contains(&("x".to_string(), ColType::Int)));
+            }
+            _ => panic!("expected Record schema"),
+        }
+        // All-nullary Maybe column stays a Tag column (consistent rows).
+        let tags = vec![rec(&[("m", nothing())]), rec(&[("m", nothing())])];
+        match infer_temp_schema(&tags) {
+            Some(TempSchema::Record(cols)) => {
+                assert_eq!(cols, vec![("m".to_string(), ColType::Tag)]);
+            }
+            _ => panic!("expected Record schema"),
+        }
+    }
+
+    #[test]
+    fn sql_dedup_falls_back_for_mixed_maybe_rows() {
+        // End-to-end through sql_dedup: mixed-arity Maybe rows must return
+        // None so the caller's in-memory dedup keeps all three distinct rows
+        // (the old Tag-typed column collapsed Just{1} and Just{2}).
+        let conn = Connection::open_in_memory().unwrap();
+        // `Nothing` FIRST: the old first-row-only inference typed the column
+        // Tag and `SELECT DISTINCT` collapsed the two Just rows.
+        let rows = vec![
+            rec(&[("m", nothing())]),
+            rec(&[("m", just(int(1)))]),
+            rec(&[("m", just(int(2)))]),
+        ];
+        assert!(sql_dedup(&conn, &rows).is_none());
+        assert_eq!(in_memory_dedup(rows).len(), 3);
+    }
+
+    // ── Fix: hash serializer divergence on duplicate relation rows ──
+
+    #[test]
+    fn hash_serializers_agree_on_relations_with_duplicates() {
+        let dup = alloc(Value::Relation(vec![
+            rec(&[("id", int(1))]),
+            rec(&[("id", int(1))]),
+            rec(&[("id", int(2))]),
+        ]));
+        let nodup = alloc(Value::Relation(vec![
+            rec(&[("id", int(2))]),
+            rec(&[("id", int(1))]),
+        ]));
+        assert!(values_equal(dup, nodup));
+
+        let mut a = Vec::new();
+        value_to_hash_bytes(dup, &mut a);
+        let mut b = Vec::new();
+        value_to_hash_bytes(nodup, &mut b);
+        assert_eq!(a, b, "value_to_hash_bytes must canonicalize duplicates");
+
+        // The join-index serializer must produce the SAME canonical form.
+        assert_eq!(
+            serialize_value_for_hash(dup),
+            serialize_value_for_hash(nodup),
+            "serialize_value_for_hash must dedup like value_to_hash_bytes"
+        );
+        assert_eq!(a, serialize_value_for_hash(dup), "the two paths must match");
+    }
+
+    // ── Fix: fetch_value_to_text constructors / Maybe ──
+
+    #[test]
+    fn fetch_text_opt_handles_maybe_and_enums() {
+        // Nothing → None (callers omit the param/header).
+        assert_eq!(fetch_value_to_text_opt(nothing()), None);
+        // Just {value: v} unwraps.
+        assert_eq!(fetch_value_to_text_opt(just(int(7))), Some("7".to_string()));
+        assert_eq!(
+            fetch_value_to_text_opt(just(text("hi"))),
+            Some("hi".to_string())
+        );
+        // Nullary constructor (enum ADT) renders as its tag — both the
+        // Unit-payload shape (DB tag decode) and the empty-record shape
+        // (user-written `Red {}`).
+        let unit_ctor = alloc(Value::Constructor(intern_str("Red"), alloc(Value::Unit)));
+        assert_eq!(fetch_value_to_text_opt(unit_ctor), Some("Red".to_string()));
+        let rec_ctor = alloc(Value::Constructor(
+            intern_str("Red"),
+            alloc(Value::Record(Vec::new())),
+        ));
+        assert_eq!(fetch_value_to_text_opt(rec_ctor), Some("Red".to_string()));
+    }
+
+    #[test]
+    fn fetch_build_query_omits_nothing_params() {
+        let payload = rec(&[("limit", just(int(5))), ("q", nothing())]);
+        let qs = fetch_build_query("q:?text,limit:?int", payload);
+        assert_eq!(qs, "limit=5");
+    }
+
+    // ── Fix: OpenAPI `?` (Maybe) type mapping ──
+
+    #[test]
+    fn openapi_schema_strips_maybe_prefix() {
+        assert_eq!(type_to_openapi_schema("?int"), "{ \"type\": \"integer\" }");
+        assert_eq!(type_to_openapi_schema("?bool"), "{ \"type\": \"boolean\" }");
+        assert_eq!(type_to_openapi_schema("int"), "{ \"type\": \"integer\" }");
+    }
+
+    // ── Fix: scalar source unwrap must not fabricate Int 0 ──
+
+    #[test]
+    #[should_panic(expected = "scalar source has no row")]
+    fn scalar_source_unwrap_panics_on_empty_relation() {
+        let empty = alloc(Value::Relation(Vec::new()));
+        let _ = knot_scalar_source_unwrap(empty);
+    }
+
+    // ── Fix: cancel() must wake a registered STM slot ──
+
+    #[test]
+    fn cancel_wakes_registered_stm_slot() {
+        let tok = CancelToken::new();
+        let slot = Arc::new(WakeSlot::new());
+        tok.set_stm_wake_slot(&slot);
+        tok.cancel();
+        assert!(tok.is_cancelled());
+        assert!(
+            *slot.woken.lock().unwrap(),
+            "cancel() must wake the slot registered by knot_stm_wait"
+        );
+    }
+
+    // ── Fix: stale Rows payloads upgrade to Bulk at notify time ──
+
+    #[test]
+    fn stale_rows_payload_upgrades_to_bulk_wake() {
+        let table = "t_toctou_upgrade_unique";
+        // Watcher indexed on col "a", registered AFTER a writer projected
+        // its payload (which only carries col "b").
+        let slot = Arc::new(WakeSlot::new());
+        EQ_WATCHERS
+            .entry((table.to_string(), "a".to_string(), SqlVal::Int(1).to_key()))
+            .or_default()
+            .push(Arc::downgrade(&slot));
+        TABLE_FILTER_COLS
+            .entry(table.to_string())
+            .or_default()
+            .cols
+            .insert("a".to_string(), 1);
+
+        let cols: Arc<[ColName]> = Arc::from(vec![intern_col("b")]);
+        let mut rows = EventRows::new(cols);
+        rows.push(vec![SqlVal::Int(9)]);
+        // Payload lacks "a": without the staleness re-check the "a" index is
+        // never probed and the watcher sleeps until the timeout.
+        wake_matching_watchers(table, &WriteEvent::Rows(rows));
+        assert!(
+            *slot.woken.lock().unwrap(),
+            "stale payload must fall back to a conservative Bulk wake"
+        );
+        TABLE_FILTER_COLS.remove(table);
+    }
+
+    #[test]
+    fn fresh_rows_payload_stays_precise() {
+        let table = "t_toctou_fresh_unique";
+        let slot = Arc::new(WakeSlot::new());
+        EQ_WATCHERS
+            .entry((table.to_string(), "a".to_string(), SqlVal::Int(1).to_key()))
+            .or_default()
+            .push(Arc::downgrade(&slot));
+        TABLE_FILTER_COLS
+            .entry(table.to_string())
+            .or_default()
+            .cols
+            .insert("a".to_string(), 1);
+
+        let cols: Arc<[ColName]> = Arc::from(vec![intern_col("a")]);
+        let mut rows = EventRows::new(cols);
+        rows.push(vec![SqlVal::Int(2)]); // ≠ 1 → indexed watcher must NOT wake
+        wake_matching_watchers(table, &WriteEvent::Rows(rows));
+        assert!(
+            !*slot.woken.lock().unwrap(),
+            "payload covering all filter cols must keep per-row precision"
+        );
+        TABLE_FILTER_COLS.remove(table);
+    }
+
+    // ── Fix: sealed-box KDF + contributory check ──
+
+    #[test]
+    fn crypto_sealed_box_round_trip() {
+        let pair = knot_crypto_generate_key_pair();
+        let private_key = knot_record_field(pair, b"privateKey".as_ptr(), 10);
+        let public_key = knot_record_field(pair, b"publicKey".as_ptr(), 9);
+
+        let plaintext = alloc(Value::Bytes(Arc::from(b"attack at dawn".to_vec())));
+        let ct = knot_crypto_encrypt(public_key, plaintext);
+        let decrypted = knot_crypto_decrypt(private_key, ct);
+        match unsafe { as_ref(decrypted) } {
+            Value::Bytes(b) => assert_eq!(&**b, b"attack at dawn" as &[u8]),
+            _ => panic!("expected Bytes from decrypt"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "non-contributory")]
+    fn crypto_encrypt_rejects_low_order_public_key() {
+        // The identity point (all zeros) is the canonical low-order input:
+        // DH with it yields an all-zero shared secret for ANY ephemeral key.
+        let zero_pub = alloc(Value::Bytes(Arc::from(vec![0u8; 32])));
+        let plaintext = alloc(Value::Bytes(Arc::from(b"x".to_vec())));
+        let _ = knot_crypto_encrypt(zero_pub, plaintext);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-contributory")]
+    fn crypto_decrypt_rejects_low_order_ephemeral() {
+        let pair = knot_crypto_generate_key_pair();
+        let private_key = knot_record_field(pair, b"privateKey".as_ptr(), 10);
+        // Forged ciphertext with an all-zero (low-order) ephemeral point.
+        let ct = vec![0u8; 32 + 12 + 16];
+        let ct_val = alloc(Value::Bytes(Arc::from(ct)));
+        let _ = knot_crypto_decrypt(private_key, ct_val);
+    }
+
+    // ── Fix: HTTP body cap take() overflow ──
+
+    #[test]
+    fn body_cap_take_saturates_at_u64_max() {
+        use std::io::Read;
+        knot_set_http_max_body_bytes(u64::MAX);
+        let data = b"hello".to_vec();
+        let mut out = Vec::new();
+        // Mirrors the listen/fetch read paths: take(max.saturating_add(1)).
+        let max = http_max_body_bytes();
+        (&data[..])
+            .take(max.saturating_add(1))
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(out, data);
+        knot_set_http_max_body_bytes(0); // restore env-or-default resolution
     }
 }

@@ -1135,19 +1135,27 @@ fn render_unit_expr(u: &UnitExpr) -> String {
     render_unit_expr_prec(u, 0)
 }
 
+/// Contexts (`ctx`): 0 = top level, 1 = left operand of `*`/`/` (left-assoc,
+/// so same-precedence children need no parens), 2 = right operand of `*`/`/`
+/// (a nested `*`/`/` must keep its parens to preserve associativity), 3 =
+/// base of `^` (the grammar's `parse_unit_power` allows one `^` per atom, so
+/// any non-atom base must be parenthesized).
 fn render_unit_expr_prec(u: &UnitExpr, ctx: u8) -> String {
     match u {
         UnitExpr::Dimensionless => "1".into(),
         UnitExpr::Named(n) => n.clone(),
         UnitExpr::Mul(a, b) => {
-            let s = format!("{} * {}", render_unit_expr_prec(a, 1), render_unit_expr_prec(b, 1));
+            let s = format!("{} * {}", render_unit_expr_prec(a, 1), render_unit_expr_prec(b, 2));
             if ctx > 1 { format!("({})", s) } else { s }
         }
         UnitExpr::Div(a, b) => {
             let s = format!("{} / {}", render_unit_expr_prec(a, 1), render_unit_expr_prec(b, 2));
             if ctx > 1 { format!("({})", s) } else { s }
         }
-        UnitExpr::Pow(a, n) => format!("{}^{}", render_unit_expr_prec(a, 2), n),
+        UnitExpr::Pow(a, n) => {
+            let s = format!("{}^{}", render_unit_expr_prec(a, 3), n);
+            if ctx > 2 { format!("({})", s) } else { s }
+        }
     }
 }
 
@@ -1276,6 +1284,12 @@ fn forces_multiline(e: &Expr) -> bool {
 fn render_expr_inline(e: &Expr, parent: Prec) -> String {
     match &e.node {
         ExprKind::Lit(l) => render_literal(l),
+        // `yield` is refused by the parser's `can_start_atom` in application
+        // argument position (it would be ambiguous with do-block yields), so
+        // a Var named `yield` must keep its parens there: `f (yield)`.
+        // Head position (Prec::App) must stay bare — `yield x` do-statements
+        // are represented as `App(Var("yield"), x)`.
+        ExprKind::Var(n) if n == "yield" && parent == Prec::Atom => format!("({})", n),
         ExprKind::Var(n) => n.clone(),
         ExprKind::Constructor(n) => n.clone(),
         ExprKind::SourceRef(n) => format!("*{}", n),
@@ -1948,6 +1962,12 @@ fn render_pat(p: &Pat) -> String {
         PatKind::Constructor { name, payload } => {
             // `Ctor {}` for empty record; otherwise `Ctor {fields}` or `Ctor pat`.
             match &payload.node {
+                // A constructor named `Cons` must print WITHOUT a payload
+                // atom: `Cons {}` would reparse via the reserved
+                // `Cons head tail` path ('{}' becomes the head pattern and
+                // the parse fails on a missing tail). A bare `Cons` reparses
+                // to Constructor("Cons", Record([])) — exactly this AST.
+                PatKind::Record(fields) if fields.is_empty() && name == "Cons" => name.clone(),
                 PatKind::Record(fields) if fields.is_empty() => format!("{} {{}}", name),
                 _ => format!("{} {}", name, render_pat_atom(payload)),
             }

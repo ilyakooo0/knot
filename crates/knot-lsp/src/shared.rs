@@ -50,7 +50,7 @@ pub(crate) fn render_signature_with_effects(inferred: &str, effects: &EffectSet)
 /// outermost row is the FIRST). Among depth-0 rows, the last along the arrow
 /// spine (`IO {a} Int -> IO {b} Text`) is the result row. Returns `None`
 /// when no top-level IO row is present.
-fn find_outermost_io_row(ty: &str) -> Option<(usize, usize)> {
+pub(crate) fn find_outermost_io_row(ty: &str) -> Option<(usize, usize)> {
     let bytes = ty.as_bytes();
     let mut last: Option<(usize, usize)> = None;
     let mut depth: i32 = 0;

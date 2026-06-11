@@ -2190,6 +2190,16 @@ impl Infer {
                     Box::new(self.subst_ty(inner, &shadowed)),
                 )
             }
+            // Aliases must be substituted through: `collect_free_vars`
+            // descends into the alias body, so quantified vars can live
+            // there (e.g. `type Box = {val: a}`). Skipping the body would
+            // share the original var across every instantiation — pinning
+            // it at the first use site and falsely rejecting later uses
+            // at other types.
+            Ty::Alias(name, inner) => Ty::Alias(
+                name.clone(),
+                Box::new(self.subst_ty(inner, mapping)),
+            ),
             _ => ty.clone(),
         }
     }
@@ -2232,6 +2242,11 @@ impl Infer {
             Ty::EffectRow(effects, row) => Ty::EffectRow(effects.clone(), *row),
             Ty::Forall(bound, inner) => Ty::Forall(
                 bound.clone(),
+                Box::new(self.subst_unit_vars_in_ty(inner, mapping)),
+            ),
+            // Mirror `subst_ty`: unit vars can occur inside alias bodies.
+            Ty::Alias(name, inner) => Ty::Alias(
+                name.clone(),
                 Box::new(self.subst_unit_vars_in_ty(inner, mapping)),
             ),
             _ => ty.clone(),
@@ -2652,6 +2667,24 @@ impl Infer {
                 "[]" => Ty::TyCon("[]".into()),
                 _ => {
                     if let Some(aliased) = self.aliases.get(name).cloned() {
+                        // Freshen any free type variables in the alias body
+                        // (e.g. the `a` in `type Box = {val: a}`): the body
+                        // was converted ONCE at collection time, so without
+                        // freshening every reference to the alias shares
+                        // the same variable — the first use pins it (e.g.
+                        // to Int) and later uses at other types are falsely
+                        // rejected.
+                        let mut fv = HashSet::new();
+                        self.collect_free_vars(&aliased, &mut fv);
+                        let aliased = if fv.is_empty() {
+                            aliased
+                        } else {
+                            let mapping: HashMap<TyVar, Ty> = fv
+                                .into_iter()
+                                .map(|v| (v, self.fresh()))
+                                .collect();
+                            self.subst_ty(&aliased, &mapping)
+                        };
                         // Wrap nullary alias references so the name flows
                         // through inference into LSP type hints. Skip the
                         // wrapper when the alias already names itself
@@ -3652,6 +3685,24 @@ impl Infer {
             }
             let body_skolemised = self.subst_ty(&body, &mapping);
             self.check_expr(expr, &body_skolemised);
+            // Escape check: a skolem must not leak into the enclosing
+            // environment. Without this, an outer flexible var (e.g. the
+            // type of an unannotated lambda param `h` in
+            // `g = \h -> takesPoly h`) can be bound toward a skolem; once
+            // the skolem is dropped from `self.skolems` it becomes an
+            // ordinary var, gets generalized, and the wrapper accepts
+            // monomorphic arguments where a polymorphic one was required.
+            let env_vars = self.free_vars_in_env();
+            if fresh_skolems.iter().any(|s| env_vars.contains(s)) {
+                self.error(
+                    "polymorphic type escapes its scope: this expression \
+                     must work for every type, but its type leaked into \
+                     the surrounding context — add an explicit `forall` \
+                     annotation to keep the wrapper polymorphic"
+                        .into(),
+                    expr.span,
+                );
+            }
             for s in fresh_skolems {
                 self.skolems.remove(&s);
             }
@@ -4006,13 +4057,55 @@ impl Infer {
             return None;
         }
 
+        // The constructor must come from a `route` declaration — route
+        // metadata drives URL construction and response typing, and
+        // codegen has no entry to emit for a plain ADT constructor (it
+        // would panic at `compile_fetch`). Reject here with a proper
+        // diagnostic instead.
+        let is_route_ctor = self
+            .route_entries_by_api
+            .values()
+            .flat_map(|entries| entries.iter())
+            .any(|e| e.constructor == ctor_name);
+        if !is_route_ctor {
+            self.error(
+                format!(
+                    "'{}' is not a route constructor — fetch/fetchWith \
+                     require an endpoint constructor declared in a \
+                     `route` block",
+                    ctor_name
+                ),
+                expr.span,
+            );
+            return Some(Ty::Error);
+        }
+
         // Infer URL argument (should be Text)
         let url_ty = self.infer_expr(args[0]);
         self.unify(&url_ty, &Ty::Text, args[0].span);
 
-        // If fetchWith, infer the options record
+        // If fetchWith, check the options record. The shape must match
+        // what codegen + the runtime consume: `compile_fetch` reads the
+        // `headers` field with `knot_record_field` and
+        // `knot_http_fetch_io` iterates it as rows of {name, value}
+        // Text pairs — anything else compiles but panics at runtime.
         if is_fetch_with {
-            let _opts_ty = self.infer_expr(args[1]);
+            let opts_ty = self.infer_expr(args[1]);
+            let header_row = Ty::Record(
+                BTreeMap::from([
+                    ("name".into(), Ty::Text),
+                    ("value".into(), Ty::Text),
+                ]),
+                None,
+            );
+            let expected_opts = Ty::Record(
+                BTreeMap::from([(
+                    "headers".into(),
+                    Ty::Relation(Box::new(header_row)),
+                )]),
+                None,
+            );
+            self.unify(&opts_ty, &expected_opts, args[1].span);
         }
 
         // Infer the constructor's record payload (request fields only).
@@ -4353,6 +4446,75 @@ impl Infer {
 
     // ── Exhaustiveness checking ────────────────────────────────
 
+    /// Whether a pattern matches *every* value of its type — i.e. it
+    /// contains no refutable sub-pattern. Wildcards and variables are
+    /// irrefutable; records are irrefutable when all their field
+    /// sub-patterns are. Literals, nested constructors, and list/cons
+    /// patterns match only a subset of values. (A nested constructor
+    /// position could in principle be exhaustive across several arms;
+    /// we conservatively do not attempt that analysis and require a
+    /// wildcard or irrefutable pattern instead.)
+    fn pattern_is_irrefutable(pat: &ast::Pat) -> bool {
+        match &pat.node {
+            ast::PatKind::Wildcard | ast::PatKind::Var(_) => true,
+            ast::PatKind::Record(fields) => fields.iter().all(|f| match &f.pattern {
+                Some(p) => Self::pattern_is_irrefutable(p),
+                None => true, // field-name shorthand binds a variable
+            }),
+            ast::PatKind::Lit(_)
+            | ast::PatKind::Constructor { .. }
+            | ast::PatKind::List(_)
+            | ast::PatKind::Cons { .. } => false,
+        }
+    }
+
+    /// Collect the constructors fully covered by `arms` (an arm covers its
+    /// constructor only when its payload pattern is irrefutable) and the
+    /// constructors that are only *partially* matched (refutable payloads —
+    /// e.g. `Circle {radius: 1.0}` — which must not count as coverage).
+    fn covered_constructors<'a>(
+        arms: &'a [ast::CaseArm],
+    ) -> (HashSet<&'a str>, HashSet<&'a str>) {
+        let mut covered: HashSet<&str> = HashSet::new();
+        let mut partial: HashSet<&str> = HashSet::new();
+        for arm in arms {
+            match &arm.pat.node {
+                ast::PatKind::Constructor { name, payload } => {
+                    if Self::pattern_is_irrefutable(payload) {
+                        covered.insert(name.as_str());
+                    } else {
+                        partial.insert(name.as_str());
+                    }
+                }
+                ast::PatKind::Lit(ast::Literal::Bool(true)) => {
+                    covered.insert("True");
+                }
+                ast::PatKind::Lit(ast::Literal::Bool(false)) => {
+                    covered.insert("False");
+                }
+                _ => {}
+            }
+        }
+        (covered, partial)
+    }
+
+    /// Format the standard non-exhaustiveness message; when some missing
+    /// constructors are matched only with refutable sub-patterns, point
+    /// the user toward a wildcard arm.
+    fn non_exhaustive_msg(missing: &[&str], partial: &HashSet<&str>) -> String {
+        let hint = if missing.iter().any(|c| partial.contains(c)) {
+            " (some arms match these constructors only partially — \
+             add a wildcard `_` case to cover the remaining values)"
+        } else {
+            ""
+        };
+        format!(
+            "non-exhaustive pattern match — missing: {}{}",
+            missing.join(", "),
+            hint
+        )
+    }
+
     /// Check that a case expression covers all constructors of the
     /// scrutinee's type.  Emits an error listing missing patterns when
     /// the match is non-exhaustive.
@@ -4385,17 +4547,7 @@ impl Infer {
                     None => return,
                 };
 
-                let covered: HashSet<&str> = arms
-                    .iter()
-                    .filter_map(|arm| match &arm.pat.node {
-                        ast::PatKind::Constructor { name, .. } => {
-                            Some(name.as_str())
-                        }
-                        ast::PatKind::Lit(ast::Literal::Bool(true)) => Some("True"),
-                        ast::PatKind::Lit(ast::Literal::Bool(false)) => Some("False"),
-                        _ => None,
-                    })
-                    .collect();
+                let (covered, partial) = Self::covered_constructors(arms);
 
                 let missing: Vec<&str> = data_info
                     .ctors
@@ -4406,26 +4558,13 @@ impl Infer {
 
                 if !missing.is_empty() {
                     self.error(
-                        format!(
-                            "non-exhaustive pattern match — missing: {}",
-                            missing.join(", "),
-                        ),
+                        Self::non_exhaustive_msg(&missing, &partial),
                         span,
                     );
                 }
             }
             Ty::Variant(ctors, row) => {
-                let covered: HashSet<&str> = arms
-                    .iter()
-                    .filter_map(|arm| match &arm.pat.node {
-                        ast::PatKind::Constructor { name, .. } => {
-                            Some(name.as_str())
-                        }
-                        ast::PatKind::Lit(ast::Literal::Bool(true)) => Some("True"),
-                        ast::PatKind::Lit(ast::Literal::Bool(false)) => Some("False"),
-                        _ => None,
-                    })
-                    .collect();
+                let (covered, partial) = Self::covered_constructors(arms);
 
                 if let Some(rv) = row {
                     // Open variant — check if the covered constructors
@@ -4507,10 +4646,8 @@ impl Infer {
                                 .collect();
                             if !missing.is_empty() {
                                 self.error(
-                                    format!(
-                                        "non-exhaustive pattern \
-                                         match — missing: {}",
-                                        missing.join(", "),
+                                    Self::non_exhaustive_msg(
+                                        &missing, &partial,
                                     ),
                                     span,
                                 );
@@ -4538,11 +4675,7 @@ impl Infer {
                         .collect();
                     if !missing.is_empty() {
                         self.error(
-                            format!(
-                                "non-exhaustive pattern match \
-                                 — missing: {}",
-                                missing.join(", "),
-                            ),
+                            Self::non_exhaustive_msg(&missing, &partial),
                             span,
                         );
                     }
@@ -4551,17 +4684,7 @@ impl Infer {
             // Bool is Ty::Bool (not Ty::Con), so handle it explicitly.
             Ty::Bool => {
                 if let Some(data_info) = self.data_types.get("Bool").cloned() {
-                    let covered: HashSet<&str> = arms
-                        .iter()
-                        .filter_map(|arm| match &arm.pat.node {
-                            ast::PatKind::Constructor { name, .. } => {
-                                Some(name.as_str())
-                            }
-                            ast::PatKind::Lit(ast::Literal::Bool(true)) => Some("True"),
-                            ast::PatKind::Lit(ast::Literal::Bool(false)) => Some("False"),
-                            _ => None,
-                        })
-                        .collect();
+                    let (covered, partial) = Self::covered_constructors(arms);
 
                     let missing: Vec<&str> = data_info
                         .ctors
@@ -4572,17 +4695,16 @@ impl Infer {
 
                     if !missing.is_empty() {
                         self.error(
-                            format!(
-                                "non-exhaustive pattern match — missing: {}",
-                                missing.join(", "),
-                            ),
+                            Self::non_exhaustive_msg(&missing, &partial),
                             span,
                         );
                     }
                 }
             }
-            // Relations: exhaustive iff `[]` and `Cons _ _` are both
-            // covered (or a wildcard is present, handled above).
+            // Relations: exhaustive iff `[]` and `Cons h t` (with
+            // irrefutable head/tail — `Cons 1 rest` only matches lists
+            // starting with 1) are both covered (or a wildcard is
+            // present, handled above).
             Ty::Relation(_) => {
                 let has_empty = arms.iter().any(|arm| matches!(
                     &arm.pat.node,
@@ -4590,7 +4712,9 @@ impl Infer {
                 ));
                 let has_cons = arms.iter().any(|arm| matches!(
                     &arm.pat.node,
-                    ast::PatKind::Cons { .. }
+                    ast::PatKind::Cons { head, tail }
+                        if Self::pattern_is_irrefutable(head)
+                            && Self::pattern_is_irrefutable(tail)
                 ));
                 let mut missing: Vec<&str> = Vec::new();
                 if !has_empty {
@@ -5017,7 +5141,28 @@ impl Infer {
         // When there's no explicit yield, use the last bare expression's type
         // as the result (like Rust's implicit return), falling back to unit.
         let promote_to_io = is_io || (self.in_io_do && !has_relation_bind);
+        let has_group_by = stmts
+            .iter()
+            .any(|s| matches!(&s.node, ast::StmtKind::GroupBy { .. }));
         if promote_to_io {
+            // An IO-promoted block that is still a *comprehension* — it
+            // iterates plain relation binds (or groupBy groups) and
+            // ACCUMULATES its yields — evaluates to the whole relation of
+            // yielded values, not a single element. Codegen compiles such
+            // blocks with a per-row loop pushing each yield into a result
+            // relation (compile_io_bind_loop / the relational groupBy
+            // path), so the type must be `IO [yield_ty]`, not
+            // `IO yield_ty`. IO blocks without comprehension binds keep
+            // `yield = pure` semantics (the yield value IS the result).
+            if let Some(ty) = &yield_ty {
+                if has_relation_bind || has_group_by {
+                    return Ty::IO(
+                        io_effects,
+                        io_row,
+                        Box::new(Ty::Relation(Box::new(ty.clone()))),
+                    );
+                }
+            }
             let inner = yield_ty.or(last_expr_ty).unwrap_or_else(Ty::unit);
             Ty::IO(io_effects, io_row, Box::new(inner))
         } else {
@@ -7039,6 +7184,9 @@ impl Infer {
                 name, params, body, ..
             } = item
             {
+                // Constraints deferred while checking this body may land on
+                // the method-local skolems below; remember where they start.
+                let pre_body_constraints = self.deferred_constraints.len();
                 // Type-check each impl method body
                 self.push_scope();
                 let mut param_types = Vec::new();
@@ -7072,12 +7220,60 @@ impl Infer {
                     for (pv, impl_ty) in param_vars.iter().zip(impl_types.iter()) {
                         mapping.insert(*pv, impl_ty.clone());
                     }
-                    // Give remaining scheme vars fresh variables
+                    // Skolemise the remaining scheme vars (method-local
+                    // type variables like the `b` in `conv : a -> b`):
+                    // the impl must be at least as polymorphic as the
+                    // trait signature. A flexible fresh var here would
+                    // let the impl pin a caller-chosen variable to a
+                    // concrete type (e.g. `conv = \x -> x + 1` against
+                    // `conv : a -> b`), producing runtime type confusion
+                    // at call sites that picked a different `b`.
+                    let mut fresh_skolems: Vec<TyVar> = Vec::new();
                     for v in &scheme.vars {
-                        mapping.entry(*v).or_insert_with(|| self.fresh());
+                        if !mapping.contains_key(v) {
+                            let s = self.fresh_var();
+                            self.skolems.insert(s);
+                            fresh_skolems.push(s);
+                            mapping.insert(*v, Ty::Var(s));
+                        }
+                    }
+                    // Constraints the trait declared on those vars (e.g.
+                    // `Ord b =>`) are promises the impl body may rely on.
+                    for c in &scheme.constraints {
+                        if let Some(Ty::Var(sv)) = mapping.get(&c.type_var) {
+                            if fresh_skolems.contains(sv) {
+                                self.declared_skolem_constraints
+                                    .entry(*sv)
+                                    .or_default()
+                                    .insert(c.trait_name.clone());
+                            }
+                        }
                     }
                     let expected = self.subst_ty(&scheme.ty, &mapping);
+                    let errors_before = self.errors.len();
                     self.unify(&expected, &inferred_method_ty, body.span);
+                    self.check_skolem_constraints(
+                        &fresh_skolems,
+                        pre_body_constraints,
+                    );
+                    if !fresh_skolems.is_empty()
+                        && self.errors.len() > errors_before
+                    {
+                        self.error(
+                            format!(
+                                "impl method '{}' is less polymorphic than \
+                                 its declaration in trait '{}' — the trait \
+                                 signature's type variables must not be \
+                                 constrained to concrete types by the impl",
+                                name, trait_name
+                            ),
+                            body.span,
+                        );
+                    }
+                    for s in &fresh_skolems {
+                        self.skolems.remove(s);
+                        self.declared_skolem_constraints.remove(s);
+                    }
                 } else {
                     // Method not found in scope — check if it belongs to a
                     // different trait or is simply unknown.  Default-body
@@ -7929,44 +8125,20 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
     // so their result rows get bound to the union of their sources' effects.
     infer.resolve_pending_effect_unions();
 
-    // Phase 4b: Check deferred trait constraints
-    infer.check_constraints();
-
-    // Phase 4c: Compress substitution chains for faster resolution
-    infer.compress_substitution();
-
-    // Phase 5: Resolve monad types from desugared do-blocks
-    let mut monad_info = MonadInfo::new();
-    for (span, m_var) in &infer.monad_vars {
-        let resolved = infer.apply(&Ty::Var(*m_var));
-        let kind = match resolved.peel_alias() {
-            Ty::TyCon(name) if name == "[]" => MonadKind::Relation,
-            Ty::TyCon(name) if name == "IO" => MonadKind::IO,
-            Ty::TyCon(name) => MonadKind::Adt(name.clone()),
-            Ty::Relation(_) => MonadKind::Relation,
-            Ty::IO(_, _, _) => MonadKind::IO,
-            // Partially applied type constructor, e.g. Result e (App(TyCon("Result"), e))
-            Ty::App(f, _) => match f.as_ref() {
-                // IO applied to an effect row (App(TyCon("IO"), EffectRow))
-                // is still the IO monad — classifying it as Adt("IO") would
-                // dispatch to a nonexistent `Monad_IO_bind`.
-                Ty::TyCon(name) if name == "IO" => MonadKind::IO,
-                Ty::TyCon(name) if name == "[]" => MonadKind::Relation,
-                Ty::TyCon(name) => MonadKind::Adt(name.clone()),
-                _ => MonadKind::Relation,
-            },
-            // Saturated ADT used as monad, e.g. Con("Result", [Text]) from Result Text a
-            Ty::Con(name, _) => MonadKind::Adt(name.clone()),
-            _ => MonadKind::Relation, // default unresolved to Relation
-        };
-        monad_info.insert(*span, kind);
-    }
-
-    // Phase 6: Resolve refine expression targets.
-    // The contextual binding of alpha (from an annotation or call site) wins;
-    // otherwise fall back to matching the refined expression's type against
-    // the declared refined types' base types — deterministically (sorted by
-    // name) and erroring when several refined types share the base.
+    // Phase 4b: Resolve refine expression targets.
+    // This must run BEFORE deferred-constraint checking (phase 4c) and
+    // monad-kind resolution (phase 5): refine-target resolution unifies
+    // type variables (the refined value against the target's base type)
+    // that constraints and do-block monad vars may resolve through.
+    // Running it later meant constraints on such vars were silently
+    // skipped (`Ty::Var` skip in check_constraints) and monad kinds were
+    // prematurely defaulted to Relation.
+    //
+    // The contextual binding of alpha (from an annotation or call site)
+    // wins; otherwise fall back to matching the refined expression's type
+    // against the declared refined types' base types — deterministically
+    // (sorted by name) and erroring when several refined types share the
+    // base.
     let mut refine_targets = RefineTargets::new();
     let refine_vars = infer.refine_vars.clone();
     for (span, var, inner_ty) in &refine_vars {
@@ -8029,6 +8201,39 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
                 ));
             }
         }
+    }
+
+    // Phase 4c: Check deferred trait constraints
+    infer.check_constraints();
+
+    // Phase 4d: Compress substitution chains for faster resolution
+    infer.compress_substitution();
+
+    // Phase 5: Resolve monad types from desugared do-blocks
+    let mut monad_info = MonadInfo::new();
+    for (span, m_var) in &infer.monad_vars {
+        let resolved = infer.apply(&Ty::Var(*m_var));
+        let kind = match resolved.peel_alias() {
+            Ty::TyCon(name) if name == "[]" => MonadKind::Relation,
+            Ty::TyCon(name) if name == "IO" => MonadKind::IO,
+            Ty::TyCon(name) => MonadKind::Adt(name.clone()),
+            Ty::Relation(_) => MonadKind::Relation,
+            Ty::IO(_, _, _) => MonadKind::IO,
+            // Partially applied type constructor, e.g. Result e (App(TyCon("Result"), e))
+            Ty::App(f, _) => match f.as_ref() {
+                // IO applied to an effect row (App(TyCon("IO"), EffectRow))
+                // is still the IO monad — classifying it as Adt("IO") would
+                // dispatch to a nonexistent `Monad_IO_bind`.
+                Ty::TyCon(name) if name == "IO" => MonadKind::IO,
+                Ty::TyCon(name) if name == "[]" => MonadKind::Relation,
+                Ty::TyCon(name) => MonadKind::Adt(name.clone()),
+                _ => MonadKind::Relation,
+            },
+            // Saturated ADT used as monad, e.g. Con("Result", [Text]) from Result Text a
+            Ty::Con(name, _) => MonadKind::Adt(name.clone()),
+            _ => MonadKind::Relation, // default unresolved to Relation
+        };
+        monad_info.insert(*span, kind);
     }
 
     // Export refined type predicates for codegen
@@ -8323,8 +8528,8 @@ main = applyPred (\\r -> r.x == r.y)\
         let diags = check_src(
             "type P = {name: Text, age: Int}\n\
              *people : [P]\n\
-             insert = \\name age -> do\n\
-               ps <- *people\n\
+             insert = \\name age -> do\n  \
+               ps <- *people\n  \
                *people = union ps [{name: name, age: age}]"
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
@@ -8338,8 +8543,8 @@ main = applyPred (\\r -> r.x == r.y)\
             "type P = {name: Text, age: Int}\n\
              *people : [P]\n\
              *other : [P]\n\
-             copy = do\n\
-               os <- *other\n\
+             copy = do\n  \
+               os <- *other\n  \
                *people = os"
         );
         assert!(has_error(&diags, "replace *people"));
@@ -8352,10 +8557,10 @@ main = applyPred (\\r -> r.x == r.y)\
         let diags = check_src(
             "type P = {name: Text, age: Int}\n\
              *people : [P]\n\
-             birthday = do\n\
-               replace *people = do\n\
-                 p <- *people\n\
-                 yield {p | age: p.age + 1}\n\
+             birthday = do\n  \
+               replace *people = do\n    \
+                 p <- *people\n    \
+                 yield {p | age: p.age + 1}\n  \
                yield {}"
         );
         assert!(has_error(&diags, "`replace *people = ...` is unnecessary"));
@@ -8368,9 +8573,9 @@ main = applyPred (\\r -> r.x == r.y)\
         let diags = check_src(
             "type P = {name: Text, age: Int}\n\
              *people : [P]\n\
-             insert = \\name age -> do\n\
-               ps <- *people\n\
-               replace *people = union ps [{name: name, age: age}]\n\
+             insert = \\name age -> do\n  \
+               ps <- *people\n  \
+               replace *people = union ps [{name: name, age: age}]\n  \
                yield {}"
         );
         assert!(has_error(&diags, "`replace *people = ...` is unnecessary"));
@@ -8383,8 +8588,8 @@ main = applyPred (\\r -> r.x == r.y)\
         let diags = check_src(
             "type P = {name: Text, age: Int}\n\
              *people : [P]\n\
-             main = do\n\
-               replace *people = [{name: \"Alice\", age: 30}]\n\
+             main = do\n  \
+               replace *people = [{name: \"Alice\", age: 30}]\n  \
                yield {}"
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
@@ -9154,9 +9359,9 @@ main = applyPred (\\r -> r.x == r.y)\
             "unit M\nunit S\n\
              double : Float<u> -> Float<u>\n\
              double = \\x -> x + x\n\
-             main = do\n\
-               let a = double 5.0<M>\n\
-               let b = double 3.0<S>\n\
+             main = do\n  \
+               let a = double 5.0<M>\n  \
+               let b = double 3.0<S>\n  \
                yield {}"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
@@ -9472,9 +9677,9 @@ main = applyPred (\\r -> r.x == r.y)\
         let diags = check_src(
             "type Person = {name: Text, age: Int}\n\
              *people : [Person]\n\
-             main = do\n\
-               replace *people = [{name: \"A\", age: 1}]\n\
-               p <- *people\n\
+             main = do\n  \
+               replace *people = [{name: \"A\", age: 1}]\n  \
+               p <- *people\n  \
                yield p.name"
         );
         assert!(diags.is_empty(), "diagnostics: {:?}", diags);

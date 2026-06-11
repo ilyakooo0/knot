@@ -195,6 +195,17 @@ struct EffectChecker {
     /// (e.g. `forEach : (a -> IO {} {}) -> IO {} {}`), the callback's effects
     /// are absorbed by the declared row, so we don't propagate.
     row_poly_decls: HashSet<String>,
+    /// Names of declarations whose annotated signature declares a *closed*
+    /// effect set (an `IO {…}` result with no row variable). Per the
+    /// documented annotation semantics, such a signature absorbs the
+    /// effects of callback arguments, so calls to these functions do NOT
+    /// propagate lambda-argument effects. Every other callee (unannotated
+    /// user functions, local bindings, unknown names, builtins) may invoke
+    /// its functional arguments, so lambda-argument effects are
+    /// conservatively charged to the call — over-approximating for HOFs
+    /// that never call their argument, which is the safe direction for
+    /// the atomic gate.
+    fixed_row_decls: HashSet<String>,
     /// Stack of local scopes mapping let-bound (or immediately-applied-
     /// lambda-bound) function names to the effects of their bodies. Lets the
     /// checker see effects of calls through local bindings, e.g.
@@ -250,6 +261,7 @@ impl EffectChecker {
             builtin_effects,
             source_names: HashSet::new(),
             row_poly_decls: HashSet::new(),
+            fixed_row_decls: HashSet::new(),
             local_fn_effects: Vec::new(),
             diagnostics: Vec::new(),
         }
@@ -264,8 +276,9 @@ impl EffectChecker {
         }
 
         // Collect declarations whose annotated signature uses an effect-row
-        // variable. Knowing this up front lets the App handler propagate
-        // lambda-arg effects through row-polymorphic callees only.
+        // variable (these propagate lambda-arg effects) and declarations
+        // with a *closed* declared effect set (these absorb lambda-arg
+        // effects). Everything else conservatively propagates.
         for decl in &module.decls {
             match &decl.node {
                 ast::DeclKind::Fun { name, ty: Some(scheme), .. }
@@ -273,6 +286,64 @@ impl EffectChecker {
                 | ast::DeclKind::Derived { name, ty: Some(scheme), .. } => {
                     if type_has_effect_row_var(&scheme.ty) {
                         self.row_poly_decls.insert(name.clone());
+                    } else if extract_effects(&scheme.ty).is_some() {
+                        self.fixed_row_decls.insert(name.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Collect trait-method bodies: impl methods and trait default
+        // bodies, grouped by method name. A trait-method call dispatches on
+        // the runtime type tag, so the only sound static approximation for
+        // a call site is the UNION of effects across every known impl
+        // (plus defaults). The union is stored in `decl_effects` under the
+        // method name so Var/callee lookups see it. (Names that collide
+        // with a top-level function are skipped — the function wins, which
+        // matches name-resolution order.) BTreeMap keeps diagnostic order
+        // deterministic.
+        let fun_names: HashSet<&str> = module
+            .decls
+            .iter()
+            .filter_map(|d| match &d.node {
+                ast::DeclKind::Fun { name, .. }
+                | ast::DeclKind::View { name, .. }
+                | ast::DeclKind::Derived { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut method_bodies: std::collections::BTreeMap<String, Vec<&ast::Expr>> =
+            std::collections::BTreeMap::new();
+        for decl in &module.decls {
+            match &decl.node {
+                ast::DeclKind::Impl { items, .. } => {
+                    for item in items {
+                        if let ast::ImplItem::Method { name, body, .. } = item {
+                            if !fun_names.contains(name.as_str()) {
+                                method_bodies
+                                    .entry(name.clone())
+                                    .or_default()
+                                    .push(body);
+                            }
+                        }
+                    }
+                }
+                ast::DeclKind::Trait { items, .. } => {
+                    for item in items {
+                        if let ast::TraitItem::Method {
+                            name,
+                            default_body: Some(body),
+                            ..
+                        } = item
+                        {
+                            if !fun_names.contains(name.as_str()) {
+                                method_bodies
+                                    .entry(name.clone())
+                                    .or_default()
+                                    .push(body);
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -322,6 +393,21 @@ impl EffectChecker {
                     changed = true;
                 }
             }
+            // Trait methods: union of all impl bodies and the trait
+            // default body, so trait-method call sites are sound for the
+            // atomic gate and relation reads/writes inside impls are
+            // visible.
+            for (name, bodies) in &method_bodies {
+                let mut effects = EffectSet::empty();
+                for body in bodies {
+                    effects = effects.union(&self.fun_body_effects(body));
+                }
+                let old = self.decl_effects.get(name);
+                if old.map_or(true, |o| *o != effects) {
+                    self.decl_effects.insert(name.clone(), effects);
+                    changed = true;
+                }
+            }
             self.diagnostics = saved_diags;
             if !changed { break; }
         }
@@ -335,6 +421,14 @@ impl EffectChecker {
         }
         for decl in &funs {
             self.process_decl(decl);
+        }
+        // Impl-method and trait-default bodies were only walked with
+        // diagnostics suppressed during the fixpoint — walk them once more
+        // so atomic-safety violations inside them are reported.
+        for bodies in method_bodies.values() {
+            for body in bodies {
+                let _ = self.fun_body_effects(body);
+            }
         }
     }
 
@@ -375,6 +469,17 @@ impl EffectChecker {
                 if let Some(effects) = self.builtin_effects.get(name) {
                     return effects.clone();
                 }
+                // A reference to a local let-bound lambda carries its
+                // body's effects: the value may be invoked by whoever
+                // receives it (e.g. `let cb = \r -> println "x"` passed
+                // to a higher-order function). Mirrors callee_effects'
+                // scope lookup — without it, effects laundered through a
+                // local name bypassed the atomic gate.
+                for scope in self.local_fn_effects.iter().rev() {
+                    if let Some(effects) = scope.get(name) {
+                        return effects.clone();
+                    }
+                }
                 if let Some(effects) = self.decl_effects.get(name) {
                     return effects.clone();
                 }
@@ -402,8 +507,21 @@ impl EffectChecker {
                 // the syntactically last (outermost) argument was considered,
                 // so `withCb2 (\u -> println "hi") 1` lost the console effect.
                 let (head, args) = app_spine(expr);
+                // Lambda-argument effects propagate to the call unless the
+                // callee's annotation declares a *closed* effect row (the
+                // documented "absorbing" signature shape). Unannotated
+                // user functions (`apply = \f x -> f x`), local bindings,
+                // unknown names, and builtins are all assumed to invoke
+                // their functional arguments — otherwise an unannotated
+                // higher-order helper launders IO past the atomic gate.
+                // Immediately-applied lambda heads keep propagate=false:
+                // `head_call_effects` analyzes those precisely by binding
+                // the lambda-valued arguments into a local scope.
                 let propagate_lambda = head_name(head)
-                    .map(|n| self.row_poly_decls.contains(n))
+                    .map(|n| {
+                        self.row_poly_decls.contains(n)
+                            || !self.fixed_row_decls.contains(n)
+                    })
                     .unwrap_or(false);
                 let mut effects = EffectSet::empty();
                 for arg in &args {
@@ -492,11 +610,16 @@ impl EffectChecker {
                 // conservative: only flag bodies that provably contain no
                 // relation operations anywhere syntactically (including
                 // inside local lambdas) — effect inference can miss reads
-                // performed through bindings it cannot resolve.
+                // performed through bindings it cannot resolve. A call to
+                // an opaque callee (lambda parameter, field-accessed
+                // function, any name we cannot analyze) is not provably
+                // relation-free either, so its presence suppresses the
+                // error too.
                 if !inner_effects.has_io()
                     && inner_effects.reads.is_empty()
                     && inner_effects.writes.is_empty()
                     && !touches_relations(inner)
+                    && !self.body_may_call_opaque(inner)
                 {
                     self.diagnostics.push(
                         Diagnostic::error("atomic block must interact with relations")
@@ -600,6 +723,117 @@ impl EffectChecker {
                 effects
             }
         }
+    }
+
+    /// Whether the expression contains a call whose callee cannot be
+    /// analyzed for relation access: lambda parameters, field-accessed
+    /// functions, or names that are neither builtins nor declarations
+    /// with (converged) inferred effects. Such a body is not *provably*
+    /// relation-free, so the hard "atomic block must interact with
+    /// relations" error must stay quiet. Trait methods are analyzable
+    /// (their impl-body union lives in `decl_effects`); constructors and
+    /// inline lambdas are analyzable too (the surrounding walk recurses
+    /// into lambda bodies).
+    fn body_may_call_opaque(&self, expr: &ast::Expr) -> bool {
+        // Let-bound lambdas inside the body are analyzable: their bodies
+        // are part of the walked tree, so `touches_relations` and effect
+        // inference both see through them. (The local_fn_effects scopes
+        // those bindings lived in are already popped by the time the
+        // Atomic arm runs this check, so collect them syntactically.)
+        // The same applies to lambda parameters bound to lambda-literal
+        // arguments — including the `(\f -> …) (\u -> …)` shape that
+        // desugared `let f = \u -> …` statements take.
+        let mut local_lambdas: HashSet<String> = HashSet::new();
+        walk_expr(expr, &mut |e| {
+            match &e.node {
+                ast::ExprKind::Do(stmts) => {
+                    for stmt in stmts {
+                        if let ast::StmtKind::Let { pat, expr } = &stmt.node {
+                            if let ast::PatKind::Var(name) = &pat.node {
+                                if is_lambda_arg(expr) {
+                                    local_lambdas.insert(name.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                ast::ExprKind::App { .. } => {
+                    let (head, args) = app_spine(e);
+                    if let ast::ExprKind::Lambda { params, .. } = &head.node {
+                        for (param, arg) in params.iter().zip(args.iter()) {
+                            if let ast::PatKind::Var(name) = &param.node {
+                                if is_lambda_arg(arg) {
+                                    local_lambdas.insert(name.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        });
+        let mut found = false;
+        walk_expr(expr, &mut |e| {
+            if found {
+                return;
+            }
+            let callee: Option<&ast::Expr> = match &e.node {
+                ast::ExprKind::App { func, .. } => {
+                    let mut head: &ast::Expr = func;
+                    while let ast::ExprKind::App { func, .. } = &head.node {
+                        head = func;
+                    }
+                    Some(head)
+                }
+                ast::ExprKind::BinOp { op: ast::BinOp::Pipe, rhs, .. } => {
+                    Some(rhs.as_ref())
+                }
+                _ => None,
+            };
+            let Some(mut head) = callee else { return };
+            // Unwrap annotation-style wrappers around the callee.
+            loop {
+                match &head.node {
+                    ast::ExprKind::Annot { expr: inner, .. }
+                    | ast::ExprKind::UnitLit { value: inner, .. }
+                    | ast::ExprKind::Refine(inner) => head = inner,
+                    _ => break,
+                }
+            }
+            match &head.node {
+                ast::ExprKind::Var(name) => {
+                    // Desugaring helpers (__bind/__yield/__empty) dispatch
+                    // to monad impls whose arguments are walked directly;
+                    // operator-trait fallbacks (eq, compare, add, …) are
+                    // intrinsically pure and user impls of them appear in
+                    // decl_effects.
+                    let known = self.builtin_effects.contains_key(name)
+                        || self.decl_effects.contains_key(name)
+                        || local_lambdas.contains(name)
+                        || crate::builtins::INTERNAL_BUILTINS
+                            .contains(&name.as_str())
+                        || crate::builtins::TRAIT_METHOD_BUILTINS
+                            .contains(&name.as_str())
+                        || self
+                            .local_fn_effects
+                            .iter()
+                            .any(|scope| scope.contains_key(name));
+                    if !known {
+                        found = true;
+                    }
+                }
+                // Constructors build data; inline lambdas are walked
+                // directly; a piped App spine is visited as its own
+                // App node by the same walk.
+                ast::ExprKind::Constructor(_)
+                | ast::ExprKind::Lambda { .. }
+                | ast::ExprKind::App { .. } => {}
+                // Field access, computed callees (if/case results), and
+                // anything else: opaque.
+                _ => found = true,
+            }
+        });
+        found
     }
 
     /// Infer effects of a do-block statement.

@@ -162,20 +162,22 @@ impl TypeEnv {
         // Re-resolve pass: fix forward references in type aliases.
         // After the first pass, some aliases may contain Named("X") where X
         // was defined later. Re-resolve those now that all aliases are known.
-        // Run until stable so chained forward refs (A→B→C) all resolve
-        // regardless of HashMap iteration order.
-        loop {
-            let mut changed = false;
-            let alias_keys: Vec<String> = aliases.keys().cloned().collect();
-            for name in &alias_keys {
-                let resolved = aliases[name].clone();
-                let fixed = re_resolve_type(&resolved, &aliases);
-                if fixed != resolved {
-                    aliases.insert(name.clone(), fixed);
-                    changed = true;
-                }
+        // A single pass suffices: `re_resolve_inner` recurses into each
+        // replacement (with a seen-set for cycle protection), so chained
+        // forward refs (A→B→C) resolve transitively regardless of HashMap
+        // iteration order. Do NOT loop until stable — a recursive type
+        // (`type A = {x: A}`, mutual cycles, self-referential data) makes
+        // every pass expand the structure one more level, so a
+        // run-until-stable loop grows it without bound until the stack
+        // overflows. Cyclic aliases are reported as diagnostics by
+        // `check_alias_cycles` / type inference before codegen runs.
+        let alias_keys: Vec<String> = aliases.keys().cloned().collect();
+        for name in &alias_keys {
+            let resolved = aliases[name].clone();
+            let fixed = re_resolve_type(&resolved, &aliases);
+            if fixed != resolved {
+                aliases.insert(name.clone(), fixed);
             }
-            if !changed { break; }
         }
         // Also re-resolve constructor fields
         let ctor_keys: Vec<String> = constructors.keys().cloned().collect();
@@ -247,6 +249,110 @@ impl TypeEnv {
     }
 }
 
+/// Detect cyclic type-alias definitions: direct (`type A = {x: A}`),
+/// mutual (`type A = B; type B = A`), and through any type structure
+/// (records, relations, functions, refined bases, ...). Returns one error
+/// diagnostic per cyclic alias.
+///
+/// Must run before `TypeEnv::from_module`'s resolution: a cyclic alias can
+/// never be fully resolved, and downstream consumers (schema generation,
+/// codegen) have no representation for infinite types.
+pub fn check_alias_cycles(module: &Module) -> Vec<knot::diagnostic::Diagnostic> {
+    let mut alias_decls: Vec<(String, &Type, Span)> = Vec::new();
+    for decl in &module.decls {
+        if let DeclKind::TypeAlias { name, params, ty } = &decl.node {
+            if params.is_empty() {
+                alias_decls.push((name.clone(), ty, decl.span));
+            }
+        }
+    }
+    let alias_names: HashSet<String> =
+        alias_decls.iter().map(|(n, _, _)| n.clone()).collect();
+    let mut deps: HashMap<String, HashSet<String>> = HashMap::new();
+    for (name, ty, _) in &alias_decls {
+        let mut refs = HashSet::new();
+        collect_named_alias_refs(ty, &alias_names, &mut refs);
+        deps.entry(name.clone()).or_default().extend(refs);
+    }
+    let mut diags = Vec::new();
+    for (name, _, span) in &alias_decls {
+        // The alias is cyclic when it can reach itself through alias refs.
+        let mut stack: Vec<String> = deps[name].iter().cloned().collect();
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut found = false;
+        while let Some(n) = stack.pop() {
+            if &n == name {
+                found = true;
+                break;
+            }
+            if visited.insert(n.clone()) {
+                if let Some(ds) = deps.get(&n) {
+                    stack.extend(ds.iter().cloned());
+                }
+            }
+        }
+        if found {
+            diags.push(
+                knot::diagnostic::Diagnostic::error(format!(
+                    "recursive type alias '{}' — a type alias cannot refer \
+                     to itself, directly or through other aliases",
+                    name
+                ))
+                .label(*span, "cycle detected in this type alias"),
+            );
+        }
+    }
+    diags
+}
+
+/// Collect the alias names referenced anywhere inside a type AST.
+fn collect_named_alias_refs(
+    ty: &Type,
+    alias_names: &HashSet<String>,
+    out: &mut HashSet<String>,
+) {
+    match &ty.node {
+        TypeKind::Named(name) => {
+            if alias_names.contains(name) {
+                out.insert(name.clone());
+            }
+        }
+        TypeKind::Var(_) | TypeKind::Hole => {}
+        TypeKind::App { func, arg } => {
+            collect_named_alias_refs(func, alias_names, out);
+            collect_named_alias_refs(arg, alias_names, out);
+        }
+        TypeKind::Record { fields, .. } => {
+            for f in fields {
+                collect_named_alias_refs(&f.value, alias_names, out);
+            }
+        }
+        TypeKind::Relation(inner) => {
+            collect_named_alias_refs(inner, alias_names, out);
+        }
+        TypeKind::Function { param, result } => {
+            collect_named_alias_refs(param, alias_names, out);
+            collect_named_alias_refs(result, alias_names, out);
+        }
+        TypeKind::Variant { constructors, .. } => {
+            for c in constructors {
+                for f in &c.fields {
+                    collect_named_alias_refs(&f.value, alias_names, out);
+                }
+            }
+        }
+        TypeKind::Effectful { ty, .. } | TypeKind::IO { ty, .. } => {
+            collect_named_alias_refs(ty, alias_names, out);
+        }
+        TypeKind::UnitAnnotated { base, .. } | TypeKind::Refined { base, .. } => {
+            collect_named_alias_refs(base, alias_names, out);
+        }
+        TypeKind::Forall { ty, .. } => {
+            collect_named_alias_refs(ty, alias_names, out);
+        }
+    }
+}
+
 /// Walk a source's type (e.g., `[{name: NonEmptyText, age: Nat}]`) and collect
 /// refinement info: (field_name_or_none, refined_type_name, predicate_expr).
 fn collect_source_refinements(
@@ -273,6 +379,29 @@ fn collect_source_refinements_inner(
         // Element type is a refined type alias: *scores : [Nat]
         TypeKind::Named(name) if refined_types.contains_key(name) => {
             result.push((None, name.clone(), refined_types[name].clone()));
+            // The alias base may itself carry field-level refinements
+            // (`type P = {age: Int where ...} where ...`) — recurse into it
+            // so those aren't dropped (mirrors the inline Refined branch).
+            if seen_aliases.insert(name.clone()) {
+                if let Some(alias_ty) = alias_ast_types.get(name) {
+                    let base: &Type = match &alias_ty.node {
+                        TypeKind::Refined { base, .. } => base.as_ref(),
+                        _ => alias_ty,
+                    };
+                    let inner_ty = if matches!(&base.node, TypeKind::Relation(_)) {
+                        base.clone()
+                    } else {
+                        Spanned::new(TypeKind::Relation(Box::new(base.clone())), ty.span)
+                    };
+                    result.extend(collect_source_refinements_inner(
+                        &inner_ty,
+                        refined_types,
+                        alias_ast_types,
+                        seen_aliases,
+                    ));
+                }
+                seen_aliases.remove(name);
+            }
         }
         // Element type is a type alias: *people : [Person]
         // Resolve through the alias to find refined fields in the underlying record.
@@ -590,10 +719,28 @@ fn col_type_str(ty: &ResolvedType) -> &'static str {
 }
 
 /// Format a single field for a schema descriptor.
-/// Nested relations are inlined as `field:[child_schema]`.
+///
+/// Contract with the runtime's `parse_record_schema`:
+/// - Nested relations of *record* element type are inlined as
+///   `field:[child_schema]` and stored in child tables.
+/// - Nested relations of any other element type (ADTs, scalars) are stored
+///   as a `json` column holding the whole relation. Child tables only
+///   support record-shaped rows (`_parent_id` + scalar columns), so the
+///   `[...]` form must not be emitted for non-record elements — the runtime
+///   used to panic at table init on descriptors like `tags:[text]` or
+///   `shapes:[#Circle:...|Dot]`. The Json column round-trip
+///   (`value_to_json`/`json_to_value` with the `__knot_ctor` marker)
+///   reconstructs relations of constructors and scalars faithfully, and
+///   `m <- t.field` binds iterate the in-memory relation read back from
+///   the column.
 fn format_schema_field(name: &str, ty: &ResolvedType) -> String {
     if let ResolvedType::Relation(inner) = ty {
-        format!("{}:[{}]", name, schema_descriptor(inner))
+        match inner.as_ref() {
+            ResolvedType::Record(_) => {
+                format!("{}:[{}]", name, schema_descriptor(inner))
+            }
+            _ => format!("{}:json", name),
+        }
     } else {
         format!("{}:{}", name, col_type_str(ty))
     }

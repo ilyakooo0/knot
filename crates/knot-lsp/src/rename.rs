@@ -81,7 +81,10 @@ pub(crate) fn handle_prepare_rename(
     // Return the word range
     let word_offset = position_to_offset(&doc.source, pos);
     let bytes = doc.source.as_bytes();
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    // `'` continues identifiers in the lexer (`x'`), so it's part of the
+    // rename range too — otherwise renaming `x'` edits only `x` and leaves
+    // a stray prime behind.
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'';
     let start = (0..word_offset)
         .rev()
         .find(|&i| !is_ident(bytes[i]))
@@ -99,19 +102,25 @@ pub(crate) fn handle_prepare_rename(
 }
 
 /// Validate that `name` is a syntactically valid Knot identifier:
-/// starts with letter or underscore, contains only ident chars, and isn't a
-/// reserved keyword. Used by `handle_rename` to reject malformed renames
+/// starts with an ASCII letter or underscore, continues with ASCII
+/// alphanumerics, `_`, or `'`, and isn't a reserved keyword. This matches
+/// the lexer's `is_ident_continue` rules exactly — the lexer is ASCII-only,
+/// so a Unicode-letter name like `naïve` would lex as garbage and corrupt
+/// every edited file. Used by `handle_rename` to reject malformed renames
 /// before scanning the workspace.
 fn is_valid_identifier(name: &str) -> bool {
-    let mut chars = name.chars();
-    let first = match chars.next() {
-        Some(c) => c,
+    let bytes = name.as_bytes();
+    let first = match bytes.first() {
+        Some(b) => *b,
         None => return false,
     };
-    if !(first.is_alphabetic() || first == '_') {
+    if !(first.is_ascii_alphabetic() || first == b'_') {
         return false;
     }
-    if !chars.all(|c| c.is_alphanumeric() || c == '_') {
+    if !bytes[1..]
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'\'')
+    {
         return false;
     }
     !KEYWORDS.iter().any(|kw| *kw == name)
@@ -318,7 +327,7 @@ fn name_span_within(source: &str, decl_span: Span, name: &str) -> Option<Span> {
     if needle.is_empty() {
         return None;
     }
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'';
     let mut i = 0;
     while i + needle.len() <= bytes.len() {
         if &bytes[i..i + needle.len()] == needle {
@@ -2371,5 +2380,157 @@ mod regress_rename_fixes_tests {
             out, "import ./owner\n\nf : Form -> Int\nf = \\s -> 1\n",
             "the importer's type annotation must be rewritten; edits: {consumer_edits:?}"
         );
+    }
+
+    // ── Body-line definition token of typed functions ────────────────
+    //
+    // The parser merges `f : T` ⏎ `f = body` into ONE DeclKind::Fun. Rename
+    // used to edit only the FIRST whole-word occurrence (the signature line)
+    // plus references, leaving the body-line `f` behind — silent corruption.
+
+    #[test]
+    fn rename_typed_function_edits_both_definition_lines() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            "double : Int -> Int\ndouble = \\x -> x * 2\nmain = double 2\n",
+        );
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("double").expect("sig line");
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "triple"))
+            .expect("rename emits edit");
+        let changes = edit.changes.expect("changes present");
+        let edits = changes.get(&uri).expect("edits for main");
+        let out = apply_edits(&doc.source, edits);
+        assert_eq!(
+            out,
+            "triple : Int -> Int\ntriple = \\x -> x * 2\nmain = triple 2\n",
+            "the body-line definition token must be renamed too; edits: {edits:?}"
+        );
+    }
+
+    #[test]
+    fn rename_typed_function_initiated_from_body_line_token() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            "double : Int -> Int\ndouble = \\x -> x * 2\nmain = double 2\n",
+        );
+        let doc = ws.doc(&uri);
+        // Cursor on the BODY-line `double` (second occurrence).
+        let off = doc.source.find("double =").expect("body line");
+        let pos = offset_to_position(&doc.source, off);
+        let prep = handle_prepare_rename(&ws.state, &prepare_params(&uri, pos));
+        assert!(prep.is_some(), "prepare must accept the body-line token");
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "triple"))
+            .expect("rename emits edit");
+        let edits = edit.changes.expect("changes").remove(&uri).expect("edits");
+        let out = apply_edits(&doc.source, &edits);
+        assert_eq!(
+            out,
+            "triple : Int -> Int\ntriple = \\x -> x * 2\nmain = triple 2\n"
+        );
+    }
+
+    #[test]
+    fn rename_typed_function_in_unopened_disk_file() {
+        use crate::test_support::TempWorkspace;
+        let mut tw = TempWorkspace::new();
+        // Owner exists ONLY on disk — never opened — and has a separate
+        // type signature, exercising `apply_owner_disk_edits`.
+        let owner_src = "parse : Int -> Int\nparse = \\x -> x\n";
+        std::fs::write(tw.root.join("owner.knot"), owner_src).expect("write owner");
+        let consumer_uri = tw.write_and_open(
+            "consumer.knot",
+            "import ./owner\n\nmain = parse 5\n",
+        );
+        let consumer_doc = tw.workspace.doc(&consumer_uri);
+        let off = consumer_doc.source.find("parse 5").expect("call site");
+        let pos = offset_to_position(&consumer_doc.source, off);
+        let edit = handle_rename(
+            &tw.workspace.state,
+            &rename_params(&consumer_uri, pos, "parsed"),
+        )
+        .expect("rename emits edit");
+        let changes = edit.changes.expect("changes present");
+        let owner_uri_entry = changes
+            .iter()
+            .find(|(u, _)| u.as_str().contains("owner.knot"))
+            .expect("owner file must be edited");
+        let out = apply_edits(owner_src, owner_uri_entry.1);
+        assert_eq!(
+            out, "parsed : Int -> Int\nparsed = \\x -> x\n",
+            "disk-path rename must edit BOTH definition lines; edits: {:?}",
+            owner_uri_entry.1
+        );
+    }
+
+    // ── Primed identifiers (`x'`) ────────────────────────────────────
+
+    #[test]
+    fn rename_primed_identifier_covers_whole_token() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "f = \\x' -> x' + 1\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("x' +").expect("usage");
+        let pos = offset_to_position(&doc.source, off);
+        let prep = handle_prepare_rename(&ws.state, &prepare_params(&uri, pos))
+            .expect("prepare accepts primed identifier");
+        match prep {
+            PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. } => {
+                assert_eq!(placeholder, "x'", "placeholder must include the prime");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "y'"))
+            .expect("rename emits edit");
+        let edits = edit.changes.expect("changes").remove(&uri).expect("edits");
+        let out = apply_edits(&doc.source, &edits);
+        assert_eq!(
+            out, "f = \\y' -> y' + 1\n",
+            "renaming `x'` must not leave stray primes; edits: {edits:?}"
+        );
+    }
+
+    // ── New-name validation must match the (ASCII-only) lexer ────────
+
+    #[test]
+    fn rename_rejects_non_ascii_new_name() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "double = \\x -> x * 2\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("double").expect("def");
+        let pos = offset_to_position(&doc.source, off);
+        // `naïve` passes Unicode is_alphabetic but the lexer is ASCII-only —
+        // accepting it would corrupt every edited file.
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "naïve"));
+        assert!(edit.is_none(), "non-ASCII name must be rejected: {edit:?}");
+    }
+
+    #[test]
+    fn rename_rejects_all_lexer_keywords() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "double = \\x -> x * 2\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("double").expect("def");
+        let pos = offset_to_position(&doc.source, off);
+        // Previously missing from KEYWORDS: serve/unit/refine/forall/true/false.
+        for kw in ["serve", "unit", "refine", "forall", "true", "false"] {
+            let edit = handle_rename(&ws.state, &rename_params(&uri, pos, kw));
+            assert!(edit.is_none(), "rename to keyword `{kw}` must be rejected");
+        }
+    }
+
+    #[test]
+    fn rename_accepts_primed_new_name() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "double = \\x -> x * 2\nmain = double 1\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("double").expect("def");
+        let pos = offset_to_position(&doc.source, off);
+        // `'` is a legal identifier-continue char in the lexer.
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "double'"));
+        assert!(edit.is_some(), "primed new name must be accepted");
     }
 }

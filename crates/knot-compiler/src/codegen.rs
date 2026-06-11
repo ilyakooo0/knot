@@ -96,6 +96,15 @@ pub struct Codegen {
     /// `fun_bodies` during inlining.
     let_bindings: HashMap<String, ast::Expr>,
 
+    /// Names bound inside the current IO do-block whose value is statically
+    /// known to be a relation (let-bound comprehensions — including groupBy
+    /// blocks — source reads, list literals, relation-returning stdlib
+    /// calls). A later `pat <- name` bind in the same IO do-block iterates
+    /// the relation per row (comprehension semantics) instead of binding
+    /// the whole relation value. Saved/restored around each IO do-block
+    /// scope by `compile_io_do_eager`.
+    io_relation_vars: HashSet<String>,
+
     // Constructor info: ctor_name -> [(field_name, field_type_str)]
     constructors: HashMap<String, Vec<(String, String)>>,
 
@@ -754,6 +763,7 @@ impl Codegen {
             source_bind_invalidations: Vec::new(),
             fun_bodies: HashMap::new(),
             let_bindings: HashMap::new(),
+            io_relation_vars: HashSet::new(),
             constructors: HashMap::new(),
             lambda_counter: 0,
             pending_lambdas: Vec::new(),
@@ -4988,6 +4998,13 @@ impl Codegen {
                     .join(",")
             };
             let (schema_ptr, schema_len) = self.string_ptr(builder, &append_schema);
+            // Validate refined types on the rows actually written to the
+            // underlying source (post-rename, post-constant-augment) — view
+            // writes must not bypass the source's refinement predicates.
+            let written_cols = schema_col_names(&append_schema);
+            self.emit_refinement_checks_filtered(
+                builder, &source_name, augmented, Some(&written_cols), env, db,
+            );
             self.call_rt_void(
                 builder,
                 "knot_source_append",
@@ -5004,6 +5021,13 @@ impl Codegen {
             }
             let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
             let (schema_ptr, schema_len) = self.string_ptr(builder, &view_schema);
+            // Validate refined types on the rows written through the view
+            // (post-rename) — view writes must not bypass the underlying
+            // source's refinement predicates.
+            let written_cols = schema_col_names(&view_schema);
+            self.emit_refinement_checks_filtered(
+                builder, &source_name, val, Some(&written_cols), env, db,
+            );
             self.call_rt_void(
                 builder,
                 "knot_source_diff_write",
@@ -5061,6 +5085,13 @@ impl Codegen {
             let (schema_ptr, schema_len) = self.string_ptr(builder, &write_schema);
             let (filter_ptr, filter_len) = self.string_ptr(builder, &filter_where);
 
+            // Validate refined types on the rows actually written to the
+            // underlying source (post-rename, post-constant-augment) — view
+            // writes must not bypass the source's refinement predicates.
+            let written_cols = schema_col_names(&write_schema);
+            self.emit_refinement_checks_filtered(
+                builder, &source_name, augmented, Some(&written_cols), env, db,
+            );
             self.call_rt_void(
                 builder,
                 "knot_view_write",
@@ -5667,7 +5698,11 @@ impl Codegen {
                                 if !schema.starts_with('#') && !schema.contains('[') {
                                     if let Some((agg_bind, agg_body)) = extract_single_param_lambda(&args[0], &self.fun_bodies, &self.let_bindings) {
                                         let agg_body: &ast::Expr = &agg_body;
-                                        if let Some(col_sql) = extract_sql_field_access(&agg_bind, agg_body, "", &schema) {
+                                        // MIN/MAX over non-numeric columns must
+                                        // stay in memory (see minmax_pushdown_type_ok).
+                                        let minmax_ok = !matches!(name.as_str(), "minOn" | "maxOn")
+                                            || minmax_pushdown_type_ok(&agg_bind, agg_body, &schema);
+                                        if let (true, Some(col_sql)) = (minmax_ok, extract_sql_field_access(&agg_bind, agg_body, "", &schema)) {
                                             if let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body, &schema) {
                                                 let arg_sql = if matches!(name.as_str(), "minOn" | "maxOn") {
                                                     col_sql_for_minmax(&col_sql, &agg_bind, agg_body, &schema)
@@ -5726,6 +5761,14 @@ impl Codegen {
                                     }
                                     _ => None,
                                 };
+                                let col_info = col_info.filter(|(_, col_ty)| {
+                                    // MIN/MAX over non-numeric projected columns
+                                    // must stay in memory: the runtime re-parses
+                                    // TEXT results as Int (see minmax_pushdown_type_ok).
+                                    !matches!(name.as_str(), "minOn" | "maxOn")
+                                        || col_ty == "int"
+                                        || col_ty == "float"
+                                });
                                 if let Some((col_sql, col_ty)) = col_info {
                                     let arg_sql = if matches!(name.as_str(), "minOn" | "maxOn")
                                         && col_ty == "int"
@@ -6722,6 +6765,27 @@ impl Codegen {
         env: &mut Env,
         db: Value,
     ) {
+        self.emit_refinement_checks_filtered(builder, source_name, relation_val, None, env, db);
+    }
+
+    /// Emit refinement validation calls for rows about to be written to
+    /// `source_name`, restricted to the columns the rows actually carry.
+    /// `written_cols: None` means the rows carry the full source schema.
+    /// With `Some(cols)`:
+    ///   - field-level refinements are emitted only for fields in `cols`
+    ///     (a projected view that doesn't select the field can't violate it);
+    ///   - whole-element refinements are emitted only when `cols` covers
+    ///     every source column (otherwise the predicate could access a
+    ///     missing field and the check can't be evaluated on partial rows).
+    fn emit_refinement_checks_filtered(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        source_name: &str,
+        relation_val: Value,
+        written_cols: Option<&HashSet<String>>,
+        env: &mut Env,
+        db: Value,
+    ) {
         // Skip refinement checks inside atomic blocks: data entering the
         // system is validated at the boundary (route handlers), so re-running
         // potentially expensive predicates on every internal `set` is
@@ -6734,7 +6798,25 @@ impl Codegen {
             Some(r) => r.clone(),
             None => return,
         };
+        let covers_all = match written_cols {
+            None => true,
+            Some(cols) => self
+                .source_schemas
+                .get(source_name)
+                .map(|full| {
+                    split_schema_fields(full).iter().all(|part| {
+                        let name = part.split(':').next().unwrap_or("");
+                        cols.contains(name)
+                    })
+                })
+                .unwrap_or(false),
+        };
         for (field_name, type_name, predicate_expr) in &refinements {
+            match (field_name, written_cols) {
+                (Some(f), Some(cols)) if !cols.contains(f.as_str()) => continue,
+                (None, _) if !covers_all => continue,
+                _ => {}
+            }
             let pred_fn = self.compile_expr(builder, predicate_expr, env, db);
             let (tn_ptr, tn_len) = self.string_ptr(builder, type_name);
             let field_str = field_name.as_deref().unwrap_or("");
@@ -7512,6 +7594,30 @@ impl Codegen {
             })
     }
 
+    /// Like `do_block_is_comprehension`, but also admits `groupBy`
+    /// statements: a do-block ending in `yield` whose other statements are
+    /// all Bind/Where/Let/GroupBy compiles through the relational loop
+    /// paths and therefore produces a relation value.
+    fn do_block_is_relational_shape(stmts: &[ast::Stmt]) -> bool {
+        let Some((last, init)) = stmts.split_last() else {
+            return false;
+        };
+        let last_is_yield = matches!(
+            &last.node,
+            ast::StmtKind::Expr(e) if e.node.as_yield_arg().is_some()
+        );
+        last_is_yield
+            && init.iter().all(|s| {
+                matches!(
+                    &s.node,
+                    ast::StmtKind::Bind { .. }
+                        | ast::StmtKind::Where { .. }
+                        | ast::StmtKind::Let { .. }
+                        | ast::StmtKind::GroupBy { .. }
+                )
+            })
+    }
+
     /// Check whether an expression's IO-ness involves *external* effects
     /// (console/fs/network/clock/random builtins, fork/race, atomic blocks,
     /// relation writes, user IO functions) rather than plain relation reads.
@@ -7681,6 +7787,8 @@ impl Codegen {
         // (via the saved snapshot) but keep outer-scope entries visible
         // while compiling inner do-blocks.
         let prev_let_bindings = self.let_bindings.clone();
+        // Save relation-valued binding names for the same scoping reasons.
+        let prev_io_relation_vars = self.io_relation_vars.clone();
         // Mark the invalidation log so writes/rebinds inside this scope are
         // replayed onto the restored snapshots when the scope exits.
         let invalidation_mark = self.source_bind_invalidations.len();
@@ -7705,10 +7813,14 @@ impl Codegen {
                     // be relations; other non-IO binds (single-value pattern
                     // matches like `InProgress ip <- t.status`) keep
                     // bind-the-value semantics.
-                    if !self.expr_is_io(expr)
+                    let rhs_iterates = !self.expr_is_io(expr)
                         && (matches!(&expr.node, ast::ExprKind::List(_))
-                            || self.expr_is_known_relation(expr))
-                    {
+                            || self.expr_is_known_relation(expr)
+                            || self.expr_is_relation_var(expr));
+                    // Names (re)bound by this pattern are rows from here on,
+                    // not the relation-valued lets they may have shadowed.
+                    self.io_relation_vars.retain(|n| !pat_binds(pat, n));
+                    if rhs_iterates {
                         last_val = self.compile_io_bind_loop(
                             builder,
                             pat,
@@ -7776,6 +7888,31 @@ impl Codegen {
                             }
                         }
                     };
+                    // Track names whose let-bound value is statically a
+                    // relation (comprehension/groupBy do-blocks, source
+                    // reads, list literals, relation-returning stdlib calls,
+                    // or another relation-valued name) so a later
+                    // `row <- name` bind iterates instead of binding the
+                    // whole relation value.
+                    let is_relation_value = match &expr.node {
+                        ast::ExprKind::Do(do_stmts) => {
+                            !self.expr_has_external_io(expr)
+                                && Self::do_block_is_relational_shape(do_stmts)
+                        }
+                        ast::ExprKind::List(_)
+                        | ast::ExprKind::SourceRef(_)
+                        | ast::ExprKind::DerivedRef(_) => true,
+                        _ => {
+                            self.expr_is_known_relation(expr)
+                                || self.expr_is_relation_var(expr)
+                        }
+                    };
+                    self.io_relation_vars.retain(|n| !pat_binds(pat, n));
+                    if is_relation_value {
+                        if let ast::PatKind::Var(var_name) = &pat.node {
+                            self.io_relation_vars.insert(var_name.clone());
+                        }
+                    }
                     self.bind_io_pattern(builder, pat, val, env, Some(done_block));
                     self.invalidate_after_possible_writes(expr);
                     last_val = val;
@@ -7825,6 +7962,7 @@ impl Codegen {
         self.in_io_eager = prev_io_eager;
         self.source_var_binds = prev_source_var_binds;
         self.let_bindings = prev_let_bindings;
+        self.io_relation_vars = prev_io_relation_vars;
         // Writes/rebinds inside this scope still invalidate outer entries.
         self.replay_source_bind_invalidations_since(invalidation_mark);
         done_param
@@ -8087,6 +8225,16 @@ impl Codegen {
         // Save let_bindings for restoration on exit; new entries inserted
         // below are visible only inside this do-block's scope.
         let prev_let_bindings = self.let_bindings.clone();
+        // Snapshot env bindings: every name bound inside this do-block
+        // (bind patterns, lets, the groupBy rebind) refers to an SSA value
+        // defined inside a loop body, which does NOT dominate code emitted
+        // after the do-block. If such a binding shadowed an outer variable
+        // that the caller references after the block, the caller would pick
+        // up the loop-local SSA value and the Cranelift verifier rejects the
+        // function ("uses value vN from non-dominating inst"). Restore the
+        // caller's bindings wholesale on exit — do-block bindings are scoped
+        // to the block and never legitimately escape it.
+        let prev_env_bindings = env.bindings.clone();
         // Save source_var_binds too: binds in this block shadow outer
         // source-read tracking for the duration of the block.
         let prev_source_var_binds = self.source_var_binds.clone();
@@ -8913,6 +9061,7 @@ impl Codegen {
         // live until the caller returned.
         let promoted = self.call_rt(builder, "knot_arena_pop_frame_promote", &[result]);
         self.atomic_arena_frames -= 1;
+        env.bindings = prev_env_bindings;
         self.let_bindings = prev_let_bindings;
         self.source_var_binds = prev_source_var_binds;
         // Writes/rebinds inside this scope still invalidate outer entries.
@@ -9427,6 +9576,13 @@ impl Codegen {
                 ))
             }
             "sum" | "avg" | "minOn" | "maxOn" => {
+                // MIN/MAX over non-numeric columns must stay in memory
+                // (see minmax_pushdown_type_ok).
+                if matches!(fn_name, "minOn" | "maxOn")
+                    && !minmax_pushdown_type_ok(&bind_var, body, schema)
+                {
+                    return None;
+                }
                 // Use unqualified column names for direct SQL aggregate
                 let col_sql = extract_sql_field_access(&bind_var, body, "", schema)?;
                 let (func, rt_fn) = aggregate_sql_func_runtime(fn_name)?;
@@ -9595,6 +9751,11 @@ impl Codegen {
                     if is_count || aggregate.is_some() || select_override.is_some() {
                         return None;
                     }
+                    // MIN over non-numeric columns must stay in memory
+                    // (see minmax_pushdown_type_ok).
+                    if !minmax_pushdown_type_ok(bind_var, body, &schema) {
+                        return None;
+                    }
                     bind_aliases.insert(bind_var.clone(), alias.clone());
                     let col_sql = extract_sql_field_access(bind_var, body, &alias, &schema)?;
                     let arg_sql = col_sql_for_minmax(&col_sql, bind_var, body, &schema);
@@ -9602,6 +9763,11 @@ impl Codegen {
                 }
                 PipeOp::Max { bind_var, body } => {
                     if is_count || aggregate.is_some() || select_override.is_some() {
+                        return None;
+                    }
+                    // MAX over non-numeric columns must stay in memory
+                    // (see minmax_pushdown_type_ok).
+                    if !minmax_pushdown_type_ok(bind_var, body, &schema) {
                         return None;
                     }
                     bind_aliases.insert(bind_var.clone(), alias.clone());
@@ -9860,7 +10026,25 @@ impl Codegen {
                     if bind_to_alias.keys().any(|k| Self::expr_refs_var(expr, k)) {
                         return None;
                     }
-                    let_binds.insert(var_name, expr.clone());
+                    // Close the expression over earlier do-local lets: a
+                    // chained `let a = 5; let b = a + 1` stores `b` as a
+                    // param expression that is later compiled in the
+                    // *enclosing* env, where `a` is not bound — substitute
+                    // previously-collected let bindings so every stored
+                    // expression only references outer-scope names. Entries
+                    // in `let_binds` are already closed (each was
+                    // substituted when stored), so a single pass suffices.
+                    let mut closed = expr.clone();
+                    for (k, v) in &let_binds {
+                        match substitute(&closed, k, v) {
+                            Some(s) => closed = s,
+                            // Substitution would capture a free variable —
+                            // bail out of the SQL plan entirely rather than
+                            // compile a param expr with unbound names.
+                            None => return None,
+                        }
+                    }
+                    let_binds.insert(var_name, closed);
                 }
                 ast::StmtKind::Where { cond } => {
                     let frag = Self::try_compile_multi_table_sql_expr(
@@ -10294,7 +10478,7 @@ impl Codegen {
                     };
                     // Try field op value, then value op field (reversed),
                     // then atom-based comparison (handles arithmetic like x.a * x.b > 100)
-                    Self::try_compile_sql_comparison(bind_var, lhs, rhs, sql_op)
+                    Self::try_compile_sql_comparison(bind_var, lhs, rhs, sql_op, schema)
                         .or_else(|| {
                             let rev = match sql_op {
                                 "=" | "!=" => sql_op,
@@ -10304,7 +10488,7 @@ impl Codegen {
                                 ">=" => "<=",
                                 _ => return None,
                             };
-                            Self::try_compile_sql_comparison(bind_var, rhs, lhs, rev)
+                            Self::try_compile_sql_comparison(bind_var, rhs, lhs, rev, schema)
                         })
                         .or_else(|| {
                             // Type-witness gate: decide between the KNOT_INT
@@ -10440,6 +10624,7 @@ impl Codegen {
         field_side: &ast::Expr,
         value_side: &ast::Expr,
         op: &str,
+        schema: &str,
     ) -> Option<SqlFragment> {
         let col_name = if let ast::ExprKind::FieldAccess { expr, field } = &field_side.node {
             if let ast::ExprKind::Var(name) = &expr.node {
@@ -10454,6 +10639,16 @@ impl Codegen {
         } else {
             return None;
         };
+
+        // Payload-bearing ADT fields and nested records are stored as JSON
+        // documents, but the runtime encodes the compared Knot value
+        // differently when binding it as a SQL parameter (constructor
+        // params bind as bare tag text). A pushed-down `col = ?` would
+        // silently drop matching rows — fall back to in-memory evaluation.
+        // Equality on all-nullary ("tag") ADT columns stays pushable.
+        if lookup_col_type_from_schema(schema, &col_name).as_deref() == Some("json") {
+            return None;
+        }
 
         let param = match &value_side.node {
             ast::ExprKind::Lit(lit) => SqlParamSource::Literal(lit.clone()),
@@ -10904,6 +11099,16 @@ impl Codegen {
             "knot_stm_track_read_pred",
             &[tn_ptr, tn_len, spec_ptr, spec_len, pred_params_rel],
         );
+    }
+
+    /// Check if an expression is (possibly through annotation wrappers) a
+    /// variable bound earlier in the current IO do-block to a value that is
+    /// statically known to be a relation (see `io_relation_vars`).
+    fn expr_is_relation_var(&self, expr: &ast::Expr) -> bool {
+        match &strip_expr_wrappers(expr).node {
+            ast::ExprKind::Var(name) => self.io_relation_vars.contains(name),
+            _ => false,
+        }
     }
 
     /// Check if an expression is statically known to produce a relation,
@@ -11542,6 +11747,23 @@ fn aggregate_sql_func_runtime(name: &str) -> Option<(&'static str, &'static str)
     }
 }
 
+/// minOn/maxOn pushdown is only sound when the projected expression's Knot
+/// type is numeric (Int or Float): the `knot_source_query_value` runtime
+/// re-parses TEXT results as Int when possible (Knot Ints are stored as
+/// TEXT in SQLite), which corrupts genuine Text results — `maxOn` over
+/// `["007", "01"]` would come back as `Int 1`. Text (and any other or
+/// unknown type) must fall back to in-memory evaluation.
+pub(crate) fn minmax_pushdown_type_ok(
+    bind_var: &str,
+    body: &ast::Expr,
+    schema: &str,
+) -> bool {
+    matches!(
+        infer_sql_expr_type(bind_var, body, schema).as_deref(),
+        Some("int") | Some("float")
+    )
+}
+
 /// Wrap a column SQL expression for use inside MIN/MAX so integer-typed
 /// columns sort numerically rather than lexicographically. Knot stores
 /// `Int` columns as `TEXT COLLATE KNOT_INT`, but SQLite does not propagate
@@ -12043,6 +12265,15 @@ fn parse_schema_columns(schema: &str) -> Vec<(String, String)> {
             let ty = part[colon + 1..].to_string();
             Some((name, ty))
         })
+        .collect()
+}
+
+/// Column names of a schema descriptor (bracket-aware).
+fn schema_col_names(schema: &str) -> HashSet<String> {
+    split_schema_fields(schema)
+        .into_iter()
+        .map(|part| part.split(':').next().unwrap_or("").to_string())
+        .filter(|n| !n.is_empty())
         .collect()
 }
 
@@ -13003,7 +13234,7 @@ fn analyze_map_select(
 }
 
 /// Infer the SQL type of an arithmetic expression by examining its leaf types.
-fn infer_sql_expr_type(bind_var: &str, expr: &ast::Expr, schema: &str) -> Option<String> {
+pub(crate) fn infer_sql_expr_type(bind_var: &str, expr: &ast::Expr, schema: &str) -> Option<String> {
     match &expr.node {
         ast::ExprKind::FieldAccess { expr: inner, field: col_name } => {
             if let ast::ExprKind::Var(name) = &inner.node {
@@ -13861,6 +14092,12 @@ pub(crate) fn sql_scalar_kind(
                     Some("int") => Some(SqlScalarKind::Int),
                     Some("float") => Some(SqlScalarKind::Float),
                     Some("text") => Some(SqlScalarKind::Text),
+                    // Payload-bearing ADT fields and nested records are
+                    // stored as JSON documents, but the runtime binds the
+                    // corresponding Knot values differently (constructor
+                    // params bind as bare tag text) — SQL comparison would
+                    // silently mismatch. Never push down json columns.
+                    Some("json") => return Err(()),
                     Some(_) => Some(SqlScalarKind::Other),
                     None => None, // not a column — runtime param
                 })
@@ -13931,6 +14168,10 @@ pub(crate) fn sql_comparison_cast_mode(
     let joined = join_sql_kinds(l, r).ok()?;
     Some(match joined {
         Some(SqlScalarKind::Float) => SqlCastMode::Plain,
+        // Text comparisons must use SQLite's default BINARY (byte-wise)
+        // collation, matching Knot's Text semantics. The KNOT_INT collation
+        // compares numerically, so e.g. `"0" ++ "7" == "7"` would match.
+        Some(SqlScalarKind::Text) => SqlCastMode::Plain,
         Some(_) => SqlCastMode::CastInt,
         None => SqlCastMode::NoArith,
     })

@@ -1240,13 +1240,32 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
             .collect();
 
         if !changed_paths.is_empty() || !deleted_paths.is_empty() {
+            // Staleness propagates TRANSITIVELY through the import graph of
+            // open documents: when C changes on disk and open B imports C
+            // while open A imports B, A's analysis is just as stale as B's.
+            // Compute the affected-path closure over the open docs' direct
+            // import edges, then requeue every open doc whose imports touch
+            // that closure.
+            let open_imports: Vec<(PathBuf, Vec<PathBuf>)> = state
+                .documents
+                .iter()
+                .filter_map(|(uri, doc)| {
+                    let path = uri_to_path(uri).and_then(|p| p.canonicalize().ok())?;
+                    Some((path, doc.imported_files.keys().cloned().collect()))
+                })
+                .collect();
+            let seed: HashSet<PathBuf> = changed_paths
+                .iter()
+                .chain(deleted_paths.iter())
+                .cloned()
+                .collect();
+            let affected = transitively_affected_paths(&open_imports, &seed);
+
             let dependents: Vec<(Uri, PathBuf, String)> = state
                 .documents
                 .iter()
                 .filter(|(_, doc)| {
-                    doc.imported_files
-                        .keys()
-                        .any(|p| changed_paths.contains(p) || deleted_paths.contains(p))
+                    doc.imported_files.keys().any(|p| affected.contains(p))
                 })
                 .filter_map(|(uri, doc)| {
                     let path = uri_to_path(uri).and_then(|p| p.canonicalize().ok())?;
@@ -1538,6 +1557,34 @@ fn shift_byte_ranges_for_edit(
 ///   hover freeze until the next edit.
 /// - `Disconnected`: the worker thread has died. Other features still work
 ///   against the last good analysis, so log and continue rather than crash.
+/// Fixpoint closure of staleness over the open documents' import edges.
+/// `open_imports` maps each open doc's canonical path to its DIRECT imports;
+/// `seed` is the set of paths that changed (or were deleted) on disk. A doc
+/// becomes affected when any of its direct imports is affected — iterating
+/// until stable captures transitive chains (A imports B imports changed C).
+fn transitively_affected_paths(
+    open_imports: &[(PathBuf, Vec<PathBuf>)],
+    seed: &HashSet<PathBuf>,
+) -> HashSet<PathBuf> {
+    let mut affected: HashSet<PathBuf> = seed.clone();
+    loop {
+        let mut grew = false;
+        for (path, imports) in open_imports {
+            if affected.contains(path) {
+                continue;
+            }
+            if imports.iter().any(|p| affected.contains(p)) {
+                affected.insert(path.clone());
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    affected
+}
+
 fn queue_analysis(state: &mut ServerState, uri: Uri, source: String, version: Option<i32>) {
     use crossbeam_channel::TrySendError;
     // Anything parked from an earlier overflow is superseded by the fresher
@@ -2160,6 +2207,29 @@ main = do
             "expected publish-on-open + publish-after-reopen; got: {:?}",
             pubs
         );
+    }
+
+    /// Watched-file staleness must propagate TRANSITIVELY through open
+    /// documents: C changes on disk; open B imports C; open A imports B —
+    /// A must be in the affected closure, not just B.
+    #[test]
+    fn transitively_affected_paths_walks_open_import_graph() {
+        let a = PathBuf::from("/w/a.knot");
+        let b = PathBuf::from("/w/b.knot");
+        let c = PathBuf::from("/w/c.knot");
+        let d = PathBuf::from("/w/unrelated.knot");
+        let open_imports = vec![
+            (a.clone(), vec![b.clone()]),
+            (b.clone(), vec![c.clone()]),
+            (d.clone(), vec![]),
+        ];
+        let mut seed = HashSet::new();
+        seed.insert(c.clone());
+        let affected = transitively_affected_paths(&open_imports, &seed);
+        assert!(affected.contains(&c), "seed retained");
+        assert!(affected.contains(&b), "direct importer affected");
+        assert!(affected.contains(&a), "TRANSITIVE importer affected");
+        assert!(!affected.contains(&d), "unrelated doc untouched");
     }
 }
 

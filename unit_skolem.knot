@@ -1,0 +1,7 @@
+unit M
+unit S
+
+f : Float<u> -> Float<u>
+f = \x -> x + 1.0<M>
+
+main = println (show (f 2.0<S>))

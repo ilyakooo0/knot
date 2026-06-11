@@ -34,6 +34,15 @@ pub struct Parser {
     /// (unary operators, constructor chaining, type arrows) to prevent
     /// stack overflow on pathological input.
     recursion_depth: usize,
+    /// Stack of locally-bound identifiers (lambda params, do-bind and
+    /// do-let names, `let ... in` names, case pattern binders). Used by
+    /// `maybe_time_unit` to suppress the `2 ms`/`5 seconds` literal sugar
+    /// when the would-be unit name is actually a bound variable, so
+    /// `\ms -> g 2 ms` applies `g` to `2` and `ms` rather than desugaring
+    /// to `g (2 * 1)`. Top-level declaration names are not tracked (the
+    /// parser has no module-wide scope), so a top-level `ms = 5` still
+    /// triggers the sugar.
+    bound_vars: Vec<Name>,
 }
 
 // ── Public API ──────────────────────────────────────────────────────
@@ -51,6 +60,7 @@ impl Parser {
             block_indent: usize::MAX,
             delimiter_depth: 0,
             recursion_depth: 0,
+            bound_vars: Vec::new(),
         }
     }
 
@@ -104,14 +114,27 @@ impl Parser {
 
 const MAX_RECURSION_DEPTH: usize = 256;
 
+/// Cost charged by `parse_atom`/`parse_type_atom` per nesting level. The
+/// expression delimiter cycle (`parse_atom` → `parse_expr` → … → `parse_atom`)
+/// burns ~10 stack frames per level — far more than the cheap cycles (unary
+/// chains, type arrows) — so it is charged more of the shared budget to stay
+/// well within thread stack limits before the guard fires.
+const DELIMITER_RECURSION_COST: usize = 4;
+
 impl Parser {
     /// Increment recursion depth and return `true`, or emit an error and
     /// return `false` if the limit is exceeded.  Callers must decrement
     /// `self.recursion_depth` when the recursive call returns.
     fn enter_recursion(&mut self) -> bool {
-        self.recursion_depth += 1;
+        self.enter_recursion_cost(1)
+    }
+
+    /// Like `enter_recursion`, but charges `cost` units of the depth budget.
+    /// Callers must subtract the same `cost` when the recursive call returns.
+    fn enter_recursion_cost(&mut self, cost: usize) -> bool {
+        self.recursion_depth += cost;
         if self.recursion_depth > MAX_RECURSION_DEPTH {
-            self.recursion_depth -= 1;
+            self.recursion_depth -= cost;
             let span = self.span();
             self.diagnostics.push(
                 Diagnostic::error("nesting depth limit exceeded")
@@ -120,6 +143,43 @@ impl Parser {
             return false;
         }
         true
+    }
+}
+
+// ── Local binding scope tracking ────────────────────────────────────
+
+impl Parser {
+    /// Push every variable bound by `pat` onto the `bound_vars` stack.
+    /// Callers record `bound_vars.len()` before pushing and truncate back
+    /// to it when the binder's scope ends.
+    fn push_pat_vars(&mut self, pat: &Pat) {
+        match &pat.node {
+            PatKind::Var(n) => self.bound_vars.push(n.clone()),
+            PatKind::Wildcard | PatKind::Lit(_) => {}
+            PatKind::Constructor { payload, .. } => self.push_pat_vars(payload),
+            PatKind::Record(fields) => {
+                for f in fields {
+                    match &f.pattern {
+                        Some(sub) => self.push_pat_vars(sub),
+                        // Punned field `{name}` binds the field name itself.
+                        None => self.bound_vars.push(f.name.clone()),
+                    }
+                }
+            }
+            PatKind::List(items) => {
+                for it in items {
+                    self.push_pat_vars(it);
+                }
+            }
+            PatKind::Cons { head, tail } => {
+                self.push_pat_vars(head);
+                self.push_pat_vars(tail);
+            }
+        }
+    }
+
+    fn is_bound_var(&self, name: &str) -> bool {
+        self.bound_vars.iter().any(|v| v == name)
     }
 }
 
@@ -432,6 +492,7 @@ impl Parser {
                             _ => unreachable!(),
                         };
                         path.push_str(&name);
+                        self.consume_import_dashed_suffix(&mut path);
                     }
                     ref tok if tok.keyword_str().is_some() => {
                         let tok = self.advance();
@@ -442,6 +503,7 @@ impl Parser {
                                 return None;
                             }
                         }
+                        self.consume_import_dashed_suffix(&mut path);
                     }
                     _ => {
                         self.error("expected path segment after '/'");
@@ -493,6 +555,40 @@ impl Parser {
         let span = Span::new(start.start, end.end);
         Some(Import { path, items, span })
     }
+
+    /// Extend the just-consumed import path segment with `-`-joined parts
+    /// (`./foo-bar` lexes as `foo`, `-`, `bar`). Only joins when the tokens
+    /// are span-adjacent (no intervening whitespace), so a following binary
+    /// minus is never absorbed into the path. Mirrors the dashed-literal
+    /// handling in `parse_route_path`.
+    fn consume_import_dashed_suffix(&mut self, path: &mut String) {
+        loop {
+            if !self.at(&TokenKind::Minus) {
+                break;
+            }
+            let minus_span = self.span();
+            if minus_span.start != self.prev_span().end {
+                break;
+            }
+            let Some(next) = self.tokens.get(self.pos + 1) else {
+                break;
+            };
+            if next.span.start != minus_span.end {
+                break;
+            }
+            let part: Option<String> = match &next.kind {
+                TokenKind::Lower(n) | TokenKind::Upper(n) => Some(n.clone()),
+                k => k.keyword_str().map(|s| s.to_string()),
+            };
+            let Some(part) = part else {
+                break;
+            };
+            self.advance(); // consume `-`
+            self.advance(); // consume the segment part
+            path.push('-');
+            path.push_str(&part);
+        }
+    }
 }
 
 // ── Layout block helper ─────────────────────────────────────────────
@@ -504,6 +600,18 @@ impl Parser {
             return vec![];
         }
         let indent = self.column_of(&self.span());
+        // Layout rule: a nested block's items must be indented strictly past
+        // the enclosing block's indent. Without this, an empty block (e.g.
+        // `trait Foo a where` followed by a blank line) silently captures the
+        // next declaration at column 0 as a block item. Only enforced outside
+        // delimiters — inside parens/brackets the closing delimiter already
+        // terminates the block, and column positions are free-form there.
+        if self.delimiter_depth == 0
+            && self.block_indent != usize::MAX
+            && indent <= self.block_indent
+        {
+            return vec![];
+        }
         let prev_block_indent = self.block_indent;
         self.block_indent = indent;
         let mut items = vec![];
@@ -2127,7 +2235,13 @@ impl Parser {
             // `yield` is not a keyword but should not start application atoms
             // (like keywords), to prevent `f; yield x` from parsing as `f yield x`
             // in inline do-blocks where `;` is lexed as Newline.
-            TokenKind::Lower(n) => n != "yield",
+            // While parsing a route's response type (including a refined
+            // type's `where` predicate), `headers`/`rateLimit` are clause
+            // keywords and must not be consumed as application arguments.
+            TokenKind::Lower(n) => {
+                n != "yield"
+                    && !(self.stop_type_at_headers && (n == "headers" || n == "rateLimit"))
+            }
             TokenKind::Star => {
                 // Source ref `*name` only when `*` is immediately adjacent to a Lower token
                 // (no whitespace). This avoids ambiguity with the `*` multiplication operator.
@@ -2206,6 +2320,9 @@ impl Parser {
     /// where factor is the millisecond equivalent.
     fn maybe_time_unit(&mut self, lit: Expr) -> Option<Expr> {
         let factor: Option<&str> = match self.peek() {
+            // A locally-bound variable named like a time unit is NOT unit
+            // sugar: `\ms -> g 2 ms` must apply `g` to `2` and `ms`.
+            TokenKind::Lower(u) if self.is_bound_var(u) => None,
             TokenKind::Lower(u) => match u.as_str() {
                 "ms" => Some("1"),
                 "seconds" => Some("1000"),
@@ -2252,6 +2369,19 @@ impl Parser {
     }
 
     fn parse_atom(&mut self) -> Option<Expr> {
+        // Guard recursion here: every expression-side delimiter cycle
+        // (parens, records, lists → parse_expr → ... → parse_atom) flows
+        // through this entry point, so guarding it prevents stack overflow
+        // on pathological input like `((((…))))`.
+        if !self.enter_recursion_cost(DELIMITER_RECURSION_COST) {
+            return None;
+        }
+        let result = self.parse_atom_inner();
+        self.recursion_depth -= DELIMITER_RECURSION_COST;
+        result
+    }
+
+    fn parse_atom_inner(&mut self) -> Option<Expr> {
         let start = self.span();
         match self.peek() {
             TokenKind::Int(_) => {
@@ -2644,7 +2774,13 @@ impl Parser {
 
             this.expect(&TokenKind::Arrow, "expected '->' in lambda expression")
                 .ok()?;
-            let body = this.parse_expr()?;
+            let scope_mark = this.bound_vars.len();
+            for p in &params {
+                this.push_pat_vars(p);
+            }
+            let body = this.parse_expr();
+            this.bound_vars.truncate(scope_mark);
+            let body = body?;
 
             let end_sp = body.span;
             Some(Spanned::new(
@@ -2724,7 +2860,11 @@ impl Parser {
             "expected '->' after pattern in case arm",
         )
         .ok()?;
-        let body = self.parse_expr()?;
+        let scope_mark = self.bound_vars.len();
+        self.push_pat_vars(&pat);
+        let body = self.parse_expr();
+        self.bound_vars.truncate(scope_mark);
+        let body = body?;
         Some(CaseArm { pat, body })
     }
 
@@ -2733,7 +2873,11 @@ impl Parser {
         self.in_context("do expression", |this| {
             this.advance(); // consume `do`
 
+            // `parse_stmt` pushes bind/let names so later statements see
+            // them as bound; the whole do-block scope ends here.
+            let scope_mark = this.bound_vars.len();
             let stmts = this.parse_block(|p| p.parse_stmt());
+            this.bound_vars.truncate(scope_mark);
 
             let end = this.prev_span();
             Some(Spanned::new(
@@ -2830,7 +2974,11 @@ impl Parser {
             let mut value = this.parse_expr()?;
             this.skip_newlines();
             this.expect(&TokenKind::In, "expected 'in' after let binding").ok()?;
-            let body = this.parse_expr()?;
+            let scope_mark = this.bound_vars.len();
+            this.push_pat_vars(&pat);
+            let body = this.parse_expr();
+            this.bound_vars.truncate(scope_mark);
+            let body = body?;
 
             // If there is a type annotation, wrap the value as `(value : Type)`
             // so that inference sees the constraint.
@@ -2949,6 +3097,9 @@ impl Parser {
             }
 
             let end_sp = expr.span;
+            // Names bound by this let are in scope for the rest of the
+            // do-block (popped by `parse_do_expr`).
+            self.push_pat_vars(&pat);
             return Some(Spanned::new(
                 StmtKind::Let { pat, expr },
                 Span::new(start.start, end_sp.end),
@@ -2970,6 +3121,9 @@ impl Parser {
                     None => return None,
                 };
                 let end_sp = expr.span;
+                // Names bound by this bind are in scope for the rest of the
+                // do-block (popped by `parse_do_expr`).
+                self.push_pat_vars(&pat);
                 return Some(Spanned::new(
                     StmtKind::Bind { pat, expr },
                     Span::new(start.start, end_sp.end),
@@ -3472,6 +3626,19 @@ impl Parser {
     }
 
     fn parse_type_atom(&mut self) -> Option<Type> {
+        // Guard recursion here: every type-side delimiter cycle (parens,
+        // record types, relation types, variant types → parse_type → ... →
+        // parse_type_atom) flows through this entry point, preventing stack
+        // overflow on pathological input like `[[[[…]]]]`.
+        if !self.enter_recursion_cost(DELIMITER_RECURSION_COST) {
+            return None;
+        }
+        let result = self.parse_type_atom_inner();
+        self.recursion_depth -= DELIMITER_RECURSION_COST;
+        result
+    }
+
+    fn parse_type_atom_inner(&mut self) -> Option<Type> {
         let start = self.span();
         match self.peek() {
             TokenKind::Upper(_) => {

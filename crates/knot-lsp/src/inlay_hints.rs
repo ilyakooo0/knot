@@ -83,7 +83,15 @@ pub(crate) fn handle_inlay_hint(
                         .map(|ty| !type_str_mentions_effects(ty, effects))
                         .unwrap_or(true);
                     if needs_hint {
-                        let hint_offset = name_end_offset(&doc.source, decl.span, name);
+                        // Anchor at the END of the signature line. Anchoring
+                        // right after the name would visually split `name`
+                        // and `:` on annotated declarations.
+                        let span_end = decl.span.end.min(doc.source.len());
+                        let hint_offset = doc.source
+                            [decl.span.start.min(span_end)..span_end]
+                            .find('\n')
+                            .map(|p| decl.span.start + p)
+                            .unwrap_or(span_end);
                         let hint_pos = offset_to_position(&doc.source, hint_offset);
                         hints.push(InlayHint {
                             position: hint_pos,
@@ -356,17 +364,70 @@ fn add_record_pattern_field_hints(
     range_end: usize,
     hints: &mut Vec<InlayHint>,
 ) {
-    /// Find each pattern that destructures a record. Tracks both the span
-    /// and an optional constructor name for ADT cases like `Person {name}`.
-    fn walk_pat_for_records(pat: &ast::Pat, out: &mut Vec<(Span, Option<String>)>) {
+    /// Field-name token positions parsed structurally from a record pattern.
+    /// The AST stores field names as bare strings, so each token is recovered
+    /// from source text — but confined to its syntactic slot: the window
+    /// between the previous field's sub-pattern (or the record opener) and
+    /// this field's sub-pattern. A whole-pattern first-occurrence search
+    /// would anchor field `b`'s hint on the BINDER `b` of an earlier field
+    /// (`P {a: b, b: c}`).
+    fn record_field_name_spans(
+        fields: &[ast::FieldPat],
+        window: Span,
+        source: &str,
+    ) -> Vec<(String, Span)> {
+        let mut out = Vec::new();
+        let mut search_start = window.start;
+        for f in fields {
+            match &f.pattern {
+                Some(p) => {
+                    if let Some(s) = crate::utils::find_word_in_source(
+                        source,
+                        &f.name,
+                        search_start,
+                        p.span.start,
+                    ) {
+                        out.push((f.name.clone(), s));
+                    }
+                    search_start = p.span.end;
+                }
+                None => {
+                    // Pun: the token both names the field and binds the var.
+                    if let Some(s) = crate::utils::find_word_in_source(
+                        source,
+                        &f.name,
+                        search_start,
+                        window.end,
+                    ) {
+                        out.push((f.name.clone(), s));
+                        search_start = s.end;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Find each pattern that destructures a record. Tracks the span, an
+    /// optional constructor name for ADT cases like `Person {name}`, and the
+    /// structurally-parsed field-name token spans.
+    fn walk_pat_for_records(
+        pat: &ast::Pat,
+        source: &str,
+        out: &mut Vec<(Span, Option<String>, Vec<(String, Span)>)>,
+    ) {
         match &pat.node {
             ast::PatKind::Record(fields) => {
-                out.push((pat.span, None));
+                out.push((
+                    pat.span,
+                    None,
+                    record_field_name_spans(fields, pat.span, source),
+                ));
                 // Recurse into field sub-patterns so nested record
                 // destructures (`{addr: {city}}`) get hints too.
                 for f in fields {
                     if let Some(p) = &f.pattern {
-                        walk_pat_for_records(p, out);
+                        walk_pat_for_records(p, source, out);
                     }
                 }
             }
@@ -376,41 +437,49 @@ fn add_record_pattern_field_hints(
                 // push the same record again and duplicate every per-field
                 // hint. Only the payload's field SUB-patterns are recursed.
                 if let ast::PatKind::Record(fields) = &payload.node {
-                    out.push((pat.span, Some(name.clone())));
+                    out.push((
+                        pat.span,
+                        Some(name.clone()),
+                        record_field_name_spans(fields, payload.span, source),
+                    ));
                     for f in fields {
                         if let Some(p) = &f.pattern {
-                            walk_pat_for_records(p, out);
+                            walk_pat_for_records(p, source, out);
                         }
                     }
                 } else {
-                    walk_pat_for_records(payload, out);
+                    walk_pat_for_records(payload, source, out);
                 }
             }
             ast::PatKind::List(pats) => {
                 for p in pats {
-                    walk_pat_for_records(p, out);
+                    walk_pat_for_records(p, source, out);
                 }
             }
             ast::PatKind::Cons { head, tail } => {
-                walk_pat_for_records(head, out);
-                walk_pat_for_records(tail, out);
+                walk_pat_for_records(head, source, out);
+                walk_pat_for_records(tail, source, out);
             }
             _ => {}
         }
     }
-    fn walk_expr(expr: &ast::Expr, out: &mut Vec<(Span, Option<String>)>) {
+    fn walk_expr(
+        expr: &ast::Expr,
+        source: &str,
+        out: &mut Vec<(Span, Option<String>, Vec<(String, Span)>)>,
+    ) {
         match &expr.node {
             ast::ExprKind::Lambda { params, body } => {
                 for p in params {
-                    walk_pat_for_records(p, out);
+                    walk_pat_for_records(p, source, out);
                 }
-                walk_expr(body, out);
+                walk_expr(body, source, out);
             }
             ast::ExprKind::Case { scrutinee, arms } => {
-                walk_expr(scrutinee, out);
+                walk_expr(scrutinee, source, out);
                 for arm in arms {
-                    walk_pat_for_records(&arm.pat, out);
-                    walk_expr(&arm.body, out);
+                    walk_pat_for_records(&arm.pat, source, out);
+                    walk_expr(&arm.body, source, out);
                 }
             }
             ast::ExprKind::Do(stmts) => {
@@ -418,33 +487,33 @@ fn add_record_pattern_field_hints(
                     match &stmt.node {
                         ast::StmtKind::Bind { pat, expr }
                         | ast::StmtKind::Let { pat, expr } => {
-                            walk_pat_for_records(pat, out);
-                            walk_expr(expr, out);
+                            walk_pat_for_records(pat, source, out);
+                            walk_expr(expr, source, out);
                         }
                         ast::StmtKind::Where { cond } | ast::StmtKind::Expr(cond) => {
-                            walk_expr(cond, out);
+                            walk_expr(cond, source, out);
                         }
-                        ast::StmtKind::GroupBy { key } => walk_expr(key, out),
+                        ast::StmtKind::GroupBy { key } => walk_expr(key, source, out),
                     }
                 }
             }
-            _ => recurse_expr(expr, |e| walk_expr(e, out)),
+            _ => recurse_expr(expr, |e| walk_expr(e, source, out)),
         }
     }
 
-    let mut record_pats: Vec<(Span, Option<String>)> = Vec::new();
+    let mut record_pats: Vec<(Span, Option<String>, Vec<(String, Span)>)> = Vec::new();
     for decl in &doc.module.decls {
         match &decl.node {
             ast::DeclKind::Fun { body: Some(body), .. }
             | ast::DeclKind::View { body, .. }
-            | ast::DeclKind::Derived { body, .. } => walk_expr(body, &mut record_pats),
+            | ast::DeclKind::Derived { body, .. } => walk_expr(body, &doc.source, &mut record_pats),
             ast::DeclKind::Impl { items, .. } => {
                 for item in items {
                     if let ast::ImplItem::Method { params, body, .. } = item {
                         for p in params {
-                            walk_pat_for_records(p, &mut record_pats);
+                            walk_pat_for_records(p, &doc.source, &mut record_pats);
                         }
-                        walk_expr(body, &mut record_pats);
+                        walk_expr(body, &doc.source, &mut record_pats);
                     }
                 }
             }
@@ -452,18 +521,20 @@ fn add_record_pattern_field_hints(
         }
     }
 
-    for (span, ctor_opt) in record_pats {
+    for (span, ctor_opt, field_name_spans) in record_pats {
         if span.end < range_start || span.start > range_end {
             continue;
         }
         // Resolve the field set. Prefer the AST-driven constructor lookup —
         // the inferencer's local_type_info often doesn't carry an entry at
         // the constructor pattern's outer span, but the data decl always
-        // does.
+        // does. Take the FIRST data type declaring a constructor with this
+        // name and stop — scanning on would accumulate fields from every ADT
+        // that happens to share the constructor name.
         let mut fields_str: Vec<(String, String)> = Vec::new();
         let mut tooltip_source = String::from("destructured record");
         if let Some(ctor_name) = ctor_opt.as_deref() {
-            for d in &doc.module.decls {
+            'ctor_lookup: for d in &doc.module.decls {
                 if let ast::DeclKind::Data { constructors, name: data_name, .. } = &d.node {
                     for c in constructors {
                         if c.name == ctor_name {
@@ -474,6 +545,7 @@ fn add_record_pattern_field_hints(
                                     crate::type_format::format_type_kind(&f.value.node),
                                 ));
                             }
+                            break 'ctor_lookup;
                         }
                     }
                 }
@@ -507,17 +579,15 @@ fn add_record_pattern_field_hints(
         if fields_str.is_empty() {
             continue;
         }
-        // Slice once; we need the pattern source to find each field's
-        // position via word-boundary scan.
-        let pat_text = match doc.source.get(span.start..span.end) {
-            Some(s) => s,
-            None => continue,
-        };
         for (field_name, ty_str) in fields_str {
-            // The field name appears as a whole-word identifier inside the
-            // pattern. Search for it with simple boundary checks.
-            if let Some(rel_pos) = find_word_boundary(pat_text, &field_name) {
-                let abs_end = span.start + rel_pos + field_name.len();
+            // Anchor each hint on the field-NAME token position parsed
+            // structurally from the pattern — not on the first same-named
+            // token, which could be an earlier field's binder.
+            if let Some((_, name_span)) = field_name_spans
+                .iter()
+                .find(|(n, _)| *n == field_name)
+            {
+                let abs_end = name_span.end;
                 if abs_end > span.end {
                     continue;
                 }
@@ -563,7 +633,7 @@ fn extract_variant_ctor_fields(
     }
     let mut j = i;
     while j < bytes.len()
-        && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
+        && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'\'')
     {
         j += 1;
     }
@@ -576,29 +646,6 @@ fn extract_variant_ctor_fields(
                 }
             }
         }
-    }
-    None
-}
-
-/// Locate `word` as a whole-word match in `text`. Returns the byte offset of
-/// its first occurrence, or `None`. Avoids matching `name` inside `nameish`.
-fn find_word_boundary(text: &str, word: &str) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let needle = word.as_bytes();
-    if needle.is_empty() || bytes.len() < needle.len() {
-        return None;
-    }
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    let mut i = 0;
-    while i + needle.len() <= bytes.len() {
-        if &bytes[i..i + needle.len()] == needle {
-            let left_ok = i == 0 || !is_ident(bytes[i - 1]);
-            let right_ok = i + needle.len() >= bytes.len() || !is_ident(bytes[i + needle.len()]);
-            if left_ok && right_ok {
-                return Some(i);
-            }
-        }
-        i += 1;
     }
     None
 }
@@ -714,15 +761,6 @@ fn add_unit_literal_hints(
             });
         }
     }
-}
-
-/// Find the byte offset just after the function name within its declaration span.
-fn name_end_offset(source: &str, decl_span: Span, _name: &str) -> usize {
-    let decl_text = safe_slice(source, decl_span);
-    let name_end = decl_text
-        .find(|c: char| !c.is_alphanumeric() && c != '_')
-        .unwrap_or(decl_text.len());
-    decl_span.start + name_end
 }
 
 /// Heuristic: does the rendered type string already mention all of the given
@@ -1386,6 +1424,99 @@ checkGlobalRate = \t -> atomic do
         assert!(
             has_monad_hint,
             "expected `[Monad]` hint; got: {labels:?}"
+        );
+    }
+
+    /// Record-destructure field hints must anchor on the FIELD-NAME token,
+    /// not the first same-named token: in `P {a: b, b: c}`, field `b`'s hint
+    /// belongs on the second `b` (the field name), not on the binder `b`
+    /// of field `a`.
+    #[test]
+    fn record_field_hints_anchor_on_field_name_not_binder() {
+        let mut ws = TestWorkspace::new();
+        let src = "data P = P {a: Int, b: Text}\n\nf = \\p -> case p of\n  P {a: b, b: c} -> c\n";
+        let uri = ws.open("main", src);
+        let doc = ws.doc(&uri);
+        let range = ws.whole_file_range(&uri);
+        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
+
+        // Expected anchor for field `b`: just after the SECOND `b` in the
+        // pattern (the field-name token of `b: c`).
+        let pat_off = doc.source.find("P {a: b, b: c}").expect("pattern");
+        let field_b_off = doc.source[pat_off..].find(", b:").map(|p| pat_off + p + 2).unwrap();
+        let expected_b_pos = offset_to_position(&doc.source, field_b_off + 1);
+        // And the WRONG anchor (the binder b of field a).
+        let binder_b_off = doc.source[pat_off..].find("a: b").map(|p| pat_off + p + 3).unwrap();
+        let wrong_b_pos = offset_to_position(&doc.source, binder_b_off + 1);
+
+        let text_hints: Vec<(&Position, String)> = hints
+            .iter()
+            .filter_map(|h| match &h.label {
+                InlayHintLabel::String(s) if s == ": Text" => Some((&h.position, s.clone())),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text_hints.iter().any(|(p, _)| **p == expected_b_pos),
+            "`: Text` hint must anchor on the field-name token of `b`; got: {text_hints:?} (expected {expected_b_pos:?})"
+        );
+        assert!(
+            text_hints.iter().all(|(p, _)| **p != wrong_b_pos),
+            "`: Text` hint anchored on the binder of field `a`: {text_hints:?}"
+        );
+    }
+
+    /// The constructor lookup must take the FIRST ADT declaring the
+    /// constructor — not accumulate fields from every ADT sharing the name.
+    #[test]
+    fn record_field_hints_do_not_accumulate_across_same_named_ctors() {
+        let mut ws = TestWorkspace::new();
+        let src = "data A = Mk {x: Int}\ndata B = Mk {y: Text}\n\nf = \\v -> case v of\n  Mk {x} -> x\n";
+        let uri = ws.open("main", src);
+        let range = ws.whole_file_range(&uri);
+        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
+        // The pattern destructures `x` only; no `: Text` hint may appear on
+        // the pattern (which would come from B's same-named constructor).
+        let doc = ws.doc(&uri);
+        let pat_off = doc.source.find("Mk {x}").expect("pattern");
+        let pat_line = offset_to_position(&doc.source, pat_off).line;
+        let leaked = hints.iter().any(|h| {
+            h.position.line == pat_line
+                && matches!(&h.label, InlayHintLabel::String(s) if s == ": Text")
+        });
+        assert!(!leaked, "fields from a second same-named ctor leaked: {hints:?}");
+    }
+
+    /// Effects hint for ANNOTATED functions must anchor at the end of the
+    /// signature line — anchoring right after the name splits `name` and `:`.
+    #[test]
+    fn effects_hint_anchors_at_end_of_signature_line() {
+        let mut ws = TestWorkspace::new();
+        let src = "*t : [{a: Int}]\n\nf : Int -> IO {} [{a: Int}]\nf = \\x -> *t\n";
+        let uri = ws.open("main", src);
+        let doc = ws.doc(&uri);
+        let range = ws.whole_file_range(&uri);
+        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
+        let sig_line_start = doc.source.find("f : Int").expect("sig");
+        let sig_line = offset_to_position(&doc.source, sig_line_start).line;
+        let sig_text_len = "f : Int -> IO {} [{a: Int}]".len() as u32;
+        for h in &hints {
+            if let InlayHintLabel::String(s) = &h.label {
+                if s.starts_with("-- effects:") {
+                    assert_eq!(h.position.line, sig_line, "hint on wrong line: {h:?}");
+                    assert_eq!(
+                        h.position.character, sig_text_len,
+                        "effects hint must sit at END of the signature line, \
+                         not after the name: {h:?}"
+                    );
+                    return;
+                }
+            }
+        }
+        panic!(
+            "expected an `-- effects:` hint for the annotated function; \
+             effect_info: {:?}, hints: {hints:?}",
+            ws.doc(&uri).effect_info
         );
     }
 }

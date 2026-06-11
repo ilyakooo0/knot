@@ -69,7 +69,13 @@ pub(crate) fn handle_completion(
     // the runtime builtins, lambdas, or do-block scaffolding belongs here.
     // Returning a tightly-scoped completion list keeps the user from typing
     // expression-level snippets that would never parse.
-    if find_enclosing_route_decl_span(&doc.module, offset).is_some() {
+    //
+    // Exception: `rateLimit <expr>` clauses hold ordinary EXPRESSIONS
+    // (`{key: \inp ctx -> ..., limit: ...}`), so a cursor inside one needs
+    // the normal expression completions, not the method/type gate.
+    if find_enclosing_route_decl_span(&doc.module, offset).is_some()
+        && !offset_in_route_rate_limit(&doc.module, offset)
+    {
         return Some(CompletionResponse::Array(route_completions(doc)));
     }
 
@@ -515,7 +521,7 @@ pub(crate) fn handle_completion(
     // the source is a partial expression (e.g. mid-typing inside a `<-` bind),
     // so the bias kicks in continuously as the user types.
     if let Some(do_span) = find_enclosing_do_span(&doc.module, offset) {
-        if let Some(monad) = monad_for_do_span(&doc.monad_info, do_span) {
+        if let Some(monad) = monad_for_do_span(&doc.monad_info, do_span, offset) {
             for item in items.iter_mut() {
                 let label = item.label.trim_start_matches(['*', '&']);
                 if let Some(ty) = doc.type_info.get(label) {
@@ -790,6 +796,24 @@ fn find_enclosing_route_decl_span(module: &Module, offset: usize) -> Option<Span
     None
 }
 
+/// True when `offset` sits inside the expression of a `rateLimit <expr>`
+/// clause of some route entry. Those expressions are ordinary value-level
+/// code and must receive normal expression completions.
+fn offset_in_route_rate_limit(module: &Module, offset: usize) -> bool {
+    for decl in &module.decls {
+        if let DeclKind::Route { entries, .. } = &decl.node {
+            for entry in entries {
+                if let Some(rl) = &entry.rate_limit {
+                    if rl.span.start <= offset && offset <= rl.span.end {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Build the completion list for a position inside a `route … where` block.
 /// Surfaces HTTP method keywords, the soft `headers` keyword, and types that
 /// are valid in field-of-type positions; everything else (functions, builtins,
@@ -945,19 +969,33 @@ fn snippet_context_matches(decl: SnippetContext, cursor: SnippetContext) -> bool
     }
 }
 
-/// Return the resolved monad kind for the do-block at `do_span`, if any. The
-/// type checker registers monad-vars with spans tied to the desugared
+/// Return the resolved monad kind for the do-block at `do_span`. The type
+/// checker registers monad-vars with spans tied to the desugared
 /// `__bind`/`__yield`/`__empty` callsites, which sit inside the original
-/// do-block, so any `monad_info` entry whose span is contained in `do_span`
-/// is a valid sample of that block's monad.
+/// do-block — but NESTED do-blocks contribute entries inside `do_span` too,
+/// so an arbitrary `.find()` over the HashMap sampled them
+/// nondeterministically. Prefer the INNERMOST entry containing the cursor
+/// (that's the block the user is typing in); when no entry covers the
+/// cursor, fall back to the first contained entry in deterministic
+/// `(start, end)` order.
 fn monad_for_do_span(
     monad_info: &HashMap<Span, MonadKind>,
     do_span: Span,
+    offset: usize,
 ) -> Option<MonadKind> {
-    monad_info
+    let mut contained: Vec<(&Span, &MonadKind)> = monad_info
         .iter()
-        .find(|(s, _)| s.start >= do_span.start && s.end <= do_span.end)
-        .map(|(_, k)| k.clone())
+        .filter(|(s, _)| s.start >= do_span.start && s.end <= do_span.end)
+        .collect();
+    if let Some((_, kind)) = contained
+        .iter()
+        .filter(|(s, _)| s.start <= offset && offset <= s.end)
+        .min_by_key(|(s, _)| (s.end - s.start, s.start, s.end))
+    {
+        return Some((*kind).clone());
+    }
+    contained.sort_by_key(|(s, _)| (s.start, s.end));
+    contained.first().map(|(_, k)| (*k).clone())
 }
 
 /// True if the rendered type of a completion candidate is a value in the
@@ -1060,7 +1098,7 @@ fn cursor_in_type_context(before: &str) -> bool {
     // In `type`/`data` declarations the RHS of `=` is type-level.
     let eq_introduces_type = head.starts_with("type ") || head.starts_with("data ");
 
-    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'\'';
     let mut ty = false; // current position is type-level?
     let mut lambda_arrows = 0usize; // `\`s whose `->` hasn't been seen yet
     let mut stack: Vec<(u8, bool)> = Vec::new(); // (bracket, ty at open)
@@ -1163,7 +1201,7 @@ fn cursor_in_type_context(before: &str) -> bool {
 /// dot-completion items when the variable was bound from a `*source`.
 fn receiver_ident_before_dot(source: &str, dot_pos: usize) -> Option<String> {
     let bytes = source.as_bytes();
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'';
     let mut end = dot_pos;
     while end > 0 && bytes[end - 1] == b' ' {
         end -= 1;
@@ -1189,7 +1227,7 @@ fn receiver_ident_before_dot(source: &str, dot_pos: usize) -> Option<String> {
 /// sent (it may be newer than `doc.source`); `dot_pos` is an offset into it.
 fn resolve_dot_fields(doc: &DocumentState, source: &str, dot_pos: usize) -> Vec<String> {
     let bytes = source.as_bytes();
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'';
 
     // Find the identifier immediately before the dot
     let mut end = dot_pos.min(bytes.len());
@@ -1241,6 +1279,18 @@ fn find_type_for_name(doc: &DocumentState, name: &str, offset: usize) -> Option<
 
 /// Extract field names from a type string like `{name: Text, age: Int}` or a named type.
 fn extract_fields_from_type_str(type_str: &str, module: &Module) -> Vec<String> {
+    let mut visited = HashSet::new();
+    extract_fields_from_type_str_inner(type_str, module, &mut visited)
+}
+
+/// Recursive worker for `extract_fields_from_type_str`. Carries a visited
+/// set of alias names so cyclic type aliases (`type A = B` ⏎ `type B = A`)
+/// terminate instead of overflowing the stack.
+fn extract_fields_from_type_str_inner(
+    type_str: &str,
+    module: &Module,
+    visited: &mut HashSet<String>,
+) -> Vec<String> {
     let type_str = type_str.trim();
 
     // Direct record type: `{name: Text, age: Int}`
@@ -1251,7 +1301,7 @@ fn extract_fields_from_type_str(type_str: &str, module: &Module) -> Vec<String> 
     // Relation type: `[{name: Text}]` or `[Person]` — extract inner type
     if type_str.starts_with('[') && type_str.ends_with(']') {
         let inner = &type_str[1..type_str.len() - 1];
-        return extract_fields_from_type_str(inner, module);
+        return extract_fields_from_type_str_inner(inner, module, visited);
     }
 
     // IO type: `IO {...} [T]` or `IO {...} {fields}` — skip to the value type
@@ -1261,7 +1311,7 @@ fn extract_fields_from_type_str(type_str: &str, module: &Module) -> Vec<String> 
         if rest.starts_with('{') {
             if let Some(close) = rest.find('}') {
                 let value_type = rest[close + 1..].trim();
-                return extract_fields_from_type_str(value_type, module);
+                return extract_fields_from_type_str_inner(value_type, module, visited);
             }
         }
     }
@@ -1269,10 +1319,14 @@ fn extract_fields_from_type_str(type_str: &str, module: &Module) -> Vec<String> 
     // Maybe type: `Maybe T` — unwrap to inner type
     if type_str.starts_with("Maybe ") {
         let inner = type_str[6..].trim();
-        return extract_fields_from_type_str(inner, module);
+        return extract_fields_from_type_str_inner(inner, module, visited);
     }
 
-    // Named type: look up in the module's declarations
+    // Named type: look up in the module's declarations. Cycle guard: a name
+    // we've already followed resolves to nothing rather than recursing.
+    if !visited.insert(type_str.to_string()) {
+        return Vec::new();
+    }
     for decl in &module.decls {
         match &decl.node {
             DeclKind::TypeAlias { name, ty, .. } if name == type_str => {
@@ -1282,7 +1336,7 @@ fn extract_fields_from_type_str(type_str: &str, module: &Module) -> Vec<String> 
                     }
                     // Follow alias to another named type
                     TypeKind::Named(target) => {
-                        return extract_fields_from_type_str(target, module);
+                        return extract_fields_from_type_str_inner(target, module, visited);
                     }
                     _ => {}
                 }
@@ -2065,5 +2119,106 @@ mod regress_fixes_tests {
         assert!(!monad_head_matches("Int -> IO {} Int", &rel));
         assert!(!monad_head_matches("Map Text [Int]", &rel));
         assert!(!monad_head_matches("Text", &rel));
+    }
+
+    fn parse_module_src(src: &str) -> Module {
+        let lexer = knot::lexer::Lexer::new(src);
+        let (tokens, _) = lexer.tokenize();
+        let parser = knot::parser::Parser::new(src.to_string(), tokens);
+        parser.parse_module().0
+    }
+
+    /// Cyclic type aliases must not overflow the stack during
+    /// dot-completion field extraction.
+    #[test]
+    fn extract_fields_terminates_on_cyclic_type_aliases() {
+        // Previously: infinite mutual recursion A → B → A → … killing the
+        // whole LSP process. Now: terminates with no fields.
+        let module = parse_module_src("type A = B\ntype B = A\nx = 1\n");
+        assert!(extract_fields_from_type_str("A", &module).is_empty());
+        assert!(extract_fields_from_type_str("B", &module).is_empty());
+        // Self-cycle too.
+        let module2 = parse_module_src("type C = C\n");
+        assert!(extract_fields_from_type_str("C", &module2).is_empty());
+    }
+
+    /// Non-cyclic alias chains still resolve through the guard.
+    #[test]
+    fn extract_fields_follows_acyclic_alias_chain() {
+        let module = parse_module_src("type Person = {name: Text}\ntype Alias = Person\n");
+        assert_eq!(extract_fields_from_type_str("Alias", &module), vec!["name"]);
+    }
+
+    /// Monad-aware ranking must sample the do-block deterministically:
+    /// the INNERMOST monad_info span containing the cursor wins; without a
+    /// containing span, the first contained entry in (start, end) order.
+    #[test]
+    fn monad_for_do_span_prefers_innermost_containing_cursor() {
+        let mut info: HashMap<Span, MonadKind> = HashMap::new();
+        let do_span = Span::new(0, 100);
+        // Outer block's callsite entry.
+        info.insert(Span::new(5, 90), MonadKind::Relation);
+        // Nested do-block's entry.
+        info.insert(Span::new(40, 60), MonadKind::IO);
+        // Cursor inside the nested block → IO.
+        assert!(matches!(
+            monad_for_do_span(&info, do_span, 50),
+            Some(MonadKind::IO)
+        ));
+        // Cursor inside the outer block only → Relation.
+        assert!(matches!(
+            monad_for_do_span(&info, do_span, 10),
+            Some(MonadKind::Relation)
+        ));
+        // Cursor outside both → deterministic fallback (first by start).
+        assert!(matches!(
+            monad_for_do_span(&info, do_span, 95),
+            Some(MonadKind::Relation)
+        ));
+    }
+
+    /// `rateLimit <expr>` clauses inside route declarations hold ordinary
+    /// expressions — the route-block completion gate must not swallow them.
+    #[test]
+    fn rate_limit_expression_gets_normal_expression_completions() {
+        use crate::test_support::TestWorkspace;
+        let mut ws = TestWorkspace::new();
+        let src = "route Api where\n  GET /things -> Text rateLimit {key: \\i -> \\c -> Nothing, limit: {requests: 10, window: 1000}} = GetThings\n";
+        let uri = ws.open("main", src);
+        let doc = ws.doc(&uri);
+        // Sanity: the parser recorded the rateLimit expression.
+        let has_rl = doc.module.decls.iter().any(|d| {
+            matches!(&d.node, DeclKind::Route { entries, .. }
+                if entries.iter().any(|e| e.rate_limit.is_some()))
+        });
+        assert!(has_rl, "parser should record the rateLimit clause");
+        let off = doc.source.find("\\i ->").expect("rateLimit lambda");
+        assert!(
+            offset_in_route_rate_limit(&doc.module, off),
+            "cursor inside the rateLimit expression must be detected"
+        );
+        let pos = crate::utils::offset_to_position(&doc.source, off);
+        let params = CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: pos,
+            },
+            context: None,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let resp = handle_completion(&ws.state, &params).expect("completion response");
+        let items = match resp {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(l) => l.items,
+        };
+        // Expression completions include builtins like `show`; the gated
+        // route list contains only methods/types/headers.
+        assert!(
+            items.iter().any(|i| i.label == "show"),
+            "expected expression completions inside rateLimit; got {} items: {:?}",
+            items.len(),
+            items.iter().map(|i| &i.label).take(20).collect::<Vec<_>>()
+        );
     }
 }

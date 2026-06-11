@@ -46,19 +46,33 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     let word = word_at_position(&doc.source, pos)?;
     let word_span = word_span_at_offset(&doc.source, offset);
 
+    // Span containment must use the same leftward-resolved offset that
+    // `word_at_position` used: a caret immediately AFTER an identifier
+    // resolves the identifier to its left, so the binding lookup has to be
+    // nudged back inside that word too — otherwise hover at `total|` falls
+    // back to a same-named global instead of the local binding.
+    let lookup_offset = crate::utils::ident_lookup_offset(&doc.source, offset);
+
     // Try local binding types (let, bind, lambda params, case patterns).
     // Check if cursor is on a binding site or on a usage that references one.
+    // Several recorded spans can overlap (a destructuring pattern contains
+    // its binders); `local_type_info` is a HashMap, so a bare `.find()` is
+    // nondeterministic across runs — always pick the SMALLEST containing
+    // span (the innermost binding), tie-broken by start for determinism.
     let local_type = doc
         .local_type_info
         .iter()
-        .find(|(span, _)| span.start <= offset && offset < span.end)
+        .filter(|(span, _)| span.start <= lookup_offset && lookup_offset < span.end)
+        .min_by_key(|(span, _)| (span.end - span.start, span.start, span.end))
         .map(|(_, ty)| ty.clone())
         .or_else(|| {
-            // Cursor is on a usage — find the definition span and look up its type
+            // Cursor is on a usage — find the definition span and look up its
+            // type. References overlap the same way, so prefer the innermost.
             let (_, def_span) = doc
                 .references
                 .iter()
-                .find(|(usage, _)| usage.start <= offset && offset < usage.end)?;
+                .filter(|(usage, _)| usage.start <= lookup_offset && lookup_offset < usage.end)
+                .min_by_key(|(usage, _)| (usage.end - usage.start, usage.start, usage.end))?;
             doc.local_type_info.get(def_span).cloned()
         });
 
@@ -353,6 +367,13 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
         value.push_str(doc_comment);
     }
 
+    // Every section above is conditional — e.g. `field_at_cursor` can be
+    // `Some` without any refinement metadata to render. Don't ship an empty
+    // popup in that case; `None` lets the editor show nothing.
+    if value.trim().is_empty() {
+        return None;
+    }
+
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
@@ -571,7 +592,7 @@ fn type_contains_name(haystack: &str, name: &str) -> bool {
     if needle.is_empty() || bytes.len() < needle.len() {
         return false;
     }
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'';
     let mut i = 0;
     while i + needle.len() <= bytes.len() {
         if &bytes[i..i + needle.len()] == needle {
@@ -881,5 +902,105 @@ mod regress_fixes_tests {
             table.contains("| `age` | `Int` |"),
             "row after function-typed field was merged/lost: {table}"
         );
+    }
+
+    use crate::test_support::TestWorkspace;
+    use crate::utils::offset_to_position;
+
+    fn hover_params(uri: &Uri, position: Position) -> HoverParams {
+        HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+        }
+    }
+
+    fn hover_text(hover: Hover) -> String {
+        match hover.contents {
+            HoverContents::Markup(m) => m.value,
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// Hover at a caret sitting immediately AFTER an identifier (standard
+    /// post-typing position) must resolve the LOCAL binding to its left —
+    /// not fall back to a same-named global. `word_at_position` resolves the
+    /// word to the left; span containment has to use the same nudged offset.
+    #[test]
+    fn hover_after_identifier_prefers_local_over_same_named_global() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            "total : Text\ntotal = \"label\"\nf = \\total -> total + 1\n",
+        );
+        let doc = ws.doc(&uri);
+        // Caret right after the body USAGE of the lambda param `total`.
+        let usage = doc.source.rfind("total +").expect("usage");
+        let pos = offset_to_position(&doc.source, usage + "total".len());
+        let hover = handle_hover(&ws.state, &hover_params(&uri, pos)).expect("hover");
+        let text = hover_text(hover);
+        assert!(
+            text.contains("Int"),
+            "expected the local param's Int type, got: {text}"
+        );
+        assert!(
+            !text.lines().nth(1).unwrap_or("").contains("Text"),
+            "hover headline leaked the same-named global's type: {text}"
+        );
+    }
+
+    /// Overlapping local_type_info spans (a destructuring pattern containing
+    /// its binders) must resolve to the SMALLEST containing span. The old
+    /// `.find()` over a HashMap was nondeterministic across process runs.
+    #[test]
+    fn hover_picks_innermost_binding_span() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            "data P = P {a: Int, b: Text}\nf = \\p -> case p of\n  P {a, b} -> b\n",
+        );
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("a, b}").expect("binder a");
+        let pos = offset_to_position(&doc.source, off);
+        // Run the lookup many times — with the smallest-span rule the result
+        // is stable; the old behavior depended on HashMap iteration order.
+        let mut seen: Option<String> = None;
+        for _ in 0..16 {
+            let hover = handle_hover(&ws.state, &hover_params(&uri, pos)).expect("hover");
+            let text = hover_text(hover);
+            let headline = text.lines().nth(1).unwrap_or("").to_string();
+            match &seen {
+                None => seen = Some(headline),
+                Some(prev) => assert_eq!(prev, &headline, "hover result not stable"),
+            }
+        }
+        // The binder `a` is an Int; the whole-pattern span would render the
+        // record/variant type instead.
+        let headline = seen.unwrap_or_default();
+        assert!(
+            headline.contains("Int") || headline.contains("a :"),
+            "expected the innermost binder's type, got: {headline}"
+        );
+    }
+
+    /// A field-access position with no refinement metadata and no symbol
+    /// info must return None — not an empty popup.
+    #[test]
+    fn hover_returns_none_instead_of_empty_popup() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "f = \\p -> p.unknownField\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("unknownField").expect("field");
+        let pos = offset_to_position(&doc.source, off + 2);
+        let resp = handle_hover(&ws.state, &hover_params(&uri, pos));
+        if let Some(h) = resp {
+            let text = hover_text(h);
+            assert!(
+                !text.trim().is_empty(),
+                "hover returned an EMPTY popup; should have been None"
+            );
+        }
     }
 }

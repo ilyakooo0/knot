@@ -94,7 +94,10 @@ pub fn word_span_at_offset(source: &str, offset: usize) -> Option<Span> {
 
 fn word_bounds_at_offset(source: &str, offset: usize) -> Option<(usize, usize)> {
     let bytes = source.as_bytes();
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    // `'` is an identifier-continue character in the lexer (`x'` is one
+    // identifier), so word boundaries must treat it the same — otherwise
+    // rename/hover on `x'` resolve only `x` and corrupt primed identifiers.
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'';
 
     // The caret immediately after the last char of an identifier (the
     // standard post-typing cursor position) should still resolve that
@@ -109,16 +112,24 @@ fn word_bounds_at_offset(source: &str, offset: usize) -> Option<(usize, usize)> 
         return None;
     };
 
-    let start = (0..offset)
+    let mut start = (0..offset)
         .rev()
         .find(|&i| !is_ident(bytes[i]))
         .map(|i| i + 1)
         .unwrap_or(0);
+    // `'` cannot START an identifier — skip any leading primes (e.g. when
+    // the scan landed inside a string literal like "don't").
+    while start < bytes.len() && bytes[start] == b'\'' && start <= offset {
+        start += 1;
+    }
 
-    let end = (offset..bytes.len())
+    let end = (offset.max(start)..bytes.len())
         .find(|&i| !is_ident(bytes[i]))
         .unwrap_or(bytes.len());
 
+    if start >= end {
+        return None;
+    }
     Some((start, end))
 }
 
@@ -253,7 +264,9 @@ pub fn find_word_in_source(source: &str, name: &str, start: usize, end: usize) -
     let end = end.min(source.len());
     let text = source.get(start..end)?;
     let bytes = source.as_bytes();
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    // `'` continues identifiers in the lexer (`x'`), so it's a word char
+    // here too — `x` must not whole-word-match the prefix of `x'`.
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'';
 
     let mut search_start = 0;
     while search_start <= text.len() {

@@ -516,6 +516,12 @@ impl<'a> Parser<'a> {
         let mut rest: Option<String> = None;
         loop {
             self.skip_ws();
+            // Unterminated `IO {…` (truncated/malformed type string): EOF
+            // before the closing `}`. Bail instead of spinning forever — no
+            // arm below can make progress on a `None` peek.
+            if self.peek().is_none() {
+                return None;
+            }
             if self.peek() == Some('}') {
                 self.eat_char('}');
                 break;
@@ -850,5 +856,18 @@ mod regress_fixes_tests {
         // Closed rows unchanged.
         assert_eq!(ParsedType::parse("IO {fs} Text").render(), "IO {fs} Text");
         assert_eq!(ParsedType::parse("IO {} Text").render(), "IO {} Text");
+    }
+
+    /// Unterminated `IO {…` (truncated type string) used to spin forever in
+    /// `parse_effects_braces` — every loop iteration must consume input or
+    /// bail at EOF. The assertion is simply that parse RETURNS.
+    #[test]
+    fn unterminated_io_effect_row_terminates() {
+        let _ = ParsedType::parse("IO {");
+        let _ = ParsedType::parse("IO {console");
+        let _ = ParsedType::parse("IO {console, r *foo");
+        let _ = ParsedType::parse("IO {|");
+        let _ = ParsedType::parse("IO {| r");
+        let _ = ParsedType::parse("Int -> IO {fs");
     }
 }

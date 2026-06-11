@@ -317,6 +317,17 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     // Desugar monadic do blocks into trait method calls
     desugar::desugar(&mut module);
 
+    // Detect recursive type aliases before resolution — a cyclic alias
+    // (`type A = {x: A}`, mutual cycles) can never be resolved, so report
+    // a diagnostic instead of letting resolution chase the cycle.
+    let cycle_diags = types::check_alias_cycles(&module);
+    if !cycle_diags.is_empty() {
+        for diag in &cycle_diags {
+            eprintln!("{}", diag.render(&source, &filename));
+        }
+        process::exit(1);
+    }
+
     // Resolve types
     let type_env = types::TypeEnv::from_module(&module);
 
@@ -407,8 +418,7 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     if let Err(e) = linker::link(&obj_path, &runtime_path, &output_path) {
         eprintln!("Link error: {}", e);
         let _ = std::fs::remove_file(&obj_path);
-        let temp_runtime = std::env::temp_dir().join(format!("libknot_runtime_{}.a", std::process::id()));
-        if runtime_path == temp_runtime {
+        if is_extracted_temp_runtime(&runtime_path) {
             let _ = std::fs::remove_file(&runtime_path);
         }
         process::exit(1);
@@ -417,8 +427,7 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     // Clean up
     let _ = std::fs::remove_file(&obj_path);
     // Remove temp runtime if it was extracted from embedded bytes
-    let temp_runtime = std::env::temp_dir().join(format!("libknot_runtime_{}.a", std::process::id()));
-    if runtime_path == temp_runtime {
+    if is_extracted_temp_runtime(&runtime_path) {
         let _ = std::fs::remove_file(&runtime_path);
     }
 
@@ -444,6 +453,19 @@ const EMBEDDED_RUNTIME: Option<&[u8]> =
 #[cfg(not(has_embedded_runtime))]
 const EMBEDDED_RUNTIME: Option<&[u8]> = None;
 
+/// True if `p` is a runtime archive that `find_runtime` extracted into the
+/// temp directory for this process (and which is therefore ours to delete).
+fn is_extracted_temp_runtime(p: &std::path::Path) -> bool {
+    let tmp_dir = std::env::temp_dir();
+    p.parent() == Some(tmp_dir.as_path())
+        && p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| {
+                n.starts_with(&format!("libknot_runtime_{}_", std::process::id()))
+                    && n.ends_with(".a")
+            })
+}
+
 fn find_runtime() -> PathBuf {
     // 1. Environment variable override
     if let Ok(path) = std::env::var("KNOT_RUNTIME_LIB") {
@@ -463,11 +485,45 @@ fn find_runtime() -> PathBuf {
         }
     }
 
-    // 3. Extract embedded runtime to a temp file
+    // 3. Extract embedded runtime to a temp file. The name includes the
+    //    pid plus a nanosecond nonce and attempt counter, and the file is
+    //    opened with `create_new` (O_CREAT|O_EXCL — fails instead of
+    //    following an attacker-planted symlink or reusing an existing
+    //    file) and owner-only permissions on unix; collisions retry with
+    //    a fresh name.
     if let Some(bytes) = EMBEDDED_RUNTIME {
-        let tmp = std::env::temp_dir().join(format!("libknot_runtime_{}.a", std::process::id()));
-        if std::fs::write(&tmp, bytes).is_ok() {
-            return tmp;
+        use std::io::Write;
+        for attempt in 0..32u32 {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let tmp = std::env::temp_dir().join(format!(
+                "libknot_runtime_{}_{}_{:08x}.a",
+                std::process::id(),
+                attempt,
+                nonce
+            ));
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            match opts.open(&tmp) {
+                Ok(mut f) => {
+                    if f.write_all(bytes).is_ok() {
+                        return tmp;
+                    }
+                    let _ = std::fs::remove_file(&tmp);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    continue; // name collision — retry with a fresh nonce
+                }
+                Err(_) => break,
+            }
         }
     }
 

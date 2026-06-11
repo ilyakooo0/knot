@@ -6438,6 +6438,44 @@ impl Codegen {
                         );
                     }
 
+                    // Register refinement predicates for route body fields
+                    // on this table. The main_init registration targets the
+                    // tables built there, not this one — the serve loop
+                    // dispatches from this table, so refinements must be
+                    // registered here for the HTTP 400 auto-validation to
+                    // fire.
+                    for entry in &entries {
+                        let (ctor_ptr, ctor_len) =
+                            self.string_ptr(builder, &entry.constructor);
+                        for field in &entry.body_fields {
+                            let refined_type_name = match &field.value.node {
+                                ast::TypeKind::Refined { predicate, .. } => {
+                                    // Inline refinement — use field name as type name
+                                    Some((field.name.clone(), (**predicate).clone()))
+                                }
+                                ast::TypeKind::Named(name) => {
+                                    self.refined_types.get(name).map(|pred| (name.clone(), pred.clone()))
+                                }
+                                _ => None,
+                            };
+                            if let Some((type_name, pred_expr)) = refined_type_name {
+                                let mut pred_env = Env::new();
+                                let pred_fn =
+                                    self.compile_expr(builder, &pred_expr, &mut pred_env, db);
+                                let (fn_ptr, fn_len) = self.string_ptr(builder, &field.name);
+                                let (tn_ptr, tn_len) = self.string_ptr(builder, &type_name);
+                                self.call_rt_void(
+                                    builder,
+                                    "knot_route_set_field_refinement",
+                                    &[
+                                        table, ctor_ptr, ctor_len, fn_ptr, fn_len,
+                                        pred_fn, tn_ptr, tn_len,
+                                    ],
+                                );
+                            }
+                        }
+                    }
+
                     // Register rate-limit configurations on this table.
                     // The compiled `rateLimit` expression is a record value
                     // `{key, limit}` that the runtime unpacks.

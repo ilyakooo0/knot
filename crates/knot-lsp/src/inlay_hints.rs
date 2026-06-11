@@ -24,6 +24,19 @@ pub(crate) fn handle_inlay_hint(
     let range_start = position_to_offset(&doc.source, params.range.start);
     let range_end = position_to_offset(&doc.source, params.range.end);
 
+    // Config gating. Two user-facing knobs cover all hint categories:
+    //   `inlayTypes` — everything that surfaces inferred TYPE-ish info:
+    //     decl signature hints, local-binding type hints, record-pattern
+    //     field types, unit-literal hints, effect rows, monad context,
+    //     and trait-constraint hints (effects/monads/constraints are part
+    //     of a decl's type in Knot, so this is the closest flag).
+    //   `inlayParameterNames` — call-site parameter-name hints, plus the
+    //     closing-block labels (both are "reading aid" annotations rather
+    //     than type info; parameter names is the closest flag).
+    // The dirty-decl telemetry stays gated on KNOT_LSP_TRACE_DIRTY only.
+    let show_types = state.config.inlay_types;
+    let show_param_names = state.config.inlay_parameter_names;
+
     // Show inferred types for unannotated function declarations.
     // For annotated functions, show only the inferred *effects* if they exist
     // and aren't already in the type signature.
@@ -32,6 +45,9 @@ pub(crate) fn handle_inlay_hint(
     // start exceeds the visible range we can stop — the linear scan is bounded
     // by the visible-region size, not by the file's total decl count.
     for decl in &doc.module.decls {
+        if !show_types {
+            break;
+        }
         if decl.span.start > range_end {
             break;
         }
@@ -43,7 +59,11 @@ pub(crate) fn handle_inlay_hint(
             DeclKind::Fun { name, ty: None, .. } => {
                 if let Some(inferred) = doc.type_info.get(name) {
                     let decl_text = safe_slice(&doc.source, decl.span);
-                    let name_end = decl_text.find(|c: char| !c.is_alphanumeric() && c != '_')
+                    // `'` continues identifiers in the lexer (`x'` is one
+                    // token), so the hint anchor must skip it too — otherwise
+                    // `x' = 1` renders as `x : Int' = 1`.
+                    let name_end = decl_text
+                        .find(|c: char| !c.is_alphanumeric() && c != '_' && c != '\'')
                         .unwrap_or(decl_text.len());
                     let hint_offset = decl.span.start + name_end;
                     let hint_pos = offset_to_position(&doc.source, hint_offset);
@@ -147,9 +167,12 @@ pub(crate) fn handle_inlay_hint(
     // (an outer let around the cursor's expression starts well before its
     // end), so the lower bound is enforced per-iteration with the existing
     // `span.end < range_start` check.
-    let upper = doc
-        .local_type_info_sorted
-        .partition_point(|(s, _)| s.start <= range_end);
+    let upper = if show_types {
+        doc.local_type_info_sorted
+            .partition_point(|(s, _)| s.start <= range_end)
+    } else {
+        0
+    };
     for (span, ty) in &doc.local_type_info_sorted[..upper] {
         if span.end < range_start {
             continue;
@@ -171,38 +194,48 @@ pub(crate) fn handle_inlay_hint(
         });
     }
 
-    // Show inferred unit hints on numeric literals whose enclosing binding has
-    // a unit-annotated type. The literals themselves don't carry explicit unit
-    // syntax, so the user otherwise has to mentally trace the type — the hint
-    // shows e.g. `<M>` after `42` in `let distance : Float<M> = 42.0`.
-    add_unit_literal_hints(doc, range_start, range_end, &mut hints);
+    if show_types {
+        // Show inferred unit hints on numeric literals whose enclosing binding has
+        // a unit-annotated type. The literals themselves don't carry explicit unit
+        // syntax, so the user otherwise has to mentally trace the type — the hint
+        // shows e.g. `<M>` after `42` in `let distance : Float<M> = 42.0`.
+        add_unit_literal_hints(doc, range_start, range_end, &mut hints);
+    }
 
-    // Show parameter-name hints at named function call sites. The hint shows
-    // `name:` before each argument so multi-arg calls don't require jumping to
-    // the definition to know which argument is which.
-    add_parameter_name_hints(doc, range_start, range_end, &mut hints);
+    if show_param_names {
+        // Show parameter-name hints at named function call sites. The hint shows
+        // `name:` before each argument so multi-arg calls don't require jumping to
+        // the definition to know which argument is which.
+        add_parameter_name_hints(doc, range_start, range_end, &mut hints);
+    }
 
-    // Show the resolved monad kind at the start of each `do` block. Helps when
-    // the same `do` syntax can desugar to `[]`, `Maybe`, `Result`, or `IO`
-    // depending on context.
-    add_monad_context_hints(doc, range_start, range_end, &mut hints);
+    if show_types {
+        // Show the resolved monad kind at the start of each `do` block. Helps when
+        // the same `do` syntax can desugar to `[]`, `Maybe`, `Result`, or `IO`
+        // depending on context.
+        add_monad_context_hints(doc, range_start, range_end, &mut hints);
 
-    // Show per-field type hints for record-destructure patterns in case arms,
-    // do-binds, and lambda params. The whole-pattern hint (above) shows the
-    // record type; this loop adds `: T` after each individual field name so
-    // users can see the field types without expanding mentally.
-    add_record_pattern_field_hints(doc, range_start, range_end, &mut hints);
+        // Show per-field type hints for record-destructure patterns in case arms,
+        // do-binds, and lambda params. The whole-pattern hint (above) shows the
+        // record type; this loop adds `: T` after each individual field name so
+        // users can see the field types without expanding mentally.
+        add_record_pattern_field_hints(doc, range_start, range_end, &mut hints);
+    }
 
-    // Closing-label hints — for blocks that span many lines, show a hint at the
-    // closing token indicating what's ending. Helps when the opener is far
-    // off-screen.
-    add_closing_label_hints(doc, range_start, range_end, &mut hints);
+    if show_param_names {
+        // Closing-label hints — for blocks that span many lines, show a hint at the
+        // closing token indicating what's ending. Helps when the opener is far
+        // off-screen.
+        add_closing_label_hints(doc, range_start, range_end, &mut hints);
+    }
 
-    // Trait-constraint hints at call sites of constrained functions. The
-    // inferencer doesn't memoize per-call-site substitutions, so we surface
-    // the *declared* constraints — useful for spotting "this call brings in
-    // an Eq/Ord/Display requirement" without jumping to the definition.
-    add_constraint_hints(doc, range_start, range_end, &mut hints);
+    if show_types {
+        // Trait-constraint hints at call sites of constrained functions. The
+        // inferencer doesn't memoize per-call-site substitutions, so we surface
+        // the *declared* constraints — useful for spotting "this call brings in
+        // an Eq/Ord/Display requirement" without jumping to the definition.
+        add_constraint_hints(doc, range_start, range_end, &mut hints);
+    }
 
     // Per-decl re-check telemetry — gated on KNOT_LSP_TRACE_DIRTY since this
     // information is mostly useful when investigating incremental-inference
@@ -665,22 +698,34 @@ fn extract_unit_from_type_str(ty: &str) -> Option<String> {
     value.unit().map(|s| s.to_string())
 }
 
-/// Walk every binding-with-unit and emit hints on numeric literals inside the
-/// binding's defining expression.
+/// Walk every binding-with-unit and emit a hint on the binding's literal.
+///
+/// Attribution is deliberately conservative: the hint fires ONLY when the
+/// binding's RHS is exactly one bare numeric literal (`let d = 42.0` with an
+/// inferred `Float<M>`). Anything compound is skipped, because the binding's
+/// unit doesn't necessarily belong to each literal inside it:
+/// - `base * 2.0` — the `2.0` is dimensionless (unit algebra composes via
+///   `*`), so stamping the binding's `<M>` on it is wrong;
+/// - `42.0<M>` — an explicit `UnitLit` already spells the unit; recursing
+///   into its inner literal used to render `42.0<M><M>`;
+/// - `5 seconds` — the time-word sugar desugars to `5 * 1000` where the
+///   synthesized `1000` literal's span covers the word `seconds`, so the
+///   old walk hinted `<Ms>` after the word.
+/// When in doubt, no hint.
 fn add_unit_literal_hints(
     doc: &DocumentState,
     range_start: usize,
     range_end: usize,
     hints: &mut Vec<InlayHint>,
 ) {
-    fn collect_literals_in_expr(expr: &ast::Expr, out: &mut Vec<Span>) {
-        if matches!(
-            &expr.node,
-            ast::ExprKind::Lit(ast::Literal::Int(_)) | ast::ExprKind::Lit(ast::Literal::Float(_))
-        ) {
-            out.push(expr.span);
+    /// The RHS's span iff it is a single bare numeric literal (no explicit
+    /// unit annotation, no surrounding expression).
+    fn bare_literal_span(expr: &ast::Expr) -> Option<Span> {
+        match &expr.node {
+            ast::ExprKind::Lit(ast::Literal::Int(_))
+            | ast::ExprKind::Lit(ast::Literal::Float(_)) => Some(expr.span),
+            _ => None,
         }
-        recurse_expr(expr, |e| collect_literals_in_expr(e, out));
     }
 
     fn collect_literals_in_decl(decl: &ast::Decl, out: &mut Vec<(Span, ast::Expr)>) {
@@ -741,25 +786,46 @@ fn add_unit_literal_hints(
             Some(u) => u,
             None => continue,
         };
-        let mut literals = Vec::new();
-        collect_literals_in_expr(&rhs, &mut literals);
-        for span in literals {
-            if span.end < range_start || span.start > range_end {
-                continue;
-            }
-            hints.push(InlayHint {
-                position: offset_to_position(&doc.source, span.end),
-                label: InlayHintLabel::String(format!("<{unit}>")),
-                kind: Some(InlayHintKind::TYPE),
-                text_edits: None,
-                tooltip: Some(InlayHintTooltip::String(format!(
-                    "Inferred unit `{unit}` from enclosing binding"
-                ))),
-                padding_left: None,
-                padding_right: None,
-                data: None,
-            });
+        let span = match bare_literal_span(&rhs) {
+            Some(s) => s,
+            None => continue,
+        };
+        if span.end < range_start || span.start > range_end {
+            continue;
         }
+        // Belt-and-suspenders: only hint when the span's source text really
+        // is a numeric literal, and the source doesn't already spell a unit
+        // (`<…>`) or a time word right after it — synthesized/desugared
+        // literals carry spans pointing at non-numeric tokens.
+        let text = safe_slice(&doc.source, span);
+        let is_numeric = !text.is_empty()
+            && text
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == '.' || c == '_');
+        if !is_numeric {
+            continue;
+        }
+        if doc
+            .source
+            .get(span.end.min(doc.source.len())..)
+            .unwrap_or("")
+            .trim_start()
+            .starts_with('<')
+        {
+            continue;
+        }
+        hints.push(InlayHint {
+            position: offset_to_position(&doc.source, span.end),
+            label: InlayHintLabel::String(format!("<{unit}>")),
+            kind: Some(InlayHintKind::TYPE),
+            text_edits: None,
+            tooltip: Some(InlayHintTooltip::String(format!(
+                "Inferred unit `{unit}` from enclosing binding"
+            ))),
+            padding_left: None,
+            padding_right: None,
+            data: None,
+        });
     }
 }
 
@@ -1485,6 +1551,159 @@ checkGlobalRate = \t -> atomic do
                 && matches!(&h.label, InlayHintLabel::String(s) if s == ": Text")
         });
         assert!(!leaked, "fields from a second same-named ctor leaked: {hints:?}");
+    }
+
+    fn hint_labels(hints: &[InlayHint]) -> Vec<String> {
+        hints
+            .iter()
+            .map(|h| match &h.label {
+                InlayHintLabel::String(s) => s.clone(),
+                _ => String::new(),
+            })
+            .collect()
+    }
+
+    /// Bug 19: `'` continues identifiers — the type-hint anchor for `x' = 1`
+    /// must sit after the prime, not between `x` and `'`.
+    #[test]
+    fn type_hint_anchor_includes_primed_identifier() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "x' = 1\n");
+        let range = ws.whole_file_range(&uri);
+        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
+        let type_hint = hints
+            .iter()
+            .find(|h| matches!(&h.label, InlayHintLabel::String(s) if s.starts_with(':')))
+            .expect("type hint for x'");
+        assert_eq!(
+            type_hint.position,
+            Position::new(0, 2),
+            "anchor must sit AFTER the prime (x'|), not inside the token"
+        );
+    }
+
+    /// Bug 18: an explicitly-annotated literal (`42.0<M>`) must not get an
+    /// additional `<M>` hint (used to render `42.0<M><M>`).
+    #[test]
+    fn unit_hint_not_duplicated_on_annotated_literal() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            "unit M\nf = \\q -> do\n  let y = 42.0<M>\n  yield y\n",
+        );
+        let range = ws.whole_file_range(&uri);
+        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
+        let labels = hint_labels(&hints);
+        assert!(
+            !labels.iter().any(|l| l == "<M>"),
+            "explicitly-annotated literal must not get a unit hint; got {labels:?}"
+        );
+    }
+
+    /// Bug 18: in `base * 2.0` the `2.0` is dimensionless (`*` composes
+    /// units), so the binding's `<M>` must not be stamped onto it.
+    #[test]
+    fn unit_hint_skips_dimensionless_literal_in_compound_rhs() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            "unit M\nbase : Float<M>\nbase = 1.0<M>\n\nf = \\q -> do\n  let y = base * 2.0\n  yield y\n",
+        );
+        let doc = ws.doc(&uri);
+        // Sanity: the binding really inferred a unit — otherwise this test
+        // passes vacuously on the old code too.
+        assert!(
+            doc.local_type_info.values().any(|t| t.contains("<M>")),
+            "setup: y should infer Float<M>; got {:?}",
+            doc.local_type_info
+        );
+        let range = ws.whole_file_range(&uri);
+        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
+        let labels = hint_labels(&hints);
+        assert!(
+            !labels.iter().any(|l| l == "<M>"),
+            "dimensionless `2.0` must not be hinted `<M>`; got {labels:?}"
+        );
+    }
+
+    /// Bug 18: the `5 seconds` sugar desugars to `5 * 1000` where the
+    /// synthesized literal's span covers the word — no `<Ms>` hint after it.
+    #[test]
+    fn unit_hint_suppressed_on_time_word_sugar() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            "f = \\q -> do\n  let t = 5 seconds\n  sleep t\n",
+        );
+        let range = ws.whole_file_range(&uri);
+        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
+        let labels = hint_labels(&hints);
+        assert!(
+            !labels.iter().any(|l| l == "<Ms>"),
+            "time-word sugar must not get a `<Ms>` hint; got {labels:?}"
+        );
+    }
+
+    /// Bug 18 (positive case): a bare-literal RHS whose binding carries a
+    /// unit still gets the hint.
+    #[test]
+    fn unit_hint_still_fires_on_bare_literal_binding() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            "unit M\nbase : Float<M>\nbase = 1.0<M>\n\nf = \\q -> do\n  let y = 2.0\n  yield (base + y)\n",
+        );
+        let doc = ws.doc(&uri);
+        if !doc.local_type_info.values().any(|t| t.contains("<M>")) {
+            // Inference rendered `y` without a concrete unit — nothing for
+            // the hint to show; skip rather than assert on inference detail.
+            return;
+        }
+        let range = ws.whole_file_range(&uri);
+        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
+        let labels = hint_labels(&hints);
+        assert!(
+            labels.iter().any(|l| l == "<M>"),
+            "bare literal with unit-carrying binding should be hinted; got {labels:?}"
+        );
+    }
+
+    /// Bug 3: `inlayTypes` config flag gates every type-ish hint category.
+    #[test]
+    fn inlay_types_flag_disables_type_hints() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "id = \\x -> x\n");
+        ws.state.config.inlay_types = false;
+        let range = ws.whole_file_range(&uri);
+        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
+        let labels = hint_labels(&hints);
+        assert!(
+            !labels.iter().any(|l| l.starts_with(':')),
+            "inlayTypes=false must suppress type hints; got {labels:?}"
+        );
+    }
+
+    /// Bug 3: `inlayParameterNames` gates call-site parameter-name hints.
+    #[test]
+    fn inlay_parameter_names_flag_disables_param_hints() {
+        let mut ws = TestWorkspace::new();
+        let src = "addUp = \\first second -> first + second\nmain = addUp 1 2\n";
+        let uri = ws.open("main", src);
+        let range = ws.whole_file_range(&uri);
+        // Default config: parameter-name hints present.
+        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
+        let labels = hint_labels(&hints);
+        assert!(
+            labels.iter().any(|l| l == "first:"),
+            "setup: param hints should fire by default; got {labels:?}"
+        );
+        ws.state.config.inlay_parameter_names = false;
+        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
+        let labels = hint_labels(&hints);
+        assert!(
+            !labels.iter().any(|l| l.ends_with(':') && !l.starts_with(':')),
+            "inlayParameterNames=false must suppress param hints; got {labels:?}"
+        );
     }
 
     /// Effects hint for ANNOTATED functions must anchor at the end of the

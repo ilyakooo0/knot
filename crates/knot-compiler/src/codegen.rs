@@ -227,6 +227,14 @@ pub struct Codegen {
     // this is the block that `retry` jumps to (rollback + wait + loop).
     // Used to short-circuit execution on retry instead of flag-based checking.
     atomic_retry_block: Option<cranelift_codegen::ir::Block>,
+    // Innermost IO comprehension loop's row-skip block — when compiling the
+    // statements that follow a `pat <- relation` bind inside an IO do-block,
+    // `where` guard failures and pattern-bind mismatches jump here so the
+    // current row is SKIPPED (no value pushed into the loop's result),
+    // instead of to the do-block's done_block (which would push unit).
+    // Saved/restored around each loop's rest and cleared for fresh nested
+    // do-blocks and new function contexts.
+    io_loop_skip_block: Option<cranelift_codegen::ir::Block>,
     // Number of arena frames pushed (and not yet popped) since the innermost
     // atomic loop head. The direct `retry` jump to atomic_retry_block must
     // emit this many extra knot_arena_pop_frame calls first: retry_block
@@ -800,6 +808,7 @@ impl Codegen {
             required_constants: Vec::new(),
             in_io_eager: false,
             atomic_retry_block: None,
+            io_loop_skip_block: None,
             atomic_arena_frames: 0,
             refined_types: HashMap::new(),
             refine_targets: HashMap::new(),
@@ -1008,6 +1017,7 @@ impl Codegen {
         self.declare_rt("knot_relation_ap", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_fold", &[p, p, p, p], &[p]);
         self.declare_rt("knot_relation_traverse", &[p, p, p], &[p]);
+        self.declare_rt("knot_relation_traverse_kind", &[p, p, p, p, p], &[p]);
         self.declare_rt("knot_relation_single", &[p], &[p]);
         self.declare_rt("knot_relation_any", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_all", &[p, p, p], &[p]);
@@ -3060,6 +3070,9 @@ impl Codegen {
         let mut ctx = std::mem::replace(&mut self.ctx, self.module.make_context());
         let mut fb_ctx =
             std::mem::replace(&mut self.builder_ctx, FunctionBuilderContext::new());
+        // Block references never cross function boundaries — clear the
+        // per-function loop-skip target for the new builder context.
+        let prev_io_loop_skip = self.io_loop_skip_block.take();
 
         ctx.func.signature = sig;
 
@@ -3081,6 +3094,7 @@ impl Codegen {
         self.builder_ctx = fb_ctx;
         self.ctx = ctx;
         self.module.clear_context(&mut self.ctx);
+        self.io_loop_skip_block = prev_io_loop_skip;
     }
 
     fn define_user_function(
@@ -4760,6 +4774,13 @@ impl Codegen {
                 let prev_atomic_arena_frames = self.atomic_arena_frames;
                 self.atomic_arena_frames = 0;
 
+                // Guard failures inside the atomic body must flow to ITS
+                // done_block (so the skip flag triggers rollback) — never
+                // to an enclosing bind-loop's skip block, which would jump
+                // straight past the commit/rollback machinery and leak the
+                // savepoint.
+                let prev_io_loop_skip = self.io_loop_skip_block.take();
+
                 // Compile inner IO eagerly so side effects run inside the transaction.
                 // If the inner is an IO do-block, we must run it inline rather than
                 // creating a deferred thunk (which would execute after commit).
@@ -4776,6 +4797,7 @@ impl Codegen {
                     self.call_rt(builder, "knot_io_run", &[db, io_val])
                 };
 
+                self.io_loop_skip_block = prev_io_loop_skip;
                 self.atomic_retry_block = prev_retry_block;
                 self.atomic_arena_frames = prev_atomic_arena_frames;
 
@@ -5752,12 +5774,22 @@ impl Codegen {
                                             .get(&plan.tables[0].source_name)
                                             .cloned()
                                             .unwrap_or_default();
-                                        extract_sql_field_access(&agg_bind, agg_body, alias, &schema)
-                                            .map(|col_sql| {
-                                                let ty = infer_sql_expr_type(&agg_bind, agg_body, &schema)
-                                                    .unwrap_or_else(|| "float".to_string());
-                                                (col_sql, ty)
-                                            })
+                                        // MIN/MAX over an Int-typed CASE
+                                        // loses the KNOT_INT collation —
+                                        // keep those in memory (see
+                                        // int_case_projection_pushable).
+                                        let case_ok = !matches!(name.as_str(), "minOn" | "maxOn")
+                                            || int_case_projection_pushable(&agg_bind, agg_body, &schema);
+                                        if case_ok {
+                                            extract_sql_field_access(&agg_bind, agg_body, alias, &schema)
+                                                .map(|col_sql| {
+                                                    let ty = infer_sql_expr_type(&agg_bind, agg_body, &schema)
+                                                        .unwrap_or_else(|| "float".to_string());
+                                                    (col_sql, ty)
+                                                })
+                                        } else {
+                                            None
+                                        }
                                     }
                                     _ => None,
                                 };
@@ -6163,6 +6195,38 @@ impl Codegen {
                 || (name == "fetchWith" && args.len() == 3)
             {
                 return self.compile_fetch(builder, &args, name == "fetchWith", env, db);
+            }
+        }
+
+        // Special case: `traverse f rel` over a relation with a statically
+        // known applicative — pass the kind so an EMPTY input produces
+        // `pure []` in the right applicative instead of unconditionally the
+        // Relation result `[[]]` (the runtime otherwise dispatches on the
+        // first mapped element, which doesn't exist for empty inputs).
+        // Inference records a monad_info entry keyed by the call span only
+        // for relation containers; locally bound or user-defined `traverse`
+        // names skip this and use normal dispatch.
+        if let ast::ExprKind::Var(name) = &func_expr.node {
+            if name == "traverse"
+                && args.len() == 2
+                && !env.bindings.contains_key("traverse")
+                && !self.top_fn_names.contains("traverse")
+            {
+                if let Some(kind) = self.monad_info.get(&expr.span).cloned() {
+                    let kind_str = match &kind {
+                        MonadKind::IO => "io".to_string(),
+                        MonadKind::Relation => "relation".to_string(),
+                        MonadKind::Adt(n) => n.clone(),
+                    };
+                    let f_val = self.compile_expr(builder, args[0], env, db);
+                    let rel_val = self.compile_expr(builder, args[1], env, db);
+                    let (k_ptr, k_len) = self.string_ptr(builder, &kind_str);
+                    return self.call_rt(
+                        builder,
+                        "knot_relation_traverse_kind",
+                        &[db, f_val, rel_val, k_ptr, k_len],
+                    );
+                }
             }
         }
 
@@ -6955,11 +7019,10 @@ impl Codegen {
             // For unconditional patterns on the last arm, use merge_block
             // as next_block. For conditional patterns, always create a
             // separate block (merge_block has a parameter that brif can't
-            // provide).
-            let is_unconditional = matches!(
-                &arm.pat.node,
-                ast::PatKind::Wildcard | ast::PatKind::Var(_) | ast::PatKind::Record(_)
-            );
+            // provide). A pattern is only unconditional when it is
+            // irrefutable all the way down — nested literals, constructor
+            // tags, and list shapes all emit runtime tests that can fail.
+            let is_unconditional = case_pattern_is_irrefutable(&arm.pat);
             let next_block = if is_last && is_unconditional {
                 merge_block
             } else {
@@ -7107,9 +7170,22 @@ impl Codegen {
             builder.switch_to_block(arm_block);
             builder.seal_block(arm_block);
 
-            // Bind pattern variables
+            // Bind pattern variables. Refutable patterns may carry nested
+            // sub-patterns (literals, constructor tags, list shapes) that
+            // the top-level discriminant test above did not cover — bind
+            // them through the testing variant, which branches to
+            // next_block on a sub-pattern mismatch so the next arm is
+            // tried. Irrefutable patterns can't fail and bind directly
+            // (next_block may be merge_block, which carries a param that
+            // a mismatch branch couldn't provide).
             let mut arm_env = env.clone();
-            self.bind_case_pattern(builder, &arm.pat, scrut, &mut arm_env);
+            if is_unconditional {
+                self.bind_case_pattern(builder, &arm.pat, scrut, &mut arm_env);
+            } else {
+                self.bind_case_pattern_checked(
+                    builder, &arm.pat, scrut, &mut arm_env, next_block,
+                );
+            }
 
             let arm_val = if self.in_io_eager {
                 self.compile_io_expr_eager(builder, &arm.body, &mut arm_env, db)
@@ -7196,6 +7272,197 @@ impl Codegen {
                     self.call_rt(builder, "knot_relation_tail", &[val]);
                 self.bind_case_pattern(builder, head, head_val, env);
                 self.bind_case_pattern(builder, tail, tail_val, env);
+            }
+        }
+    }
+
+    /// Extract a constructor's payload value for pattern binding
+    /// (Bool and nullable constructors have special representations).
+    fn case_ctor_payload(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        name: &str,
+        val: Value,
+    ) -> Value {
+        if name == "True" || name == "False" {
+            // Bool is represented as Value::Bool, not Value::Constructor —
+            // calling knot_constructor_payload would panic. The payload is
+            // conceptually unit (Bool has no fields).
+            self.call_rt(builder, "knot_value_unit", &[])
+        } else if matches!(self.nullable_ctors.get(name), Some(NullableRole::None)) {
+            // Nullable none: payload is conceptually unit
+            self.call_rt(builder, "knot_value_unit", &[])
+        } else if matches!(self.nullable_ctors.get(name), Some(NullableRole::Some)) {
+            // Nullable some: val is the bare payload
+            val
+        } else {
+            self.call_rt(builder, "knot_constructor_payload", &[val])
+        }
+    }
+
+    /// Bind a case-arm pattern whose TOP-LEVEL discriminant was already
+    /// tested by `compile_case`, emitting runtime tests for refutable
+    /// SUB-patterns (nested literals, constructor tags, list shapes).
+    /// On a sub-pattern mismatch, control branches to `fail_block` (the
+    /// next arm's test, or the no-match panic block for the last arm).
+    fn bind_case_pattern_checked(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        pat: &ast::Pat,
+        val: Value,
+        env: &mut Env,
+        fail_block: cranelift_codegen::ir::Block,
+    ) {
+        match &pat.node {
+            ast::PatKind::Var(name) => env.set(name, val),
+            ast::PatKind::Wildcard => {}
+            // Top-level literal equality was tested by compile_case.
+            ast::PatKind::Lit(_) => {}
+            ast::PatKind::Constructor { name, payload } => {
+                // Tag already tested at top level — test+bind the payload.
+                let inner = self.case_ctor_payload(builder, name, val);
+                self.test_and_bind_case_subpattern(builder, payload, inner, env, fail_block);
+            }
+            ast::PatKind::Record(fields) => {
+                for fp in fields {
+                    let (key_ptr, key_len) = self.string_ptr(builder, &fp.name);
+                    let field_val =
+                        self.call_rt(builder, "knot_record_field", &[val, key_ptr, key_len]);
+                    if let Some(inner_pat) = &fp.pattern {
+                        self.test_and_bind_case_subpattern(
+                            builder, inner_pat, field_val, env, fail_block,
+                        );
+                    } else {
+                        // Punned: {name} means {name: name}
+                        env.set(&fp.name, field_val);
+                    }
+                }
+            }
+            ast::PatKind::List(pats) => {
+                // Length already tested at top level — test+bind elements.
+                for (idx, elem_pat) in pats.iter().enumerate() {
+                    let index = builder.ins().iconst(self.ptr_type, idx as i64);
+                    let elem =
+                        self.call_rt(builder, "knot_relation_get", &[val, index]);
+                    self.test_and_bind_case_subpattern(builder, elem_pat, elem, env, fail_block);
+                }
+            }
+            ast::PatKind::Cons { head, tail } => {
+                // Non-emptiness already tested at top level.
+                let zero = builder.ins().iconst(self.ptr_type, 0);
+                let head_val =
+                    self.call_rt(builder, "knot_relation_get", &[val, zero]);
+                let tail_val =
+                    self.call_rt(builder, "knot_relation_tail", &[val]);
+                self.test_and_bind_case_subpattern(builder, head, head_val, env, fail_block);
+                self.test_and_bind_case_subpattern(builder, tail, tail_val, env, fail_block);
+            }
+        }
+    }
+
+    /// Test a NESTED case sub-pattern against `val`, branching to
+    /// `fail_block` on mismatch, then bind its variables (recursively
+    /// testing deeper sub-patterns the same way).
+    fn test_and_bind_case_subpattern(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        pat: &ast::Pat,
+        val: Value,
+        env: &mut Env,
+        fail_block: cranelift_codegen::ir::Block,
+    ) {
+        // Emit `brif test, cont, fail_block` and continue in cont.
+        let branch_on = |builder: &mut FunctionBuilder, is_match: Value| {
+            let cont = builder.create_block();
+            builder.ins().brif(is_match, cont, &[], fail_block, &[]);
+            builder.switch_to_block(cont);
+            builder.seal_block(cont);
+        };
+        match &pat.node {
+            ast::PatKind::Var(name) => env.set(name, val),
+            ast::PatKind::Wildcard => {}
+            ast::PatKind::Lit(lit) => {
+                let lit_val = self.compile_lit(builder, lit);
+                let eq_i32 = self.call_rt_typed(
+                    builder,
+                    "knot_value_eq_i32",
+                    &[val, lit_val],
+                    types::I32,
+                );
+                let is_eq = builder.ins().icmp_imm(IntCC::NotEqual, eq_i32, 0);
+                branch_on(builder, is_eq);
+            }
+            ast::PatKind::Constructor { name, payload } => {
+                let is_match = if name == "True" || name == "False" {
+                    let bool_val = self.call_rt_typed(
+                        builder,
+                        "knot_value_get_bool",
+                        &[val],
+                        types::I32,
+                    );
+                    let expected = if name == "True" { 1i64 } else { 0i64 };
+                    builder.ins().icmp_imm(IntCC::Equal, bool_val, expected)
+                } else {
+                    match self.nullable_ctors.get(name).cloned() {
+                        Some(NullableRole::None) => {
+                            builder.ins().icmp_imm(IntCC::Equal, val, 0)
+                        }
+                        Some(NullableRole::Some) => {
+                            builder.ins().icmp_imm(IntCC::NotEqual, val, 0)
+                        }
+                        None => {
+                            let (tag_ptr, tag_len) = self.string_ptr(builder, name);
+                            let matches = self.call_rt_typed(
+                                builder,
+                                "knot_constructor_matches",
+                                &[val, tag_ptr, tag_len],
+                                types::I32,
+                            );
+                            builder.ins().icmp_imm(IntCC::NotEqual, matches, 0)
+                        }
+                    }
+                };
+                branch_on(builder, is_match);
+                let inner = self.case_ctor_payload(builder, name, val);
+                self.test_and_bind_case_subpattern(builder, payload, inner, env, fail_block);
+            }
+            ast::PatKind::Record(fields) => {
+                for fp in fields {
+                    let (key_ptr, key_len) = self.string_ptr(builder, &fp.name);
+                    let field_val =
+                        self.call_rt(builder, "knot_record_field", &[val, key_ptr, key_len]);
+                    if let Some(inner_pat) = &fp.pattern {
+                        self.test_and_bind_case_subpattern(
+                            builder, inner_pat, field_val, env, fail_block,
+                        );
+                    } else {
+                        env.set(&fp.name, field_val);
+                    }
+                }
+            }
+            ast::PatKind::List(pats) => {
+                let len = self.call_rt(builder, "knot_relation_len", &[val]);
+                let expected = builder.ins().iconst(self.ptr_type, pats.len() as i64);
+                let is_match = builder.ins().icmp(IntCC::Equal, len, expected);
+                branch_on(builder, is_match);
+                for (idx, elem_pat) in pats.iter().enumerate() {
+                    let index = builder.ins().iconst(self.ptr_type, idx as i64);
+                    let elem =
+                        self.call_rt(builder, "knot_relation_get", &[val, index]);
+                    self.test_and_bind_case_subpattern(builder, elem_pat, elem, env, fail_block);
+                }
+            }
+            ast::PatKind::Cons { head, tail } => {
+                let len = self.call_rt(builder, "knot_relation_len", &[val]);
+                let is_match = builder.ins().icmp_imm(IntCC::NotEqual, len, 0);
+                branch_on(builder, is_match);
+                let zero = builder.ins().iconst(self.ptr_type, 0);
+                let head_val =
+                    self.call_rt(builder, "knot_relation_get", &[val, zero]);
+                let tail_val =
+                    self.call_rt(builder, "knot_relation_tail", &[val]);
+                self.test_and_bind_case_subpattern(builder, head, head_val, env, fail_block);
+                self.test_and_bind_case_subpattern(builder, tail, tail_val, env, fail_block);
             }
         }
     }
@@ -7881,8 +8148,12 @@ impl Codegen {
                     let io_val = self.compile_expr(builder, expr, env, db);
                     // Run the IO action to get the result
                     let result = self.call_rt(builder, "knot_io_run", &[db, io_val]);
-                    // Bind the result to the pattern
-                    self.bind_io_pattern(builder, pat, result, env, Some(done_block));
+                    // Bind the result to the pattern. Inside a bind-loop's
+                    // rest, a mismatch skips the current row instead of
+                    // pushing unit into the loop result.
+                    let mismatch_target =
+                        self.io_loop_skip_block.unwrap_or(done_block);
+                    self.bind_io_pattern(builder, pat, result, env, Some(mismatch_target));
                     // Running the bound action may have written relations —
                     // variables bound from those sources are now stale.
                     self.invalidate_after_possible_writes(expr);
@@ -7951,15 +8222,21 @@ impl Codegen {
                             self.io_relation_vars.insert(var_name.clone());
                         }
                     }
-                    self.bind_io_pattern(builder, pat, val, env, Some(done_block));
+                    let mismatch_target =
+                        self.io_loop_skip_block.unwrap_or(done_block);
+                    self.bind_io_pattern(builder, pat, val, env, Some(mismatch_target));
                     self.invalidate_after_possible_writes(expr);
                     last_val = val;
                 }
                 ast::StmtKind::Where { cond } => {
                     // In IO do-blocks, where acts as a guard:
                     // if the condition is false, skip remaining statements
-                    // and return unit. Inside an atomic body, also signal
-                    // skip so the surrounding `atomic` rolls back.
+                    // and return unit — or, when these statements are the
+                    // body of a comprehension-style bind loop, skip the
+                    // current ROW (jump to the loop's skip block) so no
+                    // unit value is pushed into the loop's result. Inside
+                    // an atomic body, also signal skip so the surrounding
+                    // `atomic` rolls back.
                     let cond_i32 =
                         self.compile_condition(builder, cond, env, db);
                     self.invalidate_after_possible_writes(cond);
@@ -7976,7 +8253,9 @@ impl Codegen {
                         self.call_rt(builder, "knot_stm_skip", &[]);
                     }
                     let unit = self.call_rt(builder, "knot_value_unit", &[]);
-                    builder.ins().jump(done_block, &[unit.into()]);
+                    let guard_target =
+                        self.io_loop_skip_block.unwrap_or(done_block);
+                    builder.ins().jump(guard_target, &[unit.into()]);
                     builder.switch_to_block(pass_block);
                     builder.seal_block(pass_block);
                 }
@@ -8028,9 +8307,17 @@ impl Codegen {
         let header = builder.create_block();
         let body = builder.create_block();
         let continue_blk = builder.create_block();
-        // The continue block receives the per-row value; bind_io_pattern's
-        // mismatch skips also jump here (passing unit).
+        // The continue block receives the per-row value and pushes it into
+        // the result relation.
         merge_block_param(builder, continue_blk, self.ptr_type);
+        // The skip block is the target of guard failures (`where` false)
+        // and pattern-bind mismatches: it advances to the next row WITHOUT
+        // pushing anything, so skipped rows don't appear as unit values in
+        // the result. It takes one (ignored) param so the shared
+        // jump-with-unit fail paths in bind_io_pattern/compile_io_do_eager
+        // can target it uniformly.
+        let skip_blk = builder.create_block();
+        merge_block_param(builder, skip_blk, self.ptr_type);
         let exit = builder.create_block();
 
         let zero = builder.ins().iconst(self.ptr_type, 0);
@@ -8047,18 +8334,29 @@ impl Codegen {
         // Bind into a per-iteration env clone so loop-local SSA values never
         // leak into code emitted after the loop exits.
         let mut body_env = env.clone();
-        self.bind_io_pattern(builder, pat, row, &mut body_env, Some(continue_blk));
+        self.bind_io_pattern(builder, pat, row, &mut body_env, Some(skip_blk));
+        // While compiling the remaining statements, guard failures skip the
+        // current row (innermost loop wins; restored on exit).
+        let prev_skip = self.io_loop_skip_block.replace(skip_blk);
         let row_val = if rest.is_empty() {
             row
         } else {
             self.compile_io_do_eager(builder, rest, &mut body_env, db)
         };
+        self.io_loop_skip_block = prev_skip;
         builder.ins().jump(continue_blk, &[row_val.into()]);
 
+        // continue_blk pushes the row value, then falls through to skip_blk
+        // for the shared "advance to next row" step (this also guarantees
+        // skip_blk is reachable even when no guard ever targets it).
         builder.switch_to_block(continue_blk);
         builder.seal_block(continue_blk);
         let cont_val = builder.block_params(continue_blk)[0];
         self.call_rt_void(builder, "knot_relation_push", &[result, cont_val]);
+        builder.ins().jump(skip_blk, &[cont_val.into()]);
+
+        builder.switch_to_block(skip_blk);
+        builder.seal_block(skip_blk);
         let one = builder.ins().iconst(self.ptr_type, 1);
         let next = builder.ins().iadd(i, one);
         builder.ins().jump(header, &[next.into()]);
@@ -8128,7 +8426,13 @@ impl Codegen {
         }
         if let ast::ExprKind::Do(stmts) = &expr.node {
             if self.is_io_do_block(stmts) {
-                return self.compile_io_do_eager(builder, stmts, env, db);
+                // A fresh nested do-block has its own guard semantics
+                // (where false returns unit from THIS block) — its guards
+                // must not skip the enclosing bind-loop's row.
+                let prev_skip = self.io_loop_skip_block.take();
+                let val = self.compile_io_do_eager(builder, stmts, env, db);
+                self.io_loop_skip_block = prev_skip;
+                return val;
             }
         }
         // General case: compile and run knot_io_run — safe for non-IO
@@ -8248,6 +8552,89 @@ impl Codegen {
         }
     }
 
+    /// Check that statements after a `groupBy` only reference the primary
+    /// (grouped) bind variable among the names bound inside the pre-group
+    /// loops. Returns a diagnostic for the first offending reference.
+    fn validate_group_by_references(
+        stmts: &[ast::Stmt],
+        group_pos: usize,
+    ) -> Option<knot::diagnostic::Diagnostic> {
+        // The primary bind is the most recent bind before groupBy — it is
+        // the one rebound to each group sub-relation.
+        let mut primary: Option<String> = None;
+        let mut first_bind_seen = false;
+        let mut loop_local: HashSet<String> = HashSet::new();
+        for stmt in &stmts[..group_pos] {
+            match &stmt.node {
+                ast::StmtKind::Bind { pat, .. } => {
+                    let mut names = HashSet::new();
+                    collect_pat_binds(pat, &mut names);
+                    loop_local.extend(names);
+                    first_bind_seen = true;
+                    if let Some(p) = pat_primary_var(&pat.node) {
+                        primary = Some(p);
+                    }
+                }
+                // Lets BEFORE the first bind are emitted outside any loop
+                // and stay valid after groupBy; lets after it are emitted
+                // inside the loop bodies.
+                ast::StmtKind::Let { pat, .. } if first_bind_seen => {
+                    let mut names = HashSet::new();
+                    collect_pat_binds(pat, &mut names);
+                    loop_local.extend(names);
+                }
+                _ => {}
+            }
+        }
+        if let Some(p) = &primary {
+            loop_local.remove(p);
+        }
+        if loop_local.is_empty() {
+            return None;
+        }
+
+        let mut live = loop_local;
+        for stmt in &stmts[group_pos..] {
+            let expr_to_check: Option<&ast::Expr> = match &stmt.node {
+                ast::StmtKind::GroupBy { key } => Some(key),
+                ast::StmtKind::Where { cond } => Some(cond),
+                ast::StmtKind::Expr(e) => Some(e),
+                ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Let { expr, .. } => Some(expr),
+            };
+            if let Some(e) = expr_to_check {
+                if let Some(name) = live.iter().find(|n| expr_refs_var(e, n)).cloned() {
+                    let grouped = primary
+                        .as_ref()
+                        .map(|p| format!(" '{}'", p))
+                        .unwrap_or_default();
+                    return Some(
+                        knot::diagnostic::Diagnostic::error(format!(
+                            "variable '{}' cannot be referenced after groupBy: \
+                             only the grouped binding{} is rebound to each group",
+                            name, grouped
+                        ))
+                        .label(stmt.span, format!("'{}' refers to a pre-groupBy row", name))
+                        .note(
+                            "yield the needed values into an intermediate relation \
+                             before grouping, or group directly on the relation that \
+                             contains them",
+                        ),
+                    );
+                }
+            }
+            // A post-group bind/let rebinding a loop-local name shadows it
+            // for the remaining statements.
+            if let ast::StmtKind::Bind { pat, .. } | ast::StmtKind::Let { pat, .. } = &stmt.node {
+                let mut names = HashSet::new();
+                collect_pat_binds(pat, &mut names);
+                for n in names {
+                    live.remove(&n);
+                }
+            }
+        }
+        None
+    }
+
     fn compile_do(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -8258,6 +8645,24 @@ impl Codegen {
         // Try to compile as a single SQL query (multi-table joins, filters).
         if let Some(val) = self.try_compile_full_sql(builder, stmts, env, db) {
             return val;
+        }
+
+        // ── groupBy post-group reference validation ───────────────────
+        // groupBy closes every pre-group loop; afterwards only the PRIMARY
+        // bind variable is rebound (to each group). SSA values of other
+        // pre-group binds (and lets emitted inside those loops) live in the
+        // now-closed loop bodies and do NOT dominate post-group code —
+        // compiling a reference to them would produce invalid IR (Cranelift
+        // verifier panic). Reject such programs with a clean diagnostic
+        // before emitting any IR for the block.
+        if let Some(pos) = stmts
+            .iter()
+            .position(|s| matches!(&s.node, ast::StmtKind::GroupBy { .. }))
+        {
+            if let Some(diag) = Self::validate_group_by_references(stmts, pos) {
+                self.diagnostics.push(diag);
+                return self.call_rt(builder, "knot_relation_empty", &[]);
+            }
         }
 
         // Save let_bindings for restoration on exit; new entries inserted
@@ -8343,8 +8748,16 @@ impl Codegen {
             })
             .collect();
 
-        // For each pair of binds, look for equi-join Where clauses
+        // For each pair of binds, look for equi-join Where clauses.
+        // Skipped entirely when a user Eq/Ord/Num impl on a primitive type
+        // exists: the hash-index lookup compares keys by built-in equality,
+        // bypassing the user's `eq` — the nested-loop fallback dispatches
+        // the `==` through the trait correctly.
+        let hash_join_allowed = !self.sql_pushdown_disabled_by_user_impls();
         for w in 0..bind_stmts.len() {
+            if !hash_join_allowed {
+                break;
+            }
             for v in 0..w {
                 let (_outer_idx, outer_var, _outer_expr) = bind_stmts[v];
                 let (inner_idx, inner_var, inner_expr) = bind_stmts[w];
@@ -8896,11 +9309,40 @@ impl Codegen {
                         ast::ExprKind::Record(fields) => fields
                             .iter()
                             .map(|f| match &f.value.node {
-                                ast::ExprKind::FieldAccess { field, .. } => {
+                                ast::ExprKind::FieldAccess { expr: key_base, field } => {
+                                    // The key column is read from the grouped
+                                    // rows (the primary bind), so the field
+                                    // access base must BE the primary bind —
+                                    // `{g: other.col}` would silently
+                                    // attribute the column to the wrong
+                                    // relation.
+                                    let base_is_primary = matches!(
+                                        &key_base.node,
+                                        ast::ExprKind::Var(v)
+                                            if Some(v) == primary_var.as_ref()
+                                    );
+                                    if !base_is_primary {
+                                        self.diagnostics.push(
+                                            knot::diagnostic::Diagnostic::error(format!(
+                                                "groupBy key '{}' must access a field of \
+                                                 the grouped binding{}",
+                                                f.name,
+                                                primary_var
+                                                    .as_ref()
+                                                    .map(|p| format!(" '{}'", p))
+                                                    .unwrap_or_default(),
+                                            ))
+                                            .label(
+                                                f.value.span,
+                                                "field access on a different variable",
+                                            ),
+                                        );
+                                    }
                                     // Verify the column exists in the schema
                                     // (skip ADT schemas, whose descriptor
                                     // format the lookup doesn't parse).
-                                    if !schema.starts_with('#')
+                                    if base_is_primary
+                                        && !schema.starts_with('#')
                                         && lookup_col_type_from_schema(&schema, field).is_none()
                                     {
                                         self.diagnostics.push(
@@ -9595,6 +10037,11 @@ impl Codegen {
         env: &mut Env,
         db: Value,
     ) -> Option<Value> {
+        // User trait impls on primitives change operator semantics that
+        // SQL can't replicate — fall back to in-memory evaluation.
+        if self.sql_pushdown_disabled_by_user_impls() {
+            return None;
+        }
         let (bind_var, body) = extract_single_param_lambda(lambda_arg, &self.fun_bodies, &self.let_bindings)?;
         let body: &ast::Expr = &body;
         let table = quote_sql_ident(&format!("_knot_{}", source_name));
@@ -9649,6 +10096,12 @@ impl Codegen {
             }
             "sortBy" => {
                 // sortBy (\m -> m.field) *source → SELECT * FROM source ORDER BY field
+                // ORDER BY CASE loses the KNOT_INT collation for Int-typed
+                // projections — keep those in memory (see
+                // int_case_projection_pushable).
+                if !int_case_projection_pushable(&bind_var, body, schema) {
+                    return None;
+                }
                 let col_sql = extract_sql_field_access(&bind_var, body, "", schema)?;
                 let cols = parse_schema_columns(schema).iter()
                     .map(|(name, _)| quote_sql_ident(name))
@@ -9677,6 +10130,11 @@ impl Codegen {
         env: &mut Env,
         db: Value,
     ) -> Option<Value> {
+        // User trait impls on primitives change operator semantics that
+        // SQL can't replicate — fall back to in-memory evaluation.
+        if self.sql_pushdown_disabled_by_user_impls() {
+            return None;
+        }
         let (source, ops) = flatten_pipe_chain(expr, &self.fun_bodies, &self.let_bindings)?;
         if ops.is_empty() {
             return None;
@@ -9763,6 +10221,12 @@ impl Codegen {
                 }
                 PipeOp::SortBy { bind_var, body } => {
                     if is_count || aggregate.is_some() {
+                        return None;
+                    }
+                    // ORDER BY CASE loses the KNOT_INT collation for
+                    // Int-typed projections — keep those in memory (see
+                    // int_case_projection_pushable).
+                    if !int_case_projection_pushable(bind_var, body, &schema) {
                         return None;
                     }
                     bind_aliases.insert(bind_var.clone(), alias.clone());
@@ -10010,6 +10474,11 @@ impl Codegen {
         env: &Env,
     ) -> Option<SqlQueryPlan> {
         if stmts.is_empty() {
+            return None;
+        }
+        // User trait impls on primitives change operator semantics that
+        // SQL can't replicate — fall back to in-memory evaluation.
+        if self.sql_pushdown_disabled_by_user_impls() {
             return None;
         }
         let mut tables: Vec<SqlTable> = Vec::new();
@@ -10399,10 +10868,11 @@ impl Codegen {
                 if let ast::ExprKind::Var(name) = &func.node {
                     // NOTE: toUpper/toLower are deliberately NOT pushed
                     // down — SQLite's UPPER/LOWER are ASCII-only while the
-                    // runtime does full Unicode case mapping.
+                    // runtime does full Unicode case mapping. Likewise
+                    // trim: SQLite TRIM strips ASCII spaces only, while
+                    // the runtime trims all Unicode whitespace.
                     let sql_fn = match name.as_str() {
                         "length" => "LENGTH",
-                        "trim" => "TRIM",
                         _ => return None,
                     };
                     let inner = Self::try_compile_sql_atom(bind_aliases, arg, env, let_binds)?;
@@ -10433,21 +10903,46 @@ impl Codegen {
         // cast around arithmetic) while floats are stored as REAL (and must
         // NOT get the text cast — it would compare floats byte-wise). Fall
         // back entirely when the comparison can't be typed.
-        let mode = sql_comparison_cast_mode(lhs, rhs, &|v, f| {
+        let col_ty = |v: &str, f: &str| {
             bind_schemas
                 .get(v)
                 .and_then(|schema| lookup_col_type_from_schema(schema, f))
-        })?;
+        };
+        let mode = sql_comparison_cast_mode(lhs, rhs, &col_ty)?;
+        // Ordered comparisons on tag columns stay in memory (byte-wise
+        // constructor-name order ≠ the type's Ord).
+        if matches!(op, "<" | ">" | "<=" | ">=")
+            && (expr_has_tag_column(lhs, &col_ty) || expr_has_tag_column(rhs, &col_ty))
+        {
+            return None;
+        }
         let l = Self::try_compile_sql_atom(bind_aliases, lhs, env, let_binds)?;
         let r = Self::try_compile_sql_atom(bind_aliases, rhs, env, let_binds)?;
-        // Wrap arithmetic atoms in CAST for correct TEXT/INTEGER comparison:
-        // SQLite arithmetic on TEXT columns produces INTEGER, but params are TEXT;
-        // without CAST, INTEGER vs TEXT comparison always puts INTEGER before TEXT.
+        // Comparisons involving Int arithmetic compare numerically: SQLite
+        // arithmetic on TEXT-stored Int columns produces INTEGER, but
+        // params/columns are TEXT — INTEGER vs TEXT comparison orders by
+        // storage class, not value. Casting both sides to NUMERIC compares
+        // by value; on i64 overflow SQLite switches the arithmetic result
+        // to REAL, which then compares by its approximate real value
+        // (in-memory panics on overflow; the approximation is the closest
+        // faithful SQL behavior — unlike the previous CAST-to-TEXT, the
+        // overflow text can no longer satisfy arbitrary KNOT_INT filters).
+        // Without arithmetic, the plain TEXT comparison stays under the
+        // columns' KNOT_INT collation (exact, including legacy
+        // BigInt-as-TEXT rows).
         let (l_sql, r_sql) = match mode {
-            SqlCastMode::CastInt => (
-                cast_arithmetic_for_where(&l.sql),
-                cast_arithmetic_for_where(&r.sql),
-            ),
+            SqlCastMode::CastInt => {
+                if cast_arithmetic_for_where(&l.sql) != l.sql
+                    || cast_arithmetic_for_where(&r.sql) != r.sql
+                {
+                    (
+                        format!("CAST({} AS NUMERIC)", l.sql),
+                        format!("CAST({} AS NUMERIC)", r.sql),
+                    )
+                } else {
+                    (l.sql.clone(), r.sql.clone())
+                }
+            }
             SqlCastMode::Plain => (l.sql.clone(), r.sql.clone()),
             SqlCastMode::NoArith => {
                 if cast_arithmetic_for_where(&l.sql) != l.sql
@@ -10481,6 +10976,11 @@ impl Codegen {
         expr: &ast::Expr,
         schema: &str,
     ) -> Option<SqlFragment> {
+        // User trait impls on primitives change operator semantics that
+        // SQL can't replicate — fall back to in-memory evaluation.
+        if self.sql_pushdown_disabled_by_user_impls() {
+            return None;
+        }
         match &expr.node {
             ast::ExprKind::BinOp { op, lhs, rhs } => match op {
                 ast::BinOp::And => {
@@ -10533,20 +11033,40 @@ impl Codegen {
                             // text-cast (ints stored as TEXT) and plain numeric
                             // SQL (floats stored as REAL); fall back entirely
                             // when the comparison can't be typed.
-                            let mode = sql_comparison_cast_mode(lhs, rhs, &|v, f| {
+                            let col_ty = |v: &str, f: &str| {
                                 if v == bind_var {
                                     lookup_col_type_from_schema(schema, f)
                                 } else {
                                     None
                                 }
-                            })?;
+                            };
+                            let mode = sql_comparison_cast_mode(lhs, rhs, &col_ty)?;
+                            // Ordered comparisons on tag columns stay in
+                            // memory (byte-wise name order ≠ Ord).
+                            if matches!(sql_op, "<" | ">" | "<=" | ">=")
+                                && (expr_has_tag_column(lhs, &col_ty)
+                                    || expr_has_tag_column(rhs, &col_ty))
+                            {
+                                return None;
+                            }
                             let l = Self::try_compile_single_table_atom(bind_var, lhs)?;
                             let r = Self::try_compile_single_table_atom(bind_var, rhs)?;
+                            // See try_compile_multi_table_comparison for
+                            // the CastInt/NUMERIC rationale (overflow-safe
+                            // numeric comparison around Int arithmetic).
                             let (l_sql, r_sql) = match mode {
-                                SqlCastMode::CastInt => (
-                                    cast_arithmetic_for_where(&l.sql),
-                                    cast_arithmetic_for_where(&r.sql),
-                                ),
+                                SqlCastMode::CastInt => {
+                                    if cast_arithmetic_for_where(&l.sql) != l.sql
+                                        || cast_arithmetic_for_where(&r.sql) != r.sql
+                                    {
+                                        (
+                                            format!("CAST({} AS NUMERIC)", l.sql),
+                                            format!("CAST({} AS NUMERIC)", r.sql),
+                                        )
+                                    } else {
+                                        (l.sql.clone(), r.sql.clone())
+                                    }
+                                }
                                 SqlCastMode::Plain => (l.sql.clone(), r.sql.clone()),
                                 SqlCastMode::NoArith => {
                                     if cast_arithmetic_for_where(&l.sql) != l.sql
@@ -10603,6 +11123,18 @@ impl Codegen {
                             });
                         }
                         if name == "elem" {
+                            // `IN` is equality under the hood — float
+                            // equality stays in memory (total_cmp treats
+                            // -0.0 ≠ +0.0 and NaN as comparable, SQL
+                            // doesn't; see the float comparison gates).
+                            if let ast::ExprKind::FieldAccess { expr: fa, field } = &first_arg.node {
+                                if matches!(&fa.node, ast::ExprKind::Var(v) if v == bind_var)
+                                    && lookup_col_type_from_schema(schema, field).as_deref()
+                                        == Some("float")
+                                {
+                                    return None;
+                                }
+                            }
                             let needle = Self::try_compile_single_table_atom(bind_var, first_arg)?;
                             // (a) Literal list: emit `IN (?, ?, …)` directly so
                             //     SQLite can compare each element by type
@@ -10678,13 +11210,26 @@ impl Codegen {
             return None;
         };
 
+        let col_ty = lookup_col_type_from_schema(schema, &col_name);
         // Payload-bearing ADT fields and nested records are stored as JSON
         // documents, but the runtime encodes the compared Knot value
         // differently when binding it as a SQL parameter (constructor
         // params bind as bare tag text). A pushed-down `col = ?` would
         // silently drop matching rows — fall back to in-memory evaluation.
-        // Equality on all-nullary ("tag") ADT columns stays pushable.
-        if lookup_col_type_from_schema(schema, &col_name).as_deref() == Some("json") {
+        if col_ty.as_deref() == Some("json") {
+            return None;
+        }
+        // Float comparisons must stay in memory: Knot compares floats with
+        // total_cmp (-0.0 < +0.0, NaN orderable) while SQL says -0.0 = 0.0
+        // and stores NaN as NULL — `col != ?` would silently drop NaN rows.
+        if col_ty.as_deref() == Some("float") {
+            return None;
+        }
+        // Equality on all-nullary ("tag") ADT columns stays pushable (tag
+        // equality is name equality), but ordered comparisons would use
+        // byte-wise name order, ignoring the type's Ord (declaration order
+        // or a user impl) — keep those in memory.
+        if col_ty.as_deref() == Some("tag") && matches!(op, "<" | ">" | "<=" | ">=") {
             return None;
         }
 
@@ -10781,10 +11326,11 @@ impl Codegen {
                 if let ast::ExprKind::Var(name) = &func.node {
                     // NOTE: toUpper/toLower are deliberately NOT pushed
                     // down — SQLite's UPPER/LOWER are ASCII-only while the
-                    // runtime does full Unicode case mapping.
+                    // runtime does full Unicode case mapping. Likewise
+                    // trim: SQLite TRIM strips ASCII spaces only, while
+                    // the runtime trims all Unicode whitespace.
                     let sql_fn = match name.as_str() {
                         "length" => "LENGTH",
-                        "trim" => "TRIM",
                         _ => return None,
                     };
                     let inner = Self::try_compile_single_table_atom(bind_var, arg)?;
@@ -11203,6 +11749,19 @@ impl Codegen {
                 .iter()
                 .any(|e| !e.is_builtin && type_name_to_tag(&e.type_name).is_some())
         })
+    }
+
+    /// SQL pushdown executes comparisons and arithmetic as native SQLite
+    /// operations, bypassing operator trait dispatch entirely. When the
+    /// user overrides `eq`/`compare` or a `Num` method on a PRIMITIVE type
+    /// (the only types stored in SQL columns), the in-memory paths dispatch
+    /// through that impl — a pushed-down query would silently use the
+    /// built-in semantics instead. Disable pushdown wholesale in that case;
+    /// the in-memory fallback is always correct.
+    fn sql_pushdown_disabled_by_user_impls(&self) -> bool {
+        ["eq", "compare", "add", "sub", "mul", "div", "mod", "negate"]
+            .iter()
+            .any(|m| self.has_user_primitive_impl(m))
     }
 
     /// Compile a binary operator via trait dispatch (e.g., `+` → `add` dispatcher).
@@ -11799,7 +12358,42 @@ pub(crate) fn minmax_pushdown_type_ok(
     matches!(
         infer_sql_expr_type(bind_var, body, schema).as_deref(),
         Some("int") | Some("float")
-    )
+    ) && int_case_projection_pushable(bind_var, body, schema)
+}
+
+/// True when an expression tree contains an if/then/else node (which
+/// compiles to a SQL CASE WHEN when pushed down).
+fn expr_contains_if(expr: &ast::Expr) -> bool {
+    match &expr.node {
+        ast::ExprKind::If { .. } => true,
+        ast::ExprKind::BinOp { lhs, rhs, .. } => {
+            expr_contains_if(lhs) || expr_contains_if(rhs)
+        }
+        ast::ExprKind::UnaryOp { operand, .. } => expr_contains_if(operand),
+        ast::ExprKind::App { func, arg } => {
+            expr_contains_if(func) || expr_contains_if(arg)
+        }
+        ast::ExprKind::FieldAccess { expr: inner, .. } => expr_contains_if(inner),
+        ast::ExprKind::Annot { expr: inner, .. } => expr_contains_if(inner),
+        ast::ExprKind::UnitLit { value, .. } => expr_contains_if(value),
+        _ => false,
+    }
+}
+
+/// MIN/MAX and ORDER BY over a CASE expression must not push down for
+/// Int-typed projections: SQLite does not propagate the KNOT_INT column
+/// collation through CASE (so values compare byte-wise as TEXT), and CASE
+/// branches mixing TEXT-stored Int columns with INTEGER literals compare
+/// by storage class rather than value. In-memory evaluation is the
+/// faithful fallback. Float (REAL storage) and Text projections are typed
+/// out elsewhere or compare consistently.
+pub(crate) fn int_case_projection_pushable(
+    bind_var: &str,
+    body: &ast::Expr,
+    schema: &str,
+) -> bool {
+    !(expr_contains_if(body)
+        && infer_sql_expr_type(bind_var, body, schema).as_deref() == Some("int"))
 }
 
 /// Wrap a column SQL expression for use inside MIN/MAX so integer-typed
@@ -12637,10 +13231,33 @@ fn beta_reduce_inner(
             }
             App { func: Box::new(f), arg: Box::new(a) }
         }
-        Lambda { params, body } => Lambda {
-            params: params.clone(),
-            body: Box::new(beta_reduce_inner(body, fun_bodies, let_bindings, visited, fuel)),
-        },
+        Lambda { params, body } => {
+            // A lambda parameter shadows any same-named do-local let or
+            // top-level binding for the body: mask those names out of the
+            // expansion maps so `\q -> q.value` is NOT rewritten to the
+            // outer `q` definition. (The App `substitute` path is already
+            // capture-avoiding; only this named-map path needs masking.)
+            let shadows = |k: &String| params.iter().any(|p| pat_binds(p, k));
+            if fun_bodies.keys().any(shadows) || let_bindings.keys().any(shadows) {
+                let mut masked_funs = fun_bodies.clone();
+                masked_funs.retain(|k, _| !shadows(k));
+                let mut masked_lets = let_bindings.clone();
+                masked_lets.retain(|k, _| !shadows(k));
+                Lambda {
+                    params: params.clone(),
+                    body: Box::new(beta_reduce_inner(
+                        body, &masked_funs, &masked_lets, visited, fuel,
+                    )),
+                }
+            } else {
+                Lambda {
+                    params: params.clone(),
+                    body: Box::new(beta_reduce_inner(
+                        body, fun_bodies, let_bindings, visited, fuel,
+                    )),
+                }
+            }
+        }
         BinOp { op, lhs, rhs } => BinOp {
             op: *op,
             lhs: Box::new(beta_reduce_inner(lhs, fun_bodies, let_bindings, visited, fuel)),
@@ -13086,6 +13703,19 @@ fn try_sql_inline_condition(
                     ast::BinOp::Ge => ">=",
                     _ => unreachable!(),
                 };
+                // Mirror the WHERE-pushdown gates: float comparisons stay
+                // in memory (total_cmp vs SQL -0.0/NaN-as-NULL semantics);
+                // ordered comparisons on tag columns ignore the type's Ord.
+                let lt = infer_sql_expr_type(bind_var, lhs, schema);
+                let rt = infer_sql_expr_type(bind_var, rhs, schema);
+                if lt.as_deref() == Some("float") || rt.as_deref() == Some("float") {
+                    return None;
+                }
+                if matches!(sql_op, "<" | ">" | "<=" | ">=")
+                    && (lt.as_deref() == Some("tag") || rt.as_deref() == Some("tag"))
+                {
+                    return None;
+                }
                 let l = try_sql_arithmetic_expr(bind_var, lhs, alias, schema)?;
                 let r = try_sql_arithmetic_expr(bind_var, rhs, alias, schema)?;
                 Some(format!("{} {} {}", l, sql_op, r))
@@ -13118,6 +13748,13 @@ fn try_sql_inline_condition(
                     if name == "elem" {
                         // elem (bind_var.field) [lit, lit, ...] → field IN (lit, lit, ...)
                         // Empty list → always-false (`0`).
+                        // Float `IN` equality stays in memory (see the
+                        // float comparison gates above).
+                        if infer_sql_expr_type(bind_var, first_arg, schema).as_deref()
+                            == Some("float")
+                        {
+                            return None;
+                        }
                         let col = try_sql_arithmetic_expr(bind_var, first_arg, alias, schema)?;
                         let elems = match &arg.node {
                             ast::ExprKind::List(es) => es,
@@ -13203,9 +13840,10 @@ fn try_sql_arithmetic_expr(
             if let ast::ExprKind::Var(name) = &func.node {
                 // toUpper/toLower deliberately not pushed down (SQLite
                 // UPPER/LOWER are ASCII-only; the runtime is Unicode-aware).
+                // trim likewise: SQLite TRIM strips ASCII spaces only, the
+                // runtime trims all Unicode whitespace.
                 let sql_fn = match name.as_str() {
                     "length" => "LENGTH",
-                    "trim" => "TRIM",
                     _ => return None,
                 };
                 let inner = try_sql_arithmetic_expr(bind_var, arg, alias, schema)?;
@@ -13293,15 +13931,18 @@ pub(crate) fn infer_sql_expr_type(bind_var: &str, expr: &ast::Expr, schema: &str
             match op {
                 ast::BinOp::Concat => Some("text".to_string()),
                 _ => {
+                    // Division joins operand witnesses like the other
+                    // arithmetic operators: Knot Int/Int division is
+                    // integer division (and SQLite `/` on TEXT-stored ints
+                    // also integer-divides), so the result column must be
+                    // typed int — typing it float would box `4 / 2` as 2.0.
                     let l = infer_sql_expr_type(bind_var, lhs, schema);
                     let r = infer_sql_expr_type(bind_var, rhs, schema);
-                    match (l.as_deref(), r.as_deref(), op) {
-                        // Division always produces float
-                        (_, _, ast::BinOp::Div) => Some("float".to_string()),
+                    match (l.as_deref(), r.as_deref()) {
                         // Float on either side → float
-                        (Some("float"), _, _) | (_, Some("float"), _) => Some("float".to_string()),
-                        (Some(t), _, _) => Some(t.to_string()),
-                        (_, Some(t), _) => Some(t.to_string()),
+                        (Some("float"), _) | (_, Some("float")) => Some("float".to_string()),
+                        (Some(t), _) => Some(t.to_string()),
+                        (_, Some(t)) => Some(t.to_string()),
                         _ => None,
                     }
                 }
@@ -13316,7 +13957,6 @@ pub(crate) fn infer_sql_expr_type(bind_var: &str, expr: &ast::Expr, schema: &str
             if let ast::ExprKind::Var(name) = &func.node {
                 match name.as_str() {
                     "length" => Some("int".to_string()),
-                    "trim" => Some("text".to_string()),
                     _ => None,
                 }
             } else {
@@ -13359,6 +13999,19 @@ fn try_multi_table_inline_condition(
                     ast::BinOp::Ge => ">=",
                     _ => unreachable!(),
                 };
+                // Mirror the WHERE-pushdown gates: float comparisons stay
+                // in memory (total_cmp vs SQL -0.0/NaN-as-NULL semantics);
+                // ordered comparisons on tag columns ignore the type's Ord.
+                let lt = infer_multi_table_sql_expr_type(bind_to_schema, lhs);
+                let rt = infer_multi_table_sql_expr_type(bind_to_schema, rhs);
+                if lt.as_deref() == Some("float") || rt.as_deref() == Some("float") {
+                    return None;
+                }
+                if matches!(sql_op, "<" | ">" | "<=" | ">=")
+                    && (lt.as_deref() == Some("tag") || rt.as_deref() == Some("tag"))
+                {
+                    return None;
+                }
                 let l = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, lhs)?;
                 let r = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, rhs)?;
                 Some(format!("{} {} {}", l, sql_op, r))
@@ -13447,9 +14100,10 @@ fn try_multi_table_arithmetic_expr(
             if let ast::ExprKind::Var(name) = &func.node {
                 // toUpper/toLower deliberately not pushed down (SQLite
                 // UPPER/LOWER are ASCII-only; the runtime is Unicode-aware).
+                // trim likewise: SQLite TRIM strips ASCII spaces only, the
+                // runtime trims all Unicode whitespace.
                 let sql_fn = match name.as_str() {
                     "length" => "LENGTH",
-                    "trim" => "TRIM",
                     _ => return None,
                 };
                 let inner = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, arg)?;
@@ -13487,13 +14141,14 @@ fn infer_multi_table_sql_expr_type(
             match op {
                 ast::BinOp::Concat => Some("text".to_string()),
                 _ => {
+                    // Division joins witnesses like other arithmetic —
+                    // see infer_sql_expr_type (Int/Int stays int).
                     let l = infer_multi_table_sql_expr_type(bind_to_schema, lhs);
                     let r = infer_multi_table_sql_expr_type(bind_to_schema, rhs);
-                    match (l.as_deref(), r.as_deref(), op) {
-                        (_, _, ast::BinOp::Div) => Some("float".to_string()),
-                        (Some("float"), _, _) | (_, Some("float"), _) => Some("float".to_string()),
-                        (Some(t), _, _) => Some(t.to_string()),
-                        (_, Some(t), _) => Some(t.to_string()),
+                    match (l.as_deref(), r.as_deref()) {
+                        (Some("float"), _) | (_, Some("float")) => Some("float".to_string()),
+                        (Some(t), _) => Some(t.to_string()),
+                        (_, Some(t)) => Some(t.to_string()),
                         _ => None,
                     }
                 }
@@ -13508,7 +14163,6 @@ fn infer_multi_table_sql_expr_type(
             if let ast::ExprKind::Var(name) = &func.node {
                 match name.as_str() {
                     "length" => Some("int".to_string()),
-                    "trim" => Some("text".to_string()),
                     _ => None,
                 }
             } else {
@@ -13579,6 +14233,25 @@ fn pat_primary_var(pat: &ast::PatKind) -> Option<String> {
         ast::PatKind::Var(name) => Some(name.clone()),
         ast::PatKind::Constructor { payload, .. } => pat_primary_var(&payload.node),
         _ => None,
+    }
+}
+
+/// A case pattern is irrefutable when it can never fail at runtime:
+/// wildcards, variables, and records whose sub-patterns are all
+/// irrefutable. Literals, constructors, and list shapes (and records
+/// containing them) require runtime tests.
+fn case_pattern_is_irrefutable(pat: &ast::Pat) -> bool {
+    match &pat.node {
+        ast::PatKind::Wildcard | ast::PatKind::Var(_) => true,
+        ast::PatKind::Record(fields) => fields.iter().all(|fp| {
+            fp.pattern
+                .as_ref()
+                .map_or(true, |p| case_pattern_is_irrefutable(p))
+        }),
+        ast::PatKind::Lit(_)
+        | ast::PatKind::Constructor { .. }
+        | ast::PatKind::List(_)
+        | ast::PatKind::Cons { .. } => false,
     }
 }
 
@@ -14073,31 +14746,47 @@ fn strip_expr_wrappers(expr: &ast::Expr) -> &ast::Expr {
 /// provably nonzero. `/` and `%` may only be pushed down to SQLite with a
 /// provably nonzero divisor: SQLite yields NULL on division by zero
 /// (silently dropping rows) while the Knot runtime panics.
-pub(crate) fn divisor_is_nonzero_literal(expr: &ast::Expr) -> bool {
+/// Resolve an (optionally negated) integer-literal divisor to its value.
+fn int_literal_divisor_value(expr: &ast::Expr) -> Option<i64> {
     let e = strip_expr_wrappers(expr);
     match &e.node {
         ast::ExprKind::UnaryOp { op: ast::UnaryOp::Neg, operand } => {
-            divisor_is_nonzero_literal(operand)
+            int_literal_divisor_value(operand).and_then(i64::checked_neg)
         }
-        ast::ExprKind::Lit(ast::Literal::Int(n)) => n.bytes().any(|c| (b'1'..=b'9').contains(&c)),
+        ast::ExprKind::Lit(ast::Literal::Int(n)) => n.parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+/// True if `expr` is an (optionally negated) nonzero float literal.
+fn float_literal_divisor_nonzero(expr: &ast::Expr) -> bool {
+    let e = strip_expr_wrappers(expr);
+    match &e.node {
+        ast::ExprKind::UnaryOp { op: ast::UnaryOp::Neg, operand } => {
+            float_literal_divisor_nonzero(operand)
+        }
         ast::ExprKind::Lit(ast::Literal::Float(f)) => *f != 0.0,
         _ => false,
     }
 }
 
+pub(crate) fn divisor_is_nonzero_literal(expr: &ast::Expr) -> bool {
+    if let Some(v) = int_literal_divisor_value(expr) {
+        // An integer-literal divisor implies Int division. `x / -1`
+        // overflows at i64::MIN (the runtime panics, SQLite silently goes
+        // REAL) — keep that edge in memory.
+        return v != 0 && v != -1;
+    }
+    float_literal_divisor_nonzero(expr)
+}
+
 /// True if `expr` is a provably nonzero *integer* literal. `%` may only be
 /// pushed down for integer operands (SQLite `%` truncates to INTEGER while
 /// the runtime does float fmod); an integer-literal divisor forces both
-/// operands to Int through type checking.
+/// operands to Int through type checking. `-1` is also rejected:
+/// `i64::MIN % -1` panics in memory while SQLite returns 0.
 pub(crate) fn divisor_is_nonzero_int_literal(expr: &ast::Expr) -> bool {
-    let e = strip_expr_wrappers(expr);
-    match &e.node {
-        ast::ExprKind::UnaryOp { op: ast::UnaryOp::Neg, operand } => {
-            divisor_is_nonzero_int_literal(operand)
-        }
-        ast::ExprKind::Lit(ast::Literal::Int(n)) => n.bytes().any(|c| (b'1'..=b'9').contains(&c)),
-        _ => false,
-    }
+    int_literal_divisor_value(expr).map_or(false, |v| v != 0 && v != -1)
 }
 
 fn join_sql_kinds(
@@ -14183,7 +14872,6 @@ pub(crate) fn sql_scalar_kind(
             if let ast::ExprKind::Var(name) = &func.node {
                 Ok(match name.as_str() {
                     "length" => Some(SqlScalarKind::Int),
-                    "trim" => Some(SqlScalarKind::Text),
                     _ => None,
                 })
             } else {
@@ -14205,7 +14893,11 @@ pub(crate) fn sql_comparison_cast_mode(
     let r = sql_scalar_kind(rhs, col_ty).ok()?;
     let joined = join_sql_kinds(l, r).ok()?;
     Some(match joined {
-        Some(SqlScalarKind::Float) => SqlCastMode::Plain,
+        // Float comparisons must stay in memory: Knot compares floats with
+        // total_cmp (-0.0 < +0.0, NaN orderable) while SQL says
+        // -0.0 = 0.0 and stores NaN as NULL, so pushed comparisons would
+        // silently drop NaN rows and conflate signed zeros.
+        Some(SqlScalarKind::Float) => return None,
         // Text comparisons must use SQLite's default BINARY (byte-wise)
         // collation, matching Knot's Text semantics. The KNOT_INT collation
         // compares numerically, so e.g. `"0" ++ "7" == "7"` would match.
@@ -14213,6 +14905,33 @@ pub(crate) fn sql_comparison_cast_mode(
         Some(_) => SqlCastMode::CastInt,
         None => SqlCastMode::NoArith,
     })
+}
+
+/// True when a comparison side contains a field access on a "tag"
+/// (enum-ADT) column. Ordered comparisons on tag columns must not be
+/// pushed down: SQL would compare constructor names byte-wise, ignoring
+/// the type's Ord (declaration order, or a user impl). Equality stays
+/// pushable — tag equality IS name equality.
+pub(crate) fn expr_has_tag_column(
+    expr: &ast::Expr,
+    col_ty: &dyn Fn(&str, &str) -> Option<String>,
+) -> bool {
+    let e = strip_expr_wrappers(expr);
+    match &e.node {
+        ast::ExprKind::FieldAccess { expr: inner, field } => {
+            matches!(&inner.node, ast::ExprKind::Var(v)
+                if col_ty(v, field).as_deref() == Some("tag"))
+        }
+        ast::ExprKind::UnaryOp { operand, .. } => expr_has_tag_column(operand, col_ty),
+        ast::ExprKind::BinOp { lhs, rhs, .. } => {
+            expr_has_tag_column(lhs, col_ty) || expr_has_tag_column(rhs, col_ty)
+        }
+        ast::ExprKind::If { then_branch, else_branch, .. } => {
+            expr_has_tag_column(then_branch, col_ty)
+                || expr_has_tag_column(else_branch, col_ty)
+        }
+        _ => false,
+    }
 }
 
 // ── AST pretty-printer (for function source display) ─────────────
@@ -14827,6 +15546,20 @@ mod tests {
             }
         }
         panic!("parse_expr: expected a single function declaration");
+    }
+
+    /// `-1` divisors are rejected (i64::MIN / -1 and i64::MIN % -1 overflow
+    /// in memory while SQLite silently produces REAL / 0); other nonzero
+    /// literals stay pushable.
+    #[test]
+    fn divisor_negative_one_not_pushable() {
+        assert!(!divisor_is_nonzero_int_literal(&parse_expr("-1")));
+        assert!(!divisor_is_nonzero_literal(&parse_expr("-1")));
+        assert!(divisor_is_nonzero_int_literal(&parse_expr("-2")));
+        assert!(divisor_is_nonzero_int_literal(&parse_expr("3")));
+        assert!(!divisor_is_nonzero_int_literal(&parse_expr("0")));
+        assert!(divisor_is_nonzero_literal(&parse_expr("-1.0")));
+        assert!(!divisor_is_nonzero_literal(&parse_expr("0.0")));
     }
 
     /// `Var(x)` resolves through `let_bindings` first, falling back to

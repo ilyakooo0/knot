@@ -21,7 +21,7 @@ use crate::state::{
     builtins as state_builtins, DocumentState, ServerState, SnippetContext, KEYWORDS, SNIPPETS,
 };
 use crate::type_format::format_type_kind;
-use crate::utils::{position_to_offset, recurse_expr, uri_to_path};
+use crate::utils::{offset_to_position, position_to_offset, recurse_expr, uri_to_path};
 
 // ── Completion ──────────────────────────────────────────────────────
 
@@ -83,6 +83,11 @@ pub(crate) fn handle_completion(
 
     // Context-aware: after `*` only suggest source/view names
     if trigger_char == Some(b'*') {
+        // No relation completion inside strings or comments — the trigger
+        // character fires on any typed `*` regardless of context.
+        if inside_string_or_comment(latest_source, offset.saturating_sub(1)) {
+            return None;
+        }
         for decl in &doc.module.decls {
             if let DeclKind::Source { name, .. } | DeclKind::View { name, .. } = &decl.node {
                 let detail = doc.type_info.get(name.as_str()).cloned();
@@ -99,6 +104,9 @@ pub(crate) fn handle_completion(
 
     // Context-aware: after `&` only suggest derived names
     if trigger_char == Some(b'&') {
+        if inside_string_or_comment(latest_source, offset.saturating_sub(1)) {
+            return None;
+        }
         for decl in &doc.module.decls {
             if let DeclKind::Derived { name, .. } = &decl.node {
                 let detail = doc.type_info.get(name.as_str()).cloned();
@@ -130,8 +138,18 @@ pub(crate) fn handle_completion(
 
     // Context-aware: after `.` suggest record field names from known types
     if trigger_char == Some(b'.') {
-        // Try to find the expression before the dot and its type
         let expr_end = offset.saturating_sub(1); // position of the `.`
+        // Context guards: the trigger fires on every typed `.`, including
+        // the decimal point of a float literal (`3.`), dots inside string
+        // literals, and dots in `--` comments. None of those are field
+        // accesses — and the all-known-fields fallback below would happily
+        // offer fields there.
+        if inside_string_or_comment(latest_source, expr_end)
+            || dot_receiver_is_numeric(latest_source, expr_end)
+        {
+            return None;
+        }
+        // Try to find the expression before the dot and its type
         let fields = resolve_dot_fields(doc, latest_source, expr_end);
         if !fields.is_empty() {
             // If the receiver before the dot is a `Var` bound from a `*source`,
@@ -315,6 +333,28 @@ pub(crate) fn handle_completion(
         });
     }
 
+    // Replace-range for relation completions (`*name`/`&name`): the typed
+    // token INCLUDING any leading sigil. With only a bare `insert_text`,
+    // clients insert after the word start — and `*`/`&` aren't word chars,
+    // so accepting `*name` after a typed `*` produced `**name`. A text_edit
+    // that spans the sigil replaces it instead.
+    let sigil_edit_range = {
+        let bytes = latest_source.as_bytes();
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'';
+        let end = offset.min(bytes.len());
+        let mut start = end;
+        while start > 0 && is_ident(bytes[start - 1]) {
+            start -= 1;
+        }
+        if start > 0 && (bytes[start - 1] == b'*' || bytes[start - 1] == b'&') {
+            start -= 1;
+        }
+        Range {
+            start: offset_to_position(latest_source, start),
+            end: offset_to_position(latest_source, end),
+        }
+    };
+
     // Declarations from current document with type details
     for decl in &doc.module.decls {
         match &decl.node {
@@ -352,6 +392,10 @@ pub(crate) fn handle_completion(
                     label: format!("*{name}"),
                     kind: Some(CompletionItemKind::VARIABLE),
                     insert_text: Some(format!("*{name}")),
+                    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                        range: sigil_edit_range,
+                        new_text: format!("*{name}"),
+                    })),
                     detail: doc.type_info.get(name.as_str()).cloned(),
                     ..Default::default()
                 });
@@ -361,6 +405,10 @@ pub(crate) fn handle_completion(
                     label: format!("&{name}"),
                     kind: Some(CompletionItemKind::VARIABLE),
                     insert_text: Some(format!("&{name}")),
+                    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                        range: sigil_edit_range,
+                        new_text: format!("&{name}"),
+                    })),
                     detail: doc.type_info.get(name.as_str()).cloned(),
                     ..Default::default()
                 });
@@ -388,9 +436,39 @@ pub(crate) fn handle_completion(
         }
     }
 
+    // Imported symbols (selective or wildcard imports): they're in scope, so
+    // they belong in the list alongside local declarations. Local decls of
+    // the same name shadow the import and were already pushed above.
+    for (name, _) in &doc.import_defs {
+        if doc.definitions.contains_key(name) {
+            continue;
+        }
+        let kind = if name.chars().next().is_some_and(|c| c.is_uppercase()) {
+            CompletionItemKind::STRUCT
+        } else {
+            CompletionItemKind::FUNCTION
+        };
+        let detail = doc.type_info.get(name.as_str()).cloned().or_else(|| {
+            doc.import_origins
+                .get(name)
+                .map(|origin| format!("imported from {origin}"))
+        });
+        items.push(CompletionItem {
+            label: name.clone(),
+            kind: Some(kind),
+            detail,
+            ..Default::default()
+        });
+    }
+
     // Built-in functions with type info. Synthesize a snippet from the
     // arity recorded in `type_info` so users get tab stops on call.
+    // A user declaration (or import) of the same name shadows the builtin —
+    // offering both produced duplicate items with divergent snippets.
     for name in state_builtins() {
+        if doc.definitions.contains_key(name) || doc.import_defs.contains_key(name) {
+            continue;
+        }
         let detail = doc.type_info.get(name).cloned();
         let snippet = detail
             .as_deref()
@@ -420,7 +498,15 @@ pub(crate) fn handle_completion(
         let source_path = uri_to_path(uri);
         let current_canonical = source_path.as_ref().and_then(|p| p.canonicalize().ok());
         let existing_imports: HashSet<String> = doc.module.imports.iter().map(|i| i.path.clone()).collect();
-        let local_names: HashSet<&str> = doc.definitions.keys().map(|s| s.as_str()).collect();
+        // Names already in scope — local declarations AND symbols brought in
+        // by existing imports. Suggesting an auto-import for a name the file
+        // can already see would add a redundant (or conflicting) import line.
+        let local_names: HashSet<&str> = doc
+            .definitions
+            .keys()
+            .map(|s| s.as_str())
+            .chain(doc.import_defs.keys().map(|s| s.as_str()))
+            .collect();
 
         // De-dupe by name across files: if two workspace files both export
         // `parse`, prefer the one with the lexicographically-shortest path.
@@ -717,8 +803,13 @@ fn lookup_local_binding_type(doc: &DocumentState, name: &str, offset: usize) -> 
 /// Within a category items keep their original alphabetical order (the
 /// editor sorts on `sort_text`, falling back to `label`).
 fn apply_default_category_ranking(items: &mut [CompletionItem], doc: &DocumentState) {
-    let local_names: std::collections::HashSet<&str> =
-        doc.definitions.keys().map(String::as_str).collect();
+    // Imported names rank with locals: both are already in scope.
+    let local_names: std::collections::HashSet<&str> = doc
+        .definitions
+        .keys()
+        .map(String::as_str)
+        .chain(doc.import_defs.keys().map(String::as_str))
+        .collect();
     for item in items.iter_mut() {
         // Skip items that already carry a contextual prefix — those bumps are
         // signals about *this* completion request, stronger than category.
@@ -1220,6 +1311,54 @@ fn receiver_ident_before_dot(source: &str, dot_pos: usize) -> Option<String> {
         return None;
     }
     Some(name.to_string())
+}
+
+/// True when `offset` sits inside a string literal or after a `--` line
+/// comment opener. Line-local scan (Knot has no multi-line strings or block
+/// comments), tracking `\"` escapes. Used by the trigger-character branches
+/// so a `.`/`*`/`&` typed inside a string or comment doesn't pop completion.
+fn inside_string_or_comment(source: &str, offset: usize) -> bool {
+    let offset = offset.min(source.len());
+    let line_start = source[..offset].rfind('\n').map(|p| p + 1).unwrap_or(0);
+    let bytes = source.as_bytes();
+    let mut in_str = false;
+    let mut i = line_start;
+    while i < offset {
+        let c = bytes[i];
+        if in_str {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_str = false;
+            }
+        } else if c == b'"' {
+            in_str = true;
+        } else if c == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            return true;
+        }
+        i += 1;
+    }
+    in_str
+}
+
+/// True when the token immediately before the `.` at `dot_pos` is a numeric
+/// literal — i.e. the dot is (part of) a float like `3.`, not a field
+/// access. Identifiers can't start with a digit, so a backward ident-char
+/// scan whose first char is a digit means "number".
+fn dot_receiver_is_numeric(source: &str, dot_pos: usize) -> bool {
+    let bytes = source.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'';
+    let mut end = dot_pos.min(bytes.len());
+    while end > 0 && bytes[end - 1] == b' ' {
+        end -= 1;
+    }
+    let tok_end = end;
+    while end > 0 && is_ident(bytes[end - 1]) {
+        end -= 1;
+    }
+    end < tok_end && bytes[end].is_ascii_digit()
 }
 
 /// Try to resolve field names for dot completion by finding the type of the
@@ -2175,6 +2314,182 @@ mod regress_fixes_tests {
             monad_for_do_span(&info, do_span, 95),
             Some(MonadKind::Relation)
         ));
+    }
+
+    use crate::test_support::TestWorkspace;
+    use crate::utils::offset_to_position;
+
+    fn comp_params(uri: &Uri, position: Position, trigger: Option<&str>) -> CompletionParams {
+        CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: Some(CompletionContext {
+                trigger_kind: if trigger.is_some() {
+                    CompletionTriggerKind::TRIGGER_CHARACTER
+                } else {
+                    CompletionTriggerKind::INVOKED
+                },
+                trigger_character: trigger.map(String::from),
+            }),
+        }
+    }
+
+    fn resp_items(resp: CompletionResponse) -> Vec<CompletionItem> {
+        match resp {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        }
+    }
+
+    /// Bug 15: a user declaration shadows the same-named builtin — offering
+    /// both produced two `map` items with divergent snippets.
+    #[test]
+    fn builtin_shadowed_by_user_declaration_is_not_duplicated() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "map = \\x -> x\nmain = map 1\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("map 1").expect("usage");
+        let pos = offset_to_position(&doc.source, off);
+        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, None))
+            .expect("completion returns");
+        let items = resp_items(resp);
+        let map_items: Vec<&CompletionItem> = items
+            .iter()
+            .filter(|i| i.label == "map" && i.kind != Some(CompletionItemKind::SNIPPET))
+            .collect();
+        assert_eq!(
+            map_items.len(),
+            1,
+            "user `map` must shadow the builtin; got: {map_items:?}"
+        );
+    }
+
+    /// Bug 12: imported symbols appear in normal completion, and the
+    /// auto-import path must not re-suggest names already in scope.
+    #[test]
+    fn imported_symbols_complete_without_auto_import_duplicate() {
+        use crate::test_support::TempWorkspace;
+        let mut tw = TempWorkspace::new();
+        std::fs::write(tw.root.join("lib.knot"), "helper = \\x -> x\n").unwrap();
+        let uri = tw.write_and_open("main.knot", "import ./lib\n\nmain = helper 1\n");
+        let doc = tw.workspace.doc(&uri);
+        let off = doc.source.find("helper 1").expect("usage");
+        let pos = offset_to_position(&doc.source, off);
+        let resp = handle_completion(&tw.workspace.state, &comp_params(&uri, pos, None))
+            .expect("completion returns");
+        let items = resp_items(resp);
+        assert!(
+            items
+                .iter()
+                .any(|i| i.label == "helper" && i.data.is_none()),
+            "imported `helper` must surface as a plain completion item"
+        );
+        let dup_auto_import = items.iter().any(|i| {
+            i.label == "helper"
+                && i.data
+                    .as_ref()
+                    .and_then(|d| d.get("kind"))
+                    .and_then(|k| k.as_str())
+                    == Some("auto_import")
+        });
+        assert!(
+            !dup_auto_import,
+            "auto-import must not re-suggest a symbol already imported"
+        );
+    }
+
+    /// Bug 14: the `.` trigger inside a float literal is a decimal point —
+    /// no field completion (the all-known-fields fallback used to fire).
+    #[test]
+    fn dot_trigger_suppressed_inside_float_literal() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "type P = {name: Text}\nx = 3.5\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("3.").expect("float") + 2;
+        let pos = offset_to_position(&doc.source, off);
+        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, Some(".")));
+        assert!(resp.is_none(), "no field completion inside a float: {resp:?}");
+    }
+
+    /// Bug 14: `.` typed inside a `--` comment must not pop completion.
+    #[test]
+    fn dot_trigger_suppressed_inside_comment() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "-- see notes.\nmain = 1\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("notes.").expect("comment dot") + "notes.".len();
+        let pos = offset_to_position(&doc.source, off);
+        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, Some(".")));
+        assert!(resp.is_none(), "no completion inside a comment: {resp:?}");
+    }
+
+    /// Bug 14: `*` typed inside a string literal must not pop relation
+    /// completion.
+    #[test]
+    fn star_trigger_suppressed_inside_string() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "*todos : [{t: Text}]\nmain = println \"a*b\"\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("a*").expect("string star") + 2;
+        let pos = offset_to_position(&doc.source, off);
+        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, Some("*")));
+        assert!(resp.is_none(), "no relation completion inside a string: {resp:?}");
+    }
+
+    /// Bug 16: relation items must carry a text_edit that REPLACES the
+    /// typed token including its sigil — bare insert_text after a typed `*`
+    /// produced `**name`.
+    #[test]
+    fn relation_completion_text_edit_replaces_typed_sigil() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "*todos : [{t: Text}]\nmain = *to\n");
+        let doc = ws.doc(&uri);
+        let cursor = doc.source.find("*to").expect("typed prefix") + 3;
+        let pos = offset_to_position(&doc.source, cursor);
+        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, None))
+            .expect("completion returns");
+        let items = resp_items(resp);
+        let item = items
+            .iter()
+            .find(|i| i.label == "*todos")
+            .expect("relation item offered");
+        let Some(CompletionTextEdit::Edit(edit)) = &item.text_edit else {
+            panic!("relation item must carry a replacing text_edit: {item:?}");
+        };
+        let sigil_off = doc.source.find("*to").unwrap();
+        assert_eq!(
+            edit.range.start,
+            offset_to_position(&doc.source, sigil_off),
+            "edit must start AT the sigil so it gets replaced"
+        );
+        assert_eq!(edit.range.end, pos);
+        assert_eq!(edit.new_text, "*todos");
+    }
+
+    /// Bug 4 consequence: completion stops offering IO builtins inside
+    /// atomic blocks of PARAMETERIZED functions (the lambda-skip in the
+    /// atomic walker made `in_atomic` always false there).
+    #[test]
+    fn completion_filters_io_builtins_in_atomic_block_of_parameterized_fn() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            "type P = {n: Text}\n*people : [P]\nf = \\x -> atomic do\n  *people = [{n: \"A\"}]\n  yield {}\n",
+        );
+        let doc = ws.doc(&uri);
+        let inside = doc.source.find("[{n:").expect("atomic body");
+        let pos = offset_to_position(&doc.source, inside);
+        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, None))
+            .expect("completion returns");
+        let labels: Vec<String> = resp_items(resp).into_iter().map(|i| i.label).collect();
+        assert!(
+            !labels.contains(&"println".to_string()),
+            "println leaked into atomic completion of a parameterized fn"
+        );
     }
 
     /// `rateLimit <expr>` clauses inside route declarations hold ordinary

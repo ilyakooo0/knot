@@ -1977,19 +1977,55 @@ fn constructor_greedy_nested() {
 
 #[test]
 fn constructor_greedy_with_field_access() {
-    // `Circle {radius: 5}.radius` should parse as `(Circle {radius: 5}).radius`
+    // Constructor payloads get the same postfix handling as function
+    // application arguments: `Circle {radius: 5}.radius` parses as
+    // `Circle ({radius: 5}.radius)`, consistent with `f x.y` → `f (x.y)`.
+    // (Previously the `.radius` attached to the whole application.)
     match fun_body("x = Circle {radius: 5}.radius") {
-        ExprKind::FieldAccess { expr, field } => {
-            assert_eq!(field, "radius");
-            match &expr.node {
-                ExprKind::App { func, arg } => {
-                    assert!(matches!(&func.node, ExprKind::Constructor(n) if n == "Circle"));
-                    assert!(matches!(&arg.node, ExprKind::Record(_)));
+        ExprKind::App { func, arg } => {
+            assert!(matches!(&func.node, ExprKind::Constructor(n) if n == "Circle"));
+            match &arg.node {
+                ExprKind::FieldAccess { expr, field } => {
+                    assert_eq!(field, "radius");
+                    assert!(matches!(&expr.node, ExprKind::Record(_)));
                 }
-                other => panic!("expected App(Constructor, Record), got {:?}", other),
+                other => panic!("expected FieldAccess(Record, radius), got {:?}", other),
             }
         }
-        other => panic!("expected FieldAccess(App(...), radius), got {:?}", other),
+        other => panic!("expected App(Circle, FieldAccess), got {:?}", other),
+    }
+}
+
+#[test]
+fn constructor_payload_field_access_like_application() {
+    // `Just x.y` parses as `Just (x.y)`, exactly like `f x.y` → `f (x.y)`.
+    match fun_body("x = Just p.name") {
+        ExprKind::App { func, arg } => {
+            assert!(matches!(&func.node, ExprKind::Constructor(n) if n == "Just"));
+            match &arg.node {
+                ExprKind::FieldAccess { expr, field } => {
+                    assert_eq!(field, "name");
+                    assert!(matches!(&expr.node, ExprKind::Var(n) if n == "p"));
+                }
+                other => panic!("expected FieldAccess(Var, name), got {:?}", other),
+            }
+        }
+        other => panic!("expected App(Just, FieldAccess), got {:?}", other),
+    }
+}
+
+#[test]
+fn constructor_payload_chained_field_access() {
+    // `Just a.b.c` parses as `Just ((a.b).c)`.
+    match fun_body("x = Just a.b.c") {
+        ExprKind::App { func, arg } => {
+            assert!(matches!(&func.node, ExprKind::Constructor(n) if n == "Just"));
+            assert!(matches!(
+                &arg.node,
+                ExprKind::FieldAccess { field, .. } if field == "c"
+            ));
+        }
+        other => panic!("expected App(Just, FieldAccess), got {:?}", other),
     }
 }
 

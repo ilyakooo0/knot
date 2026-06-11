@@ -377,6 +377,12 @@ pub struct ServerState {
     /// Monotonic id source for outgoing `workspace/diagnostic/refresh` requests.
     /// Each call bumps this so request ids stay unique across the session.
     pub diagnostic_refresh_counter: u64,
+    /// Latest LSP document version whose analysis result is stored in
+    /// `documents`. Used by the workspace-diagnostics pull handler: the LSP
+    /// spec says a report's `version` of `null` means "not open", so open
+    /// docs must carry the version their diagnostics were computed against.
+    /// Inserted by `apply_analysis_result`, removed on `didClose`.
+    pub document_versions: HashMap<Uri, i32>,
     /// URIs the *last* `workspace/diagnostic` response reported with non-empty
     /// diagnostics. Per LSP convention, clients treat URIs absent from a
     /// workspace report as "unchanged" — so a file that goes from erroring to

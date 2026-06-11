@@ -8229,6 +8229,41 @@ pub extern "C-unwind" fn knot_relation_traverse(
     }
 }
 
+/// Like `knot_relation_traverse`, but with the applicative kind supplied
+/// statically by the compiler ("io", "relation", "Maybe", "Result", or an
+/// ADT name). The kind is used ONLY to pick the EMPTY-input result —
+/// `pure []` in the right applicative — since with no elements there is no
+/// first mapped value to dispatch on (`knot_relation_traverse` historically
+/// returned the Relation result `[[]]` regardless, so `traverse f []` in IO
+/// context bound `[[]]` and Maybe/Result consumers saw a Relation).
+/// Non-empty inputs behave exactly like `knot_relation_traverse`.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_relation_traverse_kind(
+    db: *mut c_void,
+    func: *mut Value,
+    rel: *mut Value,
+    kind_ptr: *const u8,
+    kind_len: usize,
+) -> *mut Value {
+    let is_empty = match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => rows.is_empty(),
+        Value::Unit => true,
+        _ => false,
+    };
+    if is_empty {
+        let kind = unsafe { str_from_raw(kind_ptr, kind_len) };
+        return match kind {
+            "io" => traverse_sequence_io(db, Vec::new()),
+            "Maybe" => traverse_sequence_maybe(Vec::new()),
+            "Result" => traverse_sequence_result(Vec::new()),
+            // "relation" and unknown applicatives keep the historical
+            // default: the list applicative's `pure []` = [[]].
+            _ => alloc(Value::Relation(vec![alloc(Value::Relation(vec![]))])),
+        };
+    }
+    knot_relation_traverse(db, func, rel)
+}
+
 /// Sequence [IO a] into IO [a] — creates a single IO thunk that runs each action in order.
 fn traverse_sequence_io(db: *mut c_void, ios: Vec<*mut Value>) -> *mut Value {
     let _ = db;
@@ -9416,28 +9451,17 @@ pub extern "C-unwind" fn knot_source_migrate(
                 .expect("knot runtime: failed to prepare insert during migration");
 
             for row_ptr in &new_rows {
-                let row_ref = unsafe { as_ref(*row_ptr) };
-                if let Value::Constructor(tag, payload) = row_ref {
-                    let mut params: Vec<rusqlite::types::Value> = Vec::new();
-                    params.push(rusqlite::types::Value::Text(tag.to_string()));
-                    let payload_fields = match unsafe { as_ref(*payload) } {
-                        Value::Record(f) => f,
-                        Value::Unit => &Vec::new() as &Vec<RecordField>,
-                        _ => panic!("knot runtime: ADT migration result has non-record payload"),
-                    };
-                    for f in &adt.all_fields {
-                        let val = payload_fields
-                            .iter()
-                            .find(|pf| &*pf.name == f.name.as_str())
-                            .map(|pf| value_to_sql_param(pf.value))
-                            .unwrap_or(rusqlite::types::Value::Null);
-                        params.push(val);
-                    }
-                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                        params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-                    stmt.execute(param_refs.as_slice())
-                        .expect("knot runtime: failed to insert row during migration");
-                }
+                // Type-aware serialization via adt_row_to_params — the same
+                // path every other ADT write uses. The previous type-blind
+                // value_to_sql_param serialized payload-bearing constructor
+                // fields (json columns) as their bare tag string, permanently
+                // discarding the payload, and skipped the nested-relation
+                // set-semantics dedup that value_to_sqlite performs.
+                let params = adt_row_to_params(*row_ptr, &adt);
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+                stmt.execute(param_refs.as_slice())
+                    .expect("knot runtime: failed to insert row during migration");
             }
         }
     } else {
@@ -12868,6 +12892,25 @@ pub extern "C-unwind" fn knot_constraint_register(
                 sub_rel, sf, sup_rel, spf
             ).replace('\'', "''");
 
+            // Trigger names must encode BOTH endpoints of the constraint.
+            // Legacy names encoded only one side, so two constraints sharing
+            // a sub field (ins/upd) or a superset field (del) collided on
+            // the trigger name and the second was silently skipped by
+            // CREATE TRIGGER IF NOT EXISTS — dropping its enforcement.
+            let trg_suffix = format!("{}_{}__{}_{}", sub_rel, sf, sup_rel, spf);
+            // Drop stale legacy-format triggers from databases created by
+            // older builds so they don't linger alongside the new ones with
+            // potentially wrong bodies.
+            for legacy in [
+                format!("_knot_fk_{}_{}_ins", sub_rel, sf),
+                format!("_knot_fk_{}_{}_upd", sub_rel, sf),
+                format!("_knot_fk_{}_{}_del", sup_rel, spf),
+            ] {
+                let drop_sql = format!("DROP TRIGGER IF EXISTS {};", quote_ident(&legacy));
+                debug_sql(&drop_sql);
+                let _ = db_ref.conn.execute_batch(&drop_sql);
+            }
+
             // Trigger: reject INSERT into sub if value doesn't exist in sup
             let insert_trigger = format!(
                 "CREATE TRIGGER IF NOT EXISTS {trg} \
@@ -12875,7 +12918,7 @@ pub extern "C-unwind" fn knot_constraint_register(
                  FOR EACH ROW \
                  WHEN NOT EXISTS (SELECT 1 FROM {sup_table} WHERE {sup_col} = NEW.{sub_col}) \
                  BEGIN SELECT RAISE(ABORT, '{msg}'); END;",
-                trg = quote_ident(&format!("_knot_fk_{}_{}_ins", sub_rel, sf)),
+                trg = quote_ident(&format!("_knot_fk_{}_ins", trg_suffix)),
                 sub_table = sub_table,
                 sup_table = sup_table,
                 sub_col = sub_col,
@@ -12893,7 +12936,7 @@ pub extern "C-unwind" fn knot_constraint_register(
                  FOR EACH ROW \
                  WHEN NEW.{sub_col} != OLD.{sub_col} AND NOT EXISTS (SELECT 1 FROM {sup_table} WHERE {sup_col} = NEW.{sub_col}) \
                  BEGIN SELECT RAISE(ABORT, '{msg}'); END;",
-                trg = quote_ident(&format!("_knot_fk_{}_{}_upd", sub_rel, sf)),
+                trg = quote_ident(&format!("_knot_fk_{}_upd", trg_suffix)),
                 sub_table = sub_table,
                 sup_table = sup_table,
                 sub_col = sub_col,
@@ -12915,7 +12958,7 @@ pub extern "C-unwind" fn knot_constraint_register(
                  FOR EACH ROW \
                  WHEN EXISTS (SELECT 1 FROM {sub_table} WHERE {sub_col} = OLD.{sup_col}) \
                  BEGIN SELECT RAISE(ABORT, '{msg}'); END;",
-                trg = quote_ident(&format!("_knot_fk_{}_{}_del", sup_rel, spf)),
+                trg = quote_ident(&format!("_knot_fk_{}_del", trg_suffix)),
                 sup_table = sup_table,
                 sub_table = sub_table,
                 sub_col = sub_col,
@@ -14252,7 +14295,16 @@ fn http_serve_loop(
     route_table: *mut c_void,
     handler: *mut Value,
 ) -> *mut Value {
-    let table = Arc::new(*unsafe { Box::from_raw(route_table as *mut RouteTable) });
+    // The route table is built once per `listen` expression and intentionally
+    // leaked (see `knot_http_listen_io`). Never take ownership here: the
+    // `listen` IO value is first-class — it can be bound to a name and run
+    // more than once (e.g. two `fork srv`), and fork/race deep-clone the env
+    // copying the table address verbatim, so a `Box::from_raw` on the second
+    // run would be a use-after-free + double-free. The table is only mutated
+    // during program init (`knot_route_table_add`, set_field_refinement,
+    // set_rate_limit), before any serve loop starts, so a shared reference
+    // is sound here.
+    let table: &'static RouteTable = unsafe { &*(route_table as *const RouteTable) };
     let server = Arc::new(tiny_http::Server::http(&addr)
         .unwrap_or_else(|e| panic!("knot runtime: failed to start HTTP server on {}: {}", addr, e)));
     eprintln!("Knot HTTP server listening on http://{}", addr);
@@ -14294,7 +14346,6 @@ fn http_serve_loop(
         };
         let path_segments: Vec<String> = path.split('/').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
 
-        let table = Arc::clone(&table);
         let path_seg_refs: Vec<&str> = path_segments.iter().map(|s| s.as_str()).collect();
         let matched = match_route(&table.entries, &method, &path_seg_refs);
 
@@ -17362,5 +17413,360 @@ mod _bugfix_batch_tests {
             .unwrap();
         assert_eq!(out, data);
         knot_set_http_max_body_bytes(0); // restore env-or-default resolution
+    }
+}
+
+#[cfg(test)]
+mod _fk_migration_listen_tests {
+    use super::*;
+
+    fn test_db() -> *mut c_void {
+        let conn = Connection::open_in_memory().unwrap();
+        // Same collation knot_db_open registers — Int columns are TEXT
+        // with COLLATE KNOT_INT.
+        conn.create_collation("KNOT_INT", |a: &str, b: &str| {
+            match (a.parse::<i64>(), b.parse::<i64>()) {
+                (Ok(pa), Ok(pb)) => pa.cmp(&pb),
+                (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+                (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+                (Err(_), Err(_)) => a.cmp(b),
+            }
+        })
+        .unwrap();
+        Box::into_raw(Box::new(KnotDb {
+            conn,
+            atomic_depth: std::cell::Cell::new(0),
+            indexed: RefCell::new(HashSet::new()),
+        })) as *mut c_void
+    }
+
+    fn conn_of(db: *mut c_void) -> &'static Connection {
+        &unsafe { &*(db as *mut KnotDb) }.conn
+    }
+
+    fn register(db: *mut c_void, sub_rel: &str, sub_field: &str, sup_rel: &str, sup_field: &str) {
+        knot_constraint_register(
+            db,
+            sub_rel.as_ptr(),
+            sub_rel.len(),
+            sub_field.as_ptr(),
+            sub_field.len(),
+            sup_rel.as_ptr(),
+            sup_rel.len(),
+            sup_field.as_ptr(),
+            sup_field.len(),
+        );
+    }
+
+    // ── Fix: FK trigger names must encode both constraint endpoints ──
+
+    #[test]
+    fn fk_delete_triggers_shared_superset_do_not_collide() {
+        // Two constraints sharing the superset (people, name):
+        //   *orders.customer <= *people.name
+        //   *comments.author <= *people.name
+        // The legacy delete-trigger name `_knot_fk_people_name_del` collided,
+        // so the second constraint's delete enforcement was silently dropped.
+        let db = test_db();
+        let conn = conn_of(db);
+        conn.execute_batch(
+            r#"CREATE TABLE "_knot_people" ("name" TEXT);
+               CREATE TABLE "_knot_orders" ("customer" TEXT);
+               CREATE TABLE "_knot_comments" ("author" TEXT);"#,
+        )
+        .unwrap();
+        register(db, "orders", "customer", "people", "name");
+        register(db, "comments", "author", "people", "name");
+
+        conn.execute_batch(r#"INSERT INTO "_knot_people" VALUES ('alice'), ('bob');"#)
+            .unwrap();
+        // alice is referenced only by comments (the SECOND constraint).
+        conn.execute_batch(r#"INSERT INTO "_knot_comments" VALUES ('alice');"#)
+            .unwrap();
+
+        let res = conn.execute(r#"DELETE FROM "_knot_people" WHERE "name" = 'alice'"#, []);
+        assert!(
+            res.is_err(),
+            "deleting a person referenced by comments must be rejected"
+        );
+        // bob is unreferenced — delete succeeds.
+        conn.execute(r#"DELETE FROM "_knot_people" WHERE "name" = 'bob'"#, [])
+            .unwrap();
+    }
+
+    #[test]
+    fn fk_insert_update_triggers_shared_sub_field_enforce_both_supersets() {
+        // Two constraints on the SAME sub field pointing at different
+        // supersets:  *a.x <= *p.v  and  *a.x <= *q.v.  The legacy ins/upd
+        // trigger names `_knot_fk_a_x_ins/_upd` collided, dropping the
+        // second constraint's enforcement.
+        let db = test_db();
+        let conn = conn_of(db);
+        conn.execute_batch(
+            r#"CREATE TABLE "_knot_a" ("x" TEXT);
+               CREATE TABLE "_knot_p" ("v" TEXT);
+               CREATE TABLE "_knot_q" ("v" TEXT);"#,
+        )
+        .unwrap();
+        register(db, "a", "x", "p", "v");
+        register(db, "a", "x", "q", "v");
+
+        // 'ok' present in p but NOT in q — the second constraint must reject.
+        conn.execute_batch(r#"INSERT INTO "_knot_p" VALUES ('ok');"#).unwrap();
+        let res = conn.execute(r#"INSERT INTO "_knot_a" VALUES ('ok')"#, []);
+        assert!(res.is_err(), "insert must be rejected while 'ok' is absent from q");
+
+        conn.execute_batch(r#"INSERT INTO "_knot_q" VALUES ('ok');"#).unwrap();
+        conn.execute(r#"INSERT INTO "_knot_a" VALUES ('ok')"#, []).unwrap();
+
+        // Same for UPDATE: 'next' present in p only.
+        conn.execute_batch(r#"INSERT INTO "_knot_p" VALUES ('next');"#).unwrap();
+        let res = conn.execute(r#"UPDATE "_knot_a" SET "x" = 'next'"#, []);
+        assert!(res.is_err(), "update must be rejected while 'next' is absent from q");
+
+        conn.execute_batch(r#"INSERT INTO "_knot_q" VALUES ('next');"#).unwrap();
+        conn.execute(r#"UPDATE "_knot_a" SET "x" = 'next'"#, []).unwrap();
+    }
+
+    #[test]
+    fn fk_register_drops_stale_legacy_triggers() {
+        // Databases written by older builds contain single-endpoint trigger
+        // names; registration must drop them so they don't linger with
+        // potentially wrong bodies alongside the new both-endpoint triggers.
+        let db = test_db();
+        let conn = conn_of(db);
+        conn.execute_batch(
+            r#"CREATE TABLE "_knot_s" ("f" TEXT);
+               CREATE TABLE "_knot_t" ("g" TEXT);
+               CREATE TRIGGER "_knot_fk_s_f_ins" BEFORE INSERT ON "_knot_s"
+                 FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'stale'); END;
+               CREATE TRIGGER "_knot_fk_t_g_del" BEFORE DELETE ON "_knot_t"
+                 FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'stale'); END;"#,
+        )
+        .unwrap();
+        register(db, "s", "f", "t", "g");
+
+        let legacy: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN \
+                 ('_knot_fk_s_f_ins', '_knot_fk_s_f_upd', '_knot_fk_t_g_del')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy, 0, "legacy single-endpoint triggers must be dropped");
+
+        let fresh: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN \
+                 ('_knot_fk_s_f__t_g_ins', '_knot_fk_s_f__t_g_upd', '_knot_fk_s_f__t_g_del')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fresh, 3, "both-endpoint triggers must exist");
+
+        // The stale always-abort insert trigger is gone: valid inserts work.
+        conn.execute_batch(r#"INSERT INTO "_knot_t" VALUES ('v');"#).unwrap();
+        conn.execute(r#"INSERT INTO "_knot_s" VALUES ('v')"#, []).unwrap();
+    }
+
+    // ── Fix: ADT migration must keep payload-bearing constructor fields ──
+
+    extern "C-unwind" fn add_status_migrate_fn(
+        _db: *mut c_void,
+        _env: *mut Value,
+        row: *mut Value,
+    ) -> *mut Value {
+        // Item {n} -> Item {n, status: Just {value: 5}}
+        let (tag, payload) = match unsafe { as_ref(row) } {
+            Value::Constructor(t, p) => (t.clone(), *p),
+            other => panic!("expected Constructor row, got {:?}", type_name_of(other)),
+        };
+        let n = knot_record_field(payload, b"n".as_ptr(), 1);
+        let just_payload = alloc(Value::Record(vec![RecordField {
+            name: intern_str("value"),
+            value: alloc(Value::Int(5)),
+        }]));
+        let status = alloc(Value::Constructor(intern_str("Just"), just_payload));
+        let new_payload = alloc(Value::Record(vec![
+            RecordField { name: intern_str("n"), value: n },
+            RecordField { name: intern_str("status"), value: status },
+        ]));
+        alloc(Value::Constructor(tag, new_payload))
+    }
+
+    fn type_name_of(v: &Value) -> &'static str {
+        match v {
+            Value::Int(_) => "Int",
+            Value::Text(_) => "Text",
+            _ => "other",
+        }
+    }
+
+    #[test]
+    fn adt_migration_preserves_payload_bearing_fields() {
+        let db = test_db();
+        knot_schema_init(db);
+        let name = "mig_items";
+        let old_schema = "#Item:n=int";
+        let new_schema = "#Item:n=int;status=json";
+        knot_source_init(db, name.as_ptr(), name.len(), old_schema.as_ptr(), old_schema.len());
+
+        let conn = conn_of(db);
+        conn.execute_batch(r#"INSERT INTO "_knot_mig_items" ("_tag", "n") VALUES ('Item', '1');"#)
+            .unwrap();
+
+        let migrate_fn = alloc(Value::Function(Box::new(FunctionInner {
+            fn_ptr: add_status_migrate_fn as *const u8,
+            env: alloc(Value::Unit),
+            source: intern_str("<test migrate fn>"),
+        })));
+        knot_source_migrate(
+            db,
+            name.as_ptr(),
+            name.len(),
+            old_schema.as_ptr(),
+            old_schema.len(),
+            new_schema.as_ptr(),
+            new_schema.len(),
+            migrate_fn,
+        );
+
+        // The raw json column must hold the full JSON-encoded constructor —
+        // the old type-blind path wrote just the bare tag string "Just",
+        // permanently discarding the payload.
+        let raw: String = conn
+            .query_row(r#"SELECT "status" FROM "_knot_mig_items""#, [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            raw.contains("__knot_ctor"),
+            "expected JSON-encoded constructor in json column, got '{}'",
+            raw
+        );
+
+        // And the read path reconstructs the constructor with its payload.
+        let rel = knot_source_read(db, name.as_ptr(), name.len(), new_schema.as_ptr(), new_schema.len());
+        let rows = match unsafe { as_ref(rel) } {
+            Value::Relation(r) => r.clone(),
+            _ => panic!("expected relation"),
+        };
+        assert_eq!(rows.len(), 1);
+        let payload = match unsafe { as_ref(rows[0]) } {
+            Value::Constructor(tag, p) => {
+                assert_eq!(&**tag, "Item");
+                *p
+            }
+            _ => panic!("expected Constructor row"),
+        };
+        let status = knot_record_field(payload, b"status".as_ptr(), 6);
+        match unsafe { as_ref(status) } {
+            Value::Constructor(tag, p) => {
+                assert_eq!(&**tag, "Just");
+                let v = knot_record_field(*p, b"value".as_ptr(), 5);
+                match unsafe { as_ref(v) } {
+                    Value::Int(n) => assert_eq!(*n, 5, "payload value must survive migration"),
+                    _ => panic!("expected Int payload value"),
+                }
+            }
+            _ => panic!(
+                "status must round-trip as a payload-bearing Constructor, got {}",
+                brief_value(status)
+            ),
+        }
+    }
+
+    // ── Fix: running the same `listen` IO twice must not double-free ──
+
+    #[test]
+    fn http_serve_loop_route_table_shared_across_two_runs() {
+        // The `listen` IO value is first-class: it can be bound to a name and
+        // run twice (e.g. two `fork srv`), with fork/race deep-cloning the env
+        // and copying the RouteTable address verbatim. http_serve_loop used to
+        // Box::from_raw the pointer — first run freed the table, second run
+        // was a use-after-free + double-free. The table is now an
+        // intentionally leaked shared &'static; two loops on one table must
+        // both serve correctly.
+        let table = knot_route_table_new();
+        let (method, path, ctor, resp, empty) = ("GET", "/ping", "Ping", "text", "");
+        knot_route_table_add(
+            table,
+            method.as_ptr(), method.len(),
+            path.as_ptr(), path.len(),
+            ctor.as_ptr(), ctor.len(),
+            empty.as_ptr(), 0,
+            empty.as_ptr(), 0,
+            resp.as_ptr(), resp.len(),
+            empty.as_ptr(), 0,
+            empty.as_ptr(), 0,
+        );
+
+        // Reserve two distinct free ports (hold both before releasing).
+        // Sandboxed environments may forbid binding sockets entirely —
+        // skip the test there rather than failing on an unrelated policy.
+        let l1 = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping http_serve_loop_route_table_shared_across_two_runs: socket bind not permitted ({})", e);
+                return;
+            }
+            Err(e) => panic!("failed to bind loopback port: {}", e),
+        };
+        let l2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ports = [l1.local_addr().unwrap().port(), l2.local_addr().unwrap().port()];
+        drop(l1);
+        drop(l2);
+
+        for &port in &ports {
+            let table_addr = table as usize;
+            std::thread::spawn(move || {
+                // Null handler is safe: the requests below never match a
+                // route, so the handler value is never touched.
+                http_serve_loop(
+                    format!("127.0.0.1:{}", port),
+                    table_addr as *mut c_void,
+                    std::ptr::null_mut(),
+                );
+            });
+        }
+
+        fn get_unmatched(port: u16) -> String {
+            use std::io::{Read, Write};
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                    if s
+                        .write_all(
+                            b"GET /nope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                        )
+                        .is_ok()
+                    {
+                        let mut buf = String::new();
+                        let _ = s.read_to_string(&mut buf);
+                        if !buf.is_empty() {
+                            return buf;
+                        }
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "server on port {} did not come up",
+                    port
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+
+        // Both serve loops — sharing one RouteTable — must respond. Under the
+        // old ownership scheme the second loop read freed memory.
+        for &port in &ports {
+            let response = get_unmatched(port);
+            assert!(
+                response.contains("404"),
+                "expected 404 from server on port {}, got: {}",
+                port,
+                response
+            );
+        }
     }
 }

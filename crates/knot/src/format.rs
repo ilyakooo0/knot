@@ -19,6 +19,77 @@ const TARGET_WIDTH: usize = 100;
 // ── Public entry point ─────────────────────────────────────────────
 
 pub fn format_module(source: &str, module: &Module) -> String {
+    let out = format_module_inner(source, module);
+    if out == source {
+        return out;
+    }
+    // Safety net: the formatted output must reparse cleanly to the same AST
+    // (modulo spans). If it doesn't — a formatter bug, e.g. layout-sensitive
+    // indentation drift — return the original source unchanged rather than
+    // ever producing output that no longer parses or means something else.
+    // All callers (`knot fmt`, the LSP) go through this entry point.
+    if reparses_to_same_ast(module, &out) {
+        out
+    } else {
+        source.to_string()
+    }
+}
+
+/// Parse `formatted` and check it produces the same AST as `module`,
+/// ignoring source spans. Any lex/parse error counts as a mismatch.
+fn reparses_to_same_ast(module: &Module, formatted: &str) -> bool {
+    let (tokens, lex_diags) = crate::lexer::Lexer::new(formatted).tokenize();
+    if lex_diags
+        .iter()
+        .any(|d| d.severity == crate::diagnostic::Severity::Error)
+    {
+        return false;
+    }
+    let parser = crate::parser::Parser::new(formatted.to_string(), tokens);
+    let (reparsed, parse_diags) = parser.parse_module();
+    if parse_diags
+        .iter()
+        .any(|d| d.severity == crate::diagnostic::Severity::Error)
+    {
+        return false;
+    }
+    strip_spans(&format!("{:?}", module)) == strip_spans(&format!("{:?}", reparsed))
+}
+
+/// Remove every `span: Span { ... }` payload from a `Debug` rendering so AST
+/// comparison tolerates the byte-position drift formatting introduces.
+fn strip_spans(debug: &str) -> String {
+    let mut out = String::with_capacity(debug.len());
+    let bytes = debug.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &debug[i..];
+        if rest.starts_with("span: Span {") {
+            // Skip to the matching close brace (Span's Debug nests no braces).
+            match rest.find('}') {
+                Some(close) => {
+                    i += close + 1;
+                    // Swallow a following `, ` separator if present.
+                    if debug[i..].starts_with(", ") {
+                        i += 2;
+                    }
+                    continue;
+                }
+                None => {
+                    out.push_str(rest);
+                    break;
+                }
+            }
+        }
+        // Advance one full UTF-8 character.
+        let ch = rest.chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn format_module_inner(source: &str, module: &Module) -> String {
     let comments = collect_comments(source);
 
     enum Block<'a> {
@@ -327,9 +398,13 @@ fn render_decl_with_fallback(source: &str, d: &Decl, comments: &[Comment<'_>]) -
     p.finish()
 }
 
-/// Verbatim source with tabs → 2 spaces and trailing whitespace trimmed.
+/// Verbatim source with tabs → 1 space and trailing whitespace trimmed.
+/// The parser counts a tab as ONE column (`column_of` uses `chars().count()`),
+/// so a tab must be replaced by exactly one space — anything wider can change
+/// the relative indentation of mixed tab/space sibling lines inside a layout
+/// block, altering block structure on reparse.
 fn normalize_source_slice(s: &str) -> String {
-    let s = s.replace('\t', "  ");
+    let s = s.replace('\t', " ");
     let mut out = String::with_capacity(s.len());
     for (i, line) in s.split('\n').enumerate() {
         if i > 0 {
@@ -1254,6 +1329,39 @@ fn binop_str(op: BinOp) -> &'static str {
 
 // ── Expression rendering ────────────────────────────────────────────
 
+/// Detect the parser's `let pat = value in body` desugaring so the surface
+/// syntax can be printed back faithfully.
+///
+/// `parse_let_in_expr` produces `App { func: Lambda { params: [pat], body },
+/// arg: value }` where the value's span lies textually INSIDE the lambda's
+/// span (the value sits between `=` and `in`, while the lambda spans the
+/// whole `let ... body` range). A genuine application can never look like
+/// this: its argument follows the head textually, so `arg.span.end` is
+/// always past `func.span.end`. (Span identity with the App node itself is
+/// not usable — a parenthesized `(let ... in ...)` atom is re-wrapped with
+/// a widened span that includes the parens.)
+///
+/// Returns `(pat, annot_ty, value, body)`. When the let binding carried a
+/// type annotation (`let x : T = v in b`) the parser wraps the value in
+/// `Annot`; it is unwrapped here so the annotation prints back in binding
+/// position (the unannotated `let x = (v : T) in b` parses to the same AST,
+/// so either rendering reparses identically).
+fn as_let_in(e: &Expr) -> Option<(&Pat, Option<&Type>, &Expr, &Expr)> {
+    if let ExprKind::App { func, arg } = &e.node {
+        if arg.span.end < func.span.end && arg.span.start > func.span.start {
+            if let ExprKind::Lambda { params, body } = &func.node {
+                if params.len() == 1 {
+                    if let ExprKind::Annot { expr, ty } = &arg.node {
+                        return Some((&params[0], Some(ty), expr, body));
+                    }
+                    return Some((&params[0], None, arg, body));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn render_expr(p: &mut Printer, e: &Expr, parent: Prec) {
     if forces_multiline(e) {
         render_expr_block(p, e, parent);
@@ -1282,6 +1390,20 @@ fn forces_multiline(e: &Expr) -> bool {
 
 /// Render an expression on a single line, with conservative parenthesization.
 fn render_expr_inline(e: &Expr, parent: Prec) -> String {
+    // `let pat = value in body` — preserve the surface syntax instead of
+    // printing the parser's `(\pat -> body) value` desugaring.
+    if let Some((pat, ty, value, body)) = as_let_in(e) {
+        let mut s = format!("let {}", render_pat(pat));
+        if let Some(t) = ty {
+            s.push_str(" : ");
+            s.push_str(&render_type(t));
+        }
+        s.push_str(" = ");
+        s.push_str(&render_expr_inline(value, Prec::Lowest));
+        s.push_str(" in ");
+        s.push_str(&render_expr_inline(body, Prec::Lowest));
+        return paren_if(parent > Prec::Lowest, s);
+    }
     match &e.node {
         ExprKind::Lit(l) => render_literal(l),
         // `yield` is refused by the parser's `can_start_atom` in application
@@ -1601,6 +1723,11 @@ fn punned_form(f: &Field<Expr>) -> Option<String> {
 /// renderers: inline `case`/`do`/`serve` always self-parenthesize, but their
 /// multi-line renderings at `Prec::Lowest` do not.
 fn annot_inner_needs_parens(e: &Expr, inline: bool) -> bool {
+    // `let … in body` — the body is parsed with `parse_expr`, which would
+    // greedily reattach a trailing `: Type` to the body on reparse.
+    if as_let_in(e).is_some() {
+        return true;
+    }
     match &e.node {
         // Tail is `parse_expr`: lambda body, else-branch, atomic/refine
         // operand, set/replace value.
@@ -1621,6 +1748,29 @@ fn annot_inner_needs_parens(e: &Expr, inline: bool) -> bool {
 // ── Multi-line expression rendering ─────────────────────────────────
 
 fn render_expr_block(p: &mut Printer, e: &Expr, parent: Prec) {
+    // `let pat = value in body` — preserve the surface syntax (see
+    // `as_let_in`). The body may render multiline (do/case blocks manage
+    // their own layout after `in `).
+    if let Some((pat, ty, value, body)) = as_let_in(e) {
+        let need_parens = parent > Prec::Lowest;
+        if need_parens {
+            p.write("(");
+        }
+        p.write("let ");
+        p.write(&render_pat(pat));
+        if let Some(t) = ty {
+            p.write(" : ");
+            p.write(&render_type(t));
+        }
+        p.write(" = ");
+        render_expr(p, value, Prec::Lowest);
+        p.write(" in ");
+        render_expr(p, body, Prec::Lowest);
+        if need_parens {
+            p.write(")");
+        }
+        return;
+    }
     match &e.node {
         ExprKind::Do(stmts) => render_do_block(p, stmts, parent),
         ExprKind::Case { scrutinee, arms } => render_case_block(p, scrutinee, arms, parent),
@@ -1895,10 +2045,14 @@ fn render_record_update_block(p: &mut Printer, base: &Expr, fields: &[Field<Expr
 }
 
 fn render_app_block(p: &mut Printer, e: &Expr, parent: Prec) {
-    // Flatten left-spine of applications.
+    // Flatten left-spine of applications. Stop at a `let … in` node — it is
+    // an App in the AST but renders as a binding, not as head + args.
     let mut spine: Vec<&Expr> = Vec::new();
     let mut cur = e;
     while let ExprKind::App { func, arg } = &cur.node {
+        if as_let_in(cur).is_some() {
+            break;
+        }
         spine.push(arg);
         cur = func;
     }

@@ -52,6 +52,7 @@ impl TestWorkspace {
             published_lsp_diagnostics: HashMap::new(),
             client_supports_diagnostic_refresh: false,
             diagnostic_refresh_counter: 0,
+            document_versions: HashMap::new(),
             workspace_diag_reported: HashSet::new(),
         };
         TestWorkspace {

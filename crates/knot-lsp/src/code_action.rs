@@ -7,7 +7,6 @@ use lsp_types::*;
 
 use knot::ast::{self, DeclKind, Module, Span, TypeKind};
 
-use crate::builtins::EFFECTFUL_BUILTINS;
 use crate::shared::{
     extract_principal_type_name, find_enclosing_atomic_expr, render_signature_with_effects,
 };
@@ -283,32 +282,14 @@ pub(crate) fn handle_code_action(
                 }));
             }
 
-            // Additionally, if the diagnostic is "IO in atomic", suggest
-            // wrapping the offending IO call in `fork` (fire-and-forget) so it
-            // runs outside the transaction.
-            if msg.contains("IO effects are not allowed inside atomic") {
-                if let Some(call_span) = find_io_call_in_range(&doc, diag_offset) {
-                    let inner_text = safe_slice(&doc.source, call_span).to_string();
-                    let mut changes = HashMap::new();
-                    changes.insert(
-                        uri.clone(),
-                        vec![TextEdit {
-                            range: span_to_range(call_span, &doc.source),
-                            new_text: format!("fork ({inner_text})"),
-                        }],
-                    );
-                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                        title: "Wrap IO in `fork`".to_string(),
-                        kind: Some(CodeActionKind::QUICKFIX),
-                        diagnostics: Some(vec![diag.clone()]),
-                        edit: Some(WorkspaceEdit {
-                            changes: Some(changes),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }));
-                }
-            }
+            // NOTE: a "Wrap IO in `fork`" quickfix used to be offered here for
+            // the "IO effects are not allowed inside atomic" diagnostic, but
+            // the effect inferencer propagates the argument's effects through
+            // `fork` (`fork : ∀a r. IO {| r} a -> IO {| r} {}`), so the wrap
+            // never fixed the diagnostic — it was just re-offered on the inner
+            // span, nesting `fork (fork (…))` forever. A quickfix that doesn't
+            // fix is worse than none, so it was removed; "Remove `atomic`
+            // wrapper" above remains the effective fix.
         }
 
         // Quick fix for "inferred effects exceed declared effects"
@@ -575,22 +556,43 @@ pub(crate) fn handle_code_action(
                     .rfind('\n')
                     .map(|p| p + 1)
                     .unwrap_or(0);
-                let stmt_line = &doc.source[line_start..];
-                let indent = stmt_line.len() - stmt_line.trim_start().len();
-                let indent_str = " ".repeat(indent);
+                let prefix = &doc.source[line_start..stmt_start];
+                // When the statement starts its own line, insert the binding
+                // as a full line above it, reusing the line's indentation.
+                // When non-whitespace precedes it (the statement sits inline
+                // on the `do` line, e.g. `main = do let y = 5`), inserting at
+                // line start would splice text before `main = do` — anchor at
+                // the statement's own offset instead and push the statement
+                // onto a continuation line at its original column (which is
+                // the layout block's indent).
+                let insert_edit = if prefix.chars().all(char::is_whitespace) {
+                    TextEdit {
+                        range: Range {
+                            start: offset_to_position(&doc.source, line_start),
+                            end: offset_to_position(&doc.source, line_start),
+                        },
+                        new_text: format!("{prefix}let {let_name} = {trimmed}\n"),
+                    }
+                } else {
+                    let stmt_col = stmt_start - line_start;
+                    TextEdit {
+                        range: Range {
+                            start: offset_to_position(&doc.source, stmt_start),
+                            end: offset_to_position(&doc.source, stmt_start),
+                        },
+                        new_text: format!(
+                            "let {let_name} = {trimmed}\n{}",
+                            " ".repeat(stmt_col)
+                        ),
+                    }
+                };
 
                 let mut changes = HashMap::new();
                 changes.insert(
                     uri.clone(),
                     vec![
                         // Insert let binding before the enclosing do-statement
-                        TextEdit {
-                            range: Range {
-                                start: offset_to_position(&doc.source, line_start),
-                                end: offset_to_position(&doc.source, line_start),
-                            },
-                            new_text: format!("{indent_str}let {let_name} = {trimmed}\n"),
-                        },
+                        insert_edit,
                         // Replace the selected expression with the variable name
                         TextEdit {
                             range: params.range,
@@ -738,6 +740,29 @@ pub(crate) fn handle_code_action(
             }
         }
 
+        // Trailing comments on import lines (`import ./b -- pinned`) sit
+        // outside the import's span, so the regenerated block would silently
+        // drop them. Capture them per path and re-attach after the rewritten
+        // line; duplicates merged into one line keep every comment.
+        let mut trailing_comments: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for imp in &doc.module.imports {
+            if unused_imports.contains(&imp.path) {
+                continue;
+            }
+            let line_end = doc.source[imp.span.end.min(doc.source.len())..]
+                .find('\n')
+                .map(|p| imp.span.end + p)
+                .unwrap_or(doc.source.len());
+            let rest = safe_slice(&doc.source, Span::new(imp.span.end, line_end));
+            if let Some(p) = rest.find("--") {
+                trailing_comments
+                    .entry(imp.path.clone())
+                    .or_default()
+                    .push(rest[p..].trim_end().to_string());
+            }
+        }
+
         // Only emit the action if something would change. Both `first` and
         // `last` are guaranteed to be `Some` here because the outer
         // `!doc.module.imports.is_empty()` check holds, but defensively
@@ -746,19 +771,42 @@ pub(crate) fn handle_code_action(
         if let (Some(first_import), Some(last_import)) =
             (doc.module.imports.first(), doc.module.imports.last())
         {
+            // Import spans end at the import's last token, so a trailing
+            // comment on the LAST import line sits outside the rewritten
+            // block. Extend the block to the end of that line when a comment
+            // follows — otherwise the re-attached copy would duplicate it.
+            let block_end = {
+                let line_end = doc.source[last_import.span.end.min(doc.source.len())..]
+                    .find('\n')
+                    .map(|p| last_import.span.end + p)
+                    .unwrap_or(doc.source.len());
+                let rest =
+                    safe_slice(&doc.source, Span::new(last_import.span.end, line_end));
+                if rest.contains("--") {
+                    line_end
+                } else {
+                    last_import.span.end
+                }
+            };
             let import_range = Range {
                 start: offset_to_position(&doc.source, first_import.span.start),
-                end: offset_to_position(&doc.source, last_import.span.end),
+                end: offset_to_position(&doc.source, block_end),
             };
 
             let sorted_imports = merged
                 .iter()
-                .map(|(path, items)| match items {
-                    None => format!("import {path}"),
-                    Some(set) => format!(
-                        "import {path} ({})",
-                        set.iter().cloned().collect::<Vec<_>>().join(", ")
-                    ),
+                .map(|(path, items)| {
+                    let line = match items {
+                        None => format!("import {path}"),
+                        Some(set) => format!(
+                            "import {path} ({})",
+                            set.iter().cloned().collect::<Vec<_>>().join(", ")
+                        ),
+                    };
+                    match trailing_comments.get(path) {
+                        Some(comments) => format!("{line} {}", comments.join(" ")),
+                        None => line,
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -766,7 +814,7 @@ pub(crate) fn handle_code_action(
             // Compare against the current import block's text so the action
             // only appears when the rewrite actually changes something.
             let original_text =
-                safe_slice(&doc.source, Span::new(first_import.span.start, last_import.span.end));
+                safe_slice(&doc.source, Span::new(first_import.span.start, block_end));
 
             // Comment lines interleaved between imports would be wiped by the
             // block rewrite. Preserve them (in original order) above the
@@ -1246,14 +1294,17 @@ fn find_if_negate_at(
             if cond_text.contains('\n') || then_text.contains('\n') || else_text.contains('\n') {
                 return None;
             }
-            // Strip a leading `not ` if present so the negation cancels out.
-            let new_cond = if let Some(rest) = cond_text.strip_prefix("not ") {
-                rest.to_string()
-            } else if let Some(rest) = cond_text
-                .strip_prefix("(not ")
-                .and_then(|s| s.strip_suffix(')'))
+            // Strip the `not` only when the condition's AST ROOT is the
+            // negation — a textual prefix check is wrong for `not a && b`,
+            // which parses as `(not a) && b`: stripping the prefix would
+            // negate only the first conjunct. Otherwise wrap the whole
+            // condition in `not (…)`.
+            let new_cond = if let ast::ExprKind::UnaryOp {
+                op: ast::UnaryOp::Not,
+                operand,
+            } = &cond.node
             {
-                rest.to_string()
+                source.get(operand.span.start..operand.span.end)?.to_string()
             } else {
                 format!("not ({cond_text})")
             };
@@ -1416,6 +1467,16 @@ fn find_case_actions(
     }
 
     if let ast::ExprKind::Case { scrutinee, arms } = &expr.node {
+        // A wildcard (`_`) or bare-variable arm already catches every
+        // remaining constructor — the case is exhaustive, and arms inserted
+        // after the catch-all would be unreachable dead code. Suppress the
+        // fill action entirely (recursion into sub-expressions still runs).
+        let has_catch_all_arm = arms.iter().any(|arm| {
+            matches!(
+                &arm.pat.node,
+                ast::PatKind::Wildcard | ast::PatKind::Var(_)
+            )
+        });
         // Try to find the ADT type of the scrutinee. Resolve the scrutinee
         // expression's *own span* against the local-type table (innermost
         // containing span, via the deterministic sorted vec) rather than
@@ -1472,7 +1533,7 @@ fn find_case_actions(
                             .filter(|c| !existing.contains(&c.name))
                             .collect();
 
-                        if missing.is_empty() {
+                        if has_catch_all_arm || missing.is_empty() {
                             continue;
                         }
 
@@ -1852,113 +1913,6 @@ fn import_is_used(
         let _ = path;
     }
     false
-}
-
-/// Locate an effectful builtin call at or near the given offset, for `fork`-wrap suggestions.
-fn find_io_call_in_range(doc: &DocumentState, offset: usize) -> Option<Span> {
-    // Scan literal/reference info: find a Var span that names an effectful builtin
-    // and whose containing AppChain encloses the offset.
-    for decl in &doc.module.decls {
-        if decl.span.start > offset || offset > decl.span.end {
-            continue;
-        }
-        let body_opt: Option<&ast::Expr> = match &decl.node {
-            DeclKind::Fun { body: Some(b), .. }
-            | DeclKind::View { body: b, .. }
-            | DeclKind::Derived { body: b, .. } => Some(b),
-            _ => None,
-        };
-        if let Some(body) = body_opt {
-            if let Some(span) = find_io_call(body, offset) {
-                return Some(span);
-            }
-        }
-        if let DeclKind::Impl { items, .. } = &decl.node {
-            for item in items {
-                if let ast::ImplItem::Method { body, .. } = item {
-                    if let Some(span) = find_io_call(body, offset) {
-                        return Some(span);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-fn find_io_call(expr: &ast::Expr, offset: usize) -> Option<Span> {
-    if expr.span.start > offset || offset > expr.span.end {
-        return None;
-    }
-    // If this expression is an App whose head is an effectful builtin, return
-    // the entire App's span.
-    if let ast::ExprKind::App { .. } = &expr.node {
-        let mut head = expr;
-        while let ast::ExprKind::App { func, .. } = &head.node {
-            head = func;
-        }
-        if let ast::ExprKind::Var(name) = &head.node {
-            if EFFECTFUL_BUILTINS.contains(&name.as_str()) {
-                return Some(expr.span);
-            }
-        }
-    }
-    // Recurse, keeping the smallest match
-    let mut best: Option<Span> = None;
-    let consider = |s: Span, best: &mut Option<Span>| {
-        if best
-            .as_ref()
-            .map_or(true, |b| s.end - s.start < b.end - b.start)
-        {
-            *best = Some(s);
-        }
-    };
-    let recur = |e: &ast::Expr, best: &mut Option<Span>| {
-        if let Some(s) = find_io_call(e, offset) {
-            consider(s, best);
-        }
-    };
-    match &expr.node {
-        ast::ExprKind::App { func, arg } => {
-            recur(func, &mut best);
-            recur(arg, &mut best);
-        }
-        ast::ExprKind::Lambda { body, .. } => recur(body, &mut best),
-        ast::ExprKind::BinOp { lhs, rhs, .. } => {
-            recur(lhs, &mut best);
-            recur(rhs, &mut best);
-        }
-        ast::ExprKind::UnaryOp { operand, .. } => recur(operand, &mut best),
-        ast::ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            recur(cond, &mut best);
-            recur(then_branch, &mut best);
-            recur(else_branch, &mut best);
-        }
-        ast::ExprKind::Case { scrutinee, arms } => {
-            recur(scrutinee, &mut best);
-            for arm in arms {
-                recur(&arm.body, &mut best);
-            }
-        }
-        ast::ExprKind::Do(stmts) => {
-            for stmt in stmts {
-                match &stmt.node {
-                    ast::StmtKind::Bind { expr, .. }
-                    | ast::StmtKind::Let { expr, .. }
-                    | ast::StmtKind::Expr(expr)
-                    | ast::StmtKind::Where { cond: expr } => recur(expr, &mut best),
-                    ast::StmtKind::GroupBy { key } => recur(key, &mut best),
-                }
-            }
-        }
-        ast::ExprKind::Atomic(e) | ast::ExprKind::Refine(e) => recur(e, &mut best),
-        _ => {}
-    }
-    best
 }
 
 /// Pull a `{...}` block out of an effects diagnostic note like
@@ -2423,7 +2377,11 @@ fn indent_for_expr_start(source: &str, span_start: usize) -> String {
 }
 
 fn arm_indentation(case_expr: &ast::Expr, arms: &[ast::CaseArm], source: &str) -> String {
-    // Prefer the indentation of an existing arm
+    // Prefer the column of an existing arm — the layout block's indent is
+    // fixed at the first arm's column even when that arm sits inline on the
+    // `of` line (`case x of A {} -> 1`), so new arms must land at the SAME
+    // column, not at case-column+2 (which would be shallower than the block
+    // indent and fail to parse).
     if let Some(arm) = arms.first() {
         let line_start = source[..arm.pat.span.start]
             .rfind('\n')
@@ -2433,8 +2391,12 @@ fn arm_indentation(case_expr: &ast::Expr, arms: &[ast::CaseArm], source: &str) -
         if prefix.chars().all(char::is_whitespace) {
             return format!("\n{prefix}");
         }
+        // Inline arm: non-whitespace precedes it, so synthesize the column
+        // with spaces.
+        let col = arm.pat.span.start - line_start;
+        return format!("\n{}", " ".repeat(col));
     }
-    // Fall back: case expression's column + 2
+    // No arms at all: fall back to the case expression's column + 2.
     let line_start = source[..case_expr.span.start]
         .rfind('\n')
         .map(|p| p + 1)
@@ -2663,20 +2625,33 @@ fn find_inline_actions(
                             // Build edits: remove the let line, replace all usages with the value
                             let mut edits = Vec::new();
 
-                            // Remove the let statement (including the newline)
+                            // Remove the let statement. When the statement
+                            // starts its own line, remove the whole line
+                            // (including the newline). When non-whitespace
+                            // precedes it on the line (the binding sits inline
+                            // on the `do` line, e.g. `main = do let y = 5`),
+                            // deleting from line start would erase `main = do`
+                            // itself — delete only the statement's own text.
                             let let_line_start = doc.source[..stmt.span.start]
                                 .rfind('\n')
                                 .map(|p| p + 1)
-                                .unwrap_or(stmt.span.start);
-                            let let_line_end = doc.source[stmt.span.end..]
-                                .find('\n')
-                                .map(|p| stmt.span.end + p + 1)
-                                .unwrap_or(stmt.span.end);
+                                .unwrap_or(0);
+                            let prefix = &doc.source[let_line_start..stmt.span.start];
+                            let (del_start, del_end) =
+                                if prefix.chars().all(char::is_whitespace) {
+                                    let let_line_end = doc.source[stmt.span.end..]
+                                        .find('\n')
+                                        .map(|p| stmt.span.end + p + 1)
+                                        .unwrap_or(stmt.span.end);
+                                    (let_line_start, let_line_end)
+                                } else {
+                                    (stmt.span.start, stmt.span.end)
+                                };
 
                             edits.push(TextEdit {
                                 range: Range {
-                                    start: offset_to_position(&doc.source, let_line_start),
-                                    end: offset_to_position(&doc.source, let_line_end),
+                                    start: offset_to_position(&doc.source, del_start),
+                                    end: offset_to_position(&doc.source, del_end),
                                 },
                                 new_text: String::new(),
                             });
@@ -3201,9 +3176,30 @@ fn find_flip_binary_at(
             if let Some(op_text) = op_str {
                 let size = expr.span.end - expr.span.start;
                 if best.as_ref().map_or(true, |b| size < b.0.end - b.0.start) {
-                    let lhs_text = safe_slice(source, lhs.span);
-                    let rhs_text = safe_slice(source, rhs.span);
-                    let replacement = format!("{rhs_text} {op_text} {lhs_text}");
+                    // Keyword forms (if/case/lambda/do) greedily consume
+                    // everything to their right, so moving one to the other
+                    // operand position swallows the operator and the old
+                    // operand (`false && if … else false` flipped naively
+                    // becomes `if … else false && false`). Parenthesize a
+                    // moved keyword-form operand on either side — over-
+                    // parenthesizing is harmless.
+                    let operand_text = |e: &ast::Expr| -> String {
+                        let text = safe_slice(source, e.span);
+                        let keyword_form = matches!(
+                            &e.node,
+                            ast::ExprKind::If { .. }
+                                | ast::ExprKind::Case { .. }
+                                | ast::ExprKind::Lambda { .. }
+                                | ast::ExprKind::Do(_)
+                        );
+                        if keyword_form && !is_already_parenthesized(text) {
+                            format!("({text})")
+                        } else {
+                            text.to_string()
+                        }
+                    };
+                    let replacement =
+                        format!("{} {op_text} {}", operand_text(rhs), operand_text(lhs));
                     *best = Some((expr.span, replacement));
                 }
             }
@@ -3244,6 +3240,7 @@ fn find_pipe_conversion_at(
         offset: usize,
         best: &mut Option<(Span, String)>,
         is_app_head: bool,
+        under_operator: bool,
     ) {
         if expr.span.start > offset || offset > expr.span.end {
             return;
@@ -3276,28 +3273,55 @@ fn find_pipe_conversion_at(
                     } else {
                         arg_text.to_string()
                     };
-                    let replacement = format!("{arg_part} |> {func_text}");
+                    // `|>` has the lowest precedence, so splicing a bare pipe
+                    // into an operator operand re-associates the expression:
+                    // `1 + double x` → `1 + x |> double` parses as
+                    // `(1 + x) |> double`. Parenthesize the pipe whenever the
+                    // application is an operand of a Bin/UnaryOp.
+                    let replacement = if under_operator {
+                        format!("({arg_part} |> {func_text})")
+                    } else {
+                        format!("{arg_part} |> {func_text}")
+                    };
                     *best = Some((expr.span, replacement));
                 }
             }
             // Recurse manually so the function side knows it is an
-            // application head.
-            walk(func, source, offset, best, true);
-            walk(arg, source, offset, best, false);
+            // application head. An application's argument slot is atomic
+            // (complex args are parenthesized in the source), so neither
+            // child inherits the operator context.
+            walk(func, source, offset, best, true, false);
+            walk(arg, source, offset, best, false, false);
             return;
         }
-        crate::utils::recurse_expr(expr, |e| walk(e, source, offset, best, false));
+        // Operator operands need the flag so a converted App inside them is
+        // parenthesized; everything else resets it (their children sit in
+        // delimited or otherwise pipe-safe positions).
+        match &expr.node {
+            ast::ExprKind::BinOp { lhs, rhs, .. } => {
+                walk(lhs, source, offset, best, false, true);
+                walk(rhs, source, offset, best, false, true);
+            }
+            ast::ExprKind::UnaryOp { operand, .. } => {
+                walk(operand, source, offset, best, false, true);
+            }
+            _ => {
+                crate::utils::recurse_expr(expr, |e| {
+                    walk(e, source, offset, best, false, false)
+                });
+            }
+        }
     }
     let mut best = None;
     for decl in &module.decls {
         match &decl.node {
             DeclKind::Fun { body: Some(body), .. }
             | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => walk(body, source, offset, &mut best, false),
+            | DeclKind::Derived { body, .. } => walk(body, source, offset, &mut best, false, false),
             DeclKind::Impl { items, .. } => {
                 for item in items {
                     if let ast::ImplItem::Method { body, .. } = item {
-                        walk(body, source, offset, &mut best, false);
+                        walk(body, source, offset, &mut best, false, false);
                     }
                 }
             }
@@ -4518,6 +4542,44 @@ mod regress_case_arm_tests {
         }
     }
 
+    /// Item 7 (2026-06 batch 2): a `_` wildcard arm makes the case
+    /// exhaustive — offering "Add missing case arms" would insert dead arms
+    /// after the wildcard. The action must be suppressed.
+    #[test]
+    fn fill_case_arms_not_offered_when_wildcard_arm_exists() {
+        let mut tw = TestWorkspace::new();
+        let src = "data Color = Red {} | Blue {} | Green {}\n\npick : Color -> Int\npick = \\v -> case v of\n  Red {} -> 1\n  _ -> 0\n";
+        let uri = tw.open("main", src);
+        let pos = tw.position_of(&uri, "case v of");
+        let actions = handle_code_action(&tw.state, &params_at(&uri, pos)).unwrap_or_default();
+        assert!(
+            !actions.iter().any(|a| match a {
+                CodeActionOrCommand::CodeAction(ca) =>
+                    ca.title.starts_with("Add missing case arms"),
+                _ => false,
+            }),
+            "fill-case-arms must not be offered when a wildcard arm exists"
+        );
+    }
+
+    /// Same for a bare-variable catch-all arm (`other -> …`).
+    #[test]
+    fn fill_case_arms_not_offered_when_var_catch_all_exists() {
+        let mut tw = TestWorkspace::new();
+        let src = "data Color = Red {} | Blue {} | Green {}\n\npick : Color -> Int\npick = \\v -> case v of\n  Red {} -> 1\n  other -> 0\n";
+        let uri = tw.open("main", src);
+        let pos = tw.position_of(&uri, "case v of");
+        let actions = handle_code_action(&tw.state, &params_at(&uri, pos)).unwrap_or_default();
+        assert!(
+            !actions.iter().any(|a| match a {
+                CodeActionOrCommand::CodeAction(ca) =>
+                    ca.title.starts_with("Add missing case arms"),
+                _ => false,
+            }),
+            "fill-case-arms must not be offered when a catch-all binder arm exists"
+        );
+    }
+
     /// Item 4: scrutinee type resolution must be span-based (innermost
     /// binding at the scrutinee), not text-matching across all bindings.
     /// Two same-named bindings with different types in different scopes
@@ -4547,6 +4609,352 @@ mod regress_case_arm_tests {
             !fill.title.contains("Circle"),
             "scrutinee resolved to the wrong same-named binding: {}",
             fill.title
+        );
+    }
+}
+
+// Regression tests for the 2026-06 LSP bug-fix batch 2 (code-action group).
+// Kept in a separate module so the earlier regression files stay untouched.
+#[cfg(test)]
+mod regress_fixes_batch2_tests {
+    use super::*;
+    use crate::test_support::{TempWorkspace, TestWorkspace};
+
+    fn parse_module(src: &str) -> Module {
+        let (tokens, lex_diags) = knot::lexer::Lexer::new(src).tokenize();
+        assert!(lex_diags.is_empty(), "lex errors in test source: {lex_diags:?}");
+        let (module, parse_diags) =
+            knot::parser::Parser::new(src.to_string(), tokens).parse_module();
+        assert!(parse_diags.is_empty(), "parse errors in test source: {parse_diags:?}");
+        module
+    }
+
+    fn parses_cleanly(src: &str) -> bool {
+        let (tokens, lex_diags) = knot::lexer::Lexer::new(src).tokenize();
+        let (_, parse_diags) =
+            knot::parser::Parser::new(src.to_string(), tokens).parse_module();
+        lex_diags.is_empty() && parse_diags.is_empty()
+    }
+
+    fn params_for(uri: &Uri, range: Range) -> CodeActionParams {
+        CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range,
+            context: CodeActionContext {
+                diagnostics: Vec::new(),
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }
+    }
+
+    fn action_titled<'a>(
+        actions: &'a [CodeActionOrCommand],
+        pred: impl Fn(&str) -> bool,
+    ) -> Option<&'a CodeAction> {
+        actions.iter().find_map(|a| match a {
+            CodeActionOrCommand::CodeAction(ca) if pred(&ca.title) => Some(ca),
+            _ => None,
+        })
+    }
+
+    fn edits_for<'a>(action: &'a CodeAction, uri: &Uri) -> &'a [TextEdit] {
+        action
+            .edit
+            .as_ref()
+            .and_then(|e| e.changes.as_ref())
+            .and_then(|c| c.get(uri))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Apply `TextEdit`s to `source`, back-to-front so offsets stay valid.
+    fn apply_edits_to(source: &str, edits: &[TextEdit]) -> String {
+        let mut spans: Vec<(usize, usize, &str)> = edits
+            .iter()
+            .map(|e| {
+                (
+                    crate::utils::position_to_offset(source, e.range.start),
+                    crate::utils::position_to_offset(source, e.range.end),
+                    e.new_text.as_str(),
+                )
+            })
+            .collect();
+        spans.sort_by_key(|(s, _, _)| std::cmp::Reverse(*s));
+        let mut out = source.to_string();
+        for (start, end, text) in spans {
+            out.replace_range(start..end, text);
+        }
+        out
+    }
+
+    /// Bug 1: converting `double x` to pipe form under a binary operator must
+    /// parenthesize the pipe — `1 + x |> double` parses as `(1 + x) |> double`
+    /// because `|>` has the lowest precedence.
+    #[test]
+    fn pipe_conversion_parenthesizes_under_binary_operator() {
+        let src = "double = \\x -> x * 2\n\nf = \\x -> 1 + double x\n";
+        let module = parse_module(src);
+        let off = src.rfind("double x").expect("application");
+        let (span, replacement) =
+            find_pipe_conversion_at(&module, src, off).expect("pipe action offered");
+        assert_eq!(replacement, "(x |> double)");
+        let mut out = src.to_string();
+        out.replace_range(span.start..span.end, &replacement);
+        assert!(parses_cleanly(&out), "pipe rewrite must reparse: {out}");
+        assert!(out.contains("1 + (x |> double)"), "got: {out}");
+    }
+
+    /// Bug 1 (control): top-level applications keep the bare pipe form.
+    #[test]
+    fn pipe_conversion_stays_bare_outside_operators() {
+        let src = "h = \\x -> show x\n";
+        let module = parse_module(src);
+        let off = src.find("show x").expect("application") + 1;
+        let (_, replacement) =
+            find_pipe_conversion_at(&module, src, off).expect("pipe action offered");
+        assert_eq!(replacement, "x |> show");
+    }
+
+    /// Bug 2: adding a wildcard arm to a case whose first arm sits inline on
+    /// the `of` line must indent the new arm at the FIRST ARM's column (the
+    /// layout block indent), not case-column+2 — the latter is shallower than
+    /// the block indent and fails to parse.
+    #[test]
+    fn add_wildcard_arm_aligns_with_inline_first_arm() {
+        let src = "data Color = Red {} | Blue {}\n\nf = \\c -> case c of Red {} -> 1\n";
+        let module = parse_module(src);
+        let off = src.find("case c").expect("case expr");
+        let (span, replacement) =
+            find_add_wildcard_arm_at(&module, src, off).expect("wildcard action offered");
+        let mut out = src.to_string();
+        out.replace_range(span.start..span.end, &replacement);
+        assert!(
+            parses_cleanly(&out),
+            "wildcard arm rewrite must reparse cleanly; got:\n{out}"
+        );
+        // The new arm must sit at the first arm's column (`Red` is at col 20).
+        let arm_col = src.lines().nth(2).unwrap().find("Red").unwrap();
+        let last_line = replacement.lines().last().unwrap();
+        assert_eq!(
+            last_line.len() - last_line.trim_start().len(),
+            arm_col,
+            "new arm must align with the inline first arm; got {replacement:?}"
+        );
+    }
+
+    /// Bug 3: `if not a && b …` parses as `(not a) && b`, so the textual
+    /// `not `-prefix strip negated only the first conjunct. The whole
+    /// condition must be wrapped in `not (…)` instead.
+    #[test]
+    fn negate_condition_wraps_when_not_binds_only_first_conjunct() {
+        let src = "f = \\a b -> if not a && b then 1 else 2\n";
+        let module = parse_module(src);
+        let off = src.find("if not").expect("if expr");
+        let (span, replacement) =
+            find_if_negate_at(&module, src, off).expect("negate action offered");
+        assert_eq!(replacement, "if not (not a && b) then 2 else 1");
+        let mut out = src.to_string();
+        out.replace_range(span.start..span.end, &replacement);
+        assert!(parses_cleanly(&out), "negate rewrite must reparse: {out}");
+    }
+
+    /// Bug 3 (control): when the condition's AST root IS the negation, the
+    /// `not` is stripped so the double negation cancels.
+    #[test]
+    fn negate_condition_strips_root_level_not() {
+        let src = "f = \\a -> if not a then 1 else 2\n";
+        let module = parse_module(src);
+        let off = src.find("if not").expect("if expr");
+        let (_, replacement) =
+            find_if_negate_at(&module, src, off).expect("negate action offered");
+        assert_eq!(replacement, "if a then 2 else 1");
+    }
+
+    /// Bug 4: flipping `false && if … else false` must parenthesize the
+    /// moved `if` — keyword forms greedily consume to their right, so the
+    /// bare flip `if … else false && false` swallows `&& false` into the
+    /// else branch.
+    #[test]
+    fn flip_operands_parenthesizes_keyword_form_operand() {
+        let src = "g = \\x -> false && if x then true else false\n";
+        let module = parse_module(src);
+        let off = src.find("false &&").expect("lhs operand");
+        let (span, replacement) =
+            find_flip_binary_at(&module, src, off).expect("flip action offered");
+        assert_eq!(replacement, "(if x then true else false) && false");
+        let mut out = src.to_string();
+        out.replace_range(span.start..span.end, &replacement);
+        assert!(parses_cleanly(&out), "flip rewrite must reparse: {out}");
+    }
+
+    /// Bug 5a: inlining a let that sits inline on the `do` line must not
+    /// delete `main = do` itself — only the statement's own text goes.
+    #[test]
+    fn inline_variable_on_do_line_keeps_do_header() {
+        let mut tw = TestWorkspace::new();
+        let src = "main = do let y = 5\n          yield (y + 1)\n";
+        assert!(parses_cleanly(src), "fixture must parse");
+        let uri = tw.open("main", src);
+        let pos = tw.position_of(&uri, "let y = 5");
+        let actions = handle_code_action(
+            &tw.state,
+            &params_for(&uri, Range { start: pos, end: pos }),
+        )
+        .unwrap_or_default();
+        let action = action_titled(&actions, |t| t.starts_with("Inline"))
+            .expect("inline action offered");
+        let out = apply_edits_to(src, edits_for(action, &uri));
+        assert!(
+            out.contains("main = do"),
+            "`main = do` header was deleted:\n{out}"
+        );
+        assert!(out.contains("yield (5 + 1)"), "usage not inlined:\n{out}");
+        assert!(parses_cleanly(&out), "inline result must reparse:\n{out}");
+    }
+
+    /// Bug 5a (control): a let on its own line still removes the whole line.
+    #[test]
+    fn inline_variable_own_line_removes_whole_line() {
+        let mut tw = TestWorkspace::new();
+        let src = "main = do\n  let y = 5\n  yield (y + 1)\n";
+        let uri = tw.open("main", src);
+        let pos = tw.position_of(&uri, "let y = 5");
+        let actions = handle_code_action(
+            &tw.state,
+            &params_for(&uri, Range { start: pos, end: pos }),
+        )
+        .unwrap_or_default();
+        let action = action_titled(&actions, |t| t.starts_with("Inline"))
+            .expect("inline action offered");
+        let out = apply_edits_to(src, edits_for(action, &uri));
+        assert_eq!(out, "main = do\n  yield (5 + 1)\n");
+    }
+
+    /// Bug 5b: extracting to let from a statement that sits inline on the
+    /// `do` line must insert at the statement's own offset (after `do `),
+    /// not at column 0 before the declaration.
+    #[test]
+    fn extract_to_let_on_do_line_inserts_after_do() {
+        let mut tw = TestWorkspace::new();
+        let src = "main = do yield (1 + 2)\n";
+        assert!(parses_cleanly(src), "fixture must parse");
+        let uri = tw.open("main", src);
+        let doc_source = tw.doc(&uri).source.clone();
+        let off = doc_source.find("1 + 2").expect("selection");
+        let range = Range {
+            start: crate::utils::offset_to_position(&doc_source, off),
+            end: crate::utils::offset_to_position(&doc_source, off + "1 + 2".len()),
+        };
+        let actions = handle_code_action(&tw.state, &params_for(&uri, range))
+            .unwrap_or_default();
+        let action = action_titled(&actions, |t| t.starts_with("Extract to let"))
+            .expect("extract-to-let offered inside do block");
+        let out = apply_edits_to(src, edits_for(action, &uri));
+        assert!(
+            out.starts_with("main = do let "),
+            "binding must be inserted after `do `, not before the decl:\n{out}"
+        );
+        assert!(parses_cleanly(&out), "extract result must reparse:\n{out}");
+    }
+
+    /// Bug 6: the "Wrap IO in `fork`" quickfix never fixed the IO-in-atomic
+    /// diagnostic (fork propagates its argument's effects) and re-offered
+    /// itself forever on the inner span. It must no longer be offered.
+    #[test]
+    fn no_fork_quickfix_for_io_in_atomic() {
+        let mut tw = TestWorkspace::new();
+        let src = "main = atomic (println \"hi\")\n";
+        let uri = tw.open("main", src);
+        let doc_source = tw.doc(&uri).source.clone();
+        let off = doc_source.find("println").expect("io call");
+        let range = Range {
+            start: crate::utils::offset_to_position(&doc_source, off),
+            end: crate::utils::offset_to_position(&doc_source, off + "println".len()),
+        };
+        let diag = Diagnostic {
+            range,
+            message: "IO effects are not allowed inside atomic blocks".into(),
+            severity: Some(DiagnosticSeverity::ERROR),
+            ..Default::default()
+        };
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range,
+            context: CodeActionContext {
+                diagnostics: vec![diag],
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let actions = handle_code_action(&tw.state, &params).unwrap_or_default();
+        assert!(
+            action_titled(&actions, |t| t.contains("fork")).is_none(),
+            "the ineffective fork quickfix must not be offered"
+        );
+        // The effective fix (unwrapping `atomic`) remains available.
+        assert!(
+            action_titled(&actions, |t| t == "Remove `atomic` wrapper").is_some(),
+            "remove-atomic quickfix should still be offered"
+        );
+    }
+
+    /// Bug 8: organize imports must carry trailing comments on import lines
+    /// (`import ./b -- pinned`) through the reordering.
+    #[test]
+    fn organize_imports_preserves_trailing_line_comments() {
+        let mut tw = TempWorkspace::new();
+        tw.write_and_open("b.knot", "helperB = 1\n");
+        tw.write_and_open("a.knot", "helperA = 1\n");
+        let src = "import ./b -- pinned\nimport ./a\n\nmain = helperA + helperB\n";
+        let uri = tw.write_and_open("main.knot", src);
+        let pos = tw.workspace.position_of(&uri, "import ./b");
+        let actions = handle_code_action(
+            &tw.workspace.state,
+            &params_for(&uri, Range { start: pos, end: pos }),
+        )
+        .unwrap_or_default();
+        let action = action_titled(&actions, |t| t.starts_with("Organize imports"))
+            .expect("organize action offered for unsorted imports");
+        let out = apply_edits_to(src, edits_for(action, &uri));
+        assert!(
+            out.contains("import ./b -- pinned"),
+            "trailing comment was dropped:\n{out}"
+        );
+        assert_eq!(
+            out.matches("-- pinned").count(),
+            1,
+            "trailing comment must appear exactly once:\n{out}"
+        );
+        assert!(
+            out.contains("import ./a\nimport ./b"),
+            "imports must be sorted:\n{out}"
+        );
+    }
+
+    /// Bug 8 (cont.): when the LAST import line carries the trailing comment
+    /// and the block is already organized, no action may be offered — the
+    /// rewrite would otherwise duplicate the comment.
+    #[test]
+    fn organize_imports_not_offered_when_only_change_is_outside_span_comment() {
+        let mut tw = TempWorkspace::new();
+        tw.write_and_open("a2.knot", "helperA = 1\n");
+        tw.write_and_open("b2.knot", "helperB = 1\n");
+        let src = "import ./a2\nimport ./b2 -- pinned\n\nmain = helperA + helperB\n";
+        let uri = tw.write_and_open("main2.knot", src);
+        let pos = tw.workspace.position_of(&uri, "import ./a2");
+        let actions = handle_code_action(
+            &tw.workspace.state,
+            &params_for(&uri, Range { start: pos, end: pos }),
+        )
+        .unwrap_or_default();
+        assert!(
+            action_titled(&actions, |t| t.starts_with("Organize imports")).is_none(),
+            "no organize action for an already-organized block with a trailing comment"
         );
     }
 }

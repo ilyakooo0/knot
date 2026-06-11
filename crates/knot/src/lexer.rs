@@ -618,6 +618,12 @@ impl<'src> Lexer<'src> {
                                 }
                             }
                         }
+                        Some(b'\n') | Some(b'\r') => {
+                            // Backslash at end of line — never consume the
+                            // line break as an "unknown escape" (that would
+                            // swallow the whole next line into the string).
+                            // Leave it for the unterminated-string branch.
+                        }
                         Some(_) => {
                             let esc_start = self.pos - 1;
                             // Advance by one full UTF-8 character (not just one byte)
@@ -754,6 +760,12 @@ impl<'src> Lexer<'src> {
                                     }
                                 }
                             }
+                        }
+                        Some(b'\n') | Some(b'\r') => {
+                            // Backslash at end of line — never consume the
+                            // line break as an "unknown escape" (that would
+                            // swallow the whole next line into the byte
+                            // string). Leave it for the unterminated branch.
                         }
                         Some(_) => {
                             let esc_start = self.pos - 1;

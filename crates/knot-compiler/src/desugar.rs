@@ -807,13 +807,37 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
         return false;
     }
 
+    // Do-local let-bound lambdas whose bodies perform IO make applications
+    // of the bound name IO expressions: `let f = \y -> println (show y)`
+    // followed by `f x` must NOT desugar as a pure comprehension (codegen's
+    // `is_io_do_block` recurses into lambda bodies and classifies the block
+    // as IO, so desugaring it here would diverge and produce a misleading
+    // type error). Extend the IO-name sets with such local bindings before
+    // scanning; processed in order so chains (`let g = \x -> f x`) resolve.
+    let mut io_base = std::borrow::Cow::Borrowed(&io_fns.base);
+    let mut io_all = std::borrow::Cow::Borrowed(&io_fns.all);
+    for s in stmts {
+        if let StmtKind::Let { pat, expr } = &s.node {
+            if let PatKind::Var(name) = &pat.node {
+                if lambda_chain_body_is_io(expr, &io_base) {
+                    io_base.to_mut().insert(name.clone());
+                }
+                if lambda_chain_body_is_io(expr, &io_all) {
+                    io_all.to_mut().insert(name.clone());
+                }
+            }
+        }
+    }
+    let io_base = io_base.as_ref();
+    let io_all = io_all.as_ref();
+
     // IO do blocks use a dedicated codegen path (compile_io_do) that handles
     // running IO actions and iterating over resulting relations. Desugaring
     // would use IO's monadic bind (sequencing) instead, which is wrong when
     // the intent is to iterate over relation elements.
     if stmts.iter().any(|s| match &s.node {
-        StmtKind::Bind { expr, .. } | StmtKind::Let { expr, .. } | StmtKind::Expr(expr) => expr_is_io(expr, &io_fns.base),
-        StmtKind::Where { cond } => expr_is_io(cond, &io_fns.base),
+        StmtKind::Bind { expr, .. } | StmtKind::Let { expr, .. } | StmtKind::Expr(expr) => expr_is_io(expr, io_base),
+        StmtKind::Where { cond } => expr_is_io(cond, io_base),
         _ => false,
     }) {
         return false;
@@ -830,9 +854,9 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
     // desugared chain ill-typed).
     let has_trait_only_io = stmts.iter().any(|s| match &s.node {
         StmtKind::Bind { expr, .. } | StmtKind::Let { expr, .. } | StmtKind::Expr(expr) => {
-            expr_is_io(expr, &io_fns.all)
+            expr_is_io(expr, io_all)
         }
-        StmtKind::Where { cond } => expr_is_io(cond, &io_fns.all),
+        StmtKind::Where { cond } => expr_is_io(cond, io_all),
         _ => false,
     });
     if has_trait_only_io {
@@ -841,7 +865,7 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
         }
         if stmts.iter().any(|s| matches!(
             &s.node,
-            StmtKind::Bind { expr, .. } if !expr_is_io(expr, &io_fns.all)
+            StmtKind::Bind { expr, .. } if !expr_is_io(expr, io_all)
         )) {
             return false;
         }
@@ -928,6 +952,24 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
     }
 }
 
+/// Whether the expression is a lambda (possibly curried or wrapped in
+/// annotations/refinements) whose body performs IO. Used to classify
+/// do-local `let f = \y -> println ...` bindings: applications of `f`
+/// are IO expressions even though the lambda value itself is not.
+fn lambda_chain_body_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
+    match &expr.node {
+        ExprKind::Lambda { body, .. } => match &body.node {
+            // Curried lambda: keep peeling to the innermost body.
+            ExprKind::Lambda { .. } => lambda_chain_body_is_io(body, io_fns),
+            _ => expr_is_io(body, io_fns),
+        },
+        ExprKind::UnitLit { value, .. }
+        | ExprKind::Annot { expr: value, .. }
+        | ExprKind::Refine(value) => lambda_chain_body_is_io(value, io_fns),
+        _ => false,
+    }
+}
+
 /// Whether the function position of an application is a lambda (possibly
 /// curried or wrapped in annotations) whose body performs IO. An *applied*
 /// lambda runs its body immediately, so IO inside the body makes the whole
@@ -957,6 +999,52 @@ fn fresh_var() -> String {
     format!("__ds{}", n)
 }
 
+/// Globally unique spans for synthesized `__bind`/`__yield`/`__empty` Var
+/// nodes. `monad_info` is keyed by these spans (type inference records the
+/// resolved monad per helper Var; codegen dispatches on it), and real file
+/// offsets COLLIDE across merged files — the prelude and imports are merged
+/// with unshifted per-file spans, so two do-blocks at identical byte
+/// offsets in different files would otherwise share one monad slot (and a
+/// `Maybe` comprehension could get compiled with Relation binds). Spans are
+/// allocated above any plausible real file offset so they never alias a
+/// user expression. Diagnostics still anchor on the surrounding App/do
+/// spans, which keep their real locations.
+const SYNTH_SPAN_BASE: usize = 1 << 31;
+
+/// Synthesized span → original do-block span. Consumers that key on the
+/// *do-block's* real span (the LSP's monad inlay hints read
+/// `monad_info[do_span]`) still need an entry there, so type inference
+/// aliases each resolved monad back to the origin span via this table.
+/// Keys are globally unique (the atomic counter), so concurrent
+/// compilations in one process can share the table safely; stale entries
+/// from other modules are never looked up.
+static SYNTH_SPAN_ORIGINS: std::sync::Mutex<Option<std::collections::HashMap<usize, Span>>> =
+    std::sync::Mutex::new(None);
+
+fn fresh_monad_span(origin: Span) -> Span {
+    let n = DESUGAR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        as usize;
+    let span = Span::new(SYNTH_SPAN_BASE + n, SYNTH_SPAN_BASE + n + 1);
+    SYNTH_SPAN_ORIGINS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(span.start, origin);
+    span
+}
+
+/// The original do-block span a synthesized monad span was created for.
+pub(crate) fn synth_span_origin(span: Span) -> Option<Span> {
+    if span.start < SYNTH_SPAN_BASE {
+        return None;
+    }
+    SYNTH_SPAN_ORIGINS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&span.start).copied())
+}
+
 fn spanned<T>(node: T, span: Span) -> Spanned<T> {
     Spanned::new(node, span)
 }
@@ -977,7 +1065,7 @@ fn desugar_stmts(stmts: &[Stmt], span: Span) -> Expr {
                 }
             }
             // Shouldn't happen for valid pure comprehensions (last must be yield)
-            _ => spanned(ExprKind::Var("__empty".into()), span),
+            _ => mk_empty(span),
         };
     }
 
@@ -1013,7 +1101,7 @@ fn desugar_stmts(stmts: &[Stmt], span: Span) -> Expr {
                         spanned(ExprKind::Record(vec![]), span),
                         span,
                     )),
-                    else_branch: Box::new(spanned(ExprKind::Var("__empty".into()), span)),
+                    else_branch: Box::new(mk_empty(span)),
                 },
                 span,
             );
@@ -1087,7 +1175,7 @@ fn desugar_ctor_bind(pat: &Pat, expr: &Expr, rest: &Expr, span: Span) -> Expr {
                 },
                 CaseArm {
                     pat: spanned(PatKind::Wildcard, span),
-                    body: spanned(ExprKind::Var("__empty".into()), span),
+                    body: mk_empty(span),
                 },
             ],
         },
@@ -1108,23 +1196,37 @@ fn desugar_ctor_bind(pat: &Pat, expr: &Expr, rest: &Expr, span: Span) -> Expr {
 }
 
 /// Build `App(Var("__yield"), inner)` — monadic yield for generic do-blocks.
+/// The helper Var gets a unique synthesized span (see `fresh_monad_span`).
 fn mk_yield(inner: Expr, span: Span) -> Expr {
     spanned(
         ExprKind::App {
-            func: Box::new(spanned(ExprKind::Var("__yield".into()), span)),
+            func: Box::new(spanned(
+                ExprKind::Var("__yield".into()),
+                fresh_monad_span(span),
+            )),
             arg: Box::new(inner),
         },
         span,
     )
 }
 
+/// Build `Var("__empty")` with a unique synthesized span (see
+/// `fresh_monad_span`).
+fn mk_empty(span: Span) -> Expr {
+    spanned(ExprKind::Var("__empty".into()), fresh_monad_span(span))
+}
+
 /// Build `App(App(Var("__bind"), func), collection)`
+/// The helper Var gets a unique synthesized span (see `fresh_monad_span`).
 fn mk_bind(func: Expr, collection: Expr, span: Span) -> Expr {
     spanned(
         ExprKind::App {
             func: Box::new(spanned(
                 ExprKind::App {
-                    func: Box::new(spanned(ExprKind::Var("__bind".into()), span)),
+                    func: Box::new(spanned(
+                        ExprKind::Var("__bind".into()),
+                        fresh_monad_span(span),
+                    )),
                     arg: Box::new(func),
                 },
                 span,

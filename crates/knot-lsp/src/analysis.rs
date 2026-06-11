@@ -833,11 +833,29 @@ pub fn resolve_import_navigation(
             None => continue,
         };
 
+        // Selective imports: `import ./lib {parse}` only brings the listed
+        // names into scope. Mirror the compiler's filter
+        // (`knot_compiler::modules::should_include_decl`): every named decl
+        // kind is gated on its own name; impl methods ride along with their
+        // trait; a data type's constructors come with the data type itself.
+        // Without this, every decl of every imported module landed in
+        // `import_defs`, so a later import could shadow the true binder —
+        // corrupting rename's owner resolution, goto-definition, and
+        // prepare_rename.
+        let allowed: Option<std::collections::HashSet<&str>> = imp
+            .items
+            .as_ref()
+            .map(|items| items.iter().map(|i| i.name.as_str()).collect());
+        let included = |name: &str| allowed.as_ref().map_or(true, |s| s.contains(name));
+
         for decl in &module.decls {
             match &decl.node {
                 DeclKind::Data {
                     name, constructors, ..
                 } => {
+                    if !included(name) {
+                        continue;
+                    }
                     import_defs.insert(name.clone(), (canonical.clone(), decl.span));
                     import_origins.insert(name.clone(), imp.path.clone());
                     for ctor in constructors {
@@ -859,10 +877,16 @@ pub fn resolve_import_navigation(
                 | DeclKind::Fun { name, .. }
                 | DeclKind::Route { name, .. }
                 | DeclKind::RouteComposite { name, .. } => {
+                    if !included(name) {
+                        continue;
+                    }
                     import_defs.insert(name.clone(), (canonical.clone(), decl.span));
                     import_origins.insert(name.clone(), imp.path.clone());
                 }
                 DeclKind::Trait { name, items, .. } => {
+                    if !included(name) {
+                        continue;
+                    }
                     import_defs.insert(name.clone(), (canonical.clone(), decl.span));
                     import_origins.insert(name.clone(), imp.path.clone());
                     // Trait methods are jumped-to from call sites that reach
@@ -886,7 +910,12 @@ pub fn resolve_import_navigation(
                         }
                     }
                 }
-                DeclKind::Impl { items, .. } => {
+                DeclKind::Impl { trait_name, items, .. } => {
+                    // Impls ride along with their trait (mirrors
+                    // `should_include_decl`'s `Impl` arm).
+                    if !included(trait_name) {
+                        continue;
+                    }
                     for item in items {
                         if let ast::ImplItem::Method { name, name_span, .. } = item {
                             // Don't overwrite an existing trait-method
@@ -1417,6 +1446,59 @@ mod tests {
             doc_revert.signature_changed_decl_names.contains(&"foo".to_string()),
             "revert v2 → v1 must still report `foo` as signature-changed; got: {:?}",
             doc_revert.signature_changed_decl_names
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bug fix: `resolve_import_navigation` ignored selective import lists,
+    /// so EVERY decl of EVERY imported module landed in `import_defs` — a
+    /// later import could shadow the true binder, corrupting rename's
+    /// owner resolution, goto-definition, and prepare_rename. The filter
+    /// must mirror `knot_compiler::modules::should_include_decl`.
+    #[test]
+    fn selective_imports_filter_import_defs() {
+        let dir = std::env::temp_dir().join(format!(
+            "knot-lsp-selective-imports-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // lib1 exports `parse` (selected) and `hidden` (not selected).
+        std::fs::write(dir.join("lib1.knot"), "parse = \\x -> x\nhidden = 1\n").unwrap();
+        // lib2 also defines `parse` — but the import only selects `other`,
+        // so lib2's `parse` must NOT shadow lib1's.
+        std::fs::write(dir.join("lib2.knot"), "parse = \\y -> y\nother = 2\n").unwrap();
+        let main_path = dir.join("main.knot");
+        let main_src = "import ./lib1 (parse)\nimport ./lib2 (other)\n\nrun = parse 1\n";
+        std::fs::write(&main_path, main_src).unwrap();
+        let canonical = main_path.canonicalize().unwrap();
+        let uri = fake_uri(&format!("file://{}", canonical.display()));
+
+        let mut import_cache: ImportCache = HashMap::new();
+        let mut inference_cache: InferenceCache = HashMap::new();
+        let doc = analyze_document(&uri, main_src, &mut import_cache, &mut inference_cache);
+
+        let lib1_canon = dir.join("lib1.knot").canonicalize().unwrap();
+        let lib2_canon = dir.join("lib2.knot").canonicalize().unwrap();
+        let (parse_owner, _) = doc
+            .import_defs
+            .get("parse")
+            .expect("selected name `parse` must be in import_defs");
+        assert_eq!(
+            parse_owner, &lib1_canon,
+            "lib2's unselected `parse` must not shadow lib1's"
+        );
+        let (other_owner, _) = doc
+            .import_defs
+            .get("other")
+            .expect("selected name `other` must be in import_defs");
+        assert_eq!(other_owner, &lib2_canon);
+        assert!(
+            !doc.import_defs.contains_key("hidden"),
+            "unselected `hidden` must not be in import_defs"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

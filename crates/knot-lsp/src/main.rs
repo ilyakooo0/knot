@@ -294,6 +294,7 @@ fn main() {
         published_lsp_diagnostics: HashMap::new(),
         client_supports_diagnostic_refresh,
         diagnostic_refresh_counter: 0,
+        document_versions: HashMap::new(),
         workspace_diag_reported: HashSet::new(),
     };
 
@@ -715,6 +716,12 @@ fn apply_analysis_result(state: &mut ServerState, conn: &Connection, result: Ana
         .iter()
         .filter_map(|d| crate::diagnostics::to_lsp_diagnostic(d, &result.doc.source, &result.uri))
         .collect();
+    // Honor the `warnUnusedImports` config knob at the publish boundary (the
+    // analysis pipeline emits the warnings unconditionally).
+    let lsp_diags = crate::diagnostics::filter_unused_warnings(
+        lsp_diags,
+        state.config.warn_unused_imports,
+    );
 
     // Update the reverse-import graph for cross-file diagnostics. Each
     // analyzed module knows which files it imported (`imported_files`); we
@@ -780,6 +787,12 @@ fn apply_analysis_result(state: &mut ServerState, conn: &Connection, result: Ana
         None => !result.doc.knot_diagnostics.is_empty(),
     };
     state.documents.insert(result.uri, result.doc);
+    // Track the version the stored analysis corresponds to — the
+    // workspace-diagnostics pull handler reports it for open docs (the LSP
+    // spec reserves `version: null` for files that are NOT open).
+    if let Some(v) = version {
+        state.document_versions.insert(uri.clone(), v);
+    }
 
     let published = publish_diagnostics_dedup(state, conn, &uri, lsp_diags, version);
     if published || doc_diags_changed {
@@ -1353,6 +1366,10 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
                 .iter()
                 .filter_map(|d| crate::diagnostics::to_lsp_diagnostic(d, &doc.source, &uri))
                 .collect();
+            let lsp_diags = crate::diagnostics::filter_unused_warnings(
+                lsp_diags,
+                state.config.warn_unused_imports,
+            );
             // Force-publish: clear the dedup cache first so the publish always
             // goes out, then update the cache to the just-sent list.
             state.published_lsp_diagnostics.remove(&uri);
@@ -1368,6 +1385,7 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
         state.documents.remove(&params.text_document.uri);
         state.pending_sources.remove(&params.text_document.uri);
         state.semantic_token_cache.remove(&params.text_document.uri);
+        state.document_versions.remove(&params.text_document.uri);
         // Drop the diagnostic-dedup entry too: otherwise a reopen whose first
         // analysis produced the same list as the last pre-close run would
         // short-circuit republishing, leaving the editor with the empty
@@ -1761,6 +1779,7 @@ mod tests {
             published_lsp_diagnostics: HashMap::new(),
             client_supports_diagnostic_refresh: false,
             diagnostic_refresh_counter: 0,
+            document_versions: HashMap::new(),
             workspace_diag_reported: HashSet::new(),
         }
     }

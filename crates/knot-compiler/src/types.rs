@@ -64,6 +64,9 @@ impl TypeEnv {
         let mut refined_types: HashMap<String, Expr> = HashMap::new();
         // Original AST types for aliases — used to resolve refinements through aliases
         let mut alias_ast_types: HashMap<String, Type> = HashMap::new();
+        // Multi-variant data declarations — used to collect constructor
+        // field refinements for direct-ADT sources (`*shapes : [Shape]`).
+        let mut data_ctor_decls: HashMap<String, Vec<ConstructorDef>> = HashMap::new();
 
         // First pass: collect type aliases and data types
         for decl in &module.decls {
@@ -116,6 +119,7 @@ impl TypeEnv {
                         constructors.entry(ctor.name.clone()).or_insert(fields);
                     } else {
                         // Multi-variant: register each constructor and create Adt alias
+                        data_ctor_decls.insert(name.clone(), ctors.clone());
                         let mut adt_ctors = Vec::new();
                         for ctor in ctors {
                             let fields: Vec<(String, ResolvedType)> = ctor
@@ -200,7 +204,7 @@ impl TypeEnv {
                         schema_for_source(ty, &aliases, &associated_types);
                     source_schemas.insert(name.clone(), schema);
                     // Collect refined field info from the source type
-                    let refinements = collect_source_refinements(ty, &refined_types, &alias_ast_types);
+                    let refinements = collect_source_refinements(ty, &refined_types, &alias_ast_types, &data_ctor_decls);
                     if !refinements.is_empty() {
                         source_refinements.insert(name.clone(), refinements);
                     }
@@ -211,10 +215,20 @@ impl TypeEnv {
                     to_ty,
                     ..
                 } => {
-                    let old_resolved =
-                        resolve_type(from_ty, &aliases, &associated_types);
-                    let new_resolved =
-                        resolve_type(to_ty, &aliases, &associated_types);
+                    // Unwrap relation types (`[{...}]`, or aliases that
+                    // resolve to one) the same way `schema_for_source`
+                    // does — `schema_descriptor` on a `Relation` collapses
+                    // to a bare "text", which breaks every startup.
+                    let unwrap_relation = |r: ResolvedType| match r {
+                        ResolvedType::Relation(inner) => *inner,
+                        other => other,
+                    };
+                    let old_resolved = unwrap_relation(
+                        resolve_type(from_ty, &aliases, &associated_types),
+                    );
+                    let new_resolved = unwrap_relation(
+                        resolve_type(to_ty, &aliases, &associated_types),
+                    );
                     let old_schema = schema_descriptor(&old_resolved);
                     let new_schema = schema_descriptor(&new_resolved);
                     migrate_schemas
@@ -355,18 +369,35 @@ fn collect_named_alias_refs(
 
 /// Walk a source's type (e.g., `[{name: NonEmptyText, age: Nat}]`) and collect
 /// refinement info: (field_name_or_none, refined_type_name, predicate_expr).
+///
+/// Nested refinements (fields of nested relations/records, ADT constructor
+/// fields, stacked inline-over-alias predicates) are collected by
+/// synthesizing wrapper predicates over the *top-level* field value — the
+/// runtime's `knot_refinement_validate_relation` only extracts one field
+/// level, so deeper paths are folded into the predicate itself (`all`
+/// over nested relations, field access for nested records, `case` for
+/// constructor payloads). Validation runs on the in-memory rows before the
+/// parent write, so the wrappers see the full nested structure.
 fn collect_source_refinements(
     ty: &Type,
     refined_types: &HashMap<String, Expr>,
     alias_ast_types: &HashMap<String, Type>,
+    data_ctor_decls: &HashMap<String, Vec<ConstructorDef>>,
 ) -> Vec<(Option<String>, String, Expr)> {
-    collect_source_refinements_inner(ty, refined_types, alias_ast_types, &mut HashSet::new())
+    collect_source_refinements_inner(
+        ty,
+        refined_types,
+        alias_ast_types,
+        data_ctor_decls,
+        &mut HashSet::new(),
+    )
 }
 
 fn collect_source_refinements_inner(
     ty: &Type,
     refined_types: &HashMap<String, Expr>,
     alias_ast_types: &HashMap<String, Type>,
+    data_ctor_decls: &HashMap<String, Vec<ConstructorDef>>,
     seen_aliases: &mut HashSet<String>,
 ) -> Vec<(Option<String>, String, Expr)> {
     let mut result = Vec::new();
@@ -397,6 +428,7 @@ fn collect_source_refinements_inner(
                         &inner_ty,
                         refined_types,
                         alias_ast_types,
+                        data_ctor_decls,
                         seen_aliases,
                     ));
                 }
@@ -414,43 +446,42 @@ fn collect_source_refinements_inner(
                 // If the alias already resolves to a Relation type (e.g. `type People = [{name: Nat}]`),
                 // recurse directly to avoid double-wrapping Relation(Relation(...)).
                 if matches!(&alias_ty.node, TypeKind::Relation(_)) {
-                    result.extend(collect_source_refinements_inner(alias_ty, refined_types, alias_ast_types, seen_aliases));
+                    result.extend(collect_source_refinements_inner(alias_ty, refined_types, alias_ast_types, data_ctor_decls, seen_aliases));
                 } else {
                     let inner_ty = Spanned::new(TypeKind::Relation(Box::new(alias_ty.clone())), ty.span);
-                    result.extend(collect_source_refinements_inner(&inner_ty, refined_types, alias_ast_types, seen_aliases));
+                    result.extend(collect_source_refinements_inner(&inner_ty, refined_types, alias_ast_types, data_ctor_decls, seen_aliases));
                 }
                 seen_aliases.remove(name);
+            }
+        }
+        // Element type is a multi-variant data type: *shapes : [Shape] with
+        // constructor field refinements like `Circle {radius: Float where ...}`.
+        // Each refinement becomes a whole-element predicate that matches the
+        // constructor and checks the payload field (other constructors pass).
+        TypeKind::Named(name) if data_ctor_decls.contains_key(name) => {
+            for (label, pred) in adt_value_predicates(
+                name,
+                refined_types,
+                alias_ast_types,
+                data_ctor_decls,
+                seen_aliases,
+                elem_ty.span,
+            ) {
+                result.push((None, label, pred));
             }
         }
         // Element type is a record: check each field
         TypeKind::Record { fields, .. } => {
             for field in fields {
-                match &field.value.node {
-                    // Field has inline refinement: age: Int where \x -> x >= 0
-                    TypeKind::Refined { predicate, .. } => {
-                        result.push((
-                            Some(field.name.clone()),
-                            field.name.clone(),
-                            (**predicate).clone(),
-                        ));
-                    }
-                    // Field references a refined type alias, either directly
-                    // (`age: Nat`) or through a chain of plain aliases
-                    // (`type Age = Nat; age: Age`).
-                    TypeKind::Named(name) => {
-                        if let Some(refined) = follow_alias_to_refined(
-                            name,
-                            refined_types,
-                            alias_ast_types,
-                        ) {
-                            result.push((
-                                Some(field.name.clone()),
-                                refined.clone(),
-                                refined_types[&refined].clone(),
-                            ));
-                        }
-                    }
-                    _ => {}
+                for (label, pred) in field_value_predicates(
+                    &field.name,
+                    &field.value,
+                    refined_types,
+                    alias_ast_types,
+                    data_ctor_decls,
+                    seen_aliases,
+                ) {
+                    result.push((Some(field.name.clone()), label, pred));
                 }
             }
         }
@@ -460,37 +491,288 @@ fn collect_source_refinements_inner(
             result.push((None, "record".into(), (**predicate).clone()));
             // Recurse into the base to collect field-level refinements
             let inner_ty = Spanned::new(TypeKind::Relation(base.clone()), ty.span);
-            result.extend(collect_source_refinements_inner(&inner_ty, refined_types, alias_ast_types, seen_aliases));
+            result.extend(collect_source_refinements_inner(&inner_ty, refined_types, alias_ast_types, data_ctor_decls, seen_aliases));
         }
         _ => {}
     }
     result
 }
 
-/// Follow a chain of plain (non-refined) aliases — `type Age = Nat`,
-/// `type A = B; type B = Nat` — until reaching a refined type alias or a
-/// non-alias. Returns the refined alias's name (the key whose predicate in
-/// `refined_types` applies). Cycle-protected: `type A = B; type B = A`
-/// yields `None` (the cycle itself is diagnosed by type inference).
-fn follow_alias_to_refined(
-    name: &str,
+/// Predicates enforcing the declared refinements of a record FIELD, each
+/// taking the field's value directly: `(type_label, \fieldValue -> Bool)`.
+///
+/// Covers: inline refinements (`age: Int where ...` — label is the field
+/// name, matching the historical message), refined aliases reached through
+/// plain alias chains (`age: Nat`), stacked inline-over-refined-alias
+/// (`age: Nat where ...` — both predicates), nested record aliases
+/// (`addr: Addr` with refined fields inside `Addr`), and nested relations
+/// (`items: [{qty: Pos}]` — wrapped in `all`).
+fn field_value_predicates(
+    field_name: &str,
+    field_ty: &Type,
     refined_types: &HashMap<String, Expr>,
     alias_ast_types: &HashMap<String, Type>,
-) -> Option<String> {
-    let mut current = name.to_string();
-    let mut seen: HashSet<String> = HashSet::new();
-    loop {
-        if refined_types.contains_key(&current) {
-            return Some(current);
+    data_ctor_decls: &HashMap<String, Vec<ConstructorDef>>,
+    seen_aliases: &mut HashSet<String>,
+) -> Vec<(String, Expr)> {
+    match &field_ty.node {
+        TypeKind::Refined { base, predicate } => {
+            let mut out = vec![(field_name.to_string(), (**predicate).clone())];
+            // Stacked refinement: the base may itself be refined (e.g.
+            // `age: Nat where \x -> x < 150` must also enforce Nat's
+            // predicate), or carry nested refinements.
+            out.extend(value_predicates(
+                base,
+                refined_types,
+                alias_ast_types,
+                data_ctor_decls,
+                seen_aliases,
+            ));
+            out
         }
-        if !seen.insert(current.clone()) {
-            return None; // alias cycle
+        _ => value_predicates(
+            field_ty,
+            refined_types,
+            alias_ast_types,
+            data_ctor_decls,
+            seen_aliases,
+        ),
+    }
+}
+
+/// Predicates enforcing the declared refinements of a VALUE of type `ty`,
+/// each taking the value directly: `(type_label, \value -> Bool)`.
+fn value_predicates(
+    ty: &Type,
+    refined_types: &HashMap<String, Expr>,
+    alias_ast_types: &HashMap<String, Type>,
+    data_ctor_decls: &HashMap<String, Vec<ConstructorDef>>,
+    seen_aliases: &mut HashSet<String>,
+) -> Vec<(String, Expr)> {
+    let mut out = Vec::new();
+    match &ty.node {
+        // Anonymous refinement of the whole value.
+        TypeKind::Refined { base, predicate } => {
+            out.push(("record".to_string(), (**predicate).clone()));
+            out.extend(value_predicates(
+                base,
+                refined_types,
+                alias_ast_types,
+                data_ctor_decls,
+                seen_aliases,
+            ));
         }
-        match alias_ast_types.get(&current).map(|t| &t.node) {
-            Some(TypeKind::Named(next)) => current = next.clone(),
-            _ => return None,
+        TypeKind::Named(name) => {
+            if seen_aliases.insert(name.clone()) {
+                if let Some(pred) = refined_types.get(name) {
+                    out.push((name.clone(), pred.clone()));
+                    // The refined alias's base may carry deeper refinements
+                    // (`type Addr = {zip: Zip} where ...`).
+                    if let Some(alias_ty) = alias_ast_types.get(name) {
+                        let base: &Type = match &alias_ty.node {
+                            TypeKind::Refined { base, .. } => base.as_ref(),
+                            _ => alias_ty,
+                        };
+                        out.extend(value_predicates(
+                            base,
+                            refined_types,
+                            alias_ast_types,
+                            data_ctor_decls,
+                            seen_aliases,
+                        ));
+                    }
+                } else if let Some(alias_ty) = alias_ast_types.get(name) {
+                    out.extend(value_predicates(
+                        alias_ty,
+                        refined_types,
+                        alias_ast_types,
+                        data_ctor_decls,
+                        seen_aliases,
+                    ));
+                } else if data_ctor_decls.contains_key(name) {
+                    out.extend(adt_value_predicates(
+                        name,
+                        refined_types,
+                        alias_ast_types,
+                        data_ctor_decls,
+                        seen_aliases,
+                        ty.span,
+                    ));
+                }
+                seen_aliases.remove(name);
+            }
+        }
+        // Nested record: wrap each field predicate with a field access.
+        TypeKind::Record { fields, .. } => {
+            for field in fields {
+                for (label, pred) in field_value_predicates(
+                    &field.name,
+                    &field.value,
+                    refined_types,
+                    alias_ast_types,
+                    data_ctor_decls,
+                    seen_aliases,
+                ) {
+                    let span = field.value.span;
+                    let param = synth_fresh_name();
+                    let body = synth_app(
+                        pred,
+                        synth_field(synth_var(&param, span), &field.name),
+                    );
+                    out.push((label, synth_lambda(&param, body)));
+                }
+            }
+        }
+        // Nested relation: every element must satisfy the element predicates.
+        TypeKind::Relation(inner) => {
+            for (label, pred) in value_predicates(
+                inner,
+                refined_types,
+                alias_ast_types,
+                data_ctor_decls,
+                seen_aliases,
+            ) {
+                let span = inner.span;
+                let param = synth_fresh_name();
+                // \v -> all pred v
+                let body = synth_app(
+                    synth_app(synth_var("all", span), pred),
+                    synth_var(&param, span),
+                );
+                out.push((label, synth_lambda(&param, body)));
+            }
+        }
+        TypeKind::UnitAnnotated { base, .. } => {
+            out.extend(value_predicates(
+                base,
+                refined_types,
+                alias_ast_types,
+                data_ctor_decls,
+                seen_aliases,
+            ));
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Whole-element predicates for a multi-variant data type with refined
+/// constructor fields: each predicate matches one constructor, checks one
+/// payload field, and passes every other constructor.
+fn adt_value_predicates(
+    data_name: &str,
+    refined_types: &HashMap<String, Expr>,
+    alias_ast_types: &HashMap<String, Type>,
+    data_ctor_decls: &HashMap<String, Vec<ConstructorDef>>,
+    seen_aliases: &mut HashSet<String>,
+    span: Span,
+) -> Vec<(String, Expr)> {
+    let mut out = Vec::new();
+    let Some(ctors) = data_ctor_decls.get(data_name) else {
+        return out;
+    };
+    for ctor in ctors {
+        for field in &ctor.fields {
+            for (label, pred) in field_value_predicates(
+                &field.name,
+                &field.value,
+                refined_types,
+                alias_ast_types,
+                data_ctor_decls,
+                seen_aliases,
+            ) {
+                out.push((
+                    format!("{}.{}.{}", data_name, ctor.name, label),
+                    synth_ctor_field_case(&ctor.name, &field.name, pred, span),
+                ));
+            }
         }
     }
+    out
+}
+
+// ── Synthesized predicate builders for nested refinements ─────────
+
+/// Globally unique parameter names for synthesized lambdas, so nested
+/// wrappers never shadow each other.
+fn synth_fresh_name() -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SYNTH_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    format!("__refine_v{}", SYNTH_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+fn synth_var(name: &str, span: Span) -> Expr {
+    Spanned::new(ExprKind::Var(name.into()), span)
+}
+
+fn synth_app(f: Expr, a: Expr) -> Expr {
+    let span = f.span;
+    Spanned::new(
+        ExprKind::App {
+            func: Box::new(f),
+            arg: Box::new(a),
+        },
+        span,
+    )
+}
+
+fn synth_lambda(param: &str, body: Expr) -> Expr {
+    let span = body.span;
+    Spanned::new(
+        ExprKind::Lambda {
+            params: vec![Spanned::new(PatKind::Var(param.into()), span)],
+            body: Box::new(body),
+        },
+        span,
+    )
+}
+
+fn synth_field(e: Expr, field: &str) -> Expr {
+    let span = e.span;
+    Spanned::new(
+        ExprKind::FieldAccess {
+            expr: Box::new(e),
+            field: field.into(),
+        },
+        span,
+    )
+}
+
+/// `\v -> case v of Ctor {field: f} -> pred f | _ -> true`
+fn synth_ctor_field_case(ctor: &str, field: &str, pred: Expr, span: Span) -> Expr {
+    let scrut_param = synth_fresh_name();
+    let payload_param = synth_fresh_name();
+    let bound = Spanned::new(PatKind::Var(payload_param.clone()), span);
+    let rec_pat = Spanned::new(
+        PatKind::Record(vec![FieldPat {
+            name: field.into(),
+            pattern: Some(bound),
+        }]),
+        span,
+    );
+    let ctor_pat = Spanned::new(
+        PatKind::Constructor {
+            name: ctor.into(),
+            payload: Box::new(rec_pat),
+        },
+        span,
+    );
+    let match_arm = CaseArm {
+        pat: ctor_pat,
+        body: synth_app(pred, synth_var(&payload_param, span)),
+    };
+    let pass_arm = CaseArm {
+        pat: Spanned::new(PatKind::Wildcard, span),
+        body: Spanned::new(ExprKind::Lit(Literal::Bool(true)), span),
+    };
+    let case = Spanned::new(
+        ExprKind::Case {
+            scrutinee: Box::new(synth_var(&scrut_param, span)),
+            arms: vec![match_arm, pass_arm],
+        },
+        span,
+    );
+    synth_lambda(&scrut_param, case)
 }
 
 fn resolve_type(
@@ -550,6 +832,47 @@ fn resolve_type(
                             }
                         }
                     }
+                }
+            }
+            // Parameterized ADT (e.g. `Maybe Text`, `Result E A`, user data
+            // types with type args): resolve to the ADT shape so the schema
+            // maps the field to the "json" column type, which round-trips
+            // constructors faithfully via the `__knot_ctor` marker
+            // (`value_to_json`/`json_to_value`). Previously this fell
+            // through to Named("unknown") → "text", which persisted only
+            // the constructor tag and silently corrupted data.
+            if let TypeKind::Named(name) = &func.node {
+                // Built-in ADTs aren't in `aliases` — build their shapes
+                // directly, substituting the actual type argument.
+                if name == "Maybe" {
+                    let arg_ty = resolve_type(arg, aliases, assoc_types);
+                    return ResolvedType::Adt(vec![
+                        ("Nothing".into(), vec![]),
+                        ("Just".into(), vec![("value".into(), arg_ty)]),
+                    ]);
+                }
+            }
+            // `Result e a` arrives as App(App(Result, e), a).
+            if let TypeKind::App { func: inner_func, arg: err_arg } = &func.node {
+                if matches!(&inner_func.node, TypeKind::Named(n) if n == "Result") {
+                    let err_ty = resolve_type(err_arg, aliases, assoc_types);
+                    let ok_ty = resolve_type(arg, aliases, assoc_types);
+                    return ResolvedType::Adt(vec![
+                        ("Err".into(), vec![("error".into(), err_ty)]),
+                        ("Ok".into(), vec![("value".into(), ok_ty)]),
+                    ]);
+                }
+            }
+            // User-declared parameterized data types: the head's registered
+            // ADT shape is enough to pick the column type (payload-bearing
+            // ADTs become "json" columns regardless of the type arguments).
+            let mut head = func.as_ref();
+            while let TypeKind::App { func: inner, .. } = &head.node {
+                head = inner;
+            }
+            if let TypeKind::Named(name) = &head.node {
+                if let Some(resolved @ ResolvedType::Adt(_)) = aliases.get(name) {
+                    return resolved.clone();
                 }
             }
             ResolvedType::Named("unknown".into())

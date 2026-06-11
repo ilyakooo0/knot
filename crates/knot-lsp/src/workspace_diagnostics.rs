@@ -49,12 +49,32 @@ pub(crate) fn handle_document_diagnostics(
             .iter()
             .filter_map(|d| to_lsp_diagnostic(d, &doc.source, uri))
             .collect()
+    } else if let Some(pending) = state.pending_sources.get(uri) {
+        // Just-opened document whose first analysis hasn't landed yet: the
+        // editor buffer is the source of truth, not the disk copy (which may
+        // be older or not exist for an untitled-then-saved file). Analyze the
+        // buffer synchronously; don't seed the unopened-file cache — this URI
+        // is open.
+        let source = pending.source.clone();
+        let path = uri_to_path(uri)
+            .map(|p| p.canonicalize().unwrap_or(p))
+            .unwrap_or_else(|| PathBuf::from("."));
+        let (tokens, _) = knot::lexer::Lexer::new(&source).tokenize();
+        let parser = knot::parser::Parser::new(source.clone(), tokens);
+        let (module, _) = parser.parse_module();
+        analyze_unopened_file(&module, &source, &path, uri)
     } else if let Some(path) = uri_to_path(uri).and_then(|p| p.canonicalize().ok()) {
         // Cold path: file isn't open in the editor. Honor the pull anyway —
         // editors send `textDocument/diagnostic` for files surfaced via
         // workspace-symbol or goto-definition that haven't been opened yet.
         // Reuse the cached unopened-file diagnostics when available; otherwise
         // run the full pipeline and seed the cache.
+        //
+        // Stat the mtime BEFORE reading the content: if the file changes
+        // between the read and a post-analysis stat, the newer mtime would
+        // pin the old content's diagnostics in the cache (the mtime fast
+        // path would then skip re-verification forever).
+        let pre_read_mtime = current_mtime(&path);
         let source = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(_) => {
@@ -75,24 +95,27 @@ pub(crate) fn handle_document_diagnostics(
         if let Some(diags) = cached_match {
             state.workspace_diag_clock = state.workspace_diag_clock.wrapping_add(1);
             let access = state.workspace_diag_clock;
-            // Refresh the recorded mtime to the current disk mtime: we just
+            // Refresh the recorded mtime to the pre-read disk mtime: we just
             // verified content matches, so future prune/Phase-A passes can
             // take the mtime fast-path even if `jj`/`git` touched the file
             // without changing its bytes.
-            let disk_mtime = current_mtime(&path);
             if let Some(entry) = state.workspace_diag_cache.get_mut(&path) {
                 entry.2 = access;
-                if disk_mtime.is_some() {
-                    entry.3 = disk_mtime;
+                if pre_read_mtime.is_some() {
+                    entry.3 = pre_read_mtime;
                 }
             }
             diags
         } else {
-            analyze_and_cache(state, &path, &source, hash, uri)
+            analyze_and_cache(state, &path, &source, hash, pre_read_mtime, uri)
         }
     } else {
         Vec::new()
     };
+    // Honor the `warnUnusedImports` config knob at the emission boundary —
+    // the pipeline (and the caches) always carry the full list.
+    let items =
+        crate::diagnostics::filter_unused_warnings(items, state.config.warn_unused_imports);
 
     DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
         RelatedFullDocumentDiagnosticReport {
@@ -123,6 +146,7 @@ fn analyze_and_cache(
     path: &Path,
     source: &str,
     hash: u64,
+    mtime: Option<SystemTime>,
     uri: &Uri,
 ) -> Vec<Diagnostic> {
     let module = match get_or_parse_file_shared(path, &state.import_cache) {
@@ -132,7 +156,9 @@ fn analyze_and_cache(
     let diags = analyze_unopened_file(&module, source, path, uri);
     state.workspace_diag_clock = state.workspace_diag_clock.wrapping_add(1);
     let access = state.workspace_diag_clock;
-    let mtime = current_mtime(path);
+    // `mtime` was statted by the caller BEFORE reading `source` — using a
+    // post-analysis stat here would pin old-content diagnostics under a
+    // newer mtime if the file changed mid-analysis.
     state
         .workspace_diag_cache
         .insert(path.to_path_buf(), (hash, diags.clone(), access, mtime));
@@ -196,6 +222,10 @@ pub(crate) fn handle_workspace_diagnostics(
             .iter()
             .filter_map(|d| to_lsp_diagnostic(d, &doc.source, uri))
             .collect();
+        let lsp_diags = crate::diagnostics::filter_unused_warnings(
+            lsp_diags,
+            state.config.warn_unused_imports,
+        );
 
         if !lsp_diags.is_empty() {
             now_reported.insert(uri.clone());
@@ -204,7 +234,49 @@ pub(crate) fn handle_workspace_diagnostics(
             items.push(WorkspaceDocumentDiagnosticReport::Full(
                 WorkspaceFullDocumentDiagnosticReport {
                     uri: uri.clone(),
-                    version: None,
+                    // The LSP spec reserves `version: null` for documents
+                    // that are NOT open — open docs must report the version
+                    // their diagnostics were computed against.
+                    version: state
+                        .document_versions
+                        .get(uri)
+                        .map(|v| i64::from(*v)),
+                    full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                        result_id: None,
+                        items: lsp_diags,
+                    },
+                },
+            ));
+        }
+    }
+
+    // Just-opened documents whose first analysis hasn't landed yet: they're
+    // open (the editor sent didOpen), so they must be reported from the
+    // in-memory buffer — analyzing the disk copy would surface diagnostics
+    // for stale (or nonexistent) bytes. They also carry a version.
+    for (uri, pending) in &state.pending_sources {
+        if state.documents.contains_key(uri) {
+            continue;
+        }
+        let path = uri_to_path(uri)
+            .map(|p| p.canonicalize().unwrap_or(p))
+            .unwrap_or_else(|| PathBuf::from("."));
+        let (tokens, _) = knot::lexer::Lexer::new(&pending.source).tokenize();
+        let parser = knot::parser::Parser::new(pending.source.clone(), tokens);
+        let (module, _) = parser.parse_module();
+        let lsp_diags = analyze_unopened_file(&module, &pending.source, &path, uri);
+        let lsp_diags = crate::diagnostics::filter_unused_warnings(
+            lsp_diags,
+            state.config.warn_unused_imports,
+        );
+        if !lsp_diags.is_empty() {
+            now_reported.insert(uri.clone());
+        }
+        if !lsp_diags.is_empty() || prev_reported.contains(uri) {
+            items.push(WorkspaceDocumentDiagnosticReport::Full(
+                WorkspaceFullDocumentDiagnosticReport {
+                    uri: uri.clone(),
+                    version: pending.version.map(i64::from),
                     full_document_diagnostic_report: FullDocumentDiagnosticReport {
                         result_id: None,
                         items: lsp_diags,
@@ -224,9 +296,13 @@ pub(crate) fn handle_workspace_diagnostics(
     // first workspace-diagnostics call on cold caches by roughly the number
     // of cores.
     {
+        // "Open" includes just-opened docs still pending their first
+        // analysis — those were already reported from the editor buffer
+        // above and must not be re-analyzed from disk here.
         let open_paths: HashSet<PathBuf> = state
             .documents
             .keys()
+            .chain(state.pending_sources.keys())
             .filter_map(|u| uri_to_path(u))
             .filter_map(|p| p.canonicalize().ok())
             .collect();
@@ -245,12 +321,21 @@ pub(crate) fn handle_workspace_diagnostics(
                 hash: u64,
                 module: Module,
                 source: String,
+                /// On-disk mtime statted BEFORE the content read. Recorded
+                /// in the cache entry verbatim — a post-analysis stat could
+                /// pin old-content diagnostics under a newer mtime when the
+                /// file changes mid-analysis.
+                mtime: Option<SystemTime>,
             }
             let mut to_analyze: Vec<WorkItem> = Vec::new();
             let mut cached_results: Vec<(Uri, Vec<Diagnostic>, PathBuf)> = Vec::new();
             // mtime hits we should refresh after the read+hash fallback
             // confirmed content was unchanged (jj/git checkout case).
             let mut mtime_refreshes: Vec<(PathBuf, SystemTime)> = Vec::new();
+            // Files whose content hash MOVED relative to their prior cache
+            // entry — their reverse-importers' cached diagnostics are stale
+            // and must be invalidated before this pull refreshes the entry.
+            let mut hash_changed: Vec<PathBuf> = Vec::new();
             for file_path in files {
                 let canonical = match file_path.canonicalize() {
                     Ok(p) => p,
@@ -305,6 +390,9 @@ pub(crate) fn handle_workspace_diagnostics(
                         cached_results.push((file_uri, cached.clone(), canonical.clone()));
                         continue;
                     }
+                    // Prior entry exists with a DIFFERENT hash: the file
+                    // really changed since its diagnostics were cached.
+                    hash_changed.push(canonical.clone());
                 }
                 to_analyze.push(WorkItem {
                     canonical,
@@ -312,11 +400,90 @@ pub(crate) fn handle_workspace_diagnostics(
                     hash,
                     module,
                     source,
+                    mtime: disk_mtime,
                 });
             }
             for (path, mtime) in mtime_refreshes {
                 if let Some(entry) = state.workspace_diag_cache.get_mut(&path) {
                     entry.3 = Some(mtime);
+                }
+            }
+
+            // Record reverse-import edges for every file we just (re)parsed.
+            // `state.reverse_imports` is otherwise only fed by OPEN-document
+            // analysis, so without this the invalidation below could never
+            // reach an importer that was never opened. Mirrors
+            // `apply_analysis_result`: drop this importer's stale outgoing
+            // edges first, then add the current ones.
+            for w in &to_analyze {
+                for importers in state.reverse_imports.values_mut() {
+                    importers.remove(&w.canonical);
+                }
+            }
+            for w in &to_analyze {
+                let base = w.canonical.parent().unwrap_or(Path::new("."));
+                for imp in &w.module.imports {
+                    let rel = PathBuf::from(&imp.path).with_extension("knot");
+                    if let Ok(target) = base.join(&rel).canonicalize() {
+                        state
+                            .reverse_imports
+                            .entry(target)
+                            .or_default()
+                            .insert(w.canonical.clone());
+                    }
+                }
+            }
+            crate::state::prune_reverse_imports(&mut state.reverse_imports);
+
+            // Cross-file staleness (unopened importers): when a pulled
+            // file's content hash changed relative to its prior cache
+            // entry, every transitive reverse-importer's cached diagnostics
+            // may reference its old exports. Evict those entries NOW —
+            // before this pull writes the changed file's refreshed entry —
+            // otherwise the post-pull prune sees no hash mismatch anywhere
+            // and the importers' stale diagnostics survive indefinitely.
+            // Importers that were about to be served from cache in this
+            // same pull are re-analyzed instead.
+            if !hash_changed.is_empty() {
+                let mut affected: HashSet<PathBuf> = HashSet::new();
+                let mut frontier = hash_changed;
+                while let Some(p) = frontier.pop() {
+                    if let Some(importers) = state.reverse_imports.get(&p) {
+                        for imp in importers {
+                            if affected.insert(imp.clone()) {
+                                frontier.push(imp.clone());
+                            }
+                        }
+                    }
+                }
+                if !affected.is_empty() {
+                    state
+                        .workspace_diag_cache
+                        .retain(|p, _| !affected.contains(p));
+                    let mut kept: Vec<(Uri, Vec<Diagnostic>, PathBuf)> =
+                        Vec::with_capacity(cached_results.len());
+                    for (file_uri, diags, canonical) in cached_results {
+                        if !affected.contains(&canonical) {
+                            kept.push((file_uri, diags, canonical));
+                            continue;
+                        }
+                        // Stat before read — same ordering rule as Phase A.
+                        let mtime = current_mtime(&canonical);
+                        if let Some((module, source)) =
+                            get_or_parse_file_shared(&canonical, &state.import_cache)
+                        {
+                            let hash = content_hash(&source);
+                            to_analyze.push(WorkItem {
+                                canonical,
+                                file_uri,
+                                hash,
+                                module,
+                                source,
+                                mtime,
+                            });
+                        }
+                    }
+                    cached_results = kept;
                 }
             }
 
@@ -344,7 +511,8 @@ pub(crate) fn handle_workspace_diagnostics(
                 chunks.push(buf);
             }
 
-            let mut analysis_results: Vec<(PathBuf, Uri, u64, Vec<Diagnostic>)> = Vec::new();
+            let mut analysis_results: Vec<(PathBuf, Uri, u64, Option<SystemTime>, Vec<Diagnostic>)> =
+                Vec::new();
             std::thread::scope(|s| {
                 let handles: Vec<_> = chunks
                     .into_iter()
@@ -358,7 +526,7 @@ pub(crate) fn handle_workspace_diagnostics(
                                     &w.canonical,
                                     &w.file_uri,
                                 );
-                                out.push((w.canonical, w.file_uri, w.hash, diags));
+                                out.push((w.canonical, w.file_uri, w.hash, w.mtime, diags));
                             }
                             out
                         })
@@ -372,13 +540,18 @@ pub(crate) fn handle_workspace_diagnostics(
             });
 
             // Phase C: serialize cache writes and report assembly. Cheap.
-            for (canonical, file_uri, hash, lsp_diags) in analysis_results {
+            // The recorded mtime is the one statted BEFORE the content read
+            // (carried on the WorkItem) — never a fresh post-analysis stat.
+            for (canonical, file_uri, hash, mtime, lsp_diags) in analysis_results {
                 state.workspace_diag_clock = state.workspace_diag_clock.wrapping_add(1);
                 let access = state.workspace_diag_clock;
-                let mtime = current_mtime(&canonical);
                 state
                     .workspace_diag_cache
                     .insert(canonical, (hash, lsp_diags.clone(), access, mtime));
+                let lsp_diags = crate::diagnostics::filter_unused_warnings(
+                    lsp_diags,
+                    state.config.warn_unused_imports,
+                );
                 if !lsp_diags.is_empty() {
                     now_reported.insert(file_uri.clone());
                 }
@@ -403,6 +576,10 @@ pub(crate) fn handle_workspace_diagnostics(
                 if let Some(entry) = state.workspace_diag_cache.get_mut(&canonical) {
                     entry.2 = access;
                 }
+                let lsp_diags = crate::diagnostics::filter_unused_warnings(
+                    lsp_diags,
+                    state.config.warn_unused_imports,
+                );
                 if !lsp_diags.is_empty() {
                     now_reported.insert(file_uri.clone());
                 }
@@ -777,6 +954,148 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn ws_params() -> WorkspaceDiagnosticParams {
+        WorkspaceDiagnosticParams {
+            identifier: None,
+            previous_result_ids: Vec::new(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }
+    }
+
+    fn doc_params(uri: &Uri) -> DocumentDiagnosticParams {
+        DocumentDiagnosticParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            identifier: None,
+            previous_result_id: None,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }
+    }
+
+    fn full_items(r: DocumentDiagnosticReportResult) -> Vec<Diagnostic> {
+        match r {
+            DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(f)) => {
+                f.full_document_diagnostic_report.items
+            }
+            other => panic!("expected full report, got {other:?}"),
+        }
+    }
+
+    fn find_full_report(
+        result: WorkspaceDiagnosticReportResult,
+        uri: &Uri,
+    ) -> Option<WorkspaceFullDocumentDiagnosticReport> {
+        let WorkspaceDiagnosticReportResult::Report(report) = result else {
+            panic!("expected report result");
+        };
+        report.items.into_iter().find_map(|i| match i {
+            WorkspaceDocumentDiagnosticReport::Full(f) if &f.uri == uri => Some(f),
+            _ => None,
+        })
+    }
+
+    /// Bug 3: the `warnUnusedImports` flag must gate the unused warnings at
+    /// the pull boundary (the pipeline emits them unconditionally).
+    #[test]
+    fn unused_warning_filtered_when_config_disabled() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "unusedThing = 1\nmain = println \"hi\"\n");
+        let items = full_items(handle_document_diagnostics(&mut ws.state, &doc_params(&uri)));
+        assert!(
+            items.iter().any(|d| d.message.contains("unused")),
+            "setup: unused warning expected with the default config; got {items:?}"
+        );
+        ws.state.config.warn_unused_imports = false;
+        let items = full_items(handle_document_diagnostics(&mut ws.state, &doc_params(&uri)));
+        assert!(
+            !items.iter().any(|d| d.message.contains("unused")),
+            "warnUnusedImports=false must drop the warning; got {items:?}"
+        );
+    }
+
+    /// Bug 11: open docs must report the version their diagnostics were
+    /// computed against (the spec reserves `null` for not-open files).
+    #[test]
+    fn workspace_pull_reports_version_for_open_docs() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "main = undefinedFn 1\n");
+        ws.state.document_versions.insert(uri.clone(), 7);
+        let result = handle_workspace_diagnostics(&mut ws.state, &ws_params());
+        let full = find_full_report(result, &uri).expect("erroring open doc reported");
+        assert_eq!(full.version, Some(7), "open doc must carry its version");
+    }
+
+    /// Bug 11: a just-opened doc (pending, not yet analyzed) must be
+    /// diagnosed from the editor buffer — the disk copy may be stale or not
+    /// exist at all — and reported with its version.
+    #[test]
+    fn just_opened_doc_pulls_from_buffer_not_disk() {
+        use crate::state::PendingSource;
+        let mut ws = TestWorkspace::new();
+        let uri: Uri = "file:///test/pending-only.knot".parse().unwrap();
+        ws.state.pending_sources.insert(
+            uri.clone(),
+            PendingSource {
+                source: "main = undefinedFn 1\n".into(),
+                version: Some(3),
+            },
+        );
+        // Per-document pull: the old code read the (nonexistent) disk file
+        // and returned an empty report.
+        let items = full_items(handle_document_diagnostics(&mut ws.state, &doc_params(&uri)));
+        assert!(
+            !items.is_empty(),
+            "buffer text must be analyzed for a just-opened doc"
+        );
+        // Workspace pull: same, plus the buffer's version.
+        let result = handle_workspace_diagnostics(&mut ws.state, &ws_params());
+        let full = find_full_report(result, &uri).expect("pending doc reported");
+        assert_eq!(full.version, Some(3));
+        assert!(!full.full_document_diagnostic_report.items.is_empty());
+    }
+
+    /// Bug 9: when a pulled file's content hash changes, the cached
+    /// diagnostics of its (unopened, transitive) importers are stale and
+    /// must be evicted/re-analyzed in the SAME pull — the post-pull prune
+    /// sees no hash mismatch (the entry was just refreshed) and never
+    /// reaches them.
+    #[test]
+    fn workspace_pull_refreshes_unopened_importers_when_dependency_changes() {
+        use crate::test_support::TempWorkspace;
+        let mut tw = TempWorkspace::new();
+        std::fs::write(tw.root.join("b.knot"), "helper = \\x -> x\n").unwrap();
+        std::fs::write(tw.root.join("a.knot"), "import ./b\n\nmain = helper 1\n").unwrap();
+        let a_canon = tw.root.join("a.knot").canonicalize().unwrap();
+        let b_canon = tw.root.join("b.knot").canonicalize().unwrap();
+        let a_uri = path_to_uri(&a_canon).expect("uri");
+
+        let state = &mut tw.workspace.state;
+        // Pull 1: cold caches — both files analyzed; a.knot is clean.
+        let _ = handle_workspace_diagnostics(state, &ws_params());
+        assert!(
+            state.workspace_diag_cache.contains_key(&a_canon),
+            "pull 1 should cache a.knot"
+        );
+
+        // b.knot changes incompatibly: `helper` disappears.
+        std::fs::write(tw.root.join("b.knot"), "other = 1\n").unwrap();
+        // Defeat the mtime fast path for b deterministically (coarse fs
+        // clocks could otherwise serve the old entry): drop its recorded
+        // mtime so the pull takes the read+hash path.
+        if let Some(e) = state.workspace_diag_cache.get_mut(&b_canon) {
+            e.3 = None;
+        }
+
+        let result = handle_workspace_diagnostics(state, &ws_params());
+        let a_report = find_full_report(result, &a_uri)
+            .expect("importer a.knot must be re-reported after its dependency changed");
+        assert!(
+            !a_report.full_document_diagnostic_report.items.is_empty(),
+            "a.knot must surface the new cross-file error instead of its stale clean cache"
+        );
     }
 
     #[test]

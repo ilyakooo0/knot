@@ -10,7 +10,8 @@ use knot::ast::*;
 use knot::diagnostic::Diagnostic;
 
 use crate::codegen::{
-    divisor_is_nonzero_int_literal, divisor_is_nonzero_literal, expr_refs_var,
+    divisor_is_nonzero_int_literal, divisor_is_nonzero_literal, expr_has_tag_column,
+    expr_refs_var, infer_sql_expr_type, int_case_projection_pushable,
     minmax_pushdown_type_ok, sql_comparison_cast_mode, SqlCastMode,
 };
 use crate::types::TypeEnv;
@@ -422,7 +423,7 @@ fn lint_pipe_chain(
                 }
             }
             LintPipeOp::SortBy { bind_var, body, span } => {
-                if try_sql_column_expr(bind_var, body).is_none() {
+                if try_sql_sortby_expr(bind_var, body, schema).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "pipe sortBy will be evaluated at runtime instead of SQL ORDER BY",
@@ -432,7 +433,7 @@ fn lint_pipe_chain(
                 }
             }
             LintPipeOp::Sum { bind_var, body, span } => {
-                if try_sql_column_expr(bind_var, body).is_none() {
+                if try_sql_column_expr(bind_var, body, schema).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "pipe sum will be evaluated at runtime instead of SQL SUM",
@@ -442,7 +443,7 @@ fn lint_pipe_chain(
                 }
             }
             LintPipeOp::Avg { bind_var, body, span } => {
-                if try_sql_column_expr(bind_var, body).is_none() {
+                if try_sql_column_expr(bind_var, body, schema).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "pipe avg will be evaluated at runtime instead of SQL AVG",
@@ -546,7 +547,7 @@ fn lint_app_form(
                 }
             }
             "sortBy" => {
-                if try_sql_column_expr(&bind_var, body).is_none() {
+                if try_sql_sortby_expr(&bind_var, body, schema).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "sortBy will be evaluated at runtime instead of SQL ORDER BY",
@@ -559,7 +560,7 @@ fn lint_app_form(
                 }
             }
             "sum" => {
-                if try_sql_column_expr(&bind_var, body).is_none() {
+                if try_sql_column_expr(&bind_var, body, schema).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "sum will be evaluated at runtime instead of SQL SUM",
@@ -572,7 +573,7 @@ fn lint_app_form(
                 }
             }
             "avg" => {
-                if try_sql_column_expr(&bind_var, body).is_none() {
+                if try_sql_column_expr(&bind_var, body, schema).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "avg will be evaluated at runtime instead of SQL AVG",
@@ -642,20 +643,29 @@ fn try_compile_sql_expr(bind_var: &str, expr: &Expr, schema: &str) -> Option<()>
             }
             BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
                 // Try simple field op value, then atom-based (handles arithmetic)
-                try_sql_comparison(bind_var, lhs, rhs, schema)
-                    .or_else(|| try_sql_comparison(bind_var, rhs, lhs, schema))
+                try_sql_comparison(bind_var, lhs, rhs, op, schema)
+                    .or_else(|| try_sql_comparison(bind_var, rhs, lhs, op, schema))
                     .or_else(|| {
                         // Mirror codegen's type-witness gate: arithmetic
                         // comparisons only push down when they can be typed
-                        // (int → KNOT_INT cast, float → plain SQL); untypable
-                        // arithmetic falls back to runtime.
-                        let mode = sql_comparison_cast_mode(lhs, rhs, &|v, f| {
+                        // (int → numeric-cast SQL, float → in-memory);
+                        // untypable arithmetic falls back to runtime.
+                        let col_ty = |v: &str, f: &str| {
                             if v == bind_var {
                                 lookup_col_type(schema, f)
                             } else {
                                 None
                             }
-                        })?;
+                        };
+                        let mode = sql_comparison_cast_mode(lhs, rhs, &col_ty)?;
+                        // Ordered comparisons on tag columns stay in memory
+                        // (byte-wise name order ≠ Ord) — mirror codegen.
+                        if matches!(op, BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge)
+                            && (expr_has_tag_column(lhs, &col_ty)
+                                || expr_has_tag_column(rhs, &col_ty))
+                        {
+                            return None;
+                        }
                         if matches!(mode, SqlCastMode::NoArith)
                             && (atom_would_need_cast(lhs) || atom_would_need_cast(rhs))
                         {
@@ -686,6 +696,15 @@ fn try_compile_sql_expr(bind_var: &str, expr: &Expr, schema: &str) -> Option<()>
                         return try_sql_atom(bind_var, arg);
                     }
                     if name == "elem" {
+                        // Mirror codegen: `IN` is equality under the hood —
+                        // float equality stays in memory.
+                        if let ExprKind::FieldAccess { expr: fa, field } = &first_arg.node {
+                            if matches!(&fa.node, ExprKind::Var(v) if v == bind_var)
+                                && lookup_col_type(schema, field).as_deref() == Some("float")
+                            {
+                                return None;
+                            }
+                        }
                         try_sql_atom(bind_var, first_arg)?;
                         // Literal list: each element must be a sql-pushable atom
                         // (codegen emits `IN (?, ?, ...)`).
@@ -722,6 +741,7 @@ fn try_sql_comparison(
     bind_var: &str,
     field_side: &Expr,
     value_side: &Expr,
+    op: &BinOp,
     schema: &str,
 ) -> Option<()> {
     // field_side must be bind_var.field
@@ -730,10 +750,23 @@ fn try_sql_comparison(
             if name != bind_var {
                 return None;
             }
+            let col_ty = lookup_col_type(schema, field);
             // Mirror codegen: json columns (payload-bearing ADTs, nested
             // records) are never pushed down — the runtime binds the
             // compared value differently than it is stored.
-            if lookup_col_type(schema, field).as_deref() == Some("json") {
+            if col_ty.as_deref() == Some("json") {
+                return None;
+            }
+            // Float comparisons stay in memory (total_cmp vs SQL
+            // -0.0/NaN-as-NULL semantics) — mirror codegen.
+            if col_ty.as_deref() == Some("float") {
+                return None;
+            }
+            // Ordered comparisons on tag columns stay in memory
+            // (byte-wise constructor-name order ≠ Ord) — mirror codegen.
+            if col_ty.as_deref() == Some("tag")
+                && matches!(op, BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge)
+            {
                 return None;
             }
         } else {
@@ -802,13 +835,14 @@ fn try_sql_atom(bind_var: &str, expr: &Expr) -> Option<()> {
                 _ => None,
             }
         }
-        // Built-in functions: length, trim (toUpper/toLower are NOT pushed
+        // Built-in functions: length (toUpper/toLower are NOT pushed
         // down — SQLite UPPER/LOWER are ASCII-only, the runtime is
-        // Unicode-aware)
+        // Unicode-aware; trim likewise: SQLite TRIM strips ASCII spaces
+        // only while the runtime trims all Unicode whitespace)
         ExprKind::App { func, arg } => {
             if let ExprKind::Var(name) = &func.node {
                 match name.as_str() {
-                    "length" | "trim" => {
+                    "length" => {
                         try_sql_atom(bind_var, arg)
                     }
                     _ => None,
@@ -1183,10 +1217,24 @@ fn extract_single_param_lambda(expr: &Expr) -> Option<(String, &Expr)> {
 /// Mirror of codegen's minOn/maxOn pushdown approval: the lambda body must
 /// compile to a SQL column expression AND its Knot type must be numeric
 /// (Int/Float) — the MIN/MAX runtime re-parses TEXT results as Int, so
-/// Text projections fall back to in-memory evaluation.
+/// Text projections fall back to in-memory evaluation. Int-typed
+/// if/then/else projections are also rejected (MIN/MAX over CASE loses the
+/// KNOT_INT collation) — that check lives in `minmax_pushdown_type_ok`.
 fn try_sql_minmax_expr(bind_var: &str, body: &Expr, schema: &str) -> Option<()> {
-    try_sql_column_expr(bind_var, body)?;
+    try_sql_column_expr(bind_var, body, schema)?;
     if minmax_pushdown_type_ok(bind_var, body, schema) {
+        Some(())
+    } else {
+        None
+    }
+}
+
+/// Mirror of codegen's sortBy pushdown approval: the lambda body must
+/// compile to a SQL column expression, and Int-typed if/then/else
+/// projections are rejected (ORDER BY CASE loses the KNOT_INT collation).
+fn try_sql_sortby_expr(bind_var: &str, body: &Expr, schema: &str) -> Option<()> {
+    try_sql_column_expr(bind_var, body, schema)?;
+    if int_case_projection_pushable(bind_var, body, schema) {
         Some(())
     } else {
         None
@@ -1196,7 +1244,7 @@ fn try_sql_minmax_expr(bind_var: &str, body: &Expr, schema: &str) -> Option<()> 
 /// Check if a lambda body can be compiled to a SQL expression.
 /// Mirrors codegen's `extract_sql_field_access` which handles simple field access,
 /// arithmetic expressions (including ++), CASE WHEN, and built-in functions.
-fn try_sql_column_expr(bind_var: &str, body: &Expr) -> Option<()> {
+fn try_sql_column_expr(bind_var: &str, body: &Expr, schema: &str) -> Option<()> {
     match &body.node {
         ExprKind::FieldAccess { expr, .. } => {
             if let ExprKind::Var(name) = &expr.node {
@@ -1211,33 +1259,35 @@ fn try_sql_column_expr(bind_var: &str, body: &Expr) -> Option<()> {
         ExprKind::BinOp { op, lhs, rhs } => {
             match op {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Concat => {
-                    try_sql_column_expr(bind_var, lhs)?;
-                    try_sql_column_expr(bind_var, rhs)
+                    try_sql_column_expr(bind_var, lhs, schema)?;
+                    try_sql_column_expr(bind_var, rhs, schema)
                 }
                 // Mirror codegen: `/`/`%` only push down with a provably
                 // nonzero literal divisor; `%` must be integer-typed.
                 BinOp::Div if divisor_is_nonzero_literal(rhs) => {
-                    try_sql_column_expr(bind_var, lhs)?;
-                    try_sql_column_expr(bind_var, rhs)
+                    try_sql_column_expr(bind_var, lhs, schema)?;
+                    try_sql_column_expr(bind_var, rhs, schema)
                 }
                 BinOp::Mod if divisor_is_nonzero_int_literal(rhs) => {
-                    try_sql_column_expr(bind_var, lhs)?;
-                    try_sql_column_expr(bind_var, rhs)
+                    try_sql_column_expr(bind_var, lhs, schema)?;
+                    try_sql_column_expr(bind_var, rhs, schema)
                 }
                 _ => None,
             }
         }
         ExprKind::If { cond, then_branch, else_branch } => {
-            try_sql_inline_cond(bind_var, cond)?;
-            try_sql_column_expr(bind_var, then_branch)?;
-            try_sql_column_expr(bind_var, else_branch)
+            try_sql_inline_cond(bind_var, cond, schema)?;
+            try_sql_column_expr(bind_var, then_branch, schema)?;
+            try_sql_column_expr(bind_var, else_branch, schema)
         }
-        // toUpper/toLower are NOT pushed down (ASCII-only in SQLite).
+        // toUpper/toLower are NOT pushed down (ASCII-only in SQLite);
+        // trim likewise (SQLite TRIM strips ASCII spaces only, the
+        // runtime trims all Unicode whitespace).
         ExprKind::App { func, arg } => {
             if let ExprKind::Var(name) = &func.node {
                 match name.as_str() {
-                    "length" | "trim" => {
-                        try_sql_column_expr(bind_var, arg)
+                    "length" => {
+                        try_sql_column_expr(bind_var, arg, schema)
                     }
                     _ => None,
                 }
@@ -1290,36 +1340,56 @@ fn lint_pipe_order_pushable(ops: &[LintPipeOp]) -> bool {
 }
 
 /// Check if a condition can be compiled to an inline SQL condition (for CASE WHEN).
-fn try_sql_inline_cond(bind_var: &str, expr: &Expr) -> Option<()> {
+fn try_sql_inline_cond(bind_var: &str, expr: &Expr, schema: &str) -> Option<()> {
     match &expr.node {
         ExprKind::BinOp { op, lhs, rhs } => match op {
             BinOp::And | BinOp::Or => {
-                try_sql_inline_cond(bind_var, lhs)?;
-                try_sql_inline_cond(bind_var, rhs)
+                try_sql_inline_cond(bind_var, lhs, schema)?;
+                try_sql_inline_cond(bind_var, rhs, schema)
             }
             BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
-                try_sql_column_expr(bind_var, lhs)?;
-                try_sql_column_expr(bind_var, rhs)
+                // Mirror codegen's inline-condition gates: float
+                // comparisons stay in memory (total_cmp vs SQL
+                // -0.0/NaN-as-NULL); ordered comparisons on tag columns
+                // ignore the type's Ord.
+                let lt = infer_sql_expr_type(bind_var, lhs, schema);
+                let rt = infer_sql_expr_type(bind_var, rhs, schema);
+                if lt.as_deref() == Some("float") || rt.as_deref() == Some("float") {
+                    return None;
+                }
+                if matches!(op, BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge)
+                    && (lt.as_deref() == Some("tag") || rt.as_deref() == Some("tag"))
+                {
+                    return None;
+                }
+                try_sql_column_expr(bind_var, lhs, schema)?;
+                try_sql_column_expr(bind_var, rhs, schema)
             }
             _ => None,
         },
         ExprKind::UnaryOp { op: UnaryOp::Not, operand } => {
-            try_sql_inline_cond(bind_var, operand)
+            try_sql_inline_cond(bind_var, operand, schema)
         }
         ExprKind::App { func, arg } => {
             if let ExprKind::Var(name) = &func.node {
                 if name == "not" {
-                    return try_sql_inline_cond(bind_var, arg);
+                    return try_sql_inline_cond(bind_var, arg, schema);
                 }
             }
             if let ExprKind::App { func: inner_func, arg: first_arg } = &func.node {
                 if let ExprKind::Var(name) = &inner_func.node {
                     if name == "contains" {
-                        try_sql_column_expr(bind_var, first_arg)?;
-                        return try_sql_column_expr(bind_var, arg);
+                        try_sql_column_expr(bind_var, first_arg, schema)?;
+                        return try_sql_column_expr(bind_var, arg, schema);
                     }
                     if name == "elem" {
-                        try_sql_column_expr(bind_var, first_arg)?;
+                        // Mirror codegen: float `IN` equality stays in memory.
+                        if infer_sql_expr_type(bind_var, first_arg, schema).as_deref()
+                            == Some("float")
+                        {
+                            return None;
+                        }
+                        try_sql_column_expr(bind_var, first_arg, schema)?;
                         // The list arg must be a literal list of scalar literals.
                         if let ExprKind::List(elems) = &arg.node {
                             for e in elems {

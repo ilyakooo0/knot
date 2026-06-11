@@ -95,6 +95,26 @@ pub fn to_lsp_diagnostic(
     })
 }
 
+/// Drop unused-declaration warnings (produced by
+/// `knot_compiler::unused::check`, mapped to code `W001`) when the
+/// `warnUnusedImports` config flag is off. The warnings are produced
+/// unconditionally by the analysis pipeline — the worker doesn't see config,
+/// and the snapshot/workspace caches store the full list — so gating happens
+/// at every emission boundary (publish + pull handlers). That way a live
+/// config change takes effect without re-analysis or cache invalidation.
+pub(crate) fn filter_unused_warnings(
+    items: Vec<Diagnostic>,
+    warn_unused: bool,
+) -> Vec<Diagnostic> {
+    if warn_unused {
+        return items;
+    }
+    items
+        .into_iter()
+        .filter(|d| d.code != Some(NumberOrString::String("W001".into())))
+        .collect()
+}
+
 /// Hard cap on a single diagnostic message's serialized size. Compiler
 /// diagnostics with a long chain of notes (e.g. trait-resolution failures
 /// dragging in dozens of candidate impls) can blow past 100KB on the wire,

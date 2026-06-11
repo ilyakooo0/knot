@@ -23,6 +23,18 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     let uri = &params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
     let doc = state.documents.get(uri)?;
+    // Staleness guard (mirrors rename / completion-resolve): during the
+    // analysis debounce window the editor buffer is newer than the analyzed
+    // source, so positions from the live buffer would resolve against the
+    // wrong bytes — hover would caption the wrong token. Bail; the client
+    // re-requests once analysis catches up.
+    if state
+        .pending_sources
+        .get(uri)
+        .is_some_and(|p| p.source != doc.source)
+    {
+        return None;
+    }
 
     let offset = position_to_offset(&doc.source, pos);
 
@@ -52,6 +64,20 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     // nudged back inside that word too — otherwise hover at `total|` falls
     // back to a same-named global instead of the local binding.
     let lookup_offset = crate::utils::ident_lookup_offset(&doc.source, offset);
+
+    // Field-access context (AST-driven): when the cursor sits on the field
+    // token of `recv.field`, the token names a RECORD FIELD, not a symbol.
+    // Field tokens never appear in `doc.references`, so the name-based
+    // global lookups below would caption the hover with a same-named
+    // global's signature — wrong info. Computed up front so the headline
+    // lookups can suppress themselves; the field-refinement section further
+    // down still renders when metadata exists. (Numeric receivers like the
+    // `14` of `3.14` parse as float literals, not FieldAccess nodes, so
+    // they never classify as field context here.)
+    let field_at_cursor = find_field_access_at_offset(&doc.module, lookup_offset);
+    let on_field_token = field_at_cursor
+        .as_ref()
+        .is_some_and(|f| f.field_name == word);
 
     // Try local binding types (let, bind, lambda params, case patterns).
     // Check if cursor is on a binding site or on a usage that references one.
@@ -84,6 +110,13 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     let detail_opt = if let Some(ty) = local_type {
         type_for_refinement_scan = Some(ty.clone());
         Some(format!("{word} : {ty}"))
+    } else if on_field_token {
+        // Record-field token: the name-based fallbacks below would show a
+        // same-named GLOBAL's signature for `p.count` when a top-level
+        // `count` exists. We have no per-field type info plumbed through
+        // (field spans aren't in `local_type_info`), so show nothing here —
+        // the field-refinement section still renders when available.
+        None
     } else if let Some(d) = doc.details.get(word) {
         let base = if let Some(inferred) = doc.type_info.get(word) {
             type_for_refinement_scan = Some(inferred.clone());
@@ -115,7 +148,6 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     // The hover handler historically returned None when no symbol info was
     // available. With field-access and type-variable enrichment, we fall
     // through and render an informational hover for those cases too.
-    let field_at_cursor = find_field_access_at_offset(&doc.module, offset);
     let enclosing_scheme = find_enclosing_type_scheme(&doc.module, offset);
     let type_var_constraints: Vec<&knot::ast::Constraint> = enclosing_scheme
         .as_ref()
@@ -983,6 +1015,58 @@ mod regress_fixes_tests {
             headline.contains("Int") || headline.contains("a :"),
             "expected the innermost binder's type, got: {headline}"
         );
+    }
+
+    /// Bug 17: positions from the live buffer must not resolve against the
+    /// older analyzed text during the debounce window — mirror the staleness
+    /// guard rename/completion-resolve already have.
+    #[test]
+    fn hover_bails_when_pending_text_is_newer() {
+        use crate::state::PendingSource;
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "double = \\x -> x * 2\nmain = double 1\n");
+        let doc_source = ws.doc(&uri).source.clone();
+        let off = doc_source.find("double =").expect("def");
+        let pos = offset_to_position(&doc_source, off);
+        ws.state.pending_sources.insert(
+            uri.clone(),
+            PendingSource {
+                source: format!("-- new line\n{doc_source}"),
+                version: Some(2),
+            },
+        );
+        let resp = handle_hover(&ws.state, &hover_params(&uri, pos));
+        assert!(resp.is_none(), "hover against stale analysis must bail: {resp:?}");
+    }
+
+    /// Bug 13: hovering the FIELD token of `p.count` must not caption the
+    /// popup with a same-named GLOBAL's signature (field tokens are never in
+    /// `doc.references`, so the name-based fallback used to fire).
+    #[test]
+    fn hover_on_field_token_does_not_show_same_named_global() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            "count : Int -> Int\ncount = \\x -> x\nf = \\p -> p.count\n",
+        );
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("p.count").expect("access") + 2;
+        let pos = offset_to_position(&doc.source, off);
+        let resp = handle_hover(&ws.state, &hover_params(&uri, pos));
+        if let Some(h) = resp {
+            let text = hover_text(h);
+            assert!(
+                !text.contains("Int -> Int"),
+                "field hover leaked the unrelated global's signature: {text}"
+            );
+        }
+        // Hovering the actual global usage still shows its signature.
+        let uri2 = ws.open("main2", "count : Int -> Int\ncount = \\x -> x\nmain = count 1\n");
+        let doc2 = ws.doc(&uri2);
+        let off2 = doc2.source.find("count 1").expect("usage");
+        let pos2 = offset_to_position(&doc2.source, off2);
+        let hover = handle_hover(&ws.state, &hover_params(&uri2, pos2)).expect("hover");
+        assert!(hover_text(hover).contains("Int"));
     }
 
     /// A field-access position with no refinement metadata and no symbol

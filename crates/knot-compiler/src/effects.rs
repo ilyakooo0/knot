@@ -21,6 +21,13 @@ pub struct EffectSet {
     pub fs: bool,
     pub clock: bool,
     pub random: bool,
+    /// Whether evaluating this expression may run `race` (directly or via a
+    /// helper). Not a user-declarable effect — it exists solely so the
+    /// atomic gate can reject `race` reached through wrappers, where the
+    /// syntactic walk of the atomic body can't see it. Deliberately ignored
+    /// by `is_subset_of`/`difference`/`Display`, so effect annotations are
+    /// unaffected.
+    pub uses_race: bool,
 }
 
 #[allow(dead_code)]
@@ -34,6 +41,7 @@ impl EffectSet {
             fs: false,
             clock: false,
             random: false,
+            uses_race: false,
         }
     }
 
@@ -71,6 +79,7 @@ impl EffectSet {
             fs: self.fs || other.fs,
             clock: self.clock || other.clock,
             random: self.random || other.random,
+            uses_race: self.uses_race || other.uses_race,
         }
     }
 
@@ -104,6 +113,8 @@ impl EffectSet {
             fs: self.fs && !other.fs,
             clock: self.clock && !other.clock,
             random: self.random && !other.random,
+            // Not user-declarable, so never reported as an annotation delta.
+            uses_race: false,
         }
     }
 
@@ -188,6 +199,11 @@ struct EffectChecker {
     builtin_effects: HashMap<String, EffectSet>,
     /// Known source relation names.
     source_names: HashSet<String>,
+    /// Known view names. The parser produces `SourceRef` for *every* `*name`
+    /// write target, so writes to views arrive looking like source writes —
+    /// this set lets the `Set`/`ReplaceSet` arm recognize them and attribute
+    /// read/write effects to the view's backing source(s) as well.
+    view_names: HashSet<String>,
     /// Names of declarations whose annotated signature carries an effect-row
     /// variable (e.g. `IO {r *sessions | e} a`). Calls to these functions
     /// propagate the effects of their lambda arguments — matching HM's
@@ -211,6 +227,15 @@ struct EffectChecker {
     /// checker see effects of calls through local bindings, e.g.
     /// `do { let f = \u -> *items; rows <- f {} }` reads `items`.
     local_fn_effects: Vec<HashMap<String, EffectSet>>,
+    /// Bodies of user declarations, for the conservative atomic-gate scan
+    /// that looks for IO-performing lambdas reachable through opaque
+    /// callees (e.g. a lambda stored in a record field of another decl).
+    decl_bodies: HashMap<String, ast::Expr>,
+    /// Names currently shadowed by lambda params, do-binds, lets, or case
+    /// binders. A shadowed name is a local value, not the builtin — without
+    /// this, a do-bind named `race` would carry the `uses_race` marker and
+    /// be wrongly rejected inside `atomic`.
+    shadowed: Vec<String>,
     /// Accumulated diagnostics.
     diagnostics: Vec<Diagnostic>,
 }
@@ -256,22 +281,48 @@ impl EffectChecker {
 
         insert_many(PURE_BUILTINS, EffectSet::empty());
 
+        // `race` carries a marker (not a user-declarable effect) so the
+        // atomic gate catches it through helper functions — the syntactic
+        // walk of the atomic body alone misses `raceIt = \a b -> race a b`.
+        // `fork` is intentionally permitted inside atomic (see builtins.rs)
+        // and `retry` is the STM primitive, so neither is marked.
+        let mut race_effect = EffectSet::empty();
+        race_effect.uses_race = true;
+        builtin_effects.insert("race".into(), race_effect);
+
         Self {
             decl_effects: HashMap::new(),
             builtin_effects,
             source_names: HashSet::new(),
+            view_names: HashSet::new(),
             row_poly_decls: HashSet::new(),
             fixed_row_decls: HashSet::new(),
             local_fn_effects: Vec::new(),
+            decl_bodies: HashMap::new(),
+            shadowed: Vec::new(),
             diagnostics: Vec::new(),
         }
     }
 
     fn run(&mut self, module: &ast::Module) {
-        // Collect source relation names
+        // Collect source relation and view names, plus declaration bodies
+        // for the atomic-gate's opaque-callee lambda scan.
         for decl in &module.decls {
-            if let ast::DeclKind::Source { name, .. } = &decl.node {
-                self.source_names.insert(name.clone());
+            match &decl.node {
+                ast::DeclKind::Source { name, .. } => {
+                    self.source_names.insert(name.clone());
+                }
+                ast::DeclKind::View { name, body, .. }
+                | ast::DeclKind::Derived { name, body, .. } => {
+                    if let ast::DeclKind::View { .. } = &decl.node {
+                        self.view_names.insert(name.clone());
+                    }
+                    self.decl_bodies.insert(name.clone(), body.clone());
+                }
+                ast::DeclKind::Fun { name, body: Some(body), .. } => {
+                    self.decl_bodies.insert(name.clone(), body.clone());
+                }
+                _ => {}
             }
         }
 
@@ -461,13 +512,18 @@ impl EffectChecker {
             ast::ExprKind::Lit(_) | ast::ExprKind::Constructor(_) => EffectSet::empty(),
 
             ast::ExprKind::Var(name) => {
+                // A locally shadowed name is a local value, not the builtin
+                // or top-level declaration of the same name.
+                let is_shadowed = self.shadowed.iter().any(|s| s == name);
                 // For zero-argument IO builtins (now, randomFloat, readLine),
                 // referencing them IS the IO action — return their effects.
                 // For functions (println, readFile, etc.), this over-approximates
                 // (effects only manifest at call sites), but is necessary for
                 // correct validation in contexts like `atomic(now)`.
-                if let Some(effects) = self.builtin_effects.get(name) {
-                    return effects.clone();
+                if !is_shadowed {
+                    if let Some(effects) = self.builtin_effects.get(name) {
+                        return effects.clone();
+                    }
                 }
                 // A reference to a local let-bound lambda carries its
                 // body's effects: the value may be invoked by whoever
@@ -480,8 +536,10 @@ impl EffectChecker {
                         return effects.clone();
                     }
                 }
-                if let Some(effects) = self.decl_effects.get(name) {
-                    return effects.clone();
+                if !is_shadowed {
+                    if let Some(effects) = self.decl_effects.get(name) {
+                        return effects.clone();
+                    }
                 }
                 EffectSet::empty()
             }
@@ -552,15 +610,30 @@ impl EffectChecker {
 
             ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
                 let mut effects = self.infer_effects(value);
-                if let ast::ExprKind::SourceRef(name) = &target.node {
+                // The parser produces `SourceRef` for every `*name` write
+                // target, including views, so handle both node kinds the
+                // same way and dispatch on what the name refers to.
+                if let ast::ExprKind::SourceRef(name)
+                | ast::ExprKind::DerivedRef(name) = &target.node
+                {
                     effects.writes.insert(name.clone());
                     effects.reads.insert(name.clone());
-                } else if let ast::ExprKind::DerivedRef(name) = &target.node {
-                    // Writing to a view — inherit the view's effects plus writes
-                    let view_effects =
-                        self.decl_effects.get(name).cloned().unwrap_or_else(EffectSet::empty);
-                    effects = effects.union(&view_effects);
-                    effects.writes.insert(name.clone());
+                    if self.view_names.contains(name) {
+                        // Writing through a view writes the backing
+                        // source(s). The view's inferred effects record
+                        // which sources its body reads — those are
+                        // exactly the relations a write lands in (plus
+                        // any other effects evaluating the view incurs).
+                        let view_effects = self
+                            .decl_effects
+                            .get(name)
+                            .cloned()
+                            .unwrap_or_else(EffectSet::empty);
+                        for src in &view_effects.reads {
+                            effects.writes.insert(src.clone());
+                        }
+                        effects = effects.union(&view_effects);
+                    }
                 }
                 effects
             }
@@ -592,6 +665,7 @@ impl EffectChecker {
                 let mut disallowed: Vec<(String, Span)> = Vec::new();
                 let mut shadowed: Vec<String> = Vec::new();
                 collect_unshadowed_disallowed(inner, &mut shadowed, &mut disallowed);
+                let syntactic_race_found = !disallowed.is_empty();
                 for (name, span) in disallowed {
                     self.diagnostics.push(
                         Diagnostic::error(format!(
@@ -605,6 +679,47 @@ impl EffectChecker {
                              enclosing transaction",
                         ),
                     );
+                }
+                // `race` reached through a wrapper (`raceIt = \a b -> race a b`)
+                // is invisible to the syntactic walk but its marker propagates
+                // through `decl_effects` like any other effect.
+                if inner_effects.uses_race && !syntactic_race_found {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "`race` cannot be used inside atomic blocks",
+                        )
+                        .label(expr.span, "this atomic block calls `race` (possibly indirectly)")
+                        .note(
+                            "`race` spawns worker threads with independent database \
+                             connections; their work cannot be rolled back by the \
+                             enclosing transaction",
+                        ),
+                    );
+                }
+                // Calls through opaque callees (record fields, computed
+                // callees) can hide lambdas whose bodies do IO — e.g.
+                // `r = {fn: \u -> println "hidden"}` then `r.fn {}` inside
+                // atomic. When the body contains such a call AND a lambda
+                // doing IO is reachable from the body (syntactically inside
+                // it, or inside any declaration the body references), reject
+                // conservatively: atomic bodies are supposed to be DB-only.
+                if !inner_effects.has_io() && self.body_may_call_opaque(inner) {
+                    if let Some(span) = self.reachable_io_lambda(inner) {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "IO effects are not allowed inside atomic blocks",
+                            )
+                            .label(expr.span, "this atomic block")
+                            .label(
+                                span,
+                                "this function performs IO and is reachable from a call \
+                                 the atomic block makes through an opaque callee",
+                            )
+                            .note(
+                                "console, network, fs, clock, and random effects cannot be rolled back",
+                            ),
+                        );
+                    }
                 }
                 // "Must interact with relations" is a hard error, so stay
                 // conservative: only flag bodies that provably contain no
@@ -631,6 +746,7 @@ impl EffectChecker {
 
             ast::ExprKind::Do(stmts) => {
                 self.local_fn_effects.push(HashMap::new());
+                let shadow_mark = self.shadowed.len();
                 let mut effects = EffectSet::empty();
                 for stmt in stmts {
                     // Track let-bound lambdas so later calls through the
@@ -649,7 +765,14 @@ impl EffectChecker {
                     }
                     let stmt_effects = self.infer_stmt_effects(stmt);
                     effects = effects.union(&stmt_effects);
+                    // Binders come into scope for *later* statements.
+                    if let ast::StmtKind::Bind { pat, .. }
+                    | ast::StmtKind::Let { pat, .. } = &stmt.node
+                    {
+                        collect_pat_binders(pat, &mut self.shadowed);
+                    }
                 }
+                self.shadowed.truncate(shadow_mark);
                 self.local_fn_effects.pop();
                 effects
             }
@@ -668,7 +791,10 @@ impl EffectChecker {
             ast::ExprKind::Case { scrutinee, arms } => {
                 let mut effects = self.infer_effects(scrutinee);
                 for arm in arms {
+                    let mark = self.shadowed.len();
+                    collect_pat_binders(&arm.pat, &mut self.shadowed);
                     let arm_effects = self.infer_effects(&arm.body);
+                    self.shadowed.truncate(mark);
                     effects = effects.union(&arm_effects);
                 }
                 effects
@@ -836,6 +962,43 @@ impl EffectChecker {
         found
     }
 
+    /// Span of a lambda whose body references an atomic-disallowed IO
+    /// builtin, reachable from `expr`: either a lambda literal syntactically
+    /// inside it, or one inside the body of any declaration it references
+    /// (transitively). Used by the atomic gate when the body calls an opaque
+    /// callee whose effects cannot be analyzed — such a lambda may be the
+    /// thing the opaque call ends up invoking, so reject conservatively.
+    fn reachable_io_lambda(&self, expr: &ast::Expr) -> Option<Span> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut worklist: Vec<&ast::Expr> = vec![expr];
+        let mut found: Option<Span> = None;
+        while let Some(e) = worklist.pop() {
+            if found.is_some() {
+                break;
+            }
+            let mut referenced: Vec<String> = Vec::new();
+            walk_expr(e, &mut |node| {
+                match &node.node {
+                    ast::ExprKind::Lambda { body, .. } => {
+                        if found.is_none() && contains_atomic_disallowed_ref(body) {
+                            found = Some(node.span);
+                        }
+                    }
+                    ast::ExprKind::Var(name) => referenced.push(name.clone()),
+                    _ => {}
+                }
+            });
+            for name in referenced {
+                if seen.insert(name.clone()) {
+                    if let Some(body) = self.decl_bodies.get(&name) {
+                        worklist.push(body);
+                    }
+                }
+            }
+        }
+        found
+    }
+
     /// Infer effects of a do-block statement.
     fn infer_stmt_effects(&mut self, stmt: &ast::Stmt) -> EffectSet {
         match &stmt.node {
@@ -866,25 +1029,38 @@ impl EffectChecker {
         match &func_expr.node {
             ast::ExprKind::Var(name) => {
                 // Check builtins first, then local let-bound lambdas
-                // (innermost scope first), then user declarations.
-                if let Some(effects) = self.builtin_effects.get(name) {
-                    return effects.clone();
+                // (innermost scope first), then user declarations. A
+                // locally shadowed name never resolves to the builtin or
+                // the top-level declaration.
+                let is_shadowed = self.shadowed.iter().any(|s| s == name);
+                if !is_shadowed {
+                    if let Some(effects) = self.builtin_effects.get(name) {
+                        return effects.clone();
+                    }
                 }
                 for scope in self.local_fn_effects.iter().rev() {
                     if let Some(effects) = scope.get(name) {
                         return effects.clone();
                     }
                 }
-                if let Some(effects) = self.decl_effects.get(name) {
-                    return effects.clone();
+                if !is_shadowed {
+                    if let Some(effects) = self.decl_effects.get(name) {
+                        return effects.clone();
+                    }
                 }
                 // Unknown callee — treat as pure (conservative, no false positives)
                 EffectSet::empty()
             }
 
-            ast::ExprKind::Lambda { body, .. } => {
+            ast::ExprKind::Lambda { params, body } => {
                 // Immediately-applied lambda: effects are the body's effects
-                self.infer_effects(body)
+                let mark = self.shadowed.len();
+                for p in params {
+                    collect_pat_binders(p, &mut self.shadowed);
+                }
+                let effects = self.infer_effects(body);
+                self.shadowed.truncate(mark);
+                effects
             }
 
             ast::ExprKind::App { .. } => {
@@ -947,9 +1123,14 @@ impl EffectChecker {
                         }
                     }
                 }
+                let mark = self.shadowed.len();
+                for p in params {
+                    collect_pat_binders(p, &mut self.shadowed);
+                }
                 self.local_fn_effects.push(scope);
                 let effects = self.infer_effects(body);
                 self.local_fn_effects.pop();
+                self.shadowed.truncate(mark);
                 effects
             }
             // Wrappers: unwrap to find the lambda (if any) inside.
@@ -964,7 +1145,15 @@ impl EffectChecker {
     /// `\x y -> set *foo = ...` → effects of the `set` expression.
     fn fun_body_effects(&mut self, body: &ast::Expr) -> EffectSet {
         match &body.node {
-            ast::ExprKind::Lambda { body: inner, .. } => self.fun_body_effects(inner),
+            ast::ExprKind::Lambda { body: inner, params } => {
+                let mark = self.shadowed.len();
+                for p in params {
+                    collect_pat_binders(p, &mut self.shadowed);
+                }
+                let effects = self.fun_body_effects(inner);
+                self.shadowed.truncate(mark);
+                effects
+            }
             // Wrapper expressions: unwrap to find the lambda chain inside.
             ast::ExprKind::UnitLit { value, .. } => self.fun_body_effects(value),
             ast::ExprKind::Annot { expr, .. } => self.fun_body_effects(expr),
@@ -1250,6 +1439,24 @@ fn collect_unshadowed_disallowed(
             }
         }
     }
+}
+
+/// Whether the expression syntactically references any builtin from
+/// `ATOMIC_DISALLOWED_BUILTINS` (console/network/fs/clock/random IO plus
+/// `race`; `fork` and `retry` are intentionally permitted in atomic).
+/// Purely syntactic and shadow-unaware — used only for the conservative
+/// opaque-callee scan inside atomic bodies, where false positives are
+/// acceptable (atomic bodies are supposed to be DB-only).
+fn contains_atomic_disallowed_ref(expr: &ast::Expr) -> bool {
+    let mut found = false;
+    walk_expr(expr, &mut |e| {
+        if let ast::ExprKind::Var(name) = &e.node {
+            if crate::builtins::ATOMIC_DISALLOWED_BUILTINS.contains(&name.as_str()) {
+                found = true;
+            }
+        }
+    });
+    found
 }
 
 /// Whether the expression syntactically contains any relation operation

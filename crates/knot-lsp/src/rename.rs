@@ -1033,28 +1033,28 @@ fn scan_disk_files(
     if !owner.is_top_level {
         return;
     }
-    // Narrow to "files that could plausibly reference the owner" using the
-    // reverse-import graph. The graph lists every file that imports the
-    // owner directly or transitively, which is all we need — if a file
-    // doesn't import the owner, it can't see the symbol.
+    // Start from "files known to reference the owner" via the reverse-import
+    // graph (cheap, already in memory).
     let candidate_paths = transitive_importers(state, &owner.canonical_path);
     // The owner itself is always a candidate (the rename starts there too).
     let mut to_scan: Vec<PathBuf> = candidate_paths.into_iter().collect();
     to_scan.push(owner.canonical_path.clone());
-    // Fall back to a full workspace scan when the reverse-import graph is
-    // empty (e.g. before any document opens populate it). This keeps the
-    // rename correct in fresh sessions, at the cost of a one-time scan.
-    if to_scan.len() <= 1 {
-        let all = scan_knot_files_in_roots(
-            &state.workspace_roots,
-            state.workspace_root.as_deref(),
-        );
-        for f in all {
-            if let Ok(c) = f.canonicalize() {
-                if !already_scanned.contains(&c) {
-                    to_scan.push(c);
-                }
-            }
+    // The reverse-import graph only has edges for files that have been
+    // ANALYZED — i.e. open documents. An unopened importer that was never
+    // analyzed is invisible to `transitive_importers`, so gating the disk
+    // sweep on the graph being empty silently skipped such files whenever
+    // ANY importer happened to be open. Always sweep the workspace for
+    // files not already covered by the graph; the cheap
+    // `contains(old_name)` rejection below keeps the per-file cost low.
+    let known: HashSet<PathBuf> = to_scan.iter().cloned().collect();
+    let all = scan_knot_files_in_roots(
+        &state.workspace_roots,
+        state.workspace_root.as_deref(),
+    );
+    for f in all {
+        let c = f.canonicalize().unwrap_or(f);
+        if !known.contains(&c) && !already_scanned.contains(&c) {
+            to_scan.push(c);
         }
     }
 
@@ -2520,6 +2520,55 @@ mod regress_rename_fixes_tests {
             let edit = handle_rename(&ws.state, &rename_params(&uri, pos, kw));
             assert!(edit.is_none(), "rename to keyword `{kw}` must be rejected");
         }
+    }
+
+    // ── Cross-file rename must reach unopened importers even when the
+    // reverse-import graph is non-empty (it only has edges for OPEN docs) ──
+
+    #[test]
+    fn rename_reaches_unopened_importer_when_another_importer_is_open() {
+        use crate::test_support::TempWorkspace;
+        let mut tw = TempWorkspace::new();
+        let owner_uri = tw.write_and_open("owner.knot", "parse = \\x -> x\n");
+        let _open_consumer =
+            tw.write_and_open("consumer1.knot", "import ./owner\n\nuse1 = parse 1\n");
+        // A second importer exists ONLY on disk — never opened, never analyzed.
+        let c2_src = "import ./owner\n\nuse2 = parse 2\n";
+        std::fs::write(tw.root.join("consumer2.knot"), c2_src).unwrap();
+        // Simulate the reverse-import graph the real server builds from open
+        // docs: owner ← consumer1 (and ONLY consumer1 — consumer2 was never
+        // analyzed, so it has no edge). The old code skipped the workspace
+        // sweep whenever this graph was non-empty, silently missing
+        // consumer2.
+        let owner_path = tw.root.join("owner.knot").canonicalize().unwrap();
+        let c1_path = tw.root.join("consumer1.knot").canonicalize().unwrap();
+        tw.workspace
+            .state
+            .reverse_imports
+            .entry(owner_path)
+            .or_default()
+            .insert(c1_path);
+
+        let owner_doc = tw.workspace.doc(&owner_uri);
+        let off = owner_doc.source.find("parse").expect("def");
+        let pos = offset_to_position(&owner_doc.source, off);
+        let edit = handle_rename(
+            &tw.workspace.state,
+            &rename_params(&owner_uri, pos, "parsed"),
+        )
+        .expect("rename emits edit");
+        let changes = edit.changes.expect("changes present");
+        let c2_entry = changes
+            .iter()
+            .find(|(u, _)| u.as_str().contains("consumer2.knot"))
+            .expect("UNOPENED importer must receive edits");
+        let out = apply_edits(c2_src, c2_entry.1);
+        assert_eq!(out, "import ./owner\n\nuse2 = parsed 2\n");
+        assert!(
+            changes.keys().any(|u| u.as_str().contains("consumer1.knot")),
+            "open importer must still be edited; got {:?}",
+            changes.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]

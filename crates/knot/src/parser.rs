@@ -1322,7 +1322,17 @@ impl Parser {
             }
 
             if self.eat(&TokenKind::Eq) {
-                let body = self.parse_expr()?;
+                // Register the default-body parameters as bound variables so
+                // the time-unit sugar (`2 ms`) doesn't consume a parameter
+                // named `ms`/`seconds`/... as a unit suffix — mirrors
+                // parse_lambda and parse_impl_item.
+                let scope_mark = self.bound_vars.len();
+                for p in &params {
+                    self.push_pat_vars(p);
+                }
+                let body = self.parse_expr();
+                self.bound_vars.truncate(scope_mark);
+                let body = body?;
                 // We need a type for the trait item — use a hole for inference.
                 return Some(TraitItem::Method {
                     name,
@@ -1441,7 +1451,16 @@ impl Parser {
             }
             self.expect(&TokenKind::Eq, "expected '=' in method definition")
                 .ok()?;
-            let body = self.parse_expr()?;
+            // Register the method parameters as bound variables so the
+            // time-unit sugar (`2 ms`) doesn't consume a parameter named
+            // `ms`/`seconds`/... as a unit suffix — mirrors parse_lambda.
+            let scope_mark = self.bound_vars.len();
+            for p in &params {
+                self.push_pat_vars(p);
+            }
+            let body = self.parse_expr();
+            self.bound_vars.truncate(scope_mark);
+            let body = body?;
             return Some(ImplItem::Method { name, name_span, params, body });
         }
 
@@ -2271,11 +2290,14 @@ impl Parser {
     /// rather than `(f Circle) {radius: 5}`.
     /// Nested constructors are handled recursively:
     /// `Just Nothing {}` parses as `Just (Nothing {})`.
+    /// The payload is parsed with the same postfix handling as
+    /// function-application arguments, so `Just x.y` parses as
+    /// `Just (x.y)` — consistent with `f x.y` parsing as `f (x.y)`.
     fn parse_constructor_or_atom(&mut self) -> Option<Expr> {
         let expr = self.parse_atom()?;
         if matches!(expr.node, ExprKind::Constructor(_)) && self.can_start_atom() {
             if !self.enter_recursion() { return None; }
-            let arg = self.parse_constructor_or_atom();
+            let arg = self.parse_postfix();
             self.recursion_depth -= 1;
             let arg = arg?;
             let span = Span::new(expr.span.start, arg.span.end);

@@ -409,6 +409,11 @@ struct Infer {
     /// Each entry records (span, monad_tyvar) so we can resolve the
     /// concrete monad after inference completes.
     monad_vars: Vec<(Span, TyVar)>,
+    /// Full `traverse f rel` applications: (call span, result type var,
+    /// container type var). Post-inference, relation-container calls get a
+    /// `monad_info` entry keyed by the call span so codegen can tell the
+    /// runtime which applicative's `pure []` an EMPTY input must produce.
+    traverse_calls: Vec<(Span, TyVar, TyVar)>,
 
     /// Tracks `parseJson` application sites for compile-time FromJSON dispatch.
     /// Each entry records (app_span, return_type_var).
@@ -514,6 +519,14 @@ struct Infer {
     /// Unit-composition checks for `*`/`/` deferred because one operand was
     /// still an unresolved type variable when the binop was inferred.
     deferred_unit_binops: Vec<DeferredUnitBinop>,
+    /// Type variables involved in a deferred `*`/`/` whose BOTH operands
+    /// were unresolved at the binop node. These must stay monomorphic
+    /// (treated as free-in-env at generalization) so call sites pin the
+    /// very same variables the deferred composition check will inspect —
+    /// quantifying them would let each call site instantiate fresh,
+    /// unconstrained copies and the unit-composition check would never see
+    /// the units the program actually used.
+    deferred_mono_vars: HashSet<TyVar>,
 
     /// Spans of `elem` haystack args whose element type is SQL-pushable
     /// (Text/Float/Bool). Recorded during App inference, exported for codegen.
@@ -539,6 +552,7 @@ impl Infer {
             annotation_vars: HashMap::new(),
             errors: Vec::new(),
             monad_vars: Vec::new(),
+            traverse_calls: Vec::new(),
             from_json_calls: Vec::new(),
             trait_method_traits: HashMap::new(),
             trait_method_param_vars: HashMap::new(),
@@ -566,6 +580,7 @@ impl Infer {
             refined_types: HashMap::new(),
             refine_vars: Vec::new(),
             deferred_unit_binops: Vec::new(),
+            deferred_mono_vars: HashSet::new(),
             elem_pushdown_ok: HashSet::new(),
         }
     }
@@ -1367,6 +1382,36 @@ impl Infer {
                     && r2.is_none()
                     && e1 != e2
                 {
+                    // Widening is for *accumulators*: a fresh result var
+                    // (if/case arms, do-block sequencing) absorbs the
+                    // union of the branches' effects. But when the
+                    // required side is a concrete closed row (e.g. the
+                    // `IO {} {}` in a callee's annotated parameter), the
+                    // provided side's extra effects are a real violation —
+                    // silently merging would let `\u -> println …` check
+                    // against `IO {} {}` and launder console IO past both
+                    // the effect annotation and the atomic gate. The sound
+                    // direction (fewer effects than required) still merges.
+                    let (provided, required, required_is_var) = if t1_provided {
+                        (&e1, &e2, var2.is_some())
+                    } else {
+                        (&e2, &e1, var1.is_some())
+                    };
+                    if !required_is_var {
+                        let extras: Vec<String> = provided
+                            .difference(required)
+                            .map(format_io_effect)
+                            .collect();
+                        if !extras.is_empty() {
+                            self.error(
+                                format!(
+                                    "IO effects don't match: the provided IO has effects not allowed by the expected type: {{{}}}",
+                                    extras.join(", ")
+                                ),
+                                span,
+                            );
+                        }
+                    }
                     let mut merged = e1.clone();
                     merged.extend(e2.iter().cloned());
                     let unified_inner = self.apply(&a);
@@ -1387,7 +1432,7 @@ impl Infer {
                         }
                     }
                 } else {
-                    self.unify_io_effects(&e1, r1, &e2, r2, span);
+                    self.unify_io_effects(&e1, r1, &e2, r2, span, t1_provided);
                 }
             }
             (Ty::EffectRow(e1, r1), Ty::EffectRow(e2, r2)) => {
@@ -1395,7 +1440,7 @@ impl Infer {
                 let r1 = *r1;
                 let e2 = e2.clone();
                 let r2 = *r2;
-                self.unify_io_effects(&e1, r1, &e2, r2, span);
+                self.unify_io_effects(&e1, r1, &e2, r2, span, t1_provided);
             }
             // In IO do blocks, allow Relation types to unify with IO or
             // Unit types. Route handlers mix relational operations and
@@ -1755,8 +1800,11 @@ impl Infer {
     /// over `BTreeSet<IoEffect>` instead of fielded maps. Effects are
     /// equality-keyed (no inner type to unify on shared elements), so we
     /// only need to ensure each closed side covers the other's extras.
-    /// When both rows are closed, subset on either side is allowed —
-    /// only effects unique to *both* sides are a true conflict.
+    /// When both rows are closed, subsumption is directional: the
+    /// provided/actual side's effects must be a subset of the
+    /// required/expected side's (`t1_provided` says which is which) —
+    /// an `IO {}` value where `IO {console}` is required is fine, but an
+    /// effectful value cannot check against a smaller closed row.
     fn unify_io_effects(
         &mut self,
         e1: &BTreeSet<IoEffect>,
@@ -1764,6 +1812,7 @@ impl Infer {
         e2: &BTreeSet<IoEffect>,
         r2: Option<TyVar>,
         span: Span,
+        t1_provided: bool,
     ) {
         let (e1, r1) = self.resolve_effect_row(e1.clone(), r1);
         let (e2, r2) = self.resolve_effect_row(e2.clone(), r2);
@@ -1773,15 +1822,15 @@ impl Infer {
 
         match (r1, r2) {
             (None, None) => {
-                if !only1.is_empty() && !only2.is_empty() {
-                    let extras: Vec<String> = only1
+                let provided_extras = if t1_provided { &only1 } else { &only2 };
+                if !provided_extras.is_empty() {
+                    let extras: Vec<String> = provided_extras
                         .iter()
-                        .chain(only2.iter())
                         .map(format_io_effect)
                         .collect();
                     self.error(
                         format!(
-                            "IO effects don't match: extra effects {{{}}}",
+                            "IO effects don't match: the provided IO has effects not allowed by the expected type: {{{}}}",
                             extras.join(", ")
                         ),
                         span,
@@ -2294,6 +2343,15 @@ impl Infer {
 
     fn collect_free_unit_vars(&self, ty: &Ty, out: &mut HashSet<UnitVar>) {
         match ty {
+            // Follow the substitution: an env entry may be a bare type
+            // variable (e.g. a lambda parameter bound as Scheme::mono(Var α))
+            // that was later substituted to a unit-bearing type — its unit
+            // vars are env-bound and must NOT be generalized.
+            Ty::Var(v) => {
+                if let Some(resolved) = self.subst.get(v) {
+                    self.collect_free_unit_vars(resolved, out);
+                }
+            }
             Ty::IntUnit(u) | Ty::FloatUnit(u) => {
                 let applied = self.apply_unit(u);
                 for &v in applied.vars.keys() {
@@ -2305,14 +2363,24 @@ impl Infer {
                 self.collect_free_unit_vars(r, out);
             }
             Ty::Relation(inner) => self.collect_free_unit_vars(inner, out),
-            Ty::Record(fields, _) => {
+            Ty::Record(fields, row) => {
                 for v in fields.values() {
                     self.collect_free_unit_vars(v, out);
                 }
+                if let Some(rv) = row {
+                    if let Some(resolved) = self.subst.get(rv) {
+                        self.collect_free_unit_vars(resolved, out);
+                    }
+                }
             }
-            Ty::Variant(ctors, _) => {
+            Ty::Variant(ctors, row) => {
                 for v in ctors.values() {
                     self.collect_free_unit_vars(v, out);
+                }
+                if let Some(rv) = row {
+                    if let Some(resolved) = self.subst.get(rv) {
+                        self.collect_free_unit_vars(resolved, out);
+                    }
                 }
             }
             Ty::Con(_, args) => {
@@ -2324,9 +2392,23 @@ impl Infer {
                 self.collect_free_unit_vars(f, out);
                 self.collect_free_unit_vars(a, out);
             }
-            Ty::IO(_, _, inner) => self.collect_free_unit_vars(inner, out),
-            Ty::EffectRow(_, _) => {}
+            Ty::IO(_, row, inner) => {
+                if let Some(rv) = row {
+                    if let Some(resolved) = self.subst.get(rv) {
+                        self.collect_free_unit_vars(resolved, out);
+                    }
+                }
+                self.collect_free_unit_vars(inner, out);
+            }
+            Ty::EffectRow(_, row) => {
+                if let Some(rv) = row {
+                    if let Some(resolved) = self.subst.get(rv) {
+                        self.collect_free_unit_vars(resolved, out);
+                    }
+                }
+            }
             Ty::Forall(_, inner) => self.collect_free_unit_vars(inner, out),
+            Ty::Alias(_, inner) => self.collect_free_unit_vars(inner, out),
             _ => {}
         }
     }
@@ -2610,6 +2692,11 @@ impl Infer {
         for ty in self.derived_types.values() {
             self.collect_free_vars(ty, &mut s);
         }
+        // Variables awaiting a deferred Var×Var unit-composition check must
+        // not be generalized (see `deferred_mono_vars`).
+        for v in &self.deferred_mono_vars {
+            self.collect_free_vars(&Ty::Var(*v), &mut s);
+        }
         s
     }
 
@@ -2630,6 +2717,9 @@ impl Infer {
         }
         for ty in self.derived_types.values() {
             self.collect_free_unit_vars(ty, &mut s);
+        }
+        for v in &self.deferred_mono_vars {
+            self.collect_free_unit_vars(&Ty::Var(*v), &mut s);
         }
         s
     }
@@ -3399,6 +3489,19 @@ impl Infer {
                     }
                 }
 
+                // Track full `traverse f rel` applications: the resolved
+                // result type names the applicative, which codegen passes to
+                // the runtime to pick the right `pure []` for empty inputs.
+                if let ast::ExprKind::App { func: inner_f, .. } = &func.node {
+                    if matches!(&inner_f.node, ast::ExprKind::Var(n) if n == "traverse") {
+                        if let Ty::Var(res_v) = &result_ty {
+                            let cont_v = self.fresh_var();
+                            self.unify(&arg_ty, &Ty::Var(cont_v), arg.span);
+                            self.traverse_calls.push((expr.span, *res_v, cont_v));
+                        }
+                    }
+                }
+
                 // Track `elem needle haystack` haystack types for SQL pushdown.
                 // Curried: outer App's func is `App(Var("elem"), needle)`,
                 // outer App's arg is the haystack. Record only when the
@@ -3487,7 +3590,11 @@ impl Infer {
                     self.push_scope();
                     self.check_pattern(&arm.pat, &scrut_ty);
                     let body_ty = self.infer_expr(&arm.body);
-                    self.unify(&result_ty, &body_ty, arm.body.span);
+                    // Provided/actual side first (same shape `if` uses):
+                    // the accumulator var plays the *required* role so the
+                    // directional effect-widening path treats it as an
+                    // accumulator rather than a closed expectation.
+                    self.unify(&body_ty, &result_ty, arm.body.span);
                     // Collect IO effects from each arm
                     let applied = self.apply(&body_ty);
                     if let Ty::IO(ref effects, _, _) = applied {
@@ -4364,6 +4471,34 @@ impl Infer {
                 };
                 let lhs_is_var = matches!(lhs_applied, Ty::Var(_));
                 let rhs_is_var = matches!(rhs_applied, Ty::Var(_));
+                // BOTH operands unresolved: the composition can't be
+                // computed yet AND unifying them would be unsound (it
+                // types `w * h` as `w`'s unit instead of its square once
+                // units appear, and falsely rejects `Float<M> * Float<S>`).
+                // Defer the whole check; keep the operand/result variables
+                // monomorphic so the call sites that eventually pin them
+                // constrain the same variables this deferred check reads.
+                // If no units ever appear, the deferred resolution falls
+                // through to the plain `unify + Num` path below, so
+                // dimensionless code is unaffected.
+                if allow_defer && lhs_is_var && rhs_is_var {
+                    let result = self.fresh_var();
+                    if let Ty::Var(v) = lhs_applied {
+                        self.deferred_mono_vars.insert(*v);
+                    }
+                    if let Ty::Var(v) = rhs_applied {
+                        self.deferred_mono_vars.insert(*v);
+                    }
+                    self.deferred_mono_vars.insert(result);
+                    self.deferred_unit_binops.push(DeferredUnitBinop {
+                        op,
+                        lhs: lhs_applied.clone(),
+                        rhs: rhs_applied.clone(),
+                        result,
+                        span,
+                    });
+                    return Ty::Var(result);
+                }
                 let unit_side = if lhs_is_var {
                     concrete_unit(self, rhs_applied)
                 } else if rhs_is_var {
@@ -5050,13 +5185,19 @@ impl Infer {
                     } else if self.in_io_do && matches!(&resolved, Ty::Var(_)) {
                         // In an IO do-block with an unresolved type variable —
                         // assume IO so we don't incorrectly unify with Relation.
+                        // Use an OPEN effect row: the effects are unknown, not
+                        // known-empty — a closed `IO {}` here would make the
+                        // directional effect check reject effectful values
+                        // (e.g. a callback parameter) later unified with it.
                         is_io = true;
                         let inner_ty = self.fresh();
+                        let row = self.fresh_var();
                         self.unify(
                             &expr_ty,
-                            &Ty::IO(BTreeSet::new(), None, Box::new(inner_ty.clone())),
+                            &Ty::IO(BTreeSet::new(), Some(row), Box::new(inner_ty.clone())),
                             expr.span,
                         );
+                        self.merge_do_io_row(&mut io_row, row, expr.span);
                         self.check_pattern(pat, &inner_ty);
                     } else if is_ctor_pat
                         && !matches!(&resolved, Ty::Relation(_) | Ty::Var(_))
@@ -5180,13 +5321,17 @@ impl Infer {
                                 // constrain to IO to prevent double-wrapping
                                 // when the var later resolves to IO (e.g.
                                 // polymorphic callbacks in withSessionAuth).
+                                // Open effect row: the effects are unknown,
+                                // not known-empty (see the Bind arm above).
                                 is_io = true;
                                 let inner_ty = self.fresh();
+                                let row = self.fresh_var();
                                 self.unify(
                                     &expr_ty,
-                                    &Ty::IO(BTreeSet::new(), None, Box::new(inner_ty.clone())),
+                                    &Ty::IO(BTreeSet::new(), Some(row), Box::new(inner_ty.clone())),
                                     expr.span,
                                 );
+                                self.merge_do_io_row(&mut io_row, row, expr.span);
                                 last_expr_ty = Some(inner_ty);
                             } else {
                                 last_expr_ty = Some(expr_ty);
@@ -8292,27 +8437,47 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
     let mut monad_info = MonadInfo::new();
     for (span, m_var) in &infer.monad_vars {
         let resolved = infer.apply(&Ty::Var(*m_var));
-        let kind = match resolved.peel_alias() {
-            Ty::TyCon(name) if name == "[]" => MonadKind::Relation,
-            Ty::TyCon(name) if name == "IO" => MonadKind::IO,
-            Ty::TyCon(name) => MonadKind::Adt(name.clone()),
-            Ty::Relation(_) => MonadKind::Relation,
-            Ty::IO(_, _, _) => MonadKind::IO,
-            // Partially applied type constructor, e.g. Result e (App(TyCon("Result"), e))
-            Ty::App(f, _) => match f.as_ref() {
-                // IO applied to an effect row (App(TyCon("IO"), EffectRow))
-                // is still the IO monad — classifying it as Adt("IO") would
-                // dispatch to a nonexistent `Monad_IO_bind`.
-                Ty::TyCon(name) if name == "IO" => MonadKind::IO,
-                Ty::TyCon(name) if name == "[]" => MonadKind::Relation,
-                Ty::TyCon(name) => MonadKind::Adt(name.clone()),
-                _ => MonadKind::Relation,
-            },
-            // Saturated ADT used as monad, e.g. Con("Result", [Text]) from Result Text a
-            Ty::Con(name, _) => MonadKind::Adt(name.clone()),
-            _ => MonadKind::Relation, // default unresolved to Relation
-        };
+        let kind = monad_kind_of(&resolved);
+        // Synthesized helper spans (globally unique, see desugar.rs) also
+        // alias their originating do-block's real span — LSP monad inlay
+        // hints look up `monad_info[do_span]`.
+        if let Some(origin) = crate::desugar::synth_span_origin(*span) {
+            monad_info.entry(origin).or_insert_with(|| kind.clone());
+        }
         monad_info.insert(*span, kind);
+    }
+
+    // Phase 5b: Resolve applicative kinds for `traverse f rel` call sites
+    // over relation containers, keyed by the call expression's span. Codegen
+    // passes the kind to the runtime, which uses it ONLY to pick the
+    // empty-input result (`pure []` in the right applicative) — the runtime
+    // otherwise dispatches on the first mapped element, which doesn't exist
+    // for empty inputs (the old behavior unconditionally returned the
+    // Relation result `[[]]`).
+    for (span, res_v, cont_v) in &infer.traverse_calls {
+        let container = infer.apply(&Ty::Var(*cont_v));
+        if !matches!(container.peel_alias(), Ty::Relation(_)) {
+            continue; // other Traversables dispatch through their own impls
+        }
+        let resolved = infer.apply(&Ty::Var(*res_v));
+        // Open variants from case-pattern unification name the constructors
+        // rather than the ADT — recognize the built-in Maybe/Result shapes.
+        let kind = match resolved.peel_alias() {
+            Ty::Variant(ctors, _)
+                if !ctors.is_empty()
+                    && ctors.keys().all(|k| k == "Just" || k == "Nothing") =>
+            {
+                MonadKind::Adt("Maybe".into())
+            }
+            Ty::Variant(ctors, _)
+                if !ctors.is_empty()
+                    && ctors.keys().all(|k| k == "Ok" || k == "Err") =>
+            {
+                MonadKind::Adt("Result".into())
+            }
+            _ => monad_kind_of(&resolved),
+        };
+        monad_info.entry(*span).or_insert(kind);
     }
 
     // Export refined type predicates for codegen
@@ -8338,6 +8503,31 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
     (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok)
 }
 
+
+/// Classify a resolved monad/applicative type into a `MonadKind` for
+/// codegen dispatch. Defaults unresolved types to Relation.
+fn monad_kind_of(resolved: &Ty) -> MonadKind {
+    match resolved.peel_alias() {
+        Ty::TyCon(name) if name == "[]" => MonadKind::Relation,
+        Ty::TyCon(name) if name == "IO" => MonadKind::IO,
+        Ty::TyCon(name) => MonadKind::Adt(name.clone()),
+        Ty::Relation(_) => MonadKind::Relation,
+        Ty::IO(_, _, _) => MonadKind::IO,
+        // Partially applied type constructor, e.g. Result e (App(TyCon("Result"), e))
+        Ty::App(f, _) => match f.as_ref() {
+            // IO applied to an effect row (App(TyCon("IO"), EffectRow))
+            // is still the IO monad — classifying it as Adt("IO") would
+            // dispatch to a nonexistent `Monad_IO_bind`.
+            Ty::TyCon(name) if name == "IO" => MonadKind::IO,
+            Ty::TyCon(name) if name == "[]" => MonadKind::Relation,
+            Ty::TyCon(name) => MonadKind::Adt(name.clone()),
+            _ => MonadKind::Relation,
+        },
+        // Saturated ADT used as monad, e.g. Con("Result", [Text]) from Result Text a
+        Ty::Con(name, _) => MonadKind::Adt(name.clone()),
+        _ => MonadKind::Relation, // default unresolved to Relation
+    }
+}
 
 /// Collect the names of type aliases referenced by an AST type. Used for
 /// cyclic-alias detection: only names present in `alias_names` are recorded.

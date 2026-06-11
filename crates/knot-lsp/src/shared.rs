@@ -359,8 +359,20 @@ pub(crate) fn scan_knot_files_recursive(
     if depth >= MAX_SCAN_DEPTH || files.len() >= MAX_SCAN_FILES {
         return Ok(());
     }
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
+    // Per-directory and per-entry IO errors are skipped, not propagated: one
+    // unreadable subdirectory (permissions, racing deletion) must not abort
+    // the whole workspace scan — callers like the workspace-diagnostics
+    // handler would otherwise drop a partially-scanned root and mass-clear
+    // previously-reported diagnostics.
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(()),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
         // Use the dirent's metadata, not Path::is_dir, so we don't follow
         // symlinks — a self-referential symlink chain (`a -> b`, `b -> a`)
         // would otherwise recurse until the depth cap, doing pointless IO.
@@ -391,6 +403,24 @@ pub(crate) fn scan_knot_files_recursive(
     }
     Ok(())
 }
+
+// ── AST walker depth cap ────────────────────────────────────────────
+
+/// Recursion ceiling for the AST walkers in this module. Pathological
+/// left-deep expressions (a 200k-term `1+1+…` chain parses into a BinOp
+/// spine 200k nodes deep) would otherwise overflow the stack — and these
+/// walkers run on every keystroke (completion's atomic-context check) and on
+/// unopened workspace files. 10k frames is far beyond any human-written
+/// nesting while staying comfortably inside the default 8 MiB stack. Bailing
+/// out simply stops descending — features degrade (e.g. no signature help
+/// at nesting level 10_001) but the process survives.
+///
+/// Residual risk: recursive walkers in other feature modules (semantic
+/// tokens, folding, document symbols, …) and in the compiler crates still
+/// recurse unboundedly over the same ASTs; a complete fix needs either a
+/// shared iterative walker or running analysis on a dedicated thread with a
+/// large stack (`std::thread::Builder::stack_size`).
+pub(crate) const MAX_WALK_DEPTH: usize = 10_000;
 
 // ── Route formatting ────────────────────────────────────────────────
 
@@ -436,12 +466,46 @@ pub(crate) fn format_route_path(entry: &ast::RouteEntry) -> String {
     }
 }
 
-/// Returns true if any decl in the module composes the given route into a
-/// `listen port handler` call. Used by the dead-route lint.
+/// Returns true if the given route is wired into a server. Used by the
+/// dead-route lint.
+///
+/// Two signals count as "listened":
+/// 1. Any `serve <Api> where …` expression in the module whose api name is
+///    this route (or a composite route that includes it). This is the
+///    canonical wiring — `api = serve Api where …; main = listen 8080 api`
+///    stores the route as `ExprKind::Serve`'s plain `api: Name`, which is
+///    invisible to `expr_references_name`, so the lens used to fire on
+///    every working route. We deliberately do NOT require that the serve
+///    value is itself reachable from a `listen` call: a `serve` that's
+///    never listened is far rarer than the canonical pattern, and the
+///    lens's job is catching truly dead routes — a sound approximation
+///    that under-warns beats one that warns on every wired route.
+/// 2. A `listen port handler` call whose argument textually references the
+///    route name (the pre-`serve` wiring style).
 pub(crate) fn route_is_listened(module: &Module, route_name: &str) -> bool {
-    fn walk(expr: &ast::Expr, route_name: &str, found: &mut bool) {
-        if *found {
+    route_is_listened_inner(module, route_name, &mut std::collections::HashSet::new())
+}
+
+fn route_is_listened_inner(
+    module: &Module,
+    route_name: &str,
+    visiting: &mut std::collections::HashSet<String>,
+) -> bool {
+    // Cycle guard for composite-route recursion (`route A = B`, `route B = A`
+    // is malformed but must not hang the lens).
+    if !visiting.insert(route_name.to_string()) {
+        return false;
+    }
+    fn walk(expr: &ast::Expr, route_name: &str, found: &mut bool, depth: usize) {
+        if *found || depth > MAX_WALK_DEPTH {
             return;
+        }
+        // `serve Api where …` — the api is a plain Name on the Serve node.
+        if let ast::ExprKind::Serve { api, .. } = &expr.node {
+            if api == route_name {
+                *found = true;
+                return;
+            }
         }
         if let ast::ExprKind::App { func, arg } = &expr.node {
             // Detect `listen port handler` where one argument references the route.
@@ -455,7 +519,7 @@ pub(crate) fn route_is_listened(module: &Module, route_name: &str) -> bool {
                 return;
             }
         }
-        recurse_expr(expr, |e| walk(e, route_name, found));
+        recurse_expr(expr, |e| walk(e, route_name, found, depth + 1));
     }
     for decl in &module.decls {
         match &decl.node {
@@ -465,7 +529,7 @@ pub(crate) fn route_is_listened(module: &Module, route_name: &str) -> bool {
             | DeclKind::View { body, .. }
             | DeclKind::Derived { body, .. } => {
                 let mut found = false;
-                walk(body, route_name, &mut found);
+                walk(body, route_name, &mut found, 0);
                 if found {
                     return true;
                 }
@@ -474,11 +538,20 @@ pub(crate) fn route_is_listened(module: &Module, route_name: &str) -> bool {
                 for item in items {
                     if let ast::ImplItem::Method { body, .. } = item {
                         let mut found = false;
-                        walk(body, route_name, &mut found);
+                        walk(body, route_name, &mut found, 0);
                         if found {
                             return true;
                         }
                     }
+                }
+            }
+            // A composite `route Api = A | B` that is itself listened/served
+            // wires in every component route.
+            DeclKind::RouteComposite { name, components } => {
+                if components.iter().any(|c| c == route_name)
+                    && route_is_listened_inner(module, name, visiting)
+                {
+                    return true;
                 }
             }
             _ => {}
@@ -501,18 +574,18 @@ pub(crate) fn app_callee_is(expr: &ast::Expr, name: &str) -> bool {
 /// Used to decide whether a `listen` call's argument is wired to a given route.
 pub(crate) fn expr_references_name(expr: &ast::Expr, name: &str) -> bool {
     let mut found = false;
-    fn walk(expr: &ast::Expr, name: &str, found: &mut bool) {
-        if *found {
+    fn walk(expr: &ast::Expr, name: &str, found: &mut bool, depth: usize) {
+        if *found || depth > MAX_WALK_DEPTH {
             return;
         }
         match &expr.node {
             ast::ExprKind::Var(n) | ast::ExprKind::Constructor(n) if n == name => {
                 *found = true;
             }
-            _ => recurse_expr(expr, |e| walk(e, name, found)),
+            _ => recurse_expr(expr, |e| walk(e, name, found, depth + 1)),
         }
     }
-    walk(expr, name, &mut found);
+    walk(expr, name, &mut found, 0);
     found
 }
 
@@ -564,6 +637,19 @@ pub(crate) fn find_app_in_expr(
     offset: usize,
     best: &mut Option<(String, usize, usize)>,
 ) {
+    find_app_in_expr_at(expr, source, offset, best, 0)
+}
+
+fn find_app_in_expr_at(
+    expr: &ast::Expr,
+    source: &str,
+    offset: usize,
+    best: &mut Option<(String, usize, usize)>,
+    depth: usize,
+) {
+    if depth > MAX_WALK_DEPTH {
+        return;
+    }
     if expr.span.start > offset || offset > expr.span.end {
         return;
     }
@@ -608,80 +694,10 @@ pub(crate) fn find_app_in_expr(
         }
     }
 
-    // Recurse into sub-expressions
-    match &expr.node {
-        ast::ExprKind::App { func, arg } => {
-            find_app_in_expr(func, source, offset, best);
-            find_app_in_expr(arg, source, offset, best);
-        }
-        ast::ExprKind::Lambda { body, .. } => {
-            find_app_in_expr(body, source, offset, best);
-        }
-        ast::ExprKind::BinOp { lhs, rhs, .. } => {
-            find_app_in_expr(lhs, source, offset, best);
-            find_app_in_expr(rhs, source, offset, best);
-        }
-        ast::ExprKind::UnaryOp { operand, .. } => {
-            find_app_in_expr(operand, source, offset, best);
-        }
-        ast::ExprKind::If { cond, then_branch, else_branch } => {
-            find_app_in_expr(cond, source, offset, best);
-            find_app_in_expr(then_branch, source, offset, best);
-            find_app_in_expr(else_branch, source, offset, best);
-        }
-        ast::ExprKind::Case { scrutinee, arms } => {
-            find_app_in_expr(scrutinee, source, offset, best);
-            for arm in arms {
-                find_app_in_expr(&arm.body, source, offset, best);
-            }
-        }
-        ast::ExprKind::Do(stmts) => {
-            for stmt in stmts {
-                match &stmt.node {
-                    ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Let { expr, .. } => {
-                        find_app_in_expr(expr, source, offset, best);
-                    }
-                    ast::StmtKind::Expr(e) | ast::StmtKind::Where { cond: e } => {
-                        find_app_in_expr(e, source, offset, best);
-                    }
-                    ast::StmtKind::GroupBy { key } => {
-                        find_app_in_expr(key, source, offset, best);
-                    }
-                }
-            }
-        }
-        ast::ExprKind::Atomic(e) | ast::ExprKind::Refine(e) => find_app_in_expr(e, source, offset, best),
-        ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
-            find_app_in_expr(target, source, offset, best);
-            find_app_in_expr(value, source, offset, best);
-        }
-        ast::ExprKind::Record(fields) => {
-            for f in fields {
-                find_app_in_expr(&f.value, source, offset, best);
-            }
-        }
-        ast::ExprKind::RecordUpdate { base, fields } => {
-            find_app_in_expr(base, source, offset, best);
-            for f in fields {
-                find_app_in_expr(&f.value, source, offset, best);
-            }
-        }
-        ast::ExprKind::List(elems) => {
-            for e in elems {
-                find_app_in_expr(e, source, offset, best);
-            }
-        }
-        ast::ExprKind::FieldAccess { expr, .. } => {
-            find_app_in_expr(expr, source, offset, best);
-        }
-        ast::ExprKind::Annot { expr, .. } => {
-            find_app_in_expr(expr, source, offset, best);
-        }
-        ast::ExprKind::UnitLit { value, .. } => {
-            find_app_in_expr(value, source, offset, best);
-        }
-        _ => {}
-    }
+    // Recurse into sub-expressions. `recurse_expr` covers every non-leaf
+    // ExprKind — including `Serve` handler bodies, which the old manual
+    // match here omitted (signature help was dead inside serve handlers).
+    recurse_expr(expr, |e| find_app_in_expr_at(e, source, offset, best, depth + 1));
 }
 
 /// Split a Knot type string like `Int -> Text -> Bool` into the rendered
@@ -713,7 +729,16 @@ pub(crate) fn find_enclosing_atomic_expr(
     source: &str,
     offset: usize,
 ) -> Option<(Span, String)> {
-    fn walk(expr: &ast::Expr, source: &str, offset: usize, best: &mut Option<(Span, String)>) {
+    fn walk(
+        expr: &ast::Expr,
+        source: &str,
+        offset: usize,
+        best: &mut Option<(Span, String)>,
+        depth: usize,
+    ) {
+        if depth > MAX_WALK_DEPTH {
+            return;
+        }
         if expr.span.start > offset || offset > expr.span.end {
             return;
         }
@@ -728,75 +753,15 @@ pub(crate) fn find_enclosing_atomic_expr(
                 *best = Some((expr.span, inner_text));
             }
         }
-        // Recurse
-        match &expr.node {
-            ast::ExprKind::App { func, arg } => {
-                walk(func, source, offset, best);
-                walk(arg, source, offset, best);
-            }
-            // Don't recurse into lambda bodies: a lambda is a deferred
-            // computation that runs when (and where) it's eventually called,
-            // not in the atomic context that lexically encloses its
-            // definition. `fork (\_ -> println ...)` inside `atomic` should
-            // not flag `println` as atomic-disallowed.
-            ast::ExprKind::Lambda { .. } => {}
-            ast::ExprKind::BinOp { lhs, rhs, .. } => {
-                walk(lhs, source, offset, best);
-                walk(rhs, source, offset, best);
-            }
-            ast::ExprKind::UnaryOp { operand, .. } => walk(operand, source, offset, best),
-            ast::ExprKind::If {
-                cond,
-                then_branch,
-                else_branch,
-            } => {
-                walk(cond, source, offset, best);
-                walk(then_branch, source, offset, best);
-                walk(else_branch, source, offset, best);
-            }
-            ast::ExprKind::Case { scrutinee, arms } => {
-                walk(scrutinee, source, offset, best);
-                for arm in arms {
-                    walk(&arm.body, source, offset, best);
-                }
-            }
-            ast::ExprKind::Do(stmts) => {
-                for stmt in stmts {
-                    match &stmt.node {
-                        ast::StmtKind::Bind { expr, .. }
-                        | ast::StmtKind::Let { expr, .. }
-                        | ast::StmtKind::Expr(expr)
-                        | ast::StmtKind::Where { cond: expr } => walk(expr, source, offset, best),
-                        ast::StmtKind::GroupBy { key } => walk(key, source, offset, best),
-                    }
-                }
-            }
-            ast::ExprKind::Atomic(e) | ast::ExprKind::Refine(e) => walk(e, source, offset, best),
-            ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
-                walk(target, source, offset, best);
-                walk(value, source, offset, best);
-            }
-            ast::ExprKind::Record(fields) => {
-                for f in fields {
-                    walk(&f.value, source, offset, best);
-                }
-            }
-            ast::ExprKind::RecordUpdate { base, fields } => {
-                walk(base, source, offset, best);
-                for f in fields {
-                    walk(&f.value, source, offset, best);
-                }
-            }
-            ast::ExprKind::List(elems) => {
-                for e in elems {
-                    walk(e, source, offset, best);
-                }
-            }
-            ast::ExprKind::FieldAccess { expr, .. } => walk(expr, source, offset, best),
-            ast::ExprKind::Annot { expr, .. } => walk(expr, source, offset, best),
-            ast::ExprKind::UnitLit { value, .. } => walk(value, source, offset, best),
-            _ => {}
-        }
+        // Descend into ALL children via `recurse_expr` — including Lambda
+        // bodies and Serve handler bodies. The walk used to skip lambdas,
+        // which made atomic detection blind inside every parameterized
+        // function (the decl body of `f = \x -> atomic do …` is a Lambda, so
+        // the walk stopped before reaching the Atomic). Any Atomic that
+        // lexically encloses `offset` records itself BEFORE this descent, so
+        // descending into lambdas only ADDS detection of atomics nested
+        // inside them — it can't misattribute an enclosing one.
+        recurse_expr(expr, |e| walk(e, source, offset, best, depth + 1));
     }
 
     let mut best: Option<(Span, String)> = None;
@@ -807,11 +772,11 @@ pub(crate) fn find_enclosing_atomic_expr(
         match &decl.node {
             DeclKind::Fun { body: Some(body), .. }
             | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => walk(body, source, offset, &mut best),
+            | DeclKind::Derived { body, .. } => walk(body, source, offset, &mut best, 0),
             DeclKind::Impl { items, .. } => {
                 for item in items {
                     if let ast::ImplItem::Method { body, .. } = item {
-                        walk(body, source, offset, &mut best);
+                        walk(body, source, offset, &mut best, 0);
                     }
                 }
             }
@@ -1219,7 +1184,10 @@ pub(crate) fn find_field_access_at_offset(
             _ => ReceiverKind::Other,
         }
     }
-    fn walk(expr: &ast::Expr, offset: usize, best: &mut Option<FieldAccessAt>) {
+    fn walk(expr: &ast::Expr, offset: usize, best: &mut Option<FieldAccessAt>, depth: usize) {
+        if depth > MAX_WALK_DEPTH {
+            return;
+        }
         if let ast::ExprKind::FieldAccess { expr: receiver, field } = &expr.node {
             let field_start = expr.span.end.saturating_sub(field.len());
             if field_start <= offset && offset < expr.span.end {
@@ -1229,18 +1197,18 @@ pub(crate) fn find_field_access_at_offset(
                 });
             }
         }
-        recurse_expr(expr, |e| walk(e, offset, best));
+        recurse_expr(expr, |e| walk(e, offset, best, depth + 1));
     }
     let mut best = None;
     for decl in &module.decls {
         match &decl.node {
             DeclKind::Fun { body: Some(body), .. }
             | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => walk(body, offset, &mut best),
+            | DeclKind::Derived { body, .. } => walk(body, offset, &mut best, 0),
             DeclKind::Impl { items, .. } => {
                 for item in items {
                     if let ast::ImplItem::Method { body, .. } = item {
-                        walk(body, offset, &mut best);
+                        walk(body, offset, &mut best, 0);
                     }
                 }
             }
@@ -1294,8 +1262,8 @@ pub(crate) fn resolve_var_to_source(module: &Module, var_name: &str) -> Option<S
         }
     }
 
-    fn walk(expr: &ast::Expr, var_name: &str, found: &mut Option<String>) {
-        if found.is_some() {
+    fn walk(expr: &ast::Expr, var_name: &str, found: &mut Option<String>, depth: usize) {
+        if found.is_some() || depth > MAX_WALK_DEPTH {
             return;
         }
         if let ast::ExprKind::Do(stmts) = &expr.node {
@@ -1309,21 +1277,21 @@ pub(crate) fn resolve_var_to_source(module: &Module, var_name: &str) -> Option<S
                             return;
                         }
                     }
-                    walk(rhs, var_name, found);
+                    walk(rhs, var_name, found, depth + 1);
                     if found.is_some() {
                         return;
                     }
                 }
                 if let ast::StmtKind::Where { cond } | ast::StmtKind::Expr(cond) = &stmt.node {
-                    walk(cond, var_name, found);
+                    walk(cond, var_name, found, depth + 1);
                 }
                 if let ast::StmtKind::GroupBy { key } = &stmt.node {
-                    walk(key, var_name, found);
+                    walk(key, var_name, found, depth + 1);
                 }
             }
             return;
         }
-        recurse_expr(expr, |e| walk(e, var_name, found));
+        recurse_expr(expr, |e| walk(e, var_name, found, depth + 1));
     }
 
     let mut found = None;
@@ -1332,12 +1300,12 @@ pub(crate) fn resolve_var_to_source(module: &Module, var_name: &str) -> Option<S
             DeclKind::Fun { body: Some(body), .. }
             | DeclKind::View { body, .. }
             | DeclKind::Derived { body, .. } => {
-                walk(body, var_name, &mut found);
+                walk(body, var_name, &mut found, 0);
             }
             DeclKind::Impl { items, .. } => {
                 for item in items {
                     if let ast::ImplItem::Method { body, .. } = item {
-                        walk(body, var_name, &mut found);
+                        walk(body, var_name, &mut found, 0);
                     }
                 }
             }
@@ -1562,6 +1530,140 @@ mod tests {
         foreign.push_str("\\other -> other < 99");
         let rendered = predicate_to_source(&pred, &foreign);
         assert_eq!(rendered, "\\x -> x >= 0");
+    }
+}
+
+// Regression tests for the walker/scan fix batch (atomic-in-lambda, serve
+// awareness, depth caps, resilient workspace scanning).
+#[cfg(test)]
+mod regress_walker_scan_fixes_tests {
+    use super::*;
+
+    fn parse(src: &str) -> Module {
+        let (tokens, _) = knot::lexer::Lexer::new(src).tokenize();
+        let parser = knot::parser::Parser::new(src.to_string(), tokens);
+        parser.parse_module().0
+    }
+
+    /// Bug 4: the decl body of a parameterized function is a Lambda; the
+    /// old walk skipped lambda bodies, so `atomic` inside any function with
+    /// params was never detected (completion kept offering IO builtins).
+    #[test]
+    fn atomic_detected_inside_parameterized_function() {
+        let src = "*items : [{n: Text}]\nf = \\x -> atomic do\n  i <- *items\n  yield i\n";
+        let module = parse(src);
+        let off = src.find("yield i").expect("offset");
+        assert!(
+            find_enclosing_atomic_expr(&module, src, off).is_some(),
+            "atomic inside a parameterized function must be detected"
+        );
+    }
+
+    /// Bug 5: the canonical wiring `api = serve Api where …; main = listen
+    /// 8080 api` stores the route as a plain Name on the Serve node —
+    /// invisible to `expr_references_name`, so the dead-route lens fired on
+    /// every working route. Composite routes wire in their components.
+    #[test]
+    fn serve_wiring_marks_route_as_listened() {
+        let src = "route TodoApi where\n  GET /todos -> Text = GetTodos\n\n\
+                   route Api = TodoApi\n\n\
+                   api = serve Api where\n  GetTodos = \\x -> x\n\n\
+                   main = listen 8080 api\n";
+        let module = parse(src);
+        assert!(route_is_listened(&module, "Api"), "served composite route");
+        assert!(
+            route_is_listened(&module, "TodoApi"),
+            "component of a served composite route is wired in"
+        );
+    }
+
+    #[test]
+    fn unserved_route_is_not_listened() {
+        let src = "route Dead where\n  GET /nope -> Text = GetNope\n\nmain = println \"hi\"\n";
+        let module = parse(src);
+        assert!(!route_is_listened(&module, "Dead"));
+    }
+
+    /// Bug 6: the application walker omitted the Serve arm, so signature
+    /// help was dead inside serve handler bodies.
+    #[test]
+    fn enclosing_application_found_inside_serve_handler() {
+        let src = "route Api where\n  GET /t -> Text = GetT\n\n\
+                   helper = \\a b -> a\n\n\
+                   api = serve Api where\n  GetT = \\x -> helper 1 2\n";
+        let module = parse(src);
+        let off = src.find("helper 1").expect("call site") + "helper 1".len();
+        let found = find_enclosing_application(&module, src, off);
+        assert!(
+            matches!(&found, Some((name, _)) if name == "helper"),
+            "expected helper application inside serve handler; got {found:?}"
+        );
+    }
+
+    /// Bug 7: a left-deep 200k-term `1+1+…` chain used to overflow the
+    /// stack inside the shared walkers (reachable from any keystroke and
+    /// from workspace scans). The walkers now bail at `MAX_WALK_DEPTH`.
+    /// Run on a big-stack thread so the parser/drop-glue (out of scope for
+    /// this fix) don't dominate the result; without the walker cap the walk
+    /// alone needs far more than 64 MiB and aborts the process.
+    #[test]
+    fn walkers_bail_on_pathological_left_deep_ast() {
+        let handle = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let mut src = String::with_capacity(500_001);
+                src.push_str("x = 1");
+                for _ in 0..200_000 {
+                    src.push_str("+1");
+                }
+                src.push('\n');
+                let module = parse(&src);
+                let body = module
+                    .decls
+                    .iter()
+                    .find_map(|d| match &d.node {
+                        DeclKind::Fun { body: Some(b), .. } => Some(b),
+                        _ => None,
+                    })
+                    .expect("fun body");
+                assert!(!expr_references_name(body, "zzz"));
+                assert!(find_enclosing_atomic_expr(&module, &src, 4).is_none());
+                assert!(!route_is_listened(&module, "Api"));
+            })
+            .expect("spawn");
+        handle.join().expect("walkers must not overflow the stack");
+    }
+
+    /// Bug 8: one unreadable subdirectory must not abort the whole scan.
+    #[cfg(unix)]
+    #[test]
+    fn scan_skips_unreadable_subdirectory() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "knot-lsp-scan-perm-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let ok_dir = root.join("ok");
+        let locked_dir = root.join("locked");
+        std::fs::create_dir_all(&ok_dir).unwrap();
+        std::fs::create_dir_all(&locked_dir).unwrap();
+        std::fs::write(ok_dir.join("a.knot"), "x = 1\n").unwrap();
+        std::fs::write(locked_dir.join("b.knot"), "y = 2\n").unwrap();
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = scan_knot_files(&root);
+
+        // Restore permissions before asserting so cleanup always works.
+        let _ = std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o755));
+        let files = result.expect("partial scan must not abort with an error");
+        assert!(
+            files.iter().any(|f| f.ends_with("a.knot")),
+            "readable files must survive an unreadable sibling dir; got {files:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

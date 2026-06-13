@@ -399,10 +399,18 @@ impl<'a> TokenCollector<'a> {
             }
             ast::ExprKind::FieldAccess { expr: inner, field } => {
                 self.visit_expr(inner);
-                // Field name span: the part after the `.`
-                let field_start = expr.span.end - field.len();
-                if field_start < expr.span.end {
-                    self.add(Span::new(field_start, expr.span.end), TOK_PROPERTY, 0);
+                // Field name span: the part after the `.`. Guard the subtraction
+                // against underflow and confirm the suffix actually spells the
+                // field, mirroring rename.rs/linked_editing.rs — a stale or
+                // malformed span with `end < field.len()` would otherwise panic
+                // (debug) or wrap to a bogus span (release).
+                if expr.span.end >= field.len() {
+                    let field_start = expr.span.end - field.len();
+                    if field_start < expr.span.end
+                        && self.source.get(field_start..expr.span.end) == Some(field.as_str())
+                    {
+                        self.add(Span::new(field_start, expr.span.end), TOK_PROPERTY, 0);
+                    }
                 }
             }
             ast::ExprKind::Lit(ast::Literal::Int(_) | ast::Literal::Float(_)) => {

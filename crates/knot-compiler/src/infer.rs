@@ -462,6 +462,18 @@ struct Infer {
     /// effects.
     pending_effect_unions: Vec<EffectUnion>,
 
+    /// Upper bounds recorded when an effect-union RESULT row var is unified
+    /// against a *closed* (concrete, tail-`None`) required effect row before
+    /// the union is resolved. Maps the union-result var → the closed set its
+    /// row must stay within. `unify_io_effects` only stores the *difference*
+    /// when it closes a row, so the full required set is otherwise lost by the
+    /// time `resolve_effect_union` runs; without this, the union's resolution
+    /// would silently overwrite that closed binding and launder a `race`/`fork`
+    /// result's effects through a value typed with fewer effects. Checked in
+    /// `resolve_effect_union`. Multiple bounds intersect (most restrictive wins).
+    /// The `Span` anchors the violation diagnostic at the offending unify site.
+    effect_union_upper_bounds: HashMap<TyVar, (BTreeSet<IoEffect>, Span)>,
+
     /// Trait constraints declared in an enclosing function signature, keyed
     /// by the skolem TyVar they apply to. Lets us reject use sites that
     /// require a constraint not promised by the signature (e.g. using `<` on
@@ -584,6 +596,7 @@ impl Infer {
             known_impls: HashSet::new(),
             deferred_constraints: Vec::new(),
             pending_effect_unions: Vec::new(),
+            effect_union_upper_bounds: HashMap::new(),
             declared_skolem_constraints: HashMap::new(),
             binding_types: Vec::new(),
             trait_params: HashMap::new(),
@@ -1974,6 +1987,9 @@ impl Infer {
                         span,
                     );
                 }
+                // Closed required row is side 2 (effects `e2`): if `rv` is an
+                // effect-union result, its row must stay within `e2`.
+                self.record_effect_union_upper_bound(rv, &e2, span);
                 self.bind_var(rv, Ty::EffectRow(only2, None), span);
             }
             (None, Some(rv)) => {
@@ -1988,6 +2004,9 @@ impl Infer {
                         span,
                     );
                 }
+                // Closed required row is side 1 (effects `e1`): if `rv` is an
+                // effect-union result, its row must stay within `e1`.
+                self.record_effect_union_upper_bound(rv, &e1, span);
                 self.bind_var(rv, Ty::EffectRow(only1, None), span);
             }
             (Some(rv1), Some(rv2)) => {
@@ -2669,6 +2688,34 @@ impl Infer {
     /// Bind a union constraint's result row var to the union of its sources'
     /// resolved effects. Sources whose tails are still open contribute their
     /// leftover row var to the result so future growth still flows through.
+    /// Record that the effect-union result row `rv` was unified against a
+    /// *closed* required row whose effects are `bound`. Only stores a bound for
+    /// vars that are actually a pending union's result (others close normally).
+    /// Intersects with any prior bound so the most restrictive requirement wins.
+    /// See `effect_union_upper_bounds`.
+    fn record_effect_union_upper_bound(
+        &mut self,
+        rv: TyVar,
+        bound: &BTreeSet<IoEffect>,
+        span: Span,
+    ) {
+        let end = self.var_chain_end(rv);
+        let is_union_result = self
+            .pending_effect_unions
+            .iter()
+            .any(|u| self.var_chain_end(u.result) == end);
+        if !is_union_result {
+            return;
+        }
+        self.effect_union_upper_bounds
+            .entry(end)
+            .and_modify(|(existing, sp)| {
+                *existing = existing.intersection(bound).cloned().collect();
+                *sp = span;
+            })
+            .or_insert_with(|| (bound.clone(), span));
+    }
+
     fn resolve_effect_union(&mut self, u: &EffectUnion) {
         let mut effects: BTreeSet<IoEffect> = BTreeSet::new();
         let mut leftover: Option<TyVar> = None;
@@ -2703,6 +2750,28 @@ impl Infer {
                 }
             }
         }
+        // If this union's result row was unified against a *closed* required
+        // row during body checking (e.g. a `race`/`fork` result passed to an
+        // `IO {}` parameter), enforce that the now-known union of effects stays
+        // within that bound. Without this, the `bind_var` below would silently
+        // overwrite that closed binding and launder the sources' effects
+        // through a value typed with fewer effects. A bound recorded against a
+        // *larger* closed row (e.g. the do-block monad row that main's own
+        // `IO {console}` annotation governs) accommodates the union and passes.
+        let end = self.var_chain_end(u.result);
+        if let Some((bound, bound_span)) = self.effect_union_upper_bounds.get(&end).cloned() {
+            let excess: Vec<String> =
+                effects.difference(&bound).map(format_io_effect).collect();
+            if !excess.is_empty() {
+                self.error(
+                    format!(
+                        "IO effects don't match: the provided IO has effects not allowed by the expected type: {{{}}}",
+                        excess.join(", ")
+                    ),
+                    bound_span,
+                );
+            }
+        }
         // Use bind_var so the binding goes through occurs check + unification
         // — handles the case where `result` has already been narrowed.
         self.bind_var(u.result, Ty::EffectRow(effects, leftover), span);
@@ -2716,6 +2785,9 @@ impl Infer {
         for u in pending {
             self.resolve_effect_union(&u);
         }
+        // Bounds are per-declaration: clear them so a closed-row requirement in
+        // one declaration can't spuriously constrain another's unions.
+        self.effect_union_upper_bounds.clear();
     }
 
     fn free_vars(&self, ty: &Ty) -> HashSet<TyVar> {

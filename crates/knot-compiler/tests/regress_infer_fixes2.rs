@@ -450,3 +450,78 @@ main = do
         diags.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+// A `race`/`fork` result's effect-union row must not be laundered through a
+// value annotated with fewer effects. Passing `race (console) (console)` to a
+// parameter typed `IO {}` is an effect-soundness violation: the union resolves
+// to `{console}` *after* body checking, and the post-hoc resolution must not
+// silently overwrite the closed `IO {}` requirement the argument was checked
+// against. The fix records the closed upper bound at the unify site and
+// re-checks it once the union is known.
+#[test]
+fn race_result_cannot_launder_effects_through_pure_param() {
+    let diags = check_src(
+        r#"runPure : IO {} (Result {} {}) -> IO {console} {}
+runPure = \io -> do
+  r <- io
+  println "ran"
+
+main : IO {console} {}
+main = runPure (race (println "a") (println "b"))
+"#,
+    );
+    assert!(
+        has_error(&diags, "effects not allowed by the expected type"),
+        "expected effect-laundering rejection, got: {:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn fork_result_cannot_launder_effects_through_pure_param() {
+    let diags = check_src(
+        r#"runPure : IO {} {} -> IO {console} {}
+runPure = \io -> do
+  r <- io
+  println "ran"
+
+main : IO {console} {}
+main = runPure (fork (println "a"))
+"#,
+    );
+    assert!(
+        has_error(&diags, "effects not allowed by the expected type"),
+        "expected fork effect-laundering rejection, got: {:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+// The common, correct usages must still type-check: an upper bound recorded
+// at a *larger* closed requirement — or the do-block monad row whose effects
+// the declaration's own annotation governs — accommodates the union.
+#[test]
+fn race_in_io_do_block_still_type_checks() {
+    let diags = check_src(
+        r#"main : IO {console} {}
+main = do
+  r <- race (println "a") (println "b")
+  println "done"
+"#,
+    );
+    assert_clean(&diags);
+}
+
+#[test]
+fn race_result_through_matching_effect_param_type_checks() {
+    let diags = check_src(
+        r#"runConsole : IO {console} (Result {} {}) -> IO {console} {}
+runConsole = \io -> do
+  r <- io
+  println "ran"
+
+main : IO {console} {}
+main = runConsole (race (println "a") (println "b"))
+"#,
+    );
+    assert_clean(&diags);
+}

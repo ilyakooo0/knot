@@ -26,7 +26,7 @@ pub(crate) fn handle_linked_editing_range(
     // Check if cursor is on a record field name (either in a record expression,
     // pattern, or type declaration) — link all occurrences of the same field
     // within the same declaration scope
-    let mut linked_ranges = Vec::new();
+    let mut linked_spans: Vec<Span> = Vec::new();
 
     // Find the enclosing declaration
     for decl in &doc.module.decls {
@@ -39,12 +39,12 @@ pub(crate) fn handle_linked_editing_range(
             DeclKind::Fun { body: Some(body), .. }
             | DeclKind::View { body, .. }
             | DeclKind::Derived { body, .. } => {
-                collect_field_name_spans(body, word, &doc.source, &mut linked_ranges);
+                collect_field_name_spans(body, word, &doc.source, &mut linked_spans);
             }
             DeclKind::Impl { items, .. } => {
                 for item in items {
                     if let ast::ImplItem::Method { body, .. } = item {
-                        collect_field_name_spans(body, word, &doc.source, &mut linked_ranges);
+                        collect_field_name_spans(body, word, &doc.source, &mut linked_spans);
                     }
                 }
             }
@@ -52,9 +52,26 @@ pub(crate) fn handle_linked_editing_range(
         }
     }
 
-    if linked_ranges.len() <= 1 {
+    if linked_spans.len() <= 1 {
         return None;
     }
+
+    // Only activate when the cursor is actually on one of the field-name
+    // tokens. `word_at_position` matches the identifier under the cursor
+    // regardless of role, so without this a local variable / function name
+    // that merely shares a record field's spelling would get linked to that
+    // unrelated field's occurrences.
+    if !linked_spans
+        .iter()
+        .any(|s| offset >= s.start && offset <= s.end)
+    {
+        return None;
+    }
+
+    let linked_ranges = linked_spans
+        .iter()
+        .map(|s| span_to_range(*s, &doc.source))
+        .collect();
 
     Some(LinkedEditingRanges {
         ranges: linked_ranges,
@@ -66,7 +83,7 @@ fn collect_field_name_spans(
     expr: &ast::Expr,
     field_name: &str,
     source: &str,
-    ranges: &mut Vec<Range>,
+    ranges: &mut Vec<Span>,
 ) {
     match &expr.node {
         ast::ExprKind::Record(fields) => {
@@ -83,7 +100,7 @@ fn collect_field_name_spans(
                     if let Some(span) =
                         find_word_in_source(source, field_name, search_start, f.value.span.start)
                     {
-                        ranges.push(span_to_range(span, source));
+                        ranges.push(span);
                     }
                 }
                 search_start = f.value.span.end;
@@ -96,7 +113,7 @@ fn collect_field_name_spans(
                     if let Some(span) =
                         find_word_in_source(source, field_name, search_start, f.value.span.start)
                     {
-                        ranges.push(span_to_range(span, source));
+                        ranges.push(span);
                     }
                 }
                 search_start = f.value.span.end;
@@ -115,7 +132,7 @@ fn collect_field_name_spans(
                 if start >= inner.span.end
                     && source.get(start..expr.span.end) == Some(field.as_str())
                 {
-                    ranges.push(span_to_range(Span::new(start, expr.span.end), source));
+                    ranges.push(Span::new(start, expr.span.end));
                 }
             }
         }

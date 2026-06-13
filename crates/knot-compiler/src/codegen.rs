@@ -8568,8 +8568,38 @@ impl Codegen {
                 };
                 self.bind_io_pattern(builder, payload, inner, env, done_block);
             }
-            ast::PatKind::Lit(_) => {
-                // Literal patterns don't bind anything
+            ast::PatKind::Lit(lit) => {
+                // A literal pattern binds nothing but is *refutable*: a
+                // mismatched value must skip (like the do/case paths), not be
+                // silently accepted. Mirror the constructor arm's fail/skip.
+                let lit_val = self.compile_lit(builder, lit);
+                let eq_i32 = self.call_rt_typed(
+                    builder,
+                    "knot_value_eq_i32",
+                    &[val, lit_val],
+                    types::I32,
+                );
+                let is_match = builder.ins().icmp_imm(IntCC::NotEqual, eq_i32, 0);
+
+                let then_block = builder.create_block();
+                let fail_block = builder.create_block();
+                builder.ins().brif(is_match, then_block, &[], fail_block, &[]);
+
+                builder.switch_to_block(fail_block);
+                builder.seal_block(fail_block);
+                if let Some(done) = done_block {
+                    if self.atomic_retry_block.is_some() {
+                        self.call_rt(builder, "knot_stm_skip", &[]);
+                    }
+                    let unit = self.call_rt(builder, "knot_value_unit", &[]);
+                    builder.ins().jump(done, &[unit.into()]);
+                } else {
+                    self.call_rt_void(builder, "knot_guard_failed", &[]);
+                    builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+                }
+
+                builder.switch_to_block(then_block);
+                builder.seal_block(then_block);
             }
             ast::PatKind::List(pats) => {
                 for (idx, elem_pat) in pats.iter().enumerate() {

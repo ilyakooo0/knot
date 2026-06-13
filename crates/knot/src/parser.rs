@@ -866,7 +866,18 @@ impl Parser {
         self.advance(); // consume `<`
         if let Some(unit) = self.parse_unit_expr() {
             if matches!(self.peek(), TokenKind::Gt) {
+                let gt_end = self.span().end;
                 self.advance(); // consume `>`
+                // Disambiguate a real unit annotation (`5<M>`, `5<M> + x`) from
+                // a spaceless chained comparison (`5<n>0`, which is `(5 < n) > 0`).
+                // A unit literal's closing `>` is never immediately followed by
+                // an atom; if an atom-starter abuts the `>` with no whitespace,
+                // the `>` is a comparison operator, so reject and fall through.
+                if self.span().start == gt_end && self.can_start_atom() {
+                    self.diagnostics.truncate(diag_count);
+                    self.restore(saved);
+                    return None;
+                }
                 return Some(unit);
             }
         }
@@ -2124,6 +2135,19 @@ impl Parser {
 
             self.advance(); // consume operator
             self.skip_newlines();
+            // A dangling operator at end of line: if the next token begins a
+            // new declaration (column 0) or a new block item (at/under the
+            // enclosing block indent), it is NOT the operator's RHS. Report the
+            // missing operand and stop, leaving the token for the outer parser
+            // to recover on, rather than gobbling the following declaration.
+            // Mirrors the pre-operator guard above for the symmetric case.
+            if self.delimiter_depth == 0 {
+                let col = self.column_of(&self.span());
+                if col == 0 || (self.block_indent != usize::MAX && col <= self.block_indent) {
+                    self.error("expected expression after binary operator");
+                    break;
+                }
+            }
             // Allow let/if/case/do/lambda/atomic/refine on the RHS of
             // binary operators.  These are handled by `parse_expr` but not by
             // the Pratt sub-parser, so we delegate to `parse_expr` when we see

@@ -903,6 +903,13 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
             expr_is_io(func, io_fns)
                 || expr_is_io(arg, io_fns)
                 || applied_lambda_body_is_io(func, io_fns)
+                // A higher-order function applied to an IO-bodied lambda
+                // argument (e.g. `forEach xs (\i -> println i)`) produces IO
+                // when the lambda is called. codegen's `expr_is_io` recurses
+                // into every lambda body, so desugar must agree here or the
+                // do-block gets misclassified as a pure comprehension and
+                // rewritten to `__bind`/`__yield` for the wrong monad.
+                || lambda_chain_body_is_io(arg, io_fns)
         }
         ExprKind::Var(name) => {
             // `retry` is in EFFECTFUL_BUILTINS but isn't an IO-producing

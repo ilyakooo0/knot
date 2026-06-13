@@ -2507,13 +2507,26 @@ fn wake_matching_watchers(name: &str, event: &WriteEvent) {
                 // EQ-indexed: lookup by (table, col, value-key). The index proves
                 // the equality predicate holds, so skip slot.matches re-check.
                 rows.each_col_val(|col, val| {
-                    let key = (name.to_string(), col.to_string(), val.to_key());
-                    if let Some(bucket) = EQ_WATCHERS.get(&key) {
-                        for weak in bucket.iter() {
-                            if let Some(slot) = weak.upgrade() {
-                                slot.wake();
+                    let probe = |vk: SqlValKey| {
+                        let key = (name.to_string(), col.to_string(), vk);
+                        if let Some(bucket) = EQ_WATCHERS.get(&key) {
+                            for weak in bucket.iter() {
+                                if let Some(slot) = weak.upgrade() {
+                                    slot.wake();
+                                }
                             }
                         }
+                    };
+                    probe(val.to_key());
+                    // Cross-type Int↔Real: an Int row must also wake a watcher
+                    // keyed `col == <real>` (and vice-versa) since `5 == 5.0`.
+                    // SqlValKey orders Int and Real disjointly, so the
+                    // same-variant probe alone misses these — mirrors the alt
+                    // probe in `wake_range_index`. Waking is always safe (the
+                    // watcher re-validates), so the numeric-equivalent key
+                    // matching implies equality and needs no further re-check.
+                    if let Some(alt) = eq_cross_key(val) {
+                        probe(alt);
                     }
                 });
                 // Range-indexed: BTreeMap probes per direction. Each direction's
@@ -2589,6 +2602,25 @@ fn wake_all_indexed_watchers(table: &str) {
 /// disjoint contiguous ranges, so an Int row's same-variant probe won't visit
 /// Real thresholds. We add a second probe under the row's float-equivalent
 /// key to cover numeric cross-type comparisons.
+/// Numeric-equivalent EQ index key for cross-type Int↔Real equality probes.
+/// An Int row of value `n` is `==` to a watcher keyed on the float `n`, and a
+/// Real row with an integral value is `==` to a watcher keyed on that Int.
+/// Returns `None` when no cross-type integer/float value is exactly equal.
+fn eq_cross_key(val: &SqlVal) -> Option<SqlValKey> {
+    match val {
+        SqlVal::Int(n) => Some(SqlValKey::RealBits((*n as f64).to_bits())),
+        SqlVal::Real(f)
+            if f.is_finite()
+                && f.fract() == 0.0
+                && *f >= i64::MIN as f64
+                && *f <= i64::MAX as f64 =>
+        {
+            Some(SqlValKey::Int(*f as i64))
+        }
+        _ => None,
+    }
+}
+
 fn wake_range_index(idx: &RangeIndex, row_val: &SqlVal) {
     let primary = row_val.to_key();
     let alt = match row_val {
@@ -3748,7 +3780,12 @@ impl KnotDb {
         if self.indexed.borrow().contains(&key) {
             return;
         }
-        let idx_name = format!("_knot_auto_{}_{}", table, column);
+        // Length-prefix the table so the name is injective in (table, column):
+        // a bare `_knot_auto_{table}_{column}` collides when underscores blur
+        // the boundary (e.g. `user`/`id_hash` vs `user_id`/`hash`), which would
+        // make `CREATE INDEX IF NOT EXISTS` silently skip the second column's
+        // index. The decimal length + `_` pins where the table name ends.
+        let idx_name = format!("_knot_auto_{}_{}_{}", table.len(), table, column);
         let sql = format!(
             "CREATE INDEX IF NOT EXISTS {} ON {} ({});",
             quote_ident(&idx_name),
@@ -4062,15 +4099,6 @@ fn alloc_int(n: i64) -> *mut Value {
     alloc(Value::Int(n))
 }
 
-/// Extract a `usize` from an integer value.  Returns `None` if the
-/// value doesn't fit (e.g., negative or too large).
-#[inline]
-fn int_as_usize(v: &Value) -> Option<usize> {
-    match v {
-        Value::Int(n) => usize::try_from(*n).ok(),
-        _ => None,
-    }
-}
 
 /// Return a tagged Bool pointer.  The tag encoding (`0b010` in the
 /// low 3 bits, payload in bit 3) produces two globally-unique bit
@@ -7103,7 +7131,11 @@ pub extern "C-unwind" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
 
         // Detach: we drop the handle, so the thread runs to completion
         // independently.  Detached threads are reclaimed by the OS on exit.
-        let _ = std::thread::spawn(move || {
+        // Use `Builder::spawn` (which reports failure as `Err`) rather than
+        // `thread::spawn` (which panics): if the OS refuses the thread, we must
+        // undo the increment above, otherwise `knot_threads_join` waits forever
+        // on a fork that never ran.
+        let spawn_result = std::thread::Builder::new().spawn(move || {
             // Guards run in reverse declaration order.  `ForkCounter` is
             // declared first so it drops last: DB/IO cleanup happens before
             // the counter decrement, which prevents a race where a joiner
@@ -7149,6 +7181,18 @@ pub extern "C-unwind" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
                 write_lock_force_release();
             }
         });
+
+        if spawn_result.is_err() {
+            // The thread never started, so its drop-guard decrement and IO
+            // cleanup will never run. Undo the increment, wake any joiner, and
+            // free the deep-cloned IO the thread would have owned.
+            ACTIVE_FORKS.fetch_sub(1, Ordering::SeqCst);
+            {
+                let _g = ACTIVE_FORKS_MUTEX.lock().unwrap();
+                ACTIVE_FORKS_CVAR.notify_all();
+            }
+            unsafe { deep_drop_value(cloned_io as *mut u8 as *mut Value); }
+        }
 
         alloc(Value::Unit)
     }
@@ -8885,10 +8929,17 @@ pub extern "C-unwind" fn knot_bytes_slice(
     len: *mut Value,
     bytes: *mut Value,
 ) -> *mut Value {
-    let start = int_as_usize(unsafe { as_ref(start) })
-        .unwrap_or_else(|| panic!("knot runtime: bytesSlice expected Int as first arg"));
-    let len = int_as_usize(unsafe { as_ref(len) })
-        .unwrap_or_else(|| panic!("knot runtime: bytesSlice expected Int as second arg"));
+    // Clamp negative offsets/lengths to 0, matching `knot_text_take`/`drop`:
+    // an `Int<u>` can evaluate negative even from well-typed code, and a
+    // negative offset/length means "from the start"/"empty" rather than a crash.
+    let start = match unsafe { as_ref(start) } {
+        Value::Int(i) => (*i).max(0) as usize,
+        _ => panic!("knot runtime: bytesSlice expected Int as first arg, got {}", type_name(start)),
+    };
+    let len = match unsafe { as_ref(len) } {
+        Value::Int(i) => (*i).max(0) as usize,
+        _ => panic!("knot runtime: bytesSlice expected Int as second arg, got {}", type_name(len)),
+    };
     match unsafe { as_ref(bytes) } {
         Value::Bytes(b) => {
             let end = start.saturating_add(len).min(b.len());
@@ -9001,8 +9052,13 @@ pub extern "C-unwind" fn knot_hash(v: *mut Value) -> *mut Value {
 /// bytesGet(index, bytes) — get byte at index as Int (0-255)
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_bytes_get(index: *mut Value, bytes: *mut Value) -> *mut Value {
-    let i = int_as_usize(unsafe { as_ref(index) })
-        .unwrap_or_else(|| panic!("knot runtime: bytesGet expected Int as first arg"));
+    let i = match unsafe { as_ref(index) } {
+        Value::Int(n) if *n >= 0 => *n as usize,
+        // A negative index is genuinely out of bounds (not index 0); report it
+        // accurately rather than via int_as_usize's misleading "expected Int".
+        Value::Int(n) => panic!("knot runtime: bytesGet index {} out of bounds (negative)", n),
+        _ => panic!("knot runtime: bytesGet expected Int as first arg, got {}", type_name(index)),
+    };
     match unsafe { as_ref(bytes) } {
         Value::Bytes(b) => {
             if i >= b.len() {
@@ -15301,6 +15357,24 @@ pub extern "C-unwind" fn knot_http_fetch_io(
                 }
             }
         }
+
+        // Deduplicate headers case-insensitively, last value wins. ureq 3's
+        // `RequestBuilder::header` APPENDS rather than replaces, so without
+        // this an ad-hoc fetchWith header (or an explicit Content-Type) would
+        // be sent alongside the route-declared/default one — two same-named
+        // headers, which is malformed and rejected by many servers. Last-wins
+        // gives the documented override semantics.
+        let req_headers = {
+            let mut deduped: Vec<(String, String)> = Vec::with_capacity(req_headers.len());
+            for (k, v) in req_headers {
+                let lk = k.to_ascii_lowercase();
+                match deduped.iter_mut().find(|(ek, _)| ek.eq_ignore_ascii_case(&lk)) {
+                    Some(slot) => slot.1 = v,
+                    None => deduped.push((k, v)),
+                }
+            }
+            deduped
+        };
 
         // Debug log outgoing fetch
         if log::debug_enabled() {

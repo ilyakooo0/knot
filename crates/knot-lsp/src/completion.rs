@@ -45,6 +45,11 @@ pub(crate) fn handle_completion(
         .map(|p| p.source.as_str())
         .unwrap_or(&doc.source);
     let offset = position_to_offset(latest_source, pos);
+    // AST-based context checks (atomic/route) walk `doc.module`, whose spans
+    // index into `doc.source` (the last-analyzed text), not `latest_source`.
+    // Resolving the cursor against the analyzed source keeps the offset in the
+    // same byte space as those spans when the buffer is mid-debounce.
+    let analyzed_offset = position_to_offset(&doc.source, pos);
     let trigger_char = params
         .context
         .as_ref()
@@ -62,7 +67,7 @@ pub(crate) fn handle_completion(
     // type checker forbids any IO effects (console/fs/network/clock/random).
     // Drop those builtins and any user functions that perform IO from the
     // completion list so the user can't type them.
-    let in_atomic = find_enclosing_atomic_expr(&doc.module, &doc.source, offset).is_some();
+    let in_atomic = find_enclosing_atomic_expr(&doc.module, &doc.source, analyzed_offset).is_some();
 
     // Route-declaration context: a `route Foo where ...` block contains only
     // HTTP method keywords, path literals, and field-of-type entries. None of
@@ -73,8 +78,8 @@ pub(crate) fn handle_completion(
     // Exception: `rateLimit <expr>` clauses hold ordinary EXPRESSIONS
     // (`{key: \inp ctx -> ..., limit: ...}`), so a cursor inside one needs
     // the normal expression completions, not the method/type gate.
-    if find_enclosing_route_decl_span(&doc.module, offset).is_some()
-        && !offset_in_route_rate_limit(&doc.module, offset)
+    if find_enclosing_route_decl_span(&doc.module, analyzed_offset).is_some()
+        && !offset_in_route_rate_limit(&doc.module, analyzed_offset)
     {
         return Some(CompletionResponse::Array(route_completions(doc)));
     }

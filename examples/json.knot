@@ -12,18 +12,22 @@ main = do
   let nums = [{x: 1}, {x: 2}, {x: 3}]
   println (toJson nums)
 
-  -- Round-trip: encode then decode
+  -- Round-trip: encode then decode. parseJson returns `Maybe a` so malformed
+  -- input is recoverable rather than fatal — match on the result.
   let json = toJson {x: 10, y: 20}
   println json
-  let parsed = parseJson json
-  println (show parsed)
+  case parseJson json : Maybe {x: Int, y: Int} of
+    Just {value} -> println (show value)
+    Nothing {} -> println "parse failed"
 
   -- Parse a JSON array
-  let arr = parseJson "[1, 2, 3]"
-  println (show arr)
+  case parseJson "[1, 2, 3]" : Maybe [Int] of
+    Just {value} -> println (show value)
+    Nothing {} -> println "parse failed"
 
-  -- Parse nested JSON
-  let nested = parseJson "{\"user\": {\"name\": \"Bob\", \"scores\": [95, 87, 92]}}"
-  println (show nested)
+  -- Malformed input decodes to Nothing instead of crashing the program
+  case parseJson "not valid json" : Maybe [Int] of
+    Just {value} -> println (show value)
+    Nothing {} -> println "parse failed (as expected)"
 
   yield {}

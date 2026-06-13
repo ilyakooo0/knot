@@ -107,7 +107,7 @@ trait ToJSON a where
   toJson : a -> Text
 
 trait FromJSON a where
-  parseJson : Text -> a
+  parseJson : Text -> Maybe a
 
 min : Ord a => a -> a -> a
 min = \a b -> if a < b then a else b

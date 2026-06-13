@@ -111,10 +111,15 @@ showPerson = \p -> case p.nick of
   Nothing {} -> println (p.name ++ ": none")
   Just {value} -> println (p.name ++ ": " ++ value)
 
+showResult = \m -> case m of
+  Nothing {} -> println "parse failed"
+  Just {value} -> showPerson value
+
 main = do
-  showPerson (parseJson "{\"name\":\"a\",\"nick\":null}" : Person)
-  showPerson (parseJson "{\"name\":\"b\"}" : Person)
-  showPerson (parseJson "{\"name\":\"c\",\"nick\":\"hey\"}" : Person)
+  showResult (parseJson "{\"name\":\"a\",\"nick\":null}" : Maybe Person)
+  showResult (parseJson "{\"name\":\"b\"}" : Maybe Person)
+  showResult (parseJson "{\"name\":\"c\",\"nick\":\"hey\"}" : Maybe Person)
+  showResult (parseJson "not valid json!" : Maybe Person)
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -123,6 +128,10 @@ main = do
     assert!(
         stdout.contains("c: hey"),
         "present field must be Just-wrapped:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("parse failed"),
+        "parseJson returns Maybe — malformed input must decode to Nothing:\n{stdout}"
     );
 }
 
@@ -135,8 +144,9 @@ fn parse_json_maybe_in_relation_rows() {
   Just {value} -> println ("row: " ++ show value)
 
 main = do
-  let rows = parseJson "[{\"a\":null},{\"a\":7}]" : [{a: Maybe Int}]
-  forEach rows showRow
+  case parseJson "[{\"a\":null},{\"a\":7}]" : Maybe [{a: Maybe Int}] of
+    Nothing {} -> println "parse failed"
+    Just {value} -> forEach value showRow
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -156,9 +166,13 @@ showPerson = \p -> case p.nick of
   Nothing {} -> println (p.name ++ ": none")
   Just {value} -> println (p.name ++ ": " ++ value)
 
+showResult = \m -> case m of
+  Nothing {} -> println "parse failed"
+  Just {value} -> showPerson value
+
 main = do
-  showPerson (parseJson (toJson {name: "a", nick: Just {value: "x"}}) : Person)
-  showPerson (parseJson (toJson {name: "b", nick: Nothing {}}) : Person)
+  showResult (parseJson (toJson {name: "a", nick: Just {value: "x"}}) : Maybe Person)
+  showResult (parseJson (toJson {name: "b", nick: Nothing {}}) : Maybe Person)
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");

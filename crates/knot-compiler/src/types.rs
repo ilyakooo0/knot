@@ -113,6 +113,21 @@ impl TypeEnv {
                             name.clone(),
                             ResolvedType::Record(fields.clone()),
                         );
+                        // Register the AST record view under the data-type name
+                        // too, so a source of this type (`*account : [Money]`)
+                        // has its field-level refinements collected via the
+                        // alias arm of `collect_source_refinements` — otherwise
+                        // single-variant data field refinements are silently
+                        // dropped (multi-variant ones go through data_ctor_decls).
+                        alias_ast_types.entry(name.clone()).or_insert_with(|| {
+                            Spanned::new(
+                                TypeKind::Record {
+                                    fields: ctor.fields.clone(),
+                                    rest: None,
+                                },
+                                decl.span,
+                            )
+                        });
                         // First-wins: a duplicate ctor name across data types
                         // is reported as an error in inference; here we just
                         // need a consistent view of "the" Circle.

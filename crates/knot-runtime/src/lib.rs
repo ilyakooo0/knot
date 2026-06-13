@@ -5988,12 +5988,22 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
             buf.extend_from_slice(&n.to_le_bytes());
         }
         Value::Float(f) => {
-            buf.push(1);
-            // Use raw bits for hashing to match total_cmp equality semantics
-            // (total_cmp distinguishes -0.0 from +0.0). Canonicalize NaN so
-            // all NaN bit patterns hash the same (total_cmp treats them equal).
-            let bits = if f.is_nan() { f64::NAN.to_bits() } else { f.to_bits() };
-            buf.extend_from_slice(&bits.to_le_bytes());
+            // An integral Float must hash identically to the equal Int, since
+            // `values_equal` treats `Int(2) == Float(2.0)`. The condition
+            // `(i as f64) total_cmp f == Equal` exactly mirrors that equality
+            // rule, so it also correctly EXCLUDES `-0.0` (total_cmp ranks it
+            // below +0.0, and `Int(0) != Float(-0.0)`) as well as NaN/±inf.
+            let i = *f as i64;
+            if (i as f64).total_cmp(f) == std::cmp::Ordering::Equal {
+                buf.push(0);
+                buf.extend_from_slice(&i.to_le_bytes());
+            } else {
+                buf.push(1);
+                // Raw bits otherwise: total_cmp distinguishes -0.0 from +0.0;
+                // canonicalize NaN so all NaN bit patterns hash the same.
+                let bits = if f.is_nan() { f64::NAN.to_bits() } else { f.to_bits() };
+                buf.extend_from_slice(&bits.to_le_bytes());
+            }
         }
         Value::Text(s) => {
             buf.push(2);
@@ -8153,6 +8163,9 @@ pub extern "C-unwind" fn knot_source_query_fold(
         .collect();
 
     debug_sql_params(sql, &sql_params);
+    // Auto-index the WHERE/ORDER BY columns of the fold's pushed-down SELECT,
+    // matching every other SQL-pushdown entry point (query/count/float/sum/value).
+    db_ref.ensure_indexes_for_sql(sql);
 
     let rec = parse_record_schema(result_schema);
 
@@ -9216,6 +9229,40 @@ pub extern "C-unwind" fn knot_json_decode_typed(
 ) -> *mut Value {
     let desc = unsafe { str_from_raw(desc_ptr, desc_len) };
     apply_wire_type(knot_json_decode(v), desc)
+}
+
+/// parseJson : Text -> Maybe a. Returns `Nothing` on malformed input (or a
+/// non-Text argument) instead of aborting the program, and `Just decoded` on
+/// success. This is the decoder behind the user-facing `parseJson` builtin,
+/// which now carries an explicit failure channel in its type.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_json_decode_maybe(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Text(s) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(json) => make_just(json_to_value(&json)),
+            Err(_) => make_nothing(),
+        },
+        _ => make_nothing(),
+    }
+}
+
+/// `knot_json_decode_maybe` with a compile-time wire descriptor for the inner
+/// type `a`: normalizes Maybe positions / coerces fields per the descriptor on
+/// success, then wraps in `Just`. `Nothing` on parse failure.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_json_decode_typed_maybe(
+    v: *mut Value,
+    desc_ptr: *const u8,
+    desc_len: usize,
+) -> *mut Value {
+    let desc = unsafe { str_from_raw(desc_ptr, desc_len) };
+    match unsafe { as_ref(v) } {
+        Value::Text(s) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(json) => make_just(apply_wire_type(json_to_value(&json), desc)),
+            Err(_) => make_nothing(),
+        },
+        _ => make_nothing(),
+    }
 }
 
 // ── Standard library: utility operations ──────────────────────
@@ -14013,6 +14060,15 @@ fn coerce_json_field(v: *mut Value, ty: &str) -> *mut Value {
             return alloc(Value::Constructor(intern_str(s), alloc(Value::Unit)));
         }
     }
+    // A bare JSON integer (`5`) decodes to `Value::Int`, but a field declared
+    // `Float` must hold a `Value::Float` — otherwise `show`/`toJson` re-emit it
+    // as an integer and Float-specific logic sees the wrong tag. Non-Knot peers
+    // routinely send integer-valued JSON for float fields, so promote here.
+    if ty == "float" {
+        if let Value::Int(i) = unsafe { as_ref(v) } {
+            return alloc_float(*i as f64);
+        }
+    }
     v
 }
 
@@ -16024,12 +16080,22 @@ fn serialize_value_for_hash_into(v: *mut Value, buf: &mut Vec<u8>) {
             buf.extend_from_slice(&n.to_le_bytes());
         }
         Value::Float(f) => {
-            buf.push(1);
-            // Use raw bits for hashing to match total_cmp equality semantics
-            // (total_cmp distinguishes -0.0 from +0.0). Canonicalize NaN so
-            // all NaN bit patterns hash the same (total_cmp treats them equal).
-            let bits = if f.is_nan() { f64::NAN.to_bits() } else { f.to_bits() };
-            buf.extend_from_slice(&bits.to_le_bytes());
+            // An integral Float must hash identically to the equal Int, since
+            // `values_equal` treats `Int(2) == Float(2.0)`. The condition
+            // `(i as f64) total_cmp f == Equal` exactly mirrors that equality
+            // rule, so it also correctly EXCLUDES `-0.0` (total_cmp ranks it
+            // below +0.0, and `Int(0) != Float(-0.0)`) as well as NaN/±inf.
+            let i = *f as i64;
+            if (i as f64).total_cmp(f) == std::cmp::Ordering::Equal {
+                buf.push(0);
+                buf.extend_from_slice(&i.to_le_bytes());
+            } else {
+                buf.push(1);
+                // Raw bits otherwise: total_cmp distinguishes -0.0 from +0.0;
+                // canonicalize NaN so all NaN bit patterns hash the same.
+                let bits = if f.is_nan() { f64::NAN.to_bits() } else { f.to_bits() };
+                buf.extend_from_slice(&bits.to_le_bytes());
+            }
         }
         Value::Text(s) => {
             buf.push(2);

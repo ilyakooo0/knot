@@ -589,6 +589,38 @@ impl Parser {
             path.push_str(&part);
         }
     }
+
+    /// Extend a route path literal segment with `-`-joined parts, but only
+    /// when the `-` and the following identifier are span-adjacent (no
+    /// intervening whitespace). Without this, `/foo - bar` (a spaced,
+    /// binary-minus-looking sequence) would be glued into the single literal
+    /// `foo-bar`, silently parsing a different path than written. Mirrors
+    /// `consume_import_dashed_suffix`.
+    fn consume_route_dashed_suffix(&mut self, seg: &mut String) {
+        while self.at(&TokenKind::Minus)
+            && matches!(self.peek_ahead(1), TokenKind::Lower(_) | TokenKind::Upper(_))
+        {
+            let minus_span = self.span();
+            if minus_span.start != self.prev_span().end {
+                break;
+            }
+            let Some(next) = self.tokens.get(self.pos + 1) else {
+                break;
+            };
+            if next.span.start != minus_span.end {
+                break;
+            }
+            self.advance(); // consume `-`
+            let next = self.advance();
+            match next.kind {
+                TokenKind::Lower(s) | TokenKind::Upper(s) => {
+                    seg.push('-');
+                    seg.push_str(&s);
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
 }
 
 // ── Layout block helper ─────────────────────────────────────────────
@@ -1717,34 +1749,14 @@ impl Parser {
                 let tok = self.advance();
                 let TokenKind::Lower(s) = tok.kind else { unreachable!() };
                 let mut seg = s;
-                while self.at(&TokenKind::Minus) && matches!(self.peek_ahead(1), TokenKind::Lower(_) | TokenKind::Upper(_)) {
-                    self.advance(); // consume `-`
-                    let next = self.advance();
-                    match next.kind {
-                        TokenKind::Lower(s) | TokenKind::Upper(s) => {
-                            seg.push('-');
-                            seg.push_str(&s);
-                        }
-                        _ => unreachable!(),
-                    }
-                }
+                self.consume_route_dashed_suffix(&mut seg);
                 segments.push(PathSegment::Literal(seg));
             } else if matches!(self.peek(), TokenKind::Upper(_)) {
                 // uppercase segment like /api/v1 — unlikely but handle
                 let tok = self.advance();
                 let TokenKind::Upper(s) = tok.kind else { unreachable!() };
                 let mut seg = s;
-                while self.at(&TokenKind::Minus) && matches!(self.peek_ahead(1), TokenKind::Lower(_) | TokenKind::Upper(_)) {
-                    self.advance(); // consume `-`
-                    let next = self.advance();
-                    match next.kind {
-                        TokenKind::Lower(s) | TokenKind::Upper(s) => {
-                            seg.push('-');
-                            seg.push_str(&s);
-                        }
-                        _ => unreachable!(),
-                    }
-                }
+                self.consume_route_dashed_suffix(&mut seg);
                 segments.push(PathSegment::Literal(seg));
             } else if self.peek().keyword_str().is_some() {
                 let tok = self.advance();
@@ -1754,17 +1766,7 @@ impl Parser {
                     break;
                 };
                 let mut seg = kw.to_string();
-                while self.at(&TokenKind::Minus) && matches!(self.peek_ahead(1), TokenKind::Lower(_) | TokenKind::Upper(_)) {
-                    self.advance(); // consume `-`
-                    let next = self.advance();
-                    match next.kind {
-                        TokenKind::Lower(s) | TokenKind::Upper(s) => {
-                            seg.push('-');
-                            seg.push_str(&s);
-                        }
-                        _ => unreachable!(),
-                    }
-                }
+                self.consume_route_dashed_suffix(&mut seg);
                 segments.push(PathSegment::Literal(seg));
             } else {
                 // Just a trailing `/`

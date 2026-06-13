@@ -25,11 +25,16 @@ pub(crate) fn handle_goto_definition(
 
     let offset = position_to_offset(&doc.source, pos);
 
-    // Try span-based reference lookup first
+    // Try span-based reference lookup first. Usage spans can overlap (a
+    // constructor-pattern reference enclosing a nested binder reference), so
+    // pick the *smallest* containing span — the symbol the cursor is actually
+    // on — mirroring hover/goto-type-definition rather than taking an
+    // arbitrary first match.
     let def_span = doc
         .references
         .iter()
-        .find(|(usage, _)| usage.start <= offset && offset < usage.end)
+        .filter(|(usage, _)| usage.start <= offset && offset < usage.end)
+        .min_by_key(|(usage, _)| usage.end - usage.start)
         .map(|(_, def)| *def)
         .or_else(|| {
             // Fallback: name-based lookup

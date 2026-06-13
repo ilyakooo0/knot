@@ -1052,6 +1052,8 @@ impl Codegen {
         self.declare_rt("knot_json_encode_with", &[p, p, p], &[p]);
         self.declare_rt("knot_json_decode", &[p], &[p]);
         self.declare_rt("knot_json_decode_typed", &[p, p, p], &[p]);
+        self.declare_rt("knot_json_decode_maybe", &[p], &[p]);
+        self.declare_rt("knot_json_decode_typed_maybe", &[p, p, p], &[p]);
         self.declare_rt("knot_register_to_json", &[p], &[]);
 
         // Bytes value constructor and standard library
@@ -3984,6 +3986,15 @@ impl Codegen {
             }
 
             ast::ExprKind::Var(name) => {
+                // A local or captured binding shadows any builtin of the same
+                // name (e.g. a lambda param `\now -> now`, or `retry <- ...`).
+                // The applied-call path already consults `env` first; the bare
+                // builtin special-cases below must do the same or they would
+                // hijack the binding (and, for `retry`, emit STM control flow
+                // instead of reading the variable).
+                if let Some(&val) = env.bindings.get(name.as_str()) {
+                    return val;
+                }
                 if name == "now" {
                     return self.call_rt(builder, "knot_now_io", &[]);
                 }
@@ -5776,12 +5787,13 @@ impl Codegen {
                                             .get(&plan.tables[0].source_name)
                                             .cloned()
                                             .unwrap_or_default();
-                                        // MIN/MAX over an Int-typed CASE
-                                        // loses the KNOT_INT collation —
-                                        // keep those in memory (see
-                                        // int_case_projection_pushable).
+                                        // MIN/MAX over an Int-typed CASE loses
+                                        // the KNOT_INT collation, and Float
+                                        // MIN/MAX diverges from total_cmp —
+                                        // keep both in memory (see
+                                        // minmax_pushdown_type_ok).
                                         let case_ok = !matches!(name.as_str(), "minOn" | "maxOn")
-                                            || int_case_projection_pushable(&agg_bind, agg_body, &schema);
+                                            || minmax_pushdown_type_ok(&agg_bind, agg_body, &schema);
                                         if case_ok {
                                             extract_sql_field_access(&agg_bind, agg_body, alias, &schema)
                                                 .map(|col_sql| {
@@ -6019,13 +6031,17 @@ impl Codegen {
                                         if !self.views.contains_key(source_name) {
                                             if let Some(schema) = self.source_schemas.get(source_name).cloned() {
                                                 if !schema.starts_with('#') && !schema.contains('[') {
+                                                    // Same ORDER BY guards as the other sortBy paths:
+                                                    // no Int CASE (collation loss), no Float (total_cmp
+                                                    // divergence) — fall back to in-memory otherwise.
+                                                    if sortby_projection_pushable(&sort_bind, sort_body, &schema) {
                                                     if let Some(col_sql) = extract_sql_field_access(&sort_bind, sort_body, "", &schema) {
                                                         let table = quote_sql_ident(&format!("_knot_{}", source_name));
                                                         let cols = parse_schema_columns(&schema).iter()
                                                             .map(|(n, _)| quote_sql_ident(n))
                                                             .collect::<Vec<_>>()
                                                             .join(", ");
-                                                        let sql = format!("SELECT {} FROM {} ORDER BY {} LIMIT ?", cols, table, col_sql);
+                                                        let sql = format!("SELECT {} FROM {} ORDER BY {} LIMIT MAX(CAST(? AS INTEGER), 0)", cols, table, col_sql);
                                                         let source_name = source_name.clone();
                                                         self.emit_stm_track_read(builder, &source_name);
                                                         let n_val = self.compile_expr(builder, &args[0], env, db);
@@ -6037,6 +6053,7 @@ impl Codegen {
                                                             "knot_source_query",
                                                             &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
                                                         );
+                                                    }
                                                     }
                                                 }
                                             }
@@ -6058,6 +6075,12 @@ impl Codegen {
                                                 let rewritten_sort =
                                                     rewrite_body_through_projection(&plan, &sort_bind, sort_body);
                                                 if let Some(col_sql) = rewritten_sort.as_ref().and_then(|rb| {
+                                                    // Same ORDER BY guards as the other sortBy paths:
+                                                    // no Int CASE collation loss, no Float total_cmp
+                                                    // divergence.
+                                                    if !sortby_projection_pushable(&sort_bind, rb, &schema) {
+                                                        return None;
+                                                    }
                                                     extract_sql_field_access(&sort_bind, rb, &alias, &schema)
                                                 }) {
                                                     plan.order_by.push(col_sql);
@@ -6105,7 +6128,7 @@ impl Codegen {
                                     .map(|(n, _)| quote_sql_ident(n))
                                     .collect::<Vec<_>>()
                                     .join(", ");
-                                let sql = format!("SELECT {} FROM {} LIMIT ?", cols, table);
+                                let sql = format!("SELECT {} FROM {} LIMIT MAX(CAST(? AS INTEGER), 0)", cols, table);
                                 let n_val = self.compile_expr(builder, &args[0], env, db);
                                 let params_rel = self.call_rt(builder, "knot_relation_singleton", &[n_val]);
                                 let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
@@ -6135,7 +6158,7 @@ impl Codegen {
                                         .map(|(n, _)| quote_sql_ident(n))
                                         .collect::<Vec<_>>()
                                         .join(", ");
-                                    let sql = format!("SELECT {} FROM {} WHERE {} LIMIT ?", cols, table, frag.sql);
+                                    let sql = format!("SELECT {} FROM {} WHERE {} LIMIT MAX(CAST(? AS INTEGER), 0)", cols, table, frag.sql);
                                     self.emit_stm_track_read(builder, source_name);
                                     let n_val = self.compile_expr(builder, &args[0], env, db);
                                     let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
@@ -6292,14 +6315,16 @@ impl Codegen {
                         return builder.inst_results(call)[0];
                     }
                 }
-                // Maybe-aware decode: when the inferred target type has Maybe
-                // positions, pass the wire schema so `null`/absent decodes to
-                // Nothing and present values are Just-wrapped.
+                // `parseJson : Text -> Maybe a` — the decoders return `Nothing`
+                // on malformed input and `Just decoded` on success. When the
+                // inner type carries Maybe positions, pass its wire schema so
+                // `null`/absent normalizes to Nothing and present values are
+                // Just-wrapped inside the decoded value.
                 if let Some(schema) = target.as_ref().and_then(|t| t.wire_schema.as_deref()) {
                     let (sptr, slen) = self.string_ptr(builder, schema);
                     return self.call_rt(
                         builder,
-                        "knot_json_decode_typed",
+                        "knot_json_decode_typed_maybe",
                         &[compiled_args[0], sptr, slen],
                     );
                 }
@@ -6313,7 +6338,7 @@ impl Codegen {
                         return builder.inst_results(call)[0];
                     }
                 }
-                self.call_rt(builder, "knot_json_decode", &[compiled_args[0]])
+                self.call_rt(builder, "knot_json_decode_maybe", &[compiled_args[0]])
             }
 
             // Direct call to a known user function
@@ -10110,10 +10135,10 @@ impl Codegen {
             }
             "sortBy" => {
                 // sortBy (\m -> m.field) *source → SELECT * FROM source ORDER BY field
-                // ORDER BY CASE loses the KNOT_INT collation for Int-typed
-                // projections — keep those in memory (see
-                // int_case_projection_pushable).
-                if !int_case_projection_pushable(&bind_var, body, schema) {
+                // ORDER BY CASE loses KNOT_INT collation for Int projections and
+                // SQL float ordering diverges from total_cmp — keep both in
+                // memory (see sortby_projection_pushable).
+                if !sortby_projection_pushable(&bind_var, body, schema) {
                     return None;
                 }
                 let col_sql = extract_sql_field_access(&bind_var, body, "", schema)?;
@@ -10237,10 +10262,10 @@ impl Codegen {
                     if is_count || aggregate.is_some() {
                         return None;
                     }
-                    // ORDER BY CASE loses the KNOT_INT collation for
-                    // Int-typed projections — keep those in memory (see
-                    // int_case_projection_pushable).
-                    if !int_case_projection_pushable(bind_var, body, &schema) {
+                    // ORDER BY CASE loses KNOT_INT collation for Int projections
+                    // and SQL float ordering diverges from total_cmp — keep
+                    // both in memory (see sortby_projection_pushable).
+                    if !sortby_projection_pushable(bind_var, body, &schema) {
                         return None;
                     }
                     bind_aliases.insert(bind_var.clone(), alias.clone());
@@ -10731,14 +10756,19 @@ impl Codegen {
                 }
                 ast::BinOp::Add | ast::BinOp::Sub | ast::BinOp::Mul | ast::BinOp::Div
                 | ast::BinOp::Mod | ast::BinOp::Concat => {
-                    // Arithmetic/concat in WHERE: try to compile both sides as SQL atoms
+                    // Arithmetic/concat in WHERE: try to compile both sides as SQL atoms.
+                    // `/` and `%` only push down with a provably-nonzero literal
+                    // divisor (matching every other arithmetic site): SQLite yields
+                    // NULL on division by zero where the Knot runtime panics, and
+                    // SQLite's `%`/`/` on floats differ from runtime semantics.
                     let sql_op = match op {
                         ast::BinOp::Add => "+",
                         ast::BinOp::Sub => "-",
                         ast::BinOp::Mul => "*",
-                        ast::BinOp::Div => "/",
-                        ast::BinOp::Mod => "%",
+                        ast::BinOp::Div if divisor_is_nonzero_literal(rhs) => "/",
+                        ast::BinOp::Mod if divisor_is_nonzero_int_literal(rhs) => "%",
                         ast::BinOp::Concat => "||",
+                        ast::BinOp::Div | ast::BinOp::Mod => return None,
                         _ => unreachable!(),
                     };
                     let l = Self::try_compile_sql_atom(bind_aliases, lhs, env, let_binds)?;
@@ -12369,10 +12399,29 @@ pub(crate) fn minmax_pushdown_type_ok(
     body: &ast::Expr,
     schema: &str,
 ) -> bool {
+    // Only Int projections push down. Text would be mis-parsed back as Int
+    // (see above), and Float MIN/MAX diverges from Knot's `total_cmp`
+    // ordering (SQLite stores NaN as NULL and conflates -0.0/+0.0, while
+    // total_cmp orders NaN last and -0.0 < +0.0) — consistent with the float
+    // comparison policy that keeps float ordering in memory.
     matches!(
         infer_sql_expr_type(bind_var, body, schema).as_deref(),
-        Some("int") | Some("float")
+        Some("int")
     ) && int_case_projection_pushable(bind_var, body, schema)
+}
+
+/// Whether a `sortBy` projection is safe to push to SQL `ORDER BY`: not an
+/// Int-typed CASE (collation loss, see `int_case_projection_pushable`) and not
+/// Float (SQLite orders floats differently from Knot's `total_cmp` — NaN sorts
+/// as NULL and -0.0/+0.0 are conflated). Float sort keys fall back to the
+/// faithful in-memory sort, mirroring the float comparison policy.
+pub(crate) fn sortby_projection_pushable(
+    bind_var: &str,
+    body: &ast::Expr,
+    schema: &str,
+) -> bool {
+    int_case_projection_pushable(bind_var, body, schema)
+        && infer_sql_expr_type(bind_var, body, schema).as_deref() != Some("float")
 }
 
 /// True when an expression tree contains an if/then/else node (which
@@ -12765,7 +12814,14 @@ impl SqlQueryPlan {
         }
 
         if self.limit.is_some() || self.offset.is_some() {
-            sql.push_str(&format!(" LIMIT {}", if self.limit.is_some() { "?" } else { "-1" }));
+            // Clamp a negative limit to 0 (empty) so the SQL `take` matches the
+            // in-memory `knot_relation_take`, which clamps negatives to 0.
+            // SQLite otherwise reads a negative LIMIT as "no limit" (all rows).
+            // The bound param is TEXT (Ints store as TEXT), so CAST first.
+            sql.push_str(&format!(
+                " LIMIT {}",
+                if self.limit.is_some() { "MAX(CAST(? AS INTEGER), 0)" } else { "-1" }
+            ));
             if self.offset.is_some() {
                 sql.push_str(" OFFSET ?");
             }
@@ -15206,7 +15262,7 @@ fn trait_method_fallback(method_name: &str) -> Option<&'static str> {
         "negate" => Some("knot_value_negate"),
         "append" => Some("knot_value_concat"),
         "toJson" => Some("knot_json_encode"),
-        "parseJson" => Some("knot_json_decode"),
+        "parseJson" => Some("knot_json_decode_maybe"),
         _ => None,
     }
 }
@@ -15301,7 +15357,15 @@ fn type_name_to_tag(name: &str) -> Option<i64> {
         "Bool" => Some(3),
         "Unit" => Some(4),
         "Relation" => Some(6),
+        "Bytes" => Some(10),
         "IO" => Some(11),
+        // `Uuid` has no distinct runtime tag — it is stored as `Value::Text`
+        // (tag 2). Mapping it lets an `impl T Uuid` participate in dispatch
+        // instead of being silently dropped (which would panic at runtime via
+        // `knot_trait_no_impl`). A program with both `impl T Text` and
+        // `impl T Uuid` is inherently ambiguous at the tag level, but the type
+        // checker keeps the two from being reached by the wrong value.
+        "Uuid" => Some(2),
         _ => None,
     }
 }

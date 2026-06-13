@@ -1967,12 +1967,17 @@ fn render_if_block(p: &mut Printer, cond: &Expr, then_branch: &Expr, else_branch
     }
     p.write("if ");
     render_expr(p, cond, Prec::Lowest);
-    p.newline();
-    p.write("then ");
-    render_expr(p, then_branch, Prec::Lowest);
-    p.newline();
-    p.write("else ");
-    render_expr(p, else_branch, Prec::Lowest);
+    // Indent `then`/`else` relative to the `if` (mirrors how `case` indents
+    // its arms): the newline must precede the writes inside `with_indent` so
+    // the branch keywords are padded with the deeper indent.
+    p.with_indent(|p| {
+        p.newline();
+        p.write("then ");
+        render_expr(p, then_branch, Prec::Lowest);
+        p.newline();
+        p.write("else ");
+        render_expr(p, else_branch, Prec::Lowest);
+    });
     if need_parens {
         p.write(")");
     }

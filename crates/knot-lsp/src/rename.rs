@@ -636,6 +636,19 @@ fn emit_edits_for_open_doc(
         if module_defines_name(&doc.module, old_name) {
             return;
         }
+        // If this file also imports `old_name` from a module other than the
+        // owner, its body references are ambiguous; leave them untouched
+        // rather than corrupt the other module's references.
+        if let Some(file_path) = uri_to_path(uri) {
+            if imports_name_from_other_module(
+                &doc.module,
+                &file_path,
+                &owner.canonical_path,
+                old_name,
+            ) {
+                return;
+            }
+        }
         // Walk the AST to find every Var/Constructor/source-
         // ref/derived-ref site that names the symbol, and rewrite each.
         let mut sites: Vec<Span> = Vec::new();
@@ -1079,7 +1092,16 @@ fn scan_disk_files(
         if is_owner {
             apply_owner_disk_edits(&file_uri, &module, &file_source, owner, old_name, new_name, changes);
         } else if file_imports_owner(&module, &path, &owner.canonical_path, old_name) {
-            apply_importer_disk_edits(&file_uri, &module, &file_source, old_name, new_name, changes);
+            apply_importer_disk_edits(
+                &file_uri,
+                &module,
+                &file_source,
+                &path,
+                &owner.canonical_path,
+                old_name,
+                new_name,
+                changes,
+            );
         }
     }
 }
@@ -1120,6 +1142,8 @@ fn apply_importer_disk_edits(
     uri: &Uri,
     module: &Module,
     source: &str,
+    file_path: &Path,
+    owner_path: &Path,
     old_name: &str,
     new_name: &str,
     changes: &mut HashMap<Uri, Vec<TextEdit>>,
@@ -1128,6 +1152,12 @@ fn apply_importer_disk_edits(
     // declares its own top-level `old_name` resolves references locally,
     // so the imported symbol's rename must not rewrite anything here.
     if module_defines_name(module, old_name) {
+        return;
+    }
+    // If the file also imports `old_name` from a different module, its body
+    // references are ambiguous — leave them untouched rather than corrupt the
+    // other module's references.
+    if imports_name_from_other_module(module, file_path, owner_path, old_name) {
         return;
     }
     let mut sites: Vec<Span> = Vec::new();
@@ -1161,6 +1191,42 @@ fn apply_importer_disk_edits(
             new_text: new_name.to_string(),
         });
     }
+}
+
+/// True if `module` brings `name` into scope via an import whose target is a
+/// module *other than* the owner. When that happens, in-body references to
+/// `name` are ambiguous — they may resolve to the other module's export — so a
+/// rename of the owner's symbol must not rewrite them; doing so would silently
+/// break the reference to the other module. Name-only resolution can't tell
+/// the two apart, so we conservatively skip rewriting body references in such
+/// files (an unresolvable import that surfaces the name is also treated as a
+/// potential other source).
+pub(crate) fn imports_name_from_other_module(
+    module: &Module,
+    file_path: &Path,
+    owner_path: &Path,
+    name: &str,
+) -> bool {
+    let base_dir = file_path.parent().unwrap_or(Path::new("."));
+    for imp in &module.imports {
+        // Does this import surface `name`? Wildcards surface everything;
+        // selective imports must list it explicitly.
+        let surfaces = match &imp.items {
+            Some(items) => items.iter().any(|i| i.name == name),
+            None => true,
+        };
+        if !surfaces {
+            continue;
+        }
+        let rel = PathBuf::from(&imp.path).with_extension("knot");
+        let abs = base_dir.join(&rel);
+        match abs.canonicalize() {
+            Ok(p) if p == owner_path => {} // the owner import itself — expected
+            Ok(_) => return true,          // a different module also exports `name`
+            Err(_) => return true,         // can't prove it's the owner — be safe
+        }
+    }
+    false
 }
 
 /// Quick check: does `module` import `owner_path` and does that import surface

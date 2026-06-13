@@ -256,6 +256,13 @@ enum Ty {
     /// look through the alias; display preserves the name so type hints
     /// reference the alias instead of the expanded form.
     Alias(String, Box<Ty>),
+    /// Associated-type projection `AssocName arg` (e.g. `Elem c`). Carries the
+    /// projection through inference so it can be reduced once `arg` resolves to
+    /// a concrete type matching an impl's `type AssocName <head> = <body>`
+    /// definition. While `arg` is still a variable the projection is rigid: it
+    /// only unifies with an identical projection (or a variable), which keeps
+    /// the result from being silently equated with an arbitrary type.
+    Assoc(String, Box<Ty>),
     /// Error sentinel — suppresses cascading errors.
     Error,
 }
@@ -405,6 +412,13 @@ struct Infer {
 
     /// Associated type names (from trait declarations).
     assoc_type_names: HashSet<String>,
+
+    /// Associated-type definitions from impls, keyed by associated-type name.
+    /// Each entry is `(head, body, pattern_vars)` parsed from
+    /// `type AssocName <head> = <body>` (e.g. `type Elem [a] = a` stores head
+    /// `[a]`, body `a`, and the pattern var for `a`). Used to reduce
+    /// `Ty::Assoc(name, arg)` by matching `arg` against `head`.
+    assoc_impls: HashMap<String, Vec<(Ty, Ty, Vec<TyVar>)>>,
 
     /// Type aliases: name → resolved Ty.
     aliases: HashMap<String, Ty>,
@@ -558,6 +572,7 @@ impl Infer {
             derived_types: HashMap::new(),
             view_names: HashSet::new(),
             assoc_type_names: HashSet::new(),
+            assoc_impls: HashMap::new(),
             aliases: HashMap::new(),
             annotation_vars: HashMap::new(),
             errors: Vec::new(),
@@ -947,7 +962,95 @@ impl Infer {
             Ty::Alias(name, inner) => {
                 Ty::Alias(name.clone(), Box::new(self.apply(inner)))
             }
+            Ty::Assoc(name, inner) => {
+                let inner = self.apply(inner);
+                // Reduce once the argument is concrete enough to match an
+                // impl's associated-type head; otherwise stay a rigid Assoc.
+                match self.reduce_assoc(name, &inner) {
+                    Some(reduced) => reduced,
+                    None => Ty::Assoc(name.clone(), Box::new(inner)),
+                }
+            }
             _ => ty.clone(),
+        }
+    }
+
+    /// Try to reduce an associated-type projection `AssocName arg` to a
+    /// concrete type by matching `arg` against the head of an impl definition
+    /// `type AssocName <head> = <body>` and substituting into `<body>`. Returns
+    /// `None` when `arg` doesn't (yet) match any head — e.g. it's still a
+    /// variable — so the projection stays unresolved and rigid.
+    fn reduce_assoc(&self, name: &str, arg: &Ty) -> Option<Ty> {
+        let defs = self.assoc_impls.get(name)?;
+        for (head, body, pattern_vars) in defs {
+            let mut binding: HashMap<TyVar, Ty> = HashMap::new();
+            if self.match_pattern(head, arg, pattern_vars, &mut binding) {
+                // Apply the matched substitution to the body, then resolve
+                // again in case the body is itself a projection.
+                let substituted = self.subst_ty(body, &binding);
+                return Some(self.apply(&substituted));
+            }
+        }
+        None
+    }
+
+    /// One-directional structural match of an impl-head pattern against a
+    /// concrete type, binding the head's `pattern_vars`. Pure: never touches
+    /// the global substitution. Returns false on any mismatch (including when
+    /// `actual` is an unresolved variable in a non-pattern position).
+    fn match_pattern(
+        &self,
+        pat: &Ty,
+        actual: &Ty,
+        pattern_vars: &[TyVar],
+        binding: &mut HashMap<TyVar, Ty>,
+    ) -> bool {
+        let actual = self.apply(actual);
+        // A pattern variable binds to whatever the actual type is (consistently
+        // across multiple occurrences).
+        if let Ty::Var(v) = pat {
+            if pattern_vars.contains(v) {
+                return match binding.get(v) {
+                    Some(bound) => self.apply(bound) == actual,
+                    None => {
+                        binding.insert(*v, actual);
+                        true
+                    }
+                };
+            }
+        }
+        match (pat, &actual) {
+            (Ty::Var(a), Ty::Var(b)) => a == b,
+            (Ty::Int, Ty::Int)
+            | (Ty::Float, Ty::Float)
+            | (Ty::Text, Ty::Text)
+            | (Ty::Bool, Ty::Bool)
+            | (Ty::Bytes, Ty::Bytes)
+            | (Ty::Uuid, Ty::Uuid) => true,
+            (Ty::Relation(p), Ty::Relation(a)) => {
+                self.match_pattern(p, a, pattern_vars, binding)
+            }
+            (Ty::Fun(p1, p2), Ty::Fun(a1, a2)) => {
+                self.match_pattern(p1, a1, pattern_vars, binding)
+                    && self.match_pattern(p2, a2, pattern_vars, binding)
+            }
+            (Ty::Con(pn, pa), Ty::Con(an, aa)) => {
+                pn == an
+                    && pa.len() == aa.len()
+                    && pa
+                        .iter()
+                        .zip(aa.iter())
+                        .all(|(p, a)| self.match_pattern(p, a, pattern_vars, binding))
+            }
+            (Ty::TyCon(pn), Ty::TyCon(an)) => pn == an,
+            (Ty::App(pf, pa), Ty::App(af, aa)) => {
+                self.match_pattern(pf, af, pattern_vars, binding)
+                    && self.match_pattern(pa, aa, pattern_vars, binding)
+            }
+            (Ty::Assoc(pn, pa), Ty::Assoc(an, aa)) => {
+                pn == an && self.match_pattern(pa, aa, pattern_vars, binding)
+            }
+            _ => false,
         }
     }
 
@@ -1105,6 +1208,7 @@ impl Infer {
                 }
             }
             Ty::Alias(_, inner) => self.occurs_in(var, inner),
+            Ty::Assoc(_, inner) => self.occurs_in(var, inner),
             _ => false,
         }
     }
@@ -1575,6 +1679,17 @@ impl Infer {
                     }
                     None => {} // cycle already reported
                 }
+            }
+            // Two irreducible associated-type projections (both `apply`'d
+            // above, so neither reduced): they're equal iff they name the same
+            // associated type applied to unifiable arguments. A projection that
+            // failed to reduce is otherwise rigid and will not unify with a
+            // concrete type, which is what keeps `Elem c` from being silently
+            // equated with an arbitrary type.
+            (Ty::Assoc(n1, a1), Ty::Assoc(n2, a2)) if n1 == n2 => {
+                let a1 = (**a1).clone();
+                let a2 = (**a2).clone();
+                self.unify_dir(&a1, &a2, span, t1_provided);
             }
             _ => {
                 let d1 = self.display_ty(&t1);
@@ -2280,6 +2395,16 @@ impl Infer {
                 name.clone(),
                 Box::new(self.subst_ty(inner, mapping)),
             ),
+            // Substitute through the projection argument so instantiation
+            // freshens it; then try to reduce in case the argument became
+            // concrete (this is what links `Elem c` to the call-site `c`).
+            Ty::Assoc(name, inner) => {
+                let inner = self.subst_ty(inner, mapping);
+                match self.reduce_assoc(name, &inner) {
+                    Some(reduced) => reduced,
+                    None => Ty::Assoc(name.clone(), Box::new(inner)),
+                }
+            }
             _ => ty.clone(),
         }
     }
@@ -2326,6 +2451,10 @@ impl Infer {
             ),
             // Mirror `subst_ty`: unit vars can occur inside alias bodies.
             Ty::Alias(name, inner) => Ty::Alias(
+                name.clone(),
+                Box::new(self.subst_unit_vars_in_ty(inner, mapping)),
+            ),
+            Ty::Assoc(name, inner) => Ty::Assoc(
                 name.clone(),
                 Box::new(self.subst_unit_vars_in_ty(inner, mapping)),
             ),
@@ -2419,6 +2548,7 @@ impl Infer {
             }
             Ty::Forall(_, inner) => self.collect_free_unit_vars(inner, out),
             Ty::Alias(_, inner) => self.collect_free_unit_vars(inner, out),
+            Ty::Assoc(_, inner) => self.collect_free_unit_vars(inner, out),
             _ => {}
         }
     }
@@ -2681,6 +2811,7 @@ impl Infer {
                 out.extend(inner_set);
             }
             Ty::Alias(_, inner) => self.collect_free_vars(inner, out),
+            Ty::Assoc(_, inner) => self.collect_free_vars(inner, out),
             _ => {}
         }
     }
@@ -2852,10 +2983,15 @@ impl Infer {
                 Box::new(self.ast_type_to_ty(result)),
             ),
             ast::TypeKind::App { func, arg } => {
-                // Check for associated type applications first.
+                // Associated-type application `AssocName arg` (e.g. `Elem c`).
+                // Preserve it as a projection so it can be reduced once `arg`
+                // resolves to a concrete type matching an impl definition,
+                // rather than erasing it to an unconstrained fresh variable
+                // (which would let `[Elem c]` unify with any element type).
                 if let ast::TypeKind::Named(name) = &func.node {
                     if self.assoc_type_names.contains(name) {
-                        return self.fresh();
+                        let arg_ty = self.ast_type_to_ty(arg);
+                        return Ty::Assoc(name.clone(), Box::new(arg_ty));
                     }
                 }
                 let arg_ty = self.ast_type_to_ty(arg);
@@ -3085,6 +3221,9 @@ impl Infer {
             Ty::Bool => "Bool".into(),
             Ty::Bytes => "Bytes".into(),
             Ty::Uuid => "Uuid".into(),
+            Ty::Assoc(name, inner) => {
+                format!("{} {}", name, self.display_ty_inner(inner, true))
+            }
             Ty::Fun(p, r) => {
                 let s = format!(
                     "{} -> {}",
@@ -5824,6 +5963,40 @@ impl Infer {
                 } => {
                     self.register_trait_methods(trait_name, params, items);
                 }
+                ast::DeclKind::Impl { items, .. } => {
+                    // Record each impl's associated-type definition
+                    // (`type Elem [a] = a`) so `Ty::Assoc` projections can be
+                    // reduced when their argument matches the head pattern.
+                    for item in items {
+                        if let ast::ImplItem::AssociatedType { name, args, ty } = item {
+                            self.annotation_vars.clear();
+                            self.annotation_unit_vars.clear();
+                            self.in_type_annotation = true;
+                            // Parse head pattern and body in one annotation
+                            // scope so their shared pattern vars (e.g. `a`)
+                            // map to the same TyVar.
+                            let head = match args.split_first() {
+                                Some((first, rest)) => {
+                                    let mut acc = self.ast_type_to_ty(first);
+                                    for a in rest {
+                                        let at = self.ast_type_to_ty(a);
+                                        acc = Ty::App(Box::new(acc), Box::new(at));
+                                    }
+                                    acc
+                                }
+                                None => self.fresh(),
+                            };
+                            let body = self.ast_type_to_ty(ty);
+                            self.in_type_annotation = false;
+                            let pattern_vars: Vec<TyVar> =
+                                self.annotation_vars.values().copied().collect();
+                            self.assoc_impls
+                                .entry(name.clone())
+                                .or_default()
+                                .push((head, body, pattern_vars));
+                        }
+                    }
+                }
                 ast::DeclKind::Route { name, entries } => {
                     self.route_types.insert(name.clone());
                     self.route_entries_by_api
@@ -5933,10 +6106,19 @@ impl Infer {
             "toJson",
             Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Text))),
         );
+        // `parseJson : Text -> Maybe a` — a failure channel for malformed
+        // input. The runtime decoder returns `Nothing` on parse error and
+        // `Just decoded` on success, rather than aborting the program.
         let a = self.fresh_var();
         self.bind_top(
             "parseJson",
-            Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Var(a)))),
+            Scheme::poly(
+                vec![a],
+                Ty::Fun(
+                    Box::new(Ty::Text),
+                    Box::new(Ty::Con("Maybe".into(), vec![Ty::Var(a)])),
+                ),
+            ),
         );
     }
 
@@ -7865,6 +8047,7 @@ fn collect_vars_ordered(ty: &Ty, out: &mut Vec<TyVar>) {
             }
         }
         Ty::Alias(_, inner) => collect_vars_ordered(inner, out),
+        Ty::Assoc(_, inner) => collect_vars_ordered(inner, out),
         _ => {}
     }
 }
@@ -8059,6 +8242,9 @@ fn display_ty_clean_inner(
         Ty::Bool => "Bool".into(),
         Ty::Bytes => "Bytes".into(),
         Ty::Uuid => "Uuid".into(),
+        Ty::Assoc(name, inner) => {
+            format!("{} {}", name, display_ty_clean_inner(inner, names, unit_names, true))
+        }
         Ty::Fun(p, r) => {
             let s = format!(
                 "{} -> {}",
@@ -8502,11 +8688,19 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
     let mut from_json_targets = FromJsonTargets::new();
     for (span, var) in &infer.from_json_calls {
         let resolved = infer.apply(&Ty::Var(*var));
-        let type_name = ty_to_type_name(&resolved);
+        // `parseJson : Text -> Maybe a` — the JSON decodes to the inner type
+        // `a`, which is then `Just`-wrapped (or `Nothing` on failure). The
+        // type name and wire descriptor describe that inner type, not the
+        // surrounding `Maybe`.
+        let inner = match resolved.peel_alias() {
+            Ty::Con(n, args) if n == "Maybe" && args.len() == 1 => args[0].clone(),
+            other => other.clone(),
+        };
+        let type_name = ty_to_type_name(&inner);
         // Only carry a schema when it has Maybe positions to normalize —
         // the generic decoder is correct for everything else.
         let wire_schema =
-            Some(ty_to_wire_descriptor(&resolved)).filter(|d| d.contains('?'));
+            Some(ty_to_wire_descriptor(&inner)).filter(|d| d.contains('?'));
         if type_name.is_some() || wire_schema.is_some() {
             from_json_targets.insert(*span, FromJsonTarget { type_name, wire_schema });
         }

@@ -1558,12 +1558,19 @@ fn extract_effects(ty: &ast::Type) -> Option<EffectSet> {
             Some(EffectSet::from_ast_effects(effects))
         }
         ast::TypeKind::IO { effects, rest, .. } => {
-            // `IO _ a` opts out of effect checking. Any `_` in a union row
-            // makes the row open to anything, so treat it the same way.
-            if rest.iter().any(|n| n == "_") {
-                None
-            } else {
+            // An open effect row means the declared effect set is NOT a closed
+            // upper bound: the row tail (`_` or any named row variable, alone
+            // or in a `\/` union) can absorb additional effects, so the
+            // subset check against the concrete prefix is meaningless and
+            // would spuriously reject `g : IO {| e} {}` whose body does IO,
+            // or `f : IO {console | e} a` whose body/callbacks add effects
+            // beyond `console`. Only a fully closed row (`rest` empty) gives
+            // a comparable declared set. Mirrors `type_has_effect_row_var`,
+            // which classifies any non-`_` `rest` element as a row variable.
+            if rest.is_empty() {
                 Some(EffectSet::from_ast_effects(effects))
+            } else {
+                None
             }
         }
         ast::TypeKind::Function { result, .. } => {
@@ -2260,6 +2267,34 @@ mod tests {
         assert!(
             !effects["g"].console,
             "non-row-poly callee should absorb lambda effects, not propagate"
+        );
+    }
+
+    /// Regression: an open effect row (`IO {| e} a` or `IO {console | e} a`)
+    /// must not be treated as a closed declared set. The row variable can
+    /// absorb extra effects, so the subset check would spuriously reject a
+    /// body that performs IO beyond the concrete prefix. Only `_` was
+    /// previously recognized as opting out; a named row variable was not.
+    #[test]
+    fn open_row_var_annotation_absorbs_body_effects() {
+        let unit_ty = || spanned(TypeKind::Record { fields: vec![], rest: None });
+        let g_body = spanned(ExprKind::App {
+            func: Box::new(spanned(ExprKind::Var("println".into()))),
+            arg: Box::new(spanned(ExprKind::Lit(Literal::Text("hi".into())))),
+        });
+        let g_ty = TypeScheme {
+            constraints: vec![],
+            ty: spanned(TypeKind::IO {
+                effects: vec![],
+                rest: vec!["e".into()],
+                ty: Box::new(unit_ty()),
+            }),
+        };
+        let (diags, _effects) = check_module(vec![make_fun_with_type("g", g_body, g_ty)]);
+        assert!(
+            diags.is_empty(),
+            "open row-var signature should absorb body effects: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
 

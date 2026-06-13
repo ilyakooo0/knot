@@ -37,8 +37,25 @@ pub(crate) fn handle_code_action(
     }
     let mut actions = Vec::new();
 
-    let range_start = position_to_offset(&doc.source, params.range.start);
-    let range_end = position_to_offset(&doc.source, params.range.end);
+    // The LSP spec doesn't guarantee `range.start <= range.end`; a buggy
+    // client can send an inverted range. Normalize so the offsets are ordered
+    // (the extract-variable path slices `doc.source[range_start..range_end]`,
+    // which panics when `range_start > range_end`). `sel_range` is the
+    // correspondingly-normalized LSP range used in the generated TextEdits
+    // (an inverted range inside a TextEdit is itself invalid per the spec).
+    let (range_start, range_end, sel_range) = {
+        let a = position_to_offset(&doc.source, params.range.start);
+        let b = position_to_offset(&doc.source, params.range.end);
+        if a <= b {
+            (a, b, params.range)
+        } else {
+            (
+                b,
+                a,
+                lsp_types::Range { start: params.range.end, end: params.range.start },
+            )
+        }
+    };
 
     for decl in &doc.module.decls {
         // Only consider declarations overlapping the cursor range
@@ -595,7 +612,7 @@ pub(crate) fn handle_code_action(
                         insert_edit,
                         // Replace the selected expression with the variable name
                         TextEdit {
-                            range: params.range,
+                            range: sel_range,
                             new_text: let_name.clone(),
                         },
                     ],
@@ -657,7 +674,7 @@ pub(crate) fn handle_code_action(
                     },
                     // Replace the selected expression with a call
                     TextEdit {
-                        range: params.range,
+                        range: sel_range,
                         new_text: format!("{fn_name}{call_args}"),
                     },
                 ],
@@ -3900,6 +3917,25 @@ impl Describe Color where
             titles.iter().any(|t| t.starts_with("Extract to function")),
             "function extraction should remain available; got: {titles:?}"
         );
+    }
+
+    /// A client may send a code-action request whose range is inverted
+    /// (start position after end). The handler must normalize it instead of
+    /// panicking while slicing `doc.source[range_start..range_end]`.
+    #[test]
+    fn inverted_range_does_not_panic() {
+        use crate::test_support::TestWorkspace;
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "f = \\x -> x * 2 + 1\n");
+        let doc_source = ws.doc(&uri).source.clone();
+        let normal = selection_range(&doc_source, "x * 2");
+        // Invert: start and end swapped so start > end.
+        let inverted = Range {
+            start: normal.end,
+            end: normal.start,
+        };
+        // Must not panic (used to panic in the extract-variable slice).
+        let _ = handle_code_action(&ws.state, &plain_params(&uri, inverted));
     }
 
     #[test]

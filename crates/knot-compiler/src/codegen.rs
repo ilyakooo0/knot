@@ -918,7 +918,7 @@ impl Codegen {
         self.declare_rt("knot_source_query", &[p, p, p, p, p, p], &[p]);
         self.declare_rt("knot_source_query_float", &[p, p, p, p], &[p]);
         self.declare_rt("knot_source_query_sum", &[p, p, p, p], &[p]);
-        self.declare_rt("knot_source_query_value", &[p, p, p, p], &[p]);
+        self.declare_rt("knot_source_query_value", &[p, p, p, p, types::I64], &[p]);
         self.declare_rt("knot_source_fold", &[p, p, p, p, p, p, p], &[p]);
         self.declare_rt("knot_source_query_fold", &[p, p, p, p, p, p, p, p], &[p]);
         self.declare_rt("knot_source_write", &[p, p, p, p, p, p], &[]);
@@ -5749,6 +5749,13 @@ impl Codegen {
                                                 self.emit_stm_track_read(builder, source_name);
                                                 let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
                                                 let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                                                if rt_fn == "knot_source_query_value" {
+                                                    let is_text = builder.ins().iconst(
+                                                        types::I64,
+                                                        minmax_result_is_text(&agg_bind, agg_body, &schema) as i64,
+                                                    );
+                                                    return self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel, is_text]);
+                                                }
                                                 return self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]);
                                             }
                                         }
@@ -5808,14 +5815,19 @@ impl Codegen {
                                     _ => None,
                                 };
                                 let col_info = col_info.filter(|(_, col_ty)| {
-                                    // MIN/MAX over non-numeric projected columns
-                                    // must stay in memory: the runtime re-parses
-                                    // TEXT results as Int (see minmax_pushdown_type_ok).
+                                    // MIN/MAX over Float projected columns must
+                                    // stay in memory (total_cmp divergence, see
+                                    // minmax_pushdown_type_ok). Int and Text
+                                    // push down — the runtime's `is_text` flag
+                                    // keeps Text results from being re-parsed as
+                                    // Int.
                                     !matches!(name.as_str(), "minOn" | "maxOn")
                                         || col_ty == "int"
                                         || col_ty == "float"
+                                        || col_ty == "text"
                                 });
                                 if let Some((col_sql, col_ty)) = col_info {
+                                    let col_is_text = col_ty == "text";
                                     let arg_sql = if matches!(name.as_str(), "minOn" | "maxOn")
                                         && col_ty == "int"
                                     {
@@ -5835,6 +5847,10 @@ impl Codegen {
                                     self.emit_stm_track_reads_for_plan(builder, &plan);
                                     let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
                                     let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                                    if rt_fn == "knot_source_query_value" {
+                                        let is_text = builder.ins().iconst(types::I64, col_is_text as i64);
+                                        return self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel, is_text]);
+                                    }
                                     return self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]);
                                 }
                             }
@@ -8602,6 +8618,34 @@ impl Codegen {
                 builder.seal_block(then_block);
             }
             ast::PatKind::List(pats) => {
+                // A fixed-length list pattern is *refutable*: only relations
+                // of exactly `pats.len()` elements may continue. Mirror the
+                // Lit arm's fail/skip so wrong-length values are rejected
+                // instead of mis-binding out-of-bounds positions to Unit.
+                let len = self.call_rt(builder, "knot_relation_len", &[val]);
+                let expected = builder.ins().iconst(self.ptr_type, pats.len() as i64);
+                let is_match = builder.ins().icmp(IntCC::Equal, len, expected);
+
+                let then_block = builder.create_block();
+                let fail_block = builder.create_block();
+                builder.ins().brif(is_match, then_block, &[], fail_block, &[]);
+
+                builder.switch_to_block(fail_block);
+                builder.seal_block(fail_block);
+                if let Some(done) = done_block {
+                    if self.atomic_retry_block.is_some() {
+                        self.call_rt(builder, "knot_stm_skip", &[]);
+                    }
+                    let unit = self.call_rt(builder, "knot_value_unit", &[]);
+                    builder.ins().jump(done, &[unit.into()]);
+                } else {
+                    self.call_rt_void(builder, "knot_guard_failed", &[]);
+                    builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+                }
+
+                builder.switch_to_block(then_block);
+                builder.seal_block(then_block);
+
                 for (idx, elem_pat) in pats.iter().enumerate() {
                     let index = builder.ins().iconst(self.ptr_type, idx as i64);
                     let elem =
@@ -10149,7 +10193,15 @@ impl Codegen {
                 self.emit_stm_track_read(builder, source_name);
                 let params_rel = self.compile_sql_params(builder, &[], env, db);
                 let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                Some(self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]))
+                if rt_fn == "knot_source_query_value" {
+                    let is_text = builder.ins().iconst(
+                        types::I64,
+                        minmax_result_is_text(&bind_var, body, schema) as i64,
+                    );
+                    Some(self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel, is_text]))
+                } else {
+                    Some(self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]))
+                }
             }
             "countWhere" => {
                 let frag = self.try_compile_sql_expr(&bind_var, body, schema)?;
@@ -10245,7 +10297,7 @@ impl Codegen {
         let mut limit: Option<SqlParamSource> = None;
         let mut offset: Option<SqlParamSource> = None;
         let mut order_by_cols: Vec<String> = Vec::new();
-        let mut aggregate: Option<(&str, String)> = None; // (func, column_sql)
+        let mut aggregate: Option<(&str, String, bool)> = None; // (func, column_sql, result_is_text)
 
         for op in ops {
             match &op {
@@ -10308,7 +10360,7 @@ impl Codegen {
                     }
                     bind_aliases.insert(bind_var.clone(), alias.clone());
                     let col_sql = extract_sql_field_access(bind_var, body, &alias, &schema)?;
-                    aggregate = Some(("SUM", col_sql));
+                    aggregate = Some(("SUM", col_sql, false));
                 }
                 PipeOp::Avg { bind_var, body } => {
                     if is_count || aggregate.is_some() || select_override.is_some() {
@@ -10316,7 +10368,7 @@ impl Codegen {
                     }
                     bind_aliases.insert(bind_var.clone(), alias.clone());
                     let col_sql = extract_sql_field_access(bind_var, body, &alias, &schema)?;
-                    aggregate = Some(("AVG", col_sql));
+                    aggregate = Some(("AVG", col_sql, false));
                 }
                 PipeOp::Min { bind_var, body } => {
                     if is_count || aggregate.is_some() || select_override.is_some() {
@@ -10330,7 +10382,8 @@ impl Codegen {
                     bind_aliases.insert(bind_var.clone(), alias.clone());
                     let col_sql = extract_sql_field_access(bind_var, body, &alias, &schema)?;
                     let arg_sql = col_sql_for_minmax(&col_sql, bind_var, body, &schema);
-                    aggregate = Some(("MIN", arg_sql));
+                    let is_text = minmax_result_is_text(bind_var, body, &schema);
+                    aggregate = Some(("MIN", arg_sql, is_text));
                 }
                 PipeOp::Max { bind_var, body } => {
                     if is_count || aggregate.is_some() || select_override.is_some() {
@@ -10344,7 +10397,8 @@ impl Codegen {
                     bind_aliases.insert(bind_var.clone(), alias.clone());
                     let col_sql = extract_sql_field_access(bind_var, body, &alias, &schema)?;
                     let arg_sql = col_sql_for_minmax(&col_sql, bind_var, body, &schema);
-                    aggregate = Some(("MAX", arg_sql));
+                    let is_text = minmax_result_is_text(bind_var, body, &schema);
+                    aggregate = Some(("MAX", arg_sql, is_text));
                 }
                 PipeOp::CountWhere { bind_var, body } => {
                     if is_count || aggregate.is_some() || select_override.is_some() {
@@ -10362,7 +10416,7 @@ impl Codegen {
             }
         }
 
-        if let Some((func, col_sql)) = aggregate {
+        if let Some((func, col_sql, result_is_text)) = aggregate {
             // An aggregate after take/drop would have to apply AFTER the
             // LIMIT, but aggregate SQL has no LIMIT — fall back. (The order
             // check already rejects this; keep the guard as belt-and-braces.)
@@ -10387,11 +10441,20 @@ impl Codegen {
                 "MIN" | "MAX" => "knot_source_query_value",
                 _ => "knot_source_query_count",
             };
-            Some(self.call_rt(
-                builder,
-                rt_fn,
-                &[db, sql_ptr, sql_len, params_rel],
-            ))
+            if rt_fn == "knot_source_query_value" {
+                let is_text = builder.ins().iconst(types::I64, result_is_text as i64);
+                Some(self.call_rt(
+                    builder,
+                    rt_fn,
+                    &[db, sql_ptr, sql_len, params_rel, is_text],
+                ))
+            } else {
+                Some(self.call_rt(
+                    builder,
+                    rt_fn,
+                    &[db, sql_ptr, sql_len, params_rel],
+                ))
+            }
         } else if is_count {
             // COUNT(*) ignores LIMIT/OFFSET — a count after take/drop must
             // fall back. (Also rejected by the order check.)
@@ -12418,26 +12481,41 @@ fn aggregate_sql_func_runtime(name: &str) -> Option<(&'static str, &'static str)
     }
 }
 
-/// minOn/maxOn pushdown is only sound when the projected expression's Knot
-/// type is numeric (Int or Float): the `knot_source_query_value` runtime
-/// re-parses TEXT results as Int when possible (Knot Ints are stored as
-/// TEXT in SQLite), which corrupts genuine Text results — `maxOn` over
-/// `["007", "01"]` would come back as `Int 1`. Text (and any other or
-/// unknown type) must fall back to in-memory evaluation.
+/// minOn/maxOn pushdown is sound for Int and Text projections only.
+/// `knot_source_query_value` re-parses TEXT results as Int when its
+/// `is_text` flag is unset (Knot Ints are stored as TEXT in SQLite); for
+/// genuine Text columns the compiler sets `is_text` (see
+/// `minmax_result_is_text`) so the value is returned verbatim, and SQLite's
+/// default BINARY collation orders Text byte-wise, matching Knot's
+/// `str`-based Text ordering. A `tag` (all-nullary ADT) column must NOT push
+/// down: SQLite would compare its constructor names alphabetically and return
+/// a bare Text, whereas Knot's derived `Ord` compares by declaration order and
+/// expects a reconstructed `Constructor` — both diverge, so tags fall back to
+/// in-memory evaluation. Float ordering is handled by the per-path filters.
 pub(crate) fn minmax_pushdown_type_ok(
     bind_var: &str,
     body: &ast::Expr,
     schema: &str,
 ) -> bool {
-    // Only Int projections push down. Text would be mis-parsed back as Int
-    // (see above), and Float MIN/MAX diverges from Knot's `total_cmp`
-    // ordering (SQLite stores NaN as NULL and conflates -0.0/+0.0, while
-    // total_cmp orders NaN last and -0.0 < +0.0) — consistent with the float
-    // comparison policy that keeps float ordering in memory.
     matches!(
         infer_sql_expr_type(bind_var, body, schema).as_deref(),
-        Some("int")
+        Some("int") | Some("text")
     ) && int_case_projection_pushable(bind_var, body, schema)
+}
+
+/// Whether the result of a `minOn`/`maxOn` pushdown over `body` is a genuine
+/// Knot `Text` column (stored as SQLite TEXT). When true the compiler passes
+/// `is_text = 1` to `knot_source_query_value` so the runtime returns the value
+/// as `Text` instead of parsing numeric-looking strings back to `Int`/`Float`.
+pub(crate) fn minmax_result_is_text(
+    bind_var: &str,
+    body: &ast::Expr,
+    schema: &str,
+) -> bool {
+    matches!(
+        infer_sql_expr_type(bind_var, body, schema).as_deref(),
+        Some("text")
+    )
 }
 
 /// Whether a `sortBy` projection is safe to push to SQL `ORDER BY`: not an
@@ -13811,6 +13889,13 @@ fn try_sql_inline_condition(
                 if lt.as_deref() == Some("float") || rt.as_deref() == Some("float") {
                     return None;
                 }
+                // json-stored columns (ADT payloads / nested records) compare
+                // as raw JSON text in SQL, which can diverge from Knot's
+                // structural equality. The WHERE-pushdown path rejects these
+                // (sql_scalar_kind returns Err for "json"); mirror that here.
+                if lt.as_deref() == Some("json") || rt.as_deref() == Some("json") {
+                    return None;
+                }
                 if matches!(sql_op, "<" | ">" | "<=" | ">=")
                     && (lt.as_deref() == Some("tag") || rt.as_deref() == Some("tag"))
                 {
@@ -14105,6 +14190,13 @@ fn try_multi_table_inline_condition(
                 let lt = infer_multi_table_sql_expr_type(bind_to_schema, lhs);
                 let rt = infer_multi_table_sql_expr_type(bind_to_schema, rhs);
                 if lt.as_deref() == Some("float") || rt.as_deref() == Some("float") {
+                    return None;
+                }
+                // json-stored columns (ADT payloads / nested records) compare
+                // as raw JSON text in SQL, which can diverge from Knot's
+                // structural equality. The WHERE-pushdown path rejects these
+                // (sql_scalar_kind returns Err for "json"); mirror that here.
+                if lt.as_deref() == Some("json") || rt.as_deref() == Some("json") {
                     return None;
                 }
                 if matches!(sql_op, "<" | ">" | "<=" | ">=")
@@ -14441,6 +14533,24 @@ fn bind_do_pattern(
             skips.push(skip_block);
         }
         ast::PatKind::List(pats) => {
+            // Filter: a fixed-length list pattern is *refutable* — only
+            // relations of exactly `pats.len()` elements continue. Without
+            // this guard, shorter rows bind missing positions to `Unit`
+            // (knot_relation_get returns Unit out-of-bounds) and longer rows
+            // are silently kept, both of which are wrong (see the
+            // compile_case List arm, which does the same length check).
+            let len = cg.call_rt(builder, "knot_relation_len", &[val]);
+            let expected = builder.ins().iconst(cg.ptr_type, pats.len() as i64);
+            let is_match = builder.ins().icmp(IntCC::Equal, len, expected);
+
+            let then_block = builder.create_block();
+            let skip_block = builder.create_block();
+            builder.ins().brif(is_match, then_block, &[], skip_block, &[]);
+
+            builder.switch_to_block(then_block);
+            builder.seal_block(then_block);
+            skips.push(skip_block);
+
             for (idx, elem_pat) in pats.iter().enumerate() {
                 let index = builder.ins().iconst(cg.ptr_type, idx as i64);
                 let elem = cg.call_rt(builder, "knot_relation_get", &[val, index]);

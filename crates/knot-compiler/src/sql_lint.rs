@@ -1215,11 +1215,13 @@ fn extract_single_param_lambda(expr: &Expr) -> Option<(String, &Expr)> {
 }
 
 /// Mirror of codegen's minOn/maxOn pushdown approval: the lambda body must
-/// compile to a SQL column expression AND its Knot type must be numeric
-/// (Int/Float) — the MIN/MAX runtime re-parses TEXT results as Int, so
-/// Text projections fall back to in-memory evaluation. Int-typed
-/// if/then/else projections are also rejected (MIN/MAX over CASE loses the
-/// KNOT_INT collation) — that check lives in `minmax_pushdown_type_ok`.
+/// compile to a SQL column expression AND its Knot type must be Int or Text
+/// (Float MIN/MAX diverges from `total_cmp`, so it stays in memory). The
+/// MIN/MAX runtime is told whether the result column is textual (`is_text`)
+/// so Text results are returned verbatim instead of being re-parsed as Int.
+/// Int-typed if/then/else projections are also rejected (MIN/MAX over CASE
+/// loses the KNOT_INT collation) — that check lives in
+/// `minmax_pushdown_type_ok`.
 fn try_sql_minmax_expr(bind_var: &str, body: &Expr, schema: &str) -> Option<()> {
     try_sql_column_expr(bind_var, body, schema)?;
     if minmax_pushdown_type_ok(bind_var, body, schema) {

@@ -1096,8 +1096,14 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
 
         for change in params.content_changes {
             if let Some(range) = change.range {
-                let start = position_to_offset(&source, range.start);
-                let end = position_to_offset(&source, range.end);
+                let a = position_to_offset(&source, range.start);
+                let b = position_to_offset(&source, range.end);
+                // The LSP spec does not guarantee `range.start <= range.end`;
+                // a buggy client can send an inverted range. Normalize it so
+                // `replace_range`/`shift_byte_ranges_for_edit` don't panic on
+                // `start > end` (which would unwind the whole didChange handler
+                // under catch_unwind, silently desyncing the document forever).
+                let (start, end) = if a <= b { (a, b) } else { (b, a) };
                 let new_len = change.text.len();
                 if let Some(diag_ranges) = diag_byte_ranges.as_mut() {
                     shift_byte_ranges_for_edit(diag_ranges, start, end, new_len);
@@ -2201,6 +2207,73 @@ main = do
             final_pubs.is_empty(),
             "post-analysis publish should have no warnings; got: {:?}",
             final_pubs
+        );
+    }
+
+    /// A `didChange` whose range is inverted (start position after end) must
+    /// be normalized rather than panicking in `replace_range` — a panic there
+    /// unwinds the handler under `catch_unwind` and permanently desyncs the
+    /// server's copy of the document from the editor.
+    #[test]
+    fn did_change_with_inverted_range_does_not_panic() {
+        use lsp_server::Notification as LspNotification;
+        use lsp_types::notification::Notification as _;
+        use lsp_types::{
+            DidChangeTextDocumentParams, DidOpenTextDocumentParams,
+            TextDocumentContentChangeEvent, TextDocumentItem,
+            VersionedTextDocumentIdentifier,
+        };
+
+        let (server, _client) = Connection::memory();
+        let mut state = make_state();
+        let uri = Uri::from_str("file:///test/inverted.knot").unwrap();
+
+        let v1 = "hello";
+        let open = LspNotification::new(
+            lsp_types::notification::DidOpenTextDocument::METHOD.into(),
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "knot".into(),
+                    version: 1,
+                    text: v1.into(),
+                },
+            },
+        );
+        handle_notification(&mut state, &server, open);
+        apply_analysis_in(&mut state, &server, &uri, v1, Some(1));
+
+        // Client sends an INVERTED range (start at col 5, end at col 0).
+        let change = LspNotification::new(
+            lsp_types::notification::DidChangeTextDocument::METHOD.into(),
+            DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: 2,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: Some(lsp_types::Range {
+                        start: lsp_types::Position::new(0, 5),
+                        end: lsp_types::Position::new(0, 0),
+                    }),
+                    range_length: None,
+                    text: "goodbye".into(),
+                }],
+            },
+        );
+        // Must not panic.
+        handle_notification(&mut state, &server, change);
+
+        // The edit applied to the normalized [0,5] span: "hello" -> "goodbye".
+        let updated = state
+            .pending_sources
+            .get(&uri)
+            .map(|p| p.source.clone())
+            .or_else(|| state.documents.get(&uri).map(|d| d.source.clone()))
+            .unwrap_or_default();
+        assert_eq!(
+            updated, "goodbye",
+            "inverted-range edit must normalize and apply, got {updated:?}"
         );
     }
 

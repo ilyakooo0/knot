@@ -157,3 +157,45 @@ main = do
         "filtered minOn pushdown must yield an Int:\n{stdout}\n{stderr}"
     );
 }
+
+// Referential integrity invariant: under `*sub.f <= *sup.g`, renaming a
+// superset key that is still referenced by a sub row must be rejected.
+// (Current codegen rewrites the relation via full DELETE+INSERT, so the abort
+// comes from the DELETE-on-sup trigger; the BEFORE UPDATE OF <sup_col> trigger
+// added alongside it guards the same invariant on the in-place UPDATE path as
+// defense in depth. Either way the rename must not silently orphan the order.)
+#[test]
+fn renaming_referenced_superset_key_is_rejected() {
+    let (stdout, stderr, ok) = compile_and_run(
+        "fk_superset_key_rename",
+        r#"type Person = {name: Text, age: Int}
+*people : [Person]
+*orders : [{customer: Text, amount: Int}]
+
+*orders.customer <= *people.name
+
+main = do
+  replace *people = [{name: "Alice", age: 30}]
+  replace *orders = [{customer: "Alice", amount: 100}]
+  ppl <- *people
+  let renamed = do
+    p <- ppl
+    yield (if p.name == "Alice" then {p | name: "Alicia"} else p)
+  *people = renamed
+  println "rename succeeded"
+  yield {}
+"#,
+    );
+    assert!(
+        !ok,
+        "renaming a referenced superset key must abort, but it succeeded:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("rename succeeded"),
+        "program continued past the rejected key rename:\nstdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("subset constraint violated"),
+        "expected a subset-constraint abort, got:\nstderr: {stderr}"
+    );
+}

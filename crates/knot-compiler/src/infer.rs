@@ -2011,9 +2011,25 @@ impl Infer {
             }
             (Some(rv1), Some(rv2)) => {
                 if rv1 == rv2 {
-                    if !only1.is_empty() || !only2.is_empty() {
+                    // Same row tail on both sides: only the *fixed* effects
+                    // can differ, and they subsume directionally just like
+                    // the closed/closed `(None, None)` case. The provided
+                    // side may carry FEWER fixed effects than the required
+                    // side (over-declaring a result row, e.g.
+                    // `f : IO {| e} {} -> IO {console | e} {}; f = \act -> act`),
+                    // which is sound — reject only when the *provided* side
+                    // has fixed effects the required side lacks.
+                    let provided_extras = if t1_provided { &only1 } else { &only2 };
+                    if !provided_extras.is_empty() {
+                        let extras: Vec<String> = provided_extras
+                            .iter()
+                            .map(format_io_effect)
+                            .collect();
                         self.error(
-                            "IO effects don't match".into(),
+                            format!(
+                                "IO effects don't match: the provided IO has effects not allowed by the expected type: {{{}}}",
+                                extras.join(", ")
+                            ),
                             span,
                         );
                     }

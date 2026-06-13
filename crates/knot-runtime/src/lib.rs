@@ -7267,7 +7267,12 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
             cvar: Arc<Condvar>,
         ) {
             ACTIVE_FORKS.fetch_add(1, Ordering::SeqCst);
-            std::thread::spawn(move || {
+            // Clone the shared state/cvar for the spawn-failure path: the
+            // closure below is `move` and consumes the originals, so we must
+            // capture copies before the spawn call to recover from failure.
+            let fail_state = state.clone();
+            let fail_cvar = cvar.clone();
+            let spawn_result = std::thread::Builder::new().spawn(move || {
                 struct ForkCounter;
                 impl Drop for ForkCounter {
                     fn drop(&mut self) {
@@ -7376,6 +7381,40 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
                     unsafe { deep_drop_value(cloned as *mut u8 as *mut Value); }
                 }
             });
+
+            if spawn_result.is_err() {
+                // The thread never started, so its drop-guard decrement and IO
+                // cleanup never run. Undo the increment, wake any joiner, and
+                // free the deep-cloned IO the thread would have owned.
+                ACTIVE_FORKS.fetch_sub(1, Ordering::SeqCst);
+                {
+                    let _g = ACTIVE_FORKS_MUTEX.lock().unwrap();
+                    ACTIVE_FORKS_CVAR.notify_all();
+                }
+                unsafe { deep_drop_value(io_raw as *mut u8 as *mut Value); }
+
+                // Unlike `fork`, the race parent waits on an outcome, so a
+                // dead side must publish a loss — otherwise the parent parks
+                // on the outcome condvar forever. Mirror the single-panic
+                // bookkeeping: record this side's failure and only set
+                // `BothPanicked` once both sides are down with no winner.
+                let mut g = fail_state.lock().unwrap();
+                g.panic_msgs.push(format!(
+                    "{} side failed to spawn thread",
+                    if is_left { "left" } else { "right" }
+                ));
+                let both_dead = g.outcome.is_none() && g.panic_msgs.len() >= 2;
+                if both_dead {
+                    g.outcome =
+                        Some(RaceOutcome::BothPanicked(g.panic_msgs.join("; ")));
+                }
+                drop(g);
+                if both_dead {
+                    // Do NOT cancel the peer on a single spawn failure — the
+                    // peer may still legitimately win.
+                    fail_cvar.notify_all();
+                }
+            }
         }
 
         worker(
@@ -10694,6 +10733,7 @@ pub extern "C-unwind" fn knot_source_query_value(
     sql_ptr: *const u8,
     sql_len: usize,
     params: *mut Value,
+    is_text: i64,
 ) -> *mut Value {
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let sql = unsafe { str_from_raw(sql_ptr, sql_len) };
@@ -10721,18 +10761,25 @@ pub extern "C-unwind" fn knot_source_query_value(
                 ValueRef::Integer(n) => Ok(alloc_int(n)),
                 ValueRef::Real(f) => Ok(alloc_float(f)),
                 ValueRef::Text(s) => {
-                    // Int columns are stored as TEXT COLLATE KNOT_INT, so a
-                    // MIN/MAX over an Int column comes back as Text. Parse it
-                    // back to a numeric value (same logic as query_sum); only
-                    // genuinely textual results stay Text.
                     let s = std::str::from_utf8(s)
                         .expect("knot runtime: invalid UTF-8 in aggregate result");
-                    if let Ok(n) = s.parse::<i64>() {
-                        Ok(alloc_int(n))
-                    } else if let Ok(f) = s.parse::<f64>() {
-                        Ok(alloc_float(f))
-                    } else {
+                    // For a genuinely textual column the compiler sets
+                    // `is_text`, so return the Text as-is — parsing a
+                    // numeric-looking string (e.g. a zip code "02134") back to
+                    // an Int would corrupt the value the caller typed as Text.
+                    if is_text != 0 {
                         Ok(alloc(Value::Text(Arc::from(s))))
+                    } else {
+                        // Int columns are stored as TEXT COLLATE KNOT_INT, so a
+                        // MIN/MAX over an Int column comes back as Text. Parse
+                        // it back to a numeric value (same logic as query_sum).
+                        if let Ok(n) = s.parse::<i64>() {
+                            Ok(alloc_int(n))
+                        } else if let Ok(f) = s.parse::<f64>() {
+                            Ok(alloc_float(f))
+                        } else {
+                            Ok(alloc(Value::Text(Arc::from(s))))
+                        }
                     }
                 }
                 ValueRef::Blob(_) => panic!(
@@ -13177,6 +13224,32 @@ pub extern "C-unwind" fn knot_constraint_register(
             debug_sql(&delete_trigger);
             db_ref.conn.execute_batch(&delete_trigger)
                 .expect("knot runtime: failed to create delete trigger");
+
+            // Trigger: reject in-place UPDATE of the superset key column if
+            // sub still references the OLD value. Renaming a referenced
+            // superset key (e.g. people.name while orders.customer points at
+            // it) would otherwise orphan the sub rows, and the DELETE trigger
+            // above never fires for an UPDATE. Defense in depth: today every
+            // relation rewrite the codegen emits goes through a full
+            // DELETE+INSERT (caught by the DELETE trigger), so this guards the
+            // in-place `knot_source_update_where` path should a future codegen
+            // change start emitting it for a key column.
+            let sup_update_trigger = format!(
+                "CREATE TRIGGER IF NOT EXISTS {trg} \
+                 BEFORE UPDATE OF {sup_col} ON {sup_table} \
+                 FOR EACH ROW \
+                 WHEN NEW.{sup_col} != OLD.{sup_col} AND EXISTS (SELECT 1 FROM {sub_table} WHERE {sub_col} = OLD.{sup_col}) \
+                 BEGIN SELECT RAISE(ABORT, '{msg}'); END;",
+                trg = quote_ident(&format!("_knot_fk_{}_supupd", trg_suffix)),
+                sup_table = sup_table,
+                sub_table = sub_table,
+                sub_col = sub_col,
+                sup_col = sup_col,
+                msg = delete_msg,
+            );
+            debug_sql(&sup_update_trigger);
+            db_ref.conn.execute_batch(&sup_update_trigger)
+                .expect("knot runtime: failed to create superset update trigger");
         }
         _ => {}
     }

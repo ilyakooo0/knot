@@ -587,3 +587,74 @@ main = do
     assert!(ok, "program failed: {stderr}");
     assert!(stdout.contains("r: 2"), "got: {stdout}");
 }
+
+// ── Bug 13: minOn/maxOn over a genuine Text column push down but must
+//    return Text verbatim (the runtime's `is_text` flag), never re-parse a
+//    numeric-looking string back to Int. ──────────────────────────────────
+
+#[test]
+fn minmax_over_text_column_returns_text_not_reparsed_int() {
+    let (stdout, stderr, ok) = compile_and_run(
+        "minmax_text_col",
+        r#"type Z = {code: Text, n: Int}
+*z : [Z]
+
+main = do
+  replace *z = [{code: "007", n: 1}, {code: "005", n: 2}, {code: "003", n: 3}]
+  let hi = maxOn (\r -> r.code) *z
+  let lo = minOn (\r -> r.code) *z
+  -- `++` requires Text; if the runtime re-parsed "007" to Int 7 this would
+  -- both corrupt the value ("7") and break the Text concatenation.
+  println ("hi: " ++ hi)
+  println ("lo: " ++ lo)
+"#,
+    );
+    assert!(ok, "program failed: {stderr}");
+    assert!(stdout.contains("hi: 007"), "expected Text max '007', got: {stdout}");
+    assert!(stdout.contains("lo: 003"), "expected Text min '003', got: {stdout}");
+}
+
+// ── Bug 14: maxOn/minOn over a tag (all-nullary ADT) column must NOT push
+//    down. SQLite would compare constructor names alphabetically ('Low' >
+//    'High') and hand back a bare Text, silently diverging from Knot's Ord
+//    semantics. The pushdown must be rejected so this can never produce a
+//    wrong answer. (In-memory ADT comparison via maxOn is a separate
+//    limitation — what matters here is that no silently-wrong value escapes.)
+
+#[test]
+fn maxon_over_tag_column_does_not_push_down_wrong_answer() {
+    let (stdout, _stderr, _ok) = compile_and_run(
+        "maxon_tag_col",
+        r#"data Level = Low {} | High {}
+
+impl Eq Level where
+  eq = \a b -> show a == show b
+
+impl Ord Level where
+  compare = \a b -> case a of
+    Low x -> (case b of
+      Low y -> EQ {}
+      _ -> LT {})
+    High x -> (case b of
+      High y -> EQ {}
+      _ -> GT {})
+
+type T = {lvl: Level, n: Int}
+*t : [T]
+
+main = do
+  replace *t = [{lvl: Low {}, n: 1}, {lvl: High {}, n: 2}]
+  -- Ord says Low < High, so the true max is High. A byte-wise SQL MAX over
+  -- the tag strings would wrongly pick 'Low' ('L' > 'H') as bare Text.
+  let top = maxOn (\r -> r.lvl) *t
+  println ("top: " ++ show top)
+"#,
+    );
+    // Must never emit the byte-wise SQL MAX 'Low'. (Without pushdown the
+    // current runtime aborts on ADT comparison rather than returning a
+    // wrong value, which is acceptable; the corruption is what we guard.)
+    assert!(
+        !stdout.contains("top: Low"),
+        "tag maxOn must not push down to a byte-wise SQL MAX, got: {stdout}"
+    );
+}

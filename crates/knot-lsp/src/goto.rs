@@ -137,29 +137,74 @@ pub(crate) fn handle_goto_implementation(
 
     let mut locations: Vec<Location> = Vec::new();
 
+    // Classify the symbol under the cursor by scanning EVERY available module
+    // — not just the one being walked for impls. A trait declared in file A
+    // can be implemented in file B; the impl's `trait_name`/method tokens only
+    // count as navigation sources once we know `word` actually names a trait
+    // or trait method somewhere in the workspace. Determining this per-scanned
+    // module (the old behavior) silently dropped every cross-file impl, since
+    // the file holding the `impl` block rarely declares the trait itself.
+    let mut is_trait_name = false;
+    let mut is_method_name = false;
+    let mut classify = |module: &Module| {
+        for d in &module.decls {
+            if let DeclKind::Trait { name, items, .. } = &d.node {
+                if name == word {
+                    is_trait_name = true;
+                }
+                if items
+                    .iter()
+                    .any(|i| matches!(i, ast::TraitItem::Method { name: m, .. } if m == word))
+                {
+                    is_method_name = true;
+                }
+            }
+        }
+    };
+    classify(&doc.module);
+    for (other_uri, other_doc) in &state.documents {
+        if other_uri == uri {
+            continue;
+        }
+        classify(&other_doc.module);
+    }
+    // Disk scan for the classification: a trait declared in an unopened file
+    // must still be recognized. Reuses the same parse cache the impl scan uses.
+    {
+        let open_paths: HashSet<PathBuf> = state
+            .documents
+            .keys()
+            .filter_map(|u| uri_to_path(u))
+            .filter_map(|p| p.canonicalize().ok())
+            .collect();
+        for path in scan_knot_files_in_roots(&state.workspace_roots, state.workspace_root.as_deref())
+        {
+            let canonical = match path.canonicalize() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if open_paths.contains(&canonical) {
+                continue;
+            }
+            if let Some((module, source)) =
+                get_or_parse_file_shared(&canonical, &state.import_cache)
+            {
+                if source.contains(word) {
+                    classify(&module);
+                }
+            }
+        }
+    }
+
     // Helper: collect impls from a parsed module that target a given trait or
-    // contain a method of the given name.
+    // contain a method of the given name. `is_trait_name`/`is_method_name` are
+    // resolved once above against the whole workspace.
     let collect_from_module =
         |module: &Module,
          module_uri: &Uri,
          module_source: &str,
          word: &str,
          locs: &mut Vec<Location>| {
-            // Determine what kind of symbol the cursor is on:
-            // - trait name: collect every `impl <word> ...` block
-            // - method name: for each impl block, find that method and add its span
-            let is_trait_name = module.decls.iter().any(|d| {
-                matches!(&d.node, DeclKind::Trait { name, .. } if name == word)
-            });
-            let is_method_name = module.decls.iter().any(|d| {
-                if let DeclKind::Trait { items, .. } = &d.node {
-                    items.iter().any(|i| {
-                        matches!(i, ast::TraitItem::Method { name, .. } if name == word)
-                    })
-                } else {
-                    false
-                }
-            });
             for decl in &module.decls {
                 if let DeclKind::Impl {
                     trait_name, items, ..
@@ -359,6 +404,59 @@ greet = \x -> display x
             loc.uri.as_str().ends_with("shapes.knot"),
             "expected to land in shapes.knot, got {}",
             loc.uri.as_str()
+        );
+    }
+
+    #[test]
+    fn goto_implementation_finds_impl_across_files_from_trait_decl() {
+        // Regression: `is_trait_name`/`is_method_name` used to be decided per
+        // scanned module. A trait declared in one file and implemented in
+        // another would yield NO implementations, because the file holding
+        // the `impl` block doesn't itself declare the trait. The classification
+        // is now resolved once against the whole workspace.
+        let mut tmp = TempWorkspace::new();
+        let shapes_uri = tmp.write_and_open(
+            "shapes.knot",
+            "trait Display a where\n  display : a -> Text\n",
+        );
+        let impl_uri = tmp.write_and_open(
+            "impls.knot",
+            "import ./shapes\ndata Circle = Circle {}\nimpl Display Circle where\n  display = \\c -> \"circle\"\n",
+        );
+
+        // 1. From the trait declaration in shapes.knot -> must find the impl.
+        let sdoc = tmp.workspace.doc(&shapes_uri);
+        let soff = sdoc.source.find("Display").expect("trait decl name");
+        let spos = offset_to_position(&sdoc.source, soff);
+        let resp = handle_goto_implementation(&tmp.workspace.state, &goto_params(&shapes_uri, spos))
+            .expect("trait decl must resolve to its cross-file impl");
+        let loc = match resp {
+            GotoDefinitionResponse::Scalar(l) => l,
+            GotoDefinitionResponse::Array(v) => v.into_iter().next().expect("at least one impl"),
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            loc.uri.as_str().ends_with("impls.knot"),
+            "impl lives in impls.knot, got {}",
+            loc.uri.as_str()
+        );
+
+        // 2. From the trait method name in the impl file -> must resolve to the
+        //    impl's method body.
+        let idoc = tmp.workspace.doc(&impl_uri);
+        let moff = idoc.source.find("display =").expect("method") + 1;
+        let mpos = offset_to_position(&idoc.source, moff);
+        let resp2 = handle_goto_implementation(&tmp.workspace.state, &goto_params(&impl_uri, mpos))
+            .expect("trait method must resolve cross-file");
+        let loc2 = match resp2 {
+            GotoDefinitionResponse::Scalar(l) => l,
+            GotoDefinitionResponse::Array(v) => v.into_iter().next().expect("at least one method"),
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            loc2.uri.as_str().ends_with("impls.knot"),
+            "method impl lives in impls.knot, got {}",
+            loc2.uri.as_str()
         );
     }
 

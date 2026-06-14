@@ -8529,22 +8529,32 @@ impl Codegen {
                 }
             }
             ast::PatKind::Constructor { name, payload } => {
-                let is_match = match self.nullable_ctors.get(name).cloned() {
-                    Some(NullableRole::None) => {
-                        builder.ins().icmp_imm(IntCC::Equal, val, 0)
-                    }
-                    Some(NullableRole::Some) => {
-                        builder.ins().icmp_imm(IntCC::NotEqual, val, 0)
-                    }
-                    None => {
-                        let (tag_ptr, tag_len) = self.string_ptr(builder, name);
-                        let matches = self.call_rt_typed(
-                            builder,
-                            "knot_constructor_matches",
-                            &[val, tag_ptr, tag_len],
-                            types::I32,
-                        );
-                        builder.ins().icmp_imm(IntCC::NotEqual, matches, 0)
+                let is_match = if name == "True" || name == "False" {
+                    // Bool is represented as Value::Bool, not Value::Constructor —
+                    // knot_constructor_matches would always return 0. Test the
+                    // bool value directly, mirroring compile_case.
+                    let bool_val =
+                        self.call_rt_typed(builder, "knot_value_get_bool", &[val], types::I32);
+                    let expected = if name == "True" { 1i64 } else { 0i64 };
+                    builder.ins().icmp_imm(IntCC::Equal, bool_val, expected)
+                } else {
+                    match self.nullable_ctors.get(name).cloned() {
+                        Some(NullableRole::None) => {
+                            builder.ins().icmp_imm(IntCC::Equal, val, 0)
+                        }
+                        Some(NullableRole::Some) => {
+                            builder.ins().icmp_imm(IntCC::NotEqual, val, 0)
+                        }
+                        None => {
+                            let (tag_ptr, tag_len) = self.string_ptr(builder, name);
+                            let matches = self.call_rt_typed(
+                                builder,
+                                "knot_constructor_matches",
+                                &[val, tag_ptr, tag_len],
+                                types::I32,
+                            );
+                            builder.ins().icmp_imm(IntCC::NotEqual, matches, 0)
+                        }
                     }
                 };
 
@@ -8573,15 +8583,7 @@ impl Codegen {
                 builder.seal_block(then_block);
 
                 // Extract the constructor payload and bind the inner pattern
-                let inner = if matches!(self.nullable_ctors.get(name), Some(NullableRole::None)) {
-                    // Nullable none: payload is conceptually unit
-                    self.call_rt(builder, "knot_value_unit", &[])
-                } else if matches!(self.nullable_ctors.get(name), Some(NullableRole::Some)) {
-                    // Nullable some: val is the bare payload
-                    val
-                } else {
-                    self.call_rt(builder, "knot_constructor_payload", &[val])
-                };
+                let inner = self.case_ctor_payload(builder, name, val);
                 self.bind_io_pattern(builder, payload, inner, env, done_block);
             }
             ast::PatKind::Lit(lit) => {
@@ -14524,22 +14526,32 @@ fn bind_do_pattern(
         ast::PatKind::Constructor { name, payload } => {
             // Pattern match bind: `Circle c <- *shapes`
             // Filter: only rows matching the constructor tag continue
-            let is_match = match cg.nullable_ctors.get(name).cloned() {
-                Some(NullableRole::None) => {
-                    builder.ins().icmp_imm(IntCC::Equal, val, 0)
-                }
-                Some(NullableRole::Some) => {
-                    builder.ins().icmp_imm(IntCC::NotEqual, val, 0)
-                }
-                None => {
-                    let (tag_ptr, tag_len) = cg.string_ptr(builder, name);
-                    let matches = cg.call_rt_typed(
-                        builder,
-                        "knot_constructor_matches",
-                        &[val, tag_ptr, tag_len],
-                        types::I32,
-                    );
-                    builder.ins().icmp_imm(IntCC::NotEqual, matches, 0)
+            let is_match = if name == "True" || name == "False" {
+                // Bool is represented as Value::Bool, not Value::Constructor —
+                // knot_constructor_matches would always return 0. Test the bool
+                // value directly, mirroring compile_case.
+                let bool_val =
+                    cg.call_rt_typed(builder, "knot_value_get_bool", &[val], types::I32);
+                let expected = if name == "True" { 1i64 } else { 0i64 };
+                builder.ins().icmp_imm(IntCC::Equal, bool_val, expected)
+            } else {
+                match cg.nullable_ctors.get(name).cloned() {
+                    Some(NullableRole::None) => {
+                        builder.ins().icmp_imm(IntCC::Equal, val, 0)
+                    }
+                    Some(NullableRole::Some) => {
+                        builder.ins().icmp_imm(IntCC::NotEqual, val, 0)
+                    }
+                    None => {
+                        let (tag_ptr, tag_len) = cg.string_ptr(builder, name);
+                        let matches = cg.call_rt_typed(
+                            builder,
+                            "knot_constructor_matches",
+                            &[val, tag_ptr, tag_len],
+                            types::I32,
+                        );
+                        builder.ins().icmp_imm(IntCC::NotEqual, matches, 0)
+                    }
                 }
             };
 
@@ -14552,17 +14564,8 @@ fn bind_do_pattern(
             skips.push(skip_block);
 
             // Extract payload and bind inner pattern
-            if matches!(cg.nullable_ctors.get(name), Some(NullableRole::None)) {
-                // Nullable none: payload is conceptually unit
-                let unit = cg.call_rt(builder, "knot_value_unit", &[]);
-                bind_do_pattern(builder, cg, payload, unit, env, skips);
-            } else if matches!(cg.nullable_ctors.get(name), Some(NullableRole::Some)) {
-                // Nullable some: val is the bare payload
-                bind_do_pattern(builder, cg, payload, val, env, skips);
-            } else {
-                let inner = cg.call_rt(builder, "knot_constructor_payload", &[val]);
-                bind_do_pattern(builder, cg, payload, inner, env, skips);
-            }
+            let inner = cg.case_ctor_payload(builder, name, val);
+            bind_do_pattern(builder, cg, payload, inner, env, skips);
         }
         ast::PatKind::Lit(lit) => {
             // Filter: only rows matching the literal value continue

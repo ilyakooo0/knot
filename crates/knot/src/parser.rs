@@ -43,12 +43,22 @@ pub struct Parser {
     /// parser has no module-wide scope), so a top-level `ms = 5` still
     /// triggers the sugar.
     bound_vars: Vec<Name>,
+    /// Display column (chars from the start of its line) of each token,
+    /// indexed by token position. Precomputed in a single O(source) pass so
+    /// layout queries during parsing are O(1) instead of O(line-length) —
+    /// without this, the per-item `column_of` calls in `parse_block` and the
+    /// error-recovery loop are O(n²) on a long single line (e.g. a minified
+    /// or generated `do` block with `;` separators), causing a parser hang.
+    token_cols: Vec<usize>,
+    /// Display column at end-of-input, used when `pos` is past the last token.
+    eof_col: usize,
 }
 
 // ── Public API ──────────────────────────────────────────────────────
 
 impl Parser {
     pub fn new(source: String, tokens: Vec<Token>) -> Self {
+        let (token_cols, eof_col) = Self::precompute_columns(&source, &tokens);
         Self {
             source,
             tokens,
@@ -61,7 +71,51 @@ impl Parser {
             delimiter_depth: 0,
             recursion_depth: 0,
             bound_vars: Vec::new(),
+            token_cols,
+            eof_col,
         }
+    }
+
+    /// Compute the display column of every token in one pass over the source.
+    /// A column is the number of Unicode scalar values between the start of the
+    /// token's line and the token. Line boundaries are any of `\n`/`\r`/`\r\n`,
+    /// matching the lexer's layout-newline handling and the legacy `column_of`.
+    fn precompute_columns(source: &str, tokens: &[Token]) -> (Vec<usize>, usize) {
+        let mut cols = Vec::with_capacity(tokens.len());
+        let mut chars = source.char_indices();
+        let mut byte = 0usize; // byte offset of the next unconsumed char
+        let mut col = 0usize; // column at `byte`
+        for tok in tokens {
+            let target = tok.span.start.min(source.len());
+            while byte < target {
+                match chars.next() {
+                    Some((_, c)) => {
+                        byte += c.len_utf8();
+                        if c == '\n' || c == '\r' {
+                            col = 0;
+                        } else {
+                            col += 1;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            cols.push(col);
+        }
+        // Continue to the end of input for the EOF column.
+        for (_, c) in chars {
+            if c == '\n' || c == '\r' {
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        (cols, col)
+    }
+
+    /// Display column of the current token (O(1); see `token_cols`).
+    fn cur_column(&self) -> usize {
+        self.token_cols.get(self.pos).copied().unwrap_or(self.eof_col)
     }
 
     pub fn parse_module(mut self) -> (Module, Vec<Diagnostic>) {
@@ -269,18 +323,6 @@ impl Parser {
         self.recursion_depth = saved.2;
     }
 
-    fn column_of(&self, span: &Span) -> usize {
-        let offset = span.start.min(self.source.len());
-        let before = &self.source[..offset];
-        // Treat `\r` as a line boundary too, so layout columns are correct for
-        // classic-Mac (`\r`-only) and Windows (`\r\n`) line endings — matching
-        // the lexer, which emits a layout newline for any of `\n`/`\r`/`\r\n`.
-        let line_start = match before.rfind(['\n', '\r']) {
-            Some(nl) => nl + 1,
-            None => 0,
-        };
-        before[line_start..].chars().count()
-    }
 }
 
 // ── Context & error helpers ─────────────────────────────────────────
@@ -358,7 +400,7 @@ impl Parser {
             if self.at_eof() {
                 break;
             }
-            let col = self.column_of(&self.span());
+            let col = self.cur_column();
             if col == 0 {
                 match self.peek() {
                     TokenKind::Export
@@ -634,7 +676,7 @@ impl Parser {
         if self.at_eof() {
             return vec![];
         }
-        let indent = self.column_of(&self.span());
+        let indent = self.cur_column();
         // Layout rule: a nested block's items must be indented strictly past
         // the enclosing block's indent. Without this, an empty block (e.g.
         // `trait Foo a where` followed by a blank line) silently captures the
@@ -654,7 +696,7 @@ impl Parser {
             if self.at_eof() {
                 break;
             }
-            let col = self.column_of(&self.span());
+            let col = self.cur_column();
             if col < indent {
                 break;
             }
@@ -711,7 +753,7 @@ impl Parser {
             let saved = self.save();
             self.skip_newlines();
             if self.at_eof()
-                || self.column_of(&self.span()) < indent
+                || self.cur_column() < indent
                 || (self.delimiter_depth > 0
                     && matches!(
                         self.peek(),
@@ -1562,14 +1604,14 @@ impl Parser {
         if self.at_eof() {
             return vec![];
         }
-        let indent = self.column_of(&self.span());
+        let indent = self.cur_column();
         let mut entries = vec![];
         loop {
             self.skip_newlines();
             if self.at_eof() {
                 break;
             }
-            let col = self.column_of(&self.span());
+            let col = self.cur_column();
             if col < indent {
                 break;
             }
@@ -1853,7 +1895,7 @@ impl Parser {
             // `parse_type_app`) only fire when the next line is indented
             // *past* the sibling clause keywords, not at their column.
             let prev_block_indent = this.block_indent;
-            this.block_indent = this.column_of(&this.span());
+            this.block_indent = this.cur_column();
 
             if !matches!(this.peek(), TokenKind::Lower(s) if s == "from") {
                 this.error("expected 'from' in migrate declaration");
@@ -2086,7 +2128,7 @@ impl Parser {
             // at (or before) the block indent starts a new block item (a do
             // statement like `-1`, a case arm like `-1 -> ...`, etc.).
             if self.delimiter_depth == 0 && self.pos != saved_pos.0 {
-                let col = self.column_of(&self.span());
+                let col = self.cur_column();
                 if col == 0 || (self.block_indent != usize::MAX && col <= self.block_indent) {
                     self.restore(saved_pos);
                     break;
@@ -2152,7 +2194,7 @@ impl Parser {
             // calling the O(line-length) `column_of` once per operator, which
             // made a long single-line `1+1+…+1` chain parse in O(n²).
             if self.delimiter_depth == 0 && self.pos != pos_before_rhs {
-                let col = self.column_of(&self.span());
+                let col = self.cur_column();
                 if col == 0 || (self.block_indent != usize::MAX && col <= self.block_indent) {
                     self.error("expected expression after binary operator");
                     break;
@@ -2262,7 +2304,7 @@ impl Parser {
             if self.pos != saved.0
                 && !self.at_eof()
                 && self.can_start_atom()
-                && self.column_of(&self.span()) > self.block_indent
+                && self.cur_column() > self.block_indent
             {
                 let arg = self.parse_postfix()?;
                 let span = Span::new(func.span.start, arg.span.end);
@@ -2832,7 +2874,7 @@ impl Parser {
                 // Stop consuming params if we've crossed back to column 0 outside
                 // any delimiter — this prevents eating into the next declaration
                 // when `->` is missing.
-                if this.delimiter_depth == 0 && this.column_of(&this.span()) == 0 {
+                if this.delimiter_depth == 0 && this.cur_column() == 0 {
                     break;
                 }
                 let p = this.parse_pat()?;
@@ -3649,7 +3691,7 @@ impl Parser {
             let saved = self.save();
             self.skip_newlines();
             if !self.at_eof()
-                && self.column_of(&self.span()) > self.block_indent
+                && self.cur_column() > self.block_indent
                 && self.can_start_type_atom()
             {
                 let arg = self.parse_type_atom()?;

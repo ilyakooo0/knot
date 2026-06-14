@@ -3694,6 +3694,30 @@ impl Infer {
                     return ty;
                 }
 
+                // Let-binding: an immediately-applied single-variable lambda
+                // `(\x -> body) arg` is semantically `let x = arg in body`.
+                // The desugarer lowers pure-comprehension `do` `let`s to exactly
+                // this shape, so generalize the binding here to preserve
+                // let-polymorphism (e.g. `let g = \x -> x` usable at multiple
+                // types), matching the non-desugared do-block `let` path. This
+                // is sound: generalizing a let binding is always valid in a pure
+                // language, and the bound name does not escape the body.
+                if let ast::ExprKind::Lambda { params, body } = &func.node {
+                    if params.len() == 1 {
+                        if let ast::PatKind::Var(name) = &params[0].node {
+                            let arg_ty = self.infer_expr(arg);
+                            let applied = self.apply(&arg_ty);
+                            let scheme = self.generalize(&applied);
+                            self.push_scope();
+                            self.bind(name, scheme);
+                            self.binding_types.push((params[0].span, applied));
+                            let body_ty = self.infer_expr(body);
+                            self.pop_scope();
+                            return body_ty;
+                        }
+                    }
+                }
+
                 let func_ty = self.infer_expr(func);
 
                 // Higher-rank arg slot: when the function's parameter is

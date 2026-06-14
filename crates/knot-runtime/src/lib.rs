@@ -2426,9 +2426,6 @@ static GLOBAL_WRITE_WAITERS: AtomicUsize = AtomicUsize::new(0);
 /// implicit dependency.
 fn wait_for_any_write(timeout: Duration) {
     let baseline = GLOBAL_WRITES.load(Ordering::Acquire);
-    if GLOBAL_WRITES.load(Ordering::Acquire) != baseline {
-        return;
-    }
     GLOBAL_WRITE_WAITERS.fetch_add(1, Ordering::AcqRel);
     let (m, cv) = &*GLOBAL_WRITE_CV;
     let guard = m.lock().expect("global write cv mutex poisoned");

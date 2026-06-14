@@ -2137,6 +2137,7 @@ impl Parser {
             }
 
             self.advance(); // consume operator
+            let pos_before_rhs = self.pos;
             self.skip_newlines();
             // A dangling operator at end of line: if the next token begins a
             // new declaration (column 0) or a new block item (at/under the
@@ -2144,7 +2145,13 @@ impl Parser {
             // missing operand and stop, leaving the token for the outer parser
             // to recover on, rather than gobbling the following declaration.
             // Mirrors the pre-operator guard above for the symmetric case.
-            if self.delimiter_depth == 0 {
+            //
+            // Only relevant when a newline was actually crossed: if the RHS
+            // token is on the same line as the operator it can't be a
+            // line-leading declaration/block item. Gating on that also avoids
+            // calling the O(line-length) `column_of` once per operator, which
+            // made a long single-line `1+1+…+1` chain parse in O(n²).
+            if self.delimiter_depth == 0 && self.pos != pos_before_rhs {
                 let col = self.column_of(&self.span());
                 if col == 0 || (self.block_indent != usize::MAX && col <= self.block_indent) {
                     self.error("expected expression after binary operator");
@@ -2242,11 +2249,20 @@ impl Parser {
             // Try to continue across newlines: if the next non-newline token
             // is indented past the current block indent, treat it as a
             // continuation of this application (like multi-line fn args).
+            //
+            // Only worth attempting when `skip_newlines` actually crossed a
+            // newline: if it didn't, the position is unchanged from the
+            // `can_start_atom()` check above (which already returned false), so
+            // nothing new can continue the application. Gating on that — and
+            // testing the O(1) `can_start_atom` before the O(line-length)
+            // `column_of` — keeps a long single-line application chain linear
+            // instead of O(n²).
             let saved = self.save();
             self.skip_newlines();
-            if !self.at_eof()
-                && self.column_of(&self.span()) > self.block_indent
+            if self.pos != saved.0
+                && !self.at_eof()
                 && self.can_start_atom()
+                && self.column_of(&self.span()) > self.block_indent
             {
                 let arg = self.parse_postfix()?;
                 let span = Span::new(func.span.start, arg.span.end);

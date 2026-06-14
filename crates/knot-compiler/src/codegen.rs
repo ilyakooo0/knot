@@ -13082,8 +13082,32 @@ fn rewrite_body_through_projection(
 }
 
 fn lookup_col_type_from_schema(schema: &str, col_name: &str) -> Option<String> {
+    // ADT-relation schemas (`#Ctor:field=type;field=type|Ctor2:...|Nullary`)
+    // describe a wide table where each constructor's fields are columns. The
+    // record-schema parser below can't read this shape (it splits on top-level
+    // commas and `:`), so it would return `None` for every ADT field — which
+    // silently bypasses the float/json/tag pushdown guards in callers, pushing
+    // e.g. a float `<` comparison into SQL where -0.0/NaN semantics diverge.
+    if let Some(adt) = schema.strip_prefix('#') {
+        for ctor in adt.split('|') {
+            let fields = match ctor.split_once(':') {
+                Some((_name, fields)) => fields,
+                None => continue, // nullary constructor — no fields
+            };
+            for field in fields.split(';') {
+                if let Some((name, ty)) = field.split_once('=') {
+                    if name == col_name {
+                        return Some(ty.to_string());
+                    }
+                }
+            }
+        }
+        return None;
+    }
     for part in split_schema_fields(schema) {
-        let colon = part.find(':')?;
+        // A field part lacking a `:` (malformed/unexpected) must be skipped,
+        // not abort the whole lookup — `?` here would poison every later column.
+        let Some(colon) = part.find(':') else { continue };
         let name = &part[..colon];
         let ty = &part[colon + 1..];
         if name == col_name {
@@ -14688,6 +14712,11 @@ fn pat_bound_names(pat: &ast::Pat) -> Vec<String> {
             .collect(),
         ast::PatKind::Constructor { payload, .. } => pat_bound_names(payload),
         ast::PatKind::List(pats) => pats.iter().flat_map(pat_bound_names).collect(),
+        ast::PatKind::Cons { head, tail } => {
+            let mut names = pat_bound_names(head);
+            names.extend(pat_bound_names(tail));
+            names
+        }
         _ => vec![],
     }
 }

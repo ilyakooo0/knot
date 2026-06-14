@@ -2639,7 +2639,15 @@ impl Infer {
         for c in all_constraints {
             let resolved = self.apply(&Ty::Var(c.type_var));
             match resolved {
-                Ty::Var(v) if gen_set.contains(&v) => kept.push(c),
+                // Normalize to the representative var `v` (the one actually
+                // quantified in the scheme). If `c.type_var` was aliased to `v`
+                // during body inference, keeping the stale `c.type_var` would
+                // make `instantiate_at` fail to freshen this constraint (its
+                // `mapping` is keyed on the scheme's `vars`), silently dropping
+                // the trait obligation at the use site.
+                Ty::Var(v) if gen_set.contains(&v) => {
+                    kept.push(TyConstraint { type_var: v, ..c })
+                }
                 Ty::Var(_) => {} // env-bound var, not generalized
                 concrete => {
                     // Constraint resolved to a concrete type — check now

@@ -8931,14 +8931,14 @@ pub extern "C-unwind" fn knot_text_reverse(v: *mut Value) -> *mut Value {
 pub extern "C-unwind" fn knot_text_chars(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Text(s) => {
-            let mut seen = HashSet::new();
-            let mut rows = Vec::new();
-            for c in s.chars() {
-                let cs = c.to_string();
-                if seen.insert(cs.clone()) {
-                    rows.push(alloc(Value::Text(Arc::from(cs))));
-                }
-            }
+            // `chars` is a transformation, not a set operation: preserve every
+            // character in order (including duplicates). Deduping here would
+            // make `chars "hello"` drop the second 'l' and `chars "aaa"` yield
+            // a single 'a', silently destroying positional information.
+            let rows = s
+                .chars()
+                .map(|c| alloc(Value::Text(Arc::from(c.to_string()))))
+                .collect();
             alloc(Value::Relation(rows))
         }
         _ => panic!("knot runtime: chars expected Text, got {}", type_name(v)),
@@ -9067,7 +9067,10 @@ pub extern "C-unwind" fn knot_bytes_from_hex(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Text(s) => {
             let s = s.trim();
-            if !s.is_ascii() || s.len() % 2 != 0 {
+            // `u8::from_str_radix` accepts a leading `+`/`-`, so a chunk like
+            // "+5" or "-0" would parse — reject anything that isn't a pure hex
+            // digit up front to honor the "non-hex characters → Nothing" contract.
+            if !s.is_ascii() || s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return make_nothing();
             }
             let mut bytes: Vec<u8> = Vec::with_capacity(s.len() / 2);

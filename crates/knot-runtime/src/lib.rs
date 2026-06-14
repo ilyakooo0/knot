@@ -5855,7 +5855,20 @@ pub extern "C-unwind" fn knot_relation_group_by(
     let col_str = col_names.join(", ");
     let order_cols: Vec<String> = key_specs
         .iter()
-        .map(|ks| quote_ident(&ks.name))
+        .map(|ks| {
+            let ident = quote_ident(&ks.name);
+            // Int keys are encoded as TEXT (see `value_to_sqlite`), so an
+            // uncollated ORDER BY sorts them lexically ("10" < "9"). Force the
+            // numeric KNOT_INT collation explicitly: the temp-table fallback
+            // gets it from the column's declared `TEXT COLLATE KNOT_INT` type,
+            // but the VALUES-CTE fast path's columns have no declared collation,
+            // so without this the two paths would order Int groups differently.
+            if matches!(ks.ty, ColType::Int) {
+                format!("{} COLLATE KNOT_INT", ident)
+            } else {
+                ident
+            }
+        })
         .collect();
 
     // Extract key params from each row (shared by both paths)
@@ -9650,7 +9663,7 @@ pub extern "C-unwind" fn knot_source_migrate(
         let mut col_defs = vec![format!("{} TEXT NOT NULL", quote_ident("_tag"))];
         let mut col_names = vec![quote_ident("_tag")];
         for f in &adt.all_fields {
-            col_defs.push(format!("{} {}", quote_ident(&f.name), sql_type(f.ty)));
+            col_defs.push(format!("{} {}", quote_ident(&f.name), adt.col_sql_type(f)));
             col_names.push(quote_ident(&f.name));
         }
 
@@ -9795,8 +9808,32 @@ struct CtorSpec {
 /// Parsed ADT schema for direct ADT relations
 struct AdtSpec {
     constructors: Vec<CtorSpec>,
-    /// Union of all fields across all constructors (for wide table columns)
+    /// Union of all fields across all constructors (for wide table columns).
+    /// For a field name reused across constructors, the *first* constructor's
+    /// type is kept here; see `conflicting_fields` for names where that type
+    /// disagrees across constructors.
     all_fields: Vec<ColumnSpec>,
+    /// Field names that appear in more than one constructor with *different*
+    /// column types (e.g. `A:value=int | B:value=text`). The wide-table column
+    /// cannot faithfully carry both under a single affinity, so these get BLOB
+    /// affinity (no coercion) — see `col_sql_type`.
+    conflicting_fields: HashSet<String>,
+}
+
+impl AdtSpec {
+    /// SQL column type for a wide-table field. A field whose name is reused
+    /// across constructors with differing types gets BLOB affinity so SQLite
+    /// stores each constructor's value verbatim, without coercing it toward the
+    /// first constructor's affinity (which would corrupt e.g. an Int written
+    /// into a REAL column, or make a later read with the per-constructor type
+    /// panic). The per-constructor read path decodes with the correct type.
+    fn col_sql_type(&self, f: &ColumnSpec) -> String {
+        if self.conflicting_fields.contains(&f.name) {
+            "BLOB".to_string()
+        } else {
+            sql_type(f.ty).to_string()
+        }
+    }
 }
 
 /// Determine if a schema descriptor is an ADT schema (starts with '#')
@@ -9808,7 +9845,8 @@ fn is_adt_schema(spec: &str) -> bool {
 fn parse_adt_schema(spec: &str) -> AdtSpec {
     let body = &spec[1..]; // strip '#'
     let mut constructors = Vec::new();
-    let mut all_field_names: HashSet<String> = HashSet::new();
+    let mut field_types: HashMap<String, ColType> = HashMap::new();
+    let mut conflicting_fields: HashSet<String> = HashSet::new();
     let mut all_fields: Vec<ColumnSpec> = Vec::new();
 
     for ctor_part in split_respecting_brackets(body, '|') {
@@ -9844,13 +9882,21 @@ fn parse_adt_schema(spec: &str) -> AdtSpec {
             Vec::new()
         };
 
-        // Add unique fields to the all_fields list
+        // Add unique fields to the all_fields list, tracking type conflicts
+        // where the same field name recurs with a different column type.
         for f in &fields {
-            if all_field_names.insert(f.name.clone()) {
-                all_fields.push(ColumnSpec {
-                    name: f.name.clone(),
-                    ty: f.ty,
-                });
+            match field_types.get(&f.name) {
+                None => {
+                    field_types.insert(f.name.clone(), f.ty);
+                    all_fields.push(ColumnSpec {
+                        name: f.name.clone(),
+                        ty: f.ty,
+                    });
+                }
+                Some(existing) if *existing != f.ty => {
+                    conflicting_fields.insert(f.name.clone());
+                }
+                Some(_) => {}
             }
         }
 
@@ -9860,6 +9906,7 @@ fn parse_adt_schema(spec: &str) -> AdtSpec {
     AdtSpec {
         constructors,
         all_fields,
+        conflicting_fields,
     }
 }
 
@@ -10176,7 +10223,7 @@ fn auto_apply_adt_change(
                 "ALTER TABLE {} ADD COLUMN {} {};",
                 quote_ident(table),
                 quote_ident(&f.name),
-                sql_type(f.ty)
+                new_adt.col_sql_type(f)
             );
             debug_sql(&sql);
             if conn.execute_batch(&sql).is_err() {
@@ -10437,7 +10484,7 @@ pub extern "C-unwind" fn knot_source_init(
         let mut col_defs = vec![format!("{} TEXT NOT NULL", quote_ident("_tag"))];
         let mut col_names = vec![quote_ident("_tag")];
         for f in &adt.all_fields {
-            col_defs.push(format!("{} {}", quote_ident(&f.name), sql_type(f.ty)));
+            col_defs.push(format!("{} {}", quote_ident(&f.name), adt.col_sql_type(f)));
             col_names.push(quote_ident(&f.name));
         }
 
@@ -11488,6 +11535,21 @@ fn write_child_rows(
         return;
     }
 
+    // When the element type has no scalar columns, there is no DB unique index
+    // to dedup against (`init_child_table` only builds one when there is at
+    // least one scalar column; a UNIQUE index on `_parent_id` alone would
+    // wrongly collapse all of a parent's distinct elements). Such elements are
+    // distinguished only by their nested-relation content, so without this
+    // `INSERT OR IGNORE` — with nothing to ignore on — would store duplicate
+    // child rows, violating Knot's set semantics. Dedup structurally in memory.
+    let deduped_storage;
+    let rows: &[*mut Value] = if nf.columns.is_empty() {
+        deduped_storage = in_memory_dedup(rows.to_vec());
+        &deduped_storage
+    } else {
+        rows
+    };
+
     let table = quote_ident(table_name);
     let has_children = !nf.nested.is_empty();
 
@@ -11881,7 +11943,7 @@ pub extern "C-unwind" fn knot_source_diff_write(
 
             let mut col_defs = vec![format!("{} TEXT NOT NULL", quote_ident("_tag"))];
             for f in &adt.all_fields {
-                col_defs.push(format!("{} {}", quote_ident(&f.name), sql_type(f.ty)));
+                col_defs.push(format!("{} {}", quote_ident(&f.name), adt.col_sql_type(f)));
             }
             let create_temp = format!("CREATE TEMP TABLE {} ({});", temp, col_defs.join(", "));
             debug_sql(&create_temp);
@@ -14311,10 +14373,15 @@ fn value_to_serde_json_impl(v: *mut Value, wire: bool) -> serde_json::Value {
     match unsafe { as_ref(v) } {
         Value::Int(n) => serde_json::Value::Number((*n).into()),
         Value::Float(n) => {
+            // JSON has no representation for NaN/±Infinity. Encode them as
+            // `null` (matching JS `JSON.stringify`) rather than panicking:
+            // this serializer runs on the HTTP success-response path *outside*
+            // the handler's `catch_unwind`, so a panic here would crash the
+            // worker thread and drop the connection with no response.
             if n.is_finite() {
                 serde_json::json!(*n)
             } else {
-                panic!("knot runtime: toJson: cannot serialize non-finite float ({}) to JSON", n)
+                serde_json::Value::Null
             }
         }
         Value::Text(s) => serde_json::Value::String((**s).to_string()),
@@ -14881,18 +14948,31 @@ fn http_serve_loop(
                     if has_body {
                         let body_str = String::from_utf8_lossy(&body_bytes);
                         log_debug!("[HTTP]     body: {}", body_str);
-                        let body_val = match serde_json::from_str::<serde_json::Value>(&body_str) {
-                            Ok(json) => json_to_value(&json),
+                        let body_json = match serde_json::from_str::<serde_json::Value>(&body_str) {
+                            Ok(json) => json,
                             Err(e) => {
                                 let msg = format!("invalid JSON body: {}", e);
                                 log_debug!("[HTTP] --> 400 {}", msg);
                                 return Err((400, msg, None));
                             }
                         };
+                        let body_val = json_to_value(&body_json);
                         match unsafe { as_ref(body_val) } {
                             Value::Record(body_fields) => {
+                                let json_obj = body_json.as_object();
                                 for (bname, bty) in &entry_body_fields {
                                     let is_maybe = bty.starts_with('?');
+                                    // Distinguish a present, non-null field from
+                                    // one that is absent *or* explicitly `null`.
+                                    // `json_to_value` maps JSON `null` to
+                                    // `Nothing`, so without this check an explicit
+                                    // `{"age": null}` for a required field would
+                                    // slip a `Nothing` through `apply_wire_type`
+                                    // (which doesn't coerce it) — the handler then
+                                    // sees a `Nothing` where it expects e.g. an Int.
+                                    let present_non_null = json_obj
+                                        .and_then(|o| o.get(bname.as_str()))
+                                        .is_some_and(|j| !j.is_null());
                                     let raw_val = body_fields.iter()
                                         .find(|f| &*f.name == bname.as_str())
                                         .map(|f| f.value);
@@ -14902,14 +14982,16 @@ fn http_serve_loop(
                                     // are `Just`-wrapped — including nested Maybe
                                     // positions inside record/relation fields.
                                     let value = match raw_val {
-                                        Some(v) => apply_wire_type(v, bty),
-                                        None if is_maybe => make_nothing(),
-                                        // A missing required field is a
+                                        Some(v) if present_non_null => apply_wire_type(v, bty),
+                                        // Absent or explicit null: fine for Maybe
+                                        // (decodes to Nothing)...
+                                        _ if is_maybe => make_nothing(),
+                                        // ...but a missing/null required field is a
                                         // client error — defaulting to
-                                        // 0/""/false silently corrupts
-                                        // data (path/query/headers
+                                        // 0/""/false (or passing Nothing) silently
+                                        // corrupts data (path/query/headers
                                         // already 400 on bad input).
-                                        None => return Err((400, format!(
+                                        _ => return Err((400, format!(
                                             "missing required body field '{}'",
                                             bname
                                         ), None)),

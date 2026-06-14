@@ -148,7 +148,7 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     // The hover handler historically returned None when no symbol info was
     // available. With field-access and type-variable enrichment, we fall
     // through and render an informational hover for those cases too.
-    let enclosing_scheme = find_enclosing_type_scheme(&doc.module, offset);
+    let enclosing_scheme = find_enclosing_type_scheme(&doc.module, lookup_offset);
     let type_var_constraints: Vec<&knot::ast::Constraint> = enclosing_scheme
         .as_ref()
         .filter(|_| {
@@ -169,7 +169,7 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
 
     // At a call site, show the full signature with the active argument highlighted
     if let Some((func_name, active_param)) =
-        find_enclosing_application(&doc.module, &doc.source, offset)
+        find_enclosing_application(&doc.module, &doc.source, lookup_offset)
     {
         if func_name == word {
             if let Some(type_str) = doc.type_info.get(func_name.as_str()) {
@@ -268,7 +268,7 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     if let Some((_, target_name)) = doc
         .refine_targets
         .iter()
-        .find(|(span, _)| span.start <= offset && offset < span.end)
+        .find(|(span, _)| span.start <= lookup_offset && lookup_offset < span.end)
     {
         let detail = if let Some(predicate) = doc.refined_types.get(target_name) {
             let pred_src = predicate_to_source(predicate, &doc.source);

@@ -272,7 +272,10 @@ impl Parser {
     fn column_of(&self, span: &Span) -> usize {
         let offset = span.start.min(self.source.len());
         let before = &self.source[..offset];
-        let line_start = match before.rfind('\n') {
+        // Treat `\r` as a line boundary too, so layout columns are correct for
+        // classic-Mac (`\r`-only) and Windows (`\r\n`) line endings — matching
+        // the lexer, which emits a layout newline for any of `\n`/`\r`/`\r\n`.
+        let line_start = match before.rfind(['\n', '\r']) {
             Some(nl) => nl + 1,
             None => 0,
         };
@@ -3998,23 +4001,30 @@ impl Parser {
                     effects.push(Effect::Reads(name.clone()));
                     effects.push(Effect::Writes(name));
                 }
-                TokenKind::Lower(s) if s == "console" => {
+                // Bare effect keywords must not be a record field name: if the
+                // next token is `:`, this is `{console: Type}` (a record), not an
+                // effect set, so we bail and let `parse_record_type` fall back.
+                TokenKind::Lower(s)
+                    if s == "console" && self.peek_ahead(1) != &TokenKind::Colon =>
+                {
                     self.advance();
                     effects.push(Effect::Console);
                 }
-                TokenKind::Lower(s) if s == "network" => {
+                TokenKind::Lower(s)
+                    if s == "network" && self.peek_ahead(1) != &TokenKind::Colon =>
+                {
                     self.advance();
                     effects.push(Effect::Network);
                 }
-                TokenKind::Lower(s) if s == "fs" => {
+                TokenKind::Lower(s) if s == "fs" && self.peek_ahead(1) != &TokenKind::Colon => {
                     self.advance();
                     effects.push(Effect::Fs);
                 }
-                TokenKind::Lower(s) if s == "clock" => {
+                TokenKind::Lower(s) if s == "clock" && self.peek_ahead(1) != &TokenKind::Colon => {
                     self.advance();
                     effects.push(Effect::Clock);
                 }
-                TokenKind::Lower(s) if s == "random" => {
+                TokenKind::Lower(s) if s == "random" && self.peek_ahead(1) != &TokenKind::Colon => {
                     self.advance();
                     effects.push(Effect::Random);
                 }

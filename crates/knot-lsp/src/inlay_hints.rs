@@ -303,7 +303,9 @@ fn add_closing_label_hints(
 
     fn count_lines(source: &str, span: Span) -> u32 {
         let mut lines = 0u32;
-        if span.end <= source.len() {
+        // Guard `start <= end` too: an inverted span would make the slice
+        // index panic (`slice index starts at N but ends at M`).
+        if span.start <= span.end && span.end <= source.len() {
             for b in source.as_bytes()[span.start..span.end].iter() {
                 if *b == b'\n' {
                     lines += 1;

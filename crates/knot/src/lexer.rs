@@ -263,12 +263,16 @@ impl<'src> Lexer<'src> {
 
             let ch = self.bytes[self.pos];
 
-            // Newlines — collapse consecutive, suppress leading
-            if ch == b'\n' {
+            // Newlines — collapse consecutive, suppress leading. Accept `\n`,
+            // `\r`, and `\r\n` so classic-Mac (`\r`-only) and Windows (`\r\n`)
+            // line endings also produce layout newlines. (`\r` was previously
+            // eaten by `skip_whitespace`, so `\r`-only files collapsed into a
+            // single logical line and failed layout-sensitive parsing.)
+            if ch == b'\n' || ch == b'\r' {
                 if !last_was_newline {
                     let start = self.pos;
                     self.advance();
-                    while self.peek() == Some(b'\n') {
+                    while matches!(self.peek(), Some(b'\n') | Some(b'\r')) {
                         self.advance();
                     }
                     tokens.push(Token {
@@ -344,7 +348,10 @@ impl<'src> Lexer<'src> {
 
     fn skip_whitespace(&mut self) {
         while let Some(b) = self.peek() {
-            if b == b' ' || b == b'\t' || b == b'\r' {
+            // Note: `\r` is intentionally *not* skipped here — it is handled by
+            // the newline logic in `tokenize` so lone-`\r` line endings produce
+            // layout newlines.
+            if b == b' ' || b == b'\t' {
                 self.advance();
             } else {
                 break;
@@ -356,9 +363,10 @@ impl<'src> Lexer<'src> {
         // Skip the `--`
         self.advance();
         self.advance();
-        // Skip until newline (leave the newline for the main loop)
+        // Skip until newline (leave the newline for the main loop). Treat both
+        // `\n` and `\r` as line terminators so comments end on any line ending.
         while let Some(b) = self.peek() {
-            if b == b'\n' {
+            if b == b'\n' || b == b'\r' {
                 break;
             }
             self.advance();

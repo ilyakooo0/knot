@@ -8654,6 +8654,33 @@ impl Codegen {
                 }
             }
             ast::PatKind::Cons { head, tail } => {
+                // A cons pattern `(x : xs)` is *refutable*: it only matches a
+                // non-empty relation. Without this guard, an empty value would
+                // read index 0 (which the runtime returns as Unit) and silently
+                // mis-bind `head`. Mirror the List/Lit arms' fail/skip.
+                let len = self.call_rt(builder, "knot_relation_len", &[val]);
+                let is_match = builder.ins().icmp_imm(IntCC::NotEqual, len, 0);
+
+                let then_block = builder.create_block();
+                let fail_block = builder.create_block();
+                builder.ins().brif(is_match, then_block, &[], fail_block, &[]);
+
+                builder.switch_to_block(fail_block);
+                builder.seal_block(fail_block);
+                if let Some(done) = done_block {
+                    if self.atomic_retry_block.is_some() {
+                        self.call_rt(builder, "knot_stm_skip", &[]);
+                    }
+                    let unit = self.call_rt(builder, "knot_value_unit", &[]);
+                    builder.ins().jump(done, &[unit.into()]);
+                } else {
+                    self.call_rt_void(builder, "knot_guard_failed", &[]);
+                    builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+                }
+
+                builder.switch_to_block(then_block);
+                builder.seal_block(then_block);
+
                 let zero = builder.ins().iconst(self.ptr_type, 0);
                 let head_val =
                     self.call_rt(builder, "knot_relation_get", &[val, zero]);

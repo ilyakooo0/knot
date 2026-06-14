@@ -780,6 +780,24 @@ fn analyze_unopened_file_inner(
         .any(|d| matches!(d.severity, diagnostic::Severity::Error));
 
     if !has_parse_errors {
+        // The importer's own top-level declaration spans, captured *before*
+        // imports/prelude are merged in. `resolve_imports` inlines copies of
+        // imported declarations whose spans index a *different* file's source;
+        // analysis passes over the combined module can emit diagnostics anchored
+        // in those foreign spans, which — if mapped against this file's `source`
+        // — would surface as phantom errors at unrelated locations (or relocate
+        // to 0:0). We keep only diagnostics anchored within this file's own
+        // declarations.
+        let own_ranges: Vec<(usize, usize)> =
+            module.decls.iter().map(|d| (d.span.start, d.span.end)).collect();
+        let anchored_in_importer = |d: &diagnostic::Diagnostic| -> bool {
+            d.labels.iter().any(|l| {
+                own_ranges
+                    .iter()
+                    .any(|(s, e)| *s <= l.span.start && l.span.end <= *e)
+            })
+        };
+
         let mut analysis_module = module.clone();
 
         let _ = knot_compiler::modules::resolve_imports(&mut analysis_module, path);
@@ -787,19 +805,27 @@ fn analyze_unopened_file_inner(
         knot_compiler::desugar::desugar(&mut analysis_module);
 
         let (infer_diags, _, _, _, _, _, _, _) = knot_compiler::infer::check(&analysis_module);
-        all_diags.extend(infer_diags);
+        all_diags.extend(infer_diags.into_iter().filter(anchored_in_importer));
 
         let (effect_diags, _) = knot_compiler::effects::check_with_effects(&analysis_module);
-        all_diags.extend(effect_diags);
+        all_diags.extend(effect_diags.into_iter().filter(anchored_in_importer));
 
-        all_diags.extend(knot_compiler::stratify::check(&analysis_module));
+        all_diags.extend(
+            knot_compiler::stratify::check(&analysis_module)
+                .into_iter()
+                .filter(anchored_in_importer),
+        );
 
         // Unused-definition warnings: use pre-prelude decls so prelude/imported
         // names are not flagged.
         all_diags.extend(knot_compiler::unused::check(&module.decls));
 
         let type_env = knot_compiler::types::TypeEnv::from_module(&analysis_module);
-        all_diags.extend(knot_compiler::sql_lint::check(&analysis_module, &type_env));
+        all_diags.extend(
+            knot_compiler::sql_lint::check(&analysis_module, &type_env)
+                .into_iter()
+                .filter(anchored_in_importer),
+        );
     }
 
     all_diags

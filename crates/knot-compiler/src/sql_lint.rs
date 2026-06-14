@@ -11,8 +11,8 @@ use knot::diagnostic::Diagnostic;
 
 use crate::codegen::{
     divisor_is_nonzero_int_literal, divisor_is_nonzero_literal, expr_has_tag_column,
-    expr_refs_var, infer_sql_expr_type, int_case_projection_pushable,
-    minmax_pushdown_type_ok, sql_comparison_cast_mode, SqlCastMode,
+    expr_refs_var, infer_sql_expr_type,
+    minmax_pushdown_type_ok, sortby_projection_pushable, sql_comparison_cast_mode, SqlCastMode,
 };
 use crate::types::TypeEnv;
 
@@ -1232,11 +1232,16 @@ fn try_sql_minmax_expr(bind_var: &str, body: &Expr, schema: &str) -> Option<()> 
 }
 
 /// Mirror of codegen's sortBy pushdown approval: the lambda body must
-/// compile to a SQL column expression, and Int-typed if/then/else
-/// projections are rejected (ORDER BY CASE loses the KNOT_INT collation).
+/// compile to a SQL column expression, Int-typed if/then/else projections
+/// are rejected (ORDER BY CASE loses the KNOT_INT collation), and float-typed
+/// projections are rejected (SQLite REAL ordering diverges from Knot's
+/// `total_cmp`). Uses `sortby_projection_pushable` — the same predicate codegen
+/// applies — so this lint's "evaluated at runtime" info matches what actually
+/// happens (previously it used `int_case_projection_pushable`, missing the
+/// float rejection and falsely believing float sorts pushed down).
 fn try_sql_sortby_expr(bind_var: &str, body: &Expr, schema: &str) -> Option<()> {
     try_sql_column_expr(bind_var, body, schema)?;
-    if int_case_projection_pushable(bind_var, body, schema) {
+    if sortby_projection_pushable(bind_var, body, schema) {
         Some(())
     } else {
         None

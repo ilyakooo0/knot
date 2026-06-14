@@ -3186,8 +3186,11 @@ fn find_flip_binary_at(
                 ast::BinOp::Mul => Some("*"),
                 ast::BinOp::Eq => Some("=="),
                 ast::BinOp::Neq => Some("!="),
-                ast::BinOp::And => Some("&&"),
-                ast::BinOp::Or => Some("||"),
+                // `&&`/`||` are intentionally excluded: they short-circuit, so
+                // the right operand is only evaluated when the left permits it
+                // (e.g. `n != 0 && x % n == 0` guards a division). Flipping the
+                // operands would evaluate the formerly-guarded side first and
+                // can panic, so this rewrite is not semantics-preserving.
                 _ => None,
             };
             if let Some(op_text) = op_str {
@@ -4809,21 +4812,42 @@ mod regress_fixes_batch2_tests {
         assert_eq!(replacement, "if a then 2 else 1");
     }
 
-    /// Bug 4: flipping `false && if … else false` must parenthesize the
-    /// moved `if` — keyword forms greedily consume to their right, so the
-    /// bare flip `if … else false && false` swallows `&& false` into the
-    /// else branch.
+    /// Bug 4: flipping a commutative operator whose operand is a keyword form
+    /// must parenthesize the moved `if` — keyword forms greedily consume to
+    /// their right, so the bare flip `if … else 2 == 0` would swallow `== 0`
+    /// into the else branch. (`&&`/`||` are deliberately excluded from the
+    /// flippable set — see `flip_operands_excludes_short_circuit_ops` — so
+    /// this uses `==`, which evaluates both operands unconditionally.)
     #[test]
     fn flip_operands_parenthesizes_keyword_form_operand() {
-        let src = "g = \\x -> false && if x then true else false\n";
+        let src = "g = \\x -> 0 == if x then 1 else 2\n";
         let module = parse_module(src);
-        let off = src.find("false &&").expect("lhs operand");
+        let off = src.find("0 ==").expect("lhs operand");
         let (span, replacement) =
             find_flip_binary_at(&module, src, off).expect("flip action offered");
-        assert_eq!(replacement, "(if x then true else false) && false");
+        assert_eq!(replacement, "(if x then 1 else 2) == 0");
         let mut out = src.to_string();
         out.replace_range(span.start..span.end, &replacement);
         assert!(parses_cleanly(&out), "flip rewrite must reparse: {out}");
+    }
+
+    /// `&&` / `||` must NOT be flippable: they short-circuit, so swapping
+    /// operands can change evaluation semantics — e.g. flipping the
+    /// divide-by-zero guard `x != 0 && 10 / x > 1` would evaluate `10 / x`
+    /// first and panic.
+    #[test]
+    fn flip_operands_excludes_short_circuit_ops() {
+        for (src, needle) in [
+            ("g = \\x -> x != 0 && 10 / x > 1\n", "&&"),
+            ("g = \\a b -> a || b\n", "||"),
+        ] {
+            let module = parse_module(src);
+            let off = src.find(needle).expect("operator present");
+            assert!(
+                find_flip_binary_at(&module, src, off).is_none(),
+                "short-circuit operator `{needle}` must not be flippable: {src}"
+            );
+        }
     }
 
     /// Bug 5a: inlining a let that sits inline on the `do` line must not

@@ -323,7 +323,9 @@ pub(crate) fn handle_completion(
     // snippet only surfaces at top-level positions, a `let` snippet only
     // inside a do-block, etc. Keeps the completion list scoped to what the
     // cursor can actually parse.
-    let snippet_ctx = detect_snippet_context(doc, offset, in_atomic);
+    // `detect_snippet_context` walks `doc.module` spans (indexed against
+    // `doc.source`), so resolve the cursor in that same byte space.
+    let snippet_ctx = detect_snippet_context(doc, analyzed_offset, in_atomic);
     for (label, detail, snippet, ctx) in SNIPPETS {
         if !snippet_context_matches(*ctx, snippet_ctx) {
             continue;
@@ -611,8 +613,10 @@ pub(crate) fn handle_completion(
     // contextual monad sort first. The HKT unifier resolves the monad even when
     // the source is a partial expression (e.g. mid-typing inside a `<-` bind),
     // so the bias kicks in continuously as the user types.
-    if let Some(do_span) = find_enclosing_do_span(&doc.module, offset) {
-        if let Some(monad) = monad_for_do_span(&doc.monad_info, do_span, offset) {
+    // `doc.module` and `doc.monad_info` spans index `doc.source`, so use the
+    // analyzed-source offset (not the mid-debounce `offset`).
+    if let Some(do_span) = find_enclosing_do_span(&doc.module, analyzed_offset) {
+        if let Some(monad) = monad_for_do_span(&doc.monad_info, do_span, analyzed_offset) {
             for item in items.iter_mut() {
                 let label = item.label.trim_start_matches(['*', '&']);
                 if let Some(ty) = doc.type_info.get(label) {
@@ -636,8 +640,10 @@ pub(crate) fn handle_completion(
     // whose return type matches that expectation. This is the same signal
     // signature-help uses to highlight the active parameter — reusing the
     // detection here keeps the two features consistent.
+    // `find_enclosing_application` and `lookup_local_binding_type` both walk
+    // spans indexed against `doc.source`, so use `analyzed_offset`.
     if let Some((func_name, active_param)) =
-        crate::shared::find_enclosing_application(&doc.module, &doc.source, offset)
+        crate::shared::find_enclosing_application(&doc.module, &doc.source, analyzed_offset)
     {
         // Resolve the function's type. Globals first, then locals (let-bound
         // lambdas, do-block binds). Mirrors signature_help's lookup order.
@@ -645,7 +651,7 @@ pub(crate) fn handle_completion(
             .type_info
             .get(func_name.as_str())
             .cloned()
-            .or_else(|| lookup_local_binding_type(doc, &func_name, offset));
+            .or_else(|| lookup_local_binding_type(doc, &func_name, analyzed_offset));
         if let Some(ty) = func_ty {
             let params = crate::shared::parse_function_params(&ty);
             // The last entry is the return type; everything before it is a
@@ -1406,7 +1412,17 @@ fn find_type_for_name(doc: &DocumentState, name: &str, offset: usize) -> Option<
     let ident_end = offset + name.len();
     for (span, ty) in &doc.local_type_info {
         if span.start <= offset && ident_end <= span.end {
-            return Some(ty.clone());
+            // Guard that this binding's span actually spells `name`: without
+            // it, any unrelated binding whose (possibly larger) span merely
+            // contains the receiver position would hand back the wrong type,
+            // so `recv.` would offer fields of a different binding's type.
+            // Mirrors `lookup_local_binding_type`.
+            if span.end <= doc.source.len()
+                && span.start <= span.end
+                && &doc.source[span.start..span.end] == name
+            {
+                return Some(ty.clone());
+            }
         }
     }
     // Check if any reference at this offset points to a local binding with a known type

@@ -9225,10 +9225,21 @@ fn json_to_value_impl(json: &serde_json::Value, wire: bool) -> *mut Value {
             if obj.is_empty() {
                 return alloc(Value::Record(Vec::new()));
             }
-            // Reconstruct Bytes from {"__knot_bytes": "base64..."} format
+            // Reconstruct Bytes from {"__knot_bytes": "base64..."} format.
+            // Only treat the value as Bytes when the string is exactly what
+            // `base64_encode` would have produced for the decoded bytes. A real
+            // Bytes value always round-trips canonically, so this never rejects
+            // genuine Bytes; but it disambiguates from a legitimate user record
+            // whose single field happens to be literally named `__knot_bytes`
+            // (e.g. `{"__knot_bytes": "hello"}`), which would otherwise be
+            // silently corrupted into a Bytes value. Mirrors the structural
+            // guard the `__knot_ctor` marker below already uses.
             if obj.len() == 1 {
                 if let Some(serde_json::Value::String(b64)) = obj.get("__knot_bytes") {
-                    return alloc(Value::Bytes(Arc::from(base64_decode(b64))));
+                    let decoded = base64_decode(b64);
+                    if base64_encode(&decoded) == *b64 {
+                        return alloc(Value::Bytes(Arc::from(decoded)));
+                    }
                 }
             }
             // Reconstruct Constructor from the `__knot_ctor` marker shape
@@ -15262,7 +15273,11 @@ fn http_serve_loop(
                                         .unwrap(),
                                 );
                             if let Some(ms) = retry_after_ms {
-                                let secs = (ms + 999) / 1000;
+                                // Round milliseconds up to whole seconds.
+                                // `saturating_add` guards against overflow when
+                                // a (developer-configured) window is near
+                                // i64::MAX.
+                                let secs = ms.saturating_add(999) / 1000;
                                 if let Ok(h) = format!("Retry-After: {}", secs.max(1))
                                     .parse::<tiny_http::Header>()
                                 {

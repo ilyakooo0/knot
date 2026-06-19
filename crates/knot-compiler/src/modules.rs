@@ -5,7 +5,7 @@
 //! are relative to the importing file.
 
 use knot::ast;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Resolve all imports in the module, recursively loading imported files
@@ -45,7 +45,54 @@ fn resolve_recursive(
     }
 
     let base_dir = source_path.parent().unwrap_or(Path::new("."));
-    let imports = std::mem::take(&mut module.imports);
+    let raw_imports = std::mem::take(&mut module.imports);
+
+    // Coalesce repeated imports of the same module so their selective item
+    // lists union: `import ./util (valX)` followed by `import ./util (valY)`
+    // should make *both* visible. Without this, the diamond-dedup below skips
+    // the second import wholesale and its selected names are lost. A
+    // non-selective import (`items == None`) subsumes any selective import of
+    // the same module. Imports whose path fails to canonicalize are kept as-is
+    // so the main loop still reports their resolution error.
+    let imports: Vec<ast::Import> = {
+        let mut order: Vec<PathBuf> = Vec::new();
+        let mut by_canonical: HashMap<PathBuf, ast::Import> = HashMap::new();
+        let mut unresolved: Vec<ast::Import> = Vec::new();
+        for imp in raw_imports {
+            let full_path =
+                base_dir.join(PathBuf::from(&imp.path).with_extension("knot"));
+            match full_path.canonicalize() {
+                Ok(canon) => match by_canonical.get_mut(&canon) {
+                    Some(existing) => match (&mut existing.items, imp.items) {
+                        // Already non-selective — it subsumes everything.
+                        (None, _) => {}
+                        // A later non-selective import widens to the whole module.
+                        (_, None) => existing.items = None,
+                        // Union the two selective lists (dedup by name).
+                        (Some(ex), Some(new)) => {
+                            for it in new {
+                                if !ex.iter().any(|e| e.name == it.name) {
+                                    ex.push(it);
+                                }
+                            }
+                        }
+                    },
+                    None => {
+                        order.push(canon.clone());
+                        by_canonical.insert(canon, imp);
+                    }
+                },
+                Err(_) => unresolved.push(imp),
+            }
+        }
+        let mut merged: Vec<ast::Import> = order
+            .into_iter()
+            .map(|c| by_canonical.remove(&c).unwrap())
+            .collect();
+        merged.extend(unresolved);
+        merged
+    };
+
     let mut errors = Vec::new();
     let mut imported_decls: Vec<ast::Decl> = Vec::new();
 

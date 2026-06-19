@@ -3,15 +3,11 @@
 
 data Priority = Low {} | Medium {} | High {} | Critical {}
 
-
-
 data Status
   = Open {}
   | InProgress {assignee: Text}
   | Done {}
   | Blocked {reason: Text}
-
-
 
 data Department
   = Engineering {}
@@ -20,11 +16,7 @@ data Department
   | Sales {}
   | Support {}
 
-
-
 data Active = Yes {} | No {}
-
-
 
 type Employee = {name: Text, age: Int, salary: Float, dept: Department, active: Active}
 
@@ -35,8 +27,6 @@ type Ticket = {title: Text, project: Text, status: Status, priority: Priority, p
 type Customer = {name: Text, email: Text, tier: Tier}
 
 data Tier = Free {} | Pro {} | Enterprise {}
-
-
 
 type Order = {customer: Text, product: Text, quantity: Int, total: Float}
 
@@ -49,15 +39,11 @@ data Category
   | Food {}
   | Software {}
 
-
-
 type Team = {name: Text, members: [{name: Text, role: Text}]}
 
 type LogEntry = {timestamp: Int, level: Level, message: Text, source: Text}
 
 data Level = Debug {} | Info {} | Warn {} | Error {}
-
-
 
 type Metric = {name: Text, value: Float, tags: Text}
 

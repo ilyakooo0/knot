@@ -298,3 +298,40 @@ fn lockfile_resolves_types_imported_from_other_modules() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Fix 4: importing the same module twice with disjoint selective lists must
+// make *all* selected names visible. The diamond-dedup used to skip the second
+// import wholesale, dropping its selection.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn repeated_selective_imports_of_same_module_union() {
+    let dir = scratch_dir("repeated_selective_imports");
+    std::fs::write(dir.join("util.knot"), "valX = 10\n\nvalY = 20\n").unwrap();
+    std::fs::write(
+        dir.join("main.knot"),
+        "import ./util (valX)\nimport ./util (valY)\n\nmain = do\n  println (show valX)\n  println (show valY)\n",
+    )
+    .unwrap();
+
+    let out = knot_build(&["main.knot"], &dir);
+    assert!(
+        out.status.success(),
+        "build failed — second selective import was dropped: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let run = Command::new(dir.join("main"))
+        .current_dir(&dir)
+        .output()
+        .expect("failed to run compiled program");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("10") && stdout.contains("20"),
+        "both valX and valY should be visible, got stdout:\n{}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -1698,6 +1698,31 @@ impl Infer {
                     None => {} // cycle already reported
                 }
             }
+            // Single-variant record data subsumption: a single-variant,
+            // parameterless data type is registered both nominally (constructor
+            // application yields `Con(name)`) and as a record alias (a `: name`
+            // annotation or field type resolves to the record). Bridge the two
+            // so `Box {val: 5} : Box` unifies. The same-name `Con`/`Con` case
+            // above already short-circuits identical names; refined types are
+            // handled above and excluded here.
+            (Ty::Con(name, args), other)
+                if args.is_empty()
+                    && !self.refined_types.contains_key(name)
+                    && self.aliases.contains_key(name) =>
+            {
+                let aliased = self.aliases[name].clone();
+                let other = other.clone();
+                self.unify_dir(&aliased, &other, span, t1_provided);
+            }
+            (other, Ty::Con(name, args))
+                if args.is_empty()
+                    && !self.refined_types.contains_key(name)
+                    && self.aliases.contains_key(name) =>
+            {
+                let aliased = self.aliases[name].clone();
+                let other = other.clone();
+                self.unify_dir(&other, &aliased, span, t1_provided);
+            }
             // Two irreducible associated-type projections (both `apply`'d
             // above, so neither reduced): they're equal iff they name the same
             // associated type applied to unifiable arguments. A projection that

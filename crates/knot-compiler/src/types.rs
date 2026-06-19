@@ -244,8 +244,14 @@ impl TypeEnv {
                     let new_resolved = unwrap_relation(
                         resolve_type(to_ty, &aliases, &associated_types),
                     );
-                    let old_schema = schema_descriptor(&old_resolved);
-                    let new_schema = schema_descriptor(&new_resolved);
+                    // Use `relation_inner_schema` (not bare `schema_descriptor`)
+                    // so scalar element types are wrapped as `_value:<scalar>`,
+                    // matching how `schema_for_source` records the source's
+                    // schema in the lockfile. Otherwise scalar / relation-of-
+                    // scalar source migrations could never match the lockfile
+                    // (`_value:int` vs `int`) and always failed validation.
+                    let old_schema = relation_inner_schema(&old_resolved);
+                    let new_schema = relation_inner_schema(&new_resolved);
                     migrate_schemas
                         .entry(relation.clone())
                         .or_default()

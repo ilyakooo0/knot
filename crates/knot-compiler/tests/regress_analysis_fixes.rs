@@ -39,6 +39,15 @@ fn check_src(src: &str) -> Vec<Diagnostic> {
     diags
 }
 
+/// Mirror the LSP pipeline (prelude → desugar → TypeEnv) and run the SQL lint.
+fn sql_lint_diags(src: &str) -> Vec<Diagnostic> {
+    let mut module = parse(src);
+    knot_compiler::base::inject_prelude(&mut module);
+    knot_compiler::desugar::desugar(&mut module);
+    let env = knot_compiler::types::TypeEnv::from_module(&module);
+    knot_compiler::sql_lint::check(&module, &env)
+}
+
 fn effect_diags(src: &str) -> Vec<Diagnostic> {
     let mut module = parse(src);
     knot_compiler::base::inject_prelude(&mut module);
@@ -511,6 +520,127 @@ main = println "ok"
     assert_eq!(
         migs[0].1, "customer:text,qty:int",
         "to-schema must unwrap the relation"
+    );
+}
+
+#[test]
+fn sql_lint_suppressed_when_user_primitive_impl_disables_pushdown() {
+    // An out-of-order pipe (`take` before `filter`) cannot push to SQL, so the
+    // lint normally reports it. But when the program defines a user operator
+    // impl on a primitive type, codegen disables SQL pushdown wholesale and
+    // evaluates everything in memory — so the lint must stay silent rather
+    // than imply (by reporting only this construct) that others push down.
+    let base = r#"*items : [{name: Text, qty: Int}]
+firstFew : IO {} [{name: Text, qty: Int}]
+firstFew = *items |> take 3 |> filter (\m -> m.qty > 0)
+main = println "ok"
+"#;
+    let baseline = sql_lint_diags(base);
+    assert!(
+        !baseline.is_empty(),
+        "out-of-order pipe should normally produce a pushdown lint"
+    );
+
+    let with_impl = format!("{base}\nimpl Eq Int where eq = \\a b -> True\n");
+    let gated = sql_lint_diags(&with_impl);
+    assert!(
+        gated.is_empty(),
+        "a user primitive operator impl must suppress pushdown lints, got: {:?}",
+        gated.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn migrate_scalar_source_runs_end_to_end() {
+    // Two-phase: build/run a scalar `Int` source (seeds db + lockfile), then
+    // build/run a version that migrates it to `Float`. Exercises both the
+    // compile-time schema match (the `_value:` wrapping) and the runtime
+    // migration transform (unwrap `{_value: x}` → bare scalar → migrate fn →
+    // re-wrap), which previously failed at compile time and then at runtime.
+    let dir = std::env::temp_dir().join(format!(
+        "knot_regress_analysis_migscalar_{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let knot = env!("CARGO_BIN_EXE_knot");
+    let src = dir.join("prog.knot");
+
+    let build_run = |source: &str| -> (String, bool) {
+        fs::write(&src, source).unwrap();
+        let build = Command::new(knot)
+            .arg("build")
+            .arg(&src)
+            .current_dir(&dir)
+            .output()
+            .expect("spawn knot build");
+        if !build.status.success() {
+            return (String::from_utf8_lossy(&build.stderr).into_owned(), false);
+        }
+        let out = Command::new(dir.join("prog"))
+            .current_dir(&dir)
+            .output()
+            .expect("run prog");
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            out.status.success(),
+        )
+    };
+
+    let (_, ok1) = build_run("*counter : Int\nmain = do\n  *counter = 5\n  yield {}\n");
+    assert!(ok1, "phase 1 (Int source) should build and run");
+
+    let (stdout, ok2) = build_run(
+        "*counter : Float\n\
+         migrate *counter from Int to Float using \\old -> 0.0\n\
+         main = do\n  c <- *counter\n  println (show c)\n  yield {}\n",
+    );
+    let _ = fs::remove_dir_all(&dir);
+    assert!(ok2, "phase 2 (migrate Int→Float) should build and run: {stdout}");
+    assert!(
+        stdout.contains("0.0"),
+        "migrated scalar value should be 0.0, got: {stdout}"
+    );
+}
+
+#[test]
+fn migrate_scalar_source_schema_matches_source_schema() {
+    // A scalar source is stored under a `_value:<scalar>` schema. The migrate
+    // path must wrap its from/to schemas the same way; otherwise the lockfile
+    // (`_value:int`) and the migrate descriptor (`int`) never match and scalar
+    // source migrations are impossible.
+    let src = r#"*counter : Float
+migrate *counter from Int to Float using \old -> 0.0
+main = println "ok"
+"#;
+    let module = parse(src);
+    let env = knot_compiler::types::TypeEnv::from_module(&module);
+    assert_eq!(
+        env.source_schemas["counter"], "_value:float",
+        "scalar source schema is _value-wrapped"
+    );
+    let migs = &env.migrate_schemas["counter"];
+    assert_eq!(
+        migs[0],
+        ("_value:int".to_string(), "_value:float".to_string()),
+        "migrate from/to schemas must be _value-wrapped to match the source/lockfile schema"
+    );
+}
+
+#[test]
+fn migrate_relation_of_scalar_schema_matches_source_schema() {
+    // Same contract for a relation-of-scalar source (`[Text]` → `_value:text`).
+    let src = r#"*tags : [Int]
+migrate *tags from [Text] to [Int] using \r -> r
+main = println "ok"
+"#;
+    let module = parse(src);
+    let env = knot_compiler::types::TypeEnv::from_module(&module);
+    assert_eq!(env.source_schemas["tags"], "_value:int");
+    let migs = &env.migrate_schemas["tags"];
+    assert_eq!(
+        migs[0],
+        ("_value:text".to_string(), "_value:int".to_string()),
     );
 }
 

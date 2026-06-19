@@ -116,3 +116,26 @@ main = println (show ann)
         "assigning Text to an Int field should still be a type error"
     );
 }
+
+#[test]
+fn distinct_single_variant_records_do_not_unify() {
+    // The single-variant subsumption must bridge a `Con` only with a
+    // structural type (record/var), never with another nominal single-variant
+    // `Con`. Two distinct newtypes with the same field shape must stay
+    // distinct — otherwise nominal typing (and units-of-confusion safety) is
+    // defeated: a `UserId` would be accepted where an `Email` is required.
+    let diags = check_src(
+        r#"data UserId = UserId {raw: Text}
+data Email = Email {raw: Text}
+
+greet : Email -> Text
+greet = \e -> "Hello " ++ e.raw
+
+main = println (greet (UserId {raw: "12345"}))
+"#,
+    );
+    assert!(
+        !diags.is_empty(),
+        "passing a UserId where an Email is required must be a type error"
+    );
+}

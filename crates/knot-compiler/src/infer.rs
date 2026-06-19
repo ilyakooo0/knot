@@ -1317,14 +1317,30 @@ impl Infer {
         match (&t1, &t2) {
             (Ty::Error, _) | (_, Ty::Error) => {}
             // Peel alias wrappers — they're transparent to unification.
-            (Ty::Alias(_, inner), _) => {
-                let inner = (**inner).clone();
-                self.unify_dir(&inner, &t2, span, t1_provided);
+            // Exception: a nominal `data` alias (a single-variant record data
+            // type also registered as a record alias) keeps its identity and
+            // unifies by name as `Con(name)`, NOT by peeling to its structural
+            // body. Peeling would erase the name and let two distinct
+            // single-variant data types with matching field shapes unify
+            // (defeating nominal typing). Pure `type` aliases stay transparent.
+            (Ty::Alias(name, inner), _) => {
+                if self.data_types.contains_key(name) {
+                    let nominal = Ty::Con(name.clone(), vec![]);
+                    self.unify_dir(&nominal, &t2, span, t1_provided);
+                } else {
+                    let inner = (**inner).clone();
+                    self.unify_dir(&inner, &t2, span, t1_provided);
+                }
                 return;
             }
-            (_, Ty::Alias(_, inner)) => {
-                let inner = (**inner).clone();
-                self.unify_dir(&t1, &inner, span, t1_provided);
+            (_, Ty::Alias(name, inner)) => {
+                if self.data_types.contains_key(name) {
+                    let nominal = Ty::Con(name.clone(), vec![]);
+                    self.unify_dir(&t1, &nominal, span, t1_provided);
+                } else {
+                    let inner = (**inner).clone();
+                    self.unify_dir(&t1, &inner, span, t1_provided);
+                }
                 return;
             }
             // Forall types. A Forall on the provided side is instantiated
@@ -1708,7 +1724,16 @@ impl Infer {
             (Ty::Con(name, args), other)
                 if args.is_empty()
                     && !self.refined_types.contains_key(name)
-                    && self.aliases.contains_key(name) =>
+                    && self.aliases.contains_key(name)
+                    // Only bridge against a structural type (record/var/etc.),
+                    // never against another nominal aliased `Con`: reducing
+                    // both sides to their record shapes would let two distinct
+                    // single-variant data types (e.g. `UserId`/`Email` with
+                    // matching fields) unify, defeating nominal typing. The
+                    // same-name `Con`/`Con` arm above already handles identical
+                    // names, so a `Con` here is necessarily a different type.
+                    && !matches!(other, Ty::Con(n2, a2)
+                        if a2.is_empty() && self.aliases.contains_key(n2)) =>
             {
                 let aliased = self.aliases[name].clone();
                 let other = other.clone();
@@ -1717,7 +1742,9 @@ impl Infer {
             (other, Ty::Con(name, args))
                 if args.is_empty()
                     && !self.refined_types.contains_key(name)
-                    && self.aliases.contains_key(name) =>
+                    && self.aliases.contains_key(name)
+                    && !matches!(other, Ty::Con(n2, a2)
+                        if a2.is_empty() && self.aliases.contains_key(n2)) =>
             {
                 let aliased = self.aliases[name].clone();
                 let other = other.clone();

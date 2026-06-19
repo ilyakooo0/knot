@@ -15548,7 +15548,7 @@ fn method_params_body<'a>(
 }
 
 /// Map a type name to its runtime Value tag (as used by knot_value_get_tag).
-fn type_name_to_tag(name: &str) -> Option<i64> {
+pub fn type_name_to_tag(name: &str) -> Option<i64> {
     match name {
         "Int" => Some(0),
         "Float" => Some(1),

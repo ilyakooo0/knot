@@ -1598,7 +1598,14 @@ impl SqlVal {
         match self {
             SqlVal::Null => SqlValKey::Null,
             SqlVal::Int(n) => SqlValKey::Int(*n),
-            SqlVal::Real(f) => SqlValKey::RealBits(f.to_bits()),
+            SqlVal::Real(f) => {
+                // Canonicalize negative zero to positive zero. `-0.0 == 0.0`
+                // under IEEE and SQLite/Knot equality, but their bit patterns
+                // differ, so without this a watcher keyed on `0.0` would miss a
+                // row written as `-0.0`. `*f == 0.0` is true for both zeros.
+                let f = if *f == 0.0 { 0.0 } else { *f };
+                SqlValKey::RealBits(f.to_bits())
+            }
             SqlVal::Text(s) => match s.parse::<i64>() {
                 Ok(n) => SqlValKey::Int(n),
                 Err(_) => SqlValKey::Text(s.clone()),
@@ -1768,6 +1775,20 @@ struct EventRows {
     rows: Vec<Box<[SqlVal]>>,
 }
 
+/// Two event headers are compatible for row concatenation when they list the
+/// same column names in the same order. Independently-built events for the
+/// same table (e.g. an UPDATE pre-image and post-image, or two appends within
+/// one `atomic` block) each construct a fresh `Arc<[ColName]>`, so `Arc::ptr_eq`
+/// alone would wrongly reject them and force a fall back to `Bulk` — defeating
+/// the row-level watcher filtering this columnar representation exists for.
+/// Column names are interned, so the per-element check is a cheap pointer
+/// compare in the common case, with a content compare as a safe fallback.
+fn headers_compatible(a: &Arc<[ColName]>, b: &Arc<[ColName]>) -> bool {
+    Arc::ptr_eq(a, b)
+        || (a.len() == b.len()
+            && a.iter().zip(b.iter()).all(|(x, y)| Arc::ptr_eq(x, y) || x == y))
+}
+
 impl EventRows {
     fn new(columns: Arc<[ColName]>) -> Self {
         EventRows { columns, rows: Vec::new() }
@@ -1808,7 +1829,7 @@ impl EventRows {
     /// `false` if the column headers don't share identity (caller should
     /// fall back to `Bulk`).
     fn try_extend(&mut self, other: EventRows) -> bool {
-        if !Arc::ptr_eq(&self.columns, &other.columns) {
+        if !headers_compatible(&self.columns, &other.columns) {
             return false;
         }
         self.rows.extend(other.rows);
@@ -1860,7 +1881,7 @@ impl WriteEvent {
             (WriteEvent::Bulk, _) => {}
             (_, WriteEvent::Bulk) => *self = WriteEvent::Bulk,
             (WriteEvent::Rows(a), WriteEvent::Rows(b)) => {
-                let same_header = Arc::ptr_eq(&a.columns, &b.columns);
+                let same_header = headers_compatible(&a.columns, &b.columns);
                 if !same_header {
                     *self = WriteEvent::Bulk;
                     return;
@@ -2950,10 +2971,10 @@ fn preregister_table_meta(name: &str) {
 /// use in a `WriteEvent::Rows` payload. Only scalar columns from the schema
 /// are included (nested relation fields are skipped — they can't be filtered
 /// on by `ColEq` anyway). Returns None for non-Record rows.
-/// Per-record-schema cache of column headers used to build `EventRows`. The
-/// header is shared across every event built against the same schema so
-/// `Arc::ptr_eq` checks in `WriteEvent::merge` short-circuit happily, and so
-/// notification payloads share storage.
+/// Build the column header (interned names, schema order) used for `EventRows`
+/// against `rec`. Each call allocates a fresh `Arc<[ColName]>`; event merging
+/// compares headers structurally via `headers_compatible`, so distinct `Arc`s
+/// describing the same columns still combine rather than degrading to `Bulk`.
 fn schema_columns_header(rec: &RecordSchema) -> Arc<[ColName]> {
     rec.columns
         .iter()
@@ -9662,10 +9683,32 @@ pub extern "C-unwind" fn knot_source_migrate(
         _ => panic!("knot runtime: expected relation during migration"),
     };
 
-    // 2. Transform each row through the migration function
+    // 2. Transform each row through the migration function.
+    //
+    // Scalar (and relation-of-scalar) sources store each value as a
+    // `{_value: x}` row, but the migrate function operates on the bare scalar
+    // (its declared `from`/`to` element type). Unwrap the stored `_value`
+    // field before applying the function, and re-wrap the result so the
+    // record-based writer below (which expects `{_value: x}` rows) stores it
+    // correctly. Record/ADT sources pass their rows through unchanged.
+    let old_is_scalar = is_scalar_value_schema(old_schema);
+    let new_is_scalar = is_scalar_value_schema(new_schema);
     let mut new_rows: Vec<*mut Value> = Vec::with_capacity(old_rows.len());
     for row in &old_rows {
-        let new_row = knot_value_call(db, migrate_fn, *row);
+        let input = if old_is_scalar {
+            knot_record_field(*row, "_value".as_ptr(), 6)
+        } else {
+            *row
+        };
+        let out = knot_value_call(db, migrate_fn, input);
+        let new_row = if new_is_scalar {
+            alloc(Value::Record(vec![RecordField {
+                name: "_value".into(),
+                value: out,
+            }]))
+        } else {
+            out
+        };
         new_rows.push(new_row);
     }
 
@@ -9884,6 +9927,14 @@ impl AdtSpec {
 /// Determine if a schema descriptor is an ADT schema (starts with '#')
 fn is_adt_schema(spec: &str) -> bool {
     spec.starts_with('#')
+}
+
+/// True for the single-column `_value:<scalar>` schema used by scalar (and
+/// relation-of-scalar) sources. Such sources store each value as a
+/// `{_value: x}` row in SQLite but expose the bare scalar `x` to user code,
+/// so the migration transform must unwrap/rewrap around the `_value` column.
+fn is_scalar_value_schema(spec: &str) -> bool {
+    spec.starts_with("_value:") && !spec.contains(',') && !spec.contains('[')
 }
 
 /// Parse an ADT schema descriptor: "#Ctor1:f1=t1;f2=t2|Ctor2|Ctor3:f3=t3"
@@ -17112,12 +17163,30 @@ mod _stm_filter_tests {
     }
 
     #[test]
-    fn merge_upgrades_to_bulk_on_header_mismatch() {
-        // Two events built from separately-allocated headers — Arc identity
-        // differs even if the columns are nominally equal — so merge falls
-        // back to Bulk rather than reshaping the rows.
+    fn merge_concatenates_separately_allocated_matching_headers() {
+        // Two events built from separately-allocated headers with the SAME
+        // columns (the common case: an UPDATE pre-image + post-image, or two
+        // appends to one table within an `atomic` block). `Arc` identity
+        // differs, but `headers_compatible` compares structurally, so the
+        // rows concatenate rather than degrading to Bulk — preserving the
+        // row-level watcher filtering this representation exists for.
         let a = rows_with(&[("id", SqlVal::Int(1))]);
         let b = rows_with(&[("id", SqlVal::Int(2))]);
+        let mut e = WriteEvent::Rows(a);
+        e.merge(WriteEvent::Rows(b));
+        if let WriteEvent::Rows(rs) = e {
+            assert_eq!(rs.len(), 2);
+        } else {
+            panic!("expected Rows after merge of matching headers");
+        }
+    }
+
+    #[test]
+    fn merge_upgrades_to_bulk_on_header_mismatch() {
+        // Genuinely different columns ("id" vs "name") can't be concatenated
+        // positionally, so merge falls back to Bulk.
+        let a = rows_with(&[("id", SqlVal::Int(1))]);
+        let b = rows_with(&[("name", SqlVal::Text("x".into()))]);
         let mut e = WriteEvent::Rows(a);
         e.merge(WriteEvent::Rows(b));
         assert!(matches!(e, WriteEvent::Bulk));
@@ -17260,6 +17329,19 @@ mod _stm_filter_tests {
         assert!(neg < zero);
         assert!(zero < pos);
         assert!(neg < pos);
+    }
+
+    #[test]
+    fn sqlvalkey_negative_zero_matches_positive_zero() {
+        // `-0.0 == 0.0` under IEEE / SQLite / Knot equality, but the two have
+        // different bit patterns. `to_key` must canonicalize them to the same
+        // key so a watcher on `col == 0.0` wakes on a row written as `-0.0`.
+        let pos = SqlVal::Real(0.0).to_key();
+        let neg = SqlVal::Real(-0.0).to_key();
+        assert_eq!(pos, neg);
+        // NaN stays distinct (different bit pattern, exact-match semantics).
+        let nan = SqlVal::Real(f64::NAN).to_key();
+        assert_ne!(nan, pos);
     }
 
     /// Debug helper for test panics — `FilterReg` doesn't derive `Debug`.

@@ -5635,12 +5635,10 @@ pub extern "C-unwind" fn knot_relation_sort_by(
             (row, key)
         })
         .collect();
-    indexed.sort_by(|(_, a), (_, b)| {
-        let ord = knot_value_compare_ord(*a, *b);
-        if ord < 0 { std::cmp::Ordering::Less }
-        else if ord > 0 { std::cmp::Ordering::Greater }
-        else { std::cmp::Ordering::Equal }
-    });
+    // `sortBy` dispatches past any `Ord` impl, so it only orders primitive
+    // keys (aborting on ADTs rather than guessing a structural order that
+    // might contradict a user `Ord`).
+    indexed.sort_by(|(_, a), (_, b)| compare_values_primitive(*a, *b));
     let sorted: Vec<*mut Value> = indexed.into_iter().map(|(row, _)| row).collect();
     alloc(Value::Relation(sorted))
 }
@@ -6352,18 +6350,7 @@ fn compare_lt(a: *mut Value, b: *mut Value) -> bool {
         warn_null_comparison(a, b);
         return false;
     }
-    let av = unsafe { as_ref(a) };
-    let bv = unsafe { as_ref(b) };
-    if let (Value::Text(x), Value::Text(y)) = (av, bv) {
-        return x < y;
-    }
-    match (to_num_view(av), to_num_view(bv)) {
-        (Some(NumView::Int(x)), Some(NumView::Int(y))) => x < y,
-        (Some(NumView::Float(x)), Some(NumView::Float(y))) => x.total_cmp(&y) == std::cmp::Ordering::Less,
-        (Some(NumView::Int(x)), Some(NumView::Float(y))) => (x as f64).total_cmp(&y) == std::cmp::Ordering::Less,
-        (Some(NumView::Float(x)), Some(NumView::Int(y))) => x.total_cmp(&(y as f64)) == std::cmp::Ordering::Less,
-        _ => panic!("knot runtime: cannot compare {} < {}", type_name(a), type_name(b)),
-    }
+    compare_values(a, b) == std::cmp::Ordering::Less
 }
 
 fn compare_gt(a: *mut Value, b: *mut Value) -> bool {
@@ -6371,18 +6358,7 @@ fn compare_gt(a: *mut Value, b: *mut Value) -> bool {
         warn_null_comparison(a, b);
         return false;
     }
-    let av = unsafe { as_ref(a) };
-    let bv = unsafe { as_ref(b) };
-    if let (Value::Text(x), Value::Text(y)) = (av, bv) {
-        return x > y;
-    }
-    match (to_num_view(av), to_num_view(bv)) {
-        (Some(NumView::Int(x)), Some(NumView::Int(y))) => x > y,
-        (Some(NumView::Float(x)), Some(NumView::Float(y))) => x.total_cmp(&y) == std::cmp::Ordering::Greater,
-        (Some(NumView::Int(x)), Some(NumView::Float(y))) => (x as f64).total_cmp(&y) == std::cmp::Ordering::Greater,
-        (Some(NumView::Float(x)), Some(NumView::Int(y))) => x.total_cmp(&(y as f64)) == std::cmp::Ordering::Greater,
-        _ => panic!("knot runtime: cannot compare {} > {}", type_name(a), type_name(b)),
-    }
+    compare_values(a, b) == std::cmp::Ordering::Greater
 }
 
 #[unsafe(no_mangle)]
@@ -6534,7 +6510,15 @@ pub extern "C-unwind" fn knot_value_compare_ord(a: *mut Value, b: *mut Value) ->
     }
 }
 
-fn compare_values(a: *mut Value, b: *mut Value) -> std::cmp::Ordering {
+/// Ordering for the primitive types the order-taking builtins can compare
+/// without an `Ord` impl in hand (Text + numbers). Panics on everything else
+/// — notably ADTs and records, whose only correct order would come from a
+/// (possibly user-defined) `Ord` impl that builtins like `maxOn`/`minOn`/
+/// `sortBy` dispatch *past*. Aborting there keeps those builtins from silently
+/// returning a structural answer that contradicts the user's `Ord`. The
+/// `<`/`>` operators, which DO dispatch through `Ord`, use the structural
+/// `compare_values` below instead so `deriving (Ord)` types are orderable.
+fn compare_values_primitive(a: *mut Value, b: *mut Value) -> std::cmp::Ordering {
     let av = unsafe { as_ref(a) };
     let bv = unsafe { as_ref(b) };
     if let (Value::Text(x), Value::Text(y)) = (av, bv) {
@@ -6545,6 +6529,56 @@ fn compare_values(a: *mut Value, b: *mut Value) -> std::cmp::Ordering {
         (Some(NumView::Float(x)), Some(NumView::Float(y))) => x.total_cmp(&y),
         (Some(NumView::Int(x)), Some(NumView::Float(y))) => (x as f64).total_cmp(&y),
         (Some(NumView::Float(x)), Some(NumView::Int(y))) => x.total_cmp(&(y as f64)),
+        _ => panic!(
+            "knot runtime: cannot compare {} with {}",
+            type_name(a),
+            type_name(b)
+        ),
+    }
+}
+
+fn compare_values(a: *mut Value, b: *mut Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let av = unsafe { as_ref(a) };
+    let bv = unsafe { as_ref(b) };
+    if let (Value::Text(x), Value::Text(y)) = (av, bv) {
+        return x.cmp(y);
+    }
+    match (to_num_view(av), to_num_view(bv)) {
+        (Some(NumView::Int(x)), Some(NumView::Int(y))) => return x.cmp(&y),
+        (Some(NumView::Float(x)), Some(NumView::Float(y))) => return x.total_cmp(&y),
+        (Some(NumView::Int(x)), Some(NumView::Float(y))) => return (x as f64).total_cmp(&y),
+        (Some(NumView::Float(x)), Some(NumView::Int(y))) => return x.total_cmp(&(y as f64)),
+        _ => {}
+    }
+    // Structural ordering for non-numeric values — backs derived `Ord` on
+    // ADTs/records and ordered comparison of `Bool`/`Bytes`. Mirrors the
+    // structural recursion of `values_equal`. ADT constructors order by tag
+    // name (lexicographic), then by payload; records order field-by-field in
+    // their canonical (name-sorted) order. The type checker only permits these
+    // comparisons between values of the same type, so cross-shape mismatches
+    // indicate a real type error and still panic.
+    match (av, bv) {
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
+        (Value::Unit, Value::Unit) => Ordering::Equal,
+        (Value::Record(fa), Value::Record(fb)) => {
+            for (a, b) in fa.iter().zip(fb.iter()) {
+                match a.name.cmp(&b.name) {
+                    Ordering::Equal => {}
+                    o => return o,
+                }
+                match compare_values(a.value, b.value) {
+                    Ordering::Equal => {}
+                    o => return o,
+                }
+            }
+            fa.len().cmp(&fb.len())
+        }
+        (Value::Constructor(ta, pa), Value::Constructor(tb, pb)) => match ta.cmp(tb) {
+            Ordering::Equal => compare_values(*pa, *pb),
+            o => o,
+        },
         _ => panic!(
             "knot runtime: cannot compare {} with {}",
             type_name(a),
@@ -8772,7 +8806,7 @@ pub extern "C-unwind" fn knot_relation_min(
     let mut best = knot_value_call(db, f, rows[0]);
     for &row in &rows[1..] {
         let val = knot_value_call(db, f, row);
-        if compare_values(val, best) == std::cmp::Ordering::Less {
+        if compare_values_primitive(val, best) == std::cmp::Ordering::Less {
             best = val;
         }
     }
@@ -8800,7 +8834,7 @@ pub extern "C-unwind" fn knot_relation_max(
     let mut best = knot_value_call(db, f, rows[0]);
     for &row in &rows[1..] {
         let val = knot_value_call(db, f, row);
-        if compare_values(val, best) == std::cmp::Ordering::Greater {
+        if compare_values_primitive(val, best) == std::cmp::Ordering::Greater {
             best = val;
         }
     }

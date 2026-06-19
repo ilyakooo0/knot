@@ -413,3 +413,55 @@ main = do
         "13 curried args must keep their order, got:\n{stdout}"
     );
 }
+
+#[test]
+fn deriving_eq_ord_runs_with_structural_comparison() {
+    // `deriving (Eq, Ord)` must type-check AND run: `==`/`<` fall back to the
+    // runtime's structural comparison (constructors order by tag name). Before
+    // the fix the type checker rejected the program outright.
+    let (stdout, stderr, ok) = compile_and_run(
+        "deriving_eq_ord",
+        r#"data Color = Red {} | Blue {} deriving (Eq, Ord)
+main = do
+  println (show (Red {} == Blue {}))
+  println (show (Red {} == Red {}))
+  println (show (Blue {} < Red {}))
+"#,
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    // Red != Blue, Red == Red, and "Blue" < "Red" lexicographically.
+    assert!(stdout.contains("False"), "Red == Blue should be False:\n{stdout}");
+    assert!(stdout.contains("True"), "Red == Red should be True:\n{stdout}");
+}
+
+#[test]
+fn maxon_over_custom_ord_adt_does_not_silently_misorder() {
+    // `maxOn` dispatches past any user `Ord` impl, so it must abort on ADT
+    // keys rather than return a structural (lexicographic) answer that could
+    // contradict the user's order. The program must not print a "top:" line.
+    let (stdout, _stderr, _ok) = compile_and_run(
+        "maxon_custom_ord_adt",
+        r#"data Level = Low {} | High {}
+impl Eq Level where
+  eq = \a b -> show a == show b
+impl Ord Level where
+  compare = \a b -> case a of
+    Low x -> (case b of
+      Low y -> EQ {}
+      _ -> LT {})
+    High x -> (case b of
+      High y -> EQ {}
+      _ -> GT {})
+type T = {lvl: Level, n: Int}
+*t : [T]
+main = do
+  replace *t = [{lvl: Low {}, n: 1}, {lvl: High {}, n: 2}]
+  let top = maxOn (\r -> r.lvl) *t
+  println ("top: " ++ show top)
+"#,
+    );
+    assert!(
+        !stdout.contains("top: Low"),
+        "maxOn must not silently misorder ADTs against a custom Ord:\n{stdout}"
+    );
+}

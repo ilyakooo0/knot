@@ -304,6 +304,12 @@ struct Scheme {
     /// Each `EffectUnion`'s vars reference `vars` and get freshened together
     /// at instantiation.
     effect_unions: Vec<EffectUnion>,
+    /// Deferred `*`/`/` unit-composition checks captured during generalization
+    /// (e.g. `\x -> x * x`). Like `effect_unions`, each one references `vars`
+    /// and is freshened per instantiation so the same unit-polymorphic
+    /// function can be applied at different units (`square 3.0<M>` and
+    /// `square 4.0<S>` each get their own composition `M^2` / `S^2`).
+    unit_binops: Vec<DeferredUnitBinop>,
     ty: Ty,
 }
 
@@ -314,6 +320,7 @@ impl Scheme {
             unit_vars: vec![],
             constraints: vec![],
             effect_unions: vec![],
+            unit_binops: vec![],
             ty,
         }
     }
@@ -324,6 +331,7 @@ impl Scheme {
             unit_vars: vec![],
             constraints: vec![],
             effect_unions: vec![],
+            unit_binops: vec![],
             ty,
         }
     }
@@ -553,16 +561,12 @@ struct Infer {
     refine_vars: Vec<(Span, TyVar, Ty)>,
 
     /// Unit-composition checks for `*`/`/` deferred because one operand was
-    /// still an unresolved type variable when the binop was inferred.
+    /// still an unresolved type variable when the binop was inferred. When the
+    /// enclosing binding is generalized, `generalize` moves the relevant
+    /// entries onto the resulting `Scheme` (`Scheme::unit_binops`) so each
+    /// instantiation re-arms its own copy; the rest are resolved once at
+    /// end-of-inference by `resolve_deferred_unit_binops`.
     deferred_unit_binops: Vec<DeferredUnitBinop>,
-    /// Type variables involved in a deferred `*`/`/` whose BOTH operands
-    /// were unresolved at the binop node. These must stay monomorphic
-    /// (treated as free-in-env at generalization) so call sites pin the
-    /// very same variables the deferred composition check will inspect —
-    /// quantifying them would let each call site instantiate fresh,
-    /// unconstrained copies and the unit-composition check would never see
-    /// the units the program actually used.
-    deferred_mono_vars: HashSet<TyVar>,
 
     /// Spans of `elem` haystack args whose element type is SQL-pushable
     /// (Text/Float/Bool). Recorded during App inference, exported for codegen.
@@ -618,7 +622,6 @@ impl Infer {
             refined_types: HashMap::new(),
             refine_vars: Vec::new(),
             deferred_unit_binops: Vec::new(),
-            deferred_mono_vars: HashSet::new(),
             elem_pushdown_ok: HashSet::new(),
         }
     }
@@ -1339,6 +1342,7 @@ impl Infer {
                         unit_vars: vec![],
                         constraints: vec![],
                         effect_unions: vec![],
+                        unit_binops: vec![],
                         ty: (**body).clone(),
                     };
                     let inst = self.instantiate_at(&scheme, span);
@@ -1369,6 +1373,7 @@ impl Infer {
                         unit_vars: vec![],
                         constraints: vec![],
                         effect_unions: vec![],
+                        unit_binops: vec![],
                         ty: (**body).clone(),
                     };
                     let inst = self.instantiate_at(&scheme, span);
@@ -2158,7 +2163,10 @@ impl Infer {
     }
 
     fn instantiate_at(&mut self, scheme: &Scheme, span: Span) -> Ty {
-        if scheme.vars.is_empty() && scheme.unit_vars.is_empty() {
+        if scheme.vars.is_empty()
+            && scheme.unit_vars.is_empty()
+            && scheme.unit_binops.is_empty()
+        {
             return scheme.ty.clone();
         }
         let mapping: HashMap<TyVar, Ty> = scheme
@@ -2209,16 +2217,39 @@ impl Infer {
             let sources = u.sources.iter().copied().map(fresh_var).collect();
             self.pending_effect_unions.push(EffectUnion { result, sources });
         }
+        // Freshen unit variables so each instantiation gets independent units.
+        let unit_mapping: HashMap<UnitVar, UnitVar> = scheme
+            .unit_vars
+            .iter()
+            .map(|v| (*v, self.fresh_unit_var()))
+            .collect();
+        // Freshen captured `*`/`/` unit-composition checks alongside the type
+        // and unit variables, then re-arm them for end-of-inference resolution
+        // — each instantiation resolves its own composition (so `square 3.0<M>`
+        // yields `M^2` independently of `square 4.0<S>` → `S^2`).
+        for b in &scheme.unit_binops {
+            let result = match mapping.get(&b.result) {
+                Some(Ty::Var(nv)) => *nv,
+                _ => b.result,
+            };
+            let mut lhs = self.subst_ty(&b.lhs, &mapping);
+            let mut rhs = self.subst_ty(&b.rhs, &mapping);
+            if !unit_mapping.is_empty() {
+                lhs = self.subst_unit_vars_in_ty(&lhs, &unit_mapping);
+                rhs = self.subst_unit_vars_in_ty(&rhs, &unit_mapping);
+            }
+            self.deferred_unit_binops.push(DeferredUnitBinop {
+                op: b.op,
+                lhs,
+                rhs,
+                result,
+                span: b.span,
+            });
+        }
         let ty = self.subst_ty(&scheme.ty, &mapping);
-        // Freshen unit variables so each instantiation gets independent units
-        if scheme.unit_vars.is_empty() {
+        if unit_mapping.is_empty() {
             ty
         } else {
-            let unit_mapping: HashMap<UnitVar, UnitVar> = scheme
-                .unit_vars
-                .iter()
-                .map(|v| (*v, self.fresh_unit_var()))
-                .collect();
             self.subst_unit_vars_in_ty(&ty, &unit_mapping)
         }
     }
@@ -2694,6 +2725,30 @@ impl Infer {
                 }
             }
         }
+        // Drain deferred `*`/`/` unit-composition checks whose result var is
+        // generalized here, capturing them on the scheme (freshened per
+        // instantiation) just like effect-unions above. This is what lets a
+        // function like `\x -> x * x` be unit-polymorphic: each call site gets
+        // its own composition (`square 3.0<M>` → `M^2`, `square 4.0<S>` →
+        // `S^2`) instead of all uses being pinned to one monomorphic unit.
+        // Binops not generalized here stay pending for the end-of-inference
+        // global resolution.
+        let pending_binops = std::mem::take(&mut self.deferred_unit_binops);
+        let mut unit_binops = Vec::new();
+        for b in pending_binops {
+            match self.apply(&Ty::Var(b.result)) {
+                Ty::Var(v) if gen_set.contains(&v) => {
+                    unit_binops.push(DeferredUnitBinop {
+                        op: b.op,
+                        lhs: self.apply(&b.lhs),
+                        rhs: self.apply(&b.rhs),
+                        result: v,
+                        span: b.span,
+                    });
+                }
+                _ => self.deferred_unit_binops.push(b),
+            }
+        }
         let env_unit_fv = self.free_unit_vars_in_env();
         let unit_vars: Vec<UnitVar> = self
             .free_unit_vars_in_ty(&applied)
@@ -2705,6 +2760,7 @@ impl Infer {
             unit_vars,
             constraints: kept,
             effect_unions,
+            unit_binops,
             ty: applied,
         }
     }
@@ -2929,11 +2985,6 @@ impl Infer {
         for ty in self.derived_types.values() {
             self.collect_free_vars(ty, &mut s);
         }
-        // Variables awaiting a deferred Var×Var unit-composition check must
-        // not be generalized (see `deferred_mono_vars`).
-        for v in &self.deferred_mono_vars {
-            self.collect_free_vars(&Ty::Var(*v), &mut s);
-        }
         s
     }
 
@@ -2954,9 +3005,6 @@ impl Infer {
         }
         for ty in self.derived_types.values() {
             self.collect_free_unit_vars(ty, &mut s);
-        }
-        for v in &self.deferred_mono_vars {
-            self.collect_free_unit_vars(&Ty::Var(*v), &mut s);
         }
         s
     }
@@ -4744,21 +4792,16 @@ impl Infer {
                 // computed yet AND unifying them would be unsound (it
                 // types `w * h` as `w`'s unit instead of its square once
                 // units appear, and falsely rejects `Float<M> * Float<S>`).
-                // Defer the whole check; keep the operand/result variables
-                // monomorphic so the call sites that eventually pin them
-                // constrain the same variables this deferred check reads.
-                // If no units ever appear, the deferred resolution falls
-                // through to the plain `unify + Num` path below, so
+                // Defer the whole check and return a fresh result variable.
+                // If the surrounding binding is generalized, `generalize`
+                // captures this binop on the scheme so each instantiation
+                // resolves its own composition (keeping `\x -> x * x`
+                // unit-polymorphic); otherwise it is resolved once at
+                // end-of-inference. If no units ever appear, that resolution
+                // falls through to the plain `unify + Num` path below, so
                 // dimensionless code is unaffected.
                 if allow_defer && lhs_is_var && rhs_is_var {
                     let result = self.fresh_var();
-                    if let Ty::Var(v) = lhs_applied {
-                        self.deferred_mono_vars.insert(*v);
-                    }
-                    if let Ty::Var(v) = rhs_applied {
-                        self.deferred_mono_vars.insert(*v);
-                    }
-                    self.deferred_mono_vars.insert(result);
                     self.deferred_unit_binops.push(DeferredUnitBinop {
                         op,
                         lhs: lhs_applied.clone(),
@@ -4848,6 +4891,7 @@ impl Infer {
                         unit_vars: vec![],
                         constraints: vec![],
                         effect_unions: vec![],
+                        unit_binops: vec![],
                         ty: *body,
                     },
                     _ => Scheme::mono(expected.clone()),
@@ -5924,20 +5968,34 @@ impl Infer {
 
     fn collect_impls(&mut self, module: &ast::Module) {
         for decl in &module.decls {
-            if let ast::DeclKind::Impl {
-                trait_name, args, ..
-            } = &decl.node
-            {
-                // Extract type name from impl args
-                // e.g. `impl Display Int where` → ("Display", "Int")
-                // e.g. `impl Functor [] where` → ("Functor", "[]")
-                if let Some(first_arg) = args.first() {
-                    let type_name = Self::type_name_from_ast(first_arg);
-                    if let Some(name) = type_name {
-                        self.known_impls
-                            .insert((trait_name.clone(), name));
+            match &decl.node {
+                ast::DeclKind::Impl {
+                    trait_name, args, ..
+                } => {
+                    // Extract type name from impl args
+                    // e.g. `impl Display Int where` → ("Display", "Int")
+                    // e.g. `impl Functor [] where` → ("Functor", "[]")
+                    if let Some(first_arg) = args.first() {
+                        let type_name = Self::type_name_from_ast(first_arg);
+                        if let Some(name) = type_name {
+                            self.known_impls
+                                .insert((trait_name.clone(), name));
+                        }
                     }
                 }
+                // `data T = ... deriving (Eq, Ord, ...)` generates impls in
+                // codegen, so the type checker must treat the type as having
+                // each derived trait's impl — otherwise `==`/`<`/trait-method
+                // uses on `T` are spuriously rejected at the call site.
+                ast::DeclKind::Data {
+                    name, deriving, ..
+                } => {
+                    for trait_name in deriving {
+                        self.known_impls
+                            .insert((trait_name.clone(), name.clone()));
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -6068,7 +6126,7 @@ impl Infer {
                         }
                         self.bind_top(
                             name,
-                            Scheme { vars, unit_vars, constraints, effect_unions, ty },
+                            Scheme { vars, unit_vars, constraints, effect_unions, unit_binops: vec![], ty },
                         );
                     } else {
                         let var = self.fresh();
@@ -6466,6 +6524,7 @@ impl Infer {
                     unit_vars: vec![u],
                     constraints: vec![],
                     effect_unions: vec![],
+                    unit_binops: vec![],
                     ty: Ty::Fun(
                         Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
                         Box::new(int_u),
@@ -6486,6 +6545,7 @@ impl Infer {
                     unit_vars: vec![u],
                     constraints: vec![],
                     effect_unions: vec![],
+                    unit_binops: vec![],
                     ty: Ty::Fun(
                         Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Bool))),
                         Box::new(Ty::Fun(
@@ -6538,6 +6598,7 @@ impl Infer {
                     unit_vars: vec![u],
                     constraints: vec![],
                     effect_unions: vec![],
+                    unit_binops: vec![],
                     ty: Ty::Fun(
                         Box::new(int_u.clone()),
                         Box::new(Ty::IO(BTreeSet::from([IoEffect::Random]), None, Box::new(int_u))),
@@ -6555,6 +6616,7 @@ impl Infer {
                 unit_vars: vec![u],
                 constraints: vec![],
                 effect_unions: vec![],
+                unit_binops: vec![],
                 ty: Ty::IO(BTreeSet::from([IoEffect::Random]), None, Box::new(float_u)),
             });
         }
@@ -6663,6 +6725,7 @@ impl Infer {
                     unit_vars: vec![u],
                     constraints: vec![],
                     effect_unions: vec![],
+                    unit_binops: vec![],
                     ty: Ty::Fun(
                         Box::new(int_u),
                         Box::new(Ty::Fun(
@@ -6698,6 +6761,7 @@ impl Infer {
                     unit_vars: vec![u],
                     constraints: vec![],
                     effect_unions: vec![],
+                    unit_binops: vec![],
                     ty: Ty::Fun(
                         Box::new(Ty::Text),
                         Box::new(Ty::Fun(
@@ -6863,6 +6927,7 @@ impl Infer {
                     unit_vars: vec![u],
                     constraints: vec![],
                     effect_unions: vec![],
+                    unit_binops: vec![],
                     ty: Ty::Fun(
                         Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(float_u.clone()))),
                         Box::new(Ty::Fun(
@@ -7018,6 +7083,7 @@ impl Infer {
                     unit_vars: vec![u],
                     constraints: vec![],
                     effect_unions: vec![],
+                    unit_binops: vec![],
                     ty: Ty::Fun(Box::new(Ty::Text), Box::new(int_u)),
                 },
             );
@@ -7086,6 +7152,7 @@ impl Infer {
                     unit_vars: vec![u],
                     constraints: vec![],
                     effect_unions: vec![],
+                    unit_binops: vec![],
                     ty: Ty::Fun(
                         Box::new(Ty::IntUnit(UnitTy::var(u))),
                         Box::new(Ty::Int),
@@ -7104,6 +7171,7 @@ impl Infer {
                     unit_vars: vec![u],
                     constraints: vec![],
                     effect_unions: vec![],
+                    unit_binops: vec![],
                     ty: Ty::Fun(
                         Box::new(Ty::Int),
                         Box::new(Ty::IntUnit(UnitTy::var(u))),
@@ -7122,6 +7190,7 @@ impl Infer {
                     unit_vars: vec![u],
                     constraints: vec![],
                     effect_unions: vec![],
+                    unit_binops: vec![],
                     ty: Ty::Fun(
                         Box::new(Ty::FloatUnit(UnitTy::var(u))),
                         Box::new(Ty::Float),
@@ -7140,6 +7209,7 @@ impl Infer {
                     unit_vars: vec![u],
                     constraints: vec![],
                     effect_unions: vec![],
+                    unit_binops: vec![],
                     ty: Ty::Fun(
                         Box::new(Ty::Float),
                         Box::new(Ty::FloatUnit(UnitTy::var(u))),
@@ -7233,6 +7303,7 @@ impl Infer {
                     unit_vars: vec![u],
                     constraints: vec![],
                     effect_unions: vec![],
+                    unit_binops: vec![],
                     ty: Ty::Fun(Box::new(Ty::Bytes), Box::new(int_u)),
                 },
             );
@@ -7251,6 +7322,7 @@ impl Infer {
                     unit_vars: vec![u1, u2],
                     constraints: vec![],
                     effect_unions: vec![],
+                    unit_binops: vec![],
                     ty: Ty::Fun(
                         Box::new(int_u1),
                         Box::new(Ty::Fun(
@@ -7332,6 +7404,7 @@ impl Infer {
                     unit_vars: vec![u1, u2],
                     constraints: vec![],
                     effect_unions: vec![],
+                    unit_binops: vec![],
                     ty: Ty::Fun(
                         Box::new(int_u1),
                         Box::new(Ty::Fun(Box::new(Ty::Bytes), Box::new(int_u2))),
@@ -7484,7 +7557,7 @@ impl Infer {
 
                 self.bind_top(
                     name,
-                    Scheme { vars, unit_vars, constraints, effect_unions: vec![], ty: method_ty },
+                    Scheme { vars, unit_vars, constraints, effect_unions: vec![], unit_binops: vec![], ty: method_ty },
                 );
             }
         }
@@ -7581,7 +7654,7 @@ impl Infer {
                             }
                             self.bind_top(
                                 name,
-                                Scheme { vars, unit_vars, constraints, effect_unions, ty: ann_ty },
+                                Scheme { vars, unit_vars, constraints, effect_unions, unit_binops: vec![], ty: ann_ty },
                             );
                         } else {
                             let applied = self.apply(&inferred);
@@ -8633,8 +8706,15 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
             .known_impls
             .insert((trait_name.to_string(), "IO".to_string()));
     }
-    // Primitive impls registered intrinsically in codegen
-    for ty in &["Int", "Float", "Text", "Bool"] {
+    // Primitive impls registered intrinsically in codegen. `==`/`<` on these
+    // dispatch to the runtime `knot_value_eq` / `knot_value_compare` fallbacks
+    // (no user impl required). `knot_value_eq` compares records, variants,
+    // relations, bytes and uuids structurally, so those get intrinsic `Eq`.
+    // `Ord` stays minimal (matching the existing conservative design — e.g.
+    // `Bool` is deliberately not orderable): ADTs that opt in via
+    // `deriving (Ord)` are registered by `collect_impls` and ordered through
+    // the structural recursion in the runtime's `compare_values`.
+    for ty in &["Int", "Float", "Text", "Bool", "Bytes", "Uuid", "Record", "Variant", "[]"] {
         infer.known_impls.insert(("Eq".to_string(), ty.to_string()));
     }
     for ty in &["Int", "Float", "Text"] {

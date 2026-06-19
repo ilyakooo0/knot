@@ -214,6 +214,11 @@ main = do
 
 #[test]
 fn mul_with_unresolved_operand_and_unit_is_rejected() {
+    // `\x -> x * 2.0<M>` is unit-polymorphic (`∀u. Float<u> -> Float<u*M>`),
+    // so `f 3.0<M>` has unit `M^2`. Adding `4.0<M>` to an `M^2` value is a
+    // genuine dimension error and must be rejected — now with the precise
+    // "unit mismatch" rather than the old "cannot infer" that the previous
+    // (under-generalized) inference produced spuriously.
     let src = r#"unit M
 f = \x -> x * 2.0<M>
 bad = (f 3.0<M>) + 4.0<M>
@@ -221,8 +226,8 @@ main = bad
 "#;
     let diags = check_src(src);
     assert!(
-        has_error(&diags, "cannot infer the unit"),
-        "expected unit-inference diagnostic, got: {:?}",
+        has_error(&diags, "unit mismatch"),
+        "expected unit-mismatch diagnostic (M vs M^2), got: {:?}",
         diags
     );
 }
@@ -562,15 +567,21 @@ main = println (show (check []))
 }
 
 #[test]
-fn concrete_unit_times_unknown_operand_still_rejected() {
+fn concrete_unit_times_unknown_operand_is_unit_polymorphic() {
+    // `\y -> 2.0<M> * y` is `∀u. Float<u> -> Float<M*u>`. Applying it to a
+    // dimensionless `3.0` resolves `u` to the empty unit, giving `Float<M>`
+    // — a well-typed program. (Previously rejected with "cannot infer the
+    // unit" only because the deferred composition wasn't freshened per
+    // instantiation, leaving the operand var unpinned; that under-
+    // generalization bug is now fixed, so the application type-checks.)
     let src = r#"unit M
 f = \y -> 2.0<M> * y
-main = println (show (f 3.0))
+main = println (show (stripFloatUnit (f 3.0)))
 "#;
     let diags = check_src(src);
     assert!(
-        has_error(&diags, "cannot infer the unit of an operand"),
-        "got: {:?}",
+        diags.is_empty(),
+        "expected no diagnostics — the application is unit-polymorphic: {:?}",
         diags
     );
 }
@@ -582,6 +593,67 @@ main = println (show (f 2.0 3.0))
 "#;
     let diags = check_src(src);
     assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
+}
+
+#[test]
+fn self_multiply_lambda_is_unit_polymorphic() {
+    // `\x -> x * x` must generalize to `∀u. Float<u> -> Float<u^2>` so it can
+    // be applied at two different units. The deferred unit-composition is
+    // captured on the scheme and freshened per use site.
+    let src = r#"unit M
+unit S
+square = \x -> x * x
+main = do
+  let a = square 3.0<M>
+  let b = square 4.0<S>
+  println (show (stripFloatUnit a))
+  println (show (stripFloatUnit b))
+"#;
+    let diags = check_src(src);
+    assert!(diags.is_empty(), "square should be unit-polymorphic: {:?}", diags);
+}
+
+#[test]
+fn multi_param_product_is_unit_polymorphic() {
+    // Same generalization for a two-argument product used at distinct units.
+    let src = r#"unit M
+unit S
+area = \w h -> w * h
+main = do
+  let a = area 6.0<M> 2.0<M>
+  let b = area 6.0<S> 2.0<S>
+  println (show (stripFloatUnit a))
+  println (show (stripFloatUnit b))
+"#;
+    let diags = check_src(src);
+    assert!(diags.is_empty(), "area should be unit-polymorphic: {:?}", diags);
+}
+
+// ── 10b. `deriving (Eq, Ord)` and structural equality ───────────────
+
+#[test]
+fn deriving_eq_ord_registers_impls() {
+    // `deriving (Eq, Ord)` must register the impls in the type checker so
+    // `==`/`<` on the ADT are accepted (codegen already generates them).
+    let src = r#"data Color = Red {} | Blue {} deriving (Eq, Ord)
+main = do
+  println (show (Red {} == Blue {}))
+  println (show (Red {} < Blue {}))
+"#;
+    let diags = check_src(src);
+    assert!(diags.is_empty(), "deriving (Eq, Ord) should type-check: {:?}", diags);
+}
+
+#[test]
+fn record_and_list_equality_typecheck() {
+    // Structural `Eq` for records and relations: `==` must type-check even
+    // though no user impl can be written for these shapes.
+    let src = r#"main = do
+  println (show ({a: 1, b: 2} == {a: 1, b: 2}))
+  println (show ([1, 2, 3] == [1, 2, 3]))
+"#;
+    let diags = check_src(src);
+    assert!(diags.is_empty(), "structural Eq should type-check: {:?}", diags);
 }
 
 // ── 11. User-annotated `\/` effect-union rows ──

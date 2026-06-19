@@ -1364,6 +1364,14 @@ fn try_sql_inline_cond(bind_var: &str, expr: &Expr, schema: &str) -> Option<()> 
                 if lt.as_deref() == Some("float") || rt.as_deref() == Some("float") {
                     return None;
                 }
+                // json-stored columns (ADT payloads / nested records) compare
+                // as raw JSON text in SQL, which can diverge from Knot's
+                // structural equality. Codegen's `try_sql_inline_condition`
+                // refuses to push these; mirror that here so the lint doesn't
+                // claim a query is pushed down when codegen keeps it in memory.
+                if lt.as_deref() == Some("json") || rt.as_deref() == Some("json") {
+                    return None;
+                }
                 if matches!(op, BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge)
                     && (lt.as_deref() == Some("tag") || rt.as_deref() == Some("tag"))
                 {

@@ -354,23 +354,67 @@ fn hash_structure(module: &Module) -> u64 {
 /// Spans depend on byte offsets that shift with formatting changes; we want
 /// hashes that survive whitespace edits.
 fn strip_spans(s: &str) -> String {
-    // Cheap state machine: walk the string and skip the span markers.
-    let mut out = String::with_capacity(s.len());
+    // Walk the string, dropping only *complete* span markers. Matching the
+    // full `Span { start: N, end: N }` shape (rather than a bare `Span {`
+    // prefix + seek-to-`}`) is required for correctness: a string/int literal
+    // whose Debug rendering contains the text `Span {` has no `}` of its own,
+    // so a naive seek would swallow the following real span's `}` and delete
+    // the part of the AST that actually changed — making two different decl
+    // versions hash equal and leaving dependents with stale diagnostics.
     let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i..].starts_with(b"Span {") {
-            // Skip until the matching `}`. Spans don't contain nested `}`,
-            // so a simple seek is enough.
-            if let Some(end) = bytes[i..].iter().position(|&b| b == b'}') {
-                i += end + 1;
-                continue;
-            }
+        if let Some(len) = span_marker_len(&bytes[i..]) {
+            i += len;
+            continue;
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        // Copy one whole UTF-8 character verbatim. `i` is always on a char
+        // boundary: it starts at 0 and advances either by a full char width
+        // here or past an all-ASCII span marker above.
+        let step = utf8_char_len(bytes[i]);
+        let end = (i + step).min(bytes.len());
+        out.push_str(&s[i..end]);
+        i = end;
     }
     out
+}
+
+/// If `b` begins with a complete derived-`Debug` span marker
+/// (`Span { start: <digits>, end: <digits> }`), return its byte length;
+/// otherwise `None`. Pure ASCII, so the returned length keeps `i` on a
+/// UTF-8 char boundary.
+fn span_marker_len(b: &[u8]) -> Option<usize> {
+    let lit_at = |i: usize, lit: &[u8]| -> Option<usize> {
+        if b.len() >= i + lit.len() && b[i..i + lit.len()] == *lit {
+            Some(i + lit.len())
+        } else {
+            None
+        }
+    };
+    let digits_at = |i: usize| -> Option<usize> {
+        let mut j = i;
+        while j < b.len() && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > i { Some(j) } else { None }
+    };
+    let i = lit_at(0, b"Span { start: ".as_slice())?;
+    let i = digits_at(i)?;
+    let i = lit_at(i, b", end: ".as_slice())?;
+    let i = digits_at(i)?;
+    lit_at(i, b" }".as_slice())
+}
+
+/// Byte width of the UTF-8 character beginning with `first`.
+fn utf8_char_len(first: u8) -> usize {
+    match first {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1, // stray continuation byte: advance one to stay live
+    }
 }
 
 /// Collect every top-level name a declaration's body references. Used to
@@ -455,6 +499,33 @@ mod tests {
         let fb = ModuleFingerprint::from_module(&b);
         let changed = fb.changed_decls(&fa);
         assert!(changed.contains("double"), "got: {changed:?}");
+    }
+
+    #[test]
+    fn fingerprint_detects_change_inside_string_literal_with_span_text() {
+        // A string literal whose Debug rendering contains the substring
+        // `Span {` (with no `}` of its own) must not let `strip_spans` swallow
+        // the following real span and hash two different bodies equal. The two
+        // decls differ only by `foo` vs `bar` inside such a literal.
+        let a = parse_module("msg = \"Span { foo\"\n");
+        let b = parse_module("msg = \"Span { bar\"\n");
+        let fa = ModuleFingerprint::from_module(&a);
+        let fb = ModuleFingerprint::from_module(&b);
+        let changed = fb.changed_decls(&fa);
+        assert!(
+            changed.contains("msg"),
+            "change inside a literal containing `Span {{` must be detected: {changed:?}"
+        );
+    }
+
+    #[test]
+    fn strip_spans_removes_real_markers_but_keeps_literal_text() {
+        // Real `Span { start: N, end: N }` markers are dropped; the bare text
+        // `Span {` inside a string literal is preserved.
+        assert_eq!(strip_spans("Foo { span: Span { start: 1, end: 2 } }"), "Foo { span:  }");
+        assert_eq!(strip_spans("Text(\"Span { x\")"), "Text(\"Span { x\")");
+        // Non-ASCII content survives byte-accurately.
+        assert_eq!(strip_spans("Text(\"café\")"), "Text(\"café\")");
     }
 
     #[test]

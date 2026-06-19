@@ -955,15 +955,30 @@ impl Parser {
 
             let mut constructors = vec![this.parse_constructor_def()?];
             loop {
+                // Probe past newlines for a continuation `|`. If there isn't
+                // one, restore so the cursor stays right after the last
+                // constructor — otherwise the decl's span would swallow the
+                // trailing newline and any same-line comment.
+                let saved = this.save();
                 this.skip_newlines();
                 if !this.eat(&TokenKind::Pipe) {
+                    this.restore(saved);
                     break;
                 }
                 this.skip_newlines();
                 constructors.push(this.parse_constructor_def()?);
             }
 
-            // Optional deriving clause.
+            // End of the constructor list. Capture it before skipping
+            // newlines to probe for an optional `deriving` clause, so that
+            // when there is no `deriving`, the decl's span doesn't swallow the
+            // trailing newline (and any same-line trailing comment) — which
+            // would otherwise make the formatter treat that comment as
+            // internal and fall back to verbatim copying.
+            let mut end = this.prev_span();
+
+            // Optional deriving clause (possibly on a following line).
+            let saved = this.save();
             this.skip_newlines();
             let mut deriving = Vec::new();
             if this.eat(&TokenKind::Deriving) {
@@ -982,9 +997,10 @@ impl Parser {
                 }
                 this.expect(&TokenKind::RParen, "expected ')' to close deriving list")
                     .ok()?;
+                end = this.prev_span();
+            } else {
+                this.restore(saved);
             }
-
-            let end = this.prev_span();
             Some(Decl {
                 node: DeclKind::Data {
                     name,
@@ -2204,6 +2220,16 @@ impl Parser {
             // binary operators.  These are handled by `parse_expr` but not by
             // the Pratt sub-parser, so we delegate to `parse_expr` when we see
             // one of these keyword tokens.
+            // Guard the recursive RHS descent. Right-associative operators
+            // (`++`, l_bp == r_bp) parse their RHS by re-entering at the same
+            // binding power, so a long right-associative chain recurses one
+            // native frame per operator. Charge recursion across the call —
+            // mirroring `parse_type_function`'s right-recursive `->` — so a
+            // pathological chain hits the depth limit and reports an error
+            // instead of overflowing the stack. The `parse_atom` cost is
+            // released before this point, so without this guard the depth
+            // counter never accumulates here.
+            if !self.enter_recursion() { return None; }
             let rhs = if matches!(
                 self.peek(),
                 TokenKind::Let
@@ -2214,10 +2240,12 @@ impl Parser {
                     | TokenKind::Atomic
                     | TokenKind::Refine
             ) {
-                self.parse_expr()?
+                self.parse_expr()
             } else {
-                self.parse_expr_bp(r_bp)?
+                self.parse_expr_bp(r_bp)
             };
+            self.recursion_depth -= 1;
+            let rhs = rhs?;
 
             let span = Span::new(lhs.span.start, rhs.span.end);
             lhs = Spanned::new(

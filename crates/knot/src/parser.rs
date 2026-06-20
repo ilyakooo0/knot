@@ -1854,6 +1854,22 @@ impl Parser {
                 let mut seg = kw.to_string();
                 self.consume_route_dashed_suffix(&mut seg);
                 segments.push(PathSegment::Literal(seg));
+            } else if matches!(
+                self.peek(),
+                TokenKind::Int(_)
+                    | TokenKind::Float(_)
+                    | TokenKind::Text(_)
+                    | TokenKind::Bytes(_)
+                    | TokenKind::Bool(_)
+            ) {
+                // A literal can't be a path segment. Report and consume it so
+                // the segment isn't silently dropped (the leading `/` was
+                // already eaten) and the loop still makes progress.
+                let name = self.peek().display_name();
+                self.error(format!(
+                    "invalid path segment: expected an identifier after '/', found {name}"
+                ));
+                self.advance();
             } else {
                 // Just a trailing `/`
             }
@@ -2165,19 +2181,32 @@ impl Parser {
                 }
             }
 
-            // If `*` is immediately adjacent to a lowercase identifier with no
-            // whitespace, it's a source reference (`*name`), not multiplication.
-            // This matches `can_start_atom`'s rule and prevents the binop loop
-            // from gobbling a `*relation = ...` statement on the next line.
+            // `*name` is a source reference, not multiplication — but only when
+            // the `*` hugs the following identifier AND is detached from the
+            // term on its left (whitespace or a newline before it), i.e. it
+            // begins a fresh term. This still keeps the binop loop from
+            // gobbling a `*relation = ...` statement on the next line, while
+            // letting spaceless multiplication like `a*b` parse as a product
+            // (there the `*` touches both operands). The asymmetry is the point:
+            // `a*b` and `a* b` are products; `a *b` and a newline-led `*b` are
+            // source references.
             if matches!(self.peek(), TokenKind::Star) {
-                if let Some(next) = self.tokens.get(self.pos + 1) {
-                    let cur_end = self.peek_token().span.end;
-                    if matches!(next.kind, TokenKind::Lower(_))
-                        && next.span.start == cur_end
-                    {
-                        self.restore(saved_pos);
-                        break;
+                let star_span = self.peek_token().span;
+                let right_adjacent = match self.tokens.get(self.pos + 1) {
+                    Some(next) => {
+                        matches!(next.kind, TokenKind::Lower(_))
+                            && next.span.start == star_span.end
                     }
+                    None => false,
+                };
+                let left_adjacent = self.pos > 0
+                    && self
+                        .tokens
+                        .get(self.pos - 1)
+                        .map_or(false, |prev| prev.span.end == star_span.start);
+                if right_adjacent && !left_adjacent {
+                    self.restore(saved_pos);
+                    break;
                 }
             }
 
@@ -2391,14 +2420,26 @@ impl Parser {
                     && !(self.stop_type_at_headers && (n == "headers" || n == "rateLimit"))
             }
             TokenKind::Star => {
-                // Source ref `*name` only when `*` is immediately adjacent to a Lower token
-                // (no whitespace). This avoids ambiguity with the `*` multiplication operator.
-                if let Some(next) = self.tokens.get(self.pos + 1) {
-                    let cur_end = self.peek_token().span.end;
-                    matches!(next.kind, TokenKind::Lower(_)) && next.span.start == cur_end
-                } else {
-                    false
-                }
+                // Source ref `*name` (an application argument) only when `*`
+                // hugs the following Lower token AND is detached from the term
+                // on its left. When `*` touches both sides (`a*b`) it is the
+                // multiplication operator, not the start of an argument — so we
+                // must NOT treat it as an atom here, leaving it for the binop
+                // loop. This mirrors the rule in `parse_expr_bp`.
+                let star_span = self.peek_token().span;
+                let right_adjacent = match self.tokens.get(self.pos + 1) {
+                    Some(next) => {
+                        matches!(next.kind, TokenKind::Lower(_))
+                            && next.span.start == star_span.end
+                    }
+                    None => false,
+                };
+                let left_adjacent = self.pos > 0
+                    && self
+                        .tokens
+                        .get(self.pos - 1)
+                        .map_or(false, |prev| prev.span.end == star_span.start);
+                right_adjacent && !left_adjacent
             }
             TokenKind::Ampersand => {
                 // Derived ref `&name` only when `&` is immediately adjacent to a Lower token.

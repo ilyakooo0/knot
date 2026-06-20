@@ -146,6 +146,39 @@ fn add_two_vars() {
 }
 
 #[test]
+fn spaceless_mul_is_multiplication_not_source_ref() {
+    // `a*b` (no surrounding whitespace) must parse as multiplication, not as
+    // `a` applied to the source reference `*b`. The `*` touches both operands,
+    // so it is the binary operator.
+    for src in ["x = a*b", "x = a* b"] {
+        match fun_body(src) {
+            ExprKind::BinOp {
+                op: BinOp::Mul,
+                lhs,
+                rhs,
+            } => {
+                assert!(matches!(&lhs.node, ExprKind::Var(n) if n == "a"), "{src}");
+                assert!(matches!(&rhs.node, ExprKind::Var(n) if n == "b"), "{src}");
+            }
+            other => panic!("expected Mul for {src:?}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn detached_star_is_source_ref_argument() {
+    // `f *x`: the `*` is detached from `f` on its left and hugs `x`, so it is a
+    // source-reference argument — `f (*x)`, not `f * x`.
+    match fun_body("x = f *people") {
+        ExprKind::App { func, arg } => {
+            assert!(matches!(&func.node, ExprKind::Var(n) if n == "f"));
+            assert!(matches!(&arg.node, ExprKind::SourceRef(n) if n == "people"));
+        }
+        other => panic!("expected App(f, *people), got {other:?}"),
+    }
+}
+
+#[test]
 fn mul_higher_precedence_than_add() {
     // a + b * c → a + (b * c)
     match fun_body("x = a + b * c") {
@@ -1506,6 +1539,21 @@ fn route_with_path_params() {
         }
         other => panic!("expected Route, got {:?}", other),
     }
+}
+
+#[test]
+fn route_literal_path_segment_rejected() {
+    // A non-identifier path segment (here an integer literal) must produce a
+    // diagnostic rather than being silently dropped after the leading `/`.
+    let src = "route Api where\n  GET /items/123 -> [Todo] = ListItems";
+    let (_m, diags) = parse_err(src);
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.message.contains("invalid path segment")),
+        "expected an 'invalid path segment' diagnostic, got: {:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
 }
 
 #[test]

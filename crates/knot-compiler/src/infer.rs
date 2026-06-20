@@ -2033,7 +2033,13 @@ impl Infer {
                 }
             }
             (Some(rv), None) => {
-                if !only1.is_empty() {
+                // The open side is `t1`. Reject only when that open side is the
+                // *provided* side and carries fixed effects the closed required
+                // side lacks — same directional rule as the `(None, None)` and
+                // `(Some, Some)` arms. When the open side is the *required* one,
+                // its row var absorbs the provided side's effects, and its own
+                // extra fixed effects (`only1`) are a legal over-declaration.
+                if t1_provided && !only1.is_empty() {
                     let names: Vec<String> =
                         only1.iter().map(format_io_effect).collect();
                     self.error(
@@ -2050,7 +2056,10 @@ impl Infer {
                 self.bind_var(rv, Ty::EffectRow(only2, None), span);
             }
             (None, Some(rv)) => {
-                if !only2.is_empty() {
+                // Mirror of the `(Some, None)` arm: here the open side is `t2`,
+                // which is the provided side when `!t1_provided`. Reject only
+                // then, and only for its extra fixed effects (`only2`).
+                if !t1_provided && !only2.is_empty() {
                     let names: Vec<String> =
                         only2.iter().map(format_io_effect).collect();
                     self.error(

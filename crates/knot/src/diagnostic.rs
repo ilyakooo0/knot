@@ -72,11 +72,28 @@ impl Diagnostic {
 pub fn line_col(source: &str, byte_offset: usize) -> (usize, usize) {
     let offset = byte_offset.min(source.len());
     let before = source[..offset].as_bytes();
-    let line = before.iter().filter(|&&b| b == b'\n').count() + 1;
-    let line_start = match memrchr(b'\n', before) {
-        Some(nl) => nl + 1,
-        None => 0,
-    };
+    // Count line breaks treating `\n`, lone `\r`, and `\r\n` each as a single
+    // break, matching the lexer's layout handling and the parser's column
+    // bookkeeping (a `\r`-only or Windows source must not collapse to line 1).
+    let mut line = 1;
+    let mut line_start = 0;
+    let mut i = 0;
+    while i < before.len() {
+        match before[i] {
+            b'\n' => {
+                line += 1;
+                i += 1;
+                line_start = i;
+            }
+            b'\r' => {
+                line += 1;
+                // `\r\n` is one break, not two.
+                i += if before.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+                line_start = i;
+            }
+            _ => i += 1,
+        }
+    }
     // Clamp to a valid char boundary in case offset lands mid-character.
     let mut safe_offset = offset;
     while safe_offset > line_start && !source.is_char_boundary(safe_offset) {
@@ -84,11 +101,6 @@ pub fn line_col(source: &str, byte_offset: usize) -> (usize, usize) {
     }
     let col = source[line_start..safe_offset].chars().count();
     (line, col)
-}
-
-/// Find the last occurrence of a byte in a slice.
-fn memrchr(needle: u8, haystack: &[u8]) -> Option<usize> {
-    haystack.iter().rposition(|&b| b == needle)
 }
 
 /// Returns the content of a 1-based line number. Returns `""` if out of bounds.
@@ -99,17 +111,32 @@ pub fn get_line(source: &str, line: usize) -> &str {
     let bytes = source.as_bytes();
     let mut current_line = 1;
     let mut start = 0;
+    let mut i = 0;
+    // Advance to the start of the requested line, treating `\n`, lone `\r`,
+    // and `\r\n` each as one line break.
     while current_line < line {
-        match bytes[start..].iter().position(|&b| b == b'\n') {
-            Some(pos) => {
-                start += pos + 1;
+        if i >= bytes.len() {
+            return "";
+        }
+        match bytes[i] {
+            b'\n' => {
                 current_line += 1;
+                i += 1;
+                start = i;
             }
-            None => return "",
+            b'\r' => {
+                current_line += 1;
+                i += if bytes.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+                start = i;
+            }
+            _ => i += 1,
         }
     }
-    let end = bytes[start..].iter().position(|&b| b == b'\n')
-        .map_or(source.len(), |pos| start + pos);
+    // End the line at the next break of any kind.
+    let mut end = start;
+    while end < bytes.len() && bytes[end] != b'\n' && bytes[end] != b'\r' {
+        end += 1;
+    }
     &source[start..end]
 }
 
@@ -200,12 +227,36 @@ mod tests {
     }
 
     #[test]
+    fn line_col_carriage_returns() {
+        // Classic-Mac (`\r`) and Windows (`\r\n`) endings are line breaks too,
+        // matching the lexer's layout handling — a `\r`-only file must not
+        // collapse to a single line.
+        let mac = "aaa\rbbb\rccc";
+        assert_eq!(line_col(mac, 4), (2, 0));
+        assert_eq!(line_col(mac, 8), (3, 0));
+
+        let win = "aaa\r\nbbb\r\nccc";
+        // First char of line 2 (after `\r\n`).
+        assert_eq!(line_col(win, 5), (2, 0));
+        assert_eq!(line_col(win, 10), (3, 0));
+        // `\r\n` counts as one break, not two — third char of line 3.
+        assert_eq!(line_col(win, 12), (3, 2));
+    }
+
+    #[test]
     fn get_line_basic() {
         let src = "alpha\nbeta\ngamma";
         assert_eq!(get_line(src, 1), "alpha");
         assert_eq!(get_line(src, 3), "gamma");
         assert_eq!(get_line(src, 0), "");
         assert_eq!(get_line(src, 99), "");
+    }
+
+    #[test]
+    fn get_line_carriage_returns() {
+        assert_eq!(get_line("alpha\rbeta\rgamma", 2), "beta");
+        assert_eq!(get_line("alpha\r\nbeta\r\ngamma", 2), "beta");
+        assert_eq!(get_line("alpha\r\nbeta\r\ngamma", 3), "gamma");
     }
 
     #[test]

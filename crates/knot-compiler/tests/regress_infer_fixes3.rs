@@ -38,6 +38,27 @@ fn assert_clean(diags: &[Diagnostic]) {
     );
 }
 
+// ── Open effect-row subsumption respects direction ──
+//
+// An annotation with an *open* effect row that carries fixed effects
+// (`IO {console | _}`) is a supertype: a value performing FEWER effects (here a
+// pure relation read, `IO {}`) must check against it. Previously the open-vs-
+// closed unification arms ignored the direction flag and rejected the open
+// side's fixed effects unconditionally, yielding a spurious
+// "IO has unexpected effects: {console}".
+
+#[test]
+fn open_effect_row_annotation_accepts_fewer_effects() {
+    let diags = check_src(
+        r#"*items : [{id: Int}]
+
+getItems : IO {console | _} [{id: Int}]
+getItems = *items
+"#,
+    );
+    assert_clean(&diags);
+}
+
 // ── 1. Single-variant record constructor unifies with its own type name ──
 
 #[test]

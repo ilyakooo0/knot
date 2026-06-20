@@ -312,7 +312,18 @@ fn collect_comments(source: &str) -> Vec<Comment<'_>> {
             i += 1;
             continue;
         }
-        if b == b'b' && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+        if b == b'b'
+            && i + 1 < bytes.len()
+            && bytes[i + 1] == b'"'
+            // Only a `b` that *begins* a token starts a byte-string literal.
+            // A `b` preceded by an identifier character is the tail of an
+            // identifier (e.g. `foob"…"`), not a `b"…"` prefix — treating it
+            // as a byte string would swallow a following `--` comment.
+            && (i == 0 || {
+                let p = bytes[i - 1];
+                !(p.is_ascii_alphanumeric() || p == b'_' || p == b'\'')
+            })
+        {
             in_bytes = true;
             i += 2;
             continue;

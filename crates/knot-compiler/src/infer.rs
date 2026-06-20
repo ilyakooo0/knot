@@ -2219,14 +2219,12 @@ impl Infer {
 
     // ── Scheme operations ────────────────────────────────────────
 
-    fn instantiate(&mut self, scheme: &Scheme) -> Ty {
-        self.instantiate_at(scheme, Span::new(0, 0))
-    }
-
     fn instantiate_at(&mut self, scheme: &Scheme, span: Span) -> Ty {
         if scheme.vars.is_empty()
             && scheme.unit_vars.is_empty()
             && scheme.unit_binops.is_empty()
+            && scheme.constraints.is_empty()
+            && scheme.effect_unions.is_empty()
         {
             return scheme.ty.clone();
         }
@@ -3946,7 +3944,21 @@ impl Infer {
                     (Ty::IO(e1, r1, inner), Ty::IO(e2, r2, _)) => {
                         let mut merged = e1.clone();
                         merged.extend(e2.iter().cloned());
-                        Ty::IO(merged, r1.or(*r2), inner.clone())
+                        // Both branches' effect-row tails must survive into the
+                        // result. When both are still-open *distinct* row
+                        // variables, `r1.or(r2)` would silently drop one, so
+                        // effects later flowing into the dropped tail would
+                        // vanish from the if-expression's type. Unify the two
+                        // tails (the same merge `unify_io_effects` performs for
+                        // distinct rows) so neither is lost.
+                        let row = match (*r1, *r2) {
+                            (Some(a), Some(b)) if a != b => {
+                                self.unify(&Ty::Var(a), &Ty::Var(b), expr.span);
+                                Some(a)
+                            }
+                            (a, b) => a.or(b),
+                        };
+                        Ty::IO(merged, row, inner.clone())
                     }
                     // When one branch is IO and the other Relation, prefer IO.
                     // This handles functions whose IO nature wasn't detected
@@ -5652,7 +5664,12 @@ impl Infer {
                         if let ast::StmtKind::Bind { pat, .. } = &prev_stmt.node {
                             if let ast::PatKind::Var(name) = &pat.node {
                                 if let Some(scheme) = self.lookup(name).cloned() {
-                                    let ty = self.instantiate(&scheme);
+                                    // Use the groupBy key's span so any deferred
+                                    // constraint this instantiation produces is
+                                    // anchored at a real location rather than a
+                                    // dummy `(0,0)` span (which `check_constraints`
+                                    // would otherwise have to skip).
+                                    let ty = self.instantiate_at(&scheme, key.span);
                                     let elem_ty = match ty {
                                         Ty::Relation(inner) => *inner,
                                         other => other,
@@ -7777,12 +7794,53 @@ impl Infer {
                 }
                 ast::DeclKind::Route { entries, .. } => {
                     for entry in entries {
+                        self.check_route_field_collisions(entry);
                         if let Some(rate_limit_expr) = &entry.rate_limit {
                             self.check_rate_limit_expr(entry, rate_limit_expr);
                         }
                     }
                 }
                 _ => {}
+            }
+        }
+    }
+
+    /// Reject a route endpoint whose request inputs (path params, query
+    /// params, body fields, request headers) share a field name. The handler
+    /// receives a single record merging all of them, so a collision would
+    /// silently keep only one type (`route_input_record_ty` uses a `BTreeMap`)
+    /// while the desugared constructor carries both fields — diverging the
+    /// inferred input type from the runtime decode. Better a clear error.
+    fn check_route_field_collisions(&mut self, entry: &ast::RouteEntry) {
+        let mut seen: std::collections::HashMap<&str, &'static str> =
+            std::collections::HashMap::new();
+        let mut inputs: Vec<(&str, &'static str, Span)> = Vec::new();
+        for seg in &entry.path {
+            if let ast::PathSegment::Param { name, ty } = seg {
+                inputs.push((name.as_str(), "path parameter", ty.span));
+            }
+        }
+        for qp in &entry.query_params {
+            inputs.push((qp.name.as_str(), "query parameter", qp.value.span));
+        }
+        for bf in &entry.body_fields {
+            inputs.push((bf.name.as_str(), "body field", bf.value.span));
+        }
+        for hf in &entry.request_headers {
+            inputs.push((hf.name.as_str(), "request header", hf.value.span));
+        }
+        for (name, kind, span) in inputs {
+            match seen.get(name) {
+                Some(prev_kind) => self.error(
+                    format!(
+                        "duplicate route input field `{}`: declared as both a {} and a {}",
+                        name, prev_kind, kind
+                    ),
+                    span,
+                ),
+                None => {
+                    seen.insert(name, kind);
+                }
             }
         }
     }
@@ -8060,16 +8118,18 @@ impl Infer {
             if let Some(type_name) = self.type_name_of(&resolved) {
                 let key = (dc.trait_name.clone(), type_name.clone());
                 if !self.known_impls.contains(&key) {
-                    // Only emit error if the span is real (not dummy)
-                    if dc.span.start != 0 || dc.span.end != 0 {
-                        self.error(
-                            format!(
-                                "no implementation of trait '{}' for type '{}'",
-                                dc.trait_name, type_name
-                            ),
-                            dc.span,
-                        );
-                    }
+                    // All deferred constraints now carry a real call-site span
+                    // (`instantiate_at` stamps the use site; the lone dummy-span
+                    // producer was routed through it too), so report the missing
+                    // impl unconditionally rather than silently dropping
+                    // dummy-spanned obligations.
+                    self.error(
+                        format!(
+                            "no implementation of trait '{}' for type '{}'",
+                            dc.trait_name, type_name
+                        ),
+                        dc.span,
+                    );
                 }
             }
         }
@@ -8958,10 +9018,16 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
             other => other.clone(),
         };
         let type_name = ty_to_type_name(&inner);
-        // Only carry a schema when it has Maybe positions to normalize —
-        // the generic decoder is correct for everything else.
+        // Carry the wire schema whenever it constrains the shape at all (i.e.
+        // anything other than the fully-opaque `*` catch-all). Beyond
+        // normalizing Maybe positions (`?`), the typed decoder shape-checks the
+        // decoded value: `null` for a required scalar and structurally-wrong
+        // values (e.g. a forged `__knot_ctor` where a record is declared) fail
+        // the parse instead of leaking a mistyped value into the `Just`. A bare
+        // `*` (type var / non-record ADT) carries no schema, so ADT
+        // round-tripping still flows through the schema-less decoder.
         let wire_schema =
-            Some(ty_to_wire_descriptor(&inner)).filter(|d| d.contains('?'));
+            Some(ty_to_wire_descriptor(&inner)).filter(|d| d != "*");
         if type_name.is_some() || wire_schema.is_some() {
             from_json_targets.insert(*span, FromJsonTarget { type_name, wire_schema });
         }

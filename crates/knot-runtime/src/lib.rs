@@ -9334,15 +9334,36 @@ fn json_to_value_impl(json: &serde_json::Value, wire: bool) -> *mut Value {
 /// Scalar positions go through `coerce_json_field` (e.g. `tag` re-tags
 /// enum-like ADT strings); unknown descriptors leave the value unchanged.
 fn apply_wire_type(v: *mut Value, desc: &str) -> *mut Value {
+    // Infallible wrapper: on a shape / required-`null` mismatch, leave the
+    // value unchanged (legacy lenient behavior). Callers that have a failure
+    // channel (`parseJson : Maybe a`, `fetch`, route body decoding) use
+    // `apply_wire_type_checked` directly and turn the mismatch into
+    // `Nothing` / an error / a 400 instead.
+    apply_wire_type_checked(v, desc).unwrap_or(v)
+}
+
+/// Shape-directed variant of `apply_wire_type` returning `None` when the
+/// decoded value's shape contradicts the descriptor — specifically a required
+/// (non-`?`) scalar position holding `null` (`Nothing`/`Unit`), or a
+/// record/relation/scalar position holding a value of the wrong shape (e.g. an
+/// attacker-supplied `__knot_ctor` constructor where the schema declares a
+/// plain record). Without this, `null` for a required `Int` field leaked a
+/// `Nothing` downstream where an `Int` was expected, and a forged constructor
+/// could materialize where a record was declared.
+///
+/// ADT round-tripping (`parseJson (toJson adt) : Maybe T`) is unaffected:
+/// `ty_to_wire_descriptor` emits `*` for non-record ADT positions, which stays
+/// lenient here, and a schema-less `parseJson` never reaches this function.
+fn apply_wire_type_checked(v: *mut Value, desc: &str) -> Option<*mut Value> {
     let desc = desc.trim();
     if desc.is_empty() {
-        return v;
+        return Some(v);
     }
     if let Some(inner) = desc.strip_prefix('?') {
         if v.is_null() {
-            return make_nothing();
+            return Some(make_nothing());
         }
-        return match unsafe { as_ref(v) } {
+        return Some(match unsafe { as_ref(v) } {
             // `null` wire-decodes to Nothing already; Unit covers values
             // decoded by the storage path or built by older clients.
             Value::Unit => make_nothing(),
@@ -9350,46 +9371,66 @@ fn apply_wire_type(v: *mut Value, desc: &str) -> *mut Value {
             Value::Constructor(tag, payload) => match just_ctor_value(tag, *payload) {
                 // Already Just-wrapped (legacy `__knot_ctor` encoding):
                 // keep the wrapper, normalize the payload.
-                Some(jv) => make_just(apply_wire_type(jv, inner)),
-                None => make_just(apply_wire_type(v, inner)),
+                Some(jv) => make_just(apply_wire_type_checked(jv, inner)?),
+                None => make_just(apply_wire_type_checked(v, inner)?),
             },
-            _ => make_just(apply_wire_type(v, inner)),
-        };
+            _ => make_just(apply_wire_type_checked(v, inner)?),
+        });
     }
     if desc.starts_with('{') && desc.ends_with('}') {
         if let Value::Record(fields) = unsafe { as_ref(v) } {
             let descs = parse_response_fields(&desc[1..desc.len() - 1]);
-            let mut out: Vec<RecordField> = fields
-                .iter()
-                .map(|f| match descs.iter().find(|(n, _)| n.as_str() == &*f.name) {
-                    Some((_, fty)) => RecordField {
+            let mut out: Vec<RecordField> = Vec::with_capacity(fields.len());
+            for f in fields.iter() {
+                match descs.iter().find(|(n, _)| n.as_str() == &*f.name) {
+                    Some((_, fty)) => out.push(RecordField {
                         name: f.name.clone(),
-                        value: apply_wire_type(f.value, fty),
-                    },
-                    None => RecordField { name: f.name.clone(), value: f.value },
-                })
-                .collect();
-            // Absent Maybe fields decode to Nothing.
+                        value: apply_wire_type_checked(f.value, fty)?,
+                    }),
+                    None => out.push(RecordField { name: f.name.clone(), value: f.value }),
+                }
+            }
+            // Fields named in the schema but absent from the payload: a Maybe
+            // field decodes to Nothing; a required field is a decode failure.
             for (n, fty) in &descs {
-                if fty.starts_with('?') && !fields.iter().any(|f| &*f.name == n.as_str()) {
-                    out.push(RecordField { name: intern_str(n), value: make_nothing() });
+                if !fields.iter().any(|f| &*f.name == n.as_str()) {
+                    if fty.starts_with('?') {
+                        out.push(RecordField { name: intern_str(n), value: make_nothing() });
+                    } else {
+                        return None;
+                    }
                 }
             }
             out.sort_by(|a, b| a.name.cmp(&b.name));
-            return alloc(Value::Record(out));
+            return Some(alloc(Value::Record(out)));
         }
-        return v;
+        // A non-record value where the schema declares a record (e.g. a forged
+        // `__knot_ctor` constructor, or `null`) is a shape mismatch.
+        return None;
     }
     if desc.starts_with('[') && desc.ends_with(']') {
         if let Value::Relation(rows) = unsafe { as_ref(v) } {
             let inner = &desc[1..desc.len() - 1];
-            let mapped: Vec<*mut Value> =
-                rows.iter().map(|r| apply_wire_type(*r, inner)).collect();
-            return alloc(Value::Relation(mapped));
+            let mut mapped: Vec<*mut Value> = Vec::with_capacity(rows.len());
+            for r in rows.iter() {
+                mapped.push(apply_wire_type_checked(*r, inner)?);
+            }
+            return Some(alloc(Value::Relation(mapped)));
         }
-        return v;
+        return None;
     }
-    coerce_json_field(v, desc)
+    // Scalar position. For the primitive scalar descriptors, `null`
+    // (`Nothing`/`Unit`) and any structured value (record/relation/forged
+    // constructor) are decode failures rather than silent passthroughs.
+    // Non-primitive descriptors (`*` for ADTs/Bytes/Uuid, unit, unknown) stay
+    // lenient so ADT round-tripping keeps working.
+    if matches!(desc, "int" | "float" | "text" | "bool" | "bytes" | "uuid" | "tag") {
+        match unsafe { as_ref(v) } {
+            Value::Int(_) | Value::Float(_) | Value::Text(_) | Value::Bool(_) | Value::Bytes(_) => {}
+            _ => return None,
+        }
+    }
+    Some(coerce_json_field(v, desc))
 }
 
 /// parseJson with a compile-time type descriptor: wire-decodes the JSON,
@@ -9432,7 +9473,13 @@ pub extern "C-unwind" fn knot_json_decode_typed_maybe(
     let desc = unsafe { str_from_raw(desc_ptr, desc_len) };
     match unsafe { as_ref(v) } {
         Value::Text(s) => match serde_json::from_str::<serde_json::Value>(s) {
-            Ok(json) => make_just(apply_wire_type(json_to_value(&json), desc)),
+            // A required field receiving `null`, or a value whose shape
+            // contradicts the target type, decodes to `Nothing` (parse
+            // failure) rather than leaking a mistyped value into the `Just`.
+            Ok(json) => match apply_wire_type_checked(json_to_value(&json), desc) {
+                Some(decoded) => make_just(decoded),
+                None => make_nothing(),
+            },
             Err(_) => make_nothing(),
         },
         _ => make_nothing(),
@@ -15092,7 +15139,20 @@ fn http_serve_loop(
                                     // are `Just`-wrapped — including nested Maybe
                                     // positions inside record/relation fields.
                                     let value = match raw_val {
-                                        Some(v) if present_non_null => apply_wire_type(v, bty),
+                                        Some(v) if present_non_null => {
+                                            // Shape-check the present value too,
+                                            // so a nested required `null` or a
+                                            // forged-shape field is a 400 rather
+                                            // than a mistyped value reaching the
+                                            // handler.
+                                            match apply_wire_type_checked(v, bty) {
+                                                Some(decoded) => decoded,
+                                                None => return Err((400, format!(
+                                                    "body field '{}' does not match its declared type",
+                                                    bname
+                                                ), None)),
+                                            }
+                                        }
                                         // Absent or explicit null: fine for Maybe
                                         // (decodes to Nothing)...
                                         _ if is_maybe => make_nothing(),
@@ -15775,8 +15835,19 @@ pub extern "C-unwind" fn knot_http_fetch_io(
                         match serde_json::from_str::<serde_json::Value>(&body_text) {
                             // Normalize Maybe positions per the response
                             // descriptor: `null`/absent → Nothing, present
-                            // values → Just.
-                            Ok(json) => apply_wire_type(json_to_value(&json), &resp_schema),
+                            // values → Just. A required field receiving `null`
+                            // or a value of the wrong shape is a response decode
+                            // error, surfaced as `Err` rather than a mistyped Ok.
+                            Ok(json) => match apply_wire_type_checked(
+                                json_to_value(&json),
+                                &resp_schema,
+                            ) {
+                                Some(decoded) => decoded,
+                                None => return fetch_build_err(
+                                    status,
+                                    "response body does not match the declared response type",
+                                ),
+                            },
                             Err(e) => return fetch_build_err(
                                 status,
                                 &format!("invalid JSON in response: {}", e),

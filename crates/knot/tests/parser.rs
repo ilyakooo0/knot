@@ -2236,10 +2236,13 @@ fn time_unit_weeks() {
 
 #[test]
 fn time_unit_with_float() {
+    // A Float operand gets a Float factor so the multiplication is
+    // homogeneous (`Float * Float`); a `Float * Int` node would be rejected
+    // by `Num`'s same-type `mul`.
     match fun_body("x = 1.5 hours") {
         ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
             assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Float(f)) if *f == 1.5));
-            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(n)) if n == "3600000"));
+            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Float(f)) if *f == 3600000.0));
         }
         other => panic!("expected Mul, got {:?}", other),
     }

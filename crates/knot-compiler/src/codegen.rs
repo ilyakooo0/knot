@@ -5817,13 +5817,14 @@ impl Codegen {
                                 let col_info = col_info.filter(|(_, col_ty)| {
                                     // MIN/MAX over Float projected columns must
                                     // stay in memory (total_cmp divergence, see
-                                    // minmax_pushdown_type_ok). Int and Text
-                                    // push down — the runtime's `is_text` flag
-                                    // keeps Text results from being re-parsed as
-                                    // Int.
+                                    // minmax_pushdown_type_ok): SQLite stores NaN
+                                    // as NULL and skips it, and conflates ±0.0,
+                                    // both diverging from Knot's `total_cmp`. Only
+                                    // Int and Text push down — the runtime's
+                                    // `is_text` flag keeps Text results from being
+                                    // re-parsed as Int.
                                     !matches!(name.as_str(), "minOn" | "maxOn")
                                         || col_ty == "int"
-                                        || col_ty == "float"
                                         || col_ty == "text"
                                 });
                                 if let Some((col_sql, col_ty)) = col_info {
@@ -9748,6 +9749,12 @@ impl Codegen {
         let free_vars: Vec<String> = find_free_vars(body, &param_names)
             .into_iter()
             .filter(|v| {
+                // `__derived_self_*` is a synthetic recursive-accumulator key:
+                // capture it only when the enclosing body actually provides it,
+                // never via the "unshadowed local" fallback (it has no global).
+                if v.starts_with("__derived_self_") {
+                    return env.bindings.contains_key(v);
+                }
                 env.bindings.contains_key(v)
                     || (!self.user_fns.contains_key(v) && !is_builtin_name(v))
             })
@@ -14746,7 +14753,18 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
             }
         }
         ast::ExprKind::Lit(_) | ast::ExprKind::Constructor(_) => {}
-        ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => {}
+        ast::ExprKind::SourceRef(_) => {}
+        ast::ExprKind::DerivedRef(name) => {
+            // A recursive derived relation passes its in-progress accumulator
+            // through the env under `__derived_self_<name>` (see the DerivedRef
+            // codegen arm). When the self-reference appears inside a lambda, the
+            // lambda must capture that key — otherwise it falls through to the
+            // public wrapper and restarts the fixpoint from the empty relation.
+            // Outside a recursive body the key is absent from the env and the
+            // capture filter drops it, so this is harmless for ordinary derived
+            // references.
+            free.push(format!("__derived_self_{}", name));
+        }
         ast::ExprKind::Record(fields) => {
             for f in fields {
                 collect_free_vars(&f.value, bound, free);

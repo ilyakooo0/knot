@@ -2585,12 +2585,22 @@ impl Parser {
             Some(f) => {
                 let unit_tok = self.advance();
                 let span = Span::new(lit.span.start, unit_tok.span.end);
+                // Match the factor literal's kind to the operand's so the
+                // multiplication stays homogeneous. A Float operand
+                // (`2.5 seconds`) with an Int factor would produce a
+                // `Float * Int` node that `Num`'s same-type `mul` rejects;
+                // emit `Float` (`1000.0`) instead so `2.5 seconds` is `2500.0`.
+                let factor_lit = if matches!(&lit.node, ExprKind::Lit(Literal::Float(_))) {
+                    Literal::Float(f.parse::<f64>().unwrap_or(0.0))
+                } else {
+                    Literal::Int(f.to_string())
+                };
                 Some(Spanned::new(
                     ExprKind::BinOp {
                         op: BinOp::Mul,
                         lhs: Box::new(lit),
                         rhs: Box::new(Spanned::new(
-                            ExprKind::Lit(Literal::Int(f.to_string())),
+                            ExprKind::Lit(factor_lit),
                             unit_tok.span,
                         )),
                     },

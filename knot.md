@@ -10,7 +10,7 @@ type Person = {name: Text, age: Int}
 *people : [Person]
 
 main = do
-  set *people = [{name: "Alice", age: 30}, {name: "Bob", age: 25}]
+  *people = [{name: "Alice", age: 30}, {name: "Bob", age: 25}]
   people <- *people
   let result = do
     p <- people
@@ -35,7 +35,7 @@ cargo run -p knot-compiler -- build file.knot
 
 | Type | Description | Literals |
 |------|-------------|----------|
-| `Int` | Unbounded integer | `42`, `-7`, `1_000_000` |
+| `Int` | 64-bit signed integer (overflow panics) | `42`, `-7`, `1_000_000` |
 | `Float` | 64-bit float | `3.14`, `-0.5` |
 | `Text` | Unicode string | `"hello"`, `"line\n"` |
 | `Bool` | Boolean | `True {}`, `False {}` |
@@ -136,7 +136,7 @@ There are five kinds of top-level declarations:
 
 | Declaration | Kind | Description |
 |---|---|---|
-| `*foo : [T]` | Source relation | Persisted in SQLite, mutable via `set` |
+| `*foo : [T]` | Source relation | Persisted in SQLite, mutable via `*foo = expr` |
 | `*foo = expr` | View | Bidirectional query over sources |
 | `&foo = expr` | Derived relation | Read-only, recomputed on access |
 | `foo = expr` | Constant/function | Pure value, no DB effects |
@@ -260,10 +260,10 @@ main = do
 -- IO do block with DB operations
 addPerson = \name age -> do
   people <- *people                  -- IO {} [Person]
-  set *people = union people [{name: name, age: age}]
+  *people = union people [{name: name, age: age}]
 ```
 
-The compiler detects whether a do block is relational or IO from the types. Relation operations (`*rel`, `&rel`, `set`) all return `IO {} value` — the empty effect set `{}` distinguishes DB operations from external effects like `{console}` or `{fs}`.
+The compiler detects whether a do block is relational or IO from the types. Relation operations (`*rel`, `&rel`, and writes `*rel = expr`) all return `IO {} value` — the empty effect set `{}` distinguishes DB operations from external effects like `{console}` or `{fs}`.
 
 ### Pattern Matching in Bind
 
@@ -290,25 +290,25 @@ Filter and destructure in one step:
 
 ## Mutation
 
-All mutation uses `set`, which replaces a source relation with a new value. The runtime diffs old vs new to apply minimal changes.
+Mutation is written `*rel = expr`, which makes the source relation equal to `expr`. There is no `set` keyword — the assignment is the bare `*rel = ...` form. The compiler recognizes common shapes (`*rel = union *rel [...]` → INSERT, conditional `map` → UPDATE, `filter` → DELETE) and emits minimal SQL; otherwise it rewrites the whole relation. Use `replace *rel = expr` to force a full overwrite.
 
 ```knot
 -- Insert (union with singleton)
 addPerson = do
   people <- *people
-  set *people = union people [{name: "Alice", age: 30}]
+  *people = union people [{name: "Alice", age: 30}]
 
 -- Update (map with conditional)
 birthday = \name -> do
   people <- *people
-  set *people = do
+  *people = do
     p <- people
     yield (if p.name == name then {p | age: p.age + 1} else p)
 
 -- Delete (filter to keep)
 removePerson = \name -> do
   people <- *people
-  set *people = do
+  *people = do
     p <- people
     where p.name != name
     yield p
@@ -410,7 +410,7 @@ Fields can hold `[T]` — sets nested inside rows:
 -- Update nested relations
 updateTeams = do
   teams <- *teams
-  set *teams = do
+  *teams = do
     t <- teams
     yield {t | members: do
       m <- t.members
@@ -442,7 +442,7 @@ Constant columns (like `status: Open {}`) are:
 -- Insert through view — status auto-filled
 addOpenTodo = do
   openTodos <- *openTodos
-  set *openTodos = union openTodos [{title: "New task", owner: "Alice", priority: High {}}]
+  *openTodos = union openTodos [{title: "New task", owner: "Alice", priority: High {}}]
 ```
 
 ---
@@ -537,7 +537,7 @@ Eq          -- ==, !=
 Semigroup   -- ++ (text concat, relation concat)
 Display     -- display : a -> Text
 ToJSON      -- toJson : a -> Text
-FromJSON    -- parseJson : Text -> a
+FromJSON    -- parseJson : Text -> Maybe a
 Sequence    -- take, drop (impls for Text and [a])
 
 Functor (f : Type -> Type)        -- map
@@ -549,8 +549,10 @@ Foldable (t : Type -> Type)       -- fold
 └── Traversable (t : Type -> Type) -- traverse
 ```
 
-Built-in impls of the Functor/Applicative/Monad/Alternative hierarchy ship
-for `[]`, `Maybe`, `Result`, and `IO`, so do-notation works on all of them.
+Built-in impls of the Functor/Applicative/Monad hierarchy ship for `[]`,
+`Maybe`, `Result`, and `IO`, so do-notation works on all of them; `[]`,
+`Maybe`, and `Result` additionally have `Alternative` (`IO` does not), so
+`where`-guards work in their do-blocks.
 `Sequence` ships with impls for `Text` and `[]`, so `take 5 x` works on a
 string or a relation.
 
@@ -570,7 +572,7 @@ now : IO {clock} Int<Ms>
 
 -- DB operations (empty effect set)
 -- *rel : IO {} [T]
--- set *rel = val : IO {} {}
+-- *rel = val : IO {} {}
 ```
 
 ### Effect Kinds
@@ -600,7 +602,7 @@ All relation operations are IO-wrapped with an empty effect set:
 -- All relation operations are IO:
 birthday = \name -> do
   people <- *people              -- IO {} [Person]
-  set *people = do               -- IO {} {}
+  *people = do               -- IO {} {}
     p <- people
     yield (if p.name == name then {p | age: p.age + 1} else p)
 -- Inferred effects: {rw *people}
@@ -616,7 +618,7 @@ birthday = \name -> do
 handleOrder = \item -> do
   orderId <- atomic do
     orders <- *orders
-    set *orders = union orders [{item: item, qty: 1}]
+    *orders = union orders [{item: item, qty: 1}]
     newOrders <- *orders
     yield (count newOrders)
   println ("Order #" ++ show orderId)
@@ -750,9 +752,8 @@ and the loser unwinds at its next safe point.
 | `diff` | `[a] -> [a] -> [a]` | Set difference |
 | `inter` | `[a] -> [a] -> [a]` | Set intersection |
 | `sortBy` | `(a -> b) -> [a] -> [a]` | Reorder rows by projected key (`Ord b`) |
-| `take` | `Int<u> -> [a] -> [a]` | First *n* rows (`Sequence.take`) |
-| `drop` | `Int<u> -> [a] -> [a]` | Drop first *n* rows (`Sequence.drop`) |
-| `reverse` | `[a] -> [a]` | Reverse iteration order |
+| `take` | `Int -> [a] -> [a]` | First *n* rows (`Sequence.take`) |
+| `drop` | `Int -> [a] -> [a]` | Drop first *n* rows (`Sequence.drop`) |
 
 ### Text
 
@@ -764,8 +765,8 @@ and the loser unwinds at its next safe point.
 | `trim` | `Text -> Text` | Strip whitespace |
 | `reverse` | `Text -> Text` | Reverse |
 | `chars` | `Text -> [Text]` | Split to characters |
-| `take` | `Int<u> -> Text -> Text` | First *n* characters (`Sequence.take`) |
-| `drop` | `Int<u> -> Text -> Text` | Drop first *n* characters (`Sequence.drop`) |
+| `take` | `Int -> Text -> Text` | First *n* characters (`Sequence.take`) |
+| `drop` | `Int -> Text -> Text` | Drop first *n* characters (`Sequence.drop`) |
 | `contains` | `Text -> Text -> Bool` | Substring check |
 
 `take` and `drop` are `Sequence` trait methods with built-in impls for both
@@ -777,7 +778,7 @@ and the loser unwinds at its next safe point.
 |----------|------|-------------|
 | `show` | `a -> Text` | Any value to text |
 | `toJson` | `a -> Text` | Encode as JSON (`ToJSON.toJson`) |
-| `parseJson` | `Text -> a` | Decode JSON (`FromJSON.parseJson`) |
+| `parseJson` | `Text -> Maybe a` | Decode JSON (`FromJSON.parseJson`) |
 | `display` | `Display a => a -> Text` | Render a value via `Display` |
 | `stripUnit` | `Int<u> -> Int` | Drop unit tag from `Int` |
 | `withUnit` | `Int -> Int<u>` | Attach unit tag to `Int` |
@@ -895,7 +896,7 @@ api = serve Api where
 main = listen 8080 api
 ```
 
-`serve API where` produces a value of type `Server API`. Each handler takes the request record and returns `Result HttpError T`, where `T` is the response type declared on the endpoint and `HttpError = {status: Int, message: Text}`.
+`serve API where` produces a value of type `Server API r`, where `r` is the effect row of the handlers (rendered `_` when handlers are pure, or e.g. `{console}` when a handler logs). Each handler takes the request record and returns `Result HttpError T`, where `T` is the response type declared on the endpoint and `HttpError = {status: Int, message: Text}`. The row `r` flows into `listen`'s IO type: `listen : Int<u> -> Server a r -> IO {network | r} {}`.
 
 ### HTTP Status Codes
 
@@ -1083,13 +1084,13 @@ validated = do
 
 ### Automatic Validation
 
-**`set` validation**: refined fields on source relations are checked before writes. Panics on violation.
+**Write validation**: refined fields on source relations are checked before each write (`*rel = ...`). Panics on violation.
 
 ```knot
 *people : [{name: Text, age: Nat}]
 
 -- This panics if any age is negative:
-set *people = [{name: "Alice", age: -1}]
+*people = [{name: "Alice", age: -1}]
 ```
 
 **Route handlers**: refined body fields are auto-validated after JSON decoding. Returns HTTP 400 on failure.
@@ -1122,10 +1123,12 @@ result = do
   yield (a / b)
 
 -- Result — short-circuits on Err
-parseConfig = \text -> do
-  json <- parseJson text
-  name <- getField "name" json
-  yield name
+safeDivide = \x y -> if y == 0 then Err {error: "div by zero"} else Ok {value: x / y}
+
+compute = do
+  a <- Ok {value: 10}
+  b <- safeDivide a 2
+  yield (a + b)
 ```
 
 To add `do` support to a user-defined type, provide its `Functor`,
@@ -1161,11 +1164,11 @@ type Todo = {title: Text, owner: Text, priority: Priority, status: Status}
 
 add = \title owner priority -> do
   todos <- *todos
-  set *todos = union todos [{title: title, owner: owner, priority: priority, status: Open {}}]
+  *todos = union todos [{title: title, owner: owner, priority: priority, status: Open {}}]
 
 complete = \title -> do
   todos <- *todos
-  set *todos = do
+  *todos = do
     t <- todos
     yield (if t.title == title
       then {t | status: Resolved {resolution: "done"}}
@@ -1173,7 +1176,7 @@ complete = \title -> do
 
 assign = \title person -> do
   todos <- *todos
-  set *todos = do
+  *todos = do
     t <- todos
     yield (if t.title == title
       then {t | status: InProgress {assignee: person}}
@@ -1221,7 +1224,7 @@ main = do
 ```knot
 addRow = \newRow -> do
   rel <- *rel
-  set *rel = union rel [newRow]
+  *rel = union rel [newRow]
 ```
 
 ### Delete by condition
@@ -1229,7 +1232,7 @@ addRow = \newRow -> do
 ```knot
 deleteWhere = \valueToDelete -> do
   rel <- *rel
-  set *rel = do
+  *rel = do
     r <- rel
     where r.field != valueToDelete
     yield r
@@ -1240,7 +1243,7 @@ deleteWhere = \valueToDelete -> do
 ```knot
 updateWhere = \target newValue -> do
   rel <- *rel
-  set *rel = do
+  *rel = do
     r <- rel
     yield (if r.id == target then {r | field: newValue} else r)
 ```

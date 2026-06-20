@@ -6,13 +6,14 @@ See `DESIGN.md` for the full language specification.
 
 ## Project Structure
 
-Cargo workspace with three crates:
+Cargo workspace with four crates:
 
 ```
 crates/
   knot/              Frontend library (lexer, parser, AST, diagnostics)
   knot-runtime/      Rust staticlib linked into compiled programs (value representation, SQLite persistence)
   knot-compiler/     Cranelift-based compiler producing native executables (CLI binary: knot)
+  knot-lsp/          Language server for editor integration (binary: knot-lsp)
 examples/            Example .knot programs
 ```
 
@@ -20,7 +21,7 @@ examples/            Example .knot programs
 
 ```sh
 cargo build                  # Build all crates
-cargo test                   # Run all tests (268 parser/lexer + 134 compiler tests)
+cargo test                   # Run all tests (450 frontend + 518 compiler + 82 runtime + 295 lsp)
 cargo test -p knot           # Run only frontend tests
 ```
 

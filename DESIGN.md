@@ -29,7 +29,7 @@ none = []
 There are five kinds of top-level declarations:
 
 ```knot
--- Source: stored in DB, mutable via `set`
+-- Source: stored in DB, mutable via `*people = ...`
 *people : [Person]
 *orders : [{customer: Text, amount: Int}]
 
@@ -86,7 +86,7 @@ Constructors are the interface for building values, inserting, and querying. The
 
 Every constructor requires `{}` — even those with no fields. This keeps the syntax uniform: a constructor is always `Name {fields}`, whether it has fields or not. There is no distinction between "a constructor" and "a constructor applied to a record."
 
-`Bool`, `Maybe`, and `Result` are built-in — their constructors (`True`/`False`, `Nothing`/`Just`, `Ok`/`Err`) are always available without a `data` declaration. `True {}` and `False {}` are interchangeable with the `true`/`false` literals and can be used in `case` patterns. The prelude provides `Functor`, `Applicative`, `Monad`, and `Alternative` impls for `Maybe`, and `Functor`/`Applicative`/`Monad`/`Alternative` for `Result`, so `do`-notation works on both out of the box.
+`Bool`, `Maybe`, and `Result` are built-in — their constructors (`True`/`False`, `Nothing`/`Just`, `Ok`/`Err`) are always available without a `data` declaration. `True {}` and `False {}` are interchangeable with the `true`/`false` literals and can be used in `case` patterns. `Maybe` gets `Functor`, `Applicative`, `Monad`, and `Alternative` from prelude impls; `Result` gets the same hierarchy via built-in compiler support, so `do`-notation works on both out of the box.
 
 ```knot
 data Maybe a = Nothing {} | Just {value: a}
@@ -147,13 +147,13 @@ Bind through multiple levels with `<-`:
 
 #### Updating Nested Relations
 
-Use `set` with a `map` over the outer relation that transforms the nested relation:
+Write `*rel = ...` with a `map` over the outer relation that transforms the nested relation:
 
 ```knot
 -- Add a member to a team
 addMember = \teamName person -> do
   teams <- *teams
-  set *teams = do
+  *teams = do
     t <- teams
     yield (if t.name == teamName
       then {t | members: union t.members [person]}
@@ -162,7 +162,7 @@ addMember = \teamName person -> do
 -- Remove a member from all teams
 removePerson = \personName -> do
   teams <- *teams
-  set *teams = do
+  *teams = do
     t <- teams
     yield {t | members: do
       m <- t.members
@@ -281,15 +281,19 @@ richOnes = \employees departments -> do
   yield (richOnes employees departments)
 
 -- do with Maybe
-safeDivide = \a b -> do
-  where b != 0
-  yield (a / b)
+safeDivide = \a b -> if b == 0 then Nothing {} else Just {value: a / b}
+
+tryCompute = do
+  x <- safeDivide 10 2
+  y <- safeDivide x 5
+  yield (x + y)
 
 -- do with Result
-parseConfig = \text -> do
-  json <- parseJson text
-  name <- getField "name" json
-  yield name
+safeDivideR = \a b -> if b == 0 then Err {error: "div by zero"} else Ok {value: a / b}
+
+computeR = do
+  x <- safeDivideR 10 2
+  yield (x + 1)
 ```
 
 ### `[]` Trait Implementations
@@ -317,9 +321,9 @@ impl Foldable [] where
 
 ### The Only `[]`-Specific Primitive
 
-| Primitive | Type | Description |
+| Primitive | Form | Description |
 |-----------|------|-------------|
-| `set` | `*[a] -> [a] -> IO {} {}` | Set a persistent relation to a new value |
+| relation write | `*rel = expr  :  IO {} {}` | Make a persistent relation equal to `expr` (use `replace *rel = expr` to force a full overwrite) |
 
 Everything else comes from traits:
 
@@ -334,7 +338,7 @@ Everything else comes from traits:
 
 ### Derived Operations
 
-Everything else is built from trait methods + `set`. The compiler recognizes these patterns and executes them as efficient set operations (hash joins, indexed lookups, etc.) — the traits define semantics, the runtime chooses the strategy.
+Everything else is built from trait methods plus the `*rel = expr` write. The compiler recognizes these patterns and executes them as efficient set operations (hash joins, indexed lookups, etc.) — the traits define semantics, the runtime chooses the strategy.
 
 **`where`** — conditional empty (requires `Alternative`):
 
@@ -364,11 +368,11 @@ join = \a b -> do
 **`diff`** — rows in one relation but not another:
 
 ```knot
-contains = \x rel -> fold (\acc r -> acc || r == x) False {} rel
+elem = \x rel -> fold (\acc r -> acc || r == x) False {} rel
 
 diff = \a b -> do
   x <- a
-  where (not (contains x b))
+  where (not (elem x b))
   yield x
 ```
 
@@ -381,22 +385,22 @@ inter = \a b -> do
   yield x
 ```
 
-**`insert`** — add a value (union with a singleton):
+**insert** — add a value (union with a singleton). Recognized as an INSERT:
 
 ```knot
-insert = \x rel -> set rel (union rel (yield x))
+*rel = union *rel [x]
 ```
 
-**`delete`** — remove matching rows:
+**delete** — remove matching rows (keep the rest). Recognized as a DELETE:
 
 ```knot
-delete = \p rel -> set rel (filter (\x -> not (p x)) rel)
+*rel = filter (\x -> not (p x)) *rel
 ```
 
-**`update`** — transform matching rows:
+**update** — transform matching rows. Recognized as an UPDATE:
 
 ```knot
-update = \p f rel -> set rel (map (\x -> if p x then f x else x) rel)
+*rel = map (\x -> if p x then f x else x) *rel
 ```
 
 **`count`**, **`sum`**, **`avg`** — folds:
@@ -495,7 +499,7 @@ Operate on the whole relation with `case`:
 ```knot
 scale = \factor -> do
   shapes <- *shapes
-  set *shapes = do
+  *shapes = do
     s <- shapes
     yield (case s of
       Circle {radius}       -> Circle {radius: radius * factor}
@@ -550,7 +554,7 @@ Grouping is executed via SQLite — key columns are inserted into a temp table a
 
 All state operations in Knot return IO values. The IO type carries an effect set that distinguishes DB operations from external effects:
 
-- **DB operations** return `IO {} value` — the empty effect set `{}` indicates pure database interaction with no external side effects. Source refs (`*rel`), derived refs (`&rel`), `set`, and `replace` all return `IO {} value`.
+- **DB operations** return `IO {} value` — the empty effect set `{}` indicates pure database interaction with no external side effects. Source refs (`*rel`), derived refs (`&rel`), and relation writes (`*rel = expr`, `replace *rel = expr`) all return `IO {} value`.
 - **External effects** carry specific tags: `IO {console} {}`, `IO {fs} Text`, `IO {network} Result`, `IO {clock} Int<Ms>`, `IO {random} Float`.
 
 This unified model means all stateful code lives in IO do-blocks, while pure comprehensions over plain values remain non-IO.
@@ -619,7 +623,7 @@ formatName = \n -> toUpper (take 1 n) ++ drop 1 n
 -- DB write (inferred: {rw *people})
 birthday = \name -> do
   people <- *people
-  set *people = do
+  *people = do
     p <- people
     yield (if p.name == name then {p | age: p.age + 1} else p)
 ```
@@ -632,7 +636,7 @@ Effect signatures are inferred but can be written explicitly:
 birthday : {rw *people} Text -> IO {} {}
 birthday = \name -> do
   people <- *people
-  set *people = do
+  *people = do
     p <- people
     yield (if p.name == name then {p | age: p.age + 1} else p)
 ```
@@ -652,7 +656,7 @@ atomic : IO {} a -> IO {} a
 handleOrder = \req -> do
   orderId <- atomic do
     orders <- *orders
-    set *orders = union orders [{item: req.body.item, qty: 1}]
+    *orders = union orders [{item: req.body.item, qty: 1}]
     newOrders <- *orders
     yield (count newOrders)
   println ("New order #" ++ show orderId)
@@ -691,7 +695,7 @@ narrows wakeups to rows the atomic block actually read:
 - Each write — INSERT, UPDATE, or DELETE — emits a `WriteEvent` carrying the
   affected rows' column values. The runtime evaluates each watcher's filter
   against the event; only matching watchers wake.
-- A bulk replacement (`set *rel = ...`) emits `WriteEvent::Bulk` which wakes
+- A bulk replacement (`*rel = ...`) emits `WriteEvent::Bulk` which wakes
   every watcher on that table conservatively, since the row deltas are not
   enumerated.
 
@@ -753,10 +757,10 @@ The spawned action's effect row `r` propagates through `fork` to the caller — 
 
 increment = do
   c <- *counter
-  set *counter = [{n: (fold (\_ x -> x.n) 0 c) + 1}]
+  *counter = [{n: (fold (\_ x -> x.n) 0 c) + 1}]
 
 main = do
-  set *counter = [{n: 0}]
+  *counter = [{n: 0}]
   fork do
     increment
     increment
@@ -785,11 +789,11 @@ waitForCompletion = \id -> atomic do
   yield task
 
 main = do
-  set *tasks = [{id: 1, status: "pending"}]
+  *tasks = [{id: 1, status: "pending"}]
   fork do
     -- simulate work
     atomic do
-      set *tasks = [{id: 1, status: "done"}]
+      *tasks = [{id: 1, status: "done"}]
   result <- waitForCompletion 1
   println result
 ```
@@ -896,7 +900,7 @@ api = serve Api where
     else do
       atomic do
         users <- *people
-        set *people = union users [{name: name, email: email}]
+        *people = union users [{name: name, email: email}]
       yield Ok {value: {name: name, email: email}}
 ```
 
@@ -1085,7 +1089,7 @@ api = serve Api where
   CreateOrder = \{item, qty} -> do
     orderId <- atomic do
       orders <- *orders
-      set *orders = union orders [{item: item, qty: qty}]
+      *orders = union orders [{item: item, qty: qty}]
       newOrders <- *orders
       yield (count newOrders)
     println ("New order #" ++ show orderId)
@@ -1103,25 +1107,25 @@ batchTransfer = \transfers ->
 
 ### Mutation
 
-All mutation is done through `set`, which replaces a persistent relation with a new value. The runtime diffs the old and new sets to apply minimal changes. Since relation references return IO, you bind to get the current value first:
+All mutation is done through the `*rel = expr` write, which makes a persistent relation equal to `expr` (there is no `set` keyword — the bare assignment is the write). The compiler recognizes common shapes (`union *rel [...]` → INSERT, conditional `map` → UPDATE, `filter` → DELETE) and emits minimal SQL; otherwise it rewrites the whole relation. `replace *rel = expr` forces a full overwrite. Since relation references return IO, you bind to get the current value first:
 
 ```knot
 -- Insert: union with a singleton
 addPerson = do
   people <- *people
-  set *people = union people [{name: "Alice", age: 30}]
+  *people = union people [{name: "Alice", age: 30}]
 
 -- Update: map with a conditional
 birthday = \name -> do
   people <- *people
-  set *people = do
+  *people = do
     p <- people
     yield (if p.name == "Alice" then {p | age: p.age + 1} else p)
 
 -- Delete: filter to keep the rest
 removePerson = \name -> do
   people <- *people
-  set *people = do
+  *people = do
     p <- people
     where p.name != name
     yield p
@@ -1133,8 +1137,8 @@ Relations are sets. Two rows are the same row iff all their fields are equal. Se
 
 ```knot
 -- Adding an already-existing row changes nothing
-set *people = union *people [{name: "Alice", age: 30}]
-set *people = union *people [{name: "Alice", age: 30}]  -- no change
+*people = union *people [{name: "Alice", age: 30}]
+*people = union *people [{name: "Alice", age: 30}]  -- no change
 ```
 
 No surrogate IDs, no key declarations. Data identifies itself.
@@ -1192,14 +1196,14 @@ Writing through a view auto-fills constants and propagates source columns:
 -- Insert through view — status auto-filled as Open {}
 addOpenTodo = do
   openTodos <- *openTodos
-  set *openTodos = union openTodos [{title: "New task", owner: "Alice", priority: High {}}]
+  *openTodos = union openTodos [{title: "New task", owner: "Alice", priority: High {}}]
 -- Compiler rewrites →
--- set *todos = union *todos [{title: "New task", owner: "Alice", priority: High {}, status: Open {}}]
+-- *todos = union *todos [{title: "New task", owner: "Alice", priority: High {}, status: Open {}}]
 
 -- Delete through view — only affects rows matching the constant
 removeAliceTodos = do
   openTodos <- *openTodos
-  set *openTodos = do
+  *openTodos = do
     t <- openTodos
     where t.owner != "Alice"
     yield t
@@ -1320,7 +1324,7 @@ The runtime stores the compiled schema version in the database. On startup it co
 
 | Type | Description |
 |------|-------------|
-| `Int` | Unbounded integer (arbitrary precision via `BigInt`) |
+| `Int` | 64-bit signed integer (`i64`); arithmetic is checked and panics on overflow |
 | `Float` | 64-bit float |
 | `Int<u>` | Integer tagged with a compile-time unit (`Int<Usd>`) |
 | `Float<u>` | Float tagged with a compile-time unit (`Float<M>`, `Float<M/S^2>`) |
@@ -1597,7 +1601,7 @@ Two subset-constraint shapes:
 | `*rel <= *rel.field` | Field values are unique within `rel` |
 
 Field-level and cross-field refinements are enforced row-by-row before each
-`set` commits. Subset constraints are enforced by runtime triggers maintained
+relation write commits. Subset constraints are enforced by runtime triggers maintained
 on the underlying SQLite tables. Either failure mode panics with a refinement
 error or a constraint-violation message.
 
@@ -1688,13 +1692,9 @@ Checks happen at two boundaries:
 | Boundary | Mechanism | On failure |
 |----------|-----------|------------|
 | `refine expr` | Explicit coercion | Returns `Result RefinementError T` |
-| `set *rel = value` | Implicit per-row check | Panics with `RefinementError` |
+| `*rel = value` | Implicit per-row check | Panics with `RefinementError` |
 
-`set` panics because constraint violations at the persistence boundary are programming errors — input should be validated with `refine` first. For explicit error handling at the `set` boundary, use `trySet`:
-
-```knot
-trySet : *[a] -> [a] -> IO {} (Result RefinementError {})
-```
+A relation write panics because constraint violations at the persistence boundary are programming errors — input should be validated with `refine` first, so that error handling happens explicitly before the write rather than at the write itself.
 
 #### Predicates
 
@@ -1743,18 +1743,20 @@ type Person = {
   amount: Nat where \x -> x <= 1000000,
   items: [{name: NonEmptyText, qty: Nat where \q -> q > 0}]
 }]
-  where .customer in *people.email
+
+-- Referential integrity is a separate top-level subset constraint:
+*orders.customer <= *people.email
 
 route Api where
   POST {name: Text, age: Int, email: Text}  /users -> {ok: Bool, error: Maybe Text}  = CreateUser
 
 api = serve Api where
   CreateUser = \{name, age, email} ->
-    case refine {name, age, email} of    -- Person inferred from set *people
+    case refine {name, age, email} of    -- Person inferred from *people
       Ok {value: person} -> do
         atomic do
           people <- *people
-          set *people = union people [person]
+          *people = union people [person]
         yield Ok {value: {ok: true, error: Nothing {}}}
       Err {error} -> do
         let msg = fold (\acc v -> acc ++ v.message ++ "; ") "" error.violations
@@ -1803,32 +1805,36 @@ sortAndShow : Ord a => Display a => [a] -> [Text]
 Traits can have associated types:
 
 ```knot
-trait Collection c where
-  type Item c
-  empty : c
-  add : Item c -> c -> c
-  toRel : c -> [Item c]
+trait Container c where
+  type Elem c
+  size : c -> Int
+  toList : c -> [Elem c]
 
-impl Collection [a] where
-  type Item [a] = a
-  empty = []
-  add x rel = union rel (yield x)
-  toRel = id
+impl Container [a] where
+  type Elem [a] = a
+  size xs = count xs
+  toList xs = xs
 ```
+
+(Method names must not collide with prelude trait methods like `empty`/`yield`,
+since trait method names share one global namespace.)
 
 #### Deriving
 
-Common traits are auto-derived:
+`deriving (TraitName)` auto-generates an impl from the trait's **default method
+bodies**, so it only does useful work for traits that provide defaults (see
+[Default Implementations](#default-implementations) below):
 
 ```knot
 data Priority = Low {} | Medium {} | High {} | Critical {}
-  deriving (Eq, Ord, Display)
-
-data Shape
-  = Circle {radius: Float}
-  | Rect {width: Float, height: Float}
-  deriving (Eq, Display)
+  deriving (Describe)   -- Describe must supply default method bodies
 ```
+
+Equality, ordering, and `show` do **not** need deriving — `==`/`!=`, the
+comparison operators, and `show` work structurally on any value via the runtime,
+regardless of whether `Eq`/`Ord`/`Display` are derived (those built-in traits
+declare no default bodies, so `deriving (Eq, Ord, Display)` would generate
+nothing).
 
 #### Relation-Specific Traits
 
@@ -1836,8 +1842,9 @@ The standard library defines traits that interact with the relational model:
 
 ```knot
 -- Types that can be used in where clauses and joins
+-- (method names are plain identifiers; the `==` operator dispatches to `eq`)
 trait Eq a where
-  (==) : a -> a -> Bool
+  eq : a -> a -> Bool
 
 -- Types that support ordering
 trait Ord a where
@@ -1911,11 +1918,11 @@ pendingFor = \user -> do
 
 add = \title owner priority -> do
   todos <- *todos
-  set *todos = union todos [{title: formatTitle title, owner: owner, priority: priority, status: Open {}}]
+  *todos = union todos [{title: formatTitle title, owner: owner, priority: priority, status: Open {}}]
 
 assign = \title owner person -> do
   todos <- *todos
-  set *todos = do
+  *todos = do
     t <- todos
     yield (if t.title == title && t.owner == owner
       then {t | status: InProgress {assignee: person}}
@@ -1923,7 +1930,7 @@ assign = \title owner person -> do
 
 resolve = \title owner msg -> do
   todos <- *todos
-  set *todos = do
+  *todos = do
     t <- todos
     yield (if t.title == title && t.owner == owner
       then {t | status: Resolved {resolution: msg}}

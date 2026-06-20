@@ -93,7 +93,7 @@ single [1, 2]               -- Nothing {}
 ### `count`
 
 ```
-count : [a] -> Int
+count : [a] -> Int<u>
 ```
 
 Return the number of rows in a relation.
@@ -107,7 +107,7 @@ When the argument is a source relation (or its bound alias), the compiler emits 
 ### `countWhere`
 
 ```
-countWhere : (a -> Bool) -> [a] -> Int
+countWhere : (a -> Bool) -> [a] -> Int<u>
 ```
 
 Count rows that satisfy a predicate. Equivalent to `count . filter`, but pushes down to a single `SELECT COUNT(*) FROM ... WHERE pred` when the predicate is SQL-compilable.
@@ -285,14 +285,6 @@ drop : Int -> [a] -> [a]      -- Sequence.drop
 
 First / drop *n* rows. Both come from the `Sequence` trait, which also has a `Text` impl that operates on characters.
 
-### `reverse`
-
-```
-reverse : [a] -> [a]
-```
-
-Reverse iteration order of a relation. Like `sortBy`, this controls iteration order; the underlying set is unchanged.
-
 ### `upsertBy`
 
 ```
@@ -382,7 +374,7 @@ Run an IO body in a database transaction. The body must contain only DB operatio
 ```knot
 transfer = \from to amount -> atomic do
   accounts <- *accounts
-  set *accounts = do
+  *accounts = do
     a <- accounts
     yield (if a.name == from then {a | balance: a.balance - amount}
            else if a.name == to then {a | balance: a.balance + amount}
@@ -419,7 +411,7 @@ sets). A parked retry is only woken when an UPDATE, DELETE, or INSERT touches
 a matching row. So a worker retrying on `WHERE id = 1` is not woken by writes
 to `id = 2`, and a worker retrying on `status IN ("queued", "running")` is
 unaffected by writes that leave the status outside that set. Bulk
-replacements (`set *rel = ...`) wake all watchers conservatively.
+replacements (`*rel = ...`) wake all watchers conservatively.
 
 ---
 
@@ -727,10 +719,10 @@ Encode any value as a JSON string.
 ### `parseJson`
 
 ```
-parseJson : Text -> a
+parseJson : Text -> Maybe a
 ```
 
-Parse a JSON string into a value. Objects become records, arrays become relations, strings become `Text`, numbers become `Int` or `Float`, booleans become `Bool`, and null becomes `{}`.
+Parse a JSON string into a value, returning `Just value` on success and `Nothing` on a parse failure. Objects become records, arrays become relations, strings become `Text`, numbers become `Int` or `Float`, booleans become `Bool`, and null becomes `Nothing {}` (the `Maybe` wire convention). Decoding is type-directed where a target type can be inferred.
 
 ---
 
@@ -956,11 +948,10 @@ trait Eq a => Num a where
   sub : a -> a -> a
   mul : a -> a -> a
   div : a -> a -> a
-  mod : a -> a -> a
   negate : a -> a
 ```
 
-Numeric operations. Built-in implementations for `Int`, `Float`. Used by `+`, `-`, `*`, `/`, `%` operators and unary negation. Modulo on `Int` is the remainder (sign follows the dividend); on `Float` it is `fmod`. Modulo by zero panics. The `%` operator pushes down into SQLite as `%` when used inside a SQL-compilable comprehension.
+Numeric operations. Built-in implementations for `Int`, `Float`. Used by `+`, `-`, `*`, `/` operators and unary negation. The `%` (modulo) operator is **not** a `Num` trait method — it is handled by intrinsic codegen for `Int`/`Float` (a user `impl Num` cannot supply it). Modulo on `Int` is the remainder (sign follows the dividend); on `Float` it is `fmod`. Modulo by zero panics. The `%` operator pushes down into SQLite as `%` when used inside a SQL-compilable comprehension.
 
 ### `Semigroup`
 
@@ -997,7 +988,7 @@ trait ToJSON a where
   toJson : a -> Text
 
 trait FromJSON a where
-  parseJson : Text -> a
+  parseJson : Text -> Maybe a
 ```
 
 JSON encode/decode as trait methods. Built-in instances cover records, relations, primitives, ADTs, and `Maybe`/`Result`/`Bool`.
@@ -1064,7 +1055,7 @@ Walk a structure left-to-right and sequence through any `Applicative` `f`. Built
 
 | Type | Description |
 |------|-------------|
-| `Int` | Unbounded integer (arbitrary precision) |
+| `Int` | 64-bit signed integer (`i64`); arithmetic is checked and panics on overflow |
 | `Float` | 64-bit floating point |
 | `Int<u>` | Integer with compile-time unit (e.g. `Int<Usd>`) |
 | `Float<u>` | Float with compile-time unit (e.g. `Float<M>`, `Float<M/S^2>`) |

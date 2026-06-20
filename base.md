@@ -70,7 +70,7 @@ union : [a] -> [a] -> [a]
 Set union of two relations. Duplicates (by structural equality) are removed.
 
 ```knot
-count : [a] -> Int
+count : [a] -> Int<u>
 ```
 Number of rows in a relation.
 
@@ -225,7 +225,7 @@ max "a" "b"    -- "b"
 ```
 
 ```knot
-countWhere : (a -> Bool) -> [a] -> Int
+countWhere : (a -> Bool) -> [a] -> Int<u>
 ```
 Number of rows satisfying a predicate. Equivalent to `count (filter p rel)` but pushes down to `SELECT COUNT(*) ... WHERE ...` when the predicate is SQL-compilable.
 
@@ -246,7 +246,7 @@ toLower : Text -> Text
 Convert text to lowercase.
 
 ```knot
-take : Int<u> -> s -> s          -- Sequence trait method
+take : Int -> s -> s          -- Sequence trait method
 ```
 First *n* elements. `Sequence` has built-in impls for `Text` (characters) and `[]` (rows).
 
@@ -256,7 +256,7 @@ take 2 [10, 20, 30, 40]       -- [10, 20]
 ```
 
 ```knot
-drop : Int<u> -> s -> s          -- Sequence trait method
+drop : Int -> s -> s          -- Sequence trait method
 ```
 Skip the first *n* elements.
 
@@ -266,7 +266,7 @@ drop 1 [10, 20, 30]           -- [20, 30]
 ```
 
 ```knot
-length : Text -> Int
+length : Text -> Int<u>
 ```
 Number of characters in a text value.
 
@@ -325,8 +325,8 @@ main = do
 ## Control Flow
 
 ```knot
-when   : Bool -> IO r {} -> IO r {}
-unless : Bool -> IO r {} -> IO r {}
+when   : Bool -> IO {| r} {} -> IO {| r} {}
+unless : Bool -> IO {| r} {} -> IO {| r} {}
 ```
 
 Run an IO action when the condition is `True`/`False` respectively. Both
@@ -342,7 +342,7 @@ main = do
 ```
 
 ```knot
-forEach : [a] -> (a -> IO r {}) -> IO r {}
+forEach : [a] -> (a -> IO {| r} {}) -> IO {| r} {}
 ```
 
 Iterate a relation and sequence an IO action for each row. Effect row `r`
@@ -421,7 +421,7 @@ main = do
 ```knot
 toJson : a -> Text
 ```
-Convert any value to its JSON text representation. Records become JSON objects, relations become JSON arrays, `Int`/`Float` become numbers, `Text` becomes a JSON string, `Bool` becomes `true`/`false`, and `{}` becomes `{}`.
+Convert any value to its JSON text representation. Records become JSON objects, relations become JSON arrays, `Int`/`Float` become numbers, `Text` becomes a JSON string, `Bool` becomes `true`/`false`, the empty record/unit `{}` becomes `null`, and `Maybe` follows the wire convention (`Nothing` → `null`, `Just x` → `x`'s JSON).
 
 ```knot
 toJson {name: "Alice", age: 30}    -- "{\"name\":\"Alice\",\"age\":30}"
@@ -429,17 +429,17 @@ toJson [1, 2, 3]                   -- "[1,2,3]"
 ```
 
 ```knot
-parseJson : Text -> a
+parseJson : Text -> Maybe a
 ```
-Parse a JSON string into a Knot value. JSON objects become records, arrays become relations, strings become `Text`, integers become `Int`, decimals become `Float`, booleans become `Bool`, and `null` becomes `{}`. Handles standard JSON escape sequences.
+Parse a JSON string into a Knot value, returning `Just value` on success and `Nothing` on a parse failure. JSON objects become records, arrays become relations, strings become `Text`, integers become `Int`, decimals become `Float`, booleans become `Bool`, and `null` becomes `Nothing {}` (the `Maybe` wire convention). Handles standard JSON escape sequences. Decoding is type-directed where a target type is known.
 
 ```knot
-parseJson "{\"x\": 10}"           -- {x: 10}
-parseJson "[1, 2, 3]"             -- [1, 2, 3]
+parseJson "{\"x\": 10}"           -- Just {x: 10}
+parseJson "[1, 2, 3]"             -- Just [1, 2, 3]
 
 -- Round-trip
 let json = toJson {name: "Bob"}
-parseJson json                     -- {name: "Bob"}
+parseJson json                     -- Just {name: "Bob"}
 ```
 
 ## Bytes
@@ -652,7 +652,7 @@ Run an IO body as a database transaction. Body must contain only DB operations (
 ```knot
 transfer = \from to amount -> atomic do
   accounts <- *accounts
-  set *accounts = do
+  *accounts = do
     a <- accounts
     yield (if a.name == from then {a | balance: a.balance - amount}
            else if a.name == to then {a | balance: a.balance + amount}
@@ -671,7 +671,7 @@ waitForReady = atomic do
   retry
 ```
 
-The runtime narrows wakeups to rows the atomic block actually read. Codegen extracts the predicates inside `single (filter (\r -> r.col OP expr) rows)` and SQL-pushed-down query patterns — equality, inequality, ordered comparisons, and `IN` sets — and registers them as row-level read filters. When another transaction commits an UPDATE, DELETE, or INSERT, only watchers whose filters match the affected rows wake; everyone else stays parked. Bulk replacements (`set *rel = ...`) wake all watchers conservatively.
+The runtime narrows wakeups to rows the atomic block actually read. Codegen extracts the predicates inside `single (filter (\r -> r.col OP expr) rows)` and SQL-pushed-down query patterns — equality, inequality, ordered comparisons, and `IN` sets — and registers them as row-level read filters. When another transaction commits an UPDATE, DELETE, or INSERT, only watchers whose filters match the affected rows wake; everyone else stays parked. Bulk replacements (`*rel = ...`) wake all watchers conservatively.
 
 ## IO Type Syntax
 
@@ -716,10 +716,9 @@ trait Eq a => Num a where
   sub : a -> a -> a
   mul : a -> a -> a
   div : a -> a -> a
-  mod : a -> a -> a
   negate : a -> a
 ```
-Numeric operations as trait methods. Requires `Eq`. Built-in impls for `Int` and `Float`. Use as a trait bound for generic numeric code:
+Numeric operations as trait methods. Requires `Eq`. Built-in impls for `Int` and `Float`. The `%` operator is handled by intrinsic codegen for `Int`/`Float` rather than a `Num` method, so a user `impl Num` cannot supply it. Use as a trait bound for generic numeric code:
 
 ```knot
 double : Num a => a -> a
@@ -827,7 +826,7 @@ trait ToJSON a where
   toJson : a -> Text
 
 trait FromJSON a where
-  parseJson : Text -> a
+  parseJson : Text -> Maybe a
 ```
 JSON encode/decode as trait methods. Built-in instances cover records, relations, primitives, ADTs, and `Maybe`/`Result`/`Bool`.
 

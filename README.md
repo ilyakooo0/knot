@@ -157,6 +157,7 @@ crates/
                      SQLite persistence, concurrency, HTTP, crypto)
   knot-compiler/     Cranelift compiler producing native executables;
                      CLI binary is `knot`
+  knot-lsp/          Language server for editor integration (binary `knot-lsp`)
 examples/            Example .knot programs
 DESIGN.md            Language specification
 stdlib.md            Standard library reference

@@ -282,3 +282,65 @@ fn provably_relation_free_atomic_still_rejected() {
     );
     assert_has_error(&diags, "atomic block must interact with relations");
 }
+
+// ── Pipe-LHS lambda effect propagation ──────────────────────────────
+//
+// `x |> f` desugars to `f x`, so a lambda on the LHS is an *argument* to
+// the row-polymorphic callee. The effect checker must thread the lambda
+// body's effects through exactly as it does for the direct-application
+// form `f x` — otherwise the console write below is invisible and slips
+// past the IO-in-atomic gate (the unsafe under-approximation direction).
+
+#[test]
+fn pipe_lhs_lambda_io_propagates_into_atomic_check() {
+    let diags = effect_diags(
+        r#"*items : [{n: Int}]
+
+apply = \f -> f 1
+
+main = do
+  r <- atomic (do
+    rows <- *items
+    q <- (\u -> println "x") |> apply
+    yield {})
+  yield {}
+"#,
+    );
+    assert_has_error(&diags, "IO effects are not allowed inside atomic blocks");
+}
+
+#[test]
+fn pipe_lhs_lambda_io_matches_direct_application() {
+    // The pipe form must agree with the equivalent `apply (\u -> ...)`
+    // direct application: the caller is charged with `console`, so a
+    // `main : IO {} {}`-style pure context would be rejected. Here we just
+    // confirm the console effect reaches `main` by exceeding a declared
+    // empty row.
+    let diags = effect_diags(
+        r#"apply = \f -> f 1
+
+main : IO {} {}
+main = do
+  q <- (\u -> println "x") |> apply
+  yield {}
+"#,
+    );
+    assert_has_error(&diags, "inferred effects exceed declared effects");
+}
+
+#[test]
+fn pipe_lhs_pure_lambda_adds_no_effects() {
+    // Symmetric to `pure_lambda_args_add_no_effects`: a pure lambda piped
+    // into a HOF must not invent effects.
+    let diags = effect_diags(
+        r#"apply = \f -> f 1
+
+main : IO {console} {}
+main = do
+  n <- (\u -> u + 1) |> apply
+  p <- println (show n)
+  yield {}
+"#,
+    );
+    assert_no_diags(&diags);
+}

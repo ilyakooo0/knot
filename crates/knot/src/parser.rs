@@ -2160,6 +2160,16 @@ impl Parser {
     fn parse_expr_bp(&mut self, min_bp: u8) -> Option<Expr> {
         let mut lhs = self.parse_unary()?;
 
+        // Each spine node accumulated by this loop adds one level of nesting to
+        // the returned AST. Left-associative chains (`a+b+c+…`) are built
+        // iteratively — the RHS-descent guard below returns immediately for
+        // them, so it never accumulates depth. Charge the depth budget per
+        // spine node and hold it until return so a pathological flat chain
+        // (`1+1+…` with tens of thousands of terms) hits the nesting limit and
+        // reports a diagnostic, instead of building an AST whose first recursive
+        // traversal (Drop, inference, codegen) overflows the native stack.
+        let mut spine_charged = 0usize;
+
         loop {
             // Skip newlines in certain contexts to allow multiline expressions.
             // But be careful: a newline at column 0 might be a new declaration.
@@ -2272,7 +2282,7 @@ impl Parser {
             // instead of overflowing the stack. The `parse_atom` cost is
             // released before this point, so without this guard the depth
             // counter never accumulates here.
-            if !self.enter_recursion() { return None; }
+            if !self.enter_recursion() { self.recursion_depth -= spine_charged; return None; }
             let rhs = if matches!(
                 self.peek(),
                 TokenKind::Let
@@ -2288,7 +2298,15 @@ impl Parser {
                 self.parse_expr_bp(r_bp)
             };
             self.recursion_depth -= 1;
-            let rhs = rhs?;
+            let rhs = match rhs {
+                Some(rhs) => rhs,
+                None => { self.recursion_depth -= spine_charged; return None; }
+            };
+
+            // Charge one depth unit for the spine node we're about to build and
+            // hold it until return (see the comment at the top of this fn).
+            if !self.enter_recursion() { self.recursion_depth -= spine_charged; return None; }
+            spine_charged += 1;
 
             let span = Span::new(lhs.span.start, rhs.span.end);
             lhs = Spanned::new(
@@ -2301,6 +2319,7 @@ impl Parser {
             );
         }
 
+        self.recursion_depth -= spine_charged;
         Some(lhs)
     }
 
@@ -2345,9 +2364,28 @@ impl Parser {
     fn parse_application(&mut self) -> Option<Expr> {
         let mut func = self.parse_postfix()?;
 
+        // Application chains (`f a b c …`) are built iteratively into a
+        // left-spine, so — like the binop loop — they must charge the depth
+        // budget per node and hold it until return, otherwise a pathological
+        // chain produces an AST whose first recursive traversal overflows the
+        // stack. See `parse_expr_bp` for the full rationale.
+        let mut spine_charged = 0usize;
+
+        macro_rules! fail {
+            () => {{
+                self.recursion_depth -= spine_charged;
+                return None;
+            }};
+        }
+
         loop {
             if self.can_start_atom() {
-                let arg = self.parse_postfix()?;
+                let arg = match self.parse_postfix() {
+                    Some(arg) => arg,
+                    None => fail!(),
+                };
+                if !self.enter_recursion() { fail!() }
+                spine_charged += 1;
                 let span = Span::new(func.span.start, arg.span.end);
                 func = Spanned::new(
                     ExprKind::App {
@@ -2377,7 +2415,12 @@ impl Parser {
                 && self.can_start_atom()
                 && self.cur_column() > self.block_indent
             {
-                let arg = self.parse_postfix()?;
+                let arg = match self.parse_postfix() {
+                    Some(arg) => arg,
+                    None => fail!(),
+                };
+                if !self.enter_recursion() { fail!() }
+                spine_charged += 1;
                 let span = Span::new(func.span.start, arg.span.end);
                 func = Spanned::new(
                     ExprKind::App {
@@ -2392,6 +2435,7 @@ impl Parser {
             }
         }
 
+        self.recursion_depth -= spine_charged;
         Some(func)
     }
 
@@ -2486,11 +2530,21 @@ impl Parser {
     fn parse_postfix(&mut self) -> Option<Expr> {
         let mut expr = self.parse_constructor_or_atom()?;
 
+        // Field-access chains (`x.a.b.c…`) build a left-spine iteratively, so —
+        // like the binop and application loops — charge the depth budget per
+        // node and hold it until return to bound the resulting AST depth (see
+        // `parse_expr_bp`).
+        let mut spine_charged = 0usize;
+
         loop {
             if self.at(&TokenKind::Dot) {
                 self.advance();
-                let (field, field_span) =
-                    self.expect_lower("expected field name after '.'").ok()?;
+                let (field, field_span) = match self.expect_lower("expected field name after '.'") {
+                    Ok(pair) => pair,
+                    Err(_) => { self.recursion_depth -= spine_charged; return None; }
+                };
+                if !self.enter_recursion() { self.recursion_depth -= spine_charged; return None; }
+                spine_charged += 1;
                 let span = Span::new(expr.span.start, field_span.end);
                 expr = Spanned::new(
                     ExprKind::FieldAccess {
@@ -2504,6 +2558,7 @@ impl Parser {
             }
         }
 
+        self.recursion_depth -= spine_charged;
         Some(expr)
     }
 

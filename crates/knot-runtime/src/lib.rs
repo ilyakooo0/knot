@@ -14356,6 +14356,20 @@ fn coerce_json_field(v: *mut Value, ty: &str) -> *mut Value {
             return alloc_float(*i as f64);
         }
     }
+    // The mirror case: a field declared `Int` must hold a `Value::Int`, but a
+    // peer that writes an integer with a decimal point (`30.0`) fails the
+    // `as_i64()` probe in `json_to_value_impl` and decodes to `Value::Float`.
+    // Left untouched, the value persists as SQLite `REAL` instead of the
+    // int-as-TEXT (`COLLATE KNOT_INT`) encoding every other Int row uses,
+    // corrupting numeric ordering/comparison in that column. Demote integral
+    // floats back to `Int` here.
+    if ty == "int" {
+        if let Value::Float(f) = unsafe { as_ref(v) } {
+            if f.fract() == 0.0 && f.is_finite() && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 {
+                return alloc_int(*f as i64);
+            }
+        }
+    }
     v
 }
 
@@ -16951,6 +16965,37 @@ mod _maybe_json_tests {
         match unsafe { as_ref(field(rows[1], "a")) } {
             Value::Constructor(tag, _) => assert_eq!(&**tag, "Just"),
             _ => panic!("expected Just"),
+        }
+    }
+
+    #[test]
+    fn coerce_int_field_demotes_integral_float() {
+        // A peer that writes an integer with a decimal point (`30.0`) for an
+        // `Int` field decodes to `Value::Float` (the `as_i64()` probe fails on
+        // `30.0`). Left untouched it would persist as SQLite REAL rather than
+        // the int-as-TEXT encoding, corrupting numeric ordering in the column.
+        // `coerce_json_field` must demote integral floats back to `Int`.
+        match unsafe { as_ref(coerce_json_field(alloc_float(30.0), "int")) } {
+            Value::Int(30) => {}
+            _ => panic!("expected Int(30) from coerce_json_field(30.0, int)"),
+        }
+        // Already an Int → unchanged.
+        match unsafe { as_ref(coerce_json_field(alloc_int(7), "int")) } {
+            Value::Int(7) => {}
+            _ => panic!("expected Int(7) unchanged"),
+        }
+        // A genuinely fractional value for an `int` position is left as-is
+        // (no silent truncation); only exactly-integral floats are demoted.
+        match unsafe { as_ref(coerce_json_field(alloc_float(30.5), "int")) } {
+            Value::Float(f) if (*f - 30.5).abs() < 1e-9 => {}
+            _ => panic!("expected Float(30.5) left intact"),
+        }
+        // End-to-end through apply_wire_type: an `int` field receiving 30.0.
+        let rec = record(vec![("a", alloc_float(30.0))]);
+        let fixed = apply_wire_type(rec, "{a:int}");
+        match unsafe { as_ref(field(fixed, "a")) } {
+            Value::Int(30) => {}
+            _ => panic!("expected Int(30) after apply_wire_type"),
         }
     }
 

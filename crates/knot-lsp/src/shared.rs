@@ -1602,10 +1602,14 @@ mod regress_walker_scan_fixes_tests {
 
     /// Bug 7: a left-deep 200k-term `1+1+…` chain used to overflow the
     /// stack inside the shared walkers (reachable from any keystroke and
-    /// from workspace scans). The walkers now bail at `MAX_WALK_DEPTH`.
-    /// Run on a big-stack thread so the parser/drop-glue (out of scope for
-    /// this fix) don't dominate the result; without the walker cap the walk
-    /// alone needs far more than 64 MiB and aborts the process.
+    /// from workspace scans). The walkers bail at `MAX_WALK_DEPTH`, and the
+    /// parser now also caps the spine length of iterative chains (binop,
+    /// application, field-access) against its recursion budget — so a
+    /// pathological chain produces a "nesting depth limit exceeded"
+    /// diagnostic instead of a multi-hundred-thousand-deep AST whose first
+    /// recursive traversal (Drop, inference, codegen, or these walkers)
+    /// aborts the process. With the parser cap in place the walkers are
+    /// never handed a deep AST at all; this guards both layers.
     #[test]
     fn walkers_bail_on_pathological_left_deep_ast() {
         let handle = std::thread::Builder::new()
@@ -1617,16 +1621,24 @@ mod regress_walker_scan_fixes_tests {
                     src.push_str("+1");
                 }
                 src.push('\n');
-                let module = parse(&src);
-                let body = module
-                    .decls
-                    .iter()
-                    .find_map(|d| match &d.node {
-                        DeclKind::Fun { body: Some(b), .. } => Some(b),
-                        _ => None,
-                    })
-                    .expect("fun body");
-                assert!(!expr_references_name(body, "zzz"));
+                let (tokens, _) = knot::lexer::Lexer::new(&src).tokenize();
+                let parser = knot::parser::Parser::new(src.clone(), tokens);
+                let (module, diags) = parser.parse_module();
+                // The parser refuses to build the unbounded spine and reports
+                // the depth limit rather than producing a deep `Fun` body.
+                assert!(
+                    diags.iter().any(|d| d.message.contains("nesting depth limit")),
+                    "expected a nesting-depth diagnostic; got {diags:?}"
+                );
+                assert!(
+                    !module.decls.iter().any(|d| matches!(
+                        &d.node,
+                        DeclKind::Fun { body: Some(_), .. }
+                    )),
+                    "parser should not produce an unbounded fun body"
+                );
+                // The walkers must still run without overflowing on whatever
+                // bounded AST the parser produced.
                 assert!(find_enclosing_atomic_expr(&module, &src, 4).is_none());
                 assert!(!route_is_listened(&module, "Api"));
             })

@@ -596,7 +596,24 @@ impl EffectChecker {
 
             ast::ExprKind::BinOp { op, lhs, rhs } => {
                 if *op == ast::BinOp::Pipe {
-                    let lhs_effects = self.infer_effects(lhs);
+                    // `lhs |> rhs` desugars to `rhs lhs`, so `lhs` is an
+                    // *argument*. When `lhs` is a lambda and the `rhs` callee is
+                    // row-polymorphic (likely to invoke it), thread the lambda
+                    // body's effects through `arg_effects`, exactly as the `App`
+                    // spine does — otherwise a lambda piped directly into a
+                    // higher-order callee (`(\u -> println "x") |> withCb`) loses
+                    // its body effects, under-approximating (the unsafe
+                    // direction) and slipping past the IO-in-atomic gate.
+                    let propagate_lambda = head_name(rhs)
+                        .map(|n| {
+                            self.row_poly_decls.contains(n) || !self.fixed_row_decls.contains(n)
+                        })
+                        .unwrap_or(false);
+                    let lhs_effects = if propagate_lambda {
+                        self.arg_effects(lhs)
+                    } else {
+                        self.infer_effects(lhs)
+                    };
                     let rhs_effects = self.callee_effects(rhs);
                     lhs_effects.union(&rhs_effects)
                 } else {

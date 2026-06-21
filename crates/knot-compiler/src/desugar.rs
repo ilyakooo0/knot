@@ -1162,6 +1162,15 @@ fn desugar_stmts(stmts: &[Stmt], span: Span) -> Expr {
         StmtKind::Expr(e) => {
             // Bare expression in non-final position: monadic sequencing.
             // `e; rest` => `__bind (\_ -> rest) e` (run e, discard result, then rest).
+            // A non-final `yield x` must be routed through `mk_yield` (like the
+            // final-statement base case) so its helper Var gets a collision-free
+            // synthesized span. Cloning the raw `yield` keeps its real file
+            // offset, which `monad_info`/`compile_monadic_yield` key on and which
+            // collides across merged files — aliasing another do-block's monad.
+            let action = match e.node.as_yield_arg() {
+                Some(inner) => mk_yield(inner.clone(), span),
+                None => e.clone(),
+            };
             mk_bind(
                 spanned(
                     ExprKind::Lambda {
@@ -1170,7 +1179,7 @@ fn desugar_stmts(stmts: &[Stmt], span: Span) -> Expr {
                     },
                     span,
                 ),
-                e.clone(),
+                action,
                 span,
             )
         }

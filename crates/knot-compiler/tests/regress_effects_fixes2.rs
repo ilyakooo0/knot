@@ -370,3 +370,47 @@ main = doStuff
     );
     assert_has_error(&diags, "IO effects are not allowed inside atomic blocks");
 }
+
+#[test]
+fn clean_atomic_in_impl_method_not_poisoned_by_unrelated_io_lambda() {
+    // A clean `atomic` block (relation writes only) inside an IMPL METHOD must
+    // compile. The atomic gate's enclosing-body root lookup keys on
+    // `current_decl_name`/`decl_bodies`; during the final diagnostic re-walk
+    // these used to be a stale leftover from the last top-level fun (`noise`
+    // here), whose body holds an unrelated `\u -> println` IO lambda. Rooting
+    // the laundered-IO search there wrongly attributed that lambda to the
+    // method's atomic block — a false positive that rejected a valid program.
+    let diags = effect_diags(
+        r#"*items : [{id: Int}]
+
+writeItems = \u -> replace *items = [{id: 7}]
+
+useRec = \r -> do
+  xs <- *items
+  (r.fn) {}
+
+trait Doer a where
+  doIt : a -> IO {rw *items} {}
+
+impl Doer Int where
+  doIt = \x -> do
+    let r = {fn: writeItems}
+    atomic (useRec r)
+
+main : IO {rw *items} {}
+main = doIt 1
+
+noise : IO {console} {}
+noise = do
+  let bad = \u -> println "unrelated IO in another decl"
+  println "x"
+"#,
+    );
+    assert!(
+        !diags
+            .iter()
+            .any(|d| d.message.contains("IO effects are not allowed inside atomic blocks")),
+        "clean atomic in impl method wrongly flagged: {:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}

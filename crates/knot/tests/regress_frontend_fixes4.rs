@@ -113,12 +113,18 @@ fn deeply_nested_records_parse_quickly() {
 // ── 2. Route path-prefix recursion is depth-bounded ─────────────────────
 
 #[test]
-fn many_route_prefix_lines_diagnose_instead_of_crashing() {
-    // A long run of `/`-prefix lines used to overflow the stack. It must now
-    // surface a recursion-depth diagnostic and return normally.
+fn deeply_nested_route_prefixes_diagnose_instead_of_crashing() {
+    // Genuinely-nested `/`-prefix lines (each strictly more indented than the
+    // last) recurse once per level, so a deep enough chain must surface a
+    // recursion-depth diagnostic and return normally rather than overflowing
+    // the stack. (Same-indent prefix lines are siblings, not nested — see
+    // `same_indent_route_prefix_does_not_absorb_sibling`.)
     let mut src = String::from("route Api where\n");
-    for _ in 0..5000 {
-        src.push_str("  /seg\n");
+    for depth in 0..400 {
+        for _ in 0..(depth + 2) {
+            src.push(' ');
+        }
+        src.push_str("/seg\n");
     }
     let errs = parse_errors(&src);
     assert!(
@@ -126,6 +132,55 @@ fn many_route_prefix_lines_diagnose_instead_of_crashing() {
         "expected a nesting-depth diagnostic, got: {:?}",
         errs
     );
+}
+
+#[test]
+fn same_indent_route_prefix_does_not_absorb_sibling() {
+    // A `/prefix` group must only absorb entries that are STRICTLY more
+    // indented than it. A sibling entry at the same indentation is its own
+    // top-level route and must NOT get the prefix prepended.
+    let src = "route Api where\n  /todos\n  GET /x -> Int = GetX\n";
+    let module = parse(src);
+    let entries = match &module.decls[0].node {
+        DeclKind::Route { entries, .. } => entries,
+        other => panic!("expected a route declaration, got: {:?}", other),
+    };
+    assert_eq!(entries.len(), 1, "expected exactly one route entry");
+    let path: Vec<&str> = entries[0]
+        .path
+        .iter()
+        .map(|seg| match seg {
+            knot::ast::PathSegment::Literal(s) => s.as_str(),
+            knot::ast::PathSegment::Param { name, .. } => name.as_str(),
+        })
+        .collect();
+    assert_eq!(
+        path,
+        vec!["x"],
+        "same-indent sibling must keep its own path, not inherit the /todos prefix"
+    );
+}
+
+#[test]
+fn nested_route_prefix_absorbs_indented_child() {
+    // The contrast case: an entry strictly more indented than `/prefix` IS
+    // nested and gets the prefix prepended.
+    let src = "route Api where\n  /todos\n    GET /x -> Int = GetX\n";
+    let module = parse(src);
+    let entries = match &module.decls[0].node {
+        DeclKind::Route { entries, .. } => entries,
+        other => panic!("expected a route declaration, got: {:?}", other),
+    };
+    assert_eq!(entries.len(), 1, "expected exactly one route entry");
+    let path: Vec<&str> = entries[0]
+        .path
+        .iter()
+        .map(|seg| match seg {
+            knot::ast::PathSegment::Literal(s) => s.as_str(),
+            knot::ast::PathSegment::Param { name, .. } => name.as_str(),
+        })
+        .collect();
+    assert_eq!(path, vec!["todos", "x"], "indented child inherits the /todos prefix");
 }
 
 #[test]

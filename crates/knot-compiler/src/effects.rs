@@ -481,12 +481,20 @@ impl EffectChecker {
         }
         // Impl-method and trait-default bodies were only walked with
         // diagnostics suppressed during the fixpoint — walk them once more
-        // so atomic-safety violations inside them are reported.
-        for bodies in method_bodies.values() {
+        // so atomic-safety violations inside them are reported. Set
+        // `current_decl_name` per method group and register the body under it
+        // so the Atomic arm's enclosing-body root lookup (decl_bodies) resolves
+        // to the method's own body — not a stale leftover from the last
+        // top-level fun, which produced both false negatives (a laundered IO
+        // lambda in the method's own scope was missed) and false positives.
+        for (name, bodies) in &method_bodies {
+            self.current_decl_name = Some(name.clone());
             for body in bodies {
+                self.decl_bodies.insert(name.clone(), (**body).clone());
                 let _ = self.fun_body_effects(body);
             }
         }
+        self.current_decl_name = None;
     }
 
     fn process_decl(&mut self, decl: &ast::Decl) {
@@ -811,18 +819,26 @@ impl EffectChecker {
                 let shadow_mark = self.shadowed.len();
                 let mut effects = EffectSet::empty();
                 for stmt in stmts {
-                    // Track let-bound lambdas so later calls through the
-                    // local name see the lambda body's effects (e.g.
-                    // `let f = \u -> *items; rows <- f {}` reads `items`).
+                    // Register a let-bound value's latent effects under its
+                    // name so a later *execution* of it (`rows <- x`, or a bare
+                    // `x` statement) recovers them, while the `let` itself
+                    // charges nothing (binding an IO action ≠ running it). A
+                    // let-bound lambda contributes its body's effects when later
+                    // called (e.g. `let f = \u -> *items; rows <- f {}` reads
+                    // `items`); a let-bound IO action (e.g. `let x = readFile
+                    // "f"`) contributes the action's own effects when later
+                    // sequenced. An unused binding contributes nothing.
                     if let ast::StmtKind::Let { pat, expr } = &stmt.node {
                         if let ast::PatKind::Var(name) = &pat.node {
-                            if is_lambda_arg(expr) {
-                                let fn_effects = self.fun_body_effects(expr);
-                                self.local_fn_effects
-                                    .last_mut()
-                                    .unwrap()
-                                    .insert(name.clone(), fn_effects);
-                            }
+                            let latent = if is_lambda_arg(expr) {
+                                self.fun_body_effects(expr)
+                            } else {
+                                self.infer_effects(expr)
+                            };
+                            self.local_fn_effects
+                                .last_mut()
+                                .unwrap()
+                                .insert(name.clone(), latent);
                         }
                     }
                     let stmt_effects = self.infer_stmt_effects(stmt);
@@ -1102,7 +1118,10 @@ impl EffectChecker {
     fn infer_stmt_effects(&mut self, stmt: &ast::Stmt) -> EffectSet {
         match &stmt.node {
             ast::StmtKind::Bind { expr, .. } => self.infer_effects(expr),
-            ast::StmtKind::Let { expr, .. } => self.infer_effects(expr),
+            // `let x = ioAction` only binds the action description; it is not
+            // run unless later sequenced with `<-`. So it contributes no effects
+            // here (mirrors the same rule in infer.rs's `infer_do`).
+            ast::StmtKind::Let { .. } => EffectSet::empty(),
             ast::StmtKind::Where { cond } => self.infer_effects(cond),
             ast::StmtKind::GroupBy { key } => self.infer_effects(key),
             ast::StmtKind::Expr(expr) => self.infer_effects(expr),

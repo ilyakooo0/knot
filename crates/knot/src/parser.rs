@@ -1025,6 +1025,7 @@ impl Parser {
         let (name, _) = self.expect_upper("expected constructor name").ok()?;
         let mut fields = Vec::new();
         if self.eat(&TokenKind::LBrace) {
+            self.skip_newlines();
             if !self.at(&TokenKind::RBrace) {
                 loop {
                     self.skip_newlines();
@@ -1612,7 +1613,7 @@ impl Parser {
                 .ok()?;
 
             let no_prefix: Vec<PathSegment> = vec![];
-            let entries = this.parse_route_entries_with_prefix(&no_prefix);
+            let entries = this.parse_route_entries_with_prefix(&no_prefix, 0);
 
             let end = this.prev_span();
             Some(Decl {
@@ -1631,21 +1632,38 @@ impl Parser {
     /// otherwise grow the native call stack without bound and abort the
     /// process. Charge the shared recursion budget so pathological input
     /// surfaces a "nesting depth limit exceeded" diagnostic instead.
-    fn parse_route_entries_with_prefix(&mut self, prefix: &[PathSegment]) -> Vec<RouteEntry> {
+    /// `floor` is the column of the `/prefix` line that introduced this group
+    /// (0 at the top level). Nested entries must be strictly more indented than
+    /// it, so a same-indent sibling is not absorbed into the group.
+    fn parse_route_entries_with_prefix(
+        &mut self,
+        prefix: &[PathSegment],
+        floor: usize,
+    ) -> Vec<RouteEntry> {
         if !self.enter_recursion() {
             return vec![];
         }
-        let entries = self.parse_route_entries_inner(prefix);
+        let entries = self.parse_route_entries_inner(prefix, floor);
         self.recursion_depth -= 1;
         entries
     }
 
-    fn parse_route_entries_inner(&mut self, prefix: &[PathSegment]) -> Vec<RouteEntry> {
+    fn parse_route_entries_inner(
+        &mut self,
+        prefix: &[PathSegment],
+        floor: usize,
+    ) -> Vec<RouteEntry> {
         self.skip_newlines();
         if self.at_eof() {
             return vec![];
         }
         let indent = self.cur_column();
+        // A nested group's entries must be strictly more indented than the
+        // `/prefix` line that introduced them. Otherwise a same-indent sibling
+        // would be wrongly absorbed as a child and get the prefix prepended.
+        if indent <= floor {
+            return vec![];
+        }
         let mut entries = vec![];
         loop {
             self.skip_newlines();
@@ -1658,10 +1676,11 @@ impl Parser {
             }
             if self.at(&TokenKind::Slash) {
                 // Path prefix group: `/prefix` followed by nested entries
+                let group_col = col;
                 let prefix_path = self.parse_route_path();
                 let mut combined = prefix.to_vec();
                 combined.extend(prefix_path);
-                let nested = self.parse_route_entries_with_prefix(&combined);
+                let nested = self.parse_route_entries_with_prefix(&combined, group_col);
                 entries.extend(nested);
             } else {
                 // Route entry (starts with HTTP method)
@@ -1716,6 +1735,7 @@ impl Parser {
         let mut body_fields = Vec::new();
         if self.at(&TokenKind::LBrace) {
             self.advance();
+            self.skip_newlines();
             if !self.at(&TokenKind::RBrace) {
                 loop {
                     self.skip_newlines();
@@ -1748,6 +1768,7 @@ impl Parser {
         let mut query_params = Vec::new();
         if self.eat(&TokenKind::Question) {
             if self.eat(&TokenKind::LBrace) {
+                self.skip_newlines();
                 if !self.at(&TokenKind::RBrace) {
                     loop {
                         self.skip_newlines();
@@ -1910,6 +1931,7 @@ impl Parser {
     fn parse_route_header_fields(&mut self) -> Vec<Field<Type>> {
         let mut fields = Vec::new();
         if self.eat(&TokenKind::LBrace) {
+            self.skip_newlines();
             if !self.at(&TokenKind::RBrace) {
                 loop {
                     self.skip_newlines();

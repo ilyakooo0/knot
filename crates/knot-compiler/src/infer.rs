@@ -5701,15 +5701,11 @@ impl Infer {
                 }
                 ast::StmtKind::Let { pat, expr } => {
                     let expr_ty = self.infer_expr(expr);
-                    let resolved = self.apply(&expr_ty);
-                    if let Ty::IO(ref effects, ref row, _) = resolved {
-                        is_io = true;
-                        io_effects.extend(effects.iter().cloned());
-                        if let Some(rv) = row {
-                            let rv = *rv;
-                            self.merge_do_io_row(&mut io_row, rv, expr.span);
-                        }
-                    }
+                    // A `let x = ioAction` only *binds* the IO action description;
+                    // it does not run it (only `x <- ioAction` sequences/executes
+                    // it). So a let-bound IO value must not contribute its effects
+                    // to the block, nor mark the block as IO — otherwise honest
+                    // effect annotations on never-executed actions are rejected.
                     // Let-generalization: for simple variable patterns,
                     // generalize the binding so it can be used polymorphically
                     // (e.g., `let id = \x -> x` should be usable at multiple types).

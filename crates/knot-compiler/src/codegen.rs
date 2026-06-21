@@ -1551,7 +1551,7 @@ impl Codegen {
                                     default_body.as_ref().map(|body| {
                                         let (p, b) =
                                             method_params_body(default_params, body);
-                                        (p.to_vec(), b.clone())
+                                        (p, b.clone())
                                     });
                                 let param_count = if let Some((p, _)) = &norm_default {
                                     p.len()
@@ -2636,7 +2636,7 @@ impl Codegen {
                                 // Unwrap lambda-bodied methods the same way
                                 // the collection pass counted their params.
                                 let (params, body) = method_params_body(params, body);
-                                self.define_user_function(&mangled, params, body);
+                                self.define_user_function(&mangled, &params, body);
                             }
                         }
 
@@ -8305,7 +8305,12 @@ impl Codegen {
                         .brif(is_true, pass_block, &[], fail_block, &[]);
                     builder.switch_to_block(fail_block);
                     builder.seal_block(fail_block);
-                    if self.atomic_retry_block.is_some() {
+                    // Only signal an atomic-wide skip when this guard is a
+                    // top-level statement of the atomic body. Inside a
+                    // comprehension bind loop (`io_loop_skip_block.is_some()`)
+                    // a false guard just drops the current row — it must not
+                    // roll back the whole transaction.
+                    if self.atomic_retry_block.is_some() && self.io_loop_skip_block.is_none() {
                         self.call_rt(builder, "knot_stm_skip", &[]);
                     }
                     let unit = self.call_rt(builder, "knot_value_unit", &[]);
@@ -8390,10 +8395,15 @@ impl Codegen {
         // Bind into a per-iteration env clone so loop-local SSA values never
         // leak into code emitted after the loop exits.
         let mut body_env = env.clone();
-        self.bind_io_pattern(builder, pat, row, &mut body_env, Some(skip_blk));
-        // While compiling the remaining statements, guard failures skip the
-        // current row (innermost loop wins; restored on exit).
+        // Register the loop's skip block as the active row-skip target *before*
+        // binding the loop pattern, so a refutable loop-variable bind (e.g.
+        // `Circle c <- *shapes`) that mismatches a row skips that row rather
+        // than aborting a surrounding `atomic` (the `knot_stm_skip` calls in
+        // `bind_io_pattern` are suppressed when `io_loop_skip_block.is_some()`).
+        // While compiling the remaining statements, guard failures likewise
+        // skip the current row (innermost loop wins; restored on exit).
         let prev_skip = self.io_loop_skip_block.replace(skip_blk);
+        self.bind_io_pattern(builder, pat, row, &mut body_env, Some(skip_blk));
         let row_val = if rest.is_empty() {
             row
         } else {
@@ -8570,7 +8580,11 @@ impl Codegen {
                     // surrounding `atomic` rolls back rather than committing
                     // partial writes. Outside atomic this is a no-op (the
                     // flag will simply be reset on the next atomic entry).
-                    if self.atomic_retry_block.is_some() {
+                    // A per-row pattern mismatch inside a comprehension bind
+                    // loop (`io_loop_skip_block.is_some()`) only skips the row;
+                    // it must not roll back a surrounding `atomic`. Signal an
+                    // atomic-wide skip only for a top-level refutable bind.
+                    if self.atomic_retry_block.is_some() && self.io_loop_skip_block.is_none() {
                         self.call_rt(builder, "knot_stm_skip", &[]);
                     }
                     let unit = self.call_rt(builder, "knot_value_unit", &[]);
@@ -8607,7 +8621,11 @@ impl Codegen {
                 builder.switch_to_block(fail_block);
                 builder.seal_block(fail_block);
                 if let Some(done) = done_block {
-                    if self.atomic_retry_block.is_some() {
+                    // A per-row pattern mismatch inside a comprehension bind
+                    // loop (`io_loop_skip_block.is_some()`) only skips the row;
+                    // it must not roll back a surrounding `atomic`. Signal an
+                    // atomic-wide skip only for a top-level refutable bind.
+                    if self.atomic_retry_block.is_some() && self.io_loop_skip_block.is_none() {
                         self.call_rt(builder, "knot_stm_skip", &[]);
                     }
                     let unit = self.call_rt(builder, "knot_value_unit", &[]);
@@ -8636,7 +8654,11 @@ impl Codegen {
                 builder.switch_to_block(fail_block);
                 builder.seal_block(fail_block);
                 if let Some(done) = done_block {
-                    if self.atomic_retry_block.is_some() {
+                    // A per-row pattern mismatch inside a comprehension bind
+                    // loop (`io_loop_skip_block.is_some()`) only skips the row;
+                    // it must not roll back a surrounding `atomic`. Signal an
+                    // atomic-wide skip only for a top-level refutable bind.
+                    if self.atomic_retry_block.is_some() && self.io_loop_skip_block.is_none() {
                         self.call_rt(builder, "knot_stm_skip", &[]);
                     }
                     let unit = self.call_rt(builder, "knot_value_unit", &[]);
@@ -8671,7 +8693,11 @@ impl Codegen {
                 builder.switch_to_block(fail_block);
                 builder.seal_block(fail_block);
                 if let Some(done) = done_block {
-                    if self.atomic_retry_block.is_some() {
+                    // A per-row pattern mismatch inside a comprehension bind
+                    // loop (`io_loop_skip_block.is_some()`) only skips the row;
+                    // it must not roll back a surrounding `atomic`. Signal an
+                    // atomic-wide skip only for a top-level refutable bind.
+                    if self.atomic_retry_block.is_some() && self.io_loop_skip_block.is_none() {
                         self.call_rt(builder, "knot_stm_skip", &[]);
                     }
                     let unit = self.call_rt(builder, "knot_value_unit", &[]);
@@ -15548,21 +15574,26 @@ fn tramp_arg_key(i: usize) -> String {
     format!("{:04}", i)
 }
 
-/// Effective (params, body) for a trait/impl method definition. A method
-/// written as a constant bound to a lambda (`eq = \a b -> true`) is
-/// equivalent to one with explicit params (`eq a b = true`) — unwrap the
-/// lambda exactly like top-level Funs do (one level; nested lambdas curry
-/// through closure-returning bodies the same way Fun bodies do).
+/// Effective (params, body) for a trait/impl method definition. A method may
+/// split its parameters arbitrarily between the explicit form and one or more
+/// trailing lambdas: `eq a b = true`, `eq = \a b -> true`, and `eq a = \b -> true`
+/// are all equivalent. Flatten the explicit params together with every leading
+/// lambda so the impl's declared arity equals the trait signature's arrow count
+/// (`count_fn_params`), which is the arity the runtime dispatcher calls with.
+/// Unwrapping only the empty-params case (the previous behavior) left
+/// `eq a = \b -> ...` declared as a 1-param function while the dispatcher called
+/// it with 2 args — a signature mismatch / miscompile.
 fn method_params_body<'a>(
     params: &'a [ast::Pat],
     body: &'a ast::Expr,
-) -> (&'a [ast::Pat], &'a ast::Expr) {
-    if params.is_empty() {
-        if let ast::ExprKind::Lambda { params: lambda_params, body: lambda_body } = &body.node {
-            return (lambda_params, lambda_body);
-        }
+) -> (Vec<ast::Pat>, &'a ast::Expr) {
+    let mut all: Vec<ast::Pat> = params.to_vec();
+    let mut cur = body;
+    while let ast::ExprKind::Lambda { params: lambda_params, body: lambda_body } = &cur.node {
+        all.extend(lambda_params.iter().cloned());
+        cur = lambda_body;
     }
-    (params, body)
+    (all, cur)
 }
 
 /// Map a type name to its runtime Value tag (as used by knot_value_get_tag).

@@ -9424,11 +9424,25 @@ fn apply_wire_type_checked(v: *mut Value, desc: &str) -> Option<*mut Value> {
     // constructor) are decode failures rather than silent passthroughs.
     // Non-primitive descriptors (`*` for ADTs/Bytes/Uuid, unit, unknown) stay
     // lenient so ADT round-tripping keeps working.
-    if matches!(desc, "int" | "float" | "text" | "bool" | "bytes" | "uuid" | "tag") {
-        match unsafe { as_ref(v) } {
-            Value::Int(_) | Value::Float(_) | Value::Text(_) | Value::Bool(_) | Value::Bytes(_) => {}
-            _ => return None,
+    // Enforce that the wire value's tag is compatible with the declared scalar,
+    // not merely that it is *some* scalar. Accepting any scalar here let a `text`
+    // field swallow a JSON number (`42` -> Value::Int) or a `bool` field swallow
+    // `1`, since `coerce_json_field` only rewrites tag/int/float and would pass
+    // the mistyped value through to the handler as HTTP 200 instead of 400.
+    // Numbers stay interchangeable (Int<->Float) because `coerce_json_field`
+    // deliberately promotes/demotes between them.
+    let accepted = match desc {
+        "int" | "float" => matches!(unsafe { as_ref(v) }, Value::Int(_) | Value::Float(_)),
+        "text" | "tag" | "bytes" | "uuid" => {
+            matches!(unsafe { as_ref(v) }, Value::Text(_) | Value::Bytes(_))
         }
+        "bool" => matches!(unsafe { as_ref(v) }, Value::Bool(_)),
+        // Non-primitive descriptors (`*`, records, relations handled above) stay
+        // lenient so ADT round-tripping keeps working.
+        _ => true,
+    };
+    if !accepted {
+        return None;
     }
     Some(coerce_json_field(v, desc))
 }
@@ -14412,7 +14426,12 @@ fn coerce_json_field(v: *mut Value, ty: &str) -> *mut Value {
     // floats back to `Int` here.
     if ty == "int" {
         if let Value::Float(f) = unsafe { as_ref(v) } {
-            if f.fract() == 0.0 && f.is_finite() && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 {
+            // `i64::MAX as f64` rounds up to 2^63, so `*f <= i64::MAX as f64`
+            // would accept values in (i64::MAX, 2^63] and silently saturate them
+            // to i64::MAX on `as i64`. The representable integral range is
+            // [-2^63, 2^63); guard with the exclusive upper bound.
+            const I64_MAX_PLUS_ONE: f64 = 9_223_372_036_854_775_808.0; // 2^63
+            if f.fract() == 0.0 && f.is_finite() && *f >= i64::MIN as f64 && *f < I64_MAX_PLUS_ONE {
                 return alloc_int(*f as i64);
             }
         }
@@ -17067,6 +17086,57 @@ mod _maybe_json_tests {
         match unsafe { as_ref(field(fixed, "a")) } {
             Value::Int(30) => {}
             _ => panic!("expected Int(30) after apply_wire_type"),
+        }
+    }
+
+    #[test]
+    fn typed_scalar_decode_rejects_cross_type_primitives() {
+        // The wire-decode guard must enforce the *declared* scalar, not merely
+        // "some scalar". A `text` field receiving a JSON number, or a `bool`
+        // field receiving a number, must be a decode failure (None) — not a
+        // silent passthrough that reaches a handler with the wrong Value tag.
+        assert!(apply_wire_type_checked(alloc_int(42), "text").is_none());
+        assert!(apply_wire_type_checked(alloc_int(1), "bool").is_none());
+        assert!(apply_wire_type_checked(alloc_bool(true), "int").is_none());
+        assert!(apply_wire_type_checked(alloc_bool(true), "text").is_none());
+        // Compatible positions still succeed: numbers are interchangeable
+        // (Int<->Float coercion is intentional), and matching tags pass.
+        assert!(apply_wire_type_checked(alloc_int(7), "int").is_some());
+        assert!(apply_wire_type_checked(alloc_int(7), "float").is_some());
+        assert!(apply_wire_type_checked(alloc_float(1.5), "int").is_some());
+        let hi = alloc(Value::Text(Arc::from("hi")));
+        match unsafe { as_ref(apply_wire_type_checked(hi, "text").unwrap()) } {
+            Value::Text(s) => assert_eq!(&**s, "hi"),
+            _ => panic!("expected Text passthrough"),
+        }
+        match unsafe { as_ref(apply_wire_type_checked(alloc_bool(true), "bool").unwrap()) } {
+            Value::Bool(true) => {}
+            _ => panic!("expected Bool passthrough"),
+        }
+        // End-to-end via a record body: a `name:text` field given JSON 42
+        // makes the whole record fail to decode (so a route returns 400, not
+        // 200 with a mistyped field).
+        let rec = record(vec![("name", alloc_int(42))]);
+        assert!(apply_wire_type_checked(rec, "{name:text}").is_none());
+    }
+
+    #[test]
+    fn coerce_int_field_rejects_out_of_range_integral_float() {
+        // `i64::MAX as f64` rounds up to 2^63, so the old `<= i64::MAX as f64`
+        // bound accepted values in (i64::MAX, 2^63] and saturated them to
+        // i64::MAX on `as i64`. The exclusive 2^63 bound leaves them as Float
+        // rather than silently corrupting the value.
+        let two_pow_63 = 9_223_372_036_854_775_808.0_f64; // 2^63, == i64::MAX as f64
+        match unsafe { as_ref(coerce_json_field(alloc_float(two_pow_63), "int")) } {
+            Value::Float(f) if *f == two_pow_63 => {}
+            _ => panic!("2^63 must stay Float, not saturate to i64::MAX"),
+        }
+        // The largest exactly-representable integral f64 below 2^63 still
+        // demotes (2^63 - 1024 is representable and in range).
+        let in_range = 9_223_372_036_854_774_784.0_f64; // 2^63 - 1024
+        match unsafe { as_ref(coerce_json_field(alloc_float(in_range), "int")) } {
+            Value::Int(i) if i == &(in_range as i64) => {}
+            _ => panic!("in-range integral float must demote to Int"),
         }
     }
 

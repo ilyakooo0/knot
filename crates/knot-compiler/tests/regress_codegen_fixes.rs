@@ -201,6 +201,33 @@ main = do
 }
 
 #[test]
+fn impl_method_partial_explicit_params_plus_lambda() {
+    // `eq a = \b -> ...` mixes one explicit param with a trailing lambda.
+    // `method_params_body` only unwrapped the lambda when the explicit
+    // params were empty, so the impl declared a 1-arg function while the
+    // dispatcher (using the trait signature's 2-arrow arity) called it with
+    // 2 args — a signature mismatch that crashed at runtime. The fix flattens
+    // explicit params together with every leading lambda.
+    let (stdout, stderr, ok) = compile_and_run(
+        "impl_partial_params",
+        r#"data Pt = Pt {x: Int, y: Int}
+
+impl Eq Pt where
+  eq a = \b -> a.x == b.x
+
+main = do
+  println (show (Pt {x: 1, y: 2} == Pt {x: 1, y: 9}))
+  println (show (Pt {x: 1, y: 2} == Pt {x: 5, y: 2}))
+"#,
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("True") && stdout.contains("False"),
+        "partial-param eq impl must compare on x only, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn trait_default_method_lambda_body_param_count() {
     // Same bug class for trait defaults written as lambda-bound constants.
     let (stdout, stderr, ok) = compile_and_run(
@@ -463,5 +490,68 @@ main = do
     assert!(
         !stdout.contains("top: Low"),
         "maxOn must not silently misorder ADTs against a custom Ord:\n{stdout}"
+    );
+}
+
+// ── Atomic: per-row guard/pattern skip must not roll back the txn ──
+
+#[test]
+fn atomic_loop_where_guard_skip_keeps_prior_writes() {
+    // A `where` guard inside a comprehension bind loop nested in `atomic`
+    // used to call `knot_stm_skip` on every failing row, setting the sticky
+    // skip flag that rolls back the WHOLE transaction at atomic end — so a
+    // single filtered-out row discarded writes for rows that already passed.
+    // The fix gates `knot_stm_skip` on `io_loop_skip_block.is_none()` (only a
+    // top-level guard aborts the atomic; a per-row guard just skips the row).
+    let (stdout, stderr, ok) = compile_and_run(
+        "atomic_loop_where_skip",
+        r#"*log : [{id: Int}]
+
+process = atomic do
+  let items = [{id: 10, keep: true}, {id: 20, keep: false}]
+  row <- items
+  where row.keep
+  *log = union *log [{id: row.id}]
+
+main = do
+  replace *log = []
+  process
+  result <- *log
+  println ("count: " ++ show (count result))
+"#,
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("count: 1"),
+        "the id:10 write (row before the failing guard) must survive, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn atomic_loop_ctor_mismatch_skip_keeps_prior_writes() {
+    // Same bug via a constructor-pattern bind: `Circle c <- shapes` inside
+    // `atomic` skips non-Circle rows. A mismatch used to roll back the whole
+    // transaction instead of just skipping the row.
+    let (stdout, stderr, ok) = compile_and_run(
+        "atomic_loop_ctor_skip",
+        r#"data Shape = Circle {r: Int} | Square {s: Int}
+*log : [{r: Int}]
+
+process = atomic do
+  let shapes = [Circle {r: 7}, Square {s: 3}]
+  Circle c <- shapes
+  *log = union *log [{r: c.r}]
+
+main = do
+  replace *log = []
+  process
+  result <- *log
+  println ("count: " ++ show (count result))
+"#,
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("count: 1"),
+        "the Circle write must survive the later Square mismatch, got:\n{stdout}"
     );
 }

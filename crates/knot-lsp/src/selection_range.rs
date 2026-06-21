@@ -62,15 +62,35 @@ fn build_selection_range(module: &Module, source: &str, offset: usize) -> Select
         }
     }
 
-    // Sort by size (largest first) and deduplicate
-    spans.sort_by(|a, b| {
-        let a_size = a.end - a.start;
-        let b_size = b.end - b.start;
-        b_size.cmp(&a_size)
-    });
+    // Order outermost-first: smaller start first, and for an equal start the
+    // wider span (larger end) first. After de-duping exact repeats, keep only
+    // spans that form a strict containment chain. The LSP spec requires every
+    // parent range to contain its child; sorting purely by size and relying on
+    // `dedup` (which only drops *consecutive* equal entries) can otherwise leave
+    // two distinct equal-size spans that aren't nested, making one a parent of
+    // the other even though neither contains it.
+    spans.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
     spans.dedup();
 
-    // Build linked list from largest to smallest
+    let mut chain: Vec<Span> = Vec::new();
+    for span in spans {
+        match chain.last() {
+            Some(parent)
+                if parent.start <= span.start
+                    && span.end <= parent.end
+                    && (parent.start, parent.end) != (span.start, span.end) =>
+            {
+                chain.push(span);
+            }
+            // Not strictly contained in the current innermost span — skip it so
+            // the parent/child containment invariant holds.
+            Some(_) => {}
+            None => chain.push(span),
+        }
+    }
+
+    // Build linked list from largest (outermost) to smallest (innermost), so
+    // the returned leaf is the innermost span with parents growing outward.
     let mut selection = SelectionRange {
         range: Range {
             start: Position::new(0, 0),
@@ -79,7 +99,7 @@ fn build_selection_range(module: &Module, source: &str, offset: usize) -> Select
         parent: None,
     };
 
-    for span in &spans {
+    for span in &chain {
         selection = SelectionRange {
             range: span_to_range(*span, source),
             parent: Some(Box::new(selection)),

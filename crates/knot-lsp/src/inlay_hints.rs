@@ -129,7 +129,13 @@ pub(crate) fn handle_inlay_hint(
             DeclKind::View { name, ty: None, .. } | DeclKind::Derived { name, ty: None, .. } => {
                 if let Some(inferred) = doc.type_info.get(name) {
                     let decl_text = safe_slice(&doc.source, decl.span);
-                    let name_end = decl_text.find('=').unwrap_or(decl_text.len());
+                    // Anchor snug after the name token, scanning past identifier
+                    // characters (incl. the `'` that the lexer allows in `x'`),
+                    // not at the `=`. Anchoring at `=` lands after the trailing
+                    // space and renders `myView' = …` as `myView : T' = …`.
+                    let name_end = decl_text
+                        .find(|c: char| !c.is_alphanumeric() && c != '_' && c != '\'')
+                        .unwrap_or(decl_text.len());
                     let hint_offset = decl.span.start + name_end;
                     let hint_pos = offset_to_position(&doc.source, hint_offset);
                     let full_sig = match doc.effect_sets.get(name) {

@@ -6955,14 +6955,13 @@ impl Codegen {
         env: &mut Env,
         db: Value,
     ) {
-        // Skip refinement checks inside atomic blocks: data entering the
-        // system is validated at the boundary (route handlers), so re-running
-        // potentially expensive predicates on every internal `set` is
-        // redundant and can cause hangs for large values (e.g. recursive
-        // hex validation on multi-KB blobs).
-        if self.atomic_retry_block.is_some() {
-            return;
-        }
+        // Refinement checks run inside atomic blocks too: a program can build
+        // rows locally and `set` them inside `atomic do { … }`, and the
+        // documented guarantee is that every write to a refined source is
+        // validated (and panics on violation). Inside atomic a violation panic
+        // rolls back the savepoint, so the transaction is not committed with
+        // invalid data. (Route handlers also validate at the HTTP boundary, but
+        // that path does not cover locally constructed rows.)
         let refinements = match self.source_refinements.get(source_name) {
             Some(r) => r.clone(),
             None => return,

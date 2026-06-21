@@ -198,6 +198,37 @@ fn format_module_inner(source: &str, module: &Module) -> String {
             }
         }
 
+        // A comment on the `export` line of an exported declaration (e.g.
+        // `export -- keep me` on the line before `type A = Int`) is
+        // non-standalone — the `export` keyword precedes it — and lies in the
+        // gap before the decl's span, which begins *after* `export`. It is
+        // caught by neither the standalone `between`/leading filters nor the
+        // previous block's trailing-comment check, so without this it is
+        // silently dropped. Emit any such comment on its own line above the
+        // declaration. (The previous block's own trailing comment, on
+        // `line_of(prev_end)`, was already emitted, so exclude that line.)
+        if let Block::Decl(d) = block {
+            if d.exported {
+                let prev_line = if i > 0 {
+                    Some(line_of(source, prev_end))
+                } else {
+                    None
+                };
+                for c in comments.iter().filter(|c| {
+                    !c.standalone
+                        && c.span.start >= prev_end
+                        && c.span.end <= block_start
+                        && Some(c.line) != prev_line
+                }) {
+                    if !out.is_empty() && !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    out.push_str(c.text);
+                    out.push('\n');
+                }
+            }
+        }
+
         let rendered = match block {
             Block::Import(i) => render_import(i),
             Block::Decl(d) => render_decl_with_fallback(source, d, &comments),

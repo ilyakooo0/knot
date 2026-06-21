@@ -14421,7 +14421,11 @@ fn match_route<'a>(
         for (part, seg) in entry.path_parts.iter().zip(path_segments.iter()) {
             match part {
                 PathPart::Literal(lit) => {
-                    if lit != seg {
+                    // Compare against the percent-decoded request segment, like
+                    // the Param arm below — otherwise a literal containing an
+                    // encodable character (space, reserved char) requested as
+                    // e.g. `/a%20b/…` would never match its own route.
+                    if *lit != url_decode(seg, false) {
                         matched = false;
                         break;
                     }
@@ -17303,6 +17307,30 @@ mod _url_decode_tests {
     fn plus_is_space_in_query_strings() {
         assert_eq!(url_decode("a+b", true), "a b");
         assert_eq!(url_decode("a%2Bb", true), "a+b");
+    }
+
+    /// A literal path segment must be compared against the percent-decoded
+    /// request segment, just like a param segment — otherwise a literal
+    /// containing an encodable character never matches its own route.
+    #[test]
+    fn route_literal_segment_matched_against_decoded_request() {
+        let entries = vec![RouteTableEntry {
+            method: "GET".to_string(),
+            path_parts: parse_path_pattern("/a b/{id}"),
+            constructor: "X".to_string(),
+            body_fields: parse_descriptor(""),
+            query_fields: parse_descriptor(""),
+            response_type: String::new(),
+            request_headers: parse_descriptor(""),
+            response_headers: parse_descriptor(""),
+        }];
+        // The literal "a b" requested with the space percent-encoded.
+        let m = match_route(&entries, "GET", &["a%20b", "7"]);
+        assert!(m.is_some(), "percent-encoded literal segment should match");
+        let (_, params) = m.unwrap();
+        assert_eq!(params, vec![("id".to_string(), "7".to_string())]);
+        // A genuinely different segment must still not match.
+        assert!(match_route(&entries, "GET", &["xyz", "7"]).is_none());
     }
 }
 

@@ -518,14 +518,18 @@ pub(crate) fn handle_completion(
             .collect();
 
         // De-dupe by name across files: if two workspace files both export
-        // `parse`, prefer the one with the lexicographically-shortest path.
+        // `parse`, prefer the one whose path sorts first. `scan_knot_files_*`
+        // pushes files in `read_dir` order, which is filesystem-dependent, so
+        // sort first — otherwise which file's import target wins (and the
+        // suggested import line) is nondeterministic across runs and machines.
         let mut seen_names: HashSet<String> = HashSet::new();
         let mut auto_imports_added: usize = 0;
 
-        let files = scan_knot_files_in_roots(
+        let mut files = scan_knot_files_in_roots(
             &state.workspace_roots,
             state.workspace_root.as_deref(),
         );
+        files.sort();
         'files: for file_path in files {
             if auto_imports_added >= MAX_AUTO_IMPORT_ITEMS {
                 break;

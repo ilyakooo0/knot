@@ -201,25 +201,20 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                 let children: Vec<DocumentSymbol> = items
                     .iter()
                     .filter_map(|item| {
-                        if let ast::TraitItem::Method { name: method_name, ty, .. } = item {
-                            // Anchor the child on its own name token (like
-                            // constructors above) so "go to symbol" lands on
-                            // the method instead of the trait header.
-                            let name_range = find_word_in_source(
-                                source,
-                                method_name,
-                                decl.span.start,
-                                decl.span.end,
-                            )
-                            .map(|s| span_to_range(s, source))
-                            .unwrap_or(range);
+                        if let ast::TraitItem::Method { name: method_name, name_span, ty, .. } = item {
+                            // Anchor the child on its own name token (carried in
+                            // the AST) so "go to symbol" lands on the method, and
+                            // give each child its own range instead of the whole
+                            // trait — otherwise every sibling reports an identical
+                            // range covering the entire trait.
+                            let name_range = span_to_range(*name_span, source);
                             Some(DocumentSymbol {
                                 name: method_name.clone(),
                                 detail: Some(format_type_scheme(ty)),
                                 kind: SymbolKind::METHOD,
                                 tags: None,
                                 deprecated: None,
-                                range,
+                                range: name_range,
                                 selection_range: name_range,
                                 children: None,
                             })
@@ -257,22 +252,24 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                 let children: Vec<DocumentSymbol> = items
                     .iter()
                     .filter_map(|item| {
-                        if let ast::ImplItem::Method { name, .. } = item {
-                            let name_range = find_word_in_source(
-                                source,
-                                name,
-                                decl.span.start,
-                                decl.span.end,
-                            )
-                            .map(|s| span_to_range(s, source))
-                            .unwrap_or(range);
+                        if let ast::ImplItem::Method { name, name_span, body, .. } = item {
+                            // Use the AST's name span for selection, and span the
+                            // method's full extent (name through body) for range,
+                            // so each child reports its own region instead of the
+                            // whole impl block.
+                            let name_range = span_to_range(*name_span, source);
+                            let full = ast::Span::new(
+                                name_span.start,
+                                body.span.end.max(name_span.end),
+                            );
+                            let full_range = span_to_range(full, source);
                             Some(DocumentSymbol {
                                 name: name.clone(),
                                 detail: None,
                                 kind: SymbolKind::METHOD,
                                 tags: None,
                                 deprecated: None,
-                                range,
+                                range: full_range,
                                 selection_range: name_range,
                                 children: None,
                             })
@@ -297,6 +294,10 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                 });
             }
             DeclKind::Route { name, entries, .. } => {
+                // Advance the search cursor past each matched constructor so an
+                // earlier entry's name appearing in a later entry's text can't
+                // steal its span (mirrors the Data-constructor loop above).
+                let mut search_from = decl.span.start;
                 let children: Vec<DocumentSymbol> = entries
                     .iter()
                     .map(|e| {
@@ -315,21 +316,25 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                             ast::HttpMethod::Delete => "DELETE",
                             ast::HttpMethod::Patch => "PATCH",
                         };
-                        let name_range = find_word_in_source(
+                        let name_range = match find_word_in_source(
                             source,
                             &e.constructor,
-                            decl.span.start,
+                            search_from,
                             decl.span.end,
-                        )
-                        .map(|s| span_to_range(s, source))
-                        .unwrap_or(range);
+                        ) {
+                            Some(s) => {
+                                search_from = s.end;
+                                span_to_range(s, source)
+                            }
+                            None => range,
+                        };
                         DocumentSymbol {
                             name: e.constructor.clone(),
                             detail: Some(format!("{method} {path_str}")),
                             kind: SymbolKind::ENUM_MEMBER,
                             tags: None,
                             deprecated: None,
-                            range,
+                            range: name_range,
                             selection_range: name_range,
                             children: None,
                         }

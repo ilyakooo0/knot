@@ -77,6 +77,20 @@ pub(crate) fn handle_folding_range(
         }
     }
 
+    // The `if/then/else` arm in `collect_folding_ranges_expr` explicitly folds
+    // its `then`/`else` branches, and the recursion below also folds them when
+    // a branch is a foldable container (do/case/lambda/atomic/record), so the
+    // identical span can be pushed twice. Drop exact-duplicate ranges.
+    let mut seen = std::collections::HashSet::new();
+    ranges.retain(|r| {
+        seen.insert((
+            r.start_line,
+            r.start_character,
+            r.end_line,
+            r.end_character,
+        ))
+    });
+
     Some(ranges)
 }
 

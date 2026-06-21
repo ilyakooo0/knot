@@ -2110,7 +2110,25 @@ impl Parser {
     }
 
     fn parse_expr_head(&mut self) -> Option<Expr> {
+        let saved = self.save();
         self.skip_newlines();
+        // If skipping newlines crossed a line break and landed at column 0 (a
+        // new declaration) or at/under the enclosing block indent (a new block
+        // item), there is no expression here — the operand is missing (e.g. a
+        // declaration with an empty RHS: `greet =` followed by `main = …`).
+        // Report the missing expression and restore to the newline so the outer
+        // block recovery resumes cleanly at the next item, instead of reading
+        // the following declaration as this expression's head and dropping it.
+        // Mirrors the operator-RHS and application-continuation guards, which
+        // use the same column rule for mid-expression continuation.
+        if self.delimiter_depth == 0 && self.pos != saved.0 {
+            let col = self.cur_column();
+            if col == 0 || (self.block_indent != usize::MAX && col <= self.block_indent) {
+                self.error("expected expression");
+                self.restore(saved);
+                return None;
+            }
+        }
         match self.peek() {
             TokenKind::Backslash => self.parse_lambda(),
             TokenKind::If => self.parse_if(),

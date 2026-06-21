@@ -7,7 +7,10 @@ use lsp_types::*;
 
 use crate::analysis::get_or_parse_file_shared;
 use crate::defs::resolve_definitions;
-use crate::rename::{collect_name_uses_in_decl, file_imports_owner, module_defines_name};
+use crate::rename::{
+    collect_name_uses_in_decl, file_imports_owner, imports_name_from_other_module,
+    module_defines_name,
+};
 use crate::shared::scan_knot_files_in_roots;
 use crate::state::ServerState;
 use crate::utils::{
@@ -43,67 +46,111 @@ pub(crate) fn handle_references(
     // token) that merely *shares its name* with a top-level symbol, it
     // returned that unrelated symbol's references.
     let word = word_at_position(&doc.source, pos)?;
-    let def_span = doc
+    let symbol_name = word.to_string();
+
+    // Case A (mirrors `rename::resolve_canonical_owner`): a recorded reference
+    // covering the cursor, or the cursor on a definition's own name token —
+    // both resolve to a module-local declaration span. A name-keyed fallback
+    // would misfire on a record field (or any token) that merely *shares its
+    // name* with a top-level symbol.
+    let local_def = doc
         .references
         .iter()
         .find(|(usage, _)| usage.start <= offset && offset < usage.end)
         .map(|(_, def)| *def)
         .or_else(|| {
             doc.definitions.values().find(|span| span.start <= offset && offset < span.end).copied()
-        })?;
-
-    let symbol_name = word.to_string();
-    let mut locations = Vec::new();
-
-    // Include declaration if requested
-    if params.context.include_declaration {
-        locations.push(Location {
-            uri: uri.clone(),
-            range: span_to_range(def_span, &doc.source),
         });
+
+    let current_path = uri_to_path(uri).and_then(|p| p.canonicalize().ok());
+
+    // Case B: the cursor sits on a *usage* of an imported symbol. These usages
+    // are not recorded in `doc.references` (which only resolves module-local
+    // declarations), so Case A fails — fall back to `import_defs` to recover
+    // the owning file, exactly like `rename`. Without this, Find References on
+    // an imported symbol's use returned nothing even though Rename worked from
+    // the same cursor. A local definition takes priority over an import of the
+    // same name (when this file both declares and imports `parse`, references
+    // here resolve to the local declaration).
+    let imported_owner: Option<PathBuf> = if local_def.is_none() {
+        doc.import_defs.get(&symbol_name).map(|(p, _)| p.clone())
+    } else {
+        None
+    };
+
+    // Nothing resolved: not a definition, a local usage, or an imported symbol.
+    if local_def.is_none() && imported_owner.is_none() {
+        return None;
     }
 
-    // Find all usages in current document
-    for (usage_span, target_span) in &doc.references {
-        if locations.len() >= MAX_REFERENCE_LOCATIONS {
-            break;
-        }
-        if *target_span == def_span {
+    let mut locations = Vec::new();
+
+    // Current-document contributions.
+    if let Some(def_span) = local_def {
+        // Include declaration if requested.
+        if params.context.include_declaration {
             locations.push(Location {
                 uri: uri.clone(),
-                range: span_to_range(*usage_span, &doc.source),
+                range: span_to_range(def_span, &doc.source),
+            });
+        }
+        // All local usages resolving to this definition.
+        for (usage_span, target_span) in &doc.references {
+            if locations.len() >= MAX_REFERENCE_LOCATIONS {
+                break;
+            }
+            if *target_span == def_span {
+                locations.push(Location {
+                    uri: uri.clone(),
+                    range: span_to_range(*usage_span, &doc.source),
+                });
+            }
+        }
+    } else {
+        // Imported symbol: its usages in this file are not in `doc.references`,
+        // so walk the AST (scope-aware, skipping shadowed locals) plus the
+        // import items that surface the name — mirroring the importer branches
+        // below.
+        let mut sites = Vec::new();
+        for decl in &doc.module.decls {
+            collect_name_uses_in_decl(decl, &symbol_name, &doc.source, &mut sites);
+        }
+        for imp in &doc.module.imports {
+            if let Some(items) = &imp.items {
+                for item in items {
+                    if item.name == symbol_name {
+                        sites.push(item.span);
+                    }
+                }
+            }
+        }
+        for site in sites {
+            if locations.len() >= MAX_REFERENCE_LOCATIONS {
+                break;
+            }
+            locations.push(Location {
+                uri: uri.clone(),
+                range: span_to_range(site, &doc.source),
             });
         }
     }
 
     // Origin discipline (mirrors the rename path): cross-file usages count
     // only when the other file imports the symbol from its owning file and
-    // doesn't declare a same-named symbol of its own. First resolve where
-    // the symbol's canonical definition lives:
-    // - imported into the current doc → the imported file;
+    // doesn't declare a same-named symbol of its own. Resolve where the
+    // symbol's canonical definition lives:
     // - declared at top level in the current doc → the current file;
     // - a local binding (lambda param, let, do-bind) → nowhere else; other
-    //   files can't reference it, so cross-file matching is skipped.
-    let current_path = uri_to_path(uri).and_then(|p| p.canonicalize().ok());
-    // Local definition takes priority over an import of the same name
-    // (mirrors `rename.rs::resolve_canonical_owner`): when this file both
-    // declares `parse` and imports a module exporting `parse`, references
-    // here resolve to the local declaration — merging the unrelated
-    // imported symbol's references would be wrong.
-    //
-    // When the resolved definition is a *local binding* (lambda param,
-    // do-bind, case pattern), it is invisible to other files, so cross-file
-    // matching is skipped entirely. Consulting `import_defs` by name here
-    // would misattribute a shadowing local binder to the unrelated imported
-    // symbol. (Usages of imported symbols never resolve a `def_span` at all
-    // — `doc.references` only covers module-local declarations — so there
-    // is no legitimate import-owner case on this path.)
-    let owner_path: Option<PathBuf> =
-        if doc.definitions.values().any(|s| *s == def_span) {
+    //   files can't reference it, so cross-file matching is skipped;
+    // - a usage of an imported symbol → the imported (owning) file.
+    let owner_path: Option<PathBuf> = match (&local_def, &imported_owner) {
+        (Some(def_span), _) if doc.definitions.values().any(|s| s == def_span) => {
             current_path.clone()
-        } else {
-            None
-        };
+        }
+        (Some(_), _) => None,
+        (None, Some(p)) => Some(p.clone()),
+        (None, None) => None,
+    };
 
     // Cross-file: search all other open documents for references that resolve
     // to the same origin.
@@ -148,9 +195,22 @@ pub(crate) fn handle_references(
                 .map(|(p, _)| p == owner_path)
                 .unwrap_or(false)
             {
-                // Importer of the same origin. Imported-symbol usages don't
-                // appear in `references` (which only resolves local decls),
-                // so walk the AST — scope-aware, skipping shadowed locals.
+                // Importer of the same origin. If it ALSO imports the name
+                // from a different module, its body references are ambiguous —
+                // skip rather than misattribute them (mirrors the rename path).
+                if let Some(other_path) = &other_path {
+                    if imports_name_from_other_module(
+                        &other_doc.module,
+                        other_path,
+                        owner_path,
+                        &symbol_name,
+                    ) {
+                        continue;
+                    }
+                }
+                // Imported-symbol usages don't appear in `references` (which
+                // only resolves local decls), so walk the AST — scope-aware,
+                // skipping shadowed locals.
                 let mut sites = Vec::new();
                 for decl in &other_doc.module.decls {
                     collect_name_uses_in_decl(decl, &symbol_name, &other_doc.source, &mut sites);
@@ -242,6 +302,12 @@ pub(crate) fn handle_references(
                 }
             } else if !module_defines_name(&module, &symbol_name)
                 && file_imports_owner(&module, &canonical, owner_path, &symbol_name)
+                && !imports_name_from_other_module(
+                    &module,
+                    &canonical,
+                    owner_path,
+                    &symbol_name,
+                )
             {
                 let mut sites = Vec::new();
                 for decl in &module.decls {

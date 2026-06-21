@@ -69,6 +69,13 @@ pub const EFFECTFUL_BUILTINS: &[&str] = &[
     "fork", "retry", "race",
 ];
 
+/// Zero-argument IO builtins: referencing the bare name *is* the IO action,
+/// so a bare `Var` reference legitimately carries the builtin's effects. Every
+/// other effectful builtin takes arguments and performs no IO until applied —
+/// a bare reference to it (e.g. `let f = println`, never called) is pure, and
+/// its effects must only manifest at the call site.
+pub const NULLARY_IO_BUILTINS: &[&str] = &["now", "readLine", "randomFloat", "randomUuid"];
+
 /// Builtins whose effects cannot be rolled back by the savepoint-based atomic
 /// machinery. The effect checker rejects any of these inside an `atomic` block;
 /// the LSP also filters them from atomic-context completion lists.

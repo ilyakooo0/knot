@@ -5010,10 +5010,23 @@ fn infer_temp_schema(rows: &[*mut Value]) -> Option<TempSchema> {
                             Value::Record(fields) => {
                                 let mut cf = Vec::new();
                                 for f in fields {
+                                    let fname = f.name.to_string();
                                     let ty = infer_col_type(f.value)?;
-                                    cf.push((f.name.to_string(), ty));
-                                    if seen_field_names.insert(f.name.to_string()) {
-                                        all_fields.push((f.name.to_string(), ty));
+                                    cf.push((fname.clone(), ty));
+                                    if seen_field_names.insert(fname.clone()) {
+                                        all_fields.push((fname, ty));
+                                    } else if let Some((_, prev)) =
+                                        all_fields.iter().find(|(n, _)| *n == fname)
+                                    {
+                                        // Two constructors share a field name but
+                                        // disagree on its column type (e.g.
+                                        // `Paid {amount: Int}` vs
+                                        // `Refund {amount: Float}`). A single SQLite
+                                        // column can't faithfully hold both, so bail
+                                        // to the in-memory path like the Record branch.
+                                        if *prev != ty {
+                                            return None;
+                                        }
                                     }
                                 }
                                 cf
@@ -9484,7 +9497,13 @@ fn apply_wire_type_checked(v: *mut Value, desc: &str) -> Option<*mut Value> {
     // deliberately promotes/demotes between them.
     let accepted = match desc {
         "int" | "float" => matches!(unsafe { as_ref(v) }, Value::Int(_) | Value::Float(_)),
-        "text" | "tag" | "bytes" | "uuid" => {
+        // Text and tag fields must be genuine Text on the wire. Accepting a
+        // forged `Value::Bytes` here would let a peer smuggle bytes into a
+        // `Text` field (coerce_json_field never converts Bytes->Text), so the
+        // handler would run string ops on a Bytes value. Bytes/Uuid fields
+        // accept either a hex/base64 Text (decoded later) or a Bytes value.
+        "text" | "tag" => matches!(unsafe { as_ref(v) }, Value::Text(_)),
+        "bytes" | "uuid" => {
             matches!(unsafe { as_ref(v) }, Value::Text(_) | Value::Bytes(_))
         }
         "bool" => matches!(unsafe { as_ref(v) }, Value::Bool(_)),
@@ -10943,6 +10962,7 @@ pub extern "C-unwind" fn knot_source_query_sum(
     sql_ptr: *const u8,
     sql_len: usize,
     params: *mut Value,
+    is_float: i64,
 ) -> *mut Value {
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let sql = unsafe { str_from_raw(sql_ptr, sql_len) };
@@ -10966,7 +10986,11 @@ pub extern "C-unwind" fn knot_source_query_sum(
         .conn
         .query_row(sql, param_refs.as_slice(), |row| {
             match row.get_ref(0).unwrap() {
-                ValueRef::Null => Ok(alloc_int(0)),
+                // SQLite's SUM yields NULL over an empty / all-NULL column.
+                // Keep the statically expected numeric type: a Float column
+                // must produce Float 0.0, not Int 0, or downstream Float
+                // arithmetic / show / JSON mismatches.
+                ValueRef::Null => Ok(if is_float != 0 { alloc_float(0.0) } else { alloc_int(0) }),
                 ValueRef::Integer(n) => Ok(alloc_int(n)),
                 ValueRef::Real(f) => Ok(alloc_float(f)),
                 ValueRef::Text(s) => {

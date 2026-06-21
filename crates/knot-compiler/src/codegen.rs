@@ -917,7 +917,7 @@ impl Codegen {
         self.declare_rt("knot_source_read_where", &[p, p, p, p, p, p, p, p], &[p]);
         self.declare_rt("knot_source_query", &[p, p, p, p, p, p], &[p]);
         self.declare_rt("knot_source_query_float", &[p, p, p, p], &[p]);
-        self.declare_rt("knot_source_query_sum", &[p, p, p, p], &[p]);
+        self.declare_rt("knot_source_query_sum", &[p, p, p, p, types::I64], &[p]);
         self.declare_rt("knot_source_query_value", &[p, p, p, p, types::I64], &[p]);
         self.declare_rt("knot_source_fold", &[p, p, p, p, p, p, p], &[p]);
         self.declare_rt("knot_source_query_fold", &[p, p, p, p, p, p, p, p], &[p]);
@@ -5756,6 +5756,13 @@ impl Codegen {
                                                     );
                                                     return self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel, is_text]);
                                                 }
+                                                if rt_fn == "knot_source_query_sum" {
+                                                    let is_float = builder.ins().iconst(
+                                                        types::I64,
+                                                        sum_result_is_float(&agg_bind, agg_body, &schema) as i64,
+                                                    );
+                                                    return self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel, is_float]);
+                                                }
                                                 return self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]);
                                             }
                                         }
@@ -5851,6 +5858,10 @@ impl Codegen {
                                     if rt_fn == "knot_source_query_value" {
                                         let is_text = builder.ins().iconst(types::I64, col_is_text as i64);
                                         return self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel, is_text]);
+                                    }
+                                    if rt_fn == "knot_source_query_sum" {
+                                        let is_float = builder.ins().iconst(types::I64, (col_ty == "float") as i64);
+                                        return self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel, is_float]);
                                     }
                                     return self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]);
                                 }
@@ -8935,14 +8946,23 @@ impl Codegen {
                 if expr_references_var(inner_expr, outer_var) {
                     continue;
                 }
-                // Inner expr must be hoistable (source, derived, var, or list)
-                let hoistable = matches!(
-                    &inner_expr.node,
+                // Inner expr must be hoistable (source, derived, var, or list).
+                let hoistable = match &inner_expr.node {
                     ast::ExprKind::SourceRef(_)
-                        | ast::ExprKind::DerivedRef(_)
-                        | ast::ExprKind::Var(_)
-                        | ast::ExprKind::List(_)
-                );
+                    | ast::ExprKind::DerivedRef(_)
+                    | ast::ExprKind::List(_) => true,
+                    // A `Var` is only hoistable when it resolves OUTSIDE this
+                    // do-block. A var bound by another Bind in this block is
+                    // loop-local: its SSA value is defined inside a loop body
+                    // and does not dominate the pre-loop prebuild site, so
+                    // compiling it there is invalid IR (undefined-variable
+                    // panic) or silently captures a stale outer binding of the
+                    // same name. Only hoist vars from the enclosing scope.
+                    ast::ExprKind::Var(name) => {
+                        !bind_stmts.iter().any(|(_, bv, _)| bv == name)
+                    }
+                    _ => false,
+                };
                 if !hoistable {
                     continue;
                 }
@@ -9447,12 +9467,16 @@ impl Codegen {
                     }
 
                     // 3. Extract schema and key column names for SQLite grouping
-                    let schema = primary_schema.clone()
-                        .or_else(|| {
-                            primary_source.as_ref()
-                                .and_then(|name| self.source_schemas.get(name).cloned())
-                        })
-                        .unwrap_or_else(|| {
+                    let schema = match primary_schema.clone().or_else(|| {
+                        primary_source.as_ref()
+                            .and_then(|name| self.source_schemas.get(name).cloned())
+                    }) {
+                        Some(s) => s,
+                        None => {
+                            // No resolvable schema for the grouped relation.
+                            // Report a clean compile-time diagnostic and bail
+                            // (like the other GroupBy errors below) instead of
+                            // panicking and aborting the whole compiler.
                             let hint = if primary_source.is_some() {
                                 format!(
                                     "groupBy: no schema found for relation '{}' \
@@ -9465,8 +9489,13 @@ impl Codegen {
                                  or nested field of such a relation)"
                                     .to_string()
                             };
-                            panic!("{}", hint)
-                        });
+                            self.diagnostics.push(
+                                knot::diagnostic::Diagnostic::error(hint)
+                                    .label(key.span, "groupBy over a relation with no known schema"),
+                            );
+                            return self.call_rt(builder, "knot_relation_empty", &[]);
+                        }
+                    };
 
                     // Extract key column names from the key record expression.
                     // Only plain field accesses (`t.owner`) are supported as
@@ -10261,6 +10290,12 @@ impl Codegen {
                         minmax_result_is_text(&bind_var, body, schema) as i64,
                     );
                     Some(self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel, is_text]))
+                } else if rt_fn == "knot_source_query_sum" {
+                    let is_float = builder.ins().iconst(
+                        types::I64,
+                        sum_result_is_float(&bind_var, body, schema) as i64,
+                    );
+                    Some(self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel, is_float]))
                 } else {
                     Some(self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]))
                 }
@@ -10422,7 +10457,7 @@ impl Codegen {
                     }
                     bind_aliases.insert(bind_var.clone(), alias.clone());
                     let col_sql = extract_sql_field_access(bind_var, body, &alias, &schema)?;
-                    aggregate = Some(("SUM", col_sql, false));
+                    aggregate = Some(("SUM", col_sql, sum_result_is_float(bind_var, body, &schema)));
                 }
                 PipeOp::Avg { bind_var, body } => {
                     if is_count || aggregate.is_some() || select_override.is_some() {
@@ -10509,6 +10544,14 @@ impl Codegen {
                     builder,
                     rt_fn,
                     &[db, sql_ptr, sql_len, params_rel, is_text],
+                ))
+            } else if rt_fn == "knot_source_query_sum" {
+                // For SUM the tuple flag carries is_float (see PipeOp::Sum).
+                let is_float = builder.ins().iconst(types::I64, result_is_text as i64);
+                Some(self.call_rt(
+                    builder,
+                    rt_fn,
+                    &[db, sql_ptr, sql_len, params_rel, is_float],
                 ))
             } else {
                 Some(self.call_rt(
@@ -12577,6 +12620,21 @@ pub(crate) fn minmax_result_is_text(
     matches!(
         infer_sql_expr_type(bind_var, body, schema).as_deref(),
         Some("text")
+    )
+}
+
+/// Whether a `sum` pushdown projects a Float column. Passed to
+/// `knot_source_query_sum` as `is_float` so that an empty/all-NULL Float
+/// column yields `Float 0.0` instead of `Int 0`, preserving the statically
+/// expected numeric type for downstream float arithmetic / `show` / JSON.
+pub(crate) fn sum_result_is_float(
+    bind_var: &str,
+    body: &ast::Expr,
+    schema: &str,
+) -> bool {
+    matches!(
+        infer_sql_expr_type(bind_var, body, schema).as_deref(),
+        Some("float")
     )
 }
 

@@ -1033,6 +1033,10 @@ impl Parser {
                     if !self.eat(&TokenKind::Comma) {
                         break;
                     }
+                    self.skip_newlines();
+                    if self.at(&TokenKind::RBrace) {
+                        break; // trailing comma
+                    }
                 }
             }
             self.expect(&TokenKind::RBrace, "expected '}' to close constructor fields")
@@ -1719,6 +1723,10 @@ impl Parser {
                     if !self.eat(&TokenKind::Comma) {
                         break;
                     }
+                    self.skip_newlines();
+                    if self.at(&TokenKind::RBrace) {
+                        break; // trailing comma
+                    }
                 }
             }
             self.expect(&TokenKind::RBrace, "expected '}' to close route body fields")
@@ -1748,6 +1756,10 @@ impl Parser {
                         self.skip_newlines();
                         if !self.eat(&TokenKind::Comma) {
                             break;
+                        }
+                        self.skip_newlines();
+                        if self.at(&TokenKind::RBrace) {
+                            break; // trailing comma
                         }
                     }
                 }
@@ -1912,6 +1924,10 @@ impl Parser {
                     self.skip_newlines();
                     if !self.eat(&TokenKind::Comma) {
                         break;
+                    }
+                    self.skip_newlines();
+                    if self.at(&TokenKind::RBrace) {
+                        break; // trailing comma
                     }
                 }
             }
@@ -2860,6 +2876,10 @@ impl Parser {
                             if !self.eat(&TokenKind::Comma) {
                                 break;
                             }
+                            self.skip_newlines();
+                            if self.at(&TokenKind::RBrace) {
+                                break; // trailing comma
+                            }
                         }
                     }
                     self.skip_newlines();
@@ -3029,6 +3049,10 @@ impl Parser {
                 self.skip_newlines();
                 if !self.eat(&TokenKind::Comma) {
                     break;
+                }
+                self.skip_newlines();
+                if self.at(&TokenKind::RBracket) {
+                    break; // trailing comma
                 }
             }
         }
@@ -3737,6 +3761,10 @@ impl Parser {
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
+                self.skip_newlines();
+                if self.at(&TokenKind::RBrace) {
+                    break; // trailing comma
+                }
             }
         }
         self.skip_newlines();
@@ -3761,6 +3789,10 @@ impl Parser {
                 self.skip_newlines();
                 if !self.eat(&TokenKind::Comma) {
                     break;
+                }
+                self.skip_newlines();
+                if self.at(&TokenKind::RBracket) {
+                    break; // trailing comma
                 }
             }
         }

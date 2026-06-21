@@ -2400,7 +2400,9 @@ fn indent_for_expr_start(source: &str, span_start: usize) -> String {
         .rfind('\n')
         .map(|p| p + 1)
         .unwrap_or(0);
-    let col = span_start - line_start;
+    // Count CHARACTERS, not bytes — a byte count over-indents (and can corrupt
+    // the layout-sensitive parse) when multibyte text precedes on the line.
+    let col = source[line_start..span_start.min(source.len())].chars().count();
     format!("\n{}", " ".repeat(col + 2))
 }
 
@@ -2420,8 +2422,9 @@ fn arm_indentation(case_expr: &ast::Expr, arms: &[ast::CaseArm], source: &str) -
             return format!("\n{prefix}");
         }
         // Inline arm: non-whitespace precedes it, so synthesize the column
-        // with spaces.
-        let col = arm.pat.span.start - line_start;
+        // with spaces. Count CHARACTERS, not bytes (multibyte text on the line
+        // would otherwise over-indent and break the layout-sensitive parse).
+        let col = source[line_start..arm.pat.span.start].chars().count();
         return format!("\n{}", " ".repeat(col));
     }
     // No arms at all: fall back to the case expression's column + 2.
@@ -2429,7 +2432,7 @@ fn arm_indentation(case_expr: &ast::Expr, arms: &[ast::CaseArm], source: &str) -
         .rfind('\n')
         .map(|p| p + 1)
         .unwrap_or(0);
-    let case_col = case_expr.span.start - line_start;
+    let case_col = source[line_start..case_expr.span.start].chars().count();
     format!("\n{}", " ".repeat(case_col + 2))
 }
 

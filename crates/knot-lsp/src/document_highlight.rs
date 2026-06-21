@@ -16,11 +16,17 @@ pub(crate) fn handle_document_highlight(
     let doc = state.documents.get(uri)?;
     let offset = ident_lookup_offset(&doc.source, position_to_offset(&doc.source, pos));
 
-    // Find the definition span for the symbol at cursor
+    // Find the definition span for the symbol at cursor. `references` holds
+    // deliberately overlapping spans (a constructor-pattern name ref can
+    // enclose a nested binder ref), so pick the INNERMOST span containing the
+    // cursor rather than the first match — mirrors goto/hover, which were
+    // fixed the same way. Taking the first match could resolve to the wrong
+    // (outer) symbol.
     let def_span = doc
         .references
         .iter()
-        .find(|(usage, _)| usage.start <= offset && offset < usage.end)
+        .filter(|(usage, _)| usage.start <= offset && offset < usage.end)
+        .min_by_key(|(usage, _)| usage.end - usage.start)
         .map(|(_, def)| *def)
         .or_else(|| {
             doc.definitions

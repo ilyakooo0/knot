@@ -4088,8 +4088,13 @@ impl Infer {
                 self.check_expr(value, &target_inner);
                 let mut effects = BTreeSet::new();
                 if let ast::ExprKind::SourceRef(name) = &target.node {
+                    // `replace *rel = v` blindly overwrites the relation — it
+                    // does NOT read the existing contents (indeed, referencing
+                    // `*rel` in the value is rejected below in favor of `set`).
+                    // So it carries only a write effect, never a read; emitting
+                    // a spurious `r *rel` here forced honest `{w *rel}`
+                    // signatures to be widened to `{rw *rel}`.
                     effects.insert(IoEffect::Writes(name.clone()));
-                    effects.insert(IoEffect::Reads(name.clone()));
 
                     // Reject `replace *rel = ...` when the value references
                     // `*rel` (directly, via a `<- *rel` bind, or via a let

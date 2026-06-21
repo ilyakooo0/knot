@@ -527,12 +527,15 @@ impl EffectChecker {
                 // A locally shadowed name is a local value, not the builtin
                 // or top-level declaration of the same name.
                 let is_shadowed = self.shadowed.iter().any(|s| s == name);
-                // For zero-argument IO builtins (now, randomFloat, readLine),
-                // referencing them IS the IO action — return their effects.
-                // For functions (println, readFile, etc.), this over-approximates
-                // (effects only manifest at call sites), but is necessary for
-                // correct validation in contexts like `atomic(now)`.
-                if !is_shadowed {
+                // For zero-argument IO builtins (now, readLine, randomFloat,
+                // randomUuid), referencing the bare name IS the IO action — so
+                // return their effects. Multi-argument builtins (println,
+                // readFile, sleep, …) perform no IO until applied; a bare
+                // reference that is never called (e.g. `let f = println`) is
+                // pure, and their effects manifest at the call site instead
+                // (see head_call_effects / callee_effects). Attributing them
+                // here wrongly tripped the atomic gate on unused references.
+                if !is_shadowed && crate::builtins::NULLARY_IO_BUILTINS.contains(&name.as_str()) {
                     if let Some(effects) = self.builtin_effects.get(name) {
                         return effects.clone();
                     }
@@ -638,6 +641,7 @@ impl EffectChecker {
             ast::ExprKind::UnaryOp { operand, .. } => self.infer_effects(operand),
 
             ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
+                let is_replace = matches!(&expr.node, ast::ExprKind::ReplaceSet { .. });
                 let mut effects = self.infer_effects(value);
                 // The parser produces `SourceRef` for every `*name` write
                 // target, including views, so handle both node kinds the
@@ -646,7 +650,15 @@ impl EffectChecker {
                 | ast::ExprKind::DerivedRef(name) = &target.node
                 {
                     effects.writes.insert(name.clone());
-                    effects.reads.insert(name.clone());
+                    // `replace *rel = v` blindly overwrites and does NOT read
+                    // the existing relation, so it must not record a read.
+                    // `set *rel = v` does read it, but the value expression
+                    // already references `*rel` and contributes that read via
+                    // infer_effects(value) above — so adding it here is only
+                    // needed (and only correct) for the non-replace form.
+                    if !is_replace {
+                        effects.reads.insert(name.clone());
+                    }
                     if self.view_names.contains(name) {
                         // Writing through a view writes the backing
                         // source(s). The view's inferred effects record

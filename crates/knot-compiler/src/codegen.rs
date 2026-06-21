@@ -15719,14 +15719,23 @@ fn ast_type_to_descriptor_type(
             "Float" => "float".to_string(),
             "Bool" => "bool".to_string(),
             "Text" => "text".to_string(),
-            _ => {
-                if let Some(ResolvedType::Adt(ctors)) = aliases.get(n) {
-                    if ctors.iter().all(|(_, fields)| fields.is_empty()) {
-                        return "tag".to_string();
-                    }
+            _ => match aliases.get(n) {
+                // A type alias to a primitive must carry the primitive's wire
+                // type — otherwise a route field typed `type Cents = Int` gets
+                // a `text` descriptor and the request side (de)serializes it as
+                // Text, inconsistent with the response side which resolves the
+                // alias via `resolve_type_for_descriptor`.
+                Some(ResolvedType::Int) => "int".to_string(),
+                Some(ResolvedType::Float) => "float".to_string(),
+                Some(ResolvedType::Bool) => "bool".to_string(),
+                Some(ResolvedType::Text) => "text".to_string(),
+                Some(ResolvedType::Adt(ctors))
+                    if ctors.iter().all(|(_, fields)| fields.is_empty()) =>
+                {
+                    "tag".to_string()
                 }
-                "text".to_string()
-            }
+                _ => "text".to_string(),
+            },
         },
         ast::TypeKind::App { func, arg } => {
             if matches!(&func.node, ast::TypeKind::Named(n) if n == "Maybe") {

@@ -159,7 +159,17 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
         })
         .map(|(scheme, _)| constraints_for_type_var(scheme, word))
         .unwrap_or_default();
-    if detail_opt.is_none() && field_at_cursor.is_none() && type_var_constraints.is_empty() {
+    // Route declaration names carry no `details`/`type_info` entry (they live
+    // in the type-level route registry, not the value scope), so the three
+    // checks above are all empty for them. Without this exception the early
+    // return fires before `route_decl_section` / the route doc comment can
+    // render, leaving route names with no hover at all.
+    let is_route_name = is_route_decl_name(&doc.module, word);
+    if detail_opt.is_none()
+        && field_at_cursor.is_none()
+        && type_var_constraints.is_empty()
+        && !is_route_name
+    {
         return None;
     }
     let mut value = match &detail_opt {
@@ -521,6 +531,17 @@ fn trait_method_dispatch_section(state: &ServerState, name: &str) -> Option<Stri
         }
     }
     Some(out.trim_end().to_string())
+}
+
+/// True when `name` is the name of a `route` (or composite `route`)
+/// declaration in this module. Used to keep route names from being dropped by
+/// the hover early-return guard, since they have no value-scope detail entry.
+fn is_route_decl_name(module: &knot::ast::Module, name: &str) -> bool {
+    module.decls.iter().any(|decl| match &decl.node {
+        DeclKind::Route { name: rn, .. } => rn == name,
+        DeclKind::RouteComposite { name: rn, .. } => rn == name,
+        _ => false,
+    })
 }
 
 /// If `name` is a `route` declaration's name in this module, render a summary

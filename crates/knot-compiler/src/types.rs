@@ -900,10 +900,18 @@ fn resolve_type(
                 }
             }
             // User-declared parameterized data types: the head's registered
-            // ADT shape is enough to pick the column type (payload-bearing
-            // ADTs become "json" columns regardless of the type arguments).
+            // shape is enough to pick the column type (payload-bearing ADTs
+            // become "json" columns regardless of the type arguments).
+            // Single-variant data types register as a `Record` (see
+            // `collect_types`), so accept that too — otherwise an applied
+            // form like `Box Int` falls through to Named("unknown") → "text"
+            // and silently corrupts the structure, while the bare `Box`
+            // (resolved via `aliases` to a Record → "json") round-trips fine.
             if let TypeKind::Named(name) = &spine_head.node {
-                if let Some(resolved @ ResolvedType::Adt(_)) = aliases.get(name) {
+                if let Some(
+                    resolved @ (ResolvedType::Adt(_) | ResolvedType::Record(_)),
+                ) = aliases.get(name)
+                {
                     return resolved.clone();
                 }
             }

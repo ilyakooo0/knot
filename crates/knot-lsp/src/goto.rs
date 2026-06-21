@@ -95,9 +95,14 @@ pub(crate) fn handle_goto_type_definition(
         .min_by_key(|(span, _)| span.end - span.start)
         .map(|(_, ty)| ty.clone())
         .or_else(|| {
+            // Usage spans can overlap (a constructor-pattern reference
+            // enclosing a nested binder reference); pick the *smallest*
+            // containing span — the symbol the cursor is on — rather than an
+            // arbitrary first match, mirroring the innermost-span rule above.
             doc.references
                 .iter()
-                .find(|(usage, _)| usage.start <= offset && offset < usage.end)
+                .filter(|(usage, _)| usage.start <= offset && offset < usage.end)
+                .min_by_key(|(usage, _)| usage.end - usage.start)
                 .and_then(|(_, def_span)| doc.local_type_info.get(def_span).cloned())
         })
         .or_else(|| doc.type_info.get(word).cloned())?;

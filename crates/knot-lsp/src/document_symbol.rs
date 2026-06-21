@@ -54,10 +54,21 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
             DeclKind::Data {
                 name, constructors, ..
             } => {
+                // Start the search after the `=` so a self-named constructor
+                // (`data Circle = Circle {…}`) anchors on the constructor token,
+                // not the type name before the `=`. Advance past each hit so a
+                // name reused in an earlier constructor's field types can't
+                // steal a later constructor's span. Mirrors semantic_tokens.rs.
+                let mut search_from = source
+                    .get(decl.span.start..decl.span.end.min(source.len()))
+                    .and_then(|t| t.find('='))
+                    .map(|p| decl.span.start + p + 1)
+                    .unwrap_or(decl.span.start);
                 let children: Vec<DocumentSymbol> = constructors
                     .iter()
                     .filter_map(|ctor| {
-                        let ctor_span = find_word_in_source(source, &ctor.name, decl.span.start, decl.span.end)?;
+                        let ctor_span = find_word_in_source(source, &ctor.name, search_from, decl.span.end)?;
+                        search_from = ctor_span.end;
                         let ctor_range = span_to_range(ctor_span, source);
                         Some(DocumentSymbol {
                             name: ctor.name.clone(),

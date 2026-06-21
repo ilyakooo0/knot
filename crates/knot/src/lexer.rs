@@ -601,10 +601,12 @@ impl<'src> Lexer<'src> {
                                     value.push(first_hex_byte as char);
                                 }
                             } else {
-                                let bad_end = if self.pos < self.source.len() {
-                                    self.pos + self.source[self.pos..].chars().next().map_or(1, |c| c.len_utf8())
-                                } else {
-                                    self.pos
+                                // Span only the `\x`, not a trailing terminator
+                                // (`"`/newline/EOF) — recovery below never
+                                // consumes those, so they must not be underlined.
+                                let bad_end = match self.peek() {
+                                    Some(b'"') | Some(b'\n') | Some(b'\r') | None => self.pos,
+                                    Some(_) => self.pos + self.source[self.pos..].chars().next().map_or(1, |c| c.len_utf8()),
                                 };
                                 let span = Span::new(self.pos - 2, bad_end);
                                 self.diagnostics.push(
@@ -741,10 +743,12 @@ impl<'src> Lexer<'src> {
                                     value.push(first_hex_byte);
                                 }
                             } else {
-                                let bad_end = if self.pos < self.source.len() {
-                                    self.pos + self.source[self.pos..].chars().next().map_or(1, |c| c.len_utf8())
-                                } else {
-                                    self.pos
+                                // Span only the `\x`, not a trailing terminator
+                                // (`"`/newline/EOF) — recovery below never
+                                // consumes those, so they must not be underlined.
+                                let bad_end = match self.peek() {
+                                    Some(b'"') | Some(b'\n') | Some(b'\r') | None => self.pos,
+                                    Some(_) => self.pos + self.source[self.pos..].chars().next().map_or(1, |c| c.len_utf8()),
                                 };
                                 let span = Span::new(self.pos - 2, bad_end);
                                 self.diagnostics.push(

@@ -10991,11 +10991,18 @@ pub extern "C-unwind" fn knot_source_query_sum(
                 // must produce Float 0.0, not Int 0, or downstream Float
                 // arithmetic / show / JSON mismatches.
                 ValueRef::Null => Ok(if is_float != 0 { alloc_float(0.0) } else { alloc_int(0) }),
-                ValueRef::Integer(n) => Ok(alloc_int(n)),
+                // A Float column must stay Float even when SUM happens to be
+                // integral (downstream Float arithmetic / show / JSON would
+                // otherwise mismatch), mirroring the Null/default branches.
+                ValueRef::Integer(n) => {
+                    Ok(if is_float != 0 { alloc_float(n as f64) } else { alloc_int(n) })
+                }
                 ValueRef::Real(f) => Ok(alloc_float(f)),
                 ValueRef::Text(s) => {
                     let s = std::str::from_utf8(s).expect("knot runtime: invalid UTF-8 in sum result");
-                    if let Ok(n) = s.parse::<i64>() {
+                    if is_float != 0 {
+                        Ok(alloc_float(s.parse::<f64>().unwrap_or(0.0)))
+                    } else if let Ok(n) = s.parse::<i64>() {
                         Ok(alloc_int(n))
                     } else if let Ok(f) = s.parse::<f64>() {
                         Ok(alloc_float(f))
@@ -11003,7 +11010,7 @@ pub extern "C-unwind" fn knot_source_query_sum(
                         Ok(alloc_int(0))
                     }
                 }
-                _ => Ok(alloc_int(0)),
+                _ => Ok(if is_float != 0 { alloc_float(0.0) } else { alloc_int(0) }),
             }
         })
         .unwrap_or_else(|e| panic!("knot runtime: query_sum error: {}\n  SQL: {}", e, sql))

@@ -11,7 +11,10 @@ use knot::ast::{self, DeclKind, Module};
 use crate::analysis::get_or_parse_file_shared;
 use crate::shared::{extract_principal_type_name, scan_knot_files_in_roots};
 use crate::state::ServerState;
-use crate::utils::{path_to_uri, position_to_offset, span_to_range, uri_to_path, word_at_position};
+use crate::utils::{
+    ident_lookup_offset, path_to_uri, position_to_offset, span_to_range, uri_to_path,
+    word_at_position,
+};
 
 // ── Go to definition ────────────────────────────────────────────────
 
@@ -23,7 +26,12 @@ pub(crate) fn handle_goto_definition(
     let pos = params.text_document_position_params.position;
     let doc = state.documents.get(uri)?;
 
-    let offset = position_to_offset(&doc.source, pos);
+    // Nudge a caret sitting just past a usage's last char back into the word,
+    // matching references/highlight — otherwise the half-open span match
+    // (`offset < usage.end`) misses and we fall through to the name-keyed
+    // fallback, which jumps to a shadowing top-level symbol instead of the
+    // local binder under the cursor.
+    let offset = ident_lookup_offset(&doc.source, position_to_offset(&doc.source, pos));
 
     // Try span-based reference lookup first. Usage spans can overlap (a
     // constructor-pattern reference enclosing a nested binder reference), so
@@ -71,7 +79,7 @@ pub(crate) fn handle_goto_type_definition(
     let uri = &params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
     let doc = state.documents.get(uri)?;
-    let offset = position_to_offset(&doc.source, pos);
+    let offset = ident_lookup_offset(&doc.source, position_to_offset(&doc.source, pos));
     let word = word_at_position(&doc.source, pos)?;
 
     // Get the type string for the symbol at cursor. Multiple recorded spans

@@ -131,7 +131,10 @@ fn collect_folding_ranges_expr(expr: &ast::Expr, source: &str, ranges: &mut Vec<
         _ => {}
     }
 
-    // Recurse into sub-expressions
+    // Recurse into every sub-expression-bearing variant so a foldable
+    // `do`/`case`/`lambda` nested under a container (an `atomic`, a record
+    // field, a list element, `set x = do {...}`, a binop, an annotation, a
+    // `serve` handler, …) still produces a folding range.
     match &expr.node {
         ast::ExprKind::Do(stmts) => {
             for stmt in stmts {
@@ -169,6 +172,50 @@ fn collect_folding_ranges_expr(expr: &ast::Expr, source: &str, ranges: &mut Vec<
         ast::ExprKind::App { func, arg } => {
             collect_folding_ranges_expr(func, source, ranges);
             collect_folding_ranges_expr(arg, source, ranges);
+        }
+        ast::ExprKind::Record(fields) => {
+            for f in fields {
+                collect_folding_ranges_expr(&f.value, source, ranges);
+            }
+        }
+        ast::ExprKind::RecordUpdate { base, fields } => {
+            collect_folding_ranges_expr(base, source, ranges);
+            for f in fields {
+                collect_folding_ranges_expr(&f.value, source, ranges);
+            }
+        }
+        ast::ExprKind::FieldAccess { expr, .. } => {
+            collect_folding_ranges_expr(expr, source, ranges);
+        }
+        ast::ExprKind::List(items) => {
+            for item in items {
+                collect_folding_ranges_expr(item, source, ranges);
+            }
+        }
+        ast::ExprKind::BinOp { lhs, rhs, .. } => {
+            collect_folding_ranges_expr(lhs, source, ranges);
+            collect_folding_ranges_expr(rhs, source, ranges);
+        }
+        ast::ExprKind::UnaryOp { operand, .. } => {
+            collect_folding_ranges_expr(operand, source, ranges);
+        }
+        ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
+            collect_folding_ranges_expr(target, source, ranges);
+            collect_folding_ranges_expr(value, source, ranges);
+        }
+        ast::ExprKind::Atomic(inner) | ast::ExprKind::Refine(inner) => {
+            collect_folding_ranges_expr(inner, source, ranges);
+        }
+        ast::ExprKind::UnitLit { value, .. } => {
+            collect_folding_ranges_expr(value, source, ranges);
+        }
+        ast::ExprKind::Annot { expr, .. } => {
+            collect_folding_ranges_expr(expr, source, ranges);
+        }
+        ast::ExprKind::Serve { handlers, .. } => {
+            for h in handlers {
+                collect_folding_ranges_expr(&h.body, source, ranges);
+            }
         }
         _ => {}
     }

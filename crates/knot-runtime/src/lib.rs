@@ -1743,8 +1743,17 @@ fn sql_partial_cmp(a: &SqlVal, b: &SqlVal) -> Option<std::cmp::Ordering> {
 fn col_pred_matches(row_val: &SqlVal, pred: &ColPred) -> bool {
     use std::cmp::Ordering;
     match pred {
-        ColPred::Cmp(CmpOp::Eq, target) => row_val == target,
-        ColPred::Cmp(CmpOp::Neq, target) => row_val != target,
+        // Eq/Neq/In go through `sql_partial_cmp` (not raw `==`) so cross-type
+        // numeric comparisons agree with the ordered operators: `Int(5)` and
+        // `Real(5.0)` are equal, and an incompatible/unknown comparison wakes
+        // conservatively (`None` → treat as a possible match) rather than
+        // silently dropping a wake.
+        ColPred::Cmp(CmpOp::Eq, target) => {
+            !matches!(sql_partial_cmp(row_val, target), Some(o) if o != Ordering::Equal)
+        }
+        ColPred::Cmp(CmpOp::Neq, target) => {
+            !matches!(sql_partial_cmp(row_val, target), Some(Ordering::Equal))
+        }
         ColPred::Cmp(op, target) => match sql_partial_cmp(row_val, target) {
             Some(ord) => match op {
                 CmpOp::Lt => ord == Ordering::Less,
@@ -1755,7 +1764,9 @@ fn col_pred_matches(row_val: &SqlVal, pred: &ColPred) -> bool {
             },
             None => true,
         },
-        ColPred::In(targets) => targets.iter().any(|t| row_val == t),
+        ColPred::In(targets) => targets
+            .iter()
+            .any(|t| !matches!(sql_partial_cmp(row_val, t), Some(o) if o != Ordering::Equal)),
     }
 }
 
@@ -7708,6 +7719,41 @@ pub extern "C-unwind" fn knot_stm_wait(_snapshot: i64) {
     let slot = Arc::new(WakeSlot::new());
     let mut watcher_counts: Vec<Arc<AtomicUsize>> = Vec::with_capacity(read_versions.len());
 
+    // The watcher refcount increments below happen BEFORE `slot.init` is
+    // published, but `WakeSlot::Drop` undoes them via `init` — so if anything
+    // between the first increment and `init.set` unwinds, those increments are
+    // orphaned (a permanently-elevated `watcher_count_for` keeps every writer
+    // building per-row event payloads forever). This guard records exactly
+    // what was incremented and rolls it back on unwind; it is disarmed once
+    // `init` is published, after which `WakeSlot::Drop` owns the decrements.
+    struct IncrGuard {
+        counts: Vec<Arc<AtomicUsize>>,
+        cols: Vec<(String, String)>,
+        armed: bool,
+    }
+    impl Drop for IncrGuard {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            for c in &self.counts {
+                c.fetch_sub(1, Ordering::Release);
+            }
+            for (table, col) in &self.cols {
+                if let Some(mut state) = TABLE_FILTER_COLS.get_mut(table) {
+                    if let Some(c) = state.cols.get_mut(col.as_str()) {
+                        *c = c.saturating_sub(1);
+                    }
+                }
+            }
+        }
+    }
+    let mut incr_guard = IncrGuard {
+        counts: Vec::new(),
+        cols: Vec::new(),
+        armed: true,
+    };
+
     // Build registrations lock-free first; acquire the registry locks for the
     // shortest possible window.
     let mut broad_tables: Vec<&str> = Vec::new();
@@ -7740,6 +7786,7 @@ pub extern "C-unwind" fn knot_stm_wait(_snapshot: i64) {
         // is the gate for expensive event-payload construction at writes.
         let c = watcher_count_for(table);
         c.fetch_add(1, Ordering::AcqRel);
+        incr_guard.counts.push(c.clone());
         watcher_counts.push(c);
     }
 
@@ -7752,6 +7799,7 @@ pub extern "C-unwind" fn knot_stm_wait(_snapshot: i64) {
             if let ReadFilter::Cols(preds) = f {
                 for (col, _) in preds {
                     *state.cols.entry(col.to_string()).or_insert(0) += 1;
+                    incr_guard.cols.push((table.clone(), col.to_string()));
                 }
             }
         }
@@ -7763,6 +7811,9 @@ pub extern "C-unwind" fn knot_stm_wait(_snapshot: i64) {
         filters: filter_map,
         watcher_counts,
     });
+    // `init` is published — `WakeSlot::Drop` now owns the refcount decrements,
+    // so disarm the rollback guard to avoid double-decrementing.
+    incr_guard.armed = false;
 
     for table in &broad_tables {
         TABLE_WATCHERS
@@ -9782,6 +9833,11 @@ pub extern "C-unwind" fn knot_source_migrate(
         .execute_batch("SAVEPOINT knot_migrate;")
         .expect("knot runtime: failed to begin migration transaction");
 
+    // Everything that mutates the DB runs under the rollback guard so a panic
+    // mid-migration (bad insert, failed CREATE) doesn't leave the table
+    // half-dropped/half-rebuilt on a connection a `catch_unwind` site keeps
+    // using — and the savepoint isn't left dangling.
+    with_savepoint_rollback(db_ref, "knot_migrate", || {
     // Drop old child tables (for nested relation fields) before dropping parent.
     // Recurse to handle grandchild+ tables (deepest first).
     fn drop_nested_tables(conn: &rusqlite::Connection, parent_table: &str, nested: &[NestedField]) {
@@ -9892,6 +9948,7 @@ pub extern "C-unwind" fn knot_source_migrate(
             rusqlite::params![name, new_schema],
         )
         .expect("knot runtime: failed to update schema after migration");
+    });
 
     db_ref
         .conn
@@ -11794,6 +11851,26 @@ fn write_child_rows(
     }
 }
 
+/// Run `f` inside an already-opened savepoint named `sp`. On a panic, roll the
+/// savepoint back and resume unwinding so a half-applied write doesn't survive
+/// on a connection that a `catch_unwind` recovery site (HTTP worker 500s,
+/// `race`-loser cancellation, atomic retry) will keep reusing — and the
+/// connection isn't left holding a dangling savepoint. The caller RELEASEs the
+/// savepoint on the success path. (panic = "unwind" is load-bearing here; see
+/// the workspace Cargo.toml.) Mirrors the explicit rollback in
+/// `knot_source_delete_where`.
+fn with_savepoint_rollback<T>(db_ref: &KnotDb, sp: &str, f: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(payload) => {
+            let _ = db_ref
+                .conn
+                .execute_batch(&format!("ROLLBACK TO SAVEPOINT {sp}; RELEASE SAVEPOINT {sp};"));
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
 /// Write a relation to a source (replaces all rows).
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_source_write(
@@ -11822,51 +11899,53 @@ pub extern "C-unwind" fn knot_source_write(
 
     let table_name = format!("_knot_{}", name);
 
-    if is_adt_schema(schema) {
-        let table = quote_ident(&table_name);
-        let delete_sql = format!("DELETE FROM {};", table);
-        debug_sql(&delete_sql);
-        db_ref.conn.execute_batch(&delete_sql)
-            .expect("knot runtime: failed to delete rows");
+    with_savepoint_rollback(db_ref, "knot_replace", || {
+        if is_adt_schema(schema) {
+            let table = quote_ident(&table_name);
+            let delete_sql = format!("DELETE FROM {};", table);
+            debug_sql(&delete_sql);
+            db_ref.conn.execute_batch(&delete_sql)
+                .expect("knot runtime: failed to delete rows");
 
-        let adt = parse_adt_schema(schema);
-        if !rows.is_empty() {
-            let mut col_names = vec![quote_ident("_tag")];
-            for f in &adt.all_fields {
-                col_names.push(quote_ident(&f.name));
+            let adt = parse_adt_schema(schema);
+            if !rows.is_empty() {
+                let mut col_names = vec![quote_ident("_tag")];
+                for f in &adt.all_fields {
+                    col_names.push(quote_ident(&f.name));
+                }
+                let placeholders: Vec<String> = (1..=col_names.len())
+                    .map(|i| format!("?{}", i))
+                    .collect();
+                let insert_sql = format!(
+                    "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
+                    table,
+                    col_names.join(", "),
+                    placeholders.join(", ")
+                );
+                debug_sql(&insert_sql);
+
+                let mut stmt = db_ref
+                    .conn
+                    .prepare_cached(&insert_sql)
+                    .expect("knot runtime: failed to prepare insert");
+
+                for row_ptr in rows {
+                    let params = adt_row_to_params(*row_ptr, &adt);
+                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                        params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+                    stmt.execute(param_refs.as_slice()).unwrap_or_else(|e| {
+                        panic!("knot runtime: insert error: {}", e)
+                    });
+                }
             }
-            let placeholders: Vec<String> = (1..=col_names.len())
-                .map(|i| format!("?{}", i))
-                .collect();
-            let insert_sql = format!(
-                "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
-                table,
-                col_names.join(", "),
-                placeholders.join(", ")
-            );
-            debug_sql(&insert_sql);
-
-            let mut stmt = db_ref
-                .conn
-                .prepare_cached(&insert_sql)
-                .expect("knot runtime: failed to prepare insert");
-
-            for row_ptr in rows {
-                let params = adt_row_to_params(*row_ptr, &adt);
-                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-                stmt.execute(param_refs.as_slice()).unwrap_or_else(|e| {
-                    panic!("knot runtime: insert error: {}", e)
-                });
-            }
+        } else {
+            let rec = parse_record_schema(schema);
+            // Delete child tables first (deepest first), then parent
+            delete_record_table(&db_ref.conn, &table_name, &rec);
+            // Insert all rows
+            write_record_rows(&db_ref.conn, &table_name, &rec, rows);
         }
-    } else {
-        let rec = parse_record_schema(schema);
-        // Delete child tables first (deepest first), then parent
-        delete_record_table(&db_ref.conn, &table_name, &rec);
-        // Insert all rows
-        write_record_rows(&db_ref.conn, &table_name, &rec, rows);
-    }
+    });
 
     db_ref
         .conn
@@ -11915,64 +11994,69 @@ pub extern "C-unwind" fn knot_source_append(
         .expect("knot runtime: failed to begin transaction");
 
     if is_adt_schema(schema) {
-        let adt = parse_adt_schema(schema);
-        let mut col_names = vec![quote_ident("_tag")];
-        for f in &adt.all_fields {
-            col_names.push(quote_ident(&f.name));
-        }
-        let placeholders: Vec<String> = (1..=col_names.len())
-            .map(|i| format!("?{}", i))
-            .collect();
-        let insert_sql = format!(
-            "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
-            table,
-            col_names.join(", "),
-            placeholders.join(", ")
-        );
-        debug_sql(&insert_sql);
-
-        let mut stmt = db_ref
-            .conn
-            .prepare_cached(&insert_sql)
-            .expect("knot runtime: failed to prepare insert");
-
-        // Capture column values for the row-level event payload alongside the
-        // INSERT, but only if any watcher could consume it — otherwise emit
-        // `Bulk` and skip per-row payload construction entirely.
-        let want_rows_event = table_has_watchers(name);
-        let event_header: Arc<[ColName]> = if want_rows_event {
-            std::iter::once(intern_col("_tag"))
-                .chain(adt.all_fields.iter().map(|f| intern_col(&f.name)))
-                .collect::<Vec<_>>()
-                .into()
-        } else {
-            Arc::from(Vec::<ColName>::new())
-        };
-        let mut event_rows: EventRows = if want_rows_event {
-            EventRows::with_capacity(event_header.clone(), rows.len())
-        } else {
-            EventRows::new(event_header.clone())
-        };
-        for row_ptr in rows {
-            let params = adt_row_to_params(*row_ptr, &adt);
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-            stmt.execute(param_refs.as_slice()).unwrap_or_else(|e| {
-                panic!("knot runtime: insert error: {}", e)
-            });
-            if want_rows_event {
-                let mut vals = Vec::with_capacity(event_header.len());
-                for i in 0..event_header.len() {
-                    vals.push(SqlVal::from_rusqlite(&params[i]));
-                }
-                event_rows.push(vals);
+        // Build the INSERTs (and per-row event payload) under the rollback
+        // guard so a mid-batch panic doesn't leave partially-appended rows on
+        // a reused connection; emit the event after the savepoint commits.
+        let event = with_savepoint_rollback(db_ref, "knot_set", || {
+            let adt = parse_adt_schema(schema);
+            let mut col_names = vec![quote_ident("_tag")];
+            for f in &adt.all_fields {
+                col_names.push(quote_ident(&f.name));
             }
-        }
-        let event = if want_rows_event {
-            WriteEvent::Rows(event_rows)
-        } else {
-            WriteEvent::Bulk
-        };
+            let placeholders: Vec<String> = (1..=col_names.len())
+                .map(|i| format!("?{}", i))
+                .collect();
+            let insert_sql = format!(
+                "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
+                table,
+                col_names.join(", "),
+                placeholders.join(", ")
+            );
+            debug_sql(&insert_sql);
+
+            let mut stmt = db_ref
+                .conn
+                .prepare_cached(&insert_sql)
+                .expect("knot runtime: failed to prepare insert");
+
+            // Capture column values for the row-level event payload alongside the
+            // INSERT, but only if any watcher could consume it — otherwise emit
+            // `Bulk` and skip per-row payload construction entirely.
+            let want_rows_event = table_has_watchers(name);
+            let event_header: Arc<[ColName]> = if want_rows_event {
+                std::iter::once(intern_col("_tag"))
+                    .chain(adt.all_fields.iter().map(|f| intern_col(&f.name)))
+                    .collect::<Vec<_>>()
+                    .into()
+            } else {
+                Arc::from(Vec::<ColName>::new())
+            };
+            let mut event_rows: EventRows = if want_rows_event {
+                EventRows::with_capacity(event_header.clone(), rows.len())
+            } else {
+                EventRows::new(event_header.clone())
+            };
+            for row_ptr in rows {
+                let params = adt_row_to_params(*row_ptr, &adt);
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+                stmt.execute(param_refs.as_slice()).unwrap_or_else(|e| {
+                    panic!("knot runtime: insert error: {}", e)
+                });
+                if want_rows_event {
+                    let mut vals = Vec::with_capacity(event_header.len());
+                    for i in 0..event_header.len() {
+                        vals.push(SqlVal::from_rusqlite(&params[i]));
+                    }
+                    event_rows.push(vals);
+                }
+            }
+            if want_rows_event {
+                WriteEvent::Rows(event_rows)
+            } else {
+                WriteEvent::Bulk
+            }
+        });
         db_ref
             .conn
             .execute_batch("RELEASE SAVEPOINT knot_set;")
@@ -11988,13 +12072,15 @@ pub extern "C-unwind" fn knot_source_append(
         // second time.
         return;
     }
-    let rec = parse_record_schema(schema);
-    write_record_rows(&db_ref.conn, &format!("_knot_{}", name), &rec, rows);
-    let event = if table_has_watchers(name) {
-        rows_event_for_records(rows, &rec)
-    } else {
-        WriteEvent::Bulk
-    };
+    let event = with_savepoint_rollback(db_ref, "knot_set", || {
+        let rec = parse_record_schema(schema);
+        write_record_rows(&db_ref.conn, &format!("_knot_{}", name), &rec, rows);
+        if table_has_watchers(name) {
+            rows_event_for_records(rows, &rec)
+        } else {
+            WriteEvent::Bulk
+        }
+    });
     db_ref
         .conn
         .execute_batch("RELEASE SAVEPOINT knot_set;")

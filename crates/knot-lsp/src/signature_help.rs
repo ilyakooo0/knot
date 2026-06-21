@@ -10,6 +10,11 @@ use crate::shared::{
 use crate::state::{DocumentState, ServerState};
 use crate::utils::position_to_offset;
 
+/// UTF-16 code-unit length of a string — LSP measures label offsets in UTF-16.
+fn utf16_len(s: &str) -> u32 {
+    s.chars().map(|c| c.len_utf16() as u32).sum()
+}
+
 // ── Signature Help (paren-aware) ────────────────────────────────────
 
 pub(crate) fn handle_signature_help(
@@ -83,6 +88,11 @@ pub(crate) fn handle_signature_help(
     // highlight the active parameter.
     let signature_label = build_signature_label(&func_name, &param_types, &param_names, type_str);
 
+    // Running byte cursor into `signature_label`: each parameter label is
+    // searched *after* the previous one's match, so a param whose label is a
+    // substring of an earlier one (e.g. `x: Int` inside `x: Int -> ...`)
+    // highlights its own occurrence rather than the first textual hit.
+    let mut search_from = 0usize;
     let param_infos: Vec<ParameterInformation> = param_types
         .iter()
         .enumerate()
@@ -92,12 +102,20 @@ pub(crate) fn handle_signature_help(
                 Some(n) => format!("{n}: {ty}"),
                 None => ty.clone(),
             };
-            // Locate the label substring in the signature for proper highlighting
-            let label = match signature_label.find(&label_text) {
-                Some(start) => ParameterLabel::LabelOffsets([
-                    start as u32,
-                    (start + label_text.len()) as u32,
-                ]),
+            // Locate the label substring in the signature for highlighting.
+            // `ParameterLabel::LabelOffsets` are UTF-16 code-unit offsets per
+            // the LSP spec, NOT byte offsets — convert so labels containing
+            // multibyte characters highlight the correct span.
+            let label = match signature_label[search_from..].find(&label_text) {
+                Some(rel) => {
+                    let start_byte = search_from + rel;
+                    let end_byte = start_byte + label_text.len();
+                    search_from = end_byte;
+                    ParameterLabel::LabelOffsets([
+                        utf16_len(&signature_label[..start_byte]),
+                        utf16_len(&signature_label[..end_byte]),
+                    ])
+                }
                 None => ParameterLabel::Simple(label_text.clone()),
             };
             ParameterInformation {
@@ -163,7 +181,8 @@ fn lookup_local_binding_type(
         if span.end > doc.source.len() || span.start > span.end {
             continue;
         }
-        let name = &doc.source[span.start..span.end];
+        // Char-boundary-safe: a stale span could land mid-multibyte-char.
+        let name = crate::utils::safe_slice(&doc.source, *span);
         if name != func_name {
             continue;
         }

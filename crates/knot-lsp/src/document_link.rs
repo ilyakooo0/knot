@@ -46,11 +46,23 @@ pub(crate) fn handle_document_link(
         };
 
         // The link range covers the import path string within the import span.
-        // Find the path string in the source text of this import.
+        // Find the path string in the source text of this import. The parser
+        // strips whitespace inside a path, so an exact `find(&imp.path)` misses
+        // `import ./ foo`; fall back to the span from the first non-space after
+        // the `import` keyword to the end of the (trimmed) import text.
         let import_text = safe_slice(&doc.source, imp.span);
-        if let Some(path_start) = import_text.find(&imp.path) {
+        let path_span = import_text.find(&imp.path).map(|p| (p, p + imp.path.len()));
+        let path_span = path_span.or_else(|| {
+            let kw = import_text.find("import")?;
+            let after = kw + "import".len();
+            let lead_ws = import_text[after..].len() - import_text[after..].trim_start().len();
+            let rel_start = after + lead_ws;
+            let rel_end = import_text.trim_end().len();
+            (rel_end > rel_start).then_some((rel_start, rel_end))
+        });
+        if let Some((path_start, path_end)) = path_span {
             let abs_start = imp.span.start + path_start;
-            let abs_end = abs_start + imp.path.len();
+            let abs_end = imp.span.start + path_end;
             let tooltip = if exists {
                 format!("{}", resolved.display())
             } else {

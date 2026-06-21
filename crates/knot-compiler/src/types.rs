@@ -832,24 +832,39 @@ fn resolve_type(
         ),
         TypeKind::Var(_) => ResolvedType::Named("unknown".into()),
         TypeKind::App { func, arg } => {
-            // Check if the function is a known associated type name
-            if let TypeKind::Named(name) = &func.node {
+            // Collect the full application spine. A multi-argument application
+            // `Convert X Y` parses as `App(App(Convert, X), Y)`, so peel the
+            // nested funcs to recover the head constructor and its arguments
+            // left-to-right.
+            let mut spine_head = func.as_ref();
+            let mut spine_args: Vec<&Type> = vec![arg.as_ref()];
+            while let TypeKind::App { func: inner, arg: inner_arg } = &spine_head.node {
+                spine_args.push(inner_arg.as_ref());
+                spine_head = inner;
+            }
+            spine_args.reverse();
+
+            // Associated type application: match the whole spine against a
+            // definition of matching arity, binding ALL argument patterns into
+            // a SINGLE substitution. Matching only the first argument (the old
+            // behaviour) ignored `def.args[1..]`, leaving their pattern vars
+            // unsubstituted in the result and picking the wrong instance for
+            // multi-parameter associated types.
+            if let TypeKind::Named(name) = &spine_head.node {
                 if let Some(defs) = assoc_types.get(name) {
                     for def in defs {
-                        if !def.args.is_empty() {
+                        if !def.args.is_empty() && def.args.len() == spine_args.len() {
                             let mut subst = HashMap::new();
-                            if match_type_pattern(
-                                &def.args[0],
-                                arg,
-                                &mut subst,
-                            ) {
-                                let resolved_ty =
-                                    apply_type_subst(&def.ty, &subst);
-                                return resolve_type(
-                                    &resolved_ty,
-                                    aliases,
-                                    assoc_types,
-                                );
+                            if def
+                                .args
+                                .iter()
+                                .zip(spine_args.iter())
+                                .all(|(pat, concrete)| {
+                                    match_type_pattern(pat, concrete, &mut subst)
+                                })
+                            {
+                                let resolved_ty = apply_type_subst(&def.ty, &subst);
+                                return resolve_type(&resolved_ty, aliases, assoc_types);
                             }
                         }
                     }
@@ -887,11 +902,7 @@ fn resolve_type(
             // User-declared parameterized data types: the head's registered
             // ADT shape is enough to pick the column type (payload-bearing
             // ADTs become "json" columns regardless of the type arguments).
-            let mut head = func.as_ref();
-            while let TypeKind::App { func: inner, .. } = &head.node {
-                head = inner;
-            }
-            if let TypeKind::Named(name) = &head.node {
+            if let TypeKind::Named(name) = &spine_head.node {
                 if let Some(resolved @ ResolvedType::Adt(_)) = aliases.get(name) {
                     return resolved.clone();
                 }
@@ -1135,8 +1146,19 @@ fn match_type_pattern(
     subst: &mut HashMap<String, Type>,
 ) -> bool {
     match (&pattern.node, &concrete.node) {
-        // Type variables match anything
+        // Type variables match anything — but a repeated (non-linear) pattern
+        // variable must bind consistently. `Pair a a` must NOT match
+        // `Pair Int Text`; without this check the second `a` silently
+        // overwrites the first, so `match_type_pattern` would accept the
+        // mismatched type and select the wrong associated-type instance /
+        // schema column type. The prior binding is itself a concrete type (no
+        // pattern vars), so matching it against the new concrete reduces to a
+        // structural-equality check.
         (TypeKind::Var(name), _) => {
+            if let Some(existing) = subst.get(name) {
+                let mut tmp = HashMap::new();
+                return match_type_pattern(&existing.clone(), concrete, &mut tmp);
+            }
             subst.insert(name.clone(), concrete.clone());
             true
         }

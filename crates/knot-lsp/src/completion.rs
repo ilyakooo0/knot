@@ -1329,7 +1329,16 @@ fn receiver_ident_before_dot(source: &str, dot_pos: usize) -> Option<String> {
 /// comments), tracking `\"` escapes. Used by the trigger-character branches
 /// so a `.`/`*`/`&` typed inside a string or comment doesn't pop completion.
 fn inside_string_or_comment(source: &str, offset: usize) -> bool {
-    let offset = offset.min(source.len());
+    // `offset` is usually `cursor.saturating_sub(1)`. When the char ending at
+    // the cursor is multibyte (e.g. `é` in a mid-debounce `pending_sources`
+    // buffer that the client-reported trigger char disagrees with), that `-1`
+    // can land on a UTF-8 continuation byte, so snap down to a char boundary
+    // before slicing — otherwise `source[..offset]` panics and crashes the
+    // completion request.
+    let mut offset = offset.min(source.len());
+    while offset > 0 && !source.is_char_boundary(offset) {
+        offset -= 1;
+    }
     let line_start = source[..offset].rfind('\n').map(|p| p + 1).unwrap_or(0);
     let bytes = source.as_bytes();
     let mut in_str = false;
@@ -1967,6 +1976,19 @@ mod tests {
                 trigger_character: trigger.map(String::from),
             }),
         }
+    }
+
+    #[test]
+    fn inside_string_or_comment_survives_continuation_byte_offset() {
+        // `café` is 5 bytes; `é` occupies bytes 3..5. A client-reported `.`
+        // trigger against a mid-debounce buffer ending in `é` passes
+        // `cursor.saturating_sub(1)` == 4, a UTF-8 continuation byte. The
+        // slice must not panic — regression for the completion-request crash.
+        let src = "café";
+        assert!(!inside_string_or_comment(src, 4));
+        // And a non-boundary offset inside a string literal still reports true.
+        let src2 = "\"café";
+        assert!(inside_string_or_comment(src2, 5));
     }
 
     fn item_labels(resp: CompletionResponse) -> Vec<String> {

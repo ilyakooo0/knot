@@ -344,3 +344,29 @@ main = do
     );
     assert_no_diags(&diags);
 }
+
+#[test]
+fn io_laundered_into_atomic_via_record_field_rejected() {
+    // A lambda doing console IO is stashed in a record field, the record is
+    // passed into a known helper, and the helper invokes the field inside an
+    // `atomic` block. The IO is hidden behind an opaque (field-access) call one
+    // level down the call chain and the lambda is bound in the enclosing
+    // declaration — the atomic gate must still reject it.
+    let diags = effect_diags(
+        r#"*items : [{id: Int}]
+
+makeRec = \cb -> {fn: cb}
+
+useRec = \r -> do
+  xs <- *items
+  (r.fn) {}
+
+doStuff = do
+  let r = makeRec (\u -> println "hidden IO inside atomic")
+  atomic (useRec r)
+
+main = doStuff
+"#,
+    );
+    assert_has_error(&diags, "IO effects are not allowed inside atomic blocks");
+}

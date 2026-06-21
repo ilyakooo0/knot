@@ -778,6 +778,18 @@ impl Infer {
                 }
             }
             solution.normalize();
+            // Occurs check: `va` must not appear in its own solution, or
+            // `apply_unit` would chase a cycle to its iteration cap and panic.
+            // The apply-before-solve discipline already guarantees this (va is
+            // a_only and excluded from the solution), but enforce it explicitly
+            // so a future change can't silently reintroduce the cycle.
+            if solution.vars.contains_key(&va) {
+                self.error(
+                    format!("unit mismatch: {} vs {}", a.display(), b.display()),
+                    span,
+                );
+                return;
+            }
             self.unit_subst.insert(va, solution);
         } else if let Some(&vb) = b_only_vars.first() {
             // Symmetric: solve vb
@@ -805,6 +817,14 @@ impl Infer {
                 }
             }
             solution.normalize();
+            // Occurs check (see the symmetric a_only branch above).
+            if solution.vars.contains_key(&vb) {
+                self.error(
+                    format!("unit mismatch: {} vs {}", a.display(), b.display()),
+                    span,
+                );
+                return;
+            }
             self.unit_subst.insert(vb, solution);
         } else if a.vars.is_empty() && b.vars.is_empty() {
             // No variables — bases must match exactly

@@ -450,24 +450,29 @@ pub(crate) fn handle_code_action(
             let unknown_name = word_at_position(&doc.source, diag.range.start)
                 .unwrap_or("");
             if !unknown_name.is_empty() {
-                // Find similar names using edit distance
+                // Find similar names using edit distance. Dedup across
+                // definitions and builtins (a name can appear in both) so we
+                // don't emit duplicate quick-fixes, and sort by (distance,
+                // name) for a deterministic order — `doc.definitions` iterates
+                // in random hash order, which previously made the suggestion
+                // subset and the `is_preferred` flag nondeterministic.
                 let mut candidates: Vec<(&str, usize)> = Vec::new();
+                let mut seen_names: HashSet<&str> = HashSet::new();
                 for name in doc.definitions.keys() {
                     let dist = edit_distance(unknown_name, name);
-                    if dist <= 2 && dist > 0 {
-                        candidates.push((name, dist));
+                    if dist > 0 && dist <= 2 && seen_names.insert(name.as_str()) {
+                        candidates.push((name.as_str(), dist));
                     }
                 }
-                // Also check builtins
                 for name in state_builtins() {
                     let dist = edit_distance(unknown_name, name);
-                    if dist <= 2 && dist > 0 {
+                    if dist > 0 && dist <= 2 && seen_names.insert(name) {
                         candidates.push((name, dist));
                     }
                 }
-                candidates.sort_by_key(|(_, d)| *d);
+                candidates.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
 
-                for (suggestion, _) in candidates.iter().take(3) {
+                for (idx, (suggestion, _)) in candidates.iter().take(3).enumerate() {
                     let mut changes = HashMap::new();
                     changes.insert(
                         uri.clone(),
@@ -484,7 +489,9 @@ pub(crate) fn handle_code_action(
                             changes: Some(changes),
                             ..Default::default()
                         }),
-                        is_preferred: Some(candidates.first().map_or(false, |(s, _)| *s == *suggestion)),
+                        // The closest match (deterministic first entry) is the
+                        // preferred quick-fix.
+                        is_preferred: Some(idx == 0),
                         ..Default::default()
                     }));
                 }
@@ -591,7 +598,11 @@ pub(crate) fn handle_code_action(
                         new_text: format!("{prefix}let {let_name} = {trimmed}\n"),
                     }
                 } else {
-                    let stmt_col = stmt_start - line_start;
+                    // Indent the pushed-down statement to its original column.
+                    // Count CHARACTERS, not bytes — a byte count over-indents
+                    // (and can corrupt the layout-sensitive parse) when
+                    // multibyte text precedes the statement on its line.
+                    let stmt_col = doc.source[line_start..stmt_start].chars().count();
                     TextEdit {
                         range: Range {
                             start: offset_to_position(&doc.source, stmt_start),
@@ -2524,7 +2535,7 @@ fn find_free_vars_in_selection(
     let mut seen = HashSet::new();
 
     // Check all references that start within the selection range
-    for (usage_span, _def_span) in &doc.references {
+    for (usage_span, def_span) in &doc.references {
         if usage_span.start >= start && usage_span.end <= end {
             let name = safe_slice(&doc.source, *usage_span);
             // Only include if it looks like a lowercase variable (not a constructor/type)
@@ -2532,10 +2543,25 @@ fn find_free_vars_in_selection(
                 && name.chars().next().map_or(false, |c| c.is_lowercase())
                 && !seen.contains(name)
             {
-                // Check it's a local binding, not a top-level definition
-                if doc.local_type_info.keys().any(|span| {
+                // A captured free variable is one bound by a LOCAL binder
+                // sitting BEFORE the selection (not a top-level definition,
+                // and not bound within the selection itself). Detect locals
+                // two ways so a binder missing from `local_type_info` (or whose
+                // binding-span text isn't the bare name) isn't silently
+                // dropped — which would generate a helper missing a parameter
+                // and a call site that omits it, producing uncompilable code:
+                //   (a) an entry in `local_type_info` before the selection, or
+                //   (b) a reference whose definition span sits before the
+                //       selection and is not this name's top-level definition.
+                let local_via_type_info = doc.local_type_info.keys().any(|span| {
                     span.start < start && safe_slice(&doc.source, *span) == name
-                }) {
+                });
+                let resolves_to_top_level = doc
+                    .definitions
+                    .get(name)
+                    .map_or(false, |s| *s == *def_span);
+                let local_via_ref = def_span.end <= start && !resolves_to_top_level;
+                if local_via_type_info || local_via_ref {
                     seen.insert(name.to_string());
                     free_vars.push(name.to_string());
                 }

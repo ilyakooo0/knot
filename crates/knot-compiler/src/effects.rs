@@ -236,6 +236,11 @@ struct EffectChecker {
     /// this, a do-bind named `race` would carry the `uses_race` marker and
     /// be wrongly rejected inside `atomic`.
     shadowed: Vec<String>,
+    /// Name of the top-level declaration currently being checked. The atomic
+    /// gate uses it to also scan the enclosing declaration's body for IO
+    /// lambdas that a value laundered into the atomic block (through a let
+    /// binding or record field) could be carrying.
+    current_decl_name: Option<String>,
     /// Accumulated diagnostics.
     diagnostics: Vec<Diagnostic>,
 }
@@ -300,6 +305,7 @@ impl EffectChecker {
             local_fn_effects: Vec::new(),
             decl_bodies: HashMap::new(),
             shadowed: Vec::new(),
+            current_decl_name: None,
             diagnostics: Vec::new(),
         }
     }
@@ -484,6 +490,12 @@ impl EffectChecker {
     }
 
     fn process_decl(&mut self, decl: &ast::Decl) {
+        self.current_decl_name = match &decl.node {
+            ast::DeclKind::Derived { name, .. }
+            | ast::DeclKind::View { name, .. }
+            | ast::DeclKind::Fun { name, .. } => Some(name.clone()),
+            _ => None,
+        };
         match &decl.node {
             ast::DeclKind::Derived { name, body, ty, .. } => {
                 let effects = self.infer_effects(body);
@@ -721,7 +733,21 @@ impl EffectChecker {
                 // it, or inside any declaration the body references), reject
                 // conservatively: atomic bodies are supposed to be DB-only.
                 if !inner_effects.has_io() && self.body_may_call_opaque(inner) {
-                    if let Some(span) = self.reachable_io_lambda(inner) {
+                    // Search for a reachable IO lambda starting from the atomic
+                    // body AND from the enclosing declaration's body: a lambda
+                    // laundered into the block (bound by a `let`/record field in
+                    // the surrounding decl and passed in as a value) is not
+                    // syntactically inside `inner`, but the opaque call may end
+                    // up invoking it. Rooting at the enclosing decl catches it.
+                    let mut roots: Vec<&ast::Expr> = vec![inner];
+                    let enclosing = self
+                        .current_decl_name
+                        .as_ref()
+                        .and_then(|n| self.decl_bodies.get(n));
+                    if let Some(body) = enclosing {
+                        roots.push(body);
+                    }
+                    if let Some(span) = self.reachable_io_lambda_from(&roots) {
                         self.diagnostics.push(
                             Diagnostic::error(
                                 "IO effects are not allowed inside atomic blocks",
@@ -878,6 +904,19 @@ impl EffectChecker {
     /// inline lambdas are analyzable too (the surrounding walk recurses
     /// into lambda bodies).
     fn body_may_call_opaque(&self, expr: &ast::Expr) -> bool {
+        let mut visited: HashSet<String> = HashSet::new();
+        self.body_may_call_opaque_rec(expr, &mut visited)
+    }
+
+    /// Recursive core of `body_may_call_opaque`. Follows calls into known user
+    /// functions (`decl_bodies`) so an opaque call hidden one level down — a
+    /// helper that invokes a lambda handed to it through a record field — is
+    /// still detected. `visited` guards against cycles in mutual recursion.
+    fn body_may_call_opaque_rec(
+        &self,
+        expr: &ast::Expr,
+        visited: &mut HashSet<String>,
+    ) -> bool {
         // Let-bound lambdas inside the body are analyzable: their bodies
         // are part of the walked tree, so `touches_relations` and effect
         // inference both see through them. (The local_fn_effects scopes
@@ -916,6 +955,9 @@ impl EffectChecker {
             }
         });
         let mut found = false;
+        // Known user functions called from this body, to recurse into after the
+        // walk (a callee's own body may make the opaque call).
+        let mut callees_to_recurse: Vec<String> = Vec::new();
         walk_expr(expr, &mut |e| {
             if found {
                 return;
@@ -963,6 +1005,13 @@ impl EffectChecker {
                             .any(|scope| scope.contains_key(name));
                     if !known {
                         found = true;
+                    } else if self.decl_bodies.contains_key(name)
+                        && !local_lambdas.contains(name)
+                    {
+                        // A known user function — its own body might make the
+                        // opaque call (invoking a lambda it was handed via a
+                        // record field). Queue it for transitive inspection.
+                        callees_to_recurse.push(name.clone());
                     }
                 }
                 // Constructors build data; inline lambdas are walked
@@ -976,7 +1025,21 @@ impl EffectChecker {
                 _ => found = true,
             }
         });
-        found
+        if found {
+            return true;
+        }
+        // Transitively inspect the bodies of called user functions: the opaque
+        // call may live one (or more) levels down the call chain.
+        for name in callees_to_recurse {
+            if visited.insert(name.clone()) {
+                if let Some(body) = self.decl_bodies.get(&name) {
+                    if self.body_may_call_opaque_rec(body, visited) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Span of a lambda whose body references an atomic-disallowed IO
@@ -985,9 +1048,9 @@ impl EffectChecker {
     /// (transitively). Used by the atomic gate when the body calls an opaque
     /// callee whose effects cannot be analyzed — such a lambda may be the
     /// thing the opaque call ends up invoking, so reject conservatively.
-    fn reachable_io_lambda(&self, expr: &ast::Expr) -> Option<Span> {
+    fn reachable_io_lambda_from(&self, roots: &[&ast::Expr]) -> Option<Span> {
         let mut seen: HashSet<String> = HashSet::new();
-        let mut worklist: Vec<&ast::Expr> = vec![expr];
+        let mut worklist: Vec<&ast::Expr> = roots.to_vec();
         let mut found: Option<Span> = None;
         while let Some(e) = worklist.pop() {
             if found.is_some() {

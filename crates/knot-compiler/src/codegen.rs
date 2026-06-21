@@ -15734,6 +15734,16 @@ fn ast_type_to_descriptor_type(
                 {
                     "tag".to_string()
                 }
+                // An alias to a compound shape (record, relation, Maybe, or a
+                // non-nullary ADT) must carry its structural descriptor —
+                // otherwise the request side serializes it as `text` and the
+                // runtime rejects valid JSON-object/array bodies with HTTP 400,
+                // and aliased `Maybe` positions lose their `?` marker (so `null`
+                // fails to decode to `Nothing`). The response side already
+                // resolves these via `resolve_type_for_descriptor`; mirror it.
+                Some(resolved @ (ResolvedType::Record(_)
+                | ResolvedType::Relation(_)
+                | ResolvedType::Adt(_))) => resolved_type_to_descriptor(resolved),
                 _ => "text".to_string(),
             },
         },

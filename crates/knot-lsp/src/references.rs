@@ -56,7 +56,8 @@ pub(crate) fn handle_references(
     let local_def = doc
         .references
         .iter()
-        .find(|(usage, _)| usage.start <= offset && offset < usage.end)
+        .filter(|(usage, _)| usage.start <= offset && offset < usage.end)
+        .min_by_key(|(usage, _)| usage.end - usage.start)
         .map(|(_, def)| *def)
         .or_else(|| {
             doc.definitions.values().find(|span| span.start <= offset && offset < span.end).copied()
@@ -94,10 +95,18 @@ pub(crate) fn handle_references(
                 range: span_to_range(def_span, &doc.source),
             });
         }
-        // All local usages resolving to this definition.
+        // All local usages resolving to this definition. Local binders record a
+        // self-reference (usage == def) so position-based resolution works from
+        // the binder token; skip it here — the declaration is handled above
+        // (and only emitted when `include_declaration` is set), so without this
+        // guard the binder would surface as a usage even for
+        // `include_declaration = false`. Mirrors `document_highlight`.
         for (usage_span, target_span) in &doc.references {
             if locations.len() >= MAX_REFERENCE_LOCATIONS {
                 break;
+            }
+            if *usage_span == def_span {
+                continue;
             }
             if *target_span == def_span {
                 locations.push(Location {

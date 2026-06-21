@@ -400,6 +400,18 @@ fn desugar_decl(decl: &mut DeclKind, io_fns: &IoFns, source_vars: &HashSet<Strin
                 }
             }
         }
+        DeclKind::Route { entries, .. } => {
+            // A route's `rateLimit` expression (e.g. its `key` lambda body) can
+            // contain a `do` block. It is otherwise never visited by
+            // desugaring, so codegen would receive a raw `Do` node and route it
+            // to the relational comprehension path instead of resolving the
+            // intended monad — recurse into it here like any other expression.
+            for entry in entries {
+                if let Some(rate_limit) = &mut entry.rate_limit {
+                    desugar_expr(rate_limit, io_fns, source_vars);
+                }
+            }
+        }
         _ => {}
     }
 }

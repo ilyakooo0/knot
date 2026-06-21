@@ -673,6 +673,13 @@ impl EffectChecker {
                         for src in &view_effects.reads {
                             effects.writes.insert(src.clone());
                         }
+                        // Writing through a view (even via `replace`) reads the
+                        // backing source: the runtime must reconcile against the
+                        // existing backing rows to preserve those outside the
+                        // view and fill constant/auto columns, so the view's
+                        // reads legitimately propagate as reads here. (This is
+                        // why the `!is_replace` read-skip above applies only to
+                        // direct relation writes, not view writes.)
                         effects = effects.union(&view_effects);
                     }
                 }

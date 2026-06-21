@@ -353,6 +353,42 @@ main = println (greet "world")
     }
 
     #[test]
+    fn constructor_definition_span_anchors_on_the_constructor_token() {
+        // A self-named constructor (`data Pair = Pair {...}`) must resolve to
+        // the constructor token after `=`, not the type-name token before it.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "data Pair = Pair {x: Int}\n");
+        let doc = ws.doc(&uri);
+        let span = doc
+            .definitions
+            .get("Pair")
+            .expect("Pair constructor defined");
+        let eq = doc.source.find('=').unwrap();
+        assert!(
+            span.start > eq,
+            "constructor span should be after `=` (got start {}, `=` at {})",
+            span.start,
+            eq
+        );
+    }
+
+    #[test]
+    fn constructor_definition_skips_shadowing_field_type() {
+        // `B` appears first inside `A`'s field type and then as a constructor.
+        // The constructor's definition span must anchor on the constructor
+        // token (the last `B`), not the earlier field-type reference.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "data T = A {x: B} | B {}\n");
+        let doc = ws.doc(&uri);
+        let span = doc.definitions.get("B").expect("B constructor defined");
+        let ctor_b = doc.source.rfind('B').unwrap();
+        assert_eq!(
+            span.start, ctor_b,
+            "B's definition should anchor on the constructor, not the field type"
+        );
+    }
+
+    #[test]
     fn goto_definition_returns_none_for_undefined_word() {
         let mut ws = TestWorkspace::new();
         let uri = ws.open("main", "main = println \"hi\"\n");

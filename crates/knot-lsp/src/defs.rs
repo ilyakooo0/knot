@@ -12,6 +12,46 @@ use knot::ast::{self, DeclKind, Module, Span, Type, TypeKind};
 use crate::type_format::{format_type_kind, format_type_scheme};
 use crate::utils::find_word_in_source;
 
+/// Given a byte offset just after a constructor's name token, return the
+/// offset just past that constructor's brace-balanced `{…}` field block, or
+/// `from` unchanged if no field block precedes `end`. Constructors in Knot
+/// always carry a `{…}` block (even nullary ones are written `C {}`), so this
+/// lets the constructor search advance past field types — keeping a type name
+/// reused in one constructor's fields from being mistaken for a later
+/// constructor's definition token.
+fn advance_past_field_block(source: &str, from: usize, end: usize) -> usize {
+    let bytes = source.as_bytes();
+    let end = end.min(bytes.len());
+    let mut i = from;
+    // Find the opening brace of the field block. Bail if we reach the next
+    // constructor delimiter first (defensive — should not happen given the
+    // grammar always emits `{…}`).
+    while i < end && bytes[i] != b'{' {
+        if bytes[i] == b'|' {
+            return from;
+        }
+        i += 1;
+    }
+    if i >= end {
+        return from;
+    }
+    let mut depth = 0usize;
+    while i < end {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    from
+}
+
 /// Resolve definitions: returns (name_map, span_references, literal_types).
 pub fn resolve_definitions(
     module: &Module,
@@ -35,8 +75,27 @@ pub fn resolve_definitions(
                 name, constructors, ..
             } => {
                 resolver.define(name, name_span(name));
+                // Start the search after the `=` so a self-named constructor
+                // (`data Circle = Circle {…}`) anchors on the constructor
+                // token, not the type name before the `=`. Advance past each
+                // hit so a name reused in an earlier constructor's field types
+                // can't steal a later constructor's span. Mirrors
+                // document_symbol.rs / semantic_tokens.rs.
+                let mut search_from = source
+                    .get(decl.span.start..decl.span.end.min(source.len()))
+                    .and_then(|t| t.find('='))
+                    .map(|p| decl.span.start + p + 1)
+                    .unwrap_or(decl.span.start);
                 for ctor in constructors {
-                    resolver.define(&ctor.name, name_span(&ctor.name));
+                    let ctor_span =
+                        find_word_in_source(source, &ctor.name, search_from, decl.span.end)
+                            .unwrap_or(decl.span);
+                    resolver.define(&ctor.name, ctor_span);
+                    // Skip past this constructor's `{…}` field block so a type
+                    // name reused inside the fields (`data T = A {x: B} | B {}`)
+                    // can't be mistaken for the next constructor's token.
+                    search_from =
+                        advance_past_field_block(source, ctor_span.end, decl.span.end);
                 }
             }
             DeclKind::TypeAlias { name, .. } => {

@@ -3337,9 +3337,15 @@ impl Parser {
             let body = body?;
 
             // If there is a type annotation, wrap the value as `(value : Type)`
-            // so that inference sees the constraint.
+            // so that inference sees the constraint. The span covers the
+            // `: Type` too, matching the other annotation forms. The type
+            // precedes the value here, so take the union of both spans (a
+            // (value.start, ty.end) span would be inverted).
             if let Some(ty) = annot_ty {
-                let sp = value.span;
+                let sp = Span::new(
+                    value.span.start.min(ty.span.start),
+                    value.span.end.max(ty.span.end),
+                );
                 value = Spanned::new(
                     ExprKind::Annot {
                         expr: Box::new(value),
@@ -3441,8 +3447,17 @@ impl Parser {
             let mut expr = self.parse_expr()?;
 
             // Wrap value with annotation so inference sees the constraint.
+            // The `Annot` span must cover the `: Type` too (matching the
+            // parenthesized and postfix forms in `parse_expr`), so diagnostics
+            // and hover underline the whole annotated value, not just the RHS.
+            // In a `let pat : Type = value` the type precedes the value, so use
+            // the union of both spans rather than (value.start, ty.end), which
+            // would be inverted.
             if let Some(ty) = annot_ty {
-                let sp = expr.span;
+                let sp = Span::new(
+                    expr.span.start.min(ty.span.start),
+                    expr.span.end.max(ty.span.end),
+                );
                 expr = Spanned::new(
                     ExprKind::Annot {
                         expr: Box::new(expr),
@@ -4289,28 +4304,47 @@ impl Parser {
         let mut effects = Vec::new();
         loop {
             match self.peek() {
+                // For the `r`/`w`/`rw` forms, once the keyword is consumed we are
+                // committed. If the following `*`/name is malformed, `expect`
+                // already emits a diagnostic — `break` out (keeping any effects
+                // parsed so far) rather than `?`-propagating `None`, which would
+                // discard the partial parse AND leave the caller unable to tell a
+                // parse error from a legitimately empty effect set, desyncing the
+                // surrounding type-row parse.
                 TokenKind::Lower(s) if s == "r" => {
                     self.advance();
-                    self.expect(&TokenKind::Star, "expected '*' after 'r'").ok()?;
-                    let (name, _) = self
-                        .expect_lower("expected relation name after 'r *'")
-                        .ok()?;
+                    if self.expect(&TokenKind::Star, "expected '*' after 'r'").is_err() {
+                        break;
+                    }
+                    let Some((name, _)) =
+                        self.expect_lower("expected relation name after 'r *'").ok()
+                    else {
+                        break;
+                    };
                     effects.push(Effect::Reads(name));
                 }
                 TokenKind::Lower(s) if s == "w" => {
                     self.advance();
-                    self.expect(&TokenKind::Star, "expected '*' after 'w'").ok()?;
-                    let (name, _) = self
-                        .expect_lower("expected relation name after 'w *'")
-                        .ok()?;
+                    if self.expect(&TokenKind::Star, "expected '*' after 'w'").is_err() {
+                        break;
+                    }
+                    let Some((name, _)) =
+                        self.expect_lower("expected relation name after 'w *'").ok()
+                    else {
+                        break;
+                    };
                     effects.push(Effect::Writes(name));
                 }
                 TokenKind::Lower(s) if s == "rw" => {
                     self.advance();
-                    self.expect(&TokenKind::Star, "expected '*' after 'rw'").ok()?;
-                    let (name, _) = self
-                        .expect_lower("expected relation name after 'rw *'")
-                        .ok()?;
+                    if self.expect(&TokenKind::Star, "expected '*' after 'rw'").is_err() {
+                        break;
+                    }
+                    let Some((name, _)) =
+                        self.expect_lower("expected relation name after 'rw *'").ok()
+                    else {
+                        break;
+                    };
                     effects.push(Effect::Reads(name.clone()));
                     effects.push(Effect::Writes(name));
                 }

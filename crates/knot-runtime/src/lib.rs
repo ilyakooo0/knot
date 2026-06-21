@@ -3943,19 +3943,38 @@ fn extract_sql_indexable_columns(sql: &str) -> Vec<(String, String)> {
         // Check for an `<alias>.` qualifier immediately before the opening quote.
         let table = if open > 0 && bytes[open - 1] == b'.' {
             let dot = open - 1;
-            let mut k = dot;
-            while k > 0 {
-                let prev = bytes[k - 1];
-                if prev.is_ascii_alphanumeric() || prev == b'_' {
+            if dot > 0 && bytes[dot - 1] == b'"' {
+                // Quoted qualifier: `"<table>"."col"`. The compiler emits the
+                // backing table name itself as the qualifier (e.g.
+                // `"_knot_emp"."dept"`), which `parse_table_aliases` maps to
+                // itself. Scan back to the qualifier's opening quote (table
+                // identifiers contain no embedded quotes) and look it up.
+                let close_q = dot - 1;
+                let mut k = close_q;
+                while k > 0 && bytes[k - 1] != b'"' {
                     k -= 1;
-                } else {
-                    break;
                 }
-            }
-            if k == dot {
-                None
+                if k == 0 || k > close_q {
+                    None
+                } else {
+                    aliases.get(&region[k..close_q]).cloned()
+                }
             } else {
-                aliases.get(&region[k..dot]).cloned()
+                // Unquoted identifier qualifier: `alias."col"`.
+                let mut k = dot;
+                while k > 0 {
+                    let prev = bytes[k - 1];
+                    if prev.is_ascii_alphanumeric() || prev == b'_' {
+                        k -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                if k == dot {
+                    None
+                } else {
+                    aliases.get(&region[k..dot]).cloned()
+                }
             }
         } else {
             single_table.clone()
@@ -9508,12 +9527,19 @@ fn apply_wire_type_checked(v: *mut Value, desc: &str) -> Option<*mut Value> {
         // Text and tag fields must be genuine Text on the wire. Accepting a
         // forged `Value::Bytes` here would let a peer smuggle bytes into a
         // `Text` field (coerce_json_field never converts Bytes->Text), so the
-        // handler would run string ops on a Bytes value. Bytes/Uuid fields
-        // accept either a hex/base64 Text (decoded later) or a Bytes value.
+        // handler would run string ops on a Bytes value.
         "text" | "tag" => matches!(unsafe { as_ref(v) }, Value::Text(_)),
-        "bytes" | "uuid" => {
-            matches!(unsafe { as_ref(v) }, Value::Text(_) | Value::Bytes(_))
-        }
+        // `Bytes` has exactly one wire form: the `{"__knot_bytes":"<base64>"}`
+        // object that `json_to_value_impl` reconstructs into a real
+        // `Value::Bytes` *before* this check runs. A bare JSON string is NOT a
+        // valid Bytes encoding — there is no decode step downstream
+        // (`coerce_json_field` has no bytes arm), so accepting a `Value::Text`
+        // here would hand the handler a Text where it expects Bytes and crash
+        // the worker on the first bytes op. Reject it as a 400 instead.
+        "bytes" => matches!(unsafe { as_ref(v) }, Value::Bytes(_)),
+        // `Uuid` is represented as `Value::Text` at runtime (stored as TEXT in
+        // SQLite), so a JSON string is its genuine wire form.
+        "uuid" => matches!(unsafe { as_ref(v) }, Value::Text(_) | Value::Bytes(_)),
         "bool" => matches!(unsafe { as_ref(v) }, Value::Bool(_)),
         // Non-primitive descriptors (`*`, records, relations handled above) stay
         // lenient so ADT round-tripping keeps working.
@@ -17257,6 +17283,27 @@ mod _maybe_json_tests {
     }
 
     #[test]
+    fn bytes_field_rejects_bare_json_string() {
+        // A `bytes` field has exactly one wire form: the
+        // `{"__knot_bytes":"<base64>"}` object that `json_to_value` turns into
+        // a real `Value::Bytes` *before* this check. There is no downstream
+        // decode for a plain JSON string (`coerce_json_field` has no bytes
+        // arm), so accepting a `Value::Text` here would hand the handler a Text
+        // where it expects Bytes and panic the worker on the first bytes op.
+        // It must be rejected (→ HTTP 400) instead.
+        let s = alloc(Value::Text(Arc::from("deadbeef")));
+        assert!(apply_wire_type_checked(s, "bytes").is_none());
+        // A genuine Bytes value (already reconstructed from the wire form) is
+        // accepted.
+        let b = alloc(Value::Bytes(Arc::from(&b"\xde\xad\xbe\xef"[..])));
+        assert!(apply_wire_type_checked(b, "bytes").is_some());
+        // `uuid` is `Value::Text` at runtime, so a JSON string is its genuine
+        // wire form and must still be accepted.
+        let u = alloc(Value::Text(Arc::from("018f...")));
+        assert!(apply_wire_type_checked(u, "uuid").is_some());
+    }
+
+    #[test]
     fn coerce_int_field_rejects_out_of_range_integral_float() {
         // `i64::MAX as f64` rounds up to 2^63, so the old `<= i64::MAX as f64`
         // bound accepted values in (i64::MAX, 2^63] and saturated them to
@@ -17794,6 +17841,19 @@ mod _sql_index_tests {
         // `FROM "_knot_t" AS t0` and `FROM "_knot_t" t0` should both work.
         let sql = r#"SELECT t0."col" FROM "_knot_t" t0 WHERE t0."x" = ?1"#;
         assert_eq!(pairs(sql), vec![("_knot_t".into(), "x".into())]);
+    }
+
+    #[test]
+    fn quoted_table_qualified_columns_are_indexed() {
+        // When columns are qualified by the quoted backing table name itself
+        // (`"_knot_a"."x"`) rather than a short alias, the qualifier walk-back
+        // must read past the `"` to recover the table. `parse_table_aliases`
+        // maps `_knot_a` -> `_knot_a`, so both join keys should be indexed.
+        let sql = r#"SELECT "_knot_a"."id" FROM "_knot_a", "_knot_b" WHERE "_knot_a"."x" = "_knot_b"."y""#;
+        assert_eq!(
+            pairs(sql),
+            vec![("_knot_a".into(), "x".into()), ("_knot_b".into(), "y".into())]
+        );
     }
 
     #[test]

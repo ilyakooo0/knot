@@ -445,6 +445,12 @@ struct Infer {
     /// Each entry records (span, monad_tyvar) so we can resolve the
     /// concrete monad after inference completes.
     monad_vars: Vec<(Span, TyVar)>,
+    /// Spans of synthesized `__empty` nodes (from desugaring a `where` guard or
+    /// `Alternative`-using comprehension). After inference resolves the monad,
+    /// we check the resolved type actually has an `Alternative` impl so a
+    /// user-defined monad lacking one gets a clean diagnostic instead of a
+    /// missing-impl panic in codegen.
+    empty_spans: std::collections::HashSet<Span>,
     /// Full `traverse f rel` applications: (call span, result type var,
     /// container type var). Post-inference, relation-container calls get a
     /// `monad_info` entry keyed by the call span so codegen can tell the
@@ -597,6 +603,7 @@ impl Infer {
             annotation_vars: HashMap::new(),
             errors: Vec::new(),
             monad_vars: Vec::new(),
+            empty_spans: std::collections::HashSet::new(),
             traverse_calls: Vec::new(),
             from_json_calls: Vec::new(),
             trait_method_traits: HashMap::new(),
@@ -1484,11 +1491,22 @@ impl Infer {
                 self.unify_dir(f1, f2, span, t1_provided);
                 self.unify_dir(a1, a2, span, t1_provided);
             }
-            // App(f, a) vs Relation(b) → f = [], a = b
-            (Ty::App(f, a), Ty::Relation(b))
-            | (Ty::Relation(b), Ty::App(f, a)) => {
-                self.unify(f, &Ty::TyCon("[]".into()), span);
-                self.unify(a, b, span);
+            // App(f, a) vs Relation(b) → f = [], a = b.
+            // These arms are split by direction (rather than `|`-merged) so the
+            // recursive unifications carry the correct polarity: when the `App`
+            // is on the t1 side its parts inherit `t1_provided`; when it is on
+            // the t2 side they take `!t1_provided`. Polarity is what
+            // distinguishes instantiating vs skolemising a `Forall` reached
+            // through the decomposition, so collapsing both directions (or
+            // hardcoding `t1_provided = true` via bare `unify`) is unsound for
+            // rank-2 types — mirrors the `(App, App)` arm above.
+            (Ty::App(f, a), Ty::Relation(b)) => {
+                self.unify_dir(f, &Ty::TyCon("[]".into()), span, t1_provided);
+                self.unify_dir(a, b, span, t1_provided);
+            }
+            (Ty::Relation(b), Ty::App(f, a)) => {
+                self.unify_dir(f, &Ty::TyCon("[]".into()), span, !t1_provided);
+                self.unify_dir(a, b, span, !t1_provided);
             }
             // App(f, a) vs IO(effects, row, b) → f = App(IO, EffectRow(effects, row)), a = b
             // Binding f to a partially-applied IO (carrying the effect row)
@@ -1496,43 +1514,66 @@ impl Infer {
             // monad-type variables — otherwise `App(m, _)` always normalizes
             // to closed-empty IO, breaking polymorphic-effect code like
             // `forEach : [a] -> (a -> IO {| e} {}) -> IO {| e} {}`.
-            (Ty::App(f, a), Ty::IO(effects, row, b))
-            | (Ty::IO(effects, row, b), Ty::App(f, a)) => {
+            (Ty::App(f, a), Ty::IO(effects, row, b)) => {
                 let io_app = Ty::App(
                     Box::new(Ty::TyCon("IO".into())),
                     Box::new(Ty::EffectRow(effects.clone(), *row)),
                 );
-                self.unify(f, &io_app, span);
-                self.unify(a, b, span);
+                self.unify_dir(f, &io_app, span, t1_provided);
+                self.unify_dir(a, b, span, t1_provided);
             }
-            // App(f, a) vs Con(name, args) — decompose the constructor
-            (Ty::App(f, a), Ty::Con(name, args))
-            | (Ty::Con(name, args), Ty::App(f, a)) => {
+            (Ty::IO(effects, row, b), Ty::App(f, a)) => {
+                let io_app = Ty::App(
+                    Box::new(Ty::TyCon("IO".into())),
+                    Box::new(Ty::EffectRow(effects.clone(), *row)),
+                );
+                self.unify_dir(f, &io_app, span, !t1_provided);
+                self.unify_dir(a, b, span, !t1_provided);
+            }
+            // App(f, a) vs Con(name, args) — decompose the constructor. Split by
+            // direction for correct polarity (see the Relation arms above). The
+            // mismatch diagnostic uses the original `t1`/`t2`/`t1_provided`, so
+            // it is identical in both arms.
+            (Ty::App(f, a), Ty::Con(name, args)) => {
                 if args.is_empty() {
                     let d1 = self.display_ty(&t1);
                     let d2 = self.display_ty(&t2);
-                    // `t1` is the provided/actual side when `t1_provided`
-                    // (see `unify`), so the expected type is `t2` then.
-                    let (exp, fnd) =
-                        if t1_provided { (d2, d1) } else { (d1, d2) };
+                    let (exp, fnd) = if t1_provided { (d2, d1) } else { (d1, d2) };
                     self.error(
-                        format!(
-                            "type mismatch: expected {}, found {}",
-                            exp, fnd
-                        ),
+                        format!("type mismatch: expected {}, found {}", exp, fnd),
                         span,
                     );
                 } else {
                     let last = args.last().unwrap().clone();
-                    let init: Vec<Ty> =
-                        args[..args.len() - 1].to_vec();
+                    let init: Vec<Ty> = args[..args.len() - 1].to_vec();
                     let partial = if init.is_empty() {
                         Ty::TyCon(name.clone())
                     } else {
                         Ty::Con(name.clone(), init)
                     };
-                    self.unify(&f, &partial, span);
-                    self.unify(&a, &last, span);
+                    self.unify_dir(&f, &partial, span, t1_provided);
+                    self.unify_dir(&a, &last, span, t1_provided);
+                }
+            }
+            (Ty::Con(name, args), Ty::App(f, a)) => {
+                if args.is_empty() {
+                    let d1 = self.display_ty(&t1);
+                    let d2 = self.display_ty(&t2);
+                    let (exp, fnd) = if t1_provided { (d2, d1) } else { (d1, d2) };
+                    self.error(
+                        format!("type mismatch: expected {}, found {}", exp, fnd),
+                        span,
+                    );
+                } else {
+                    let last = args.last().unwrap().clone();
+                    let init: Vec<Ty> = args[..args.len() - 1].to_vec();
+                    let partial = if init.is_empty() {
+                        Ty::TyCon(name.clone())
+                    } else {
+                        Ty::Con(name.clone(), init)
+                    };
+                    self.unify_dir(&f, &partial, span, !t1_provided);
+                    self.unify_dir(&a, &last, span, !t1_provided);
                 }
             }
             // ── IO monad with effect-row unification ──────────
@@ -3670,6 +3711,7 @@ impl Infer {
                 let m = self.fresh_var();
                 let a = self.fresh_var();
                 self.monad_vars.push((expr.span, m));
+                self.empty_spans.insert(expr.span);
                 Ty::App(Box::new(Ty::Var(m)), Box::new(Ty::Var(a)))
             }
 
@@ -8998,9 +9040,35 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
 
     // Phase 5: Resolve monad types from desugared do-blocks
     let mut monad_info = MonadInfo::new();
-    for (span, m_var) in &infer.monad_vars {
+    let monad_vars = infer.monad_vars.clone();
+    let empty_spans = infer.empty_spans.clone();
+    for (span, m_var) in &monad_vars {
         let resolved = infer.apply(&Ty::Var(*m_var));
         let kind = monad_kind_of(&resolved);
+        // A `__empty` (from a `where` guard or `empty` in a comprehension)
+        // dispatches through the monad's `Alternative` impl. `[]`, `Maybe`,
+        // and `Result` always have one; a user-defined monad with only
+        // Functor/Applicative/Monad does not, and would otherwise blow up with
+        // a missing-impl panic in codegen. Surface it as a clean diagnostic.
+        if empty_spans.contains(span) {
+            let alt_ty = match &kind {
+                MonadKind::Relation => Some("[]".to_string()),
+                MonadKind::Adt(name) => Some(name.clone()),
+                MonadKind::IO => Some("IO".to_string()),
+            };
+            if let Some(ty_name) = alt_ty {
+                if !infer.known_impls.contains(&("Alternative".to_string(), ty_name.clone())) {
+                    infer.error(
+                        format!(
+                            "do-block uses a 'where' guard (or empty), which requires an \
+                             Alternative impl, but '{}' has no Alternative instance",
+                            ty_name
+                        ),
+                        *span,
+                    );
+                }
+            }
+        }
         // Synthesized helper spans (globally unique, see desugar.rs) also
         // alias their originating do-block's real span — LSP monad inlay
         // hints look up `monad_info[do_span]`.

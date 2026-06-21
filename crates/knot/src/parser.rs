@@ -141,6 +141,7 @@ impl Parser {
             }
             let exported = self.eat(&TokenKind::Export);
             self.skip_newlines();
+            let decl_start = self.pos;
             match self.parse_decl() {
                 Some(mut d) => {
                     d.exported = exported;
@@ -150,9 +151,15 @@ impl Parser {
                     // Error recovery: clear stale parser context entries
                     // left by early returns via `?` in parse functions.
                     self.context.clear();
-                    // Skip to next declaration boundary.
+                    // Skip to next declaration boundary. Only force a one-token
+                    // advance when the failed parse consumed nothing — otherwise
+                    // it may have already parked the cursor exactly on the next
+                    // column-0 declaration (e.g. a lambda missing its `->`),
+                    // and advancing would drop that whole declaration.
                     if !self.at_eof() {
-                        self.advance();
+                        if self.pos == decl_start {
+                            self.advance();
+                        }
                         self.skip_to_decl_boundary();
                     }
                 }
@@ -2252,6 +2259,24 @@ impl Parser {
                 TokenKind::Star => (BinOp::Mul, 15, 16),
                 TokenKind::Slash => (BinOp::Div, 15, 16),
                 TokenKind::Percent => (BinOp::Mod, 15, 16),
+                TokenKind::Caret => {
+                    // `^` is only meaningful as a unit-of-measure exponent
+                    // (e.g. `M^2`), which is parsed in unit context — it has no
+                    // meaning in an ordinary expression. Report it clearly and
+                    // consume the operator + RHS so the stray `^ b` doesn't
+                    // cascade into a misleading "expected declaration" error.
+                    self.error(
+                        "`^` is not an expression operator — it is only valid \
+                         in unit-of-measure exponents like `M^2`",
+                    );
+                    self.advance(); // consume `^`
+                    self.skip_newlines();
+                    if self.enter_recursion() {
+                        let _ = self.parse_expr_bp(0); // parse and discard RHS
+                        self.recursion_depth -= 1;
+                    }
+                    break;
+                }
                 _ => {
                     self.restore(saved_pos);
                     break;

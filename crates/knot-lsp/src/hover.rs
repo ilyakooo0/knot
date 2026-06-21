@@ -278,7 +278,8 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     if let Some((_, target_name)) = doc
         .refine_targets
         .iter()
-        .find(|(span, _)| span.start <= lookup_offset && lookup_offset < span.end)
+        .filter(|(span, _)| span.start <= lookup_offset && lookup_offset < span.end)
+        .min_by_key(|(span, _)| (span.end - span.start, span.start, span.end))
     {
         let detail = if let Some(predicate) = doc.refined_types.get(target_name) {
             let pred_src = predicate_to_source(predicate, &doc.source);

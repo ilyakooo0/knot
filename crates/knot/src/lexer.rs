@@ -464,6 +464,30 @@ impl<'src> Lexer<'src> {
 
     // ── Numbers ─────────────────────────────────────────────────────
 
+    /// Emit a diagnostic if a `_` digit separator is not flanked by digits on
+    /// both sides (leading, trailing, doubled, or `_`-adjacent-to-`.`). The
+    /// caller still strips underscores for the value, so recovery is exact —
+    /// this only surfaces the malformed source. No-op when there are no `_`.
+    fn check_digit_separators(&mut self, slice: &str, start: usize) {
+        let bytes = slice.as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'_' {
+                let prev_ok = i > 0 && bytes[i - 1].is_ascii_digit();
+                let next_ok = i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit();
+                if !prev_ok || !next_ok {
+                    let span = self.span_from(start);
+                    self.diagnostics.push(
+                        Diagnostic::error("misplaced digit separator").label(
+                            span,
+                            "`_` in a numeric literal must appear between two digits",
+                        ),
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
     fn lex_number(&mut self) -> TokenKind {
         let start = self.pos;
 
@@ -487,7 +511,12 @@ impl<'src> Lexer<'src> {
                 }
             }
             let slice = self.slice(start, self.pos);
-            let raw = if slice.contains('_') { slice.replace('_', "") } else { slice.to_string() };
+            let raw = if slice.contains('_') {
+                self.check_digit_separators(slice, start);
+                slice.replace('_', "")
+            } else {
+                slice.to_string()
+            };
             let value = match raw.parse::<f64>() {
                 Ok(v) if !v.is_finite() => {
                     // `parse::<f64>` saturates oversized literals to infinity;
@@ -514,7 +543,12 @@ impl<'src> Lexer<'src> {
             TokenKind::Float(value)
         } else {
             let slice = self.slice(start, self.pos);
-            let raw = if slice.contains('_') { slice.replace('_', "") } else { slice.to_string() };
+            let raw = if slice.contains('_') {
+                self.check_digit_separators(slice, start);
+                slice.replace('_', "")
+            } else {
+                slice.to_string()
+            };
             TokenKind::Int(raw)
         }
     }

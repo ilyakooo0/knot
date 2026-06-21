@@ -9329,9 +9329,17 @@ fn json_to_value_impl(json: &serde_json::Value, wire: bool) -> *mut Value {
             if let Some(i) = n.as_i64() {
                 alloc_int(i)
             } else if let Some(f) = n.as_f64() {
+                // Outside i64 range (e.g. a u64 id above i64::MAX) or
+                // fractional. Knot integers are i64-only by design (no
+                // bignum), so an integer above i64::MAX is kept as the nearest
+                // f64 and will NOT round-trip exactly; all in-range integers
+                // and magnitudes below 2^53 are exact.
                 alloc_float(f)
             } else {
-                alloc_int(0)
+                // Only reachable with serde's `arbitrary_precision` feature
+                // (not enabled here): a number too large even for f64. Surface
+                // it instead of silently collapsing the value to 0.
+                panic!("knot runtime: JSON number {} is not representable as Int or Float", n)
             }
         }
         serde_json::Value::String(s) => alloc(Value::Text(Arc::from(s.as_str()))),
@@ -12155,6 +12163,11 @@ pub extern "C-unwind" fn knot_source_diff_write(
         .execute_batch("SAVEPOINT knot_diff_write;")
         .expect("knot runtime: failed to begin transaction");
 
+    // Run the body under the rollback guard so an interior panic (subset
+    // constraint failure, SQLITE_BUSY) rolls back and releases the savepoint
+    // instead of leaving it dangling on a connection that recoverable contexts
+    // (HTTP workers, `race` losers, `atomic` retry) keep reusing.
+    with_savepoint_rollback(db_ref, "knot_diff_write", || {
     if is_adt_schema(schema) {
         let adt = parse_adt_schema(schema);
         let mut col_names = vec![quote_ident("_tag")];
@@ -12418,6 +12431,8 @@ pub extern "C-unwind" fn knot_source_diff_write(
                 .expect("knot runtime: failed to drop temp table");
         }
     }
+
+    });
 
     db_ref.conn.execute_batch("RELEASE SAVEPOINT knot_diff_write;")
         .expect("knot runtime: failed to commit transaction");

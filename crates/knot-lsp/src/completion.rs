@@ -154,8 +154,10 @@ pub(crate) fn handle_completion(
         {
             return None;
         }
-        // Try to find the expression before the dot and its type
-        let fields = resolve_dot_fields(doc, latest_source, expr_end);
+        // Try to find the expression before the dot and its type. The receiver
+        // name comes from `latest_source` (what the user sees); the type lookup
+        // uses the analyzed-source offset so it matches `doc.source` span space.
+        let fields = resolve_dot_fields(doc, latest_source, expr_end, analyzed_offset);
         if !fields.is_empty() {
             // If the receiver before the dot is a `Var` bound from a `*source`,
             // attach the source's field refinement (when present) as completion
@@ -1384,11 +1386,11 @@ fn dot_receiver_is_numeric(source: &str, dot_pos: usize) -> bool {
 /// Try to resolve field names for dot completion by finding the type of the
 /// expression before the dot. `source` is the freshest text the client has
 /// sent (it may be newer than `doc.source`); `dot_pos` is an offset into it.
-fn resolve_dot_fields(doc: &DocumentState, source: &str, dot_pos: usize) -> Vec<String> {
+/// Scan backwards from `dot_pos` over trailing spaces, then over an
+/// identifier, returning its `[start, end)` byte range in `source`.
+fn ident_range_before_dot(source: &str, dot_pos: usize) -> Option<(usize, usize)> {
     let bytes = source.as_bytes();
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'';
-
-    // Find the identifier immediately before the dot
     let mut end = dot_pos.min(bytes.len());
     while end > 0 && bytes[end - 1] == b' ' {
         end -= 1;
@@ -1398,14 +1400,46 @@ fn resolve_dot_fields(doc: &DocumentState, source: &str, dot_pos: usize) -> Vec<
         end -= 1;
     }
     if end == ident_end {
-        return Vec::new();
+        None
+    } else {
+        Some((end, ident_end))
     }
+}
 
-    let var_name = &source[end..ident_end];
+/// `latest_dot_pos` indexes `latest_source` (the freshest, possibly
+/// not-yet-analyzed buffer) — used to read the receiver name the user sees.
+/// `analyzed_dot_pos` indexes `doc.source` (the last-analyzed text) and is used
+/// for the type lookup, because `find_type_for_name` compares against and
+/// slices `doc.source`-space spans. Feeding it a `latest_source` offset (the
+/// previous bug) made the local-binding lookup miss whenever the two buffers
+/// differed in length before the cursor mid-debounce, yielding no/wrong fields.
+fn resolve_dot_fields(
+    doc: &DocumentState,
+    latest_source: &str,
+    latest_dot_pos: usize,
+    analyzed_dot_pos: usize,
+) -> Vec<String> {
+    let (start, ident_end) = match ident_range_before_dot(latest_source, latest_dot_pos) {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+    let var_name = &latest_source[start..ident_end];
+
+    // Locate the same receiver in `doc.source` so the type lookup offset lives
+    // in the span space `find_type_for_name` expects. `analyzed_dot_pos` is the
+    // cursor mapped into `doc.source`: when the analyzed buffer lacks the dot
+    // (mid-debounce) it clamps to just past the receiver, but when the dot is
+    // already analyzed it sits just past the dot — so try that position and
+    // then one byte earlier. Fall back to the latest-source offset if neither
+    // finds a receiver (the name guard inside the lookup keeps a stale match
+    // safe).
+    let lookup_offset = ident_range_before_dot(&doc.source, analyzed_dot_pos)
+        .or_else(|| ident_range_before_dot(&doc.source, analyzed_dot_pos.saturating_sub(1)))
+        .map(|(s, _)| s)
+        .unwrap_or(start);
 
     // Look up the variable's type
-    let type_str = find_type_for_name(doc, var_name, end);
-    let type_str = match type_str {
+    let type_str = match find_type_for_name(doc, var_name, lookup_offset) {
         Some(t) => t,
         None => return Vec::new(),
     };

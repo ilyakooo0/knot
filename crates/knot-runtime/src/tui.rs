@@ -495,14 +495,17 @@ fn ui(frame: &mut Frame, app: &mut App) {
         let hdrs = column_headers(&schema);
         let w: Vec<Constraint> = hdrs
             .iter()
-            .map(|h| {
+            .enumerate()
+            .map(|(i, h)| {
                 // Calculate width from header + data. Use display width
                 // (terminal columns), not byte length — multi-byte UTF-8 and
                 // wide (CJK/emoji) characters would otherwise mis-size columns.
+                // Index by column position (not by name) so duplicate header
+                // names size from their own column rather than the first match.
                 let max_data = app
                     .data_rows
                     .iter()
-                    .filter_map(|row| row.get(hdrs.iter().position(|x| x == h)?))
+                    .filter_map(|row| row.get(i))
                     .map(|s| s.width())
                     .max()
                     .unwrap_or(0);

@@ -403,8 +403,12 @@ struct Infer {
     /// Scoped variable environment (functions, let-bindings, params).
     scopes: Vec<HashMap<String, Scheme>>,
 
-    /// Constructor metadata: ctor_name → info.
-    constructors: HashMap<String, CtorInfo>,
+    /// Constructor metadata: ctor_name → one entry per ADT that declares it.
+    /// Distinct ADTs may legally share a constructor name; keeping all
+    /// candidates (rather than last-write-wins) lets `instantiate_ctor`
+    /// produce a row-polymorphic open variant for an overloaded name instead
+    /// of arbitrarily committing to whichever ADT was declared last.
+    constructors: HashMap<String, Vec<CtorInfo>>,
 
     /// Data type definitions: type_name → info.
     data_types: HashMap<String, DataInfo>,
@@ -3591,7 +3595,24 @@ impl Infer {
         name: &str,
         _span: Span,
     ) -> Option<(Ty, Ty)> {
-        let info = self.constructors.get(name)?.clone();
+        let infos = self.constructors.get(name)?.clone();
+
+        // A constructor name shared by more than one ADT is genuinely
+        // ambiguous at this site — without a known expected type we can't tell
+        // which ADT (or payload shape) is meant. Resolving it to one nominal
+        // ADT (last-write-wins) makes typing order-dependent and rejects
+        // correct programs. Instead, give it a row-polymorphic open variant
+        // `payload -> <name: payload | r>`: unifying against the expected
+        // type later (a nominal ADT via `con_to_variant`, or another open
+        // variant) pins down both the ADT and the payload.
+        if infos.len() > 1 {
+            let payload = self.fresh();
+            let row = self.fresh_var();
+            let mut ctors = BTreeMap::new();
+            ctors.insert(name.to_string(), payload.clone());
+            return Some((Ty::Variant(ctors, Some(row)), payload));
+        }
+        let info = infos.into_iter().next()?;
 
         // Save and restore annotation_vars so constructor instantiation
         // doesn't corrupt the enclosing declaration's type variable mapping.
@@ -4663,7 +4684,7 @@ impl Infer {
         // restore annotation_vars so fetch inference doesn't corrupt the
         // enclosing declaration's type variable mapping.
         let saved_annotation_vars = self.annotation_vars.clone();
-        if let Some(info) = self.constructors.get(ctor_name).cloned() {
+        if let Some(info) = self.constructors.get(ctor_name).and_then(|v| v.last()).cloned() {
             self.annotation_vars.clear();
             for p in &info.data_params {
                 let v = self.fresh_var();
@@ -5966,19 +5987,19 @@ impl Infer {
                     // `case_pattern_infers_open_variant` /
                     // `open_variant_applied_to_multiple_adts`. Row-polymorphic
                     // variants depend on this; an error here would forbid the
-                    // documented feature. The later registration *replaces* the
-                    // earlier in `self.constructors` so closed-variant lookups
-                    // resolve to the most recent definition; open-variant
-                    // dispatch goes through `knot_constructor_matches` at
-                    // runtime which doesn't depend on this map.
-                    self.constructors.insert(
-                        ctor.name.clone(),
-                        CtorInfo {
+                    // documented feature. We keep *every* declaring ADT so an
+                    // overloaded name instantiates as an open variant rather
+                    // than last-write-wins; open-variant dispatch goes through
+                    // `knot_constructor_matches` at runtime which doesn't
+                    // depend on this map.
+                    self.constructors
+                        .entry(ctor.name.clone())
+                        .or_default()
+                        .push(CtorInfo {
                             data_type: name.clone(),
                             data_params: params.clone(),
                             fields: fields.clone(),
-                        },
-                    );
+                        });
                     ctor_list.push((ctor.name.clone(), fields));
                 }
 
@@ -6411,22 +6432,22 @@ impl Infer {
         let dummy_span = Span::new(0, 0);
         self.constructors.insert(
             "Nothing".into(),
-            CtorInfo {
+            vec![CtorInfo {
                 data_type: "Maybe".into(),
                 data_params: vec!["a".into()],
                 fields: vec![],
-            },
+            }],
         );
         self.constructors.insert(
             "Just".into(),
-            CtorInfo {
+            vec![CtorInfo {
                 data_type: "Maybe".into(),
                 data_params: vec!["a".into()],
                 fields: vec![(
                     "value".into(),
                     ast::Type::new(ast::TypeKind::Var("a".into()), dummy_span),
                 )],
-            },
+            }],
         );
         self.data_types.insert(
             "Maybe".into(),
@@ -6442,19 +6463,19 @@ impl Infer {
         // Built-in ADT: data Bool = True {} | False {}
         self.constructors.insert(
             "True".into(),
-            CtorInfo {
+            vec![CtorInfo {
                 data_type: "Bool".into(),
                 data_params: vec![],
                 fields: vec![],
-            },
+            }],
         );
         self.constructors.insert(
             "False".into(),
-            CtorInfo {
+            vec![CtorInfo {
                 data_type: "Bool".into(),
                 data_params: vec![],
                 fields: vec![],
-            },
+            }],
         );
         self.data_types.insert(
             "Bool".into(),
@@ -6470,25 +6491,25 @@ impl Infer {
         // Built-in ADT: data Result e a = Err {error: e} | Ok {value: a}
         self.constructors.insert(
             "Err".into(),
-            CtorInfo {
+            vec![CtorInfo {
                 data_type: "Result".into(),
                 data_params: vec!["e".into(), "a".into()],
                 fields: vec![(
                     "error".into(),
                     ast::Type::new(ast::TypeKind::Var("e".into()), dummy_span),
                 )],
-            },
+            }],
         );
         self.constructors.insert(
             "Ok".into(),
-            CtorInfo {
+            vec![CtorInfo {
                 data_type: "Result".into(),
                 data_params: vec!["e".into(), "a".into()],
                 fields: vec![(
                     "value".into(),
                     ast::Type::new(ast::TypeKind::Var("a".into()), dummy_span),
                 )],
-            },
+            }],
         );
         self.data_types.insert(
             "Result".into(),
@@ -10071,6 +10092,33 @@ main = applyPred (\\r -> r.x == r.y)\
              main = hasA (A {})",
         );
         assert!(diags.is_empty(), "unexpected errors: {:?}", diags);
+    }
+
+    #[test]
+    fn overloaded_ctor_expr_unifies_with_either_nominal_adt() {
+        // A constructor name shared by two ADTs, used as an expression against
+        // a *nominal* ADT parameter, must type-check regardless of declaration
+        // order (previously last-write-wins picked `Signal` and rejected this).
+        let prog = |first: &str| {
+            format!(
+                "{first}\n\
+                 classify : Color -> Text\n\
+                 classify = \\s -> case s of\n\
+                 \x20 Red {{}} -> \"stop\"\n\
+                 \x20 _ -> \"other\"\n\
+                 main = classify (Red {{}})",
+            )
+        };
+        // Color declared first…
+        let a = check_src(&prog(
+            "data Color = Red {} | Green {} | Blue {}\ndata Signal = Red {} | Green {}",
+        ));
+        assert!(a.is_empty(), "Color-first unexpected errors: {:?}", a);
+        // …and Color declared last — both orders must work.
+        let b = check_src(&prog(
+            "data Signal = Red {} | Green {}\ndata Color = Red {} | Green {} | Blue {}",
+        ));
+        assert!(b.is_empty(), "Color-last unexpected errors: {:?}", b);
     }
 
     // ── Units of measure ─────────────────────────────────────────

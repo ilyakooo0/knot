@@ -350,13 +350,19 @@ pub(crate) fn handle_completion(
     let sigil_edit_range = {
         let bytes = latest_source.as_bytes();
         let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'';
-        let end = offset.min(bytes.len());
-        let mut start = end;
+        let mut start = offset.min(bytes.len());
         while start > 0 && is_ident(bytes[start - 1]) {
             start -= 1;
         }
         if start > 0 && (bytes[start - 1] == b'*' || bytes[start - 1] == b'&') {
             start -= 1;
+        }
+        // Extend the end past the caret over the rest of the identifier, so a
+        // mid-token completion (`*us|ers`) replaces the whole token rather than
+        // appending the suffix and producing `*usersers`.
+        let mut end = offset.min(bytes.len());
+        while end < bytes.len() && is_ident(bytes[end]) {
+            end += 1;
         }
         Range {
             start: offset_to_position(latest_source, start),
@@ -2529,7 +2535,10 @@ mod regress_fixes_tests {
         let mut ws = TestWorkspace::new();
         let uri = ws.open("main", "*todos : [{t: Text}]\nmain = *to\n");
         let doc = ws.doc(&uri);
-        let cursor = doc.source.find("*to").expect("typed prefix") + 3;
+        // Target the `*to` in `main = *to` (end-of-token), not the line-1
+        // `*todos` declaration that `find` would match first.
+        let sigil_off = doc.source.rfind("*to").expect("typed prefix");
+        let cursor = sigil_off + 3;
         let pos = offset_to_position(&doc.source, cursor);
         let resp = handle_completion(&ws.state, &comp_params(&uri, pos, None))
             .expect("completion returns");
@@ -2541,13 +2550,46 @@ mod regress_fixes_tests {
         let Some(CompletionTextEdit::Edit(edit)) = &item.text_edit else {
             panic!("relation item must carry a replacing text_edit: {item:?}");
         };
-        let sigil_off = doc.source.find("*to").unwrap();
         assert_eq!(
             edit.range.start,
             offset_to_position(&doc.source, sigil_off),
             "edit must start AT the sigil so it gets replaced"
         );
         assert_eq!(edit.range.end, pos);
+        assert_eq!(edit.new_text, "*todos");
+    }
+
+    /// Bug 2: completing mid-token must replace the WHOLE token, not just up
+    /// to the caret — otherwise accepting `*todos` at `*to|dos` left the `dos`
+    /// suffix behind, producing `*todosdos`.
+    #[test]
+    fn relation_completion_text_edit_replaces_whole_token_midword() {
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "*todos : [{t: Text}]\nmain = *todos\n");
+        let doc = ws.doc(&uri);
+        // Caret in the middle of the `*todos` usage on line 2: `*to|dos`.
+        let usage = doc.source.rfind("*todos").expect("usage");
+        let caret = usage + 3;
+        let pos = offset_to_position(&doc.source, caret);
+        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, None))
+            .expect("completion returns");
+        let item = resp_items(resp)
+            .into_iter()
+            .find(|i| i.label == "*todos")
+            .expect("relation item offered");
+        let Some(CompletionTextEdit::Edit(edit)) = &item.text_edit else {
+            panic!("relation item must carry a replacing text_edit: {item:?}");
+        };
+        assert_eq!(
+            edit.range.start,
+            offset_to_position(&doc.source, usage),
+            "edit starts at the sigil"
+        );
+        assert_eq!(
+            edit.range.end,
+            offset_to_position(&doc.source, usage + "*todos".len()),
+            "edit must extend past the caret to the end of the token"
+        );
         assert_eq!(edit.new_text, "*todos");
     }
 

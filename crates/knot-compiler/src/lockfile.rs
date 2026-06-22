@@ -88,15 +88,33 @@ fn parse_adt_constructors(spec: &str) -> Vec<(String, Vec<(String, String)>)> {
     ctors
 }
 
+/// Compare two field lists by name, ignoring declaration order: same set of
+/// names, each with the same type. Adding or removing a field counts as a
+/// mismatch.
+fn fields_match(old: &[(String, String)], new: &[(String, String)]) -> bool {
+    if old.len() != new.len() {
+        return false;
+    }
+    old.iter().all(|(name, ty)| {
+        new.iter()
+            .find(|(n, _)| n == name)
+            .map_or(false, |(_, new_ty)| new_ty == ty)
+    })
+}
+
 fn classify_adt_change(old: &str, new: &str) -> SchemaChange {
     let old_ctors = parse_adt_constructors(old);
     let new_ctors = parse_adt_constructors(new);
 
-    // Every old constructor must exist in new with identical fields
+    // Every old constructor must exist in new with the same set of fields.
+    // Field *order* is irrelevant: all constructor fields share one wide
+    // nullable-column table, so physical column order carries no meaning —
+    // the same way `classify_record_change` matches record fields by name.
+    // Reordering must not force an unnecessary migrate block.
     for (old_name, old_fields) in &old_ctors {
         match new_ctors.iter().find(|(n, _)| n == old_name) {
             Some((_, new_fields)) => {
-                if old_fields != new_fields {
+                if !fields_match(old_fields, new_fields) {
                     return SchemaChange::Breaking;
                 }
             }
@@ -514,6 +532,30 @@ mod tests {
         assert_eq!(
             classify_schema_change("name:text", "#Circle:radius=float"),
             SchemaChange::Breaking
+        );
+    }
+
+    #[test]
+    fn adt_constructor_field_reorder_is_not_breaking() {
+        // Constructor fields all share one wide nullable-column table, so the
+        // physical declaration order is irrelevant — reordering must not force
+        // a migrate block, matching record-field reorder semantics.
+        assert_eq!(
+            classify_schema_change(
+                "#Rect:width=float;height=float",
+                "#Rect:height=float;width=float"
+            ),
+            SchemaChange::Safe
+        );
+    }
+
+    #[test]
+    fn record_field_reorder_is_identical() {
+        // The record path already treats reorder as a no-op; pin it so the two
+        // paths stay consistent.
+        assert_eq!(
+            classify_schema_change("name:text,age:int", "age:int,name:text"),
+            SchemaChange::Identical
         );
     }
 }

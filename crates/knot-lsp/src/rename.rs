@@ -265,10 +265,17 @@ fn resolve_canonical_owner(
     name: &str,
 ) -> Option<CanonicalOwner> {
     // Case A: the cursor is on a local def or usage that resolves locally.
+    // Pick the *innermost* (smallest) covering usage span, matching
+    // `references::find_local_def`, `goto`, and `document_highlight`. Using
+    // first-in-walk-order here instead would resolve a different (outer)
+    // symbol than `prepare_rename`/find-references advertise when two recorded
+    // references overlap (e.g. a relation sigil span overlapping a nested
+    // binder), renaming the wrong binding.
     let local_def = doc
         .references
         .iter()
-        .find(|(usage, _)| usage.start <= offset && offset < usage.end)
+        .filter(|(usage, _)| usage.start <= offset && offset < usage.end)
+        .min_by_key(|(usage, _)| usage.end - usage.start)
         .map(|(_, def)| *def)
         .or_else(|| {
             doc.definitions

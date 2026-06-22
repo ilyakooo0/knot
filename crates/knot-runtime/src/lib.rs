@@ -9520,10 +9520,26 @@ fn apply_wire_type_checked(v: *mut Value, desc: &str) -> Option<*mut Value> {
     // field swallow a JSON number (`42` -> Value::Int) or a `bool` field swallow
     // `1`, since `coerce_json_field` only rewrites tag/int/float and would pass
     // the mistyped value through to the handler as HTTP 200 instead of 400.
-    // Numbers stay interchangeable (Int<->Float) because `coerce_json_field`
-    // deliberately promotes/demotes between them.
+    // Numbers stay interchangeable (Int<->Float) for a `float` position. For an
+    // `int` position a Float is only accepted when it demotes losslessly to a
+    // representable i64 (integral, finite, in range) — exactly what
+    // `coerce_json_field` can convert. A fractional or out-of-range float for an
+    // int field is a decode error, not a silent passthrough: stored as-is it
+    // would land in the `TEXT COLLATE KNOT_INT` column as a SQLite REAL (see
+    // `value_to_sqlite`), breaking numeric ordering against the int-as-TEXT rows.
     let accepted = match desc {
-        "int" | "float" => matches!(unsafe { as_ref(v) }, Value::Int(_) | Value::Float(_)),
+        "int" => match unsafe { as_ref(v) } {
+            Value::Int(_) => true,
+            Value::Float(f) => {
+                const I64_MAX_PLUS_ONE: f64 = 9_223_372_036_854_775_808.0; // 2^63
+                f.fract() == 0.0
+                    && f.is_finite()
+                    && *f >= i64::MIN as f64
+                    && *f < I64_MAX_PLUS_ONE
+            }
+            _ => false,
+        },
+        "float" => matches!(unsafe { as_ref(v) }, Value::Int(_) | Value::Float(_)),
         // Text and tag fields must be genuine Text on the wire. Accepting a
         // forged `Value::Bytes` here would let a peer smuggle bytes into a
         // `Text` field (coerce_json_field never converts Bytes->Text), so the
@@ -14523,31 +14539,12 @@ fn hex_val(b: u8) -> Option<u8> {
 
 
 
-fn string_to_value(s: &str, ty: &str) -> *mut Value {
-    match ty {
-        "int" => {
-            let n: i64 = s.parse().unwrap_or(0);
-            alloc_int(n)
-        }
-        "float" => {
-            let n: f64 = s.parse().unwrap_or(0.0);
-            alloc_float(n)
-        }
-        "bool" => {
-            let b = s == "true" || s == "True";
-            alloc_bool(b)
-        }
-        "tag" => {
-            alloc(Value::Constructor(intern_str(s), alloc(Value::Unit)))
-        }
-        _ => alloc(Value::Text(Arc::from(s))),
-    }
-}
-
-/// Strict variant of `string_to_value`: returns `None` when `s` does not
-/// parse as `ty`. Used for HTTP path and query parameters so the server can
-/// reply with a 400 instead of silently coercing `"abc"` to `0` (which would
-/// hide caller bugs and let malformed traffic through unannotated).
+/// Parse an HTTP header / path / query string into a typed `Value`, returning
+/// `None` when `s` does not parse as `ty`. Used wherever a typed string input
+/// crosses the wire (path/query params, response headers) so the server can
+/// reply 400 / `fetch` can return `Err`, instead of silently coercing `"abc"`
+/// to `0` (which would hide caller bugs and let malformed traffic through
+/// unannotated).
 fn try_string_to_value(s: &str, ty: &str) -> Option<*mut Value> {
     match ty {
         "int" => s.parse::<i64>().ok().map(alloc_int),
@@ -15972,10 +15969,23 @@ pub extern "C-unwind" fn knot_http_fetch_io(
                         let raw_val = response.headers().get(&http_name)
                             .and_then(|v| v.to_str().ok())
                             .map(|s| s.to_string());
+                        // Decode strictly, mirroring the response-body path
+                        // (and the server-side query/path param paths): a
+                        // typed header that doesn't parse is a response decode
+                        // error surfaced as `Err`, not silently coerced to 0.
                         let value = if is_maybe {
                             match raw_val {
                                 Some(v) => {
-                                    let inner = string_to_value(&v, inner_ty);
+                                    let inner = match try_string_to_value(&v, inner_ty) {
+                                        Some(inner) => inner,
+                                        None => return fetch_build_err(
+                                            status,
+                                            &format!(
+                                                "response header '{}' does not match the declared type",
+                                                http_name
+                                            ),
+                                        ),
+                                    };
                                     alloc(Value::Constructor(
                                         "Just".into(),
                                         alloc(Value::Record(vec![
@@ -15987,7 +15997,16 @@ pub extern "C-unwind" fn knot_http_fetch_io(
                             }
                         } else {
                             let v = raw_val.unwrap_or_default();
-                            string_to_value(&v, inner_ty)
+                            match try_string_to_value(&v, inner_ty) {
+                                Some(val) => val,
+                                None => return fetch_build_err(
+                                    status,
+                                    &format!(
+                                        "response header '{}' does not match the declared type",
+                                        http_name
+                                    ),
+                                ),
+                            }
                         };
                         hdr_fields.push(RecordField {
                             name: intern_str(name),
@@ -17265,7 +17284,14 @@ mod _maybe_json_tests {
         // (Int<->Float coercion is intentional), and matching tags pass.
         assert!(apply_wire_type_checked(alloc_int(7), "int").is_some());
         assert!(apply_wire_type_checked(alloc_int(7), "float").is_some());
-        assert!(apply_wire_type_checked(alloc_float(1.5), "int").is_some());
+        assert!(apply_wire_type_checked(alloc_float(1.5), "float").is_some());
+        // An *integral* float demotes losslessly into an int position, so the
+        // common peer case of `30.0` for an `Int` field is accepted...
+        assert!(apply_wire_type_checked(alloc_float(30.0), "int").is_some());
+        // ...but a *fractional* float for an int position is a decode error
+        // (storing it would corrupt the TEXT COLLATE KNOT_INT column with a
+        // REAL storage class), so it is rejected rather than silently coerced.
+        assert!(apply_wire_type_checked(alloc_float(1.5), "int").is_none());
         let hi = alloc(Value::Text(Arc::from("hi")));
         match unsafe { as_ref(apply_wire_type_checked(hi, "text").unwrap()) } {
             Value::Text(s) => assert_eq!(&**s, "hi"),

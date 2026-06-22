@@ -344,6 +344,11 @@ struct DeferredConstraint {
     trait_name: String,
     type_var: TyVar,
     span: Span,
+    /// Monotonically increasing push order. `check_skolem_constraints` uses
+    /// this — not a positional index into `deferred_constraints` — to identify
+    /// "constraints this body added", because `generalize_with_constraints`
+    /// *removes* entries mid-body, which would invalidate any length snapshot.
+    seq: u64,
 }
 
 /// A deferred unit-composition check for `*`/`/`: one operand carried a
@@ -473,6 +478,8 @@ struct Infer {
 
     /// Deferred trait constraint checks, resolved after inference.
     deferred_constraints: Vec<DeferredConstraint>,
+    /// Next sequence number to stamp onto a pushed `DeferredConstraint`.
+    next_constraint_seq: u64,
 
     /// `r3 := r1 \/ r2 \/ ...` row-union constraints produced by `\/`
     /// syntax in IO type annotations. Resolved after each declaration's
@@ -610,6 +617,7 @@ impl Infer {
             trait_method_param_vars: HashMap::new(),
             known_impls: HashSet::new(),
             deferred_constraints: Vec::new(),
+            next_constraint_seq: 0,
             pending_effect_unions: Vec::new(),
             effect_union_upper_bounds: HashMap::new(),
             declared_skolem_constraints: HashMap::new(),
@@ -2321,10 +2329,12 @@ impl Infer {
                 }
                 None => c.type_var,
             };
+            let seq = self.next_constraint_seq();
             self.deferred_constraints.push(DeferredConstraint {
                 trait_name: c.trait_name.clone(),
                 type_var: target_var,
                 span,
+                seq,
             });
         }
         // Freshen effect-union constraints alongside the type — each
@@ -2407,10 +2417,12 @@ impl Infer {
                 Some(Ty::Var(new_var)) => *new_var,
                 _ => c.type_var,
             };
+            let seq = self.next_constraint_seq();
             self.deferred_constraints.push(DeferredConstraint {
                 trait_name: c.trait_name.clone(),
                 type_var: target_var,
                 span,
+                seq,
             });
             self.declared_skolem_constraints
                 .entry(target_var)
@@ -2764,8 +2776,10 @@ impl Infer {
         // scheme — `check_constraints` skips unresolved vars on the
         // assumption that the obligation is checked at the use site, which
         // only happens if instantiation re-registers it. Constraints on
-        // vars NOT quantified here stay in the deferred list (their order
-        // is preserved so `check_skolem_constraints` indices stay valid).
+        // vars NOT quantified here stay in the deferred list. Removing the
+        // generalized entries reorders/shrinks the list, but
+        // `check_skolem_constraints` keys off each constraint's stable `seq`
+        // (not a positional index), so its bookkeeping survives this take.
         let mut all_constraints = all_constraints;
         let mut captured: HashSet<(String, TyVar)> = all_constraints
             .iter()
@@ -7739,8 +7753,7 @@ impl Infer {
                             }
                             None => (self.fresh(), Vec::new()),
                         };
-                        let pre_body_constraints =
-                            self.deferred_constraints.len();
+                        let pre_body_constraints = self.next_constraint_seq;
                         self.check_expr(body, &expected);
                         self.check_skolem_constraints(
                             &fresh_skolems,
@@ -7966,10 +7979,12 @@ impl Infer {
         self.check_expr(expr, &expected);
         // Require Ord on the key value type so the runtime has a stable
         // notion of equality / serialization for clients.
+        let seq = self.next_constraint_seq();
         self.deferred_constraints.push(DeferredConstraint {
             trait_name: "Ord".into(),
             type_var: alpha,
             span: expr.span,
+            seq,
         });
     }
 
@@ -7991,7 +8006,7 @@ impl Infer {
             {
                 // Constraints deferred while checking this body may land on
                 // the method-local skolems below; remember where they start.
-                let pre_body_constraints = self.deferred_constraints.len();
+                let pre_body_constraints = self.next_constraint_seq;
                 // Type-check each impl method body
                 self.push_scope();
                 let mut param_types = Vec::new();
@@ -8114,10 +8129,12 @@ impl Infer {
             Ty::Error => return,
             Ty::Var(v) => {
                 let v = *v;
+                let seq = self.next_constraint_seq();
                 self.deferred_constraints.push(DeferredConstraint {
                     trait_name: trait_name.to_string(),
                     type_var: v,
                     span,
+                    seq,
                 });
                 return;
             }
@@ -8142,10 +8159,17 @@ impl Infer {
     /// to a constraint declared in the signature. Otherwise the body needs
     /// a polymorphism the signature didn't promise — e.g. using `<` on
     /// `a -> a -> a` without `Ord a =>`.
+    /// Allocate the next push-order sequence number for a deferred constraint.
+    fn next_constraint_seq(&mut self) -> u64 {
+        let s = self.next_constraint_seq;
+        self.next_constraint_seq += 1;
+        s
+    }
+
     fn check_skolem_constraints(
         &mut self,
         fresh_skolems: &[TyVar],
-        start: usize,
+        start: u64,
     ) {
         if fresh_skolems.is_empty() {
             return;
@@ -8154,7 +8178,7 @@ impl Infer {
         let new_constraints: Vec<DeferredConstraint> = self
             .deferred_constraints
             .iter()
-            .skip(start)
+            .filter(|dc| dc.seq >= start)
             .cloned()
             .collect();
         let mut reported: HashSet<(TyVar, String)> = HashSet::new();

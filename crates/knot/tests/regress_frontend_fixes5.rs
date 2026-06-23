@@ -65,6 +65,20 @@ fn long_field_access_chain_diagnoses_instead_of_crashing() {
 }
 
 #[test]
+fn long_type_application_chain_diagnoses_instead_of_crashing() {
+    // The type-side application loop (`T a a a …`) builds a left-spine the same
+    // way `parse_application` does. It was the one such loop that omitted the
+    // depth charge, so a pathological type-app chain parsed "successfully" into
+    // an unbounded-depth AST that overflowed the stack on first traversal.
+    let mut src = String::from("f : T");
+    for _ in 0..50_000 {
+        src.push_str(" a");
+    }
+    src.push_str("\nf = x\n");
+    assert_depth_diag(&src, "type application chain");
+}
+
+#[test]
 fn modest_chains_still_parse() {
     // Realistic expressions well under the depth budget must not trip the guard.
     let cases = [
@@ -72,6 +86,7 @@ fn modest_chains_still_parse() {
         "x = f a b c d e\n",
         "x = r.a.b.c.d\n",
         "x = f a.b (g c) + h d e\n",
+        "f : Maybe (Result Text Int) -> List a -> Map k v\nf = x\n",
     ];
     for src in cases {
         let errs = parse_errors(src);

@@ -16276,10 +16276,27 @@ fn fetch_build_body(body_desc: &str, payload: *mut Value) -> String {
     // Bracket-aware split: field types can be structural (`addr:{city:text}`).
     for (name, ty) in parse_descriptor(body_desc) {
         let is_maybe = ty.starts_with('?');
+        // An enum-like (all-nullary ADT) field carries the `tag` descriptor.
+        // It must serialize as a bare JSON string (e.g. `"Active"`) — the
+        // server's `tag` decode arm only accepts a string. Using the generic
+        // `value_to_serde_json` here would emit the `{"__knot_ctor":...}`
+        // storage marker, which the server rejects with HTTP 400.
+        let bare_ty = ty.strip_prefix('?').unwrap_or(&ty);
+        let is_tag = bare_ty == "tag";
+        let encode = |v: *mut Value| -> serde_json::Value {
+            if is_tag {
+                match fetch_value_to_text_opt(v) {
+                    Some(s) => serde_json::Value::String(s),
+                    None => serde_json::Value::Null,
+                }
+            } else {
+                value_to_serde_json(v)
+            }
+        };
         let field_val = knot_record_field(payload, name.as_ptr(), name.len());
         if is_maybe {
             match unwrap_maybe(field_val) {
-                Some(inner) => { map.insert(name.to_string(), value_to_serde_json(inner)); }
+                Some(inner) => { map.insert(name.to_string(), encode(inner)); }
                 // Omit Nothing fields entirely (consistent with how fetch
                 // skips Nothing headers and query params). Servers decode
                 // both an absent Maybe field and an explicit `null` as
@@ -16287,7 +16304,7 @@ fn fetch_build_body(body_desc: &str, payload: *mut Value) -> String {
                 None => {}
             }
         } else {
-            map.insert(name.to_string(), value_to_serde_json(field_val));
+            map.insert(name.to_string(), encode(field_val));
         }
     }
     serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
@@ -17473,6 +17490,34 @@ mod _maybe_json_tests {
                 ("n".to_string(), "?int".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn fetch_body_encodes_tag_field_as_bare_string() {
+        // Regression: a body field of an all-nullary ADT (descriptor `tag`) was
+        // serialized via the generic encoder, emitting the `__knot_ctor`
+        // storage marker — which a Knot `listen` server rejects with HTTP 400.
+        // It must encode as a bare JSON string, matching the query/header path
+        // and the server's `tag` decoder.
+        let active = alloc(Value::Constructor(intern_str("Active"), alloc(Value::Unit)));
+        let payload = record(vec![("status", active)]);
+        assert_eq!(
+            fetch_build_body("status:tag", payload),
+            r#"{"status":"Active"}"#
+        );
+    }
+
+    #[test]
+    fn fetch_body_encodes_optional_tag_field() {
+        // `?tag`: a present Just unwraps to the bare tag; Nothing is omitted.
+        let active = alloc(Value::Constructor(intern_str("Active"), alloc(Value::Unit)));
+        let present = record(vec![("status", make_just(active))]);
+        assert_eq!(
+            fetch_build_body("status:?tag", present),
+            r#"{"status":"Active"}"#
+        );
+        let absent = record(vec![("status", make_nothing())]);
+        assert_eq!(fetch_build_body("status:?tag", absent), "{}");
     }
 }
 

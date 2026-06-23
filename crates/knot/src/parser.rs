@@ -3987,9 +3987,29 @@ impl Parser {
 
     fn parse_type_app(&mut self) -> Option<Type> {
         let mut func = self.parse_type_atom()?;
+
+        // The type-application chain (`T a b c …`) is built iteratively into a
+        // left-spine, so — like the expression application loop — it must charge
+        // the depth budget per node and hold it until return, otherwise a
+        // pathological chain produces an AST whose first recursive traversal
+        // overflows the stack. See `parse_application` for the full rationale.
+        let mut spine_charged = 0usize;
+
+        macro_rules! fail {
+            () => {{
+                self.recursion_depth -= spine_charged;
+                return None;
+            }};
+        }
+
         loop {
             if self.can_start_type_atom() {
-                let arg = self.parse_type_atom()?;
+                let arg = match self.parse_type_atom() {
+                    Some(arg) => arg,
+                    None => fail!(),
+                };
+                if !self.enter_recursion() { fail!() }
+                spine_charged += 1;
                 let span = Span::new(func.span.start, arg.span.end);
                 func = Spanned::new(
                     TypeKind::App {
@@ -4009,7 +4029,12 @@ impl Parser {
                 && self.cur_column() > self.block_indent
                 && self.can_start_type_atom()
             {
-                let arg = self.parse_type_atom()?;
+                let arg = match self.parse_type_atom() {
+                    Some(arg) => arg,
+                    None => fail!(),
+                };
+                if !self.enter_recursion() { fail!() }
+                spine_charged += 1;
                 let span = Span::new(func.span.start, arg.span.end);
                 func = Spanned::new(
                     TypeKind::App {
@@ -4023,6 +4048,7 @@ impl Parser {
                 break;
             }
         }
+        self.recursion_depth -= spine_charged;
         Some(func)
     }
 

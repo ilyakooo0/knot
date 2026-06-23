@@ -273,6 +273,26 @@ pub fn resolve_definitions(
                     }
                 }
             }
+            DeclKind::RouteComposite { components, .. } => {
+                // `route Api = A | B` — each component names another route.
+                // Register each as a reference so goto/rename/highlight reach
+                // the composed routes. Start after `=` so the composite's own
+                // name token isn't mistaken for a component, and advance the
+                // cursor so repeated names each resolve to their own span.
+                let mut search_from = source
+                    .get(decl.span.start..decl.span.end.min(source.len()))
+                    .and_then(|t| t.find('='))
+                    .map(|p| decl.span.start + p + 1)
+                    .unwrap_or(decl.span.start);
+                for comp in components {
+                    if let Some(span) =
+                        find_word_in_source(source, comp, search_from, decl.span.end)
+                    {
+                        search_from = span.end;
+                        resolver.add_ref(span, comp);
+                    }
+                }
+            }
             _ => {}
         }
     }

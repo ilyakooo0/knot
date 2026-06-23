@@ -245,13 +245,14 @@ pub(crate) fn handle_goto_implementation(
                         });
                     } else if is_method_name {
                         for item in items {
-                            if let ast::ImplItem::Method { name, body, .. } = item {
+                            if let ast::ImplItem::Method { name, name_span, .. } = item {
                                 if name == word {
-                                    // Use the body span as the navigation target
-                                    // (keeps the method declaration in view).
+                                    // Anchor on the method-name token (not the
+                                    // body lambda) so the cursor lands on the
+                                    // declaration, matching `analysis.rs`.
                                     locs.push(Location {
                                         uri: module_uri.clone(),
-                                        range: span_to_range(body.span, module_source),
+                                        range: span_to_range(*name_span, module_source),
                                     });
                                 }
                             }
@@ -546,6 +547,40 @@ greet = \x -> display x
             loc2.uri.as_str().ends_with("impls.knot"),
             "method impl lives in impls.knot, got {}",
             loc2.uri.as_str()
+        );
+    }
+
+    #[test]
+    fn goto_implementation_anchors_on_method_name_not_body() {
+        // Regression: `goto_implementation` used the method *body* span (`\c ->
+        // …`) as the navigation target, so the cursor landed inside the lambda
+        // instead of on the `display` declaration token. It must anchor on the
+        // method-name token.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            "trait Display a where\n  display : a -> Text\ndata Circle = Circle {}\nimpl Display Circle where\n  display = \\c -> \"circle\"\n",
+        );
+        let doc = ws.doc(&uri);
+        // Cursor on the `display` method name inside the impl block.
+        let impl_off = doc.source.find("impl Display").expect("impl block");
+        let method_off = doc.source[impl_off..].find("display").expect("method name") + impl_off;
+        let pos = offset_to_position(&doc.source, method_off + 1);
+        let resp = handle_goto_implementation(&ws.state, &goto_params(&uri, pos))
+            .expect("method resolves to its impl");
+        let loc = match resp {
+            GotoDefinitionResponse::Scalar(l) => l,
+            GotoDefinitionResponse::Array(v) => v.into_iter().next().expect("one impl"),
+            other => panic!("unexpected response: {other:?}"),
+        };
+        // The target must be the method-name token, not the `\c -> …` body.
+        let target_off = crate::utils::position_to_offset(&doc.source, loc.range.start);
+        assert_eq!(
+            &doc.source[target_off..target_off + "display".len()],
+            "display",
+            "implementation target should land on the `display` name token, \
+             got {:?}",
+            &doc.source[target_off..(target_off + 8).min(doc.source.len())]
         );
     }
 

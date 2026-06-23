@@ -222,7 +222,10 @@ pub(crate) fn handle_rename(
     // Defensive de-duplication: the owner-file path can discover the same
     // name-token span through both the declaration edit and a reference
     // whose target equals it. Clients reject workspace edits with
-    // overlapping ranges, so collapse exact duplicates here.
+    // overlapping ranges, so collapse not just exact duplicates but any
+    // edit that overlaps an already-kept one — pun expansion (`name: newName`
+    // over the bare token span) and the decl-edit-vs-reference paths can
+    // produce nested/overlapping ranges that exact-equality dedup misses.
     for edits in changes.values_mut() {
         edits.sort_by(|a, b| {
             let ka = (
@@ -239,14 +242,33 @@ pub(crate) fn handle_rename(
             );
             ka.cmp(&kb)
                 // Tie-break so the dedup below is deterministic AND keeps the
-                // most complete replacement at a shared span: a punned field
+                // most complete replacement at a shared start: a punned field
                 // rewrite (`name: newName`) must win over a bare `newName`,
-                // else the pun expansion is silently dropped. Longest-first,
-                // then lexicographic for a total order.
+                // else the pun expansion is silently dropped. Longest range
+                // first (so it's the one kept), then lexicographic for a total
+                // order.
+                .then_with(|| {
+                    let ea = (a.range.end.line, a.range.end.character);
+                    let eb = (b.range.end.line, b.range.end.character);
+                    eb.cmp(&ea)
+                })
                 .then_with(|| b.new_text.len().cmp(&a.new_text.len()))
                 .then_with(|| a.new_text.cmp(&b.new_text))
         });
-        edits.dedup_by(|a, b| a.range == b.range);
+        // Keep an edit only if it starts at or after the end of the last edit
+        // we kept; otherwise it overlaps and would be rejected by the client.
+        let mut kept: Vec<TextEdit> = Vec::with_capacity(edits.len());
+        for e in edits.drain(..) {
+            if let Some(last) = kept.last() {
+                let last_end = (last.range.end.line, last.range.end.character);
+                let e_start = (e.range.start.line, e.range.start.character);
+                if e_start < last_end {
+                    continue;
+                }
+            }
+            kept.push(e);
+        }
+        *edits = kept;
     }
 
     Some(WorkspaceEdit {
@@ -586,7 +608,7 @@ fn scan_workspace_files(
         // push them onto the disk-scan path, which computes edits against
         // the on-disk bytes instead of their (possibly unsaved) buffers.
         let imports_owner = owner.is_top_level
-            && other_doc
+            && (other_doc
                 .import_defs
                 .get(old_name)
                 .map(|(p, span)| {
@@ -597,11 +619,30 @@ fn scan_workspace_files(
                             || (owner.decl_span.start <= span.start
                                 && span.end <= owner.decl_span.end))
                 })
-                .unwrap_or(false);
-        if !is_owner && !imports_owner {
-            continue;
+                .unwrap_or(false)
+                // Lenient fallback mirroring the disk-scan import check
+                // (`file_imports_owner`). When `import_defs` span-containment
+                // misses an open importer, it must still be handled here —
+                // against its live (possibly unsaved) buffer — rather than
+                // falling through to the disk scan, which computes edits from
+                // on-disk bytes and corrupts the unsaved buffer's ranges.
+                || other_path.as_ref().map_or(false, |p| {
+                    file_imports_owner(
+                        &other_doc.module,
+                        p,
+                        &owner.canonical_path,
+                        old_name,
+                    )
+                }));
+        if is_owner || imports_owner {
+            emit_edits_for_open_doc(
+                other_uri, other_doc, owner, old_name, new_name, is_owner, changes,
+            );
         }
-        emit_edits_for_open_doc(other_uri, other_doc, owner, old_name, new_name, is_owner, changes);
+        // Always mark open documents as scanned, even when they neither own
+        // nor import the symbol. The disk phase must never recompute an open
+        // document's edits from on-disk bytes — those can differ from the
+        // editor's unsaved buffer, producing edits at the wrong offsets.
         if let Some(p) = other_path {
             scanned.insert(p);
         }
@@ -1045,6 +1086,23 @@ pub(crate) fn collect_name_uses_in_decl(
                 for seg in &entry.path {
                     if let ast::PathSegment::Param { ty, .. } = seg {
                         walk_type(ty, name, source, out);
+                    }
+                }
+            }
+        }
+        DeclKind::RouteComposite { components, .. } => {
+            // `route Api = A | B` — each component references another route by
+            // name. Components are spanless in the AST, so recover each token
+            // span by scanning the decl source. A moving cursor lets repeated
+            // component names each get their own span.
+            let mut cursor = decl.span.start;
+            for comp in components {
+                if comp == name {
+                    if let Some(span) =
+                        find_word_in_source(source, name, cursor, decl.span.end)
+                    {
+                        cursor = span.end;
+                        out.push(span);
                     }
                 }
             }
@@ -1702,6 +1760,35 @@ mod tests {
         let pos = offset_to_position(&doc.source, off);
         let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "do"));
         assert!(edit.is_none(), "rename to keyword should be rejected: {edit:?}");
+    }
+
+    #[test]
+    fn rename_route_updates_composite_component() {
+        // Regression: `route Api = AApi | BApi` component references were never
+        // renamed — `collect_name_uses_in_decl` had no `RouteComposite` arm and
+        // `defs.rs` didn't record component references. Renaming `AApi` must
+        // update the composite component token too.
+        let mut ws = TestWorkspace::new();
+        let src = "route AApi where\n  /a\n    GET /one -> Int = GetOne\nroute BApi where\n  /b\n    GET /two -> Int = GetTwo\nroute Api = AApi | BApi\n";
+        let uri = ws.open("main", src);
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("route AApi").expect("route def") + "route ".len();
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "RenamedApi"))
+            .expect("rename produces edits");
+        let mut changes = edit.changes.expect("changes present");
+        let edits = changes.remove(&uri).expect("file has edits");
+
+        // Locate the composite's `AApi` component token (after `=`).
+        let composite_off = doc.source.find("Api = AApi").expect("composite line");
+        let comp_off = doc.source[composite_off..].find("AApi").unwrap() + composite_off;
+        let comp_pos = offset_to_position(&doc.source, comp_off);
+        assert!(
+            edits
+                .iter()
+                .any(|e| e.range.start == comp_pos && e.new_text.contains("RenamedApi")),
+            "composite component `AApi` must be renamed; edits: {edits:?}"
+        );
     }
 
     #[test]

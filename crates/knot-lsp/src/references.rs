@@ -27,6 +27,21 @@ use crate::utils::{
 /// which is far more than anyone scrolls through anyway.
 const MAX_REFERENCE_LOCATIONS: usize = 10_000;
 
+/// True if `usage` is a definition-name token of a top-level declaration —
+/// i.e. it begins at column 0 (after an optional `*`/`&` relation sigil), the
+/// invariant `defs::register_extra_definition_tokens` relies on. Such tokens
+/// (e.g. the `f =` line of a `f : T` ⏎ `f = body` decl) are recorded in
+/// `references` as self-references so position-based goto/highlight work from
+/// the body line, but they are *declarations*, not usages — emitting them in a
+/// Find-References result over-counts. Body-line usages are layout-indented, so
+/// column-0 reliably distinguishes the two.
+fn is_declaration_token(source: &str, usage: knot::ast::Span) -> bool {
+    let start = usage.start.min(source.len());
+    let line_start = source[..start].rfind('\n').map_or(0, |i| i + 1);
+    let prefix = &source[line_start..start];
+    prefix.is_empty() || prefix == "*" || prefix == "&"
+}
+
 // ── Find References ─────────────────────────────────────────────────
 
 pub(crate) fn handle_references(
@@ -115,6 +130,11 @@ pub(crate) fn handle_references(
                 continue;
             }
             if *target_span == def_span {
+                // Skip declaration-name tokens of multi-line decls; they're
+                // recorded as self-references but are not usages.
+                if is_declaration_token(&doc.source, *usage_span) {
+                    continue;
+                }
                 locations.push(Location {
                     uri: uri.clone(),
                     range: span_to_range(*usage_span, &doc.source),
@@ -193,6 +213,9 @@ pub(crate) fn handle_references(
                             break 'open_docs;
                         }
                         if *target_span == other_def {
+                            if is_declaration_token(&other_doc.source, *usage_span) {
+                                continue;
+                            }
                             locations.push(Location {
                                 uri: other_uri.clone(),
                                 range: span_to_range(*usage_span, &other_doc.source),
@@ -308,6 +331,9 @@ pub(crate) fn handle_references(
                             break;
                         }
                         if *target_span == def {
+                            if is_declaration_token(&source, *usage_span) {
+                                continue;
+                            }
                             locations.push(Location {
                                 uri: other_uri.clone(),
                                 range: span_to_range(*usage_span, &source),
@@ -407,6 +433,41 @@ main = println (show (double 3))
             .expect("references found");
         // Three call sites: `double 1`, `double 2`, `double 3`.
         assert_eq!(locs.len(), 3, "got: {locs:?}");
+    }
+
+    #[test]
+    fn references_does_not_count_two_line_decl_body_token_as_usage() {
+        // Regression: a decl written with a separate signature line
+        // (`greet : Text` ⏎ `greet = …`) registers the body-line `greet` token
+        // as a self-reference so position-based goto works from it. Find
+        // References must not report that declaration token as a usage.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            "greet : Text\ngreet = \"hi\"\nmain = println greet\n",
+        );
+        let doc = ws.doc(&uri);
+        let pos = offset_to_position(&doc.source, doc.source.find("greet :").expect("sig"));
+
+        // Without the declaration, the only usage is the call in `main`.
+        let locs = handle_references(&ws.state, &ref_params(&uri, pos, false))
+            .expect("references found");
+        assert_eq!(locs.len(), 1, "exactly one usage expected; got: {locs:?}");
+        let usage_off = crate::utils::position_to_offset(&doc.source, locs[0].range.start);
+        assert!(
+            usage_off > doc.source.find("println").unwrap(),
+            "the single usage must be the call site in `main`, got offset {usage_off}"
+        );
+
+        // With the declaration included, we get the declaration + the one call
+        // — but NOT the `greet =` body-line token (which would make it 3).
+        let with_decl = handle_references(&ws.state, &ref_params(&uri, pos, true))
+            .expect("references found");
+        assert_eq!(
+            with_decl.len(),
+            2,
+            "declaration + one usage expected; got: {with_decl:?}"
+        );
     }
 
     #[test]

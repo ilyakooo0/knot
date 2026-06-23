@@ -555,3 +555,46 @@ main = do
         "the Circle write must survive the later Square mismatch, got:\n{stdout}"
     );
 }
+
+// ── View `where` filters must not be silently dropped ──────────────
+
+#[test]
+fn view_where_filter_restricts_reads_and_fills_writes() {
+    // Regression: `analyze_view` only inspected the bind + yield statements,
+    // discarding `where bindvar.col == const` filters entirely. Reads returned
+    // ALL source rows, and writes left the filter column NULL (a later read
+    // then crashed on the null field). The filter must drive both the read
+    // WHERE and the write auto-fill.
+    let (stdout, stderr, ok) = compile_and_run(
+        "view_where_filter",
+        r#"*accounts : [{owner: Text, balance: Int}]
+
+*aliceAccounts = do
+  a <- *accounts
+  where a.owner == "alice"
+  yield {balance: a.balance}
+
+main = do
+  replace *accounts = [{owner: "alice", balance: 1}, {owner: "bob", balance: 2}]
+  filtered <- *aliceAccounts
+  println ("read: " ++ show (count filtered))
+  *aliceAccounts = [{balance: 7}]
+  all <- *accounts
+  forEach all (\r -> println ("row: " ++ r.owner ++ ":" ++ show r.balance))
+"#,
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("read: 1"),
+        "view read must be filtered to alice's single row, got:\n{stdout}"
+    );
+    // The write through the view must auto-fill owner = "alice".
+    assert!(
+        stdout.contains("row: alice:7"),
+        "view write must auto-fill the filter column (owner=alice), got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("row: :7"),
+        "view write must not leave the filter column empty, got:\n{stdout}"
+    );
+}

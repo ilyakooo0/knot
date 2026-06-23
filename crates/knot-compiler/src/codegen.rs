@@ -12403,6 +12403,58 @@ fn analyze_view(body: &ast::Expr) -> Option<ViewInfo> {
         let mut source_columns = Vec::new();
         let mut constant_columns = Vec::new();
 
+        // Extract `where <bindvar>.<col> == <const>` filter statements. Such a
+        // filter restricts the view (read side) and implies a constant column
+        // to auto-fill on write, exactly like a constant yield field — so we
+        // record it as a constant column keyed by the *source* column name.
+        // Forms we cannot reduce to `col == const` (e.g. inequalities, computed
+        // predicates) make the view unanalyzable for writes; bail out so we
+        // never silently drop a filter.
+        for s in stmts {
+            if let ast::StmtKind::Where { cond } = &s.node {
+                if let ast::ExprKind::BinOp {
+                    op: ast::BinOp::Eq,
+                    lhs,
+                    rhs,
+                } = &cond.node
+                {
+                    // Identify which side is `bindvar.col` and which is the
+                    // constant (must not reference the bind var).
+                    let field_of = |e: &ast::Expr| -> Option<String> {
+                        if let ast::ExprKind::FieldAccess { expr, field } = &e.node {
+                            if let ast::ExprKind::Var(v) = &expr.node {
+                                if v == &bind_var {
+                                    return Some(field.clone());
+                                }
+                            }
+                        }
+                        None
+                    };
+                    let lhs_col = field_of(lhs);
+                    let rhs_col = field_of(rhs);
+                    match (lhs_col, rhs_col) {
+                        (Some(col), None) if !expr_references_var(rhs, &bind_var) => {
+                            constant_columns.push((col, (**rhs).clone()));
+                            continue;
+                        }
+                        (None, Some(col)) if !expr_references_var(lhs, &bind_var) => {
+                            constant_columns.push((col, (**lhs).clone()));
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                // Any other `where` form can't be represented in ViewInfo's
+                // constant-column model. Fail loudly rather than silently
+                // dropping the filter (which would return unfiltered rows on
+                // read and write rows that violate the filter).
+                panic!(
+                    "codegen: unsupported `where` filter in view body — view `where` \
+                     clauses must have the form `<bindvar>.<field> == <constant>`"
+                );
+            }
+        }
+
         for field in &yield_record {
             // Check if it's a field access on the bind var: t.field
             if let ast::ExprKind::FieldAccess {

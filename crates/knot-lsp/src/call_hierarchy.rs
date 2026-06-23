@@ -101,7 +101,13 @@ pub(crate) fn handle_call_hierarchy_incoming(
             DeclKind::Derived { name, .. } => name.clone(),
             _ => continue,
         };
-        // Collect call sites within this declaration that point to target_def
+        // Collect call sites within this declaration that point to target_def.
+        // Skip declaration tokens (the line-start name occurrence of a
+        // multi-line decl, e.g. the `f =` body line of a `f : T` ⏎ `f = …`
+        // function): `defs::register_extra_definition_tokens` records those as
+        // self-references to the canonical definition span, which would
+        // otherwise make every declaration appear to "call" itself. Genuine
+        // recursive calls are indented (never at column 0), so they survive.
         let call_sites: Vec<Span> = doc
             .references
             .iter()
@@ -109,6 +115,7 @@ pub(crate) fn handle_call_hierarchy_incoming(
                 *def == *target_def
                     && usage.start >= decl.span.start
                     && usage.end <= decl.span.end
+                    && !crate::references::is_declaration_token(&doc.source, *usage)
             })
             .map(|(usage, _)| *usage)
             .collect();

@@ -215,6 +215,47 @@ fn call_hierarchy_prepare_works_from_call_site() {
     assert_eq!(items[0].name, "greet");
 }
 
+#[test]
+fn call_hierarchy_incoming_excludes_self_declaration_token() {
+    // A function written with a separate type-signature line parses into a
+    // single `DeclKind::Fun` whose span covers both lines; the body-line name
+    // token (`inc =`) is recorded as a self-reference to the canonical
+    // definition span. Incoming-calls must not treat that declaration token as
+    // a call site, i.e. `inc` must not appear to call itself.
+    let mut ws = TestWorkspace::new();
+    let uri = ws.open(
+        "main",
+        "inc : Int -> Int\ninc = \\x -> x + 1\nmain = println (show (inc 41))\n",
+    );
+    let doc = ws.doc(&uri);
+    let inc_def = *doc.definitions.get("inc").expect("inc defined");
+    let params = CallHierarchyIncomingCallsParams {
+        item: CallHierarchyItem {
+            name: "inc".to_string(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            detail: None,
+            uri: uri.clone(),
+            range: crate::utils::span_to_range(inc_def, &doc.source),
+            selection_range: crate::utils::span_to_range(inc_def, &doc.source),
+            data: None,
+        },
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+    };
+    let incoming = crate::call_hierarchy::handle_call_hierarchy_incoming(&ws.state, &params)
+        .expect("inc has an incoming call from main");
+    let callers: Vec<&str> = incoming.iter().map(|c| c.from.name.as_str()).collect();
+    assert!(
+        !callers.contains(&"inc"),
+        "inc must not appear as its own caller (declaration token leaked as a call site): {callers:?}"
+    );
+    assert!(
+        callers.contains(&"main"),
+        "the genuine caller `main` must be present: {callers:?}"
+    );
+}
+
 // ── Finding 8: type-hierarchy whole-token supertype match ────────────
 
 fn th_supertypes_params(uri: &Uri, kind: &str, name: &str) -> TypeHierarchySupertypesParams {

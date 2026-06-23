@@ -35,7 +35,7 @@ const MAX_REFERENCE_LOCATIONS: usize = 10_000;
 /// the body line, but they are *declarations*, not usages — emitting them in a
 /// Find-References result over-counts. Body-line usages are layout-indented, so
 /// column-0 reliably distinguishes the two.
-fn is_declaration_token(source: &str, usage: knot::ast::Span) -> bool {
+pub(crate) fn is_declaration_token(source: &str, usage: knot::ast::Span) -> bool {
     let start = usage.start.min(source.len());
     let line_start = source[..start].rfind('\n').map_or(0, |i| i + 1);
     let prefix = &source[line_start..start];

@@ -1,0 +1,11 @@
+data A = X {} | Y {}
+data B = X {} | Y {} | Z {}
+
+mkB : B
+mkB = Z {}
+
+f = \b -> case b of
+  X {} -> 1
+  Y {} -> 2
+
+main = print (show (f mkB))

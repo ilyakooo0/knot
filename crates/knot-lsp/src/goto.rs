@@ -45,9 +45,17 @@ pub(crate) fn handle_goto_definition(
         .min_by_key(|(usage, _)| usage.end - usage.start)
         .map(|(_, def)| *def)
         .or_else(|| {
-            // Fallback: name-based lookup
-            let word = word_at_position(&doc.source, pos)?;
-            doc.definitions.get(word).copied()
+            // Fallback: the cursor sitting directly on a definition's own name
+            // token resolves to that definition. Strictly position-based — a
+            // name-keyed fallback (`definitions.get(word)`) misfires on a
+            // record-field token (or any token) that merely *shares its name*
+            // with a top-level symbol, jumping to that unrelated declaration.
+            // `references.rs` removed exactly this fallback for the same reason;
+            // keep the two handlers consistent.
+            doc.definitions
+                .values()
+                .find(|span| span.start <= offset && offset < span.end)
+                .copied()
         });
 
     if let Some(span) = def_span {
@@ -397,6 +405,31 @@ main = println (greet "world")
         let _ = handle_goto_definition(&ws.state, &goto_params(&uri, pos));
         // We don't assert None here strictly because `"hi"` may resolve as
         // word-based fallback; the important thing is no panic.
+    }
+
+    #[test]
+    fn goto_definition_on_field_token_does_not_jump_to_shared_name_symbol() {
+        // A record-field token (`b.size`) that merely shares its name with a
+        // top-level symbol (`size = 100`) must not resolve to that symbol via a
+        // name-keyed fallback. The field is not a recorded reference and the
+        // cursor is not on a definition's own name token, so resolution must
+        // NOT land on the unrelated `size` declaration.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            "data Box = Box {size: Int}\nsize = 100\nget = \\b -> b.size\n",
+        );
+        let doc = ws.doc(&uri);
+        // Cursor on `size` in `b.size` (the last occurrence).
+        let field_off = doc.source.rfind("size").expect("b.size field token");
+        let pos = offset_to_position(&doc.source, field_off + 1);
+        let resp = handle_goto_definition(&ws.state, &goto_params(&uri, pos));
+        if let Some(GotoDefinitionResponse::Scalar(loc)) = resp {
+            assert_ne!(
+                loc.range.start.line, 1,
+                "goto on a field token must not jump to the unrelated top-level `size = 100`"
+            );
+        }
     }
 
     #[test]

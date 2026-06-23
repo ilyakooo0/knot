@@ -1054,6 +1054,14 @@ fn schema_for_source(
 fn relation_inner_schema(inner: &ResolvedType) -> String {
     match inner {
         ResolvedType::Record(_) | ResolvedType::Adt(_) => schema_descriptor(inner),
+        // A relation-of-relations element (`*tags : [[Text]]`, `*grid : [[R]]`)
+        // is itself a relation and can never live in a scalar column. Store it
+        // in a single `_value:json` column, the same round-trip used for
+        // relation-typed *record* fields (`format_schema_field`). Without this,
+        // `col_type_str` falls through to `"text"`, the schema becomes
+        // `_value:text`, the program compiles clean, and every write panics at
+        // runtime ("cannot convert Relation to SQL").
+        ResolvedType::Relation(_) => "_value:json".to_string(),
         _ => format!("_value:{}", col_type_str(inner)),
     }
 }

@@ -2212,9 +2212,12 @@ impl Parser {
                 }
             }
             TokenKind::Atomic => {
+                if !self.enter_recursion() { return None; }
                 let start = self.span();
                 self.advance();
-                let e = self.parse_expr()?;
+                let e = self.parse_expr();
+                self.recursion_depth -= 1;
+                let e = e?;
                 let end_sp = e.span;
                 Some(Spanned::new(
                     ExprKind::Atomic(Box::new(e)),
@@ -2222,9 +2225,12 @@ impl Parser {
                 ))
             }
             TokenKind::Refine => {
+                if !self.enter_recursion() { return None; }
                 let start = self.span();
                 self.advance();
-                let e = self.parse_expr()?;
+                let e = self.parse_expr();
+                self.recursion_depth -= 1;
+                let e = e?;
                 let end_sp = e.span;
                 Some(Spanned::new(
                     ExprKind::Refine(Box::new(e)),

@@ -112,9 +112,12 @@ pub(crate) fn handle_inlay_hint(
                         // out the continuation.
                         let span_end = decl.span.end.min(doc.source.len());
                         let sig_end = scheme.ty.span.end.min(span_end);
-                        let hint_offset = doc.source[sig_end..span_end]
-                            .find('\n')
-                            .map(|p| sig_end + p)
+                        // `sig_end`/`span_end` are clamped to `len` but a stale
+                        // or mid-token span endpoint can land mid-multibyte-char;
+                        // a direct slice would panic, so use `get` and fall back.
+                        let hint_offset = doc.source
+                            .get(sig_end..span_end)
+                            .and_then(|s| s.find('\n').map(|p| sig_end + p))
                             .unwrap_or(span_end);
                         let hint_pos = offset_to_position(&doc.source, hint_offset);
                         hints.push(InlayHint {

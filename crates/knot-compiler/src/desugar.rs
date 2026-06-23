@@ -950,10 +950,15 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
             expr_is_io(scrutinee, io_fns)
                 || arms.iter().any(|arm| expr_is_io(&arm.body, io_fns))
         }
-        // A lambda value is just a function — it doesn't *produce* IO until
-        // applied, even if its body uses IO when called. (Same logic as
-        // records/lists below: containing IO is not the same as being IO.)
-        ExprKind::Lambda { .. } => false,
+        // Recurse into the lambda body to mirror codegen's `expr_is_io`
+        // (codegen.rs: `Lambda { body, .. } => self.expr_is_io(body)`). The
+        // two classifiers MUST agree: if they diverge on a bare IO-bodied
+        // lambda used as a do-statement, desugar rewrites the block to
+        // `__bind`/`__yield` (wrong monad) while codegen routes it to the IO
+        // path. Keeping them identical is what prevents that misclassification
+        // — the App-arm `applied_lambda_body_is_io`/`lambda_chain_body_is_io`
+        // helpers become redundant but stay as a belt-and-braces guard.
+        ExprKind::Lambda { body, .. } => expr_is_io(body, io_fns),
         ExprKind::Do(stmts) => {
             stmts.iter().any(|s| match &s.node {
                 StmtKind::Bind { expr, .. } => expr_is_io(expr, io_fns),

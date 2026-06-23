@@ -224,13 +224,27 @@ pub(crate) fn handle_rename(
     // whose target equals it. Clients reject workspace edits with
     // overlapping ranges, so collapse exact duplicates here.
     for edits in changes.values_mut() {
-        edits.sort_by_key(|e| {
-            (
-                e.range.start.line,
-                e.range.start.character,
-                e.range.end.line,
-                e.range.end.character,
-            )
+        edits.sort_by(|a, b| {
+            let ka = (
+                a.range.start.line,
+                a.range.start.character,
+                a.range.end.line,
+                a.range.end.character,
+            );
+            let kb = (
+                b.range.start.line,
+                b.range.start.character,
+                b.range.end.line,
+                b.range.end.character,
+            );
+            ka.cmp(&kb)
+                // Tie-break so the dedup below is deterministic AND keeps the
+                // most complete replacement at a shared span: a punned field
+                // rewrite (`name: newName`) must win over a bare `newName`,
+                // else the pun expansion is silently dropped. Longest-first,
+                // then lexicographic for a total order.
+                .then_with(|| b.new_text.len().cmp(&a.new_text.len()))
+                .then_with(|| a.new_text.cmp(&b.new_text))
         });
         edits.dedup_by(|a, b| a.range == b.range);
     }

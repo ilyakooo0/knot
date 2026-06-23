@@ -659,11 +659,25 @@ impl EffectChecker {
                             self.row_poly_decls.contains(n) || !self.fixed_row_decls.contains(n)
                         })
                         .unwrap_or(false);
-                    let lhs_effects = if propagate_lambda {
+                    let mut lhs_effects = if propagate_lambda {
                         self.arg_effects(lhs)
                     } else {
                         self.infer_effects(lhs)
                     };
+                    // `lhs |> fork` ≡ `fork lhs`: strip the spawned action's IO
+                    // for the atomic-gate view, exactly as the `App` spine does,
+                    // so `(println "x") |> fork` is not falsely rejected inside
+                    // `atomic`. Reads/writes/`uses_race` still propagate.
+                    let strip_fork_io = self.suppress_fork_io
+                        && head_name(rhs) == Some("fork")
+                        && !self.shadowed.iter().any(|s| s == "fork");
+                    if strip_fork_io {
+                        lhs_effects.console = false;
+                        lhs_effects.network = false;
+                        lhs_effects.fs = false;
+                        lhs_effects.clock = false;
+                        lhs_effects.random = false;
+                    }
                     let rhs_effects = self.callee_effects(rhs);
                     lhs_effects.union(&rhs_effects)
                 } else {

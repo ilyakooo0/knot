@@ -1530,12 +1530,17 @@ fn extract_fields_from_type_str_inner(
     // IO type: `IO {...} [T]` or `IO {...} {fields}` — skip to the value type
     if type_str.starts_with("IO ") {
         let rest = &type_str[3..];
-        // Skip the effect set `{...}`
+        // Skip the effect set `{...}` when present.
         if rest.starts_with('{') {
             if let Some(close) = rest.find('}') {
                 let value_type = rest[close + 1..].trim();
                 return extract_fields_from_type_str_inner(value_type, module, visited);
             }
+        } else {
+            // No effect row rendered (`IO Person`, `IO [Person]`): the value
+            // type is the whole remainder. Without this, field completion on
+            // such receivers offered nothing. Mirrors `shared.rs`.
+            return extract_fields_from_type_str_inner(rest.trim(), module, visited);
         }
     }
 

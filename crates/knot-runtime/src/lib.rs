@@ -12611,14 +12611,54 @@ pub extern "C-unwind" fn knot_source_delete_where(
             .filter(|n| n.starts_with(&prefix))
             .collect()
     };
-    // Sort by depth (number of `__` segments) ascending so direct children are deleted first.
-    // Grandchild+ deletion uses `NOT IN (SELECT _id FROM parent_table)` to find orphans,
-    // which requires the intermediate parent rows to already be gone.
-    descendant_tables.sort_by(|a, b| {
-        let depth_a = a.matches("__").count();
-        let depth_b = b.matches("__").count();
-        depth_a.cmp(&depth_b)
-    });
+    // Determine each descendant's immediate parent table. A nested field name
+    // may itself contain `__`, so the hierarchy CANNOT be inferred by counting
+    // `__` segments — `T__a__b` is a direct child whose field is `a__b` unless
+    // `T__a` is itself a real table (in which case it's a grandchild). Resolve
+    // this by taking the longest prefix (cut at a `__` boundary) that is an
+    // actual table; that prefix is the immediate parent.
+    let known_tables: HashSet<String> = descendant_tables
+        .iter()
+        .cloned()
+        .chain(std::iter::once(table.clone()))
+        .collect();
+    let immediate_parent = |ct: &str| -> String {
+        let bytes = ct.as_bytes();
+        let mut best: Option<&str> = None;
+        let mut i = 0usize;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'_' && bytes[i + 1] == b'_' {
+                let prefix = &ct[..i];
+                if prefix != ct && known_tables.contains(prefix) {
+                    best = Some(prefix); // longest match wins as we scan left→right
+                }
+            }
+            i += 1;
+        }
+        best.unwrap_or(table.as_str()).to_string()
+    };
+    let parent_of: HashMap<String, String> = descendant_tables
+        .iter()
+        .map(|ct| (ct.clone(), immediate_parent(ct)))
+        .collect();
+    // Depth = length of the parent chain to the root `table`. Sort ascending so
+    // a grandchild's orphan check runs only after its intermediate parent rows
+    // are already deleted within this cascade.
+    let depth_of = |ct: &str| -> usize {
+        let mut depth = 0usize;
+        let mut cur = ct.to_string();
+        while cur != table {
+            match parent_of.get(&cur) {
+                Some(p) if *p != cur => {
+                    depth += 1;
+                    cur = p.clone();
+                }
+                _ => break,
+            }
+        }
+        depth
+    };
+    descendant_tables.sort_by_key(|t| depth_of(t));
     if !descendant_tables.is_empty() {
         // Collect _ids of parent rows that will be deleted
         let id_sql = format!(
@@ -12634,37 +12674,29 @@ pub extern "C-unwind" fn knot_source_delete_where(
                 .filter_map(|r| r.ok())
                 .collect();
             if !ids.is_empty() {
-                // For direct children, delete by _parent_id matching the deleted parent rows.
-                // For grandchildren+, we need to find their parent IDs transitively.
-                let direct_prefix = format!("{}__", table);
                 for ct in &descendant_tables {
-                    let suffix = &ct[direct_prefix.len()..];
-                    if !suffix.contains("__") {
-                        // Direct child: delete by parent _id
-                        let del = format!(
+                    let parent_table = &parent_of[ct];
+                    let del = if parent_table == &table {
+                        // Direct child: the root rows aren't deleted yet, so
+                        // delete by the explicit list of doomed parent _ids.
+                        format!(
                             "DELETE FROM {} WHERE _parent_id IN ({})",
                             quote_ident(ct),
                             ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",")
-                        );
-                        debug_sql(&del);
-                        if let Err(e) = db_ref.conn.execute_batch(&del) {
-                            rollback_delete_where(db_ref);
-                            panic!("knot runtime: delete_where cascade error: {}\n  SQL: {}", e, del);
-                        }
+                        )
                     } else {
-                        // Grandchild+: find its immediate parent table and delete rows
-                        // whose _parent_id no longer exists in the parent table.
-                        let parent_table = &ct[..ct.rfind("__").unwrap()];
-                        let del = format!(
+                        // Deeper descendant: its intermediate parent rows are
+                        // already gone, so delete rows orphaned by that.
+                        format!(
                             "DELETE FROM {} WHERE _parent_id NOT IN (SELECT _id FROM {})",
                             quote_ident(ct),
                             quote_ident(parent_table)
-                        );
-                        debug_sql(&del);
-                        if let Err(e) = db_ref.conn.execute_batch(&del) {
-                            rollback_delete_where(db_ref);
-                            panic!("knot runtime: delete_where cascade error: {}\n  SQL: {}", e, del);
-                        }
+                        )
+                    };
+                    debug_sql(&del);
+                    if let Err(e) = db_ref.conn.execute_batch(&del) {
+                        rollback_delete_where(db_ref);
+                        panic!("knot runtime: delete_where cascade error: {}\n  SQL: {}", e, del);
                     }
                 }
             }

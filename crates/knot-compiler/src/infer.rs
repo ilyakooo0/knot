@@ -1766,7 +1766,19 @@ impl Infer {
             // `type T = T where ...` or `type A = B / type B = A` diagnoses
             // instead of overflowing the stack.
             (Ty::Con(name, args), other)
-                if args.is_empty() && self.refined_types.contains_key(name) =>
+                if args.is_empty()
+                    && self.refined_types.contains_key(name)
+                    // …but NOT when `other` is a *different* refined type:
+                    // reducing both to their shared base would let e.g. `Nat`
+                    // and `Pos` (both `Int where …`) interchange with no
+                    // predicate re-check, defeating nominal refinement. Let that
+                    // fall through to the mismatch arm so the user must `refine`.
+                    // (Same-name refined `Con`s are handled by the `Con`/`Con`
+                    // arm above.)
+                    && !matches!(other, Ty::Con(n2, a2)
+                        if a2.is_empty()
+                            && n2 != name
+                            && self.refined_types.contains_key(n2)) =>
             {
                 match self.resolve_refined_base(name, span) {
                     Some(base_ty) => {
@@ -1777,7 +1789,12 @@ impl Infer {
                 }
             }
             (other, Ty::Con(name, args))
-                if args.is_empty() && self.refined_types.contains_key(name) =>
+                if args.is_empty()
+                    && self.refined_types.contains_key(name)
+                    && !matches!(other, Ty::Con(n2, a2)
+                        if a2.is_empty()
+                            && n2 != name
+                            && self.refined_types.contains_key(n2)) =>
             {
                 match self.resolve_refined_base(name, span) {
                     Some(base_ty) => {
@@ -4244,7 +4261,18 @@ impl Infer {
 
             ast::ExprKind::Annot { expr: inner, ty } => {
                 let inner_ty = self.infer_expr(inner);
+                // Treat lowercase unit names in an inline ascription as
+                // polymorphic unit variables (as in a signature), not as
+                // concrete units — otherwise `(x : Float<u>)` would pin `u`
+                // to a unit literally named `u` and reject valid code. Isolate
+                // the unit-var map so these fresh vars don't collide with any
+                // signature's unit vars.
+                let saved_flag = self.in_type_annotation;
+                let saved_unit_vars = std::mem::take(&mut self.annotation_unit_vars);
+                self.in_type_annotation = true;
                 let annot_ty = self.ast_type_to_ty(ty);
+                self.in_type_annotation = saved_flag;
+                self.annotation_unit_vars = saved_unit_vars;
                 self.unify(&inner_ty, &annot_ty, inner.span);
                 annot_ty
             }
@@ -4330,7 +4358,14 @@ impl Infer {
         }
         match &expr.node {
             ast::ExprKind::Annot { expr: inner, ty } => {
+                // See the infer-mode `Annot` arm: lowercase units in an inline
+                // ascription must be polymorphic unit variables, not concrete.
+                let saved_flag = self.in_type_annotation;
+                let saved_unit_vars = std::mem::take(&mut self.annotation_unit_vars);
+                self.in_type_annotation = true;
                 let annot_ty = self.ast_type_to_ty(ty);
+                self.in_type_annotation = saved_flag;
+                self.annotation_unit_vars = saved_unit_vars;
                 self.check_expr(inner, &annot_ty);
                 self.unify(&annot_ty, expected, ty.span);
             }

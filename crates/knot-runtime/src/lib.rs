@@ -2638,6 +2638,14 @@ fn wake_all_indexed_watchers(table: &str) {
 fn eq_cross_key(val: &SqlVal) -> Option<SqlValKey> {
     match val {
         SqlVal::Int(n) => Some(SqlValKey::RealBits((*n as f64).to_bits())),
+        // Integers are stored in SQLite as TEXT, so an integer write row reaches
+        // the wake path as `Text("5")`, not `Int(5)` (mirrors `to_key`'s
+        // numeric-text parse). Probe its float-equivalent EQ key so a Real-keyed
+        // watcher (`r.col == 5.0`) still wakes on an integer write of `5`.
+        SqlVal::Text(s) => s
+            .parse::<i64>()
+            .ok()
+            .map(|n| SqlValKey::RealBits((n as f64).to_bits())),
         SqlVal::Real(f)
             if f.is_finite()
                 && f.fract() == 0.0
@@ -2654,6 +2662,13 @@ fn wake_range_index(idx: &RangeIndex, row_val: &SqlVal) {
     let primary = row_val.to_key();
     let alt = match row_val {
         SqlVal::Int(n) => Some(SqlValKey::RealBits((*n as f64).to_bits())),
+        // Integer rows arrive as TEXT (see `eq_cross_key`); probe the Real
+        // thresholds via the float-equivalent key so Real-keyed range watchers
+        // wake on integer writes.
+        SqlVal::Text(s) => s
+            .parse::<i64>()
+            .ok()
+            .map(|n| SqlValKey::RealBits((n as f64).to_bits())),
         SqlVal::Real(f) if f.is_finite() && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 => {
             // For Real rows probing Int thresholds, exact float-int comparison
             // boundaries depend on op direction. Use `floor` for "less" probes
@@ -2710,7 +2725,10 @@ fn wake_range_keyed_cross(idx: &RangeIndex, row_val: &SqlVal, alt: &SqlValKey) {
     //   - ge (row>=thr): need thr <= f. If f.fract()==0, `range((..,Included(floor)))`
     //     is `..=f` ✓. If f.fract()!=0, want `..=floor` since floor < f. Same bound.
     let exact = matches!(row_val, SqlVal::Int(_))
-        || matches!(row_val, SqlVal::Real(f) if f.fract() == 0.0);
+        || matches!(row_val, SqlVal::Real(f) if f.fract() == 0.0)
+        // Integer-valued TEXT rows (the storage form of `Int`) map to an exact
+        // float key, so they use the same inclusion semantics as `Int` rows.
+        || matches!(row_val, SqlVal::Text(s) if s.parse::<i64>().is_ok());
     let (le_low, gt_high) = if exact {
         (Bound::Included(alt.clone()), Bound::Excluded(alt.clone()))
     } else {

@@ -129,12 +129,23 @@ pub(crate) fn handle_inlay_hint(
             DeclKind::View { name, ty: None, .. } | DeclKind::Derived { name, ty: None, .. } => {
                 if let Some(inferred) = doc.type_info.get(name) {
                     let decl_text = safe_slice(&doc.source, decl.span);
+                    // View/derived decls begin with a `*`/`&` sigil and
+                    // `decl.span.start` points at it, so skip the sigil before
+                    // scanning for the end of the name — otherwise the scan
+                    // stops at offset 0 and the hint lands *on* the sigil,
+                    // rendering `*v = …` as `: T*v = …`.
+                    let sigil_len = decl_text
+                        .chars()
+                        .next()
+                        .filter(|c| *c == '*' || *c == '&')
+                        .map_or(0, char::len_utf8);
                     // Anchor snug after the name token, scanning past identifier
                     // characters (incl. the `'` that the lexer allows in `x'`),
                     // not at the `=`. Anchoring at `=` lands after the trailing
                     // space and renders `myView' = …` as `myView : T' = …`.
-                    let name_end = decl_text
+                    let name_end = decl_text[sigil_len..]
                         .find(|c: char| !c.is_alphanumeric() && c != '_' && c != '\'')
+                        .map(|p| sigil_len + p)
                         .unwrap_or(decl_text.len());
                     let hint_offset = decl.span.start + name_end;
                     let hint_pos = offset_to_position(&doc.source, hint_offset);

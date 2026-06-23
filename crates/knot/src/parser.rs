@@ -1767,33 +1767,32 @@ impl Parser {
         self.skip_newlines();
         let mut query_params = Vec::new();
         if self.eat(&TokenKind::Question) {
-            if self.eat(&TokenKind::LBrace) {
-                self.skip_newlines();
-                if !self.at(&TokenKind::RBrace) {
-                    loop {
-                        self.skip_newlines();
-                        let (qname, _) =
-                            self.expect_lower("expected query param name").ok()?;
-                        self.expect(&TokenKind::Colon, "expected ':' after query param name")
-                            .ok()?;
-                        let ty = self.parse_type()?;
-                        query_params.push(Field {
-                            name: qname,
-                            value: ty,
-                        });
-                        self.skip_newlines();
-                        if !self.eat(&TokenKind::Comma) {
-                            break;
-                        }
-                        self.skip_newlines();
-                        if self.at(&TokenKind::RBrace) {
-                            break; // trailing comma
-                        }
+            self.expect(&TokenKind::LBrace, "expected '{' after '?'").ok()?;
+            self.skip_newlines();
+            if !self.at(&TokenKind::RBrace) {
+                loop {
+                    self.skip_newlines();
+                    let (qname, _) =
+                        self.expect_lower("expected query param name").ok()?;
+                    self.expect(&TokenKind::Colon, "expected ':' after query param name")
+                        .ok()?;
+                    let ty = self.parse_type()?;
+                    query_params.push(Field {
+                        name: qname,
+                        value: ty,
+                    });
+                    self.skip_newlines();
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                    self.skip_newlines();
+                    if self.at(&TokenKind::RBrace) {
+                        break; // trailing comma
                     }
                 }
-                self.expect(&TokenKind::RBrace, "expected '}' to close query params")
-                    .ok()?;
             }
+            self.expect(&TokenKind::RBrace, "expected '}' to close query params")
+                .ok()?;
         }
 
         // Optional request headers: `headers {name: Type, ...}`

@@ -8879,6 +8879,11 @@ impl Codegen {
 
         let result = self.call_rt(builder, "knot_relation_empty", &[]);
         let mut loop_stack: Vec<LoopInfo> = Vec::new();
+        // Skip blocks for `where` guards that appear before any bind (so there
+        // is no enclosing loop to skip to). In list/relation-monad semantics a
+        // failed guard yields the empty relation, so these route to the
+        // do-block's exit returning `result` as-is rather than trapping.
+        let mut pre_bind_where_skips: Vec<cranelift_codegen::ir::Block> = Vec::new();
 
         // Pre-scan: if there's a groupBy, create a temp relation to collect
         // pre-group rows. This must be allocated before any loops start.
@@ -9356,14 +9361,13 @@ impl Codegen {
                     if let Some(loop_info) = loop_stack.last_mut() {
                         loop_info.where_skips.push(skip_block);
                     } else {
-                        // Where outside a loop — seal the skip block with a
-                        // guard failure (there's no loop to skip to), then
-                        // continue compiling in the then_block.
-                        builder.switch_to_block(skip_block);
-                        builder.seal_block(skip_block);
-                        self.call_rt_void(builder, "knot_guard_failed", &[]);
-                        builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
-                        builder.switch_to_block(then_block);
+                        // Where outside a loop — there's no loop to skip to. A
+                        // failed guard yields the empty relation (list/relation
+                        // monad semantics), so defer the skip block and route it
+                        // to the do-block's exit at the tail (returning the
+                        // empty `result`). We stay in `then_block` to keep
+                        // compiling the guarded continuation.
+                        pre_bind_where_skips.push(skip_block);
                     }
                 }
 
@@ -9726,6 +9730,21 @@ impl Codegen {
             // Switch to exit block for the next outer loop
             builder.switch_to_block(info.exit);
             builder.seal_block(info.exit);
+        }
+
+        // Merge any pre-bind `where` skips (failed guards before the first
+        // bind) into the do-block's exit. Both the normal flow and each skip
+        // converge here returning the same (empty-on-skip) `result`.
+        if !pre_bind_where_skips.is_empty() {
+            let do_exit = builder.create_block();
+            builder.ins().jump(do_exit, &[]);
+            for skip in &pre_bind_where_skips {
+                builder.switch_to_block(*skip);
+                builder.seal_block(*skip);
+                builder.ins().jump(do_exit, &[]);
+            }
+            builder.switch_to_block(do_exit);
+            builder.seal_block(do_exit);
         }
 
         // Free all pre-built hash join indices

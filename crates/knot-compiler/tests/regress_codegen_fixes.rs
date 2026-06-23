@@ -598,3 +598,50 @@ main = do
         "view write must not leave the filter column empty, got:\n{stdout}"
     );
 }
+
+// ── Finding 6: local binding shadowing a function name was ignored ──
+// `compile_app` dispatched applied calls by name (`user_fns` / stdlib /
+// SQL-pushdown special forms) WITHOUT first checking whether the name was
+// locally bound, so a lambda param / let / do-bind that shadowed a function
+// called the global instead of the local value — a silent wrong answer, or a
+// hard runtime crash when the shadowed name was a stdlib function.
+
+#[test]
+fn local_param_shadowing_user_fn_is_called() {
+    // `run`'s param `helper` shadows the top-level `helper`; `run (\y -> y*100)`
+    // must apply the lambda (500), not the global `helper` (5+1=6).
+    let (stdout, stderr, ok) = compile_and_run(
+        "shadow_user_fn",
+        r#"helper = \x -> x + 1
+run = \helper -> helper 5
+main = do
+  let r = run (\y -> y * 100)
+  println (show r)
+"#,
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("500"),
+        "local param must shadow the top-level `helper` (expected 500), got:\n{stdout}"
+    );
+}
+
+#[test]
+fn local_param_shadowing_stdlib_fn_is_called() {
+    // `count` is a stdlib function (in `user_fns`); shadowing it with a lambda
+    // param used to dispatch to the `count` runtime and crash with
+    // "expected Relation in len, got Int".
+    let (stdout, stderr, ok) = compile_and_run(
+        "shadow_stdlib_fn",
+        r#"apply2 = \count -> count 7
+main = do
+  let r = apply2 (\n -> n * 2)
+  println (show r)
+"#,
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("14"),
+        "local param must shadow the stdlib `count` (expected 14), got:\n{stdout}"
+    );
+}

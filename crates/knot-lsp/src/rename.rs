@@ -1510,9 +1510,23 @@ fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::Decl, source: &str, f: 
                     }
                 };
                 field_list(&entry.body_fields, &mut cursor, f);
+                // The path appears before the body in source but is processed
+                // after it here, so the body-advanced `cursor` points past the
+                // path. Use a dedicated monotonic cursor for the param-name
+                // search (the param name `{userId: Int}` is between the
+                // previous segment's end and the type's start). Without this,
+                // renaming a field that is also a route path param left the
+                // path-param declaration site stale, breaking the route.
+                let mut path_name_cursor = decl.span.start;
                 for seg in &entry.path {
-                    if let ast::PathSegment::Param { ty, .. } = seg {
+                    if let ast::PathSegment::Param { name, ty } = seg {
+                        if let Some(span) =
+                            find_word_in_source(source, name, path_name_cursor, ty.span.start)
+                        {
+                            f(name, span);
+                        }
                         field_sites_in_type(ty, source, f);
+                        path_name_cursor = ty.span.end;
                         cursor = ty.span.end;
                     }
                 }
@@ -1788,6 +1802,38 @@ mod tests {
                 .iter()
                 .any(|e| e.range.start == comp_pos && e.new_text.contains("RenamedApi")),
             "composite component `AApi` must be renamed; edits: {edits:?}"
+        );
+    }
+
+    #[test]
+    fn rename_field_updates_route_path_param() {
+        // Regression: route path-param names (`/{owner: Text}`) were never
+        // collected as field-rename sites — the param walk only visited the
+        // param's *type*. Renaming a field also used as a path param left the
+        // path-param declaration stale, breaking the route. Renaming the
+        // `owner` field must also update the `/{owner: Text}` token.
+        let mut ws = TestWorkspace::new();
+        let src = "type Todo = {title: Text, owner: Text}\n\
+                   *todos : [Todo]\n\
+                   route TodoApi where\n  /todos\n    GET /{owner: Text} -> [Todo] = GetTodos\n";
+        let uri = ws.open("main", src);
+        let doc = ws.doc(&uri);
+        // Initiate the rename from the `owner` field in the `Todo` record.
+        let field_off = doc.source.find("owner").expect("owner field");
+        let pos = offset_to_position(&doc.source, field_off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "holder"))
+            .expect("rename produces edits");
+        let mut changes = edit.changes.expect("changes present");
+        let edits = changes.remove(&uri).expect("file has edits");
+
+        // Locate the path-param `owner` token (after `/{`).
+        let param_off = doc.source.find("/{owner").expect("path param") + "/{".len();
+        let param_pos = offset_to_position(&doc.source, param_off);
+        assert!(
+            edits
+                .iter()
+                .any(|e| e.range.start == param_pos && e.new_text.contains("holder")),
+            "path-param `owner` must be renamed; edits: {edits:?}"
         );
     }
 

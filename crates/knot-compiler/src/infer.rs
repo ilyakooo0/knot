@@ -576,6 +576,17 @@ struct Infer {
     refined_types: HashMap<String, (Ty, knot::ast::Expr)>,
     /// Refine expression type vars: (span, alpha_var, inner_ty) for post-inference resolution.
     refine_vars: Vec<(Span, TyVar, Ty)>,
+    /// When true, the directional refined-type check (which otherwise rejects
+    /// implicitly introducing a refinement, e.g. a raw `Int` flowing where a
+    /// `Nat` is required) is suppressed. Set ONLY while checking a `set` /
+    /// `replace` value against its source's element type: every row written is
+    /// validated at runtime (`knot_refinement_validate_relation`), so the
+    /// implicit coercion is sound there — including when the value flows
+    /// through plumbing like `union rows [newRow]`. It is saved/restored
+    /// around that single `check_expr`, so it never affects ordinary function
+    /// boundaries (where `asNat = \x -> x : Int -> Nat` is still rejected).
+    /// See the refined arms in `unify_dir`.
+    suppress_refine_intro: bool,
 
     /// Unit-composition checks for `*`/`/` deferred because one operand was
     /// still an unresolved type variable when the binop was inferred. When the
@@ -640,6 +651,7 @@ impl Infer {
             show_unit_strings: HashMap::new(),
             refined_types: HashMap::new(),
             refine_vars: Vec::new(),
+            suppress_refine_intro: false,
             deferred_unit_binops: Vec::new(),
             elem_pushdown_ok: HashSet::new(),
         }
@@ -700,6 +712,19 @@ impl Infer {
                 _ => return Some(current),
             }
         }
+    }
+
+    /// True when `ty` resolves to a concrete primitive that can serve as a
+    /// refinement base (Int/Float/Text/Bool, with or without units). Used to
+    /// distinguish "a real base value is being supplied" (reject the implicit
+    /// introduction of a refinement) from "the type is still an unresolved
+    /// variable" (let inference flow). An unrelated concrete type is left to
+    /// the normal mismatch path.
+    fn is_concrete_refinement_base(&self, ty: &Ty) -> bool {
+        matches!(
+            self.apply(ty),
+            Ty::Int | Ty::Float | Ty::Text | Ty::Bool | Ty::IntUnit(_) | Ty::FloatUnit(_)
+        )
     }
 
     fn fresh_var(&mut self) -> TyVar {
@@ -1765,6 +1790,19 @@ impl Infer {
             // refined alias to its non-refined base, with cycle detection so
             // `type T = T where ...` or `type A = B / type B = A` diagnoses
             // instead of overflowing the stack.
+            //
+            // Subsumption is DIRECTIONAL. *Forgetting* a refinement (a `Nat`
+            // value flowing where an `Int` is required) is always sound. But
+            // *introducing* one — a plain `Int` value flowing where a refined
+            // `Nat` is required — must NOT happen implicitly at an unchecked
+            // boundary: the predicate would never run, so e.g. `asNat : Int ->
+            // Nat; asNat = \x -> x` would launder a negative into a `Nat`. The
+            // sound introduction form is `refine`, which performs the runtime
+            // check and yields `Result RefinementError Nat`. We therefore
+            // reject the introducing direction (mirroring the IO-effect
+            // directional check below) — EXCEPT when `suppress_refine_intro`
+            // is set, i.e. while unifying a `set`/`replace` value against its
+            // source type, where the runtime validates every written row.
             (Ty::Con(name, args), other)
                 if args.is_empty()
                     && self.refined_types.contains_key(name)
@@ -1783,7 +1821,24 @@ impl Infer {
                 match self.resolve_refined_base(name, span) {
                     Some(base_ty) => {
                         let other = other.clone();
-                        self.unify_dir(&base_ty, &other, span, t1_provided);
+                        // The refined type is `t1`; introducing = it is the
+                        // *required* side (`!t1_provided`) and a concrete base
+                        // value is supplied.
+                        if !self.suppress_refine_intro
+                            && !t1_provided
+                            && self.is_concrete_refinement_base(&other)
+                        {
+                            self.error(
+                                format!(
+                                    "cannot implicitly use `{}` where refined type `{}` is required; use `refine` to check the predicate",
+                                    self.display_ty(&other),
+                                    name
+                                ),
+                                span,
+                            );
+                        } else {
+                            self.unify_dir(&base_ty, &other, span, t1_provided);
+                        }
                     }
                     None => {} // cycle already reported
                 }
@@ -1799,7 +1854,24 @@ impl Infer {
                 match self.resolve_refined_base(name, span) {
                     Some(base_ty) => {
                         let other = other.clone();
-                        self.unify_dir(&other, &base_ty, span, t1_provided);
+                        // The refined type is `t2`; introducing = it is the
+                        // *required* side (`t1_provided`) and a concrete base
+                        // value (`other`, the provided side) flows into it.
+                        if !self.suppress_refine_intro
+                            && t1_provided
+                            && self.is_concrete_refinement_base(&other)
+                        {
+                            self.error(
+                                format!(
+                                    "cannot implicitly use `{}` where refined type `{}` is required; use `refine` to check the predicate",
+                                    self.display_ty(&other),
+                                    name
+                                ),
+                                span,
+                            );
+                        } else {
+                            self.unify_dir(&other, &base_ty, span, t1_provided);
+                        }
                     }
                     None => {} // cycle already reported
                 }
@@ -4133,8 +4205,16 @@ impl Infer {
                 };
                 let target_inner = unwrap_io(&target_applied);
                 // Push target's element type into the value so element-level
-                // mismatches highlight just the offending element.
+                // mismatches highlight just the offending element. Every row
+                // written is validated at runtime
+                // (`knot_refinement_validate_relation`), so a raw base value
+                // may flow into a refined field anywhere in this value — even
+                // through plumbing like `union rows [newRow]`. Suppress the
+                // refined-introduction check for the whole value subtree.
+                let prev_suppress = self.suppress_refine_intro;
+                self.suppress_refine_intro = true;
                 self.check_expr(value, &target_inner);
+                self.suppress_refine_intro = prev_suppress;
                 let mut effects = BTreeSet::new();
                 if let ast::ExprKind::SourceRef(name) = &target.node {
                     effects.insert(IoEffect::Writes(name.clone()));
@@ -4179,7 +4259,12 @@ impl Infer {
                     other => other.clone(),
                 };
                 let target_inner = unwrap_io(&target_applied);
+                // See the `Set` arm: writes are runtime-validated, so suppress
+                // the refined-introduction check for this structural unify.
+                let prev_suppress = self.suppress_refine_intro;
+                self.suppress_refine_intro = true;
                 self.check_expr(value, &target_inner);
+                self.suppress_refine_intro = prev_suppress;
                 let mut effects = BTreeSet::new();
                 if let ast::ExprKind::SourceRef(name) = &target.node {
                     // `replace *rel = v` blindly overwrites the relation — it
@@ -9023,10 +9108,19 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
         if let Ty::Con(name, args) = &resolved {
             if args.is_empty() && infer.refined_types.contains_key(name) {
                 // Context named the refined type — check the refined value
-                // against its base type, then record the target.
-                let base = infer.refined_types[name].0.clone();
+                // against its *fully-resolved* base type (walking any chain of
+                // refined aliases, e.g. Age → Nat → Int), then record the
+                // target. Resolving to the ultimate base (not the immediate
+                // one) matters now that subsumption is directional: the value
+                // here is a raw base being introduced via `refine`, so an
+                // immediate base that is itself refined (`Age = Nat where …`)
+                // would otherwise look like an unchecked Int→Nat and be
+                // rejected.
                 let name = name.clone();
-                infer.unify(inner_ty, &base, *span);
+                match infer.resolve_refined_base(&name, *span) {
+                    Some(base) => infer.unify(inner_ty, &base, *span),
+                    None => continue, // cycle already reported
+                }
                 refine_targets.insert(*span, name);
                 continue;
             }
@@ -10432,9 +10526,38 @@ main = applyPred (\\r -> r.x == r.y)\
 
     #[test]
     fn refined_type_subsumption() {
-        // A function accepting Nat should accept Int via subsumption
+        // Forgetting a refinement is sound: a `Nat` value flows where an
+        // `Int` is required (the `\x -> x` body returns its `Nat` param as the
+        // declared `Int` result). The `Nat` is obtained soundly via `refine`.
+        let diags = check_src(
+            "type Nat = Int where \\x -> x >= 0\nf : Nat -> Int\nf = \\x -> x\nmain = case refine 42 of\n  Ok {value: n} -> f n\n  Err {error: _} -> 0"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn refined_type_introduction_requires_refine() {
+        // Introducing a refinement implicitly at a function boundary — passing
+        // a raw `Int` where a refined `Nat` is required — is rejected: no
+        // runtime check runs there, so a negative could masquerade as a `Nat`.
+        // `refine` is the only sound introduction form at such a boundary.
         let diags = check_src(
             "type Nat = Int where \\x -> x >= 0\nf : Nat -> Int\nf = \\x -> x\nmain = f 42"
+        );
+        assert!(
+            has_error(&diags, "use `refine`"),
+            "expected refine-required error, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn refined_write_still_allows_base_value() {
+        // Conversely, writing a raw base value into a refined source field is
+        // allowed at type-check time — the write is validated at runtime — so
+        // it must NOT trip the refined-introduction check.
+        let diags = check_src(
+            "type Nat = Int where \\x -> x >= 0\n*ages : [{age: Nat}]\nmain = replace *ages = [{age: 30}]"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -10468,9 +10591,11 @@ main = applyPred (\\r -> r.x == r.y)\
 
     #[test]
     fn refined_type_stacking() {
-        // Stacked refinements: Age = Nat where <= 150, Nat = Int where >= 0
+        // Stacked refinements: Age = Nat where <= 150, Nat = Int where >= 0.
+        // Forgetting still walks the whole chain to the base, so an `Age`
+        // value (obtained soundly via `refine`) flows where `Int` is required.
         let diags = check_src(
-            "type Nat = Int where \\x -> x >= 0\ntype Age = Nat where \\x -> x <= 150\nf : Age -> Int\nf = \\x -> x\nmain = f 25"
+            "type Nat = Int where \\x -> x >= 0\ntype Age = Nat where \\x -> x <= 150\nf : Age -> Int\nf = \\x -> x\nmain = case refine 25 of\n  Ok {value: a} -> f a\n  Err {error: _} -> 0"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }

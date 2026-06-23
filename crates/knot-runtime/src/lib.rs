@@ -11085,6 +11085,24 @@ pub extern "C-unwind" fn knot_source_query_sum(
     debug_sql_params(sql, &sql_params);
     db_ref.ensure_indexes_for_sql(sql);
 
+    // For an Int-typed column, SQLite can hand back a REAL even though the
+    // statically expected type is Int: integer SUM silently promotes to REAL
+    // on i64 accumulation overflow, and summing the TEXT-stored ints used by
+    // the KNOT_INT encoding can likewise yield a REAL. Returning that Float
+    // verbatim would break downstream Int arithmetic / show / JSON. Coerce
+    // back to Int when the value is integral and fits i64; a value outside
+    // i64 range is a genuine overflow the runtime's i64 (checked-arithmetic)
+    // ints cannot represent, so panic with a clear message — matching how
+    // ordinary integer overflow is reported elsewhere — rather than silently
+    // producing a wrong-typed or precision-lossy Float.
+    let int_from_real = |f: f64| -> *mut Value {
+        if f.fract() == 0.0 && f >= i64::MIN as f64 && f < 9_223_372_036_854_775_808.0 {
+            alloc_int(f as i64)
+        } else {
+            panic!("knot runtime: integer SUM result {} is outside the i64 range", f);
+        }
+    };
+
     db_ref
         .conn
         .query_row(sql, param_refs.as_slice(), |row| {
@@ -11100,7 +11118,7 @@ pub extern "C-unwind" fn knot_source_query_sum(
                 ValueRef::Integer(n) => {
                     Ok(if is_float != 0 { alloc_float(n as f64) } else { alloc_int(n) })
                 }
-                ValueRef::Real(f) => Ok(alloc_float(f)),
+                ValueRef::Real(f) => Ok(if is_float != 0 { alloc_float(f) } else { int_from_real(f) }),
                 ValueRef::Text(s) => {
                     let s = std::str::from_utf8(s).expect("knot runtime: invalid UTF-8 in sum result");
                     if is_float != 0 {
@@ -11108,9 +11126,11 @@ pub extern "C-unwind" fn knot_source_query_sum(
                     } else if let Ok(n) = s.parse::<i64>() {
                         Ok(alloc_int(n))
                     } else if let Ok(f) = s.parse::<f64>() {
-                        Ok(alloc_float(f))
+                        // Int column whose textual sum doesn't fit i64 — same
+                        // overflow case as the REAL branch above.
+                        Ok(int_from_real(f))
                     } else {
-                        Ok(alloc_int(0))
+                        panic!("knot runtime: non-numeric SUM result {:?} for an Int column", s);
                     }
                 }
                 _ => Ok(if is_float != 0 { alloc_float(0.0) } else { alloc_int(0) }),

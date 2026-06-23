@@ -271,7 +271,13 @@ impl<'a> TokenCollector<'a> {
     fn visit_decl(&mut self, decl: &ast::Decl) {
         match &decl.node {
             DeclKind::Fun { name, body, ty, .. } => {
-                if let Some(s) = find_word_in_source(self.source, name, decl.span.start, decl.span.start + name.len() + 20) {
+                // Search the whole declaration span (like the sibling arms
+                // below) rather than an arbitrary `name.len() + 20` byte
+                // window: that window could end mid-codepoint when a multibyte
+                // char follows the name (e.g. `f : Café -> Int`), making
+                // `find_word_in_source`'s `source.get(start..end)` return None
+                // and silently dropping the function's declaration highlight.
+                if let Some(s) = find_word_in_source(self.source, name, decl.span.start, decl.span.end) {
                     self.add(s, TOK_FUNCTION, MOD_DECLARATION);
                 }
                 if let Some(scheme) = ty {

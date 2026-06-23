@@ -5413,6 +5413,34 @@ impl Codegen {
         // Uncurry nested applications
         let (func_expr, args) = uncurry_app(expr);
 
+        // A locally-bound name (lambda param, `let`, do-bind, captured free
+        // var) shadows any same-named top-level function, builtin, stdlib
+        // function, or SQL-pushdown special form. Resolve it dynamically so
+        // the local value wins, BEFORE any of the name-based special-case
+        // dispatch below — mirroring the bare-`Var` path in `compile_expr`,
+        // which already consults `env` first. Without this, e.g.
+        // `\helper -> helper 5` (shadowing a top-level `helper`) or
+        // `\count -> count xs` (shadowing the stdlib `count`) would call the
+        // global instead of the local value.
+        if let ast::ExprKind::Var(name) = &func_expr.node {
+            if env.bindings.contains_key(name) {
+                let compiled_args: Vec<Value> = args
+                    .iter()
+                    .map(|a| self.compile_expr(builder, a, env, db))
+                    .collect();
+                let func_val = self.compile_expr(builder, func_expr, env, db);
+                let mut result = func_val;
+                for arg in &compiled_args {
+                    result = self.call_rt(
+                        builder,
+                        "knot_value_call",
+                        &[db, result, *arg],
+                    );
+                }
+                return result;
+            }
+        }
+
         // Special case: count *rel → SQL COUNT(*)
         if let ast::ExprKind::Var(name) = &func_expr.node {
             if name == "count" && args.len() == 1 {

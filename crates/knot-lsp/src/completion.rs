@@ -128,6 +128,13 @@ pub(crate) fn handle_completion(
 
     // Context-aware: after `/` in an import line, suggest file paths
     if trigger_char == Some(b'/') {
+        // Don't hijack `/` typed inside a string literal or comment — the
+        // sibling `*`/`&`/`.` triggers all guard against this, and otherwise a
+        // comment like `-- see import a/b` whose trimmed text begins with
+        // `import ` would suppress all other completions with path items.
+        if inside_string_or_comment(latest_source, offset.saturating_sub(1)) {
+            return None;
+        }
         let line_start = latest_source[..offset].rfind('\n').map(|p| p + 1).unwrap_or(0);
         let line_text = &latest_source[line_start..offset];
         if line_text.trim_start().starts_with("import ") {

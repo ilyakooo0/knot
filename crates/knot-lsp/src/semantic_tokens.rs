@@ -304,12 +304,31 @@ impl<'a> TokenCollector<'a> {
                     .or_else(|| name_span.map(|s| s.end))
                     .unwrap_or(decl.span.start);
                 for ctor in constructors {
-                    if let Some(s) = find_word_in_source(self.source, &ctor.name, search_from, decl.span.end) {
+                    // Bound the name search to the window *before* this
+                    // constructor's first field type. Otherwise a later
+                    // constructor whose name also appears as a field type in an
+                    // earlier constructor (`data T = A {x: B} | B {y: Int}`)
+                    // would match that field-type occurrence instead of the
+                    // real constructor. The name always precedes the fields.
+                    let search_end = ctor
+                        .fields
+                        .first()
+                        .map(|f| f.value.span.start)
+                        .unwrap_or(decl.span.end);
+                    let found = find_word_in_source(self.source, &ctor.name, search_from, search_end);
+                    if let Some(s) = found {
                         self.add(s, TOK_ENUM_MEMBER, MOD_DECLARATION);
-                        search_from = s.end;
                     }
                     for f in &ctor.fields {
                         self.visit_type(&f.value);
+                    }
+                    // Advance past this constructor's last field type (or its
+                    // name, if nullary) so its field types can never be matched
+                    // as the next constructor's name.
+                    if let Some(last) = ctor.fields.last() {
+                        search_from = last.value.span.end;
+                    } else if let Some(s) = found {
+                        search_from = s.end;
                     }
                 }
             }
@@ -676,6 +695,36 @@ mod tests {
         // a panic. Exact deltas don't matter — just that we got back two
         // entries with no overflow propagated through `length`.
         assert!(encoded.iter().all(|t| t.length == 3));
+    }
+
+    #[test]
+    fn constructor_token_not_stolen_by_same_named_field_type() {
+        // `B` appears first as a field type inside `A`'s payload and then as a
+        // real constructor. The ENUM_MEMBER token for the constructor must be
+        // anchored on the real `B` (after the `|`), not on the field-type `B`.
+        let src = "data T = A {x: B} | B {y: Int}\n";
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", src);
+        let doc = ws.state.documents.get(&uri).expect("doc");
+        let tokens = collect_tokens(doc, None);
+
+        let field_b = src.find("x: B").unwrap() + 3; // offset of the field-type B
+        let ctor_b = src.rfind('B').unwrap(); // offset of the real constructor B
+        assert_ne!(field_b, ctor_b);
+
+        let enum_members: Vec<usize> = tokens
+            .iter()
+            .filter(|t| t.token_type == TOK_ENUM_MEMBER)
+            .map(|t| t.start)
+            .collect();
+        assert!(
+            enum_members.contains(&ctor_b),
+            "constructor B's ENUM_MEMBER token must sit on the real ctor (offset {ctor_b}); got {enum_members:?}"
+        );
+        assert!(
+            !enum_members.contains(&field_b),
+            "field-type B (offset {field_b}) must NOT be tagged as an ENUM_MEMBER; got {enum_members:?}"
+        );
     }
 
     #[test]

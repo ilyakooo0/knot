@@ -12862,13 +12862,32 @@ fn count_sql_placeholders(sql: &str) -> usize {
     count
 }
 
+/// Convert a Float into a SQLite REAL, refusing non-finite values. SQLite
+/// silently converts NaN/±Infinity to NULL on storage, so a value written to a
+/// `Float` column would read back as NULL (→ `Nothing`/`Unit`), a silent
+/// round-trip violation. Panic loudly instead — consistent with the checked
+/// arithmetic that panics on integer overflow rather than producing garbage.
+/// (The JSON encoder maps non-finite floats to `null` instead, because that
+/// path runs outside the handler's `catch_unwind` and must not crash the
+/// connection; persistence has no such constraint.)
+fn float_to_sqlite_real(n: f64) -> rusqlite::types::Value {
+    if !n.is_finite() {
+        panic!(
+            "knot runtime: cannot store non-finite Float ({}) in the database — \
+             SQLite would silently store it as NULL, breaking round-trips",
+            n
+        );
+    }
+    rusqlite::types::Value::Real(n)
+}
+
 fn value_to_sql_param(v: *mut Value) -> rusqlite::types::Value {
     if v.is_null() {
         return rusqlite::types::Value::Null;
     }
     match unsafe { as_ref(v) } {
         Value::Int(n) => rusqlite::types::Value::Text(n.to_string()),
-        Value::Float(n) => rusqlite::types::Value::Real(*n),
+        Value::Float(n) => float_to_sqlite_real(*n),
         Value::Text(s) => rusqlite::types::Value::Text((**s).to_string()),
         Value::Bool(b) => rusqlite::types::Value::Integer(*b as i64),
         Value::Bytes(b) => rusqlite::types::Value::Blob((**b).to_vec()),
@@ -12889,7 +12908,7 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
     }
     match (unsafe { as_ref(v) }, ty) {
         (Value::Int(n), _) => rusqlite::types::Value::Text(n.to_string()),
-        (Value::Float(n), _) => rusqlite::types::Value::Real(*n),
+        (Value::Float(n), _) => float_to_sqlite_real(*n),
         (Value::Text(s), _) => rusqlite::types::Value::Text((**s).to_string()),
         (Value::Bool(b), _) => rusqlite::types::Value::Integer(*b as i64),
         (Value::Bytes(b), _) => rusqlite::types::Value::Blob((**b).to_vec()),
@@ -18464,6 +18483,28 @@ mod _bugfix_batch_tests {
     fn scalar_source_unwrap_panics_on_empty_relation() {
         let empty = alloc(Value::Relation(Vec::new()));
         let _ = knot_scalar_source_unwrap(empty);
+    }
+
+    // ── Fix: non-finite floats must not be silently stored as NULL ──
+
+    #[test]
+    fn finite_float_stores_as_real() {
+        match float_to_sqlite_real(3.5) {
+            rusqlite::types::Value::Real(r) => assert_eq!(r, 3.5),
+            other => panic!("expected Real, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "non-finite Float")]
+    fn nan_float_panics_instead_of_storing_null() {
+        let _ = float_to_sqlite_real(f64::NAN);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-finite Float")]
+    fn infinity_float_panics_instead_of_storing_null() {
+        let _ = float_to_sqlite_real(f64::INFINITY);
     }
 
     // ── Fix: cancel() must wake a registered STM slot ──

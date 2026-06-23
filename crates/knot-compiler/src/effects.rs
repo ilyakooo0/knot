@@ -241,6 +241,15 @@ struct EffectChecker {
     /// lambdas that a value laundered into the atomic block (through a let
     /// binding or record field) could be carrying.
     current_decl_name: Option<String>,
+    /// When set, the `App` arm strips the *IO* effects (console/network/fs/
+    /// clock/random) contributed by a `fork`'s spawned argument, keeping only
+    /// its relation reads/writes and `uses_race` marker. `fork`'s spawned IO
+    /// runs on an independent connection and is intentionally permitted inside
+    /// `atomic` (see `builtins::ATOMIC_DISALLOWED_BUILTINS`), so the atomic IO
+    /// gate must not count it — even though those effects legitimately
+    /// propagate through `fork`'s type into the enclosing declaration's
+    /// overall inferred effect set (computed with this flag off).
+    suppress_fork_io: bool,
     /// Accumulated diagnostics.
     diagnostics: Vec<Diagnostic>,
 }
@@ -306,6 +315,7 @@ impl EffectChecker {
             decl_bodies: HashMap::new(),
             shadowed: Vec::new(),
             current_decl_name: None,
+            suppress_fork_io: false,
             diagnostics: Vec::new(),
         }
     }
@@ -604,13 +614,30 @@ impl EffectChecker {
                             || !self.fixed_row_decls.contains(n)
                     })
                     .unwrap_or(false);
+                // `fork <action>` spawns its argument's IO on an independent
+                // connection. When computing the atomic-gate view of effects,
+                // strip the spawned action's IO so `atomic (fork (println …))`
+                // is not falsely rejected — fork is intentionally allowed
+                // inside atomic. Relation reads/writes and the `uses_race`
+                // marker still propagate (a forked `race`, or relation work
+                // that escapes the savepoint, must remain visible).
+                let strip_fork_io = self.suppress_fork_io
+                    && head_name(head) == Some("fork")
+                    && !self.shadowed.iter().any(|s| s == "fork");
                 let mut effects = EffectSet::empty();
                 for arg in &args {
-                    let arg_effects = if propagate_lambda {
+                    let mut arg_effects = if propagate_lambda {
                         self.arg_effects(arg)
                     } else {
                         self.infer_effects(arg)
                     };
+                    if strip_fork_io {
+                        arg_effects.console = false;
+                        arg_effects.network = false;
+                        arg_effects.fs = false;
+                        arg_effects.clock = false;
+                        arg_effects.random = false;
+                    }
                     effects = effects.union(&arg_effects);
                 }
                 let call_effects = self.head_call_effects(head, &args);
@@ -696,7 +723,24 @@ impl EffectChecker {
 
             ast::ExprKind::Atomic(inner) => {
                 let inner_effects = self.infer_effects(inner);
-                if inner_effects.has_io() {
+                // The IO gate uses a fork-stripped view of the body's effects:
+                // `fork`'s spawned IO runs on an independent connection and is
+                // intentionally permitted inside atomic, so it must not trip
+                // this check (the full `inner_effects` — with fork's IO intact
+                // — is what propagates to the enclosing declaration).
+                let prev_suppress = self.suppress_fork_io;
+                self.suppress_fork_io = true;
+                // This is a second traversal of `inner`, purely to recompute the
+                // has_io() boolean under fork-stripping. The diagnostics it
+                // produces duplicate those already emitted by the first
+                // `infer_effects(inner)` traversal above (nested atomics manage
+                // their own gate independently), so discard anything appended
+                // here to avoid double-reporting nested violations.
+                let diags_before_gate = self.diagnostics.len();
+                let gate_effects = self.infer_effects(inner);
+                self.diagnostics.truncate(diags_before_gate);
+                self.suppress_fork_io = prev_suppress;
+                if gate_effects.has_io() {
                     self.diagnostics.push(
                         Diagnostic::error("IO effects are not allowed inside atomic blocks")
                             .label(expr.span, "this atomic block")
@@ -759,7 +803,7 @@ impl EffectChecker {
                 // doing IO is reachable from the body (syntactically inside
                 // it, or inside any declaration the body references), reject
                 // conservatively: atomic bodies are supposed to be DB-only.
-                if !inner_effects.has_io() && self.body_may_call_opaque(inner) {
+                if !gate_effects.has_io() && self.body_may_call_opaque(inner) {
                     // Search for a reachable IO lambda starting from the atomic
                     // body AND from the enclosing declaration's body: a lambda
                     // laundered into the block (bound by a `let`/record field in
@@ -800,7 +844,7 @@ impl EffectChecker {
                 // function, any name we cannot analyze) is not provably
                 // relation-free either, so its presence suppresses the
                 // error too.
-                if !inner_effects.has_io()
+                if !gate_effects.has_io()
                     && inner_effects.reads.is_empty()
                     && inner_effects.writes.is_empty()
                     && !touches_relations(inner)
@@ -2009,6 +2053,113 @@ mod tests {
             check_module(vec![make_source("people"), make_fun("f", body)]);
         assert!(diags.is_empty());
         assert!(effects["f"].writes.contains("people"));
+    }
+
+    #[test]
+    fn atomic_fork_io_allowed() {
+        // atomic (do { _ <- *people; fork (println "spawned"); set *people = [] })
+        // `fork`'s spawned IO runs on its own connection and is intentionally
+        // permitted inside atomic, so the IO gate must NOT reject this — even
+        // though the console effect still propagates to the decl's effects.
+        let body = spanned(ExprKind::Atomic(Box::new(spanned(ExprKind::Do(vec![
+            spanned(StmtKind::Bind {
+                pat: spanned(PatKind::Wildcard),
+                expr: spanned(ExprKind::SourceRef("people".into())),
+            }),
+            spanned(StmtKind::Expr(spanned(ExprKind::App {
+                func: Box::new(spanned(ExprKind::Var("fork".into()))),
+                arg: Box::new(spanned(ExprKind::App {
+                    func: Box::new(spanned(ExprKind::Var("println".into()))),
+                    arg: Box::new(spanned(ExprKind::Lit(Literal::Text(
+                        "spawned".into(),
+                    )))),
+                })),
+            }))),
+            spanned(StmtKind::Expr(spanned(ExprKind::Set {
+                target: Box::new(spanned(ExprKind::SourceRef("people".into()))),
+                value: Box::new(spanned(ExprKind::List(vec![]))),
+            }))),
+        ])))));
+        let (diags, effects) =
+            check_module(vec![make_source("people"), make_fun("f", body)]);
+        assert!(
+            diags.is_empty(),
+            "fork-spawned IO inside atomic should not be rejected: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        // The spawned console effect still propagates to the decl's effects.
+        assert!(effects["f"].console, "fork's console effect should propagate");
+        assert!(effects["f"].writes.contains("people"));
+    }
+
+    #[test]
+    fn atomic_fork_plus_direct_io_error() {
+        // atomic (do { _ <- *people; fork (println "ok"); println "direct" })
+        // The direct (non-forked) println IO is still rejected.
+        let body = spanned(ExprKind::Atomic(Box::new(spanned(ExprKind::Do(vec![
+            spanned(StmtKind::Bind {
+                pat: spanned(PatKind::Wildcard),
+                expr: spanned(ExprKind::SourceRef("people".into())),
+            }),
+            spanned(StmtKind::Expr(spanned(ExprKind::App {
+                func: Box::new(spanned(ExprKind::Var("fork".into()))),
+                arg: Box::new(spanned(ExprKind::App {
+                    func: Box::new(spanned(ExprKind::Var("println".into()))),
+                    arg: Box::new(spanned(ExprKind::Lit(Literal::Text("ok".into())))),
+                })),
+            }))),
+            spanned(StmtKind::Expr(spanned(ExprKind::App {
+                func: Box::new(spanned(ExprKind::Var("println".into()))),
+                arg: Box::new(spanned(ExprKind::Lit(Literal::Text("direct".into())))),
+            }))),
+        ])))));
+        let (diags, _effects) =
+            check_module(vec![make_source("people"), make_fun("f", body)]);
+        assert!(
+            diags.iter().any(|d| d.message.contains("IO effects are not allowed inside atomic")),
+            "direct IO alongside fork should still be rejected: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn nested_atomic_io_violation_reported_once_per_block() {
+        // atomic (do { _ <- *people; _ <- atomic (do { _ <- *people; now }) })
+        // The inner atomic's clock violation must be reported exactly once for
+        // the inner block (plus once for the outer, which sees the propagated
+        // clock effect) — not duplicated by the outer block's fork-stripped
+        // gate re-traversal of `inner`.
+        let inner_atomic = spanned(ExprKind::Atomic(Box::new(spanned(ExprKind::Do(
+            vec![
+                spanned(StmtKind::Bind {
+                    pat: spanned(PatKind::Wildcard),
+                    expr: spanned(ExprKind::SourceRef("people".into())),
+                }),
+                spanned(StmtKind::Expr(spanned(ExprKind::Var("now".into())))),
+            ],
+        )))));
+        let body = spanned(ExprKind::Atomic(Box::new(spanned(ExprKind::Do(vec![
+            spanned(StmtKind::Bind {
+                pat: spanned(PatKind::Wildcard),
+                expr: spanned(ExprKind::SourceRef("people".into())),
+            }),
+            spanned(StmtKind::Bind {
+                pat: spanned(PatKind::Wildcard),
+                expr: inner_atomic,
+            }),
+        ])))));
+        let (diags, _effects) =
+            check_module(vec![make_source("people"), make_fun("f", body)]);
+        let io_errors = diags
+            .iter()
+            .filter(|d| d.message.contains("IO effects are not allowed inside atomic"))
+            .count();
+        // One per atomic block (inner + outer), with no gate-traversal dupes.
+        assert_eq!(
+            io_errors, 2,
+            "nested atomic IO violation should be reported once per block, got {io_errors}: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -67,8 +67,25 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                 let children: Vec<DocumentSymbol> = constructors
                     .iter()
                     .filter_map(|ctor| {
-                        let ctor_span = find_word_in_source(source, &ctor.name, search_from, decl.span.end)?;
-                        search_from = ctor_span.end;
+                        // Bound the name search to the window before this
+                        // constructor's first field type, so a later ctor whose
+                        // name reappears as a field type of an earlier ctor
+                        // (`data T = A {x: B} | B {…}`) isn't matched at that
+                        // field-type occurrence. The name precedes its fields.
+                        let search_end = ctor
+                            .fields
+                            .first()
+                            .map(|f| f.value.span.start)
+                            .unwrap_or(decl.span.end);
+                        let ctor_span = find_word_in_source(source, &ctor.name, search_from, search_end)?;
+                        // Advance past this ctor's last field type (or its name,
+                        // if nullary) so its field types can't be matched as the
+                        // next ctor's name.
+                        search_from = ctor
+                            .fields
+                            .last()
+                            .map(|f| f.value.span.end)
+                            .unwrap_or(ctor_span.end);
                         let ctor_range = span_to_range(ctor_span, source);
                         Some(DocumentSymbol {
                             name: ctor.name.clone(),

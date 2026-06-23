@@ -916,16 +916,34 @@ impl Parser {
         let saved = self.save();
         let diag_count = self.diagnostics.len();
         self.advance(); // consume `<`
+        // A unit body that is a single bare lowercase identifier (`<n>`) is
+        // syntactically also a valid value variable, so `5<n> …` is genuinely
+        // ambiguous with the chained comparison `(5 < n) > …`. Uppercase units
+        // (`<M>`), compound units (`<m/s>`), and powers (`<m^2>`) have no
+        // value-variable reading, so they are never ambiguous.
+        let body_is_bare_lower_ident = matches!(self.peek(), TokenKind::Lower(_))
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::Gt)
+            );
         if let Some(unit) = self.parse_unit_expr() {
             if matches!(self.peek(), TokenKind::Gt) {
                 let gt_end = self.span().end;
                 self.advance(); // consume `>`
                 // Disambiguate a real unit annotation (`5<M>`, `5<M> + x`) from
-                // a spaceless chained comparison (`5<n>0`, which is `(5 < n) > 0`).
-                // A unit literal's closing `>` is never immediately followed by
-                // an atom; if an atom-starter abuts the `>` with no whitespace,
-                // the `>` is a comparison operator, so reject and fall through.
-                if self.span().start == gt_end && self.can_start_atom() {
+                // a chained comparison (`5<n>0`, which is `(5 < n) > 0`).
+                // A unit literal's closing `>` is never followed by an atom:
+                //   - if an atom-starter abuts the `>` (no whitespace), the `>`
+                //     is a comparison operator regardless of the unit body; or
+                //   - for the ambiguous bare-lowercase-ident body, any following
+                //     atom (even whitespace-separated) means comparison — so
+                //     `5<n> 0` parses identically to `5<n>0`, not as a unit
+                //     literal applied to `0`. Concrete/compound units keep the
+                //     adjacency-only rule so `f 5<M> 0` still parses as
+                //     application of the unit-annotated literal.
+                let following_atom = self.can_start_atom();
+                let adjacent = self.span().start == gt_end;
+                if following_atom && (adjacent || body_is_bare_lower_ident) {
                     self.diagnostics.truncate(diag_count);
                     self.restore(saved);
                     return None;

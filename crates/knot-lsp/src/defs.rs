@@ -126,9 +126,23 @@ pub fn resolve_definitions(
             }
             DeclKind::Trait { name, items, .. } => {
                 resolver.define(name, name_span(name));
+                // Methods live after `where`; searching from the trait header
+                // (`name_span` starts at `decl.span.start`) lets a method name
+                // collide with the trait name, a supertrait, or a type
+                // parameter (`trait T a where  a : a -> Int` anchors method `a`
+                // on the header's `a`). Start the search past `where` so each
+                // method resolves to its own signature token. Mirrors the Data
+                // arm's `=`-anchored search above.
+                let search_from = source
+                    .get(decl.span.start..decl.span.end.min(source.len()))
+                    .and_then(|t| t.find("where"))
+                    .map(|p| decl.span.start + p + "where".len())
+                    .unwrap_or(decl.span.start);
                 for item in items {
                     if let ast::TraitItem::Method { name, .. } = item {
-                        resolver.define(name, name_span(name));
+                        let span = find_word_in_source(source, name, search_from, decl.span.end)
+                            .unwrap_or(decl.span);
+                        resolver.define(name, span);
                     }
                 }
             }
@@ -657,4 +671,35 @@ pub fn build_details(module: &Module) -> HashMap<String, String> {
     }
 
     details
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(source: &str) -> Module {
+        let lexer = knot::lexer::Lexer::new(source);
+        let (tokens, _) = lexer.tokenize();
+        let parser = knot::parser::Parser::new(source.to_string(), tokens);
+        let (module, _) = parser.parse_module();
+        module
+    }
+
+    #[test]
+    fn trait_method_def_anchors_on_signature_not_header() {
+        // A trait method whose name collides with a token in the trait
+        // header (here the type parameter `a`) must resolve to its own
+        // signature line, not the header occurrence — otherwise goto/rename
+        // on calls of the method jump to / edit the type parameter.
+        let source = "trait T a where\n  a : a -> Int\n";
+        let module = parse(source);
+        let (defs, _, _) = resolve_definitions(&module, source);
+        let span = defs.get("a").expect("method `a` is defined");
+        // The header `a` is on line 0; the method signature is on line 1.
+        assert!(
+            span.start > source.find('\n').unwrap(),
+            "method def should anchor after the header line, got {span:?}"
+        );
+        assert_eq!(&source[span.start..span.end], "a");
+    }
 }

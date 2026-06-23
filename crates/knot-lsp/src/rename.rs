@@ -72,6 +72,7 @@ pub(crate) fn handle_prepare_rename(
     // builtin is refused even though `handle_rename` would succeed.
     if builtins().any(|b| b == word)
         && !is_ref
+        && !is_field
         && !doc.definitions.contains_key(word)
         && !is_imported
     {
@@ -1634,6 +1635,27 @@ mod tests {
         match resp {
             PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. } => {
                 assert_eq!(placeholder, "id");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prepare_rename_accepts_field_named_like_builtin() {
+        // A record field named like a stdlib symbol (`count`, `map`, …) lives
+        // in a separate namespace from the builtin, and `handle_rename`
+        // renames it correctly. The builtin-rejection guard must exempt field
+        // positions, otherwise the editor never offers F2 on the field.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "g = {count: 2}\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("count").expect("field");
+        let pos = offset_to_position(&doc.source, off);
+        let resp = handle_prepare_rename(&ws.state, &prepare_params(&uri, pos))
+            .expect("prepare rename accepts builtin-named field");
+        match resp {
+            PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. } => {
+                assert_eq!(placeholder, "count");
             }
             other => panic!("unexpected response: {other:?}"),
         }

@@ -79,6 +79,30 @@ fn long_type_application_chain_diagnoses_instead_of_crashing() {
 }
 
 #[test]
+fn deeply_nested_do_blocks_diagnose_instead_of_crashing() {
+    // `do do do … 1` nests an `ExprKind::Do` per `do` keyword. `parse_do_expr`
+    // did not charge the recursion budget (unlike lambdas/records/route
+    // prefixes), so a pathological stack of `do`s parsed into an unbounded-depth
+    // AST that overflowed the native stack on a later traversal (the build run
+    // aborted with `fatal runtime error: stack overflow`). It now charges one
+    // depth unit per `do`, surfacing the nesting diagnostic instead.
+    let mut src = String::from("main = ");
+    for _ in 0..5_000 {
+        src.push_str("do ");
+    }
+    src.push_str("1\n");
+    assert_depth_diag(&src, "do-block nesting");
+}
+
+#[test]
+fn modest_do_nesting_still_parses() {
+    // A handful of nested do-blocks (well under the budget) must still parse.
+    let src = "main = do\n  x <- do\n    y <- pure 1\n    pure y\n  pure x\n";
+    let errs = parse_errors(src);
+    assert!(errs.is_empty(), "unexpected parse errors for nested do: {errs:?}");
+}
+
+#[test]
 fn modest_chains_still_parse() {
     // Realistic expressions well under the depth budget must not trip the guard.
     let cases = [

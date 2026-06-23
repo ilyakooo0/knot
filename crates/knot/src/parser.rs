@@ -3271,7 +3271,21 @@ impl Parser {
 
     fn parse_do_expr(&mut self) -> Option<Expr> {
         let start = self.span();
-        self.in_context("do expression", |this| {
+        // Deeply nested do-blocks (`do do do … 1`) would otherwise grow the
+        // native call stack without bound and abort the process. `do` is
+        // dispatched from `parse_expr_head`, NOT `parse_atom`, so it never gets
+        // the delimiter charge that guards `((((…))))` — without a charge here
+        // the budget never accumulates across `do` levels and a pathological
+        // stack overflows the native stack instead of diagnosing. Charge the
+        // same `DELIMITER_RECURSION_COST` as parens/records: each `do` level's
+        // parse spine (parse_do_expr → parse_block → parse_stmt → parse_expr →
+        // parse_expr_head → parse_do_expr) is at least as deep as a delimiter
+        // cycle, so the limit must trip at the same shallow depth to stay
+        // within the smaller stacks worker threads (e.g. the LSP) run on.
+        if !self.enter_recursion_cost(DELIMITER_RECURSION_COST) {
+            return None;
+        }
+        let result = self.in_context("do expression", |this| {
             this.advance(); // consume `do`
 
             // `parse_stmt` pushes bind/let names so later statements see
@@ -3285,7 +3299,9 @@ impl Parser {
                 ExprKind::Do(stmts),
                 Span::new(start.start, end.end),
             ))
-        })
+        });
+        self.recursion_depth -= DELIMITER_RECURSION_COST;
+        result
     }
 
     /// Parse `serve Api where E1 = expr1; E2 = expr2; ...`

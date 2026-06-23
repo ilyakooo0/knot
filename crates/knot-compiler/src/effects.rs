@@ -984,17 +984,29 @@ impl EffectChecker {
     /// into lambda bodies).
     fn body_may_call_opaque(&self, expr: &ast::Expr) -> bool {
         let mut visited: HashSet<String> = HashSet::new();
-        self.body_may_call_opaque_rec(expr, &mut visited)
+        self.body_may_call_opaque_rec(expr, &mut visited, &HashSet::new())
     }
 
     /// Recursive core of `body_may_call_opaque`. Follows calls into known user
     /// functions (`decl_bodies`) so an opaque call hidden one level down — a
     /// helper that invokes a lambda handed to it through a record field — is
     /// still detected. `visited` guards against cycles in mutual recursion.
+    ///
+    /// `known_params` are the formal parameters of the callee whose body we're
+    /// currently analyzing. A higher-order function applying its OWN parameter
+    /// (`findFirst = \items pred -> … pred x …`, `forEach = \items action -> …
+    /// action x …`) is not an opaque call in the dangerous sense: the actual
+    /// argument is supplied at the call site, where it is either a lambda
+    /// literal (walked directly, and whose effects flow through type inference)
+    /// or an opaque value (already flagged there). Treating a callee's own
+    /// params as known therefore avoids false positives for the common prelude
+    /// HOFs without weakening the record-field / computed-callee laundering
+    /// checks, which key on field-access (non-Var) callees regardless.
     fn body_may_call_opaque_rec(
         &self,
         expr: &ast::Expr,
         visited: &mut HashSet<String>,
+        known_params: &HashSet<String>,
     ) -> bool {
         // Let-bound lambdas inside the body are analyzable: their bodies
         // are part of the walked tree, so `touches_relations` and effect
@@ -1074,6 +1086,7 @@ impl EffectChecker {
                     let known = self.builtin_effects.contains_key(name)
                         || self.decl_effects.contains_key(name)
                         || local_lambdas.contains(name)
+                        || known_params.contains(name)
                         || crate::builtins::INTERNAL_BUILTINS
                             .contains(&name.as_str())
                         || crate::builtins::TRAIT_METHOD_BUILTINS
@@ -1108,11 +1121,15 @@ impl EffectChecker {
             return true;
         }
         // Transitively inspect the bodies of called user functions: the opaque
-        // call may live one (or more) levels down the call chain.
+        // call may live one (or more) levels down the call chain. The callee's
+        // own formal parameters are passed as `known_params` so a HOF applying
+        // its callback parameter isn't mistaken for an opaque call (see the
+        // doc comment).
         for name in callees_to_recurse {
             if visited.insert(name.clone()) {
                 if let Some(body) = self.decl_bodies.get(&name) {
-                    if self.body_may_call_opaque_rec(body, visited) {
+                    let params = lambda_param_names(body);
+                    if self.body_may_call_opaque_rec(body, visited, &params) {
                         return true;
                     }
                 }
@@ -1601,6 +1618,25 @@ fn collect_unshadowed_disallowed(
             }
         }
     }
+}
+
+/// Formal parameter names of a function body, peeling the curried lambda
+/// chain (`\a b -> …` desugars to nested single-param lambdas, but the parser
+/// keeps multi-param `Lambda` nodes — handle both). Used by the atomic
+/// opaque-callee scan so a callee that applies its own parameter isn't
+/// mistaken for a call through an opaque value.
+fn lambda_param_names(expr: &ast::Expr) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let mut cur = expr;
+    while let ast::ExprKind::Lambda { params, body } = &cur.node {
+        for p in params {
+            if let ast::PatKind::Var(name) = &p.node {
+                names.insert(name.clone());
+            }
+        }
+        cur = body;
+    }
+    names
 }
 
 /// Whether the expression syntactically references any builtin from

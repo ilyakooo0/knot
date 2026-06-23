@@ -414,3 +414,51 @@ noise = do
         diags.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn pure_hof_builtin_in_atomic_not_flagged_opaque() {
+    // `sortBy`/`countWhere`/`minOn`/`maxOn` are pure builtins; they were
+    // missing from `PURE_BUILTINS`, so the atomic gate's opaque-callee scan
+    // treated a call to them as a call through an opaque value. Combined with a
+    // legitimate IO call (`now`) in the enclosing declaration but OUTSIDE the
+    // atomic block, the gate wrongly rooted its laundered-IO search at the
+    // whole declaration and rejected the (DB-only) atomic body.
+    let diags = effect_diags(
+        r#"*items : [{n: Int, expiresAt: Int}]
+
+handle = do
+  t <- now
+  atomic (do
+    rows <- *items
+    *items = sortBy (\x -> x.expiresAt) rows)
+
+main = handle
+"#,
+    );
+    assert_no_error(&diags, "IO effects are not allowed inside atomic blocks");
+}
+
+#[test]
+fn prelude_hof_callback_param_in_atomic_not_flagged_opaque() {
+    // A prelude HOF (`findFirst`) applies its own callback parameter inside its
+    // body. The opaque-callee scan used to recurse into `findFirst` and flag
+    // `pred x` as a call through an opaque value (the parameter), producing a
+    // false "IO not allowed in atomic" when the enclosing decl did IO (`now`)
+    // outside the atomic. A callee's own params are now treated as known.
+    let diags = effect_diags(
+        r#"*items : [{n: Int}]
+
+lookup = \rows -> findFirst rows (\r -> r.n > 0)
+
+handle = do
+  t <- now
+  atomic (do
+    rows <- *items
+    let hit = lookup rows
+    *items = rows)
+
+main = handle
+"#,
+    );
+    assert_no_error(&diags, "IO effects are not allowed inside atomic blocks");
+}

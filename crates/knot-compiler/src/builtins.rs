@@ -46,6 +46,8 @@ pub const PURE_BUILTINS: &[&str] = &[
     "id", "not", "toJson", "parseJson",
     "decrypt", "sign", "verify",
     "upsertBy",
+    "countWhere", "minOn", "maxOn", "sortBy",
+    "stripUnit", "withUnit", "stripFloatUnit", "withFloatUnit",
 ];
 
 /// Set of builtin function names that perform some IO effect. Used by the LSP

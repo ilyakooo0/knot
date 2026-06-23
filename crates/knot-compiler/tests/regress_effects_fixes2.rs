@@ -462,3 +462,65 @@ main = handle
     );
     assert_no_error(&diags, "IO effects are not allowed inside atomic blocks");
 }
+
+// ── fork reached through a helper inside atomic ─────────────────────
+
+#[test]
+fn fork_via_helper_inside_atomic_accepted() {
+    // `fork` is intentionally permitted inside atomic (its spawned IO runs on an
+    // independent connection). When the fork lives one call deep — `helper`
+    // forks console IO — the atomic gate used to falsely reject the block: the
+    // helper's stored effects baked in the forked `console`, and the syntactic
+    // opaque-callee scan saw a reachable IO lambda. Both views are now
+    // fork-stripped, so this is accepted.
+    let diags = effect_diags(
+        r#"*people : [{name: Text}]
+
+helper = \u -> fork (println "hi")
+
+main =
+  atomic (do
+    _ <- *people
+    helper {})
+"#,
+    );
+    assert_no_error(&diags, "IO effects are not allowed inside atomic blocks");
+}
+
+#[test]
+fn non_forked_io_via_helper_inside_atomic_still_rejected() {
+    // The fork-stripping must not over-permit: a helper that does *direct*
+    // (non-forked) console IO inside atomic is still rejected.
+    let diags = effect_diags(
+        r#"*people : [{name: Text}]
+
+helper = \u -> println "hi"
+
+main =
+  atomic (do
+    _ <- *people
+    helper {})
+"#,
+    );
+    assert_has_error(&diags, "IO effects are not allowed inside atomic blocks");
+}
+
+#[test]
+fn helper_mixing_direct_and_forked_io_inside_atomic_rejected() {
+    // A helper that forks some IO but ALSO performs direct IO is rejected for
+    // the direct part — only the forked subtree is exempt.
+    let diags = effect_diags(
+        r#"*people : [{name: Text}]
+
+helper = \u -> do
+  _ <- println "direct"
+  fork (println "forked")
+
+main =
+  atomic (do
+    _ <- *people
+    helper {})
+"#,
+    );
+    assert_has_error(&diags, "IO effects are not allowed inside atomic blocks");
+}

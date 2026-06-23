@@ -195,6 +195,12 @@ impl fmt::Display for EffectSet {
 struct EffectChecker {
     /// Inferred effects per declaration name.
     decl_effects: HashMap<String, EffectSet>,
+    /// Inferred effects per declaration name, computed under fork-stripping
+    /// (`suppress_fork_io = true`). Consulted by cross-declaration Var/DerivedRef
+    /// lookups when recomputing the atomic gate's fork-stripped view, so that a
+    /// helper function whose only IO is a `fork`ed action (`helper = \u -> fork
+    /// (println …)`) is not falsely treated as IO when called inside `atomic`.
+    decl_effects_atomic_safe: HashMap<String, EffectSet>,
     /// Built-in function effects.
     builtin_effects: HashMap<String, EffectSet>,
     /// Known source relation names.
@@ -306,6 +312,7 @@ impl EffectChecker {
 
         Self {
             decl_effects: HashMap::new(),
+            decl_effects_atomic_safe: HashMap::new(),
             builtin_effects,
             source_names: HashSet::new(),
             view_names: HashSet::new(),
@@ -479,6 +486,56 @@ impl EffectChecker {
             if !changed { break; }
         }
 
+        // Second fixpoint: recompute each declaration's effects under
+        // fork-stripping into `decl_effects_atomic_safe`. The Var/DerivedRef
+        // lookups consult this map (instead of `decl_effects`) while
+        // `suppress_fork_io` is set, so a helper whose only IO is a `fork`ed
+        // action contributes no IO to an enclosing `atomic` gate — matching the
+        // syntactic `fork (…)` stripping the App/Pipe arms already do. Reads,
+        // writes, and the race marker are preserved (fork stripping only clears
+        // the spawned action's console/network/fs/clock/random). Diagnostics are
+        // suppressed throughout (intermediate states may be incomplete and this
+        // map is only consulted, never the source of user-visible errors).
+        {
+            let prev_suppress = self.suppress_fork_io;
+            self.suppress_fork_io = true;
+            let saved_diags = std::mem::take(&mut self.diagnostics);
+            loop {
+                let mut changed = false;
+                for decl in &module.decls {
+                    let (name, effects) = match &decl.node {
+                        ast::DeclKind::Derived { name, body, .. }
+                        | ast::DeclKind::View { name, body, .. } => {
+                            (name, self.infer_effects(body))
+                        }
+                        ast::DeclKind::Fun { name, body: Some(body), .. } => {
+                            (name, self.fun_body_effects(body))
+                        }
+                        _ => continue,
+                    };
+                    let old = self.decl_effects_atomic_safe.get(name);
+                    if old.map_or(true, |o| *o != effects) {
+                        self.decl_effects_atomic_safe.insert(name.clone(), effects);
+                        changed = true;
+                    }
+                }
+                for (name, bodies) in &method_bodies {
+                    let mut effects = EffectSet::empty();
+                    for body in bodies {
+                        effects = effects.union(&self.fun_body_effects(body));
+                    }
+                    let old = self.decl_effects_atomic_safe.get(name);
+                    if old.map_or(true, |o| *o != effects) {
+                        self.decl_effects_atomic_safe.insert(name.clone(), effects);
+                        changed = true;
+                    }
+                }
+                if !changed { break; }
+            }
+            self.diagnostics = saved_diags;
+            self.suppress_fork_io = prev_suppress;
+        }
+
         // Final pass: emit diagnostics and check annotations with converged effects
         for decl in derived {
             self.process_decl(decl);
@@ -570,7 +627,7 @@ impl EffectChecker {
                     }
                 }
                 if !is_shadowed {
-                    if let Some(effects) = self.decl_effects.get(name) {
+                    if let Some(effects) = self.lookup_decl_effects(name) {
                         return effects.clone();
                     }
                 }
@@ -584,7 +641,7 @@ impl EffectChecker {
             }
 
             ast::ExprKind::DerivedRef(name) => {
-                self.decl_effects.get(name).cloned().unwrap_or_else(EffectSet::empty)
+                self.lookup_decl_effects(name).cloned().unwrap_or_else(EffectSet::empty)
             }
 
             ast::ExprKind::Lambda { .. } => {
@@ -1218,6 +1275,19 @@ impl EffectChecker {
     }
 
     /// Resolve effects when a function expression is *called*.
+    /// Look up a declaration's converged effects, choosing the fork-stripped
+    /// view while `suppress_fork_io` is set (the atomic-gate recomputation) so
+    /// IO laundered through a `fork`ing helper does not trip the gate. Both maps
+    /// share the same key set (every Fun/View/Derived/trait-method is inserted
+    /// into both fixpoints), so this never silently falls back across views.
+    fn lookup_decl_effects(&self, name: &str) -> Option<&EffectSet> {
+        if self.suppress_fork_io {
+            self.decl_effects_atomic_safe.get(name)
+        } else {
+            self.decl_effects.get(name)
+        }
+    }
+
     fn callee_effects(&mut self, func_expr: &ast::Expr) -> EffectSet {
         match &func_expr.node {
             ast::ExprKind::Var(name) => {
@@ -1237,7 +1307,7 @@ impl EffectChecker {
                     }
                 }
                 if !is_shadowed {
-                    if let Some(effects) = self.decl_effects.get(name) {
+                    if let Some(effects) = self.lookup_decl_effects(name) {
                         return effects.clone();
                     }
                 }
@@ -1660,10 +1730,28 @@ fn lambda_param_names(expr: &ast::Expr) -> HashSet<String> {
 /// opaque-callee scan inside atomic bodies, where false positives are
 /// acceptable (atomic bodies are supposed to be DB-only).
 fn contains_atomic_disallowed_ref(expr: &ast::Expr) -> bool {
+    // Argument subtrees of `fork (<action>)` are exempt: forked IO runs on an
+    // independent connection and is intentionally permitted inside `atomic`, so
+    // a disallowed builtin reached only through a `fork` must not count. walk_expr
+    // is pre-order, so the enclosing `fork` App is visited (and its arg spans
+    // recorded) before any disallowed Var nested inside it.
+    let mut pruned: Vec<Span> = Vec::new();
     let mut found = false;
     walk_expr(expr, &mut |e| {
+        if let ast::ExprKind::App { .. } = &e.node {
+            let (head, args) = app_spine(e);
+            if head_name(head) == Some("fork") {
+                for a in args {
+                    pruned.push(a.span);
+                }
+            }
+        }
         if let ast::ExprKind::Var(name) = &e.node {
-            if crate::builtins::ATOMIC_DISALLOWED_BUILTINS.contains(&name.as_str()) {
+            if crate::builtins::ATOMIC_DISALLOWED_BUILTINS.contains(&name.as_str())
+                && !pruned
+                    .iter()
+                    .any(|p| p.start <= e.span.start && e.span.end <= p.end)
+            {
                 found = true;
             }
         }

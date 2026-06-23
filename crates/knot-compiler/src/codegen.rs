@@ -9966,8 +9966,16 @@ impl Codegen {
             _ => unreachable!(),
         };
         if is_maybe {
+            // The runtime's `Maybe` convention is `Just {value: payload}` (see
+            // `make_just`), so the payload must be wrapped in a single-field
+            // record — not passed as the bare scalar — or `case x of Just {value: n}`
+            // and `.value` access read a field from a non-record at runtime.
+            let cap = builder.ins().iconst(self.ptr_type, 1);
+            let rec = self.call_rt(builder, "knot_record_empty", &[cap]);
+            let (key_ptr, key_len) = self.string_ptr(builder, "value");
+            self.call_rt_void(builder, "knot_record_set_field", &[rec, key_ptr, key_len, inner]);
             let (tag_ptr, tag_len) = self.string_ptr(builder, "Just");
-            self.call_rt(builder, "knot_value_constructor", &[tag_ptr, tag_len, inner])
+            self.call_rt(builder, "knot_value_constructor", &[tag_ptr, tag_len, rec])
         } else {
             inner
         }

@@ -73,7 +73,13 @@ pub(crate) fn handle_references(
     // the same cursor. A local definition takes priority over an import of the
     // same name (when this file both declares and imports `parse`, references
     // here resolve to the local declaration).
-    let imported_owner: Option<PathBuf> = if local_def.is_none() {
+    // The `import_defs` lookup is name-keyed, so guard it like Case A is
+    // position-based: a record-field token must not fall through to an imported
+    // symbol that merely shares its name (field tokens aren't in `references`, so
+    // Case A always fails for them and they'd otherwise hit this fallback).
+    let imported_owner: Option<PathBuf> = if local_def.is_none()
+        && !crate::rename::is_at_record_field(&doc.module, &doc.source, offset)
+    {
         doc.import_defs.get(&symbol_name).map(|(p, _)| p.clone())
     } else {
         None

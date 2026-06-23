@@ -5947,6 +5947,14 @@ pub extern "C-unwind" fn knot_relation_group_by(
             }
         })
         .collect();
+    // Append `_idx` (original input order) as the final ORDER BY term so rows
+    // sharing the same key keep a deterministic, input order within their group.
+    // SQLite does not guarantee a stable sort for equal ORDER BY keys, so without
+    // this a first-element field access (or `head`) on a group could return a
+    // different member across runs. When there are no key columns, ordering by
+    // `_idx` alone yields the single group in input order.
+    let mut order_cols = order_cols;
+    order_cols.push("\"_idx\"".to_string());
 
     // Extract key params from each row (shared by both paths)
     let extract_key_params = |row_ptr: &*mut Value, key_specs: &[&ColumnSpec]| -> Vec<rusqlite::types::Value> {
@@ -6206,6 +6214,18 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
 }
 
 
+
+/// Hex BLAKE3 hash of a full record value, used as the parent-identity key for
+/// record tables that have nested children. `value_to_hash_bytes` canonicalizes
+/// nested relations as sets, so two records that are equal under set semantics
+/// hash identically, while records that differ only in nested content hash
+/// differently — giving full-record identity instead of scalar-columns-only
+/// identity (which would collapse `{a:1, items:[X]}` and `{a:1, items:[Y]}`).
+fn record_content_hash_hex(row_ptr: *mut Value) -> String {
+    let mut buf = Vec::new();
+    value_to_hash_bytes(row_ptr, &mut buf);
+    blake3::hash(&buf).to_hex().to_string()
+}
 
 fn values_equal(a: *mut Value, b: *mut Value) -> bool {
     if a == b {
@@ -10381,17 +10401,32 @@ fn init_record_table(conn: &rusqlite::Connection, table_name: &str, schema: &Rec
 
     if has_children {
         col_defs.push("_id INTEGER PRIMARY KEY AUTOINCREMENT".to_string());
+        // Parent identity for tables with nested children is the hash of the
+        // *whole* record (scalars + nested content), not the scalar columns
+        // alone. Without this, two records that differ only in their nested
+        // fields collapse onto one parent under INSERT OR IGNORE and have their
+        // children merged. `_content_hash` is internal (never read back into a
+        // Knot value — `read_record_table` selects only `_id` + scalar columns).
+        col_defs.push("_content_hash TEXT".to_string());
     }
 
     for c in &schema.columns {
         col_defs.push(format!("{} {}", quote_ident(&c.name), sql_type(c.ty)));
-        // NULL-coalesced so rows containing NULLs still dedupe under
-        // INSERT OR IGNORE (SQLite treats raw NULLs as distinct in UNIQUE
-        // indexes) — same sentinel scheme as the ADT path. Existing DBs
-        // keep their old raw-column index under the same name (IF NOT
-        // EXISTS no-ops), matching how the ADT init path handles upgrades;
-        // schema migrations (`auto_apply_record_change`) drop + recreate.
-        unique_cols.push(null_safe_coalesce(&quote_ident(&c.name), c.ty));
+        if !has_children {
+            // Flat record tables dedupe on their scalar columns (= the whole
+            // record). NULL-coalesced so rows containing NULLs still dedupe
+            // under INSERT OR IGNORE (SQLite treats raw NULLs as distinct in
+            // UNIQUE indexes) — same sentinel scheme as the ADT path. Existing
+            // DBs keep their old raw-column index under the same name (IF NOT
+            // EXISTS no-ops); schema migrations (`auto_apply_record_change`)
+            // drop + recreate. Tables with children index on `_content_hash`
+            // below instead.
+            unique_cols.push(null_safe_coalesce(&quote_ident(&c.name), c.ty));
+        }
+    }
+
+    if has_children {
+        unique_cols.push(quote_ident("_content_hash"));
     }
 
     if col_defs.is_empty() {
@@ -11734,38 +11769,37 @@ fn write_record_rows(
         return;
     }
 
-    let placeholders: Vec<String> = (1..=col_names.len()).map(|i| format!("?{}", i)).collect();
+    // For tables with children, parent identity is the full record: append the
+    // internal `_content_hash` column (and its bind param) after the scalar
+    // columns. It is always the LAST param, at index `col_names.len() + 1`.
+    let mut insert_cols = col_names.clone();
+    if has_children {
+        insert_cols.push(quote_ident("_content_hash"));
+    }
+    let placeholders: Vec<String> = (1..=insert_cols.len()).map(|i| format!("?{}", i)).collect();
 
-    // For tables with children, we need the _id back.
-    // Use INSERT OR IGNORE to handle duplicate parent rows gracefully,
-    // then look up the existing _id if the insert was ignored.
-    let insert_sql = if has_children && !col_names.is_empty() {
-        format!(
-            "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
-            table, col_names.join(", "), placeholders.join(", ")
-        )
-    } else if has_children {
-        // No scalar columns, just get an _id
-        format!("INSERT INTO {} DEFAULT VALUES;", table)
-    } else {
-        format!(
-            "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
-            table, col_names.join(", "), placeholders.join(", ")
-        )
-    };
+    // Use INSERT OR IGNORE to handle duplicate rows gracefully, then (for tables
+    // with children) look up the existing _id if the insert was ignored.
+    // `insert_cols` is never empty here: the unit-type case (no scalars, no
+    // children) returned early above, and children always contribute
+    // `_content_hash`.
+    let insert_sql = format!(
+        "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
+        table, insert_cols.join(", "), placeholders.join(", ")
+    );
     debug_sql(&insert_sql);
 
-    // Prepare a SELECT to look up existing _id when INSERT OR IGNORE skips a duplicate
-    let select_id_sql = if has_children && !col_names.is_empty() {
-        let where_conds: Vec<String> = col_names
-            .iter()
-            .enumerate()
-            .map(|(i, c)| format!("{} IS ?{}", c, i + 1))
-            .collect();
+    // Prepare a SELECT to look up existing _id when INSERT OR IGNORE skips a
+    // duplicate. Match on `_content_hash` (the full-record key, last param) so a
+    // genuine full-record duplicate reuses its parent, while a record differing
+    // only in nested content gets a fresh parent.
+    let select_id_sql = if has_children {
+        let hash_idx = col_names.len() + 1;
         Some(format!(
-            "SELECT _id FROM {} WHERE {} LIMIT 1;",
+            "SELECT _id FROM {} WHERE {} IS ?{} LIMIT 1;",
             table,
-            where_conds.join(" AND ")
+            quote_ident("_content_hash"),
+            hash_idx
         ))
     } else {
         None
@@ -11783,8 +11817,9 @@ fn write_record_rows(
         // Build field lookup map for O(1) access
         let field_map: HashMap<&str, *mut Value> = fields.iter().map(|f| (&*f.name, f.value)).collect();
 
-        // Build scalar params
-        let params: Vec<rusqlite::types::Value> = schema.columns
+        // Build scalar params, then the `_content_hash` of the whole record
+        // (last param) for tables with children.
+        let mut params: Vec<rusqlite::types::Value> = schema.columns
             .iter()
             .map(|col| {
                 let value = field_map.get(col.name.as_str())
@@ -11792,6 +11827,9 @@ fn write_record_rows(
                 value_to_sqlite(*value, col.ty)
             })
             .collect();
+        if has_children {
+            params.push(rusqlite::types::Value::Text(record_content_hash_hex(*row_ptr)));
+        }
 
         if !params.is_empty() {
             let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -17089,13 +17127,19 @@ pub extern "C-unwind" fn knot_crypto_verify(
         _ => panic!("knot runtime: verify expected Bytes for signature, got {}", type_name(signature)),
     };
 
-    let pub_arr: [u8; 32] = (**pub_bytes).try_into()
-        .expect("knot runtime: verify publicKey must be 32 bytes");
-    let sig_arr: [u8; 64] = (**sig_bytes).try_into()
-        .expect("knot runtime: verify signature must be 64 bytes");
-
-    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pub_arr)
-        .expect("knot runtime: verify invalid public key");
+    // `verify` validates untrusted data: a malformed signature or public key is
+    // a verification failure, not a crash. Returning False (rather than panicking
+    // via `.expect`) keeps a wrong-length signature from a network request from
+    // taking down the process.
+    let Ok(pub_arr) = <[u8; 32]>::try_from(&**pub_bytes) else {
+        return alloc_bool(false);
+    };
+    let Ok(sig_arr) = <[u8; 64]>::try_from(&**sig_bytes) else {
+        return alloc_bool(false);
+    };
+    let Ok(verifying_key) = ed25519_dalek::VerifyingKey::from_bytes(&pub_arr) else {
+        return alloc_bool(false);
+    };
     let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
 
     let valid = verifying_key.verify(msg, &signature).is_ok();
@@ -18614,6 +18658,42 @@ mod _bugfix_batch_tests {
         let ct = vec![0u8; 32 + 12 + 16];
         let ct_val = alloc(Value::Bytes(Arc::from(ct)));
         let _ = knot_crypto_decrypt(private_key, ct_val);
+    }
+
+    // ── Fix: verify() returns false on untrusted malformed input ──
+
+    #[test]
+    fn crypto_verify_accepts_valid_signature() {
+        let pair = knot_crypto_generate_signing_key_pair();
+        let private_key = knot_record_field(pair, b"privateKey".as_ptr(), 10);
+        let public_key = knot_record_field(pair, b"publicKey".as_ptr(), 9);
+        let msg = alloc(Value::Bytes(Arc::from(b"hello".to_vec())));
+        let sig = knot_crypto_sign(private_key, msg);
+        let result = knot_crypto_verify(std::ptr::null_mut(), public_key, msg, sig);
+        assert!(matches!(unsafe { as_ref(result) }, Value::Bool(true)));
+    }
+
+    #[test]
+    fn crypto_verify_returns_false_on_malformed_signature() {
+        // `verify` validates untrusted data: a wrong-length signature must
+        // verify false, not panic and crash the process.
+        let pair = knot_crypto_generate_signing_key_pair();
+        let public_key = knot_record_field(pair, b"publicKey".as_ptr(), 9);
+        let msg = alloc(Value::Bytes(Arc::from(b"hello".to_vec())));
+        let bad_sig = alloc(Value::Bytes(Arc::from(b"too short".to_vec())));
+        let result = knot_crypto_verify(std::ptr::null_mut(), public_key, msg, bad_sig);
+        assert!(matches!(unsafe { as_ref(result) }, Value::Bool(false)));
+    }
+
+    #[test]
+    fn crypto_verify_returns_false_on_malformed_public_key() {
+        // A public key that isn't a valid 32-byte curve point also verifies
+        // false rather than panicking.
+        let msg = alloc(Value::Bytes(Arc::from(b"hello".to_vec())));
+        let bad_pub = alloc(Value::Bytes(Arc::from(vec![1u8; 10])));
+        let bad_sig = alloc(Value::Bytes(Arc::from(vec![0u8; 64])));
+        let result = knot_crypto_verify(std::ptr::null_mut(), bad_pub, msg, bad_sig);
+        assert!(matches!(unsafe { as_ref(result) }, Value::Bool(false)));
     }
 
     // ── Fix: HTTP body cap take() overflow ──

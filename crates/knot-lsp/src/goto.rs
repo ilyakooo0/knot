@@ -66,7 +66,14 @@ pub(crate) fn handle_goto_definition(
         }));
     }
 
-    // Cross-file: check imported definitions
+    // Cross-file: check imported definitions. The `import_defs` lookup is purely
+    // name-keyed, so guard it the same way the local path above is position-based:
+    // a record-field token must not fall through to an imported symbol that merely
+    // shares its name (field tokens are never recorded in `references`, so without
+    // this guard `b.size` jumps to an imported `size` function).
+    if crate::rename::is_at_record_field(&doc.module, &doc.source, offset) {
+        return None;
+    }
     let word = word_at_position(&doc.source, pos)?;
     let (path, span) = doc.import_defs.get(word)?;
     let imported_source = doc.imported_files.get(path)?;

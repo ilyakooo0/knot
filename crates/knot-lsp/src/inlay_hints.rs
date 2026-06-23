@@ -93,7 +93,7 @@ pub(crate) fn handle_inlay_hint(
                     });
                 }
             }
-            DeclKind::Fun { name, ty: Some(_), .. } => {
+            DeclKind::Fun { name, ty: Some(scheme), .. } => {
                 // Annotated function: show the inferred *effects* as a hint at
                 // the function body's start, only when the type doesn't already
                 // declare them. Helps with effect-row polymorphism debugging.
@@ -105,12 +105,16 @@ pub(crate) fn handle_inlay_hint(
                     if needs_hint {
                         // Anchor at the END of the signature line. Anchoring
                         // right after the name would visually split `name`
-                        // and `:` on annotated declarations.
+                        // and `:` on annotated declarations. Use the end of the
+                        // *type signature* line, not the first `\n` in the whole
+                        // declaration — on a multi-line signature the latter
+                        // lands mid-type, where the `--` hint reads as commenting
+                        // out the continuation.
                         let span_end = decl.span.end.min(doc.source.len());
-                        let hint_offset = doc.source
-                            [decl.span.start.min(span_end)..span_end]
+                        let sig_end = scheme.ty.span.end.min(span_end);
+                        let hint_offset = doc.source[sig_end..span_end]
                             .find('\n')
-                            .map(|p| decl.span.start + p)
+                            .map(|p| sig_end + p)
                             .unwrap_or(span_end);
                         let hint_pos = offset_to_position(&doc.source, hint_offset);
                         hints.push(InlayHint {

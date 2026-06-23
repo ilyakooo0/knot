@@ -1274,7 +1274,7 @@ pub(crate) fn file_imports_owner(
 /// and data-constructor fields (`Circle {radius: Float}`). The AST stores
 /// field names as bare strings (no per-name span), so we recover spans by
 /// scanning the field's containing source range.
-fn is_at_record_field(module: &ast::Module, source: &str, offset: usize) -> bool {
+pub(crate) fn is_at_record_field(module: &ast::Module, source: &str, offset: usize) -> bool {
     field_position_at(module, source, offset).is_some()
 }
 
@@ -1385,6 +1385,73 @@ fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::Decl, source: &str, f: 
         }
         DeclKind::TypeAlias { ty, .. } | DeclKind::Source { ty, .. } => {
             field_sites_in_type(ty, source, f);
+        }
+        DeclKind::Trait { items, .. } => {
+            for item in items {
+                if let ast::TraitItem::Method {
+                    ty,
+                    default_params,
+                    default_body,
+                    ..
+                } = item
+                {
+                    field_sites_in_type(&ty.ty, source, f);
+                    for p in default_params {
+                        field_sites_in_pat(p, source, f);
+                    }
+                    if let Some(body) = default_body {
+                        field_sites_in_expr(body, source, f);
+                    }
+                }
+            }
+        }
+        DeclKind::Migrate {
+            from_ty,
+            to_ty,
+            using_fn,
+            ..
+        } => {
+            field_sites_in_type(from_ty, source, f);
+            field_sites_in_type(to_ty, source, f);
+            field_sites_in_expr(using_fn, source, f);
+        }
+        DeclKind::Route { entries, .. } => {
+            // Route field names are declared inline (`body {userId: Int}`,
+            // `?{q: Text}`, `headers {auth: Text}`, and the response record
+            // type) before their type. They appear in source order: body, path
+            // params, query, request headers, response type, response headers.
+            // A single running cursor confines each name search to its own slot
+            // (mirroring the `Data`/`Record` walks).
+            for entry in entries {
+                let mut cursor = decl.span.start;
+                let field_list = |flds: &[ast::Field<ast::Type>],
+                                  cursor: &mut usize,
+                                  f: &mut F| {
+                    for fld in flds {
+                        if let Some(span) =
+                            find_word_in_source(source, &fld.name, *cursor, fld.value.span.start)
+                        {
+                            f(&fld.name, span);
+                        }
+                        field_sites_in_type(&fld.value, source, f);
+                        *cursor = fld.value.span.end;
+                    }
+                };
+                field_list(&entry.body_fields, &mut cursor, f);
+                for seg in &entry.path {
+                    if let ast::PathSegment::Param { ty, .. } = seg {
+                        field_sites_in_type(ty, source, f);
+                        cursor = ty.span.end;
+                    }
+                }
+                field_list(&entry.query_params, &mut cursor, f);
+                field_list(&entry.request_headers, &mut cursor, f);
+                if let Some(resp) = &entry.response_ty {
+                    field_sites_in_type(resp, source, f);
+                    cursor = resp.span.end;
+                }
+                field_list(&entry.response_headers, &mut cursor, f);
+            }
         }
         _ => {}
     }

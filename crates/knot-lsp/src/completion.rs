@@ -1482,7 +1482,17 @@ fn find_type_for_name(doc: &DocumentState, name: &str, offset: usize) -> Option<
     for (usage_span, def_span) in &doc.references {
         if usage_span.start <= offset && offset < usage_span.end {
             if let Some(ty) = doc.local_type_info.get(def_span) {
-                return Some(ty.clone());
+                // Guard that the pointed-at definition is actually named `name`,
+                // mirroring the `local_type_info` branch above. Without it a
+                // stale or mismatched reference span covering the receiver
+                // offset hands back an unrelated binding's type, offering the
+                // wrong fields after `.`.
+                if def_span.end <= doc.source.len()
+                    && def_span.start <= def_span.end
+                    && &doc.source[def_span.start..def_span.end] == name
+                {
+                    return Some(ty.clone());
+                }
             }
         }
     }

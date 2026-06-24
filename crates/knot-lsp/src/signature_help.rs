@@ -69,7 +69,7 @@ pub(crate) fn handle_signature_help(
     // otherwise attach a name to the return-type slot).
     param_names.truncate(arity);
     if param_names.len() < arity {
-        let existing: std::collections::HashSet<String> =
+        let mut existing: std::collections::HashSet<String> =
             param_names.iter().cloned().collect();
         for i in param_names.len()..arity {
             // Walk `a`, `b`, … `z`, `a1`, `b1`, … skipping any that collide.
@@ -79,6 +79,8 @@ pub(crate) fn handle_signature_help(
                 k += 26;
                 name = synth_param_name(k);
             }
+            // Record the synthesized name so a later slot can't reuse it.
+            existing.insert(name.clone());
             param_names.push(name);
         }
     }

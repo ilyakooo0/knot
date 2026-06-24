@@ -15979,9 +15979,13 @@ fn resolved_type_to_descriptor(ty: &ResolvedType) -> String {
                     }
                 }
             }
-            // Represent ADT as object with _tag + all constructor fields
+            // Represent ADT as object with _tag + all constructor fields.
+            // Seed `seen` with the synthetic `_tag` so a constructor field
+            // literally named `_tag` can't emit a duplicate descriptor entry
+            // (the synthetic tag column wins).
             let mut fields: Vec<String> = vec!["_tag:text".to_string()];
             let mut seen = std::collections::HashSet::<String>::new();
+            seen.insert("_tag".to_string());
             for (_ctor_name, ctor_fields) in ctors {
                 for (fname, fty) in ctor_fields {
                     if seen.insert(fname.clone()) {

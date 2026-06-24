@@ -69,10 +69,19 @@ pub(crate) fn handle_code_lens(
             .get(decl_name)
             .copied()
             .unwrap_or(decl.span);
+        // Filter out self-references the way `references.rs` and
+        // `call_hierarchy.rs` do: the declaration's own name token (and, for
+        // multi-line decls, the definition-line name token recorded by
+        // `defs::register_extra_definition_tokens`) are stored as references to
+        // `def_span` but are not real usages — counting them inflates the lens.
         let ref_locations: Vec<Location> = doc
             .references
             .iter()
-            .filter(|(_, def)| *def == def_span)
+            .filter(|(usage, def)| {
+                *def == def_span
+                    && *usage != def_span
+                    && !crate::references::is_declaration_token(&doc.source, *usage)
+            })
             .map(|(usage, _)| Location {
                 uri: uri.clone(),
                 range: span_to_range(*usage, &doc.source),

@@ -714,16 +714,29 @@ impl Infer {
         }
     }
 
-    /// True when `ty` resolves to a concrete primitive that can serve as a
-    /// refinement base (Int/Float/Text/Bool, with or without units). Used to
-    /// distinguish "a real base value is being supplied" (reject the implicit
-    /// introduction of a refinement) from "the type is still an unresolved
-    /// variable" (let inference flow). An unrelated concrete type is left to
-    /// the normal mismatch path.
+    /// True when `ty` resolves to a concrete type that can serve as a
+    /// refinement base. Used to distinguish "a real base value is being
+    /// supplied" (reject the implicit introduction of a refinement) from
+    /// "the type is still an unresolved variable" (let inference flow). An
+    /// unrelated concrete type is left to the normal mismatch path.
+    ///
+    /// Covers the primitive bases (Int/Float/Text/Bool, with or without
+    /// units) as well as the composite bases a refined alias can wrap —
+    /// records (`type Valid = {x: Int} where …`) and relations. Without the
+    /// composite forms, a concrete record/relation value flowing into a
+    /// refined type with a matching base would skip the guard and be
+    /// laundered into the refined type with no predicate check.
     fn is_concrete_refinement_base(&self, ty: &Ty) -> bool {
         matches!(
             self.apply(ty),
-            Ty::Int | Ty::Float | Ty::Text | Ty::Bool | Ty::IntUnit(_) | Ty::FloatUnit(_)
+            Ty::Int
+                | Ty::Float
+                | Ty::Text
+                | Ty::Bool
+                | Ty::IntUnit(_)
+                | Ty::FloatUnit(_)
+                | Ty::Record(..)
+                | Ty::Relation(_)
         )
     }
 
@@ -2531,15 +2544,41 @@ impl Infer {
             let sources = u.sources.iter().copied().map(fresh_var).collect();
             self.pending_effect_unions.push(EffectUnion { result, sources });
         }
+        // Freshen unit variables so the body check gets independent units.
+        let unit_mapping: HashMap<UnitVar, UnitVar> = scheme
+            .unit_vars
+            .iter()
+            .map(|v| (*v, self.fresh_unit_var()))
+            .collect();
+        // Re-arm captured `*`/`/` unit-composition checks alongside the
+        // skolems and fresh units, mirroring `instantiate_at`. Without this,
+        // a unit-polymorphic annotation like `square : Float<u> -> Float<u2>`
+        // (carrying a deferred `u2 = u * u` obligation) would have that
+        // obligation silently dropped while checking the body, so the body
+        // could violate the declared unit relationship undetected.
+        for b in &scheme.unit_binops {
+            let result = match mapping.get(&b.result) {
+                Some(Ty::Var(nv)) => *nv,
+                _ => b.result,
+            };
+            let mut lhs = self.subst_ty(&b.lhs, &mapping);
+            let mut rhs = self.subst_ty(&b.rhs, &mapping);
+            if !unit_mapping.is_empty() {
+                lhs = self.subst_unit_vars_in_ty(&lhs, &unit_mapping);
+                rhs = self.subst_unit_vars_in_ty(&rhs, &unit_mapping);
+            }
+            self.deferred_unit_binops.push(DeferredUnitBinop {
+                op: b.op,
+                lhs,
+                rhs,
+                result,
+                span: b.span,
+            });
+        }
         let ty = self.subst_ty(&scheme.ty, &mapping);
-        let ty = if scheme.unit_vars.is_empty() {
+        let ty = if unit_mapping.is_empty() {
             ty
         } else {
-            let unit_mapping: HashMap<UnitVar, UnitVar> = scheme
-                .unit_vars
-                .iter()
-                .map(|v| (*v, self.fresh_unit_var()))
-                .collect();
             self.subst_unit_vars_in_ty(&ty, &unit_mapping)
         };
         (ty, fresh_skolems)

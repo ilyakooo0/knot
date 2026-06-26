@@ -136,18 +136,18 @@ pub(crate) fn handle_type_hierarchy_supertypes(
                         trait_name, args, ..
                     } = &decl.node
                     {
-                        // Whole-token comparison: a substring `contains`
-                        // would make `impl Display UserId` register Display
-                        // as a supertype of an unrelated type `Id`
-                        // ("UserId".contains("Id")). Split the formatted
-                        // impl args into identifier tokens and require an
-                        // exact token match.
-                        let matches_token = args.iter().any(|t| {
-                            crate::type_format::format_type_kind(&t.node)
-                                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                                .any(|tok| tok == name)
-                        });
-                        if matches_token {
+                        // Compare `name` only against the *head* type
+                        // constructor of each impl arg. A whole-token scan over
+                        // the rendered arg over-matches: for `impl Container
+                        // [Widget]` it would split `[Widget]` and report
+                        // Container as a supertype of `Widget`, when it is the
+                        // *list* type that implements Container, not `Widget`.
+                        // The head of `Result e` is `Result`; of `[a]` the list
+                        // constructor — never the nested element type.
+                        let matches_head = args
+                            .iter()
+                            .any(|t| head_type_name(&t.node).as_deref() == Some(name));
+                        if matches_head {
                             push_trait_item(trait_name, state, &mut out);
                         }
                     }
@@ -251,6 +251,23 @@ pub(crate) fn handle_type_hierarchy_subtypes(
         None
     } else {
         Some(out)
+    }
+}
+
+/// The head type constructor of a type expression: `Foo` for `Foo`, `Result`
+/// for `Result e a`, the list constructor for `[a]`. Used to decide whether an
+/// impl head is *about* a given data type, without matching type arguments
+/// nested inside a compound head (which would wrongly attribute the impl to the
+/// element/argument type).
+fn head_type_name(tk: &knot::ast::TypeKind) -> Option<String> {
+    use knot::ast::TypeKind;
+    match tk {
+        TypeKind::Named(n) => Some(n.clone()),
+        TypeKind::App { func, .. } => head_type_name(&func.node),
+        TypeKind::Relation(_) => Some("[]".to_string()),
+        TypeKind::UnitAnnotated { base, .. } => head_type_name(&base.node),
+        TypeKind::Refined { base, .. } => head_type_name(&base.node),
+        _ => None,
     }
 }
 

@@ -291,6 +291,21 @@ pub fn find_word_in_source(source: &str, name: &str, start: usize, end: usize) -
     None
 }
 
+/// Like [`find_word_in_source`] but returns the *last* whole-word match in the
+/// range. Useful when a name's true site is the one closest to the end of the
+/// window — e.g. a route field/param declaration `name: Type`, where the name
+/// sits immediately before its type, but an identical word (a path literal like
+/// `/name`) may appear earlier in the same window and must not be chosen.
+pub fn find_word_last_in_source(source: &str, name: &str, start: usize, end: usize) -> Option<Span> {
+    let mut last = None;
+    let mut from = start;
+    while let Some(span) = find_word_in_source(source, name, from, end) {
+        from = span.end;
+        last = Some(span);
+    }
+    last
+}
+
 // ── Doc comments ────────────────────────────────────────────────────
 
 /// Extract doc comments (lines starting with `-- `) above each declaration.

@@ -142,10 +142,14 @@ fn collect_field_name_spans(
             let mut search_start = expr.span.start;
             for f in fields {
                 if f.name == field_name {
-                    if let Some(span) =
-                        find_word_in_source(source, field_name, search_start, f.value.span.start)
-                    {
-                        ranges.push(span);
+                    match find_word_in_source(source, field_name, search_start, f.value.span.start) {
+                        Some(span) => ranges.push(span),
+                        // No explicit `name:` label before the value means a
+                        // punned field (`{name}`, or `{expr.field}`). Its token
+                        // doubles as a variable reference / field access, so it
+                        // can't be linked in isolation — suppress, mirroring the
+                        // pattern path's `pun_seen`.
+                        None => *pun_seen = true,
                     }
                 }
                 search_start = f.value.span.end;
@@ -155,10 +159,9 @@ fn collect_field_name_spans(
             let mut search_start = base.span.end;
             for f in fields {
                 if f.name == field_name {
-                    if let Some(span) =
-                        find_word_in_source(source, field_name, search_start, f.value.span.start)
-                    {
-                        ranges.push(span);
+                    match find_word_in_source(source, field_name, search_start, f.value.span.start) {
+                        Some(span) => ranges.push(span),
+                        None => *pun_seen = true,
                     }
                 }
                 search_start = f.value.span.end;

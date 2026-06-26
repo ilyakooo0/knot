@@ -6238,8 +6238,16 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Float(x), Value::Float(y)) => x.total_cmp(y) == std::cmp::Ordering::Equal,
-        (Value::Int(x), Value::Float(y)) => (*x as f64).total_cmp(y) == std::cmp::Ordering::Equal,
-        (Value::Float(x), Value::Int(y)) => x.total_cmp(&(*y as f64)) == std::cmp::Ordering::Equal,
+        // Int↔Float equality must agree with `value_to_hash_bytes`, which
+        // canonicalizes an integral Float by casting it to i64. Casting the Int
+        // to f64 instead (lossy past 2^53) makes `==` non-transitive and breaks
+        // the "equal values hash equally" contract: `Int(2^53+1)` would equal
+        // `Float(2^53.0)` yet hash differently. Use the exact-round-trip basis:
+        // equal only when the Float is integral, fits i64, and equals the Int.
+        (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => {
+            let i = *y as i64;
+            (i as f64).total_cmp(y) == std::cmp::Ordering::Equal && i == *x
+        }
         (Value::Text(x), Value::Text(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Bytes(x), Value::Bytes(y)) => x == y,
@@ -6388,6 +6396,12 @@ pub extern "C-unwind" fn knot_value_mod(a: *mut Value, b: *mut Value) -> *mut Va
         (Some(NumView::Int(x)), Some(NumView::Int(y))) => {
             if y == 0 {
                 panic!("knot runtime: modulo by zero");
+            }
+            // `i64::MIN % -1` is mathematically 0 but `checked_rem` returns
+            // None (it shares the division-overflow guard). Special-case it so
+            // the representable result is returned instead of panicking.
+            if x == i64::MIN && y == -1 {
+                return alloc_int(0);
             }
             match x.checked_rem(y) {
                 Some(r) => alloc_int(r),
@@ -15961,15 +15975,20 @@ pub extern "C-unwind" fn knot_http_fetch_io(
                 if field_desc.is_empty() { continue; }
                 let (name, _ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
                 let http_name = camel_to_header_case(name);
-                if http_name.eq_ignore_ascii_case("Content-Type") {
-                    has_content_type = true;
-                }
                 let field_val = knot_record_field(payload, name.as_ptr(), name.len());
                 // `fetch_value_to_text_opt` unwraps Just and returns None
                 // for Nothing — covers both Maybe (`?`-typed) and plain
                 // header fields (a `None` on a non-Maybe field can't occur
                 // by typing, and omitting it is safe regardless).
                 if let Some(text) = fetch_value_to_text_opt(field_val) {
+                    // Only treat Content-Type as set when a value is actually
+                    // emitted. Keying off the route declaration alone would
+                    // suppress the default `application/json` even when an
+                    // optional `contentType` header resolves to Nothing,
+                    // sending a JSON body with no Content-Type at all.
+                    if http_name.eq_ignore_ascii_case("Content-Type") {
+                        has_content_type = true;
+                    }
                     req_headers.push((http_name, text));
                 }
             }

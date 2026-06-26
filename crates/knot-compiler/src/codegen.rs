@@ -15874,6 +15874,12 @@ fn ast_type_to_descriptor_type(
             format!("[{}]", ast_type_to_descriptor_type(inner, aliases))
         }
         ast::TypeKind::UnitAnnotated { base, .. } => ast_type_to_descriptor_type(base, aliases),
+        // A refined field (`amount: Int where \x -> x > 0`) is transparent for
+        // the wire: it must carry the base type's descriptor, not the `text`
+        // fallback — otherwise valid JSON numbers/objects are (de)serialized as
+        // Text, inconsistent with the refinement validators codegen already
+        // registers for the same fields, yielding spurious HTTP 400s.
+        ast::TypeKind::Refined { base, .. } => ast_type_to_descriptor_type(base, aliases),
         _ => "text".to_string(),
     }
 }
@@ -15941,6 +15947,9 @@ fn resolve_type_for_descriptor(
             }
         }
         ast::TypeKind::UnitAnnotated { base, .. } => resolve_type_for_descriptor(base, aliases),
+        // Refined types are transparent for the wire descriptor; recurse into
+        // the base so the response side agrees with the request side.
+        ast::TypeKind::Refined { base, .. } => resolve_type_for_descriptor(base, aliases),
         _ => ResolvedType::Text,
     }
 }

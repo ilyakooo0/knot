@@ -36,12 +36,24 @@ pub(crate) fn handle_signature_help(
     // The fallback matches by name + by the binding span — any local binding
     // whose name matches and whose span lies before the call site is a
     // candidate.
+    // An in-scope local binding shadows a same-named top-level decl, so it must
+    // win over the global table. Bound the local search to the enclosing
+    // declaration (a binding ending before the call site but in a *different*
+    // top-level decl is out of scope and must not shadow). Only fall back to
+    // the global table when no shadowing local is in scope.
+    let enclosing = doc
+        .module
+        .decls
+        .iter()
+        .map(|d| d.span)
+        .find(|s| s.start <= offset && offset <= s.end);
+    let local = lookup_local_binding_type(doc, &func_name, offset, enclosing);
     let type_str_owned: String;
-    let type_str: &str = if let Some(global) = doc.type_info.get(func_name.as_str()) {
-        global.as_str()
-    } else if let Some(local) = lookup_local_binding_type(doc, &func_name, offset) {
+    let type_str: &str = if let Some(local) = local {
         type_str_owned = local;
         type_str_owned.as_str()
+    } else if let Some(global) = doc.type_info.get(func_name.as_str()) {
+        global.as_str()
     } else {
         return None;
     };
@@ -174,6 +186,7 @@ fn lookup_local_binding_type(
     doc: &DocumentState,
     func_name: &str,
     call_offset: usize,
+    enclosing: Option<Span>,
 ) -> Option<String> {
     let mut best: Option<(Span, String)> = None;
     for (span, ty) in &doc.local_type_info {
@@ -182,6 +195,14 @@ fn lookup_local_binding_type(
         }
         if span.end > doc.source.len() || span.start > span.end {
             continue;
+        }
+        // Restrict to bindings inside the enclosing declaration; a local in a
+        // sibling decl that merely precedes the call is not in scope and must
+        // not be treated as a shadowing binding.
+        if let Some(enc) = enclosing {
+            if span.start < enc.start || span.end > enc.end {
+                continue;
+            }
         }
         // Char-boundary-safe: a stale span could land mid-multibyte-char.
         let name = crate::utils::safe_slice(&doc.source, *span);

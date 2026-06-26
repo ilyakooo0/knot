@@ -437,6 +437,12 @@ struct Infer {
     /// `Ty::Assoc(name, arg)` by matching `arg` against `head`.
     assoc_impls: HashMap<String, Vec<(Ty, Ty, Vec<TyVar>)>>,
 
+    /// Re-entrancy depth of associated-type reduction during `apply`. Guards
+    /// against a self-referential type-family body (`type F X = F X`) that would
+    /// otherwise drive `apply → reduce_assoc → apply` into an unbounded
+    /// recursion and overflow the stack instead of stalling as a rigid Assoc.
+    assoc_reduce_depth: std::cell::Cell<u32>,
+
     /// Type aliases: name → resolved Ty.
     aliases: HashMap<String, Ty>,
 
@@ -560,6 +566,12 @@ struct Infer {
     next_unit_var: UnitVar,
     /// Unit variable substitution.
     unit_subst: HashMap<UnitVar, UnitTy>,
+    /// Rigid unit variables introduced while checking a function body against a
+    /// unit-polymorphic signature. `unify_units` refuses to solve these, so the
+    /// body cannot silently narrow a `∀u` signature to a concrete unit (which
+    /// would be unsound — e.g. a body mixing `<S>` and `<M>` would otherwise
+    /// type-check). Removed once the body check completes.
+    unit_skolems: HashSet<UnitVar>,
     /// Declared units: name → definition (None for base units).
     declared_units: HashMap<String, Option<UnitTy>>,
     /// Unit variable names from type annotations: name → UnitVar.
@@ -617,6 +629,7 @@ impl Infer {
             view_names: HashSet::new(),
             assoc_type_names: HashSet::new(),
             assoc_impls: HashMap::new(),
+            assoc_reduce_depth: std::cell::Cell::new(0),
             aliases: HashMap::new(),
             annotation_vars: HashMap::new(),
             errors: Vec::new(),
@@ -645,6 +658,7 @@ impl Infer {
             let_bindings: HashMap::new(),
             next_unit_var: 0,
             unit_subst: HashMap::new(),
+            unit_skolems: HashSet::new(),
             declared_units: HashMap::new(),
             annotation_unit_vars: HashMap::new(),
             in_type_annotation: false,
@@ -799,11 +813,15 @@ impl Infer {
 
         // Find a variable in either side that we can solve.
         // Prefer solving a variable that appears on only one side.
+        // Skolems are rigid and must never be solved — excluding them here means
+        // a unit-polymorphic signature variable cannot be narrowed by the body;
+        // an unsatisfiable difference falls through to the mismatch error below.
+        // (A flexible var may still be solved *to* a skolem, which is correct.)
         let a_only_vars: Vec<UnitVar> = a.vars.keys()
-            .filter(|v| !b.vars.contains_key(v))
+            .filter(|v| !b.vars.contains_key(v) && !self.unit_skolems.contains(v))
             .copied().collect();
         let b_only_vars: Vec<UnitVar> = b.vars.keys()
-            .filter(|v| !a.vars.contains_key(v))
+            .filter(|v| !a.vars.contains_key(v) && !self.unit_skolems.contains(v))
             .copied().collect();
 
         if let Some(&va) = a_only_vars.first() {
@@ -1059,10 +1077,20 @@ impl Infer {
                 let inner = self.apply(inner);
                 // Reduce once the argument is concrete enough to match an
                 // impl's associated-type head; otherwise stay a rigid Assoc.
-                match self.reduce_assoc(name, &inner) {
+                // Bound the reduction depth: a self-referential family body
+                // (`type F X = F X`) would loop here forever, so once we exceed
+                // the cap we leave the projection rigid rather than overflow.
+                const MAX_ASSOC_REDUCE_DEPTH: u32 = 100;
+                if self.assoc_reduce_depth.get() >= MAX_ASSOC_REDUCE_DEPTH {
+                    return Ty::Assoc(name.clone(), Box::new(inner));
+                }
+                self.assoc_reduce_depth.set(self.assoc_reduce_depth.get() + 1);
+                let result = match self.reduce_assoc(name, &inner) {
                     Some(reduced) => reduced,
                     None => Ty::Assoc(name.clone(), Box::new(inner)),
-                }
+                };
+                self.assoc_reduce_depth.set(self.assoc_reduce_depth.get() - 1);
+                result
             }
             _ => ty.clone(),
         }
@@ -2502,9 +2530,9 @@ impl Infer {
         &mut self,
         scheme: &Scheme,
         span: Span,
-    ) -> (Ty, Vec<TyVar>) {
+    ) -> (Ty, Vec<TyVar>, Vec<UnitVar>) {
         if scheme.vars.is_empty() && scheme.unit_vars.is_empty() {
-            return (scheme.ty.clone(), Vec::new());
+            return (scheme.ty.clone(), Vec::new(), Vec::new());
         }
         let mut fresh_skolems: Vec<TyVar> = Vec::with_capacity(scheme.vars.len());
         let mut mapping: HashMap<TyVar, Ty> = HashMap::new();
@@ -2544,11 +2572,19 @@ impl Infer {
             let sources = u.sources.iter().copied().map(fresh_var).collect();
             self.pending_effect_unions.push(EffectUnion { result, sources });
         }
-        // Freshen unit variables so the body check gets independent units.
+        // Freshen unit variables to fresh *skolems* (rigid): the body must hold
+        // for every unit, so it may not narrow `∀u` to a concrete unit. Marking
+        // them in `unit_skolems` makes `unify_units` refuse to solve them.
+        let mut fresh_unit_skolems: Vec<UnitVar> = Vec::with_capacity(scheme.unit_vars.len());
         let unit_mapping: HashMap<UnitVar, UnitVar> = scheme
             .unit_vars
             .iter()
-            .map(|v| (*v, self.fresh_unit_var()))
+            .map(|v| {
+                let s = self.fresh_unit_var();
+                self.unit_skolems.insert(s);
+                fresh_unit_skolems.push(s);
+                (*v, s)
+            })
             .collect();
         // Re-arm captured `*`/`/` unit-composition checks alongside the
         // skolems and fresh units, mirroring `instantiate_at`. Without this,
@@ -2581,7 +2617,7 @@ impl Infer {
         } else {
             self.subst_unit_vars_in_ty(&ty, &unit_mapping)
         };
-        (ty, fresh_skolems)
+        (ty, fresh_skolems, fresh_unit_skolems)
     }
 
     /// Substitute type variables according to a mapping (for instantiation).
@@ -3119,8 +3155,12 @@ impl Infer {
             }
         }
         // Use bind_var so the binding goes through occurs check + unification
-        // — handles the case where `result` has already been narrowed.
-        self.bind_var(u.result, Ty::EffectRow(effects, leftover), span);
+        // — handles the case where `result` has already been narrowed. Bind the
+        // chain representative `end`, not `u.result`: if `u.result` was aliased
+        // to another row var during body inference, binding the interior var
+        // would orphan every alias past it (`end` and the do-block's IO row
+        // stay unbound), laundering/dropping the union's effects.
+        self.bind_var(end, Ty::EffectRow(effects, leftover), span);
     }
 
     /// Final-pass resolution of all remaining effect-union constraints.
@@ -6133,6 +6173,20 @@ impl Infer {
                 self.aliases.insert(name.clone(), Ty::Error);
             }
         }
+        // Collect unit declarations *before* the alias fixpoint and refined-type
+        // population below: both call `ast_type_to_ty` → `ast_unit_to_unit_ty`,
+        // which expands derived unit aliases by consulting `declared_units`. If
+        // this ran afterwards (as it once did), a derived unit used in a refined
+        // base or alias body would freeze unexpanded (`{Speed:1}` instead of
+        // `{M:1,S:-1}`), producing spurious unit-mismatch errors against the
+        // expanded form every other site computes.
+        for decl in &module.decls {
+            if let ast::DeclKind::UnitDecl { name, definition } = &decl.node {
+                let def = definition.as_ref().map(|u| self.ast_unit_to_unit_ty(u));
+                self.declared_units.insert(name.clone(), def);
+            }
+        }
+
         // Iterate until alias resolutions stabilize (fixpoint).
         // Clear annotation_vars once before the loop so that type variable
         // names (e.g. `a` in `type T = a`) map to stable TyVars across
@@ -6166,14 +6220,6 @@ impl Infer {
             let base_ty = self.ast_type_to_ty(base_ty_ast);
             self.refined_types
                 .insert(name.clone(), (base_ty, predicate.clone()));
-        }
-
-        // Collect unit declarations
-        for decl in &module.decls {
-            if let ast::DeclKind::UnitDecl { name, definition } = &decl.node {
-                let def = definition.as_ref().map(|u| self.ast_unit_to_unit_ty(u));
-                self.declared_units.insert(name.clone(), def);
-            }
         }
 
         // Second pass: data types and constructors
@@ -7906,11 +7952,11 @@ impl Infer {
                 ast::DeclKind::Fun { name, body, ty, .. } => {
                     if let Some(body) = body {
                         let scheme = self.lookup(name).cloned();
-                        let (expected, fresh_skolems) = match scheme {
+                        let (expected, fresh_skolems, fresh_unit_skolems) = match scheme {
                             Some(scheme) => {
                                 self.skolemise_scheme(&scheme, body.span)
                             }
-                            None => (self.fresh(), Vec::new()),
+                            None => (self.fresh(), Vec::new(), Vec::new()),
                         };
                         let pre_body_constraints = self.next_constraint_seq;
                         self.check_expr(body, &expected);
@@ -7921,6 +7967,9 @@ impl Infer {
                         for s in &fresh_skolems {
                             self.skolems.remove(s);
                             self.declared_skolem_constraints.remove(s);
+                        }
+                        for u in &fresh_unit_skolems {
+                            self.unit_skolems.remove(u);
                         }
                         let inferred = self.apply(&expected);
 

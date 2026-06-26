@@ -364,7 +364,37 @@ fn strip_spans(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
+    // Track whether we're inside a string-literal's Debug rendering. A user
+    // string whose contents happen to spell `Span { start: N, end: N }` must
+    // NOT be scrubbed — otherwise edits confined to those digits would hash
+    // identically, a false negative in change detection. Derived `Debug`
+    // always quotes string contents and escapes inner quotes as `\"`, so a
+    // simple in-string flag (with backslash escape handling) separates real
+    // span markers (rendered outside quotes) from look-alike string contents.
+    let mut in_string = false;
     while i < bytes.len() {
+        if in_string {
+            // Inside a string: copy verbatim, honoring `\`-escapes (so an
+            // escaped `\"` does not prematurely close the string), and exit
+            // on the closing unescaped quote.
+            let step = utf8_char_len(bytes[i]);
+            let end = (i + step).min(bytes.len());
+            out.push_str(&s[i..end]);
+            if bytes[i] == b'\\' {
+                // Copy the escaped char too, so it can't be misread as a quote.
+                if end < bytes.len() {
+                    let step2 = utf8_char_len(bytes[end]);
+                    let end2 = (end + step2).min(bytes.len());
+                    out.push_str(&s[end..end2]);
+                    i = end2;
+                    continue;
+                }
+            } else if bytes[i] == b'"' {
+                in_string = false;
+            }
+            i = end;
+            continue;
+        }
         if let Some(len) = span_marker_len(&bytes[i..]) {
             i += len;
             continue;
@@ -375,6 +405,9 @@ fn strip_spans(s: &str) -> String {
         let step = utf8_char_len(bytes[i]);
         let end = (i + step).min(bytes.len());
         out.push_str(&s[i..end]);
+        if bytes[i] == b'"' {
+            in_string = true;
+        }
         i = end;
     }
     out

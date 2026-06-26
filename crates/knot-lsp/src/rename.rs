@@ -12,7 +12,8 @@ use crate::defs::resolve_definitions;
 use crate::shared::scan_knot_files_in_roots;
 use crate::state::{builtins, DocumentState, ServerState, KEYWORDS};
 use crate::utils::{
-    find_word_in_source, ident_lookup_offset, path_to_uri, position_to_offset, recurse_expr,
+    find_word_in_source, find_word_last_in_source, ident_lookup_offset, path_to_uri,
+    position_to_offset, recurse_expr,
     safe_slice, span_to_range, uri_to_path, word_at_position,
 };
 
@@ -818,31 +819,41 @@ pub(crate) fn collect_name_uses_in_decl(
 ) {
     // Collect constructor-pattern name tokens (`Ctor pat <- …`, `case … of
     // Ctor …`) — these reference the renamed symbol when it's a constructor.
-    fn walk_pat_ctors(pat: &ast::Pat, name: &str, out: &mut Vec<Span>) {
+    fn walk_pat_ctors(pat: &ast::Pat, name: &str, source: &str, out: &mut Vec<Span>) {
         match &pat.node {
             ast::PatKind::Constructor { name: n, payload } => {
                 if n == name {
-                    // Constructor names lead the pattern span; `n.len()` is
-                    // bytes, matching the byte-indexed span representation.
-                    out.push(Span::new(pat.span.start, pat.span.start + n.len()));
+                    // The constructor name does NOT always lead the pattern
+                    // span: a parenthesized pattern (`(Circle c)`, the normal
+                    // form for destructuring in a lambda/case) rewrites the
+                    // span to start at `(`. Locate the actual name token via
+                    // word search rather than assuming `start + n.len()`,
+                    // which would otherwise corrupt the source on rename.
+                    if let Some(span) =
+                        find_word_in_source(source, n, pat.span.start, pat.span.end)
+                    {
+                        out.push(span);
+                    } else if safe_slice(source, pat.span) == name {
+                        out.push(pat.span);
+                    }
                 }
-                walk_pat_ctors(payload, name, out);
+                walk_pat_ctors(payload, name, source, out);
             }
             ast::PatKind::Record(fields) => {
                 for f in fields {
                     if let Some(p) = &f.pattern {
-                        walk_pat_ctors(p, name, out);
+                        walk_pat_ctors(p, name, source, out);
                     }
                 }
             }
             ast::PatKind::List(pats) => {
                 for p in pats {
-                    walk_pat_ctors(p, name, out);
+                    walk_pat_ctors(p, name, source, out);
                 }
             }
             ast::PatKind::Cons { head, tail } => {
-                walk_pat_ctors(head, name, out);
-                walk_pat_ctors(tail, name, out);
+                walk_pat_ctors(head, name, source, out);
+                walk_pat_ctors(tail, name, source, out);
             }
             _ => {}
         }
@@ -921,7 +932,7 @@ pub(crate) fn collect_name_uses_in_decl(
             }
             ast::ExprKind::Lambda { params, body } => {
                 for p in params {
-                    walk_pat_ctors(p, name, out);
+                    walk_pat_ctors(p, name, source, out);
                 }
                 let sh = shadowed || params.iter().any(|p| pat_binds_name(p, name));
                 walk_expr(body, name, source, sh, out);
@@ -930,7 +941,7 @@ pub(crate) fn collect_name_uses_in_decl(
             ast::ExprKind::Case { scrutinee, arms } => {
                 walk_expr(scrutinee, name, source, shadowed, out);
                 for arm in arms {
-                    walk_pat_ctors(&arm.pat, name, out);
+                    walk_pat_ctors(&arm.pat, name, source, out);
                     let sh = shadowed || pat_binds_name(&arm.pat, name);
                     walk_expr(&arm.body, name, source, sh, out);
                 }
@@ -945,7 +956,7 @@ pub(crate) fn collect_name_uses_in_decl(
                             // The RHS is evaluated before the pattern binds,
                             // so it sees the pre-bind shadow status.
                             walk_expr(expr, name, source, sh, out);
-                            walk_pat_ctors(pat, name, out);
+                            walk_pat_ctors(pat, name, source, out);
                             if pat_binds_name(pat, name) {
                                 sh = true;
                             }
@@ -1025,7 +1036,7 @@ pub(crate) fn collect_name_uses_in_decl(
                             out.push(*name_span);
                         }
                         for p in params {
-                            walk_pat_ctors(p, name, out);
+                            walk_pat_ctors(p, name, source, out);
                         }
                         let sh = params.iter().any(|p| pat_binds_name(p, name));
                         walk_expr(body, name, source, sh, out);
@@ -1056,7 +1067,7 @@ pub(crate) fn collect_name_uses_in_decl(
                     walk_scheme(ty, name, source, out);
                     if let Some(body) = default_body {
                         for p in default_params {
-                            walk_pat_ctors(p, name, out);
+                            walk_pat_ctors(p, name, source, out);
                         }
                         let sh = default_params.iter().any(|p| pat_binds_name(p, name));
                         walk_expr(body, name, source, sh, out);
@@ -1500,9 +1511,17 @@ fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::Decl, source: &str, f: 
                                   cursor: &mut usize,
                                   f: &mut F| {
                     for fld in flds {
-                        if let Some(span) =
-                            find_word_in_source(source, &fld.name, *cursor, fld.value.span.start)
-                        {
+                        // Use the *last* match before the type: the field name
+                        // declaration sits immediately before `fld.value`, so a
+                        // same-named path literal earlier in the window (the
+                        // body cursor starts at the route keyword, before the
+                        // path in source) is correctly skipped.
+                        if let Some(span) = find_word_last_in_source(
+                            source,
+                            &fld.name,
+                            *cursor,
+                            fld.value.span.start,
+                        ) {
                             f(&fld.name, span);
                         }
                         field_sites_in_type(&fld.value, source, f);
@@ -1520,8 +1539,10 @@ fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::Decl, source: &str, f: 
                 let mut path_name_cursor = decl.span.start;
                 for seg in &entry.path {
                     if let ast::PathSegment::Param { name, ty } = seg {
+                        // Same reasoning as body fields: the param name `{id:
+                        // Int}` is the last occurrence before its type.
                         if let Some(span) =
-                            find_word_in_source(source, name, path_name_cursor, ty.span.start)
+                            find_word_last_in_source(source, name, path_name_cursor, ty.span.start)
                         {
                             f(name, span);
                         }

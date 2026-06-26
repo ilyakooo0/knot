@@ -435,10 +435,17 @@ impl<'a> DefResolver<'a> {
             ast::PatKind::Constructor { name, payload } => {
                 // The reference must cover only the constructor name, not the
                 // payload — rename replaces usage spans verbatim, so a
-                // whole-pattern span would delete the payload binder. The
-                // name leads the pattern span; `name.len()` is bytes,
-                // matching the byte-indexed span representation.
-                self.add_ref(Span::new(pat.span.start, pat.span.start + name.len()), name);
+                // whole-pattern span would delete the payload binder. The name
+                // does NOT always lead the pattern span: a parenthesized
+                // pattern (`(Circle c)`, the normal form for destructuring in
+                // a lambda/case) rewrites the span to start at `(`, so
+                // `start + name.len()` would cover `(Circl` instead of the
+                // name. Locate the actual token via word search, falling back
+                // to the leading-name form only for unparenthesized patterns.
+                // (Mirrors `rename.rs::walk_pat_ctors`.)
+                let name_span = find_word_in_source(self.source, name, pat.span.start, pat.span.end)
+                    .unwrap_or_else(|| Span::new(pat.span.start, pat.span.start + name.len()));
+                self.add_ref(name_span, name);
                 self.define_pat(payload);
             }
             ast::PatKind::Record(fields) => {

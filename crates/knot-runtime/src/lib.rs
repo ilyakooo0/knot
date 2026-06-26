@@ -1654,9 +1654,12 @@ impl Ord for SqlValKey {
             (SqlValKey::Null, SqlValKey::Null) => Ordering::Equal,
             (SqlValKey::Int(a), SqlValKey::Int(b)) => a.cmp(b),
             (SqlValKey::RealBits(a), SqlValKey::RealBits(b)) => {
-                let af = f64::from_bits(*a);
-                let bf = f64::from_bits(*b);
-                af.partial_cmp(&bf).unwrap_or(Ordering::Equal)
+                // `f64::total_cmp` provides a total order consistent with
+                // IEEE-754 totalOrder. Unlike `partial_cmp().unwrap_or(Equal)`,
+                // it never maps NaN to `Equal` against every value (which
+                // violated BTreeMap's total-order invariant and left the
+                // derived Hash inconsistent with Ord).
+                f64::from_bits(*a).total_cmp(&f64::from_bits(*b))
             }
             (SqlValKey::Text(a), SqlValKey::Text(b)) => a.cmp(b),
             (SqlValKey::Blob(a), SqlValKey::Blob(b)) => a.cmp(b),
@@ -1744,23 +1747,42 @@ fn sql_partial_cmp(a: &SqlVal, b: &SqlVal) -> Option<std::cmp::Ordering> {
     }
 }
 
+/// Column-mode-aware comparison used by STM row-level wake filtering.
+/// `text_col = true` means the column is a genuine TEXT column (BINARY
+/// collation): Text/Text must compare byte-wise to match SQLite, NOT via the
+/// numeric-parse heuristic (which is correct only for `KNOT_INT`-collated Int
+/// columns stored as TEXT). All other type pairs (and `text_col = false`)
+/// delegate to `sql_partial_cmp`. See `TEXT_COLUMNS`.
+fn cmp_for_col(a: &SqlVal, b: &SqlVal, text_col: bool) -> Option<std::cmp::Ordering> {
+    // Genuine TEXT column (BINARY collation): compare byte-wise to match
+    // SQLite, NOT via the numeric-parse heuristic (correct only for
+    // `KNOT_INT`-collated Int columns stored as TEXT). See `TEXT_COLUMNS`.
+    if text_col {
+        if let (SqlVal::Text(x), SqlVal::Text(y)) = (a, b) {
+            return Some(x.cmp(y));
+        }
+    }
+    sql_partial_cmp(a, b)
+}
+
 /// True if `row_val` satisfies `pred`. Unknown comparisons (incompatible types)
 /// return `true` to wake conservatively.
-fn col_pred_matches(row_val: &SqlVal, pred: &ColPred) -> bool {
+fn col_pred_matches(row_val: &SqlVal, pred: &ColPred, text_col: bool) -> bool {
     use std::cmp::Ordering;
+    let cmp = |a: &SqlVal, b: &SqlVal| cmp_for_col(a, b, text_col);
     match pred {
-        // Eq/Neq/In go through `sql_partial_cmp` (not raw `==`) so cross-type
-        // numeric comparisons agree with the ordered operators: `Int(5)` and
-        // `Real(5.0)` are equal, and an incompatible/unknown comparison wakes
-        // conservatively (`None` → treat as a possible match) rather than
-        // silently dropping a wake.
+        // Eq/Neq/In go through the (column-aware) partial cmp (not raw `==`)
+        // so cross-type numeric comparisons agree with the ordered operators:
+        // `Int(5)` and `Real(5.0)` are equal, and an incompatible/unknown
+        // comparison wakes conservatively (`None` → treat as a possible match)
+        // rather than silently dropping a wake.
         ColPred::Cmp(CmpOp::Eq, target) => {
-            !matches!(sql_partial_cmp(row_val, target), Some(o) if o != Ordering::Equal)
+            !matches!(cmp(row_val, target), Some(o) if o != Ordering::Equal)
         }
         ColPred::Cmp(CmpOp::Neq, target) => {
-            !matches!(sql_partial_cmp(row_val, target), Some(Ordering::Equal))
+            !matches!(cmp(row_val, target), Some(Ordering::Equal))
         }
-        ColPred::Cmp(op, target) => match sql_partial_cmp(row_val, target) {
+        ColPred::Cmp(op, target) => match cmp(row_val, target) {
             Some(ord) => match op {
                 CmpOp::Lt => ord == Ordering::Less,
                 CmpOp::Le => ord != Ordering::Greater,
@@ -1772,7 +1794,7 @@ fn col_pred_matches(row_val: &SqlVal, pred: &ColPred) -> bool {
         },
         ColPred::In(targets) => targets
             .iter()
-            .any(|t| !matches!(sql_partial_cmp(row_val, t), Some(o) if o != Ordering::Equal)),
+            .any(|t| !matches!(cmp(row_val, t), Some(o) if o != Ordering::Equal)),
     }
 }
 
@@ -1855,12 +1877,15 @@ impl EventRows {
 }
 
 /// True if `row` (indexed into `columns` by position) satisfies every
-/// `(idx, pred)` in `preds_with_idx`. Index resolution is done once per
-/// filter outside the row loop. An `idx` of `None` means the predicate's
-/// column isn't present in the event payload — we wake conservatively in
-/// that case.
-fn row_matches_preds_indexed(row: &[SqlVal], preds_with_idx: &[(Option<usize>, &ColPred)]) -> bool {
-    for (idx, pred) in preds_with_idx {
+/// `(idx, pred, text_col)` in `preds_with_idx`. Index resolution and the
+/// column's text-ness are resolved once per filter outside the row loop. An
+/// `idx` of `None` means the predicate's column isn't present in the event
+/// payload — we wake conservatively in that case.
+fn row_matches_preds_indexed(
+    row: &[SqlVal],
+    preds_with_idx: &[(Option<usize>, &ColPred, bool)],
+) -> bool {
+    for (idx, pred, text_col) in preds_with_idx {
         match idx {
             None => return true, // column missing → wake conservatively
             Some(i) => {
@@ -1868,7 +1893,7 @@ fn row_matches_preds_indexed(row: &[SqlVal], preds_with_idx: &[(Option<usize>, &
                     Some(v) => v,
                     None => return true,
                 };
-                if !col_pred_matches(rv, pred) {
+                if !col_pred_matches(rv, pred, *text_col) {
                     return false;
                 }
             }
@@ -1914,7 +1939,7 @@ impl WriteEvent {
 
     /// True if the event would wake a watcher with the given filter set for this table.
     /// AND semantics within a filter, OR across filters.
-    fn matches_filters(&self, filters: &[ReadFilter]) -> bool {
+    fn matches_filters(&self, table: &str, filters: &[ReadFilter]) -> bool {
         match self {
             WriteEvent::Bulk => true,
             WriteEvent::Rows(rows) => {
@@ -1925,12 +1950,18 @@ impl WriteEvent {
                     match f {
                         ReadFilter::All => return true,
                         ReadFilter::Cols(preds) => {
-                            // Pre-resolve column indices once for this filter
-                            // across every row in the event. `None` means
-                            // "column missing"; handled inside the matcher.
-                            let preds_with_idx: Vec<(Option<usize>, &ColPred)> = preds
+                            // Pre-resolve column indices AND each column's
+                            // text-ness once for this filter across every row
+                            // in the event. `None` means "column missing";
+                            // handled inside the matcher. `text_col` selects
+                            // byte-wise Text/Text comparison for genuine TEXT
+                            // columns (BINARY collation) vs the numeric-parse
+                            // heuristic used for `KNOT_INT`-stored Int columns.
+                            let preds_with_idx: Vec<(Option<usize>, &ColPred, bool)> = preds
                                 .iter()
-                                .map(|(c, p)| (rows.col_index(c), p))
+                                .map(|(c, p)| {
+                                    (rows.col_index(c), p, col_is_text(table, c))
+                                })
                                 .collect();
                             for row in &rows.rows {
                                 if row_matches_preds_indexed(row, &preds_with_idx) {
@@ -1994,6 +2025,36 @@ fn get_source_schema(name: &str) -> Option<Arc<RecordSchema>> {
     SOURCE_SCHEMAS.read().unwrap().get(name).cloned()
 }
 
+/// Registry of columns stored as genuine TEXT (BINARY collation in SQLite) —
+/// `ColType::Text`, `Tag`, or `Json` — keyed by `(source, column)`. Int columns
+/// are *also* stored as TEXT but use the `KNOT_INT` collation (numeric order),
+/// so they must NOT appear here.
+///
+/// STM row-level wake filtering mirrors SQLite's comparison semantics: for a
+/// numeric (`KNOT_INT`) column `"100" < "99"` is FALSE (numeric), but for a
+/// genuine TEXT column it is TRUE (byte order, `'1' < '9'`). Without knowing
+/// which columns are genuinely text, the wake path can't tell — so it is
+/// resolved once (at `knot_source_init`) and consulted by the filter
+/// comparison (`col_pred_matches`) and watcher routing (`classify_filter`).
+static TEXT_COLUMNS: std::sync::LazyLock<std::sync::RwLock<std::collections::HashSet<(String, String)>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashSet::new()));
+
+fn register_text_column(source: &str, col: &str) {
+    TEXT_COLUMNS
+        .write()
+        .unwrap()
+        .insert((source.to_string(), col.to_string()));
+}
+
+/// True if `(source, col)` is a genuine TEXT column (BINARY collation), whose
+/// string values must compare byte-wise — not numerically — to match SQLite.
+fn col_is_text(source: &str, col: &str) -> bool {
+    TEXT_COLUMNS
+        .read()
+        .unwrap()
+        .contains(&(source.to_string(), col.to_string()))
+}
+
 /// Hard ceiling on the number of rows captured in a single `WriteEvent::Rows`.
 /// Beyond this we upgrade to `Bulk` to bound notification cost: bulk-style
 /// writes (resetting an entire table, full-table migrations) shouldn't pay
@@ -2037,13 +2098,26 @@ fn pred_selectivity(pred: &ColPred) -> Option<(u8, usize)> {
 
 /// Pick the most-selective indexable predicate from a filter and emit its
 /// registration. A filter with no indexable predicate is `Broad`.
-fn classify_filter(filter: &ReadFilter) -> FilterReg {
+///
+/// Genuine TEXT columns (BINARY collation) are routed `Broad` regardless of
+/// operator: the EQ/RANGE indices key on `SqlValKey`, which collapses
+/// numeric-looking text (`"100"` → `Int(100)`) — wrong for a text column where
+/// `"100" < "99"` byte-wise. A broad slot is always re-checked via
+/// `matches_filters` (column-aware, byte-wise for text), so routing text
+/// columns broadly preserves correctness at a small selectivity cost (only
+/// text-column watchers in `atomic`/`retry` are affected). Over-waking is
+/// always safe in STM (the body simply re-runs).
+fn classify_filter(table: &str, filter: &ReadFilter) -> FilterReg {
     let preds = match filter {
         ReadFilter::All => return FilterReg::Broad,
         ReadFilter::Cols(p) => p,
     };
     let mut best: Option<(usize, (u8, usize))> = None;
-    for (i, (_, pred)) in preds.iter().enumerate() {
+    for (i, (col, pred)) in preds.iter().enumerate() {
+        // Skip text columns — they can't use the numeric-collapse index safely.
+        if col_is_text(table, col) {
+            continue;
+        }
         if let Some(rank) = pred_selectivity(pred) {
             if best.map_or(true, |(_, br)| rank < br) {
                 best = Some((i, rank));
@@ -2117,7 +2191,7 @@ impl WakeSlot {
     fn matches(&self, table: &str, event: &WriteEvent) -> bool {
         match self.init.get() {
             Some(init) => match init.filters.get(table) {
-                Some(fs) => event.matches_filters(fs),
+                Some(fs) => event.matches_filters(table, fs),
                 None => true,
             },
             None => true,
@@ -7852,7 +7926,7 @@ pub extern "C-unwind" fn knot_stm_wait(_snapshot: i64) {
     let mut range_registrations: Vec<(RangeKey, CmpOp, SqlVal)> = Vec::new();
     for (table, _, _) in &read_versions {
         let fs = filter_map.get(table).map(|v| v.as_slice()).unwrap_or(&[]);
-        let regs: Vec<FilterReg> = fs.iter().map(classify_filter).collect();
+        let regs: Vec<FilterReg> = fs.iter().map(|f| classify_filter(table, f)).collect();
         let any_broad = regs.iter().any(|r| matches!(r, FilterReg::Broad));
         if any_broad || regs.is_empty() {
             // Defensive: empty filter list shouldn't happen (we only iterate
@@ -10872,10 +10946,24 @@ pub extern "C-unwind" fn knot_source_init(
 
         // Auto-index _tag for efficient pattern matching (WHERE _tag = ?)
         db_ref.ensure_index(&format!("_knot_{}", name), "_tag");
+
+        // Record genuine TEXT fields (BINARY collation) so STM wake filtering
+        // compares them byte-wise, matching SQLite. `_tag` is also text but is
+        // an internal column watchers don't filter on by name.
+        for f in &adt.all_fields {
+            if matches!(f.ty, ColType::Text | ColType::Tag | ColType::Json) {
+                register_text_column(name, &f.name);
+            }
+        }
     } else {
         // Regular record schema (may include nested relations)
         let rec = Arc::new(parse_record_schema(schema));
         init_record_table(&db_ref.conn, &format!("_knot_{}", name), &rec);
+        for c in &rec.columns {
+            if matches!(c.ty, ColType::Text | ColType::Tag | ColType::Json) {
+                register_text_column(name, &c.name);
+            }
+        }
         register_source_schema(name, rec);
     }
 
@@ -17694,9 +17782,9 @@ mod _stm_filter_tests {
     #[test]
     fn bulk_event_wakes_any_filter() {
         let event = WriteEvent::Bulk;
-        assert!(event.matches_filters(&[ReadFilter::All]));
-        assert!(event.matches_filters(&[col_eq("id", SqlVal::Int(5))]));
-        assert!(event.matches_filters(&[]));
+        assert!(event.matches_filters("t", &[ReadFilter::All]));
+        assert!(event.matches_filters("t", &[col_eq("id", SqlVal::Int(5))]));
+        assert!(event.matches_filters("t", &[]));
     }
 
     #[test]
@@ -17705,9 +17793,9 @@ mod _stm_filter_tests {
             &[("id", SqlVal::Int(5)), ("name", SqlVal::Text("a".into()))],
             &[("id", SqlVal::Int(7)), ("name", SqlVal::Text("b".into()))],
         ]));
-        assert!(event.matches_filters(&[col_eq("id", SqlVal::Int(5))]));
-        assert!(!event.matches_filters(&[col_eq("id", SqlVal::Int(99))]));
-        assert!(event.matches_filters(&[ReadFilter::All]));
+        assert!(event.matches_filters("t", &[col_eq("id", SqlVal::Int(5))]));
+        assert!(!event.matches_filters("t", &[col_eq("id", SqlVal::Int(99))]));
+        assert!(event.matches_filters("t", &[ReadFilter::All]));
     }
 
     #[test]
@@ -17715,13 +17803,13 @@ mod _stm_filter_tests {
         // BigInts are stored as TEXT in SQLite; reader's filter may compare
         // against SqlVal::Text("5") while the row carries SqlVal::Int(5) or vice versa.
         let event = WriteEvent::Rows(rows_with(&[("id", SqlVal::Text("5".into()))]));
-        assert!(event.matches_filters(&[col_eq("id", SqlVal::Int(5))]));
+        assert!(event.matches_filters("t", &[col_eq("id", SqlVal::Int(5))]));
     }
 
     #[test]
     fn empty_filters_do_not_wake_on_rows() {
         let event = WriteEvent::Rows(rows_with(&[("id", SqlVal::Int(1))]));
-        assert!(!event.matches_filters(&[]));
+        assert!(!event.matches_filters("t", &[]));
     }
 
     #[test]
@@ -17731,19 +17819,19 @@ mod _stm_filter_tests {
             &[("qty", SqlVal::Int(150))],
         ]));
         // qty > 100 matches the 150 row → wake.
-        assert!(event.matches_filters(&[col_cmp("qty", CmpOp::Gt, SqlVal::Int(100))]));
+        assert!(event.matches_filters("t", &[col_cmp("qty", CmpOp::Gt, SqlVal::Int(100))]));
         // qty > 200 matches nothing.
-        assert!(!event.matches_filters(&[col_cmp("qty", CmpOp::Gt, SqlVal::Int(200))]));
+        assert!(!event.matches_filters("t", &[col_cmp("qty", CmpOp::Gt, SqlVal::Int(200))]));
         // qty <= 60 matches the 50 row.
-        assert!(event.matches_filters(&[col_cmp("qty", CmpOp::Le, SqlVal::Int(60))]));
+        assert!(event.matches_filters("t", &[col_cmp("qty", CmpOp::Le, SqlVal::Int(60))]));
     }
 
     #[test]
     fn cmp_filter_real_int_cross_type() {
         // Reader compares against a float; row carries int.
         let event = WriteEvent::Rows(rows_with(&[("price", SqlVal::Int(10))]));
-        assert!(event.matches_filters(&[col_cmp("price", CmpOp::Ge, SqlVal::Real(9.5))]));
-        assert!(!event.matches_filters(&[col_cmp("price", CmpOp::Ge, SqlVal::Real(10.5))]));
+        assert!(event.matches_filters("t", &[col_cmp("price", CmpOp::Ge, SqlVal::Real(9.5))]));
+        assert!(!event.matches_filters("t", &[col_cmp("price", CmpOp::Ge, SqlVal::Real(10.5))]));
     }
 
     #[test]
@@ -17757,13 +17845,13 @@ mod _stm_filter_tests {
             (intern_col("status"), ColPred::Cmp(CmpOp::Eq, SqlVal::Text("open".into()))),
             (intern_col("qty"), ColPred::Cmp(CmpOp::Gt, SqlVal::Int(100))),
         ]);
-        assert!(event.matches_filters(&[both_match]));
+        assert!(event.matches_filters("t", &[both_match]));
         // status=closed AND qty > 100 — first fails, row doesn't match.
         let first_fails = ReadFilter::Cols(vec![
             (intern_col("status"), ColPred::Cmp(CmpOp::Eq, SqlVal::Text("closed".into()))),
             (intern_col("qty"), ColPred::Cmp(CmpOp::Gt, SqlVal::Int(100))),
         ]);
-        assert!(!event.matches_filters(&[first_fails]));
+        assert!(!event.matches_filters("t", &[first_fails]));
     }
 
     #[test]
@@ -17777,15 +17865,15 @@ mod _stm_filter_tests {
             intern_col("id"),
             ColPred::In(vec![SqlVal::Int(1), SqlVal::Int(2)]),
         )]);
-        assert!(event.matches_filters(&[in_match]));
-        assert!(!event.matches_filters(&[in_miss]));
+        assert!(event.matches_filters("t", &[in_match]));
+        assert!(!event.matches_filters("t", &[in_miss]));
     }
 
     #[test]
     fn missing_column_wakes_conservatively() {
         // Row payload lacks the column referenced by the filter — wake anyway.
         let event = WriteEvent::Rows(rows_with(&[("qty", SqlVal::Int(1))]));
-        assert!(event.matches_filters(&[col_eq("status", SqlVal::Text("open".into()))]));
+        assert!(event.matches_filters("t", &[col_eq("status", SqlVal::Text("open".into()))]));
     }
 
     #[test]
@@ -17800,7 +17888,7 @@ mod _stm_filter_tests {
             col_eq("status", SqlVal::Text("open".into())),
             col_cmp("qty", CmpOp::Gt, SqlVal::Int(1000)),
         ];
-        assert!(event.matches_filters(&filters));
+        assert!(event.matches_filters("t", &filters));
     }
 
     #[test]
@@ -17867,7 +17955,7 @@ mod _stm_filter_tests {
             ("category".into(), ColPred::In(vec![SqlVal::Text("a".into()), SqlVal::Text("b".into())])),
             ("id".into(), ColPred::Cmp(CmpOp::Eq, SqlVal::Int(42))),
         ]);
-        match classify_filter(&f) {
+        match classify_filter("t", &f) {
             FilterReg::Eq { col, keys } => {
                 assert_eq!(col, "id");
                 assert_eq!(keys, vec![SqlValKey::Int(42)]);
@@ -17891,7 +17979,7 @@ mod _stm_filter_tests {
             ),
             ("status".into(), ColPred::In(vec![SqlVal::Text("a".into()), SqlVal::Text("b".into())])),
         ]);
-        match classify_filter(&f) {
+        match classify_filter("t", &f) {
             FilterReg::Eq { col, keys } => {
                 assert_eq!(col, "status");
                 assert_eq!(keys.len(), 2);
@@ -17907,7 +17995,7 @@ mod _stm_filter_tests {
             ("status".into(), ColPred::Cmp(CmpOp::Neq, SqlVal::Text("done".into()))),
             ("price".into(), ColPred::Cmp(CmpOp::Lt, SqlVal::Int(500))),
         ]);
-        match classify_filter(&f) {
+        match classify_filter("t", &f) {
             FilterReg::Range { col, op, threshold } => {
                 assert_eq!(col, "price");
                 assert!(matches!(op, CmpOp::Lt));
@@ -17924,9 +18012,9 @@ mod _stm_filter_tests {
             "status".into(),
             ColPred::Cmp(CmpOp::Neq, SqlVal::Text("done".into())),
         )]);
-        assert!(matches!(classify_filter(&f), FilterReg::Broad));
+        assert!(matches!(classify_filter("t", &f), FilterReg::Broad));
         // ReadFilter::All is always broad.
-        assert!(matches!(classify_filter(&ReadFilter::All), FilterReg::Broad));
+        assert!(matches!(classify_filter("t", &ReadFilter::All), FilterReg::Broad));
     }
 
     #[test]
@@ -17936,7 +18024,7 @@ mod _stm_filter_tests {
             "id".into(),
             ColPred::In(vec![SqlVal::Int(1), SqlVal::Int(2), SqlVal::Int(3)]),
         )]);
-        match classify_filter(&f) {
+        match classify_filter("t", &f) {
             FilterReg::Eq { col, keys } => {
                 assert_eq!(col, "id");
                 assert_eq!(
@@ -18535,8 +18623,61 @@ mod _bugfix_batch_tests {
         // STM watcher on `qty < 10`: write payload carries Int-as-TEXT "5"
         // (SqlVal::from_knot serializes Int that way) — must match.
         let pred = ColPred::Cmp(CmpOp::Lt, SqlVal::Text("10".into()));
-        assert!(col_pred_matches(&SqlVal::Text("5".into()), &pred));
-        assert!(!col_pred_matches(&SqlVal::Text("50".into()), &pred));
+        assert!(col_pred_matches(&SqlVal::Text("5".into()), &pred, false));
+        assert!(!col_pred_matches(&SqlVal::Text("50".into()), &pred, false));
+    }
+
+    #[test]
+    fn stm_text_column_compares_byte_wise_not_numeric() {
+        // A genuine TEXT column (BINARY collation) must compare byte-wise to
+        // match SQLite: lexicographically "100" < "99" ('1' < '9'). The
+        // numeric heuristic used for KNOT_INT-stored Int columns would say the
+        // opposite (100 > 99), so a watcher `code < "99"` would MISS a write of
+        // "100" and stall an `atomic`/`retry` for up to the 5-minute timeout.
+        use std::cmp::Ordering;
+
+        // Numeric (Int-column) mode: "100" > "99".
+        assert_eq!(
+            cmp_for_col(&SqlVal::Text("100".into()), &SqlVal::Text("99".into()), false),
+            Some(Ordering::Greater)
+        );
+        // Text-column mode: "100" < "99" byte-wise.
+        assert_eq!(
+            cmp_for_col(&SqlVal::Text("100".into()), &SqlVal::Text("99".into()), true),
+            Some(Ordering::Less)
+        );
+
+        // `code < "99"` against a written "100":
+        let pred = ColPred::Cmp(CmpOp::Lt, SqlVal::Text("99".into()));
+        //  - on a numeric column: no match (would miss the wake → stall).
+        assert!(!col_pred_matches(&SqlVal::Text("100".into()), &pred, false));
+        //  - on a text column: match (correct, byte-order).
+        assert!(col_pred_matches(&SqlVal::Text("100".into()), &pred, true));
+
+        // End-to-end via matches_filters. Use a dedicated source name so the
+        // global text-column registry isn't polluted for other tests.
+        register_text_column("fix5_codes", "code");
+        let mut ev = EventRows::new({
+            let v: Arc<[ColName]> = vec![intern_col("code")].into();
+            v
+        });
+        ev.push(vec![SqlVal::Text("100".into())]);
+        let event = WriteEvent::Rows(ev);
+        let lt99 = ReadFilter::Cols(vec![(
+            intern_col("code"),
+            ColPred::Cmp(CmpOp::Lt, SqlVal::Text("99".into())),
+        )]);
+        // `code < "99"` wakes on a text column (byte-order: "100" < "99").
+        assert!(event.matches_filters("fix5_codes", &[lt99.clone()]));
+        // The same column/value on an UNregistered (numeric) table does NOT wake.
+        assert!(!event.matches_filters("not_registered", &[lt99.clone()]));
+
+        // classify_filter routes a text-column range predicate Broad (so it is
+        // re-checked via the column-aware matches_filters), never into the
+        // numeric-collapse RANGE index which would under-wake.
+        assert!(matches!(classify_filter("fix5_codes", &lt99), FilterReg::Broad));
+        // A numeric column still indexes normally.
+        assert!(matches!(classify_filter("not_registered", &lt99), FilterReg::Range { .. }));
     }
 
     // ── Fix: infer_temp_schema must scan all rows ──

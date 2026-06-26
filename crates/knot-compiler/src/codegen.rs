@@ -8212,10 +8212,31 @@ impl Codegen {
                     // be relations; other non-IO binds (single-value pattern
                     // matches like `InProgress ip <- t.status`) keep
                     // bind-the-value semantics.
-                    let rhs_iterates = !self.expr_is_io(expr)
+                    // A refutable pattern (Constructor/List/Cons/Lit) bound
+                    // from a relation source iterates per row, mirroring the
+                    // type checker which types `Circle c <- *shapes` as a
+                    // comprehension bind (c : element, per-row filter). Without
+                    // this, the IO source falls through to bind_io_pattern
+                    // against the *whole* relation value, which always
+                    // mismatches and silently skips the rest of the do-block
+                    // (returning {}). Plain (non-IO) relation values are
+                    // already covered by the second disjunct below.
+                    let pat_filters_rows = matches!(
+                        &pat.node,
+                        ast::PatKind::Constructor { .. }
+                            | ast::PatKind::List(_)
+                            | ast::PatKind::Cons { .. }
+                            | ast::PatKind::Lit(_)
+                    );
+                    let rhs_is_io_relation_source = matches!(
+                        &expr.node,
+                        ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_)
+                    );
+                    let rhs_iterates = (!self.expr_is_io(expr)
                         && (matches!(&expr.node, ast::ExprKind::List(_))
                             || self.expr_is_known_relation(expr)
-                            || self.expr_is_relation_var(expr));
+                            || self.expr_is_relation_var(expr)))
+                        || (pat_filters_rows && rhs_is_io_relation_source);
                     // Names (re)bound by this pattern are rows from here on,
                     // not the relation-valued lets they may have shadowed.
                     self.io_relation_vars.retain(|n| !pat_binds(pat, n));
@@ -8399,7 +8420,18 @@ impl Codegen {
         env: &mut Env,
         db: Value,
     ) -> Value {
-        let rel = self.compile_expr(builder, expr, env, db);
+        let raw = self.compile_expr(builder, expr, env, db);
+        // Relation sources (`*source`, `&derived`) are IO-typed: compile_expr
+        // yields an IO value that must be run to produce the relation. Plain
+        // relation values (list literals, relation vars) are non-IO and pass
+        // through knot_io_run unchanged (it returns non-IO values as-is), so
+        // running it unconditionally is safe too — but skip it for non-IO
+        // expressions to avoid a redundant call.
+        let rel = if self.expr_is_io(expr) {
+            self.call_rt(builder, "knot_io_run", &[db, raw])
+        } else {
+            raw
+        };
         let result = self.call_rt(builder, "knot_relation_empty", &[]);
         let len = self.call_rt(builder, "knot_relation_len", &[rel]);
 

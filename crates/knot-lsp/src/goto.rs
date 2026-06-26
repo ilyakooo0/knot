@@ -139,7 +139,20 @@ pub(crate) fn handle_goto_type_definition(
                 .min_by_key(|(usage, _)| usage.end - usage.start)
                 .and_then(|(_, def_span)| doc.local_type_info.get(def_span).cloned())
         })
-        .or_else(|| doc.type_info.get(word).cloned())?;
+        .or_else(|| {
+            // The global `type_info` lookup is name-keyed, so guard it the
+            // same way `handle_goto_definition` guards its cross-file fallback:
+            // a record-field token (`p.name`) is never recorded in the local
+            // type-info tables, so without this guard it falls through to an
+            // unrelated top-level symbol that merely shares the field's name.
+            // (`references.rs`/`hover` suppress name-based lookups for the same
+            // reason.)
+            if crate::rename::is_at_record_field(&doc.module, &doc.source, offset) {
+                None
+            } else {
+                doc.type_info.get(word).cloned()
+            }
+        })?;
 
     // Extract the principal named type from the type string
     let type_name = extract_principal_type_name(&type_str)?;

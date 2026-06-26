@@ -579,8 +579,17 @@ impl<'a> TokenCollector<'a> {
                 let tok = if is_param { TOK_PARAMETER } else { TOK_VARIABLE };
                 self.add(pat.span, tok, MOD_DECLARATION);
             }
-            ast::PatKind::Constructor { payload, .. } => {
-                // Visit payload (the constructor name itself is part of pat.span)
+            ast::PatKind::Constructor { name, payload } => {
+                // Emit an ENUM_MEMBER token for the constructor name itself,
+                // mirroring the expression-side `ExprKind::Constructor` arm so
+                // `Circle c` in a pattern highlights like `Circle {..}` in
+                // expression position. Locate the actual name token via
+                // `find_word_in_source` — the name does NOT lead `pat.span`
+                // for parenthesized patterns `(Circle c)`, where `pat.span`
+                // starts at `(`.
+                let name_span = find_word_in_source(self.source, name, pat.span.start, pat.span.end)
+                    .unwrap_or_else(|| Span::new(pat.span.start, pat.span.start + name.len()));
+                self.add(name_span, TOK_ENUM_MEMBER, 0);
                 self.visit_pat(payload, false);
             }
             ast::PatKind::Record(fields) => {

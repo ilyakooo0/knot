@@ -3205,7 +3205,17 @@ impl Parser {
 
     fn parse_lambda(&mut self) -> Option<Expr> {
         let start = self.span();
-        self.in_context("lambda expression", |this| {
+        // Deeply nested lambdas (`\x -> \x -> … x`) would otherwise grow the
+        // native call stack without bound and abort the process. `parse_lambda`
+        // is dispatched from `parse_expr_head`, NOT `parse_atom`, so it never
+        // gets the delimiter charge that guards `((((…))))`. Charge the budget
+        // here so pathological nesting diagnoses instead of overflowing.
+        // (Mirrors `parse_do_expr`. Same applies to `parse_if`/`parse_case`/
+        // `parse_let_in_expr` below.)
+        if !self.enter_recursion_cost(DELIMITER_RECURSION_COST) {
+            return None;
+        }
+        let result = self.in_context("lambda expression", |this| {
             this.advance(); // consume `\`
 
             let mut params = Vec::new();
@@ -3240,12 +3250,17 @@ impl Parser {
                 },
                 Span::new(start.start, end_sp.end),
             ))
-        })
+        });
+        self.recursion_depth -= DELIMITER_RECURSION_COST;
+        result
     }
 
     fn parse_if(&mut self) -> Option<Expr> {
         let start = self.span();
-        self.in_context("if expression", |this| {
+        if !self.enter_recursion_cost(DELIMITER_RECURSION_COST) {
+            return None;
+        }
+        let result = self.in_context("if expression", |this| {
             this.advance(); // consume `if`
 
             let cond = this.parse_expr()?;
@@ -3273,12 +3288,17 @@ impl Parser {
                 },
                 Span::new(start.start, end_sp.end),
             ))
-        })
+        });
+        self.recursion_depth -= DELIMITER_RECURSION_COST;
+        result
     }
 
     fn parse_case(&mut self) -> Option<Expr> {
         let start = self.span();
-        self.in_context("case expression", |this| {
+        if !self.enter_recursion_cost(DELIMITER_RECURSION_COST) {
+            return None;
+        }
+        let result = self.in_context("case expression", |this| {
             this.advance(); // consume `case`
 
             let scrutinee = this.parse_expr()?;
@@ -3296,7 +3316,9 @@ impl Parser {
                 },
                 Span::new(start.start, end.end),
             ))
-        })
+        });
+        self.recursion_depth -= DELIMITER_RECURSION_COST;
+        result
     }
 
     fn parse_case_arm(&mut self) -> Option<CaseArm> {
@@ -3423,7 +3445,10 @@ impl Parser {
 
     fn parse_let_in_expr(&mut self) -> Option<Expr> {
         let start = self.span();
-        self.in_context("let expression", |this| {
+        if !self.enter_recursion_cost(DELIMITER_RECURSION_COST) {
+            return None;
+        }
+        let result = self.in_context("let expression", |this| {
             this.advance(); // consume `let`
 
             let pat = this.parse_pat()?;
@@ -3482,7 +3507,9 @@ impl Parser {
                 },
                 Span::new(start.start, end_sp.end),
             ))
-        })
+        });
+        self.recursion_depth -= DELIMITER_RECURSION_COST;
+        result
     }
 }
 

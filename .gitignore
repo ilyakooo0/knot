@@ -3,6 +3,7 @@
 *.db-shm
 *.db-wal
 .DS_Store
+/.vibe
 examples/hello
 examples/todo
 examples/traits

@@ -1172,11 +1172,25 @@ fn match_type_pattern(
         // structural-equality check.
         (TypeKind::Var(name), _) => {
             if let Some(existing) = subst.get(name) {
-                let mut tmp = HashMap::new();
-                return match_type_pattern(&existing.clone(), concrete, &mut tmp);
+                // The prior binding is the concrete type captured at an earlier
+                // occurrence of this pattern variable. The second occurrence must
+                // be structurally identical. When the prior binding is itself a
+                // type variable (from a polymorphic concrete context), we must
+                // NOT treat its name as a fresh pattern variable — doing so would
+                // accept distinct variables (e.g., `Pair a a` matching `Pair x y`).
+                match &existing.node {
+                    TypeKind::Var(prev_name) => {
+                        matches!(&concrete.node, TypeKind::Var(n) if n == prev_name)
+                    }
+                    _ => {
+                        let mut tmp = HashMap::new();
+                        match_type_pattern(existing, concrete, &mut tmp)
+                    }
+                }
+            } else {
+                subst.insert(name.clone(), concrete.clone());
+                true
             }
-            subst.insert(name.clone(), concrete.clone());
-            true
         }
         // Named types must match exactly
         (TypeKind::Named(a), TypeKind::Named(b)) => a == b,

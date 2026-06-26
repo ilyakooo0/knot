@@ -3169,8 +3169,14 @@ fn select_rows_with_rowid(
         quote_ident(table),
         where_clause,
     );
-    let mut stmt = conn.prepare_cached(&sql).ok()?;
-    let mut q = stmt.query(params).ok()?;
+    let mut stmt = match conn.prepare_cached(&sql) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("knot runtime: select_rows prepare error: {}", e); return None; }
+    };
+    let mut q = match stmt.query(params) {
+        Ok(q) => q,
+        Err(e) => { eprintln!("knot runtime: select_rows query error: {}", e); return None; }
+    };
     let n_cols = selected.len();
     let header: Arc<[ColName]> = selected
         .iter()
@@ -3340,8 +3346,8 @@ pub extern "C-unwind" fn knot_override_lookup(
         3 => {
             // Bool
             match val_str.as_str() {
-                "true" | "1" => encode_bool(true),
-                "false" | "0" => encode_bool(false),
+                "true" | "True" | "1" => encode_bool(true),
+                "false" | "False" | "0" => encode_bool(false),
                 _ => {
                     eprintln!(
                         "Error: invalid value '{}' for --{} (expected true or false)",
@@ -3920,8 +3926,9 @@ impl KnotDb {
             quote_ident(column)
         );
         debug_sql(&sql);
-        let _ = self.conn.execute_batch(&sql);
-        self.indexed.borrow_mut().insert(key);
+        if self.conn.execute_batch(&sql).is_ok() {
+            self.indexed.borrow_mut().insert(key);
+        }
     }
 
     /// Ensure indexes on all columns referenced in a WHERE clause.
@@ -4257,8 +4264,9 @@ fn alloc_bool(b: bool) -> *mut Value {
 }
 
 /// Allocate a float, returning a cached pointer for +0.0 and 1.0.
+/// Canonicalizes -0.0 to +0.0 to keep equality consistent with SQLite.
 fn alloc_float(n: f64) -> *mut Value {
-    if n.to_bits() == 0.0_f64.to_bits() {
+    if n == 0.0 {
         SINGLETONS.with(|s| s.float_zero)
     } else if n == 1.0 {
         SINGLETONS.with(|s| s.float_one)
@@ -6197,16 +6205,15 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
             // An integral Float must hash identically to the equal Int, since
             // `values_equal` treats `Int(2) == Float(2.0)`. The condition
             // `(i as f64) total_cmp f == Equal` exactly mirrors that equality
-            // rule, so it also correctly EXCLUDES `-0.0` (total_cmp ranks it
-            // below +0.0, and `Int(0) != Float(-0.0)`) as well as NaN/±inf.
+            // rule. `-0.0` is canonicalized to `+0.0` by `alloc_float`, so it
+            // hashes as `Int(0)` correctly. Also excludes NaN/±inf.
             let i = *f as i64;
             if (i as f64).total_cmp(f) == std::cmp::Ordering::Equal {
                 buf.push(0);
                 buf.extend_from_slice(&i.to_le_bytes());
             } else {
                 buf.push(1);
-                // Raw bits otherwise: total_cmp distinguishes -0.0 from +0.0;
-                // canonicalize NaN so all NaN bit patterns hash the same.
+                // Raw bits otherwise; canonicalize NaN so all NaN bit patterns hash the same.
                 let bits = if f.is_nan() { f64::NAN.to_bits() } else { f.to_bits() };
                 buf.extend_from_slice(&bits.to_le_bytes());
             }
@@ -6318,7 +6325,7 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
     }
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Int(x), Value::Int(y)) => x == y,
-        (Value::Float(x), Value::Float(y)) => x.total_cmp(y) == std::cmp::Ordering::Equal,
+        (Value::Float(x), Value::Float(y)) => x == y,
         // Int↔Float equality must agree with `value_to_hash_bytes`, which
         // canonicalizes an integral Float by casting it to i64. Casting the Int
         // to f64 instead (lossy past 2^53) makes `==` non-transitive and breaks
@@ -9011,7 +9018,7 @@ pub extern "C-unwind" fn knot_relation_count_where(
     for &row in rows {
         let result = knot_value_call(db, pred, row);
         match unsafe { as_ref(result) } {
-            Value::Bool(true) => n += 1,
+            Value::Bool(true) => n = n.checked_add(1).expect("knot runtime: count overflow"),
             Value::Bool(false) => {}
             _ => panic!(
                 "knot runtime: countWhere predicate must return Bool, got {}",
@@ -9688,7 +9695,7 @@ fn apply_wire_type_checked(v: *mut Value, desc: &str) -> Option<*mut Value> {
         "bytes" => matches!(unsafe { as_ref(v) }, Value::Bytes(_)),
         // `Uuid` is represented as `Value::Text` at runtime (stored as TEXT in
         // SQLite), so a JSON string is its genuine wire form.
-        "uuid" => matches!(unsafe { as_ref(v) }, Value::Text(_) | Value::Bytes(_)),
+        "uuid" => matches!(unsafe { as_ref(v) }, Value::Text(_)),
         "bool" => matches!(unsafe { as_ref(v) }, Value::Bool(_)),
         // Non-primitive descriptors (`*`, records, relations handled above) stay
         // lenient so ADT round-tripping keeps working.
@@ -10479,7 +10486,7 @@ fn read_sql_column(row: &rusqlite::Row, i: usize, ty: ColType) -> *mut Value {
             let s: String = row.get(i).unwrap_or_else(|_| panic!("{}", mismatch()));
             match serde_json::from_str::<serde_json::Value>(&s) {
                 Ok(json) => json_to_value_db(&json),
-                Err(_) => alloc(Value::Text(Arc::from(s))),
+                Err(e) => panic!("{}: failed to parse JSON column value: {}", mismatch(), e),
             }
         }
     }
@@ -10968,14 +10975,16 @@ pub extern "C-unwind" fn knot_source_init(
     }
 
     // Check stored schema against compiled schema
-    let stored: Option<String> = db_ref
-        .conn
-        .query_row(
+    let stored: Option<String> =
+        match db_ref.conn.query_row(
             "SELECT schema FROM _knot_schema WHERE name = ?1;",
             rusqlite::params![name],
             |row| row.get(0),
-        )
-        .ok();
+        ) {
+            Ok(schema) => Some(schema),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => panic!("knot runtime: error reading schema for source '*{}': {}", name, e),
+        };
 
     if let Some(ref stored_schema) = stored {
         if stored_schema != schema {
@@ -11789,10 +11798,13 @@ fn adt_row_to_params(
             params.push(rusqlite::types::Value::Text(tag.to_string()));
 
             // Find which fields belong to this constructor
-            let ctor = adt.constructors.iter().find(|c| c.name.as_str() == &**tag);
+            let ctor = adt.constructors.iter().find(|c| c.name.as_str() == &**tag)
+                .unwrap_or_else(|| panic!(
+                    "knot runtime: unknown constructor tag '{}' in ADT source write (known: {})",
+                    tag, adt.constructors.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
+                ));
             let ctor_field_names: HashSet<&str> = ctor
-                .map(|c| c.fields.iter().map(|f| f.name.as_str()).collect())
-                .unwrap_or_default();
+                .fields.iter().map(|f| f.name.as_str()).collect();
 
             // For each field in the wide table
             for field in &adt.all_fields {
@@ -14829,12 +14841,13 @@ fn try_string_to_value(s: &str, ty: &str) -> Option<*mut Value> {
         "int" => s.parse::<i64>().ok().map(alloc_int),
         "float" => s.parse::<f64>().ok().map(alloc_float),
         "bool" => match s {
-            "true" | "True" => Some(alloc_bool(true)),
-            "false" | "False" => Some(alloc_bool(false)),
+            "true" | "True" | "1" => Some(alloc_bool(true)),
+            "false" | "False" | "0" => Some(alloc_bool(false)),
             _ => None,
         },
         "tag" => Some(alloc(Value::Constructor(intern_str(s), alloc(Value::Unit)))),
-        _ => Some(alloc(Value::Text(Arc::from(s)))),
+        "text" => Some(alloc(Value::Text(Arc::from(s)))),
+        _ => None,
     }
 }
 
@@ -15125,6 +15138,8 @@ fn camel_to_header_case(s: &str) -> String {
                 result.push('-');
             }
             result.push(c);
+        } else if c == '_' {
+            result.push('-');
         } else {
             result.push(c);
         }
@@ -15460,7 +15475,17 @@ fn http_serve_loop(
                         let max = http_max_body_bytes();
                         // saturating: `max` may be u64::MAX (env override).
                         let mut limited = request.as_reader().take(max.saturating_add(1));
-                        let _ = limited.read_to_end(&mut buf);
+                        if limited.read_to_end(&mut buf).is_err() {
+                            eprintln!(
+                                "knot runtime: error reading request body; rejecting"
+                            );
+                            let response = tiny_http::Response::from_string("{\"error\":\"bad request\"}")
+                                .with_status_code(400)
+                                .with_header("Content-Type: application/json".parse::<tiny_http::Header>().unwrap());
+                            let _ = request.respond(response);
+                            unsafe { deep_drop_value(handler); }
+                            return;
+                        }
                         if buf.len() as u64 > max {
                             eprintln!(
                                 "knot runtime: request body exceeds {} byte limit; rejecting",
@@ -15925,11 +15950,14 @@ fn http_serve_loop(
                                 "internal server error".to_string()
                             };
 
-                            // Panics with "400:..." prefix indicate bad requests
+                            // Panics with "400:..." prefix indicate bad requests;
+                            // those messages are safe to surface. Other panics are
+                            // internal errors — don't leak runtime internals to the
+                            // client, send a generic message instead.
                             let (status_code, error_msg) = if let Some(rest) = msg.strip_prefix("400:") {
                                 (400, rest.to_string())
                             } else {
-                                (500, msg.clone())
+                                (500, "internal server error".to_string())
                             };
 
                             eprintln!("[HTTP] handler panicked: {}", msg);
@@ -16966,8 +16994,12 @@ fn parse_response_fields(s: &str) -> Vec<(String, String)> {
 fn json_escape(s: &str) -> String {
     // serde_json::to_string produces a quoted string with proper escaping;
     // strip the surrounding quotes for use in manually-built JSON.
-    let quoted = serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s));
-    quoted[1..quoted.len() - 1].to_string()
+    let quoted = serde_json::to_string(s).unwrap_or_default();
+    if quoted.len() >= 2 {
+        quoted[1..quoted.len() - 1].to_string()
+    } else {
+        String::new()
+    }
 }
 
 // ── Hash index for equi-join optimization ──────────────────────────
@@ -16998,16 +17030,15 @@ fn serialize_value_for_hash_into(v: *mut Value, buf: &mut Vec<u8>) {
             // An integral Float must hash identically to the equal Int, since
             // `values_equal` treats `Int(2) == Float(2.0)`. The condition
             // `(i as f64) total_cmp f == Equal` exactly mirrors that equality
-            // rule, so it also correctly EXCLUDES `-0.0` (total_cmp ranks it
-            // below +0.0, and `Int(0) != Float(-0.0)`) as well as NaN/±inf.
+            // rule. `-0.0` is canonicalized to `+0.0` by `alloc_float`, so it
+            // hashes as `Int(0)` correctly. Also excludes NaN/±inf.
             let i = *f as i64;
             if (i as f64).total_cmp(f) == std::cmp::Ordering::Equal {
                 buf.push(0);
                 buf.extend_from_slice(&i.to_le_bytes());
             } else {
                 buf.push(1);
-                // Raw bits otherwise: total_cmp distinguishes -0.0 from +0.0;
-                // canonicalize NaN so all NaN bit patterns hash the same.
+                // Raw bits otherwise; canonicalize NaN so all NaN bit patterns hash the same.
                 let bits = if f.is_nan() { f64::NAN.to_bits() } else { f.to_bits() };
                 buf.extend_from_slice(&bits.to_le_bytes());
             }

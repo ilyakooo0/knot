@@ -500,7 +500,7 @@ main = do
 // ── Bug 11: float comparisons stay in memory ───────────────────────
 
 #[test]
-fn float_comparisons_use_total_cmp_semantics() {
+fn float_neg_zero_equality_is_consistent() {
     let (stdout, stderr, ok) = compile_and_run(
         "float_total_cmp",
         r#"type T = {x: Float}
@@ -517,12 +517,11 @@ main = do
 "#,
     );
     assert!(ok, "program failed: {stderr}");
-    // `neg` is -0.0 (the DB write path normalizes -0.0, so the divergence
-    // is observable through a comparison PARAMETER). Knot's total_cmp says
-    // +0.0 != -0.0 and +0.0 > -0.0; pushed SQL said -0.0 = 0.0
-    // (eq: 1, gt: 0).
-    assert!(stdout.contains("eq: 0"), "got: {stdout}");
-    assert!(stdout.contains("gt: 1"), "got: {stdout}");
+    // -0.0 == 0.0 under IEEE / SQLite / Knot equality. alloc_float
+    // canonicalizes -0.0 to +0.0 so both in-memory and pushed SQL agree:
+    // eq: 1 (equal), gt: 0 (not greater-than).
+    assert!(stdout.contains("eq: 1"), "got: {stdout}");
+    assert!(stdout.contains("gt: 0"), "got: {stdout}");
 }
 
 // ── Bug 12: ordered comparisons on tag columns stay in memory ──────

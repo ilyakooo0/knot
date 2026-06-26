@@ -877,7 +877,10 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
         }
         if stmts.iter().any(|s| matches!(
             &s.node,
-            StmtKind::Bind { expr, .. } if !expr_is_io(expr, io_all)
+            StmtKind::Bind { expr, .. }
+            | StmtKind::Expr(expr)
+            | StmtKind::Let { expr, .. }
+            if !expr_is_io(expr, io_all)
         )) {
             return false;
         }

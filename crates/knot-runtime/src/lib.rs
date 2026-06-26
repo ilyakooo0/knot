@@ -4,6 +4,12 @@
 //! and SQLite-backed persistence. This crate is compiled as a static
 //! library and linked into every compiled Knot program.
 
+// This crate is the FFI boundary: nearly every public function is an
+// `extern "C"` entry point invoked by Cranelift-generated code with raw
+// `*mut Value` pointers. Marking all of them `unsafe` would be noise
+// without benefit since they are never called from safe Rust.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 pub mod log;
 mod tui;
 

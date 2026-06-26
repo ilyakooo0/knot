@@ -74,6 +74,7 @@ fn int_literal() {
 }
 
 #[test]
+    #[allow(clippy::approx_constant)]
 fn float_literal() {
     match fun_body("x = 3.14") {
         ExprKind::Lit(Literal::Float(f)) => assert!((f - 3.14).abs() < 1e-10),

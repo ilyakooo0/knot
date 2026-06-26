@@ -19,6 +19,17 @@ pub(crate) fn handle_inlay_hint(
     params: &InlayHintParams,
 ) -> Option<Vec<InlayHint>> {
     let doc = state.documents.get(&params.text_document.uri)?;
+    // Staleness guard: during the analysis debounce window the editor buffer
+    // is newer than the analyzed source, so range positions from the live
+    // buffer would resolve against the wrong bytes — hints would land on the
+    // wrong tokens. Bail; the client re-requests once analysis catches up.
+    if state
+        .pending_sources
+        .get(&params.text_document.uri)
+        .is_some_and(|p| p.source != doc.source)
+    {
+        return None;
+    }
     let mut hints = Vec::new();
 
     let range_start = position_to_offset(&doc.source, params.range.start);

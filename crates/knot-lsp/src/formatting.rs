@@ -229,8 +229,14 @@ pub(crate) fn handle_on_type_formatting(
     let prev_line = lines[prev_line_idx];
     let prev_trimmed = prev_line.trim();
 
-    // Measure the previous line's indentation
+    // Measure the previous line's indentation (in characters, so tab-based
+    // indents are counted correctly for stacking the same indent unit).
     let prev_indent = prev_line.len() - prev_line.trim_start().len();
+
+    // Honor the editor's formatting options rather than hardcoding 2 spaces.
+    let tab_size = clamp_tab_size(params.options.tab_size);
+    let use_spaces = params.options.insert_spaces;
+    let step = if use_spaces { tab_size } else { 1 };
 
     // Keywords that should increase indent on the next line
     let should_indent = prev_trimmed == "do"
@@ -248,7 +254,7 @@ pub(crate) fn handle_on_type_formatting(
         return None;
     }
 
-    let new_indent = prev_indent + 2;
+    let new_indent = prev_indent + step;
     let current_line_idx = pos.line as usize;
 
     // Only add indent if the current line is empty or has less indentation
@@ -260,7 +266,8 @@ pub(crate) fn handle_on_type_formatting(
         }
     }
 
-    let indent_str = " ".repeat(new_indent);
+    let indent_unit = if use_spaces { " " } else { "\t" };
+    let indent_str = indent_unit.repeat(new_indent);
     Some(vec![TextEdit {
         range: Range {
             start: Position::new(pos.line, 0),

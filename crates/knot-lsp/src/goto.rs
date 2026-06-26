@@ -26,6 +26,18 @@ pub(crate) fn handle_goto_definition(
     let pos = params.text_document_position_params.position;
     let doc = state.documents.get(uri)?;
 
+    // Staleness guard (mirrors hover / rename): during the analysis debounce
+    // window the live buffer diverges from the analyzed source, so a position
+    // from the editor would resolve against stale bytes and jump to the wrong
+    // symbol. Bail; the client re-requests once analysis catches up.
+    if state
+        .pending_sources
+        .get(uri)
+        .is_some_and(|p| p.source != doc.source)
+    {
+        return None;
+    }
+
     // Nudge a caret sitting just past a usage's last char back into the word,
     // matching references/highlight — otherwise the half-open span match
     // (`offset < usage.end`) misses and we fall through to the name-keyed
@@ -94,6 +106,13 @@ pub(crate) fn handle_goto_type_definition(
     let uri = &params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
     let doc = state.documents.get(uri)?;
+    if state
+        .pending_sources
+        .get(uri)
+        .is_some_and(|p| p.source != doc.source)
+    {
+        return None;
+    }
     let offset = ident_lookup_offset(&doc.source, position_to_offset(&doc.source, pos));
     let word = word_at_position(&doc.source, pos)?;
 
@@ -161,6 +180,13 @@ pub(crate) fn handle_goto_implementation(
     let uri = &params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
     let doc = state.documents.get(uri)?;
+    if state
+        .pending_sources
+        .get(uri)
+        .is_some_and(|p| p.source != doc.source)
+    {
+        return None;
+    }
     let word = word_at_position(&doc.source, pos)?;
 
     let mut locations: Vec<Location> = Vec::new();

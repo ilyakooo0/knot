@@ -51,6 +51,17 @@ pub(crate) fn handle_references(
     let uri = &params.text_document_position.text_document.uri;
     let pos = params.text_document_position.position;
     let doc = state.documents.get(uri)?;
+    // Staleness guard (mirrors hover / goto): during the analysis debounce
+    // window the live buffer diverges from the analyzed source, so a position
+    // from the editor would resolve against stale bytes. Bail; the client
+    // re-requests once analysis catches up.
+    if state
+        .pending_sources
+        .get(uri)
+        .is_some_and(|p| p.source != doc.source)
+    {
+        return None;
+    }
     let offset = ident_lookup_offset(&doc.source, position_to_offset(&doc.source, pos));
 
     // Find the symbol name and definition span in current document. The

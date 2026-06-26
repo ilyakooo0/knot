@@ -6191,6 +6191,7 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
             buf.push(9);
             buf.extend_from_slice(&(f.source.len() as u32).to_le_bytes());
             buf.extend_from_slice(f.source.as_bytes());
+            buf.extend_from_slice(&(f.fn_ptr as usize).to_le_bytes());
             value_to_hash_bytes(f.env, buf);
         }
         Value::IO(fn_ptr, env) => {
@@ -12575,6 +12576,21 @@ pub extern "C-unwind" fn knot_source_diff_write(
     }
 }
 
+/// Check whether a SQLite table has a column with the given name.
+fn table_has_column(conn: &rusqlite::Connection, table: &str, col: &str) -> bool {
+    let sql = format!("PRAGMA table_info({})", quote_ident(table));
+    if let Ok(mut stmt) = conn.prepare(&sql) {
+        if let Ok(names) = stmt.query_map([], |row| row.get::<_, String>(1)) {
+            for name in names.flatten() {
+                if name == col {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// DELETE rows that don't match a WHERE condition.
 /// Used for `set *rel = do { t <- *rel; where cond; yield t }`.
 /// The where_clause is the *keep* condition; rows NOT matching are deleted.
@@ -12643,6 +12659,12 @@ pub extern "C-unwind" fn knot_source_delete_where(
             .flatten()
             .filter_map(|r| r.ok())
             .filter(|n| n.starts_with(&prefix))
+            // Only include child tables that actually have a `_parent_id`
+            // column. An unrelated source whose name shares the `__`
+            // prefix (e.g. source `users__archive` produces table
+            // `_knot_users__archive`, a MAIN table without `_parent_id`)
+            // must NOT be treated as a child of `_knot_users`.
+            .filter(|n| table_has_column(&db_ref.conn, n, "_parent_id"))
             .collect()
     };
     // Determine each descendant's immediate parent table. A nested field name
@@ -12656,7 +12678,7 @@ pub extern "C-unwind" fn knot_source_delete_where(
         .cloned()
         .chain(std::iter::once(table.clone()))
         .collect();
-    let immediate_parent = |ct: &str| -> String {
+    let immediate_parent = |ct: &str| -> Option<String> {
         let bytes = ct.as_bytes();
         let mut best: Option<&str> = None;
         let mut i = 0usize;
@@ -12669,12 +12691,30 @@ pub extern "C-unwind" fn knot_source_delete_where(
             }
             i += 1;
         }
-        best.unwrap_or(table.as_str()).to_string()
+        match best {
+            Some(p) if p == table => {
+                // If the best parent is the root but the table name has
+                // more `__` segments after the root prefix, the real
+                // intermediate parent is missing (likely an unrelated
+                // source table filtered out for lacking `_parent_id`).
+                // Exclude this table from the cascade.
+                let suffix = &ct[table.len() + 2..];
+                if suffix.contains("__") {
+                    None
+                } else {
+                    Some(p.to_string())
+                }
+            }
+            Some(p) => Some(p.to_string()),
+            None => None,
+        }
     };
     let parent_of: HashMap<String, String> = descendant_tables
         .iter()
-        .map(|ct| (ct.clone(), immediate_parent(ct)))
+        .filter_map(|ct| immediate_parent(ct).map(|p| (ct.clone(), p)))
         .collect();
+    // Only cascade to tables whose parent chain is unbroken.
+    descendant_tables.retain(|ct| parent_of.contains_key(ct));
     // Depth = length of the parent chain to the root `table`. Sort ascending so
     // a grandchild's orphan check runs only after its intermediate parent rows
     // are already deleted within this cascade.
@@ -13463,6 +13503,10 @@ fn check_rate_limit(
     if requests <= 0 || window_ms <= 0 {
         return Ok(());
     }
+    // Acquire the process-wide write lock so the BEGIN IMMEDIATE below
+    // doesn't contend at the SQLite level with other writers — every
+    // other write path in the runtime is wrapped in this guard.
+    let _guard = write_lock_guard();
     ensure_rate_limit_table(db);
     let now = current_unix_ms();
     // BEGIN IMMEDIATE serializes concurrent same-key checks. If it fails
@@ -13641,7 +13685,7 @@ pub extern "C-unwind" fn knot_constraint_register(
                 "CREATE TRIGGER IF NOT EXISTS {trg} \
                  BEFORE UPDATE OF {col} ON {table} \
                  FOR EACH ROW \
-                 WHEN NEW.{col} != OLD.{col} AND EXISTS (SELECT 1 FROM {table} WHERE {col} = NEW.{col}) \
+                 WHEN NEW.{col} IS NOT OLD.{col} AND EXISTS (SELECT 1 FROM {table} WHERE {col} = NEW.{col}) \
                  BEGIN SELECT RAISE(ABORT, '{msg}'); END;",
                 trg = quote_ident(&format!("_knot_uniq_{}_{}_upd", sub_rel, sf)),
                 table = table,
@@ -13724,7 +13768,7 @@ pub extern "C-unwind" fn knot_constraint_register(
                 "CREATE TRIGGER IF NOT EXISTS {trg} \
                  BEFORE UPDATE OF {sub_col} ON {sub_table} \
                  FOR EACH ROW \
-                 WHEN NEW.{sub_col} != OLD.{sub_col} AND NOT EXISTS (SELECT 1 FROM {sup_table} WHERE {sup_col} = NEW.{sub_col}) \
+                 WHEN NEW.{sub_col} IS NOT OLD.{sub_col} AND NOT EXISTS (SELECT 1 FROM {sup_table} WHERE {sup_col} = NEW.{sub_col}) \
                  BEGIN SELECT RAISE(ABORT, '{msg}'); END;",
                 trg = quote_ident(&format!("_knot_fk_{}_upd", trg_suffix)),
                 sub_table = sub_table,
@@ -13772,7 +13816,7 @@ pub extern "C-unwind" fn knot_constraint_register(
                 "CREATE TRIGGER IF NOT EXISTS {trg} \
                  BEFORE UPDATE OF {sup_col} ON {sup_table} \
                  FOR EACH ROW \
-                 WHEN NEW.{sup_col} != OLD.{sup_col} AND EXISTS (SELECT 1 FROM {sub_table} WHERE {sub_col} = OLD.{sup_col}) \
+                 WHEN NEW.{sup_col} IS NOT OLD.{sup_col} AND EXISTS (SELECT 1 FROM {sub_table} WHERE {sub_col} = OLD.{sup_col}) \
                  BEGIN SELECT RAISE(ABORT, '{msg}'); END;",
                 trg = quote_ident(&format!("_knot_fk_{}_supupd", trg_suffix)),
                 sup_table = sup_table,

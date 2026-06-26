@@ -24,6 +24,18 @@ pub(crate) fn handle_signature_help(
     let uri = &params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
     let doc = state.documents.get(uri)?;
+    // Staleness guard (mirrors hover / inlay-hint): during the analysis
+    // debounce window the editor buffer is newer than the analyzed source,
+    // so the cursor position would resolve against the wrong bytes — the
+    // wrong parameter would be highlighted. Bail; the client re-requests
+    // once analysis catches up.
+    if state
+        .pending_sources
+        .get(uri)
+        .is_some_and(|p| p.source != doc.source)
+    {
+        return None;
+    }
     let offset = position_to_offset(&doc.source, pos);
 
     // Strategy: find the innermost App chain in the AST that contains the cursor,

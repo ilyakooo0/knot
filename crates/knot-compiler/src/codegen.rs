@@ -9489,6 +9489,7 @@ impl Codegen {
                         }
                         builder.switch_to_block(info.continue_blk);
                         builder.seal_block(info.continue_blk);
+                        self.call_rt_void(builder, "knot_arena_reset_to", &[info.arena_mark]);
                         let one = builder.ins().iconst(self.ptr_type, 1);
                         let next_i = builder.ins().iadd(info.index_var, one);
                         builder.ins().jump(info.header, &[next_i.into()]);

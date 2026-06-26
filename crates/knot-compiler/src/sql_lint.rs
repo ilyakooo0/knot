@@ -912,7 +912,9 @@ fn atom_would_need_cast(expr: &Expr) -> bool {
 /// Look up a column's schema type (schema format: "name:text,age:int").
 fn lookup_col_type(schema: &str, col_name: &str) -> Option<String> {
     for part in schema.split(',') {
-        let (name, ty) = part.split_once(':')?;
+        let Some((name, ty)) = part.split_once(':') else {
+            continue;
+        };
         if name == col_name {
             return Some(ty.to_string());
         }

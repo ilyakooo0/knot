@@ -747,6 +747,8 @@ impl Infer {
                 | Ty::Float
                 | Ty::Text
                 | Ty::Bool
+                | Ty::Bytes
+                | Ty::Uuid
                 | Ty::IntUnit(_)
                 | Ty::FloatUnit(_)
                 | Ty::Record(..)
@@ -985,21 +987,33 @@ impl Infer {
     // ── Substitution application ─────────────────────────────────
 
     fn apply(&self, ty: &Ty) -> Ty {
+        self.apply_impl(ty, &[])
+    }
+
+    /// Like `apply` but skips substitution for any `TyVar` in `excluded`,
+    /// so that `Forall`-bound variables are not captured by the outer
+    /// substitution (mirrors `subst_ty`'s shadowing).
+    fn apply_impl(&self, ty: &Ty, excluded: &[TyVar]) -> Ty {
         match ty {
-            Ty::Var(v) => match self.subst.get(v) {
-                Some(resolved) => self.apply(resolved),
-                None => ty.clone(),
-            },
+            Ty::Var(v) => {
+                if excluded.contains(v) {
+                    return ty.clone();
+                }
+                match self.subst.get(v) {
+                    Some(resolved) => self.apply_impl(resolved, excluded),
+                    None => ty.clone(),
+                }
+            }
             Ty::Fun(p, r) => {
-                Ty::Fun(Box::new(self.apply(p)), Box::new(self.apply(r)))
+                Ty::Fun(Box::new(self.apply_impl(p, excluded)), Box::new(self.apply_impl(r, excluded)))
             }
             Ty::Record(fields, row) => {
                 let mut applied: BTreeMap<String, Ty> = fields
                     .iter()
-                    .map(|(k, v)| (k.clone(), self.apply(v)))
+                    .map(|(k, v)| (k.clone(), self.apply_impl(v, excluded)))
                     .collect();
                 if let Some(rv) = row {
-                    let resolved = self.apply(&Ty::Var(*rv));
+                    let resolved = self.apply_impl(&Ty::Var(*rv), excluded);
                     match resolved {
                         Ty::Record(extra, rest) => {
                             for (k, v) in extra {
@@ -1017,10 +1031,10 @@ impl Infer {
             Ty::Variant(ctors, row) => {
                 let mut applied: BTreeMap<String, Ty> = ctors
                     .iter()
-                    .map(|(k, v)| (k.clone(), self.apply(v)))
+                    .map(|(k, v)| (k.clone(), self.apply_impl(v, excluded)))
                     .collect();
                 if let Some(rv) = row {
-                    let resolved = self.apply(&Ty::Var(*rv));
+                    let resolved = self.apply_impl(&Ty::Var(*rv), excluded);
                     match resolved {
                         Ty::Variant(extra, rest) => {
                             for (k, v) in extra {
@@ -1036,20 +1050,20 @@ impl Infer {
                 }
             }
             Ty::Relation(inner) => {
-                Ty::Relation(Box::new(self.apply(inner)))
+                Ty::Relation(Box::new(self.apply_impl(inner, excluded)))
             }
             Ty::Con(name, args) => Ty::Con(
                 name.clone(),
-                args.iter().map(|a| self.apply(a)).collect(),
+                args.iter().map(|a| self.apply_impl(a, excluded)).collect(),
             ),
             Ty::TyCon(_) => ty.clone(),
             Ty::App(f, a) => {
-                let f = self.apply(f);
-                let a = self.apply(a);
+                let f = self.apply_impl(f, excluded);
+                let a = self.apply_impl(a, excluded);
                 Self::normalize_app(f, a)
             }
             Ty::IO(effects, row, inner) => {
-                let inner = self.apply(inner);
+                let inner = self.apply_impl(inner, excluded);
                 let (effects, row) =
                     self.resolve_effect_row(effects.clone(), *row);
                 Ty::IO(effects, row, Box::new(inner))
@@ -1068,13 +1082,17 @@ impl Infer {
                 if u.is_dimensionless() { Ty::Float } else { Ty::FloatUnit(u) }
             }
             Ty::Forall(vars, inner) => {
-                Ty::Forall(vars.clone(), Box::new(self.apply(inner)))
+                let mut new_excluded = excluded.to_vec();
+                for v in vars.iter() {
+                    new_excluded.push(*v);
+                }
+                Ty::Forall(vars.clone(), Box::new(self.apply_impl(inner, &new_excluded)))
             }
             Ty::Alias(name, inner) => {
-                Ty::Alias(name.clone(), Box::new(self.apply(inner)))
+                Ty::Alias(name.clone(), Box::new(self.apply_impl(inner, excluded)))
             }
             Ty::Assoc(name, inner) => {
-                let inner = self.apply(inner);
+                let inner = self.apply_impl(inner, excluded);
                 // Reduce once the argument is concrete enough to match an
                 // impl's associated-type head; otherwise stay a rigid Assoc.
                 // Bound the reduction depth: a self-referential family body
@@ -1996,16 +2014,50 @@ impl Infer {
             }
         }
 
-        let only1: BTreeMap<String, Ty> = f1
+        let mut only1: BTreeMap<String, Ty> = f1
             .iter()
             .filter(|(k, _)| !f2.contains_key(*k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        let only2: BTreeMap<String, Ty> = f2
+        let mut only2: BTreeMap<String, Ty> = f2
             .iter()
             .filter(|(k, _)| !f1.contains_key(*k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+
+        // Re-resolve row tails after common-field unification, which may
+        // have bound them if a field type shares the row variable. Without
+        // this, bind_var would overwrite the field-loop's binding.
+        let r1 = match r1 {
+            Some(rv) => match self.apply(&Ty::Var(rv)) {
+                Ty::Record(extra, rest) => {
+                    for (k, v) in extra {
+                        if !f2.contains_key(&k) {
+                            only1.entry(k).or_insert(v);
+                        }
+                    }
+                    rest
+                }
+                Ty::Var(rv2) => Some(rv2),
+                _ => None,
+            },
+            None => None,
+        };
+        let r2 = match r2 {
+            Some(rv) => match self.apply(&Ty::Var(rv)) {
+                Ty::Record(extra, rest) => {
+                    for (k, v) in extra {
+                        if !f1.contains_key(&k) {
+                            only2.entry(k).or_insert(v);
+                        }
+                    }
+                    rest
+                }
+                Ty::Var(rv2) => Some(rv2),
+                _ => None,
+            },
+            None => None,
+        };
 
         match (r1, r2) {
             (None, None) => {
@@ -2106,16 +2158,49 @@ impl Infer {
             }
         }
 
-        let only1: BTreeMap<String, Ty> = c1
+        let mut only1: BTreeMap<String, Ty> = c1
             .iter()
             .filter(|(k, _)| !c2.contains_key(*k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        let only2: BTreeMap<String, Ty> = c2
+        let mut only2: BTreeMap<String, Ty> = c2
             .iter()
             .filter(|(k, _)| !c1.contains_key(*k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+
+        // Re-resolve row tails after common-constructor unification, which
+        // may have bound them if a field type shares the row variable.
+        let r1 = match r1 {
+            Some(rv) => match self.apply(&Ty::Var(rv)) {
+                Ty::Variant(extra, rest) => {
+                    for (k, v) in extra {
+                        if !c2.contains_key(&k) {
+                            only1.entry(k).or_insert(v);
+                        }
+                    }
+                    rest
+                }
+                Ty::Var(rv2) => Some(rv2),
+                _ => None,
+            },
+            None => None,
+        };
+        let r2 = match r2 {
+            Some(rv) => match self.apply(&Ty::Var(rv)) {
+                Ty::Variant(extra, rest) => {
+                    for (k, v) in extra {
+                        if !c1.contains_key(&k) {
+                            only2.entry(k).or_insert(v);
+                        }
+                    }
+                    rest
+                }
+                Ty::Var(rv2) => Some(rv2),
+                _ => None,
+            },
+            None => None,
+        };
 
         match (r1, r2) {
             (None, None) => {

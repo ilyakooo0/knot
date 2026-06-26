@@ -608,15 +608,24 @@ fn handle_will_rename_files(
                     .find("import")
                     .map(|i| i + "import".len())
                     .unwrap_or(0);
-                let path_start = span.start
-                    + path_offset_in_span
-                    + span_text[path_offset_in_span..]
-                        .chars()
-                        .take_while(|c| c.is_whitespace())
-                        .map(|c| c.len_utf8())
-                        .sum::<usize>();
+                let leading_ws: usize = span_text[path_offset_in_span..]
+                    .chars()
+                    .take_while(|c| c.is_whitespace())
+                    .map(|c| c.len_utf8())
+                    .sum();
+                let path_start = span.start + path_offset_in_span + leading_ws;
+                // The path ends at the first whitespace or `(` (selective
+                // import list) after it — NOT at `span.end`, which for
+                // `import ./foo (bar, baz)` extends through the closing `)`.
+                // Replacing up to `span.end` would silently delete the
+                // import list.
+                let path_portion = &span_text[path_offset_in_span + leading_ws..];
+                let path_rel_end = path_portion
+                    .find(|c: char| c.is_whitespace() || c == '(')
+                    .unwrap_or(path_portion.len());
+                let path_end = path_start + path_rel_end;
                 let path_start_pos = offset_to_position(live_source, path_start);
-                let path_end_pos = offset_to_position(live_source, span.end);
+                let path_end_pos = offset_to_position(live_source, path_end);
                 changes
                     .entry(importer_uri.clone())
                     .or_default()

@@ -3,6 +3,7 @@
 use crate::ast::*;
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{Token, TokenKind};
+use std::collections::HashSet;
 
 // ── Parser state ────────────────────────────────────────────────────
 
@@ -39,10 +40,13 @@ pub struct Parser {
     /// `maybe_time_unit` to suppress the `2 ms`/`5 seconds` literal sugar
     /// when the would-be unit name is actually a bound variable, so
     /// `\ms -> g 2 ms` applies `g` to `2` and `ms` rather than desugaring
-    /// to `g (2 * 1)`. Top-level declaration names are not tracked (the
-    /// parser has no module-wide scope), so a top-level `ms = 5` still
-    /// triggers the sugar.
+    /// to `g (2 * 1)`.
     bound_vars: Vec<Name>,
+    /// Top-level declaration names that collide with time-unit words
+    /// (`ms`/`seconds`/...). Populated by a pre-scan in `parse_module` so
+    /// that `maybe_time_unit` can suppress sugar for `ms = 5; ... 2 ms`
+    /// (where `ms` is a user-defined top-level value, not the unit).
+    top_level_names: HashSet<String>,
     /// Display column (chars from the start of its line) of each token,
     /// indexed by token position. Precomputed in a single O(source) pass so
     /// layout queries during parsing are O(1) instead of O(line-length) —
@@ -71,6 +75,7 @@ impl Parser {
             delimiter_depth: 0,
             recursion_depth: 0,
             bound_vars: Vec::new(),
+            top_level_names: HashSet::new(),
             token_cols,
             eof_col,
         }
@@ -133,6 +138,10 @@ impl Parser {
         // Set block_indent so that multiline expressions inside declarations
         // can continue across newlines (parse_application checks column > block_indent).
         self.block_indent = 0;
+        // Pre-scan for top-level declaration names that collide with
+        // time-unit words so `maybe_time_unit` doesn't silently rewrite
+        // `2 ms` as `2 * 1` when `ms` is a user-defined top-level value.
+        self.top_level_names = self.scan_top_level_names();
         let mut decls = Vec::new();
         while !self.at_eof() {
             self.skip_newlines();
@@ -241,6 +250,45 @@ impl Parser {
 
     fn is_bound_var(&self, name: &str) -> bool {
         self.bound_vars.iter().any(|v| v == name)
+    }
+
+    /// Pre-scan the token stream for top-level declaration names that collide
+    /// with time-unit words (`ms`, `seconds`, `minutes`, `hours`, `days`,
+    /// `weeks`). This lets `maybe_time_unit` suppress unit sugar when such a
+    /// name is a user-defined value rather than the built-in unit.
+    fn scan_top_level_names(&self) -> HashSet<String> {
+        const TIME_UNITS: &[&str] =
+            &["ms", "seconds", "minutes", "hours", "days", "weeks"];
+        let mut names = HashSet::new();
+        let n = self.tokens.len();
+        for i in 0..n {
+            let TokenKind::Lower(s) = &self.tokens[i].kind else {
+                continue;
+            };
+            if !TIME_UNITS.contains(&s.as_str()) {
+                continue;
+            }
+            // Must be followed by `=` or `:` to be a declaration name.
+            if i + 1 >= n {
+                continue;
+            }
+            if !matches!(self.tokens[i + 1].kind, TokenKind::Eq | TokenKind::Colon) {
+                continue;
+            }
+            // A top-level declaration name is at column 0, or immediately
+            // preceded by a `*`/`&`/`export` token that is itself at column 0.
+            if self.token_cols[i] == 0 {
+                names.insert(s.clone());
+            } else if i >= 1
+                && matches!(
+                    self.tokens[i - 1].kind,
+                    TokenKind::Star | TokenKind::Ampersand | TokenKind::Export
+                ) && self.token_cols[i - 1] == 0
+            {
+                names.insert(s.clone());
+            }
+        }
+        names
     }
 }
 
@@ -1779,6 +1827,7 @@ impl Parser {
         }
 
         // Parse path: /segment/{param: Type}/...
+        self.skip_newlines();
         let path = self.parse_route_path();
 
         // Optional query params: ?{name: Type, ...}
@@ -2673,7 +2722,7 @@ impl Parser {
         let factor: Option<&str> = match self.peek() {
             // A locally-bound variable named like a time unit is NOT unit
             // sugar: `\ms -> g 2 ms` must apply `g` to `2` and `ms`.
-            TokenKind::Lower(u) if self.is_bound_var(u) => None,
+            TokenKind::Lower(u) if self.is_bound_var(u) || self.top_level_names.contains(u) => None,
             TokenKind::Lower(u) => match u.as_str() {
                 "ms" => Some("1"),
                 "seconds" => Some("1000"),

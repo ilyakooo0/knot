@@ -18,9 +18,13 @@ pub fn link(
     // On macOS, link system libraries needed by the Rust runtime
     if cfg!(target_os = "macos") {
         cmd.arg("-lSystem").arg("-lresolv").arg("-liconv");
-    } else {
-        // Linux
+    } else if cfg!(target_os = "linux") {
         cmd.arg("-lpthread").arg("-ldl").arg("-lm");
+    } else {
+        return Err(format!(
+            "unsupported target OS for linking: {}; only macOS and Linux are supported",
+            std::env::consts::OS
+        ));
     }
 
     let output = cmd

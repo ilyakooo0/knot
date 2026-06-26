@@ -500,8 +500,11 @@ impl<'src> Lexer<'src> {
             }
         }
 
-        // Check for float: `.` followed by a digit
+        let mut is_float = false;
+
+        // Check for fractional part: `.` followed by a digit
         if self.peek() == Some(b'.') && matches!(self.peek_at(1), Some(b'0'..=b'9')) {
+            is_float = true;
             self.advance(); // consume '.'
             while let Some(b) = self.peek() {
                 if b.is_ascii_digit() || b == b'_' {
@@ -510,13 +513,40 @@ impl<'src> Lexer<'src> {
                     break;
                 }
             }
-            let slice = self.slice(start, self.pos);
-            let raw = if slice.contains('_') {
-                self.check_digit_separators(slice, start);
-                slice.replace('_', "")
-            } else {
-                slice.to_string()
+        }
+
+        // Check for exponent: `e`/`E`, optional `+`/`-`, at least one digit.
+        // Scientific notation always produces a float literal.
+        if matches!(self.peek(), Some(b'e') | Some(b'E')) {
+            let exp_digit_pos = match self.peek_at(1) {
+                Some(b'+') | Some(b'-') => 2,
+                _ => 1,
             };
+            if matches!(self.peek_at(exp_digit_pos), Some(b'0'..=b'9')) {
+                is_float = true;
+                self.advance(); // consume 'e'/'E'
+                if matches!(self.peek(), Some(b'+') | Some(b'-')) {
+                    self.advance(); // consume sign
+                }
+                while let Some(b) = self.peek() {
+                    if b.is_ascii_digit() || b == b'_' {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let slice = self.slice(start, self.pos);
+        let raw = if slice.contains('_') {
+            self.check_digit_separators(slice, start);
+            slice.replace('_', "")
+        } else {
+            slice.to_string()
+        };
+
+        if is_float {
             let value = match raw.parse::<f64>() {
                 Ok(v) if !v.is_finite() => {
                     // `parse::<f64>` saturates oversized literals to infinity;
@@ -542,13 +572,6 @@ impl<'src> Lexer<'src> {
             };
             TokenKind::Float(value)
         } else {
-            let slice = self.slice(start, self.pos);
-            let raw = if slice.contains('_') {
-                self.check_digit_separators(slice, start);
-                slice.replace('_', "")
-            } else {
-                slice.to_string()
-            };
             TokenKind::Int(raw)
         }
     }

@@ -10005,12 +10005,16 @@ impl Codegen {
         let is_maybe = type_str.starts_with("Maybe ");
         let inner = match type_str {
             "Int" | "Maybe Int" => {
-                let n: i64 = val_str.parse().unwrap();
+                let n: i64 = val_str.parse().unwrap_or_else(|e| {
+                    panic!("knot: override value '{}' is not a valid Int: {}", val_str, e)
+                });
                 let n_val = builder.ins().iconst(types::I64, n);
                 self.call_rt(builder, "knot_value_int", &[n_val])
             }
             "Float" | "Maybe Float" => {
-                let n: f64 = val_str.parse().unwrap();
+                let n: f64 = val_str.parse().unwrap_or_else(|e| {
+                    panic!("knot: override value '{}' is not a valid Float: {}", val_str, e)
+                });
                 let n_val = builder.ins().f64const(n);
                 self.call_rt(builder, "knot_value_float", &[n_val])
             }

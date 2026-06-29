@@ -53,6 +53,7 @@ impl EffectSet {
             && !self.fs
             && !self.clock
             && !self.random
+            && !self.uses_race
     }
 
     pub fn union(&self, other: &EffectSet) -> EffectSet {

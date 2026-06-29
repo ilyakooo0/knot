@@ -7,7 +7,7 @@
 use crate::types::TypeEnv;
 use knot::ast::*;
 use knot::diagnostic::{Diagnostic, Severity};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Lockfile path: `examples/todo.knot` → `examples/todo.schema.lock`
@@ -90,16 +90,17 @@ fn parse_adt_constructors(spec: &str) -> Vec<(String, Vec<(String, String)>)> {
 
 /// Compare two field lists by name, ignoring declaration order: same set of
 /// names, each with the same type. Adding or removing a field counts as a
-/// mismatch.
+/// mismatch. Uses sorted comparison to correctly handle duplicate field names
+/// (a first-match `find` would match the wrong duplicate).
 fn fields_match(old: &[(String, String)], new: &[(String, String)]) -> bool {
     if old.len() != new.len() {
         return false;
     }
-    old.iter().all(|(name, ty)| {
-        new.iter()
-            .find(|(n, _)| n == name)
-            .map_or(false, |(_, new_ty)| new_ty == ty)
-    })
+    let mut old_sorted: Vec<&(String, String)> = old.iter().collect();
+    let mut new_sorted: Vec<&(String, String)> = new.iter().collect();
+    old_sorted.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    new_sorted.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    old_sorted == new_sorted
 }
 
 fn classify_adt_change(old: &str, new: &str) -> SchemaChange {
@@ -122,7 +123,16 @@ fn classify_adt_change(old: &str, new: &str) -> SchemaChange {
         }
     }
 
-    // All old constructors preserved — new ones are safe additions
+    // All old constructors preserved with identical fields — new
+    // constructors are safe additions (nullable columns, no data loss).
+    // Also verify no old constructor was duplicated in new (which the
+    // find-based loop above would not catch).
+    let mut new_seen: HashSet<&String> = HashSet::new();
+    for (n, _) in &new_ctors {
+        if !new_seen.insert(n) {
+            return SchemaChange::Breaking;
+        }
+    }
     SchemaChange::Safe
 }
 
@@ -170,20 +180,10 @@ fn classify_record_change(old: &str, new: &str) -> SchemaChange {
     let old_fields = parse_record_fields(old);
     let new_fields = parse_record_fields(new);
 
-    // Every old field must exist in new with same type
-    for (old_name, old_ty) in &old_fields {
-        match new_fields.iter().find(|(n, _)| n == old_name) {
-            Some((_, new_ty)) => {
-                if old_ty != new_ty {
-                    return SchemaChange::Breaking;
-                }
-            }
-            None => return SchemaChange::Breaking,
-        }
-    }
-
-    // New fields added → Breaking for now (Safe once Maybe/nullable is supported)
-    if new_fields.len() > old_fields.len() {
+    // Use fields_match for a correct multiset comparison that handles
+    // duplicate field names (a first-match `find` would match the wrong
+    // duplicate, masking a breaking change).
+    if !fields_match(&old_fields, &new_fields) {
         return SchemaChange::Breaking;
     }
 

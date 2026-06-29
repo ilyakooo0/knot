@@ -2492,6 +2492,23 @@ pub extern "C-unwind" fn knot_stm_pop_merge() {
     STM_FRESH_ALL.with(|m| m.borrow_mut().clear());
 }
 
+/// Clear the STM tracking stack and reset tracking state. Called at
+/// `catch_unwind` recovery sites to discard stale stack entries left by
+/// a panicked nested atomic (whose `knot_stm_pop_merge` was skipped when
+/// the panic unwound past `done_block`). Without this, repeated
+/// panic-recover cycles would grow the stack unboundedly.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_stm_reset_tracking() {
+    STM_TRACKING_STACK.with(|stack| stack.borrow_mut().clear());
+    STM_TRACK.with(|t| {
+        let mut t = t.borrow_mut();
+        t.reads.clear();
+        t.filters.clear();
+        t.writes.clear();
+    });
+    STM_FRESH_ALL.with(|m| m.borrow_mut().clear());
+}
+
 /// Notify waiting `retry` callers that a specific relation has changed.
 /// Only wakes threads that registered interest in this table AND whose
 /// stored filters match the event payload.
@@ -2730,7 +2747,7 @@ fn eq_cross_key(val: &SqlVal) -> Option<SqlValKey> {
             if f.is_finite()
                 && f.fract() == 0.0
                 && *f >= i64::MIN as f64
-                && *f <= i64::MAX as f64 =>
+                && *f < 9_223_372_036_854_775_808.0 =>
         {
             Some(SqlValKey::Int(*f as i64))
         }
@@ -2749,7 +2766,7 @@ fn wake_range_index(idx: &RangeIndex, row_val: &SqlVal) {
             .parse::<i64>()
             .ok()
             .map(|n| SqlValKey::RealBits((n as f64).to_bits())),
-        SqlVal::Real(f) if f.is_finite() && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 => {
+        SqlVal::Real(f) if f.is_finite() && *f >= i64::MIN as f64 && *f < 9_223_372_036_854_775_808.0 => {
             // For Real rows probing Int thresholds, exact float-int comparison
             // boundaries depend on op direction. Use `floor` for "less" probes
             // (wakes Int thresholds strictly above the floor) and rely on the
@@ -7427,6 +7444,7 @@ pub extern "C-unwind" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
             }));
             if run.is_err() {
                 write_lock_force_release();
+                knot_stm_reset_tracking();
             }
         });
 
@@ -7570,6 +7588,7 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
                         // in the process. The connection (and its open
                         // savepoints) is discarded by `CleanupGuard` below.
                         write_lock_force_release();
+                        knot_stm_reset_tracking();
                         // Cooperative cancellation surfaces as a `Cancelled`
                         // panic raised by `knot_io_run`. It is not an error:
                         // the peer already produced the outcome, so this side
@@ -8842,7 +8861,7 @@ pub extern "C-unwind" fn knot_relation_diff(
         _ => panic!("knot runtime: diff expected Relation, got {}", type_name(b)),
     };
 
-    if rows_a.is_empty() { return a; }
+    if rows_a.is_empty() { return alloc(Value::Relation(Vec::new())); }
     if rows_b.is_empty() {
         // Dedup a for set semantics (SQL EXCEPT would dedup)
         let mut seen = HashSet::new();
@@ -14016,9 +14035,13 @@ pub extern "C-unwind" fn knot_atomic_rollback(db: *mut c_void) {
         ))
         .expect("knot runtime: failed to rollback atomic");
     db_ref.atomic_depth.set(depth - 1);
-    if depth == 1 {
-        STM_TRACK.with(|t| t.borrow_mut().writes.clear());
-    }
+    // Clear inner writes from the STM tracking set on every rollback, not
+    // just at depth 1. For a nested atomic, `knot_stm_push` already saved
+    // the outer write set; clearing here ensures the rolled-back inner
+    // writes are not merged back into the outer set by `knot_stm_pop_merge`,
+    // which would cause spurious watcher wakeups when the outer atomic
+    // commits even though no data actually changed.
+    STM_TRACK.with(|t| t.borrow_mut().writes.clear());
 }
 
 // ── Record update ─────────────────────────────────────────────────
@@ -15462,7 +15485,13 @@ fn http_serve_loop(
                 // Deep-clone handler for the worker thread
                 let handler_cloned = deep_clone_value(handler) as usize;
 
-                let handle = std::thread::spawn(move || {
+                // Use Builder::spawn instead of thread::spawn so that thread
+                // creation failure (resource exhaustion) returns an error
+                // instead of panicking the accept loop. The request is moved
+                // into the closure; if spawn fails the closure (and request)
+                // is dropped — the client sees a connection reset, same as
+                // a network error, but the server stays up.
+                let spawn_result = std::thread::Builder::new().spawn(move || {
                     let handler = handler_cloned as *mut Value;
                     let mut request = request;
 
@@ -15941,6 +15970,9 @@ fn http_serve_loop(
                                 );
                             }
                             db_ref.atomic_depth.set(0);
+                            // Discard stale STM tracking stack entries left
+                            // by a panicked nested atomic.
+                            knot_stm_reset_tracking();
 
                             let msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
                                 s.to_string()
@@ -15982,21 +16014,32 @@ fn http_serve_loop(
                     //    and will be abandoned when this thread exits
                     unsafe { deep_drop_value(handler); }
                 });
-                // Don't push HTTP request handles into THREAD_HANDLES — the
-                // server loop runs forever so they would accumulate without
-                // bound.  Spawn a monitor thread to join and report panics.
-                std::thread::spawn(move || {
-                    if let Err(e) = handle.join() {
-                        let msg = if let Some(s) = e.downcast_ref::<&str>() {
-                            s.to_string()
-                        } else if let Some(s) = e.downcast_ref::<String>() {
-                            s.clone()
-                        } else {
-                            "unknown panic".to_string()
-                        };
-                        log_error!("[HTTP] handler thread panicked: {}", msg);
+                match spawn_result {
+                    Ok(handle) => {
+                        // Don't push HTTP request handles into THREAD_HANDLES — the
+                        // server loop runs forever so they would accumulate without
+                        // bound.  Spawn a monitor thread to join and report panics.
+                        std::thread::spawn(move || {
+                            if let Err(e) = handle.join() {
+                                let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                                    s.to_string()
+                                } else if let Some(s) = e.downcast_ref::<String>() {
+                                    s.clone()
+                                } else {
+                                    "unknown panic".to_string()
+                                };
+                                log_error!("[HTTP] handler thread panicked: {}", msg);
+                            }
+                        });
                     }
-                });
+                    Err(e) => {
+                        log_error!("[HTTP] failed to spawn handler thread: {}", e);
+                        // The request was moved into the closure which was
+                        // dropped on spawn failure — the client will see a
+                        // connection reset. Clean up the deep-cloned handler.
+                        unsafe { deep_drop_value(handler_cloned as *mut Value); }
+                    }
+                }
             }
             None => {
                 log_debug!("[HTTP] --> 404 not found");

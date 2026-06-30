@@ -450,16 +450,43 @@ fn utf8_char_len(first: u8) -> usize {
     }
 }
 
-/// Collect every top-level name a declaration's body references. Used to
-/// build the reverse-dependency graph for selective re-inference.
+/// Collect every top-level name a declaration references, including type-level
+/// dependencies (type annotations, source types, constraints, data constructors).
+/// Used to build the reverse-dependency graph for selective re-inference.
 fn collect_decl_deps(decl: &ast::Decl) -> HashSet<String> {
     let mut deps = HashSet::new();
     match &decl.node {
-        DeclKind::Fun {
-            body: Some(body), ..
-        } => collect_expr_names(body, &mut deps),
-        DeclKind::View { body, .. } | DeclKind::Derived { body, .. } => {
+        DeclKind::Fun { ty, body, .. } => {
+            if let Some(ts) = ty {
+                collect_type_names(&ts.ty, &mut deps);
+                for c in &ts.constraints {
+                    for arg in &c.args {
+                        collect_type_names(arg, &mut deps);
+                    }
+                }
+            }
+            if let Some(body) = body {
+                collect_expr_names(body, &mut deps);
+            }
+        }
+        DeclKind::View { ty, body, .. } | DeclKind::Derived { ty, body, .. } => {
+            if let Some(ts) = ty {
+                collect_type_names(&ts.ty, &mut deps);
+            }
             collect_expr_names(body, &mut deps);
+        }
+        DeclKind::Source { ty, .. } => {
+            collect_type_names(ty, &mut deps);
+        }
+        DeclKind::TypeAlias { ty, .. } => {
+            collect_type_names(ty, &mut deps);
+        }
+        DeclKind::Data { constructors, .. } => {
+            for ctor in constructors {
+                for field in &ctor.fields {
+                    collect_type_names(&field.value, &mut deps);
+                }
+            }
         }
         DeclKind::Impl { items, .. } => {
             for item in items {
@@ -482,6 +509,42 @@ fn collect_decl_deps(decl: &ast::Decl) -> HashSet<String> {
         _ => {}
     }
     deps
+}
+
+/// Collect named type references from a type AST node (or a slice of them).
+fn collect_type_names(ty: &ast::Type, out: &mut HashSet<String>) {
+    match &ty.node {
+        ast::TypeKind::Named(name) => {
+            out.insert(name.clone());
+        }
+        ast::TypeKind::Var(_) | ast::TypeKind::Hole => {}
+        ast::TypeKind::App { func, arg } => {
+            collect_type_names(func, out);
+            collect_type_names(arg, out);
+        }
+        ast::TypeKind::Record { fields, .. } => {
+            for f in fields {
+                collect_type_names(&f.value, out);
+            }
+        }
+        ast::TypeKind::Relation(inner) => collect_type_names(inner, out),
+        ast::TypeKind::Function { param, result } => {
+            collect_type_names(param, out);
+            collect_type_names(result, out);
+        }
+        ast::TypeKind::Variant { constructors, .. } => {
+            for ctor in constructors {
+                for field in &ctor.fields {
+                    collect_type_names(&field.value, out);
+                }
+            }
+        }
+        ast::TypeKind::Effectful { ty, .. } => collect_type_names(ty, out),
+        ast::TypeKind::IO { ty, .. } => collect_type_names(ty, out),
+        ast::TypeKind::UnitAnnotated { base, .. } => collect_type_names(base, out),
+        ast::TypeKind::Refined { base, .. } => collect_type_names(base, out),
+        ast::TypeKind::Forall { ty, .. } => collect_type_names(ty, out),
+    }
 }
 
 fn collect_expr_names(expr: &ast::Expr, out: &mut HashSet<String>) {

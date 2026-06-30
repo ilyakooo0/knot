@@ -890,10 +890,24 @@ impl Arena {
         self.promote_cache.clear();
         let child = self.frames.pop().unwrap();
         // Clone into the (now-current) parent frame before dropping the child.
-        let promoted = self.clone_from_child(val, &child);
-        self.drop_and_harvest_frame(child);
+        // Use catch_unwind so the promote_cache is cleared even if
+        // clone_from_child panics — otherwise the child frame's values are
+        // freed during unwind but stale pointers remain in the cache, causing
+        // use-after-free on the next promote_value call.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.clone_from_child(val, &child)
+        }));
         self.promote_cache.clear();
-        promoted
+        match result {
+            Ok(promoted) => {
+                self.drop_and_harvest_frame(child);
+                promoted
+            }
+            Err(payload) => {
+                self.drop_and_harvest_frame(child);
+                std::panic::resume_unwind(payload);
+            }
+        }
     }
 
     // ── Promote (selective clone into pinned) ────────────────────
@@ -1261,7 +1275,7 @@ impl CancelToken {
     /// wake-up.
     fn cancel(&self) {
         {
-            let _g = self.notify.0.lock().unwrap();
+            let _g = self.notify.0.lock().unwrap_or_else(|e| e.into_inner());
             self.flag.store(true, Ordering::Release);
             self.notify.1.notify_all();
         }
@@ -1270,7 +1284,7 @@ impl CancelToken {
         // slot here BEFORE checking `is_cancelled()` — so either we see the
         // registered slot (and wake it), or the waiter's check sees the flag
         // (the `stm_slot` mutex orders the two paths).
-        let slot = self.stm_slot.lock().unwrap().take();
+        let slot = self.stm_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(slot) = slot.and_then(|w| w.upgrade()) {
             slot.wake();
         }
@@ -1278,12 +1292,12 @@ impl CancelToken {
 
     /// Register the current STM wake slot so `cancel()` can wake it.
     fn set_stm_wake_slot(&self, slot: &Arc<WakeSlot>) {
-        *self.stm_slot.lock().unwrap() = Some(Arc::downgrade(slot));
+        *self.stm_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(slot));
     }
 
     /// Clear the registered STM wake slot after the wait completes.
     fn clear_stm_wake_slot(&self) {
-        *self.stm_slot.lock().unwrap() = None;
+        *self.stm_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Sleep for `duration`, returning early as soon as `cancel()` is
@@ -1293,7 +1307,7 @@ impl CancelToken {
         if self.is_cancelled() {
             return;
         }
-        let guard = self.notify.0.lock().unwrap();
+        let guard = self.notify.0.lock().unwrap_or_else(|e| e.into_inner());
         let _ = self
             .notify
             .1
@@ -1414,9 +1428,9 @@ fn write_lock_acquire() {
     // calls `notify_one`, so a parked waiter is guaranteed to be woken.
     let (m, cv) = &*WRITE_LOCK_PARK;
     loop {
-        let mut guard = m.lock().expect("write lock park mutex poisoned");
+        let mut guard = m.lock().unwrap_or_else(|e| e.into_inner());
         while WRITE_LOCKED.load(Ordering::Acquire) {
-            guard = cv.wait(guard).expect("write lock park condvar poisoned");
+            guard = cv.wait(guard).unwrap_or_else(|e| e.into_inner());
         }
         // Drop the mutex before attempting CAS so a concurrent releaser can
         // make progress on its notify path.
@@ -1471,7 +1485,7 @@ fn write_lock_force_release() {
 /// the wakeup and park indefinitely.
 fn wake_one_write_waiter() {
     let (m, cv) = &*WRITE_LOCK_PARK;
-    let _g = m.lock().expect("write lock park mutex poisoned");
+    let _g = m.lock().unwrap_or_else(|e| e.into_inner());
     cv.notify_one();
 }
 
@@ -1503,9 +1517,9 @@ fn write_lock_reacquire_at_depth(depth: usize) {
     }
     let (m, cv) = &*WRITE_LOCK_PARK;
     loop {
-        let mut guard = m.lock().expect("write lock park mutex poisoned");
+        let mut guard = m.lock().unwrap_or_else(|e| e.into_inner());
         while WRITE_LOCKED.load(Ordering::Acquire) {
-            guard = cv.wait(guard).expect("write lock park condvar poisoned");
+            guard = cv.wait(guard).unwrap_or_else(|e| e.into_inner());
         }
         drop(guard);
         if WRITE_LOCKED
@@ -1995,10 +2009,10 @@ static COL_INTERN: std::sync::LazyLock<RwLock<HashMap<String, Arc<str>>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
 fn intern_col(name: &str) -> Arc<str> {
-    if let Some(v) = COL_INTERN.read().unwrap().get(name) {
+    if let Some(v) = COL_INTERN.read().unwrap_or_else(|e| e.into_inner()).get(name) {
         return v.clone();
     }
-    let mut w = COL_INTERN.write().unwrap();
+    let mut w = COL_INTERN.write().unwrap_or_else(|e| e.into_inner());
     if let Some(v) = w.get(name) {
         return v.clone();
     }
@@ -2022,7 +2036,7 @@ fn register_source_schema(name: &str, schema: Arc<RecordSchema>) {
 }
 
 fn get_source_schema(name: &str) -> Option<Arc<RecordSchema>> {
-    SOURCE_SCHEMAS.read().unwrap().get(name).cloned()
+    SOURCE_SCHEMAS.read().unwrap_or_else(|e| e.into_inner()).get(name).cloned()
 }
 
 /// Registry of columns stored as genuine TEXT (BINARY collation in SQLite) —
@@ -2175,11 +2189,11 @@ impl WakeSlot {
         }
     }
     fn wake(&self) {
-        *self.woken.lock().unwrap() = true;
+        *self.woken.lock().unwrap_or_else(|e| e.into_inner()) = true;
         self.cvar.notify_one();
     }
     fn wait(&self, timeout: Duration) {
-        let guard = self.woken.lock().unwrap();
+        let guard = self.woken.lock().unwrap_or_else(|e| e.into_inner());
         if *guard {
             return;
         }
@@ -2541,7 +2555,7 @@ fn bump_global_writes() {
     // common case is a single atomic add with no mutex touch.
     if GLOBAL_WRITE_WAITERS.load(Ordering::Acquire) > 0 {
         let (m, cv) = &*GLOBAL_WRITE_CV;
-        let _g = m.lock().expect("global write cv mutex poisoned");
+        let _g = m.lock().unwrap_or_else(|e| e.into_inner());
         cv.notify_all();
     }
 }
@@ -2557,7 +2571,7 @@ fn wait_for_any_write(timeout: Duration) {
     let baseline = GLOBAL_WRITES.load(Ordering::Acquire);
     GLOBAL_WRITE_WAITERS.fetch_add(1, Ordering::AcqRel);
     let (m, cv) = &*GLOBAL_WRITE_CV;
-    let guard = m.lock().expect("global write cv mutex poisoned");
+    let guard = m.lock().unwrap_or_else(|e| e.into_inner());
     let _ = cv.wait_timeout_while(guard, timeout, |_| {
         GLOBAL_WRITES.load(Ordering::Acquire) == baseline
     });
@@ -2946,11 +2960,11 @@ static SPEC_CACHE: std::sync::LazyLock<RwLock<HashMap<(usize, usize), Option<Arc
 
 fn lookup_or_parse_spec(spec_ptr: *const u8, spec_len: usize, spec: &str) -> Option<Arc<ParsedSpec>> {
     let key = (spec_ptr as usize, spec_len);
-    if let Some(entry) = SPEC_CACHE.read().unwrap().get(&key) {
+    if let Some(entry) = SPEC_CACHE.read().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return entry.clone();
     }
     let parsed = parse_spec_structure(spec).map(Arc::new);
-    SPEC_CACHE.write().unwrap().insert(key, parsed.clone());
+    SPEC_CACHE.write().unwrap_or_else(|e| e.into_inner()).insert(key, parsed.clone());
     parsed
 }
 
@@ -3718,7 +3732,7 @@ fn intern_str(s: &str) -> Arc<str> {
         return arc;
     }
     let arc = {
-        let mut table = STRING_INTERNER.lock().unwrap();
+        let mut table = STRING_INTERNER.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = table.get(s) {
             existing
         } else {
@@ -4687,7 +4701,7 @@ pub extern "C-unwind" fn knot_value_int_from_str(ptr: *const u8, len: usize) -> 
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_value_float(n: f64) -> *mut Value {
-    if n.to_bits() == 0.0_f64.to_bits() {
+    if n == 0.0 {
         SINGLETONS.with(|s| s.float_zero)
     } else if n == 1.0 {
         SINGLETONS.with(|s| s.float_one)
@@ -6708,6 +6722,16 @@ pub extern "C-unwind" fn knot_value_concat(a: *mut Value, b: *mut Value) -> *mut
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_value_compare(a: *mut Value, b: *mut Value) -> *mut Value {
+    if a == b {
+        return alloc(Value::Constructor(intern_str("EQ"), alloc(Value::Unit)));
+    }
+    if a.is_null() || b.is_null() {
+        panic!(
+            "knot runtime: cannot compare {} with {}",
+            if a.is_null() { "null" } else { type_name(a) },
+            if b.is_null() { "null" } else { type_name(b) },
+        );
+    }
     let ordering = compare_values(a, b);
     let tag = match ordering {
         std::cmp::Ordering::Less => "LT",
@@ -6724,11 +6748,62 @@ pub extern "C-unwind" fn knot_value_compare(a: *mut Value, b: *mut Value) -> *mu
 /// Avoids allocating an Ordering constructor for use in comparison operators.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_value_compare_ord(a: *mut Value, b: *mut Value) -> i32 {
+    if a == b {
+        return 0;
+    }
+    if a.is_null() || b.is_null() {
+        panic!(
+            "knot runtime: cannot compare {} with {}",
+            if a.is_null() { "null" } else { type_name(a) },
+            if b.is_null() { "null" } else { type_name(b) },
+        );
+    }
     match compare_values(a, b) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,
     }
+}
+
+/// Compare an `i64` with an `f64` without precision loss for large integers.
+/// Returns `Equal` only when the float is integral, fits in `i64`, and equals the int —
+/// consistent with `values_equal`'s round-trip check.
+fn cmp_int_float(x: i64, y: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if y.is_nan() {
+        return Ordering::Equal;
+    }
+    // If y is integral and fits in i64, compare exactly as integers.
+    let yi = y as i64;
+    if (yi as f64).total_cmp(&y) == Ordering::Equal {
+        return x.cmp(&yi);
+    }
+    // If x fits in f64 without precision loss, compare as f64.
+    let xf = x as f64;
+    if (xf as i64) == x {
+        return xf.total_cmp(&y);
+    }
+    // x doesn't fit f64 (|x| > 2^53) and y is not i64-exact.
+    // Since x is a valid i64, |x| <= i64::MAX. If y is out of i64 range,
+    // the ordering is determined by magnitude alone.
+    if y > (i64::MAX as f64) {
+        return Ordering::Less;
+    }
+    if y < (i64::MIN as f64) {
+        return Ordering::Greater;
+    }
+    // y is in i64 range but not integral. Use floor for exact comparison:
+    // since y is not integral, y > floor(y) and y < floor(y) + 1.
+    let floor_i = y.floor() as i64;
+    if x < floor_i {
+        return Ordering::Less;
+    }
+    if x > floor_i {
+        // x >= floor_i + 1 > y (since y < floor(y) + 1 for non-integral y)
+        return Ordering::Greater;
+    }
+    // x == floor(y), and y > floor(y) since y is not integral
+    Ordering::Less
 }
 
 /// Ordering for the primitive types the order-taking builtins can compare
@@ -6748,8 +6823,8 @@ fn compare_values_primitive(a: *mut Value, b: *mut Value) -> std::cmp::Ordering 
     match (to_num_view(av), to_num_view(bv)) {
         (Some(NumView::Int(x)), Some(NumView::Int(y))) => x.cmp(&y),
         (Some(NumView::Float(x)), Some(NumView::Float(y))) => x.total_cmp(&y),
-        (Some(NumView::Int(x)), Some(NumView::Float(y))) => (x as f64).total_cmp(&y),
-        (Some(NumView::Float(x)), Some(NumView::Int(y))) => x.total_cmp(&(y as f64)),
+        (Some(NumView::Int(x)), Some(NumView::Float(y))) => cmp_int_float(x, y),
+        (Some(NumView::Float(x)), Some(NumView::Int(y))) => cmp_int_float(y, x).reverse(),
         _ => panic!(
             "knot runtime: cannot compare {} with {}",
             type_name(a),
@@ -6768,8 +6843,8 @@ fn compare_values(a: *mut Value, b: *mut Value) -> std::cmp::Ordering {
     match (to_num_view(av), to_num_view(bv)) {
         (Some(NumView::Int(x)), Some(NumView::Int(y))) => return x.cmp(&y),
         (Some(NumView::Float(x)), Some(NumView::Float(y))) => return x.total_cmp(&y),
-        (Some(NumView::Int(x)), Some(NumView::Float(y))) => return (x as f64).total_cmp(&y),
-        (Some(NumView::Float(x)), Some(NumView::Int(y))) => return x.total_cmp(&(y as f64)),
+        (Some(NumView::Int(x)), Some(NumView::Float(y))) => return cmp_int_float(x, y),
+        (Some(NumView::Float(x)), Some(NumView::Int(y))) => return cmp_int_float(y, x).reverse(),
         _ => {}
     }
     // Structural ordering for non-numeric values — backs derived `Ord` on
@@ -7410,7 +7485,7 @@ pub extern "C-unwind" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
                 fn drop(&mut self) {
                     ACTIVE_FORKS.fetch_sub(1, Ordering::SeqCst);
                     // Notify under the mutex so waiters never miss the wakeup.
-                    let _g = ACTIVE_FORKS_MUTEX.lock().unwrap();
+                    let _g = ACTIVE_FORKS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
                     ACTIVE_FORKS_CVAR.notify_all();
                 }
             }
@@ -7418,7 +7493,7 @@ pub extern "C-unwind" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
 
             let io = cloned_io as *mut u8 as *mut Value;
             // Open a new DB connection for this thread
-            let db_path = DB_PATH.lock().unwrap().clone();
+            let db_path = DB_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let db = knot_db_open(db_path.as_ptr(), db_path.len());
 
             // Use a drop guard to ensure cleanup even if knot_io_run panics
@@ -7454,7 +7529,7 @@ pub extern "C-unwind" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
             // free the deep-cloned IO the thread would have owned.
             ACTIVE_FORKS.fetch_sub(1, Ordering::SeqCst);
             {
-                let _g = ACTIVE_FORKS_MUTEX.lock().unwrap();
+                let _g = ACTIVE_FORKS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
                 ACTIVE_FORKS_CVAR.notify_all();
             }
             unsafe { deep_drop_value(cloned_io as *mut u8 as *mut Value); }
@@ -7543,7 +7618,7 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
                 impl Drop for ForkCounter {
                     fn drop(&mut self) {
                         ACTIVE_FORKS.fetch_sub(1, Ordering::SeqCst);
-                        let _g = ACTIVE_FORKS_MUTEX.lock().unwrap();
+                        let _g = ACTIVE_FORKS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
                         ACTIVE_FORKS_CVAR.notify_all();
                     }
                 }
@@ -7552,7 +7627,7 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
                 CANCEL_FLAG.with(|c| *c.borrow_mut() = Some(my_cancel.clone()));
 
                 let io = io_raw as *mut u8 as *mut Value;
-                let db_path = DB_PATH.lock().unwrap().clone();
+                let db_path = DB_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let db = knot_db_open(db_path.as_ptr(), db_path.len());
 
                 struct CleanupGuard {
@@ -7603,7 +7678,7 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
                         } else {
                             "unknown panic".to_string()
                         };
-                        let mut g = state.lock().unwrap();
+                        let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
                         g.panic_msgs.push(format!(
                             "{} side panicked: {}",
                             if is_left { "left" } else { "right" },
@@ -7636,7 +7711,7 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
                 // so it outlives this thread's arena.
                 let cloned = deep_clone_value(result) as *mut u8 as usize;
 
-                let mut g = state.lock().unwrap();
+                let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
                 if g.outcome.is_none() {
                     g.outcome = Some(RaceOutcome::Winner(is_left, cloned));
                     drop(g);
@@ -7655,7 +7730,7 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
                 // free the deep-cloned IO the thread would have owned.
                 ACTIVE_FORKS.fetch_sub(1, Ordering::SeqCst);
                 {
-                    let _g = ACTIVE_FORKS_MUTEX.lock().unwrap();
+                    let _g = ACTIVE_FORKS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
                     ACTIVE_FORKS_CVAR.notify_all();
                 }
                 unsafe { deep_drop_value(io_raw as *mut u8 as *mut Value); }
@@ -7665,7 +7740,7 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
                 // on the outcome condvar forever. Mirror the single-panic
                 // bookkeeping: record this side's failure and only set
                 // `BothPanicked` once both sides are down with no winner.
-                let mut g = fail_state.lock().unwrap();
+                let mut g = fail_state.lock().unwrap_or_else(|e| e.into_inner());
                 g.panic_msgs.push(format!(
                     "{} side failed to spawn thread",
                     if is_left { "left" } else { "right" }
@@ -7704,7 +7779,7 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
         // Wait for an outcome — but don't join the loser.  The loser runs
         // to its next safe point in the background, tracked by
         // ACTIVE_FORKS for the program-exit join.
-        let g = state.lock().unwrap();
+        let g = state.lock().unwrap_or_else(|e| e.into_inner());
         let g = cvar.wait_while(g, |s| s.outcome.is_none()).unwrap();
         let outcome = g.outcome.as_ref().cloned().expect("race outcome present");
         drop(g);
@@ -7746,7 +7821,7 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
 /// been forked.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_threads_join() {
-    let lock = ACTIVE_FORKS_MUTEX.lock().unwrap();
+    let lock = ACTIVE_FORKS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let _guard = ACTIVE_FORKS_CVAR
         .wait_while(lock, |_| ACTIVE_FORKS.load(Ordering::SeqCst) > 0)
         .unwrap();
@@ -9923,7 +9998,7 @@ pub extern "C-unwind" fn knot_fs_list_dir(path: *mut Value) -> *mut Value {
 pub extern "C-unwind" fn knot_db_open(path_ptr: *const u8, path_len: usize) -> *mut c_void {
     let path = unsafe { str_from_raw(path_ptr, path_len) };
     // Store path globally so spawned threads can open their own connections
-    *DB_PATH.lock().unwrap() = path.to_string();
+    *DB_PATH.lock().unwrap_or_else(|e| e.into_inner()) = path.to_string();
     let conn = Connection::open(path).expect("knot runtime: failed to open database");
     conn.create_collation("KNOT_INT", |a: &str, b: &str| {
         match (a.parse::<i64>(), b.parse::<i64>()) {
@@ -13213,12 +13288,22 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
 /// Return current time as milliseconds since Unix epoch.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_now() -> *mut Value {
-    let ms: i64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis()
-        .try_into()
-        .expect("knot runtime: system clock milliseconds overflowed i64");
+    let now = std::time::SystemTime::now();
+    let ms: i64 = if now >= std::time::UNIX_EPOCH {
+        now.duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(0)
+    } else {
+        std::time::UNIX_EPOCH
+            .duration_since(now)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .map(|v: i64| -v)
+            .unwrap_or(0)
+    };
     knot_value_int(ms)
 }
 
@@ -15541,7 +15626,7 @@ fn http_serve_loop(
                     };
 
                     // Open a DB connection for this thread
-                    let db_path = DB_PATH.lock().unwrap().clone();
+                    let db_path = DB_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     let db = knot_db_open(db_path.as_ptr(), db_path.len());
 
                     let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<*mut Value, (u16, String, Option<i64>)> {
@@ -15622,6 +15707,24 @@ fn http_serve_loop(
                     let has_body = !entry_body_fields.is_empty()
                         && entry_method != "GET" && entry_method != "HEAD";
                     if has_body {
+                        // Validate Content-Type for body-bearing requests
+                        let ct_ok = request
+                            .headers()
+                            .iter()
+                            .any(|h| {
+                                h.field.as_str().as_str().eq_ignore_ascii_case("content-type")
+                                    && h.value
+                                        .as_str()
+                                        .split(';')
+                                        .next()
+                                        .map(|s| s.trim().eq_ignore_ascii_case("application/json"))
+                                        .unwrap_or(false)
+                            });
+                        if !ct_ok {
+                            let msg = "expected Content-Type: application/json";
+                            log_debug!("[HTTP] --> 415 {}", msg);
+                            return Err((415, msg.to_string(), None));
+                        }
                         let body_str = String::from_utf8_lossy(&body_bytes);
                         log_debug!("[HTTP]     body: {}", body_str);
                         let body_json = match serde_json::from_str::<serde_json::Value>(&body_str) {
@@ -16681,7 +16784,7 @@ pub extern "C-unwind" fn knot_api_register(
     // allowing knot_http_listen to consume the original without use-after-free.
     let table_ref = unsafe { &*(table as *const RouteTable) };
     let cloned = Box::into_raw(Box::new(table_ref.clone())) as *mut c_void;
-    API_REGISTRY.lock().unwrap().push((name, SendPtr(cloned)));
+    API_REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).push((name, SendPtr(cloned)));
 }
 
 #[unsafe(no_mangle)]
@@ -16704,7 +16807,7 @@ pub extern "C-unwind" fn knot_api_handle(argc: i32, argv: *const *const u8) -> i
         return 0;
     }
 
-    let registry = API_REGISTRY.lock().unwrap();
+    let registry = API_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
 
     if argc < 3 {
         eprintln!("Usage: <program> api <RouteName>");
@@ -17020,7 +17123,7 @@ fn parse_response_fields(s: &str) -> Vec<(String, String)> {
     for i in 0..bytes.len() {
         match bytes[i] {
             b'[' | b'{' => depth += 1,
-            b']' | b'}' => depth -= 1,
+            b']' | b'}' => depth = depth.saturating_sub(1),
             b',' if depth == 0 => {
                 let part = s[start..i].trim();
                 if let Some((name, ty)) = part.split_once(':') {
@@ -18501,7 +18604,7 @@ mod _regress_runtime_tests {
         EQ_WATCHERS.entry(key).or_default().push(Arc::downgrade(&slot));
         wake_matching_watchers("t_fix2_eq_unique", &WriteEvent::Bulk);
         assert!(
-            *slot.woken.lock().unwrap(),
+            *slot.woken.lock().unwrap_or_else(|e| e.into_inner()),
             "Bulk write must conservatively wake EQ-indexed watchers"
         );
     }
@@ -18519,7 +18622,7 @@ mod _regress_runtime_tests {
             .push(Arc::downgrade(&slot));
         wake_matching_watchers("t_fix2_range_unique", &WriteEvent::Bulk);
         assert!(
-            *slot.woken.lock().unwrap(),
+            *slot.woken.lock().unwrap_or_else(|e| e.into_inner()),
             "Bulk write must conservatively wake Range-indexed watchers"
         );
     }
@@ -18534,7 +18637,7 @@ mod _regress_runtime_tests {
         );
         EQ_WATCHERS.entry(key).or_default().push(Arc::downgrade(&slot));
         wake_matching_watchers("t_fix2_unrelated_table", &WriteEvent::Bulk);
-        assert!(!*slot.woken.lock().unwrap());
+        assert!(!*slot.woken.lock().unwrap_or_else(|e| e.into_inner()));
     }
 }
 
@@ -18946,7 +19049,7 @@ mod _bugfix_batch_tests {
         tok.cancel();
         assert!(tok.is_cancelled());
         assert!(
-            *slot.woken.lock().unwrap(),
+            *slot.woken.lock().unwrap_or_else(|e| e.into_inner()),
             "cancel() must wake the slot registered by knot_stm_wait"
         );
     }
@@ -18976,7 +19079,7 @@ mod _bugfix_batch_tests {
         // never probed and the watcher sleeps until the timeout.
         wake_matching_watchers(table, &WriteEvent::Rows(rows));
         assert!(
-            *slot.woken.lock().unwrap(),
+            *slot.woken.lock().unwrap_or_else(|e| e.into_inner()),
             "stale payload must fall back to a conservative Bulk wake"
         );
         TABLE_FILTER_COLS.remove(table);
@@ -19001,7 +19104,7 @@ mod _bugfix_batch_tests {
         rows.push(vec![SqlVal::Int(2)]); // ≠ 1 → indexed watcher must NOT wake
         wake_matching_watchers(table, &WriteEvent::Rows(rows));
         assert!(
-            !*slot.woken.lock().unwrap(),
+            !*slot.woken.lock().unwrap_or_else(|e| e.into_inner()),
             "payload covering all filter cols must keep per-row precision"
         );
         TABLE_FILTER_COLS.remove(table);

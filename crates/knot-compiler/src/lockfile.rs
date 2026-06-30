@@ -265,7 +265,9 @@ pub fn check(source_path: &Path, module: &Module, type_env: &TypeEnv) -> Vec<Dia
                                 let first_from = &migrations[0].0;
                                 let last_to = &migrations[migrations.len() - 1].1;
 
-                                if first_from != old_schema || last_to != new_schema {
+                                if classify_schema_change(first_from, old_schema) != SchemaChange::Identical
+                                    || classify_schema_change(last_to, new_schema) != SchemaChange::Identical
+                                {
                                     let first_span = find_migrate_span(module, name);
                                     diags.push(
                                         Diagnostic::error(format!(
@@ -282,7 +284,7 @@ pub fn check(source_path: &Path, module: &Module, type_env: &TypeEnv) -> Vec<Dia
 
                                 // Validate chain contiguity
                                 for i in 1..migrations.len() {
-                                    if migrations[i - 1].1 != migrations[i].0 {
+                                    if classify_schema_change(&migrations[i - 1].1, &migrations[i].0) != SchemaChange::Identical {
                                         diags.push(
                                             Diagnostic::error(format!(
                                                 "migration chain for '*{}' is not contiguous: step {} 'to' doesn't match step {} 'from'",
@@ -326,7 +328,10 @@ pub fn check(source_path: &Path, module: &Module, type_env: &TypeEnv) -> Vec<Dia
         let source_migrations = type_env.migrate_schemas.get(name);
         for (lock_from, lock_to) in lock_migrations {
             let still_present = source_migrations.map_or(false, |sm| {
-                sm.iter().any(|(f, t)| f == lock_from && t == lock_to)
+                sm.iter().any(|(f, t)| {
+                    classify_schema_change(f, lock_from) == SchemaChange::Identical
+                        && classify_schema_change(t, lock_to) == SchemaChange::Identical
+                })
             });
             if !still_present {
                 diags.push(

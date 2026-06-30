@@ -9502,9 +9502,19 @@ impl Codegen {
                     //
                     // 1. Push the primary bind variable's value into temp
                     //    (we're inside the pre-group loops)
-                    let var_val = primary_row_val.expect(
-                        "groupBy requires a preceding bind statement"
-                    );
+                    let var_val = match primary_row_val {
+                        Some(v) => v,
+                        None => {
+                            self.diagnostics.push(
+                                knot::diagnostic::Diagnostic::error(
+                                    "groupBy requires a preceding bind from a relation \
+                                     (e.g. `t <- *source` before `groupBy {key: t.field}`)",
+                                )
+                                .label(key.span, "groupBy without a preceding relation bind"),
+                            );
+                            return self.call_rt(builder, "knot_relation_empty", &[]);
+                        }
+                    };
                     self.call_rt_void(
                         builder,
                         "knot_relation_push",

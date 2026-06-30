@@ -5345,14 +5345,66 @@ impl Infer {
                 // the quantified variables. This is what makes higher-rank
                 // arguments usable at multiple types inside the body.
                 let scheme = match self.apply(expected) {
-                    Ty::Forall(vars, body) => Scheme {
-                        vars,
-                        unit_vars: vec![],
-                        constraints: vec![],
-                        effect_unions: vec![],
-                        unit_binops: vec![],
-                        ty: *body,
-                    },
+                    Ty::Forall(vars, body) => {
+                        // Collect deferred constraints/effect-unions/unit-binops
+                        // that reference the quantified vars so they travel with
+                        // the scheme and are re-registered at each instantiation.
+                        let var_set: HashSet<TyVar> = vars.iter().copied().collect();
+                        let mut constraints = Vec::new();
+                        let deferred = std::mem::take(&mut self.deferred_constraints);
+                        let mut remaining = Vec::with_capacity(deferred.len());
+                        for dc in deferred {
+                            match self.apply(&Ty::Var(dc.type_var)) {
+                                Ty::Var(v) if var_set.contains(&v) => {
+                                    constraints.push(TyConstraint {
+                                        trait_name: dc.trait_name,
+                                        type_var: v,
+                                        span: dc.span,
+                                    });
+                                }
+                                _ => remaining.push(dc),
+                            }
+                        }
+                        self.deferred_constraints = remaining;
+                        let mut effect_unions = Vec::new();
+                        let pending = std::mem::take(&mut self.pending_effect_unions);
+                        let mut remaining_eu = Vec::with_capacity(pending.len());
+                        for u in pending {
+                            match self.apply(&Ty::Var(u.result)) {
+                                Ty::Var(v) if var_set.contains(&v) => {
+                                    effect_unions.push(EffectUnion { result: v, sources: u.sources });
+                                }
+                                _ => remaining_eu.push(u),
+                            }
+                        }
+                        self.pending_effect_unions = remaining_eu;
+                        let mut unit_binops = Vec::new();
+                        let pending_ub = std::mem::take(&mut self.deferred_unit_binops);
+                        let mut remaining_ub = Vec::with_capacity(pending_ub.len());
+                        for b in pending_ub {
+                            match self.apply(&Ty::Var(b.result)) {
+                                Ty::Var(v) if var_set.contains(&v) => {
+                                    unit_binops.push(DeferredUnitBinop {
+                                        op: b.op,
+                                        lhs: self.apply(&b.lhs),
+                                        rhs: self.apply(&b.rhs),
+                                        result: v,
+                                        span: b.span,
+                                    });
+                                }
+                                _ => remaining_ub.push(b),
+                            }
+                        }
+                        self.deferred_unit_binops = remaining_ub;
+                        Scheme {
+                            vars,
+                            unit_vars: vec![],
+                            constraints,
+                            effect_unions,
+                            unit_binops,
+                            ty: *body,
+                        }
+                    }
                     _ => Scheme::mono(expected.clone()),
                 };
                 self.bind(name, scheme);
@@ -6048,6 +6100,15 @@ impl Infer {
                                     // dummy `(0,0)` span (which `check_constraints`
                                     // would otherwise have to skip).
                                     let ty = self.instantiate_at(&scheme, key.span);
+                                    // Skip IO-typed variables: groupBy on IO
+                                    // actions is semantically meaningless and
+                                    // wrapping IO in Relation produces a
+                                    // nonsensical type. Only relation-typed
+                                    // or plain value variables get rebound as
+                                    // groups ([T]).
+                                    if matches!(ty, Ty::IO(..)) {
+                                        continue;
+                                    }
                                     let elem_ty = match ty {
                                         Ty::Relation(inner) => *inner,
                                         other => other,

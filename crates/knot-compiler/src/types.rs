@@ -1198,7 +1198,7 @@ fn match_type_pattern(
         (TypeKind::Relation(p_inner), TypeKind::Relation(c_inner)) => {
             match_type_pattern(p_inner, c_inner, subst)
         }
-        // Record types match field-by-field
+        // Record types match field-by-field, by name (not positionally)
         (
             TypeKind::Record { fields: pf, .. },
             TypeKind::Record { fields: cf, .. },
@@ -1206,9 +1206,11 @@ fn match_type_pattern(
             if pf.len() != cf.len() {
                 return false;
             }
-            pf.iter().zip(cf.iter()).all(|(p, c)| {
-                p.name == c.name
-                    && match_type_pattern(&p.value, &c.value, subst)
+            pf.iter().all(|p| {
+                cf.iter().any(|c| {
+                    p.name == c.name
+                        && match_type_pattern(&p.value, &c.value, subst)
+                })
             })
         }
         // Type applications recurse on both parts

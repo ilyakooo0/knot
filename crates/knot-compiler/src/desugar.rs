@@ -725,6 +725,10 @@ fn is_sql_compilable(stmts: &[Stmt], source_vars: &HashSet<String>) -> bool {
                     return false;
                 }
             }
+            StmtKind::Let { .. } => {
+                // Let statements are handled by codegen's `analyze_sql_plan`
+                // (which substitutes let-bound values as SQL parameters).
+            }
             _ => return false,
         }
     }
@@ -772,6 +776,25 @@ fn is_sql_where_expr(expr: &Expr, bind_vars: &std::collections::HashSet<&str>) -
             op: UnaryOp::Not,
             operand,
         } => is_sql_where_expr(operand, bind_vars),
+        // `contains needle haystack` and `elem element list` are SQL-compilable
+        // (codegen emits INSTR/IN for them). Accept when at least one argument
+        // is a bound field access, matching the codegen pattern.
+        ExprKind::App { func, arg } => {
+            if let ExprKind::App { func: inner, arg: first_arg } = &func.node {
+                if let ExprKind::Var(name) = &inner.node {
+                    if name == "contains" || name == "elem" {
+                        let a_bound = is_bound_field_access(first_arg, bind_vars)
+                            || is_sql_atom(first_arg);
+                        let b_bound = is_bound_field_access(arg, bind_vars)
+                            || is_sql_atom(arg);
+                        return a_bound && b_bound
+                            && (is_bound_field_access(first_arg, bind_vars)
+                                || is_bound_field_access(arg, bind_vars));
+                    }
+                }
+            }
+            false
+        }
         _ => false,
     }
 }

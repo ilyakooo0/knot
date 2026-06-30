@@ -229,18 +229,8 @@ pub(crate) fn handle_rename(
     // produce nested/overlapping ranges that exact-equality dedup misses.
     for edits in changes.values_mut() {
         edits.sort_by(|a, b| {
-            let ka = (
-                a.range.start.line,
-                a.range.start.character,
-                a.range.end.line,
-                a.range.end.character,
-            );
-            let kb = (
-                b.range.start.line,
-                b.range.start.character,
-                b.range.end.line,
-                b.range.end.character,
-            );
+            let ka = (a.range.start.line, a.range.start.character);
+            let kb = (b.range.start.line, b.range.start.character);
             ka.cmp(&kb)
                 // Tie-break so the dedup below is deterministic AND keeps the
                 // most complete replacement at a shared start: a punned field

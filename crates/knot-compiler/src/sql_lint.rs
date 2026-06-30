@@ -726,11 +726,6 @@ fn try_compile_sql_expr(bind_var: &str, expr: &Expr, schema: &str) -> Option<()>
         // `not expr` function application → NOT (...)
         // `contains needle haystack` → INSTR(haystack, needle) > 0
         ExprKind::App { func, arg } => {
-            if let ExprKind::Var(name) = &func.node {
-                if name == "not" {
-                    return try_compile_sql_expr(bind_var, arg, schema);
-                }
-            }
             if let ExprKind::App { func: inner_func, arg: first_arg } = &func.node {
                 if let ExprKind::Var(name) = &inner_func.node {
                     if name == "contains" {
@@ -1430,11 +1425,6 @@ fn try_sql_inline_cond(bind_var: &str, expr: &Expr, schema: &str) -> Option<()> 
             try_sql_inline_cond(bind_var, operand, schema)
         }
         ExprKind::App { func, arg } => {
-            if let ExprKind::Var(name) = &func.node {
-                if name == "not" {
-                    return try_sql_inline_cond(bind_var, arg, schema);
-                }
-            }
             if let ExprKind::App { func: inner_func, arg: first_arg } = &func.node {
                 if let ExprKind::Var(name) = &inner_func.node {
                     if name == "contains" {

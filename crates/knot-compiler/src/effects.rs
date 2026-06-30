@@ -1833,6 +1833,7 @@ fn type_has_effect_row_var(ty: &ast::Type) -> bool {
         ast::TypeKind::Relation(inner) => type_has_effect_row_var(inner),
         ast::TypeKind::UnitAnnotated { base, .. } => type_has_effect_row_var(base),
         ast::TypeKind::Refined { base, .. } => type_has_effect_row_var(base),
+        ast::TypeKind::Forall { ty: inner, .. } => type_has_effect_row_var(inner),
         _ => false,
     }
 }
@@ -1845,6 +1846,7 @@ fn effects_span(ty: &ast::Type) -> Option<Span> {
             // result side, so the label should point there too.
             effects_span(result)
         }
+        ast::TypeKind::Forall { ty: inner, .. } => effects_span(inner),
         _ => None,
     }
 }
@@ -1886,6 +1888,7 @@ fn extract_effects(ty: &ast::Type) -> Option<EffectSet> {
             // body launder its own effects through a parameter annotation.
             extract_effects(result)
         }
+        ast::TypeKind::Forall { ty: inner, .. } => extract_effects(inner),
         _ => None,
     }
 }

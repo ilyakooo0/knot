@@ -8332,9 +8332,9 @@ impl Infer {
 
     /// Type-check a route's `rateLimit <expr>` clause. The expression must
     /// have type `{key: input -> RequestCtx -> Maybe a, limit: {requests: Int, window: Int<Ms>}}`
-    /// for some `a` constrained by `Ord`, where `input` is the same record
-    /// the handler receives (path/query/body/headers fields). The `Ord a`
-    /// constraint is deferred so it's checked once `a` is concretized.
+    /// for some `a`, where `input` is the same record the handler receives
+    /// (path/query/body/headers fields). The runtime serializes the key via
+    /// `show`, so no trait constraint is needed on `a`.
     fn check_rate_limit_expr(&mut self, entry: &ast::RouteEntry, expr: &ast::Expr) {
         let alpha = self.fresh_var();
         let input_ty = self.route_input_record_ty(entry);
@@ -8365,15 +8365,8 @@ impl Infer {
             None,
         );
         self.check_expr(expr, &expected);
-        // Require Ord on the key value type so the runtime has a stable
-        // notion of equality / serialization for clients.
-        let seq = self.next_constraint_seq();
-        self.deferred_constraints.push(DeferredConstraint {
-            trait_name: "Ord".into(),
-            type_var: alpha,
-            span: expr.span,
-            seq,
-        });
+        // The runtime serializes the key via `show`, which works for all
+        // types, so no trait constraint is needed on the key value type.
     }
 
     fn check_impl_items(

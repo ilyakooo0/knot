@@ -898,13 +898,21 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
         if stmts.iter().any(|s| matches!(&s.node, StmtKind::Where { .. })) {
             return false;
         }
-        if stmts.iter().any(|s| matches!(
-            &s.node,
-            StmtKind::Bind { expr, .. }
-            | StmtKind::Expr(expr)
-            | StmtKind::Let { expr, .. }
-            if !expr_is_io(expr, io_all)
-        )) {
+        // The desugared IO chain requires every `Bind` source and every
+        // non-final bare `Expr` to be IO (they become `__bind` arguments).
+        // `Let` expressions are applied directly (`(\x -> rest) expr`), not
+        // through `__bind`, so they don't need to be IO. The final `Expr`
+        // is wrapped in `__yield` (Applicative.pure), so it doesn't need to
+        // be IO either. Only `Bind`/non-final `Expr` must be IO for the
+        // chain to be well-typed in the IO monad.
+        if stmts.iter().enumerate().any(|(i, s)| {
+            let is_last = i + 1 == stmts.len();
+            match &s.node {
+                StmtKind::Bind { expr, .. } => !expr_is_io(expr, io_all),
+                StmtKind::Expr(expr) if !is_last => !expr_is_io(expr, io_all),
+                _ => false,
+            }
+        }) {
             return false;
         }
     }

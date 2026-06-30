@@ -5613,7 +5613,7 @@ fn sql_dedup(conn: &Connection, rows: &[*mut Value]) -> Option<Vec<*mut Value>> 
     }
     let schema = infer_temp_schema(rows)?;
 
-    if rows.len() * schema_col_count(&schema) <= MAX_VALUES_PARAMS {
+    if rows.len().saturating_mul(schema_col_count(&schema)) <= MAX_VALUES_PARAMS {
         let col_names = schema_col_names(&schema);
         let (values_sql, params) = build_values_clause(rows, &schema, 0);
         let sql = format!(
@@ -6089,7 +6089,7 @@ pub extern "C-unwind" fn knot_relation_group_by(
     };
 
     // Only key columns are params (_idx is a literal); check if VALUES is feasible
-    let n_key_params = rows.len() * key_specs.len();
+    let n_key_params = rows.len().saturating_mul(key_specs.len());
     let (select_sql, sql_params, temp_to_drop) = if n_key_params <= MAX_VALUES_PARAMS && !key_specs.is_empty() {
         // VALUES CTE path: _idx is a literal integer, key columns are params
         let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(n_key_params);
@@ -7780,7 +7780,7 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
         // to its next safe point in the background, tracked by
         // ACTIVE_FORKS for the program-exit join.
         let g = state.lock().unwrap_or_else(|e| e.into_inner());
-        let g = cvar.wait_while(g, |s| s.outcome.is_none()).unwrap();
+        let g = cvar.wait_while(g, |s| s.outcome.is_none()).unwrap_or_else(|e| e.into_inner());
         let outcome = g.outcome.as_ref().cloned().expect("race outcome present");
         drop(g);
 
@@ -8492,7 +8492,7 @@ pub extern "C-unwind" fn knot_relation_ap(
     }
 
     // Apply all function-value pairs
-    let mut all: Vec<*mut Value> = Vec::with_capacity(funcs.len() * vals.len());
+    let mut all: Vec<*mut Value> = Vec::with_capacity(funcs.len().saturating_mul(vals.len()));
     for &f in funcs {
         for &x in vals {
             all.push(knot_value_call(db, f, x));
@@ -12528,9 +12528,9 @@ pub extern "C-unwind" fn knot_source_diff_write(
             })).collect()
         };
 
-        if !rows.is_empty() && rows.len() * n_cols <= MAX_VALUES_PARAMS {
+        if !rows.is_empty() && rows.len().saturating_mul(n_cols) <= MAX_VALUES_PARAMS {
             // VALUES CTE path
-            let mut all_params = Vec::with_capacity(rows.len() * n_cols);
+            let mut all_params = Vec::with_capacity(rows.len().saturating_mul(n_cols));
             let mut row_clauses = Vec::with_capacity(rows.len());
             let mut pidx = 1usize;
             for row_ptr in rows {
@@ -12680,9 +12680,9 @@ pub extern "C-unwind" fn knot_source_diff_write(
             }
         };
 
-        if !rows.is_empty() && rows.len() * n_cols <= MAX_VALUES_PARAMS {
+        if !rows.is_empty() && rows.len().saturating_mul(n_cols) <= MAX_VALUES_PARAMS {
             // VALUES CTE path
-            let mut all_params = Vec::with_capacity(rows.len() * n_cols);
+            let mut all_params = Vec::with_capacity(rows.len().saturating_mul(n_cols));
             let mut row_clauses = Vec::with_capacity(rows.len());
             let mut pidx = 1usize;
             for row_ptr in rows {

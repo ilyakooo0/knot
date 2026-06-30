@@ -80,16 +80,6 @@ fn collect_edges(
                 collect_edges(first_arg, polarity, derived_names, out);
                 let neg = negate(polarity);
                 collect_edges(arg, neg, derived_names, out);
-            } else if let ast::ExprKind::Var(name) = &func.node {
-                if name == "not" {
-                    // `not x` negates the polarity of derived-ref edges inside x.
-                    collect_edges(func, polarity, derived_names, out);
-                    let neg = negate(polarity);
-                    collect_edges(arg, neg, derived_names, out);
-                } else {
-                    collect_edges(func, polarity, derived_names, out);
-                    collect_edges(arg, polarity, derived_names, out);
-                }
             } else {
                 collect_edges(func, polarity, derived_names, out);
                 collect_edges(arg, polarity, derived_names, out);
@@ -122,8 +112,13 @@ fn collect_edges(
             collect_edges(lhs, polarity, derived_names, out);
             collect_edges(rhs, polarity, derived_names, out);
         }
-        ast::ExprKind::UnaryOp { operand, .. } => {
-            collect_edges(operand, polarity, derived_names, out);
+        ast::ExprKind::UnaryOp { op, operand } => {
+            let p = if *op == ast::UnaryOp::Not {
+                negate(polarity)
+            } else {
+                polarity
+            };
+            collect_edges(operand, p, derived_names, out);
         }
         ast::ExprKind::If { cond, then_branch, else_branch } => {
             collect_edges(cond, polarity, derived_names, out);

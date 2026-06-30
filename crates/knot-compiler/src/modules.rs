@@ -141,6 +141,7 @@ fn resolve_recursive(
                     imp.path, e
                 ));
                 in_flight.remove(&canonical);
+                imported.remove(&canonical);
                 continue;
             }
         };
@@ -171,6 +172,7 @@ fn resolve_recursive(
                 ));
             }
             in_flight.remove(&canonical);
+            imported.remove(&canonical);
             continue;
         }
 
@@ -200,6 +202,7 @@ fn resolve_recursive(
         in_flight.remove(&canonical);
         if let Err(sub_errors) = sub_result {
             errors.extend(sub_errors);
+            imported.remove(&canonical);
             continue;
         }
 

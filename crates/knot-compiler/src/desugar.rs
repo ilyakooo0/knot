@@ -1085,7 +1085,7 @@ fn fresh_monad_span(origin: Span) -> Span {
     let span = Span::new(SYNTH_SPAN_BASE + n, SYNTH_SPAN_BASE + n + 1);
     SYNTH_SPAN_ORIGINS
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(std::collections::HashMap::new)
         .insert(span.start, origin);
     span
@@ -1098,7 +1098,7 @@ pub(crate) fn synth_span_origin(span: Span) -> Option<Span> {
     }
     SYNTH_SPAN_ORIGINS
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .and_then(|m| m.get(&span.start).copied())
 }

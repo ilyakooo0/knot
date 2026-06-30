@@ -133,7 +133,13 @@ fn classify_adt_change(old: &str, new: &str) -> SchemaChange {
             return SchemaChange::Breaking;
         }
     }
-    SchemaChange::Safe
+    // If no new constructors were added, the schemas are semantically
+    // identical (field/constructor order is irrelevant — see comment above).
+    if old_ctors.len() == new_ctors.len() {
+        SchemaChange::Identical
+    } else {
+        SchemaChange::Safe
+    }
 }
 
 /// Parse a record schema into Vec<(field_name, field_type)>.
@@ -543,14 +549,15 @@ mod tests {
     #[test]
     fn adt_constructor_field_reorder_is_not_breaking() {
         // Constructor fields all share one wide nullable-column table, so the
-        // physical declaration order is irrelevant — reordering must not force
-        // a migrate block, matching record-field reorder semantics.
+        // physical declaration order is irrelevant — reordering without adding
+        // or removing constructors is semantically identical, matching
+        // record-field reorder semantics.
         assert_eq!(
             classify_schema_change(
                 "#Rect:width=float;height=float",
                 "#Rect:height=float;width=float"
             ),
-            SchemaChange::Safe
+            SchemaChange::Identical
         );
     }
 

@@ -5636,11 +5636,15 @@ impl Infer {
                                 .collect();
                             if covered == all_ctors {
                                 // All constructors of a known type are
-                                // covered — close the row var.
+                                // covered — close the row var.  Use
+                                // `bind_var` so the occurs- and skolem-
+                                // checks that every other binding site
+                                // enforces are applied here too.
                                 let rv = *rv;
-                                self.subst.insert(
+                                self.bind_var(
                                     rv,
                                     Ty::Variant(BTreeMap::new(), None),
+                                    span,
                                 );
                                 return;
                             }

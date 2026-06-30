@@ -29,6 +29,7 @@ pub fn resolve_imports(
     imported.insert(canonical);
     let mut type_snippets = Vec::new();
     resolve_recursive(module, source_path, &mut in_flight, &mut imported, &mut type_snippets)?;
+    type_snippets.sort();
     type_snippets.dedup();
     Ok(type_snippets)
 }

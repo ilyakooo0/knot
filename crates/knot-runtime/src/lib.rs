@@ -2031,7 +2031,7 @@ static SOURCE_SCHEMAS: std::sync::LazyLock<RwLock<HashMap<String, Arc<RecordSche
 fn register_source_schema(name: &str, schema: Arc<RecordSchema>) {
     SOURCE_SCHEMAS
         .write()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .insert(name.to_string(), schema);
 }
 
@@ -2056,7 +2056,7 @@ static TEXT_COLUMNS: std::sync::LazyLock<std::sync::RwLock<std::collections::Has
 fn register_text_column(source: &str, col: &str) {
     TEXT_COLUMNS
         .write()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .insert((source.to_string(), col.to_string()));
 }
 
@@ -2065,7 +2065,7 @@ fn register_text_column(source: &str, col: &str) {
 fn col_is_text(source: &str, col: &str) -> bool {
     TEXT_COLUMNS
         .read()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .contains(&(source.to_string(), col.to_string()))
 }
 
@@ -5573,7 +5573,7 @@ fn sql_set_op(
     let schema = infer_temp_schema(&combined)?;
     let n_cols = schema_col_count(&schema);
 
-    if !a.is_empty() && !b.is_empty() && (a.len() + b.len()) * n_cols <= MAX_VALUES_PARAMS {
+    if !a.is_empty() && !b.is_empty() && (a.len().saturating_add(b.len())).saturating_mul(n_cols) <= MAX_VALUES_PARAMS {
         let col_names = schema_col_names(&schema);
         let col_str = col_names.join(", ");
         let (values_a, params_a) = build_values_clause(a, &schema, 0);
@@ -5646,7 +5646,7 @@ fn sql_relations_equal(conn: &Connection, a: &[*mut Value], b: &[*mut Value]) ->
     let schema = infer_temp_schema(a)?;
     let n_cols = schema_col_count(&schema);
 
-    if (a.len() + b.len()) * n_cols <= MAX_VALUES_PARAMS {
+    if (a.len().saturating_add(b.len())).saturating_mul(n_cols) <= MAX_VALUES_PARAMS {
         let col_names = schema_col_names(&schema);
         let col_str = col_names.join(", ");
         let (values_a, params_a) = build_values_clause(a, &schema, 0);

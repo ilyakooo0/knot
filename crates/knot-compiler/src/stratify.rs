@@ -108,17 +108,25 @@ fn collect_edges(
         ast::ExprKind::Lambda { body, .. } => {
             collect_edges(body, polarity, derived_names, out);
         }
-        ast::ExprKind::BinOp { lhs, rhs, .. } => {
+        ast::ExprKind::BinOp { lhs, rhs, op } => {
+            // `a |> f` is `f a`. If `f` is a partially-applied `diff` (i.e.,
+            // `diff base`), then `a` becomes the subtracted (negative) arg.
+            if *op == ast::BinOp::Pipe {
+                if let Some(base) = is_diff_applied_once(rhs) {
+                    collect_edges(base, polarity, derived_names, out);
+                    let neg = negate(polarity);
+                    collect_edges(lhs, neg, derived_names, out);
+                    return;
+                }
+            }
             collect_edges(lhs, polarity, derived_names, out);
             collect_edges(rhs, polarity, derived_names, out);
         }
-        ast::ExprKind::UnaryOp { op, operand } => {
-            let p = if *op == ast::UnaryOp::Not {
-                negate(polarity)
-            } else {
-                polarity
-            };
-            collect_edges(operand, p, derived_names, out);
+        ast::ExprKind::UnaryOp { op: _, operand } => {
+            // `not` is boolean negation (`Bool -> Bool`), not set complement —
+            // it does not create negative dependencies. Only `diff` (set
+            // difference) creates negative edges.
+            collect_edges(operand, polarity, derived_names, out);
         }
         ast::ExprKind::If { cond, then_branch, else_branch } => {
             collect_edges(cond, polarity, derived_names, out);
@@ -454,5 +462,108 @@ mod tests {
         ]);
         let diags = check(&m);
         assert!(diags.is_empty(), "self-ref as first arg of diff is positive");
+    }
+
+    #[test]
+    fn boolean_not_does_not_create_negative_dep() {
+        // &a = if not (&b == []) then *source else []
+        // `not` is boolean negation, not set complement — &b is read
+        // positively (just checking emptiness), so this should NOT create
+        // a negative edge.
+        use knot::ast::{ExprKind, UnaryOp};
+        let not_expr = spanned(ExprKind::UnaryOp {
+            op: UnaryOp::Not,
+            operand: Box::new(spanned(ExprKind::BinOp {
+                lhs: Box::new(derived_ref("b")),
+                rhs: Box::new(spanned(ExprKind::List(vec![]))),
+                op: BinOp::Eq,
+            })),
+        });
+        let if_expr = spanned(ExprKind::If {
+            cond: Box::new(not_expr),
+            then_branch: Box::new(source_ref("source")),
+            else_branch: Box::new(spanned(ExprKind::List(vec![]))),
+        });
+        let m = module(vec![
+            derived("a", if_expr),
+            derived("b", source_ref("source")),
+        ]);
+        let diags = check(&m);
+        // If `not` incorrectly created a negative edge, &a → &b would be
+        // negative, and &b → *source is positive, so no cycle — this
+        // particular test doesn't produce a cycle.  But if &b also
+        // depended on &a, a false negative edge would create a spurious
+        // unstratifiable error.  The mutual case is tested below.
+        assert!(diags.is_empty(), "boolean `not` should not create negative dep");
+    }
+
+    #[test]
+    fn boolean_not_in_mutual_recursion_is_ok() {
+        // &a depends on &b through `not`, and &b depends on &a — if `not`
+        // creates a negative edge, this would be rejected as unstratifiable.
+        // But `not` is boolean negation, so &b is read positively.
+        use knot::ast::{ExprKind, UnaryOp};
+        let not_expr = spanned(ExprKind::UnaryOp {
+            op: UnaryOp::Not,
+            operand: Box::new(spanned(ExprKind::BinOp {
+                lhs: Box::new(derived_ref("b")),
+                rhs: Box::new(spanned(ExprKind::List(vec![]))),
+                op: BinOp::Eq,
+            })),
+        });
+        let if_a = spanned(ExprKind::If {
+            cond: Box::new(not_expr),
+            then_branch: Box::new(source_ref("source")),
+            else_branch: Box::new(spanned(ExprKind::List(vec![]))),
+        });
+        let m = module(vec![
+            derived("a", if_a),
+            derived("b", union(source_ref("source"), derived_ref("a"))),
+        ]);
+        let diags = check(&m);
+        assert!(
+            diags.is_empty(),
+            "boolean `not` should not create negative edge in mutual recursion"
+        );
+    }
+
+    #[test]
+    fn pipe_diff_creates_negative_dep() {
+        // &bad = &bad |> diff *all
+        // This is `diff *all &bad` — &bad is the subtracted (negative) arg.
+        // The pipe form must be recognized, otherwise the negative self-edge
+        // is missed and the unstratifiable recursion goes undetected.
+        let pipe = spanned(ExprKind::BinOp {
+            lhs: Box::new(derived_ref("bad")),
+            rhs: Box::new(app(var("diff"), source_ref("all"))),
+            op: BinOp::Pipe,
+        });
+        let m = module(vec![
+            derived("bad", pipe),
+        ]);
+        let diags = check(&m);
+        assert!(!diags.is_empty(), "pipe-diff self-recursion should be rejected");
+        assert!(diags[0].message.contains("unstratifiable"));
+    }
+
+    #[test]
+    fn pipe_diff_mutual_creates_negative_dep() {
+        // &a = &b |> diff *all   (diff *all &b — &b is negative)
+        // &b = union *source &a   (&a is positive)
+        // The negative edge &a → &b in a cycle should be detected.
+        let pipe = spanned(ExprKind::BinOp {
+            lhs: Box::new(derived_ref("b")),
+            rhs: Box::new(app(var("diff"), source_ref("all"))),
+            op: BinOp::Pipe,
+        });
+        let m = module(vec![
+            derived("a", pipe),
+            derived("b", union(source_ref("source"), derived_ref("a"))),
+        ]);
+        let diags = check(&m);
+        assert!(
+            !diags.is_empty(),
+            "pipe-diff mutual recursion should be detected as unstratifiable"
+        );
     }
 }

@@ -680,7 +680,7 @@ fn find_app_in_expr_at(
                     param_idx = i;
                     break;
                 }
-                if offset >= arg.span.start && offset <= arg.span.end {
+                if offset >= arg.span.start && offset < arg.span.end {
                     param_idx = i;
                     break;
                 }

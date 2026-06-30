@@ -8852,12 +8852,16 @@ pub extern "C-unwind" fn knot_relation_diff(
     a: *mut Value,
     b: *mut Value,
 ) -> *mut Value {
+    let empty_a;
     let rows_a = match unsafe { as_ref(a) } {
         Value::Relation(rows) => rows,
+        Value::Unit => { empty_a = Vec::new(); &empty_a }
         _ => panic!("knot runtime: diff expected Relation, got {}", type_name(a)),
     };
+    let empty_b;
     let rows_b = match unsafe { as_ref(b) } {
         Value::Relation(rows) => rows,
+        Value::Unit => { empty_b = Vec::new(); &empty_b }
         _ => panic!("knot runtime: diff expected Relation, got {}", type_name(b)),
     };
 
@@ -8909,15 +8913,19 @@ pub extern "C-unwind" fn knot_relation_inter(
     a: *mut Value,
     b: *mut Value,
 ) -> *mut Value {
+    let empty_a;
     let rows_a = match unsafe { as_ref(a) } {
         Value::Relation(rows) => rows,
+        Value::Unit => { empty_a = Vec::new(); &empty_a }
         _ => panic!(
             "knot runtime: inter expected Relation, got {}",
             type_name(a)
         ),
     };
+    let empty_b;
     let rows_b = match unsafe { as_ref(b) } {
         Value::Relation(rows) => rows,
+        Value::Unit => { empty_b = Vec::new(); &empty_b }
         _ => panic!(
             "knot runtime: inter expected Relation, got {}",
             type_name(b)
@@ -14869,7 +14877,7 @@ fn try_string_to_value(s: &str, ty: &str) -> Option<*mut Value> {
             _ => None,
         },
         "tag" => Some(alloc(Value::Constructor(intern_str(s), alloc(Value::Unit)))),
-        "text" => Some(alloc(Value::Text(Arc::from(s)))),
+        "text" | "uuid" => Some(alloc(Value::Text(Arc::from(s)))),
         _ => None,
     }
 }
@@ -16582,7 +16590,7 @@ fn fetch_build_query(query_desc: &str, payload: *mut Value) -> String {
 /// matching the server-side `tag` column decode for enum-like ADTs.
 fn fetch_value_to_text_opt(v: *mut Value) -> Option<String> {
     if v.is_null() {
-        return Some(String::new());
+        return None;
     }
     match unsafe { as_ref(v) } {
         Value::Int(n) => Some(n.to_string()),
@@ -16772,8 +16780,8 @@ fn generate_openapi(name: &str, table: &RouteTable) -> String {
     ));
     out.push_str("  \"paths\": {\n");
 
-    // Group entries by path
-    let mut path_map: HashMap<String, Vec<&RouteTableEntry>> = HashMap::new();
+    // Group entries by path (BTreeMap for deterministic, sorted ordering)
+    let mut path_map: std::collections::BTreeMap<String, Vec<&RouteTableEntry>> = std::collections::BTreeMap::new();
     for entry in &table.entries {
         let path_str = openapi_path(&entry.path_parts);
         path_map.entry(path_str).or_default().push(entry);
@@ -16833,9 +16841,7 @@ fn generate_openapi(name: &str, table: &RouteTable) -> String {
                     out.push('\n');
                 }
                 out.push_str("        ]");
-                if has_body || has_response {
-                    out.push(',');
-                }
+                out.push(',');
                 out.push('\n');
             }
 
@@ -16876,9 +16882,7 @@ fn generate_openapi(name: &str, table: &RouteTable) -> String {
                 out.push_str("            }\n");
                 out.push_str("          }\n");
                 out.push_str("        }");
-                if has_response {
-                    out.push(',');
-                }
+                out.push(',');
                 out.push('\n');
             }
 

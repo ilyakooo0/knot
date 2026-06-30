@@ -903,7 +903,7 @@ fn is_disallowed_in_atomic(label: &str, doc: &DocumentState, state: &ServerState
 /// encloses `offset`, or `None` if the cursor is outside any route block.
 fn find_enclosing_route_decl_span(module: &Module, offset: usize) -> Option<Span> {
     for decl in &module.decls {
-        let in_span = decl.span.start <= offset && offset <= decl.span.end;
+        let in_span = decl.span.start <= offset && offset < decl.span.end;
         if !in_span {
             continue;
         }
@@ -925,7 +925,7 @@ fn offset_in_route_rate_limit(module: &Module, offset: usize) -> bool {
         if let DeclKind::Route { entries, .. } = &decl.node {
             for entry in entries {
                 if let Some(rl) = &entry.rate_limit {
-                    if rl.span.start <= offset && offset <= rl.span.end {
+                    if rl.span.start <= offset && offset < rl.span.end {
                         return true;
                     }
                 }
@@ -1042,7 +1042,7 @@ fn detect_snippet_context(doc: &DocumentState, offset: usize, in_atomic: bool) -
     // cursor at top-level even when textually overlapping their span — but
     // the body-bearing decls are what matter for expression-position snippets.
     for decl in &doc.module.decls {
-        let inside = decl.span.start <= offset && offset <= decl.span.end;
+        let inside = decl.span.start <= offset && offset < decl.span.end;
         if !inside {
             continue;
         }
@@ -1050,14 +1050,14 @@ fn detect_snippet_context(doc: &DocumentState, offset: usize, in_atomic: bool) -
             ast::DeclKind::Fun { body: Some(body), .. }
             | ast::DeclKind::View { body, .. }
             | ast::DeclKind::Derived { body, .. } => {
-                if body.span.start <= offset && offset <= body.span.end {
+                if body.span.start <= offset && offset < body.span.end {
                     return SnippetContext::Expression;
                 }
             }
             ast::DeclKind::Impl { items, .. } => {
                 for item in items {
                     if let ast::ImplItem::Method { body, .. } = item {
-                        if body.span.start <= offset && offset <= body.span.end {
+                        if body.span.start <= offset && offset < body.span.end {
                             return SnippetContext::Expression;
                         }
                     }

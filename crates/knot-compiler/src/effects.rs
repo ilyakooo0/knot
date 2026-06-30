@@ -132,6 +132,7 @@ impl EffectSet {
             && !self.fs
             && !self.clock
             && !self.random
+            && !self.uses_race
     }
 
     pub fn from_ast_effects(effects: &[ast::Effect]) -> EffectSet {
@@ -773,8 +774,7 @@ impl EffectChecker {
                         // exactly the relations a write lands in (plus
                         // any other effects evaluating the view incurs).
                         let view_effects = self
-                            .decl_effects
-                            .get(name)
+                            .lookup_decl_effects(name)
                             .cloned()
                             .unwrap_or_else(EffectSet::empty);
                         for src in &view_effects.reads {
@@ -1349,7 +1349,11 @@ impl EffectChecker {
                 // Callee is a case: effects are the union of each arm's callable effects
                 let mut effects = self.infer_effects(scrutinee);
                 for arm in arms {
-                    effects = effects.union(&self.callee_effects(&arm.body));
+                    let mark = self.shadowed.len();
+                    collect_pat_binders(&arm.pat, &mut self.shadowed);
+                    let arm_effects = self.callee_effects(&arm.body);
+                    self.shadowed.truncate(mark);
+                    effects = effects.union(&arm_effects);
                 }
                 effects
             }

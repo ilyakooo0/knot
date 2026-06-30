@@ -5848,11 +5848,9 @@ impl Infer {
                 // fold further rigid rows into its sources rather than
                 // aliasing the union var to a skolem.
                 if r_rigid {
-                    if let Some(u) = self
-                        .pending_effect_unions
-                        .iter_mut()
-                        .find(|u| u.result == e)
-                    {
+                    let idx = self.pending_effect_unions.iter().position(|u| self.var_chain_end(u.result) == e);
+                    if let Some(idx) = idx {
+                        let u = &mut self.pending_effect_unions[idx];
                         if !u.sources.contains(&r) {
                             u.sources.push(r);
                         }
@@ -5860,11 +5858,9 @@ impl Infer {
                     }
                 }
                 if e_rigid {
-                    if let Some(u) = self
-                        .pending_effect_unions
-                        .iter_mut()
-                        .find(|u| u.result == r)
-                    {
+                    let idx = self.pending_effect_unions.iter().position(|u| self.var_chain_end(u.result) == r);
+                    if let Some(idx) = idx {
+                        let u = &mut self.pending_effect_unions[idx];
                         if !u.sources.contains(&e) {
                             u.sources.push(e);
                         }
@@ -8100,7 +8096,7 @@ impl Infer {
                                 .values()
                                 .copied()
                                 .collect();
-                            let unit_vars: Vec<UnitVar> = self
+                            let mut unit_vars: Vec<UnitVar> = self
                                 .annotation_unit_vars
                                 .values()
                                 .copied()
@@ -8120,9 +8116,47 @@ impl Infer {
                                     }
                                 }
                             }
+                            // Capture deferred `*`/`/` unit-composition checks
+                            // whose result var resolves to a skolemized
+                            // annotation variable, so each call-site
+                            // instantiation gets its own fresh composition
+                            // (mirrors `generalize`).
+                            let skolem_set: std::collections::HashSet<TyVar> = fresh_skolems.iter().copied().collect();
+                            let unit_skolem_set: std::collections::HashSet<UnitVar> = fresh_unit_skolems.iter().copied().collect();
+                            let pending_binops = std::mem::take(&mut self.deferred_unit_binops);
+                            let mut captured_binops: Vec<DeferredUnitBinop> = Vec::new();
+                            for b in pending_binops {
+                                let resolved_result = self.apply(&Ty::Var(b.result));
+                                if let Ty::Var(v) = &resolved_result {
+                                    if skolem_set.contains(v) {
+                                        let lhs = self.apply(&b.lhs);
+                                        let rhs = self.apply(&b.rhs);
+                                        if !vars.contains(v) {
+                                            vars.push(*v);
+                                        }
+                                        let mut all_uv = Vec::new();
+                                        collect_unit_vars_ordered(&lhs, &mut all_uv);
+                                        collect_unit_vars_ordered(&rhs, &mut all_uv);
+                                        for uv in &all_uv {
+                                            if unit_skolem_set.contains(uv) && !unit_vars.contains(uv) {
+                                                unit_vars.push(*uv);
+                                            }
+                                        }
+                                        captured_binops.push(DeferredUnitBinop {
+                                            op: b.op,
+                                            lhs,
+                                            rhs,
+                                            result: *v,
+                                            span: b.span,
+                                        });
+                                        continue;
+                                    }
+                                }
+                                self.deferred_unit_binops.push(b);
+                            }
                             self.bind_top(
                                 name,
-                                Scheme { vars, unit_vars, constraints, effect_unions, unit_binops: vec![], ty: ann_ty },
+                                Scheme { vars, unit_vars, constraints, effect_unions, unit_binops: captured_binops, ty: ann_ty },
                             );
                         } else {
                             let applied = self.apply(&inferred);

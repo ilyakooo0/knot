@@ -676,7 +676,17 @@ fn try_compile_sql_expr(bind_var: &str, expr: &Expr, schema: &str) -> Option<()>
             BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
                 // Try simple field op value, then atom-based (handles arithmetic)
                 try_sql_comparison(bind_var, lhs, rhs, op, schema)
-                    .or_else(|| try_sql_comparison(bind_var, rhs, lhs, op, schema))
+                    .or_else(|| {
+                        let rev = match op {
+                            BinOp::Eq | BinOp::Neq => *op,
+                            BinOp::Lt => BinOp::Gt,
+                            BinOp::Gt => BinOp::Lt,
+                            BinOp::Le => BinOp::Ge,
+                            BinOp::Ge => BinOp::Le,
+                            _ => *op,
+                        };
+                        try_sql_comparison(bind_var, rhs, lhs, &rev, schema)
+                    })
                     .or_else(|| {
                         // Mirror codegen's type-witness gate: arithmetic
                         // comparisons only push down when they can be typed

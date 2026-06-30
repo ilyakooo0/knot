@@ -13,7 +13,18 @@ pub(crate) fn handle_selection_range(
     state: &ServerState,
     params: &SelectionRangeParams,
 ) -> Option<Vec<SelectionRange>> {
-    let doc = state.documents.get(&params.text_document.uri)?;
+    let uri = &params.text_document.uri;
+    let doc = state.documents.get(uri)?;
+    // Staleness guard: during the analysis debounce window the editor buffer
+    // is newer than the analyzed source, so positions from the live buffer
+    // would resolve against the wrong bytes.
+    if state
+        .pending_sources
+        .get(uri)
+        .is_some_and(|p| p.source != doc.source)
+    {
+        return None;
+    }
     let mut results = Vec::new();
 
     for pos in &params.positions {

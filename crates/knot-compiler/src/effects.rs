@@ -672,7 +672,7 @@ impl EffectChecker {
                         self.row_poly_decls.contains(n)
                             || !self.fixed_row_decls.contains(n)
                     })
-                    .unwrap_or(false);
+                    .unwrap_or(true);
                 // `fork <action>` spawns its argument's IO on an independent
                 // connection. When computing the atomic-gate view of effects,
                 // strip the spawned action's IO so `atomic (fork (println …))`

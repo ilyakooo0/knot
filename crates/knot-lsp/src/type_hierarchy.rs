@@ -22,6 +22,16 @@ pub(crate) fn handle_prepare_type_hierarchy(
     let uri = &params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
     let doc = state.documents.get(uri)?;
+    // Staleness guard: during the analysis debounce window the editor buffer
+    // is newer than the analyzed source, so positions from the live buffer
+    // would resolve against the wrong bytes.
+    if state
+        .pending_sources
+        .get(uri)
+        .is_some_and(|p| p.source != doc.source)
+    {
+        return None;
+    }
     let word = word_at_position(&doc.source, pos)?.to_string();
 
     let mut items = Vec::new();

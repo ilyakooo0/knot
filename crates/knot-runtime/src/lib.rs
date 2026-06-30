@@ -7781,7 +7781,10 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
         // ACTIVE_FORKS for the program-exit join.
         let g = state.lock().unwrap_or_else(|e| e.into_inner());
         let g = cvar.wait_while(g, |s| s.outcome.is_none()).unwrap_or_else(|e| e.into_inner());
-        let outcome = g.outcome.as_ref().cloned().expect("race outcome present");
+        let outcome = match g.outcome.as_ref().cloned() {
+            Some(o) => o,
+            None => panic!("knot runtime: race: both workers panicked before producing an outcome"),
+        };
         drop(g);
 
         let (is_left, raw_ptr) = match outcome {
@@ -7824,7 +7827,7 @@ pub extern "C-unwind" fn knot_threads_join() {
     let lock = ACTIVE_FORKS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let _guard = ACTIVE_FORKS_CVAR
         .wait_while(lock, |_| ACTIVE_FORKS.load(Ordering::SeqCst) > 0)
-        .unwrap();
+        .unwrap_or_else(|e| e.into_inner());
 }
 
 // ── STM retry functions ──────────────────────────────────────────
@@ -15240,25 +15243,28 @@ fn camel_to_header_case(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let mut result = String::new();
     let len = chars.len();
-    for (i, &c) in chars.iter().enumerate() {
+    let mut i = 0;
+    while i < len {
+        let c = chars[i];
         if i == 0 {
             result.extend(c.to_uppercase());
         } else if c.is_uppercase() {
             let prev_upper = chars[i - 1].is_uppercase();
             let next_lower = i + 1 < len && chars[i + 1].is_lowercase();
-            // Insert hyphen before an uppercase letter when:
-            //   - previous char was lowercase (new word: "contentType" → "Content-Type")
-            //   - OR this is the last uppercase in a run followed by lowercase
-            //     (acronym end: "xHTTPStatus" → "X-HTTP-Status")
             if !prev_upper || next_lower {
                 result.push('-');
             }
             result.push(c);
         } else if c == '_' {
             result.push('-');
+            if i + 1 < len {
+                result.extend(chars[i + 1].to_uppercase());
+                i += 1;
+            }
         } else {
             result.push(c);
         }
+        i += 1;
     }
     result
 }
@@ -15986,7 +15992,24 @@ fn http_serve_loop(
                         if has_resp_headers {
                             let body_field = knot_record_field(body_val, b"body".as_ptr(), 4);
                             let hdrs_val = knot_record_field(body_val, b"headers".as_ptr(), 7);
-                            let json = json_encode_value(db, body_field);
+                            let json = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                json_encode_value(db, body_field)
+                            })) {
+                                Ok(j) => j,
+                                Err(_) => {
+                                    log_error!("[HTTP] panic during response body encoding");
+                                    let body = "{\"error\":\"internal server error\"}".to_string();
+                                    let response = tiny_http::Response::from_string(&body)
+                                        .with_status_code(500)
+                                        .with_header(
+                                            "Content-Type: application/json"
+                                                .parse::<tiny_http::Header>()
+                                                .unwrap(),
+                                        );
+                                    let _ = request.respond(response);
+                                    return;
+                                }
+                            };
                             let mut response = tiny_http::Response::from_string(&json)
                                 .with_status_code(status_code)
                                 .with_header(
@@ -16030,7 +16053,24 @@ fn http_serve_loop(
                             log_debug!("[HTTP] --> {} {}", status_code, json);
                             let _ = request.respond(response);
                         } else {
-                            let json = json_encode_value(db, body_val);
+                            let json = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                json_encode_value(db, body_val)
+                            })) {
+                                Ok(j) => j,
+                                Err(_) => {
+                                    log_error!("[HTTP] panic during response body encoding");
+                                    let body = "{\"error\":\"internal server error\"}".to_string();
+                                    let response = tiny_http::Response::from_string(&body)
+                                        .with_status_code(500)
+                                        .with_header(
+                                            "Content-Type: application/json"
+                                                .parse::<tiny_http::Header>()
+                                                .unwrap(),
+                                        );
+                                    let _ = request.respond(response);
+                                    return;
+                                }
+                            };
                             log_debug!("[HTTP] --> {} {}", status_code, json);
                             let response = tiny_http::Response::from_string(&json)
                                 .with_status_code(status_code)
@@ -16362,6 +16402,7 @@ pub extern "C-unwind" fn knot_http_fetch_io(
         let agent = ureq::Agent::new_with_config(
             ureq::config::Config::builder()
                 .http_status_as_error(false)
+                .timeout_global(Some(std::time::Duration::from_secs(30)))
                 .build()
         );
 

@@ -3378,7 +3378,10 @@ impl Parser {
     /// Parse `serve Api where E1 = expr1; E2 = expr2; ...`
     fn parse_serve_expr(&mut self) -> Option<Expr> {
         let start = self.span();
-        self.in_context("serve expression", |this| {
+        if !self.enter_recursion_cost(DELIMITER_RECURSION_COST) {
+            return None;
+        }
+        let result = self.in_context("serve expression", |this| {
             this.advance(); // consume `serve`
             let (api, api_span) = this.expect_upper("expected route name after 'serve'").ok()?;
             this.skip_newlines();
@@ -3394,7 +3397,9 @@ impl Parser {
                 },
                 Span::new(start.start, end.end),
             ))
-        })
+        });
+        self.recursion_depth -= DELIMITER_RECURSION_COST;
+        result
     }
 
     fn parse_serve_handler(&mut self) -> Option<ServeHandler> {
@@ -4041,7 +4046,7 @@ impl Parser {
         let saved = self.save();
         self.skip_newlines();
         if self.eat(&TokenKind::Arrow) {
-            if !self.enter_recursion() { return None; }
+            if !self.enter_recursion() { self.restore(saved); return None; }
             self.skip_newlines();
             let rhs = self.parse_type_function(); // right-associative
             self.recursion_depth -= 1;

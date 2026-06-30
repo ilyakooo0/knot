@@ -9,6 +9,34 @@ use knot::ast::Span;
 use knot::diagnostic::Diagnostic;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+/// Collect all variable names bound by a pattern, recursing into
+/// Constructor, Record, List, and Cons sub-patterns.
+fn collect_pat_bound_names(pat: &ast::Pat, out: &mut Vec<String>) {
+    use knot::ast::PatKind;
+    match &pat.node {
+        PatKind::Var(name) => out.push(name.clone()),
+        PatKind::Wildcard | PatKind::Lit(_) => {}
+        PatKind::Constructor { payload, .. } => collect_pat_bound_names(payload, out),
+        PatKind::Record(fields) => {
+            for f in fields {
+                match &f.pattern {
+                    Some(p) => collect_pat_bound_names(p, out),
+                    None => out.push(f.name.clone()),
+                }
+            }
+        }
+        PatKind::List(pats) => {
+            for p in pats {
+                collect_pat_bound_names(p, out);
+            }
+        }
+        PatKind::Cons { head, tail } => {
+            collect_pat_bound_names(head, out);
+            collect_pat_bound_names(tail, out);
+        }
+    }
+}
+
 // ── Monad info (shared with codegen) ──────────────────────────────
 
 /// Which monad a desugared do-block targets.
@@ -5424,7 +5452,7 @@ impl Infer {
                     ctors.insert(name.clone(), record_ty.clone());
                     let variant_ty =
                         Ty::Variant(ctors, Some(row_var));
-                    self.unify(expected, &variant_ty, pat.span);
+                    self.unify(&variant_ty, expected, pat.span);
                     self.check_pattern(payload, &record_ty);
                 } else {
                     self.error(
@@ -5451,11 +5479,11 @@ impl Infer {
                 }
                 let row_var = self.fresh_var();
                 let record_ty = Ty::Record(field_types, Some(row_var));
-                self.unify(expected, &record_ty, pat.span);
+                self.unify(&record_ty, expected, pat.span);
             }
             ast::PatKind::Lit(lit) => {
                 let lit_ty = self.literal_type(lit);
-                self.unify(expected, &lit_ty, pat.span);
+                self.unify(&lit_ty, expected, pat.span);
             }
             ast::PatKind::List(pats) => {
                 let elem_ty = self.fresh();
@@ -5463,12 +5491,12 @@ impl Infer {
                     self.check_pattern(p, &elem_ty);
                 }
                 let list_ty = Ty::Relation(Box::new(elem_ty));
-                self.unify(expected, &list_ty, pat.span);
+                self.unify(&list_ty, expected, pat.span);
             }
             ast::PatKind::Cons { head, tail } => {
                 let elem_ty = self.fresh();
                 let rel_ty = Ty::Relation(Box::new(elem_ty.clone()));
-                self.unify(expected, &rel_ty, pat.span);
+                self.unify(&rel_ty, expected, pat.span);
                 self.check_pattern(head, &elem_ty);
                 self.check_pattern(tail, &rel_ty);
             }
@@ -6096,20 +6124,13 @@ impl Infer {
                             break;
                         }
                         if let ast::StmtKind::Bind { pat, .. } = &prev_stmt.node {
-                            if let ast::PatKind::Var(name) = &pat.node {
+                            // Collect all variable names bound by this pattern
+                            // (handles Var, Constructor, Record, List, Cons patterns).
+                            let mut bound: Vec<String> = Vec::new();
+                            collect_pat_bound_names(pat, &mut bound);
+                            for name in &bound {
                                 if let Some(scheme) = self.lookup(name).cloned() {
-                                    // Use the groupBy key's span so any deferred
-                                    // constraint this instantiation produces is
-                                    // anchored at a real location rather than a
-                                    // dummy `(0,0)` span (which `check_constraints`
-                                    // would otherwise have to skip).
                                     let ty = self.instantiate_at(&scheme, key.span);
-                                    // Skip IO-typed variables: groupBy on IO
-                                    // actions is semantically meaningless and
-                                    // wrapping IO in Relation produces a
-                                    // nonsensical type. Only relation-typed
-                                    // or plain value variables get rebound as
-                                    // groups ([T]).
                                     if matches!(ty, Ty::IO(..)) {
                                         continue;
                                     }
@@ -6128,7 +6149,7 @@ impl Infer {
                         let inner_ty = self.infer_expr(inner);
                         if let Some(ref yt) = yield_ty {
                             let yt = yt.clone();
-                            self.unify(&yt, &inner_ty, expr.span);
+                            self.unify(&inner_ty, &yt, expr.span);
                         } else {
                             yield_ty = Some(inner_ty);
                         }
@@ -8456,7 +8477,7 @@ impl Infer {
                     }
                     let expected = self.subst_ty(&scheme.ty, &mapping);
                     let errors_before = self.errors.len();
-                    self.unify(&expected, &inferred_method_ty, body.span);
+                    self.unify(&inferred_method_ty, &expected, body.span);
                     self.check_skolem_constraints(
                         &fresh_skolems,
                         pre_body_constraints,

@@ -523,8 +523,9 @@ impl<'a> TokenCollector<'a> {
             ast::ExprKind::UnitLit { value, .. } => {
                 self.visit_expr(value);
             }
-            ast::ExprKind::Annot { expr: inner, .. } => {
+            ast::ExprKind::Annot { expr: inner, ty } => {
                 self.visit_expr(inner);
+                self.visit_type(ty);
             }
             _ => {}
         }
@@ -536,6 +537,11 @@ impl<'a> TokenCollector<'a> {
     /// and recurses through the type AST to find each `Refined` node.
     fn visit_type(&mut self, ty: &ast::Type) {
         match &ty.node {
+            ast::TypeKind::Named(name) => {
+                if let Some(s) = find_word_in_source(self.source, name, ty.span.start, ty.span.end) {
+                    self.add(s, TOK_TYPE, 0);
+                }
+            }
             ast::TypeKind::Refined { base, predicate } => {
                 self.visit_type(base);
                 self.visit_expr(predicate);

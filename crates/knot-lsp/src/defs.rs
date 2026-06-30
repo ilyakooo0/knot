@@ -582,7 +582,10 @@ impl<'a> DefResolver<'a> {
                 self.literals.push((expr.span, ty.to_string()));
             }
             ast::ExprKind::UnitLit { value, .. } => self.resolve_expr(value),
-            ast::ExprKind::Annot { expr: inner, .. } => self.resolve_expr(inner),
+            ast::ExprKind::Annot { expr: inner, ty } => {
+                self.resolve_type(ty, self.source);
+                self.resolve_expr(inner);
+            }
             ast::ExprKind::Refine(inner) => self.resolve_expr(inner),
             ast::ExprKind::Serve { api, api_span, handlers } => {
                 self.add_ref(*api_span, api);

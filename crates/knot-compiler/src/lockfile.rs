@@ -189,11 +189,33 @@ fn classify_record_change(old: &str, new: &str) -> SchemaChange {
     // Use fields_match for a correct multiset comparison that handles
     // duplicate field names (a first-match `find` would match the wrong
     // duplicate, masking a breaking change).
-    if !fields_match(&old_fields, &new_fields) {
-        return SchemaChange::Breaking;
+    if fields_match(&old_fields, &new_fields) {
+        return SchemaChange::Identical;
     }
 
-    SchemaChange::Identical
+    // Check if this is a safe addition: all old fields must be present
+    // in new with identical types. New fields are added as nullable
+    // columns, so existing data is not lost.
+    let old_map: HashMap<&str, &str> = old_fields
+        .iter()
+        .map(|(n, t)| (n.as_str(), t.as_str()))
+        .collect();
+    let new_map: HashMap<&str, &str> = new_fields
+        .iter()
+        .map(|(n, t)| (n.as_str(), t.as_str()))
+        .collect();
+
+    // Every old field must exist in new with the same type
+    for (name, ty) in &old_map {
+        match new_map.get(*name) {
+            Some(new_ty) if *new_ty == *ty => {}
+            _ => return SchemaChange::Breaking,
+        }
+    }
+
+    // If we get here, all old fields are preserved. New fields are
+    // nullable additions — safe.
+    SchemaChange::Safe
 }
 
 fn parse_lockfile(lock_path: &Path) -> Result<SchemaInfo, String> {
@@ -466,10 +488,10 @@ mod tests {
     }
 
     #[test]
-    fn record_field_added_is_breaking() {
+    fn record_field_added_is_safe() {
         assert_eq!(
             classify_schema_change("name:text", "name:text,age:int"),
-            SchemaChange::Breaking
+            SchemaChange::Safe
         );
     }
 

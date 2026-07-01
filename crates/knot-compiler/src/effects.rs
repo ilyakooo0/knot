@@ -717,7 +717,7 @@ impl EffectChecker {
                         .map(|n| {
                             self.row_poly_decls.contains(n) || !self.fixed_row_decls.contains(n)
                         })
-                        .unwrap_or(false);
+                        .unwrap_or(true);
                     let mut lhs_effects = if propagate_lambda {
                         self.arg_effects(lhs)
                     } else {
@@ -2736,5 +2736,38 @@ mod tests {
         assert!(diags.is_empty());
         assert!(effects["f"].reads.contains("a"));
         assert!(effects["f"].reads.contains("b"));
+    }
+
+    /// Regression: when a lambda is piped into a non-Var callee (e.g. an
+    /// inline lambda), the pipe arm's `head_name(rhs)` returns None.
+    /// The default must be `true` (matching the App spine) so the lambda's
+    /// body effects propagate — otherwise IO slips past the atomic gate.
+    #[test]
+    fn pipe_lambda_into_non_var_callee_propagates_effects() {
+        // f = (\_ -> println "hi") |> (\g -> g 0)
+        let lhs = spanned(ExprKind::Lambda {
+            params: vec![spanned(PatKind::Var("_".into()))],
+            body: Box::new(spanned(ExprKind::App {
+                func: Box::new(spanned(ExprKind::Var("println".into()))),
+                arg: Box::new(spanned(ExprKind::Lit(Literal::Text("hi".into())))),
+            })),
+        });
+        let rhs = spanned(ExprKind::Lambda {
+            params: vec![spanned(PatKind::Var("g".into()))],
+            body: Box::new(spanned(ExprKind::App {
+                func: Box::new(spanned(ExprKind::Var("g".into()))),
+                arg: Box::new(spanned(ExprKind::Lit(Literal::Int("0".into())))),
+            })),
+        });
+        let body = spanned(ExprKind::BinOp {
+            op: BinOp::Pipe,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        });
+        let (_diags, effects) = check_module(vec![make_fun("f", body)]);
+        assert!(
+            effects["f"].console,
+            "lambda piped into non-Var callee should still propagate console effect"
+        );
     }
 }

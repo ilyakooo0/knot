@@ -1312,7 +1312,7 @@ impl CancelToken {
             .notify
             .1
             .wait_timeout_while(guard, duration, |_| !self.is_cancelled())
-            .unwrap();
+            .unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -6815,6 +6815,18 @@ fn cmp_int_float(x: i64, y: f64) -> std::cmp::Ordering {
 /// `<`/`>` operators, which DO dispatch through `Ord`, use the structural
 /// `compare_values` below instead so `deriving (Ord)` types are orderable.
 fn compare_values_primitive(a: *mut Value, b: *mut Value) -> std::cmp::Ordering {
+    // Nullable encoding: null represents the "none" variant (Nothing).
+    // Handle nulls before calling as_ref, which panics on null pointers.
+    // Mirrors values_equal's null handling. Nothing < Just x (like Haskell).
+    if a.is_null() && b.is_null() {
+        return std::cmp::Ordering::Equal;
+    }
+    if a.is_null() {
+        return std::cmp::Ordering::Less;
+    }
+    if b.is_null() {
+        return std::cmp::Ordering::Greater;
+    }
     let av = unsafe { as_ref(a) };
     let bv = unsafe { as_ref(b) };
     if let (Value::Text(x), Value::Text(y)) = (av, bv) {
@@ -6835,6 +6847,18 @@ fn compare_values_primitive(a: *mut Value, b: *mut Value) -> std::cmp::Ordering 
 
 fn compare_values(a: *mut Value, b: *mut Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
+    // Nullable encoding: null represents the "none" variant (Nothing).
+    // Handle nulls before calling as_ref, which panics on null pointers.
+    // Mirrors values_equal's null handling. Nothing < Just x (like Haskell).
+    if a.is_null() && b.is_null() {
+        return Ordering::Equal;
+    }
+    if a.is_null() {
+        return Ordering::Less;
+    }
+    if b.is_null() {
+        return Ordering::Greater;
+    }
     let av = unsafe { as_ref(a) };
     let bv = unsafe { as_ref(b) };
     if let (Value::Text(x), Value::Text(y)) = (av, bv) {
@@ -16007,6 +16031,8 @@ fn http_serve_loop(
                                                 .unwrap(),
                                         );
                                     let _ = request.respond(response);
+                                    knot_db_close(db);
+                                    unsafe { deep_drop_value(handler); }
                                     return;
                                 }
                             };
@@ -16068,6 +16094,8 @@ fn http_serve_loop(
                                                 .unwrap(),
                                         );
                                     let _ = request.respond(response);
+                                    knot_db_close(db);
+                                    unsafe { deep_drop_value(handler); }
                                     return;
                                 }
                             };
@@ -19596,5 +19624,56 @@ mod _fk_migration_listen_tests {
                 response
             );
         }
+    }
+
+    // ── Regression: compare_values must not panic on null field values ──
+    //
+    // read_sql_column returns null_mut() for NULL SQLite columns (e.g.
+    // nullable/Maybe fields). Those null pointers become field values in
+    // records and constructor payloads read from the database. Before the
+    // fix, compare_values called as_ref() on them unconditionally, which
+    // panicked ("null pointer dereference").
+
+    #[test]
+    fn compare_values_handles_null_record_fields() {
+        let mk_rec = |id: i64, opt: *mut Value| {
+            let mut fs = vec![
+                RecordField { name: intern_str("id"), value: alloc_int(id) },
+                RecordField { name: intern_str("opt"), value: opt },
+            ];
+            fs.sort_by(|a, b| a.name.cmp(&b.name));
+            alloc(Value::Record(fs))
+        };
+        let a = mk_rec(1, std::ptr::null_mut());
+        let b = mk_rec(1, std::ptr::null_mut());
+        let c = mk_rec(2, std::ptr::null_mut());
+
+        // Both null → Equal
+        assert_eq!(compare_values(a, b), std::cmp::Ordering::Equal);
+        // Different non-null field → ordered by that field
+        assert_eq!(compare_values(a, c), std::cmp::Ordering::Less);
+        assert_eq!(compare_values(c, a), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn compare_values_handles_null_constructor_payloads() {
+        let mk_just = |n: i64| {
+            let val = if n == -1 {
+                std::ptr::null_mut()
+            } else {
+                alloc_int(n)
+            };
+            let inner = {
+                let mut fs = vec![RecordField { name: intern_str("value"), value: val }];
+                fs.sort_by(|a, b| a.name.cmp(&b.name));
+                alloc(Value::Record(fs))
+            };
+            alloc(Value::Constructor(intern_str("Just"), inner))
+        };
+        // Just {value: null} vs Just {value: null} → Equal
+        assert_eq!(compare_values(mk_just(-1), mk_just(-1)), std::cmp::Ordering::Equal);
+        // Just {value: null} < Just {value: 5} (Nothing < Just x)
+        assert_eq!(compare_values(mk_just(-1), mk_just(5)), std::cmp::Ordering::Less);
+        assert_eq!(compare_values(mk_just(5), mk_just(-1)), std::cmp::Ordering::Greater);
     }
 }

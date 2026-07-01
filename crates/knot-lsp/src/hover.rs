@@ -38,11 +38,17 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
 
     let offset = position_to_offset(&doc.source, pos);
 
+    // Span containment must use the same leftward-resolved offset that
+    // `word_at_position` used: a caret immediately AFTER an identifier
+    // (or literal) resolves the token to its left, so the lookup has to
+    // be nudged back inside that token too.
+    let lookup_offset = crate::utils::ident_lookup_offset(&doc.source, offset);
+
     // Try literal types first (span-based, works for strings/floats/etc.)
     if let Some((span, ty)) = doc
         .literal_types
         .iter()
-        .find(|(span, _)| span.start <= offset && offset < span.end)
+        .find(|(span, _)| span.start <= lookup_offset && lookup_offset < span.end)
     {
         let source_text = safe_slice(&doc.source, *span);
         let detail = format!("{source_text} : {ty}");
@@ -57,13 +63,6 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
 
     let word = word_at_position(&doc.source, pos)?;
     let word_span = word_span_at_offset(&doc.source, offset);
-
-    // Span containment must use the same leftward-resolved offset that
-    // `word_at_position` used: a caret immediately AFTER an identifier
-    // resolves the identifier to its left, so the binding lookup has to be
-    // nudged back inside that word too — otherwise hover at `total|` falls
-    // back to a same-named global instead of the local binding.
-    let lookup_offset = crate::utils::ident_lookup_offset(&doc.source, offset);
 
     // Field-access context (AST-driven): when the cursor sits on the field
     // token of `recv.field`, the token names a RECORD FIELD, not a symbol.

@@ -547,3 +547,32 @@ fn inference_cache_keys_are_content_addressed() {
     keys.insert((std::path::PathBuf::from("/x.knot"), a));
     assert!(!keys.contains(&(std::path::PathBuf::from("/x.knot"), b)));
 }
+
+#[test]
+fn call_hierarchy_prepare_works_from_end_of_identifier() {
+    // Cursor placed exactly AT the end of the identifier (the standard
+    // post-typing caret position). Without ident_lookup_offset nudging,
+    // the half-open `offset < usage.end` check failed and prepare
+    // returned None.
+    let mut ws = TestWorkspace::new();
+    let uri = ws.open(
+        "main",
+        "greet = \\name -> \"hi \" ++ name\nmain = println (greet \"world\")\n",
+    );
+    let doc = ws.doc(&uri);
+    let call_start = doc.source.find("greet \"world\"").expect("call site");
+    // Position cursor right after the last char of "greet"
+    let call_offset = call_start + "greet".len();
+    let pos = crate::utils::offset_to_position(&doc.source, call_offset);
+    let params = CallHierarchyPrepareParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            position: pos,
+        },
+        work_done_progress_params: Default::default(),
+    };
+    let items = crate::call_hierarchy::handle_call_hierarchy_prepare(&ws.state, &params)
+        .expect("prepare must resolve when cursor is at end of identifier");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].name, "greet");
+}

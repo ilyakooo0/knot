@@ -8,7 +8,8 @@ use knot::ast::{self, DeclKind, Span};
 
 use crate::state::ServerState;
 use crate::utils::{
-    find_word_in_source, position_to_offset, recurse_expr, span_to_range, word_at_position,
+    find_word_in_source, ident_lookup_offset, position_to_offset, recurse_expr,
+    span_to_range, word_at_position,
 };
 
 // ── Call Hierarchy ───────────────────────────────────────────────────
@@ -30,7 +31,7 @@ pub(crate) fn handle_call_hierarchy_prepare(
     {
         return None;
     }
-    let offset = position_to_offset(&doc.source, pos);
+    let offset = ident_lookup_offset(&doc.source, position_to_offset(&doc.source, pos));
     let word = word_at_position(&doc.source, pos)?;
 
     // Find the declaration containing this name

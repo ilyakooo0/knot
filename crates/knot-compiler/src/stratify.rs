@@ -306,10 +306,12 @@ pub fn check(module: &ast::Module) -> Vec<Diagnostic> {
 
         // Check if any edge within this SCC is negative.
         let scc_set: HashSet<&String> = scc.iter().collect();
+        let mut scc_has_negative = false;
         for name in scc {
             if let Some(es) = edges.get(name) {
                 for edge in es {
                     if edge.polarity == Polarity::Negative && scc_set.contains(&edge.target) {
+                        scc_has_negative = true;
                         let mut diag = Diagnostic::error(format!(
                             "unstratifiable recursion: `&{}` negates `&{}` through `diff`",
                             name, edge.target,
@@ -341,6 +343,47 @@ pub fn check(module: &ast::Module) -> Vec<Diagnostic> {
                     }
                 }
             }
+        }
+
+        // Multi-relation (mutual / indirect) recursion. Codegen only emits a
+        // `knot_relation_fixpoint` wrapper for a *single* self-recursive
+        // derived relation (detected syntactically by the same name appearing
+        // in its own body). A cycle spanning two or more relations is not
+        // detected there, so each relation compiles as an ordinary recompute
+        // and calls its peer, which calls back — unbounded mutual recursion
+        // that stack-overflows at runtime instead of converging to a Datalog
+        // fixpoint. Reject it with a clear diagnostic. (A cycle already
+        // carrying a negative edge is reported as unstratifiable above; don't
+        // pile on a second message.)
+        if scc.len() >= 2 && !scc_has_negative {
+            let mut names: Vec<String> = scc.clone();
+            names.sort();
+            let list = names
+                .iter()
+                .map(|n| format!("`&{}`", n))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut diag = Diagnostic::error(format!(
+                "mutually recursive derived relations are not supported: {}",
+                list
+            ));
+            // Attach the label to the first cycle member that actually has a
+            // recorded span. `decl_spans` only holds derived relations, so the
+            // alphabetically-first member may be absent (e.g. a view in the
+            // cycle) — `find_map` skips those instead of dropping the label.
+            if let Some(&decl_span) = names.iter().find_map(|n| decl_spans.get(n)) {
+                diag = diag.label(decl_span, "part of a mutually recursive cycle");
+            }
+            diag = diag.note(
+                "codegen computes a fixpoint only for a single self-recursive derived \
+                 relation; a mutual cycle recomputes its peers without converging, \
+                 overflowing the stack at runtime",
+            );
+            diag = diag.note(
+                "combine the relations into one self-recursive derived relation, or make \
+                 one of them non-recursive",
+            );
+            diagnostics.push(diag);
         }
     }
 
@@ -443,15 +486,47 @@ mod tests {
     }
 
     #[test]
-    fn mutual_recursion_all_positive_is_ok() {
+    fn mutual_recursion_all_positive_is_rejected_as_unsupported() {
         // &a = union *source &b
         // &b = union *source &a
+        // Positive mutual recursion is well-defined in Datalog, but codegen
+        // only emits a fixpoint for a *single* self-recursive relation — a
+        // mutual cycle compiles to unbounded mutual recompute (stack
+        // overflow). It must be rejected with a clear diagnostic rather than
+        // silently miscompiled.
         let m = module(vec![
             derived("a", union(source_ref("source"), derived_ref("b"))),
             derived("b", union(source_ref("source"), derived_ref("a"))),
         ]);
         let diags = check(&m);
-        assert!(diags.is_empty(), "all-positive mutual recursion is fine");
+        assert_eq!(diags.len(), 1, "one unsupported-mutual-recursion error");
+        assert!(
+            diags[0].message.contains("mutually recursive"),
+            "expected mutual-recursion diagnostic, got: {}",
+            diags[0].message
+        );
+        assert!(
+            !diags[0].message.contains("unstratifiable"),
+            "positive cycle is unsupported, not unstratifiable"
+        );
+    }
+
+    #[test]
+    fn indirect_positive_cycle_is_rejected() {
+        // &a = union *s &b ; &b = union *s &c ; &c = union *s &a
+        // A 3-relation cycle: none is directly self-recursive, so codegen's
+        // syntactic self-ref check misses all three and would emit looping
+        // recompute. The SCC detection must catch the whole cycle.
+        let m = module(vec![
+            derived("a", union(source_ref("s"), derived_ref("b"))),
+            derived("b", union(source_ref("s"), derived_ref("c"))),
+            derived("c", union(source_ref("s"), derived_ref("a"))),
+        ]);
+        let diags = check(&m);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("mutually recursive"));
+        assert!(diags[0].message.contains("&a"));
+        assert!(diags[0].message.contains("&c"));
     }
 
     #[test]
@@ -521,9 +596,16 @@ mod tests {
             derived("b", union(source_ref("source"), derived_ref("a"))),
         ]);
         let diags = check(&m);
+        // The cycle is now rejected as *unsupported* mutual recursion, but the
+        // point of this test stands: `not` must NOT make it *unstratifiable*
+        // (a spurious negative edge). So there is exactly one diagnostic and it
+        // is the mutual-recursion one, never the negation one.
+        assert_eq!(diags.len(), 1);
         assert!(
-            diags.is_empty(),
-            "boolean `not` should not create negative edge in mutual recursion"
+            diags[0].message.contains("mutually recursive")
+                && !diags[0].message.contains("unstratifiable"),
+            "boolean `not` must not create a negative edge: {}",
+            diags[0].message
         );
     }
 

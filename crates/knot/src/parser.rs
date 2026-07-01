@@ -4030,7 +4030,15 @@ impl Parser {
             }
             self.expect(&TokenKind::Dot, "expected '.' after forall variables").ok()?;
             self.skip_newlines();
-            let body = self.parse_type()?;
+            // Guard the recursive body parse: `forall a. forall a. …` would
+            // otherwise recurse unbounded and overflow the stack (every other
+            // recursive type path is charged against MAX_RECURSION_DEPTH).
+            if !self.enter_recursion() {
+                return None;
+            }
+            let body = self.parse_type();
+            self.recursion_depth -= 1;
+            let body = body?;
             let span = Span::new(start.start, body.span.end);
             return Some(Spanned::new(
                 TypeKind::Forall { vars, ty: Box::new(body) },

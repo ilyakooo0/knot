@@ -132,12 +132,14 @@ pub fn resolve_definitions(
                 // parameter (`trait T a where  a : a -> Int` anchors method `a`
                 // on the header's `a`). Start the search past `where` so each
                 // method resolves to its own signature token. Mirrors the Data
-                // arm's `=`-anchored search above.
-                let search_from = source
-                    .get(decl.span.start..decl.span.end.min(source.len()))
-                    .and_then(|t| t.find("where"))
-                    .map(|p| decl.span.start + p + "where".len())
-                    .unwrap_or(decl.span.start);
+                // arm's `=`-anchored search above. Use a whole-word search for
+                // the keyword so a trait/supertrait/param name that merely
+                // *contains* the substring `where` (e.g. `Nowhere`) doesn't
+                // anchor the search before the real keyword.
+                let search_from =
+                    find_word_in_source(source, "where", decl.span.start, decl.span.end)
+                        .map(|s| s.end)
+                        .unwrap_or(decl.span.start);
                 for item in items {
                     if let ast::TraitItem::Method { name, .. } = item {
                         let span = find_word_in_source(source, name, search_from, decl.span.end)
@@ -590,6 +592,13 @@ impl<'a> DefResolver<'a> {
             ast::ExprKind::Serve { api, api_span, handlers } => {
                 self.add_ref(*api_span, api);
                 for h in handlers {
+                    // Each endpoint token references the route endpoint
+                    // constructor it handles. Mirror the rename walker so
+                    // goto/find-references/highlight see it too (a no-op until
+                    // endpoint constructors are registered as definitions, but
+                    // keeps the two walkers symmetric so navigation and rename
+                    // never diverge on these tokens).
+                    self.add_ref(h.endpoint_span, &h.endpoint);
                     self.resolve_expr(&h.body);
                 }
             }
@@ -726,6 +735,23 @@ mod tests {
         let (defs, _, _) = resolve_definitions(&module, source);
         let span = defs.get("a").expect("method `a` is defined");
         // The header `a` is on line 0; the method signature is on line 1.
+        assert!(
+            span.start > source.find('\n').unwrap(),
+            "method def should anchor after the header line, got {span:?}"
+        );
+        assert_eq!(&source[span.start..span.end], "a");
+    }
+
+    #[test]
+    fn trait_method_anchor_ignores_where_substring_in_header() {
+        // The trait name "Nowhere" contains the substring "where". Anchoring
+        // the method search on the first *substring* `where` would land inside
+        // the name, before the real keyword, and resolve method `a` to the
+        // header type parameter `a`. A whole-word keyword search must skip it.
+        let source = "trait Nowhere a where\n  a : a -> Int\n";
+        let module = parse(source);
+        let (defs, _, _) = resolve_definitions(&module, source);
+        let span = defs.get("a").expect("method `a` is defined");
         assert!(
             span.start > source.find('\n').unwrap(),
             "method def should anchor after the header line, got {span:?}"

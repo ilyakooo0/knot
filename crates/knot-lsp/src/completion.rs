@@ -811,7 +811,10 @@ fn lookup_local_binding_type(doc: &DocumentState, name: &str, offset: usize) -> 
         if span.end > doc.source.len() || span.start > span.end {
             continue;
         }
-        if &doc.source[span.start..span.end] != name {
+        // Char-boundary-safe: a stale span could land mid-multibyte-char, and
+        // a raw slice there would panic. Mirrors the hardened signature_help
+        // twin.
+        if crate::utils::safe_slice(&doc.source, *span) != name {
             continue;
         }
         match &best {
@@ -2314,6 +2317,111 @@ main = atomic do
 #[cfg(test)]
 mod regress_fixes_tests {
     use super::*;
+
+    #[test]
+    fn fuzz_helpers_no_panic() {
+        // Directly probe byte-offset helpers with every offset including
+        // non-char-boundaries and out-of-range, on multibyte strings.
+        let strings = [
+            "café.field", "3.5", "é.", ".x", "x'.", "  foo  .", "\"a.b\"",
+            "-- a.b", "IO {fs} café", "usér.ok", "𝟛.5", "a\r\nb.", "",
+            "\u{200b}.x", "n😀.", "  ", "\t\tx.",
+        ];
+        for s in strings {
+            for off in 0..=s.len() {
+                let _ = super::inside_string_or_comment(s, off);
+                let _ = super::dot_receiver_is_numeric(s, off);
+                let _ = super::receiver_ident_before_dot(s, off);
+                let _ = super::ident_range_before_dot(s, off);
+                let idx = off.min(s.len());
+                if s.is_char_boundary(idx) {
+                    let _ = super::cursor_in_type_context(&s[..idx]);
+                }
+            }
+            let _ = super::arrow_arity(s);
+            let _ = super::type_matches_monad(s, &MonadKind::Relation);
+            let _ = super::type_matches_monad(s, &MonadKind::IO);
+            let _ = super::type_matches_monad(s, &MonadKind::Adt("Maybe".into()));
+            let _ = super::monad_head_matches(s, &MonadKind::Relation);
+        }
+    }
+
+    #[test]
+    fn fuzz_no_panic() {
+        use crate::test_support::TestWorkspace;
+        use crate::utils::offset_to_position;
+        let sources = [
+            "*usérs : [{náme: Text, age: Int}]\nmain = do\n  u <- *usérs\n  yield u",
+            "type P = {café: Text}\nx = 3.5\nmain = x.",
+            "-- see notés.\nmain = 1",
+            "main = println \"a*b—é\"\nfoo : Int",
+            "type X = {n: Text}\nf = \\x -> atomic do\n  yield {}\n",
+            "route Hello where\n  GET /hí -> Text\n",
+            "import ./café\nmain = 1\n",
+            "x = \"\\\"é\nfoo :",
+            "🎉 = 1\nmain = 🎉.\n",
+            "f : {name: \ng = {a: 1}.",
+            "*t : [{x: Int}]\nmain = *té\n",
+            "&d = do yield {}\nmain = &dé\n",
+            "s = \"café\nmain = s.",
+            "Ünïcöde = 1\nmain = Ünïcöde",
+            "a = 1\r\nb = 2\r\nmain = a.\r\n",
+        ];
+        let valid = [
+            "*people : [{name: Text, age: Int}]\nmain = do\n  p <- *people\n  yield p.name\n",
+            "type Person = {name: Text, age: Int}\ngreet = \\p -> p.name\n",
+            "*t : [{x: Int}]\nf = \\r -> r.x\nmain = f\n",
+            "u = {a: 1, b: 2}\nmain = u.a\n",
+        ];
+        let triggers = [None, Some("."), Some("*"), Some("&"), Some("/"), Some(":")];
+        for src in sources.iter().copied().chain(valid.iter().copied()) {
+            let mut ws = TestWorkspace::new();
+            let uri = ws.open("main", src);
+            // Exercise mid-debounce / latest_source paths: pending source may
+            // be longer OR shorter than the analyzed text, shifting offsets.
+            let shorter = {
+                let mut idx = src.len().saturating_sub(2);
+                while idx > 0 && !src.is_char_boundary(idx) { idx -= 1; }
+                if idx > 0 { Some(src[..idx].to_string()) } else { None }
+            };
+            for pend in [
+                None,
+                Some(format!("{src}.")),
+                Some(format!("{src}é")),
+                Some(format!("{src}é.")),
+                shorter,
+            ] {
+                if let Some(p) = pend {
+                    ws.state.pending_sources.insert(
+                        uri.clone(),
+                        crate::state::PendingSource { source: p, version: Some(2) },
+                    );
+                } else {
+                    ws.state.pending_sources.remove(&uri);
+                }
+                let latest = ws
+                    .state
+                    .pending_sources
+                    .get(&uri)
+                    .map(|p| p.source.clone())
+                    .unwrap_or_else(|| src.to_string());
+                for off in 0..=latest.len() {
+                    if !latest.is_char_boundary(off) {
+                        continue;
+                    }
+                    let pos = offset_to_position(&latest, off);
+                    for trig in triggers {
+                        let _ = handle_completion(&ws.state, &comp_params(&uri, pos, trig));
+                    }
+                    // Also try positions one past line ends etc via raw pos.
+                    let big = Position::new(pos.line, pos.character + 3);
+                    for trig in triggers {
+                        let _ = handle_completion(&ws.state, &comp_params(&uri, big, trig));
+                    }
+                }
+            }
+        }
+    }
 
     /// Item 8: `->` must be skipped at any depth so its `>` never reaches
     /// the bracket-depth logic.

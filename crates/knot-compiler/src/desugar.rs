@@ -1079,15 +1079,32 @@ const SYNTH_SPAN_BASE: usize = 1 << 31;
 static SYNTH_SPAN_ORIGINS: std::sync::Mutex<Option<std::collections::HashMap<usize, Span>>> =
     std::sync::Mutex::new(None);
 
+/// Soft cap on retained synth-span→origin entries. The map is consulted only
+/// by the *same* compile's inference, so entries from finished compiles are
+/// dead weight; without bounding, the long-running LSP (which re-desugars on
+/// every keystroke) grows the map without limit. See `fresh_monad_span`.
+const MAX_SYNTH_SPANS: usize = 1 << 16;
+
 fn fresh_monad_span(origin: Span) -> Span {
     let n = DESUGAR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         as usize;
     let span = Span::new(SYNTH_SPAN_BASE + n, SYNTH_SPAN_BASE + n + 1);
-    SYNTH_SPAN_ORIGINS
+    let mut guard = SYNTH_SPAN_ORIGINS
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_with(std::collections::HashMap::new)
-        .insert(span.start, origin);
+        .unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    map.insert(span.start, origin);
+    // Reclaim memory in long-running processes. Keys are the monotonic
+    // `DESUGAR_COUNTER`, so any compile still in flight holds the *highest*
+    // keys; dropping the lowest keys when we run far over capacity evicts only
+    // entries from long-finished compiles, never a live one. Amortized O(1):
+    // eviction runs once per ~`MAX_SYNTH_SPANS` inserts.
+    if map.len() > 2 * MAX_SYNTH_SPANS {
+        let mut keys: Vec<usize> = map.keys().copied().collect();
+        keys.sort_unstable();
+        let cutoff = keys[keys.len() - MAX_SYNTH_SPANS];
+        map.retain(|k, _| *k >= cutoff);
+    }
     span
 }
 
@@ -1309,6 +1326,33 @@ fn mk_bind(func: Expr, collection: Expr, span: Span) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synth_span_origins_stay_bounded() {
+        // Regression: `SYNTH_SPAN_ORIGINS` only ever inserted, so the
+        // long-running LSP (which re-desugars on every keystroke) grew it
+        // without bound. Flood well past the eviction threshold and confirm
+        // the map stays capped while a just-created span still resolves.
+        let origin = Span::new(5, 10);
+        let mut last = Span::new(0, 0);
+        for _ in 0..(2 * MAX_SYNTH_SPANS + 1000) {
+            last = fresh_monad_span(origin);
+        }
+        // Held under the lock, so the per-insert eviction invariant applies
+        // regardless of other tests touching the same global concurrently.
+        let len = SYNTH_SPAN_ORIGINS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert!(
+            len <= 2 * MAX_SYNTH_SPANS,
+            "map must stay bounded, got {len}"
+        );
+        // The most recent span (highest key) is never a candidate for eviction.
+        assert_eq!(synth_span_origin(last), Some(origin));
+    }
 
     fn parse(src: &str) -> Module {
         let lexer = knot::lexer::Lexer::new(src);

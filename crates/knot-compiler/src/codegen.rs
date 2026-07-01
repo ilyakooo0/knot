@@ -579,8 +579,17 @@ pub fn compile(
     // Collect view declarations and analyze provenance
     for decl in &module.decls {
         if let ast::DeclKind::View { name, body, .. } = &decl.node {
-            if let Some(info) = analyze_view(body) {
-                cg.views.insert(name.clone(), info);
+            match analyze_view(body) {
+                Ok(Some(info)) => {
+                    cg.views.insert(name.clone(), info);
+                }
+                Ok(None) => {}
+                Err((span, msg)) => {
+                    cg.diagnostics.push(
+                        knot::diagnostic::Diagnostic::error(msg)
+                            .label(span, "unsupported view filter"),
+                    );
+                }
             }
         }
     }
@@ -9002,7 +9011,19 @@ impl Codegen {
             if !hash_join_allowed {
                 break;
             }
+            // Only ONE hash-join plan is supported per inner bind (the map is
+            // keyed by inner bind index). Once we've chosen a plan for this
+            // inner bind against some earlier bind, stop: consuming a second
+            // matching `where` against a *different* earlier bind would mark it
+            // handled while its plan silently overwrites the first — dropping a
+            // real join predicate and returning rows that violate it. Leaving
+            // the second `where` unconsumed lets the normal nested-loop path
+            // enforce it.
+            let mut planned_for_inner = false;
             for v in 0..w {
+                if planned_for_inner {
+                    break;
+                }
                 let (_outer_idx, outer_var, _outer_expr) = bind_stmts[v];
                 let (inner_idx, inner_var, inner_expr) = bind_stmts[w];
 
@@ -9064,6 +9085,7 @@ impl Codegen {
                                         _where_idx: wi,
                                     },
                                 );
+                                planned_for_inner = true;
                                 break; // one join per bind pair
                             }
                         }
@@ -12436,15 +12458,21 @@ impl Codegen {
 
 /// Analyze a view body expression to extract column provenance.
 /// Returns `None` if the view body cannot be analyzed (unsupported pattern).
-fn analyze_view(body: &ast::Expr) -> Option<ViewInfo> {
+/// Analyze a view body. Returns `Ok(Some(info))` when the body is a
+/// recognizable view, `Ok(None)` when it isn't a view shape at all, and
+/// `Err((span, msg))` when it *is* a view but contains a `where` filter we
+/// cannot represent — the caller turns that into a diagnostic. We must not
+/// silently drop such a filter (that would return unfiltered rows on read and
+/// write rows that violate the filter), and we must not panic on valid input.
+fn analyze_view(body: &ast::Expr) -> Result<Option<ViewInfo>, (ast::Span, String)> {
     // Case 1: simple alias — *view = *source
     if let ast::ExprKind::SourceRef(source_name) = &body.node {
-        return Some(ViewInfo {
+        return Ok(Some(ViewInfo {
             source_name: source_name.clone(),
             source_columns: vec![],
             constant_columns: vec![],
             body: body.clone(),
-        });
+        }));
     }
 
     // Case 2: do-block with bind + yield
@@ -12459,7 +12487,11 @@ fn analyze_view(body: &ast::Expr) -> Option<ViewInfo> {
                 }
             }
             None
-        })?;
+        });
+        let bind_info = match bind_info {
+            Some(bi) => bi,
+            None => return Ok(None),
+        };
 
         let (bind_var, source_name) = bind_info;
 
@@ -12473,7 +12505,11 @@ fn analyze_view(body: &ast::Expr) -> Option<ViewInfo> {
                 }
             }
             None
-        })?;
+        });
+        let yield_record = match yield_record {
+            Some(yr) => yr,
+            None => return Ok(None),
+        };
 
         let mut source_columns = Vec::new();
         let mut constant_columns = Vec::new();
@@ -12520,13 +12556,16 @@ fn analyze_view(body: &ast::Expr) -> Option<ViewInfo> {
                     }
                 }
                 // Any other `where` form can't be represented in ViewInfo's
-                // constant-column model. Fail loudly rather than silently
-                // dropping the filter (which would return unfiltered rows on
-                // read and write rows that violate the filter).
-                panic!(
-                    "codegen: unsupported `where` filter in view body — view `where` \
-                     clauses must have the form `<bindvar>.<field> == <constant>`"
-                );
+                // constant-column model. Report a diagnostic rather than
+                // silently dropping the filter (which would return unfiltered
+                // rows on read and write rows that violate the filter) or
+                // panicking the whole compile on otherwise-valid input.
+                return Err((
+                    cond.span,
+                    "unsupported `where` filter in view body — view `where` clauses \
+                     must have the form `<bindvar>.<field> == <constant>`"
+                        .to_string(),
+                ));
             }
         }
 
@@ -12552,15 +12591,15 @@ fn analyze_view(body: &ast::Expr) -> Option<ViewInfo> {
             // it's a computed column — view reads work, writes are not supported.
         }
 
-        return Some(ViewInfo {
+        return Ok(Some(ViewInfo {
             source_name,
             source_columns,
             constant_columns,
             body: body.clone(),
-        });
+        }));
     }
 
-    None
+    Ok(None)
 }
 
 /// Check if an expression references a specific variable name.

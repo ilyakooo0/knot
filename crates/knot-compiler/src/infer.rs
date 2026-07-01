@@ -140,13 +140,20 @@ impl UnitTy {
         self.vars.retain(|_, exp| *exp != 0);
     }
 
+    // Exponent arithmetic saturates rather than wrapping/panicking. Absurd
+    // exponents (e.g. `M^2000000000 * M^2000000000`) are meaningless units, so
+    // clamping to `i32::MIN/MAX` is harmless — but unchecked `+=`/`*=` would
+    // panic in debug builds and silently wrap in release on a type-correct
+    // program, turning a nonsensical annotation into a compiler crash.
     fn mul(&self, other: &UnitTy) -> UnitTy {
         let mut result = self.clone();
         for (name, exp) in &other.bases {
-            *result.bases.entry(name.clone()).or_insert(0) += exp;
+            let e = result.bases.entry(name.clone()).or_insert(0);
+            *e = e.saturating_add(*exp);
         }
         for (&v, &exp) in &other.vars {
-            *result.vars.entry(v).or_insert(0) += exp;
+            let e = result.vars.entry(v).or_insert(0);
+            *e = e.saturating_add(exp);
         }
         result.normalize();
         result
@@ -155,10 +162,12 @@ impl UnitTy {
     fn div(&self, other: &UnitTy) -> UnitTy {
         let mut result = self.clone();
         for (name, exp) in &other.bases {
-            *result.bases.entry(name.clone()).or_insert(0) -= exp;
+            let e = result.bases.entry(name.clone()).or_insert(0);
+            *e = e.saturating_sub(*exp);
         }
         for (&v, &exp) in &other.vars {
-            *result.vars.entry(v).or_insert(0) -= exp;
+            let e = result.vars.entry(v).or_insert(0);
+            *e = e.saturating_sub(exp);
         }
         result.normalize();
         result
@@ -167,10 +176,10 @@ impl UnitTy {
     fn pow(&self, n: i32) -> UnitTy {
         let mut result = self.clone();
         for exp in result.bases.values_mut() {
-            *exp *= n;
+            *exp = exp.saturating_mul(n);
         }
         for exp in result.vars.values_mut() {
-            *exp *= n;
+            *exp = exp.saturating_mul(n);
         }
         result.normalize();
         result
@@ -781,7 +790,34 @@ impl Infer {
                 | Ty::FloatUnit(_)
                 | Ty::Record(..)
                 | Ty::Relation(_)
+                // A nominal ADT / data base (`type Warm = Color where …`).
+                // Without this, a plain `Color` value flowing where `Warm` is
+                // required skips the introduction guard and is laundered into
+                // the refined type with no predicate check. (A *different*
+                // refined `Con` never reaches the guard — the refined
+                // subsumption arms exclude it — so this only ever rejects a
+                // genuine base value.)
+                | Ty::Con(..)
         )
+    }
+
+    /// Arithmetic and concatenation do not preserve a refinement predicate
+    /// (`Nat - Nat` can be negative; `Short ++ Short` can exceed the length
+    /// bound), so the result of a `Num`/negation/`Semigroup` op on a refined
+    /// operand must degrade to the refined type's *base*. Otherwise a value
+    /// that never passed `refine` inhabits the refined type — e.g.
+    /// `sub : Nat -> Nat -> Nat = \a b -> a - b` would launder `-2` into `Nat`.
+    /// After degrading, the directional subsumption check forces the caller to
+    /// `refine` the result wherever a refined type is required.
+    fn degrade_refinement(&mut self, ty: Ty, span: Span) -> Ty {
+        if let Ty::Con(name, args) = self.apply(&ty) {
+            if args.is_empty() && self.refined_types.contains_key(&name) {
+                if let Some(base) = self.resolve_refined_base(&name, span) {
+                    return base;
+                }
+            }
+        }
+        ty
     }
 
     fn fresh_var(&mut self) -> TyVar {
@@ -813,14 +849,20 @@ impl Infer {
             for (&v, &exp) in &current.vars {
                 if let Some(resolved) = self.unit_subst.get(&v) {
                     changed = true;
+                    // Saturating: exponents this large are nonsensical units,
+                    // but unchecked arithmetic would panic/wrap on a
+                    // type-correct program (see `UnitTy::mul`).
                     for (name, &base_exp) in &resolved.bases {
-                        *next.bases.entry(name.clone()).or_insert(0) += base_exp * exp;
+                        let e = next.bases.entry(name.clone()).or_insert(0);
+                        *e = e.saturating_add(base_exp.saturating_mul(exp));
                     }
                     for (&rv, &rexp) in &resolved.vars {
-                        *next.vars.entry(rv).or_insert(0) += rexp * exp;
+                        let e = next.vars.entry(rv).or_insert(0);
+                        *e = e.saturating_add(rexp.saturating_mul(exp));
                     }
                 } else {
-                    *next.vars.entry(v).or_insert(0) += exp;
+                    let e = next.vars.entry(v).or_insert(0);
+                    *e = e.saturating_add(exp);
                 }
             }
             next.normalize();
@@ -4283,7 +4325,7 @@ impl Infer {
                 match op {
                     ast::UnaryOp::Neg => {
                         self.require_trait("Num", &operand_ty, operand.span);
-                        operand_ty
+                        self.degrade_refinement(operand_ty, operand.span)
                     }
                     ast::UnaryOp::Not => {
                         self.unify(
@@ -5136,17 +5178,19 @@ impl Infer {
                 // silently stripped when it appears on the RHS.
                 let lhs_final = self.apply(&lhs_applied);
                 let rhs_final = self.apply(&rhs_applied);
-                match (&lhs_final, &rhs_final) {
+                let result = match (&lhs_final, &rhs_final) {
                     (Ty::IntUnit(_), _) | (Ty::FloatUnit(_), _) => lhs_final,
                     (_, Ty::IntUnit(_)) | (_, Ty::FloatUnit(_)) => rhs_final,
                     _ => lhs_final,
-                }
+                };
+                self.degrade_refinement(result, span)
             }
             // Mul/Div: units compose
             ast::BinOp::Mul | ast::BinOp::Div => {
                 let lhs_applied = self.apply(&lhs_ty);
                 let rhs_applied = self.apply(&rhs_ty);
-                self.unit_mul_div_ty(op, &lhs_applied, &rhs_applied, span, true)
+                let result = self.unit_mul_div_ty(op, &lhs_applied, &rhs_applied, span, true);
+                self.degrade_refinement(result, span)
             }
             // Comparison: both same type, result Bool
             ast::BinOp::Eq | ast::BinOp::Neq => {
@@ -5169,7 +5213,7 @@ impl Infer {
             ast::BinOp::Concat => {
                 self.unify(&lhs_ty, &rhs_ty, span);
                 self.require_trait("Semigroup", &lhs_ty, span);
-                lhs_ty
+                self.degrade_refinement(lhs_ty, span)
             }
             // Pipe: a |> f  =  f a
             ast::BinOp::Pipe => {

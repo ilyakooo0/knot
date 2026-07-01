@@ -643,10 +643,12 @@ pub fn run_db_explorer(db_path: &str) -> io::Result<()> {
     app.load_data(&conn);
 
     enable_raw_mode()?;
-    stdout().execute(EnterAlternateScreen)?;
-    // From here on the terminal is in raw mode + alternate screen; the guard
-    // restores it on every exit path, including panics inside the loop.
+    // Install the restore guard immediately — before entering the alternate
+    // screen — so that if `EnterAlternateScreen` fails, `?` doesn't return
+    // while leaving the terminal stuck in raw mode. The guard restores on
+    // every exit path, including panics inside the loop.
     let _restore = TerminalRestoreGuard;
+    stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     let result = (|| -> io::Result<()> {

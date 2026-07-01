@@ -258,6 +258,16 @@ struct EffectChecker {
     /// propagate through `fork`'s type into the enclosing declaration's
     /// overall inferred effect set (computed with this flag off).
     suppress_fork_io: bool,
+    /// Declarations that are `fork` wrappers: `name -> forwarded param index`.
+    /// A fork wrapper is a lambda chain whose body is exactly `fork <param>`
+    /// (or `<param> |> fork`); the argument passed at the forwarded position is
+    /// spawned on an independent connection, so — like a syntactic
+    /// `fork (…)` — its IO never runs in the caller and is stripped from the
+    /// atomic-gate view at the call site. Without this, `atomic (forkIt
+    /// (println …))` is falsely rejected while `atomic (fork (println …))` is
+    /// allowed. Deliberately minimal (single direct forward) so it can only
+    /// ever *remove* effects that fork already defers — never launder real IO.
+    fork_wrapper_params: HashMap<String, usize>,
     /// Accumulated diagnostics.
     diagnostics: Vec<Diagnostic>,
 }
@@ -311,6 +321,12 @@ impl EffectChecker {
         let mut race_effect = EffectSet::empty();
         race_effect.uses_race = true;
         builtin_effects.insert("race".into(), race_effect);
+        // `fork` and `retry` carry no intrinsic effect (fork's effects flow
+        // through its argument; retry is the STM primitive). Register them as
+        // known/pure so the atomic-gate's opaque-callee scan does not mistake
+        // `fork (helper {})` for a call through an unanalyzable callee.
+        builtin_effects.insert("fork".into(), EffectSet::empty());
+        builtin_effects.insert("retry".into(), EffectSet::empty());
 
         Self {
             decl_effects: HashMap::new(),
@@ -325,6 +341,7 @@ impl EffectChecker {
             shadowed: Vec::new(),
             current_decl_name: None,
             suppress_fork_io: false,
+            fork_wrapper_params: HashMap::new(),
             diagnostics: Vec::new(),
         }
     }
@@ -348,6 +365,16 @@ impl EffectChecker {
                     self.decl_bodies.insert(name.clone(), body.clone());
                 }
                 _ => {}
+            }
+            // Record `fork` wrappers so the atomic gate can strip the forwarded
+            // argument's IO at the call site (see `fork_wrapper_params`).
+            if let ast::DeclKind::Fun { name, body: Some(body), .. }
+            | ast::DeclKind::View { name, body, .. }
+            | ast::DeclKind::Derived { name, body, .. } = &decl.node
+            {
+                if let Some(idx) = fork_wrapper_param(body) {
+                    self.fork_wrapper_params.insert(name.clone(), idx);
+                }
             }
         }
 
@@ -683,14 +710,25 @@ impl EffectChecker {
                 let strip_fork_io = self.suppress_fork_io
                     && head_name(head) == Some("fork")
                     && !self.shadowed.iter().any(|s| s == "fork");
+                // `forkIt (println …)` where `forkIt = \a -> fork a`: the
+                // forwarded argument is spawned just like a syntactic `fork`,
+                // so strip its IO from the atomic-gate view. The wrapper name
+                // must resolve to the top-level decl (not a shadowing local).
+                let fork_wrapper_idx = if self.suppress_fork_io {
+                    head_name(head)
+                        .filter(|n| !self.shadowed.iter().any(|s| s == n))
+                        .and_then(|n| self.fork_wrapper_params.get(n).copied())
+                } else {
+                    None
+                };
                 let mut effects = EffectSet::empty();
-                for arg in &args {
+                for (i, arg) in args.iter().enumerate() {
                     let mut arg_effects = if propagate_lambda {
                         self.arg_effects(arg)
                     } else {
                         self.infer_effects(arg)
                     };
-                    if strip_fork_io {
+                    if strip_fork_io || fork_wrapper_idx == Some(i) {
                         arg_effects.console = false;
                         arg_effects.network = false;
                         arg_effects.fs = false;
@@ -730,7 +768,15 @@ impl EffectChecker {
                     let strip_fork_io = self.suppress_fork_io
                         && head_name(rhs) == Some("fork")
                         && !self.shadowed.iter().any(|s| s == "fork");
-                    if strip_fork_io {
+                    // `action |> forkIt` ≡ `forkIt action`: `lhs` is arg 0, so
+                    // strip it when `forkIt` is a fork wrapper forwarding its
+                    // first parameter (mirrors the `App` spine's handling).
+                    let strip_fork_wrapper = self.suppress_fork_io
+                        && head_name(rhs)
+                            .filter(|n| !self.shadowed.iter().any(|s| s == n))
+                            .and_then(|n| self.fork_wrapper_params.get(n).copied())
+                            == Some(0);
+                    if strip_fork_io || strip_fork_wrapper {
                         lhs_effects.console = false;
                         lhs_effects.network = false;
                         lhs_effects.fs = false;
@@ -1811,6 +1857,82 @@ fn head_name(expr: &ast::Expr) -> Option<&str> {
     }
 }
 
+/// If `body` is a `fork` wrapper — a lambda chain whose body is exactly
+/// `fork <param>` (or `<param> |> fork`) — return the (curry-order) index of
+/// the forwarded parameter. The argument passed there is spawned on an
+/// independent connection, so its IO never runs in the caller and may be
+/// stripped from the atomic-gate view, exactly like a syntactic `fork (…)`.
+///
+/// Deliberately minimal: only this single-direct-forward shape is recognized.
+/// Any richer body keeps the parameter's effects (the safe over-approximating
+/// direction), so this can only ever remove IO that `fork` already defers.
+fn fork_wrapper_param(body: &ast::Expr) -> Option<usize> {
+    let mut params: Vec<&str> = Vec::new();
+    let inner = unwrap_lambda_params(body, &mut params);
+    // If a parameter shadows `fork`, the `fork` in the body is not the builtin.
+    if params.iter().any(|p| *p == "fork") {
+        return None;
+    }
+    let forked = fork_call_arg_var(inner)?;
+    params.iter().position(|p| *p == forked)
+}
+
+/// Unwrap a (possibly curried) lambda chain, collecting parameter names in
+/// order, and return the innermost body. Non-`Var` parameters push `""` (which
+/// never matches a forwarded variable name), keeping index alignment intact.
+fn unwrap_lambda_params<'a>(
+    expr: &'a ast::Expr,
+    params: &mut Vec<&'a str>,
+) -> &'a ast::Expr {
+    match &expr.node {
+        ast::ExprKind::Lambda { params: ps, body } => {
+            for p in ps {
+                match &p.node {
+                    ast::PatKind::Var(n) => params.push(n.as_str()),
+                    _ => params.push(""),
+                }
+            }
+            unwrap_lambda_params(body, params)
+        }
+        ast::ExprKind::Annot { expr: inner, .. }
+        | ast::ExprKind::UnitLit { value: inner, .. } => unwrap_lambda_params(inner, params),
+        ast::ExprKind::Refine(inner) => unwrap_lambda_params(inner, params),
+        _ => expr,
+    }
+}
+
+/// If `expr` is exactly `fork <Var>` or `<Var> |> fork` (through the usual
+/// wrapper nodes), return the variable's name.
+fn fork_call_arg_var(expr: &ast::Expr) -> Option<&str> {
+    match &expr.node {
+        ast::ExprKind::App { .. } => {
+            let (head, args) = app_spine(expr);
+            if head_name(head) == Some("fork") && args.len() == 1 {
+                if let ast::ExprKind::Var(v) = &args[0].node {
+                    return Some(v.as_str());
+                }
+            }
+            None
+        }
+        ast::ExprKind::BinOp {
+            op: ast::BinOp::Pipe,
+            lhs,
+            rhs,
+        } => {
+            if head_name(rhs) == Some("fork") {
+                if let ast::ExprKind::Var(v) = &lhs.node {
+                    return Some(v.as_str());
+                }
+            }
+            None
+        }
+        ast::ExprKind::Annot { expr: inner, .. }
+        | ast::ExprKind::UnitLit { value: inner, .. } => fork_call_arg_var(inner),
+        ast::ExprKind::Refine(inner) => fork_call_arg_var(inner),
+        _ => None,
+    }
+}
+
 /// Whether `ty` contains an `IO {... | r}` row variable anywhere in its
 /// structure. Used to detect row-polymorphic effect signatures so that
 /// higher-order callbacks pass their effects through to the caller — the
@@ -2264,6 +2386,93 @@ mod tests {
         assert!(
             diags.iter().any(|d| d.message.contains("IO effects are not allowed inside atomic")),
             "direct IO alongside fork should still be rejected: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn atomic_fork_through_wrapper_allowed() {
+        // forkIt = \a -> fork a
+        // f = atomic (do { _ <- *people; forkIt (println "spawned"); set *people = [] })
+        // The forwarded argument is spawned exactly like a syntactic `fork`, so
+        // the IO gate must not reject it. Regression: only a literal `fork`
+        // head was stripped, so fork-through-a-wrapper was falsely rejected.
+        let fork_it = make_fun(
+            "forkIt",
+            spanned(ExprKind::Lambda {
+                params: vec![spanned(PatKind::Var("a".into()))],
+                body: Box::new(spanned(ExprKind::App {
+                    func: Box::new(spanned(ExprKind::Var("fork".into()))),
+                    arg: Box::new(spanned(ExprKind::Var("a".into()))),
+                })),
+            }),
+        );
+        let body = spanned(ExprKind::Atomic(Box::new(spanned(ExprKind::Do(vec![
+            spanned(StmtKind::Bind {
+                pat: spanned(PatKind::Wildcard),
+                expr: spanned(ExprKind::SourceRef("people".into())),
+            }),
+            spanned(StmtKind::Expr(spanned(ExprKind::App {
+                func: Box::new(spanned(ExprKind::Var("forkIt".into()))),
+                arg: Box::new(spanned(ExprKind::App {
+                    func: Box::new(spanned(ExprKind::Var("println".into()))),
+                    arg: Box::new(spanned(ExprKind::Lit(Literal::Text(
+                        "spawned".into(),
+                    )))),
+                })),
+            }))),
+            spanned(StmtKind::Expr(spanned(ExprKind::Set {
+                target: Box::new(spanned(ExprKind::SourceRef("people".into()))),
+                value: Box::new(spanned(ExprKind::List(vec![]))),
+            }))),
+        ])))));
+        let (diags, effects) =
+            check_module(vec![make_source("people"), fork_it, make_fun("f", body)]);
+        assert!(
+            diags.is_empty(),
+            "fork-through-wrapper IO inside atomic should not be rejected: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        assert!(effects["f"].writes.contains("people"));
+    }
+
+    #[test]
+    fn atomic_non_fork_wrapper_io_still_rejected() {
+        // sink = \a -> a  (returns its argument unchanged — NOT a fork wrapper)
+        // f = atomic (do { _ <- *people; _ <- sink (println "x") })
+        // `_ <- sink (…)` runs the IO in the transaction, so the console effect
+        // must still trip the gate. Guards against the fork-wrapper stripping
+        // over-reaching and laundering real IO.
+        let sink = make_fun(
+            "sink",
+            spanned(ExprKind::Lambda {
+                params: vec![spanned(PatKind::Var("a".into()))],
+                body: Box::new(spanned(ExprKind::Var("a".into()))),
+            }),
+        );
+        let body = spanned(ExprKind::Atomic(Box::new(spanned(ExprKind::Do(vec![
+            spanned(StmtKind::Bind {
+                pat: spanned(PatKind::Wildcard),
+                expr: spanned(ExprKind::SourceRef("people".into())),
+            }),
+            spanned(StmtKind::Bind {
+                pat: spanned(PatKind::Wildcard),
+                expr: spanned(ExprKind::App {
+                    func: Box::new(spanned(ExprKind::Var("sink".into()))),
+                    arg: Box::new(spanned(ExprKind::App {
+                        func: Box::new(spanned(ExprKind::Var("println".into()))),
+                        arg: Box::new(spanned(ExprKind::Lit(Literal::Text("x".into())))),
+                    })),
+                }),
+            }),
+        ])))));
+        let (diags, _effects) =
+            check_module(vec![make_source("people"), sink, make_fun("f", body)]);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("IO effects are not allowed inside atomic")),
+            "IO run through a non-fork wrapper must still be rejected: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }

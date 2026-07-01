@@ -3306,6 +3306,11 @@ pub extern "C-unwind" fn knot_override_lookup(
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     let flag = format!("--{}", name);
 
+    // Tags 4-7 are Maybe variants of 0-3
+    let base_tag = if type_tag >= 4 { type_tag - 4 } else { type_tag };
+    let wrap_maybe = type_tag >= 4;
+    let is_bool = base_tag == 3;
+
     let args: Vec<String> = std::env::args().collect();
     let mut value: Option<String> = None;
 
@@ -3316,8 +3321,26 @@ pub extern "C-unwind" fn knot_override_lookup(
                 value = Some(v.to_string());
                 break;
             } else if v.is_empty() {
-                // --name value (two-arg form)
-                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                if is_bool {
+                    // Boolean flag. Consume the explicit two-arg form
+                    // `--name true` / `--name false` only when the next token
+                    // is itself a bool literal; otherwise a bare `--name`
+                    // means `true` and must NOT swallow the following
+                    // positional argument (which previously parsed it as a
+                    // bool and hard-exited on failure).
+                    if i + 1 < args.len()
+                        && matches!(
+                            args[i + 1].as_str(),
+                            "true" | "True" | "1" | "false" | "False" | "0"
+                        )
+                    {
+                        value = Some(args[i + 1].clone());
+                    } else {
+                        value = Some("true".to_string());
+                    }
+                    break;
+                } else if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    // --name value (two-arg form)
                     value = Some(args[i + 1].clone());
                     break;
                 }
@@ -3330,10 +3353,6 @@ pub extern "C-unwind" fn knot_override_lookup(
         Some(v) => v,
         None => return std::ptr::null_mut(),
     };
-
-    // Tags 4-7 are Maybe variants of 0-3
-    let base_tag = if type_tag >= 4 { type_tag - 4 } else { type_tag };
-    let wrap_maybe = type_tag >= 4;
 
     let type_name = match base_tag {
         0 => "Int",
@@ -5142,57 +5161,113 @@ fn infer_temp_schema(rows: &[*mut Value]) -> Option<TempSchema> {
             Some(TempSchema::Record(cols))
         }
         Value::Constructor(_, _) => {
-            // Scan all rows to collect all constructor variants
-            let mut ctors: Vec<(String, Vec<(String, ColType)>)> = Vec::new();
-            let mut seen_tags: HashSet<String> = HashSet::new();
-            let mut seen_field_names: HashSet<String> = HashSet::new();
-            let mut all_fields: Vec<(String, ColType)> = Vec::new();
+            // Scan ALL rows, not just the first per constructor tag: a
+            // first-row-only guess corrupts data when later rows of the *same*
+            // constructor disagree — e.g. a `Maybe` field whose first row is
+            // `Nothing`/NULL is typed as Tag/Text, then a later payload-carrying
+            // row is silently mis-stored against that column. Any inconsistency
+            // (mixed nullary/payload, NULL vs typed within one constructor,
+            // conflicting scalar types, a constructor's field set differing
+            // across rows, or two constructors disagreeing on a shared field's
+            // type) returns None so callers take the safe in-memory fallback.
+            //
+            // Per constructor tag: (field-name order, per-field
+            // (Option<ColType>, saw_null)). Kept in a Vec keyed by tag to
+            // preserve first-seen order; constructor/field counts are tiny.
+            #[allow(clippy::type_complexity)]
+            let mut tags: Vec<(String, Vec<String>, Vec<(Option<ColType>, bool)>)> = Vec::new();
 
             for row in rows {
                 if row.is_null() { continue; }
-                match unsafe { as_ref(*row) } {
-                    Value::Constructor(tag, payload) => {
-                        if !seen_tags.insert(tag.to_string()) {
-                            continue;
-                        }
-                        let unit_placeholder = Value::Unit;
-                        let payload_ref = if (*payload).is_null() {
-                            &unit_placeholder
-                        } else {
-                            unsafe { as_ref(*payload) }
-                        };
-                        let ctor_fields = match payload_ref {
-                            Value::Unit => Vec::new(),
-                            Value::Record(fields) => {
-                                let mut cf = Vec::new();
-                                for f in fields {
-                                    let fname = f.name.to_string();
-                                    let ty = infer_col_type(f.value)?;
-                                    cf.push((fname.clone(), ty));
-                                    if seen_field_names.insert(fname.clone()) {
-                                        all_fields.push((fname, ty));
-                                    } else if let Some((_, prev)) =
-                                        all_fields.iter().find(|(n, _)| *n == fname)
-                                    {
-                                        // Two constructors share a field name but
-                                        // disagree on its column type (e.g.
-                                        // `Paid {amount: Int}` vs
-                                        // `Refund {amount: Float}`). A single SQLite
-                                        // column can't faithfully hold both, so bail
-                                        // to the in-memory path like the Record branch.
-                                        if *prev != ty {
-                                            return None;
-                                        }
-                                    }
-                                }
-                                cf
-                            }
-                            _ => return None,
-                        };
-                        ctors.push((tag.to_string(), ctor_fields));
+                let (tag, payload) = match unsafe { as_ref(*row) } {
+                    Value::Constructor(tag, payload) => (tag, payload),
+                    _ => return None,
+                };
+                let unit_placeholder = Value::Unit;
+                let payload_ref = if (*payload).is_null() {
+                    &unit_placeholder
+                } else {
+                    unsafe { as_ref(*payload) }
+                };
+                let this_fields: Vec<(&str, *mut Value)> = match payload_ref {
+                    Value::Unit => Vec::new(),
+                    Value::Record(fields) => {
+                        fields.iter().map(|f| (&*f.name, f.value)).collect()
                     }
                     _ => return None,
+                };
+
+                let tag_str: &str = tag;
+                let idx = match tags.iter().position(|(t, _, _)| t == tag_str) {
+                    Some(i) => {
+                        // Field set (names, in order) must match exactly.
+                        let names = &tags[i].1;
+                        if this_fields.len() != names.len()
+                            || this_fields.iter().zip(names).any(|((n, _), en)| n != en)
+                        {
+                            return None;
+                        }
+                        i
+                    }
+                    None => {
+                        let mut names: Vec<String> = Vec::with_capacity(this_fields.len());
+                        for (n, _) in &this_fields {
+                            if names.iter().any(|en| en == n) {
+                                return None; // duplicate field name in constructor
+                            }
+                            names.push(n.to_string());
+                        }
+                        let slots = vec![(None, false); names.len()];
+                        tags.push((tag_str.to_string(), names, slots));
+                        tags.len() - 1
+                    }
+                };
+
+                let slots = &mut tags[idx].2;
+                for (i, (_, fval)) in this_fields.iter().enumerate() {
+                    if fval.is_null() {
+                        slots[i].1 = true;
+                        continue;
+                    }
+                    match unsafe { as_ref(*fval) } {
+                        Value::Relation(_) | Value::Function(_) => return None,
+                        _ => {}
+                    }
+                    let ty = infer_col_type(*fval)?;
+                    match slots[i].0 {
+                        None => slots[i].0 = Some(ty),
+                        Some(prev) if prev == ty => {}
+                        Some(_) => return None,
+                    }
                 }
+            }
+
+            let mut ctors: Vec<(String, Vec<(String, ColType)>)> = Vec::new();
+            let mut all_fields: Vec<(String, ColType)> = Vec::new();
+            for (tag, names, slots) in &tags {
+                let mut cf = Vec::with_capacity(names.len());
+                for (name, (ty_opt, saw_null)) in names.iter().zip(slots) {
+                    let ty = match ty_opt {
+                        // Mixed NULL and typed within one constructor's field:
+                        // bail, matching the Record branch's conservatism.
+                        Some(_) if *saw_null => return None,
+                        Some(ty) => *ty,
+                        // Every occurrence NULL: Text (matches infer_col_type).
+                        None => ColType::Text,
+                    };
+                    cf.push((name.clone(), ty));
+                    if let Some((_, prev)) = all_fields.iter().find(|(n, _)| n == name) {
+                        // Two constructors share a field name but disagree on
+                        // its column type — a single SQLite column can't hold
+                        // both, so bail to the in-memory path.
+                        if *prev != ty {
+                            return None;
+                        }
+                    } else {
+                        all_fields.push((name.clone(), ty));
+                    }
+                }
+                ctors.push((tag.clone(), cf));
             }
             Some(TempSchema::Adt { constructors: ctors, all_fields })
         }
@@ -7026,17 +7101,20 @@ fn format_value(v: *mut Value) -> String {
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_read_line() -> *mut Value {
-    let mut line = String::new();
-    std::io::stdin()
-        .read_line(&mut line)
-        .expect("knot runtime: failed to read from stdin");
-    // Strip trailing newline
-    if line.ends_with('\n') {
-        line.pop();
-        if line.ends_with('\r') {
-            line.pop();
+    use std::io::BufRead;
+    // Read raw bytes so non-UTF-8 stdin doesn't abort the program (the old
+    // `read_line` returned Err(InvalidData) on any invalid UTF-8). Decode
+    // lossily instead — invalid sequences become U+FFFD.
+    let mut buf: Vec<u8> = Vec::new();
+    let _ = std::io::stdin().lock().read_until(b'\n', &mut buf);
+    // Strip trailing newline (and CR).
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
         }
     }
+    let line = String::from_utf8_lossy(&buf).into_owned();
     alloc(Value::Text(Arc::from(line)))
 }
 
@@ -7918,6 +7996,15 @@ pub extern "C-unwind" fn knot_stm_snapshot() -> i64 {
     // that no longer exist. Stale `true` entries could let a later specialize
     // remove an `All` it doesn't own.
     STM_FRESH_ALL.with(|m| m.borrow_mut().clear());
+    // Clear the skip flag at the head of every iteration. The retry path takes
+    // priority over the skip check (codegen checks `stm_check_and_clear` first),
+    // so a `retry` and a failed `where`/pattern bind can both fire in one
+    // iteration (e.g. when `retry` is reached through a helper call and thus
+    // uses the flag path rather than the direct jump). The retry path does not
+    // clear STM_SKIP, so without this reset a stale skip would survive into the
+    // next iteration and force a spurious rollback-to-unit on a later
+    // successful iteration, silently discarding its writes.
+    STM_SKIP.with(|s| s.set(false));
     0
 }
 
@@ -10782,6 +10869,23 @@ fn auto_apply_adt_change(
         }
     }
 
+    // A field shared with the old schema that now requires a *different*
+    // column affinity cannot be auto-migrated in place. The common case is a
+    // field transitioning non-conflicting → conflicting (BLOB) when a new
+    // constructor reuses an existing field name with a different type: the
+    // existing column keeps its old (e.g. REAL) affinity, so the new
+    // constructor's values are silently coerced on write and then panic on
+    // read with the per-constructor type. Treat any affinity change as a
+    // breaking change so the caller demands an explicit `migrate` block
+    // instead of corrupting the relation.
+    for nf in &new_adt.all_fields {
+        if let Some(of) = old_adt.all_fields.iter().find(|f| f.name == nf.name) {
+            if old_adt.col_sql_type(of) != new_adt.col_sql_type(nf) {
+                return false;
+            }
+        }
+    }
+
     // Add new columns for new constructor fields
     let old_field_names: HashSet<&str> = old_adt.all_fields.iter().map(|f| f.name.as_str()).collect();
     for f in &new_adt.all_fields {
@@ -12653,13 +12757,8 @@ pub extern "C-unwind" fn knot_source_diff_write(
             delete_record_table(&db_ref.conn, &table_name, &rec_schema);
             write_record_rows(&db_ref.conn, &table_name, &rec_schema, rows);
 
-            db_ref.conn.execute_batch("RELEASE SAVEPOINT knot_diff_write;")
-                .expect("knot runtime: failed to commit transaction");
-            if db_ref.atomic_depth.get() > 0 {
-                stm_track_write(name);
-            } else {
-                notify_relation_changed(name);
-            }
+            // Return from the closure only; the shared RELEASE SAVEPOINT +
+            // relation-change notify after the guard runs exactly once.
             return;
         }
 
@@ -12669,13 +12768,6 @@ pub extern "C-unwind" fn knot_source_diff_write(
             delete_record_table(&db_ref.conn, &table_name, &rec_schema);
             write_record_rows(&db_ref.conn, &table_name, &rec_schema, rows);
 
-            db_ref.conn.execute_batch("RELEASE SAVEPOINT knot_diff_write;")
-                .expect("knot runtime: failed to commit transaction");
-            if db_ref.atomic_depth.get() > 0 {
-                stm_track_write(name);
-            } else {
-                notify_relation_changed(name);
-            }
             return;
         }
 
@@ -15274,17 +15366,28 @@ fn camel_to_header_case(s: &str) -> String {
             result.extend(c.to_uppercase());
         } else if c.is_uppercase() {
             let prev_upper = chars[i - 1].is_uppercase();
+            let prev_underscore = chars[i - 1] == '_';
             let next_lower = i + 1 < len && chars[i + 1].is_lowercase();
-            if !prev_upper || next_lower {
+            // A `_` already emitted the separator dash (see below); don't
+            // double it when an uppercase letter follows (`x_Id` → `X-Id`).
+            if (!prev_upper || next_lower) && !prev_underscore {
                 result.push('-');
             }
             result.push(c);
         } else if c == '_' {
-            result.push('-');
-            if i + 1 < len {
-                result.extend(chars[i + 1].to_uppercase());
-                i += 1;
+            // snake_case separator → a single dash, but only when a real
+            // character follows. A trailing `_` (`token_`) or a doubled `__`
+            // must not leave a dangling or doubled dash, and the following
+            // char is uppercased by the branch below (via the `prev == '_'`
+            // check) rather than being consumed here — consuming it blindly
+            // mishandled a following `_` (`x__id` → `X-_id`).
+            if i + 1 < len && chars[i + 1] != '_' {
+                result.push('-');
             }
+        } else if i > 0 && chars[i - 1] == '_' {
+            // First char of a new snake_case word → uppercase
+            // (`content_type` → `Content-Type`).
+            result.extend(c.to_uppercase());
         } else {
             result.push(c);
         }
@@ -17683,6 +17786,85 @@ mod _size_tests {
 }
 
 #[cfg(test)]
+mod _adt_migration_tests {
+    use super::*;
+
+    #[test]
+    fn field_affinity_change_is_breaking() {
+        // Old: constructor `A` with `value: Float` → REAL column affinity.
+        // New: adds constructor `B` reusing `value` as `Int`, making the field
+        // conflicting → BLOB affinity. The stored column keeps REAL, so an
+        // in-place auto-migration would coerce `B`'s ints to reals on write and
+        // panic on read. It must be rejected as breaking (→ explicit migrate).
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let applied = auto_apply_adt_change(
+            &conn,
+            "_knot_shapes",
+            "shapes",
+            "#A:value=float",
+            "#A:value=float|B:value=int",
+        );
+        assert!(
+            !applied,
+            "a field transitioning to a different column affinity must be breaking"
+        );
+    }
+
+    #[test]
+    fn adding_constructor_with_new_field_is_safe() {
+        // Adding a constructor whose fields are all new names is auto-applied
+        // via ALTER TABLE ADD COLUMN — the guard must not over-reject this.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE \"_knot_shapes\" (\"_tag\" TEXT NOT NULL, \"radius\" REAL);",
+        )
+        .unwrap();
+        // `side=float` keeps the ADD COLUMN off the custom `KNOT_INT`
+        // collation, which isn't registered on this bare test connection.
+        let applied = auto_apply_adt_change(
+            &conn,
+            "_knot_shapes",
+            "shapes",
+            "#A:radius=float",
+            "#A:radius=float|B:side=float",
+        );
+        assert!(
+            applied,
+            "adding a constructor with only new field names must stay auto-applicable"
+        );
+    }
+}
+
+#[cfg(test)]
+mod _header_case_tests {
+    use super::*;
+
+    #[test]
+    fn camel_and_snake_convert_to_header_case() {
+        // camelCase and PascalCase humps.
+        assert_eq!(camel_to_header_case("authorization"), "Authorization");
+        assert_eq!(camel_to_header_case("contentType"), "Content-Type");
+        assert_eq!(camel_to_header_case("xRequestId"), "X-Request-Id");
+        // Acronym runs stay together, splitting only before a trailing word.
+        assert_eq!(camel_to_header_case("contentID"), "Content-ID");
+        // snake_case: separator becomes a dash and the next word is capitalized.
+        assert_eq!(camel_to_header_case("content_type"), "Content-Type");
+    }
+
+    #[test]
+    fn degenerate_underscores_do_not_mangle() {
+        // Regression: the `_` arm blindly uppercased+consumed the next char, so
+        // a following `_` was emitted literally and a trailing `_` left a
+        // dangling dash. A doubled/trailing underscore must produce a clean
+        // header name instead.
+        assert_eq!(camel_to_header_case("x__id"), "X-Id");
+        assert_eq!(camel_to_header_case("token_"), "Token");
+        // A `_` directly before an uppercase letter must not double the dash.
+        assert_eq!(camel_to_header_case("x_Id"), "X-Id");
+    }
+}
+
+#[cfg(test)]
 mod _maybe_json_tests {
     use super::*;
 
@@ -18837,6 +19019,15 @@ mod _bugfix_batch_tests {
         make_just(v)
     }
 
+    fn ctor(tag: &str, fields: &[(&str, *mut Value)]) -> *mut Value {
+        let payload = if fields.is_empty() {
+            alloc(Value::Unit)
+        } else {
+            rec(fields)
+        };
+        alloc(Value::Constructor(intern_str(tag), payload))
+    }
+
     // ── Fix: sql_partial_cmp must compare numeric texts numerically ──
 
     #[test]
@@ -18987,6 +19178,66 @@ mod _bugfix_batch_tests {
                 assert_eq!(cols, vec![("m".to_string(), ColType::Tag)]);
             }
             _ => panic!("expected Record schema"),
+        }
+    }
+
+    // ── Fix: the ADT branch of infer_temp_schema must also scan ALL rows ──
+    // per constructor (it used to inspect only the first row of each tag).
+
+    #[test]
+    fn temp_schema_adt_mixed_maybe_field_returns_none() {
+        // Same constructor tag: first row's Maybe field is `Nothing` (Tag),
+        // a later row carries a `Just` payload. Inspecting only the first row
+        // typed the column Tag and silently dropped the payload.
+        let rows = vec![
+            ctor("Wrap", &[("m", nothing())]),
+            ctor("Wrap", &[("m", just(int(5)))]),
+        ];
+        assert!(infer_temp_schema(&rows).is_none());
+        // Opposite order must bail too.
+        let rev = vec![
+            ctor("Wrap", &[("m", just(int(5)))]),
+            ctor("Wrap", &[("m", nothing())]),
+        ];
+        assert!(infer_temp_schema(&rev).is_none());
+    }
+
+    #[test]
+    fn temp_schema_adt_null_then_typed_field_returns_none() {
+        // A constructor field NULL in one row and Int in another (within the
+        // same constructor) used to be typed from the first row alone.
+        let rows = vec![
+            ctor("Wrap", &[("x", std::ptr::null_mut())]),
+            ctor("Wrap", &[("x", int(7))]),
+        ];
+        assert!(infer_temp_schema(&rows).is_none());
+    }
+
+    #[test]
+    fn temp_schema_adt_conflicting_shared_field_returns_none() {
+        // Two constructors share a field name but disagree on its type.
+        let rows = vec![
+            ctor("Paid", &[("amount", int(1))]),
+            ctor("Refund", &[("amount", text("x"))]),
+        ];
+        assert!(infer_temp_schema(&rows).is_none());
+    }
+
+    #[test]
+    fn temp_schema_adt_consistent_rows_still_infer() {
+        let rows = vec![
+            ctor("Circle", &[("radius", int(1))]),
+            ctor("Circle", &[("radius", int(2))]),
+            ctor("Rect", &[("w", int(3)), ("h", int(4))]),
+        ];
+        match infer_temp_schema(&rows) {
+            Some(TempSchema::Adt { constructors, all_fields }) => {
+                assert_eq!(constructors.len(), 2);
+                assert!(all_fields.contains(&("radius".to_string(), ColType::Int)));
+                assert!(all_fields.contains(&("w".to_string(), ColType::Int)));
+                assert!(all_fields.contains(&("h".to_string(), ColType::Int)));
+            }
+            _ => panic!("expected Adt schema"),
         }
     }
 

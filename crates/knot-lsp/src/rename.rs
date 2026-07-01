@@ -1413,11 +1413,26 @@ fn collect_field_rename_sites(
 /// Invoke `f(name, span)` for every record-field-name token in `decl`.
 fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::Decl, source: &str, f: &mut F) {
     match &decl.node {
-        DeclKind::Fun {
-            body: Some(body), ..
+        DeclKind::Fun { ty, body, .. } => {
+            // The type signature can carry record types whose field names must
+            // rename in lockstep with the body (`mkPerson : Text -> {name:
+            // Text}`); every other decl arm walks its type via
+            // `field_sites_in_type`, so the Fun arm must too — otherwise a
+            // field rename leaves the signature stale and corrupts the source.
+            // Signature-only decls (`body: None`) still need their `ty` walked.
+            if let Some(scheme) = ty {
+                field_sites_in_type(&scheme.ty, source, f);
+            }
+            if let Some(body) = body {
+                field_sites_in_expr(body, source, f);
+            }
         }
-        | DeclKind::View { body, .. }
-        | DeclKind::Derived { body, .. } => field_sites_in_expr(body, source, f),
+        DeclKind::View { ty, body, .. } | DeclKind::Derived { ty, body, .. } => {
+            if let Some(scheme) = ty {
+                field_sites_in_type(&scheme.ty, source, f);
+            }
+            field_sites_in_expr(body, source, f);
+        }
         DeclKind::Impl { items, .. } => {
             for item in items {
                 if let ast::ImplItem::Method { params, body, .. } = item {
@@ -1613,6 +1628,13 @@ fn field_sites_in_expr<F: FnMut(&str, Span)>(expr: &ast::Expr, source: &str, f: 
             for p in params {
                 field_sites_in_pat(p, source, f);
             }
+        }
+        ast::ExprKind::Annot { ty, .. } => {
+            // Inline type annotations (`(x : {name: Text})`) carry record field
+            // names that must rename alongside their value occurrences.
+            // `recurse_expr` descends only into the annotation's inner
+            // expression, never its type, so walk the type here.
+            field_sites_in_type(ty, source, f);
         }
         _ => {}
     }
@@ -2114,6 +2136,56 @@ mod tests {
         assert_eq!(edits.len(), 2, "one edit per record; got: {edits:?}");
         let new_src = apply_edits(&doc.source, edits);
         assert_eq!(new_src, "g = [{m: 1}, {m: 2}]\n");
+    }
+
+    #[test]
+    fn field_rename_updates_function_signature_type() {
+        // Regression: `field_sites_in_decl`'s Fun arm walked only the body and
+        // dropped the `ty` scheme, so renaming a record field left the
+        // signature's `{name: Text}` stale — a type mismatch that corrupts the
+        // source. The signature occurrence must rename in lockstep.
+        let mut ws = TestWorkspace::new();
+        let src = "mkPerson : Text -> {name: Text}\nmkPerson = \\n -> {name: n}\n";
+        let uri = ws.open("main", src);
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("name: n").expect("body field");
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "fullName"))
+            .expect("rename emits edit");
+        let edits = edit.changes.expect("changes").get(&uri).expect("edits").clone();
+        assert_eq!(
+            edits.len(),
+            2,
+            "both signature and body field tokens; got: {edits:?}"
+        );
+        let new_src = apply_edits(&doc.source, &edits);
+        assert_eq!(
+            new_src,
+            "mkPerson : Text -> {fullName: Text}\nmkPerson = \\n -> {fullName: n}\n"
+        );
+    }
+
+    #[test]
+    fn field_rename_updates_inline_annotation_type() {
+        // Regression: `field_sites_in_expr` had no `Annot` arm and
+        // `recurse_expr` descends only into an annotation's inner expression,
+        // never its type — so the field in `(r : {name: Text})` was never
+        // collected, leaving the annotation stale after a field rename.
+        let mut ws = TestWorkspace::new();
+        let src = "f = \\r -> (r : {name: Text})\ng = {name: 1}\n";
+        let uri = ws.open("main", src);
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("name: 1").expect("record field");
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "label"))
+            .expect("rename emits edit");
+        let edits = edit.changes.expect("changes").get(&uri).expect("edits").clone();
+        let new_src = apply_edits(&doc.source, &edits);
+        assert_eq!(
+            new_src,
+            "f = \\r -> (r : {label: Text})\ng = {label: 1}\n",
+            "annotation field must rename too; got edits: {edits:?}"
+        );
     }
 
     #[test]

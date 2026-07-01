@@ -53,9 +53,39 @@ pub(crate) fn handle_linked_editing_range(
         // editing entirely and defer to the proper rename, which handles puns.
         let mut pun_seen = false;
         match &decl.node {
-            DeclKind::Fun { body: Some(body), .. }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => {
+            DeclKind::Fun { ty, body, .. } => {
+                // The signature can carry record types whose field names must
+                // link in lockstep with the body (`mkPerson : Text -> {name:
+                // Text}`) — mirror `rename.rs::field_sites_in_decl`'s Fun arm,
+                // which walks both the `ty` scheme and the body. Without this a
+                // live-rename of a field desyncs the signature from the body.
+                if let Some(scheme) = ty {
+                    collect_type_field_name_spans(
+                        &scheme.ty,
+                        word,
+                        &doc.source,
+                        &mut linked_spans,
+                    );
+                }
+                if let Some(body) = body {
+                    collect_field_name_spans(
+                        body,
+                        word,
+                        &doc.source,
+                        &mut linked_spans,
+                        &mut pun_seen,
+                    );
+                }
+            }
+            DeclKind::View { ty, body, .. } | DeclKind::Derived { ty, body, .. } => {
+                if let Some(scheme) = ty {
+                    collect_type_field_name_spans(
+                        &scheme.ty,
+                        word,
+                        &doc.source,
+                        &mut linked_spans,
+                    );
+                }
                 collect_field_name_spans(body, word, &doc.source, &mut linked_spans, &mut pun_seen);
             }
             DeclKind::Impl { items, .. } => {
@@ -194,6 +224,14 @@ fn collect_field_name_spans(
                 }
             }
         }
+        ast::ExprKind::Annot { ty, .. } => {
+            // Inline type annotations (`(r : {name: Text})`) carry record
+            // field names that must link alongside their value occurrences.
+            // `recurse_expr` descends only into the annotation's inner
+            // expression, never its type — mirror `rename.rs`'s
+            // `field_sites_in_expr` Annot arm and walk the type here.
+            collect_type_field_name_spans(ty, field_name, source, ranges);
+        }
         _ => {}
     }
     // Recurse into all sub-expressions via the shared walker — the manual
@@ -202,6 +240,83 @@ fn collect_field_name_spans(
     recurse_expr(expr, |e| {
         collect_field_name_spans(e, field_name, source, ranges, pun_seen)
     });
+}
+
+/// Collect record-field-name token spans matching `field_name` inside a type
+/// AST (signature schemes and inline annotation types). Field names are bare
+/// strings without their own spans, so each is located in its syntactic
+/// field-name position — the slice between the previous field's value (or the
+/// record's opening token) and this field's value. Types have no puns, so a
+/// missed search is simply skipped (no `pun_seen`). Mirrors
+/// `rename.rs::field_sites_in_type`.
+fn collect_type_field_name_spans(
+    ty: &ast::Type,
+    field_name: &str,
+    source: &str,
+    ranges: &mut Vec<Span>,
+) {
+    match &ty.node {
+        ast::TypeKind::Record { fields, .. } => {
+            let mut search_start = ty.span.start;
+            for fld in fields {
+                if fld.name == field_name {
+                    if let Some(span) = find_word_in_source(
+                        source,
+                        field_name,
+                        search_start,
+                        fld.value.span.start,
+                    ) {
+                        ranges.push(span);
+                    }
+                }
+                collect_type_field_name_spans(&fld.value, field_name, source, ranges);
+                search_start = fld.value.span.end;
+            }
+        }
+        ast::TypeKind::Variant { constructors, .. } => {
+            let mut search_start = ty.span.start;
+            for ctor in constructors {
+                for fld in &ctor.fields {
+                    if fld.name == field_name {
+                        if let Some(span) = find_word_in_source(
+                            source,
+                            field_name,
+                            search_start,
+                            fld.value.span.start,
+                        ) {
+                            ranges.push(span);
+                        }
+                    }
+                    collect_type_field_name_spans(&fld.value, field_name, source, ranges);
+                    search_start = fld.value.span.end;
+                }
+            }
+        }
+        ast::TypeKind::Relation(inner) => {
+            collect_type_field_name_spans(inner, field_name, source, ranges)
+        }
+        ast::TypeKind::App { func, arg } => {
+            collect_type_field_name_spans(func, field_name, source, ranges);
+            collect_type_field_name_spans(arg, field_name, source, ranges);
+        }
+        ast::TypeKind::Function { param, result } => {
+            collect_type_field_name_spans(param, field_name, source, ranges);
+            collect_type_field_name_spans(result, field_name, source, ranges);
+        }
+        ast::TypeKind::Effectful { ty: inner, .. } | ast::TypeKind::IO { ty: inner, .. } => {
+            collect_type_field_name_spans(inner, field_name, source, ranges)
+        }
+        ast::TypeKind::UnitAnnotated { base, .. } => {
+            collect_type_field_name_spans(base, field_name, source, ranges)
+        }
+        ast::TypeKind::Refined { base, .. } => {
+            collect_type_field_name_spans(base, field_name, source, ranges)
+        }
+        ast::TypeKind::Forall { ty: inner, .. } => {
+            collect_type_field_name_spans(inner, field_name, source, ranges)
+        }
+        _ => {}
+    }
 }
 
 /// Collect record-field-name token spans matching `field_name` inside a

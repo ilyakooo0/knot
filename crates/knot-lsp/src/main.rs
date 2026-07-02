@@ -1091,20 +1091,44 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
         // *current* source, then move with each edit), and finally render
         // them back to LSP positions against the post-edit source.
         let cached_diags = state.published_lsp_diagnostics.get(&uri).cloned();
-        // Convert each diagnostic's `Range` (and any related-info ranges that
-        // happen to live in this same file) to byte offsets up front. After
-        // each edit the offsets are adjusted in place; ranges that overlap
-        // an edit are tagged with `usize::MAX` and dropped at the end.
-        let mut diag_byte_ranges: Option<Vec<(usize, usize)>> = cached_diags
-            .as_ref()
-            .map(|ds| {
-                ds.iter()
-                    .map(|d| (
-                        position_to_offset(&source, d.range.start),
-                        position_to_offset(&source, d.range.end),
-                    ))
-                    .collect()
-            });
+        // Convert each diagnostic's primary `Range` AND any `related_information`
+        // ranges that live in this same file (all related-info entries emitted
+        // by `diagnostics.rs` point at the diagnostic's own URI) to byte
+        // offsets up front. After each edit the offsets are adjusted in place;
+        // ranges that overlap an edit are tagged with `usize::MAX` and dropped
+        // at the end. Rebuilding the rebased `Diagnostic` rewrites both the
+        // primary range and the related-info locations, so "click to navigate"
+        // targets stay correct during the debounce window before the next full
+        // analysis.
+        let mut diag_byte_ranges: Option<Vec<(usize, usize, Vec<(usize, usize)>)>> =
+            cached_diags
+                .as_ref()
+                .map(|ds| {
+                    ds.iter()
+                        .map(|d| {
+                            let primary = (
+                                position_to_offset(&source, d.range.start),
+                                position_to_offset(&source, d.range.end),
+                            );
+                            let related = d
+                                .related_information
+                                .as_ref()
+                                .map(|ris| {
+                                    ris.iter()
+                                        .filter(|ri| ri.location.uri == uri)
+                                        .map(|ri| {
+                                            (
+                                                position_to_offset(&source, ri.location.range.start),
+                                                position_to_offset(&source, ri.location.range.end),
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            (primary.0, primary.1, related)
+                        })
+                        .collect()
+                });
 
         for change in params.content_changes {
             if let Some(range) = change.range {
@@ -1118,7 +1142,18 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
                 let (start, end) = if a <= b { (a, b) } else { (b, a) };
                 let new_len = change.text.len();
                 if let Some(diag_ranges) = diag_byte_ranges.as_mut() {
-                    shift_byte_ranges_for_edit(diag_ranges, start, end, new_len);
+                    for (ps, pe, related) in diag_ranges {
+                        // Shift the primary and all related-info ranges in one
+                        // pass so they move consistently with the edit.
+                        let mut all: Vec<(usize, usize)> =
+                            std::iter::once((*ps, *pe)).chain(related.iter().copied()).collect();
+                        shift_byte_ranges_for_edit(&mut all, start, end, new_len);
+                        *ps = all[0].0;
+                        *pe = all[0].1;
+                        for (i, r) in related.iter_mut().enumerate() {
+                            *r = all[i + 1];
+                        }
+                    }
                 }
                 source.replace_range(start..end, &change.text);
             } else {
@@ -1126,8 +1161,12 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
                 // Full replace invalidates every cached range — the document
                 // structure no longer relates to the prior analysis output.
                 if let Some(diag_ranges) = diag_byte_ranges.as_mut() {
-                    for r in diag_ranges {
-                        *r = (usize::MAX, usize::MAX);
+                    for (ps, pe, related) in diag_ranges {
+                        *ps = usize::MAX;
+                        *pe = usize::MAX;
+                        for r in related {
+                            *r = (usize::MAX, usize::MAX);
+                        }
                     }
                 }
             }
@@ -1140,15 +1179,50 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
             let rebased: Vec<lsp_types::Diagnostic> = cached
                 .iter()
                 .zip(byte_ranges.iter())
-                .filter_map(|(d, &(s, e))| {
-                    if s == usize::MAX || e > source.len() {
+                .filter_map(|(d, &(ps, pe, ref related))| {
+                    if ps == usize::MAX || pe > source.len() {
                         return None;
                     }
                     let mut shifted = d.clone();
                     shifted.range = lsp_types::Range {
-                        start: offset_to_position(&source, s),
-                        end: offset_to_position(&source, e),
+                        start: offset_to_position(&source, ps),
+                        end: offset_to_position(&source, pe),
                     };
+                    // Rebase related-info locations that live in this file.
+                    // Entries pointing at other URIs (none are emitted today,
+                    // but the guard keeps the rebase correct if that changes)
+                    // are preserved verbatim — their target file's positions
+                    // are unaffected by an edit in *this* file.
+                    if let Some(orig_related) = d.related_information.as_ref() {
+                        let mut ri_iter = orig_related.iter();
+                        let mut shifted_related: Vec<lsp_types::DiagnosticRelatedInformation> =
+                            Vec::with_capacity(orig_related.len());
+                        let mut rel_iter = related.iter();
+                        while let Some(ri) = ri_iter.next() {
+                            if ri.location.uri != uri {
+                                shifted_related.push(ri.clone());
+                            } else if let Some(&(rs, re)) = rel_iter.next() {
+                                if rs != usize::MAX && re <= source.len() {
+                                    shifted_related.push(lsp_types::DiagnosticRelatedInformation {
+                                        location: lsp_types::Location {
+                                            uri: uri.clone(),
+                                            range: lsp_types::Range {
+                                                start: offset_to_position(&source, rs),
+                                                end: offset_to_position(&source, re),
+                                            },
+                                        },
+                                        message: ri.message.clone(),
+                                    });
+                                }
+                                // else: overlapped an edit — drop this related entry.
+                            }
+                        }
+                        shifted.related_information = if shifted_related.is_empty() {
+                            None
+                        } else {
+                            Some(shifted_related)
+                        };
+                    }
                     Some(shifted)
                 })
                 .collect();

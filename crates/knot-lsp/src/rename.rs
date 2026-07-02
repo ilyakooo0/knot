@@ -584,6 +584,24 @@ fn scan_workspace_files(
 ) -> HashSet<PathBuf> {
     let mut scanned = HashSet::new();
     for (other_uri, other_doc) in &state.documents {
+        // Staleness guard for *other* open documents, mirroring the
+        // originating-file guard in `handle_rename`. When the editor holds
+        // newer text for `other_uri` than the last analyzed `other_doc.source`,
+        // every span we'd compute here indexes into the old bytes — applying
+        // those edits to the new buffer corrupts it. Skip this document and
+        // let the client retry once analysis catches up. It is still marked
+        // `scanned` below so the disk phase never recomputes its edits from
+        // on-disk bytes either.
+        if state
+            .pending_sources
+            .get(other_uri)
+            .is_some_and(|p| p.source != other_doc.source)
+        {
+            if let Some(p) = canonical_for_uri(other_uri) {
+                scanned.insert(p);
+            }
+            continue;
+        }
         let other_path = canonical_for_uri(other_uri);
         let is_owner = other_path.as_ref() == Some(&owner.canonical_path);
         // Span comparison must be containment-tolerant: when the rename

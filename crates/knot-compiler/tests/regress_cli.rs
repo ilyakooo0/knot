@@ -334,3 +334,69 @@ fn repeated_selective_imports_of_same_module_union() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Bool compile-time override: `--flag=True` must compile to `true`, not
+// `false`. Previously `emit_override_literal` matched only `"true" | "1"`,
+// so the capital-T form (the Knot language's native boolean literal and a
+// value the validation at codegen.rs:709 explicitly accepts) silently
+// compiled to `false`. `--flag=False` was correct only by coincidence.
+// ---------------------------------------------------------------------------
+
+const BOOL_OVERRIDE_SRC: &str = "\
+flag : Bool
+
+main = do
+  if flag then println \"ON\" else println \"off\"
+";
+
+fn build_and_run_bool_override(dir: &Path, flag_val: &str) -> String {
+    let src_path = dir.join("ovr.knot");
+    std::fs::write(&src_path, BOOL_OVERRIDE_SRC).unwrap();
+    let flag_arg = format!("--flag={flag_val}");
+    let out = knot_build(&["ovr.knot", &flag_arg, "-o", "ovr"], dir);
+    assert!(
+        out.status.success(),
+        "build failed for {}: {}",
+        flag_arg,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run = Command::new(dir.join("ovr"))
+        .current_dir(dir)
+        .output()
+        .expect("failed to run compiled program");
+    String::from_utf8_lossy(&run.stdout).to_string()
+}
+
+#[test]
+fn bool_override_capital_true_compiles_true() {
+    let dir = scratch_dir("bool_ovr_true");
+    let stdout = build_and_run_bool_override(&dir, "True");
+    assert!(
+        stdout.contains("ON") && !stdout.contains("off"),
+        "--flag=True should print ON, got: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bool_override_capital_false_compiles_false() {
+    let dir = scratch_dir("bool_ovr_false");
+    let stdout = build_and_run_bool_override(&dir, "False");
+    assert!(
+        stdout.contains("off") && !stdout.contains("ON"),
+        "--flag=False should print off, got: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bool_override_lowercase_true_still_works() {
+    let dir = scratch_dir("bool_ovr_lower");
+    let stdout = build_and_run_bool_override(&dir, "true");
+    assert!(
+        stdout.contains("ON"),
+        "--flag=true should print ON, got: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

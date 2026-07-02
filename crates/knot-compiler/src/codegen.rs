@@ -10129,7 +10129,7 @@ impl Codegen {
                 self.call_rt(builder, "knot_value_text_intern", &[ptr, len, slot])
             }
             "Bool" | "Maybe Bool" => {
-                let b = matches!(val_str, "true" | "1");
+                let b = matches!(val_str, "true" | "True" | "1");
                 let val = builder.ins().iconst(types::I32, b as i64);
                 self.call_rt(builder, "knot_value_bool", &[val])
             }

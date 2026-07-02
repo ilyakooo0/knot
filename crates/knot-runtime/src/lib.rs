@@ -4941,10 +4941,14 @@ pub extern "C-unwind" fn knot_record_from_pairs(data: *const usize, count: usize
         let name = intern_str(unsafe { str_from_raw(key_ptr, key_len) });
         fields.push(RecordField { name, value });
     }
-    debug_assert!(
-        fields.windows(2).all(|w| w[0].name <= w[1].name),
-        "knot_record_from_pairs: codegen emitted unsorted field pairs"
-    );
+    // Defensive sort: the field-lookup in `knot_record_field` uses binary
+    // search by name, which requires fields sorted by `name`. All current
+    // codegen call sites sort before calling this, but sorting here makes the
+    // invariant robust against future regressions instead of relying on a
+    // debug-only assertion. The previous version only `debug_assert!`ed
+    // sortedness, so a release-build caller emitting unsorted pairs would
+    // silently fail field lookups.
+    fields.sort_by(|a, b| a.name.cmp(&b.name));
     alloc(Value::Record(fields))
 }
 
@@ -9712,8 +9716,12 @@ fn json_to_value_impl(json: &serde_json::Value, wire: bool) -> *mut Value {
             // guard the `__knot_ctor` marker below already uses.
             if obj.len() == 1
                 && let Some(serde_json::Value::String(b64)) = obj.get("__knot_bytes") {
-                    let decoded = base64_decode(b64);
-                    if base64_encode(&decoded) == *b64 {
+                    // `base64_decode` now returns `None` on malformed input
+                    // (non-alphabet bytes, bad tail) instead of silently
+                    // dropping them; a `None` falls through to the record
+                    // path below, matching the existing round-trip rejection.
+                    if let Some(decoded) = base64_decode(b64)
+                        && base64_encode(&decoded) == *b64 {
                         return alloc(Value::Bytes(Arc::from(decoded)));
                     }
                 }
@@ -13444,23 +13452,7 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
 /// Return current time as milliseconds since Unix epoch.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_now() -> *mut Value {
-    let now = std::time::SystemTime::now();
-    let ms: i64 = if now >= std::time::UNIX_EPOCH {
-        now.duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .try_into()
-            .unwrap_or(0)
-    } else {
-        std::time::UNIX_EPOCH
-            .duration_since(now)
-            .unwrap_or_default()
-            .as_millis()
-            .try_into()
-            .map(|v: i64| -v)
-            .unwrap_or(0)
-    };
-    knot_value_int(ms)
+    knot_value_int(current_unix_ms())
 }
 
 /// Sleep for the given number of milliseconds.
@@ -13849,11 +13841,33 @@ fn build_request_ctx(
     alloc(Value::Record(fields))
 }
 
+/// Current time as milliseconds since Unix epoch, signed so pre-epoch
+/// clocks report a negative value (consistent with `knot_now`). The
+/// `as_millis` -> `i64` conversion is guarded with `try_into` to avoid a
+/// truncating `as i64` cast (the `u128` from `as_millis()` can exceed `i64`
+/// range only well past the year 292 million, but the explicit check keeps
+/// it safe and matches `knot_now`'s pattern).
 fn current_unix_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    let now = std::time::SystemTime::now();
+    if now >= std::time::UNIX_EPOCH {
+        now.duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(0)
+    } else {
+        // Pre-epoch: report the negative magnitude so the rate-limiter's
+        // `elapsed = (now - last_refill).max(0)` still advances as the clock
+        // moves forward. The previous `unwrap_or(0)` pinned `now` to 0,
+        // stranding tokens at their `last_refill` value forever.
+        std::time::UNIX_EPOCH
+            .duration_since(now)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .map(|v: i64| -v)
+            .unwrap_or(0)
+    }
 }
 
 /// Lazily ensure the `_knot_rate_limits` table exists. Cheap on subsequent
@@ -15197,7 +15211,14 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-fn base64_decode(s: &str) -> Vec<u8> {
+/// Decode a standard base64 string. Returns `None` on any malformed input —
+/// a byte outside the base64 alphabet (after stripping `=`, whitespace), or a
+/// leftover 6-bit tail that cannot form a full byte. The previous version
+/// silently dropped non-alphabet bytes via `filter_map`, which corrupted
+/// malformed input into a *different* valid value with no error; this makes
+/// the failure loud so callers (e.g. the JSON `__knot_bytes` path) can reject
+/// the input rather than silently producing the wrong Bytes.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
     fn char_to_val(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),
@@ -15208,16 +15229,20 @@ fn base64_decode(s: &str) -> Vec<u8> {
             _ => None,
         }
     }
-    let bytes: Vec<u8> = s.bytes()
-        .filter(|&b| b != b'=' && b != b'\n' && b != b'\r' && b != b' ' && b != b'\t')
-        .filter_map(char_to_val)
-        .collect();
+    let mut bytes: Vec<u8> = Vec::with_capacity(s.len());
+    for b in s.bytes() {
+        if b == b'=' || b == b'\n' || b == b'\r' || b == b' ' || b == b'\t' {
+            continue;
+        }
+        // Reject any non-alphabet byte instead of silently dropping it.
+        bytes.push(char_to_val(b)?);
+    }
     let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
     for chunk in bytes.chunks(4) {
         if chunk.len() < 2 {
             // A single base64 character is malformed (encodes only 6 bits,
-            // not enough for a full byte). Skip rather than silently losing data.
-            break;
+            // not enough for a full byte).
+            return None;
         }
         let b0 = chunk[0] as u32;
         let b1 = chunk[1] as u32;
@@ -15228,7 +15253,7 @@ fn base64_decode(s: &str) -> Vec<u8> {
         if chunk.len() > 2 { out.push(((triple >> 8) & 0xFF) as u8); }
         if chunk.len() > 3 { out.push((triple & 0xFF) as u8); }
     }
-    out
+    Some(out)
 }
 
 /// Wire JSON encoding: `Maybe` follows the standard JSON convention —
@@ -16931,7 +16956,7 @@ fn fetch_build_query(query_desc: &str, payload: *mut Value) -> String {
             Some(s) => s,
             None => continue,
         };
-        parts.push(format!("{}={}", name, percent_encode(&val_str)));
+        parts.push(format!("{}={}", percent_encode(&name), percent_encode(&val_str)));
     }
     parts.join("&")
 }
@@ -20051,5 +20076,50 @@ mod _fk_migration_listen_tests {
         // Just {value: null} < Just {value: 5} (Nothing < Just x)
         assert_eq!(compare_values(mk_just(-1), mk_just(5)), std::cmp::Ordering::Less);
         assert_eq!(compare_values(mk_just(5), mk_just(-1)), std::cmp::Ordering::Greater);
+    }
+}
+
+#[cfg(test)]
+mod _base64_regress {
+    use super::{base64_decode, base64_encode};
+
+    #[test]
+    fn roundtrips_arbitrary_bytes() {
+        for n in 0..=8 {
+            let data: Vec<u8> = (0..n).map(|i| (i * 7 + 3) as u8).collect();
+            let enc = base64_encode(&data);
+            assert_eq!(base64_decode(&enc), Some(data));
+        }
+    }
+
+    #[test]
+    fn roundtrips_with_padding() {
+        // 1-byte and 2-byte inputs produce `=` padding, which the decoder
+        // must strip while still returning the exact input.
+        assert_eq!(base64_decode(&base64_encode(&[0xAB])), Some(vec![0xAB]));
+        assert_eq!(
+            base64_decode(&base64_encode(&[0xAB, 0xCD])),
+            Some(vec![0xAB, 0xCD])
+        );
+    }
+
+    #[test]
+    fn rejects_non_alphabet_bytes_instead_of_silent_drop() {
+        // Previously, `$` and `!` were silently dropped by `filter_map`,
+        // decoding "aGVsbG8$" to "hello" with no error. Now the decoder
+        // rejects the whole input.
+        assert_eq!(base64_decode("aGVsbG8$"), None);
+        assert_eq!(base64_decode("aGVsbG8!"), None);
+    }
+
+    #[test]
+    fn rejects_truncated_tail() {
+        // A single leftover base64 char encodes only 6 bits — malformed.
+        assert_eq!(base64_decode("a"), None);
+    }
+
+    #[test]
+    fn ignores_whitespace_and_padding() {
+        assert_eq!(base64_decode("aGVs bG8="), base64_decode("aGVsbG8="));
     }
 }

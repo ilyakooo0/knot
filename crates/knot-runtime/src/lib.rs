@@ -14633,68 +14633,76 @@ pub extern "C-unwind" fn knot_view_write(
         .execute_batch("SAVEPOINT knot_view_write;")
         .expect("knot runtime: view_write begin failed");
 
-    // 1. Delete rows matching the view's constant filter.
-    //    For sources with nested relations, delete child rows first to avoid orphans.
-    if !rec_schema.nested.is_empty() {
-        // Collect _ids of parent rows about to be deleted
-        let select_sql = if filter_where.is_empty() {
-            format!("SELECT _id FROM {};", table)
+    // Run the delete+insert inside a rollback guard so a panic (e.g. a
+    // subset/uniqueness constraint RAISE(ABORT) or a missing field in
+    // `write_record_rows`) rolls the savepoint back before resuming the
+    // unwind, instead of leaking a dangling savepoint on a connection that a
+    // `catch_unwind` recovery site (HTTP worker 500s, race-loser cancellation,
+    // atomic retry) will keep reusing. Mirrors `knot_source_write`/`replace`.
+    with_savepoint_rollback(db_ref, "knot_view_write", || {
+        // 1. Delete rows matching the view's constant filter.
+        //    For sources with nested relations, delete child rows first to avoid orphans.
+        if !rec_schema.nested.is_empty() {
+            // Collect _ids of parent rows about to be deleted
+            let select_sql = if filter_where.is_empty() {
+                format!("SELECT _id FROM {};", table)
+            } else {
+                format!("SELECT _id FROM {} WHERE {};", table, filter_where)
+            };
+            let sql_params: Vec<rusqlite::types::Value> = filter_values
+                .iter()
+                .map(|v| value_to_sql_param(*v))
+                .collect();
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> = sql_params
+                .iter()
+                .map(|p| p as &dyn rusqlite::types::ToSql)
+                .collect();
+            let mut stmt = db_ref.conn.prepare(&select_sql).expect("knot runtime: view_write select _id failed");
+            let ids: Vec<i64> = stmt
+                .query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))
+                .expect("knot runtime: view_write query _id failed")
+                .filter_map(|r| r.ok())
+                .collect();
+            drop(stmt);
+
+            // Delete child rows for each parent _id
+            for nf in &rec_schema.nested {
+                let child_table = format!("{}__{}", table_name, nf.name);
+                for &parent_id in &ids {
+                    delete_child_rows_for_parent(&db_ref.conn, &child_table, parent_id, nf);
+                }
+            }
+        }
+
+        let delete_sql = if filter_where.is_empty() {
+            format!("DELETE FROM {};", table)
         } else {
-            format!("SELECT _id FROM {} WHERE {};", table, filter_where)
+            format!("DELETE FROM {} WHERE {};", table, filter_where)
         };
         let sql_params: Vec<rusqlite::types::Value> = filter_values
             .iter()
             .map(|v| value_to_sql_param(*v))
             .collect();
+        debug_sql_params(&delete_sql, &sql_params);
         let param_refs: Vec<&dyn rusqlite::types::ToSql> = sql_params
             .iter()
             .map(|p| p as &dyn rusqlite::types::ToSql)
             .collect();
-        let mut stmt = db_ref.conn.prepare(&select_sql).expect("knot runtime: view_write select _id failed");
-        let ids: Vec<i64> = stmt
-            .query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))
-            .expect("knot runtime: view_write query _id failed")
-            .filter_map(|r| r.ok())
-            .collect();
-        drop(stmt);
+        db_ref
+            .conn
+            .execute(&delete_sql, param_refs.as_slice())
+            .unwrap_or_else(|e| {
+                panic!(
+                    "knot runtime: view_write delete error: {}\n  SQL: {}",
+                    e, delete_sql
+                )
+            });
 
-        // Delete child rows for each parent _id
-        for nf in &rec_schema.nested {
-            let child_table = format!("{}__{}", table_name, nf.name);
-            for &parent_id in &ids {
-                delete_child_rows_for_parent(&db_ref.conn, &child_table, parent_id, nf);
-            }
+        // 2. Insert new rows (including child tables for nested relations)
+        if !rows.is_empty() {
+            write_record_rows(&db_ref.conn, &table_name, &rec_schema, rows);
         }
-    }
-
-    let delete_sql = if filter_where.is_empty() {
-        format!("DELETE FROM {};", table)
-    } else {
-        format!("DELETE FROM {} WHERE {};", table, filter_where)
-    };
-    let sql_params: Vec<rusqlite::types::Value> = filter_values
-        .iter()
-        .map(|v| value_to_sql_param(*v))
-        .collect();
-    debug_sql_params(&delete_sql, &sql_params);
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = sql_params
-        .iter()
-        .map(|p| p as &dyn rusqlite::types::ToSql)
-        .collect();
-    db_ref
-        .conn
-        .execute(&delete_sql, param_refs.as_slice())
-        .unwrap_or_else(|e| {
-            panic!(
-                "knot runtime: view_write delete error: {}\n  SQL: {}",
-                e, delete_sql
-            )
-        });
-
-    // 2. Insert new rows (including child tables for nested relations)
-    if !rows.is_empty() {
-        write_record_rows(&db_ref.conn, &table_name, &rec_schema, rows);
-    }
+    });
 
     db_ref
         .conn
@@ -15110,7 +15118,13 @@ fn hex_val(b: u8) -> Option<u8> {
 fn try_string_to_value(s: &str, ty: &str) -> Option<*mut Value> {
     match ty {
         "int" => s.parse::<i64>().ok().map(alloc_int),
-        "float" => s.parse::<f64>().ok().map(alloc_float),
+        // Reject non-finite floats: `f64::from_str` accepts "nan"/"inf"/
+        // "infinity" (case-insensitive) and overflows "1e400" to ±inf. These
+        // are malformed for a typed wire input — a handler that gets NaN
+        // silently empties every ordered comparison, and storing NaN to a
+        // SQLite REAL column collapses it to NULL. Match the int arm's
+        // strictness and reply 400 / return `Err` instead of coercing.
+        "float" => s.parse::<f64>().ok().filter(|f| f.is_finite()).map(alloc_float),
         "bool" => match s {
             "true" | "True" | "1" => Some(alloc_bool(true)),
             "false" | "False" | "0" => Some(alloc_bool(false)),

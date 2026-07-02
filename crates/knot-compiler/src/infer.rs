@@ -1239,7 +1239,18 @@ impl Infer {
                     }
                 };
             }
-        match (pat, &actual) {
+        // Normalize alias wrappers exactly as unification does (see
+        // `unify_dir`): a nominal `data` alias (a single-variant record data
+        // type that is also registered as a record alias) keeps its identity
+        // and matches by name as `Con(name)`; a pure `type` alias is
+        // transparent and peels to its body. `apply` preserves `Ty::Alias`
+        // wrappers, so without this an impl head (or head argument) that is a
+        // `Ty::Alias` — which `ast_type_to_ty` produces for both single-variant
+        // record data types and transparent aliases — could never match, and
+        // the associated-type projection would stay rigid.
+        let pat = self.peel_match_alias(pat);
+        let actual = self.peel_match_alias(&actual);
+        match (&pat, &actual) {
             (Ty::Var(a), Ty::Var(b)) => a == b,
             (Ty::Int, Ty::Int)
             | (Ty::Float, Ty::Float)
@@ -1271,6 +1282,23 @@ impl Infer {
                 pn == an && self.match_pattern(pa, aa, pattern_vars, binding)
             }
             _ => false,
+        }
+    }
+
+    /// Peel `Ty::Alias` wrappers for impl-head pattern matching, mirroring
+    /// `unify_dir`: a nominal `data` alias (single-variant record data type)
+    /// collapses to `Con(name)` so it matches by identity, while a pure `type`
+    /// alias is transparent and peels to its body.
+    fn peel_match_alias(&self, t: &Ty) -> Ty {
+        match t {
+            Ty::Alias(name, inner) => {
+                if self.data_types.contains_key(name) {
+                    Ty::Con(name.clone(), vec![])
+                } else {
+                    self.peel_match_alias(inner)
+                }
+            }
+            _ => t.clone(),
         }
     }
 

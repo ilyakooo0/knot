@@ -182,6 +182,43 @@ pub(crate) fn handle_code_action(
                 })
                 .collect();
 
+            // The parser emits a defaulted trait method as TWO items: the
+            // signature (`default_body: None`) and the body (`default_body:
+            // Some`). The signature survives the `default_body: None` filter
+            // above, so collect the names that ALSO carry a default body and
+            // exclude them — an impl may legally omit a defaulted method, and
+            // stubbing it with `= todo` would override a working default with
+            // the undefined identifier `todo`.
+            let defaulted_method_names: HashSet<&str> = doc
+                .module
+                .decls
+                .iter()
+                .filter_map(|d| {
+                    if let DeclKind::Trait {
+                        name,
+                        items: trait_items,
+                        ..
+                    } = &d.node
+                        && name == trait_name {
+                            return Some(trait_items);
+                        }
+                    None
+                })
+                .flatten()
+                .filter_map(|item| {
+                    if let ast::TraitItem::Method {
+                        name,
+                        default_body: Some(_),
+                        ..
+                    } = item
+                    {
+                        Some(name.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
             let impl_methods: HashSet<&str> = items
                 .iter()
                 .filter_map(|item| {
@@ -198,6 +235,7 @@ pub(crate) fn handle_code_action(
                 .filter(|item| {
                     if let ast::TraitItem::Method { name, .. } = item {
                         !impl_methods.contains(name.as_str())
+                            && !defaulted_method_names.contains(name.as_str())
                     } else {
                         false
                     }
@@ -1670,11 +1708,19 @@ fn collect_referenced_names(module: &Module) -> HashSet<String> {
             DeclKind::TypeAlias { ty, .. } => {
                 collect_names_in_type(ty, &mut names);
             }
-            DeclKind::Data { constructors, .. } => {
+            DeclKind::Data { constructors, deriving, .. } => {
                 for ctor in constructors {
                     for f in &ctor.fields {
                         collect_names_in_type(&f.value, &mut names);
                     }
+                }
+                // `deriving (Trait, …)` references each trait — an import used
+                // only there (e.g. `import ./describe (Describe)` with
+                // `data Color = … deriving (Describe)`) must count as used, or
+                // organize/remove-unused-imports would delete it and leave the
+                // `deriving` clause referencing an undefined trait.
+                for trait_name in deriving {
+                    names.insert(trait_name.clone());
                 }
             }
             DeclKind::Trait {

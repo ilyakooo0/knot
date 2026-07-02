@@ -6032,6 +6032,12 @@ impl Codegen {
                                                 .unwrap_or_default();
                                             if let Some(rewritten) =
                                                 rewrite_body_through_projection(&plan, &bind_var, body)
+                                                // Same ORDER BY guards as every other sortBy path:
+                                                // no Int CASE (KNOT_INT collation is lost through CASE)
+                                                // and no Float key (SQLite conflates -0.0/+0.0 and sorts
+                                                // NaN as NULL, diverging from in-memory total_cmp) —
+                                                // fall back to in-memory otherwise.
+                                                && sortby_projection_pushable(&bind_var, &rewritten, &schema)
                                                 && let Some(col_sql) = extract_sql_field_access(
                                                     &bind_var, &rewritten, &alias, &schema,
                                                 ) {
@@ -11563,15 +11569,34 @@ impl Codegen {
                                 if !self.elem_pushdown_ok.contains(&arg.span) {
                                     return None;
                                 }
+                                // An arithmetic needle (e.g. `x.a + x.b`)
+                                // evaluates to an INTEGER in SQLite, but Int list
+                                // elements bind as TEXT, so a raw `8 IN ('10','20')`
+                                // is a storage-class mismatch that never matches.
+                                // Cast both the needle and every element to
+                                // NUMERIC (mirrors the comparison path's CastInt
+                                // handling). A bare-column needle keeps its TEXT
+                                // affinity/collation, so only arithmetic needs it.
+                                let needle_arith =
+                                    cast_arithmetic_for_where(&needle.sql) != needle.sql;
                                 let mut parts = Vec::with_capacity(elems.len());
                                 let mut params = needle.params;
                                 for e in elems {
                                     let frag = Self::try_compile_single_table_atom(bind_var, e)?;
-                                    parts.push(frag.sql);
+                                    parts.push(if needle_arith {
+                                        format!("CAST({} AS NUMERIC)", frag.sql)
+                                    } else {
+                                        frag.sql
+                                    });
                                     params.extend(frag.params);
                                 }
+                                let needle_sql = if needle_arith {
+                                    format!("CAST({} AS NUMERIC)", needle.sql)
+                                } else {
+                                    needle.sql
+                                };
                                 return Some(SqlFragment {
-                                    sql: format!("{} IN ({})", needle.sql, parts.join(", ")),
+                                    sql: format!("{} IN ({})", needle_sql, parts.join(", ")),
                                     params,
                                 });
                             }

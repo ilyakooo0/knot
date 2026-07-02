@@ -39,7 +39,22 @@ pub(crate) fn is_declaration_token(source: &str, usage: knot::ast::Span) -> bool
     let start = usage.start.min(source.len());
     let line_start = source[..start].rfind('\n').map_or(0, |i| i + 1);
     let prefix = &source[line_start..start];
-    prefix.is_empty() || prefix == "*" || prefix == "&"
+    if !(prefix.is_empty() || prefix == "*" || prefix == "&") {
+        return false;
+    }
+    // A genuine top-level declaration name is followed (after optional
+    // whitespace) by its separator — `:` for a type signature / source, `=`
+    // for a definition / view / derived. A subset-constraint LHS puts a
+    // *relation reference* at the same column-0-after-sigil position
+    // (`*people <= *people.email`, or `*people.email <= …`), but is followed
+    // by `<=` (or a `.field` access first), so without this suffix check it
+    // would be misclassified as a declaration and silently dropped from
+    // Find-References / document-highlight results.
+    let end = usage.end.min(source.len());
+    matches!(
+        source[end..].trim_start().as_bytes().first(),
+        Some(b':') | Some(b'=')
+    )
 }
 
 // ── Find References ─────────────────────────────────────────────────
@@ -477,6 +492,32 @@ main = println (show (double 3))
             with_decl.len(),
             2,
             "declaration + one usage expected; got: {with_decl:?}"
+        );
+    }
+
+    #[test]
+    fn references_includes_subset_constraint_lhs_relation() {
+        // Regression: a subset-constraint LHS relation (`*people <= …`) sits at
+        // column 0 right after the `*` sigil — the same shape as a declaration
+        // name token — but it is a genuine reference. `is_declaration_token`
+        // used to filter it out, silently dropping it from Find-References.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            "*people : [{name: Text, email: Text}]\n*people <= *people.email\nmain = do\n  p <- *people\n  println p.name\n",
+        );
+        let doc = ws.doc(&uri);
+        let pos = offset_to_position(&doc.source, doc.source.find("*people :").unwrap() + 1);
+        let locs = handle_references(&ws.state, &ref_params(&uri, pos, false))
+            .expect("references found");
+        // The LHS `people` token starts one byte past the constraint line's `*`.
+        let lhs_off = doc.source.find("*people <=").unwrap() + 1;
+        let has_lhs = locs
+            .iter()
+            .any(|l| crate::utils::position_to_offset(&doc.source, l.range.start) == lhs_off);
+        assert!(
+            has_lhs,
+            "subset-constraint LHS reference at offset {lhs_off} missing; got: {locs:?}"
         );
     }
 

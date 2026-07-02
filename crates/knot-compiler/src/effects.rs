@@ -234,7 +234,14 @@ struct EffectChecker {
     /// lambda-bound) function names to the effects of their bodies. Lets the
     /// checker see effects of calls through local bindings, e.g.
     /// `do { let f = \u -> *items; rows <- f {} }` reads `items`.
-    local_fn_effects: Vec<HashMap<String, EffectSet>>,
+    ///
+    /// The `bool` flags an *opaque mask*: an entry inserted only to shadow an
+    /// outer effectful binding of the same name (a lambda/case parameter or a
+    /// `<-` bind), whose body is NOT an analyzable local function. Effect
+    /// lookups treat masks as pure (their real effects, if any, flow in at the
+    /// call site), but `body_may_call_opaque` must NOT count them as "known"
+    /// functions — a call through such a name is still an opaque call.
+    local_fn_effects: Vec<HashMap<String, (EffectSet, bool)>>,
     /// Bodies of user declarations, for the conservative atomic-gate scan
     /// that looks for IO-performing lambdas reachable through opaque
     /// callees (e.g. a lambda stored in a record field of another decl).
@@ -622,6 +629,41 @@ impl EffectChecker {
         }
     }
 
+    /// Push a set of lambda/case/comprehension binders as shadows AND as
+    /// masking entries in `local_fn_effects` (mapped to no effects), then
+    /// return the previous `shadowed` length for later truncation. Masking is
+    /// essential: without it, an inner binder that shadows an outer let-bound
+    /// *effectful* name (e.g. `let log = \_ -> println "x"` then `\log -> log`)
+    /// would resolve the inner opaque reference to the outer binding's latent
+    /// effects via the `local_fn_effects` scope lookup — an over-approximation
+    /// that spuriously trips the atomic gate / annotation checks. A shadowing
+    /// binder is opaque here; its real effects (if any) flow in at the call
+    /// site through `head_call_effects`' scope map, not this lookup.
+    fn push_masking_binders<'p>(
+        &mut self,
+        pats: impl IntoIterator<Item = &'p ast::Pat>,
+    ) -> usize {
+        let mark = self.shadowed.len();
+        let mut names: Vec<String> = Vec::new();
+        for p in pats {
+            collect_pat_binders(p, &mut names);
+        }
+        let mut frame = HashMap::new();
+        for n in &names {
+            frame.insert(n.clone(), (EffectSet::empty(), true));
+        }
+        self.shadowed.extend(names);
+        self.local_fn_effects.push(frame);
+        mark
+    }
+
+    /// Undo a `push_masking_binders`: pop the masking frame and truncate the
+    /// shadow stack back to `mark`.
+    fn pop_masking_binders(&mut self, mark: usize) {
+        self.local_fn_effects.pop();
+        self.shadowed.truncate(mark);
+    }
+
     /// Infer effects of evaluating an expression.
     fn infer_effects(&mut self, expr: &ast::Expr) -> EffectSet {
         match &expr.node {
@@ -651,7 +693,7 @@ impl EffectChecker {
                 // scope lookup — without it, effects laundered through a
                 // local name bypassed the atomic gate.
                 for scope in self.local_fn_effects.iter().rev() {
-                    if let Some(effects) = scope.get(name) {
+                    if let Some((effects, _opaque)) = scope.get(name) {
                         return effects.clone();
                     }
                 }
@@ -1000,7 +1042,7 @@ impl EffectChecker {
                             self.local_fn_effects
                                 .last_mut()
                                 .unwrap()
-                                .insert(name.clone(), latent);
+                                .insert(name.clone(), (latent, false));
                         }
                     }
                     let stmt_effects = self.infer_stmt_effects(stmt);
@@ -1010,6 +1052,19 @@ impl EffectChecker {
                     | ast::StmtKind::Let { pat, .. } = &stmt.node
                     {
                         collect_pat_binders(pat, &mut self.shadowed);
+                    }
+                    // A `<-` bind rebinds its name to (opaque) relation rows, not
+                    // an effectful action. Mask any same/outer-scope effect entry
+                    // for that name so a later reference doesn't launder those
+                    // effects. (`let` names deliberately keep their latent-effect
+                    // entry registered above, so they are excluded here.)
+                    if let ast::StmtKind::Bind { pat, .. } = &stmt.node {
+                        let mut bind_names: Vec<String> = Vec::new();
+                        collect_pat_binders(pat, &mut bind_names);
+                        let frame = self.local_fn_effects.last_mut().unwrap();
+                        for n in bind_names {
+                            frame.insert(n, (EffectSet::empty(), true));
+                        }
                     }
                 }
                 self.shadowed.truncate(shadow_mark);
@@ -1031,10 +1086,9 @@ impl EffectChecker {
             ast::ExprKind::Case { scrutinee, arms } => {
                 let mut effects = self.infer_effects(scrutinee);
                 for arm in arms {
-                    let mark = self.shadowed.len();
-                    collect_pat_binders(&arm.pat, &mut self.shadowed);
+                    let mark = self.push_masking_binders(std::iter::once(&arm.pat));
                     let arm_effects = self.infer_effects(&arm.body);
-                    self.shadowed.truncate(mark);
+                    self.pop_masking_binders(mark);
                     effects = effects.union(&arm_effects);
                 }
                 effects
@@ -1212,7 +1266,12 @@ impl EffectChecker {
                         || self
                             .local_fn_effects
                             .iter()
-                            .any(|scope| scope.contains_key(name));
+                            .any(|scope| {
+                                // Only a REAL analyzable local binding counts as
+                                // "known"; an opaque shadowing mask does not — a
+                                // call through it is still an opaque call.
+                                scope.get(name).is_some_and(|(_, opaque)| !opaque)
+                            });
                     if !known {
                         found = true;
                     } else if self.decl_bodies.contains_key(name)
@@ -1349,7 +1408,7 @@ impl EffectChecker {
                     }
                 }
                 for scope in self.local_fn_effects.iter().rev() {
-                    if let Some(effects) = scope.get(name) {
+                    if let Some((effects, _opaque)) = scope.get(name) {
                         return effects.clone();
                     }
                 }
@@ -1364,12 +1423,9 @@ impl EffectChecker {
 
             ast::ExprKind::Lambda { params, body } => {
                 // Immediately-applied lambda: effects are the body's effects
-                let mark = self.shadowed.len();
-                for p in params {
-                    collect_pat_binders(p, &mut self.shadowed);
-                }
+                let mark = self.push_masking_binders(params.iter());
                 let effects = self.infer_effects(body);
-                self.shadowed.truncate(mark);
+                self.pop_masking_binders(mark);
                 effects
             }
 
@@ -1395,10 +1451,9 @@ impl EffectChecker {
                 // Callee is a case: effects are the union of each arm's callable effects
                 let mut effects = self.infer_effects(scrutinee);
                 for arm in arms {
-                    let mark = self.shadowed.len();
-                    collect_pat_binders(&arm.pat, &mut self.shadowed);
+                    let mark = self.push_masking_binders(std::iter::once(&arm.pat));
                     let arm_effects = self.callee_effects(&arm.body);
-                    self.shadowed.truncate(mark);
+                    self.pop_masking_binders(mark);
                     effects = effects.union(&arm_effects);
                 }
                 effects
@@ -1433,14 +1488,23 @@ impl EffectChecker {
                     if let ast::PatKind::Var(name) = &param.node {
                         if is_lambda_arg(arg) {
                             let fn_effects = self.fun_body_effects(arg);
-                            scope.insert(name.clone(), fn_effects);
+                            scope.insert(name.clone(), (fn_effects, false));
                         }
                     }
                 }
                 let mark = self.shadowed.len();
+                let mut binders: Vec<String> = Vec::new();
                 for p in params {
-                    collect_pat_binders(p, &mut self.shadowed);
+                    collect_pat_binders(p, &mut binders);
                 }
+                // Any binder not given a concrete callback effect above is an
+                // opaque local; mask it (→ no effects) so a reference inside
+                // the body isn't laundered to an outer let-bound name of the
+                // same identifier via the scope lookup.
+                for n in &binders {
+                    scope.entry(n.clone()).or_insert_with(|| (EffectSet::empty(), true));
+                }
+                self.shadowed.extend(binders);
                 self.local_fn_effects.push(scope);
                 let effects = self.infer_effects(body);
                 self.local_fn_effects.pop();
@@ -1460,12 +1524,9 @@ impl EffectChecker {
     fn fun_body_effects(&mut self, body: &ast::Expr) -> EffectSet {
         match &body.node {
             ast::ExprKind::Lambda { body: inner, params } => {
-                let mark = self.shadowed.len();
-                for p in params {
-                    collect_pat_binders(p, &mut self.shadowed);
-                }
+                let mark = self.push_masking_binders(params.iter());
                 let effects = self.fun_body_effects(inner);
-                self.shadowed.truncate(mark);
+                self.pop_masking_binders(mark);
                 effects
             }
             // Wrapper expressions: unwrap to find the lambda chain inside.

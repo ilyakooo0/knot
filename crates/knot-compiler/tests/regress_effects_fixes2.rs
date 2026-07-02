@@ -271,6 +271,28 @@ main = do
 }
 
 #[test]
+fn inner_binder_shadowing_let_effectful_name_is_not_laundered() {
+    // `log` is a let-bound console lambda. The inner `\log -> log` shadows it
+    // with an opaque parameter of the same name; a reference to that parameter
+    // must NOT resolve to the outer binding's `{console}` effect (which would
+    // spuriously trip the IO-in-atomic gate). The atomic body only writes.
+    let diags = effect_diags(
+        r#"*items : [{n: Int}]
+
+apply = \g x -> g x
+
+main = do
+  atomic (do
+    let log = \u -> println "hi"
+    _ <- apply (\log -> log) (*items)
+    replace *items = [])
+  yield {}
+"#,
+    );
+    assert_no_error(&diags, "IO effects are not allowed inside atomic blocks");
+}
+
+#[test]
 fn provably_relation_free_atomic_still_rejected() {
     let diags = effect_diags(
         r#"main = do

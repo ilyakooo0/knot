@@ -86,6 +86,20 @@ pub(crate) fn handle_completion(
 
     let mut items = Vec::new();
 
+    // `*` and `&` are trigger characters but also binary operators (`a * b`,
+    // `a && b`). Treat them as source/derived-ref prefixes only in *atom*
+    // position — not immediately preceded by an expression-ending byte
+    // (identifier char, digit, closing bracket, string quote) or, for `&`,
+    // another `&` (the `&&` operator). This mirrors the parser's adjacency
+    // rule and stops `x && ` / `a * ` from collapsing the completion popup.
+    let trigger_is_operator = offset
+        .checked_sub(2)
+        .and_then(|i| latest_source.as_bytes().get(i))
+        .copied()
+        .is_some_and(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b')' | b']' | b'}' | b'"' | b'&')
+        });
+
     // Context-aware: after `*` only suggest source/view names
     if trigger_char == Some(b'*') {
         // No relation completion inside strings or comments — the trigger
@@ -93,18 +107,22 @@ pub(crate) fn handle_completion(
         if inside_string_or_comment(latest_source, offset.saturating_sub(1)) {
             return None;
         }
-        for decl in &doc.module.decls {
-            if let DeclKind::Source { name, .. } | DeclKind::View { name, .. } = &decl.node {
-                let detail = doc.type_info.get(name.as_str()).cloned();
-                items.push(CompletionItem {
-                    label: name.clone(),
-                    kind: Some(CompletionItemKind::VARIABLE),
-                    detail,
-                    ..Default::default()
-                });
+        // Only a `*` in atom position is a source-ref prefix; a `*` used as
+        // multiplication falls through to general completion (see above).
+        if !trigger_is_operator {
+            for decl in &doc.module.decls {
+                if let DeclKind::Source { name, .. } | DeclKind::View { name, .. } = &decl.node {
+                    let detail = doc.type_info.get(name.as_str()).cloned();
+                    items.push(CompletionItem {
+                        label: name.clone(),
+                        kind: Some(CompletionItemKind::VARIABLE),
+                        detail,
+                        ..Default::default()
+                    });
+                }
             }
+            return Some(CompletionResponse::Array(items));
         }
-        return Some(CompletionResponse::Array(items));
     }
 
     // Context-aware: after `&` only suggest derived names
@@ -112,18 +130,22 @@ pub(crate) fn handle_completion(
         if inside_string_or_comment(latest_source, offset.saturating_sub(1)) {
             return None;
         }
-        for decl in &doc.module.decls {
-            if let DeclKind::Derived { name, .. } = &decl.node {
-                let detail = doc.type_info.get(name.as_str()).cloned();
-                items.push(CompletionItem {
-                    label: name.clone(),
-                    kind: Some(CompletionItemKind::VARIABLE),
-                    detail,
-                    ..Default::default()
-                });
+        // `&&` (or `&` after an expression) is the boolean operator, not a
+        // derived-ref prefix — fall through to general completion.
+        if !trigger_is_operator {
+            for decl in &doc.module.decls {
+                if let DeclKind::Derived { name, .. } = &decl.node {
+                    let detail = doc.type_info.get(name.as_str()).cloned();
+                    items.push(CompletionItem {
+                        label: name.clone(),
+                        kind: Some(CompletionItemKind::VARIABLE),
+                        detail,
+                        ..Default::default()
+                    });
+                }
             }
+            return Some(CompletionResponse::Array(items));
         }
-        return Some(CompletionResponse::Array(items));
     }
 
     // Context-aware: after `/` in an import line, suggest file paths
@@ -2214,6 +2236,54 @@ get = \_ -> *
         let labels = item_labels(resp);
         assert!(labels.contains(&"people".to_string()), "labels: {labels:?}");
         assert!(labels.contains(&"pets".to_string()), "labels: {labels:?}");
+    }
+
+    #[test]
+    fn completion_after_double_amp_operator_does_not_collapse() {
+        // Typing the second `&` of `&&` fires a `&` trigger, but the popup
+        // must NOT collapse to derived-relation names only — `flag` (a param)
+        // should still be offered.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            r#"&active = []
+check = \flag -> flag &&
+"#,
+        );
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("flag &&").expect("trigger") + "flag &&".len();
+        let pos = offset_to_position(&doc.source, off);
+        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, Some("&")))
+            .expect("completion returns");
+        let labels = item_labels(resp);
+        // Falls through to general completion instead of collapsing to the
+        // derived-only list: general items like builtins are present, and the
+        // set is not just the single derived name `active`.
+        assert!(labels.contains(&"count".to_string()), "labels: {labels:?}");
+        assert!(labels.len() > 1, "should not collapse to one item: {labels:?}");
+    }
+
+    #[test]
+    fn completion_after_mul_operator_does_not_collapse() {
+        // `n *` (mul, `*` adjacent to nothing but preceded by an expression):
+        // the `n*` form must fall through, not force source-name completion.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            r#"*people : [{n: Int}]
+calc = \n -> n*
+"#,
+        );
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("n*").expect("trigger") + "n*".len();
+        let pos = offset_to_position(&doc.source, off);
+        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, Some("*")))
+            .expect("completion returns");
+        // Falls through to general completion rather than the source-only list:
+        // general items are present (a `*` in operator position is not a
+        // source-ref prefix).
+        let labels = item_labels(resp);
+        assert!(labels.contains(&"count".to_string()), "labels: {labels:?}");
     }
 
     #[test]

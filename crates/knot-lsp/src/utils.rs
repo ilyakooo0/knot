@@ -59,9 +59,17 @@ pub fn position_to_offset(source: &str, pos: Position) -> usize {
     let mut offset = 0;
     for (i, line) in source.split('\n').enumerate() {
         if i == pos.line as usize {
-            // Strip trailing \r so CRLF line endings don't contribute a phantom
-            // UTF-16 column. The LSP spec says the line break is one character.
-            let line = line.strip_suffix('\r').unwrap_or(line);
+            // Strip a trailing \r only when it is the \r of a real CRLF line
+            // break — i.e. this segment is followed by a \n. On the final
+            // segment (no following \n) a trailing \r is a stray character and
+            // must count as a column, matching `offset_to_position`; stripping
+            // it there desynchronizes the round-trip by one byte.
+            let is_last_segment = offset + line.len() == source.len();
+            let line = if is_last_segment {
+                line
+            } else {
+                line.strip_suffix('\r').unwrap_or(line)
+            };
             let mut utf16_count: u32 = 0;
             let mut byte_pos: usize = 0;
             for c in line.chars() {
@@ -572,6 +580,22 @@ mod regress_fixes_tests {
         let src = "ab\rcd";
         assert_eq!(offset_to_position(src, 3), Position::new(0, 3));
         assert_eq!(offset_to_position(src, 5), Position::new(0, 5));
+    }
+
+    #[test]
+    fn round_trip_final_line_bare_cr() {
+        // A document whose last line ends in a bare CR (no LF): the trailing \r
+        // is stray content, so column 4 maps back to byte 4, not 3. Previously
+        // `position_to_offset` stripped it and returned 3, desyncing the pair.
+        let src = "abc\r";
+        assert_eq!(offset_to_position(src, 4), Position::new(0, 4));
+        assert_eq!(position_to_offset(src, Position::new(0, 4)), 4);
+        // A real CRLF terminator is still stripped from the column count, so
+        // the second line starts at the byte after the \n.
+        let crlf = "abc\r\ndef";
+        assert_eq!(position_to_offset(crlf, Position::new(0, 3)), 3); // end of "abc"
+        assert_eq!(position_to_offset(crlf, Position::new(1, 0)), 5); // start of "def"
+        assert_eq!(position_to_offset(crlf, Position::new(1, 3)), 8); // end of "def"
     }
 
     #[test]

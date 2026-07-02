@@ -136,15 +136,15 @@ pub fn resolve_definitions(
                 // the keyword so a trait/supertrait/param name that merely
                 // *contains* the substring `where` (e.g. `Nowhere`) doesn't
                 // anchor the search before the real keyword.
-                let search_from =
-                    find_word_in_source(source, "where", decl.span.start, decl.span.end)
-                        .map(|s| s.end)
-                        .unwrap_or(decl.span.start);
+                // Each method carries an authoritative `name_span` pointing at
+                // its own signature token (see `ast::TraitItem::Method`). Use it
+                // directly — a non-advancing text search anchored past `where`
+                // mis-resolves a method to an *earlier* method's default-body
+                // reference of the same name (e.g. `eq` calling `neq` before
+                // `neq`'s own signature appears). Mirrors document_symbol.rs.
                 for item in items {
-                    if let ast::TraitItem::Method { name, .. } = item {
-                        let span = find_word_in_source(source, name, search_from, decl.span.end)
-                            .unwrap_or(decl.span);
-                        resolver.define(name, span);
+                    if let ast::TraitItem::Method { name, name_span, .. } = item {
+                        resolver.define(name, *name_span);
                     }
                 }
             }

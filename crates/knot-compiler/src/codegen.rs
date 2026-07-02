@@ -194,6 +194,13 @@ pub struct Codegen {
     // snapshot retry machinery doesn't need transactional rollback when no
     // SQL writes can happen.
     write_functions: HashSet<String>,
+    /// Functions that may RETURN one of their arguments unapplied, to be run
+    /// by the caller (`when`/`unless`/`id`, or user helpers of that shape).
+    /// The write-analysis can't see a write performed by such a returned
+    /// action from the call syntax alone, so an application of one of these
+    /// to an opaque IO value is treated as possibly-writing (otherwise a
+    /// write laundered through `when act` slips past the `atomic` SAVEPOINT).
+    passthrough_functions: HashSet<String>,
     /// Names of all top-level function declarations (used by the
     /// write-analysis: calls to anything NOT in this set and not a builtin
     /// are conservatively treated as possibly-writing).
@@ -810,6 +817,7 @@ impl Codegen {
             nullable_ctors: HashMap::new(),
             io_functions: HashSet::new(),
             write_functions: HashSet::new(),
+            passthrough_functions: HashSet::new(),
             top_fn_names: HashSet::new(),
             scalar_sources: HashSet::new(),
             overridable_constants: HashMap::new(),
@@ -1781,6 +1789,7 @@ impl Codegen {
 
         // Detect user functions that produce IO values (fixed-point iteration)
         self.detect_io_functions(&module.decls);
+        self.detect_passthrough_functions(&module.decls);
         self.detect_write_functions(&module.decls);
 
         // Process deriving clauses: auto-generate impl methods from trait defaults
@@ -4758,6 +4767,7 @@ impl Codegen {
                     inner,
                     &self.write_functions,
                     &self.top_fn_names,
+                    &self.passthrough_functions,
                 );
 
                 // For nested atomics, save outer STM tracking before the loop
@@ -5387,7 +5397,7 @@ impl Codegen {
     /// SQL pushdown optimization — the general in-memory path stays
     /// correct — so being conservative here is safe.
     fn invalidate_after_possible_writes(&mut self, expr: &ast::Expr) {
-        if !Self::expr_contains_writes(expr, &self.write_functions, &self.top_fn_names) {
+        if !Self::expr_contains_writes(expr, &self.write_functions, &self.top_fn_names, &self.passthrough_functions) {
             return;
         }
         let mut direct: Vec<String> = Vec::new();
@@ -7800,6 +7810,81 @@ impl Codegen {
     /// skip the SAVEPOINT entirely for read-only atomic bodies — the version-
     /// snapshot retry machinery doesn't need transactional rollback when no
     /// SQL write can occur.
+    /// Populate `passthrough_functions`: top-level functions whose body may
+    /// evaluate to one of their own parameters *unapplied* (so the caller runs
+    /// it), directly (`id = \x -> x`) or via branches (`when = \c a -> if c
+    /// then a else yield {}`), or by forwarding a parameter into another
+    /// passthrough function. Fixed-point to capture forwarding chains.
+    fn detect_passthrough_functions(&mut self, decls: &[ast::Decl]) {
+        let mut fun_bodies: Vec<(String, &ast::Expr)> = Vec::new();
+        for decl in decls {
+            if let ast::DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
+                fun_bodies.push((name.clone(), body));
+            }
+        }
+        loop {
+            let mut changed = false;
+            for (name, body) in &fun_bodies {
+                if self.passthrough_functions.contains(name) {
+                    continue;
+                }
+                // Collect the (possibly curried) parameter names, then test
+                // whether the innermost body returns one of them unapplied.
+                let mut params: HashSet<String> = HashSet::new();
+                let mut cur = strip_expr_wrappers(body);
+                while let ast::ExprKind::Lambda { params: ps, body: inner } = &cur.node {
+                    for p in ps {
+                        collect_pat_var_names(p, &mut params);
+                    }
+                    cur = strip_expr_wrappers(inner);
+                }
+                if params.is_empty() {
+                    continue;
+                }
+                if Self::tail_returns_param(cur, &params, &self.passthrough_functions) {
+                    self.passthrough_functions.insert(name.clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    /// True when `expr`, in value/tail position, may evaluate to one of `params`
+    /// unapplied — as a bare reference, through `if`/`case` branches, or by
+    /// forwarding a param into a known passthrough function.
+    fn tail_returns_param(
+        expr: &ast::Expr,
+        params: &HashSet<String>,
+        passthrough_fns: &HashSet<String>,
+    ) -> bool {
+        match &strip_expr_wrappers(expr).node {
+            ast::ExprKind::Var(name) => params.contains(name),
+            ast::ExprKind::If { then_branch, else_branch, .. } => {
+                Self::tail_returns_param(then_branch, params, passthrough_fns)
+                    || Self::tail_returns_param(else_branch, params, passthrough_fns)
+            }
+            ast::ExprKind::Case { arms, .. } => arms
+                .iter()
+                .any(|arm| Self::tail_returns_param(&arm.body, params, passthrough_fns)),
+            ast::ExprKind::App { .. } => {
+                // `g <args>` where g is a passthrough fn and some argument is one
+                // of our params passed unapplied → we forward that param onward.
+                let (head, spine_args) = uncurry_app(expr);
+                match &strip_expr_wrappers(head).node {
+                    ast::ExprKind::Var(hname) if passthrough_fns.contains(hname) => spine_args
+                        .iter()
+                        .any(|a| matches!(&strip_expr_wrappers(a).node,
+                            ast::ExprKind::Var(n) if params.contains(n))),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
     fn detect_write_functions(&mut self, decls: &[ast::Decl]) {
         let mut fun_bodies: Vec<(String, &ast::Expr)> = Vec::new();
         for decl in decls {
@@ -7814,7 +7899,7 @@ impl Codegen {
                 if self.write_functions.contains(name) {
                     continue;
                 }
-                if Self::expr_contains_writes(body, &self.write_functions, &self.top_fn_names) {
+                if Self::expr_contains_writes(body, &self.write_functions, &self.top_fn_names, &self.passthrough_functions) {
                     self.write_functions.insert(name.clone());
                     changed = true;
                 }
@@ -7841,6 +7926,7 @@ impl Codegen {
         expr: &ast::Expr,
         write_fns: &HashSet<String>,
         known_fns: &HashSet<String>,
+        passthrough_fns: &HashSet<String>,
     ) -> bool {
         // A callee/IO-value name is "known write-free" only when it is a
         // top-level function (the fixed-point analysis covers it) or a
@@ -7864,14 +7950,14 @@ impl Codegen {
         };
         match &expr.node {
             ast::ExprKind::Set { .. } | ast::ExprKind::ReplaceSet { .. } => true,
-            ast::ExprKind::Atomic(inner) => Self::expr_contains_writes(inner, write_fns, known_fns),
+            ast::ExprKind::Atomic(inner) => Self::expr_contains_writes(inner, write_fns, known_fns, passthrough_fns),
             ast::ExprKind::Var(name) => write_fns.contains(name),
             ast::ExprKind::App { func, arg } => {
                 // Conservatively treat applications of unknown callees as
                 // possibly-writing: a lambda received as a parameter
                 // (`runAtomic = \act -> atomic (do rows <- *t; act rows)`)
                 // can perform a write the static analysis can't see.
-                let (head, _) = uncurry_app(expr);
+                let (head, spine_args) = uncurry_app(expr);
                 let head_unknown = match &strip_expr_wrappers(head).node {
                     ast::ExprKind::Var(name) => !name_is_known_write_free(name),
                     ast::ExprKind::Constructor(_) => false,
@@ -7881,51 +7967,61 @@ impl Codegen {
                     // can't tell what it does.
                     _ => true,
                 };
+                // A passthrough combinator (`when`/`unless`/`id`, …) returns an
+                // argument unapplied to be run by the caller. If that argument
+                // is an opaque IO value, the returned action may write — a fact
+                // the head-name check misses because the passthrough itself is
+                // "known write-free". Treat such applications as possibly-writing.
+                let passthrough_arg_writes = matches!(
+                    &strip_expr_wrappers(head).node,
+                    ast::ExprKind::Var(name) if passthrough_fns.contains(name)
+                ) && spine_args.iter().any(|a| unknown_io_value(a));
                 head_unknown
-                    || Self::expr_contains_writes(func, write_fns, known_fns)
-                    || Self::expr_contains_writes(arg, write_fns, known_fns)
+                    || passthrough_arg_writes
+                    || Self::expr_contains_writes(func, write_fns, known_fns, passthrough_fns)
+                    || Self::expr_contains_writes(arg, write_fns, known_fns, passthrough_fns)
             }
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
-                Self::expr_contains_writes(lhs, write_fns, known_fns)
-                    || Self::expr_contains_writes(rhs, write_fns, known_fns)
+                Self::expr_contains_writes(lhs, write_fns, known_fns, passthrough_fns)
+                    || Self::expr_contains_writes(rhs, write_fns, known_fns, passthrough_fns)
             }
-            ast::ExprKind::UnaryOp { operand, .. } => Self::expr_contains_writes(operand, write_fns, known_fns),
+            ast::ExprKind::UnaryOp { operand, .. } => Self::expr_contains_writes(operand, write_fns, known_fns, passthrough_fns),
             ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
                 // Bind/expression statements RUN their value when it is an
                 // IO action — a bare `io` of unknown provenance may write.
                 ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Expr(expr) => {
                     unknown_io_value(expr)
-                        || Self::expr_contains_writes(expr, write_fns, known_fns)
+                        || Self::expr_contains_writes(expr, write_fns, known_fns, passthrough_fns)
                 }
-                ast::StmtKind::Let { expr, .. } => Self::expr_contains_writes(expr, write_fns, known_fns),
-                ast::StmtKind::Where { cond } => Self::expr_contains_writes(cond, write_fns, known_fns),
-                ast::StmtKind::GroupBy { key } => Self::expr_contains_writes(key, write_fns, known_fns),
+                ast::StmtKind::Let { expr, .. } => Self::expr_contains_writes(expr, write_fns, known_fns, passthrough_fns),
+                ast::StmtKind::Where { cond } => Self::expr_contains_writes(cond, write_fns, known_fns, passthrough_fns),
+                ast::StmtKind::GroupBy { key } => Self::expr_contains_writes(key, write_fns, known_fns, passthrough_fns),
             }),
-            ast::ExprKind::Lambda { body, .. } => Self::expr_contains_writes(body, write_fns, known_fns),
+            ast::ExprKind::Lambda { body, .. } => Self::expr_contains_writes(body, write_fns, known_fns, passthrough_fns),
             ast::ExprKind::If { cond, then_branch, else_branch, .. } => {
-                Self::expr_contains_writes(cond, write_fns, known_fns)
-                    || Self::expr_contains_writes(then_branch, write_fns, known_fns)
-                    || Self::expr_contains_writes(else_branch, write_fns, known_fns)
+                Self::expr_contains_writes(cond, write_fns, known_fns, passthrough_fns)
+                    || Self::expr_contains_writes(then_branch, write_fns, known_fns, passthrough_fns)
+                    || Self::expr_contains_writes(else_branch, write_fns, known_fns, passthrough_fns)
             }
             ast::ExprKind::Case { scrutinee, arms, .. } => {
-                Self::expr_contains_writes(scrutinee, write_fns, known_fns)
-                    || arms.iter().any(|arm| Self::expr_contains_writes(&arm.body, write_fns, known_fns))
+                Self::expr_contains_writes(scrutinee, write_fns, known_fns, passthrough_fns)
+                    || arms.iter().any(|arm| Self::expr_contains_writes(&arm.body, write_fns, known_fns, passthrough_fns))
             }
-            ast::ExprKind::UnitLit { value, .. } => Self::expr_contains_writes(value, write_fns, known_fns),
-            ast::ExprKind::Annot { expr, .. } => Self::expr_contains_writes(expr, write_fns, known_fns),
-            ast::ExprKind::Refine(inner) => Self::expr_contains_writes(inner, write_fns, known_fns),
+            ast::ExprKind::UnitLit { value, .. } => Self::expr_contains_writes(value, write_fns, known_fns, passthrough_fns),
+            ast::ExprKind::Annot { expr, .. } => Self::expr_contains_writes(expr, write_fns, known_fns, passthrough_fns),
+            ast::ExprKind::Refine(inner) => Self::expr_contains_writes(inner, write_fns, known_fns, passthrough_fns),
             ast::ExprKind::Record(fields) => fields
                 .iter()
-                .any(|f| Self::expr_contains_writes(&f.value, write_fns, known_fns)),
+                .any(|f| Self::expr_contains_writes(&f.value, write_fns, known_fns, passthrough_fns)),
             ast::ExprKind::RecordUpdate { base, fields } => {
-                Self::expr_contains_writes(base, write_fns, known_fns)
-                    || fields.iter().any(|f| Self::expr_contains_writes(&f.value, write_fns, known_fns))
+                Self::expr_contains_writes(base, write_fns, known_fns, passthrough_fns)
+                    || fields.iter().any(|f| Self::expr_contains_writes(&f.value, write_fns, known_fns, passthrough_fns))
             }
             ast::ExprKind::FieldAccess { expr, .. } => {
-                Self::expr_contains_writes(expr, write_fns, known_fns)
+                Self::expr_contains_writes(expr, write_fns, known_fns, passthrough_fns)
             }
             ast::ExprKind::List(items) => {
-                items.iter().any(|e| Self::expr_contains_writes(e, write_fns, known_fns))
+                items.iter().any(|e| Self::expr_contains_writes(e, write_fns, known_fns, passthrough_fns))
             }
             _ => false,
         }
@@ -14925,6 +15021,37 @@ fn uncurry_app(expr: &ast::Expr) -> (&ast::Expr, Vec<&ast::Expr>) {
             (f, args)
         }
         _ => (expr, Vec::new()),
+    }
+}
+
+/// Collect all `Var` binder names introduced by a pattern (recursing into
+/// constructor/record/list/cons sub-patterns).
+fn collect_pat_var_names(pat: &ast::Pat, out: &mut HashSet<String>) {
+    match &pat.node {
+        ast::PatKind::Var(name) => {
+            out.insert(name.clone());
+        }
+        ast::PatKind::Wildcard | ast::PatKind::Lit(_) => {}
+        ast::PatKind::Constructor { payload, .. } => collect_pat_var_names(payload, out),
+        ast::PatKind::Record(fields) => {
+            for f in fields {
+                match &f.pattern {
+                    Some(p) => collect_pat_var_names(p, out),
+                    None => {
+                        out.insert(f.name.clone());
+                    }
+                }
+            }
+        }
+        ast::PatKind::List(pats) => {
+            for p in pats {
+                collect_pat_var_names(p, out);
+            }
+        }
+        ast::PatKind::Cons { head, tail } => {
+            collect_pat_var_names(head, out);
+            collect_pat_var_names(tail, out);
+        }
     }
 }
 

@@ -527,6 +527,17 @@ impl<'a> TokenCollector<'a> {
                 self.visit_expr(inner);
                 self.visit_type(ty);
             }
+            ast::ExprKind::Serve { api_span, handlers, .. } => {
+                // The API type name, each endpoint constructor, and every
+                // handler body need tokens — otherwise a whole `serve` block
+                // renders unhighlighted. (Mirrors defs/rename/folding, which
+                // all recurse into serve handler bodies.)
+                self.add(*api_span, TOK_TYPE, 0);
+                for h in handlers {
+                    self.add(h.endpoint_span, TOK_ENUM_MEMBER, 0);
+                    self.visit_expr(&h.body);
+                }
+            }
             _ => {}
         }
     }

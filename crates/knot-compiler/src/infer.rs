@@ -628,17 +628,25 @@ struct Infer {
     refined_types: HashMap<String, (Ty, knot::ast::Expr)>,
     /// Refine expression type vars: (span, alpha_var, inner_ty) for post-inference resolution.
     refine_vars: Vec<(Span, TyVar, Ty)>,
-    /// When true, the directional refined-type check (which otherwise rejects
-    /// implicitly introducing a refinement, e.g. a raw `Int` flowing where a
-    /// `Nat` is required) is suppressed. Set ONLY while checking a `set` /
-    /// `replace` value against its source's element type: every row written is
-    /// validated at runtime (`knot_refinement_validate_relation`), so the
-    /// implicit coercion is sound there — including when the value flows
-    /// through plumbing like `union rows [newRow]`. It is saved/restored
-    /// around that single `check_expr`, so it never affects ordinary function
-    /// boundaries (where `asNat = \x -> x : Int -> Nat` is still rejected).
-    /// See the refined arms in `unify_dir`.
-    suppress_refine_intro: bool,
+    /// Refined-type names for which the directional refined-type check (which
+    /// otherwise rejects implicitly introducing a refinement, e.g. a raw `Int`
+    /// flowing where a `Nat` is required) is suppressed. `None` = suppress
+    /// nothing (the default). Set to `Some(names)` ONLY while checking a `set` /
+    /// `replace` value against its source's element type, where `names` is
+    /// exactly the set of refined types appearing in that element type: every
+    /// row written is validated at runtime (`knot_refinement_validate_relation`),
+    /// so implicitly coercing a base value into one of *those* refinements is
+    /// sound — including when the value flows through plumbing like
+    /// `union rows [newRow]`.
+    ///
+    /// Crucially, it is scoped to the source's own refinements: a refined type
+    /// used only as a *function parameter* inside the value expression (e.g.
+    /// `divBy : Pos -> Int` called as `divBy someInt`) is NOT in this set, so
+    /// the raw argument is still rejected — the runtime never validates that
+    /// call boundary, so implicit introduction there would be unsound. Saved/
+    /// restored around the single `check_expr`. See the refined arms in
+    /// `unify_dir`.
+    suppress_refine_intro: Option<HashSet<String>>,
 
     /// Unit-composition checks for `*`/`/` deferred because one operand was
     /// still an unresolved type variable when the binop was inferred. When the
@@ -705,7 +713,7 @@ impl Infer {
             show_unit_strings: HashMap::new(),
             refined_types: HashMap::new(),
             refine_vars: Vec::new(),
-            suppress_refine_intro: false,
+            suppress_refine_intro: None,
             deferred_unit_binops: Vec::new(),
             elem_pushdown_ok: HashSet::new(),
         }
@@ -1009,6 +1017,59 @@ impl Infer {
 
     fn apply(&self, ty: &Ty) -> Ty {
         self.apply_impl(ty, &[])
+    }
+
+    /// True when an implicit introduction of the refined type `name` should be
+    /// allowed (suppressed) at the current site — i.e. `name` is one of the
+    /// source refinements the runtime validates for the `set`/`replace` value
+    /// being checked. See `suppress_refine_intro`.
+    fn refine_intro_suppressed(&self, name: &str) -> bool {
+        match &self.suppress_refine_intro {
+            Some(names) => names.contains(name),
+            None => false,
+        }
+    }
+
+    /// Collect the names of every refined type (a `Con(name, [])` with `name`
+    /// registered in `refined_types`) reachable in `ty`, resolving
+    /// substitutions first. Used to scope refined-introduction suppression to
+    /// exactly the source relation's own refinements.
+    fn refined_names_in(&self, ty: &Ty) -> HashSet<String> {
+        let mut out = HashSet::new();
+        self.collect_refined_names(&self.apply(ty), &mut out);
+        out
+    }
+
+    fn collect_refined_names(&self, ty: &Ty, out: &mut HashSet<String>) {
+        match ty {
+            Ty::Con(name, args) => {
+                if args.is_empty() && self.refined_types.contains_key(name) {
+                    out.insert(name.clone());
+                }
+                for a in args {
+                    self.collect_refined_names(a, out);
+                }
+            }
+            Ty::Fun(p, r) => {
+                self.collect_refined_names(p, out);
+                self.collect_refined_names(r, out);
+            }
+            Ty::Record(fields, _) | Ty::Variant(fields, _) => {
+                for v in fields.values() {
+                    self.collect_refined_names(v, out);
+                }
+            }
+            Ty::Relation(inner)
+            | Ty::IO(_, _, inner)
+            | Ty::Alias(_, inner)
+            | Ty::Assoc(_, inner)
+            | Ty::Forall(_, inner) => self.collect_refined_names(inner, out),
+            Ty::App(f, a) => {
+                self.collect_refined_names(f, out);
+                self.collect_refined_names(a, out);
+            }
+            _ => {}
+        }
     }
 
     /// Like `apply` but skips substitution for any `TyVar` in `excluded`,
@@ -1895,7 +1956,7 @@ impl Infer {
                     // The refined type is `t1`; introducing = it is the
                     // *required* side (`!t1_provided`) and a concrete base
                     // value is supplied.
-                    if !self.suppress_refine_intro
+                    if !self.refine_intro_suppressed(name)
                         && !t1_provided
                         && self.is_concrete_refinement_base(&other)
                     {
@@ -1926,7 +1987,7 @@ impl Infer {
                     // The refined type is `t2`; introducing = it is the
                     // *required* side (`t1_provided`) and a concrete base
                     // value (`other`, the provided side) flows into it.
-                    if !self.suppress_refine_intro
+                    if !self.refine_intro_suppressed(name)
                         && t1_provided
                         && self.is_concrete_refinement_base(&other)
                     {
@@ -4377,9 +4438,12 @@ impl Infer {
                 // (`knot_refinement_validate_relation`), so a raw base value
                 // may flow into a refined field anywhere in this value — even
                 // through plumbing like `union rows [newRow]`. Suppress the
-                // refined-introduction check for the whole value subtree.
-                let prev_suppress = self.suppress_refine_intro;
-                self.suppress_refine_intro = true;
+                // refined-introduction check, but ONLY for refinements that the
+                // source itself carries (those the runtime validates), not for
+                // refined function parameters encountered inside the value.
+                let source_refined = self.refined_names_in(&target_inner);
+                let prev_suppress =
+                    std::mem::replace(&mut self.suppress_refine_intro, Some(source_refined));
                 self.check_expr(value, &target_inner);
                 self.suppress_refine_intro = prev_suppress;
                 let mut effects = BTreeSet::new();
@@ -4427,9 +4491,12 @@ impl Infer {
                 };
                 let target_inner = unwrap_io(&target_applied);
                 // See the `Set` arm: writes are runtime-validated, so suppress
-                // the refined-introduction check for this structural unify.
-                let prev_suppress = self.suppress_refine_intro;
-                self.suppress_refine_intro = true;
+                // the refined-introduction check for this structural unify —
+                // but only for the source's own refinements, not refined
+                // function parameters used inside the value.
+                let source_refined = self.refined_names_in(&target_inner);
+                let prev_suppress =
+                    std::mem::replace(&mut self.suppress_refine_intro, Some(source_refined));
                 self.check_expr(value, &target_inner);
                 self.suppress_refine_intro = prev_suppress;
                 let mut effects = BTreeSet::new();

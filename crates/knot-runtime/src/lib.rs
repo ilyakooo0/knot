@@ -1496,49 +1496,6 @@ fn wake_one_write_waiter() {
     cv.notify_one();
 }
 
-/// Re-acquire the write lock at the given depth after a release by
-/// `knot_stm_wait`. Goes through the same parking acquire path as
-/// `write_lock_acquire`, then sets the thread-local depth directly so the
-/// nested reentry counting picks up where it left off.
-fn write_lock_reacquire_at_depth(depth: usize) {
-    if depth == 0 {
-        return;
-    }
-    // Fast path: uncontended CAS.
-    if WRITE_LOCKED
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_ok()
-    {
-        WRITE_LOCK_DEPTH.with(|d| d.set(depth));
-        return;
-    }
-    for _ in 0..WRITE_LOCK_SPIN_HINT {
-        if WRITE_LOCKED
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            WRITE_LOCK_DEPTH.with(|d| d.set(depth));
-            return;
-        }
-        std::hint::spin_loop();
-    }
-    let (m, cv) = &*WRITE_LOCK_PARK;
-    loop {
-        let mut guard = m.lock().unwrap_or_else(|e| e.into_inner());
-        while WRITE_LOCKED.load(Ordering::Acquire) {
-            guard = cv.wait(guard).unwrap_or_else(|e| e.into_inner());
-        }
-        drop(guard);
-        if WRITE_LOCKED
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            WRITE_LOCK_DEPTH.with(|d| d.set(depth));
-            return;
-        }
-    }
-}
-
 /// Acquire the write lock, returning an RAII guard that releases on drop.
 fn write_lock_guard() -> WriteLockGuard {
     write_lock_acquire();
@@ -8044,26 +8001,22 @@ const STM_WAIT_TIMEOUT: Duration = Duration::from_secs(60 * 5);
 /// Avoids cloning the read map on fast paths (empty / already changed).
 /// The `_snapshot` parameter is unused but kept for ABI compatibility.
 ///
-/// Releases the write lock (if held) before blocking so that other threads
-/// can perform writes during the wait. Re-acquires after waking.
+/// NOTE: this deliberately does NOT touch the write lock. The atomic retry
+/// codegen calls `knot_atomic_rollback` — which releases *this* atomic's
+/// write-lock level — before `knot_stm_wait`, so any `WRITE_LOCK_DEPTH` still
+/// held here belongs exclusively to *enclosing* atomics whose SQLite
+/// transactions are still open. Those enclosing transactions hold SQLite's WAL
+/// writer lock regardless of the Rust-level `WRITE_LOCKED` flag; clearing the
+/// flag would let another thread believe it may write, hit `SQLITE_BUSY`
+/// against the still-open outer transaction, and panic after `busy_timeout`.
+/// (A `retry` in an inner atomic nested inside a *writing* outer atomic cannot
+/// make progress anyway — no other thread can write while the outer
+/// transaction holds the writer lock — so it parks until `STM_WAIT_TIMEOUT`
+/// rather than corrupting a sibling thread's connection. For a non-nested
+/// atomic the rollback already dropped the lock to depth 0, so there is
+/// nothing to release here regardless.)
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_stm_wait(_snapshot: i64) {
-    // Release the write lock before any potential blocking so nested atomic
-    // retries don't prevent other threads from writing.
-    let saved_lock_depth = WRITE_LOCK_DEPTH.with(|d| {
-        let depth = d.get();
-        if depth > 0 {
-            d.set(0);
-            WRITE_LOCKED.store(false, Ordering::Release);
-        }
-        depth
-    });
-    if saved_lock_depth > 0 {
-        // Mirror `write_lock_release`: a writer parked on `WRITE_LOCK_PARK`'s
-        // condvar (no timeout) must be notified or it sleeps forever.
-        wake_one_write_waiter();
-    }
-
     let is_empty = STM_TRACK.with(|t| t.borrow().reads.is_empty());
     if is_empty {
         // No read set means there's nothing to wait *on* — the body retried
@@ -8071,7 +8024,6 @@ pub extern "C-unwind" fn knot_stm_wait(_snapshot: i64) {
         // Park on the global write-event condvar so we wake on any write
         // anywhere in the system instead of burning a 50 ms tick.
         wait_for_any_write(Duration::from_millis(50));
-        write_lock_reacquire_at_depth(saved_lock_depth);
         return;
     }
 
@@ -8091,7 +8043,6 @@ pub extern "C-unwind" fn knot_stm_wait(_snapshot: i64) {
         // spin-starve writers that would satisfy the retry condition,
         // causing unbounded memory growth from repeated SQL reads.
         std::thread::yield_now();
-        write_lock_reacquire_at_depth(saved_lock_depth);
         return;
     }
 
@@ -8283,9 +8234,8 @@ pub extern "C-unwind" fn knot_stm_wait(_snapshot: i64) {
     if let Some(tok) = &cancel_token {
         tok.clear_stm_wake_slot();
     }
-
-    // Re-acquire write lock if we held it before waiting
-    write_lock_reacquire_at_depth(saved_lock_depth);
+    // No write-lock reacquire: see the note on this fn — the lock was never
+    // released here, and any depth still held belongs to enclosing atomics.
 }
 
 // ── IO wrappers for effectful functions ──────────────────────────
@@ -13464,7 +13414,24 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
             // Nested relations stored as JSON columns keep set semantics:
             // dedup rows before serializing, mirroring the INSERT OR IGNORE
             // dedup that child-table storage gets from its UNIQUE index.
-            let deduped = in_memory_dedup(rows.clone());
+            //
+            // The serialized text also participates in the parent table's
+            // `_unique` index, so it must be *canonical*: two logically-equal
+            // set values (e.g. `["a","b"]` and `["b","a"]`) must produce
+            // identical text, or the parent row would spuriously duplicate.
+            // `value_to_hash_bytes` already defines the canonical set order
+            // (it sorts+dedups rows), so order the deduped rows by that same
+            // key before serializing. Matches how every other identity path
+            // (dedup, union, `values_equal`, child-table `_content_hash`)
+            // treats relations as unordered sets.
+            let mut deduped = in_memory_dedup(rows.clone());
+            deduped.sort_by(|a, b| {
+                let mut ka = Vec::new();
+                let mut kb = Vec::new();
+                value_to_hash_bytes(*a, &mut ka);
+                value_to_hash_bytes(*b, &mut kb);
+                ka.cmp(&kb)
+            });
             rusqlite::types::Value::Text(value_to_json_db(alloc(Value::Relation(deduped))))
         }
         (Value::Record(_), ColType::Json) => {

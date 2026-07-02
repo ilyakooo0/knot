@@ -7,7 +7,7 @@ use knot::ast::{self, DeclKind};
 
 use crate::state::{DocumentState, ServerState};
 use crate::type_format::{format_type_kind, format_type_scheme};
-use crate::utils::{find_word_in_source, span_to_range};
+use crate::utils::{find_word_after_eq, find_word_in_source, span_to_range};
 
 // ── Document symbols (hierarchical) ─────────────────────────────────
 
@@ -332,7 +332,12 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                             ast::HttpMethod::Delete => "DELETE",
                             ast::HttpMethod::Patch => "PATCH",
                         };
-                        let name_range = match find_word_in_source(
+                        // The endpoint constructor is defined after `=`
+                        // (`… -> Response = Ctor`); anchor on that token so an
+                        // identically-named response type or path segment
+                        // earlier in the entry isn't picked instead. Mirrors
+                        // `defs.rs`'s `find_word_after_eq` lookup.
+                        let name_range = match find_word_after_eq(
                             source,
                             &e.constructor,
                             search_from,

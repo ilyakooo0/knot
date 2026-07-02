@@ -1363,6 +1363,34 @@ fn apply_owner_disk_edits(
             }
         }
     }
+    // Impl-method definition tokens are not linked to the trait method in
+    // `resolve_definitions`, so — exactly as the open-doc owner path does at
+    // the top of `build_changes` — when this (disk) owner module declares
+    // `old_name` as a trait method, rename every `impl … <old_name> =` method
+    // token too. Without this, renaming a trait method from an importer's call
+    // site left every impl in an *unopened* owner file stale, producing broken
+    // code.
+    let renames_trait_method = module.decls.iter().any(|d| {
+        matches!(&d.node, DeclKind::Trait { items, .. }
+            if items.iter().any(|it| matches!(
+                it, ast::TraitItem::Method { name: m, .. } if m == old_name)))
+    });
+    if renames_trait_method {
+        for decl in &module.decls {
+            if let DeclKind::Impl { items, .. } = &decl.node {
+                for item in items {
+                    if let ast::ImplItem::Method { name: m, name_span, .. } = item
+                        && m == old_name
+                    {
+                        changes.entry(uri.clone()).or_default().push(TextEdit {
+                            range: span_to_range(*name_span, source),
+                            new_text: new_name.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
     let _ = owner;
 }
 

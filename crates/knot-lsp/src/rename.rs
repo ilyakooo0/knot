@@ -976,9 +976,42 @@ pub(crate) fn collect_name_uses_in_decl(
         }
         recurse_expr(expr, |e| walk_expr(e, name, source, shadowed, out));
     }
+    // Recover rename sites for a textually-ordered sequence of *spanless*
+    // trait-name tokens (an `impl`'s trait, a supertrait, or a `Trait a =>`
+    // constraint) within `[from, to)`. Each name is located in source order
+    // with a moving cursor (searching for its own text) so distinct trait
+    // names in one clause each anchor on their own token; a token equal to the
+    // renamed `name` is recorded. Without this, renaming a trait leaves
+    // `impl Show …` and `Show a =>` bounds stale and corrupts the source.
+    fn push_trait_name_refs<'b>(
+        names: impl Iterator<Item = &'b str>,
+        name: &str,
+        source: &str,
+        from: usize,
+        to: usize,
+        out: &mut Vec<Span>,
+    ) {
+        let mut cursor = from;
+        for tn in names {
+            if let Some(span) = find_word_in_source(source, tn, cursor, to) {
+                cursor = span.end;
+                if tn == name {
+                    out.push(span);
+                }
+            }
+        }
+    }
     match &decl.node {
         DeclKind::Fun { ty, body, .. } => {
             if let Some(scheme) = ty {
+                push_trait_name_refs(
+                    scheme.constraints.iter().map(|c| c.trait_name.as_str()),
+                    name,
+                    source,
+                    decl.span.start,
+                    scheme.ty.span.start,
+                    out,
+                );
                 walk_scheme(scheme, name, source, out);
             }
             if let Some(body) = body {
@@ -987,6 +1020,14 @@ pub(crate) fn collect_name_uses_in_decl(
         }
         DeclKind::View { ty, body, .. } | DeclKind::Derived { ty, body, .. } => {
             if let Some(scheme) = ty {
+                push_trait_name_refs(
+                    scheme.constraints.iter().map(|c| c.trait_name.as_str()),
+                    name,
+                    source,
+                    decl.span.start,
+                    scheme.ty.span.start,
+                    out,
+                );
                 walk_scheme(scheme, name, source, out);
             }
             walk_expr(body, name, source, false, out);
@@ -1001,7 +1042,21 @@ pub(crate) fn collect_name_uses_in_decl(
                 }
             }
         }
-        DeclKind::Impl { args, constraints, items, .. } => {
+        DeclKind::Impl { trait_name, args, constraints, items, .. } => {
+            // Impl head: `impl (Constraint =>)* TraitName args*`. All trait-name
+            // tokens precede the first arg, in constraint-then-head order.
+            let head_end = args.first().map(|a| a.span.start).unwrap_or(decl.span.end);
+            push_trait_name_refs(
+                constraints
+                    .iter()
+                    .map(|c| c.trait_name.as_str())
+                    .chain(std::iter::once(trait_name.as_str())),
+                name,
+                source,
+                decl.span.start,
+                head_end,
+                out,
+            );
             for arg in args {
                 walk_type(arg, name, source, out);
             }
@@ -1034,6 +1089,16 @@ pub(crate) fn collect_name_uses_in_decl(
             }
         }
         DeclKind::Trait { items, supertraits, .. } => {
+            // `trait T a : Super1, Super2` — each supertrait name references
+            // that trait and must be renamed with it.
+            push_trait_name_refs(
+                supertraits.iter().map(|c| c.trait_name.as_str()),
+                name,
+                source,
+                decl.span.start,
+                decl.span.end,
+                out,
+            );
             for c in supertraits {
                 for arg in &c.args {
                     walk_type(arg, name, source, out);
@@ -1058,7 +1123,17 @@ pub(crate) fn collect_name_uses_in_decl(
                 }
             }
         }
-        DeclKind::Migrate { from_ty, to_ty, using_fn, .. } => {
+        DeclKind::Migrate { relation, from_ty, to_ty, using_fn, .. } => {
+            // `migrate *rel from … to …` — the migrated relation references its
+            // source declaration; rename it too so the migrate doesn't dangle.
+            // `relation` is the bare name (no `*`), recovered from the source;
+            // the `*` sigil is a word boundary for the search.
+            if relation == name
+                && let Some(span) =
+                    find_word_in_source(source, name, decl.span.start, decl.span.end)
+            {
+                out.push(span);
+            }
             walk_type(from_ty, name, source, out);
             walk_type(to_ty, name, source, out);
             walk_expr(using_fn, name, source, false, out);
@@ -1873,6 +1948,83 @@ mod tests {
                 .iter()
                 .any(|e| e.range.start == param_pos && e.new_text.contains("holder")),
             "path-param `owner` must be renamed; edits: {edits:?}"
+        );
+    }
+
+    #[test]
+    fn rename_trait_updates_impl_head() {
+        // Regression: `impl Show Foo`'s trait-name token was never collected —
+        // `collect_name_uses_in_decl`'s Impl arm dropped `trait_name`. Renaming
+        // the trait left `impl Show` stale, breaking the file. Renaming `Show`
+        // must also update the `impl Show` occurrence.
+        let mut ws = TestWorkspace::new();
+        let src = "trait Show a where\n  present : a -> Text\ndata Foo = Foo {}\nimpl Show Foo where\n  present = \\x -> \"foo\"\n";
+        let uri = ws.open("main", src);
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("Show").expect("trait def");
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "Display"))
+            .expect("rename produces edits");
+        let mut changes = edit.changes.expect("changes present");
+        let edits = changes.remove(&uri).expect("file has edits");
+
+        let impl_off = doc.source.find("impl Show").expect("impl head") + "impl ".len();
+        let impl_pos = offset_to_position(&doc.source, impl_off);
+        assert!(
+            edits
+                .iter()
+                .any(|e| e.range.start == impl_pos && e.new_text.contains("Display")),
+            "trait name in `impl Show` must be renamed; edits: {edits:?}"
+        );
+    }
+
+    #[test]
+    fn rename_trait_updates_constraint() {
+        // A `Show a =>` bound's trait name must rename with the trait too.
+        let mut ws = TestWorkspace::new();
+        let src = "trait Show a where\n  present : a -> Text\nfmtAll : Show a => a -> Text\nfmtAll = \\x -> present x\n";
+        let uri = ws.open("main", src);
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("Show").expect("trait def");
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "Display"))
+            .expect("rename produces edits");
+        let mut changes = edit.changes.expect("changes present");
+        let edits = changes.remove(&uri).expect("file has edits");
+
+        let bound_off = doc.source.find("Show a =>").expect("constraint");
+        let bound_pos = offset_to_position(&doc.source, bound_off);
+        assert!(
+            edits
+                .iter()
+                .any(|e| e.range.start == bound_pos && e.new_text.contains("Display")),
+            "trait name in `Show a =>` constraint must be renamed; edits: {edits:?}"
+        );
+    }
+
+    #[test]
+    fn rename_source_updates_migrate_relation() {
+        // Regression: `migrate *users …`'s relation token was never collected —
+        // the Migrate arm dropped `relation`. Renaming the source left the
+        // migrate dangling. Renaming `users` must also update `migrate *users`.
+        let mut ws = TestWorkspace::new();
+        let src = "*users : [{v: Int}]\nf = \\x -> x\nmigrate *users from Int to Int using f\n";
+        let uri = ws.open("main", src);
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("users").expect("source def");
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "accounts"))
+            .expect("rename produces edits");
+        let mut changes = edit.changes.expect("changes present");
+        let edits = changes.remove(&uri).expect("file has edits");
+
+        let migrate_off = doc.source.find("migrate *users").expect("migrate") + "migrate *".len();
+        let migrate_pos = offset_to_position(&doc.source, migrate_off);
+        assert!(
+            edits
+                .iter()
+                .any(|e| e.range.start == migrate_pos && e.new_text.contains("accounts")),
+            "migrated relation `*users` must be renamed; edits: {edits:?}"
         );
     }
 

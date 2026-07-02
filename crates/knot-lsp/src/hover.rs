@@ -374,10 +374,14 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     // that fall back to a default body, when the method has one). The trait
     // dispatch code lens shows the same data, but a hover on the method name
     // is the most natural place for it too.
-    if let Some(method_section) = trait_method_dispatch_section(state, word) {
-        value.push_str("\n\n");
-        value.push_str(&method_section);
-    }
+    // Not on a record-field token: a field named `map` must not surface an
+    // unrelated trait method `map`'s dispatch info (field names are lowercase
+    // and collide with method names).
+    if !on_field_token
+        && let Some(method_section) = trait_method_dispatch_section(state, word) {
+            value.push_str("\n\n");
+            value.push_str(&method_section);
+        }
 
     // Route hover (on the route declaration's name): list all of its
     // constructor entries with method+path. Hovering on a single constructor
@@ -404,11 +408,15 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
         value.push_str(&ctor_section);
     }
 
-    // Include doc comments if available
-    if let Some(doc_comment) = doc.doc_comments.get(word) {
-        value.push_str("\n\n---\n\n");
-        value.push_str(doc_comment);
-    }
+    // Include doc comments if available. Doc comments are keyed on lowercase
+    // top-level decl names (fun/source/view/derived), which collide with
+    // record-field names — so a field token like `rec.total` must not pick up
+    // an unrelated top-level `total`'s doc comment.
+    if !on_field_token
+        && let Some(doc_comment) = doc.doc_comments.get(word) {
+            value.push_str("\n\n---\n\n");
+            value.push_str(doc_comment);
+        }
 
     // Every section above is conditional — e.g. `field_at_cursor` can be
     // `Some` without any refinement metadata to render. Don't ship an empty
@@ -908,6 +916,47 @@ show2 = \x -> display x
         let pos = Position::new(5, 5);
         let resp = handle_hover(&ws.state, &hover_params(&uri, pos));
         assert!(resp.is_none());
+    }
+
+    #[test]
+    fn hover_on_field_token_does_not_leak_top_level_doc_comment() {
+        // Regression: a record field named `total` picked up the doc comment
+        // of an unrelated top-level `total` decl (doc comments are keyed on
+        // lowercase names, which collide with field names). The doc-comment
+        // section must be gated out on field tokens.
+        let mut ws = TestWorkspace::new();
+        let src = "-- The grand total value.\ntotal = 42\ntype Rec = {total: Int}\nuseRec = \\r -> r.total\nmain = println (show total)\n";
+        let uri = ws.open("main", src);
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("r.total").expect("field access") + "r.".len();
+        let pos = offset_to_position(&doc.source, off);
+        let text = handle_hover(&ws.state, &hover_params(&uri, pos))
+            .map(hover_text)
+            .unwrap_or_default();
+        assert!(
+            !text.contains("grand total"),
+            "field-token hover must not leak an unrelated top-level doc comment; got: {text}"
+        );
+    }
+
+    #[test]
+    fn hover_on_field_token_does_not_leak_trait_method_dispatch() {
+        // Regression: a record field named `combine` surfaced the dispatch
+        // info of an unrelated trait method `combine`. Gated out on field
+        // tokens.
+        let mut ws = TestWorkspace::new();
+        let src = "trait Combiner a where\n  combine : a -> a -> a\ndata Foo = Foo {}\nimpl Combiner Foo where\n  combine = \\x y -> x\ntype Rec = {combine: Int}\nuseRec = \\r -> r.combine\nmain = println \"hi\"\n";
+        let uri = ws.open("main", src);
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("r.combine").expect("field access") + "r.".len();
+        let pos = offset_to_position(&doc.source, off);
+        let text = handle_hover(&ws.state, &hover_params(&uri, pos))
+            .map(hover_text)
+            .unwrap_or_default();
+        assert!(
+            !text.contains("dispatches to"),
+            "field-token hover must not leak trait-method dispatch info; got: {text}"
+        );
     }
 }
 

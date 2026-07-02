@@ -2610,9 +2610,13 @@ impl Parser {
             // While parsing a route's response type (including a refined
             // type's `where` predicate), `headers`/`rateLimit` are clause
             // keywords and must not be consumed as application arguments.
+            // Likewise, while parsing a migrate `from`/`to` type (including a
+            // refined type's `where` predicate expression), `to`/`using` are
+            // clause keywords and must not be eaten as application arguments.
             TokenKind::Lower(n) => {
                 n != "yield"
                     && !(self.stop_type_at_headers && (n == "headers" || n == "rateLimit"))
+                    && !(self.stop_type_at_migrate_clauses && (n == "to" || n == "using"))
             }
             TokenKind::Star => {
                 // Source ref `*name` (an application argument) only when `*`

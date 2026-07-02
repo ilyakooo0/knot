@@ -161,6 +161,13 @@ pub fn resolve_definitions(module: &Module, source: &str) -> Definitions {
         match &decl.node {
             DeclKind::Fun { body, ty, .. } => {
                 if let Some(scheme) = ty {
+                    // `Show a =>` constraint trait names precede the type; they
+                    // are spanless, so recover them before walking the type.
+                    resolver.resolve_trait_names(
+                        scheme.constraints.iter().map(|c| c.trait_name.as_str()),
+                        decl.span.start,
+                        scheme.ty.span.start,
+                    );
                     resolver.resolve_type(&scheme.ty, source);
                     for c in &scheme.constraints {
                         for arg in &c.args {
@@ -174,6 +181,11 @@ pub fn resolve_definitions(module: &Module, source: &str) -> Definitions {
             }
             DeclKind::View { body, ty, .. } | DeclKind::Derived { body, ty, .. } => {
                 if let Some(scheme) = ty {
+                    resolver.resolve_trait_names(
+                        scheme.constraints.iter().map(|c| c.trait_name.as_str()),
+                        decl.span.start,
+                        scheme.ty.span.start,
+                    );
                     resolver.resolve_type(&scheme.ty, source);
                     for c in &scheme.constraints {
                         for arg in &c.args {
@@ -196,7 +208,22 @@ pub fn resolve_definitions(module: &Module, source: &str) -> Definitions {
                     }
                 }
             }
-            DeclKind::Impl { args, items, constraints, .. } => {
+            DeclKind::Impl { trait_name, args, items, constraints, .. } => {
+                // The impl head is `impl (Constraint =>)* TraitName args*`, so
+                // every trait-name token (the constraints' trait names then the
+                // impl's own) precedes the first arg. Recover them in order so
+                // goto/find-references/rename reach `impl Show …` and any
+                // `Show a =>` bound — otherwise renaming the trait leaves them
+                // stale.
+                let head_end = args.first().map(|a| a.span.start).unwrap_or(decl.span.end);
+                resolver.resolve_trait_names(
+                    constraints
+                        .iter()
+                        .map(|c| c.trait_name.as_str())
+                        .chain(std::iter::once(trait_name.as_str())),
+                    decl.span.start,
+                    head_end,
+                );
                 for arg in args {
                     resolver.resolve_type(arg, source);
                 }
@@ -217,6 +244,13 @@ pub fn resolve_definitions(module: &Module, source: &str) -> Definitions {
                 }
             }
             DeclKind::Trait { items, supertraits, .. } => {
+                // `trait T a : Super1, Super2` — each supertrait's trait name is
+                // a reference to that trait's definition.
+                resolver.resolve_trait_names(
+                    supertraits.iter().map(|c| c.trait_name.as_str()),
+                    decl.span.start,
+                    decl.span.end,
+                );
                 for c in supertraits {
                     for arg in &c.args {
                         resolver.resolve_type(arg, source);
@@ -247,7 +281,16 @@ pub fn resolve_definitions(module: &Module, source: &str) -> Definitions {
                     }
                 }
             }
-            DeclKind::Migrate { from_ty, to_ty, using_fn, .. } => {
+            DeclKind::Migrate { relation, from_ty, to_ty, using_fn, .. } => {
+                // `migrate *rel from … to … using …` — the migrated relation is
+                // a reference to its source declaration. `relation` is spanless
+                // (the bare name, no `*`), so recover its token from the decl
+                // source; the `*` sigil is a word boundary for the search.
+                if let Some(span) =
+                    find_word_in_source(source, relation, decl.span.start, decl.span.end)
+                {
+                    resolver.add_ref(span, relation);
+                }
                 resolver.resolve_type(from_ty, source);
                 resolver.resolve_type(to_ty, source);
                 resolver.resolve_expr(using_fn);
@@ -344,6 +387,28 @@ impl<'a> DefResolver<'a> {
     fn add_ref(&mut self, usage: Span, name: &str) {
         if let Some(def) = self.lookup(name) {
             self.refs.push((usage, def));
+        }
+    }
+
+    /// Register goto/find-references for a textually-ordered sequence of
+    /// *spanless* trait-name tokens occurring within `[from, to)` — the trait
+    /// applied by an `impl`, a supertrait, or a `Trait a =>` constraint. Each
+    /// name is located in source order with a moving cursor (searching for the
+    /// token's own text, not a shared needle) so distinct trait names in one
+    /// clause each anchor on their own token. `add_ref` no-ops for names not
+    /// defined in this module, so an out-of-module trait simply records nothing.
+    fn resolve_trait_names<'b>(
+        &mut self,
+        names: impl Iterator<Item = &'b str>,
+        from: usize,
+        to: usize,
+    ) {
+        let mut cursor = from;
+        for tn in names {
+            if let Some(span) = find_word_in_source(self.source, tn, cursor, to) {
+                cursor = span.end;
+                self.add_ref(span, tn);
+            }
         }
     }
 
@@ -747,6 +812,55 @@ mod tests {
             "method def should anchor after the header line, got {span:?}"
         );
         assert_eq!(&source[span.start..span.end], "a");
+    }
+
+    /// True if some recorded reference's usage span is exactly `text` and
+    /// points at the definition of `def_name`.
+    fn has_ref_to(defs: &Definitions, source: &str, text: &str, def_name: &str) -> bool {
+        let (name_map, refs, _) = defs;
+        let Some(def) = name_map.get(def_name) else {
+            return false;
+        };
+        refs.iter().any(|(usage, d)| {
+            d == def && source.get(usage.start..usage.end) == Some(text)
+        })
+    }
+
+    #[test]
+    fn impl_trait_name_is_recorded_as_reference() {
+        // `impl Show Foo` must record its `Show` token as a reference to the
+        // trait definition, so goto/find-references reach it.
+        let source =
+            "trait Show a where\n  present : a -> Text\ndata Foo = Foo {}\nimpl Show Foo where\n  present = \\x -> \"foo\"\n";
+        let module = parse(source);
+        let defs = resolve_definitions(&module, source);
+        assert!(
+            has_ref_to(&defs, source, "Show", "Show"),
+            "the `impl Show` trait token must be a reference to trait `Show`"
+        );
+    }
+
+    #[test]
+    fn constraint_trait_name_is_recorded_as_reference() {
+        let source =
+            "trait Show a where\n  present : a -> Text\nfmtAll : Show a => a -> Text\nfmtAll = \\x -> present x\n";
+        let module = parse(source);
+        let defs = resolve_definitions(&module, source);
+        assert!(
+            has_ref_to(&defs, source, "Show", "Show"),
+            "the `Show a =>` constraint token must be a reference to trait `Show`"
+        );
+    }
+
+    #[test]
+    fn migrate_relation_is_recorded_as_reference() {
+        let source = "*users : [{v: Int}]\nf = \\x -> x\nmigrate *users from Int to Int using f\n";
+        let module = parse(source);
+        let defs = resolve_definitions(&module, source);
+        assert!(
+            has_ref_to(&defs, source, "users", "users"),
+            "the migrated `*users` relation token must be a reference to source `users`"
+        );
     }
 
     #[test]

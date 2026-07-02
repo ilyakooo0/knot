@@ -1043,6 +1043,13 @@ impl EffectChecker {
                         && let ast::PatKind::Var(name) = &pat.node {
                             let latent = if is_lambda_arg(expr) {
                                 self.fun_body_effects(expr)
+                            } else if let Some(alias) = self.builtin_alias_effects(expr) {
+                                // Point-free alias of a non-nullary IO builtin
+                                // (`let f = readFile`): later applying `f`
+                                // performs the builtin's effects, so charge
+                                // them here rather than laundering IO past the
+                                // atomic gate.
+                                alias
                             } else {
                                 self.infer_effects(expr)
                             };
@@ -1528,8 +1535,32 @@ impl EffectChecker {
             ast::ExprKind::UnitLit { value, .. } => self.fun_body_effects(value),
             ast::ExprKind::Annot { expr, .. } => self.fun_body_effects(expr),
             ast::ExprKind::Refine(inner) => self.fun_body_effects(inner),
-            _ => self.infer_effects(body),
+            _ => self
+                .builtin_alias_effects(body)
+                .unwrap_or_else(|| self.infer_effects(body)),
         }
+    }
+
+    /// If `expr` is a point-free reference to a *non-nullary* IO builtin — an
+    /// alias like `readIt = readFile` or a local `let f = println` — return
+    /// that builtin's call effects.
+    ///
+    /// The `infer_effects` `Var` arm deliberately treats such a bare reference
+    /// as pure (an unapplied reference must not trip the atomic gate — see the
+    /// comment there). But when the reference is the *value of a binding*, the
+    /// binding is a callable that performs the builtin's effects when applied,
+    /// so its latent/decl effects must recover them. Without this, aliasing an
+    /// IO builtin and then applying the alias inside `atomic` launders the IO
+    /// past the atomic gate. (Nullary IO builtins already surface their effects
+    /// from a bare reference, so they need no special handling here.)
+    fn builtin_alias_effects(&self, expr: &ast::Expr) -> Option<EffectSet> {
+        if let ast::ExprKind::Var(name) = &expr.node
+            && !self.shadowed.iter().any(|s| s == name)
+            && !crate::builtins::NULLARY_IO_BUILTINS.contains(&name.as_str())
+        {
+            return self.builtin_effects.get(name).cloned();
+        }
+        None
     }
 
     /// Check that explicit effect annotations (if any) are a superset of inferred effects.

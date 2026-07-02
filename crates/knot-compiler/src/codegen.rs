@@ -5509,7 +5509,7 @@ impl Codegen {
                         let sql = if plan.conditions.is_empty() {
                             format!("SELECT COUNT(*) FROM {}", from)
                         } else {
-                            format!("SELECT COUNT(*) FROM {} WHERE {}", from, plan.conditions.join(" AND "))
+                            format!("SELECT COUNT(*) FROM {} WHERE {}", from, join_sql_conditions(&plan.conditions))
                         };
                         self.emit_stm_track_reads_for_plan(builder, &plan);
                         let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
@@ -5862,7 +5862,7 @@ impl Codegen {
                                     let sql = if plan.conditions.is_empty() {
                                         format!("SELECT {}({}) FROM {}", sql_func, arg_sql, from)
                                     } else {
-                                        format!("SELECT {}({}) FROM {} WHERE {}", sql_func, arg_sql, from, plan.conditions.join(" AND "))
+                                        format!("SELECT {}({}) FROM {} WHERE {}", sql_func, arg_sql, from, join_sql_conditions(&plan.conditions))
                                     };
                                     self.emit_stm_track_reads_for_plan(builder, &plan);
                                     let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
@@ -5896,7 +5896,7 @@ impl Codegen {
                                             && let Some(filter_frag) = self.try_compile_sql_expr(&filter_bind, filter_body, &schema) {
                                                 let table = quote_sql_ident(&format!("_knot_{}", source_name));
                                                 let sql = format!(
-                                                    "SELECT COUNT(*) FROM {} WHERE {} AND {}",
+                                                    "SELECT COUNT(*) FROM {} WHERE ({}) AND ({})",
                                                     table, filter_frag.sql, pred_frag.sql,
                                                 );
                                                 let mut all_params = filter_frag.params;
@@ -5947,7 +5947,7 @@ impl Codegen {
                                             let sql = format!(
                                                 "SELECT COUNT(*) FROM {} WHERE {}",
                                                 from,
-                                                all_conditions.join(" AND "),
+                                                join_sql_conditions(&all_conditions),
                                             );
                                             self.emit_stm_track_reads_for_plan(builder, &plan);
                                             let mut all_params = plan.params.clone();
@@ -10675,7 +10675,7 @@ impl Codegen {
             } else {
                 format!(
                     "SELECT {}({}) FROM {} AS {} WHERE {}",
-                    func, col_sql, table, alias, conditions.join(" AND ")
+                    func, col_sql, table, alias, join_sql_conditions(&conditions)
                 )
             };
             self.emit_stm_track_read(builder, &source_name);
@@ -10721,7 +10721,7 @@ impl Codegen {
             } else {
                 format!(
                     "SELECT COUNT(*) FROM {} AS {} WHERE {}",
-                    table, alias, conditions.join(" AND ")
+                    table, alias, join_sql_conditions(&conditions)
                 )
             };
             self.emit_stm_track_read(builder, &source_name);
@@ -12899,6 +12899,18 @@ fn quote_sql_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// AND-join independently-generated boolean SQL fragments, parenthesizing
+/// each one first. Without the parens a top-level `OR` inside one fragment
+/// would bind across the `AND` (SQLite precedence: AND binds tighter than
+/// OR), silently matching the wrong rows.
+fn join_sql_conditions(conditions: &[String]) -> String {
+    conditions
+        .iter()
+        .map(|c| format!("({})", c))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
 /// A field-level predicate extracted from a filter body for STM row tracking.
 /// Used by `try_extract_field_preds` to produce inputs for the runtime
 /// `knot_stm_track_read_pred` ABI.
@@ -13216,7 +13228,7 @@ impl SqlQueryPlan {
         let mut sql = if self.conditions.is_empty() {
             format!("SELECT {} FROM {}", select, from)
         } else {
-            let where_clause = self.conditions.join(" AND ");
+            let where_clause = join_sql_conditions(&self.conditions);
             format!("SELECT {} FROM {} WHERE {}", select, from, where_clause)
         };
 
@@ -13702,6 +13714,17 @@ fn beta_reduce_inner(
             if let Lambda { params, body } = &f.node
                 && !params.is_empty()
                     && let ast::PatKind::Var(name) = &params[0].node
+                        // For a multi-param lambda the remaining params
+                        // (`params[1..]`) become binders wrapped *around* the
+                        // substituted body. `substitute` is capture-avoiding
+                        // only w.r.t. the head param it replaces — it has no
+                        // knowledge of these outer binders. So if a free
+                        // variable of the argument collides with one of them,
+                        // wrapping would capture it (e.g. `(\l p -> ...) p.l`
+                        // turning the outer `p` into the inner row `p`). Bail
+                        // out in that case; SQL pushdown then falls back to
+                        // in-memory evaluation rather than emitting wrong SQL.
+                        && !multi_param_would_capture(&params[1..], &a)
                         && let Some(substituted) = substitute(body, name, &a) {
                             if params.len() == 1 {
                                 return beta_reduce_inner(
@@ -14046,6 +14069,23 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
         // Conservative: ignore SQL-irrelevant constructs.
         Case { .. } | Do(_) | Set { .. } | ReplaceSet { .. } | Atomic(_) => {}
     }
+}
+
+/// True if wrapping `params` as binders around a substituted body would
+/// capture a free variable of `arg`. Used by `beta_reduce_inner` to refuse a
+/// partial application whose argument mentions a name that one of the
+/// remaining lambda parameters would shadow.
+fn multi_param_would_capture(params: &[ast::Pat], arg: &ast::Expr) -> bool {
+    let mut bound: HashSet<String> = HashSet::new();
+    for p in params {
+        collect_pat_binds(p, &mut bound);
+    }
+    if bound.is_empty() {
+        return false;
+    }
+    let mut free: HashSet<String> = HashSet::new();
+    collect_free_vars_set(arg, &HashSet::new(), &mut free);
+    free.iter().any(|f| bound.contains(f))
 }
 
 fn collect_pat_binds(pat: &ast::Pat, bound: &mut HashSet<String>) {

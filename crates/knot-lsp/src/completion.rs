@@ -30,6 +30,22 @@ use crate::utils::{offset_to_position, position_to_offset, recurse_expr, uri_to_
 /// with `insert_text: "*name"` + a `text_edit` over this range replaces the
 /// sigil rather than inserting after it, avoiding `**name`/`&&name` in clients
 /// that fold the trigger char into the word start.
+/// Whether a `*`/`&` immediately preceded by `before` is a *binary operator*
+/// rather than a source/derived-ref sigil. `*` is multiplication when it
+/// follows an expression-ending byte (`n * m`, `xs] * `). `&` has NO
+/// left-adjacency rule in the parser (`x&d` parses as `x (&d)`), so its only
+/// non-sigil use is the second `&` of the `&&` operator — anything else
+/// (including an identifier/closer before it) is still a derived-ref sigil.
+fn sigil_is_binary_operator(sigil: u8, before: Option<u8>) -> bool {
+    if sigil == b'&' {
+        before == Some(b'&')
+    } else {
+        before.is_some_and(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b')' | b']' | b'}' | b'"' | b'&')
+        })
+    }
+}
+
 fn sigil_replace_range(latest_source: &str, offset: usize) -> Range {
     let bytes = latest_source.as_bytes();
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'';
@@ -40,20 +56,18 @@ fn sigil_replace_range(latest_source: &str, offset: usize) -> Range {
     if start > 0 && (bytes[start - 1] == b'*' || bytes[start - 1] == b'&') {
         // Only absorb the `*`/`&` into the edit range when it's an actual
         // source/derived-ref sigil (atom position) — NOT when it's a binary
-        // operator (`n * m`, `a && b`). Mirroring `trigger_is_operator`: the
-        // byte before the sigil being an expression-ending byte (or another
-        // `&`) means operator position. Absorbing an operator byte would
-        // corrupt the buffer — `n*` accepting `*people` → `n*people`
-        // (`n * people`), `flag &&` accepting `&active` → `flag &&active`
-        // (the derived-ref sigil silently lost).
+        // operator. Absorbing an operator byte would corrupt the buffer:
+        // `n*` accepting `*people` → `n*people` (`n * people`). For `&`, the
+        // sigil is lost only when it is the second `&` of `&&` (`flag &&`
+        // accepting `&active` must NOT absorb, leaving `flag &&&active` =
+        // `flag && (&active)`); after an identifier/closer, `report&` accepting
+        // `&active` should absorb, giving `report&active` = `report (&active)`.
+        let sigil = bytes[start - 1];
         let before_sigil = (start - 1)
             .checked_sub(1)
             .and_then(|i| bytes.get(i))
             .copied();
-        let sigil_is_operator = before_sigil.is_some_and(|b| {
-            b.is_ascii_alphanumeric() || matches!(b, b'_' | b')' | b']' | b'}' | b'"' | b'&')
-        });
-        if !sigil_is_operator {
+        if !sigil_is_binary_operator(sigil, before_sigil) {
             start -= 1;
         }
     }
@@ -137,13 +151,20 @@ pub(crate) fn handle_completion(
     // (identifier char, digit, closing bracket, string quote) or, for `&`,
     // another `&` (the `&&` operator). This mirrors the parser's adjacency
     // rule and stops `x && ` / `a * ` from collapsing the completion popup.
-    let trigger_is_operator = offset
+    let before_trigger = offset
         .checked_sub(2)
         .and_then(|i| latest_source.as_bytes().get(i))
-        .copied()
-        .is_some_and(|b| {
+        .copied();
+    // Sigil-aware: `*` after an expression-ending byte is multiplication, but
+    // `&` is a derived-ref sigil everywhere except as the second `&` of `&&`
+    // (so `x&` still offers derived refs). Only meaningful in the `*`/`&`
+    // branches below.
+    let trigger_is_operator = match trigger_char {
+        Some(sigil @ (b'*' | b'&')) => sigil_is_binary_operator(sigil, before_trigger),
+        _ => before_trigger.is_some_and(|b| {
             b.is_ascii_alphanumeric() || matches!(b, b'_' | b')' | b']' | b'}' | b'"' | b'&')
-        });
+        }),
+    };
 
     // Context-aware: after `*` only suggest source/view names
     if trigger_char == Some(b'*') {
@@ -2099,6 +2120,30 @@ mod tests {
         // And a non-boundary offset inside a string literal still reports true.
         let src2 = "\"café";
         assert!(inside_string_or_comment(src2, 5));
+    }
+
+    #[test]
+    fn ampersand_sigil_is_operator_only_as_second_of_double() {
+        // Regression: `&` has no left-adjacency rule in the parser (`x&d`
+        // parses as `x (&d)`), so it is a derived-ref sigil everywhere except
+        // as the second `&` of `&&`. `*` keeps its expression-adjacency rule.
+        assert!(!sigil_is_binary_operator(b'&', Some(b'x'))); // report& → sigil
+        assert!(!sigil_is_binary_operator(b'&', Some(b')'))); // f(x)&   → sigil
+        assert!(sigil_is_binary_operator(b'&', Some(b'&'))); // flag &&  → operator
+        assert!(!sigil_is_binary_operator(b'&', None)); // leading &     → sigil
+        assert!(sigil_is_binary_operator(b'*', Some(b'n'))); // n*        → operator
+        assert!(!sigil_is_binary_operator(b'*', Some(b' '))); // n *      → sigil
+    }
+
+    #[test]
+    fn sigil_replace_range_absorbs_ampersand_after_identifier() {
+        // `report&` accepting a `&derived` item must replace the `&` (the edit
+        // range covers it) so the buffer becomes `report&active`, NOT
+        // `report&&active` (which the lexer fuses into `&&`, dropping the ref).
+        let src = "report&";
+        let range = sigil_replace_range(src, src.len());
+        let start_off = crate::utils::position_to_offset(src, range.start);
+        assert_eq!(start_off, 6, "the `&` sigil should be absorbed into the edit range");
     }
 
     fn item_labels(resp: CompletionResponse) -> Vec<String> {

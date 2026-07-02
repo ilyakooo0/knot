@@ -822,7 +822,13 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
 
     // Need at least one Bind/Where (relational comprehension) or multiple
     // statements (monadic sequencing). A single bare expression doesn't need
-    // desugaring.
+    // desugaring — EXCEPT a lone `yield e`: left undesugared it falls through
+    // to the relational `compile_do` path, which wraps the value in a
+    // singleton relation (`[e]`) even when the do-block's monad is IO/Maybe/…
+    // (e.g. an `IO`-typed handler body `do { yield Ok {...} }` would return
+    // `[value]` and be serialized as a relation). Routing it through `__yield`
+    // lets it dispatch on the resolved monad (`knot_io_pure` for IO, `Just`
+    // for Maybe, singleton for `[]`), which is correct in every monad.
     let has_bind_or_where = stmts.iter().any(|s| {
         matches!(
             &s.node,
@@ -830,7 +836,13 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
         )
     });
     if !has_bind_or_where && stmts.len() < 2 {
-        return false;
+        let lone_yield = matches!(
+            stmts.first().map(|s| &s.node),
+            Some(StmtKind::Expr(e)) if e.node.as_yield_arg().is_some()
+        );
+        if !lone_yield {
+            return false;
+        }
     }
 
     // GroupBy requires loop-based codegen — not eligible for desugaring

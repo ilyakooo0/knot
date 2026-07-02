@@ -3721,18 +3721,30 @@ impl Parser {
                 let tok = self.advance();
                 let TokenKind::Upper(name) = tok.kind else { unreachable!() };
                 // `Cons head tail` — non-empty relation pattern (reserved name).
+                // The built-in form has exactly TWO atom sub-patterns; a single
+                // atom after `Cons` (e.g. `Cons {head: h, tail: t}` or `Cons c`)
+                // is a user-defined constructor named `Cons` with one record/var
+                // payload, so fall through to a normal constructor pattern
+                // instead of erroring — otherwise a `data … = … | Cons {…}` type
+                // is constructable but impossible to pattern-match.
                 if name == "Cons" && self.can_start_pat_atom() {
                     let head = self.parse_pat_atom()?;
-                    if !self.can_start_pat_atom() {
-                        self.error("expected tail pattern after 'Cons head'");
-                        return None;
+                    if self.can_start_pat_atom() {
+                        let tail = self.parse_pat_atom()?;
+                        let span = Span::new(start.start, tail.span.end);
+                        return Some(Spanned::new(
+                            PatKind::Cons {
+                                head: Box::new(head),
+                                tail: Box::new(tail),
+                            },
+                            span,
+                        ));
                     }
-                    let tail = self.parse_pat_atom()?;
-                    let span = Span::new(start.start, tail.span.end);
+                    let span = Span::new(start.start, head.span.end);
                     return Some(Spanned::new(
-                        PatKind::Cons {
-                            head: Box::new(head),
-                            tail: Box::new(tail),
+                        PatKind::Constructor {
+                            name,
+                            payload: Box::new(head),
                         },
                         span,
                     ));

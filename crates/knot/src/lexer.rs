@@ -475,7 +475,7 @@ impl<'src> Lexer<'src> {
                 let prev_ok = i > 0 && bytes[i - 1].is_ascii_digit();
                 let next_ok = i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit();
                 if !prev_ok || !next_ok {
-                    let span = self.span_from(start);
+                    let span = Span::new(start + i, start + i + 1);
                     self.diagnostics.push(
                         Diagnostic::error("misplaced digit separator").label(
                             span,

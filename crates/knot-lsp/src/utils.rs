@@ -425,11 +425,14 @@ pub fn collect_keyword_operator_positions(tokens: &[knot::lexer::Token]) -> Vec<
             | TokenKind::With
             | TokenKind::Export
             | TokenKind::Unit
-            | TokenKind::Refine => Some(TOK_KEYWORD),
+            | TokenKind::Refine
+            | TokenKind::Serve
+            | TokenKind::Forall => Some(TOK_KEYWORD),
             TokenKind::Plus
             | TokenKind::Minus
             | TokenKind::Star
             | TokenKind::Slash
+            | TokenKind::Percent
             | TokenKind::EqEq
             | TokenKind::BangEq
             | TokenKind::Lt

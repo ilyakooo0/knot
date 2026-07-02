@@ -12,6 +12,7 @@ use knot::diagnostic::Diagnostic;
 use crate::codegen::{
     divisor_is_nonzero_int_literal, divisor_is_nonzero_literal, expr_has_tag_column,
     expr_refs_var, infer_sql_expr_type,
+    lookup_col_type_from_schema,
     minmax_pushdown_type_ok, sortby_projection_pushable, sql_comparison_cast_mode, type_name_to_tag,
     SqlCastMode,
 };
@@ -904,17 +905,13 @@ fn atom_would_need_cast(expr: &Expr) -> bool {
     }
 }
 
-/// Look up a column's schema type (schema format: "name:text,age:int").
+/// Look up a column's schema type. Delegates to codegen's
+/// `lookup_col_type_from_schema` so the lint can never diverge from the
+/// compiler's actual pushdown behavior — that function is bracket-aware
+/// (handling nested relation fields like `items:[price:int,qty:int]`) and
+/// recognizes ADT-relation schemas prefixed with `#`.
 fn lookup_col_type(schema: &str, col_name: &str) -> Option<String> {
-    for part in schema.split(',') {
-        let Some((name, ty)) = part.split_once(':') else {
-            continue;
-        };
-        if name == col_name {
-            return Some(ty.to_string());
-        }
-    }
-    None
+    lookup_col_type_from_schema(schema, col_name)
 }
 
 // `expr_refs_var` is shared with codegen (crate::codegen::expr_refs_var) so

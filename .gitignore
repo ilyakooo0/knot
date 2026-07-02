@@ -4,6 +4,7 @@
 *.db-wal
 .DS_Store
 /.vibe
+.opencode-tmp
 examples/hello
 examples/todo
 examples/traits

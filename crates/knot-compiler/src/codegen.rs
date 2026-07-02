@@ -706,7 +706,7 @@ pub fn compile(
                         continue;
                     }
                 "Bool"
-                    if !matches!(val.as_str(), "true" | "false" | "0" | "1") => {
+                    if !matches!(val.as_str(), "true" | "True" | "false" | "False" | "0" | "1") => {
                         cg.diagnostics.push(knot::diagnostic::Diagnostic::error(
                             format!("invalid compile-time override '{}' for --{} (expected true or false)", val, name),
                         ));
@@ -13433,7 +13433,7 @@ fn rewrite_body_through_projection(
     rewrite(plan, bind_var, body)
 }
 
-fn lookup_col_type_from_schema(schema: &str, col_name: &str) -> Option<String> {
+pub(crate) fn lookup_col_type_from_schema(schema: &str, col_name: &str) -> Option<String> {
     // ADT-relation schemas (`#Ctor:field=type;field=type|Ctor2:...|Nullary`)
     // describe a wide table where each constructor's fields are columns. The
     // record-schema parser below can't read this shape (it splits on top-level
@@ -13491,7 +13491,7 @@ fn schema_col_names(schema: &str) -> HashSet<String> {
 
 /// Split a schema descriptor by commas while respecting `[...]` bracket nesting
 /// for nested relation fields (e.g. `name:text,items:[price:int,qty:int]`).
-fn split_schema_fields(s: &str) -> Vec<&str> {
+pub(crate) fn split_schema_fields(s: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0usize;
     let mut start = 0;

@@ -58,35 +58,102 @@ fn reparses_to_same_ast(module: &Module, formatted: &str) -> bool {
 
 /// Remove every `span: Span { ... }` payload from a `Debug` rendering so AST
 /// comparison tolerates the byte-position drift formatting introduces.
+///
+/// Matches the *full* `Span { start: N, end: N }` shape (not a bare `Span {`
+/// prefix + seek-to-`}`) and tracks whether we're inside a string literal's
+/// Debug rendering. A user string whose contents happen to spell
+/// `Span { start: N, end: N }` must NOT be scrubbed — otherwise edits
+/// confined to those digits would compare equal, a false negative that
+/// silently makes the formatter fall back to the original source. Derived
+/// `Debug` always quotes string contents and escapes inner quotes as `\"`,
+/// so a simple in-string flag (with backslash escape handling) separates
+/// real span markers (rendered outside quotes) from look-alike string
+/// contents. Mirrors `incremental.rs::strip_spans`.
 fn strip_spans(debug: &str) -> String {
-    let mut out = String::with_capacity(debug.len());
     let bytes = debug.as_bytes();
+    let mut out = String::with_capacity(debug.len());
     let mut i = 0;
+    let mut in_string = false;
     while i < bytes.len() {
-        let rest = &debug[i..];
-        if rest.starts_with("span: Span {") {
-            // Skip to the matching close brace (Span's Debug nests no braces).
-            match rest.find('}') {
-                Some(close) => {
-                    i += close + 1;
-                    // Swallow a following `, ` separator if present.
-                    if debug[i..].starts_with(", ") {
-                        i += 2;
-                    }
+        if in_string {
+            // Inside a string: copy verbatim, honoring `\`-escapes (so an
+            // escaped `\"` does not prematurely close the string), and exit
+            // on the closing unescaped quote.
+            let step = utf8_char_len(bytes[i]);
+            let end = (i + step).min(bytes.len());
+            out.push_str(&debug[i..end]);
+            if bytes[i] == b'\\' {
+                // Copy the escaped char too, so it can't be misread as a quote.
+                if end < bytes.len() {
+                    let step2 = utf8_char_len(bytes[end]);
+                    let end2 = (end + step2).min(bytes.len());
+                    out.push_str(&debug[end..end2]);
+                    i = end2;
                     continue;
                 }
-                None => {
-                    out.push_str(rest);
-                    break;
-                }
+            } else if bytes[i] == b'"' {
+                in_string = false;
             }
+            i = end;
+            continue;
         }
-        // Advance one full UTF-8 character.
-        let ch = rest.chars().next().unwrap();
-        out.push(ch);
-        i += ch.len_utf8();
+        if let Some(len) = span_marker_len(&bytes[i..]) {
+            i += len;
+            // Swallow a following `, ` separator if present.
+            if debug[i..].starts_with(", ") {
+                i += 2;
+            }
+            continue;
+        }
+        // Copy one whole UTF-8 character verbatim. `i` is always on a char
+        // boundary: it starts at 0 and advances either by a full char width
+        // here or past an all-ASCII span marker above.
+        let step = utf8_char_len(bytes[i]);
+        let end = (i + step).min(bytes.len());
+        out.push_str(&debug[i..end]);
+        if bytes[i] == b'"' {
+            in_string = true;
+        }
+        i = end;
     }
     out
+}
+
+/// If `b` begins with a complete derived-`Debug` span marker
+/// (`Span { start: <digits>, end: <digits> }`), return its byte length;
+/// otherwise `None`. Pure ASCII, so the returned length keeps `i` on a
+/// UTF-8 char boundary.
+fn span_marker_len(b: &[u8]) -> Option<usize> {
+    let lit_at = |i: usize, lit: &[u8]| -> Option<usize> {
+        if b.len() >= i + lit.len() && b[i..i + lit.len()] == *lit {
+            Some(i + lit.len())
+        } else {
+            None
+        }
+    };
+    let digits_at = |i: usize| -> Option<usize> {
+        let mut j = i;
+        while j < b.len() && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > i { Some(j) } else { None }
+    };
+    let i = lit_at(0, b"Span { start: ".as_slice())?;
+    let i = digits_at(i)?;
+    let i = lit_at(i, b", end: ".as_slice())?;
+    let i = digits_at(i)?;
+    lit_at(i, b" }".as_slice())
+}
+
+/// Byte width of the UTF-8 character beginning with `first`.
+fn utf8_char_len(first: u8) -> usize {
+    match first {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1, // stray continuation byte: advance one to stay live
+    }
 }
 
 fn format_module_inner(source: &str, module: &Module) -> String {
@@ -295,6 +362,18 @@ fn collect_comments(source: &str) -> Vec<Comment<'_>> {
     let mut in_text = false;
     let mut in_bytes = false;
 
+    // Treat `\r` (lone CR) and `\r\n` as a single line break, matching
+    // `diagnostic::line_col` and the lexer. Counting only `\n` here would
+    // report every comment in a `\r`-only file as line 0 and misplace it.
+    // Returns the byte advance for a line break, or `None` for non-breaks.
+    let line_break_adv = |b: u8, next: Option<u8>| -> Option<usize> {
+        match b {
+            b'\n' => Some(1),
+            b'\r' => Some(if next == Some(b'\n') { 2 } else { 1 }),
+            _ => None,
+        }
+    };
+
     while i < bytes.len() {
         let b = bytes[i];
 
@@ -305,9 +384,9 @@ fn collect_comments(source: &str) -> Vec<Comment<'_>> {
             }
             if b == b'"' {
                 in_text = false;
-            } else if b == b'\n' {
+            } else if let Some(adv) = line_break_adv(b, bytes.get(i + 1).copied()) {
                 line += 1;
-                line_start = i + 1;
+                line_start = i + adv;
             }
             i += 1;
             continue;
@@ -319,9 +398,9 @@ fn collect_comments(source: &str) -> Vec<Comment<'_>> {
             }
             if b == b'"' {
                 in_bytes = false;
-            } else if b == b'\n' {
+            } else if let Some(adv) = line_break_adv(b, bytes.get(i + 1).copied()) {
                 line += 1;
-                line_start = i + 1;
+                line_start = i + adv;
             }
             i += 1;
             continue;
@@ -352,7 +431,7 @@ fn collect_comments(source: &str) -> Vec<Comment<'_>> {
             // Comment to end of line.
             let standalone = source[line_start..i].chars().all(|c| c == ' ' || c == '\t');
             let comment_start = i;
-            while i < bytes.len() && bytes[i] != b'\n' {
+            while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
                 i += 1;
             }
             let span = Span::new(comment_start, i);
@@ -365,9 +444,11 @@ fn collect_comments(source: &str) -> Vec<Comment<'_>> {
             });
             continue;
         }
-        if b == b'\n' {
+        if let Some(adv) = line_break_adv(b, bytes.get(i + 1).copied()) {
             line += 1;
-            line_start = i + 1;
+            i += adv;
+            line_start = i;
+            continue;
         }
         i += 1;
     }
@@ -375,7 +456,26 @@ fn collect_comments(source: &str) -> Vec<Comment<'_>> {
 }
 
 fn line_of(source: &str, byte: usize) -> usize {
-    source[..byte.min(source.len())].bytes().filter(|&b| b == b'\n').count()
+    // Count both `\n` and lone `\r` as line breaks (treat `\r\n` as one),
+    // mirroring `diagnostic::line_col` so comment placement is consistent
+    // across line-ending styles.
+    let bytes = source.as_bytes();
+    let end = byte.min(source.len());
+    let mut line = 0usize;
+    let mut i = 0usize;
+    while i < end {
+        let b = bytes[i];
+        if b == b'\n' {
+            line += 1;
+            i += 1;
+        } else if b == b'\r' {
+            line += 1;
+            i += if bytes.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+        } else {
+            i += 1;
+        }
+    }
+    line
 }
 
 fn trailing_line_comment<'a>(

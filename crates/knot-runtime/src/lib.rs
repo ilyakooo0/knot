@@ -16195,6 +16195,20 @@ fn http_serve_loop(
                                             continue;
                                         }
                                     };
+                                    // Reject CR/LF in the value: `tiny_http`'s
+                                    // header parser only `.trim()`s, so an
+                                    // embedded "\r\n" would survive and split
+                                    // the response (HTTP response splitting /
+                                    // header injection, CWE-113) when the value
+                                    // is derived from request data. Drop the
+                                    // header rather than emit a poisoned one.
+                                    if hdr_value.contains(['\r', '\n']) {
+                                        log_warn!(
+                                            "[HTTP] dropping response header '{}': value contains CR/LF",
+                                            http_name
+                                        );
+                                        continue;
+                                    }
                                     if let Ok(header) = format!("{}: {}", http_name, hdr_value)
                                         .parse::<tiny_http::Header>()
                                     {

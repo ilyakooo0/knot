@@ -5430,6 +5430,21 @@ impl Codegen {
         // Uncurry nested applications
         let (func_expr, args) = uncurry_app(expr);
 
+        // A user-defined top-level function shadows any same-named builtin,
+        // stdlib function, or SQL-pushdown special form. When present, skip all
+        // the name-based special-case dispatch below and fall through to the
+        // normal `user_fns` call arm in the match — mirroring the `traverse`
+        // special form, which already guards on `top_fn_names`. Without this a
+        // top-level `count = \xs -> …` would silently be replaced by the
+        // built-in `knot_source_query_count` SQL pushdown. (None of the
+        // special-cased names — count/single/fold/filter/… — are prelude
+        // functions, so this never spuriously suppresses a special form.)
+        let user_shadows_special = matches!(
+            &func_expr.node,
+            ast::ExprKind::Var(name)
+                if self.top_fn_names.contains(name) && self.user_fns.contains_key(name)
+        );
+
         // A locally-bound name (lambda param, `let`, do-bind, captured free
         // var) shadows any same-named top-level function, builtin, stdlib
         // function, or SQL-pushdown special form. Resolve it dynamically so
@@ -5459,7 +5474,7 @@ impl Codegen {
 
         // Special case: count *rel → SQL COUNT(*)
         if let ast::ExprKind::Var(name) = &func_expr.node
-            && name == "count" && args.len() == 1 {
+            && name == "count" && args.len() == 1 && !user_shadows_special {
                 if let Some(source_name) = self.resolve_source(args[0]) {
                     // Only for actual sources, not views
                     if !self.views.contains_key(&source_name)
@@ -5524,7 +5539,7 @@ impl Codegen {
 
         // Special case: single *rel / single (filter f *rel) / single (do {...}) → LIMIT 2
         if let ast::ExprKind::Var(name) = &func_expr.node
-            && name == "single" && args.len() == 1 {
+            && name == "single" && args.len() == 1 && !user_shadows_special {
                 // single *source → SELECT ... LIMIT 2 then knot_relation_single
                 if let Some(source_name) = self.resolve_source(args[0])
                     && !self.views.contains_key(&source_name)
@@ -5615,7 +5630,7 @@ impl Codegen {
         // streaming would do a redundant SQL pass.  The wins are in the filter
         // and do-block paths, which would otherwise build an intermediate Vec.
         if let ast::ExprKind::Var(name) = &func_expr.node
-            && name == "fold" && args.len() == 3 {
+            && name == "fold" && args.len() == 3 && !user_shadows_special {
                 // fold f init *source → SELECT cols FROM table; stream
                 if let ast::ExprKind::SourceRef(source_name) = &args[2].node
                     && !self.views.contains_key(source_name)
@@ -5693,7 +5708,7 @@ impl Codegen {
 
         // Special case: match Constructor SourceRef → SQL-level filtered read
         if let ast::ExprKind::Var(name) = &func_expr.node
-            && name == "match" && args.len() == 2
+            && name == "match" && args.len() == 2 && !user_shadows_special
                 && let ast::ExprKind::Constructor(ctor_name) = &args[0].node {
                     if let ast::ExprKind::SourceRef(source_name) = &args[1].node
                         && let Some(schema) = self.source_schemas.get(source_name).cloned() {
@@ -5726,7 +5741,7 @@ impl Codegen {
 
         // Special case: filter/sum/avg with lambda on source → SQL
         if let ast::ExprKind::Var(name) = &func_expr.node
-            && args.len() == 2 {
+            && args.len() == 2 && !user_shadows_special {
                 if let Some(source_name) = self.resolve_source(args[1])
                     && !self.views.contains_key(&source_name)
                         && let Some(schema) = self.source_schemas.get(&source_name).cloned()
@@ -6041,7 +6056,7 @@ impl Codegen {
 
         // Special case: takeRelation N (sortBy f *source) → SQL ORDER BY + LIMIT
         if let ast::ExprKind::Var(name) = &func_expr.node
-            && (name == "takeRelation" || name == "take") && args.len() == 2 {
+            && (name == "takeRelation" || name == "take") && args.len() == 2 && !user_shadows_special {
                 // args[0] = N, args[1] = sortBy f *source (or just *source)
                 if let ast::ExprKind::App { func: sort_func, arg: sort_source } = &args[1].node
                     && let ast::ExprKind::App { func: sort_name_expr, arg: sort_lambda } = &sort_func.node
@@ -6185,7 +6200,8 @@ impl Codegen {
             }
 
         // SQL set operations: diff/inter/union on two source relations
-        if let ast::ExprKind::Var(name) = &func_expr.node {
+        if let ast::ExprKind::Var(name) = &func_expr.node
+            && !user_shadows_special {
             let sql_op = match name.as_str() {
                 "diff" => Some("EXCEPT"),
                 "inter" => Some("INTERSECT"),
@@ -11525,17 +11541,6 @@ impl Codegen {
                             });
                         }
                         if name == "elem" {
-                            // `IN` is equality under the hood — float
-                            // equality stays in memory (total_cmp treats
-                            // -0.0 ≠ +0.0 and NaN as comparable, SQL
-                            // doesn't; see the float comparison gates).
-                            if let ast::ExprKind::FieldAccess { expr: fa, field } = &first_arg.node
-                                && matches!(&fa.node, ast::ExprKind::Var(v) if v == bind_var)
-                                    && lookup_col_type_from_schema(schema, field).as_deref()
-                                        == Some("float")
-                                {
-                                    return None;
-                                }
                             let needle = Self::try_compile_single_table_atom(bind_var, first_arg)?;
                             // (a) Literal list: emit `IN (?, ?, …)` directly so
                             //     SQLite can compare each element by type
@@ -11546,6 +11551,17 @@ impl Codegen {
                                         sql: "0".to_string(),
                                         params: vec![],
                                     });
+                                }
+                                // `IN` is equality under the hood, so — like the
+                                // dynamic path below — only push down when
+                                // inference marked the haystack's element type a
+                                // SQL-pushable scalar. This excludes floats
+                                // (total_cmp treats -0.0 ≠ +0.0 and NaN as
+                                // comparable, SQL doesn't), regardless of whether
+                                // the needle is a column, a computed value, or a
+                                // literal. Non-pushable → fall back to memory.
+                                if !self.elem_pushdown_ok.contains(&arg.span) {
+                                    return None;
                                 }
                                 let mut parts = Vec::with_capacity(elems.len());
                                 let mut params = needle.params;
@@ -14090,8 +14106,46 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
                 collect_free_vars_set(&h.body, bound, free);
             }
         }
-        // Conservative: ignore SQL-irrelevant constructs.
-        Case { .. } | Do(_) | Set { .. } | ReplaceSet { .. } | Atomic(_) => {}
+        Case { scrutinee, arms } => {
+            collect_free_vars_set(scrutinee, bound, free);
+            for arm in arms {
+                // Each arm's pattern binds names local to that arm's body.
+                let mut arm_bound = bound.clone();
+                collect_pat_binds(&arm.pat, &mut arm_bound);
+                collect_free_vars_set(&arm.body, &arm_bound, free);
+            }
+        }
+        Do(stmts) => {
+            // A `do` block sequences statements; `Bind`/`Let` introduce names
+            // visible to *subsequent* statements, so thread the bound set.
+            let mut do_bound = bound.clone();
+            for stmt in stmts {
+                match &stmt.node {
+                    ast::StmtKind::Bind { pat, expr } => {
+                        collect_free_vars_set(expr, &do_bound, free);
+                        collect_pat_binds(pat, &mut do_bound);
+                    }
+                    ast::StmtKind::Let { pat, expr } => {
+                        collect_free_vars_set(expr, &do_bound, free);
+                        collect_pat_binds(pat, &mut do_bound);
+                    }
+                    ast::StmtKind::Where { cond } => {
+                        collect_free_vars_set(cond, &do_bound, free);
+                    }
+                    ast::StmtKind::GroupBy { key } => {
+                        collect_free_vars_set(key, &do_bound, free);
+                    }
+                    ast::StmtKind::Expr(e) => {
+                        collect_free_vars_set(e, &do_bound, free);
+                    }
+                }
+            }
+        }
+        Set { target, value } | ReplaceSet { target, value } => {
+            collect_free_vars_set(target, bound, free);
+            collect_free_vars_set(value, bound, free);
+        }
+        Atomic(inner) => collect_free_vars_set(inner, bound, free),
     }
 }
 

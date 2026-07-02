@@ -12,7 +12,7 @@ use crate::defs::resolve_definitions;
 use crate::shared::scan_knot_files_in_roots;
 use crate::state::{builtins, DocumentState, ServerState, KEYWORDS};
 use crate::utils::{
-    find_word_in_source, find_word_last_in_source, ident_lookup_offset, path_to_uri,
+    find_word_after_eq, find_word_in_source, find_word_last_in_source, ident_lookup_offset, path_to_uri,
     position_to_offset, recurse_expr,
     safe_slice, span_to_range, uri_to_path, word_at_position,
 };
@@ -1133,12 +1133,26 @@ pub(crate) fn collect_name_uses_in_decl(
             }
             for item in items {
                 if let ast::TraitItem::Method {
+                    name_span,
                     ty,
                     default_body,
                     default_params,
                     ..
                 } = item
                 {
+                    // A method's own `Trait a =>` constraint trait names
+                    // (`eq : Show a => Bool`) are spanless; `walk_scheme` covers
+                    // the type and constraint args but not the trait names, so
+                    // recover them between the method name and its type (mirrors
+                    // the `Fun`/supertrait handling).
+                    push_trait_name_refs(
+                        ty.constraints.iter().map(|c| c.trait_name.as_str()),
+                        name,
+                        source,
+                        name_span.end,
+                        ty.ty.span.start,
+                        out,
+                    );
                     walk_scheme(ty, name, source, out);
                     if let Some(body) = default_body {
                         for p in default_params {
@@ -1166,6 +1180,7 @@ pub(crate) fn collect_name_uses_in_decl(
             walk_expr(using_fn, name, source, false, out);
         }
         DeclKind::Route { entries, .. } => {
+            let mut ctor_cursor = decl.span.start;
             for entry in entries {
                 for f in entry
                     .body_fields
@@ -1190,6 +1205,19 @@ pub(crate) fn collect_name_uses_in_decl(
                 // otherwise the rename leaves stale names and breaks the source.
                 if let Some(rl) = &entry.rate_limit {
                     walk_expr(rl, name, source, false, out);
+                }
+                // The endpoint constructor (`… -> Response = GetUsers`) is a
+                // definition referenced by `serve API where GetUsers = …` and
+                // `fetch url (GetUsers {…})`. It's spanless in the AST, so
+                // recover its `= Ctor` token by scanning the decl source;
+                // without this a rename updates the serve/fetch sites but
+                // leaves the route declaration dangling.
+                if entry.constructor == name
+                    && let Some(span) =
+                        find_word_after_eq(source, name, ctor_cursor, decl.span.end)
+                {
+                    ctor_cursor = span.end;
+                    out.push(span);
                 }
             }
         }
@@ -3188,5 +3216,40 @@ mod regress_rename_fixes_tests {
         // `'` is a legal identifier-continue char in the lexer.
         let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "double'"));
         assert!(edit.is_some(), "primed new name must be accepted");
+    }
+
+    #[test]
+    fn rename_route_endpoint_constructor_updates_route_decl_and_serve() {
+        // Renaming the endpoint constructor from its `serve` handler must also
+        // rewrite the route declaration's `= GetUsers` site (spanless in the
+        // AST) — otherwise the route dangles and serve exhaustiveness breaks.
+        let mut ws = TestWorkspace::new();
+        let src = r#"type Resp = {ok: Bool}
+route Api where
+  GET /users -> Resp = GetUsers
+
+srv = serve Api where GetUsers = \req -> Ok {value: {ok: true}}
+"#;
+        let uri = ws.open("main", src);
+        let doc = ws.doc(&uri);
+        // Start the rename from the `serve` handler's endpoint token.
+        let off = doc.source.find("GetUsers = \\req").expect("serve endpoint");
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "ListUsers"))
+            .expect("rename emits edit");
+        let edits = edit.changes.expect("changes").remove(&uri).expect("edits");
+        let out = apply_edits(&doc.source, &edits);
+        assert!(
+            out.contains("-> Resp = ListUsers"),
+            "route decl endpoint constructor must be renamed; got:\n{out}"
+        );
+        assert!(
+            out.contains("serve Api where ListUsers ="),
+            "serve handler endpoint must be renamed; got:\n{out}"
+        );
+        assert!(
+            !out.contains("GetUsers"),
+            "no stale GetUsers should remain; got:\n{out}"
+        );
     }
 }

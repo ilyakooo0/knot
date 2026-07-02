@@ -302,6 +302,34 @@ pub fn find_word_in_source(source: &str, name: &str, start: usize, end: usize) -
     None
 }
 
+/// Find a whole-word `name` in the range whose nearest preceding
+/// non-whitespace character is a single `=` (assignment), advancing past any
+/// earlier occurrences that aren't in that position. Used to locate a route
+/// endpoint constructor's definition site (`… -> Response = GetUsers`), which
+/// is spanless in the AST, without matching an identically-named response type
+/// or path segment earlier in the same entry. Rejects `==`/`>=`/`<=`/`!=` so a
+/// comparison operator is never mistaken for assignment.
+pub fn find_word_after_eq(source: &str, name: &str, start: usize, end: usize) -> Option<Span> {
+    let bytes = source.as_bytes();
+    let mut from = start;
+    while let Some(span) = find_word_in_source(source, name, from, end) {
+        from = span.end;
+        // Walk back over whitespace to the char preceding the name.
+        let mut i = span.start;
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        if i > 0 && bytes[i - 1] == b'=' {
+            // Ensure it's a lone `=`, not part of `==`/`>=`/`<=`/`!=`.
+            let prev = if i >= 2 { Some(bytes[i - 2]) } else { None };
+            if !matches!(prev, Some(b'=' | b'>' | b'<' | b'!')) {
+                return Some(span);
+            }
+        }
+    }
+    None
+}
+
 /// Like [`find_word_in_source`] but returns the *last* whole-word match in the
 /// range. Useful when a name's true site is the one closest to the end of the
 /// window — e.g. a route field/param declaration `name: Type`, where the name

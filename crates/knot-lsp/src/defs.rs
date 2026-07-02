@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use knot::ast::{self, DeclKind, Module, Span, Type, TypeKind};
 
 use crate::type_format::{format_type_kind, format_type_scheme};
-use crate::utils::find_word_in_source;
+use crate::utils::{find_word_after_eq, find_word_in_source};
 
 /// Given a byte offset just after a constructor's name token, return the
 /// offset just past that constructor's brace-balanced `{…}` field block, or
@@ -149,7 +149,23 @@ pub fn resolve_definitions(module: &Module, source: &str) -> Definitions {
                     }
                 }
             }
-            DeclKind::Route { name, .. } | DeclKind::RouteComposite { name, .. } => {
+            DeclKind::Route { name, entries, .. } => {
+                resolver.define(name, name_span(name));
+                // Each endpoint's constructor (`… -> Response = GetUsers`) is a
+                // definition referenced from `serve`/`fetch`. It's spanless, so
+                // recover its `= Ctor` token and register it so goto and
+                // find-references from those sites reach the route declaration.
+                let mut cursor = decl.span.start;
+                for entry in entries {
+                    if let Some(span) =
+                        find_word_after_eq(source, &entry.constructor, cursor, decl.span.end)
+                    {
+                        cursor = span.end;
+                        resolver.define(&entry.constructor, span);
+                    }
+                }
+            }
+            DeclKind::RouteComposite { name, .. } => {
                 resolver.define(name, name_span(name));
             }
             _ => {}
@@ -233,13 +249,25 @@ pub fn resolve_definitions(module: &Module, source: &str) -> Definitions {
                     }
                 }
                 for item in items {
-                    if let ast::ImplItem::Method { params, body, .. } = item {
-                        resolver.push_scope();
-                        for p in params {
-                            resolver.define_pat(p);
+                    match item {
+                        ast::ImplItem::Method { params, body, .. } => {
+                            resolver.push_scope();
+                            for p in params {
+                                resolver.define_pat(p);
+                            }
+                            resolver.resolve_expr(body);
+                            resolver.pop_scope();
                         }
-                        resolver.resolve_expr(body);
-                        resolver.pop_scope();
+                        ast::ImplItem::AssociatedType { args, ty, .. } => {
+                            // `type Item [a] = SomeType` — the argument and
+                            // definition types name real types; resolve them so
+                            // goto/find-references reach those definitions
+                            // (mirrors the rename walker).
+                            for arg in args {
+                                resolver.resolve_type(arg, source);
+                            }
+                            resolver.resolve_type(ty, source);
+                        }
                     }
                 }
             }
@@ -258,12 +286,22 @@ pub fn resolve_definitions(module: &Module, source: &str) -> Definitions {
                 }
                 for item in items {
                     if let ast::TraitItem::Method {
+                        name_span,
                         default_params,
                         default_body,
                         ty,
                         ..
                     } = item
                     {
+                        // A method's own `Trait a =>` constraint trait names
+                        // (`eq : Show a => Bool`) are spanless — recover them
+                        // between the method name and its type, so goto/rename
+                        // reach the constrained trait (mirrors the `Fun` arm).
+                        resolver.resolve_trait_names(
+                            ty.constraints.iter().map(|c| c.trait_name.as_str()),
+                            name_span.end,
+                            ty.ty.span.start,
+                        );
                         resolver.resolve_type(&ty.ty, source);
                         for c in &ty.constraints {
                             for arg in &c.args {

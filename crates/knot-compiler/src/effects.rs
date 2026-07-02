@@ -1381,8 +1381,41 @@ impl EffectChecker {
         let mut effects = self.infer_effects(arg);
         if is_lambda_arg(arg) {
             effects = effects.union(&self.fun_body_effects(arg));
+        } else if let Some(latent) = self.callback_arg_latent_effects(arg) {
+            // A *bare* (point-free) reference to an effectful callable passed as
+            // a higher-order callback — an IO builtin (`forEach xs removeFile`)
+            // or a user decl (`forEach xs deleteThing`). The `infer_effects`
+            // `Var` arm treats such an unapplied reference as pure, but the
+            // callee will invoke it, so its latent effects are performed here.
+            // Recover them so the IO-in-atomic gate is not bypassed, mirroring
+            // the lambda-arg and `let`-binding paths (`fun_body_effects` /
+            // `builtin_alias_effects`).
+            effects = effects.union(&latent);
         }
         effects
+    }
+
+    /// Latent effects of a bare point-free callable passed as a HOF callback.
+    /// Unwraps the same wrappers as `is_lambda_arg`, then resolves either an IO
+    /// builtin alias (`removeFile`, `println`, …) or a user declaration's
+    /// converged effects (using the atomic-gate-safe view when applicable).
+    /// Returns `None` for anything that isn't a bare reference to a callable.
+    fn callback_arg_latent_effects(&self, arg: &ast::Expr) -> Option<EffectSet> {
+        match &arg.node {
+            ast::ExprKind::UnitLit { value, .. }
+            | ast::ExprKind::Annot { expr: value, .. }
+            | ast::ExprKind::Refine(value) => self.callback_arg_latent_effects(value),
+            ast::ExprKind::Var(name) => {
+                if self.shadowed.iter().any(|s| s == name) {
+                    return None;
+                }
+                if let Some(e) = self.builtin_alias_effects(arg) {
+                    return Some(e);
+                }
+                self.lookup_decl_effects(name).cloned()
+            }
+            _ => None,
+        }
     }
 
     /// Resolve effects when a function expression is *called*.

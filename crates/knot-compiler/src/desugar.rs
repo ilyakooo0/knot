@@ -912,13 +912,19 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
         }
     }
 
-    // Constructor pattern binds may be value pattern matches (not monadic
-    // binds). The desugarer can't tell syntactically whether the expression
-    // is a relation or a value, so we leave these for direct codegen which
-    // handles both cases correctly.
+    // Refutable bind patterns (`Circle c <- xs`, `5 <- xs`, `[] <- xs`,
+    // `Cons h t <- xs`, or a record with a refutable subpattern) must not be
+    // desugared. Two reasons: constructor binds may be value pattern matches
+    // rather than monadic binds (the desugarer can't tell syntactically), and
+    // any refutable pattern needs *filtering* semantics — a non-matching
+    // element is skipped, not a hard failure. The desugared `__bind (\pat ->
+    // …)` lambda has no skip target, so a refutable pattern compiles to a trap
+    // (aborting the process on the first non-matching element). Direct codegen
+    // (`compile_do` / `bind_do_pattern`) handles both cases correctly, so
+    // leave these do-blocks un-desugared.
     if stmts.iter().any(|s| matches!(
         &s.node,
-        StmtKind::Bind { pat, .. } if matches!(&pat.node, PatKind::Constructor { .. })
+        StmtKind::Bind { pat, .. } if pat_is_refutable(&pat.node)
     )) {
         return false;
     }
@@ -934,6 +940,23 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
         }
     }
     matches!(stmts.last().unwrap().node, StmtKind::Expr(_))
+}
+
+/// Whether a bind pattern can fail to match a given value. Irrefutable
+/// patterns (`x`, `_`, and records whose subpatterns are all irrefutable)
+/// always bind; everything else (constructor, literal, list, cons) is
+/// refutable and needs the skip/filter semantics of direct do-codegen.
+fn pat_is_refutable(pat: &PatKind) -> bool {
+    match pat {
+        PatKind::Var(_) | PatKind::Wildcard => false,
+        PatKind::Constructor { .. }
+        | PatKind::Lit(_)
+        | PatKind::List(_)
+        | PatKind::Cons { .. } => true,
+        PatKind::Record(fields) => fields
+            .iter()
+            .any(|f| f.pattern.as_ref().is_some_and(|p| pat_is_refutable(&p.node))),
+    }
 }
 
 /// Check if an expression contains an IO-returning builtin or user-defined IO function.

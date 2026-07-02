@@ -729,7 +729,13 @@ impl Infer {
 
     fn is_sql_pushable_scalar_for_elem(&self, ty: &Ty) -> bool {
         match ty.peel_alias() {
-            Ty::Int | Ty::Text | Ty::Float | Ty::Bool | Ty::Uuid | Ty::IntUnit(_) | Ty::FloatUnit(_) => true,
+            // Float is deliberately excluded: `IN` / `=` in SQL is IEEE equality
+            // (-0.0 = +0.0, NaN stored as NULL), while Knot compares floats with
+            // `total_cmp` (-0.0 ≠ +0.0, NaN orderable). Pushing a float `elem`
+            // down — whether the needle is a bare column, a computed value, or a
+            // literal — would silently disagree with in-memory semantics, so
+            // keep every float `elem` in memory (see the codegen `elem` gates).
+            Ty::Int | Ty::Text | Ty::Bool | Ty::Uuid | Ty::IntUnit(_) => true,
             // Refined nominal alias `type Nat = Int where ...` shows up as
             // `Con(name, [])`; recurse to its base type.
             Ty::Con(name, args) if args.is_empty() => {
@@ -884,114 +890,58 @@ impl Infer {
 
         if a == b { return; }
 
-        // Find a variable in either side that we can solve.
-        // Prefer solving a variable that appears on only one side.
-        // Skolems are rigid and must never be solved — excluding them here means
-        // a unit-polymorphic signature variable cannot be narrowed by the body;
-        // an unsatisfiable difference falls through to the mismatch error below.
-        // (A flexible var may still be solved *to* a skolem, which is correct.)
-        let a_only_vars: Vec<UnitVar> = a.vars.keys()
-            .filter(|v| !b.vars.contains_key(v) && !self.unit_skolems.contains(v))
-            .copied().collect();
-        let b_only_vars: Vec<UnitVar> = b.vars.keys()
-            .filter(|v| !a.vars.contains_key(v) && !self.unit_skolems.contains(v))
-            .copied().collect();
-
-        if let Some(&va) = a_only_vars.first() {
-            // Solve va: a_bases + va^ea + shared_vars = b_bases + b_vars
-            // => va^ea = (b - a_without_va)
-            let ea = a.vars[&va];
-            let mut solution = b.div(&UnitTy { bases: a.bases.clone(), vars: a.vars.iter()
-                .filter(|(k, _)| **k != va).map(|(&k, &v)| (k, v)).collect() });
-            // Scale by 1/ea if ea != 1
-            if ea != 1 {
-                // Can only solve cleanly if all exponents divide evenly
-                let mut clean = true;
-                for exp in solution.bases.values() {
-                    if exp % ea != 0 { clean = false; break; }
-                }
-                for exp in solution.vars.values() {
-                    if exp % ea != 0 { clean = false; break; }
-                }
-                if clean {
-                    for exp in solution.bases.values_mut() { *exp /= ea; }
-                    for exp in solution.vars.values_mut() { *exp /= ea; }
-                    solution.normalize();
-                } else {
-                    self.error(
-                        format!("unit mismatch: {} vs {}", a.display(), b.display()),
-                        span,
-                    );
-                    return;
-                }
-            }
-            solution.normalize();
-            // Occurs check: `va` must not appear in its own solution, or
-            // `apply_unit` would chase a cycle to its iteration cap and panic.
-            // The apply-before-solve discipline already guarantees this (va is
-            // a_only and excluded from the solution), but enforce it explicitly
-            // so a future change can't silently reintroduce the cycle.
-            if solution.vars.contains_key(&va) {
-                self.error(
-                    format!("unit mismatch: {} vs {}", a.display(), b.display()),
-                    span,
-                );
-                return;
-            }
-            self.unit_subst.insert(va, solution);
-        } else if let Some(&vb) = b_only_vars.first() {
-            // Symmetric: solve vb
-            let eb = b.vars[&vb];
-            let mut solution = a.div(&UnitTy { bases: b.bases.clone(), vars: b.vars.iter()
-                .filter(|(k, _)| **k != vb).map(|(&k, &v)| (k, v)).collect() });
-            if eb != 1 {
-                let mut clean = true;
-                for exp in solution.bases.values() {
-                    if exp % eb != 0 { clean = false; break; }
-                }
-                for exp in solution.vars.values() {
-                    if exp % eb != 0 { clean = false; break; }
-                }
-                if clean {
-                    for exp in solution.bases.values_mut() { *exp /= eb; }
-                    for exp in solution.vars.values_mut() { *exp /= eb; }
-                    solution.normalize();
-                } else {
-                    self.error(
-                        format!("unit mismatch: {} vs {}", a.display(), b.display()),
-                        span,
-                    );
-                    return;
-                }
-            }
-            solution.normalize();
-            // Occurs check (see the symmetric a_only branch above).
-            if solution.vars.contains_key(&vb) {
-                self.error(
-                    format!("unit mismatch: {} vs {}", a.display(), b.display()),
-                    span,
-                );
-                return;
-            }
-            self.unit_subst.insert(vb, solution);
-        } else if a.vars.is_empty() && b.vars.is_empty() {
-            // No variables — bases must match exactly
-            if a.bases != b.bases {
-                self.error(
-                    format!("unit mismatch: {} vs {}", a.display(), b.display()),
-                    span,
-                );
-            }
-        } else {
-            // Both sides share all variables — check if difference is concrete
-            let diff = a.div(&b);
-            if !diff.is_dimensionless() {
-                self.error(
-                    format!("unit mismatch: {} vs {}", a.display(), b.display()),
-                    span,
-                );
-            }
+        // Reduce the two sides to a single equation: `a == b` iff the quotient
+        // `diff = a / b` is dimensionless. Solving for one flexible variable in
+        // `diff` yields the most general unifier and handles both one-sided and
+        // shared variables uniformly.
+        let diff = a.div(&b);
+        if diff.is_dimensionless() {
+            return;
         }
+
+        // Solve `diff = 1` for one flexible (non-skolem) unit variable `v`:
+        // `v^e · rest = 1` ⇒ `v = rest^(-1/e)`, which needs `e` to divide every
+        // remaining exponent. Skolems are rigid and must never be solved (a
+        // unit-polymorphic signature variable cannot be narrowed by the body),
+        // though a flexible var may still be solved *to* a skolem. Prefer a
+        // variable with |e| == 1 (always cleanly solvable); otherwise try any
+        // whose exponent evenly divides the rest. Considering *every* candidate
+        // rather than the first is what lets `Float<u*u*v>` unify with
+        // `Float<M>` (solve the exp-1 `v`, leaving `u` free) and `Float<u>`
+        // unify with `Float<u^2>` (solve the shared `u` to dimensionless) — a
+        // first-only greedy pick would wrongly reject both.
+        let mut candidates: Vec<UnitVar> = diff.vars.keys()
+            .filter(|v| !self.unit_skolems.contains(v))
+            .copied()
+            .collect();
+        candidates.sort_by_key(|v| diff.vars[v].abs());
+
+        for v in candidates {
+            let e = diff.vars[&v];
+            // rest = diff without `v`; `v` therefore can't appear in its own
+            // solution (so no occurs-cycle for `apply_unit` to chase).
+            let mut rest = diff.clone();
+            rest.vars.remove(&v);
+            let clean = rest.bases.values().all(|x| x % e == 0)
+                && rest.vars.values().all(|x| x % e == 0);
+            if !clean {
+                continue;
+            }
+            // v = rest^(-1/e): negate and divide every exponent by e.
+            for x in rest.bases.values_mut() { *x = -(*x / e); }
+            for x in rest.vars.values_mut() { *x = -(*x / e); }
+            rest.normalize();
+            self.unit_subst.insert(v, rest);
+            return;
+        }
+
+        // No solvable flexible variable remains: the residual difference is
+        // concrete bases and/or rigid skolem variables, so the units genuinely
+        // differ.
+        self.error(
+            format!("unit mismatch: {} vs {}", a.display(), b.display()),
+            span,
+        );
     }
 
     /// Convert an AST UnitExpr to our internal UnitTy, expanding aliases.

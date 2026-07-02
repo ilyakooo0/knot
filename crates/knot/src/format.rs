@@ -122,10 +122,18 @@ fn format_module_inner(source: &str, module: &Module) -> String {
         .first()
         .map(|b| b.span().start)
         .unwrap_or(source.len());
-    let leading_comments: Vec<&Comment> = comments
+    // An exported declaration's `export` keyword sits in the gap before the
+    // decl's span, so a comment on the `export` line (`export -- keep me`) is
+    // non-standalone yet must still be emitted above the decl. Include such
+    // comments alongside the standalone ones and emit them in source order, so
+    // they are neither dropped nor reordered relative to the standalone
+    // comments in the same gap.
+    let first_exported = matches!(blocks.first(), Some(Block::Decl(d)) if d.exported);
+    let mut leading_comments: Vec<&Comment> = comments
         .iter()
-        .filter(|c| c.standalone && c.span.end <= first_start)
+        .filter(|c| (c.standalone || first_exported) && c.span.end <= first_start)
         .collect();
+    leading_comments.sort_by_key(|c| c.span.start);
     if !leading_comments.is_empty() {
         for (j, c) in leading_comments.iter().enumerate() {
             if j > 0 {
@@ -162,11 +170,23 @@ fn format_module_inner(source: &str, module: &Module) -> String {
             // Always start a fresh line for the next block.
             out.push('\n');
 
-            // Standalone comments between the previous block and this one.
-            let between: Vec<&Comment> = comments
+            // Comments between the previous block and this one, in source
+            // order. Standalone comments always qualify; when this block is an
+            // exported declaration, a comment on its `export` line is
+            // non-standalone but belongs here too (see the leading section).
+            // The previous block's own trailing comment (on `prev_line`) is
+            // emitted with that block, so exclude it.
+            let this_exported = matches!(block, Block::Decl(d) if d.exported);
+            let prev_line = line_of(source, prev_end);
+            let mut between: Vec<&Comment> = comments
                 .iter()
-                .filter(|c| c.standalone && c.span.start >= prev_end && c.span.end <= block_start)
+                .filter(|c| {
+                    (c.standalone || (this_exported && c.line != prev_line))
+                        && c.span.start >= prev_end
+                        && c.span.end <= block_start
+                })
                 .collect();
+            between.sort_by_key(|c| c.span.start);
 
             if !between.is_empty() {
                 if has_blank_lines_between(source, prev_end, between[0].span.start) {
@@ -197,36 +217,6 @@ fn format_module_inner(source: &str, module: &Module) -> String {
                 out.push('\n');
             }
         }
-
-        // A comment on the `export` line of an exported declaration (e.g.
-        // `export -- keep me` on the line before `type A = Int`) is
-        // non-standalone — the `export` keyword precedes it — and lies in the
-        // gap before the decl's span, which begins *after* `export`. It is
-        // caught by neither the standalone `between`/leading filters nor the
-        // previous block's trailing-comment check, so without this it is
-        // silently dropped. Emit any such comment on its own line above the
-        // declaration. (The previous block's own trailing comment, on
-        // `line_of(prev_end)`, was already emitted, so exclude that line.)
-        if let Block::Decl(d) = block
-            && d.exported {
-                let prev_line = if i > 0 {
-                    Some(line_of(source, prev_end))
-                } else {
-                    None
-                };
-                for c in comments.iter().filter(|c| {
-                    !c.standalone
-                        && c.span.start >= prev_end
-                        && c.span.end <= block_start
-                        && Some(c.line) != prev_line
-                }) {
-                    if !out.is_empty() && !out.ends_with('\n') {
-                        out.push('\n');
-                    }
-                    out.push_str(c.text);
-                    out.push('\n');
-                }
-            }
 
         let rendered = match block {
             Block::Import(i) => render_import(i),

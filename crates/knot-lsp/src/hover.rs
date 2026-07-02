@@ -73,7 +73,7 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     // down still renders when metadata exists. (Numeric receivers like the
     // `14` of `3.14` parse as float literals, not FieldAccess nodes, so
     // they never classify as field context here.)
-    let field_at_cursor = find_field_access_at_offset(&doc.module, lookup_offset);
+    let field_at_cursor = find_field_access_at_offset(&doc.module, &doc.source, lookup_offset);
     let on_field_token = field_at_cursor
         .as_ref()
         .is_some_and(|f| f.field_name == word);

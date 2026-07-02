@@ -383,6 +383,23 @@ pub fn resolve_definitions(module: &Module, source: &str) -> Definitions {
                     }
                 }
             }
+            DeclKind::SubsetConstraint { sub, sup } => {
+                // `*orders.customer <= *people.name` references source
+                // relations by name. `RelationPath` is spanless, so recover
+                // each relation-name token from the decl source (the `*` sigil
+                // is a word boundary) and register it so goto/find-references/
+                // rename reach the referenced sources. A moving cursor lets
+                // both sides — including `*users <= *users.email` — resolve.
+                let mut search_from = decl.span.start;
+                for rel in [&sub.relation, &sup.relation] {
+                    if let Some(span) =
+                        find_word_in_source(source, rel, search_from, decl.span.end)
+                    {
+                        search_from = span.end;
+                        resolver.add_ref(span, rel);
+                    }
+                }
+            }
             _ => {}
         }
     }

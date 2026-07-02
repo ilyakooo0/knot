@@ -182,11 +182,27 @@ impl ParsedType {
         }
     }
 
-    /// Render with surrounding parens when needed for unambiguous nesting.
+    /// Render with surrounding parens when needed for unambiguous nesting in
+    /// argument position. Anything whose rendering contains a top-level space
+    /// would re-associate wrongly as a bare application argument — a function
+    /// (`a -> b`), an applied constructor (`Maybe Int` inside `List (Maybe
+    /// Int)` must not become `List Maybe Int`), an `IO … ty`, a `… where p`
+    /// refinement, or a `forall …`. Self-delimiting forms (records `{…}`,
+    /// variants `<…>`, relations `[…]`, unit annotations `T<u>`, bare names
+    /// and vars) need none.
     fn render_atomic(&self) -> String {
-        match self {
-            ParsedType::Function(_, _) => format!("({})", self.render()),
-            other => other.render(),
+        let needs_parens = match self {
+            ParsedType::Function(_, _)
+            | ParsedType::Io { .. }
+            | ParsedType::Refined { .. }
+            | ParsedType::Forall(_, _) => true,
+            ParsedType::Named(_, args) => !args.is_empty(),
+            _ => false,
+        };
+        if needs_parens {
+            format!("({})", self.render())
+        } else {
+            self.render()
         }
     }
 }
@@ -853,6 +869,24 @@ mod regress_fixes_tests {
         // Closed rows unchanged.
         assert_eq!(ParsedType::parse("IO {fs} Text").render(), "IO {fs} Text");
         assert_eq!(ParsedType::parse("IO {} Text").render(), "IO {} Text");
+    }
+
+    /// `render_atomic` must parenthesize any argument whose rendering carries
+    /// a top-level space — otherwise a nested application re-associates and
+    /// renders a semantically different type (e.g. `Maybe (List Int)` would
+    /// collapse to `Maybe List Int`, i.e. `(Maybe List) Int`). Covers applied
+    /// constructors, IO, refinements and functions in argument position.
+    #[test]
+    fn nested_application_args_are_parenthesized() {
+        for s in [
+            "Maybe (List Int)",
+            "List (Maybe Int)",
+            "Either (List Int) (Maybe Text)",
+            "Maybe (IO {} Int)",
+            "List (Int -> Text)",
+        ] {
+            assert_eq!(ParsedType::parse(s).render(), s, "round-trip failed for {s}");
+        }
     }
 
     /// Unterminated `IO {…` (truncated type string) used to spin forever in

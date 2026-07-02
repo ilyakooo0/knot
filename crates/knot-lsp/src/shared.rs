@@ -8,7 +8,7 @@ use knot::ast::{self, DeclKind, Module, Span};
 use knot_compiler::effects::EffectSet;
 
 use crate::type_format::format_type_kind;
-use crate::utils::{recurse_expr, safe_slice};
+use crate::utils::{find_word_in_source, recurse_expr, safe_slice};
 
 // ── Signature rendering ─────────────────────────────────────────────
 
@@ -1159,10 +1159,14 @@ pub(crate) enum ReceiverKind {
 
 /// If a `FieldAccess { expr, field }` node has its field-name token under the
 /// cursor, return the field name and a coarse classification of the receiver.
-/// The field-name span is the trailing `field.len()` bytes of the FieldAccess's
-/// overall span (mirrors `semantic_tokens::visit_expr`).
+/// The field-name token is located by whole-word search in the window between
+/// the receiver's end and the access node's end — NOT as a fixed `field.len()`
+/// suffix of the access span, because a parenthesized access (`(r.total)`)
+/// widens the node span to cover the trailing paren(s), which would shift the
+/// suffix offset off the real token.
 pub(crate) fn find_field_access_at_offset(
     module: &Module,
+    source: &str,
     offset: usize,
 ) -> Option<FieldAccessAt> {
     fn classify_receiver(expr: &ast::Expr) -> ReceiverKind {
@@ -1173,31 +1177,39 @@ pub(crate) fn find_field_access_at_offset(
             _ => ReceiverKind::Other,
         }
     }
-    fn walk(expr: &ast::Expr, offset: usize, best: &mut Option<FieldAccessAt>, depth: usize) {
+    fn walk(
+        expr: &ast::Expr,
+        source: &str,
+        offset: usize,
+        best: &mut Option<FieldAccessAt>,
+        depth: usize,
+    ) {
         if depth > MAX_WALK_DEPTH {
             return;
         }
-        if let ast::ExprKind::FieldAccess { expr: receiver, field } = &expr.node {
-            let field_start = expr.span.end.saturating_sub(field.len());
-            if field_start <= offset && offset < expr.span.end {
-                *best = Some(FieldAccessAt {
-                    field_name: field.clone(),
-                    receiver: classify_receiver(receiver),
-                });
-            }
+        if let ast::ExprKind::FieldAccess { expr: receiver, field } = &expr.node
+            && let Some(tok) =
+                find_word_in_source(source, field, receiver.span.end, expr.span.end)
+            && tok.start <= offset
+            && offset < tok.end
+        {
+            *best = Some(FieldAccessAt {
+                field_name: field.clone(),
+                receiver: classify_receiver(receiver),
+            });
         }
-        recurse_expr(expr, |e| walk(e, offset, best, depth + 1));
+        recurse_expr(expr, |e| walk(e, source, offset, best, depth + 1));
     }
     let mut best = None;
     for decl in &module.decls {
         match &decl.node {
             DeclKind::Fun { body: Some(body), .. }
             | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => walk(body, offset, &mut best, 0),
+            | DeclKind::Derived { body, .. } => walk(body, source, offset, &mut best, 0),
             DeclKind::Impl { items, .. } => {
                 for item in items {
                     if let ast::ImplItem::Method { body, .. } = item {
-                        walk(body, offset, &mut best, 0);
+                        walk(body, source, offset, &mut best, 0);
                     }
                 }
             }

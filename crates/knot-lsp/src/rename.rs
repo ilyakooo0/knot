@@ -1237,6 +1237,24 @@ pub(crate) fn collect_name_uses_in_decl(
                     }
             }
         }
+        DeclKind::SubsetConstraint { sub, sup } => {
+            // `*orders.customer <= *people.name` references source relations by
+            // name. `RelationPath` is spanless, so recover each relation-name
+            // occurrence by scanning the decl source with a moving cursor (both
+            // sides may name the same relation, e.g. `*users <= *users.email`).
+            // The `*` sigil is a word boundary for the search. Without this, a
+            // source rename leaves the constraint dangling and broken.
+            let mut cursor = decl.span.start;
+            for rel in [&sub.relation, &sup.relation] {
+                if rel.as_str() == name
+                    && let Some(span) =
+                        find_word_in_source(source, name, cursor, decl.span.end)
+                {
+                    cursor = span.end;
+                    out.push(span);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -1735,16 +1753,17 @@ fn field_sites_in_expr<F: FnMut(&str, Span)>(expr: &ast::Expr, source: &str, f: 
                 search_start = fld.value.span.end;
             }
         }
-        ast::ExprKind::FieldAccess { field, expr: rec }
-            // The field token is the suffix of the access expression.
-            if expr.span.end >= field.len() => {
-                let start = expr.span.end - field.len();
-                if start >= rec.span.end
-                    && source.get(start..expr.span.end) == Some(field.as_str())
-                {
-                    f(field, Span::new(start, expr.span.end));
-                }
+        ast::ExprKind::FieldAccess { field, expr: rec } => {
+            // The field token sits between the receiver's end and the access
+            // expression's end. It is NOT reliably the exact suffix of the
+            // access span: a parenthesized access (`(r.total)`) widens the
+            // node span to cover the closing paren(s), so a fixed suffix
+            // offset would slice `otal)` instead of `total`. Locate the token
+            // by whole-word search in the receiver→access window instead.
+            if let Some(span) = find_word_in_source(source, field, rec.span.end, expr.span.end) {
+                f(field, span);
             }
+        }
         ast::ExprKind::Case { arms, .. } => {
             for arm in arms {
                 field_sites_in_pat(&arm.pat, source, f);
@@ -3250,6 +3269,40 @@ srv = serve Api where GetUsers = \req -> Ok {value: {ok: true}}
         assert!(
             !out.contains("GetUsers"),
             "no stale GetUsers should remain; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn rename_source_updates_subset_constraint_refs() {
+        // Renaming a source relation must rewrite its occurrences inside a
+        // `*sub <= *sup` subset constraint (spanless `RelationPath`), including
+        // when the same relation appears on both sides of a uniqueness
+        // constraint. Otherwise the constraint dangles and breaks the source.
+        let mut ws = TestWorkspace::new();
+        let src = "*people : [{name: Text, email: Text}]\n\
+                   *orders : [{customer: Text}]\n\
+                   *orders.customer <= *people.name\n\
+                   *people <= *people.email\n";
+        let uri = ws.open("main", src);
+        let doc = ws.doc(&uri);
+        // Rename `people` starting from its declaration.
+        let off = doc.source.find("people").expect("source decl");
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "humans"))
+            .expect("rename emits edit");
+        let edits = edit.changes.expect("changes").remove(&uri).expect("edits");
+        let out = apply_edits(&doc.source, &edits);
+        assert!(
+            out.contains("*orders.customer <= *humans.name"),
+            "referential-integrity constraint must be renamed; got:\n{out}"
+        );
+        assert!(
+            out.contains("*humans <= *humans.email"),
+            "both sides of the uniqueness constraint must be renamed; got:\n{out}"
+        );
+        assert!(
+            !out.contains("people"),
+            "no stale `people` should remain; got:\n{out}"
         );
     }
 }

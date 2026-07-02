@@ -11112,12 +11112,21 @@ fn auto_apply_record_change(
     debug_sql(&drop_idx);
     let _ = conn.execute_batch(&drop_idx);
 
-    // NULL-coalesced — same scheme as `init_record_table` / the ADT path.
-    let unique_cols: Vec<String> = new_rec
-        .columns
-        .iter()
-        .map(|c| null_safe_coalesce(&quote_ident(&c.name), c.ty))
-        .collect();
+    // Rebuild the unique index using the SAME scheme as `init_record_table`:
+    // tables with nested children index on `_content_hash` (whole-record
+    // identity), flat tables index on their NULL-coalesced scalar columns.
+    // Ignoring `new_rec.nested` here would drop the content-hash uniqueness on
+    // a table with children and replace it with scalar-column uniqueness,
+    // silently merging parents that differ only in nested content.
+    let unique_cols: Vec<String> = if new_rec.nested.is_empty() {
+        new_rec
+            .columns
+            .iter()
+            .map(|c| null_safe_coalesce(&quote_ident(&c.name), c.ty))
+            .collect()
+    } else {
+        vec![quote_ident("_content_hash")]
+    };
     if !unique_cols.is_empty() {
         let idx_sql = format!(
             "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({});",

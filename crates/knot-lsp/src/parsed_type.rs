@@ -237,7 +237,7 @@ impl<'a> Parser<'a> {
         // A constraint sequence ends with ` => `. If we don't find that
         // before the next `->` (or EOF), treat the whole thing as a type.
         let mut depth = 0i32;
-        for (offset, b) in self.src[self.pos..].as_bytes().iter().enumerate() {
+        for (offset, b) in self.src.as_bytes()[self.pos..].iter().enumerate() {
             let i = self.pos + offset;
             match *b {
                 b'(' | b'[' | b'{' | b'<' => depth += 1,
@@ -469,14 +469,13 @@ impl<'a> Parser<'a> {
             // the time we reach this iteration, so the tail looks like a bare
             // ident. Constructors are always uppercase, so a lowercase ident
             // here is unambiguously the row variable.
-            if let Some(name) = self.peek_ident() {
-                if first_lowercase(&name) {
+            if let Some(name) = self.peek_ident()
+                && first_lowercase(&name) {
                     rest = self.consume_ident();
                     self.skip_ws();
                     self.eat_char('>');
                     break;
                 }
-            }
             let name = self.consume_ident()?;
             self.skip_ws();
             // Optional payload — anything up to `|` or `>`.
@@ -519,9 +518,7 @@ impl<'a> Parser<'a> {
             // Unterminated `IO {…` (truncated/malformed type string): EOF
             // before the closing `}`. Bail instead of spinning forever — no
             // arm below can make progress on a `None` peek.
-            if self.peek().is_none() {
-                return None;
-            }
+            self.peek()?;
             if self.peek() == Some('}') {
                 self.eat_char('}');
                 break;
@@ -633,9 +630,9 @@ impl<'a> Parser<'a> {
     fn eat_keyword(&mut self, kw: &str) -> bool {
         let saved = self.pos;
         let rest = &self.src[self.pos..];
-        if rest.starts_with(kw) {
-            let next = rest[kw.len()..].chars().next();
-            if next.map_or(true, |c| !is_ident_cont(c)) {
+        if let Some(after) = rest.strip_prefix(kw) {
+            let next = after.chars().next();
+            if next.is_none_or(|c| !is_ident_cont(c)) {
                 self.pos += kw.len();
                 return true;
             }
@@ -692,11 +689,11 @@ fn is_ident_cont(c: char) -> bool {
 }
 
 fn first_uppercase(s: &str) -> bool {
-    s.chars().next().map_or(false, |c| c.is_uppercase())
+    s.chars().next().is_some_and(|c| c.is_uppercase())
 }
 
 fn first_lowercase(s: &str) -> bool {
-    s.chars().next().map_or(false, |c| c.is_lowercase())
+    s.chars().next().is_some_and(|c| c.is_lowercase())
 }
 
 fn type_takes_unit(t: &ParsedType) -> bool {

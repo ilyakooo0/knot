@@ -9,11 +9,10 @@ fn is_valid_lib(p: &Path) -> bool {
 /// tui.rs and may gain more) plus the runtime crate's Cargo.toml.
 fn runtime_src_mtime(workspace_root: &Path) -> Option<std::time::SystemTime> {
     fn consider(p: &Path, newest: &mut Option<std::time::SystemTime>) {
-        if let Ok(m) = std::fs::metadata(p).and_then(|m| m.modified()) {
-            if newest.map(|n| m > n).unwrap_or(true) {
+        if let Ok(m) = std::fs::metadata(p).and_then(|m| m.modified())
+            && newest.map(|n| m > n).unwrap_or(true) {
                 *newest = Some(m);
             }
-        }
     }
     fn walk(dir: &Path, newest: &mut Option<std::time::SystemTime>) {
         if let Ok(rd) = std::fs::read_dir(dir) {

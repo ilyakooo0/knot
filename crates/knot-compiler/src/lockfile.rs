@@ -355,7 +355,7 @@ pub fn check(source_path: &Path, module: &Module, type_env: &TypeEnv) -> Vec<Dia
     for (name, lock_migrations) in &old.migrations {
         let source_migrations = type_env.migrate_schemas.get(name);
         for (lock_from, lock_to) in lock_migrations {
-            let still_present = source_migrations.map_or(false, |sm| {
+            let still_present = source_migrations.is_some_and(|sm| {
                 sm.iter().any(|(f, t)| {
                     classify_schema_change(f, lock_from) == SchemaChange::Identical
                         && classify_schema_change(t, lock_to) == SchemaChange::Identical

@@ -438,8 +438,8 @@ pub fn analyze_document(
         // to skip re-queuing dependents that don't actually import any of the
         // changed names — a real win when a user edits one decl in a file
         // with many importers.
-        if let Some(key) = &cache_key {
-            if let Some(latest) = inference_cache
+        if let Some(key) = &cache_key
+            && let Some(latest) = inference_cache
                 .iter()
                 .filter(|(k, _)| k.0 == key.0)
                 .max_by_key(|(_, s)| s.access_clock)
@@ -476,7 +476,6 @@ pub fn analyze_document(
                     );
                 }
             }
-        }
         if let Some(key) = &cache_key {
             // Exact content-hash match: reuse the cached snapshot verbatim.
             // Same source bytes ⇒ same spans, so every Span key in the
@@ -594,15 +593,14 @@ pub fn analyze_document(
         // between) resident through long sessions; previously the random
         // eviction could discard a fresh snapshot before its first hit.
         if let Some(key) = cache_key {
-            if inference_cache.len() >= MAX_INFERENCE_CACHE_ENTRIES {
-                if let Some((victim, _)) = inference_cache
+            if inference_cache.len() >= MAX_INFERENCE_CACHE_ENTRIES
+                && let Some((victim, _)) = inference_cache
                     .iter()
                     .min_by_key(|(_, s)| s.access_clock)
                     .map(|(k, s)| (k.clone(), s.access_clock))
                 {
                     inference_cache.remove(&victim);
                 }
-            }
             let snapshot = InferenceSnapshot {
                 diagnostics: all_diags[pre_inference_len..].to_vec(),
                 type_info: type_info.clone(),
@@ -737,12 +735,11 @@ pub fn get_or_parse_file(
     let source = std::fs::read_to_string(path).ok()?;
     let hash = content_hash(&source);
     let new_clock = next_import_clock(cache);
-    if let Some(entry) = cache.get_mut(path) {
-        if entry.content_hash == hash {
+    if let Some(entry) = cache.get_mut(path)
+        && entry.content_hash == hash {
             entry.access_clock = new_clock;
             return Some((entry.module.clone(), entry.source.clone()));
         }
-    }
     let lexer = knot::lexer::Lexer::new(&source);
     let (tokens, _) = lexer.tokenize();
     let parser = knot::parser::Parser::new(source.clone(), tokens);
@@ -774,12 +771,11 @@ pub fn get_or_parse_file_shared(
     {
         let mut guard = cache.lock().ok()?;
         let new_clock = next_import_clock(&guard);
-        if let Some(entry) = guard.get_mut(path) {
-            if entry.content_hash == hash {
+        if let Some(entry) = guard.get_mut(path)
+            && entry.content_hash == hash {
                 entry.access_clock = new_clock;
                 return Some((entry.module.clone(), entry.source.clone()));
             }
-        }
     }
     let lexer = knot::lexer::Lexer::new(&source);
     let (tokens, _) = lexer.tokenize();
@@ -803,16 +799,20 @@ pub fn get_or_parse_file_shared(
 
 // ── Import navigation ───────────────────────────────────────────────
 
+/// Import navigation resolution: imported file sources, import def sites
+/// (name → (path, span)), and import origin module names (name → module).
+type ImportNavigation = (
+    HashMap<PathBuf, String>,
+    HashMap<String, (PathBuf, Span)>,
+    HashMap<String, String>,
+);
+
 /// Resolve imported files for cross-file navigation.
 pub fn resolve_import_navigation(
     imports: &[ast::Import],
     source_path: &Path,
     import_cache: &mut ImportCache,
-) -> (
-    HashMap<PathBuf, String>,
-    HashMap<String, (PathBuf, Span)>,
-    HashMap<String, String>,
-) {
+) -> ImportNavigation {
     let mut imported_files = HashMap::new();
     let mut import_defs = HashMap::new();
     let mut import_origins = HashMap::new();
@@ -846,7 +846,7 @@ pub fn resolve_import_navigation(
             .items
             .as_ref()
             .map(|items| items.iter().map(|i| i.name.as_str()).collect());
-        let included = |name: &str| allowed.as_ref().map_or(true, |s| s.contains(name));
+        let included = |name: &str| allowed.as_ref().is_none_or(|s| s.contains(name));
 
         for decl in &module.decls {
             match &decl.node {

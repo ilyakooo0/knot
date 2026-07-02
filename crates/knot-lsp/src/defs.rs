@@ -52,11 +52,12 @@ fn advance_past_field_block(source: &str, from: usize, end: usize) -> usize {
     from
 }
 
+/// Definition resolution result: name → def span, (use span, def span)
+/// references, and (literal span, type name) pairs.
+type Definitions = (HashMap<String, Span>, Vec<(Span, Span)>, Vec<(Span, String)>);
+
 /// Resolve definitions: returns (name_map, span_references, literal_types).
-pub fn resolve_definitions(
-    module: &Module,
-    source: &str,
-) -> (HashMap<String, Span>, Vec<(Span, Span)>, Vec<(Span, String)>) {
+pub fn resolve_definitions(module: &Module, source: &str) -> Definitions {
     let mut resolver = DefResolver {
         source,
         scopes: vec![HashMap::new()],
@@ -374,7 +375,7 @@ impl<'a> DefResolver<'a> {
                 let boundary_ok = line
                     .as_bytes()
                     .get(tok_end)
-                    .map_or(true, |b| !is_ident(*b));
+                    .is_none_or(|b| !is_ident(*b));
                 if boundary_ok {
                     let span = Span::new(start + rel + cand, start + rel + tok_end);
                     if span != primary {

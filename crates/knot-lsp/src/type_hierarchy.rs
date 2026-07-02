@@ -127,13 +127,11 @@ pub(crate) fn handle_type_hierarchy_supertypes(
                         supertraits,
                         ..
                     } = &decl.node
-                    {
-                        if tn == name {
+                        && tn == name {
                             for c in supertraits {
                                 push_trait_item(&c.trait_name, state, &mut out);
                             }
                         }
-                    }
                 }
                 let _ = decl_uri;
             }
@@ -195,8 +193,7 @@ pub(crate) fn handle_type_hierarchy_subtypes(
                     if let DeclKind::Impl {
                         trait_name, args, ..
                     } = &decl.node
-                    {
-                        if trait_name == name {
+                        && trait_name == name {
                             let arg_names: Vec<String> = args
                                 .iter()
                                 .map(|t| crate::type_format::format_type_kind(&t.node))
@@ -219,7 +216,6 @@ pub(crate) fn handle_type_hierarchy_subtypes(
                                 })),
                             });
                         }
-                    }
                 }
             }
         }
@@ -232,8 +228,7 @@ pub(crate) fn handle_type_hierarchy_subtypes(
                         constructors,
                         ..
                     } = &decl.node
-                    {
-                        if dn == name {
+                        && dn == name {
                             for c in constructors {
                                 out.push(TypeHierarchyItem {
                                     name: c.name.clone(),
@@ -251,7 +246,6 @@ pub(crate) fn handle_type_hierarchy_subtypes(
                                 });
                             }
                         }
-                    }
                 }
             }
         }
@@ -284,8 +278,8 @@ fn head_type_name(tk: &knot::ast::TypeKind) -> Option<String> {
 fn push_trait_item(name: &str, state: &ServerState, out: &mut Vec<TypeHierarchyItem>) {
     for (decl_uri, doc) in &state.documents {
         for decl in &doc.module.decls {
-            if let DeclKind::Trait { name: tn, .. } = &decl.node {
-                if tn == name {
+            if let DeclKind::Trait { name: tn, .. } = &decl.node
+                && tn == name {
                     out.push(TypeHierarchyItem {
                         name: format!("trait {tn}"),
                         kind: SymbolKind::INTERFACE,
@@ -298,7 +292,6 @@ fn push_trait_item(name: &str, state: &ServerState, out: &mut Vec<TypeHierarchyI
                     });
                     return;
                 }
-            }
         }
     }
 }
@@ -306,8 +299,8 @@ fn push_trait_item(name: &str, state: &ServerState, out: &mut Vec<TypeHierarchyI
 fn push_data_item(name: &str, state: &ServerState, out: &mut Vec<TypeHierarchyItem>) {
     for (decl_uri, doc) in &state.documents {
         for decl in &doc.module.decls {
-            if let DeclKind::Data { name: dn, .. } = &decl.node {
-                if dn == name {
+            if let DeclKind::Data { name: dn, .. } = &decl.node
+                && dn == name {
                     out.push(TypeHierarchyItem {
                         name: format!("data {dn}"),
                         kind: SymbolKind::CLASS,
@@ -320,7 +313,6 @@ fn push_data_item(name: &str, state: &ServerState, out: &mut Vec<TypeHierarchyIt
                     });
                     return;
                 }
-            }
         }
     }
 }

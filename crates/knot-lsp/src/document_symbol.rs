@@ -28,11 +28,10 @@ fn detail_for(doc: &DocumentState, name: &str, declared: Option<String>) -> Opti
     if let Some(t) = ty {
         parts.push(t);
     }
-    if let Some(eff) = doc.effect_info.get(name) {
-        if !eff.trim_start_matches('{').trim_end_matches('}').trim().is_empty() {
+    if let Some(eff) = doc.effect_info.get(name)
+        && !eff.trim_start_matches('{').trim_end_matches('}').trim().is_empty() {
             parts.push(eff.clone());
         }
-    }
     if parts.is_empty() {
         None
     } else {

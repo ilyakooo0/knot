@@ -241,6 +241,9 @@ impl UnitTy {
 type TyVar = u32;
 
 /// Internal type representation for unification-based inference.
+// `TyCon` deliberately shares the `Ty` prefix — it is standard PL terminology
+// ("type constructor") and renaming would ripple across the whole crate.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, PartialEq)]
 enum Ty {
     /// Unification variable.
@@ -810,13 +813,11 @@ impl Infer {
     /// After degrading, the directional subsumption check forces the caller to
     /// `refine` the result wherever a refined type is required.
     fn degrade_refinement(&mut self, ty: Ty, span: Span) -> Ty {
-        if let Ty::Con(name, args) = self.apply(&ty) {
-            if args.is_empty() && self.refined_types.contains_key(&name) {
-                if let Some(base) = self.resolve_refined_base(&name, span) {
+        if let Ty::Con(name, args) = self.apply(&ty)
+            && args.is_empty() && self.refined_types.contains_key(&name)
+                && let Some(base) = self.resolve_refined_base(&name, span) {
                     return base;
                 }
-            }
-        }
         ty
     }
 
@@ -1217,8 +1218,8 @@ impl Infer {
         let actual = self.apply(actual);
         // A pattern variable binds to whatever the actual type is (consistently
         // across multiple occurrences).
-        if let Ty::Var(v) = pat {
-            if pattern_vars.contains(v) {
+        if let Ty::Var(v) = pat
+            && pattern_vars.contains(v) {
                 return match binding.get(v) {
                     Some(bound) => self.apply(bound) == actual,
                     None => {
@@ -1227,7 +1228,6 @@ impl Infer {
                     }
                 };
             }
-        }
         match (pat, &actual) {
             (Ty::Var(a), Ty::Var(b)) => a == b,
             (Ty::Int, Ty::Int)
@@ -1288,11 +1288,9 @@ impl Infer {
             Ty::App(ref inner_f, ref eff) => {
                 if let (Ty::TyCon(name), Ty::EffectRow(effects, row)) =
                     (inner_f.as_ref(), eff.as_ref())
-                {
-                    if name == "IO" {
+                    && name == "IO" {
                         return Ty::IO(effects.clone(), *row, Box::new(a));
                     }
-                }
                 Ty::App(Box::new(f), Box::new(a))
             }
             Ty::TyCon(name) => Ty::Con(name, vec![a]),
@@ -1390,11 +1388,10 @@ impl Infer {
                     if *rv == var {
                         return true;
                     }
-                    if let Some(resolved) = self.subst.get(rv) {
-                        if self.occurs_in(var, resolved) {
+                    if let Some(resolved) = self.subst.get(rv)
+                        && self.occurs_in(var, resolved) {
                             return true;
                         }
-                    }
                 }
                 self.occurs_in(var, inner)
             }
@@ -1429,11 +1426,10 @@ impl Infer {
     fn bind_var(&mut self, v: TyVar, ty: Ty, span: Span) {
         if self.skolems.contains(&v) {
             // Allow self-binding (already handled by Var(a)==Var(b)).
-            if let Ty::Var(other) = &ty {
-                if *other == v {
+            if let Ty::Var(other) = &ty
+                && *other == v {
                     return;
                 }
-            }
             self.error(
                 format!(
                     "rigid type variable would escape: cannot unify with {}",
@@ -1524,7 +1520,6 @@ impl Infer {
                     let inner = (**inner).clone();
                     self.unify_dir(&inner, &t2, span, t1_provided);
                 }
-                return;
             }
             (_, Ty::Alias(name, inner)) => {
                 if self.data_types.contains_key(name) {
@@ -1534,7 +1529,6 @@ impl Infer {
                     let inner = (**inner).clone();
                     self.unify_dir(&t1, &inner, span, t1_provided);
                 }
-                return;
             }
             // Forall types. A Forall on the provided side is instantiated
             // with fresh unification vars (the value is polymorphic, so it
@@ -1564,7 +1558,6 @@ impl Infer {
                         self.skolems.remove(&s);
                     }
                 }
-                return;
             }
             (_, Ty::Forall(vars, body)) => {
                 if t1_provided {
@@ -1588,7 +1581,6 @@ impl Infer {
                     let inst = self.instantiate_at(&scheme, span);
                     self.unify_dir(&t1, &inst, span, t1_provided);
                 }
-                return;
             }
             (Ty::Var(a), Ty::Var(b)) if a == b => {}
             (Ty::Var(a), Ty::Var(b)) => {
@@ -1713,8 +1705,8 @@ impl Infer {
                     } else {
                         Ty::Con(name.clone(), init)
                     };
-                    self.unify_dir(&f, &partial, span, t1_provided);
-                    self.unify_dir(&a, &last, span, t1_provided);
+                    self.unify_dir(f, &partial, span, t1_provided);
+                    self.unify_dir(a, &last, span, t1_provided);
                 }
             }
             (Ty::Con(name, args), Ty::App(f, a)) => {
@@ -1734,8 +1726,8 @@ impl Infer {
                     } else {
                         Ty::Con(name.clone(), init)
                     };
-                    self.unify_dir(&f, &partial, span, !t1_provided);
-                    self.unify_dir(&a, &last, span, !t1_provided);
+                    self.unify_dir(f, &partial, span, !t1_provided);
+                    self.unify_dir(a, &last, span, !t1_provided);
                 }
             }
             // ── IO monad with effect-row unification ──────────
@@ -1947,29 +1939,27 @@ impl Infer {
                             && n2 != name
                             && self.refined_types.contains_key(n2)) =>
             {
-                match self.resolve_refined_base(name, span) {
-                    Some(base_ty) => {
-                        let other = other.clone();
-                        // The refined type is `t1`; introducing = it is the
-                        // *required* side (`!t1_provided`) and a concrete base
-                        // value is supplied.
-                        if !self.suppress_refine_intro
-                            && !t1_provided
-                            && self.is_concrete_refinement_base(&other)
-                        {
-                            self.error(
-                                format!(
-                                    "cannot implicitly use `{}` where refined type `{}` is required; use `refine` to check the predicate",
-                                    self.display_ty(&other),
-                                    name
-                                ),
-                                span,
-                            );
-                        } else {
-                            self.unify_dir(&base_ty, &other, span, t1_provided);
-                        }
+                // None => cycle already reported
+                if let Some(base_ty) = self.resolve_refined_base(name, span) {
+                    let other = other.clone();
+                    // The refined type is `t1`; introducing = it is the
+                    // *required* side (`!t1_provided`) and a concrete base
+                    // value is supplied.
+                    if !self.suppress_refine_intro
+                        && !t1_provided
+                        && self.is_concrete_refinement_base(&other)
+                    {
+                        self.error(
+                            format!(
+                                "cannot implicitly use `{}` where refined type `{}` is required; use `refine` to check the predicate",
+                                self.display_ty(&other),
+                                name
+                            ),
+                            span,
+                        );
+                    } else {
+                        self.unify_dir(&base_ty, &other, span, t1_provided);
                     }
-                    None => {} // cycle already reported
                 }
             }
             (other, Ty::Con(name, args))
@@ -1980,29 +1970,27 @@ impl Infer {
                             && n2 != name
                             && self.refined_types.contains_key(n2)) =>
             {
-                match self.resolve_refined_base(name, span) {
-                    Some(base_ty) => {
-                        let other = other.clone();
-                        // The refined type is `t2`; introducing = it is the
-                        // *required* side (`t1_provided`) and a concrete base
-                        // value (`other`, the provided side) flows into it.
-                        if !self.suppress_refine_intro
-                            && t1_provided
-                            && self.is_concrete_refinement_base(&other)
-                        {
-                            self.error(
-                                format!(
-                                    "cannot implicitly use `{}` where refined type `{}` is required; use `refine` to check the predicate",
-                                    self.display_ty(&other),
-                                    name
-                                ),
-                                span,
-                            );
-                        } else {
-                            self.unify_dir(&other, &base_ty, span, t1_provided);
-                        }
+                // None => cycle already reported
+                if let Some(base_ty) = self.resolve_refined_base(name, span) {
+                    let other = other.clone();
+                    // The refined type is `t2`; introducing = it is the
+                    // *required* side (`t1_provided`) and a concrete base
+                    // value (`other`, the provided side) flows into it.
+                    if !self.suppress_refine_intro
+                        && t1_provided
+                        && self.is_concrete_refinement_base(&other)
+                    {
+                        self.error(
+                            format!(
+                                "cannot implicitly use `{}` where refined type `{}` is required; use `refine` to check the predicate",
+                                self.display_ty(&other),
+                                name
+                            ),
+                            span,
+                        );
+                    } else {
+                        self.unify_dir(&other, &base_ty, span, t1_provided);
                     }
-                    None => {} // cycle already reported
                 }
             }
             // Single-variant record data subsumption: a single-variant,
@@ -3027,21 +3015,19 @@ impl Infer {
                 for v in fields.values() {
                     self.collect_free_unit_vars(v, out);
                 }
-                if let Some(rv) = row {
-                    if let Some(resolved) = self.subst.get(rv) {
+                if let Some(rv) = row
+                    && let Some(resolved) = self.subst.get(rv) {
                         self.collect_free_unit_vars(resolved, out);
                     }
-                }
             }
             Ty::Variant(ctors, row) => {
                 for v in ctors.values() {
                     self.collect_free_unit_vars(v, out);
                 }
-                if let Some(rv) = row {
-                    if let Some(resolved) = self.subst.get(rv) {
+                if let Some(rv) = row
+                    && let Some(resolved) = self.subst.get(rv) {
                         self.collect_free_unit_vars(resolved, out);
                     }
-                }
             }
             Ty::Con(_, args) => {
                 for a in args {
@@ -3053,19 +3039,17 @@ impl Infer {
                 self.collect_free_unit_vars(a, out);
             }
             Ty::IO(_, row, inner) => {
-                if let Some(rv) = row {
-                    if let Some(resolved) = self.subst.get(rv) {
+                if let Some(rv) = row
+                    && let Some(resolved) = self.subst.get(rv) {
                         self.collect_free_unit_vars(resolved, out);
                     }
-                }
                 self.collect_free_unit_vars(inner, out);
             }
             Ty::EffectRow(_, row) => {
-                if let Some(rv) = row {
-                    if let Some(resolved) = self.subst.get(rv) {
+                if let Some(rv) = row
+                    && let Some(resolved) = self.subst.get(rv) {
                         self.collect_free_unit_vars(resolved, out);
                     }
-                }
             }
             Ty::Forall(_, inner) => self.collect_free_unit_vars(inner, out),
             Ty::Alias(_, inner) => self.collect_free_unit_vars(inner, out),
@@ -3403,18 +3387,13 @@ impl Infer {
                 }
                 self.collect_free_vars(inner, out);
             }
-            Ty::EffectRow(_, row) => {
-                if let Some(rv) = row {
-                    match self.subst.get(rv) {
-                        Some(resolved) => {
-                            self.collect_free_vars(resolved, out)
-                        }
-                        None => {
-                            out.insert(*rv);
-                        }
-                    }
+            Ty::EffectRow(_, Some(rv)) => match self.subst.get(rv) {
+                Some(resolved) => self.collect_free_vars(resolved, out),
+                None => {
+                    out.insert(*rv);
                 }
-            }
+            },
+            Ty::EffectRow(_, None) => {}
             Ty::Forall(bound, inner) => {
                 let mut inner_set = HashSet::new();
                 self.collect_free_vars(inner, &mut inner_set);
@@ -3554,7 +3533,7 @@ impl Infer {
                     } else if self
                         .data_types
                         .get(name)
-                        .map_or(false, |d| !d.params.is_empty())
+                        .is_some_and(|d| !d.params.is_empty())
                     {
                         // Parameterized data type used without arguments
                         // → type constructor (for HKT support).
@@ -3593,12 +3572,11 @@ impl Infer {
                 // resolves to a concrete type matching an impl definition,
                 // rather than erasing it to an unconstrained fresh variable
                 // (which would let `[Elem c]` unify with any element type).
-                if let ast::TypeKind::Named(name) = &func.node {
-                    if self.assoc_type_names.contains(name) {
+                if let ast::TypeKind::Named(name) = &func.node
+                    && self.assoc_type_names.contains(name) {
                         let arg_ty = self.ast_type_to_ty(arg);
                         return Ty::Assoc(name.clone(), Box::new(arg_ty));
                     }
-                }
                 let arg_ty = self.ast_type_to_ty(arg);
                 let func_ty = self.ast_type_to_ty(func);
                 match func_ty {
@@ -4229,9 +4207,9 @@ impl Infer {
                 // types), matching the non-desugared do-block `let` path. This
                 // is sound: generalizing a let binding is always valid in a pure
                 // language, and the bound name does not escape the body.
-                if let ast::ExprKind::Lambda { params, body } = &func.node {
-                    if params.len() == 1 {
-                        if let ast::PatKind::Var(name) = &params[0].node {
+                if let ast::ExprKind::Lambda { params, body } = &func.node
+                    && params.len() == 1
+                        && let ast::PatKind::Var(name) = &params[0].node {
                             let arg_ty = self.infer_expr(arg);
                             let applied = self.apply(&arg_ty);
                             let scheme = self.generalize(&applied);
@@ -4242,8 +4220,6 @@ impl Infer {
                             self.pop_scope();
                             return body_ty;
                         }
-                    }
-                }
 
                 let func_ty = self.infer_expr(func);
 
@@ -4257,13 +4233,11 @@ impl Infer {
                     if matches!(arg_slot_resolved, Ty::Forall(..)) {
                         self.check_expr(arg, &arg_slot_resolved);
                         let result_ty = (**ret_ty).clone();
-                        if let ast::ExprKind::Var(name) = &func.node {
-                            if name == "parseJson" {
-                                if let Ty::Var(v) = &result_ty {
+                        if let ast::ExprKind::Var(name) = &func.node
+                            && name == "parseJson"
+                                && let Ty::Var(v) = &result_ty {
                                     self.from_json_calls.push((expr.span, *v));
                                 }
-                            }
-                        }
                         return result_ty;
                     }
                 }
@@ -4277,41 +4251,35 @@ impl Infer {
                 self.unify(&func_ty, &expected, arg.span);
 
                 // Track parseJson calls for compile-time FromJSON dispatch
-                if let ast::ExprKind::Var(name) = &func.node {
-                    if name == "parseJson" {
-                        if let Ty::Var(v) = &result_ty {
+                if let ast::ExprKind::Var(name) = &func.node
+                    && name == "parseJson"
+                        && let Ty::Var(v) = &result_ty {
                             self.from_json_calls.push((expr.span, *v));
                         }
-                    }
-                }
 
                 // Track full `traverse f rel` applications: the resolved
                 // result type names the applicative, which codegen passes to
                 // the runtime to pick the right `pure []` for empty inputs.
-                if let ast::ExprKind::App { func: inner_f, .. } = &func.node {
-                    if matches!(&inner_f.node, ast::ExprKind::Var(n) if n == "traverse") {
-                        if let Ty::Var(res_v) = &result_ty {
+                if let ast::ExprKind::App { func: inner_f, .. } = &func.node
+                    && matches!(&inner_f.node, ast::ExprKind::Var(n) if n == "traverse")
+                        && let Ty::Var(res_v) = &result_ty {
                             let cont_v = self.fresh_var();
                             self.unify(&arg_ty, &Ty::Var(cont_v), arg.span);
                             self.traverse_calls.push((expr.span, *res_v, cont_v));
                         }
-                    }
-                }
 
                 // Track `elem needle haystack` haystack types for SQL pushdown.
                 // Curried: outer App's func is `App(Var("elem"), needle)`,
                 // outer App's arg is the haystack. Record only when the
                 // haystack's element type is a SQL-pushable scalar.
-                if let ast::ExprKind::App { func: inner_f, .. } = &func.node {
-                    if let ast::ExprKind::Var(name) = &inner_f.node {
-                        if name == "elem" {
+                if let ast::ExprKind::App { func: inner_f, .. } = &func.node
+                    && let ast::ExprKind::Var(name) = &inner_f.node
+                        && name == "elem" {
                             let resolved = self.apply(&arg_ty);
                             if self.is_elem_haystack_pushable(&resolved) {
                                 self.elem_pushdown_ok.insert(arg.span);
                             }
                         }
-                    }
-                }
 
                 result_ty
             }
@@ -5281,6 +5249,7 @@ impl Infer {
                     let inv = u.pow(-1);
                     if inv.is_dimensionless() { Ty::Float } else { Ty::FloatUnit(inv) }
                 } else if op == ast::BinOp::Div && matches!(lhs_applied, Ty::FloatUnit(_)) {
+                    // x<u> / y → x<u>
                     Ty::FloatUnit(u.clone())
                 } else {
                     Ty::FloatUnit(u.clone())
@@ -5575,9 +5544,9 @@ impl Infer {
     /// constructor only when its payload pattern is irrefutable) and the
     /// constructors that are only *partially* matched (refutable payloads —
     /// e.g. `Circle {radius: 1.0}` — which must not count as coverage).
-    fn covered_constructors<'a>(
-        arms: &'a [ast::CaseArm],
-    ) -> (HashSet<&'a str>, HashSet<&'a str>) {
+    fn covered_constructors(
+        arms: &[ast::CaseArm],
+    ) -> (HashSet<&str>, HashSet<&str>) {
         let mut covered: HashSet<&str> = HashSet::new();
         let mut partial: HashSet<&str> = HashSet::new();
         for arm in arms {
@@ -5881,7 +5850,7 @@ impl Infer {
             }
             ast::ExprKind::Var(name) => {
                 (crate::builtins::is_io_builtin(name) || name == "fork" || name == "race")
-                || self.lookup(name).map_or(false, |scheme| {
+                || self.lookup(name).is_some_and(|scheme| {
                     fn returns_io(ty: &Ty) -> bool {
                         match ty {
                             Ty::IO(_, _, _) => true,
@@ -5959,8 +5928,7 @@ impl Infer {
         };
         if let (Some(e), Some(r)) =
             (root_of(self, existing), root_of(self, rv))
-        {
-            if e != r {
+            && e != r {
                 let e_rigid = self.skolems.contains(&e);
                 let r_rigid = self.skolems.contains(&r);
                 if e_rigid && r_rigid {
@@ -5997,7 +5965,6 @@ impl Infer {
                     }
                 }
             }
-        }
         self.unify(&Ty::Var(existing), &Ty::Var(rv), span);
     }
 
@@ -6114,12 +6081,11 @@ impl Infer {
                     }
 
                     // Track `x <- *foo` for `set` full-replacement detection.
-                    if let ast::PatKind::Var(var_name) = &pat.node {
-                        if let ast::ExprKind::SourceRef(source_name) = &expr.node {
+                    if let ast::PatKind::Var(var_name) = &pat.node
+                        && let ast::ExprKind::SourceRef(source_name) = &expr.node {
                             self.source_var_binds
                                 .insert(var_name.clone(), source_name.clone());
                         }
-                    }
                 }
                 ast::StmtKind::Let { pat, expr } => {
                     let expr_ty = self.infer_expr(expr);
@@ -6270,15 +6236,14 @@ impl Infer {
             // path), so the type must be `IO [yield_ty]`, not
             // `IO yield_ty`. IO blocks without comprehension binds keep
             // `yield = pure` semantics (the yield value IS the result).
-            if let Some(ty) = &yield_ty {
-                if has_relation_bind || has_group_by {
+            if let Some(ty) = &yield_ty
+                && (has_relation_bind || has_group_by) {
                     return Ty::IO(
                         io_effects,
                         io_row,
                         Box::new(Ty::Relation(Box::new(ty.clone()))),
                     );
                 }
-            }
             let inner = yield_ty.or(last_expr_ty).unwrap_or_else(Ty::unit);
             Ty::IO(io_effects, io_row, Box::new(inner))
         } else {
@@ -6324,8 +6289,8 @@ impl Infer {
         let mut alias_decls: Vec<(String, ast::Type, Span)> = Vec::new();
         let mut refined_alias_decls: Vec<(String, ast::Type, ast::Expr)> = Vec::new();
         for decl in &module.decls {
-            if let ast::DeclKind::TypeAlias { name, params, ty } = &decl.node {
-                if params.is_empty() {
+            if let ast::DeclKind::TypeAlias { name, params, ty } = &decl.node
+                && params.is_empty() {
                     if let ast::TypeKind::Refined { base, predicate } = &ty.node {
                         refined_alias_decls.push((
                             name.clone(),
@@ -6336,7 +6301,6 @@ impl Infer {
                         alias_decls.push((name.clone(), ty.clone(), decl.span));
                     }
                 }
-            }
         }
         // Detect cyclic alias definitions (e.g. `type A = B; type B = A`)
         // before the fixpoint loop: each iteration would wrap another
@@ -6364,11 +6328,10 @@ impl Infer {
                     found = true;
                     break;
                 }
-                if visited.insert(n.clone()) {
-                    if let Some(ds) = alias_deps.get(&n) {
+                if visited.insert(n.clone())
+                    && let Some(ds) = alias_deps.get(&n) {
                         stack.extend(ds.iter().cloned());
                     }
-                }
             }
             if found {
                 cyclic_names.insert(name.clone());
@@ -6642,7 +6605,7 @@ impl Infer {
         loop {
             match current {
                 Ty::Con(n, args) if args.is_empty() && self.refined_types.contains_key(n) => {
-                    if visited.iter().any(|v| *v == n.as_str()) {
+                    if visited.contains(&n.as_str()) {
                         return None;
                     }
                     visited.push(n.as_str());
@@ -8082,11 +8045,10 @@ impl Infer {
         for item in items {
             if let ast::TraitItem::Method { name, ty, .. } = item {
                 // Skip default-body entries with placeholder types
-                if let ast::TypeKind::Named(n) = &ty.ty.node {
-                    if n == "_" {
+                if let ast::TypeKind::Named(n) = &ty.ty.node
+                    && n == "_" {
                         continue;
                     }
-                }
                 self.annotation_vars.clear();
                 self.annotation_unit_vars.clear();
                 self.in_type_annotation = true;
@@ -8124,15 +8086,14 @@ impl Infer {
                             ast::TypeKind::Var(n) | ast::TypeKind::Named(n) => Some(n),
                             _ => None,
                         };
-                        if let Some(var_name) = var_name {
-                            if let Some(&v) = self.annotation_vars.get(var_name) {
+                        if let Some(var_name) = var_name
+                            && let Some(&v) = self.annotation_vars.get(var_name) {
                                 constraints.push(TyConstraint {
                                     trait_name: c.trait_name.clone(),
                                     type_var: v,
                                     span: Span::new(0, 0),
                                 });
                             }
-                        }
                     }
                 }
 
@@ -8160,8 +8121,8 @@ impl Infer {
     fn infer_declarations(&mut self, module: &ast::Module) {
         for decl in &module.decls {
             match &decl.node {
-                ast::DeclKind::Fun { name, body, ty, .. } => {
-                    if let Some(body) = body {
+                ast::DeclKind::Fun { name, body: Some(body), ty, .. } => {
+                    {
                         let scheme = self.lookup(name).cloned();
                         let (expected, fresh_skolems, fresh_unit_skolems) = match scheme {
                             Some(scheme) => {
@@ -8196,7 +8157,7 @@ impl Infer {
                         // (We already verified the body matches via unification.)
                         let has_constraints = ty
                             .as_ref()
-                            .map_or(false, |ts| !ts.constraints.is_empty());
+                            .is_some_and(|ts| !ts.constraints.is_empty());
                         if has_constraints {
                             let ts = ty.as_ref().unwrap();
                             self.annotation_vars.clear();
@@ -8257,8 +8218,8 @@ impl Infer {
                             let mut captured_binops: Vec<DeferredUnitBinop> = Vec::new();
                             for b in pending_binops {
                                 let resolved_result = self.apply(&Ty::Var(b.result));
-                                if let Ty::Var(v) = &resolved_result {
-                                    if skolem_set.contains(v) {
+                                if let Ty::Var(v) = &resolved_result
+                                    && skolem_set.contains(v) {
                                         let lhs = self.apply(&b.lhs);
                                         let rhs = self.apply(&b.rhs);
                                         if !vars.contains(v) {
@@ -8281,7 +8242,6 @@ impl Infer {
                                         });
                                         continue;
                                     }
-                                }
                                 self.deferred_unit_binops.push(b);
                             }
                             self.bind_top(
@@ -8447,7 +8407,7 @@ impl Infer {
         // Build mapping from trait type params to the impl's concrete types.
         // e.g. `trait Display a` + `impl Display Int` → { a_var => Int }
         self.annotation_vars.clear();
-        let impl_types: Vec<Ty> = impl_args.iter().map(|a| self.ast_type_to_ty(&a)).collect();
+        let impl_types: Vec<Ty> = impl_args.iter().map(|a| self.ast_type_to_ty(a)).collect();
 
         for item in items {
             if let ast::ImplItem::Method {
@@ -8510,14 +8470,13 @@ impl Infer {
                     // Constraints the trait declared on those vars (e.g.
                     // `Ord b =>`) are promises the impl body may rely on.
                     for c in &scheme.constraints {
-                        if let Some(Ty::Var(sv)) = mapping.get(&c.type_var) {
-                            if fresh_skolems.contains(sv) {
+                        if let Some(Ty::Var(sv)) = mapping.get(&c.type_var)
+                            && fresh_skolems.contains(sv) {
                                 self.declared_skolem_constraints
                                     .entry(*sv)
                                     .or_default()
                                     .insert(c.trait_name.clone());
                             }
-                        }
                     }
                     let expected = self.subst_ty(&scheme.ty, &mapping);
                     let errors_before = self.errors.len();
@@ -8644,7 +8603,7 @@ impl Infer {
             let declared = self
                 .declared_skolem_constraints
                 .get(&v)
-                .map_or(false, |s| s.contains(&dc.trait_name));
+                .is_some_and(|s| s.contains(&dc.trait_name));
             if declared {
                 continue;
             }
@@ -8854,11 +8813,10 @@ fn collect_unit_vars_ordered(ty: &Ty, out: &mut Vec<UnitVar>) {
 
 fn collect_vars_ordered(ty: &Ty, out: &mut Vec<TyVar>) {
     match ty {
-        Ty::Var(v) => {
-            if !out.contains(v) {
+        Ty::Var(v)
+            if !out.contains(v) => {
                 out.push(*v);
             }
-        }
         Ty::Fun(p, r) => {
             collect_vars_ordered(p, out);
             collect_vars_ordered(r, out);
@@ -8867,11 +8825,10 @@ fn collect_vars_ordered(ty: &Ty, out: &mut Vec<TyVar>) {
             for t in fields.values() {
                 collect_vars_ordered(t, out);
             }
-            if let Some(rv) = row {
-                if !out.contains(rv) {
+            if let Some(rv) = row
+                && !out.contains(rv) {
                     out.push(*rv);
                 }
-            }
         }
         Ty::Relation(inner) => collect_vars_ordered(inner, out),
         Ty::Con(_, args) => {
@@ -8883,30 +8840,27 @@ fn collect_vars_ordered(ty: &Ty, out: &mut Vec<TyVar>) {
             for t in ctors.values() {
                 collect_vars_ordered(t, out);
             }
-            if let Some(rv) = row {
-                if !out.contains(rv) {
+            if let Some(rv) = row
+                && !out.contains(rv) {
                     out.push(*rv);
                 }
-            }
         }
         Ty::App(f, a) => {
             collect_vars_ordered(f, out);
             collect_vars_ordered(a, out);
         }
         Ty::IO(_, row, inner) => {
-            if let Some(rv) = row {
-                if !out.contains(rv) {
+            if let Some(rv) = row
+                && !out.contains(rv) {
                     out.push(*rv);
                 }
-            }
             collect_vars_ordered(inner, out);
         }
         Ty::EffectRow(_, row) => {
-            if let Some(rv) = row {
-                if !out.contains(rv) {
+            if let Some(rv) = row
+                && !out.contains(rv) {
                     out.push(*rv);
                 }
-            }
         }
         Ty::Forall(bound, inner) => {
             // Collect free vars from the body, then drop the bound ones.
@@ -9234,15 +9188,14 @@ fn value_references_source_inner(
             }
             // Fold through let bindings: `let foo = ...; *rel = foo`
             // counts as referencing the source if the body does.
-            if visited.insert(name.clone()) {
-                if let Some(body) = let_bindings.get(name) {
+            if visited.insert(name.clone())
+                && let Some(body) = let_bindings.get(name) {
                     let result = value_references_source_inner(
                         body, source_name, aliases, let_bindings, visited,
                     );
                     visited.remove(name);
                     return result;
                 }
-            }
             false
         }
         ast::ExprKind::Lit(_)
@@ -9435,8 +9388,8 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
     let refine_vars = infer.refine_vars.clone();
     for (span, var, inner_ty) in &refine_vars {
         let resolved = infer.apply(&Ty::Var(*var));
-        if let Ty::Con(name, args) = &resolved {
-            if args.is_empty() && infer.refined_types.contains_key(name) {
+        if let Ty::Con(name, args) = &resolved
+            && args.is_empty() && infer.refined_types.contains_key(name) {
                 // Context named the refined type — check the refined value
                 // against its *fully-resolved* base type (walking any chain of
                 // refined aliases, e.g. Age → Nat → Int), then record the
@@ -9454,7 +9407,6 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
                 refine_targets.insert(*span, name);
                 continue;
             }
-        }
         // Alpha is unconstrained or resolved to a base type (e.g. Int via
         // do-block subsumption). Match against refined types' base types.
         let key_ty = match &resolved {
@@ -9463,12 +9415,11 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
         };
         // The refined expression may itself already have the refined type
         // (e.g. `refine (x : Nat)`).
-        if let Ty::Con(name, args) = &key_ty {
-            if args.is_empty() && infer.refined_types.contains_key(name) {
+        if let Ty::Con(name, args) = &key_ty
+            && args.is_empty() && infer.refined_types.contains_key(name) {
                 refine_targets.insert(*span, name.clone());
                 continue;
             }
-        }
         let mut candidates: Vec<String> = infer
             .refined_types
             .iter()
@@ -9535,8 +9486,8 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
                 MonadKind::Adt(name) => Some(name.clone()),
                 MonadKind::IO => Some("IO".to_string()),
             };
-            if let Some(ty_name) = alt_ty {
-                if !infer.known_impls.contains(&("Alternative".to_string(), ty_name.clone())) {
+            if let Some(ty_name) = alt_ty
+                && !infer.known_impls.contains(&("Alternative".to_string(), ty_name.clone())) {
                     infer.error(
                         format!(
                             "do-block uses a 'where' guard (or empty), which requires an \
@@ -9546,7 +9497,6 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
                         *span,
                     );
                 }
-            }
         }
         // Synthesized helper spans (globally unique, see desugar.rs) also
         // alias their originating do-block's real span — LSP monad inlay
@@ -9765,6 +9715,50 @@ fn ty_to_type_name(ty: &Ty) -> Option<String> {
         Ty::Relation(_) => Some("Relation".to_string()),
         Ty::Record(_, _) => Some("Record".to_string()),
         _ => None,
+    }
+}
+
+/// Extract the constructor name from a `fetch url (Ctor {..})` or
+/// `fetch url opts (Ctor {..})` expression tree.  Returns `None` if
+/// the expression is not a fetch call with a constructor argument.
+fn fetch_ctor_name(expr: &ast::Expr) -> Option<&str> {
+    let ast::ExprKind::App { func, arg } = &expr.node else {
+        return None;
+    };
+    // The last argument should be a constructor application
+    let ctor_name = match &arg.node {
+        ast::ExprKind::App { func: ctor_func, .. } => {
+            if let ast::ExprKind::Constructor(name) = &ctor_func.node {
+                name.as_str()
+            } else {
+                return None;
+            }
+        }
+        ast::ExprKind::Constructor(name) => name.as_str(),
+        _ => return None,
+    };
+    // Walk the function chain to find Var("fetch") or Var("fetchWith") at the root
+    let mut f = func.as_ref();
+    loop {
+        match &f.node {
+            ast::ExprKind::Var(name) if name == "fetch" || name == "fetchWith" => {
+                return Some(ctor_name);
+            }
+            ast::ExprKind::App { func: inner, .. } => f = inner.as_ref(),
+            _ => return None,
+        }
+    }
+}
+
+/// Uncurry a fetch application into its root function and arguments.
+fn uncurry_fetch(expr: &ast::Expr) -> (&ast::Expr, Vec<&ast::Expr>) {
+    match &expr.node {
+        ast::ExprKind::App { func, arg } => {
+            let (f, mut args) = uncurry_fetch(func);
+            args.push(arg);
+            (f, args)
+        }
+        _ => (expr, Vec::new()),
     }
 }
 
@@ -11368,48 +11362,4 @@ main = applyPred (\\r -> r.x == r.y)\
         );
     }
 
-}
-
-/// Extract the constructor name from a `fetch url (Ctor {..})` or
-/// `fetch url opts (Ctor {..})` expression tree.  Returns `None` if
-/// the expression is not a fetch call with a constructor argument.
-fn fetch_ctor_name(expr: &ast::Expr) -> Option<&str> {
-    let ast::ExprKind::App { func, arg } = &expr.node else {
-        return None;
-    };
-    // The last argument should be a constructor application
-    let ctor_name = match &arg.node {
-        ast::ExprKind::App { func: ctor_func, .. } => {
-            if let ast::ExprKind::Constructor(name) = &ctor_func.node {
-                name.as_str()
-            } else {
-                return None;
-            }
-        }
-        ast::ExprKind::Constructor(name) => name.as_str(),
-        _ => return None,
-    };
-    // Walk the function chain to find Var("fetch") or Var("fetchWith") at the root
-    let mut f = func.as_ref();
-    loop {
-        match &f.node {
-            ast::ExprKind::Var(name) if name == "fetch" || name == "fetchWith" => {
-                return Some(ctor_name);
-            }
-            ast::ExprKind::App { func: inner, .. } => f = inner.as_ref(),
-            _ => return None,
-        }
-    }
-}
-
-/// Uncurry a fetch application into its root function and arguments.
-fn uncurry_fetch<'a>(expr: &'a ast::Expr) -> (&'a ast::Expr, Vec<&'a ast::Expr>) {
-    match &expr.node {
-        ast::ExprKind::App { func, arg } => {
-            let (f, mut args) = uncurry_fetch(func);
-            args.push(arg);
-            (f, args)
-        }
-        _ => (expr, Vec::new()),
-    }
 }

@@ -42,7 +42,7 @@ pub(crate) fn handle_prepare_rename(
     // Reject keywords up front. `word_at_position` returns None for non-ident
     // chars, so the cursor lands on something that *parses* as an identifier;
     // if that identifier is a reserved keyword, no rename is meaningful.
-    if KEYWORDS.iter().any(|kw| *kw == word) {
+    if KEYWORDS.contains(&word) {
         return None;
     }
 
@@ -125,7 +125,7 @@ fn is_valid_identifier(name: &str) -> bool {
     {
         return false;
     }
-    !KEYWORDS.iter().any(|kw| *kw == name)
+    !KEYWORDS.contains(&name)
 }
 
 /// Whether `name` is uppercase-initial — i.e. lexes as a constructor/type
@@ -469,40 +469,34 @@ fn span_is_record_pun(module: &Module, source: &str, span: Span) -> bool {
             return;
         }
         match &expr.node {
-            ast::ExprKind::Record(fields) => {
-                if pun_field_in_fields(fields, expr.span.start, source, span) {
+            ast::ExprKind::Record(fields)
+                if pun_field_in_fields(fields, expr.span.start, source, span) => {
                     *found = true;
                     return;
                 }
-            }
-            ast::ExprKind::RecordUpdate { base, fields } => {
-                if pun_field_in_fields(fields, base.span.end, source, span) {
+            ast::ExprKind::RecordUpdate { base, fields }
+                if pun_field_in_fields(fields, base.span.end, source, span) => {
                     *found = true;
                     return;
                 }
-            }
-            ast::ExprKind::Lambda { params, .. } => {
-                if params.iter().any(|p| pun_in_pat(p, source, span)) {
+            ast::ExprKind::Lambda { params, .. }
+                if params.iter().any(|p| pun_in_pat(p, source, span)) => {
                     *found = true;
                     return;
                 }
-            }
-            ast::ExprKind::Case { arms, .. } => {
-                if arms.iter().any(|a| pun_in_pat(&a.pat, source, span)) {
+            ast::ExprKind::Case { arms, .. }
+                if arms.iter().any(|a| pun_in_pat(&a.pat, source, span)) => {
                     *found = true;
                     return;
                 }
-            }
             ast::ExprKind::Do(stmts) => {
                 for stmt in stmts {
                     if let ast::StmtKind::Bind { pat, .. } | ast::StmtKind::Let { pat, .. } =
                         &stmt.node
-                    {
-                        if pun_in_pat(pat, source, span) {
+                        && pun_in_pat(pat, source, span) {
                             *found = true;
                             return;
                         }
-                    }
                 }
             }
             _ => {}
@@ -617,7 +611,7 @@ fn scan_workspace_files(
                 // against its live (possibly unsaved) buffer — rather than
                 // falling through to the disk scan, which computes edits from
                 // on-disk bytes and corrupts the unsaved buffer's ranges.
-                || other_path.as_ref().map_or(false, |p| {
+                || other_path.as_ref().is_some_and(|p| {
                     file_imports_owner(
                         &other_doc.module,
                         p,
@@ -693,8 +687,8 @@ fn emit_edits_for_open_doc(
         // If this file also imports `old_name` from a module other than the
         // owner, its body references are ambiguous; leave them untouched
         // rather than corrupt the other module's references.
-        if let Some(file_path) = uri_to_path(uri) {
-            if imports_name_from_other_module(
+        if let Some(file_path) = uri_to_path(uri)
+            && imports_name_from_other_module(
                 &doc.module,
                 &file_path,
                 &owner.canonical_path,
@@ -702,7 +696,6 @@ fn emit_edits_for_open_doc(
             ) {
                 return;
             }
-        }
         // Walk the AST to find every Var/Constructor/source-
         // ref/derived-ref site that names the symbol, and rewrite each.
         let mut sites: Vec<Span> = Vec::new();
@@ -1105,14 +1098,13 @@ pub(crate) fn collect_name_uses_in_decl(
             // component names each get their own span.
             let mut cursor = decl.span.start;
             for comp in components {
-                if comp == name {
-                    if let Some(span) =
+                if comp == name
+                    && let Some(span) =
                         find_word_in_source(source, name, cursor, decl.span.end)
                     {
                         cursor = span.end;
                         out.push(span);
                     }
-                }
             }
         }
         _ => {}
@@ -1226,6 +1218,9 @@ fn apply_owner_disk_edits(
     let _ = owner;
 }
 
+// Each argument carries distinct rename context (uri, module, source, paths,
+// old/new name, output map); bundling them would not clarify the call sites.
+#[allow(clippy::too_many_arguments)]
 fn apply_importer_disk_edits(
     uri: &Uri,
     module: &Module,
@@ -1610,9 +1605,9 @@ fn field_sites_in_expr<F: FnMut(&str, Span)>(expr: &ast::Expr, source: &str, f: 
                 search_start = fld.value.span.end;
             }
         }
-        ast::ExprKind::FieldAccess { field, expr: rec } => {
+        ast::ExprKind::FieldAccess { field, expr: rec }
             // The field token is the suffix of the access expression.
-            if expr.span.end >= field.len() {
+            if expr.span.end >= field.len() => {
                 let start = expr.span.end - field.len();
                 if start >= rec.span.end
                     && source.get(start..expr.span.end) == Some(field.as_str())
@@ -1620,7 +1615,6 @@ fn field_sites_in_expr<F: FnMut(&str, Span)>(expr: &ast::Expr, source: &str, f: 
                     f(field, Span::new(start, expr.span.end));
                 }
             }
-        }
         ast::ExprKind::Case { arms, .. } => {
             for arm in arms {
                 field_sites_in_pat(&arm.pat, source, f);
@@ -1958,7 +1952,7 @@ mod tests {
             changes.contains_key(&consumer_uri),
             "consumer file missed edit; got: {changes:?}"
         );
-        for (_, edits) in &changes {
+        for edits in changes.values() {
             assert!(
                 edits.iter().all(|e| e.new_text == "parsed"),
                 "all edits should rewrite to `parsed`; got: {edits:?}"

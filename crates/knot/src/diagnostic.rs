@@ -71,7 +71,7 @@ impl Diagnostic {
 /// Returns `(line, col)` for a byte offset. Line is 1-based, column is 0-based (in characters, not bytes).
 pub fn line_col(source: &str, byte_offset: usize) -> (usize, usize) {
     let offset = byte_offset.min(source.len());
-    let before = source[..offset].as_bytes();
+    let before = &source.as_bytes()[..offset];
     // Count line breaks treating `\n`, lone `\r`, and `\r\n` each as a single
     // break, matching the lexer's layout handling and the parser's column
     // bookkeeping (a `\r`-only or Windows source must not collapse to line 1).

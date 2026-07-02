@@ -52,7 +52,7 @@ fn normalize(module: &knot::ast::Module) -> String {
             let lookahead: String = chars.clone().take(11).collect();
             if lookahead.starts_with("pan: Span {") {
                 let mut depth = 0;
-                while let Some(c2) = chars.next() {
+                for c2 in chars.by_ref() {
                     if c2 == '{' {
                         depth += 1;
                     } else if c2 == '}' {
@@ -103,11 +103,10 @@ fn check_str(label: &str, source: &str) -> String {
 
 fn decl_body<'a>(m: &'a knot::ast::Module, name: &str) -> &'a knot::ast::Expr {
     for d in &m.decls {
-        if let DeclKind::Fun { name: n, body: Some(body), .. } = &d.node {
-            if n == name {
+        if let DeclKind::Fun { name: n, body: Some(body), .. } = &d.node
+            && n == name {
                 return body;
             }
-        }
     }
     panic!("no Fun decl named {}", name);
 }

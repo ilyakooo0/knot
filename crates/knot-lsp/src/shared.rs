@@ -262,13 +262,11 @@ pub(crate) fn extract_principal_type_name(type_str: &str) -> Option<String> {
     }
 
     // Strip IO wrapper: IO {effects} T -> T
-    if s.starts_with("IO ") {
-        let rest = &s[3..];
-        if rest.starts_with('{') {
-            if let Some(close) = rest.find('}') {
+    if let Some(rest) = s.strip_prefix("IO ") {
+        if rest.starts_with('{')
+            && let Some(close) = rest.find('}') {
                 return extract_principal_type_name(rest[close + 1..].trim());
             }
-        }
         return extract_principal_type_name(rest);
     }
 
@@ -501,12 +499,11 @@ fn route_is_listened_inner(
             return;
         }
         // `serve Api where …` — the api is a plain Name on the Serve node.
-        if let ast::ExprKind::Serve { api, .. } = &expr.node {
-            if api == route_name {
+        if let ast::ExprKind::Serve { api, .. } = &expr.node
+            && api == route_name {
                 *found = true;
                 return;
             }
-        }
         if let ast::ExprKind::App { func, arg } = &expr.node {
             // Detect `listen port handler` where one argument references the route.
             // The handler's body typically destructures the route ADT, so any reference
@@ -547,13 +544,12 @@ fn route_is_listened_inner(
             }
             // A composite `route Api = A | B` that is itself listened/served
             // wires in every component route.
-            DeclKind::RouteComposite { name, components } => {
+            DeclKind::RouteComposite { name, components }
                 if components.iter().any(|c| c == route_name)
                     && route_is_listened_inner(module, name, visiting)
-                {
+                => {
                     return true;
                 }
-            }
             _ => {}
         }
     }
@@ -640,6 +636,9 @@ pub(crate) fn find_app_in_expr(
     find_app_in_expr_at(expr, source, offset, best, 0)
 }
 
+// `source` is threaded through recursion to mirror `find_app_in_expr`'s
+// signature (it feeds recursive calls); not otherwise read in this body.
+#[allow(clippy::only_used_in_recursion)]
 fn find_app_in_expr_at(
     expr: &ast::Expr,
     source: &str,
@@ -688,7 +687,7 @@ fn find_app_in_expr_at(
 
             let span_size = expr.span.end - expr.span.start;
             // Prefer the smallest (innermost) enclosing application
-            if best.as_ref().map_or(true, |b| span_size <= b.2) {
+            if best.as_ref().is_none_or(|b| span_size <= b.2) {
                 *best = Some((name, param_idx, span_size));
             }
         }
@@ -748,7 +747,7 @@ pub(crate) fn find_enclosing_atomic_expr(
             let size = expr.span.end - expr.span.start;
             if best
                 .as_ref()
-                .map_or(true, |b: &(Span, String)| size < b.0.end - b.0.start)
+                .is_none_or(|b: &(Span, String)| size < b.0.end - b.0.start)
             {
                 *best = Some((expr.span, inner_text));
             }
@@ -799,13 +798,11 @@ pub(crate) fn find_enclosing_atomic_expr(
 /// to pretty-printing the AST, which is always correct.
 pub(crate) fn predicate_to_source(expr: &ast::Expr, source: &str) -> String {
     let span = expr.span;
-    if span.start < span.end && span.end <= source.len() {
-        if let Some(text) = source.get(span.start..span.end) {
-            if slice_matches_predicate(text, expr) {
+    if span.start < span.end && span.end <= source.len()
+        && let Some(text) = source.get(span.start..span.end)
+            && slice_matches_predicate(text, expr) {
                 return text.to_string();
             }
-        }
-    }
     render_predicate_expr(expr)
 }
 
@@ -1051,20 +1048,18 @@ pub(crate) fn extract_param_names(module: &Module, func_name: &str) -> Vec<Strin
                         default_params,
                         ..
                     } = item
-                    {
-                        if name == func_name && !default_params.is_empty() {
+                        && name == func_name && !default_params.is_empty() {
                             return default_params
                                 .iter()
                                 .map(|p| pat_to_simple_name(&p.node))
                                 .collect();
                         }
-                    }
                 }
             }
             DeclKind::Impl { items, .. } => {
                 for item in items {
-                    if let ast::ImplItem::Method { name, params, .. } = item {
-                        if name == func_name && from_impl.is_none() {
+                    if let ast::ImplItem::Method { name, params, .. } = item
+                        && name == func_name && from_impl.is_none() {
                             from_impl = Some(
                                 params
                                     .iter()
@@ -1072,7 +1067,6 @@ pub(crate) fn extract_param_names(module: &Module, func_name: &str) -> Vec<Strin
                                     .collect(),
                             );
                         }
-                    }
                 }
             }
             _ => {}
@@ -1085,16 +1079,11 @@ pub(crate) fn extract_param_names(module: &Module, func_name: &str) -> Vec<Strin
 pub(crate) fn collect_lambda_param_names(expr: &ast::Expr) -> Vec<String> {
     let mut names = Vec::new();
     let mut cur = expr;
-    loop {
-        match &cur.node {
-            ast::ExprKind::Lambda { params, body } => {
-                for p in params {
-                    names.push(pat_to_simple_name(&p.node));
-                }
-                cur = body;
-            }
-            _ => break,
+    while let ast::ExprKind::Lambda { params, body } = &cur.node {
+        for p in params {
+            names.push(pat_to_simple_name(&p.node));
         }
+        cur = body;
     }
     names
 }
@@ -1133,7 +1122,7 @@ pub(crate) fn pat_to_simple_name(pat: &ast::PatKind) -> String {
 /// Flatten an `App(App(App(f, x), y), z)` chain into `(callee_expr, [x, y, z])`.
 /// Returns the args in source order. The callee is whatever sits at the
 /// bottom of the chain — typically a `Var` for named function calls.
-pub(crate) fn flatten_app_chain<'a>(expr: &'a ast::Expr) -> (&'a ast::Expr, Vec<&'a ast::Expr>) {
+pub(crate) fn flatten_app_chain(expr: &ast::Expr) -> (&ast::Expr, Vec<&ast::Expr>) {
     let mut args: Vec<&ast::Expr> = Vec::new();
     let mut current = expr;
     while let ast::ExprKind::App { func, arg } = &current.node {
@@ -1271,12 +1260,11 @@ pub(crate) fn resolve_var_to_source(module: &Module, var_name: &str) -> Option<S
                 if let ast::StmtKind::Bind { pat, expr: rhs }
                 | ast::StmtKind::Let { pat, expr: rhs } = &stmt.node
                 {
-                    if pat_binds_var(pat, var_name) {
-                        if let Some(name) = rhs_source_name(rhs) {
+                    if pat_binds_var(pat, var_name)
+                        && let Some(name) = rhs_source_name(rhs) {
                             *found = Some(name);
                             return;
                         }
-                    }
                     walk(rhs, var_name, found, depth + 1);
                     if found.is_some() {
                         return;
@@ -1321,11 +1309,13 @@ pub(crate) fn resolve_var_to_source(module: &Module, var_name: &str) -> Option<S
 /// Look up a per-field refinement by source name + field name. Returns the
 /// refined-type label and the predicate expression for hover/completion to
 /// render.
+/// Refinement predicates per source: source name → `(field?, type label,
+/// predicate)` entries (field is `None` for whole-element refinements).
+pub(crate) type SourceRefinements =
+    std::collections::HashMap<String, Vec<(Option<String>, String, ast::Expr)>>;
+
 pub(crate) fn find_field_refinement<'a>(
-    source_refinements: &'a std::collections::HashMap<
-        String,
-        Vec<(Option<String>, String, ast::Expr)>,
-    >,
+    source_refinements: &'a SourceRefinements,
     source_name: &str,
     field_name: &str,
 ) -> Option<(&'a str, &'a ast::Expr)> {
@@ -1383,26 +1373,24 @@ fn scheme_contains_offset(scheme: &ast::TypeScheme, offset: usize) -> bool {
 /// signature, return the `TypeScheme` plus the decl name. Used by hover to
 /// surface trait constraints that mention a generic parameter under the
 /// cursor.
-pub(crate) fn find_enclosing_type_scheme<'a>(
-    module: &'a Module,
+pub(crate) fn find_enclosing_type_scheme(
+    module: &Module,
     offset: usize,
-) -> Option<(&'a ast::TypeScheme, &'a str)> {
+) -> Option<(&ast::TypeScheme, &str)> {
     for decl in &module.decls {
         match &decl.node {
             DeclKind::Fun { name, ty: Some(scheme), .. }
             | DeclKind::View { name, ty: Some(scheme), .. }
-            | DeclKind::Derived { name, ty: Some(scheme), .. } => {
-                if scheme_contains_offset(scheme, offset) {
+            | DeclKind::Derived { name, ty: Some(scheme), .. }
+                if scheme_contains_offset(scheme, offset) => {
                     return Some((scheme, name.as_str()));
                 }
-            }
             DeclKind::Trait { items, .. } => {
                 for item in items {
-                    if let ast::TraitItem::Method { name, ty, .. } = item {
-                        if scheme_contains_offset(ty, offset) {
+                    if let ast::TraitItem::Method { name, ty, .. } = item
+                        && scheme_contains_offset(ty, offset) {
                             return Some((ty, name.as_str()));
                         }
-                    }
                 }
             }
             _ => {}
@@ -1470,11 +1458,10 @@ mod tests {
         let (module, parse_diags) = parser.parse_module();
         assert!(parse_diags.is_empty(), "parse errors: {parse_diags:?}");
         for decl in &module.decls {
-            if let DeclKind::TypeAlias { ty, .. } = &decl.node {
-                if let ast::TypeKind::Refined { predicate, .. } = &ty.node {
+            if let DeclKind::TypeAlias { ty, .. } = &decl.node
+                && let ast::TypeKind::Refined { predicate, .. } = &ty.node {
                     return (**predicate).clone();
                 }
-            }
         }
         panic!("no refined type alias found in: {source}");
     }

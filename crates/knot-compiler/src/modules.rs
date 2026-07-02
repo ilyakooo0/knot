@@ -185,11 +185,10 @@ fn resolve_recursive(
                 &d.node,
                 ast::DeclKind::TypeAlias { params, .. } if params.is_empty()
             ) || matches!(&d.node, ast::DeclKind::Data { .. });
-            if is_type_decl {
-                if let Some(text) = source.get(d.span.start..d.span.end) {
+            if is_type_decl
+                && let Some(text) = source.get(d.span.start..d.span.end) {
                     type_snippets.push(text.to_string());
                 }
-            }
         }
 
         // Recursively resolve imports of the imported module
@@ -249,8 +248,8 @@ fn resolve_recursive(
             // Collect additional data type names to include (owned, to avoid borrow conflict)
             let mut extra_data: Vec<String> = Vec::new();
             for d in &visible_decls {
-                if let ast::DeclKind::Trait { name: trait_name, items: trait_items, .. } = &d.node {
-                    if names.contains(trait_name.as_str()) {
+                if let ast::DeclKind::Trait { name: trait_name, items: trait_items, .. } = &d.node
+                    && names.contains(trait_name.as_str()) {
                         for item in trait_items {
                             if let ast::TraitItem::Method { ty, .. } = item {
                                 for data_name in &data_names {
@@ -261,7 +260,6 @@ fn resolve_recursive(
                             }
                         }
                     }
-                }
             }
             for name in &extra_data {
                 names.insert(name.as_str());

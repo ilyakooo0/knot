@@ -194,11 +194,10 @@ fn collect_tokens(
         // Coarse pre-filter: skip decls whose span doesn't overlap the
         // requested range. Fine-grained per-token filtering still happens
         // below, but this avoids walking unrelated subtrees.
-        if let Some((rs, re)) = range {
-            if decl.span.end < rs || decl.span.start > re {
+        if let Some((rs, re)) = range
+            && (decl.span.end < rs || decl.span.start > re) {
                 continue;
             }
-        }
         collector.visit_decl(decl);
     }
 
@@ -836,11 +835,10 @@ fn delta_encode_tokens(tokens: &[RawToken], source: &str) -> Vec<SemanticToken> 
                 while next < source.len() && !source.is_char_boundary(next) {
                     next += 1;
                 }
-                if let Some(s) = source.get(byte_cursor..next) {
-                    if let Some(c) = s.chars().next() {
+                if let Some(s) = source.get(byte_cursor..next)
+                    && let Some(c) = s.chars().next() {
                         col_utf16 += c.len_utf16() as u32;
                     }
-                }
                 byte_cursor = next;
             }
         }

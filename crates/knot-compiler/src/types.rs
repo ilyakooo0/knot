@@ -71,8 +71,8 @@ impl TypeEnv {
         // First pass: collect type aliases and data types
         for decl in &module.decls {
             match &decl.node {
-                DeclKind::TypeAlias { name, params, ty } => {
-                    if params.is_empty() {
+                DeclKind::TypeAlias { name, params, ty }
+                    if params.is_empty() => {
                         alias_ast_types.insert(name.clone(), ty.clone());
                         // Track refined type aliases separately
                         if let TypeKind::Refined { base, predicate } = &ty.node {
@@ -86,7 +86,6 @@ impl TypeEnv {
                             aliases.insert(name.clone(), resolved);
                         }
                     }
-                }
                 DeclKind::Data {
                     name,
                     constructors: ctors,
@@ -295,11 +294,10 @@ impl TypeEnv {
 pub fn check_alias_cycles(module: &Module) -> Vec<knot::diagnostic::Diagnostic> {
     let mut alias_decls: Vec<(String, &Type, Span)> = Vec::new();
     for decl in &module.decls {
-        if let DeclKind::TypeAlias { name, params, ty } = &decl.node {
-            if params.is_empty() {
+        if let DeclKind::TypeAlias { name, params, ty } = &decl.node
+            && params.is_empty() {
                 alias_decls.push((name.clone(), ty, decl.span));
             }
-        }
     }
     let alias_names: HashSet<String> =
         alias_decls.iter().map(|(n, _, _)| n.clone()).collect();
@@ -320,11 +318,10 @@ pub fn check_alias_cycles(module: &Module) -> Vec<knot::diagnostic::Diagnostic> 
                 found = true;
                 break;
             }
-            if visited.insert(n.clone()) {
-                if let Some(ds) = deps.get(&n) {
+            if visited.insert(n.clone())
+                && let Some(ds) = deps.get(&n) {
                     stack.extend(ds.iter().cloned());
                 }
-            }
         }
         if found {
             diags.push(
@@ -458,11 +455,11 @@ fn collect_source_refinements_inner(
         }
         // Element type is a type alias: *people : [Person]
         // Resolve through the alias to find refined fields in the underlying record.
-        TypeKind::Named(name) if alias_ast_types.contains_key(name) => {
+        TypeKind::Named(name) if alias_ast_types.contains_key(name)
             // Guard against cyclic aliases (`type A = B; type B = A`):
             // without a seen-set this recursion never terminates. The cycle
             // itself is reported as a diagnostic by type inference.
-            if seen_aliases.insert(name.clone()) {
+            && seen_aliases.insert(name.clone()) => {
                 let alias_ty = &alias_ast_types[name];
                 // If the alias already resolves to a Relation type (e.g. `type People = [{name: Nat}]`),
                 // recurse directly to avoid double-wrapping Relation(Relation(...)).
@@ -474,7 +471,6 @@ fn collect_source_refinements_inner(
                 }
                 seen_aliases.remove(name);
             }
-        }
         // Element type is a multi-variant data type: *shapes : [Shape] with
         // constructor field refinements like `Circle {radius: Float where ...}`.
         // Each refinement becomes a whole-element predicate that matches the
@@ -583,8 +579,8 @@ fn value_predicates(
                 seen_aliases,
             ));
         }
-        TypeKind::Named(name) => {
-            if seen_aliases.insert(name.clone()) {
+        TypeKind::Named(name)
+            if seen_aliases.insert(name.clone()) => {
                 if let Some(pred) = refined_types.get(name) {
                     out.push((name.clone(), pred.clone()));
                     // The refined alias's base may carry deeper refinements
@@ -622,7 +618,6 @@ fn value_predicates(
                 }
                 seen_aliases.remove(name);
             }
-        }
         // Nested record: wrap each field predicate with a field access.
         TypeKind::Record { fields, .. } => {
             for field in fields {
@@ -850,8 +845,8 @@ fn resolve_type(
             // behaviour) ignored `def.args[1..]`, leaving their pattern vars
             // unsubstituted in the result and picking the wrong instance for
             // multi-parameter associated types.
-            if let TypeKind::Named(name) = &spine_head.node {
-                if let Some(defs) = assoc_types.get(name) {
+            if let TypeKind::Named(name) = &spine_head.node
+                && let Some(defs) = assoc_types.get(name) {
                     for def in defs {
                         if !def.args.is_empty() && def.args.len() == spine_args.len() {
                             let mut subst = HashMap::new();
@@ -869,7 +864,6 @@ fn resolve_type(
                         }
                     }
                 }
-            }
             // Parameterized ADT (e.g. `Maybe Text`, `Result E A`, user data
             // types with type args): resolve to the ADT shape so the schema
             // maps the field to the "json" column type, which round-trips
@@ -889,8 +883,8 @@ fn resolve_type(
                 }
             }
             // `Result e a` arrives as App(App(Result, e), a).
-            if let TypeKind::App { func: inner_func, arg: err_arg } = &func.node {
-                if matches!(&inner_func.node, TypeKind::Named(n) if n == "Result") {
+            if let TypeKind::App { func: inner_func, arg: err_arg } = &func.node
+                && matches!(&inner_func.node, TypeKind::Named(n) if n == "Result") {
                     let err_ty = resolve_type(err_arg, aliases, assoc_types);
                     let ok_ty = resolve_type(arg, aliases, assoc_types);
                     return ResolvedType::Adt(vec![
@@ -898,7 +892,6 @@ fn resolve_type(
                         ("Ok".into(), vec![("value".into(), ok_ty)]),
                     ]);
                 }
-            }
             // User-declared parameterized data types: the head's registered
             // shape is enough to pick the column type (payload-bearing ADTs
             // become "json" columns regardless of the type arguments).
@@ -907,14 +900,13 @@ fn resolve_type(
             // form like `Box Int` falls through to Named("unknown") → "text"
             // and silently corrupts the structure, while the bare `Box`
             // (resolved via `aliases` to a Record → "json") round-trips fine.
-            if let TypeKind::Named(name) = &spine_head.node {
-                if let Some(
+            if let TypeKind::Named(name) = &spine_head.node
+                && let Some(
                     resolved @ (ResolvedType::Adt(_) | ResolvedType::Record(_)),
                 ) = aliases.get(name)
                 {
                     return resolved.clone();
                 }
-            }
             ResolvedType::Named("unknown".into())
         }
         TypeKind::Hole => ResolvedType::Named("unknown".into()),

@@ -462,13 +462,12 @@ fn desugar_expr(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<String>) 
         // recurse_into_children above.
         return;
     }
-    if pure_comp {
-        if let ExprKind::Do(stmts) = &expr.node {
+    if pure_comp
+        && let ExprKind::Do(stmts) = &expr.node {
             let span = expr.span;
             let desugared = desugar_stmts(stmts, span);
             *expr = desugared;
         }
-    }
 }
 
 /// Recurse into all child expressions of a node (except Do blocks handled
@@ -780,9 +779,9 @@ fn is_sql_where_expr(expr: &Expr, bind_vars: &std::collections::HashSet<&str>) -
         // (codegen emits INSTR/IN for them). Accept when at least one argument
         // is a bound field access, matching the codegen pattern.
         ExprKind::App { func, arg } => {
-            if let ExprKind::App { func: inner, arg: first_arg } = &func.node {
-                if let ExprKind::Var(name) = &inner.node {
-                    if name == "contains" || name == "elem" {
+            if let ExprKind::App { func: inner, arg: first_arg } = &func.node
+                && let ExprKind::Var(name) = &inner.node
+                    && (name == "contains" || name == "elem") {
                         let a_bound = is_bound_field_access(first_arg, bind_vars)
                             || is_sql_atom(first_arg);
                         let b_bound = is_bound_field_access(arg, bind_vars)
@@ -791,8 +790,6 @@ fn is_sql_where_expr(expr: &Expr, bind_vars: &std::collections::HashSet<&str>) -
                             && (is_bound_field_access(first_arg, bind_vars)
                                 || is_bound_field_access(arg, bind_vars));
                     }
-                }
-            }
             false
         }
         _ => false,
@@ -807,11 +804,10 @@ fn is_sql_atom(expr: &Expr) -> bool {
 }
 
 fn is_bound_field_access(expr: &Expr, bind_vars: &std::collections::HashSet<&str>) -> bool {
-    if let ExprKind::FieldAccess { expr, .. } = &expr.node {
-        if let ExprKind::Var(name) = &expr.node {
+    if let ExprKind::FieldAccess { expr, .. } = &expr.node
+        && let ExprKind::Var(name) = &expr.node {
             return bind_vars.contains(name.as_str());
         }
-    }
     false
 }
 
@@ -852,8 +848,8 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
     let mut io_base = std::borrow::Cow::Borrowed(&io_fns.base);
     let mut io_all = std::borrow::Cow::Borrowed(&io_fns.all);
     for s in stmts {
-        if let StmtKind::Let { pat, expr } = &s.node {
-            if let PatKind::Var(name) = &pat.node {
+        if let StmtKind::Let { pat, expr } = &s.node
+            && let PatKind::Var(name) = &pat.node {
                 if lambda_chain_body_is_io(expr, &io_base) {
                     io_base.to_mut().insert(name.clone());
                 }
@@ -861,7 +857,6 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
                     io_all.to_mut().insert(name.clone());
                 }
             }
-        }
     }
     let io_base = io_base.as_ref();
     let io_all = io_all.as_ref();
@@ -1408,11 +1403,10 @@ mod tests {
         let mut module = parse(src);
         desugar(&mut module);
         for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
-                if name == "names" {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
+                && name == "names" {
                     assert!(has_bind_var(body), "expected __bind in desugared body");
                 }
-            }
         }
     }
 
@@ -1429,12 +1423,11 @@ mod tests {
         desugar(&mut module);
         // The main body should still be a Do block (mixed: has set + bind)
         for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
-                if name == "main" {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
+                && name == "main" {
                     assert!(matches!(&body.node, ExprKind::Do(_)),
                         "mixed do block should not be desugared");
                 }
-            }
         }
     }
 
@@ -1451,17 +1444,15 @@ mod tests {
         desugar(&mut module);
         // The set value should still be a Do block
         for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
-                if name == "complete" {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
+                && name == "complete" {
                     // body is a lambda whose body is a set
-                    if let ExprKind::Lambda { body: lbody, .. } = &body.node {
-                        if let ExprKind::Set { value, .. } = &lbody.node {
+                    if let ExprKind::Lambda { body: lbody, .. } = &body.node
+                        && let ExprKind::Set { value, .. } = &lbody.node {
                             assert!(matches!(&value.node, ExprKind::Do(_)),
                                 "set value do block should not be desugared");
                         }
-                    }
                 }
-            }
         }
     }
 
@@ -1477,12 +1468,11 @@ mod tests {
         desugar(&mut module);
         // No bind/where → sequential, should not be desugared
         for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
-                if name == "main" {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
+                && name == "main" {
                     assert!(matches!(&body.node, ExprKind::Do(_)),
                         "sequential do block should not be desugared");
                 }
-            }
         }
     }
 
@@ -1500,14 +1490,13 @@ mod tests {
         let mut module = parse(src);
         desugar(&mut module);
         for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
-                if name == "filtered" {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
+                && name == "filtered" {
                     assert!(
                         matches!(&body.node, ExprKind::Do(_)),
                         "sql-compilable do block should be preserved for codegen"
                     );
                 }
-            }
         }
     }
 
@@ -1523,12 +1512,11 @@ mod tests {
         let mut module = parse(src);
         desugar(&mut module);
         for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
-                if name == "names" {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
+                && name == "names" {
                     assert!(has_bind_var(body), "expected __bind in desugared body");
                     assert!(!has_do_block(body), "expected no Do block after desugaring");
                 }
-            }
         }
     }
 
@@ -1545,14 +1533,13 @@ mod tests {
         desugar(&mut module);
         // groupBy do blocks must stay as Do nodes (loop-based codegen)
         for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
-                if name == "grouped" {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
+                && name == "grouped" {
                     assert!(
                         matches!(&body.node, ExprKind::Do(_)),
                         "groupBy do block should not be desugared"
                     );
                 }
-            }
         }
     }
 
@@ -1570,14 +1557,13 @@ mod tests {
         let mut module = parse(src);
         desugar(&mut module);
         for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
-                if name == "joined" {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
+                && name == "joined" {
                     assert!(
                         matches!(&body.node, ExprKind::Do(_)),
                         "multi-table sql-compilable do block should be preserved"
                     );
                 }
-            }
         }
     }
 
@@ -1597,12 +1583,11 @@ mod tests {
         let mut module = parse(src);
         desugar(&mut module);
         for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
-                if name == "firstAdult" {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
+                && name == "firstAdult" {
                     assert!(has_bind_var(body), "expected __bind in desugared body");
                     assert!(!has_do_block(body), "expected no Do block after desugaring");
                 }
-            }
         }
     }
 
@@ -1625,8 +1610,8 @@ mod tests {
         let mut module = parse(src);
         desugar(&mut module);
         for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
-                if name == "main" {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
+                && name == "main" {
                     // outer block is mixed/IO → preserved; the let-bound
                     // inner do must also still be a Do node.
                     let stmts = match &body.node {
@@ -1643,7 +1628,6 @@ mod tests {
                         "inner do over source-bound var should be preserved"
                     );
                 }
-            }
         }
     }
 
@@ -1664,8 +1648,8 @@ mod tests {
         let mut module = parse(src);
         desugar(&mut module);
         for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
-                if name == "main" {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
+                && name == "main" {
                     let stmts = match &body.node {
                         ExprKind::Do(stmts) => stmts,
                         other => panic!("expected outer Do, got {:?}", other),
@@ -1684,7 +1668,6 @@ mod tests {
                         "shadowed var bind should not be preserved as Do"
                     );
                 }
-            }
         }
     }
 
@@ -1705,14 +1688,13 @@ mod tests {
         let mut module = parse(src);
         desugar(&mut module);
         for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
-                if name == "main" {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
+                && name == "main" {
                     assert!(
                         matches!(&body.node, ExprKind::Do(_)),
                         "IO trait-method do block should not be desugared"
                     );
                 }
-            }
         }
     }
 
@@ -1732,14 +1714,13 @@ mod tests {
         let mut module = parse(src);
         desugar(&mut module);
         for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
-                if name == "main" {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
+                && name == "main" {
                     assert!(
                         matches!(&body.node, ExprKind::Do(_)),
                         "do block calling an IO-bodied impl method should not be desugared"
                     );
                 }
-            }
         }
     }
 
@@ -1759,14 +1740,13 @@ mod tests {
         let mut module = parse(src);
         desugar(&mut module);
         for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
-                if name == "main" {
+            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
+                && name == "main" {
                     assert!(
                         matches!(&body.node, ExprKind::Do(_)),
                         "ctor pattern bind do block should not be desugared"
                     );
                 }
-            }
         }
     }
 }

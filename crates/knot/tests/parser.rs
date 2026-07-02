@@ -3621,7 +3621,7 @@ fn do_nested() {
     let src = "x = do\n  a <- do\n    b <- xs\n    yield b\n  yield a";
     match fun_body(src) {
         ExprKind::Do(stmts) => {
-            assert!(stmts.len() >= 1);
+            assert!(!stmts.is_empty());
             match &stmts[0].node {
                 StmtKind::Bind { expr, .. } => {
                     assert!(matches!(&expr.node, ExprKind::Do(_)));

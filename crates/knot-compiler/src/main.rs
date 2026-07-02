@@ -476,14 +476,13 @@ fn find_runtime() -> PathBuf {
     }
 
     // 2. Same directory as the compiler executable
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(exe_dir) = exe.parent() {
             let candidate = exe_dir.join("libknot_runtime.a");
             if candidate.exists() {
                 return candidate;
             }
         }
-    }
 
     // 3. Extract embedded runtime to a temp file. The name includes the
     //    pid plus a nanosecond nonce and attempt counter, and the file is

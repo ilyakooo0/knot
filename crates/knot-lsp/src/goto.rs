@@ -241,7 +241,7 @@ pub(crate) fn handle_goto_implementation(
         let open_paths: HashSet<PathBuf> = state
             .documents
             .keys()
-            .filter_map(|u| uri_to_path(u))
+            .filter_map(uri_to_path)
             .filter_map(|p| p.canonicalize().ok())
             .collect();
         for path in scan_knot_files_in_roots(&state.workspace_roots, state.workspace_root.as_deref())
@@ -255,11 +255,9 @@ pub(crate) fn handle_goto_implementation(
             }
             if let Some((module, source)) =
                 get_or_parse_file_shared(&canonical, &state.import_cache)
-            {
-                if source.contains(word) {
+                && source.contains(word) {
                     classify(&module);
                 }
-            }
         }
     }
 
@@ -284,8 +282,8 @@ pub(crate) fn handle_goto_implementation(
                         });
                     } else if is_method_name {
                         for item in items {
-                            if let ast::ImplItem::Method { name, name_span, .. } = item {
-                                if name == word {
+                            if let ast::ImplItem::Method { name, name_span, .. } = item
+                                && name == word {
                                     // Anchor on the method-name token (not the
                                     // body lambda) so the cursor lands on the
                                     // declaration, matching `analysis.rs`.
@@ -294,7 +292,6 @@ pub(crate) fn handle_goto_implementation(
                                         range: span_to_range(*name_span, module_source),
                                     });
                                 }
-                            }
                         }
                     }
                 }
@@ -317,7 +314,7 @@ pub(crate) fn handle_goto_implementation(
         let open_paths: HashSet<PathBuf> = state
             .documents
             .keys()
-            .filter_map(|u| uri_to_path(u))
+            .filter_map(uri_to_path)
             .filter_map(|p| p.canonicalize().ok())
             .collect();
 

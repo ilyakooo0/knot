@@ -247,8 +247,8 @@ pub(crate) fn handle_references(
                 // Importer of the same origin. If it ALSO imports the name
                 // from a different module, its body references are ambiguous —
                 // skip rather than misattribute them (mirrors the rename path).
-                if let Some(other_path) = &other_path {
-                    if imports_name_from_other_module(
+                if let Some(other_path) = &other_path
+                    && imports_name_from_other_module(
                         &other_doc.module,
                         other_path,
                         owner_path,
@@ -256,7 +256,6 @@ pub(crate) fn handle_references(
                     ) {
                         continue;
                     }
-                }
                 // Imported-symbol usages don't appear in `references` (which
                 // only resolves local decls), so walk the AST — scope-aware,
                 // skipping shadowed locals.
@@ -296,7 +295,7 @@ pub(crate) fn handle_references(
         let open_paths: HashSet<PathBuf> = state
             .documents
             .keys()
-            .filter_map(|u| uri_to_path(u))
+            .filter_map(uri_to_path)
             .filter_map(|p| p.canonicalize().ok())
             .collect();
         let workspace_files =

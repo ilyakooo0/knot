@@ -73,11 +73,11 @@ fn let_annotation_span_covers_the_type() {
 
     let mut found = false;
     for decl in &module.decls {
-        if let DeclKind::Fun { body: Some(b), .. } = &decl.node {
-            if let ExprKind::Do(stmts) = &b.node {
+        if let DeclKind::Fun { body: Some(b), .. } = &decl.node
+            && let ExprKind::Do(stmts) = &b.node {
                 for st in stmts {
-                    if let StmtKind::Let { expr, .. } = &st.node {
-                        if let ExprKind::Annot { ty, .. } = &expr.node {
+                    if let StmtKind::Let { expr, .. } = &st.node
+                        && let ExprKind::Annot { ty, .. } = &expr.node {
                             // span must be non-inverted and cover both the type
                             // (which precedes the value) and the value.
                             assert!(expr.span.start <= expr.span.end, "inverted span");
@@ -86,17 +86,15 @@ fn let_annotation_span_covers_the_type() {
                                 "Annot span should start at/before the type"
                             );
                             assert!(
-                                expr.span.end >= five_off + 1,
+                                expr.span.end > five_off,
                                 "Annot span should extend through the value"
                             );
                             // sanity: the type really is the `Int` we expect
                             assert!(ty.span.start <= int_off + 3);
                             found = true;
                         }
-                    }
                 }
             }
-        }
     }
     assert!(found, "did not find the annotated let binding");
 }

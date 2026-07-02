@@ -211,11 +211,10 @@ fn lookup_local_binding_type(
         // Restrict to bindings inside the enclosing declaration; a local in a
         // sibling decl that merely precedes the call is not in scope and must
         // not be treated as a shadowing binding.
-        if let Some(enc) = enclosing {
-            if span.start < enc.start || span.end > enc.end {
+        if let Some(enc) = enclosing
+            && (span.start < enc.start || span.end > enc.end) {
                 continue;
             }
-        }
         // Char-boundary-safe: a stale span could land mid-multibyte-char.
         let name = crate::utils::safe_slice(&doc.source, *span);
         if name != func_name {

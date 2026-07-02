@@ -39,11 +39,10 @@ fn parse(src: &str) -> Module {
 /// for the route named `route_name`.
 fn data_ctor_names(module: &Module, route_name: &str) -> Vec<String> {
     for decl in &module.decls {
-        if let DeclKind::Data { name, constructors, .. } = &decl.node {
-            if name == route_name {
+        if let DeclKind::Data { name, constructors, .. } = &decl.node
+            && name == route_name {
                 return constructors.iter().map(|c| c.name.clone()).collect();
             }
-        }
     }
     panic!("no generated data decl named {}", route_name);
 }

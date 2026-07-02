@@ -111,14 +111,13 @@ fn collect_edges(
         ast::ExprKind::BinOp { lhs, rhs, op } => {
             // `a |> f` is `f a`. If `f` is a partially-applied `diff` (i.e.,
             // `diff base`), then `a` becomes the subtracted (negative) arg.
-            if *op == ast::BinOp::Pipe {
-                if let Some(base) = is_diff_applied_once(rhs) {
+            if *op == ast::BinOp::Pipe
+                && let Some(base) = is_diff_applied_once(rhs) {
                     collect_edges(base, polarity, derived_names, out);
                     let neg = negate(polarity);
                     collect_edges(lhs, neg, derived_names, out);
                     return;
                 }
-            }
             collect_edges(lhs, polarity, derived_names, out);
             collect_edges(rhs, polarity, derived_names, out);
         }
@@ -186,13 +185,11 @@ fn collect_edges(
 
 /// Check if `expr` is `App(Var("diff"), arg)`, returning the first arg if so.
 fn is_diff_applied_once(expr: &ast::Expr) -> Option<&ast::Expr> {
-    if let ast::ExprKind::App { func, arg } = &expr.node {
-        if let ast::ExprKind::Var(name) = &func.node {
-            if name == "diff" {
+    if let ast::ExprKind::App { func, arg } = &expr.node
+        && let ast::ExprKind::Var(name) = &func.node
+            && name == "diff" {
                 return Some(arg);
             }
-        }
-    }
     None
 }
 
@@ -296,7 +293,7 @@ pub fn check(module: &ast::Module) -> Vec<Diagnostic> {
         let is_cycle = if scc.len() == 1 {
             // Check for self-edge.
             let name = &scc[0];
-            edges.get(name).map_or(false, |es| es.iter().any(|e| &e.target == name))
+            edges.get(name).is_some_and(|es| es.iter().any(|e| &e.target == name))
         } else {
             true
         };

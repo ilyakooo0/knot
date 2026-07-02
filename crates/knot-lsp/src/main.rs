@@ -1,3 +1,8 @@
+// `lsp_types::Uri` (fluent-uri backed) carries interior mutability but is only
+// ever used immutably as a map/set key throughout the server, so the lint fires
+// as a false positive across every `HashMap<Uri, _>`/`HashSet<Uri>`.
+#![allow(clippy::mutable_key_type)]
+
 // ── Module declarations ─────────────────────────────────────────────
 
 mod analysis;
@@ -305,11 +310,10 @@ fn main() {
     // also non-fatal — the editor just won't push file-change events — but
     // log it so we don't silently lose cross-file invalidation if the
     // connection has gone bad.
-    if let Some(register_request) = build_file_watcher_registration() {
-        if let Err(e) = connection.sender.send(Message::Request(register_request)) {
+    if let Some(register_request) = build_file_watcher_registration()
+        && let Err(e) = connection.sender.send(Message::Request(register_request)) {
             eprintln!("knot-lsp: failed to register file watcher: {e}");
         }
-    }
 
     // Pre-warm the workspace-symbol cache in the background. The first
     // `workspace/symbol` query then sees a populated cache instead of having
@@ -427,7 +431,7 @@ fn prune_caches_outside_roots(state: &mut ServerState) {
     let open_paths: HashSet<PathBuf> = state
         .documents
         .keys()
-        .filter_map(|u| uri_to_path(u))
+        .filter_map(uri_to_path)
         .filter_map(|p| p.canonicalize().ok())
         .collect();
     let in_scope = |p: &Path| -> bool {
@@ -707,11 +711,10 @@ fn apply_analysis_result(state: &mut ServerState, conn: &Connection, result: Ana
             // every subsequent didChange range (computed by the client
             // against its own buffer) would be applied to the wrong text —
             // persistent corruption. Drop it instead.
-            if let Some(current) = state.documents.get(&result.uri) {
-                if current.source != result.doc.source {
+            if let Some(current) = state.documents.get(&result.uri)
+                && current.source != result.doc.source {
                     return;
                 }
-            }
         }
     }
 
@@ -1249,8 +1252,8 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
         // content hash and naturally re-populates.
         let mut deleted_paths: HashSet<PathBuf> = HashSet::new();
         for c in &params.changes {
-            if matches!(c.typ, FileChangeType::DELETED) {
-                if let Some(p) = uri_to_path(&c.uri) {
+            if matches!(c.typ, FileChangeType::DELETED)
+                && let Some(p) = uri_to_path(&c.uri) {
                     // `canonicalize` fails on paths the OS no longer knows
                     // about, so fall back to the lexical path. Either form is
                     // acceptable here — the cache keys are canonical paths
@@ -1258,7 +1261,6 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
                     // try both shapes when evicting.
                     deleted_paths.insert(p.canonicalize().unwrap_or(p));
                 }
-            }
         }
         let changed_paths: HashSet<PathBuf> = params
             .changes
@@ -1446,11 +1448,10 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
             .collect();
         state.workspace_roots.retain(|p| !removed.contains(p));
         for added in &params.event.added {
-            if let Some(path) = uri_to_path(&added.uri) {
-                if !state.workspace_roots.contains(&path) {
+            if let Some(path) = uri_to_path(&added.uri)
+                && !state.workspace_roots.contains(&path) {
                     state.workspace_roots.push(path);
                 }
-            }
         }
         state.workspace_root = state.workspace_roots.first().cloned();
 
@@ -1590,6 +1591,7 @@ fn shift_byte_ranges_for_edit(
 ///   hover freeze until the next edit.
 /// - `Disconnected`: the worker thread has died. Other features still work
 ///   against the last good analysis, so log and continue rather than crash.
+///
 /// Fixpoint closure of staleness over the open documents' import edges.
 /// `open_imports` maps each open doc's canonical path to its DIRECT imports;
 /// `seed` is the set of paths that changed (or were deleted) on disk. A doc
@@ -1875,9 +1877,9 @@ mod tests {
     fn drain_publishes(client: &Connection) -> Vec<(String, Option<i32>, usize, Vec<String>)> {
         let mut out = Vec::new();
         while let Ok(msg) = client.receiver.try_recv() {
-            if let Message::Notification(n) = msg {
-                if n.method == lsp_types::notification::PublishDiagnostics::METHOD {
-                    if let Ok(p) = serde_json::from_value::<
+            if let Message::Notification(n) = msg
+                && n.method == lsp_types::notification::PublishDiagnostics::METHOD
+                    && let Ok(p) = serde_json::from_value::<
                         lsp_types::PublishDiagnosticsParams,
                     >(n.params)
                     {
@@ -1888,8 +1890,6 @@ mod tests {
                             .collect();
                         out.push((p.uri.as_str().to_string(), p.version, p.diagnostics.len(), msgs));
                     }
-                }
-            }
         }
         out
     }

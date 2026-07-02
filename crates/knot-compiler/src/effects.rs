@@ -378,11 +378,9 @@ impl EffectChecker {
             if let ast::DeclKind::Fun { name, body: Some(body), .. }
             | ast::DeclKind::View { name, body, .. }
             | ast::DeclKind::Derived { name, body, .. } = &decl.node
-            {
-                if let Some(idx) = fork_wrapper_param(body) {
+                && let Some(idx) = fork_wrapper_param(body) {
                     self.fork_wrapper_params.insert(name.clone(), idx);
                 }
-            }
         }
 
         // Collect declarations whose annotated signature uses an effect-row
@@ -429,14 +427,13 @@ impl EffectChecker {
             match &decl.node {
                 ast::DeclKind::Impl { items, .. } => {
                     for item in items {
-                        if let ast::ImplItem::Method { name, body, .. } = item {
-                            if !fun_names.contains(name.as_str()) {
+                        if let ast::ImplItem::Method { name, body, .. } = item
+                            && !fun_names.contains(name.as_str()) {
                                 method_bodies
                                     .entry(name.clone())
                                     .or_default()
                                     .push(body);
                             }
-                        }
                     }
                 }
                 ast::DeclKind::Trait { items, .. } => {
@@ -446,14 +443,12 @@ impl EffectChecker {
                             default_body: Some(body),
                             ..
                         } = item
-                        {
-                            if !fun_names.contains(name.as_str()) {
+                            && !fun_names.contains(name.as_str()) {
                                 method_bodies
                                     .entry(name.clone())
                                     .or_default()
                                     .push(body);
                             }
-                        }
                     }
                 }
                 _ => {}
@@ -498,7 +493,7 @@ impl EffectChecker {
                     _ => continue,
                 };
                 let old = self.decl_effects.get(name);
-                if old.map_or(true, |o| *o != effects) {
+                if old.is_none_or(|o| *o != effects) {
                     self.decl_effects.insert(name.clone(), effects);
                     changed = true;
                 }
@@ -513,7 +508,7 @@ impl EffectChecker {
                     effects = effects.union(&self.fun_body_effects(body));
                 }
                 let old = self.decl_effects.get(name);
-                if old.map_or(true, |o| *o != effects) {
+                if old.is_none_or(|o| *o != effects) {
                     self.decl_effects.insert(name.clone(), effects);
                     changed = true;
                 }
@@ -550,7 +545,7 @@ impl EffectChecker {
                         _ => continue,
                     };
                     let old = self.decl_effects_atomic_safe.get(name);
-                    if old.map_or(true, |o| *o != effects) {
+                    if old.is_none_or(|o| *o != effects) {
                         self.decl_effects_atomic_safe.insert(name.clone(), effects);
                         changed = true;
                     }
@@ -561,7 +556,7 @@ impl EffectChecker {
                         effects = effects.union(&self.fun_body_effects(body));
                     }
                     let old = self.decl_effects_atomic_safe.get(name);
-                    if old.map_or(true, |o| *o != effects) {
+                    if old.is_none_or(|o| *o != effects) {
                         self.decl_effects_atomic_safe.insert(name.clone(), effects);
                         changed = true;
                     }
@@ -618,12 +613,10 @@ impl EffectChecker {
                 self.decl_effects.insert(name.clone(), effects.clone());
                 self.check_annotation(ty, &effects);
             }
-            ast::DeclKind::Fun { name, body, ty, .. } => {
-                if let Some(body) = body {
-                    let effects = self.fun_body_effects(body);
-                    self.decl_effects.insert(name.clone(), effects.clone());
-                    self.check_annotation(ty, &effects);
-                }
+            ast::DeclKind::Fun { name, body: Some(body), ty, .. } => {
+                let effects = self.fun_body_effects(body);
+                self.decl_effects.insert(name.clone(), effects.clone());
+                self.check_annotation(ty, &effects);
             }
             _ => {}
         }
@@ -681,11 +674,10 @@ impl EffectChecker {
                 // pure, and their effects manifest at the call site instead
                 // (see head_call_effects / callee_effects). Attributing them
                 // here wrongly tripped the atomic gate on unused references.
-                if !is_shadowed && crate::builtins::NULLARY_IO_BUILTINS.contains(&name.as_str()) {
-                    if let Some(effects) = self.builtin_effects.get(name) {
+                if !is_shadowed && crate::builtins::NULLARY_IO_BUILTINS.contains(&name.as_str())
+                    && let Some(effects) = self.builtin_effects.get(name) {
                         return effects.clone();
                     }
-                }
                 // A reference to a local let-bound lambda carries its
                 // body's effects: the value may be invoked by whoever
                 // receives it (e.g. `let cb = \r -> println "x"` passed
@@ -697,11 +689,10 @@ impl EffectChecker {
                         return effects.clone();
                     }
                 }
-                if !is_shadowed {
-                    if let Some(effects) = self.lookup_decl_effects(name) {
+                if !is_shadowed
+                    && let Some(effects) = self.lookup_decl_effects(name) {
                         return effects.clone();
                     }
-                }
                 EffectSet::empty()
             }
 
@@ -1048,8 +1039,8 @@ impl EffectChecker {
                     // `items`); a let-bound IO action (e.g. `let x = readFile
                     // "f"`) contributes the action's own effects when later
                     // sequenced. An unused binding contributes nothing.
-                    if let ast::StmtKind::Let { pat, expr } = &stmt.node {
-                        if let ast::PatKind::Var(name) = &pat.node {
+                    if let ast::StmtKind::Let { pat, expr } = &stmt.node
+                        && let ast::PatKind::Var(name) = &pat.node {
                             let latent = if is_lambda_arg(expr) {
                                 self.fun_body_effects(expr)
                             } else {
@@ -1060,7 +1051,6 @@ impl EffectChecker {
                                 .unwrap()
                                 .insert(name.clone(), (latent, false));
                         }
-                    }
                     let stmt_effects = self.infer_stmt_effects(stmt);
                     effects = effects.union(&stmt_effects);
                     // Binders come into scope for *later* statements.
@@ -1209,24 +1199,21 @@ impl EffectChecker {
             match &e.node {
                 ast::ExprKind::Do(stmts) => {
                     for stmt in stmts {
-                        if let ast::StmtKind::Let { pat, expr } = &stmt.node {
-                            if let ast::PatKind::Var(name) = &pat.node {
-                                if is_lambda_arg(expr) {
+                        if let ast::StmtKind::Let { pat, expr } = &stmt.node
+                            && let ast::PatKind::Var(name) = &pat.node
+                                && is_lambda_arg(expr) {
                                     local_lambdas.insert(name.clone());
                                 }
-                            }
-                        }
                     }
                 }
                 ast::ExprKind::App { .. } => {
                     let (head, args) = app_spine(e);
                     if let ast::ExprKind::Lambda { params, .. } = &head.node {
                         for (param, arg) in params.iter().zip(args.iter()) {
-                            if let ast::PatKind::Var(name) = &param.node {
-                                if is_lambda_arg(arg) {
+                            if let ast::PatKind::Var(name) = &param.node
+                                && is_lambda_arg(arg) {
                                     local_lambdas.insert(name.clone());
                                 }
-                            }
                         }
                     }
                 }
@@ -1256,13 +1243,11 @@ impl EffectChecker {
             };
             let Some(mut head) = callee else { return };
             // Unwrap annotation-style wrappers around the callee.
-            loop {
-                match &head.node {
-                    ast::ExprKind::Annot { expr: inner, .. }
-                    | ast::ExprKind::UnitLit { value: inner, .. }
-                    | ast::ExprKind::Refine(inner) => head = inner,
-                    _ => break,
-                }
+            while let ast::ExprKind::Annot { expr: inner, .. }
+            | ast::ExprKind::UnitLit { value: inner, .. }
+            | ast::ExprKind::Refine(inner) = &head.node
+            {
+                head = inner;
             }
             match &head.node {
                 ast::ExprKind::Var(name) => {
@@ -1319,14 +1304,13 @@ impl EffectChecker {
         // its callback parameter isn't mistaken for an opaque call (see the
         // doc comment).
         for name in callees_to_recurse {
-            if visited.insert(name.clone()) {
-                if let Some(body) = self.decl_bodies.get(&name) {
+            if visited.insert(name.clone())
+                && let Some(body) = self.decl_bodies.get(&name) {
                     let params = lambda_param_names(body);
                     if self.body_may_call_opaque_rec(body, visited, &params) {
                         return true;
                     }
                 }
-            }
         }
         false
     }
@@ -1348,21 +1332,19 @@ impl EffectChecker {
             let mut referenced: Vec<String> = Vec::new();
             walk_expr(e, &mut |node| {
                 match &node.node {
-                    ast::ExprKind::Lambda { body, .. } => {
-                        if found.is_none() && contains_atomic_disallowed_ref(body) {
+                    ast::ExprKind::Lambda { body, .. }
+                        if found.is_none() && contains_atomic_disallowed_ref(body) => {
                             found = Some(node.span);
                         }
-                    }
                     ast::ExprKind::Var(name) => referenced.push(name.clone()),
                     _ => {}
                 }
             });
             for name in referenced {
-                if seen.insert(name.clone()) {
-                    if let Some(body) = self.decl_bodies.get(&name) {
+                if seen.insert(name.clone())
+                    && let Some(body) = self.decl_bodies.get(&name) {
                         worklist.push(body);
                     }
-                }
             }
         }
         found
@@ -1418,21 +1400,19 @@ impl EffectChecker {
                 // locally shadowed name never resolves to the builtin or
                 // the top-level declaration.
                 let is_shadowed = self.shadowed.iter().any(|s| s == name);
-                if !is_shadowed {
-                    if let Some(effects) = self.builtin_effects.get(name) {
+                if !is_shadowed
+                    && let Some(effects) = self.builtin_effects.get(name) {
                         return effects.clone();
                     }
-                }
                 for scope in self.local_fn_effects.iter().rev() {
                     if let Some((effects, _opaque)) = scope.get(name) {
                         return effects.clone();
                     }
                 }
-                if !is_shadowed {
-                    if let Some(effects) = self.lookup_decl_effects(name) {
+                if !is_shadowed
+                    && let Some(effects) = self.lookup_decl_effects(name) {
                         return effects.clone();
                     }
-                }
                 // Unknown callee — treat as pure (conservative, no false positives)
                 EffectSet::empty()
             }
@@ -1501,12 +1481,11 @@ impl EffectChecker {
             ast::ExprKind::Lambda { params, body } => {
                 let mut scope = HashMap::new();
                 for (param, arg) in params.iter().zip(args.iter()) {
-                    if let ast::PatKind::Var(name) = &param.node {
-                        if is_lambda_arg(arg) {
+                    if let ast::PatKind::Var(name) = &param.node
+                        && is_lambda_arg(arg) {
                             let fn_effects = self.fun_body_effects(arg);
                             scope.insert(name.clone(), (fn_effects, false));
                         }
-                    }
                 }
                 let mark = self.shadowed.len();
                 let mut binders: Vec<String> = Vec::new();
@@ -1882,15 +1861,14 @@ fn contains_atomic_disallowed_ref(expr: &ast::Expr) -> bool {
                 }
             }
         }
-        if let ast::ExprKind::Var(name) = &e.node {
-            if crate::builtins::ATOMIC_DISALLOWED_BUILTINS.contains(&name.as_str())
+        if let ast::ExprKind::Var(name) = &e.node
+            && crate::builtins::ATOMIC_DISALLOWED_BUILTINS.contains(&name.as_str())
                 && !pruned
                     .iter()
                     .any(|p| p.start <= e.span.start && e.span.end <= p.end)
             {
                 found = true;
             }
-        }
     });
     found
 }
@@ -1955,7 +1933,7 @@ fn fork_wrapper_param(body: &ast::Expr) -> Option<usize> {
     let mut params: Vec<&str> = Vec::new();
     let inner = unwrap_lambda_params(body, &mut params);
     // If a parameter shadows `fork`, the `fork` in the body is not the builtin.
-    if params.iter().any(|p| *p == "fork") {
+    if params.contains(&"fork") {
         return None;
     }
     let forked = fork_call_arg_var(inner)?;
@@ -1992,11 +1970,10 @@ fn fork_call_arg_var(expr: &ast::Expr) -> Option<&str> {
     match &expr.node {
         ast::ExprKind::App { .. } => {
             let (head, args) = app_spine(expr);
-            if head_name(head) == Some("fork") && args.len() == 1 {
-                if let ast::ExprKind::Var(v) = &args[0].node {
+            if head_name(head) == Some("fork") && args.len() == 1
+                && let ast::ExprKind::Var(v) = &args[0].node {
                     return Some(v.as_str());
                 }
-            }
             None
         }
         ast::ExprKind::BinOp {
@@ -2004,11 +1981,10 @@ fn fork_call_arg_var(expr: &ast::Expr) -> Option<&str> {
             lhs,
             rhs,
         } => {
-            if head_name(rhs) == Some("fork") {
-                if let ast::ExprKind::Var(v) = &lhs.node {
+            if head_name(rhs) == Some("fork")
+                && let ast::ExprKind::Var(v) = &lhs.node {
                     return Some(v.as_str());
                 }
-            }
             None
         }
         ast::ExprKind::Annot { expr: inner, .. }

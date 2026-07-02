@@ -287,13 +287,13 @@ fn lint_do_block_skipping(
                 })
                 .map_or(stmts.len(), |p| i + 1 + p);
 
-            for wi in (i + 1)..search_end {
-                if let StmtKind::Where { cond } = &stmts[wi].node {
-                    if try_compile_sql_expr(bind_var, cond, schema).is_none() {
+            for stmt in &stmts[i + 1..search_end] {
+                if let StmtKind::Where { cond } = &stmt.node
+                    && try_compile_sql_expr(bind_var, cond, schema).is_none() {
                         diags.push(
                             Diagnostic::info("where clause will be evaluated at runtime")
                                 .label(
-                                    stmts[wi].span,
+                                    stmt.span,
                                     "cannot be compiled to a SQL WHERE clause",
                                 )
                                 .note(
@@ -303,7 +303,6 @@ fn lint_do_block_skipping(
                                 ),
                         );
                     }
-                }
             }
         }
     }
@@ -565,8 +564,8 @@ fn lint_app_form(
         };
 
         match fn_name {
-            "filter" => {
-                if try_compile_sql_expr(&bind_var, body, schema).is_none() {
+            "filter"
+                if try_compile_sql_expr(&bind_var, body, schema).is_none() => {
                     diags.push(
                         Diagnostic::info(
                             "filter will be evaluated at runtime instead of SQL WHERE",
@@ -577,9 +576,8 @@ fn lint_app_form(
                         ),
                     );
                 }
-            }
-            "sortBy" => {
-                if try_sql_sortby_expr(&bind_var, body, schema).is_none() {
+            "sortBy"
+                if try_sql_sortby_expr(&bind_var, body, schema).is_none() => {
                     diags.push(
                         Diagnostic::info(
                             "sortBy will be evaluated at runtime instead of SQL ORDER BY",
@@ -590,9 +588,8 @@ fn lint_app_form(
                         ),
                     );
                 }
-            }
-            "sum" => {
-                if try_sql_column_expr(&bind_var, body, schema).is_none() {
+            "sum"
+                if try_sql_column_expr(&bind_var, body, schema).is_none() => {
                     diags.push(
                         Diagnostic::info(
                             "sum will be evaluated at runtime instead of SQL SUM",
@@ -603,9 +600,8 @@ fn lint_app_form(
                         ),
                     );
                 }
-            }
-            "avg" => {
-                if try_sql_column_expr(&bind_var, body, schema).is_none() {
+            "avg"
+                if try_sql_column_expr(&bind_var, body, schema).is_none() => {
                     diags.push(
                         Diagnostic::info(
                             "avg will be evaluated at runtime instead of SQL AVG",
@@ -616,9 +612,8 @@ fn lint_app_form(
                         ),
                     );
                 }
-            }
-            "minOn" => {
-                if try_sql_minmax_expr(&bind_var, body, schema).is_none() {
+            "minOn"
+                if try_sql_minmax_expr(&bind_var, body, schema).is_none() => {
                     diags.push(
                         Diagnostic::info(
                             "minOn will be evaluated at runtime instead of SQL MIN",
@@ -629,9 +624,8 @@ fn lint_app_form(
                         ),
                     );
                 }
-            }
-            "maxOn" => {
-                if try_sql_minmax_expr(&bind_var, body, schema).is_none() {
+            "maxOn"
+                if try_sql_minmax_expr(&bind_var, body, schema).is_none() => {
                     diags.push(
                         Diagnostic::info(
                             "maxOn will be evaluated at runtime instead of SQL MAX",
@@ -642,9 +636,8 @@ fn lint_app_form(
                         ),
                     );
                 }
-            }
-            "countWhere" => {
-                if try_compile_sql_expr(&bind_var, body, schema).is_none() {
+            "countWhere"
+                if try_compile_sql_expr(&bind_var, body, schema).is_none() => {
                     diags.push(
                         Diagnostic::info(
                             "countWhere will be evaluated at runtime instead of SQL COUNT",
@@ -655,7 +648,6 @@ fn lint_app_form(
                         ),
                     );
                 }
-            }
             _ => {}
         }
     }
@@ -726,8 +718,8 @@ fn try_compile_sql_expr(bind_var: &str, expr: &Expr, schema: &str) -> Option<()>
         // `not expr` function application → NOT (...)
         // `contains needle haystack` → INSTR(haystack, needle) > 0
         ExprKind::App { func, arg } => {
-            if let ExprKind::App { func: inner_func, arg: first_arg } = &func.node {
-                if let ExprKind::Var(name) = &inner_func.node {
+            if let ExprKind::App { func: inner_func, arg: first_arg } = &func.node
+                && let ExprKind::Var(name) = &inner_func.node {
                     if name == "contains" {
                         try_sql_atom(bind_var, first_arg)?;
                         return try_sql_atom(bind_var, arg);
@@ -735,13 +727,12 @@ fn try_compile_sql_expr(bind_var: &str, expr: &Expr, schema: &str) -> Option<()>
                     if name == "elem" {
                         // Mirror codegen: `IN` is equality under the hood —
                         // float equality stays in memory.
-                        if let ExprKind::FieldAccess { expr: fa, field } = &first_arg.node {
-                            if matches!(&fa.node, ExprKind::Var(v) if v == bind_var)
+                        if let ExprKind::FieldAccess { expr: fa, field } = &first_arg.node
+                            && matches!(&fa.node, ExprKind::Var(v) if v == bind_var)
                                 && lookup_col_type(schema, field).as_deref() == Some("float")
                             {
                                 return None;
                             }
-                        }
                         try_sql_atom(bind_var, first_arg)?;
                         // Literal list: each element must be a sql-pushable atom
                         // (codegen emits `IN (?, ?, ...)`).
@@ -766,7 +757,6 @@ fn try_compile_sql_expr(bind_var: &str, expr: &Expr, schema: &str) -> Option<()>
                         return None;
                     }
                 }
-            }
             None
         }
         _ => None,
@@ -932,10 +922,14 @@ fn lookup_col_type(schema: &str, col_name: &str) -> Option<String> {
 
 // ── Pattern matchers (mirror codegen.rs) ───────────────────────────
 
+/// Matched conditional-update shape: the condition expression, the update
+/// value expression, and the `(column, value-expr)` field assignments.
+type ConditionalUpdate<'a> = (String, &'a Expr, Vec<(&'a str, &'a Expr)>);
+
 fn match_conditional_update<'a>(
     source_name: &str,
     value: &'a Expr,
-) -> Option<(String, &'a Expr, Vec<(&'a str, &'a Expr)>)> {
+) -> Option<ConditionalUpdate<'a>> {
     let stmts = match &value.node {
         ExprKind::Do(stmts) => stmts,
         _ => return None,
@@ -952,9 +946,9 @@ fn match_conditional_update<'a>(
         _ => return None,
     };
 
-    if let StmtKind::Expr(e) = &stmts[1].node {
-        if let Some(yield_inner) = e.node.as_yield_arg() {
-            if let ExprKind::If {
+    if let StmtKind::Expr(e) = &stmts[1].node
+        && let Some(yield_inner) = e.node.as_yield_arg()
+            && let ExprKind::If {
                 cond,
                 then_branch,
                 else_branch,
@@ -980,8 +974,6 @@ fn match_conditional_update<'a>(
                     return Some((bind_var, cond, update_fields));
                 }
             }
-        }
-    }
     None
 }
 
@@ -1152,22 +1144,18 @@ fn flatten_pipe_chain(expr: &Expr) -> Option<(&Expr, Vec<LintPipeOp<'_>>)> {
     let mut ops = Vec::new();
     let mut current = expr;
 
-    loop {
-        match &current.node {
-            ExprKind::BinOp {
-                op: BinOp::Pipe,
-                lhs,
-                rhs,
-            } => {
-                if let Some(pipe_op) = analyze_pipe_op(rhs) {
-                    ops.push(pipe_op);
-                } else {
-                    return None;
-                }
-                current = lhs;
-            }
-            _ => break,
+    while let ExprKind::BinOp {
+        op: BinOp::Pipe,
+        lhs,
+        rhs,
+    } = &current.node
+    {
+        if let Some(pipe_op) = analyze_pipe_op(rhs) {
+            ops.push(pipe_op);
+        } else {
+            return None;
         }
+        current = lhs;
     }
 
     ops.reverse();
@@ -1243,13 +1231,11 @@ fn analyze_pipe_op(expr: &Expr) -> Option<LintPipeOp<'_>> {
 }
 
 fn extract_single_param_lambda(expr: &Expr) -> Option<(String, &Expr)> {
-    if let ExprKind::Lambda { params, body } = &expr.node {
-        if params.len() == 1 {
-            if let PatKind::Var(name) = &params[0].node {
+    if let ExprKind::Lambda { params, body } = &expr.node
+        && params.len() == 1
+            && let PatKind::Var(name) = &params[0].node {
                 return Some((name.clone(), body));
             }
-        }
-    }
     None
 }
 
@@ -1293,15 +1279,14 @@ fn try_sql_sortby_expr(bind_var: &str, body: &Expr, schema: &str) -> Option<()> 
 fn try_sql_column_expr(bind_var: &str, body: &Expr, schema: &str) -> Option<()> {
     match &body.node {
         ExprKind::FieldAccess { expr, .. } => {
-            if let ExprKind::Var(name) = &expr.node {
-                if name == bind_var { return Some(()); }
-            }
+            if let ExprKind::Var(name) = &expr.node
+                && name == bind_var { return Some(()); }
             None
         }
-        ExprKind::Lit(lit) => match lit {
-            Literal::Int(_) | Literal::Float(_) | Literal::Text(_) | Literal::Bool(_) => Some(()),
-            _ => None,
-        },
+        ExprKind::Lit(
+            Literal::Int(_) | Literal::Float(_) | Literal::Text(_) | Literal::Bool(_),
+        ) => Some(()),
+        ExprKind::Lit(_) => None,
         ExprKind::BinOp { op, lhs, rhs } => {
             match op {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Concat => {
@@ -1425,8 +1410,8 @@ fn try_sql_inline_cond(bind_var: &str, expr: &Expr, schema: &str) -> Option<()> 
             try_sql_inline_cond(bind_var, operand, schema)
         }
         ExprKind::App { func, arg } => {
-            if let ExprKind::App { func: inner_func, arg: first_arg } = &func.node {
-                if let ExprKind::Var(name) = &inner_func.node {
+            if let ExprKind::App { func: inner_func, arg: first_arg } = &func.node
+                && let ExprKind::Var(name) = &inner_func.node {
                     if name == "contains" {
                         try_sql_column_expr(bind_var, first_arg, schema)?;
                         return try_sql_column_expr(bind_var, arg, schema);
@@ -1455,7 +1440,6 @@ fn try_sql_inline_cond(bind_var: &str, expr: &Expr, schema: &str) -> Option<()> 
                         return None;
                     }
                 }
-            }
             None
         }
         _ => None,

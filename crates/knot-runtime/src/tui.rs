@@ -45,8 +45,7 @@ fn parse_schema_kind(schema: &str) -> SchemaKind {
     if schema.is_empty() {
         return SchemaKind::Unit;
     }
-    if schema.starts_with('#') {
-        let body = &schema[1..];
+    if let Some(body) = schema.strip_prefix('#') {
         let mut ctors = Vec::new();
         for ctor_part in split_respecting_brackets(body, '|') {
             let mut parts = ctor_part.splitn(2, ':');
@@ -215,8 +214,8 @@ fn load_rows(conn: &Connection, rel: &RelationInfo) -> Vec<Vec<String>> {
 
             let rows = match stmt.query_map([], |row| {
                 let mut cells = Vec::with_capacity(col_count);
-                for i in 0..col_count {
-                    let cell = format_cell(row, i, field_types[i]);
+                for (i, field_ty) in field_types.iter().enumerate().take(col_count) {
+                    let cell = format_cell(row, i, field_ty);
                     cells.push(cell);
                 }
                 Ok(cells)
@@ -467,7 +466,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         .map(|r| {
             let line = Line::from(vec![
                 Span::styled("*", Style::default().fg(Color::DarkGray)),
-                Span::raw(format!("{}", r.name)),
+                Span::raw(r.name.to_string()),
                 Span::styled(format!(" ({})", r.row_count), Style::default().fg(Color::DarkGray)),
             ]);
             ListItem::new(line)
@@ -636,7 +635,7 @@ impl Drop for TerminalRestoreGuard {
 
 pub fn run_db_explorer(db_path: &str) -> io::Result<()> {
     let conn = Connection::open(db_path).map_err(|e| {
-        io::Error::new(io::ErrorKind::Other, format!("Failed to open database: {}", e))
+        io::Error::other(format!("Failed to open database: {}", e))
     })?;
 
     let mut app = App::new(&conn);

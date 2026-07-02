@@ -28,8 +28,8 @@ pub fn offset_to_position(source: &str, offset: usize) -> Position {
     let bytes = source.as_bytes();
     let mut line: u32 = 0;
     let mut line_start: usize = 0;
-    for i in 0..clamped {
-        if bytes[i] == b'\n' {
+    for (i, &byte) in bytes.iter().enumerate().take(clamped) {
+        if byte == b'\n' {
             line += 1;
             line_start = i + 1;
         }
@@ -86,7 +86,7 @@ pub fn position_to_offset(source: &str, pos: Position) -> usize {
     source.len()
 }
 
-pub fn word_at_position<'a>(source: &'a str, pos: Position) -> Option<&'a str> {
+pub fn word_at_position(source: &str, pos: Position) -> Option<&str> {
     let offset = position_to_offset(source, pos);
     let (start, end) = word_bounds_at_offset(source, offset)?;
     Some(&source[start..end])
@@ -159,7 +159,7 @@ pub fn ident_lookup_offset(source: &str, offset: usize) -> usize {
 /// point into when an edit truncates the document. Clamping both endpoints
 /// (and snapping to char boundaries) keeps such spans safe to read instead
 /// of taking down the LSP.
-pub fn safe_slice<'a>(source: &'a str, span: Span) -> &'a str {
+pub fn safe_slice(source: &str, span: Span) -> &str {
     let len = source.len();
     let mut start = span.start.min(len);
     let mut end = span.end.min(len);
@@ -248,9 +248,12 @@ pub fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
     let mut dp = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    // DP-table init: the index is both the row/column position and the value.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..=a.len() {
         dp[i][0] = i;
     }
+    #[allow(clippy::needless_range_loop)]
     for j in 0..=b.len() {
         dp[0][j] = j;
     }

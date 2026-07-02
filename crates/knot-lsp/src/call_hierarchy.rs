@@ -199,11 +199,10 @@ pub(crate) fn handle_call_hierarchy_outgoing(
     // so users can navigate from a caller to functions they hand off to.
     let mut higher_order_arg_spans: HashSet<Span> = HashSet::new();
     fn collect_higher_order_args(expr: &ast::Expr, out: &mut HashSet<Span>) {
-        if let ast::ExprKind::App { arg, .. } = &expr.node {
-            if matches!(&arg.node, ast::ExprKind::Var(_)) {
+        if let ast::ExprKind::App { arg, .. } = &expr.node
+            && matches!(&arg.node, ast::ExprKind::Var(_)) {
                 out.insert(arg.span);
             }
-        }
         recurse_expr(expr, |e| collect_higher_order_args(e, out));
     }
     match &source_decl.node {

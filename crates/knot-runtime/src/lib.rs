@@ -538,6 +538,13 @@ static GC_STATS: GcStats = GcStats::new();
 /// Populate `out` with a snapshot of the GC counters.  Exposed for
 /// programs/tests that want to observe allocator behaviour in-process.
 /// Safe to call from any thread.
+///
+/// # Safety
+///
+/// `out` must either be null (in which case the call is a no-op) or a valid,
+/// properly aligned pointer to a writable `GcStatsSnapshot` that the caller
+/// owns for the duration of the call. The existing contents (if any) are
+/// overwritten without being dropped.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn knot_gc_stats_snapshot(out: *mut GcStatsSnapshot) {
     if out.is_null() { return; }
@@ -573,7 +580,7 @@ const RELATION_POOL_MAX_CAPACITY: usize = 4096;
 /// Number of size-class bins.  Bin `i` stores vecs with capacity in
 /// `[1 << i, 1 << (i+1))`.  We cap at `log2(RELATION_POOL_MAX_CAPACITY)
 /// + 1 = 13` so bin 12 covers [4096, 8192) but the reject threshold
-/// keeps the tail small.
+///   keeps the tail small.
 const RELATION_POOL_BINS: usize = 13;
 
 /// Per-bin capacity cap.  Keeps total pool memory bounded while still
@@ -782,7 +789,7 @@ impl Arena {
             .expect("arena: no frames")
             .chunks
             .last()
-            .map_or(true, Chunk::is_full);
+            .is_none_or(Chunk::is_full);
         if need_new {
             let chunk = self.take_chunk();
             self.current_frame().push_chunk(chunk);
@@ -855,7 +862,7 @@ impl Arena {
         frame.drop_chunks();
         frame.drop_pinned_chunks();
         let mut chunks: Vec<Chunk> = frame.chunks.drain(..).collect();
-        chunks.extend(frame.pinned_chunks.drain(..));
+        chunks.append(&mut frame.pinned_chunks);
         drop(frame);
         for chunk in chunks {
             self.return_chunk(chunk);
@@ -1139,7 +1146,7 @@ impl Arena {
             .current_frame()
             .pinned_chunks
             .last()
-            .map_or(true, Chunk::is_full);
+            .is_none_or(Chunk::is_full);
         if need_new {
             let chunk = self.take_chunk();
             self.current_frame().push_pinned_chunk(chunk);
@@ -1771,11 +1778,10 @@ fn cmp_for_col(a: &SqlVal, b: &SqlVal, text_col: bool) -> Option<std::cmp::Order
     // Genuine TEXT column (BINARY collation): compare byte-wise to match
     // SQLite, NOT via the numeric-parse heuristic (correct only for
     // `KNOT_INT`-collated Int columns stored as TEXT). See `TEXT_COLUMNS`.
-    if text_col {
-        if let (SqlVal::Text(x), SqlVal::Text(y)) = (a, b) {
+    if text_col
+        && let (SqlVal::Text(x), SqlVal::Text(y)) = (a, b) {
             return Some(x.cmp(y));
         }
-    }
     sql_partial_cmp(a, b)
 }
 
@@ -2132,11 +2138,10 @@ fn classify_filter(table: &str, filter: &ReadFilter) -> FilterReg {
         if col_is_text(table, col) {
             continue;
         }
-        if let Some(rank) = pred_selectivity(pred) {
-            if best.map_or(true, |(_, br)| rank < br) {
+        if let Some(rank) = pred_selectivity(pred)
+            && best.is_none_or(|(_, br)| rank < br) {
                 best = Some((i, rank));
             }
-        }
     }
     let Some((idx, _)) = best else {
         return FilterReg::Broad;
@@ -2438,7 +2443,7 @@ thread_local! {
     static STM_TRACK: RefCell<StmTracking> = RefCell::new(StmTracking::default());
     /// Stack of saved tracking state for nested atomic blocks.
     /// Pushed before inner atomic's loop, popped/merged on inner commit.
-    static STM_TRACKING_STACK: RefCell<Vec<StmTracking>> = RefCell::new(Vec::new());
+    static STM_TRACKING_STACK: RefCell<Vec<StmTracking>> = const { RefCell::new(Vec::new()) };
     /// Per-table flag recording whether the most recent `stm_track_read` for
     /// that table freshly INSERTED an `All` filter (true) or was deduped
     /// against a pre-existing broad read (false). Codegen always emits
@@ -2580,7 +2585,7 @@ fn wait_for_any_write(timeout: Duration) {
 
 /// Bump the global per-table version counter. Steady-state: one shard read
 /// + one atomic increment, no write-lock. Pre-populated by `knot_source_init`
-/// so the entry-miss path is essentially dead code at runtime.
+///   so the entry-miss path is essentially dead code at runtime.
 fn bump_table_version(name: &str) {
     if let Some(v) = TABLE_VERSIONS.get(name) {
         v.fetch_add(1, Ordering::Release);
@@ -2633,11 +2638,10 @@ fn wake_matching_watchers(name: &str, event: &WriteEvent) {
     // 1) Broad watchers — All filters and non-indexable Cols.
     if let Some(slots) = TABLE_WATCHERS.get(name) {
         for weak in slots.iter() {
-            if let Some(slot) = weak.upgrade() {
-                if slot.matches(name, event) {
+            if let Some(slot) = weak.upgrade()
+                && slot.matches(name, event) {
                     slot.wake();
                 }
-            }
         }
     }
     // 2) Indexed watchers.
@@ -2950,12 +2954,16 @@ struct ParsedSpec {
     clauses: Vec<(String, SpecOp)>,
 }
 
+/// Map from `(spec_ptr, spec_len)` key to a cached parse result:
+/// `Some(Arc)` means "parses cleanly", `None` is a cached negative result.
+type SpecCacheMap = HashMap<(usize, usize), Option<Arc<ParsedSpec>>>;
+
 /// Cache from `(spec_ptr, spec_len)` → parsed structure. Spec strings come
 /// from compiler-emitted static memory, so two calls with the same pointer
 /// describe the same spec. Wrap entries in `Arc` so concurrent readers can
 /// clone cheaply without re-locking. `Some(Arc)` means "parses cleanly";
 /// `None` is cached negative-result so malformed specs aren't re-parsed.
-static SPEC_CACHE: std::sync::LazyLock<RwLock<HashMap<(usize, usize), Option<Arc<ParsedSpec>>>>> =
+static SPEC_CACHE: std::sync::LazyLock<RwLock<SpecCacheMap>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
 fn lookup_or_parse_spec(spec_ptr: *const u8, spec_len: usize, spec: &str) -> Option<Arc<ParsedSpec>> {
@@ -3067,11 +3075,10 @@ fn stm_specialize_read_pred(name: &str, preds: Vec<(Arc<str>, ColPred)>) {
         let mut t = t.borrow_mut();
         t.reads.entry(name.to_string()).or_insert((arc, ver));
         let v = t.filters.entry(name.to_string()).or_default();
-        if fresh {
-            if let Some(pos) = v.iter().rposition(|f| matches!(f, ReadFilter::All)) {
+        if fresh
+            && let Some(pos) = v.iter().rposition(|f| matches!(f, ReadFilter::All)) {
                 v.remove(pos);
             }
-        }
         v.push(ReadFilter::Cols(preds));
     });
 }
@@ -3819,7 +3826,7 @@ pub(crate) fn encode_smallint(n: i64) -> Option<*mut Value> {
     // i61 range: −2^60 .. 2^60 − 1
     const MIN: i64 = -(1i64 << 60);
     const MAX: i64 = (1i64 << 60) - 1;
-    if n < MIN || n > MAX { return None; }
+    if !(MIN..=MAX).contains(&n) { return None; }
     let raw = ((n as usize) << 3) | TAG_SMALLINT;
     Some(raw as *mut Value)
 }
@@ -4293,7 +4300,7 @@ fn alloc(v: Value) -> *mut Value {
 /// existing runtime functions.
 #[inline]
 fn alloc_int(n: i64) -> *mut Value {
-    if n >= SMALL_INT_MIN && n <= SMALL_INT_MAX {
+    if (SMALL_INT_MIN..=SMALL_INT_MAX).contains(&n) {
         return SINGLETONS.with(|s| s.small_ints[(n - SMALL_INT_MIN) as usize]);
     }
     if let Some(tagged) = encode_smallint(n) {
@@ -4421,13 +4428,13 @@ struct UnpackScratchRing {
 }
 
 thread_local! {
-    static UNPACK_SCRATCH: UnpackScratchRing = UnpackScratchRing {
+    static UNPACK_SCRATCH: UnpackScratchRing = const { UnpackScratchRing {
         slots: std::cell::UnsafeCell::new([
             Value::Unit, Value::Unit, Value::Unit, Value::Unit,
             Value::Unit, Value::Unit, Value::Unit, Value::Unit,
         ]),
         cursor: std::cell::Cell::new(0),
-    };
+    } };
 }
 
 unsafe fn str_from_raw(ptr: *const u8, len: usize) -> &'static str {
@@ -4788,6 +4795,16 @@ pub extern "C-unwind" fn knot_value_text_cached(ptr: *const u8, len: usize) -> *
 /// LRU from per-call pressure — the LRU remains available for dynamic
 /// callers that don't go through the inline slot path, but the common
 /// case (compiled-code-emitted literals) stays entirely out of it.
+///
+/// # Safety
+///
+/// - `ptr`/`len` must describe a valid UTF-8 byte range readable for the
+///   duration of the call (same contract as `str_from_raw`).
+/// - `slot` must be a non-null pointer to a `*mut Value` cell that is either
+///   correctly aligned for `AtomicPtr<Value>` (fast path) or unaligned (in
+///   which case the per-thread LRU fallback is used). The cell must start
+///   zeroed and must outlive the program, since the interned value is never
+///   reclaimed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn knot_value_text_intern(
     ptr: *const u8,
@@ -4804,7 +4821,7 @@ pub unsafe extern "C-unwind" fn knot_value_text_intern(
     // we detect that case and fall back to the per-thread LRU cache, which
     // doesn't require any alignment from the caller.  Same observable result,
     // just gives up the inline-slot fast path.
-    if slot as usize % std::mem::align_of::<std::sync::atomic::AtomicPtr<Value>>() != 0 {
+    if !(slot as usize).is_multiple_of(std::mem::align_of::<std::sync::atomic::AtomicPtr<Value>>()) {
         return knot_value_text_cached(ptr, len);
     }
     let atomic = unsafe { &*(slot as *const std::sync::atomic::AtomicPtr<Value>) };
@@ -5038,7 +5055,7 @@ pub extern "C-unwind" fn knot_record_field_by_index(record: *mut Value, index: u
 // ── SQLite-backed temp tables for relation operations ─────────────
 
 thread_local! {
-    static TEMP_COUNTER: std::cell::Cell<u64> = std::cell::Cell::new(0);
+    static TEMP_COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn next_temp_name() -> String {
@@ -5367,7 +5384,7 @@ fn temp_row_to_params(v: *mut Value, schema: &TempSchema) -> Vec<rusqlite::types
                     let mut params = vec![rusqlite::types::Value::Text(tag.to_string())];
                     let ctor = constructors.iter().find(|(t, _)| t.as_str() == &**tag);
                     for (fname, fty) in all_fields {
-                        let has_field = ctor.map_or(false, |(_, fields)| {
+                        let has_field = ctor.is_some_and(|(_, fields)| {
                             fields.iter().any(|(n, _)| n == fname)
                         });
                         if has_field {
@@ -6261,11 +6278,10 @@ pub extern "C-unwind" fn knot_relation_group_by(
                 .map(|i| row.get(i).unwrap())
                 .collect();
 
-            if let Some(ref prev) = prev_keys {
-                if keys != *prev {
+            if let Some(ref prev) = prev_keys
+                && keys != *prev {
                     groups.push(std::mem::take(&mut current_group));
                 }
-            }
 
             current_group.push(rows[idx as usize]);
             prev_keys = Some(keys);
@@ -8085,10 +8101,10 @@ pub extern "C-unwind" fn knot_stm_wait(_snapshot: i64) {
     // ownership saves the clone allocation on every park.
     // `read_versions` carries the cached version Arc per table so the
     // post-register re-check below is a memory load, not a DashMap lookup.
-    let (read_versions, filter_map): (
-        Vec<(String, Arc<AtomicU64>, u64)>,
-        HashMap<String, Vec<ReadFilter>>,
-    ) = STM_TRACK.with(|t| {
+    // Snapshot of the tracked reads (`table`, cached version `Arc`, version at
+    // read time) paired with the per-table read filters.
+    type StmSnapshot = (Vec<(String, Arc<AtomicU64>, u64)>, HashMap<String, Vec<ReadFilter>>);
+    let (read_versions, filter_map): StmSnapshot = STM_TRACK.with(|t| {
         let mut t = t.borrow_mut();
         (
             t.reads
@@ -8129,11 +8145,10 @@ pub extern "C-unwind" fn knot_stm_wait(_snapshot: i64) {
                 c.fetch_sub(1, Ordering::Release);
             }
             for (table, col) in &self.cols {
-                if let Some(mut state) = TABLE_FILTER_COLS.get_mut(table) {
-                    if let Some(c) = state.cols.get_mut(col.as_str()) {
+                if let Some(mut state) = TABLE_FILTER_COLS.get_mut(table)
+                    && let Some(c) = state.cols.get_mut(col.as_str()) {
                         *c = c.saturating_sub(1);
                     }
-                }
             }
         }
     }
@@ -8358,8 +8373,8 @@ pub extern "C-unwind" fn knot_fs_write_file_io(path: *mut Value, contents: *mut 
     ]));
     extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let _ = db;
-        let p = knot_record_field(env, "_p\0".as_ptr(), 2);
-        let c = knot_record_field(env, "_c\0".as_ptr(), 2);
+        let p = knot_record_field(env, c"_p".as_ptr().cast(), 2);
+        let c = knot_record_field(env, c"_c".as_ptr().cast(), 2);
         knot_fs_write_file(p, c)
     }
     alloc(Value::IO(thunk as *const u8, env))
@@ -8373,8 +8388,8 @@ pub extern "C-unwind" fn knot_fs_append_file_io(path: *mut Value, contents: *mut
     ]));
     extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let _ = db;
-        let p = knot_record_field(env, "_p\0".as_ptr(), 2);
-        let c = knot_record_field(env, "_c\0".as_ptr(), 2);
+        let p = knot_record_field(env, c"_p".as_ptr().cast(), 2);
+        let c = knot_record_field(env, c"_c".as_ptr().cast(), 2);
         knot_fs_append_file(p, c)
     }
     alloc(Value::IO(thunk as *const u8, env))
@@ -9386,7 +9401,7 @@ pub extern "C-unwind" fn knot_text_trim(v: *mut Value) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_text_contains(needle: *mut Value, haystack: *mut Value) -> *mut Value {
     let needle: &str = match unsafe { as_ref(needle) } {
-        Value::Text(s) => &**s,
+        Value::Text(s) => s,
         _ => panic!("knot runtime: contains expected Text as first arg"),
     };
     match unsafe { as_ref(haystack) } {
@@ -9745,21 +9760,20 @@ fn json_to_value_impl(json: &serde_json::Value, wire: bool) -> *mut Value {
             // (e.g. `{"__knot_bytes": "hello"}`), which would otherwise be
             // silently corrupted into a Bytes value. Mirrors the structural
             // guard the `__knot_ctor` marker below already uses.
-            if obj.len() == 1 {
-                if let Some(serde_json::Value::String(b64)) = obj.get("__knot_bytes") {
+            if obj.len() == 1
+                && let Some(serde_json::Value::String(b64)) = obj.get("__knot_bytes") {
                     let decoded = base64_decode(b64);
                     if base64_encode(&decoded) == *b64 {
                         return alloc(Value::Bytes(Arc::from(decoded)));
                     }
                 }
-            }
             // Reconstruct Constructor from the `__knot_ctor` marker shape
             // emitted by value_to_serde_json. Using a `__knot_`-prefixed key
             // (like `__knot_bytes`/`__knot_bigint`) avoids colliding with
             // legitimate user records that happen to have `tag`/`value` fields.
-            if obj.len() == 1 {
-                if let Some(serde_json::Value::Object(inner)) = obj.get("__knot_ctor") {
-                    if let (Some(serde_json::Value::String(tag)), Some(val)) =
+            if obj.len() == 1
+                && let Some(serde_json::Value::Object(inner)) = obj.get("__knot_ctor")
+                    && let (Some(serde_json::Value::String(tag)), Some(val)) =
                         (inner.get("tag"), inner.get("value"))
                     {
                         return alloc(Value::Constructor(
@@ -9767,8 +9781,6 @@ fn json_to_value_impl(json: &serde_json::Value, wire: bool) -> *mut Value {
                             json_to_value_impl(val, wire),
                         ));
                     }
-                }
-            }
             let mut fields: Vec<RecordField> = obj
                 .iter()
                 .map(|(k, v)| RecordField {
@@ -10020,14 +10032,14 @@ pub extern "C-unwind" fn knot_fs_read_file(path: *mut Value) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_fs_write_file(path: *mut Value, contents: *mut Value) -> *mut Value {
     let p: &str = match unsafe { as_ref(path) } {
-        Value::Text(s) => &**s,
+        Value::Text(s) => s,
         _ => panic!(
             "knot runtime: writeFile expected Text as first arg, got {}",
             type_name(path)
         ),
     };
     let c: &str = match unsafe { as_ref(contents) } {
-        Value::Text(s) => &**s,
+        Value::Text(s) => s,
         _ => panic!(
             "knot runtime: writeFile expected Text as second arg, got {}",
             type_name(contents)
@@ -10044,14 +10056,14 @@ pub extern "C-unwind" fn knot_fs_write_file(path: *mut Value, contents: *mut Val
 pub extern "C-unwind" fn knot_fs_append_file(path: *mut Value, contents: *mut Value) -> *mut Value {
     use std::io::Write;
     let p: &str = match unsafe { as_ref(path) } {
-        Value::Text(s) => &**s,
+        Value::Text(s) => s,
         _ => panic!(
             "knot runtime: appendFile expected Text as first arg, got {}",
             type_name(path)
         ),
     };
     let c: &str = match unsafe { as_ref(contents) } {
-        Value::Text(s) => &**s,
+        Value::Text(s) => s,
         _ => panic!(
             "knot runtime: appendFile expected Text as second arg, got {}",
             type_name(contents)
@@ -10888,11 +10900,10 @@ fn auto_apply_adt_change(
     // breaking change so the caller demands an explicit `migrate` block
     // instead of corrupting the relation.
     for nf in &new_adt.all_fields {
-        if let Some(of) = old_adt.all_fields.iter().find(|f| f.name == nf.name) {
-            if old_adt.col_sql_type(of) != new_adt.col_sql_type(nf) {
+        if let Some(of) = old_adt.all_fields.iter().find(|f| f.name == nf.name)
+            && old_adt.col_sql_type(of) != new_adt.col_sql_type(nf) {
                 return false;
             }
-        }
     }
 
     // Add new columns for new constructor fields
@@ -11016,11 +11027,10 @@ fn auto_apply_child_change(
 
     // Recurse into nested-within-nested fields
     for new_sub in &new_nf.nested {
-        if let Some(old_sub) = old_nf.nested.iter().find(|n| n.name == new_sub.name) {
-            if !auto_apply_child_change(conn, &child_table, old_sub, new_sub) {
+        if let Some(old_sub) = old_nf.nested.iter().find(|n| n.name == new_sub.name)
+            && !auto_apply_child_change(conn, &child_table, old_sub, new_sub) {
                 return false;
             }
-        }
     }
 
     // Initialize any brand-new nested sub-tables
@@ -11116,11 +11126,10 @@ fn auto_apply_record_change(
     // Migrate existing child tables whose inner schema changed
     let old_nested_names: HashSet<&str> = old_rec.nested.iter().map(|n| n.name.as_str()).collect();
     for new_nf in &new_rec.nested {
-        if let Some(old_nf) = old_rec.nested.iter().find(|n| n.name == new_nf.name) {
-            if !auto_apply_child_change(conn, table, old_nf, new_nf) {
+        if let Some(old_nf) = old_rec.nested.iter().find(|n| n.name == new_nf.name)
+            && !auto_apply_child_change(conn, table, old_nf, new_nf) {
                 return false;
             }
-        }
     }
 
     // Initialize any new child tables for nested relations
@@ -11228,9 +11237,9 @@ pub extern "C-unwind" fn knot_source_init(
             Err(e) => panic!("knot runtime: error reading schema for source '*{}': {}", name, e),
         };
 
-    if let Some(ref stored_schema) = stored {
-        if stored_schema != schema {
-            if !auto_apply_schema_change(&db_ref.conn, name, stored_schema, schema) {
+    if let Some(ref stored_schema) = stored
+        && stored_schema != schema
+            && !auto_apply_schema_change(&db_ref.conn, name, stored_schema, schema) {
                 panic!(
                     "knot runtime: schema mismatch for source '*{}'.\n\
                      Stored:   {}\n\
@@ -11239,8 +11248,6 @@ pub extern "C-unwind" fn knot_source_init(
                     name, stored_schema, schema, name
                 );
             }
-        }
-    }
 
     // Record current schema
     db_ref
@@ -12247,11 +12254,10 @@ fn write_record_rows(
                 let child_val = field_map.get(nf.name.as_str())
                     .copied()
                     .unwrap_or(std::ptr::null_mut());
-                if !child_val.is_null() {
-                    if let Value::Relation(child_rows) = unsafe { as_ref(child_val) } {
+                if !child_val.is_null()
+                    && let Value::Relation(child_rows) = unsafe { as_ref(child_val) } {
                         write_child_rows(conn, &child_table, nf, parent_id, child_rows);
                     }
-                }
             }
         }
     }
@@ -12361,11 +12367,10 @@ fn write_child_rows(
                 let gc_val = field_map.get(grandchild.name.as_str())
                     .copied()
                     .unwrap_or(std::ptr::null_mut());
-                if !gc_val.is_null() {
-                    if let Value::Relation(gc_rows) = unsafe { as_ref(gc_val) } {
+                if !gc_val.is_null()
+                    && let Value::Relation(gc_rows) = unsafe { as_ref(gc_val) } {
                         write_child_rows(conn, &gc_table, grandchild, child_id, gc_rows);
                     }
-                }
             }
         }
     }
@@ -12565,8 +12570,8 @@ pub extern "C-unwind" fn knot_source_append(
                 });
                 if want_rows_event {
                     let mut vals = Vec::with_capacity(event_header.len());
-                    for i in 0..event_header.len() {
-                        vals.push(SqlVal::from_rusqlite(&params[i]));
+                    for p in params.iter().take(event_header.len()) {
+                        vals.push(SqlVal::from_rusqlite(p));
                     }
                     event_rows.push(vals);
                 }
@@ -12915,15 +12920,14 @@ pub extern "C-unwind" fn knot_source_diff_write(
 /// Check whether a SQLite table has a column with the given name.
 fn table_has_column(conn: &rusqlite::Connection, table: &str, col: &str) -> bool {
     let sql = format!("PRAGMA table_info({})", quote_ident(table));
-    if let Ok(mut stmt) = conn.prepare(&sql) {
-        if let Ok(names) = stmt.query_map([], |row| row.get::<_, String>(1)) {
+    if let Ok(mut stmt) = conn.prepare(&sql)
+        && let Ok(names) = stmt.query_map([], |row| row.get::<_, String>(1)) {
             for name in names.flatten() {
                 if name == col {
                     return true;
                 }
             }
         }
-    }
     false
 }
 
@@ -14318,7 +14322,7 @@ pub extern "C-unwind" fn knot_record_update_batch(
     let mut upd_idx = 0;
 
     while base_idx < base_fields.len() && upd_idx < updates.len() {
-        let base_name: &str = &*base_fields[base_idx].name;
+        let base_name: &str = &base_fields[base_idx].name;
         let upd_name = updates[upd_idx].0;
         match base_name.cmp(upd_name) {
             std::cmp::Ordering::Less => {
@@ -14538,7 +14542,7 @@ pub extern "C-unwind" fn knot_relation_rename_columns(
             };
             let new_rec = knot_record_empty(fields.len());
             for field in fields {
-                let field_name_str: &str = &*field.name;
+                let field_name_str: &str = &field.name;
                 let new_name: &str = renames
                     .iter()
                     .find(|(old, _)| **old == *field_name_str)
@@ -15046,13 +15050,12 @@ fn url_decode(s: &str, plus_as_space: bool) -> String {
     let raw = s.as_bytes();
     let mut i = 0;
     while i < raw.len() {
-        if raw[i] == b'%' && i + 2 < raw.len() {
-            if let (Some(h), Some(l)) = (hex_val(raw[i + 1]), hex_val(raw[i + 2])) {
+        if raw[i] == b'%' && i + 2 < raw.len()
+            && let (Some(h), Some(l)) = (hex_val(raw[i + 1]), hex_val(raw[i + 2])) {
                 bytes.push(h * 16 + l);
                 i += 3;
                 continue;
             }
-        }
         if raw[i] == b'+' && plus_as_space {
             bytes.push(b' ');
         } else {
@@ -15098,20 +15101,18 @@ fn try_string_to_value(s: &str, ty: &str) -> Option<*mut Value> {
 /// Coerce a JSON-parsed value to match the expected field type.
 /// JSON strings become Constructors for "tag"-typed fields (all-nullary ADTs).
 fn coerce_json_field(v: *mut Value, ty: &str) -> *mut Value {
-    if ty == "tag" {
-        if let Value::Text(s) = unsafe { as_ref(v) } {
+    if ty == "tag"
+        && let Value::Text(s) = unsafe { as_ref(v) } {
             return alloc(Value::Constructor(intern_str(s), alloc(Value::Unit)));
         }
-    }
     // A bare JSON integer (`5`) decodes to `Value::Int`, but a field declared
     // `Float` must hold a `Value::Float` — otherwise `show`/`toJson` re-emit it
     // as an integer and Float-specific logic sees the wrong tag. Non-Knot peers
     // routinely send integer-valued JSON for float fields, so promote here.
-    if ty == "float" {
-        if let Value::Int(i) = unsafe { as_ref(v) } {
+    if ty == "float"
+        && let Value::Int(i) = unsafe { as_ref(v) } {
             return alloc_float(*i as f64);
         }
-    }
     // The mirror case: a field declared `Int` must hold a `Value::Int`, but a
     // peer that writes an integer with a decimal point (`30.0`) fails the
     // `as_i64()` probe in `json_to_value_impl` and decodes to `Value::Float`.
@@ -15119,8 +15120,8 @@ fn coerce_json_field(v: *mut Value, ty: &str) -> *mut Value {
     // int-as-TEXT (`COLLATE KNOT_INT`) encoding every other Int row uses,
     // corrupting numeric ordering/comparison in that column. Demote integral
     // floats back to `Int` here.
-    if ty == "int" {
-        if let Value::Float(f) = unsafe { as_ref(v) } {
+    if ty == "int"
+        && let Value::Float(f) = unsafe { as_ref(v) } {
             // `i64::MAX as f64` rounds up to 2^63, so `*f <= i64::MAX as f64`
             // would accept values in (i64::MAX, 2^63] and silently saturate them
             // to i64::MAX on `as i64`. The representable integral range is
@@ -15130,14 +15131,13 @@ fn coerce_json_field(v: *mut Value, ty: &str) -> *mut Value {
                 return alloc_int(*f as i64);
             }
         }
-    }
     v
 }
 
 const BASE64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn base64_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
@@ -15172,7 +15172,7 @@ fn base64_decode(s: &str) -> Vec<u8> {
     }
     let bytes: Vec<u8> = s.bytes()
         .filter(|&b| b != b'=' && b != b'\n' && b != b'\r' && b != b' ' && b != b'\t')
-        .filter_map(|b| char_to_val(b))
+        .filter_map(char_to_val)
         .collect();
     let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
     for chunk in bytes.chunks(4) {
@@ -15415,9 +15415,9 @@ const HTTP_MAX_BODY_BYTES_DEFAULT: u64 = 16 * 1024 * 1024;
 ///      the program (read once on first access).
 ///   2. Call `knot_set_http_max_body_bytes` from the host or from generated
 ///      code at any point — subsequent reads see the new limit.
-/// Stored as `AtomicU64` so updates are visible to all threads (`listen`
-/// runs request handlers on a worker pool; `fetch` may be called from
-/// `fork`ed threads).
+///      Stored as `AtomicU64` so updates are visible to all threads (`listen`
+///      runs request handlers on a worker pool; `fetch` may be called from
+///      `fork`ed threads).
 static HTTP_MAX_BODY_BYTES_CELL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -16019,8 +16019,8 @@ fn http_serve_loop(
                     // spam still consumes tokens and gets 429. On rejection
                     // respond 429 with a Retry-After header (carried as the
                     // Err's third tuple element).
-                    if let Some(cfg) = entry_rate_limit.as_ref() {
-                        if let Some(key) = rate_limit_key_for_request(
+                    if let Some(cfg) = entry_rate_limit.as_ref()
+                        && let Some(key) = rate_limit_key_for_request(
                             db,
                             cfg,
                             &client_ip,
@@ -16047,7 +16047,6 @@ fn http_serve_loop(
                                 ));
                             }
                         }
-                    }
 
                     // Validate refined body fields (after the rate-limit
                     // check — see above).
@@ -16445,14 +16444,14 @@ pub extern "C-unwind" fn knot_http_fetch_io(
             Value::Text(s) if !s.is_empty()
                 && method_str.as_str() != "GET" && method_str.as_str() != "HEAD" =>
             {
-                Some(fetch_build_body(&**s, payload))
+                Some(fetch_build_body(s, payload))
             }
             _ => None,
         };
 
         // Build query string from query field descriptor
         let query_string = match unsafe { as_ref(query_desc) } {
-            Value::Text(s) if !s.is_empty() => Some(fetch_build_query(&**s, payload)),
+            Value::Text(s) if !s.is_empty() => Some(fetch_build_query(s, payload)),
             _ => None,
         };
 
@@ -16501,15 +16500,14 @@ pub extern "C-unwind" fn knot_http_fetch_io(
         }
 
         // Ad-hoc headers from fetchWith options (override route-declared headers)
-        if !headers.is_null() {
-            if let Value::Relation(rows) = unsafe { as_ref(headers) } {
+        if !headers.is_null()
+            && let Value::Relation(rows) = unsafe { as_ref(headers) } {
                 for row in rows {
                     let n = fetch_record_text_field(*row, "name");
                     let v = fetch_record_text_field(*row, "value");
                     req_headers.push((n, v));
                 }
             }
-        }
 
         // Deduplicate headers case-insensitively, last value wins. ureq 3's
         // `RequestBuilder::header` APPENDS rather than replaces, so without
@@ -16835,13 +16833,12 @@ fn fetch_build_body(body_desc: &str, payload: *mut Value) -> String {
         };
         let field_val = knot_record_field(payload, name.as_ptr(), name.len());
         if is_maybe {
-            match unwrap_maybe(field_val) {
-                Some(inner) => { map.insert(name.to_string(), encode(inner)); }
-                // Omit Nothing fields entirely (consistent with how fetch
-                // skips Nothing headers and query params). Servers decode
-                // both an absent Maybe field and an explicit `null` as
-                // Nothing, so omission is the lighter equivalent.
-                None => {}
+            // Omit Nothing fields entirely (consistent with how fetch
+            // skips Nothing headers and query params). Servers decode
+            // both an absent Maybe field and an explicit `null` as
+            // Nothing, so omission is the lighter equivalent.
+            if let Some(inner) = unwrap_maybe(field_val) {
+                map.insert(name.to_string(), encode(inner));
             }
         } else {
             map.insert(name.to_string(), encode(field_val));
@@ -17890,7 +17887,7 @@ mod _maybe_json_tests {
         alloc(Value::Record(fs))
     }
 
-    fn field<'a>(v: *mut Value, name: &str) -> *mut Value {
+    fn field(v: *mut Value, name: &str) -> *mut Value {
         knot_record_field(v, name.as_ptr(), name.len())
     }
 
@@ -19122,9 +19119,9 @@ mod _bugfix_batch_tests {
             ColPred::Cmp(CmpOp::Lt, SqlVal::Text("99".into())),
         )]);
         // `code < "99"` wakes on a text column (byte-order: "100" < "99").
-        assert!(event.matches_filters("fix5_codes", &[lt99.clone()]));
+        assert!(event.matches_filters("fix5_codes", std::slice::from_ref(&lt99)));
         // The same column/value on an UNregistered (numeric) table does NOT wake.
-        assert!(!event.matches_filters("not_registered", &[lt99.clone()]));
+        assert!(!event.matches_filters("not_registered", std::slice::from_ref(&lt99)));
 
         // classify_filter routes a text-column range predicate Broad (so it is
         // re-checked via the column-aware matches_filters), never into the
@@ -19854,8 +19851,8 @@ mod _fk_migration_listen_tests {
             use std::io::{Read, Write};
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
             loop {
-                if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
-                    if s
+                if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port))
+                    && s
                         .write_all(
                             b"GET /nope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
                         )
@@ -19867,7 +19864,6 @@ mod _fk_migration_listen_tests {
                             return buf;
                         }
                     }
-                }
                 assert!(
                     std::time::Instant::now() < deadline,
                     "server on port {} did not come up",

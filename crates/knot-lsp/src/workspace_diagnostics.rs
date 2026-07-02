@@ -303,7 +303,7 @@ pub(crate) fn handle_workspace_diagnostics(
             .documents
             .keys()
             .chain(state.pending_sources.keys())
-            .filter_map(|u| uri_to_path(u))
+            .filter_map(uri_to_path)
             .filter_map(|p| p.canonicalize().ok())
             .collect();
 
@@ -355,11 +355,10 @@ pub(crate) fn handle_workspace_diagnostics(
                 // diagnostics without reading or hashing the file. Saves
                 // O(workspace_size) disk reads per workspace pull.
                 let disk_mtime = current_mtime(&canonical);
-                if let Some(dm) = disk_mtime {
-                    if let Some((_, cached, _, Some(cached_mtime))) =
+                if let Some(dm) = disk_mtime
+                    && let Some((_, cached, _, Some(cached_mtime))) =
                         state.workspace_diag_cache.get(&canonical)
-                    {
-                        if *cached_mtime == dm {
+                        && *cached_mtime == dm {
                             cached_results.push((
                                 file_uri,
                                 cached.clone(),
@@ -367,8 +366,6 @@ pub(crate) fn handle_workspace_diagnostics(
                             ));
                             continue;
                         }
-                    }
-                }
 
                 // Mtime missing or moved — fall through to read+hash.
                 let (module, source) =
@@ -495,7 +492,7 @@ pub(crate) fn handle_workspace_diagnostics(
             let cores = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4);
-            let chunk_size = ((to_analyze.len() + cores - 1) / cores).max(1);
+            let chunk_size = to_analyze.len().div_ceil(cores).max(1);
 
             // Move into per-chunk Vec<WorkItem> so each worker owns its slice.
             let mut chunks: Vec<Vec<WorkItem>> = Vec::new();
@@ -511,8 +508,9 @@ pub(crate) fn handle_workspace_diagnostics(
                 chunks.push(buf);
             }
 
-            let mut analysis_results: Vec<(PathBuf, Uri, u64, Option<SystemTime>, Vec<Diagnostic>)> =
-                Vec::new();
+            // Per-file analysis result: path, uri, source hash, mtime, diagnostics.
+            type AnalysisResult = (PathBuf, Uri, u64, Option<SystemTime>, Vec<Diagnostic>);
+            let mut analysis_results: Vec<AnalysisResult> = Vec::new();
             std::thread::scope(|s| {
                 let handles: Vec<_> = chunks
                     .into_iter()
@@ -661,11 +659,10 @@ pub(crate) fn prune_stale_workspace_diag_cache(state: &mut ServerState) {
     let mut mtime_refreshes: Vec<(PathBuf, SystemTime)> = Vec::new();
     for (path, (cached_h, _, _, cached_mtime)) in &state.workspace_diag_cache {
         let disk_mtime = current_mtime(path);
-        if let (Some(cm), Some(dm)) = (cached_mtime, disk_mtime) {
-            if *cm == dm {
+        if let (Some(cm), Some(dm)) = (cached_mtime, disk_mtime)
+            && *cm == dm {
                 continue;
             }
-        }
         // Mtime missing or moved — verify by hash. A content match here means
         // the bytes were untouched but mtime was bumped (`jj`/`git` checkout):
         // refresh the recorded mtime so the fast path applies next time.

@@ -224,13 +224,13 @@ fn collect_field_name_spans(
         }
         ast::ExprKind::FieldAccess {
             expr: inner, field, ..
-        } => {
+        }
             // The field token is the suffix of the access expression. Guard
             // against underflow on malformed/stale spans, against the
             // computed start overlapping the receiver expression, and
             // against the slice not actually holding the field name —
             // mirroring `rename.rs::field_sites_in_expr`.
-            if field == field_name && expr.span.end >= field.len() {
+            if field == field_name && expr.span.end >= field.len() => {
                 let start = expr.span.end - field.len();
                 if start >= inner.span.end
                     && source.get(start..expr.span.end) == Some(field.as_str())
@@ -238,7 +238,6 @@ fn collect_field_name_spans(
                     ranges.push(Span::new(start, expr.span.end));
                 }
             }
-        }
         ast::ExprKind::Annot { ty, .. } => {
             // Inline type annotations (`(r : {name: Text})`) carry record
             // field names that must link alongside their value occurrences.
@@ -274,8 +273,8 @@ fn collect_type_field_name_spans(
         ast::TypeKind::Record { fields, .. } => {
             let mut search_start = ty.span.start;
             for fld in fields {
-                if fld.name == field_name {
-                    if let Some(span) = find_word_in_source(
+                if fld.name == field_name
+                    && let Some(span) = find_word_in_source(
                         source,
                         field_name,
                         search_start,
@@ -283,7 +282,6 @@ fn collect_type_field_name_spans(
                     ) {
                         ranges.push(span);
                     }
-                }
                 collect_type_field_name_spans(&fld.value, field_name, source, ranges);
                 search_start = fld.value.span.end;
             }
@@ -292,8 +290,8 @@ fn collect_type_field_name_spans(
             let mut search_start = ty.span.start;
             for ctor in constructors {
                 for fld in &ctor.fields {
-                    if fld.name == field_name {
-                        if let Some(span) = find_word_in_source(
+                    if fld.name == field_name
+                        && let Some(span) = find_word_in_source(
                             source,
                             field_name,
                             search_start,
@@ -301,7 +299,6 @@ fn collect_type_field_name_spans(
                         ) {
                             ranges.push(span);
                         }
-                    }
                     collect_type_field_name_spans(&fld.value, field_name, source, ranges);
                     search_start = fld.value.span.end;
                 }
@@ -354,8 +351,8 @@ fn collect_pat_field_spans(
             for f in fields {
                 match &f.pattern {
                     Some(sub) => {
-                        if f.name == field_name {
-                            if let Some(span) = find_word_in_source(
+                        if f.name == field_name
+                            && let Some(span) = find_word_in_source(
                                 source,
                                 field_name,
                                 search_start,
@@ -363,7 +360,6 @@ fn collect_pat_field_spans(
                             ) {
                                 ranges.push(span);
                             }
-                        }
                         search_start = sub.span.end;
                     }
                     None => {

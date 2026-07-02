@@ -179,9 +179,8 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     // At a call site, show the full signature with the active argument highlighted
     if let Some((func_name, active_param)) =
         find_enclosing_application(&doc.module, &doc.source, lookup_offset)
-    {
-        if func_name == word {
-            if let Some(type_str) = doc.type_info.get(func_name.as_str()) {
+        && func_name == word
+            && let Some(type_str) = doc.type_info.get(func_name.as_str()) {
                 let params_list = parse_function_params(type_str);
                 if params_list.len() > 1 {
                     let highlighted: Vec<String> = params_list
@@ -202,8 +201,6 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
                     ));
                 }
             }
-        }
-    }
 
     // For source/view/derived refs, show the relation schema. Suppressed on a
     // record-field token: hovering the `items` field of `rec.items` must not
@@ -300,8 +297,8 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     // Sources whose schema declares refined fields: list the refinements so the
     // user knows which fields will be validated on `set`. Skip on a record-field
     // token (same wrong-info reason as the schema section above).
-    if let Some(refinements) = doc.source_refinements.get(word).filter(|_| !on_field_token) {
-        if !refinements.is_empty() {
+    if let Some(refinements) = doc.source_refinements.get(word).filter(|_| !on_field_token)
+        && !refinements.is_empty() {
             value.push_str("\n\n**Refinements (validated on write):**");
             for (field, type_name, predicate) in refinements {
                 let pred_src = predicate_to_source(predicate, &doc.source);
@@ -312,7 +309,6 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
                 value.push_str(&format!("\n- {label} — `{pred_src}`"));
             }
         }
-    }
 
     // Trait-constraint hover: if the cursor lands on a generic type parameter
     // inside a function's type signature, list the trait constraints that
@@ -351,8 +347,8 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
             ReceiverKind::SourceRef(name) | ReceiverKind::DerivedRef(name) => Some(name.clone()),
             ReceiverKind::Other => None,
         };
-        if let Some(source_name) = owner_source.as_deref() {
-            if let Some((type_label, predicate)) =
+        if let Some(source_name) = owner_source.as_deref()
+            && let Some((type_label, predicate)) =
                 find_field_refinement(&doc.source_refinements, source_name, &field_at.field_name)
             {
                 let pred_src = predicate_to_source(predicate, &doc.source);
@@ -364,7 +360,6 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
                     source_name, field_at.field_name, pred_src, type_label
                 ));
             }
-        }
     }
 
     // Trait hover: list all known impls across open documents so the user can
@@ -396,12 +391,11 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     // Unit-annotated types: surface the canonical unit form and the unit
     // conversion functions so users can spot dimensionality at a glance and
     // know how to drop into / out of unit-tagged numeric flows.
-    if let Some(ref ty) = type_for_refinement_scan {
-        if let Some(section) = unit_aware_section(ty) {
+    if let Some(ref ty) = type_for_refinement_scan
+        && let Some(section) = unit_aware_section(ty) {
             value.push_str("\n\n");
             value.push_str(&section);
         }
-    }
 
     // Constructor → parent type: hovering on a constructor surfaces the parent
     // data type and a link-style listing of sibling constructors.
@@ -480,11 +474,9 @@ fn trait_method_dispatch_section(state: &ServerState, name: &str) -> Option<Stri
                         default_body,
                         ..
                     } = item
-                    {
-                        if method_name == name {
+                        && method_name == name {
                             owning_trait = Some((tn.clone(), default_body.is_some()));
                         }
-                    }
                 }
             }
         }
@@ -532,7 +524,7 @@ fn trait_method_dispatch_section(state: &ServerState, name: &str) -> Option<Stri
         }
     }
     if !defaulted.is_empty() {
-        out.push_str("\n");
+        out.push('\n');
         for ty in &defaulted {
             out.push_str(&format!("- `{ty}` (uses default body)\n"));
         }
@@ -623,8 +615,7 @@ fn constructor_parent_section(module: &knot::ast::Module, name: &str) -> Option<
             constructors,
             ..
         } = &decl.node
-        {
-            if constructors.iter().any(|c| c.name == name) {
+            && constructors.iter().any(|c| c.name == name) {
                 let siblings: Vec<String> = constructors
                     .iter()
                     .filter(|c| c.name != name)
@@ -636,7 +627,6 @@ fn constructor_parent_section(module: &knot::ast::Module, name: &str) -> Option<
                 }
                 return Some(out);
             }
-        }
     }
     None
 }
@@ -691,8 +681,7 @@ fn format_schema_from_type(ty: &TypeKind) -> String {
 fn format_schema_from_type_str(type_str: &str) -> String {
     let s = type_str.trim();
     // Unwrap IO wrapper
-    let s = if s.starts_with("IO ") {
-        let rest = &s[3..];
+    let s = if let Some(rest) = s.strip_prefix("IO ") {
         if rest.starts_with('{') {
             if let Some(close) = rest.find('}') {
                 rest[close + 1..].trim()

@@ -207,8 +207,8 @@ fn format_module_inner(source: &str, module: &Module) -> String {
         // silently dropped. Emit any such comment on its own line above the
         // declaration. (The previous block's own trailing comment, on
         // `line_of(prev_end)`, was already emitted, so exclude that line.)
-        if let Block::Decl(d) = block {
-            if d.exported {
+        if let Block::Decl(d) = block
+            && d.exported {
                 let prev_line = if i > 0 {
                     Some(line_of(source, prev_end))
                 } else {
@@ -227,7 +227,6 @@ fn format_module_inner(source: &str, module: &Module) -> String {
                     out.push('\n');
                 }
             }
-        }
 
         let rendered = match block {
             Block::Import(i) => render_import(i),
@@ -1216,13 +1215,12 @@ fn render_effects_coalesced(effects: &[Effect]) -> Vec<String> {
     let mut out = Vec::with_capacity(effects.len());
     let mut i = 0;
     while i < effects.len() {
-        if let Effect::Reads(n) = &effects[i] {
-            if matches!(effects.get(i + 1), Some(Effect::Writes(m)) if m == n) {
+        if let Effect::Reads(n) = &effects[i]
+            && matches!(effects.get(i + 1), Some(Effect::Writes(m)) if m == n) {
                 out.push(format!("rw *{}", n));
                 i += 2;
                 continue;
             }
-        }
         out.push(render_effect(&effects[i]));
         i += 1;
     }
@@ -1389,18 +1387,15 @@ fn binop_str(op: BinOp) -> &'static str {
 /// position (the unannotated `let x = (v : T) in b` parses to the same AST,
 /// so either rendering reparses identically).
 fn as_let_in(e: &Expr) -> Option<(&Pat, Option<&Type>, &Expr, &Expr)> {
-    if let ExprKind::App { func, arg } = &e.node {
-        if arg.span.end < func.span.end && arg.span.start > func.span.start {
-            if let ExprKind::Lambda { params, body } = &func.node {
-                if params.len() == 1 {
+    if let ExprKind::App { func, arg } = &e.node
+        && arg.span.end < func.span.end && arg.span.start > func.span.start
+            && let ExprKind::Lambda { params, body } = &func.node
+                && params.len() == 1 {
                     if let ExprKind::Annot { expr, ty } = &arg.node {
                         return Some((&params[0], Some(ty), expr, body));
                     }
                     return Some((&params[0], None, arg, body));
                 }
-            }
-        }
-    }
     None
 }
 

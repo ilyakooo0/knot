@@ -478,14 +478,15 @@ fn add_record_pattern_field_hints(
         out
     }
 
+    /// A record-destructuring pattern: its span, an optional constructor
+    /// name (for ADT cases like `Person {name}`), and the structurally-parsed
+    /// field-name token spans.
+    type RecordPat = (Span, Option<String>, Vec<(String, Span)>);
+
     /// Find each pattern that destructures a record. Tracks the span, an
     /// optional constructor name for ADT cases like `Person {name}`, and the
     /// structurally-parsed field-name token spans.
-    fn walk_pat_for_records(
-        pat: &ast::Pat,
-        source: &str,
-        out: &mut Vec<(Span, Option<String>, Vec<(String, Span)>)>,
-    ) {
+    fn walk_pat_for_records(pat: &ast::Pat, source: &str, out: &mut Vec<RecordPat>) {
         match &pat.node {
             ast::PatKind::Record(fields) => {
                 out.push((
@@ -533,11 +534,7 @@ fn add_record_pattern_field_hints(
             _ => {}
         }
     }
-    fn walk_expr(
-        expr: &ast::Expr,
-        source: &str,
-        out: &mut Vec<(Span, Option<String>, Vec<(String, Span)>)>,
-    ) {
+    fn walk_expr(expr: &ast::Expr, source: &str, out: &mut Vec<RecordPat>) {
         match &expr.node {
             ast::ExprKind::Lambda { params, body } => {
                 for p in params {
@@ -571,7 +568,7 @@ fn add_record_pattern_field_hints(
         }
     }
 
-    let mut record_pats: Vec<(Span, Option<String>, Vec<(String, Span)>)> = Vec::new();
+    let mut record_pats: Vec<RecordPat> = Vec::new();
     for decl in &doc.module.decls {
         match &decl.node {
             ast::DeclKind::Fun { body: Some(body), .. }
@@ -709,13 +706,11 @@ fn extract_variant_ctor_fields(
     }
     let ctor_name = pat_text.get(i..j)?;
     for (name, payload) in ctors {
-        if name == ctor_name {
-            if let Some(p) = payload {
-                if let Some(fields) = p.record_fields() {
+        if name == ctor_name
+            && let Some(p) = payload
+                && let Some(fields) = p.record_fields() {
                     return Some(fields.to_vec());
                 }
-            }
-        }
     }
     None
 }
@@ -748,6 +743,7 @@ fn extract_unit_from_type_str(ty: &str) -> Option<String> {
 /// - `5 seconds` — the time-word sugar desugars to `5 * 1000` where the
 ///   synthesized `1000` literal's span covers the word `seconds`, so the
 ///   old walk hinted `<Ms>` after the word.
+///
 /// When in doubt, no hint.
 fn add_unit_literal_hints(
     doc: &DocumentState,
@@ -1057,11 +1053,10 @@ fn emit_arg_hints(
         };
         // Suppress hint for bare-name args that already match the parameter
         // name — `transfer(amount, from, to)` doesn't need `amount: amount`.
-        if let ast::ExprKind::Var(arg_name) = &arg.node {
-            if arg_name == name {
+        if let ast::ExprKind::Var(arg_name) = &arg.node
+            && arg_name == name {
                 continue;
             }
-        }
         // Don't hint trivial/anonymous parameter names (`_`, single letters
         // synthesized by the fallback). Single-letter ASCII params from real
         // code (`\x -> ...`) are kept — the hint is still useful there.
@@ -1116,9 +1111,9 @@ fn add_monad_context_hints(
         range_end: usize,
         hints: &mut Vec<InlayHint>,
     ) {
-        if let ast::ExprKind::Do(_) = &expr.node {
-            if expr.span.start >= range_start && expr.span.start <= range_end {
-                if let Some(monad) = doc.monad_info.get(&expr.span) {
+        if let ast::ExprKind::Do(_) = &expr.node
+            && expr.span.start >= range_start && expr.span.start <= range_end
+                && let Some(monad) = doc.monad_info.get(&expr.span) {
                     let label = match monad {
                         MonadKind::Relation => "[Relation]".to_string(),
                         MonadKind::IO => "[IO]".to_string(),
@@ -1145,8 +1140,6 @@ fn add_monad_context_hints(
                         data: None,
                     });
                 }
-            }
-        }
         recurse_expr(expr, |e| walk(e, doc, range_start, range_end, hints));
     }
 
@@ -1206,10 +1199,10 @@ fn add_constraint_hints(
     ) {
         if matches!(expr.node, ast::ExprKind::App { .. }) {
             let (callee, args) = flatten_app_chain(expr);
-            if let ast::ExprKind::Var(name) = &callee.node {
-                if callee.span.start >= range_start && callee.span.end <= range_end {
-                    if let Some(constraints) = constraints_for_callee(&doc.module, name) {
-                        if !constraints.is_empty() {
+            if let ast::ExprKind::Var(name) = &callee.node
+                && callee.span.start >= range_start && callee.span.end <= range_end
+                    && let Some(constraints) = constraints_for_callee(&doc.module, name)
+                        && !constraints.is_empty() {
                             let label = format!("[{}]", constraints.join(", "));
                             hints.push(InlayHint {
                                 position: offset_to_position(&doc.source, callee.span.end),
@@ -1224,9 +1217,6 @@ fn add_constraint_hints(
                                 data: None,
                             });
                         }
-                    }
-                }
-            }
             // Recurse into the head too — it can be a non-Var expression
             // (`(if c then f else g) a b`, lambda/case heads) containing
             // further call chains. The head is non-App, so no re-processing.
@@ -1266,8 +1256,7 @@ fn add_constraint_hints(
                         if let ast::TraitItem::Method {
                             name: n, ty, ..
                         } = item
-                        {
-                            if n == name {
+                            && n == name {
                                 let cs: Vec<String> = ty
                                     .constraints
                                     .iter()
@@ -1282,7 +1271,6 @@ fn add_constraint_hints(
                                     .collect();
                                 return Some(cs);
                             }
-                        }
                     }
                 }
                 _ => {}
@@ -1757,8 +1745,8 @@ checkGlobalRate = \t -> atomic do
         let sig_line = offset_to_position(&doc.source, sig_line_start).line;
         let sig_text_len = "f : Int -> IO {} [{a: Int}]".len() as u32;
         for h in &hints {
-            if let InlayHintLabel::String(s) = &h.label {
-                if s.starts_with("-- effects:") {
+            if let InlayHintLabel::String(s) = &h.label
+                && s.starts_with("-- effects:") {
                     assert_eq!(h.position.line, sig_line, "hint on wrong line: {h:?}");
                     assert_eq!(
                         h.position.character, sig_text_len,
@@ -1767,7 +1755,6 @@ checkGlobalRate = \t -> atomic do
                     );
                     return;
                 }
-            }
         }
         panic!(
             "expected an `-- effects:` hint for the annotated function; \

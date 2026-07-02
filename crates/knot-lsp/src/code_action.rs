@@ -68,8 +68,8 @@ pub(crate) fn handle_code_action(
         // merges any per-decl effect-checker findings into that row when HM
         // inference dropped them (e.g., forward references through annotated
         // callers can collapse the row to `{}`).
-        if let DeclKind::Fun { name, ty: None, .. } = &decl.node {
-            if let Some(inferred) = doc.type_info.get(name) {
+        if let DeclKind::Fun { name, ty: None, .. } = &decl.node
+            && let Some(inferred) = doc.type_info.get(name) {
                 let signature = match doc.effect_sets.get(name) {
                     Some(eff) => render_signature_with_effects(inferred, eff),
                     None => inferred.clone(),
@@ -105,7 +105,6 @@ pub(crate) fn handle_code_action(
                     }));
                 }
             }
-        }
 
         // Action: Add type annotation to unannotated views/derived. Same
         // effect-merging treatment as the Fun case above.
@@ -166,11 +165,9 @@ pub(crate) fn handle_code_action(
                         items: trait_items,
                         ..
                     } = &d.node
-                    {
-                        if name == trait_name {
+                        && name == trait_name {
                             return Some(trait_items);
                         }
-                    }
                     None
                 })
                 .flatten()
@@ -326,8 +323,7 @@ pub(crate) fn handle_code_action(
                         }
                         _ => None,
                     })
-                {
-                    if let Some(edit) = build_effect_widen_edit(decl, &doc.source, &inferred) {
+                    && let Some(edit) = build_effect_widen_edit(decl, &doc.source, &inferred) {
                         let mut changes = HashMap::new();
                         changes.insert(uri.clone(), vec![edit]);
                         actions.push(CodeActionOrCommand::CodeAction(CodeAction {
@@ -343,7 +339,6 @@ pub(crate) fn handle_code_action(
                         }));
                         let _ = fun_name; // for diagnostics in future
                     }
-                }
             }
         }
 
@@ -352,8 +347,8 @@ pub(crate) fn handle_code_action(
         // or `IO ... T` is expected, offer to wrap the expression in the
         // appropriate constructor. Cheaper than asking users to rewrite the
         // expression themselves.
-        if msg.starts_with("type mismatch:") {
-            if let Some((expected, found)) = parse_type_mismatch(msg) {
+        if msg.starts_with("type mismatch:")
+            && let Some((expected, found)) = parse_type_mismatch(msg) {
                 let diag_start = position_to_offset(&doc.source, diag.range.start);
                 let diag_end = position_to_offset(&doc.source, diag.range.end);
                 if diag_end > diag_start && diag_end <= doc.source.len() {
@@ -385,7 +380,6 @@ pub(crate) fn handle_code_action(
                     }
                 }
             }
-        }
 
         // Unit-mismatch quick fixes: when the inferred unit on a numeric
         // expression doesn't match what the surrounding context expects
@@ -1180,11 +1174,10 @@ fn find_add_wildcard_arm_at(
             // Recurse first — pick the innermost match so nested cases work.
             let mut inner = None;
             crate::utils::recurse_expr(expr, |child| {
-                if inner.is_none() {
-                    if let Some(hit) = walk(child, source, offset) {
+                if inner.is_none()
+                    && let Some(hit) = walk(child, source, offset) {
                         inner = Some(hit);
                     }
-                }
             });
             if inner.is_some() {
                 return inner;
@@ -1218,11 +1211,10 @@ fn find_add_wildcard_arm_at(
         }
         let mut found = None;
         crate::utils::recurse_expr(expr, |child| {
-            if found.is_none() {
-                if let Some(hit) = walk(child, source, offset) {
+            if found.is_none()
+                && let Some(hit) = walk(child, source, offset) {
                     found = Some(hit);
                 }
-            }
         });
         found
     }
@@ -1239,11 +1231,10 @@ fn find_add_wildcard_arm_at(
             }
             DeclKind::Impl { items, .. } => {
                 for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item {
-                        if let Some(hit) = walk(body, source, offset) {
+                    if let ast::ImplItem::Method { body, .. } = item
+                        && let Some(hit) = walk(body, source, offset) {
                             return Some(hit);
                         }
-                    }
                 }
             }
             _ => {}
@@ -1343,11 +1334,10 @@ fn find_if_negate_at(
         }
         let mut found = None;
         crate::utils::recurse_expr(expr, |child| {
-            if found.is_none() {
-                if let Some(hit) = walk(child, source, offset) {
+            if found.is_none()
+                && let Some(hit) = walk(child, source, offset) {
                     found = Some(hit);
                 }
-            }
         });
         found
     }
@@ -1431,11 +1421,10 @@ fn find_wrap_in_err_at(
         // Prefer the smallest child that still contains the whole selection.
         let mut inner = None;
         crate::utils::recurse_expr(expr, |child| {
-            if inner.is_none() {
-                if let Some(s) = walk(child, range_start, range_end) {
+            if inner.is_none()
+                && let Some(s) = walk(child, range_start, range_end) {
                     inner = Some(s);
                 }
-            }
         });
         if inner.is_some() {
             return inner;
@@ -1460,12 +1449,10 @@ fn find_wrap_in_err_at(
         }
         | DeclKind::View { body, .. }
         | DeclKind::Derived { body, .. } = &decl.node
-        {
-            if let Some(span) = walk(body, range_start, range_end) {
+            && let Some(span) = walk(body, range_start, range_end) {
                 let text = source.get(span.start..span.end)?;
                 return Some((span, format!("Err {{error: {text}}}")));
             }
-        }
     }
     None
 }
@@ -1975,7 +1962,7 @@ fn build_effect_widen_edit(decl: &ast::Decl, source: &str, target_effects: &str)
             if bytes[i] == b'\n'
                 && bytes
                     .get(i + 1)
-                    .map_or(true, |b| *b != b' ' && *b != b'\t' && *b != b'\r')
+                    .is_none_or(|b| *b != b' ' && *b != b'\t' && *b != b'\r')
             {
                 end = i;
                 break;
@@ -2081,14 +2068,13 @@ fn detect_wrap_suggestions(
 ) -> Vec<WrapSuggestion> {
     let mut out = Vec::new();
     // `expected Maybe T, found T` → wrap in Just
-    if let Some(inner) = expected.strip_prefix("Maybe ") {
-        if inner.trim() == found.trim() {
+    if let Some(inner) = expected.strip_prefix("Maybe ")
+        && inner.trim() == found.trim() {
             out.push(WrapSuggestion {
                 title: "Wrap in `Just`".to_string(),
                 template: format!("Just {{value: {WRAP_PLACEHOLDER}}}"),
             });
         }
-    }
     // `expected Maybe T, found {}` → suggest `Nothing {}`. The `{}` here is
     // the empty-record literal Knot uses for unit-like values; if the user
     // wrote `{}` where a `Maybe T` was expected, replacing with `Nothing {}`
@@ -2161,7 +2147,7 @@ fn build_deriving_action(
     // The impl arg list must be a single Named type referring to a local data
     // declaration. Refuse multi-arg impls (HKT impls like `impl Functor []`)
     // and impls over non-data types — `deriving` only works on data decls.
-    let target_name = match doc
+    let target_name = doc
         .module
         .decls
         .iter()
@@ -2176,10 +2162,7 @@ fn build_deriving_action(
                 }
             }
             _ => None,
-        }) {
-        Some(n) => n,
-        None => return None,
-    };
+        })?;
 
     // Find the data decl. Bail if it already lists this trait — the impl is
     // redundant in that case but `deriving` would be a no-op edit.
@@ -2204,11 +2187,10 @@ fn build_deriving_action(
     // behavior. If we can't find the trait in this module, bail — the trait
     // may live in another file and we'd need cross-file analysis to verify.
     let trait_decl = doc.module.decls.iter().find_map(|d| {
-        if let DeclKind::Trait { name, items, .. } = &d.node {
-            if name == trait_name {
+        if let DeclKind::Trait { name, items, .. } = &d.node
+            && name == trait_name {
                 return Some(items.clone());
             }
-        }
         None
     })?;
     // The Knot parser splits a method's signature line and its default body
@@ -2350,7 +2332,7 @@ fn build_trait_method_stub(item: &ast::TraitItem, indent: &str) -> String {
             let mut n = i;
             loop {
                 s.insert(0, (b'a' + (n % 26) as u8) as char);
-                n = n / 26;
+                n /= 26;
                 if n == 0 {
                     break;
                 }
@@ -2543,7 +2525,7 @@ fn find_free_vars_in_selection(
             let name = safe_slice(&doc.source, *usage_span);
             // Only include if it looks like a lowercase variable (not a constructor/type)
             if !name.is_empty()
-                && name.chars().next().map_or(false, |c| c.is_lowercase())
+                && name.chars().next().is_some_and(|c| c.is_lowercase())
                 && !seen.contains(name)
             {
                 // A captured free variable is one bound by a LOCAL binder
@@ -2562,7 +2544,7 @@ fn find_free_vars_in_selection(
                 let resolves_to_top_level = doc
                     .definitions
                     .get(name)
-                    .map_or(false, |s| *s == *def_span);
+                    .is_some_and(|s| *s == *def_span);
                 let local_via_ref = def_span.end <= start && !resolves_to_top_level;
                 if local_via_type_info || local_via_ref {
                     seen.insert(name.to_string());
@@ -2603,7 +2585,7 @@ fn is_atomic_expr_text(s: &str) -> bool {
         let num_ok = num
             .bytes()
             .all(|b| b.is_ascii_digit() || b == b'.' || b == b'_');
-        let unit_ok = unit.map_or(true, |u| {
+        let unit_ok = unit.is_none_or(|u| {
             !u.is_empty() && u.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
         });
         if num_ok && unit_ok {
@@ -2651,8 +2633,8 @@ fn find_inline_actions(
         for stmt in stmts {
             if let ast::StmtKind::Let { pat, expr: value_expr } = &stmt.node {
                 // Check if cursor is on the let binding
-                if stmt.span.start <= cursor_offset && cursor_offset <= stmt.span.end {
-                    if let ast::PatKind::Var(var_name) = &pat.node {
+                if stmt.span.start <= cursor_offset && cursor_offset <= stmt.span.end
+                    && let ast::PatKind::Var(var_name) = &pat.node {
                         let value_text = &doc.source
                             [value_expr.span.start..value_expr.span.end.min(doc.source.len())];
 
@@ -2740,7 +2722,6 @@ fn find_inline_actions(
                             }));
                         }
                     }
-                }
             }
         }
 
@@ -2955,11 +2936,10 @@ fn module_declares_name(module: &Module, name: &str) -> bool {
             | DeclKind::Fun { name: dname, .. }
             | DeclKind::Trait { name: dname, .. }
             | DeclKind::Route { name: dname, .. }
-            | DeclKind::RouteComposite { name: dname, .. } => {
-                if dname == name {
+            | DeclKind::RouteComposite { name: dname, .. }
+                if dname == name => {
                     return true;
                 }
-            }
             _ => {}
         }
     }
@@ -3117,11 +3097,10 @@ fn already_imports(doc: &DocumentState, name: &str) -> bool {
     // Selective imports list specific names — guard against the case where
     // a duplicate `import` action would be redundant.
     for imp in &doc.module.imports {
-        if let Some(items) = &imp.items {
-            if items.iter().any(|i| i.name == name) {
+        if let Some(items) = &imp.items
+            && items.iter().any(|i| i.name == name) {
                 return true;
             }
-        }
     }
     false
 }
@@ -3150,7 +3129,7 @@ fn find_if_to_case_at(
         } = &expr.node
         {
             let size = expr.span.end - expr.span.start;
-            if best.as_ref().map_or(true, |b| size < b.0.end - b.0.start) {
+            if best.as_ref().is_none_or(|b| size < b.0.end - b.0.start) {
                 let cond_text = safe_slice(source, cond.span);
                 let then_text = safe_slice(source, then_branch.span);
                 let else_text = safe_slice(source, else_branch.span);
@@ -3224,7 +3203,7 @@ fn find_flip_binary_at(
             };
             if let Some(op_text) = op_str {
                 let size = expr.span.end - expr.span.start;
-                if best.as_ref().map_or(true, |b| size < b.0.end - b.0.start) {
+                if best.as_ref().is_none_or(|b| size < b.0.end - b.0.start) {
                     // Keyword forms (if/case/lambda/do) greedily consume
                     // everything to their right, so moving one to the other
                     // operand position swallows the operator and the old
@@ -3310,7 +3289,7 @@ fn find_pipe_conversion_at(
             );
             if is_simple && !is_app_head {
                 let size = expr.span.end - expr.span.start;
-                if best.as_ref().map_or(true, |b| size < b.0.end - b.0.start) {
+                if best.as_ref().is_none_or(|b| size < b.0.end - b.0.start) {
                     let func_text = safe_slice(source, func.span);
                     let arg_text = safe_slice(source, arg.span);
                     // Wrap the arg in parens when it isn't a single token —
@@ -4086,10 +4065,10 @@ mod regress_fixes_tests {
         }
     }
 
-    fn action_titled<'a>(
-        actions: &'a [CodeActionOrCommand],
+    fn action_titled(
+        actions: &[CodeActionOrCommand],
         pred: impl Fn(&str) -> bool,
-    ) -> Option<&'a CodeAction> {
+    ) -> Option<&CodeAction> {
         actions.iter().find_map(|a| match a {
             CodeActionOrCommand::CodeAction(ca) if pred(&ca.title) => Some(ca),
             _ => None,
@@ -4718,10 +4697,10 @@ mod regress_fixes_batch2_tests {
         }
     }
 
-    fn action_titled<'a>(
-        actions: &'a [CodeActionOrCommand],
+    fn action_titled(
+        actions: &[CodeActionOrCommand],
         pred: impl Fn(&str) -> bool,
-    ) -> Option<&'a CodeAction> {
+    ) -> Option<&CodeAction> {
         actions.iter().find_map(|a| match a {
             CodeActionOrCommand::CodeAction(ca) if pred(&ca.title) => Some(ca),
             _ => None,

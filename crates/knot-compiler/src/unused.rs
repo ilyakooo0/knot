@@ -134,9 +134,7 @@ where
 fn make_warning(kind: &str, name: &str, span: ast::Span) -> Diagnostic {
     Diagnostic::warning(format!("unused {}: `{}`", kind, name))
         .label(span, "defined here but never used")
-        .note(format!(
-            "prefix the name with `_` to silence this warning, mark it `export`, or remove it"
-        ))
+        .note("prefix the name with `_` to silence this warning, mark it `export`, or remove it".to_string())
 }
 
 // ── Per-declaration reference collection ─────────────────────────────

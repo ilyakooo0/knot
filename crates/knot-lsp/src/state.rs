@@ -240,8 +240,8 @@ pub struct DocumentState {
     /// Top-level decl names whose AST shape changed between this analysis
     /// and the previous one for the same file. Empty when no prior snapshot
     /// exists or the fingerprints matched (typical first analysis or
-    /// whitespace-only edits). Used for the in-file dirty closure (telemetry
-    /// + future selective re-inference). Production code currently routes
+    /// whitespace-only edits). Used for the in-file dirty closure (telemetry +
+    /// future selective re-inference). Production code currently routes
     /// dependent re-queue through `signature_changed_decl_names` (a strict
     /// subset that excludes body-only changes to typed decls); this broader
     /// field stays populated for tests and the planned in-file selective

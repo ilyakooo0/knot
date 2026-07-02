@@ -7,8 +7,9 @@
 //!   5. User trait impls on primitives must disable SQL pushdown.
 //!   6. Int/Int division pushed to SQL must stay Int-typed.
 //!   7. `trim` must not push down (Unicode vs ASCII whitespace).
+//!
 //!   8/9. minOn/maxOn/sortBy over if/then/else on Int columns must not
-//!      push down (CASE loses the KNOT_INT collation).
+//!   push down (CASE loses the KNOT_INT collation).
 //!  10. Pushed Int-arithmetic comparisons must compare numerically so an
 //!      i64 overflow can't satisfy arbitrary filters.
 //!  11. Float comparisons must not push down (total_cmp vs SQL

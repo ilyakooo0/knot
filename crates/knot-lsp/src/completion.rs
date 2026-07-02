@@ -160,12 +160,11 @@ pub(crate) fn handle_completion(
         let line_start = latest_source[..offset].rfind('\n').map(|p| p + 1).unwrap_or(0);
         let line_text = &latest_source[line_start..offset];
         if line_text.trim_start().starts_with("import ") {
-            if let Some(source_path) = uri_to_path(uri) {
-                if let Some(base_dir) = source_path.parent() {
+            if let Some(source_path) = uri_to_path(uri)
+                && let Some(base_dir) = source_path.parent() {
                     let partial = line_text.trim_start().strip_prefix("import ").unwrap_or("");
                     items.extend(complete_import_path(base_dir, partial));
                 }
-            }
             return Some(CompletionResponse::Array(items));
         }
     }
@@ -202,8 +201,8 @@ pub(crate) fn handle_completion(
                     kind: Some(CompletionItemKind::FIELD),
                     ..Default::default()
                 };
-                if let Some(src) = owner_source.as_deref() {
-                    if let Some((type_label, predicate)) =
+                if let Some(src) = owner_source.as_deref()
+                    && let Some((type_label, predicate)) =
                         find_field_refinement(&doc.source_refinements, src, &name)
                     {
                         let pred_src = predicate_to_source(predicate, &doc.source);
@@ -215,7 +214,6 @@ pub(crate) fn handle_completion(
                             ),
                         }));
                     }
-                }
                 items.push(item);
             }
             return Some(CompletionResponse::Array(items));
@@ -500,7 +498,7 @@ pub(crate) fn handle_completion(
     // Imported symbols (selective or wildcard imports): they're in scope, so
     // they belong in the list alongside local declarations. Local decls of
     // the same name shadow the import and were already pushed above.
-    for (name, _) in &doc.import_defs {
+    for name in doc.import_defs.keys() {
         if doc.definitions.contains_key(name) {
             continue;
         }
@@ -673,12 +671,12 @@ pub(crate) fn handle_completion(
     // so the bias kicks in continuously as the user types.
     // `doc.module` and `doc.monad_info` spans index `doc.source`, so use the
     // analyzed-source offset (not the mid-debounce `offset`).
-    if let Some(do_span) = find_enclosing_do_span(&doc.module, analyzed_offset) {
-        if let Some(monad) = monad_for_do_span(&doc.monad_info, do_span, analyzed_offset) {
+    if let Some(do_span) = find_enclosing_do_span(&doc.module, analyzed_offset)
+        && let Some(monad) = monad_for_do_span(&doc.monad_info, do_span, analyzed_offset) {
             for item in items.iter_mut() {
                 let label = item.label.trim_start_matches(['*', '&']);
-                if let Some(ty) = doc.type_info.get(label) {
-                    if type_matches_monad(ty, &monad) {
+                if let Some(ty) = doc.type_info.get(label)
+                    && type_matches_monad(ty, &monad) {
                         // Prefix the existing sort_text (or label fallback) so
                         // matching items rank ahead of everything else but keep
                         // their relative order from the original list.
@@ -688,10 +686,8 @@ pub(crate) fn handle_completion(
                             .unwrap_or_else(|| item.label.clone());
                         item.sort_text = Some(format!("aaa_{base}"));
                     }
-                }
             }
         }
-    }
 
     // Type-aware ranking: when the cursor sits at an argument position in a
     // function call we know the expected parameter type. Push candidates
@@ -755,12 +751,12 @@ fn rank_by_type_alignment(
         if item
             .sort_text
             .as_deref()
-            .map_or(false, |s| s.starts_with("aaa_"))
+            .is_some_and(|s| s.starts_with("aaa_"))
         {
             continue;
         }
         let label = item.label.trim_start_matches(['*', '&']);
-        let Some(ty) = doc.type_info.get(label).or_else(|| item.detail.as_ref())
+        let Some(ty) = doc.type_info.get(label).or(item.detail.as_ref())
         else {
             continue;
         };
@@ -932,11 +928,10 @@ fn is_disallowed_in_atomic(label: &str, doc: &DocumentState, state: &ServerState
     // (the import isn't applied), but if any open doc declares the same
     // name with IO effects, it's almost certainly the same definition.
     for other in state.documents.values() {
-        if let Some(eff) = other.effect_sets.get(bare) {
-            if eff.has_io() {
+        if let Some(eff) = other.effect_sets.get(bare)
+            && eff.has_io() {
                 return true;
             }
-        }
     }
     false
 }
@@ -966,11 +961,10 @@ fn offset_in_route_rate_limit(module: &Module, offset: usize) -> bool {
     for decl in &module.decls {
         if let DeclKind::Route { entries, .. } = &decl.node {
             for entry in entries {
-                if let Some(rl) = &entry.rate_limit {
-                    if rl.span.start <= offset && offset < rl.span.end {
+                if let Some(rl) = &entry.rate_limit
+                    && rl.span.start <= offset && offset < rl.span.end {
                         return true;
                     }
-                }
             }
         }
     }
@@ -1035,7 +1029,7 @@ fn find_enclosing_do_span(module: &Module, offset: usize) -> Option<Span> {
         }
         if let ast::ExprKind::Do(_) = &expr.node {
             let size = expr.span.end - expr.span.start;
-            if best.map_or(true, |b| size < b.end - b.start) {
+            if best.is_none_or(|b| size < b.end - b.start) {
                 *best = Some(expr.span);
             }
         }
@@ -1091,18 +1085,16 @@ fn detect_snippet_context(doc: &DocumentState, offset: usize, in_atomic: bool) -
         match &decl.node {
             ast::DeclKind::Fun { body: Some(body), .. }
             | ast::DeclKind::View { body, .. }
-            | ast::DeclKind::Derived { body, .. } => {
-                if body.span.start <= offset && offset < body.span.end {
+            | ast::DeclKind::Derived { body, .. }
+                if body.span.start <= offset && offset < body.span.end => {
                     return SnippetContext::Expression;
                 }
-            }
             ast::DeclKind::Impl { items, .. } => {
                 for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item {
-                        if body.span.start <= offset && offset < body.span.end {
+                    if let ast::ImplItem::Method { body, .. } = item
+                        && body.span.start <= offset && offset < body.span.end {
                             return SnippetContext::Expression;
                         }
-                    }
                 }
             }
             _ => {}
@@ -1176,11 +1168,10 @@ fn type_matches_monad(ty: &str, monad: &MonadKind) -> bool {
     // constructor like `Just : a -> Maybe a` wouldn't match by leading prefix
     // but should still rank into a Maybe context.
     let params = crate::shared::parse_function_params(t);
-    if params.len() > 1 {
-        if let Some(ret) = params.last() {
+    if params.len() > 1
+        && let Some(ret) = params.last() {
             return monad_head_matches(ret.trim(), monad);
         }
-    }
     false
 }
 
@@ -1277,14 +1268,13 @@ fn cursor_in_type_context(before: &str) -> bool {
             i += 1;
             continue;
         }
-        if let Some(ws) = word_start.take() {
-            if matches!(
+        if let Some(ws) = word_start.take()
+            && matches!(
                 &text[ws..i],
                 "case" | "of" | "if" | "then" | "else" | "do" | "let" | "yield" | "where"
             ) {
                 ty = false;
             }
-        }
         match c {
             b'"' => {
                 // Skip string literal (with escapes).
@@ -1529,8 +1519,8 @@ fn find_type_for_name(doc: &DocumentState, name: &str, offset: usize) -> Option<
     }
     // Check if any reference at this offset points to a local binding with a known type
     for (usage_span, def_span) in &doc.references {
-        if usage_span.start <= offset && offset < usage_span.end {
-            if let Some(ty) = doc.local_type_info.get(def_span) {
+        if usage_span.start <= offset && offset < usage_span.end
+            && let Some(ty) = doc.local_type_info.get(def_span) {
                 // Guard that the pointed-at definition is actually named `name`,
                 // mirroring the `local_type_info` branch above. Without it a
                 // stale or mismatched reference span covering the receiver
@@ -1543,7 +1533,6 @@ fn find_type_for_name(doc: &DocumentState, name: &str, offset: usize) -> Option<
                     return Some(ty.clone());
                 }
             }
-        }
     }
     // Check global type info
     doc.type_info.get(name).cloned()
@@ -1577,8 +1566,7 @@ fn extract_fields_from_type_str_inner(
     }
 
     // IO type: `IO {...} [T]` or `IO {...} {fields}` — skip to the value type
-    if type_str.starts_with("IO ") {
-        let rest = &type_str[3..];
+    if let Some(rest) = type_str.strip_prefix("IO ") {
         // Skip the effect set `{...}` when present.
         if rest.starts_with('{') {
             if let Some(close) = rest.find('}') {
@@ -1594,8 +1582,8 @@ fn extract_fields_from_type_str_inner(
     }
 
     // Maybe type: `Maybe T` — unwrap to inner type
-    if type_str.starts_with("Maybe ") {
-        let inner = type_str[6..].trim();
+    if let Some(rest) = type_str.strip_prefix("Maybe ") {
+        let inner = rest.trim();
         return extract_fields_from_type_str_inner(inner, module, visited);
     }
 
@@ -1624,11 +1612,10 @@ fn extract_fields_from_type_str_inner(
                 }
             }
             // Data type with a single constructor — expose its fields
-            DeclKind::Data { name, constructors, .. } if name == type_str => {
-                if constructors.len() == 1 {
+            DeclKind::Data { name, constructors, .. } if name == type_str
+                && constructors.len() == 1 => {
                     return constructors[0].fields.iter().map(|f| f.name.clone()).collect();
                 }
-            }
             _ => {}
         }
     }
@@ -1647,13 +1634,13 @@ pub(crate) fn handle_resolve_completion_item(
 
     // If this is an auto-import marker (added by the workspace scan in
     // `handle_completion`), resolve the actual TextEdit lazily here.
-    if let Some(data) = item.data.clone() {
-        if data.get("kind").and_then(|v| v.as_str()) == Some("auto_import") {
+    if let Some(data) = item.data.clone()
+        && data.get("kind").and_then(|v| v.as_str()) == Some("auto_import") {
             let import_path = data.get("import_path").and_then(|v| v.as_str()).unwrap_or("");
             let source_uri = data.get("source_uri").and_then(|v| v.as_str()).unwrap_or("");
-            if !import_path.is_empty() && !source_uri.is_empty() {
-                if let Ok(uri) = source_uri.parse::<Uri>() {
-                    if let Some(doc) = state.documents.get(&uri) {
+            if !import_path.is_empty() && !source_uri.is_empty()
+                && let Ok(uri) = source_uri.parse::<Uri>()
+                    && let Some(doc) = state.documents.get(&uri) {
                         // The insert position is computed against the analyzed
                         // text; if the buffer has newer pending edits the
                         // position could land mid-edit and corrupt the file.
@@ -1685,10 +1672,7 @@ pub(crate) fn handle_resolve_completion_item(
                             }]);
                         }
                     }
-                }
-            }
         }
-    }
 
     // Aggregate enrichment across all open documents — workspace-symbol-style
     // labels can come from any file, and effect/doc/type info may live in
@@ -1704,16 +1688,14 @@ pub(crate) fn handle_resolve_completion_item(
     };
 
     for doc in state.documents.values() {
-        if detail.is_none() {
-            if let Some(ty) = doc.type_info.get(label.as_str()) {
+        if detail.is_none()
+            && let Some(ty) = doc.type_info.get(label.as_str()) {
                 detail = Some(ty.clone());
             }
-        }
-        if doc_md.is_none() {
-            if let Some(d) = doc.doc_comments.get(label.as_str()) {
+        if doc_md.is_none()
+            && let Some(d) = doc.doc_comments.get(label.as_str()) {
                 doc_md = Some(d.clone());
             }
-        }
         if let Some(eff) = doc.effect_info.get(label.as_str()) {
             push_unique(&mut sections, format!("*Effects:* `{eff}`"));
         }
@@ -1787,11 +1769,10 @@ fn trait_method_dispatch_summary(module: &Module, name: &str) -> Option<String> 
     for decl in &module.decls {
         if let DeclKind::Trait { name: tn, items, .. } = &decl.node {
             for item in items {
-                if let ast::TraitItem::Method { name: mn, .. } = item {
-                    if mn == name {
+                if let ast::TraitItem::Method { name: mn, .. } = item
+                    && mn == name {
                         owning_trait = Some(tn.clone());
                     }
-                }
             }
         }
     }
@@ -1834,8 +1815,8 @@ fn trait_method_dispatch_summary(module: &Module, name: &str) -> Option<String> 
 /// function exists or it has no constraints.
 fn function_constraint_summary(module: &Module, name: &str) -> Option<String> {
     for decl in &module.decls {
-        if let DeclKind::Fun { name: n, ty: Some(scheme), .. } = &decl.node {
-            if n == name && !scheme.constraints.is_empty() {
+        if let DeclKind::Fun { name: n, ty: Some(scheme), .. } = &decl.node
+            && n == name && !scheme.constraints.is_empty() {
                 let cs: Vec<String> = scheme
                     .constraints
                     .iter()
@@ -1850,7 +1831,6 @@ fn function_constraint_summary(module: &Module, name: &str) -> Option<String> {
                     .collect();
                 return Some(format!("*Constraints:* {}", cs.join(", ")));
             }
-        }
     }
     None
 }
@@ -1866,14 +1846,12 @@ fn trait_method_default_source(module: &Module, source: &str, name: &str) -> Opt
                     default_body: Some(body),
                     ..
                 } = item
-                {
-                    if m == name {
+                    && m == name {
                         let s = body.span;
                         if s.start < s.end && s.end <= source.len() {
                             return Some(source[s.start..s.end].to_string());
                         }
                     }
-                }
             }
         }
     }

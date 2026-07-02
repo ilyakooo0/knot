@@ -277,14 +277,13 @@ impl Parser {
             }
             // A top-level declaration name is at column 0, or immediately
             // preceded by a `*`/`&`/`export` token that is itself at column 0.
-            if self.token_cols[i] == 0 {
-                names.insert(s.clone());
-            } else if i >= 1
+            let preceded_by_sigil_at_col0 = i >= 1
                 && matches!(
                     self.tokens[i - 1].kind,
                     TokenKind::Star | TokenKind::Ampersand | TokenKind::Export
-                ) && self.token_cols[i - 1] == 0
-            {
+                )
+                && self.token_cols[i - 1] == 0;
+            if self.token_cols[i] == 0 || preceded_by_sigil_at_col0 {
                 names.insert(s.clone());
             }
         }
@@ -594,7 +593,7 @@ impl Parser {
                         path.push_str(&name);
                         self.consume_import_dashed_suffix(&mut path);
                     }
-                    ref tok if tok.keyword_str().is_some() => {
+                    tok if tok.keyword_str().is_some() => {
                         let tok = self.advance();
                         match tok.kind.keyword_str() {
                             Some(s) => path.push_str(s),
@@ -974,8 +973,8 @@ impl Parser {
                 self.tokens.get(self.pos + 1).map(|t| &t.kind),
                 Some(TokenKind::Gt)
             );
-        if let Some(unit) = self.parse_unit_expr() {
-            if matches!(self.peek(), TokenKind::Gt) {
+        if let Some(unit) = self.parse_unit_expr()
+            && matches!(self.peek(), TokenKind::Gt) {
                 let gt_end = self.span().end;
                 self.advance(); // consume `>`
                 // Disambiguate a real unit annotation (`5<M>`, `5<M> + x`) from
@@ -998,7 +997,6 @@ impl Parser {
                 }
                 return Some(unit);
             }
-        }
         // Not a unit annotation — restore
         self.diagnostics.truncate(diag_count);
         self.restore(saved);
@@ -2348,7 +2346,7 @@ impl Parser {
                     && self
                         .tokens
                         .get(self.pos - 1)
-                        .map_or(false, |prev| prev.span.end == star_span.start);
+                        .is_some_and(|prev| prev.span.end == star_span.start);
                 if right_adjacent && !left_adjacent {
                     self.restore(saved_pos);
                     break;
@@ -2635,7 +2633,7 @@ impl Parser {
                     && self
                         .tokens
                         .get(self.pos - 1)
-                        .map_or(false, |prev| prev.span.end == star_span.start);
+                        .is_some_and(|prev| prev.span.end == star_span.start);
                 right_adjacent && !left_adjacent
             }
             TokenKind::Ampersand => {
@@ -3624,15 +3622,12 @@ impl Parser {
         let saved = self.save();
         let diag_count = self.diagnostics.len();
 
-        if let Some(pat) = self.try_parse_pat() {
-            if self.eat(&TokenKind::LArrow) {
+        if let Some(pat) = self.try_parse_pat()
+            && self.eat(&TokenKind::LArrow) {
                 // Committed to a bind statement — `<-` was consumed.
                 // If the expression fails, return None without trying
                 // to re-parse as an expression statement.
-                let expr = match self.parse_expr() {
-                    Some(expr) => expr,
-                    None => return None,
-                };
+                let expr = self.parse_expr()?;
                 let end_sp = expr.span;
                 // Names bound by this bind are in scope for the rest of the
                 // do-block (popped by `parse_do_expr`).
@@ -3642,7 +3637,6 @@ impl Parser {
                     Span::new(start.start, end_sp.end),
                 ));
             }
-        }
 
         // Not a bind — restore and parse as expression statement.
         self.restore(saved);
@@ -4015,14 +4009,9 @@ impl Parser {
             let start = self.span();
             self.advance(); // consume 'forall'
             let mut vars = Vec::new();
-            loop {
-                match self.peek().clone() {
-                    TokenKind::Lower(name) => {
-                        self.advance();
-                        vars.push(name);
-                    }
-                    _ => break,
-                }
+            while let TokenKind::Lower(name) = self.peek().clone() {
+                self.advance();
+                vars.push(name);
             }
             if vars.is_empty() {
                 self.error("expected one or more type variables after 'forall'");
@@ -4158,16 +4147,14 @@ impl Parser {
     }
 
     fn can_start_type_atom(&self) -> bool {
-        if self.stop_type_at_headers {
-            if matches!(self.peek(), TokenKind::Lower(s) if s == "headers" || s == "rateLimit") {
+        if self.stop_type_at_headers
+            && matches!(self.peek(), TokenKind::Lower(s) if s == "headers" || s == "rateLimit") {
                 return false;
             }
-        }
-        if self.stop_type_at_migrate_clauses {
-            if matches!(self.peek(), TokenKind::Lower(s) if s == "to" || s == "using") {
+        if self.stop_type_at_migrate_clauses
+            && matches!(self.peek(), TokenKind::Lower(s) if s == "to" || s == "using") {
                 return false;
             }
-        }
         matches!(
             self.peek(),
             TokenKind::Upper(_)
@@ -4274,14 +4261,13 @@ impl Parser {
                     let saved = self.save();
                     let diag_count = self.diagnostics.len();
                     self.advance(); // consume `<`
-                    if let Some(unit) = self.parse_unit_expr() {
-                        if matches!(self.peek(), TokenKind::Gt) {
+                    if let Some(unit) = self.parse_unit_expr()
+                        && matches!(self.peek(), TokenKind::Gt) {
                             self.advance(); // consume `>`
                             let span = Span::new(tok.span.start, self.prev_span().end);
                             let base = Box::new(Spanned::new(TypeKind::Named(name), tok.span));
                             return Some(Spanned::new(TypeKind::UnitAnnotated { base, unit }, span));
                         }
-                    }
                     self.diagnostics.truncate(diag_count);
                     self.restore(saved);
                     Some(Spanned::new(TypeKind::Named(name), tok.span))

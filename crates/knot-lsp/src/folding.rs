@@ -102,8 +102,8 @@ fn collect_folding_ranges_expr(expr: &ast::Expr, source: &str, ranges: &mut Vec<
         | ast::ExprKind::Case { .. }
         | ast::ExprKind::Lambda { .. }
         | ast::ExprKind::Atomic { .. }
-        | ast::ExprKind::Record(_) => {
-            if range.end.line > range.start.line {
+        | ast::ExprKind::Record(_)
+            if range.end.line > range.start.line => {
                 ranges.push(FoldingRange {
                     start_line: range.start.line,
                     start_character: Some(range.start.character),
@@ -113,7 +113,6 @@ fn collect_folding_ranges_expr(expr: &ast::Expr, source: &str, ranges: &mut Vec<
                     ..Default::default()
                 });
             }
-        }
         ast::ExprKind::If {
             then_branch,
             else_branch,

@@ -299,13 +299,11 @@ pub struct ServeHandler {
 impl ExprKind {
     /// If this is `yield arg` (i.e. `App(Var("yield"), arg)`), return the argument.
     pub fn as_yield_arg(&self) -> Option<&Expr> {
-        if let ExprKind::App { func, arg } = self {
-            if let ExprKind::Var(name) = &func.node {
-                if name == "yield" {
+        if let ExprKind::App { func, arg } = self
+            && let ExprKind::Var(name) = &func.node
+                && name == "yield" {
                     return Some(arg);
                 }
-            }
-        }
         None
     }
 }
@@ -534,6 +532,10 @@ pub struct TraitParam {
 }
 
 /// An item inside a `trait` block.
+// `Method` is inherently larger than `AssociatedType`; boxing a field would push
+// `Box` indirection through every construction and pattern-match site across the
+// compiler and LSP with no real payoff — trait items aren't stored in bulk.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum TraitItem {
     /// A method signature with optional default body.

@@ -426,8 +426,8 @@ route Api where
         assert_eq!(m.selection_range.start.line, 3);
     }
 
-    if let Some(route_sym) = nested.iter().find(|s| s.name == "route Api") {
-        if let Some(children) = route_sym.children.as_ref() {
+    if let Some(route_sym) = nested.iter().find(|s| s.name == "route Api")
+        && let Some(children) = route_sym.children.as_ref() {
             let entry = children
                 .iter()
                 .find(|c| c.name == "GetCount")
@@ -438,7 +438,6 @@ route Api where
             );
             assert_eq!(entry.selection_range.start.line, 6);
         }
-    }
 }
 
 // ── Finding 11: workspace diagnostics clear deleted files ────────────

@@ -4069,7 +4069,16 @@ impl Parser {
     fn parse_type_refined(&mut self) -> Option<Type> {
         let base = self.parse_type_app()?;
         if self.eat(&TokenKind::Where) {
-            let predicate = self.parse_expr()?;
+            // The predicate re-enters the expression grammar, which can loop
+            // back here via a postfix `: Type` annotation. Charge the recursion
+            // budget across the predicate so deeply chained `where` clauses trip
+            // MAX_RECURSION_DEPTH instead of overflowing the native stack.
+            if !self.enter_recursion() {
+                return None;
+            }
+            let predicate = self.parse_expr();
+            self.recursion_depth -= 1;
+            let predicate = predicate?;
             let span = Span::new(base.span.start, predicate.span.end);
             Some(Spanned::new(
                 TypeKind::Refined {

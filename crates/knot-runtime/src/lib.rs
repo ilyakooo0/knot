@@ -9776,10 +9776,16 @@ fn json_to_value_impl(json: &serde_json::Value, wire: bool) -> *mut Value {
                     && let (Some(serde_json::Value::String(tag)), Some(val)) =
                         (inner.get("tag"), inner.get("value"))
                     {
-                        return alloc(Value::Constructor(
-                            intern_str(tag),
-                            json_to_value_impl(val, wire),
-                        ));
+                        // A nullary constructor's payload is `Unit`, encoded as
+                        // JSON `null`. A `null` in the `__knot_ctor` value slot is
+                        // always that `Unit`, never a Maybe `Nothing` — otherwise
+                        // `Red` != `parseJson (toJson Red)`. Any other payload keeps
+                        // wire semantics so nested Maybe fields still round-trip.
+                        let payload = match val {
+                            serde_json::Value::Null => alloc(Value::Unit),
+                            other => json_to_value_impl(other, wire),
+                        };
+                        return alloc(Value::Constructor(intern_str(tag), payload));
                     }
             let mut fields: Vec<RecordField> = obj
                 .iter()
@@ -15830,7 +15836,16 @@ fn http_serve_loop(
                                 None => alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit))),
                             }
                         } else {
-                            let raw = raw_val.unwrap_or("");
+                            // A required (non-Maybe) param must be present. Don't
+                            // default a missing value to "" — for text/uuid that
+                            // would silently pass as an empty string instead of 400.
+                            let raw = match raw_val {
+                                Some(v) => v,
+                                None => return Err((400, format!(
+                                    "missing required query parameter '{}'",
+                                    qname
+                                ), None)),
+                            };
                             match try_string_to_value(raw, inner_ty) {
                                 Some(v) => v,
                                 None => return Err((400, format!(
@@ -16641,7 +16656,19 @@ pub extern "C-unwind" fn knot_http_fetch_io(
                                 None => alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit))),
                             }
                         } else {
-                            let v = raw_val.unwrap_or_default();
+                            // A required (non-Maybe) response header must be
+                            // present. Don't default to "" — for text/uuid that
+                            // would silently pass instead of erroring.
+                            let v = match raw_val {
+                                Some(v) => v,
+                                None => return fetch_build_err(
+                                    status,
+                                    &format!(
+                                        "required response header '{}' is missing",
+                                        http_name
+                                    ),
+                                ),
+                            };
                             match try_string_to_value(&v, inner_ty) {
                                 Some(val) => val,
                                 None => return fetch_build_err(
@@ -17932,6 +17959,49 @@ mod _maybe_json_tests {
         match unsafe { as_ref(json_to_value(&null)) } {
             Value::Constructor(tag, _) => assert_eq!(&**tag, "Nothing"),
             _ => panic!("expected Nothing"),
+        }
+    }
+
+    #[test]
+    fn wire_nullary_constructor_round_trips_to_unit_not_nothing() {
+        // A bare nullary constructor (e.g. `Red`) is `Constructor(tag, Unit)`.
+        // Its wire payload is JSON `null`; on decode that `null` sits in the
+        // `__knot_ctor` value slot, so it must reconstruct `Unit` (a nullary
+        // ctor), NOT Maybe `Nothing` — otherwise `Red != parseJson (toJson Red)`.
+        let red = alloc(Value::Constructor(intern_str("Red"), alloc(Value::Unit)));
+        let json = value_to_json(red);
+        assert_eq!(json, r#"{"__knot_ctor":{"tag":"Red","value":null}}"#);
+        let decoded = json_to_value(&serde_json::from_str(&json).unwrap());
+        match unsafe { as_ref(decoded) } {
+            Value::Constructor(tag, payload) => {
+                assert_eq!(&**tag, "Red");
+                assert!(
+                    matches!(unsafe { as_ref(*payload) }, Value::Unit),
+                    "nullary ctor payload must decode as Unit, not Nothing"
+                );
+            }
+            _ => panic!("expected Constructor"),
+        }
+        assert!(values_equal(red, decoded));
+    }
+
+    #[test]
+    fn wire_constructor_with_maybe_field_still_round_trips() {
+        // A non-null `__knot_ctor` payload keeps wire semantics, so a `Nothing`
+        // field inside a constructor payload still decodes as `Nothing`, not Unit.
+        let payload = record(vec![("val", make_nothing())]);
+        let boxed = alloc(Value::Constructor(intern_str("Box"), payload));
+        let json = value_to_json(boxed);
+        let decoded = json_to_value(&serde_json::from_str(&json).unwrap());
+        match unsafe { as_ref(decoded) } {
+            Value::Constructor(tag, p) => {
+                assert_eq!(&**tag, "Box");
+                match unsafe { as_ref(field(*p, "val")) } {
+                    Value::Constructor(inner, _) => assert_eq!(&**inner, "Nothing"),
+                    _ => panic!("expected Nothing field"),
+                }
+            }
+            _ => panic!("expected Constructor"),
         }
     }
 

@@ -2090,7 +2090,13 @@ impl Infer {
             Some(rv) => match self.apply(&Ty::Var(rv)) {
                 Ty::Record(extra, rest) => {
                     for (k, v) in extra {
-                        if !f2.contains_key(&k) {
+                        // A tail field shared with an explicit field on the
+                        // other side is a common field: unify their payloads
+                        // rather than dropping it (which would spuriously
+                        // reject an equal record or leave the types unlinked).
+                        if let Some(v2) = f2.get(&k) {
+                            self.unify_dir(&v, v2, span, t1_provided);
+                        } else {
                             only1.entry(k).or_insert(v);
                         }
                     }
@@ -2105,7 +2111,9 @@ impl Infer {
             Some(rv) => match self.apply(&Ty::Var(rv)) {
                 Ty::Record(extra, rest) => {
                     for (k, v) in extra {
-                        if !f1.contains_key(&k) {
+                        if let Some(v1) = f1.get(&k) {
+                            self.unify_dir(v1, &v, span, t1_provided);
+                        } else {
                             only2.entry(k).or_insert(v);
                         }
                     }
@@ -2233,7 +2241,12 @@ impl Infer {
             Some(rv) => match self.apply(&Ty::Var(rv)) {
                 Ty::Variant(extra, rest) => {
                     for (k, v) in extra {
-                        if !c2.contains_key(&k) {
+                        // A tail constructor shared with an explicit
+                        // constructor on the other side is common: unify their
+                        // payloads rather than dropping it.
+                        if let Some(v2) = c2.get(&k) {
+                            self.unify_dir(&v, v2, span, t1_provided);
+                        } else {
                             only1.entry(k).or_insert(v);
                         }
                     }
@@ -2248,7 +2261,9 @@ impl Infer {
             Some(rv) => match self.apply(&Ty::Var(rv)) {
                 Ty::Variant(extra, rest) => {
                     for (k, v) in extra {
-                        if !c1.contains_key(&k) {
+                        if let Some(v1) = c1.get(&k) {
+                            self.unify_dir(v1, &v, span, t1_provided);
+                        } else {
                             only2.entry(k).or_insert(v);
                         }
                     }
@@ -5361,6 +5376,10 @@ impl Infer {
             let rhs = self.apply(&d.rhs);
             let result_ty = self.unit_mul_div_ty(d.op, &lhs, &rhs, d.span, false);
             if !matches!(result_ty, Ty::Error) {
+                // Mirror the direct mul/div sites: a product/quotient of refined
+                // operands is not itself refined (e.g. 9*9=81 isn't `Small`), so
+                // strip the refinement before unifying to prevent laundering.
+                let result_ty = self.degrade_refinement(result_ty, d.span);
                 self.unify(&Ty::Var(d.result), &result_ty, d.span);
             }
         }
@@ -6354,10 +6373,35 @@ impl Infer {
         // base or alias body would freeze unexpanded (`{Speed:1}` instead of
         // `{M:1,S:-1}`), producing spurious unit-mismatch errors against the
         // expanded form every other site computes.
+        let mut unit_decl_count = 0;
         for decl in &module.decls {
             if let ast::DeclKind::UnitDecl { name, definition } = &decl.node {
+                unit_decl_count += 1;
                 let def = definition.as_ref().map(|u| self.ast_unit_to_unit_ty(u));
                 self.declared_units.insert(name.clone(), def);
+            }
+        }
+        // Re-expand derived units to a fixpoint: a single source-order pass
+        // freezes any unit that forward-references a later-declared derived
+        // unit (e.g. `unit Force = M * Accel` before `unit Accel = M / S`
+        // stores `{M:1, Accel:1}` instead of `{M:2, S:-1}`). Re-running
+        // `ast_unit_to_unit_ty` now that all names are registered expands
+        // those references; iterate until stable, bounded like the alias loop.
+        let mut unit_passes = 0;
+        loop {
+            let mut changed = false;
+            for decl in &module.decls {
+                if let ast::DeclKind::UnitDecl { name, definition: Some(u) } = &decl.node {
+                    let def = Some(self.ast_unit_to_unit_ty(u));
+                    if self.declared_units.get(name) != Some(&def) {
+                        self.declared_units.insert(name.clone(), def);
+                        changed = true;
+                    }
+                }
+            }
+            unit_passes += 1;
+            if !changed || unit_passes > unit_decl_count + 1 {
+                break;
             }
         }
 

@@ -9561,7 +9561,20 @@ impl Codegen {
                                 )
                                 .label(key.span, "groupBy without a preceding relation bind"),
                             );
-                            return self.call_rt(builder, "knot_relation_empty", &[]);
+                            // No primary bind means no loops were opened
+                            // (loop_stack is empty here), so we can bail — but
+                            // must still pop the do-block's arena frame and
+                            // restore the shadowed bindings, or a later scope /
+                            // `retry` in the enclosing function is corrupted.
+                            let empty = self.call_rt(builder, "knot_relation_empty", &[]);
+                            let promoted =
+                                self.call_rt(builder, "knot_arena_pop_frame_promote", &[empty]);
+                            self.atomic_arena_frames -= 1;
+                            env.bindings = prev_env_bindings;
+                            self.let_bindings = prev_let_bindings;
+                            self.source_var_binds = prev_source_var_binds;
+                            self.replay_source_bind_invalidations_since(invalidation_mark);
+                            return promoted;
                         }
                     };
                     self.call_rt_void(
@@ -9616,7 +9629,18 @@ impl Codegen {
                                 knot::diagnostic::Diagnostic::error(hint)
                                     .label(key.span, "groupBy over a relation with no known schema"),
                             );
-                            return self.call_rt(builder, "knot_relation_empty", &[]);
+                            // Pre-group loops are already closed here; still tear
+                            // down the do-block scope so the leaked arena frame /
+                            // shadowed bindings don't corrupt a later scope.
+                            let empty = self.call_rt(builder, "knot_relation_empty", &[]);
+                            let promoted =
+                                self.call_rt(builder, "knot_arena_pop_frame_promote", &[empty]);
+                            self.atomic_arena_frames -= 1;
+                            env.bindings = prev_env_bindings;
+                            self.let_bindings = prev_let_bindings;
+                            self.source_var_binds = prev_source_var_binds;
+                            self.replay_source_bind_invalidations_since(invalidation_mark);
+                            return promoted;
                         }
                     };
 
@@ -14452,7 +14476,10 @@ pub(crate) fn infer_sql_expr_type(bind_var: &str, expr: &ast::Expr, schema: &str
             ast::Literal::Int(_) => Some("int".to_string()),
             ast::Literal::Float(_) => Some("float".to_string()),
             ast::Literal::Text(_) => Some("text".to_string()),
-            ast::Literal::Bool(_) => Some("int".to_string()),
+            // A bool literal is emitted as SQL `1`/`0`; it must be typed
+            // `bool` (not `int`) so the column reads back through
+            // `ColType::Bool` -> `Value::Bool`, matching the bool-column path.
+            ast::Literal::Bool(_) => Some("bool".to_string()),
             _ => None,
         },
         ast::ExprKind::BinOp { op, lhs, rhs } => {
@@ -14664,7 +14691,10 @@ fn infer_multi_table_sql_expr_type(
             ast::Literal::Int(_) => Some("int".to_string()),
             ast::Literal::Float(_) => Some("float".to_string()),
             ast::Literal::Text(_) => Some("text".to_string()),
-            ast::Literal::Bool(_) => Some("int".to_string()),
+            // A bool literal is emitted as SQL `1`/`0`; it must be typed
+            // `bool` (not `int`) so the column reads back through
+            // `ColType::Bool` -> `Value::Bool`, matching the bool-column path.
+            ast::Literal::Bool(_) => Some("bool".to_string()),
             _ => None,
         },
         ast::ExprKind::BinOp { op, lhs, rhs } => {

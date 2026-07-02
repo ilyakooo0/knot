@@ -676,6 +676,33 @@ fn emit_edits_for_open_doc(
                 });
             }
         }
+        // Impl-method definition tokens don't appear in `doc.references`
+        // (defs.rs never links them to the trait method), so a same-file
+        // trait-method rename would leave `impl … method =` stale. When this
+        // module declares `old_name` as a trait method, rename every impl
+        // method of that name here too. (Other files are handled by the
+        // importer path via `collect_name_uses_in_decl`.)
+        let renames_trait_method = doc.module.decls.iter().any(|d| {
+            matches!(&d.node, DeclKind::Trait { items, .. }
+                if items.iter().any(|it| matches!(
+                    it, ast::TraitItem::Method { name: m, .. } if m == old_name)))
+        });
+        if renames_trait_method {
+            for decl in &doc.module.decls {
+                if let DeclKind::Impl { items, .. } = &decl.node {
+                    for item in items {
+                        if let ast::ImplItem::Method { name: m, name_span, .. } = item
+                            && m == old_name
+                        {
+                            changes.entry(uri.clone()).or_default().push(TextEdit {
+                                range: span_to_range(*name_span, &doc.source),
+                                new_text: new_name.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
     } else {
         // Importer file. If the file declares its own top-level symbol with
         // the same name, every local reference resolves to that declaration
@@ -1975,6 +2002,36 @@ mod tests {
                 .iter()
                 .any(|e| e.range.start == impl_pos && e.new_text.contains("Display")),
             "trait name in `impl Show` must be renamed; edits: {edits:?}"
+        );
+    }
+
+    #[test]
+    fn rename_trait_method_updates_impl_method_same_file() {
+        // Regression: a same-file trait-method rename left the `impl … method =`
+        // definition stale. Impl-method name tokens aren't in `doc.references`
+        // (defs.rs never links them to the trait method), and the collector that
+        // does know them ran only on importer files — so the owner file's impl
+        // was skipped, producing a trait method with no matching impl.
+        let mut ws = TestWorkspace::new();
+        let src = "trait Show a where\n  present : a -> Text\ndata Foo = Foo {}\nimpl Show Foo where\n  present = \\x -> \"foo\"\nmain = present (Foo {})\n";
+        let uri = ws.open("main", src);
+        let doc = ws.doc(&uri);
+        // Initiate the rename from the trait-method declaration.
+        let off = doc.source.find("present").expect("trait method decl");
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "render"))
+            .expect("rename produces edits");
+        let mut changes = edit.changes.expect("changes present");
+        let edits = changes.remove(&uri).expect("file has edits");
+
+        // The impl method definition token must be renamed too.
+        let impl_off = doc.source.find("present = ").expect("impl method def");
+        let impl_pos = offset_to_position(&doc.source, impl_off);
+        assert!(
+            edits
+                .iter()
+                .any(|e| e.range.start == impl_pos && e.new_text.contains("render")),
+            "impl method `present =` must be renamed; edits: {edits:?}"
         );
     }
 

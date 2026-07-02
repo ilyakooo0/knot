@@ -738,12 +738,13 @@ impl EffectChecker {
                 // Propagate lambda-arg effects conservatively at the gate;
                 // genuinely fork-deferred args are still stripped below.
                 let propagate_lambda = self.suppress_fork_io
-                    || head_name(head)
-                        .map(|n| {
-                            self.row_poly_decls.contains(n)
-                                || !self.fixed_row_decls.contains(n)
-                        })
-                        .unwrap_or(true);
+                    || (!is_lambda_head(head)
+                        && head_name(head)
+                            .map(|n| {
+                                self.row_poly_decls.contains(n)
+                                    || !self.fixed_row_decls.contains(n)
+                            })
+                            .unwrap_or(true));
                 // `fork <action>` spawns its argument's IO on an independent
                 // connection. When computing the atomic-gate view of effects,
                 // strip the spawned action's IO so `atomic (fork (println …))`
@@ -1967,6 +1968,24 @@ fn app_spine(expr: &ast::Expr) -> (&ast::Expr, Vec<&ast::Expr>) {
     }
     args.reverse();
     (cur, args)
+}
+
+/// Whether an application-spine head is an immediately-applied lambda,
+/// looking through the same wrappers `head_call_effects` unwraps. Such heads
+/// are analyzed precisely by `head_call_effects` (which binds the lambda-valued
+/// arguments into a local scope and only counts an argument's effects when the
+/// body actually invokes the parameter), so the caller must NOT independently
+/// propagate lambda-arg body effects — doing so double-counts the effects of an
+/// *unused* lambda argument, spuriously rejecting a well-typed program.
+fn is_lambda_head(expr: &ast::Expr) -> bool {
+    match &expr.node {
+        ast::ExprKind::Lambda { .. } => true,
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::Annot { expr: value, .. } => {
+            is_lambda_head(value)
+        }
+        ast::ExprKind::Refine(inner) => is_lambda_head(inner),
+        _ => false,
+    }
 }
 
 /// Resolve the head name of a (possibly curried) function expression.

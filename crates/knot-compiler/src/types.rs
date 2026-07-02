@@ -506,8 +506,18 @@ fn collect_source_refinements_inner(
         TypeKind::Refined { base, predicate } => {
             // Collect the cross-field predicate
             result.push((None, "record".into(), (**predicate).clone()));
-            // Recurse into the base to collect field-level refinements
-            let inner_ty = Spanned::new(TypeKind::Relation(base.clone()), ty.span);
+            // Recurse into the base to collect field-level refinements. If the
+            // base is already a Relation (a refined *nested* relation element,
+            // e.g. `[[Item] where \xs -> ...]`), recurse directly to avoid
+            // double-wrapping Relation(Relation(...)) — which the single-unwrap
+            // recursion would leave as a bare Relation, matching no arm and
+            // silently dropping the inner element/field refinements. Mirrors the
+            // guarded `Named`-alias arms above.
+            let inner_ty = if matches!(&base.node, TypeKind::Relation(_)) {
+                (**base).clone()
+            } else {
+                Spanned::new(TypeKind::Relation(base.clone()), ty.span)
+            };
             result.extend(collect_source_refinements_inner(&inner_ty, refined_types, alias_ast_types, data_ctor_decls, seen_aliases));
         }
         _ => {}

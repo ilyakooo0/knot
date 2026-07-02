@@ -10776,6 +10776,11 @@ fn init_record_table(conn: &rusqlite::Connection, table_name: &str, schema: &Rec
 
     if col_defs.is_empty() {
         col_defs.push("_dummy INTEGER DEFAULT 0".to_string());
+        // A unit-typed relation (`*u : [{}]`) is a set of `{}` values — all
+        // equal, so it holds at most one element. Uniquely index the constant
+        // `_dummy` column so INSERT OR IGNORE (in `write_record_rows`) keeps a
+        // single row regardless of how many `{}`s are written.
+        unique_cols.push(quote_ident("_dummy"));
     }
 
     let sql = format!("CREATE TABLE IF NOT EXISTS {} ({});", table, col_defs.join(", "));
@@ -10812,14 +10817,28 @@ fn init_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &Nested
 
     if has_children {
         col_defs.push("_id INTEGER PRIMARY KEY AUTOINCREMENT".to_string());
+        // Child identity for elements that themselves have nested children is the
+        // hash of the *whole* element (scalars + nested content), scoped to the
+        // parent — mirrors `init_record_table`'s parent treatment. Without this,
+        // two child elements under one parent that differ only in grandchild
+        // content collapse onto a single child row under INSERT OR IGNORE and have
+        // their grandchildren merged. Indexed on `(_parent_id, _content_hash)`
+        // below instead of the scalar columns.
+        col_defs.push("_content_hash TEXT".to_string());
     }
 
     for c in &nf.columns {
         col_defs.push(format!("{} {}", quote_ident(&c.name), sql_type(c.ty)));
-        // NULL-coalesced for set semantics with NULL-bearing rows — see
-        // the matching comment in `init_record_table`. `_parent_id` stays
-        // raw (NOT NULL by definition).
-        unique_cols.push(null_safe_coalesce(&quote_ident(&c.name), c.ty));
+        if !has_children {
+            // NULL-coalesced for set semantics with NULL-bearing rows — see
+            // the matching comment in `init_record_table`. `_parent_id` stays
+            // raw (NOT NULL by definition). Children index on `_content_hash`.
+            unique_cols.push(null_safe_coalesce(&quote_ident(&c.name), c.ty));
+        }
+    }
+
+    if has_children {
+        unique_cols.push(quote_ident("_content_hash"));
     }
 
     let sql = format!("CREATE TABLE IF NOT EXISTS {} ({});", child_table, col_defs.join(", "));
@@ -10828,7 +10847,9 @@ fn init_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &Nested
         panic!("knot runtime: failed to create child table '{}': {}", child_table_name, e)
     });
 
-    // Unique index: (_parent_id, scalar_cols) for set semantics within each parent row
+    // Unique index for set semantics within each parent row: (_parent_id,
+    // scalar_cols) for leaf children, (_parent_id, _content_hash) for children
+    // that have their own nested children.
     if unique_cols.len() > 1 {
         let idx_sql = format!(
             "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({});",
@@ -11015,10 +11036,19 @@ fn auto_apply_child_change(
     debug_sql(&drop_idx);
     let _ = conn.execute_batch(&drop_idx);
 
+    // Rebuild using the SAME scheme as `init_child_table`: children with their
+    // own nested children index on `(_parent_id, _content_hash)` (whole-element
+    // identity), leaf children on `(_parent_id, scalar cols)`. Using scalar
+    // columns for a child that has children would silently merge elements that
+    // differ only in grandchild content.
     let mut unique_cols = vec![quote_ident("_parent_id")];
-    for c in &new_nf.columns {
-        // NULL-coalesced — same scheme as `init_child_table`.
-        unique_cols.push(null_safe_coalesce(&quote_ident(&c.name), c.ty));
+    if new_nf.nested.is_empty() {
+        for c in &new_nf.columns {
+            // NULL-coalesced — same scheme as `init_child_table`.
+            unique_cols.push(null_safe_coalesce(&quote_ident(&c.name), c.ty));
+        }
+    } else {
+        unique_cols.push(quote_ident("_content_hash"));
     }
     if unique_cols.len() > 1 {
         let idx_sql = format!(
@@ -12164,8 +12194,9 @@ fn write_record_rows(
     // Build INSERT for scalar columns only
     let col_names: Vec<String> = schema.columns.iter().map(|c| quote_ident(&c.name)).collect();
     if col_names.is_empty() && !has_children {
-        // Unit-type relation: insert rows via the _dummy column
-        let sql = format!("INSERT INTO {} (\"_dummy\") VALUES (0);", table);
+        // Unit-type relation: a set of `{}`, so at most one row. INSERT OR
+        // IGNORE against the unique `_dummy` index dedups repeated `{}` writes.
+        let sql = format!("INSERT OR IGNORE INTO {} (\"_dummy\") VALUES (0);", table);
         let mut stmt = conn.prepare_cached(&sql)
             .expect("knot runtime: prepare unit insert failed");
         for _ in rows.iter() {
@@ -12290,15 +12321,19 @@ fn write_child_rows(
         return;
     }
 
-    // When the element type has no scalar columns, there is no DB unique index
-    // to dedup against (`init_child_table` only builds one when there is at
-    // least one scalar column; a UNIQUE index on `_parent_id` alone would
-    // wrongly collapse all of a parent's distinct elements). Such elements are
-    // distinguished only by their nested-relation content, so without this
+    let has_children = !nf.nested.is_empty();
+
+    // When the element type has no scalar columns AND no nested children, there
+    // is no DB unique index to dedup against (`init_child_table` builds one only
+    // when there is at least one scalar column, or a `_content_hash` index when
+    // the element has children; a UNIQUE index on `_parent_id` alone would
+    // wrongly collapse all of a parent's distinct elements). A childless,
+    // column-less element is indistinguishable from any other, so without this
     // `INSERT OR IGNORE` — with nothing to ignore on — would store duplicate
     // child rows, violating Knot's set semantics. Dedup structurally in memory.
+    // (Elements with children dedup in the DB via the `_content_hash` index.)
     let deduped_storage;
-    let rows: &[*mut Value] = if nf.columns.is_empty() {
+    let rows: &[*mut Value] = if nf.columns.is_empty() && !has_children {
         deduped_storage = in_memory_dedup(rows.to_vec());
         &deduped_storage
     } else {
@@ -12306,11 +12341,15 @@ fn write_child_rows(
     };
 
     let table = quote_ident(table_name);
-    let has_children = !nf.nested.is_empty();
 
     let mut col_names = vec![quote_ident("_parent_id")];
     for c in &nf.columns {
         col_names.push(quote_ident(&c.name));
+    }
+    // Elements with their own children append `_content_hash` (whole-element
+    // identity) as the LAST column/param — mirrors `write_record_rows`.
+    if has_children {
+        col_names.push(quote_ident("_content_hash"));
     }
     let placeholders: Vec<String> = (1..=col_names.len()).map(|i| format!("?{}", i)).collect();
 
@@ -12320,17 +12359,17 @@ fn write_child_rows(
     );
     debug_sql(&insert_sql);
 
-    // Prepare a SELECT to look up existing _id when INSERT OR IGNORE skips a duplicate
-    let select_id_sql = if has_children && !nf.columns.is_empty() {
-        let where_conds: Vec<String> = col_names
-            .iter()
-            .enumerate()
-            .map(|(i, c)| format!("{} IS ?{}", c, i + 1))
-            .collect();
+    // Prepare a SELECT to look up the existing _id when INSERT OR IGNORE skips a
+    // duplicate. Match on `_content_hash` (the whole-element key, last param) so a
+    // genuine full-element duplicate reuses its child row, while an element
+    // differing only in grandchild content gets a fresh child row.
+    let select_id_sql = if has_children {
+        let hash_idx = col_names.len();
         Some(format!(
-            "SELECT _id FROM {} WHERE {} LIMIT 1;",
+            "SELECT _id FROM {} WHERE {} IS ?{} LIMIT 1;",
             table,
-            where_conds.join(" AND ")
+            quote_ident("_content_hash"),
+            hash_idx
         ))
     } else {
         None
@@ -12354,6 +12393,9 @@ fn write_child_rows(
             let value = field_map.get(col.name.as_str())
                 .unwrap_or_else(|| panic!("knot runtime: missing field '{}' in child record", col.name));
             params.push(value_to_sqlite(*value, col.ty));
+        }
+        if has_children {
+            params.push(rusqlite::types::Value::Text(record_content_hash_hex(*row_ptr)));
         }
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =

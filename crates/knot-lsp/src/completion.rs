@@ -25,6 +25,51 @@ use crate::utils::{offset_to_position, position_to_offset, recurse_expr, uri_to_
 
 // ── Completion ──────────────────────────────────────────────────────
 
+/// Replace-range for a relation completion (`*name`/`&name`) at `offset`: the
+/// typed token INCLUDING any leading source/derived-ref sigil. Emitting items
+/// with `insert_text: "*name"` + a `text_edit` over this range replaces the
+/// sigil rather than inserting after it, avoiding `**name`/`&&name` in clients
+/// that fold the trigger char into the word start.
+fn sigil_replace_range(latest_source: &str, offset: usize) -> Range {
+    let bytes = latest_source.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'';
+    let mut start = offset.min(bytes.len());
+    while start > 0 && is_ident(bytes[start - 1]) {
+        start -= 1;
+    }
+    if start > 0 && (bytes[start - 1] == b'*' || bytes[start - 1] == b'&') {
+        // Only absorb the `*`/`&` into the edit range when it's an actual
+        // source/derived-ref sigil (atom position) — NOT when it's a binary
+        // operator (`n * m`, `a && b`). Mirroring `trigger_is_operator`: the
+        // byte before the sigil being an expression-ending byte (or another
+        // `&`) means operator position. Absorbing an operator byte would
+        // corrupt the buffer — `n*` accepting `*people` → `n*people`
+        // (`n * people`), `flag &&` accepting `&active` → `flag &&active`
+        // (the derived-ref sigil silently lost).
+        let before_sigil = (start - 1)
+            .checked_sub(1)
+            .and_then(|i| bytes.get(i))
+            .copied();
+        let sigil_is_operator = before_sigil.is_some_and(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b')' | b']' | b'}' | b'"' | b'&')
+        });
+        if !sigil_is_operator {
+            start -= 1;
+        }
+    }
+    // Extend the end past the caret over the rest of the identifier, so a
+    // mid-token completion (`*us|ers`) replaces the whole token rather than
+    // appending the suffix and producing `*usersers`.
+    let mut end = offset.min(bytes.len());
+    while end < bytes.len() && is_ident(bytes[end]) {
+        end += 1;
+    }
+    Range {
+        start: offset_to_position(latest_source, start),
+        end: offset_to_position(latest_source, end),
+    }
+}
+
 pub(crate) fn handle_completion(
     state: &ServerState,
     params: &CompletionParams,
@@ -110,12 +155,21 @@ pub(crate) fn handle_completion(
         // Only a `*` in atom position is a source-ref prefix; a `*` used as
         // multiplication falls through to general completion (see above).
         if !trigger_is_operator {
+            // Mirror the general path's sigil handling (label/insert_text/
+            // text_edit over the sigil range) so accepting an item right after
+            // the typed `*` replaces the sigil instead of producing `**name`.
+            let edit_range = sigil_replace_range(latest_source, offset);
             for decl in &doc.module.decls {
                 if let DeclKind::Source { name, .. } | DeclKind::View { name, .. } = &decl.node {
                     let detail = doc.type_info.get(name.as_str()).cloned();
                     items.push(CompletionItem {
-                        label: name.clone(),
+                        label: format!("*{name}"),
                         kind: Some(CompletionItemKind::VARIABLE),
+                        insert_text: Some(format!("*{name}")),
+                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                            range: edit_range,
+                            new_text: format!("*{name}"),
+                        })),
                         detail,
                         ..Default::default()
                     });
@@ -133,12 +187,20 @@ pub(crate) fn handle_completion(
         // `&&` (or `&` after an expression) is the boolean operator, not a
         // derived-ref prefix — fall through to general completion.
         if !trigger_is_operator {
+            // Mirror the general path's sigil handling so accepting an item
+            // right after the typed `&` replaces the sigil instead of `&&name`.
+            let edit_range = sigil_replace_range(latest_source, offset);
             for decl in &doc.module.decls {
                 if let DeclKind::Derived { name, .. } = &decl.node {
                     let detail = doc.type_info.get(name.as_str()).cloned();
                     items.push(CompletionItem {
-                        label: name.clone(),
+                        label: format!("&{name}"),
                         kind: Some(CompletionItemKind::VARIABLE),
+                        insert_text: Some(format!("&{name}")),
+                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                            range: edit_range,
+                            new_text: format!("&{name}"),
+                        })),
                         detail,
                         ..Default::default()
                     });
@@ -374,45 +436,7 @@ pub(crate) fn handle_completion(
     // clients insert after the word start — and `*`/`&` aren't word chars,
     // so accepting `*name` after a typed `*` produced `**name`. A text_edit
     // that spans the sigil replaces it instead.
-    let sigil_edit_range = {
-        let bytes = latest_source.as_bytes();
-        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'';
-        let mut start = offset.min(bytes.len());
-        while start > 0 && is_ident(bytes[start - 1]) {
-            start -= 1;
-        }
-        if start > 0 && (bytes[start - 1] == b'*' || bytes[start - 1] == b'&') {
-            // Only absorb the `*`/`&` into the edit range when it's an actual
-            // source/derived-ref sigil (atom position) — NOT when it's a binary
-            // operator (`n * m`, `a && b`). Mirroring `trigger_is_operator`
-            // above: the byte before the sigil being an expression-ending byte
-            // (or another `&`) means operator position. Absorbing an operator
-            // byte would corrupt the buffer — `n*` accepting `*people` →
-            // `n*people` (`n * people`), `flag &&` accepting `&active` →
-            // `flag &&active` (the derived-ref sigil silently lost).
-            let before_sigil = (start - 1)
-                .checked_sub(1)
-                .and_then(|i| bytes.get(i))
-                .copied();
-            let sigil_is_operator = before_sigil.is_some_and(|b| {
-                b.is_ascii_alphanumeric() || matches!(b, b'_' | b')' | b']' | b'}' | b'"' | b'&')
-            });
-            if !sigil_is_operator {
-                start -= 1;
-            }
-        }
-        // Extend the end past the caret over the rest of the identifier, so a
-        // mid-token completion (`*us|ers`) replaces the whole token rather than
-        // appending the suffix and producing `*usersers`.
-        let mut end = offset.min(bytes.len());
-        while end < bytes.len() && is_ident(bytes[end]) {
-            end += 1;
-        }
-        Range {
-            start: offset_to_position(latest_source, start),
-            end: offset_to_position(latest_source, end),
-        }
-    };
+    let sigil_edit_range = sigil_replace_range(latest_source, offset);
 
     // Declarations from current document with type details
     for decl in &doc.module.decls {
@@ -2229,8 +2253,11 @@ get = \_ -> *
         let resp = handle_completion(&ws.state, &comp_params(&uri, pos, Some("*")))
             .expect("completion returns");
         let labels = item_labels(resp);
-        assert!(labels.contains(&"people".to_string()), "labels: {labels:?}");
-        assert!(labels.contains(&"pets".to_string()), "labels: {labels:?}");
+        // Labels carry the sigil (matching the general completion path) and the
+        // items replace the typed `*` via a text_edit so accepting one yields
+        // `*people`, not `**people`.
+        assert!(labels.contains(&"*people".to_string()), "labels: {labels:?}");
+        assert!(labels.contains(&"*pets".to_string()), "labels: {labels:?}");
     }
 
     #[test]

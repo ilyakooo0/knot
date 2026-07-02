@@ -10,8 +10,11 @@ pub fn debug_enabled() -> bool {
 /// Scan `--debug` in process arguments and enable debug logging.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_debug_init() {
-    for arg in std::env::args() {
-        if arg == "--debug" {
+    // Use `args_os()`: `args()` panics mid-iteration on any non-UTF-8 argv
+    // entry, which would crash every compiled program at startup over an
+    // argument irrelevant to the `--debug` check.
+    for arg in std::env::args_os() {
+        if arg.to_str() == Some("--debug") {
             DEBUG.store(true, Ordering::Relaxed);
             return;
         }

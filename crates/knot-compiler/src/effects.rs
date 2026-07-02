@@ -736,12 +736,23 @@ impl EffectChecker {
                 // Immediately-applied lambda heads keep propagate=false:
                 // `head_call_effects` analyzes those precisely by binding
                 // the lambda-valued arguments into a local scope.
-                let propagate_lambda = head_name(head)
-                    .map(|n| {
-                        self.row_poly_decls.contains(n)
-                            || !self.fixed_row_decls.contains(n)
-                    })
-                    .unwrap_or(true);
+                // During the atomic-gate recomputation (`suppress_fork_io`),
+                // never trust a *closed* declared row to "absorb" a callback's
+                // effects: a `fixed_row` helper's own recorded effects are
+                // computed with its callback parameter masked, so dropping the
+                // lambda arg here would let synchronous IO inside the callback
+                // launder past the atomic gate — e.g.
+                // `atomic (runTwice (\_ -> println "hi") u)` where
+                // `runTwice : (a -> IO {console} {}) -> a -> IO {console} {}`.
+                // Propagate lambda-arg effects conservatively at the gate;
+                // genuinely fork-deferred args are still stripped below.
+                let propagate_lambda = self.suppress_fork_io
+                    || head_name(head)
+                        .map(|n| {
+                            self.row_poly_decls.contains(n)
+                                || !self.fixed_row_decls.contains(n)
+                        })
+                        .unwrap_or(true);
                 // `fork <action>` spawns its argument's IO on an independent
                 // connection. When computing the atomic-gate view of effects,
                 // strip the spawned action's IO so `atomic (fork (println …))`
@@ -793,11 +804,16 @@ impl EffectChecker {
                     // higher-order callee (`(\u -> println "x") |> withCb`) loses
                     // its body effects, under-approximating (the unsafe
                     // direction) and slipping past the IO-in-atomic gate.
-                    let propagate_lambda = head_name(rhs)
-                        .map(|n| {
-                            self.row_poly_decls.contains(n) || !self.fixed_row_decls.contains(n)
-                        })
-                        .unwrap_or(true);
+                    // See the `App` arm: at the atomic gate never trust a closed
+                    // declared row to absorb a piped-in lambda's effects, or
+                    // `(\u -> println "x") |> runTwiceClosed` would launder IO
+                    // past the gate. Fork-piped args are still stripped below.
+                    let propagate_lambda = self.suppress_fork_io
+                        || head_name(rhs)
+                            .map(|n| {
+                                self.row_poly_decls.contains(n) || !self.fixed_row_decls.contains(n)
+                            })
+                            .unwrap_or(true);
                     let mut lhs_effects = if propagate_lambda {
                         self.arg_effects(lhs)
                     } else {
@@ -1560,7 +1576,15 @@ impl EffectChecker {
                         .note(format!("undeclared effects: {}", extra)),
                 );
             }
-            let unused = declared.difference(inferred);
+            // A closed-row higher-order function legitimately declares effects
+            // that its *body* never performs directly — they are contributed by
+            // invoking an effectful callback parameter (whose effects are masked
+            // out of `inferred`). Don't flag those as "unused": subtract effects
+            // that also appear in a parameter (callback) position of the
+            // signature. Effects declared but present in neither the body nor any
+            // callback param are still reported.
+            let param_effects = param_declared_effects(&scheme.ty);
+            let unused = declared.difference(inferred).difference(&param_effects);
             if !unused.is_empty() {
                 self.diagnostics.push(
                     Diagnostic::warning("declared effects are not used")
@@ -2042,6 +2066,29 @@ fn effects_span(ty: &ast::Type) -> Option<Span> {
 ///
 /// `IO _ a` (wildcard) returns `None` — the user opted out of declaring
 /// effects, so there's nothing for `check_annotation` to compare against.
+/// Collect the effects declared in *parameter* (callback) positions of a
+/// function signature — the mirror of `extract_effects`, which looks only at
+/// the result side. Used to recognize that a higher-order function's declared
+/// result effects may be contributed by invoking an effectful callback argument
+/// rather than by its own body, so the "declared but unused" warning does not
+/// fire on legitimate closed-row HOFs.
+fn param_declared_effects(ty: &ast::Type) -> EffectSet {
+    match &ty.node {
+        ast::TypeKind::Function { param, result } => {
+            // The parameter's own effects (a callback like `a -> IO {console} {}`
+            // contributes `{console}`), plus any effects nested deeper in the
+            // parameter, plus the parameter positions of the remaining (curried)
+            // arrows. The final result's effects are intentionally NOT collected
+            // here — those are the function's own, handled by `extract_effects`.
+            let mut e = extract_effects(param).unwrap_or_else(EffectSet::empty);
+            e = e.union(&param_declared_effects(param));
+            e.union(&param_declared_effects(result))
+        }
+        ast::TypeKind::Forall { ty: inner, .. } => param_declared_effects(inner),
+        _ => EffectSet::empty(),
+    }
+}
+
 fn extract_effects(ty: &ast::Type) -> Option<EffectSet> {
     match &ty.node {
         ast::TypeKind::Effectful { effects, .. } => {

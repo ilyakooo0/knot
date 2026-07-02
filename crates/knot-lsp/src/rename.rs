@@ -1089,6 +1089,13 @@ pub(crate) fn collect_name_uses_in_decl(
                         walk_type(ty, name, source, out);
                     }
                 }
+                // The `rateLimit <expr>` clause references user names (e.g.
+                // `rateLimit {key: keyByIp, ...}`). Walk it so renaming a
+                // function/constructor used inside it updates those sites too —
+                // otherwise the rename leaves stale names and breaks the source.
+                if let Some(rl) = &entry.rate_limit {
+                    walk_expr(rl, name, source, false, out);
+                }
             }
         }
         DeclKind::RouteComposite { components, .. } => {
@@ -1563,6 +1570,11 @@ fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::Decl, source: &str, f: 
                     cursor = resp.span.end;
                 }
                 field_list(&entry.response_headers, &mut cursor, f);
+                // Record-field occurrences inside the `rateLimit` expression
+                // (e.g. `key: \input ctx -> input.userId`) must be renamed too.
+                if let Some(rl) = &entry.rate_limit {
+                    field_sites_in_expr(rl, source, f);
+                }
             }
         }
         _ => {}

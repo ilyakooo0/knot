@@ -6268,7 +6268,27 @@ impl Codegen {
                         self.try_set_op_subquery(&args[0], env),
                         self.try_set_op_subquery(&args[1], env),
                     ) {
-                        let sql = format!("{} {} {}", sub_a.sql, sql_op, sub_b.sql);
+                        // SQLite's EXCEPT/INTERSECT/UNION match columns
+                        // POSITIONALLY. The two sides can have different SELECT
+                        // column orders (a bare/filtered source uses schema
+                        // order, a do-block uses yield-record field order), so
+                        // align sub_b to sub_a's schema column order by name
+                        // before combining — otherwise the set op compares
+                        // mismatched columns and silently returns wrong rows.
+                        // Output columns are aliased to their field names in
+                        // both subquery forms, so a name-based reprojection is
+                        // safe. The result is read positionally as sub_a.schema.
+                        let b_sql = if sub_b.schema == sub_a.schema {
+                            sub_b.sql
+                        } else {
+                            let order_cols = parse_schema_columns(&sub_a.schema)
+                                .iter()
+                                .map(|(n, _)| quote_sql_ident(n))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            format!("SELECT {} FROM ({})", order_cols, sub_b.sql)
+                        };
+                        let sql = format!("{} {} {}", sub_a.sql, sql_op, b_sql);
                         let result_schema = sub_a.schema;
                         for table in sub_a.tables.iter().chain(sub_b.tables.iter()) {
                             let table = table.clone();
@@ -13296,10 +13316,19 @@ impl SqlQueryPlan {
             .select_columns
             .iter()
             .map(|c| {
+                // Alias every output column to its result field name. Reads are
+                // positional (`knot_source_query`), so this is cosmetic for the
+                // normal path — but it lets set-op subqueries be reordered by
+                // name to align two differently-ordered SELECT lists.
                 if let Some(ref sql_expr) = c.sql_expr {
                     format!("{} AS {}", sql_expr, quote_sql_ident(&c.result_field))
                 } else {
-                    format!("{}.{}", c.alias, quote_sql_ident(&c.source_col))
+                    format!(
+                        "{}.{} AS {}",
+                        c.alias,
+                        quote_sql_ident(&c.source_col),
+                        quote_sql_ident(&c.result_field)
+                    )
                 }
             })
             .collect::<Vec<_>>()

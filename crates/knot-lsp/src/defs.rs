@@ -273,6 +273,12 @@ pub fn resolve_definitions(
                             resolver.resolve_type(ty, source);
                         }
                     }
+                    // The `rateLimit <expr>` clause is a real user-edited
+                    // expression (e.g. `{key: keyByIp, ...}`); resolve names
+                    // used inside it so goto/find-references reach them.
+                    if let Some(rl) = &entry.rate_limit {
+                        resolver.resolve_expr(rl);
+                    }
                 }
             }
             DeclKind::RouteComposite { components, .. } => {

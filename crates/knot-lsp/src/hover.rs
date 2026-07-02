@@ -205,8 +205,14 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
         }
     }
 
-    // For source/view/derived refs, show the relation schema
+    // For source/view/derived refs, show the relation schema. Suppressed on a
+    // record-field token: hovering the `items` field of `rec.items` must not
+    // leak the schema of an unrelated lowercase source/view/derived also named
+    // `items` — the same wrong-info class the headline suppression guards.
     for decl in &doc.module.decls {
+        if on_field_token {
+            break;
+        }
         match &decl.node {
             DeclKind::Source { name, ty, .. } if name == word => {
                 let schema = format_schema_from_type(&ty.node);
@@ -292,8 +298,9 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     }
 
     // Sources whose schema declares refined fields: list the refinements so the
-    // user knows which fields will be validated on `set`.
-    if let Some(refinements) = doc.source_refinements.get(word) {
+    // user knows which fields will be validated on `set`. Skip on a record-field
+    // token (same wrong-info reason as the schema section above).
+    if let Some(refinements) = doc.source_refinements.get(word).filter(|_| !on_field_token) {
         if !refinements.is_empty() {
             value.push_str("\n\n**Refinements (validated on write):**");
             for (field, type_name, predicate) in refinements {

@@ -6309,12 +6309,12 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
         }
         Value::Float(f) => {
             // An integral Float must hash identically to the equal Int, since
-            // `values_equal` treats `Int(2) == Float(2.0)`. The condition
-            // `(i as f64) total_cmp f == Equal` exactly mirrors that equality
-            // rule. `-0.0` is canonicalized to `+0.0` by `alloc_float`, so it
-            // hashes as `Int(0)` correctly. Also excludes NaN/±inf.
-            let i = *f as i64;
-            if (i as f64).total_cmp(f) == std::cmp::Ordering::Equal {
+            // `values_equal` treats `Int(2) == Float(2.0)`. `float_as_exact_i64`
+            // is the shared basis for that equality rule (and avoids the 2^63
+            // saturation trap). `-0.0` is canonicalized to `+0.0` by
+            // `alloc_float`, so it hashes as `Int(0)` correctly. NaN/±inf/out-of-
+            // range fall through to the raw-bits branch.
+            if let Some(i) = float_as_exact_i64(*f) {
                 buf.push(0);
                 buf.extend_from_slice(&i.to_le_bytes());
             } else {
@@ -6439,8 +6439,7 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
         // `Float(2^53.0)` yet hash differently. Use the exact-round-trip basis:
         // equal only when the Float is integral, fits i64, and equals the Int.
         (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => {
-            let i = *y as i64;
-            (i as f64).total_cmp(y) == std::cmp::Ordering::Equal && i == *x
+            float_as_exact_i64(*y) == Some(*x)
         }
         (Value::Text(x), Value::Text(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
@@ -6840,6 +6839,25 @@ pub extern "C-unwind" fn knot_value_compare_ord(a: *mut Value, b: *mut Value) ->
     }
 }
 
+/// If `f` is integral and lies in the exact `i64` range, return the equal
+/// `i64`. Returns `None` for non-integral, NaN, ±inf, or out-of-range floats.
+///
+/// This is the single basis for Int↔Float equality/ordering/hashing. A naive
+/// `let i = f as i64; (i as f64).total_cmp(&f) == Equal` is WRONG at the upper
+/// boundary: `2^63` casts (saturating) to `i64::MAX`, and `i64::MAX as f64`
+/// rounds back up to `2^63`, so the round-trip spuriously reports equality and
+/// `Int(i64::MAX)` compares/hashes equal to `Float(2^63)` even though
+/// `i64::MAX == 2^63 - 1 < 2^63`. The explicit range check below avoids that:
+/// `i64::MIN as f64` is exactly `-2^63`, and `f < 2^63` excludes the saturating
+/// boundary. `f.fract() == 0.0` is false for NaN/±inf. `-0.0` maps to `0`.
+fn float_as_exact_i64(f: f64) -> Option<i64> {
+    if f.fract() == 0.0 && f >= i64::MIN as f64 && f < 9_223_372_036_854_775_808.0 {
+        Some(f as i64)
+    } else {
+        None
+    }
+}
+
 /// Compare an `i64` with an `f64` without precision loss for large integers.
 /// Returns `Equal` only when the float is integral, fits in `i64`, and equals the int —
 /// consistent with `values_equal`'s round-trip check.
@@ -6849,36 +6867,27 @@ fn cmp_int_float(x: i64, y: f64) -> std::cmp::Ordering {
         return Ordering::Equal;
     }
     // If y is integral and fits in i64, compare exactly as integers.
-    let yi = y as i64;
-    if (yi as f64).total_cmp(&y) == Ordering::Equal {
+    if let Some(yi) = float_as_exact_i64(y) {
         return x.cmp(&yi);
     }
-    // If x fits in f64 without precision loss, compare as f64.
-    let xf = x as f64;
-    if (xf as i64) == x {
-        return xf.total_cmp(&y);
-    }
-    // x doesn't fit f64 (|x| > 2^53) and y is not i64-exact.
-    // Since x is a valid i64, |x| <= i64::MAX. If y is out of i64 range,
-    // the ordering is determined by magnitude alone.
-    if y > (i64::MAX as f64) {
+    // y is non-integral or outside the exact i64 range. If y is out of range,
+    // magnitude alone decides (x is a valid i64, so |x| <= i64::MAX < |y|).
+    if y >= 9_223_372_036_854_775_808.0 {
         return Ordering::Less;
     }
     if y < (i64::MIN as f64) {
         return Ordering::Greater;
     }
     // y is in i64 range but not integral. Use floor for exact comparison:
-    // since y is not integral, y > floor(y) and y < floor(y) + 1.
+    // since y is not integral, floor(y) < y < floor(y) + 1.
     let floor_i = y.floor() as i64;
-    if x < floor_i {
-        return Ordering::Less;
+    if x <= floor_i {
+        // x <= floor(y) < y
+        Ordering::Less
+    } else {
+        // x >= floor(y) + 1 > y
+        Ordering::Greater
     }
-    if x > floor_i {
-        // x >= floor_i + 1 > y (since y < floor(y) + 1 for non-integral y)
-        return Ordering::Greater;
-    }
-    // x == floor(y), and y > floor(y) since y is not integral
-    Ordering::Less
 }
 
 /// Ordering for the primitive types the order-taking builtins can compare
@@ -17350,12 +17359,12 @@ fn serialize_value_for_hash_into(v: *mut Value, buf: &mut Vec<u8>) {
         }
         Value::Float(f) => {
             // An integral Float must hash identically to the equal Int, since
-            // `values_equal` treats `Int(2) == Float(2.0)`. The condition
-            // `(i as f64) total_cmp f == Equal` exactly mirrors that equality
-            // rule. `-0.0` is canonicalized to `+0.0` by `alloc_float`, so it
-            // hashes as `Int(0)` correctly. Also excludes NaN/±inf.
-            let i = *f as i64;
-            if (i as f64).total_cmp(f) == std::cmp::Ordering::Equal {
+            // `values_equal` treats `Int(2) == Float(2.0)`. `float_as_exact_i64`
+            // is the shared basis for that equality rule (and avoids the 2^63
+            // saturation trap). `-0.0` is canonicalized to `+0.0` by
+            // `alloc_float`, so it hashes as `Int(0)` correctly. NaN/±inf/out-of-
+            // range fall through to the raw-bits branch.
+            if let Some(i) = float_as_exact_i64(*f) {
                 buf.push(0);
                 buf.extend_from_slice(&i.to_le_bytes());
             } else {
@@ -17424,6 +17433,10 @@ fn serialize_value_for_hash_into(v: *mut Value, buf: &mut Vec<u8>) {
             buf.push(9);
             buf.extend_from_slice(&(f.source.len() as u32).to_le_bytes());
             buf.extend_from_slice(f.source.as_bytes());
+            // Include the fn pointer (mirroring `value_to_hash_bytes` and
+            // `values_equal`): two functions with identical source/env but
+            // distinct compiled bodies must not collide as equal join keys.
+            buf.extend_from_slice(&(f.fn_ptr as usize).to_le_bytes());
             serialize_value_for_hash_into(f.env, buf);
         }
         Value::IO(fn_ptr, env) => {

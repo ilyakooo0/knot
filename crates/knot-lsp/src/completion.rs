@@ -384,7 +384,24 @@ pub(crate) fn handle_completion(
             start -= 1;
         }
         if start > 0 && (bytes[start - 1] == b'*' || bytes[start - 1] == b'&') {
-            start -= 1;
+            // Only absorb the `*`/`&` into the edit range when it's an actual
+            // source/derived-ref sigil (atom position) — NOT when it's a binary
+            // operator (`n * m`, `a && b`). Mirroring `trigger_is_operator`
+            // above: the byte before the sigil being an expression-ending byte
+            // (or another `&`) means operator position. Absorbing an operator
+            // byte would corrupt the buffer — `n*` accepting `*people` →
+            // `n*people` (`n * people`), `flag &&` accepting `&active` →
+            // `flag &&active` (the derived-ref sigil silently lost).
+            let before_sigil = (start - 1)
+                .checked_sub(1)
+                .and_then(|i| bytes.get(i))
+                .copied();
+            let sigil_is_operator = before_sigil.is_some_and(|b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'_' | b')' | b']' | b'}' | b'"' | b'&')
+            });
+            if !sigil_is_operator {
+                start -= 1;
+            }
         }
         // Extend the end past the caret over the rest of the identifier, so a
         // mid-token completion (`*us|ers`) replaces the whole token rather than

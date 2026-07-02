@@ -4471,7 +4471,7 @@ impl Infer {
                 // refined function parameters encountered inside the value.
                 let source_refined = self.refined_names_in(&target_inner);
                 let prev_suppress =
-                    std::mem::replace(&mut self.suppress_refine_intro, Some(source_refined));
+                    self.suppress_refine_intro.replace(source_refined);
                 self.check_expr(value, &target_inner);
                 self.suppress_refine_intro = prev_suppress;
                 let mut effects = BTreeSet::new();
@@ -4524,7 +4524,7 @@ impl Infer {
                 // function parameters used inside the value.
                 let source_refined = self.refined_names_in(&target_inner);
                 let prev_suppress =
-                    std::mem::replace(&mut self.suppress_refine_intro, Some(source_refined));
+                    self.suppress_refine_intro.replace(source_refined);
                 self.check_expr(value, &target_inner);
                 self.suppress_refine_intro = prev_suppress;
                 let mut effects = BTreeSet::new();

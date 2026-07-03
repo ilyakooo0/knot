@@ -265,6 +265,21 @@ pub(crate) fn handle_completion(
         {
             return None;
         }
+        // On an `import ./…` line the `.` is a path separator, not a field
+        // access: suggest import paths (as the `/` trigger does) rather than
+        // falling through to the all-known-fields fallback, which would pop up
+        // every record field name after `import .`.
+        let line_start = latest_source[..offset].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let line_text = &latest_source[line_start..offset];
+        if line_text.trim_start().starts_with("import ") {
+            if let Some(source_path) = uri_to_path(uri)
+                && let Some(base_dir) = source_path.parent()
+            {
+                let partial = line_text.trim_start().strip_prefix("import ").unwrap_or("");
+                items.extend(complete_import_path(base_dir, partial));
+            }
+            return Some(CompletionResponse::Array(items));
+        }
         // Try to find the expression before the dot and its type. The receiver
         // name comes from `latest_source` (what the user sees); the type lookup
         // uses the analyzed-source offset so it matches `doc.source` span space.

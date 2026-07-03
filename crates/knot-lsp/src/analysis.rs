@@ -519,6 +519,30 @@ pub fn analyze_document(
         // are repopulated on every call from fresh state).
         let pre_inference_len = all_diags.len();
 
+        // Inference/effects/stratify/sql_lint run on `analysis_module` — the
+        // prelude-injected, import-inlined module. Binding spans and diagnostic
+        // labels recorded for prelude and imported decls are byte offsets into
+        // OTHER sources; treating them as offsets into this document produces
+        // ghost inlay hints, wrong hover types, and — for diagnostics —
+        // phantom errors that relocate to 0:0 when mapped against this file's
+        // source (and duplicate the real error the importee reports for itself).
+        // Keep only entries anchored inside one of the *user's* own decl spans
+        // (`module` is the pre-injection parse of this file). Mirrors
+        // `workspace_diagnostics`' `anchored_in_importer` filter.
+        let user_decl_spans: Vec<Span> = module.decls.iter().map(|d| d.span).collect();
+        let in_user_decl = |s: &Span| {
+            user_decl_spans
+                .iter()
+                .any(|d| d.start <= s.start && s.end <= d.end)
+        };
+        let anchored_in_user = |d: &Diagnostic| -> bool {
+            d.labels.iter().any(|l| {
+                user_decl_spans
+                    .iter()
+                    .any(|u| u.start <= l.span.start && l.span.end <= u.end)
+            })
+        };
+
         let (
             infer_diags,
             mi,
@@ -529,26 +553,13 @@ pub fn analyze_document(
             _from_json,
             _elem_pushdown,
         ) = knot_compiler::infer::check(&analysis_module);
-        all_diags.extend(infer_diags);
+        all_diags.extend(infer_diags.into_iter().filter(anchored_in_user));
         type_info = inferred_types;
         local_type_info = local_types;
         refined_types = refined_type_info;
         refine_targets = rt;
         monad_info = mi;
 
-        // Inference ran on `analysis_module` — the prelude-injected,
-        // import-inlined module. Binding spans recorded for prelude and
-        // imported decls are byte offsets into OTHER sources; treating them
-        // as offsets into this document produces ghost inlay hints and wrong
-        // hover types at unrelated positions (comments, mid-token, …).
-        // Keep only span-keyed entries that fall inside one of the *user's*
-        // own decl spans (`module` is the pre-injection parse of this file).
-        let user_decl_spans: Vec<Span> = module.decls.iter().map(|d| d.span).collect();
-        let in_user_decl = |s: &Span| {
-            user_decl_spans
-                .iter()
-                .any(|d| d.start <= s.start && s.end <= d.end)
-        };
         local_type_info.retain(|s, _| in_user_decl(s));
         refine_targets.retain(|s, _| in_user_decl(s));
         monad_info.retain(|s, _| in_user_decl(s));
@@ -565,7 +576,7 @@ pub fn analyze_document(
 
         let (effect_diags, effects) =
             knot_compiler::effects::check_with_effects(&analysis_module);
-        all_diags.extend(effect_diags);
+        all_diags.extend(effect_diags.into_iter().filter(anchored_in_user));
         for (name, eff) in &effects {
             if !eff.is_pure() {
                 effect_info.insert(name.clone(), format!("{eff}"));
@@ -573,7 +584,11 @@ pub fn analyze_document(
             effect_sets.insert(name.clone(), eff.clone());
         }
 
-        all_diags.extend(knot_compiler::stratify::check(&analysis_module));
+        all_diags.extend(
+            knot_compiler::stratify::check(&analysis_module)
+                .into_iter()
+                .filter(anchored_in_user),
+        );
 
         // Unused-definition warnings: run on the user's pre-prelude decls so
         // we don't flag prelude/imported names. Cached as part of
@@ -584,7 +599,11 @@ pub fn analyze_document(
         let type_env = knot_compiler::types::TypeEnv::from_module(&analysis_module);
         source_refinements = type_env.source_refinements.clone();
 
-        all_diags.extend(knot_compiler::sql_lint::check(&analysis_module, &type_env));
+        all_diags.extend(
+            knot_compiler::sql_lint::check(&analysis_module, &type_env)
+                .into_iter()
+                .filter(anchored_in_user),
+        );
 
         // Stash the inferred outputs for the next analysis of this same
         // (path, content_hash) pair. Eviction is bounded — if we're at the

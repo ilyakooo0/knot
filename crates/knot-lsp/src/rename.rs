@@ -653,6 +653,37 @@ fn scan_workspace_files(
     scanned
 }
 
+/// Trait names whose `impl … <method> =` definition tokens should be rewritten
+/// when renaming a trait method. Impl-method name tokens aren't linked to the
+/// trait method in `references`/`resolve_definitions`, so a trait-method rename
+/// has to find them structurally — but *only* when the rename actually targets
+/// a trait method. `owner_name_span` is the rename target's resolved name-token
+/// span; a trait's method qualifies only when its own declaration token is
+/// exactly that span. Returns empty when the rename targets something else that
+/// merely shares the name — a local binding, a top-level function, or a method
+/// of a *different* trait — so those impls are left untouched.
+fn traits_declaring_renamed_method(
+    decls: &[ast::Decl],
+    method: &str,
+    owner_name_span: Span,
+) -> HashSet<String> {
+    decls
+        .iter()
+        .filter_map(|d| match &d.node {
+            DeclKind::Trait { name, items, .. }
+                if items.iter().any(|it| {
+                    matches!(it,
+                        ast::TraitItem::Method { name: m, name_span, .. }
+                            if m == method && *name_span == owner_name_span)
+                }) =>
+            {
+                Some(name.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Apply rename edits to a single open document. The owner-file branch uses
 /// the AST-derived `references` to find usages; the importer-file branch
 /// walks the AST directly because imported-symbol uses don't appear in
@@ -696,18 +727,20 @@ fn emit_edits_for_open_doc(
         }
         // Impl-method definition tokens don't appear in `doc.references`
         // (defs.rs never links them to the trait method), so a same-file
-        // trait-method rename would leave `impl … method =` stale. When this
-        // module declares `old_name` as a trait method, rename every impl
-        // method of that name here too. (Other files are handled by the
-        // importer path via `collect_name_uses_in_decl`.)
-        let renames_trait_method = doc.module.decls.iter().any(|d| {
-            matches!(&d.node, DeclKind::Trait { items, .. }
-                if items.iter().any(|it| matches!(
-                    it, ast::TraitItem::Method { name: m, .. } if m == old_name)))
-        });
-        if renames_trait_method {
+        // trait-method rename would leave `impl … method =` stale. When the
+        // rename actually targets a trait method (its declaration token is
+        // `name_span`), rename every impl method of that name — but only for
+        // impls of the owning trait(s), so an unrelated same-named symbol or a
+        // method of a different trait isn't corrupted. (Other files are handled
+        // by the importer path via `collect_name_uses_in_decl`.)
+        let target_traits =
+            traits_declaring_renamed_method(&doc.module.decls, old_name, name_span);
+        if !target_traits.is_empty() {
             for decl in &doc.module.decls {
-                if let DeclKind::Impl { items, .. } = &decl.node {
+                if let DeclKind::Impl { trait_name, items, .. } = &decl.node {
+                    if !target_traits.contains(trait_name) {
+                        continue;
+                    }
                     for item in items {
                         if let ast::ImplItem::Method { name: m, name_span, .. } = item
                             && m == old_name
@@ -1382,20 +1415,25 @@ fn apply_owner_disk_edits(
         }
     }
     // Impl-method definition tokens are not linked to the trait method in
-    // `resolve_definitions`, so — exactly as the open-doc owner path does at
-    // the top of `build_changes` — when this (disk) owner module declares
-    // `old_name` as a trait method, rename every `impl … <old_name> =` method
-    // token too. Without this, renaming a trait method from an importer's call
-    // site left every impl in an *unopened* owner file stale, producing broken
-    // code.
-    let renames_trait_method = module.decls.iter().any(|d| {
-        matches!(&d.node, DeclKind::Trait { items, .. }
-            if items.iter().any(|it| matches!(
-                it, ast::TraitItem::Method { name: m, .. } if m == old_name)))
-    });
-    if renames_trait_method {
+    // `resolve_definitions`, so — exactly as the open-doc owner path does — when
+    // this (disk) owner module's rename targets a trait method, rename every
+    // `impl … <old_name> =` token for impls of the owning trait(s). Without this,
+    // renaming a trait method from an importer's call site left every impl in an
+    // *unopened* owner file stale. The target trait method is identified by the
+    // resolved definition span of `old_name` (`resolve_definitions` records each
+    // trait method at its own name token), so renaming an unrelated same-named
+    // symbol — or a method of a *different* trait — doesn't touch these impls.
+    let owner_name_span = defs
+        .get(old_name)
+        .map(|decl_span| name_span_within(source, *decl_span, old_name).unwrap_or(*decl_span))
+        .unwrap_or(owner.name_span);
+    let target_traits = traits_declaring_renamed_method(&module.decls, old_name, owner_name_span);
+    if !target_traits.is_empty() {
         for decl in &module.decls {
-            if let DeclKind::Impl { items, .. } = &decl.node {
+            if let DeclKind::Impl { trait_name, items, .. } = &decl.node {
+                if !target_traits.contains(trait_name) {
+                    continue;
+                }
                 for item in items {
                     if let ast::ImplItem::Method { name: m, name_span, .. } = item
                         && m == old_name
@@ -1409,7 +1447,6 @@ fn apply_owner_disk_edits(
             }
         }
     }
-    let _ = owner;
 }
 
 // Each argument carries distinct rename context (uri, module, source, paths,
@@ -1488,6 +1525,7 @@ pub(crate) fn imports_name_from_other_module(
     for imp in &module.imports {
         // Does this import surface `name`? Wildcards surface everything;
         // selective imports must list it explicitly.
+        let is_wildcard = imp.items.is_none();
         let surfaces = match &imp.items {
             Some(items) => items.iter().any(|i| i.name == name),
             None => true,
@@ -1499,11 +1537,34 @@ pub(crate) fn imports_name_from_other_module(
         let abs = base_dir.join(&rel);
         match abs.canonicalize() {
             Ok(p) if p == owner_path => {} // the owner import itself — expected
-            Ok(_) => return true,          // a different module also exports `name`
-            Err(_) => return true,         // can't prove it's the owner — be safe
+            Ok(p) => {
+                // A selective import that lists `name` is a definite other
+                // source. A *wildcard* import surfaces `name` only if the module
+                // actually exports it — otherwise the file has no competing
+                // `name` and must still be rewritten, so don't skip it. (Bailing
+                // for every wildcard import of any unrelated module left the
+                // owner's definition renamed but importer uses dangling.)
+                if !is_wildcard || module_at_path_defines(&p, name) {
+                    return true;
+                }
+            }
+            Err(_) => return true, // can't prove it's the owner — be safe
         }
     }
     false
+}
+
+/// Parse the module at `path` from disk and report whether it defines `name`
+/// as a top-level export. Used to decide whether a wildcard import genuinely
+/// surfaces `name`. On any read/parse failure returns `true` conservatively —
+/// treat it as a potential other source rather than risk a bad rewrite.
+fn module_at_path_defines(path: &Path, name: &str) -> bool {
+    let Ok(source) = std::fs::read_to_string(path) else {
+        return true;
+    };
+    let (tokens, _) = knot::lexer::Lexer::new(&source).tokenize();
+    let (module, _) = knot::parser::Parser::new(source, tokens).parse_module();
+    module_defines_name(&module, name)
 }
 
 /// Quick check: does `module` import `owner_path` and does that import surface
@@ -2125,6 +2186,48 @@ mod tests {
                 .iter()
                 .any(|e| e.range.start == impl_pos && e.new_text.contains("render")),
             "impl method `present =` must be renamed; edits: {edits:?}"
+        );
+    }
+
+    #[test]
+    fn rename_local_does_not_touch_impl_method_of_same_name() {
+        // Regression: the trait-method impl rewrite fired for *any* symbol that
+        // merely shared a trait method's name. Renaming a local binding named
+        // like a trait method must not rewrite the unrelated `impl … method =`
+        // token (nor the trait method's own signature).
+        let mut ws = TestWorkspace::new();
+        let src = "trait Show a where\n  present : a -> Text\ndata Foo = Foo {}\nimpl Show Foo where\n  present = \\x -> \"foo\"\nf = \\present -> present\n";
+        let uri = ws.open("main", src);
+        let doc = ws.doc(&uri);
+        // Rename the local `present` from its usage in `f`'s body.
+        let off = doc.source.find("-> present").expect("local usage") + 3;
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "p"))
+            .expect("rename produces edits");
+        let mut changes = edit.changes.expect("changes present");
+        let edits = changes.remove(&uri).expect("file has edits");
+
+        // Sanity: the local usage itself was renamed (test isn't vacuous).
+        let usage_pos = offset_to_position(&doc.source, off);
+        assert!(
+            edits
+                .iter()
+                .any(|e| e.range.start == usage_pos && e.new_text.contains('p')),
+            "local usage must be renamed; edits: {edits:?}"
+        );
+        // The unrelated impl method definition token must NOT be renamed.
+        let impl_off = doc.source.find("present = ").expect("impl method def");
+        let impl_pos = offset_to_position(&doc.source, impl_off);
+        assert!(
+            edits.iter().all(|e| e.range.start != impl_pos),
+            "unrelated impl method `present =` must not be renamed; edits: {edits:?}"
+        );
+        // The trait method's signature token must also be untouched.
+        let trait_off = doc.source.find("present :").expect("trait method decl");
+        let trait_pos = offset_to_position(&doc.source, trait_off);
+        assert!(
+            edits.iter().all(|e| e.range.start != trait_pos),
+            "unrelated trait method decl must not be renamed; edits: {edits:?}"
         );
     }
 

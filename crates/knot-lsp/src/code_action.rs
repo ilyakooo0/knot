@@ -2275,11 +2275,15 @@ fn build_deriving_action(
     // a duplicate `deriving` and a parse error. Then remove the impl decl.
 
     // Compute the impl removal range — include the trailing newline so we
-    // don't leave a blank gap behind.
-    let impl_line_end = doc.source[impl_decl.span.end..]
+    // don't leave a blank gap behind. Decl spans include the trailing-newline
+    // run, so scan from the trimmed text end (`decl_text_end`); scanning from
+    // the raw `span.end` would land on the *next* declaration's newline and
+    // delete that whole line too.
+    let impl_text_end = decl_text_end(&doc.source, impl_decl.span);
+    let impl_line_end = doc.source[impl_text_end..]
         .find('\n')
-        .map(|p| impl_decl.span.end + p + 1)
-        .unwrap_or(impl_decl.span.end);
+        .map(|p| impl_text_end + p + 1)
+        .unwrap_or(impl_text_end);
     let impl_line_start = doc.source[..impl_decl.span.start]
         .rfind('\n')
         .map(|p| p + 1)

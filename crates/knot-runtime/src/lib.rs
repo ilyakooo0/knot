@@ -13095,13 +13095,29 @@ pub extern "C-unwind" fn knot_source_delete_where(
             qt, where_clause
         );
         debug_sql(&id_sql);
-        if let Ok(mut stmt) = db_ref.conn.prepare(&id_sql) {
-            let ids: Vec<i64> = stmt
-                .query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))
-                .into_iter()
-                .flatten()
-                .filter_map(|r| r.ok())
-                .collect();
+        {
+            // Collect the _ids of parent rows that will be deleted. A failure
+            // here must NOT silently skip the cascade: the parent DELETE below
+            // still runs, so orphaned child rows would be left with a dangling
+            // _parent_id. Roll back and surface the error, matching the cascade
+            // DELETE and parent DELETE error paths. (The previous `if let Ok`
+            // swallowed a prepare failure, and `filter_map(|r| r.ok())` dropped
+            // per-row errors, both of which produced an empty `ids` and a
+            // partial cascade.)
+            let ids: Vec<i64> = match (|| -> rusqlite::Result<Vec<i64>> {
+                let mut stmt = db_ref.conn.prepare(&id_sql)?;
+                let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))?;
+                rows.collect()
+            })() {
+                Ok(ids) => ids,
+                Err(e) => {
+                    rollback_delete_where(db_ref);
+                    panic!(
+                        "knot runtime: delete_where cascade error: {}\n  SQL: {}",
+                        e, id_sql
+                    );
+                }
+            };
             if !ids.is_empty() {
                 for ct in &descendant_tables {
                     let parent_table = &parent_of[ct];
@@ -15307,15 +15323,27 @@ fn value_to_serde_json_impl(v: *mut Value, wire: bool) -> serde_json::Value {
     match unsafe { as_ref(v) } {
         Value::Int(n) => serde_json::Value::Number((*n).into()),
         Value::Float(n) => {
-            // JSON has no representation for NaN/±Infinity. Encode them as
-            // `null` (matching JS `JSON.stringify`) rather than panicking:
-            // this serializer runs on the HTTP success-response path *outside*
-            // the handler's `catch_unwind`, so a panic here would crash the
-            // worker thread and drop the connection with no response.
             if n.is_finite() {
                 serde_json::json!(*n)
-            } else {
+            } else if wire {
+                // JSON has no representation for NaN/±Infinity. On the HTTP wire
+                // path encode them as `null` (matching JS `JSON.stringify`)
+                // rather than panicking: this serializer runs on the success-
+                // response path *outside* the handler's `catch_unwind`, so a
+                // panic here would crash the worker thread and drop the
+                // connection with no response.
                 serde_json::Value::Null
+            } else {
+                // Storage path (`value_to_json_db`): a non-finite Float in a
+                // JSON column would round-trip Float → null → Unit on read,
+                // silently changing the value *and* its type. Panic to protect
+                // the round-trip, matching `float_to_sqlite_real`'s guard for
+                // scalar columns.
+                panic!(
+                    "knot runtime: cannot store non-finite Float ({}) in a JSON \
+                     column — it would round-trip to Unit, breaking round-trips",
+                    n
+                );
             }
         }
         Value::Text(s) => serde_json::Value::String((**s).to_string()),
@@ -16197,8 +16225,37 @@ fn http_serve_loop(
                         let body_val = body_val_opt.unwrap();
                         let has_resp_headers = !entry_response_headers.is_empty();
                         if has_resp_headers {
-                            let body_field = knot_record_field(body_val, b"body".as_ptr(), 4);
-                            let hdrs_val = knot_record_field(body_val, b"headers".as_ptr(), 7);
+                            // The `{body, headers}` shape is guaranteed by the
+                            // type checker, but these field reads run OUTSIDE the
+                            // worker's catch_unwind; a shape mismatch would panic
+                            // `knot_record_field`, killing the thread and leaking
+                            // the db connection + handler with no response. Guard
+                            // them so a mismatch becomes a clean 500 with cleanup.
+                            let (body_field, hdrs_val) = match std::panic::catch_unwind(
+                                std::panic::AssertUnwindSafe(|| {
+                                    (
+                                        knot_record_field(body_val, b"body".as_ptr(), 4),
+                                        knot_record_field(body_val, b"headers".as_ptr(), 7),
+                                    )
+                                }),
+                            ) {
+                                Ok(pair) => pair,
+                                Err(_) => {
+                                    log_error!("[HTTP] panic extracting response body/headers");
+                                    let body = "{\"error\":\"internal server error\"}".to_string();
+                                    let response = tiny_http::Response::from_string(&body)
+                                        .with_status_code(500)
+                                        .with_header(
+                                            "Content-Type: application/json"
+                                                .parse::<tiny_http::Header>()
+                                                .unwrap(),
+                                        );
+                                    let _ = request.respond(response);
+                                    knot_db_close(db);
+                                    unsafe { deep_drop_value(handler); }
+                                    return;
+                                }
+                            };
                             let json = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 json_encode_value(db, body_field)
                             })) {

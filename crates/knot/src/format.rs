@@ -336,7 +336,27 @@ fn has_blank_lines_between(source: &str, from: usize, to: usize) -> bool {
     if from >= to || to > source.len() {
         return false;
     }
-    source[from..to].bytes().filter(|&b| b == b'\n').count() >= 2
+    // Count line-break events, treating `\n`, a lone `\r`, and `\r\n` each as a
+    // single break — mirroring `line_of`/`diagnostic::line_col`. Counting only
+    // `\n` would miss a blank line in a lone-CR (classic-Mac) file, where a
+    // blank line is `\r\r` and contains no `\n`, silently collapsing it.
+    let bytes = source.as_bytes();
+    let mut breaks = 0usize;
+    let mut i = from;
+    while i < to {
+        match bytes[i] {
+            b'\n' => {
+                breaks += 1;
+                i += 1;
+            }
+            b'\r' => {
+                breaks += 1;
+                i += if bytes.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+            }
+            _ => i += 1,
+        }
+    }
+    breaks >= 2
 }
 
 // ── Comment extraction ─────────────────────────────────────────────

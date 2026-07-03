@@ -182,6 +182,21 @@ pub(crate) fn handle_goto_type_definition(
 
 // ── Go to implementation ─────────────────────────────────────────────
 
+/// The head type constructor name of a type, peeling type application, unit
+/// annotations, and refinements — `Foo` → `Foo`, `Maybe a` → `Maybe`,
+/// `Int<Usd>` → `Int`. `None` for types with no named head (vars, records,
+/// functions, `[]`, …). Used to match `impl Trait <Type>` args to a type name.
+fn type_head_name(ty: &ast::Type) -> Option<&str> {
+    match &ty.node {
+        ast::TypeKind::Named(n) => Some(n.as_str()),
+        ast::TypeKind::App { func, .. } => type_head_name(func),
+        ast::TypeKind::UnitAnnotated { base, .. } | ast::TypeKind::Refined { base, .. } => {
+            type_head_name(base)
+        }
+        _ => None,
+    }
+}
+
 /// Resolve `textDocument/implementation`:
 /// - On a trait name: jump to all `impl Trait ...` blocks across the workspace.
 /// - On a trait method name: jump to each impl's version of that method.
@@ -213,18 +228,34 @@ pub(crate) fn handle_goto_implementation(
     // the file holding the `impl` block rarely declares the trait itself.
     let mut is_trait_name = false;
     let mut is_method_name = false;
+    // Whether `word` names a data type or type alias — for "on a type name, list
+    // all impls" navigation.
+    let mut is_type_name = false;
+    // Traits that declare `word` as a method. Impl-method navigation is
+    // restricted to impls of these traits so a method of an unrelated trait
+    // that happens to share the name isn't offered.
+    let mut method_traits: HashSet<String> = HashSet::new();
     let mut classify = |module: &Module| {
         for d in &module.decls {
-            if let DeclKind::Trait { name, items, .. } = &d.node {
-                if name == word {
-                    is_trait_name = true;
+            match &d.node {
+                DeclKind::Trait { name, items, .. } => {
+                    if name == word {
+                        is_trait_name = true;
+                    }
+                    if items
+                        .iter()
+                        .any(|i| matches!(i, ast::TraitItem::Method { name: m, .. } if m == word))
+                    {
+                        is_method_name = true;
+                        method_traits.insert(name.clone());
+                    }
                 }
-                if items
-                    .iter()
-                    .any(|i| matches!(i, ast::TraitItem::Method { name: m, .. } if m == word))
+                DeclKind::Data { name, .. } | DeclKind::TypeAlias { name, .. }
+                    if name == word =>
                 {
-                    is_method_name = true;
+                    is_type_name = true;
                 }
+                _ => {}
             }
         }
     };
@@ -272,7 +303,7 @@ pub(crate) fn handle_goto_implementation(
          locs: &mut Vec<Location>| {
             for decl in &module.decls {
                 if let DeclKind::Impl {
-                    trait_name, items, ..
+                    trait_name, args, items, ..
                 } = &decl.node
                 {
                     if is_trait_name && trait_name == word {
@@ -280,7 +311,7 @@ pub(crate) fn handle_goto_implementation(
                             uri: module_uri.clone(),
                             range: span_to_range(decl.span, module_source),
                         });
-                    } else if is_method_name {
+                    } else if is_method_name && method_traits.contains(trait_name) {
                         for item in items {
                             if let ast::ImplItem::Method { name, name_span, .. } = item
                                 && name == word {
@@ -293,6 +324,16 @@ pub(crate) fn handle_goto_implementation(
                                     });
                                 }
                         }
+                    } else if is_type_name
+                        && args.iter().any(|a| type_head_name(a) == Some(word))
+                    {
+                        // On a type name: list impls implemented *for* that type
+                        // (the type is the head constructor of an impl arg, e.g.
+                        // `impl Show Foo`, `impl Functor (Maybe a)`).
+                        locs.push(Location {
+                            uri: module_uri.clone(),
+                            range: span_to_range(decl.span, module_source),
+                        });
                     }
                 }
             }

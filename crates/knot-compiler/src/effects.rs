@@ -294,8 +294,8 @@ impl EffectChecker {
         // exact same lists. Adding a new effectful builtin should only require
         // editing one file.
         use crate::builtins::{
-            CLOCK_BUILTINS, CONSOLE_BUILTINS, FS_BUILTINS, NETWORK_BUILTINS, PURE_BUILTINS,
-            RANDOM_BUILTINS,
+            BYTES_BUILTINS, CLOCK_BUILTINS, CONSOLE_BUILTINS, FS_BUILTINS, NETWORK_BUILTINS,
+            PURE_BUILTINS, RANDOM_BUILTINS,
         };
 
         let mut console_effect = EffectSet::empty();
@@ -319,6 +319,12 @@ impl EffectChecker {
         insert_many(FS_BUILTINS, fs_effect);
 
         insert_many(PURE_BUILTINS, EffectSet::empty());
+        // Bytes/crypto intrinsics (`hash`, `bytesConcat`, `textToBytes`, …) are
+        // registered directly in `infer.rs`, not as prelude decls, so they
+        // never reach `decl_effects`. They are pure; without this a call to one
+        // inside an `atomic` block is treated as an opaque callee and trips the
+        // "IO effects are not allowed inside atomic blocks" gate.
+        insert_many(BYTES_BUILTINS, EffectSet::empty());
 
         // `race` carries a marker (not a user-declarable effect) so the
         // atomic gate catches it through helper functions — the syntactic

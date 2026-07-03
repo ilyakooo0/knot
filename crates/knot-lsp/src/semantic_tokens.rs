@@ -458,6 +458,37 @@ impl<'a> TokenCollector<'a> {
         }
     }
 
+    /// Strip surrounding parentheses (and interior whitespace) from a span.
+    /// The parser folds `( … )` into the wrapped node's span — `(x)` becomes a
+    /// `Var` whose span covers the parens — so leaf tokens must trim them back
+    /// or they'd color the parentheses (and `(r.total)` would miscompute the
+    /// field-name suffix). Sigils (`*`/`&`) are preserved. A no-op for spans
+    /// that aren't parenthesized. Handles nested parens (`((x))`).
+    fn strip_parens(&self, mut span: Span) -> Span {
+        let bytes = self.source.as_bytes();
+        loop {
+            while span.start < span.end
+                && bytes.get(span.start).is_some_and(|b| b.is_ascii_whitespace())
+            {
+                span.start += 1;
+            }
+            while span.end > span.start
+                && bytes.get(span.end - 1).is_some_and(|b| b.is_ascii_whitespace())
+            {
+                span.end -= 1;
+            }
+            if span.end - span.start >= 2
+                && bytes.get(span.start) == Some(&b'(')
+                && bytes.get(span.end - 1) == Some(&b')')
+            {
+                span.start += 1;
+                span.end -= 1;
+            } else {
+                return span;
+            }
+        }
+    }
+
     fn visit_expr(&mut self, expr: &ast::Expr) {
         match &expr.node {
             ast::ExprKind::Var(name) => {
@@ -466,38 +497,42 @@ impl<'a> TokenCollector<'a> {
                 } else {
                     0
                 };
-                self.add(expr.span, TOK_VARIABLE, modifier);
+                self.add(self.strip_parens(expr.span), TOK_VARIABLE, modifier);
             }
             ast::ExprKind::Constructor(_) => {
-                self.add(expr.span, TOK_ENUM_MEMBER, 0);
+                self.add(self.strip_parens(expr.span), TOK_ENUM_MEMBER, 0);
             }
             ast::ExprKind::SourceRef(_) => {
-                self.add(expr.span, TOK_NAMESPACE, 0);
+                self.add(self.strip_parens(expr.span), TOK_NAMESPACE, 0);
             }
             ast::ExprKind::DerivedRef(_) => {
-                self.add(expr.span, TOK_NAMESPACE, MOD_READONLY);
+                self.add(self.strip_parens(expr.span), TOK_NAMESPACE, MOD_READONLY);
             }
             ast::ExprKind::FieldAccess { expr: inner, field } => {
                 self.visit_expr(inner);
-                // Field name span: the part after the `.`. Guard the subtraction
-                // against underflow and confirm the suffix actually spells the
-                // field, mirroring rename.rs/linked_editing.rs — a stale or
-                // malformed span with `end < field.len()` would otherwise panic
-                // (debug) or wrap to a bogus span (release).
-                if expr.span.end >= field.len() {
-                    let field_start = expr.span.end - field.len();
-                    if field_start < expr.span.end
-                        && self.source.get(field_start..expr.span.end) == Some(field.as_str())
+                // Field name span: the part after the `.`. A parenthesized field
+                // access (`(r.total)`) widens `expr.span` to include the `)`, so
+                // strip parens first, then take the field as the suffix of the
+                // trimmed end. Guard the subtraction against underflow and
+                // confirm the suffix actually spells the field, mirroring
+                // rename.rs/linked_editing.rs — a stale or malformed span with
+                // `end < field.len()` would otherwise panic (debug) or wrap to a
+                // bogus span (release).
+                let field_end = self.strip_parens(expr.span).end;
+                if field_end >= field.len() {
+                    let field_start = field_end - field.len();
+                    if field_start < field_end
+                        && self.source.get(field_start..field_end) == Some(field.as_str())
                     {
-                        self.add(Span::new(field_start, expr.span.end), TOK_PROPERTY, 0);
+                        self.add(Span::new(field_start, field_end), TOK_PROPERTY, 0);
                     }
                 }
             }
             ast::ExprKind::Lit(ast::Literal::Int(_) | ast::Literal::Float(_)) => {
-                self.add(expr.span, TOK_NUMBER, 0);
+                self.add(self.strip_parens(expr.span), TOK_NUMBER, 0);
             }
             ast::ExprKind::Lit(ast::Literal::Text(_)) => {
-                self.add(expr.span, TOK_STRING, 0);
+                self.add(self.strip_parens(expr.span), TOK_STRING, 0);
             }
             ast::ExprKind::Lambda { params, body } => {
                 for p in params {

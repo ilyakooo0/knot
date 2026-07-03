@@ -6916,7 +6916,17 @@ fn float_as_exact_i64(f: f64) -> Option<i64> {
 fn cmp_int_float(x: i64, y: f64) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     if y.is_nan() {
-        return Ordering::Equal;
+        // Match `f64::total_cmp` used for Float↔Float: a positive NaN is the
+        // greatest value and a negative NaN the least. Returning `Equal`
+        // here (as the code historically did) would make both `le` and `ge`
+        // true — i.e. the int "equals" NaN for ordering — which contradicts
+        // `values_equal` (Int never equals NaN) and `total_cmp`. The int's
+        // exact magnitude is irrelevant because NaN sits at an extreme.
+        return if y.is_sign_negative() {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        };
     }
     // If y is integral and fits in i64, compare exactly as integers.
     if let Some(yi) = float_as_exact_i64(y) {
@@ -7655,6 +7665,21 @@ pub extern "C-unwind" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
             let _counter = ForkCounter;
 
             let io = cloned_io as *mut u8 as *mut Value;
+            // Guard the deep-cloned IO tree from the moment this thread owns
+            // it. `knot_db_open` below can panic (`.expect` on open/collation/
+            // pragma failures); without this guard the panic would unwind past
+            // the CleanupGuard installation below and leak the entire IO
+            // subtree (and every value it references). On the happy path the
+            // guard is `forget`ten once CleanupGuard takes ownership, so there
+            // is no double-free.
+            struct IoDropGuard(*mut Value);
+            impl Drop for IoDropGuard {
+                fn drop(&mut self) {
+                    unsafe { deep_drop_value(self.0); }
+                }
+            }
+            let io_guard = IoDropGuard(io);
+
             // Open a new DB connection for this thread
             let db_path = DB_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let db = knot_db_open(db_path.as_ptr(), db_path.len());
@@ -7671,6 +7696,9 @@ pub extern "C-unwind" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
                 }
             }
             let _guard = CleanupGuard { db, io };
+            // CleanupGuard now owns `io`; release the early-panic guard so it
+            // is not freed a second time when this scope ends.
+            std::mem::forget(io_guard);
 
             // Run the IO action under catch_unwind so a panicking body (e.g.
             // inside an `atomic` block, which holds the global write lock
@@ -7790,6 +7818,18 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
                 CANCEL_FLAG.with(|c| *c.borrow_mut() = Some(my_cancel.clone()));
 
                 let io = io_raw as *mut u8 as *mut Value;
+                // Guard the deep-cloned IO tree before knot_db_open, which can
+                // panic (`.expect` on open/pragma failures) and unwind past
+                // the CleanupGuard below — without this the whole IO subtree
+                // leaks. `forget`ten once CleanupGuard takes ownership.
+                struct IoDropGuard(*mut Value);
+                impl Drop for IoDropGuard {
+                    fn drop(&mut self) {
+                        unsafe { deep_drop_value(self.0); }
+                    }
+                }
+                let io_guard = IoDropGuard(io);
+
                 let db_path = DB_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let db = knot_db_open(db_path.as_ptr(), db_path.len());
 
@@ -7805,6 +7845,10 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
                     }
                 }
                 let _guard = CleanupGuard { db, io };
+                // CleanupGuard now owns `io`; release the early-panic guard so
+                // it is not freed a second time when this scope ends.
+                std::mem::forget(io_guard);
+
 
                 // Run the user IO under catch_unwind: a panicking side must
                 // record a loss instead of silently unwinding — otherwise two
@@ -15354,6 +15398,18 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
         let b1 = chunk[1] as u32;
         let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
         let b3 = if chunk.len() > 3 { chunk[3] as u32 } else { 0 };
+        // RFC 4648: the unused trailing bits of a non-full final group must be
+        // zero. A 2-char group carries 12 bits (1 byte + 4 unused, in the low
+        // nibble of the 2nd char); a 3-char group carries 18 bits (2 bytes + 2
+        // unused, in the low 2 bits of the 3rd char). Accepting non-zero tail
+        // bits would let distinct encodings decode to the same Bytes, breaking
+        // the canonical round-trip that `__knot_bytes` storage relies on.
+        if chunk.len() == 2 && (b1 & 0x0F) != 0 {
+            return None;
+        }
+        if chunk.len() == 3 && (b2 & 0x03) != 0 {
+            return None;
+        }
         let triple = (b0 << 18) | (b1 << 12) | (b2 << 6) | b3;
         out.push(((triple >> 16) & 0xFF) as u8);
         if chunk.len() > 2 { out.push(((triple >> 8) & 0xFF) as u8); }
@@ -20307,6 +20363,20 @@ mod _base64_regress {
     fn rejects_truncated_tail() {
         // A single leftover base64 char encodes only 6 bits — malformed.
         assert_eq!(base64_decode("a"), None);
+    }
+
+    #[test]
+    fn rejects_nonzero_unused_tail_bits() {
+        // RFC 4648 requires the unused trailing bits of a non-full final
+        // group to be zero. `TQ==` is the canonical encoding of 'M' (0x4D):
+        // bits 010011|010000 — the 2nd char's low nibble is zero. `TW==`
+        // (2nd char low nibble = 6) and `TWE=` with a tweaked 3rd char (low 2
+        // bits set) carry non-zero tail bits and must be rejected, otherwise
+        // distinct encodings would decode to the same Bytes.
+        assert_eq!(base64_decode("TQ=="), Some(vec![0x4D]));
+        assert_eq!(base64_decode("TW=="), None); // 2-char group, low nibble != 0
+        assert_eq!(base64_decode("TWE="), Some(vec![0x4D, 0x61]));
+        assert_eq!(base64_decode("TWG="), None); // 3-char group, low 2 bits != 0
     }
 
     #[test]

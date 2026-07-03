@@ -250,6 +250,16 @@ pub struct Codegen {
     // and the `retry` would otherwise leak one frame per retry iteration.
     atomic_arena_frames: usize,
 
+    // Pre-built hash-join index values (`knot_relation_build_index` results)
+    // that are currently live. These are system-heap `Box<HashIndex>`
+    // allocations, NOT arena-managed, so the only reclaim path is an explicit
+    // `knot_relation_index_free`. `compile_do` pushes its indices here after it
+    // pre-builds them and pops them on exit; the `retry` handler reads this
+    // stack and frees every live index before jumping to the atomic retry
+    // block — otherwise each retry iteration leaks one `Box<HashIndex>` per
+    // active join (the normal-exit free loop is bypassed by the retry jump).
+    pending_index_frees: Vec<Value>,
+
     // Refined type predicates: type_name -> predicate AST expression
     refined_types: HashMap<String, knot::ast::Expr>,
     // Source refinements: source_name -> [(field_name_or_none, type_name, predicate_expr)]
@@ -684,36 +694,42 @@ pub fn compile(
     // Validate and store compile-time overrides
     for (name, val) in compile_time_overrides {
         if let Some(ty_str) = cg.overridable_constants.get(name) {
-            let base_type = match ty_str.as_str() {
-                "Int" | "Maybe Int" => "Int",
-                "Float" | "Maybe Float" => "Float",
-                "Text" | "Maybe Text" => "Text",
-                "Bool" | "Maybe Bool" => "Bool",
-                _ => continue,
-            };
-            match base_type {
-                "Int"
-                    if val.parse::<i64>().is_err() => {
-                        cg.diagnostics.push(knot::diagnostic::Diagnostic::error(
-                            format!("invalid compile-time override '{}' for --{} (expected Int)", val, name),
-                        ));
-                        continue;
-                    }
-                "Float"
-                    if val.parse::<f64>().is_err() => {
-                        cg.diagnostics.push(knot::diagnostic::Diagnostic::error(
-                            format!("invalid compile-time override '{}' for --{} (expected Float)", val, name),
-                        ));
-                        continue;
-                    }
-                "Bool"
-                    if !matches!(val.as_str(), "true" | "True" | "false" | "False" | "0" | "1") => {
-                        cg.diagnostics.push(knot::diagnostic::Diagnostic::error(
-                            format!("invalid compile-time override '{}' for --{} (expected true or false)", val, name),
-                        ));
-                        continue;
-                    }
-                _ => {} // Text always valid
+            let is_maybe = ty_str.starts_with("Maybe ");
+            // `Nothing` is a valid override for any Maybe-typed constant
+            // (emitted as the null none-encoding by `emit_override_literal`),
+            // so skip the inner-type parse check for it.
+            if !(is_maybe && val == "Nothing") {
+                let base_type = match ty_str.as_str() {
+                    "Int" | "Maybe Int" => "Int",
+                    "Float" | "Maybe Float" => "Float",
+                    "Text" | "Maybe Text" => "Text",
+                    "Bool" | "Maybe Bool" => "Bool",
+                    _ => continue,
+                };
+                match base_type {
+                    "Int"
+                        if val.parse::<i64>().is_err() => {
+                            cg.diagnostics.push(knot::diagnostic::Diagnostic::error(
+                                format!("invalid compile-time override '{}' for --{} (expected Int)", val, name),
+                            ));
+                            continue;
+                        }
+                    "Float"
+                        if val.parse::<f64>().is_err() => {
+                            cg.diagnostics.push(knot::diagnostic::Diagnostic::error(
+                                format!("invalid compile-time override '{}' for --{} (expected Float)", val, name),
+                            ));
+                            continue;
+                        }
+                    "Bool"
+                        if !matches!(val.as_str(), "true" | "True" | "false" | "False" | "0" | "1") => {
+                            cg.diagnostics.push(knot::diagnostic::Diagnostic::error(
+                                format!("invalid compile-time override '{}' for --{} (expected true or false)", val, name),
+                            ));
+                            continue;
+                        }
+                    _ => {} // Text always valid
+                }
             }
             cg.compile_time_overrides.insert(name.clone(), val.clone());
         } else {
@@ -834,6 +850,7 @@ impl Codegen {
             atomic_retry_block: None,
             io_loop_skip_block: None,
             atomic_arena_frames: 0,
+            pending_index_frees: Vec::new(),
             refined_types: HashMap::new(),
             refine_targets: HashMap::new(),
             refined_predicate_fns: HashMap::new(),
@@ -4043,6 +4060,18 @@ impl Codegen {
                         // leak one frame per retry iteration.
                         for _ in 0..self.atomic_arena_frames {
                             self.call_rt_void(builder, "knot_arena_pop_frame", &[]);
+                        }
+                        // Free every live pre-built hash-join index. These are
+                        // heap `Box<HashIndex>` allocations (not arena-managed),
+                        // so the arena-pop above does not reclaim them, and the
+                        // normal-exit free loop in `compile_do` is unreachable
+                        // from here. Without this each retry iteration leaks one
+                        // box per active join. The stack is left untouched (it
+                        // is balanced by `compile_do`'s own push/pop) — we only
+                        // read it to know which SSA values are live at this site.
+                        let live_indices = self.pending_index_frees.clone();
+                        for idx in live_indices {
+                            self.call_rt_void(builder, "knot_relation_index_free", &[idx]);
                         }
                         // Jump directly to the retry path, short-circuiting
                         // all subsequent code in the atomic body.
@@ -9156,6 +9185,11 @@ impl Codegen {
 
         // ── Pre-build hash join indices before any loops ──────────────
         let mut prebuilt_indices: HashMap<usize, Value> = HashMap::new();
+        // Remember the stack height so this do-block's indices are popped on
+        // every exit path (normal, and the groupBy error bails below). They
+        // are registered on `pending_index_frees` so a `retry` inside the
+        // enclosing `atomic` can free them before re-entering the loop.
+        let index_free_mark = self.pending_index_frees.len();
         for (&stmt_idx, plan) in &hash_join_plans {
             if let ast::StmtKind::Bind { expr, .. } = &stmts[stmt_idx].node {
                 let inner_rel = self.compile_expr(builder, expr, env, db);
@@ -9167,6 +9201,7 @@ impl Codegen {
                     &[inner_rel, field_ptr, field_len],
                 );
                 prebuilt_indices.insert(stmt_idx, idx_val);
+                self.pending_index_frees.push(idx_val);
             }
         }
 
@@ -9602,6 +9637,7 @@ impl Codegen {
                             env.bindings = prev_env_bindings;
                             self.let_bindings = prev_let_bindings;
                             self.source_var_binds = prev_source_var_binds;
+                            self.pending_index_frees.truncate(index_free_mark);
                             self.replay_source_bind_invalidations_since(invalidation_mark);
                             return promoted;
                         }
@@ -9668,6 +9704,7 @@ impl Codegen {
                             env.bindings = prev_env_bindings;
                             self.let_bindings = prev_let_bindings;
                             self.source_var_binds = prev_source_var_binds;
+                            self.pending_index_frees.truncate(index_free_mark);
                             self.replay_source_bind_invalidations_since(invalidation_mark);
                             return promoted;
                         }
@@ -9924,6 +9961,8 @@ impl Codegen {
         for idx_val in prebuilt_indices.values() {
             self.call_rt_void(builder, "knot_relation_index_free", &[*idx_val]);
         }
+        // Drop this do-block's indices from the live-for-retry stack.
+        self.pending_index_frees.truncate(index_free_mark);
 
         // Pop the do-block's frame, deep-cloning `result` into the parent.
         // This frees every per-iteration pinned yield that would otherwise
@@ -10107,7 +10146,12 @@ impl Codegen {
 
     /// Emit a literal value for a compile-time constant override.
     /// Parses `val_str` according to `type_str` and emits the appropriate
-    /// Cranelift IR, wrapping in `Just` for Maybe types.
+    /// Cranelift IR, wrapping in `Just` for Maybe types. A Maybe-typed
+    /// override may also be the literal string `Nothing` (emitted as the null
+    /// pointer the runtime uses for the none variant). Invalid values push a
+    /// clean compile error diagnostic instead of panicking, so a mistyped
+    /// `--flag=...` reports like any other compile error rather than dumping a
+    /// stack trace.
     fn emit_override_literal(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -10115,21 +10159,43 @@ impl Codegen {
         type_str: &str,
     ) -> Value {
         let is_maybe = type_str.starts_with("Maybe ");
+        // `Nothing` for a Maybe-typed constant compiles to the same
+        // `Constructor("Nothing", Unit)` value that a bare `Nothing`
+        // reference produces in user code (nullable pointer encoding is
+        // disabled), so pattern matching and field access behave identically
+        // whether the constant used its default body or this override.
+        if is_maybe && val_str == "Nothing" {
+            let (tag_ptr, tag_len) = self.string_ptr(builder, "Nothing");
+            let unit = self.call_rt(builder, "knot_value_unit", &[]);
+            return self.call_rt(builder, "knot_value_constructor", &[tag_ptr, tag_len, unit]);
+        }
+        // Helper to report a bad override value as a compile error and emit a
+        // harmless unit value so codegen can keep going (the error aborts the
+        // build before linking, via `compile()`'s diagnostics check).
+        let mut bad = |expected: &str| -> Value {
+            self.diagnostics.push(knot::diagnostic::Diagnostic::error(
+                format!(
+                    "override value '{}' is not a valid {} for this constant",
+                    val_str, expected
+                ),
+            ));
+            self.call_rt(builder, "knot_value_unit", &[])
+        };
         let inner = match type_str {
-            "Int" | "Maybe Int" => {
-                let n: i64 = val_str.parse().unwrap_or_else(|e| {
-                    panic!("knot: override value '{}' is not a valid Int: {}", val_str, e)
-                });
-                let n_val = builder.ins().iconst(types::I64, n);
-                self.call_rt(builder, "knot_value_int", &[n_val])
-            }
-            "Float" | "Maybe Float" => {
-                let n: f64 = val_str.parse().unwrap_or_else(|e| {
-                    panic!("knot: override value '{}' is not a valid Float: {}", val_str, e)
-                });
-                let n_val = builder.ins().f64const(n);
-                self.call_rt(builder, "knot_value_float", &[n_val])
-            }
+            "Int" | "Maybe Int" => match val_str.parse::<i64>() {
+                Ok(n) => {
+                    let n_val = builder.ins().iconst(types::I64, n);
+                    self.call_rt(builder, "knot_value_int", &[n_val])
+                }
+                Err(_) => bad("Int"),
+            },
+            "Float" | "Maybe Float" => match val_str.parse::<f64>() {
+                Ok(n) => {
+                    let n_val = builder.ins().f64const(n);
+                    self.call_rt(builder, "knot_value_float", &[n_val])
+                }
+                Err(_) => bad("Float"),
+            },
             "Text" | "Maybe Text" => {
                 let (ptr, len) = self.string_ptr(builder, val_str);
                 let slot = self.text_literal_slot(builder, val_str);
@@ -10137,20 +10203,29 @@ impl Codegen {
             }
             "Bool" | "Maybe Bool" => {
                 // Reject unparseable Bool overrides instead of silently
-                // coercing them to `false` — matching the Int/Float arms, so a
-                // mistyped `--flag=ture` is a clear error, not a wrong value.
-                let b = match val_str {
-                    "true" | "True" | "1" => true,
-                    "false" | "False" | "0" => false,
-                    other => panic!(
-                        "knot: override value '{}' is not a valid Bool (expected true/false)",
-                        other
-                    ),
-                };
-                let val = builder.ins().iconst(types::I32, b as i64);
-                self.call_rt(builder, "knot_value_bool", &[val])
+                // coercing them to `false`, so a mistyped `--flag=ture` is a
+                // clear error, not a wrong value.
+                match val_str {
+                    "true" | "True" | "1" => {
+                        let val = builder.ins().iconst(types::I32, 1);
+                        self.call_rt(builder, "knot_value_bool", &[val])
+                    }
+                    "false" | "False" | "0" => {
+                        let val = builder.ins().iconst(types::I32, 0);
+                        self.call_rt(builder, "knot_value_bool", &[val])
+                    }
+                    _ => bad("Bool (expected true/false)"),
+                }
             }
-            _ => unreachable!(),
+            _ => {
+                self.diagnostics.push(knot::diagnostic::Diagnostic::error(
+                    format!(
+                        "constant of type '{}' cannot be supplied as a compile-time override",
+                        type_str
+                    ),
+                ));
+                self.call_rt(builder, "knot_value_unit", &[])
+            }
         };
         if is_maybe {
             // The runtime's `Maybe` convention is `Just {value: payload}` (see

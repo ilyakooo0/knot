@@ -4175,7 +4175,25 @@ impl Infer {
                 if let Some((data_ty, record_ty)) =
                     self.instantiate_ctor(name, expr.span)
                 {
-                    Ty::Fun(Box::new(record_ty), Box::new(data_ty))
+                    // A bare *nullary* constructor (no fields) denotes its
+                    // value directly: codegen emits the unit constructor
+                    // value (`knot_value_constructor(tag, Unit)`), the Bool
+                    // value for `True`/`False`, or null for a nullable `None`
+                    // — never a function. Typing it as `{} -> T` would let a
+                    // well-typed program treat it as a first-class function
+                    // and then crash at runtime when codegen's value is
+                    // called. Non-nullary constructors must still be applied,
+                    // so they keep the `fields -> T` function type, and the
+                    // ambiguous (multi-ADT) case returns a non-record payload
+                    // so it stays in function form too. The applied form
+                    // `Ctor {fields}` is typed directly in the `App` arm.
+                    let is_nullary_value =
+                        matches!(&record_ty, Ty::Record(fs, None) if fs.is_empty());
+                    if is_nullary_value {
+                        data_ty
+                    } else {
+                        Ty::Fun(Box::new(record_ty), Box::new(data_ty))
+                    }
                 } else {
                     self.error(
                         format!("unknown constructor '{}'", name),
@@ -4293,6 +4311,23 @@ impl Infer {
                 // response type can be resolved from route metadata.
                 if let Some(ty) = self.try_infer_fetch(expr) {
                     return ty;
+                }
+
+                // Constructor application `Ctor {fields}`: type the argument
+                // against the constructor's field record and return the data
+                // type directly. This is required now that bare nullary
+                // constructors are values rather than `{} -> T` functions
+                // (see the `Constructor` arm) — the generic application path
+                // below would otherwise try to unify a value type with
+                // `arg -> result`. Only the unambiguous record-payload case
+                // is handled here; the ambiguous row-polymorphic-variant
+                // constructor falls through to the generic path.
+                if let ast::ExprKind::Constructor(name) = &func.node
+                    && let Some((data_ty, record_ty)) = self.instantiate_ctor(name, func.span)
+                        && matches!(record_ty, Ty::Record(..))
+                {
+                    self.check_expr(arg, &record_ty);
+                    return data_ty;
                 }
 
                 // Let-binding: an immediately-applied single-variable lambda

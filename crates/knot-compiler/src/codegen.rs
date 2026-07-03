@@ -8397,6 +8397,12 @@ impl Codegen {
                         _ => {
                             self.expr_is_known_relation(expr)
                                 || self.expr_is_relation_var(expr)
+                                // A pure comprehension over the relation monad
+                                // is desugared to an `App` of `__bind`/`__yield`
+                                // — recognize it here so `let xs = do { … }`
+                                // (relation-typed) is iterable downstream.
+                                || self.desugared_monad_kind(expr)
+                                    == Some(MonadKind::Relation)
                         }
                     };
                     self.io_relation_vars.retain(|n| !pat_binds(pat, n));
@@ -10129,7 +10135,17 @@ impl Codegen {
                 self.call_rt(builder, "knot_value_text_intern", &[ptr, len, slot])
             }
             "Bool" | "Maybe Bool" => {
-                let b = matches!(val_str, "true" | "True" | "1");
+                // Reject unparseable Bool overrides instead of silently
+                // coercing them to `false` — matching the Int/Float arms, so a
+                // mistyped `--flag=ture` is a clear error, not a wrong value.
+                let b = match val_str {
+                    "true" | "True" | "1" => true,
+                    "false" | "False" | "0" => false,
+                    other => panic!(
+                        "knot: override value '{}' is not a valid Bool (expected true/false)",
+                        other
+                    ),
+                };
                 let val = builder.ins().iconst(types::I32, b as i64);
                 self.call_rt(builder, "knot_value_bool", &[val])
             }
@@ -12126,6 +12142,27 @@ impl Codegen {
             ast::ExprKind::Var(name) => self.io_relation_vars.contains(name),
             _ => false,
         }
+    }
+
+    /// A pure-comprehension do-block is desugared (before codegen) into nested
+    /// `__bind`/`__yield`/`__empty` applications, so by the time codegen sees a
+    /// `let xs = do { r <- rel; ...; yield e }` the RHS is an `App` spine, not
+    /// an `ExprKind::Do`. Inference records the resolved monad kind keyed by the
+    /// head combinator's span (the same key `compile_app` dispatches on). Return
+    /// that kind when `expr` is such a desugared comprehension, so a relation-
+    /// monad comprehension is recognized as relation-valued and a later
+    /// `row <- xs` bind iterates per-row instead of binding the whole relation.
+    fn desugared_monad_kind(&self, expr: &ast::Expr) -> Option<MonadKind> {
+        let mut head = strip_expr_wrappers(expr);
+        while let ast::ExprKind::App { func, .. } = &head.node {
+            head = func.as_ref();
+        }
+        if let ast::ExprKind::Var(name) = &head.node
+            && matches!(name.as_str(), "__bind" | "__yield" | "__empty")
+        {
+            return self.monad_info.get(&head.span).cloned();
+        }
+        None
     }
 
     /// Check if an expression is statically known to produce a relation,

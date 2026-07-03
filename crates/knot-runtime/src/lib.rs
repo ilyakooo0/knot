@@ -5610,6 +5610,36 @@ fn in_memory_dedup(rows: Vec<*mut Value>) -> Vec<*mut Value> {
     })
 }
 
+/// Returns true if `v` contains a non-finite float (NaN/±inf), recursing
+/// through records, constructors, nested relations, and pairs. Non-finite
+/// floats can't round-trip through SQLite: scalar columns go through
+/// `float_to_sqlite_real` (which panics on non-finite) while nested columns
+/// go through the JSON encoder (which lossily maps non-finite to `null`).
+/// Either way the SQL-backed set ops are unsafe/incorrect, so callers scan
+/// their operands and fall back to the in-memory hash path (the same basis
+/// `++`/`knot_value_concat` uses) when a non-finite float is present.
+fn value_contains_nonfinite_float(v: *mut Value) -> bool {
+    if v.is_null() {
+        return false;
+    }
+    match unsafe { as_ref(v) } {
+        Value::Float(f) => !f.is_finite(),
+        Value::Record(fields) => fields.iter().any(|f| value_contains_nonfinite_float(f.value)),
+        Value::Constructor(_, payload) => value_contains_nonfinite_float(*payload),
+        Value::Relation(rows) => rows.iter().any(|r| value_contains_nonfinite_float(*r)),
+        Value::Pair(a, b) => {
+            value_contains_nonfinite_float(*a) || value_contains_nonfinite_float(*b)
+        }
+        _ => false,
+    }
+}
+
+/// True if any value in `rows` contains a non-finite float. See
+/// `value_contains_nonfinite_float`.
+fn rows_contain_nonfinite_float(rows: &[*mut Value]) -> bool {
+    rows.iter().any(|r| value_contains_nonfinite_float(*r))
+}
+
 /// Perform a set operation (UNION/EXCEPT/INTERSECT) using SQLite.
 /// Uses VALUES CTEs for small datasets, falls back to temp tables for large ones.
 fn sql_set_op(
@@ -5620,6 +5650,12 @@ fn sql_set_op(
 ) -> Option<Vec<*mut Value>> {
     if a.is_empty() && b.is_empty() {
         return Some(Vec::new());
+    }
+    // Non-finite floats (NaN/±inf) can't round-trip through SQLite. Bail so the
+    // caller's in-memory hash path runs instead — consistent with `++` and
+    // never panicking.
+    if rows_contain_nonfinite_float(a) || rows_contain_nonfinite_float(b) {
+        return None;
     }
     // Infer schema from both sides combined so ADT unions see all constructors
     let combined: Vec<*mut Value> = a.iter().chain(b.iter()).copied().collect();
@@ -5664,6 +5700,11 @@ fn sql_dedup(conn: &Connection, rows: &[*mut Value]) -> Option<Vec<*mut Value>> 
     if rows.is_empty() {
         return Some(Vec::new());
     }
+    // Non-finite floats can't round-trip through SQLite; defer to the caller's
+    // in-memory dedup (see `value_contains_nonfinite_float`).
+    if rows_contain_nonfinite_float(rows) {
+        return None;
+    }
     let schema = infer_temp_schema(rows)?;
 
     if rows.len().saturating_mul(schema_col_count(&schema)) <= MAX_VALUES_PARAMS {
@@ -5692,6 +5733,11 @@ fn sql_relations_equal(conn: &Connection, a: &[*mut Value], b: &[*mut Value]) ->
     }
     if a.is_empty() || b.is_empty() {
         return Some(false);
+    }
+    // Non-finite floats can't round-trip through SQLite; let the caller fall
+    // back to `values_equal` (see `value_contains_nonfinite_float`).
+    if rows_contain_nonfinite_float(a) || rows_contain_nonfinite_float(b) {
+        return None;
     }
     // Don't short-circuit on a.len() != b.len() — in-memory vectors may contain
     // duplicates, so different lengths don't imply different logical sets.
@@ -16286,6 +16332,28 @@ fn http_serve_loop(
                             if let Value::Record(hdr_fields) = unsafe { as_ref(hdrs_val) } {
                                 for hf in hdr_fields {
                                     let http_name = camel_to_header_case(&hf.name);
+                                    // `tiny_http` special-cases framing/length
+                                    // headers in `add_header`: `Content-Length`
+                                    // would override the body length (truncating
+                                    // the separately-serialized JSON body) and
+                                    // `Connection`/`Transfer-Encoding`/`Trailer`/
+                                    // `Upgrade` control message framing. Emitting
+                                    // a route-declared value for any of these
+                                    // corrupts the response — drop them.
+                                    if matches!(
+                                        http_name.to_ascii_lowercase().as_str(),
+                                        "content-length"
+                                            | "transfer-encoding"
+                                            | "connection"
+                                            | "trailer"
+                                            | "upgrade"
+                                    ) {
+                                        log_warn!(
+                                            "[HTTP] ignoring route-declared response header '{}': reserved framing/length header",
+                                            http_name
+                                        );
+                                        continue;
+                                    }
                                     // This loop runs OUTSIDE the worker's
                                     // catch_unwind — a conversion panic here
                                     // would kill the response path entirely.
@@ -16766,8 +16834,12 @@ pub extern "C-unwind" fn knot_http_fetch_io(
                                 Some(v) => {
                                     let inner = match try_string_to_value(&v, inner_ty) {
                                         Some(inner) => inner,
+                                        // Client-side decode failure on a 2xx
+                                        // response: report status 0 (a sentinel
+                                        // for "not a real HTTP error status")
+                                        // rather than the misleading upstream 2xx.
                                         None => return fetch_build_err(
-                                            status,
+                                            0,
                                             &format!(
                                                 "response header '{}' does not match the declared type",
                                                 http_name
@@ -16789,8 +16861,10 @@ pub extern "C-unwind" fn knot_http_fetch_io(
                             // would silently pass instead of erroring.
                             let v = match raw_val {
                                 Some(v) => v,
+                                // Client-side decode failure on a 2xx response:
+                                // status 0 sentinel, not the upstream 2xx.
                                 None => return fetch_build_err(
-                                    status,
+                                    0,
                                     &format!(
                                         "required response header '{}' is missing",
                                         http_name
@@ -16799,8 +16873,10 @@ pub extern "C-unwind" fn knot_http_fetch_io(
                             };
                             match try_string_to_value(&v, inner_ty) {
                                 Some(val) => val,
+                                // Client-side decode failure on a 2xx response:
+                                // status 0 sentinel, not the upstream 2xx.
                                 None => return fetch_build_err(
-                                    status,
+                                    0,
                                     &format!(
                                         "response header '{}' does not match the declared type",
                                         http_name
@@ -16821,7 +16897,13 @@ pub extern "C-unwind" fn knot_http_fetch_io(
 
                 let body_text = match fetch_read_capped_body(response.body_mut()) {
                     Ok(s) => s,
-                    Err(e) => return fetch_build_err(status, &e),
+                    // For a genuine HTTP error (>= 400) keep the real status; for
+                    // a 2xx this is a client-side decode/cap failure, so report
+                    // the status 0 sentinel rather than the misleading success.
+                    Err(e) => return fetch_build_err(
+                        if status >= 400 { status } else { 0 },
+                        &e,
+                    ),
                 };
 
                 if status >= 400 {
@@ -16843,13 +16925,17 @@ pub extern "C-unwind" fn knot_http_fetch_io(
                                 &resp_schema,
                             ) {
                                 Some(decoded) => decoded,
+                                // Client-side decode failure on a 2xx response:
+                                // status 0 sentinel, not the upstream 2xx.
                                 None => return fetch_build_err(
-                                    status,
+                                    0,
                                     "response body does not match the declared response type",
                                 ),
                             },
+                            // Invalid JSON on a 2xx response is likewise a
+                            // client-side decode failure — status 0 sentinel.
                             Err(e) => return fetch_build_err(
-                                status,
+                                0,
                                 &format!("invalid JSON in response: {}", e),
                             ),
                         }
@@ -17408,6 +17494,10 @@ fn response_type_to_schema(desc: &str) -> String {
     if let Some(inner) = desc.strip_prefix('?') {
         let inner_schema = response_type_to_schema(inner);
         return match inner_schema.strip_prefix('{') {
+            // Inner is already nullable (`??T` = Maybe (Maybe T)) — prepending a
+            // second `"nullable": true` would emit a duplicate JSON object key
+            // that strict OpenAPI validators reject, so keep the inner as-is.
+            Some(rest) if rest.trim_start().starts_with("\"nullable\"") => inner_schema,
             Some(rest) if rest.trim() != "}" => format!("{{ \"nullable\": true,{}", rest),
             _ => "{ \"nullable\": true }".to_string(),
         };

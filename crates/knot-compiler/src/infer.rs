@@ -5182,6 +5182,32 @@ impl Infer {
         ))
     }
 
+    /// Unify two operand types of a *symmetric* context — a binary operator or
+    /// a literal pattern — where relating two existing values must not be
+    /// treated as unsafely *introducing* a refined type. The directional
+    /// refined-introduction guard in `unify_dir` exists for unchecked
+    /// boundaries (function/assignment), where a bare `Int` claiming to be a
+    /// `Nat` would skip the predicate. A binop does no such thing: neither
+    /// operand is coerced into the other's refined type, and any refined result
+    /// is degraded to its base via `degrade_refinement`. Without this, the
+    /// guard fired asymmetrically — `n == 5` compiled but `5 == n` did not,
+    /// depending only on which operand sat on the "required" side.
+    ///
+    /// Only the base↔refined introduction error is suppressed; two *different*
+    /// refined types (`Nat` vs `Pos`) still fail to unify (handled by a
+    /// separate guard in `unify_dir`), preserving nominal refinement.
+    fn unify_symmetric(&mut self, t1: &Ty, t2: &Ty, span: Span) {
+        let mut refined = match &self.suppress_refine_intro {
+            Some(existing) => existing.clone(),
+            None => HashSet::new(),
+        };
+        refined.extend(self.refined_names_in(t1));
+        refined.extend(self.refined_names_in(t2));
+        let prev = self.suppress_refine_intro.replace(refined);
+        self.unify(t1, t2, span);
+        self.suppress_refine_intro = prev;
+    }
+
     fn infer_binop(
         &mut self,
         op: ast::BinOp,
@@ -5197,8 +5223,9 @@ impl Infer {
             ast::BinOp::Add | ast::BinOp::Sub | ast::BinOp::Mod => {
                 let lhs_applied = self.apply(&lhs_ty);
                 let rhs_applied = self.apply(&rhs_ty);
-                // For unit-bearing types, unify normally (which checks unit equality)
-                self.unify(&lhs_applied, &rhs_applied, span);
+                // For unit-bearing types, unify normally (which checks unit
+                // equality). Symmetric so `1 + n` and `n + 1` (n : Nat) agree.
+                self.unify_symmetric(&lhs_applied, &rhs_applied, span);
                 self.require_trait("Num", &lhs_applied, span);
                 // Plain Int/Float are unit-agnostic, so `unitless + unit`
                 // unifies without binding either side. Return the more
@@ -5217,17 +5244,33 @@ impl Infer {
             ast::BinOp::Mul | ast::BinOp::Div => {
                 let lhs_applied = self.apply(&lhs_ty);
                 let rhs_applied = self.apply(&rhs_ty);
+                // Symmetric refined handling: `2 * n` and `n * 2` (n : Nat)
+                // agree; the composed result is degraded to its base anyway.
+                let prev = match &self.suppress_refine_intro {
+                    Some(existing) => {
+                        let mut r = existing.clone();
+                        r.extend(self.refined_names_in(&lhs_applied));
+                        r.extend(self.refined_names_in(&rhs_applied));
+                        self.suppress_refine_intro.replace(r)
+                    }
+                    None => {
+                        let mut r = self.refined_names_in(&lhs_applied);
+                        r.extend(self.refined_names_in(&rhs_applied));
+                        self.suppress_refine_intro.replace(r)
+                    }
+                };
                 let result = self.unit_mul_div_ty(op, &lhs_applied, &rhs_applied, span, true);
+                self.suppress_refine_intro = prev;
                 self.degrade_refinement(result, span)
             }
             // Comparison: both same type, result Bool
             ast::BinOp::Eq | ast::BinOp::Neq => {
-                self.unify(&lhs_ty, &rhs_ty, span);
+                self.unify_symmetric(&lhs_ty, &rhs_ty, span);
                 self.require_trait("Eq", &lhs_ty, span);
                 Ty::Bool
             }
             ast::BinOp::Lt | ast::BinOp::Gt | ast::BinOp::Le | ast::BinOp::Ge => {
-                self.unify(&lhs_ty, &rhs_ty, span);
+                self.unify_symmetric(&lhs_ty, &rhs_ty, span);
                 self.require_trait("Ord", &lhs_ty, span);
                 Ty::Bool
             }
@@ -5239,7 +5282,7 @@ impl Infer {
             }
             // Concat: both same type (Semigroup), result same type
             ast::BinOp::Concat => {
-                self.unify(&lhs_ty, &rhs_ty, span);
+                self.unify_symmetric(&lhs_ty, &rhs_ty, span);
                 self.require_trait("Semigroup", &lhs_ty, span);
                 self.degrade_refinement(lhs_ty, span)
             }
@@ -5560,7 +5603,10 @@ impl Infer {
             }
             ast::PatKind::Lit(lit) => {
                 let lit_ty = self.literal_type(lit);
-                self.unify(&lit_ty, expected, pat.span);
+                // Matching a literal against a refined scrutinee (`case n of 0
+                // -> …`, n : Nat) only tests the value; it introduces nothing,
+                // so use symmetric unification (mirrors binary operators).
+                self.unify_symmetric(&lit_ty, expected, pat.span);
             }
             ast::PatKind::List(pats) => {
                 let elem_ty = self.fresh();
@@ -7542,21 +7588,34 @@ impl Infer {
             ),
         );
 
-        // sum : ∀a b. (a -> b) -> [a] -> b
+        // sum : ∀a b. Num b => (a -> b) -> [a] -> b
+        // The `Num b` bound rejects nonsensical aggregations such as summing a
+        // `Text` projection, which would otherwise type-check and then panic at
+        // runtime ("cannot add Int + Text"). Units/refined aliases resolve to
+        // their base primitive via `type_name_of`, so `Num Int`/`Num Float`
+        // discharge unit- and refinement-typed projections unchanged.
         let a = self.fresh_var();
         let b = self.fresh_var();
         self.bind_top(
             "sum",
-            Scheme::poly(
-                vec![a, b],
-                Ty::Fun(
+            Scheme {
+                vars: vec![a, b],
+                unit_vars: vec![],
+                constraints: vec![TyConstraint {
+                    trait_name: "Num".to_string(),
+                    type_var: b,
+                    span: Span::new(0, 0),
+                }],
+                effect_unions: vec![],
+                unit_binops: vec![],
+                ty: Ty::Fun(
                     Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
                     Box::new(Ty::Fun(
                         Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
                         Box::new(Ty::Var(b)),
                     )),
                 ),
-            ),
+            },
         );
 
         // avg : ∀a u. (a -> Float<u>) -> [a] -> Float<u>
@@ -7583,38 +7642,59 @@ impl Infer {
             );
         }
 
-        // minOn : ∀a b. (a -> b) -> [a] -> b
+        // minOn : ∀a b. Ord b => (a -> b) -> [a] -> b
+        // The `Ord b` bound rejects projecting to an unorderable type (e.g. a
+        // record with no `Ord` impl), which would otherwise type-check and then
+        // fail at runtime. `Ord Int`/`Ord Float`/`Ord Text` (plus `deriving
+        // (Ord)` ADTs) discharge the common cases; units/refined aliases route
+        // to their base primitive via `type_name_of`.
         let a = self.fresh_var();
         let b = self.fresh_var();
         self.bind_top(
             "minOn",
-            Scheme::poly(
-                vec![a, b],
-                Ty::Fun(
+            Scheme {
+                vars: vec![a, b],
+                unit_vars: vec![],
+                constraints: vec![TyConstraint {
+                    trait_name: "Ord".to_string(),
+                    type_var: b,
+                    span: Span::new(0, 0),
+                }],
+                effect_unions: vec![],
+                unit_binops: vec![],
+                ty: Ty::Fun(
                     Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
                     Box::new(Ty::Fun(
                         Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
                         Box::new(Ty::Var(b)),
                     )),
                 ),
-            ),
+            },
         );
 
-        // maxOn : ∀a b. (a -> b) -> [a] -> b
+        // maxOn : ∀a b. Ord b => (a -> b) -> [a] -> b  (see `minOn`)
         let a = self.fresh_var();
         let b = self.fresh_var();
         self.bind_top(
             "maxOn",
-            Scheme::poly(
-                vec![a, b],
-                Ty::Fun(
+            Scheme {
+                vars: vec![a, b],
+                unit_vars: vec![],
+                constraints: vec![TyConstraint {
+                    trait_name: "Ord".to_string(),
+                    type_var: b,
+                    span: Span::new(0, 0),
+                }],
+                effect_unions: vec![],
+                unit_binops: vec![],
+                ty: Ty::Fun(
                     Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
                     Box::new(Ty::Fun(
                         Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
                         Box::new(Ty::Var(b)),
                     )),
                 ),
-            ),
+            },
         );
 
         // match : ∀a b. (a -> b) -> [b] -> [a]

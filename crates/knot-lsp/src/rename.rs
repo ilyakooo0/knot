@@ -207,18 +207,26 @@ pub(crate) fn handle_rename(
     // the owner is that imported file's decl, not this file.
     let owner = resolve_canonical_owner(state, uri, doc, offset, &old_name)?;
 
+    // If the rename targets a trait method, compute the set of traits (from the
+    // owner module) that declare it. The shared cross-file oracle uses this to
+    // confine impl-method edits to the target method's own trait(s); an empty
+    // set means "not a trait method" and no impl tokens are rewritten.
+    let target_traits =
+        owner_trait_method_scope(state, &owner.canonical_path, owner.name_span, &old_name);
+
     let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
 
     // Phase 2: visit every file in the workspace and emit edits if it
     // either owns the symbol or imports it from the owner. Open files use
     // the cached `DocumentState`; closed files are read off disk.
-    let scanned = scan_workspace_files(state, &owner, &old_name, new_name, &mut changes);
+    let scanned =
+        scan_workspace_files(state, &owner, &old_name, new_name, &target_traits, &mut changes);
 
     // Phase 3: scan unopened workspace files for references via on-disk
     // parse. We narrow by the reverse-import graph when possible — most
     // files don't reach the owner, and skipping them avoids per-file
     // parse cost.
-    scan_disk_files(state, &owner, &old_name, new_name, &scanned, &mut changes);
+    scan_disk_files(state, &owner, &old_name, new_name, &target_traits, &scanned, &mut changes);
 
     // Defensive de-duplication: the owner-file path can discover the same
     // name-token span through both the declaration edit and a reference
@@ -557,9 +565,38 @@ fn span_is_record_pun(module: &Module, source: &str, span: Span) -> bool {
 /// it gets deleted along with the old name. Reference *display* (find-
 /// references, highlight) keeps the full span; only edits are narrowed.
 fn edit_span(source: &str, span: Span) -> Span {
-    match source.as_bytes().get(span.start) {
-        Some(b'*') | Some(b'&') => Span::new(span.start + 1, span.end),
-        _ => span,
+    let bytes = source.as_bytes();
+    // Skip any leading noise before the identifier: a `(` folded into the span
+    // (the parser rewrites a parenthesized expression's span to start at `(`),
+    // the `*`/`&` relation sigils, and ASCII whitespace. This handles nested
+    // forms like `(*users)` / `((*users))` / `(&d)` whose SourceRef/DerivedRef
+    // span begins at `(`, not the sigil — narrowing only `span.start` would
+    // otherwise replace the whole `(*users)` and drop the sigil and parens.
+    let mut start = span.start;
+    while start < span.end {
+        match bytes.get(start) {
+            Some(b'(') | Some(b'*') | Some(b'&') => start += 1,
+            Some(b) if b.is_ascii_whitespace() => start += 1,
+            _ => break,
+        }
+    }
+    // Take the contiguous identifier run (matches the lexer's
+    // `is_ident_continue`: ASCII alphanumeric, `_`, and a trailing `'` prime),
+    // so a trailing `)` — or anything else the folded span swept up — is left
+    // in place.
+    let mut end = start;
+    while end < span.end {
+        match bytes.get(end) {
+            Some(b) if b.is_ascii_alphanumeric() || *b == b'_' || *b == b'\'' => end += 1,
+            _ => break,
+        }
+    }
+    // Defensive: if no identifier was found (unexpected shape), fall back to the
+    // original span rather than emit an empty/inverted edit.
+    if end > start {
+        Span::new(start, end)
+    } else {
+        span
     }
 }
 
@@ -580,6 +617,7 @@ fn scan_workspace_files(
     owner: &CanonicalOwner,
     old_name: &str,
     new_name: &str,
+    target_traits: &HashSet<String>,
     changes: &mut HashMap<Uri, Vec<TextEdit>>,
 ) -> HashSet<PathBuf> {
     let mut scanned = HashSet::new();
@@ -639,7 +677,7 @@ fn scan_workspace_files(
                 }));
         if is_owner || imports_owner {
             emit_edits_for_open_doc(
-                other_uri, other_doc, owner, old_name, new_name, is_owner, changes,
+                other_uri, other_doc, owner, old_name, new_name, target_traits, is_owner, changes,
             );
         }
         // Always mark open documents as scanned, even when they neither own
@@ -684,16 +722,49 @@ fn traits_declaring_renamed_method(
         .collect()
 }
 
+/// Trait scope for the shared cross-file oracle (`collect_name_uses_in_decl`).
+/// Returns the trait names — declared in the owner module at `owner_path` — whose
+/// method named `name` is the exact rename/reference target, disambiguated by
+/// `owner_decl_span` (the owner's declaration or name-token span). Empty when
+/// `name` isn't a trait method, so importer/disk files leave every `impl … where
+/// name =` token alone. The owner module is read from an open buffer when one is
+/// available (authoritative), else the disk/cache copy; a fetch miss yields an
+/// empty set (safe: under-match rather than corrupt an unrelated impl).
+pub(crate) fn owner_trait_method_scope(
+    state: &ServerState,
+    owner_path: &Path,
+    owner_decl_span: Span,
+    name: &str,
+) -> HashSet<String> {
+    for (u, d) in &state.documents {
+        if canonical_for_uri(u).as_deref() == Some(owner_path) {
+            let name_span =
+                name_span_within(&d.source, owner_decl_span, name).unwrap_or(owner_decl_span);
+            return traits_declaring_renamed_method(&d.module.decls, name, name_span);
+        }
+    }
+    if let Some((module, source)) = get_or_parse_file_shared(owner_path, &state.import_cache) {
+        let name_span =
+            name_span_within(&source, owner_decl_span, name).unwrap_or(owner_decl_span);
+        return traits_declaring_renamed_method(&module.decls, name, name_span);
+    }
+    HashSet::new()
+}
+
 /// Apply rename edits to a single open document. The owner-file branch uses
 /// the AST-derived `references` to find usages; the importer-file branch
 /// walks the AST directly because imported-symbol uses don't appear in
 /// `references` (which only resolves local decls).
+// Each argument carries distinct rename context; bundling would not clarify
+// the call site.
+#[allow(clippy::too_many_arguments)]
 fn emit_edits_for_open_doc(
     uri: &Uri,
     doc: &DocumentState,
     owner: &CanonicalOwner,
     old_name: &str,
     new_name: &str,
+    target_traits: &HashSet<String>,
     is_owner: bool,
     changes: &mut HashMap<Uri, Vec<TextEdit>>,
 ) {
@@ -778,7 +849,7 @@ fn emit_edits_for_open_doc(
         // ref/derived-ref site that names the symbol, and rewrite each.
         let mut sites: Vec<Span> = Vec::new();
         for decl in &doc.module.decls {
-            collect_name_uses_in_decl(decl, old_name, &doc.source, &mut sites);
+            collect_name_uses_in_decl(decl, old_name, &doc.source, target_traits, &mut sites);
         }
         // Selective import items: `import foo {bar, baz}` — if the rename
         // targets `bar`, the import line itself needs updating. These sit
@@ -872,10 +943,18 @@ fn pat_binds_name(pat: &ast::Pat, name: &str) -> bool {
 /// occurrences underneath that binder refer to the local and are skipped.
 /// Constructor / SourceRef / DerivedRef / type occurrences live in
 /// namespaces value binders can't shadow and are always collected.
+///
+/// `target_traits` scopes impl-method name tokens: an `impl T Foo where name =`
+/// token is only a use of the renamed symbol when `name` is a trait method AND
+/// `T` is one of the traits that declares it (computed from the owner module via
+/// `owner_trait_method_scope`). An empty set means the symbol isn't a trait
+/// method, so no impl-method token is a use of it — leaving e.g. an unrelated
+/// `impl Draw Foo where present =` untouched when renaming `Show.present`.
 pub(crate) fn collect_name_uses_in_decl(
     decl: &ast::Decl,
     name: &str,
     source: &str,
+    target_traits: &HashSet<String>,
     out: &mut Vec<Span>,
 ) {
     // Collect constructor-pattern name tokens (`Ctor pat <- …`, `case … of
@@ -1143,12 +1222,19 @@ pub(crate) fn collect_name_uses_in_decl(
                     walk_type(arg, name, source, out);
                 }
             }
+            // Only an impl of one of the renamed method's own trait(s) has a
+            // method-name token that refers to the renamed symbol. Renaming
+            // `Show.present` must not touch `impl Draw Foo where present = …`
+            // (a different trait that happens to declare a `present` method) —
+            // the owner-file path scopes this the same way via
+            // `traits_declaring_renamed_method`.
+            let impl_method_is_target = target_traits.contains(trait_name);
             for item in items {
                 match item {
                     ast::ImplItem::Method { name: m, name_span, params, body } => {
                         // The method-name token references the trait's
                         // method declaration.
-                        if m == name {
+                        if m == name && impl_method_is_target {
                             out.push(*name_span);
                         }
                         for p in params {
@@ -1315,6 +1401,7 @@ fn scan_disk_files(
     owner: &CanonicalOwner,
     old_name: &str,
     new_name: &str,
+    target_traits: &HashSet<String>,
     already_scanned: &HashSet<PathBuf>,
     changes: &mut HashMap<Uri, Vec<TextEdit>>,
 ) {
@@ -1379,6 +1466,7 @@ fn scan_disk_files(
                 &owner.canonical_path,
                 old_name,
                 new_name,
+                target_traits,
                 changes,
             );
         }
@@ -1460,6 +1548,7 @@ fn apply_importer_disk_edits(
     owner_path: &Path,
     old_name: &str,
     new_name: &str,
+    target_traits: &HashSet<String>,
     changes: &mut HashMap<Uri, Vec<TextEdit>>,
 ) {
     // Same shadowing discipline as the open-doc importer path: a file that
@@ -1476,7 +1565,7 @@ fn apply_importer_disk_edits(
     }
     let mut sites: Vec<Span> = Vec::new();
     for decl in &module.decls {
-        collect_name_uses_in_decl(decl, old_name, source, &mut sites);
+        collect_name_uses_in_decl(decl, old_name, source, target_traits, &mut sites);
     }
     // Import items live inside braces but are not record puns — plain
     // replacement, no pun expansion.
@@ -1548,7 +1637,12 @@ pub(crate) fn imports_name_from_other_module(
                     return true;
                 }
             }
-            Err(_) => return true, // can't prove it's the owner — be safe
+            // An import that can't be resolved on disk cannot *define* `name`, so
+            // it is not a competing other-module source — skip it and keep
+            // checking the remaining imports. Bailing with `true` here would let a
+            // single broken/dangling `import ./nonexistent` suppress every edit /
+            // reference in a consumer that legitimately imports the owner.
+            Err(_) => continue,
         }
     }
     false
@@ -2044,6 +2138,31 @@ mod tests {
     }
 
     #[test]
+    fn edit_span_narrows_to_identifier_token() {
+        // For each source the whole string is the reference span; `edit_span`
+        // must narrow it to the bare identifier — stripping leading `(`/`*`/`&`
+        // (parser folds parens into the SourceRef/DerivedRef span) and stopping
+        // before any trailing `)`. Renaming otherwise drops the sigil/parens.
+        for (src, expected) in [
+            ("users", "users"),
+            ("*users", "users"),
+            ("&d", "d"),
+            ("(*users)", "users"),
+            ("((*users))", "users"),
+            ("(&d)", "d"),
+            ("x'", "x'"),
+        ] {
+            let span = Span::new(0, src.len());
+            let narrowed = edit_span(src, span);
+            assert_eq!(
+                &src[narrowed.start..narrowed.end],
+                expected,
+                "edit_span({src:?}) should narrow to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
     fn prepare_rename_rejects_unshadowed_builtin() {
         // Cursor on `println` — a stdlib symbol with no local declaration.
         // Renaming it would leave the binding broken, so prepare_rename
@@ -2228,6 +2347,81 @@ mod tests {
         assert!(
             edits.iter().all(|e| e.range.start != trait_pos),
             "unrelated trait method decl must not be renamed; edits: {edits:?}"
+        );
+    }
+
+    #[test]
+    fn collect_name_uses_scopes_impl_methods_by_trait() {
+        // Regression (shared cross-file oracle): `collect_name_uses_in_decl`
+        // rewrote every `impl … where present =` method token that matched the
+        // renamed method name, ignoring which trait the impl belonged to.
+        // Renaming `Show.present` (target scope `{Show}`) must collect the
+        // `impl Show` method token but NOT the `impl Draw` one — a different
+        // trait that merely declares a same-named method.
+        let src = "impl Show Foo where\n  present = \\x -> \"foo\"\nimpl Draw Bar where\n  present = \\x -> \"bar\"\n";
+        let (tokens, _) = knot::lexer::Lexer::new(src).tokenize();
+        let (module, _) = knot::parser::Parser::new(src.to_string(), tokens).parse_module();
+        let show_off = src.find("present = \\x -> \"foo\"").expect("Show impl method");
+        let draw_off = src.find("present = \\x -> \"bar\"").expect("Draw impl method");
+
+        let mut scope = HashSet::new();
+        scope.insert("Show".to_string());
+        let mut sites = Vec::new();
+        for decl in &module.decls {
+            collect_name_uses_in_decl(decl, "present", src, &scope, &mut sites);
+        }
+        assert!(
+            sites.iter().any(|s| s.start == show_off),
+            "impl Show method token must be collected; sites: {sites:?}"
+        );
+        assert!(
+            sites.iter().all(|s| s.start != draw_off),
+            "impl Draw method token (different trait) must NOT be collected; sites: {sites:?}"
+        );
+
+        // Empty scope (`present` isn't a trait method at all) collects no impl
+        // method token — a plain-function rename must never touch impls.
+        let mut none_sites = Vec::new();
+        for decl in &module.decls {
+            collect_name_uses_in_decl(decl, "present", src, &HashSet::new(), &mut none_sites);
+        }
+        assert!(
+            none_sites
+                .iter()
+                .all(|s| s.start != show_off && s.start != draw_off),
+            "no impl method token collected when scope is empty; sites: {none_sites:?}"
+        );
+    }
+
+    #[test]
+    fn broken_sibling_import_does_not_suppress_importer_edits() {
+        // Regression (Bug 4): a consumer with a valid `import ./owner` PLUS a
+        // broken `import ./nonexistent` had ALL its edits suppressed — the
+        // unresolvable import's `Err(_)` arm claimed the name was imported from
+        // another module. A broken import can't define the name, so it must not
+        // gate the rename.
+        use crate::test_support::TempWorkspace;
+        let mut tw = TempWorkspace::new();
+        let owner_uri = tw.write_and_open("owner.knot", "parse = \\x -> x\n");
+        let consumer_uri = tw.write_and_open(
+            "consumer.knot",
+            "import ./owner\nimport ./nonexistent\nrun = parse 1\n",
+        );
+        let owner_doc = tw.workspace.doc(&owner_uri);
+        let off = owner_doc.source.find("parse =").expect("owner def");
+        let pos = offset_to_position(&owner_doc.source, off);
+        let edit = handle_rename(&tw.workspace.state, &rename_params(&owner_uri, pos, "parsed"))
+            .expect("rename produces edits");
+        let changes = edit.changes.expect("changes present");
+        let consumer_doc = tw.workspace.doc(&consumer_uri);
+        let consumer_edits = changes.get(&consumer_uri).cloned().unwrap_or_default();
+        let call_off = consumer_doc.source.find("parse 1").expect("call site");
+        let call_pos = offset_to_position(&consumer_doc.source, call_off);
+        assert!(
+            consumer_edits
+                .iter()
+                .any(|e| e.range.start == call_pos && e.new_text.contains("parsed")),
+            "consumer usage must be renamed despite a broken sibling import; edits: {consumer_edits:?}"
         );
     }
 

@@ -43,7 +43,8 @@ fn build_dependency_graph(module: &ast::Module) -> (HashSet<String>, HashMap<Str
     for decl in &module.decls {
         if let ast::DeclKind::Derived { name, body, .. } = &decl.node {
             let mut found = Vec::new();
-            collect_edges(body, Polarity::Positive, &derived_names, &mut found);
+            let env = HashMap::new();
+            collect_edges(body, Polarity::Positive, &derived_names, &env, &mut found);
             edges.get_mut(name).unwrap().extend(found);
         }
     }
@@ -55,19 +56,34 @@ fn build_dependency_graph(module: &ast::Module) -> (HashSet<String>, HashMap<Str
 ///
 /// `diff a b` makes `b` negative (it's the subtracted set). `a` stays positive.
 /// Everything else propagates the current polarity unchanged.
+///
+/// `env` maps local variables bound *directly* to a derived relation (`self <-
+/// &bad` / `let self = &bad`) to that relation's name. A negative use of such a
+/// variable (`diff all self`) then records a negative edge to the derived
+/// relation — without this, self-negation laundered through a bind escapes the
+/// stratification check (a bare `diff *all &bad` doesn't even type-check, since
+/// `&bad` is `IO`-typed inside a derived body; it must be bound first), so the
+/// oscillating fixpoint would only be caught at runtime after 10000 iterations.
 fn collect_edges(
     expr: &ast::Expr,
     polarity: Polarity,
     derived_names: &HashSet<String>,
+    env: &HashMap<String, String>,
     out: &mut Vec<Edge>,
 ) {
     match &expr.node {
         ast::ExprKind::DerivedRef(name) if derived_names.contains(name) => {
             out.push(Edge { target: name.clone(), polarity, span: expr.span });
         }
+        // A variable aliasing a derived relation carries that relation's
+        // dependency at the variable's current polarity.
+        ast::ExprKind::Var(name) => {
+            if let Some(derived) = env.get(name) {
+                out.push(Edge { target: derived.clone(), polarity, span: expr.span });
+            }
+        }
         ast::ExprKind::DerivedRef(_)
         | ast::ExprKind::Lit(_)
-        | ast::ExprKind::Var(_)
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::SourceRef(_) => {}
 
@@ -77,107 +93,147 @@ fn collect_edges(
         ast::ExprKind::App { func, arg } => {
             if let Some(first_arg) = is_diff_applied_once(func) {
                 // This is `(diff a) b` — `a` keeps polarity, `b` is negated.
-                collect_edges(first_arg, polarity, derived_names, out);
+                collect_edges(first_arg, polarity, derived_names, env, out);
                 let neg = negate(polarity);
-                collect_edges(arg, neg, derived_names, out);
+                collect_edges(arg, neg, derived_names, env, out);
             } else {
-                collect_edges(func, polarity, derived_names, out);
-                collect_edges(arg, polarity, derived_names, out);
+                collect_edges(func, polarity, derived_names, env, out);
+                collect_edges(arg, polarity, derived_names, env, out);
             }
         }
 
         ast::ExprKind::Record(fields) => {
             for f in fields {
-                collect_edges(&f.value, polarity, derived_names, out);
+                collect_edges(&f.value, polarity, derived_names, env, out);
             }
         }
         ast::ExprKind::RecordUpdate { base, fields } => {
-            collect_edges(base, polarity, derived_names, out);
+            collect_edges(base, polarity, derived_names, env, out);
             for f in fields {
-                collect_edges(&f.value, polarity, derived_names, out);
+                collect_edges(&f.value, polarity, derived_names, env, out);
             }
         }
         ast::ExprKind::FieldAccess { expr, .. } => {
-            collect_edges(expr, polarity, derived_names, out);
+            collect_edges(expr, polarity, derived_names, env, out);
         }
         ast::ExprKind::List(elems) => {
             for e in elems {
-                collect_edges(e, polarity, derived_names, out);
+                collect_edges(e, polarity, derived_names, env, out);
             }
         }
-        ast::ExprKind::Lambda { body, .. } => {
-            collect_edges(body, polarity, derived_names, out);
+        ast::ExprKind::Lambda { params, body } => {
+            // A lambda parameter shadows any outer alias of the same name.
+            let mut inner = env.clone();
+            for p in params {
+                if let ast::PatKind::Var(v) = &p.node {
+                    inner.remove(v);
+                }
+            }
+            collect_edges(body, polarity, derived_names, &inner, out);
         }
         ast::ExprKind::BinOp { lhs, rhs, op } => {
             // `a |> f` is `f a`. If `f` is a partially-applied `diff` (i.e.,
             // `diff base`), then `a` becomes the subtracted (negative) arg.
             if *op == ast::BinOp::Pipe
                 && let Some(base) = is_diff_applied_once(rhs) {
-                    collect_edges(base, polarity, derived_names, out);
+                    collect_edges(base, polarity, derived_names, env, out);
                     let neg = negate(polarity);
-                    collect_edges(lhs, neg, derived_names, out);
+                    collect_edges(lhs, neg, derived_names, env, out);
                     return;
                 }
-            collect_edges(lhs, polarity, derived_names, out);
-            collect_edges(rhs, polarity, derived_names, out);
+            collect_edges(lhs, polarity, derived_names, env, out);
+            collect_edges(rhs, polarity, derived_names, env, out);
         }
         ast::ExprKind::UnaryOp { op: _, operand } => {
             // `not` is boolean negation (`Bool -> Bool`), not set complement —
             // it does not create negative dependencies. Only `diff` (set
             // difference) creates negative edges.
-            collect_edges(operand, polarity, derived_names, out);
+            collect_edges(operand, polarity, derived_names, env, out);
         }
         ast::ExprKind::If { cond, then_branch, else_branch } => {
-            collect_edges(cond, polarity, derived_names, out);
-            collect_edges(then_branch, polarity, derived_names, out);
-            collect_edges(else_branch, polarity, derived_names, out);
+            collect_edges(cond, polarity, derived_names, env, out);
+            collect_edges(then_branch, polarity, derived_names, env, out);
+            collect_edges(else_branch, polarity, derived_names, env, out);
         }
         ast::ExprKind::Case { scrutinee, arms } => {
-            collect_edges(scrutinee, polarity, derived_names, out);
+            collect_edges(scrutinee, polarity, derived_names, env, out);
             for arm in arms {
-                collect_edges(&arm.body, polarity, derived_names, out);
+                collect_edges(&arm.body, polarity, derived_names, env, out);
             }
         }
         ast::ExprKind::Do(stmts) => {
+            // Bindings are visible to the statements that follow them, so
+            // accumulate derived-relation aliases into a local env as we go.
+            let mut local_env = env.clone();
             for s in stmts {
                 match &s.node {
-                    ast::StmtKind::Bind { expr, .. } => {
-                        collect_edges(expr, polarity, derived_names, out);
+                    ast::StmtKind::Bind { pat, expr } => {
+                        collect_edges(expr, polarity, derived_names, &local_env, out);
+                        bind_derived_alias(pat, expr, derived_names, &mut local_env);
                     }
-                    ast::StmtKind::Let { expr, .. } => {
-                        collect_edges(expr, polarity, derived_names, out);
+                    ast::StmtKind::Let { pat, expr } => {
+                        collect_edges(expr, polarity, derived_names, &local_env, out);
+                        bind_derived_alias(pat, expr, derived_names, &mut local_env);
                     }
                     ast::StmtKind::Where { cond } => {
-                        collect_edges(cond, polarity, derived_names, out);
+                        collect_edges(cond, polarity, derived_names, &local_env, out);
                     }
                     ast::StmtKind::GroupBy { key } => {
-                        collect_edges(key, polarity, derived_names, out);
+                        collect_edges(key, polarity, derived_names, &local_env, out);
                     }
                     ast::StmtKind::Expr(e) => {
-                        collect_edges(e, polarity, derived_names, out);
+                        collect_edges(e, polarity, derived_names, &local_env, out);
                     }
                 }
             }
         }
         ast::ExprKind::Atomic(inner) => {
-            collect_edges(inner, polarity, derived_names, out);
+            collect_edges(inner, polarity, derived_names, env, out);
         }
         ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
-            collect_edges(target, polarity, derived_names, out);
-            collect_edges(value, polarity, derived_names, out);
+            collect_edges(target, polarity, derived_names, env, out);
+            collect_edges(value, polarity, derived_names, env, out);
         }
         ast::ExprKind::UnitLit { value, .. } => {
-            collect_edges(value, polarity, derived_names, out);
+            collect_edges(value, polarity, derived_names, env, out);
         }
         ast::ExprKind::Annot { expr: inner, .. } => {
-            collect_edges(inner, polarity, derived_names, out);
+            collect_edges(inner, polarity, derived_names, env, out);
         }
         ast::ExprKind::Refine(inner) => {
-            collect_edges(inner, polarity, derived_names, out);
+            collect_edges(inner, polarity, derived_names, env, out);
         }
         ast::ExprKind::Serve { handlers, .. } => {
             for h in handlers {
-                collect_edges(&h.body, polarity, derived_names, out);
+                collect_edges(&h.body, polarity, derived_names, env, out);
+            }
+        }
+    }
+}
+
+/// If `pat` binds a simple variable and `expr` refers directly to a known
+/// derived relation, record `var -> derived` so a later negative use of the
+/// variable is attributed to that relation. Any other binding of the same
+/// variable name clears a stale alias (shadowing).
+fn bind_derived_alias(
+    pat: &ast::Pat,
+    expr: &ast::Expr,
+    derived_names: &HashSet<String>,
+    env: &mut HashMap<String, String>,
+) {
+    if let ast::PatKind::Var(v) = &pat.node {
+        match &expr.node {
+            ast::ExprKind::DerivedRef(name) if derived_names.contains(name) => {
+                env.insert(v.clone(), name.clone());
+            }
+            // Aliasing another already-aliased variable (`let y = x`) carries
+            // the alias transitively; anything else drops a stale mapping.
+            ast::ExprKind::Var(other) if env.contains_key(other) => {
+                let target = env[other].clone();
+                env.insert(v.clone(), target);
+            }
+            _ => {
+                env.remove(v);
             }
         }
     }
@@ -623,6 +679,80 @@ mod tests {
         let diags = check(&m);
         assert!(!diags.is_empty(), "pipe-diff self-recursion should be rejected");
         assert!(diags[0].message.contains("unstratifiable"));
+    }
+
+    fn var_pat(name: &str) -> Pat {
+        spanned(PatKind::Var(name.to_string()))
+    }
+
+    fn bind_stmt(name: &str, expr: Expr) -> Spanned<StmtKind> {
+        spanned(StmtKind::Bind { pat: var_pat(name), expr })
+    }
+
+    fn yield_stmt(expr: Expr) -> Spanned<StmtKind> {
+        spanned(StmtKind::Expr(expr))
+    }
+
+    fn do_expr(stmts: Vec<Spanned<StmtKind>>) -> Expr {
+        spanned(ExprKind::Do(stmts))
+    }
+
+    #[test]
+    fn do_bind_self_negation_is_rejected() {
+        // &bad = do
+        //   self <- &bad
+        //   all  <- *items
+        //   d    <- diff all self
+        //   yield d
+        //
+        // `diff` is applied to the *variable* `self` (not `&bad` directly),
+        // which is how a self-negating derived relation must actually be
+        // written — `diff *all &bad` doesn't type-check inside a derived body.
+        // The alias `self -> &bad` must be tracked so the negative edge is
+        // recorded; otherwise this compiles and oscillates forever at runtime.
+        let body = do_expr(vec![
+            bind_stmt("self", derived_ref("bad")),
+            bind_stmt("all", source_ref("items")),
+            bind_stmt("d", diff(var("all"), var("self"))),
+            yield_stmt(var("d")),
+        ]);
+        let m = module(vec![derived("bad", body)]);
+        let diags = check(&m);
+        assert!(
+            !diags.is_empty(),
+            "self-negation laundered through a do-bind should be rejected"
+        );
+        assert!(diags[0].message.contains("unstratifiable"));
+        assert!(diags[0].message.contains("&bad"));
+    }
+
+    #[test]
+    fn do_bind_negating_non_recursive_alias_is_ok() {
+        // &a = *source
+        // &b = do
+        //   x   <- &a
+        //   all <- *items
+        //   d   <- diff all x
+        //   yield d
+        //
+        // Negating an alias of a *non-recursive* peer (&a) is a valid
+        // stratified negation — no cycle, so no error.
+        let body = do_expr(vec![
+            bind_stmt("x", derived_ref("a")),
+            bind_stmt("all", source_ref("items")),
+            bind_stmt("d", diff(var("all"), var("x"))),
+            yield_stmt(var("d")),
+        ]);
+        let m = module(vec![
+            derived("a", source_ref("source")),
+            derived("b", body),
+        ]);
+        let diags = check(&m);
+        assert!(
+            diags.is_empty(),
+            "negating an alias of a non-recursive derived relation is fine: {:?}",
+            diags.first().map(|d| &d.message)
+        );
     }
 
     #[test]

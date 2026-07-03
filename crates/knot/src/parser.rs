@@ -782,13 +782,18 @@ impl Parser {
                 continue;
             }
             // When inside delimiters (parens, brackets, braces), a closing
-            // delimiter ends the block — it belongs to an outer scope.
-            // Without this, `(case x of A -> 1; B -> 2)` would try to
-            // parse `)` as a case arm pattern.
+            // delimiter — or a comma separating outer list/record elements —
+            // ends the block; it belongs to an outer scope. Without this,
+            // `(case x of A -> 1; B -> 2)` would try to parse `)` as a case
+            // arm pattern, and `[do ...; yield x, 2]` would swallow the `, 2`
+            // into the do block instead of ending it at the comma.
             if self.delimiter_depth > 0
                 && matches!(
                     self.peek(),
-                    TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace
+                    TokenKind::RParen
+                        | TokenKind::RBracket
+                        | TokenKind::RBrace
+                        | TokenKind::Comma
                 )
             {
                 break;
@@ -811,7 +816,10 @@ impl Parser {
                 || (self.delimiter_depth > 0
                     && matches!(
                         self.peek(),
-                        TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace
+                        TokenKind::RParen
+                            | TokenKind::RBracket
+                            | TokenKind::RBrace
+                            | TokenKind::Comma
                     ))
             {
                 self.restore(saved);

@@ -9,7 +9,7 @@ use crate::analysis::get_or_parse_file_shared;
 use crate::defs::resolve_definitions;
 use crate::rename::{
     collect_name_uses_in_decl, file_imports_owner, imports_name_from_other_module,
-    module_defines_name,
+    module_defines_name, owner_trait_method_scope,
 };
 use crate::shared::scan_knot_files_in_roots;
 use crate::state::ServerState;
@@ -131,6 +131,26 @@ pub(crate) fn handle_references(
         return None;
     }
 
+    // Trait-method scope for the shared cross-file oracle (mirrors the rename
+    // path): confine impl-method reference hits to the target method's own
+    // trait(s). Empty for anything that isn't a trait method, so an unrelated
+    // `impl Draw Foo where present =` is not reported when finding references to
+    // `Show.present`. The owner is the current file for a local top-level
+    // definition, else the imported symbol's owning file.
+    let target_traits: HashSet<String> = if let Some(def_span) = local_def {
+        current_path
+            .as_deref()
+            .map(|p| owner_trait_method_scope(state, p, def_span, &symbol_name))
+            .unwrap_or_default()
+    } else if let Some(owner) = &imported_owner {
+        doc.import_defs
+            .get(&symbol_name)
+            .map(|(_, decl_span)| owner_trait_method_scope(state, owner, *decl_span, &symbol_name))
+            .unwrap_or_default()
+    } else {
+        HashSet::new()
+    };
+
     let mut locations = Vec::new();
 
     // Current-document contributions.
@@ -174,7 +194,7 @@ pub(crate) fn handle_references(
         // below.
         let mut sites = Vec::new();
         for decl in &doc.module.decls {
-            collect_name_uses_in_decl(decl, &symbol_name, &doc.source, &mut sites);
+            collect_name_uses_in_decl(decl, &symbol_name, &doc.source, &target_traits, &mut sites);
         }
         for imp in &doc.module.imports {
             if let Some(items) = &imp.items {
@@ -276,7 +296,13 @@ pub(crate) fn handle_references(
                 // skipping shadowed locals.
                 let mut sites = Vec::new();
                 for decl in &other_doc.module.decls {
-                    collect_name_uses_in_decl(decl, &symbol_name, &other_doc.source, &mut sites);
+                    collect_name_uses_in_decl(
+                        decl,
+                        &symbol_name,
+                        &other_doc.source,
+                        &target_traits,
+                        &mut sites,
+                    );
                 }
                 for imp in &other_doc.module.imports {
                     if let Some(items) = &imp.items {
@@ -377,7 +403,7 @@ pub(crate) fn handle_references(
             {
                 let mut sites = Vec::new();
                 for decl in &module.decls {
-                    collect_name_uses_in_decl(decl, &symbol_name, &source, &mut sites);
+                    collect_name_uses_in_decl(decl, &symbol_name, &source, &target_traits, &mut sites);
                 }
                 for imp in &module.imports {
                     if let Some(items) = &imp.items {

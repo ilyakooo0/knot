@@ -230,6 +230,16 @@ struct EffectChecker {
     /// that never call their argument, which is the safe direction for
     /// the atomic gate.
     fixed_row_decls: HashSet<String>,
+    /// The *declared* closed result-effect set for each `fixed_row_decls`
+    /// entry. Because a closed-row callee "absorbs" its callback arguments,
+    /// the callback's effects are dropped at the call site — but the callee's
+    /// own declared row is exactly its promised effects (e.g. `runTwice :
+    /// (a -> IO {console} {}) -> a -> IO {console} {}` promises `{console}`).
+    /// The callee's *inferred* effects are computed with its callback
+    /// parameter masked, so they'd be empty; using the declared row instead
+    /// prevents under-reporting the caller's effects (and the spurious
+    /// "declared effects are not used" warning it causes).
+    fixed_row_effects: HashMap<String, EffectSet>,
     /// Stack of local scopes mapping let-bound (or immediately-applied-
     /// lambda-bound) function names to the effects of their bodies. Lets the
     /// checker see effects of calls through local bindings, e.g.
@@ -349,6 +359,7 @@ impl EffectChecker {
             view_names: HashSet::new(),
             row_poly_decls: HashSet::new(),
             fixed_row_decls: HashSet::new(),
+            fixed_row_effects: HashMap::new(),
             local_fn_effects: Vec::new(),
             decl_bodies: HashMap::new(),
             shadowed: Vec::new(),
@@ -400,8 +411,9 @@ impl EffectChecker {
                 | ast::DeclKind::Derived { name, ty: Some(scheme), .. } => {
                     if type_has_effect_row_var(&scheme.ty) {
                         self.row_poly_decls.insert(name.clone());
-                    } else if extract_effects(&scheme.ty).is_some() {
+                    } else if let Some(declared) = extract_effects(&scheme.ty) {
                         self.fixed_row_decls.insert(name.clone());
+                        self.fixed_row_effects.insert(name.clone(), declared);
                     }
                 }
                 _ => {}
@@ -789,7 +801,22 @@ impl EffectChecker {
                     effects = effects.union(&arg_effects);
                 }
                 let call_effects = self.head_call_effects(head, &args);
-                effects.union(&call_effects)
+                effects = effects.union(&call_effects);
+                // A closed-row callee absorbs its callback arguments
+                // (`propagate_lambda == false`), so those effects were dropped
+                // above. The callee's *declared* row is its promised effect set
+                // — recover it here, since its *inferred* effects are computed
+                // with the callback parameter masked and would under-report
+                // (e.g. `runTwice : (a -> IO {console} {}) -> a -> IO {console}
+                // {}` would otherwise contribute nothing). Skipped at the atomic
+                // gate, where `propagate_lambda` is forced true.
+                if !propagate_lambda
+                    && let Some(name) = head_name(head)
+                    && let Some(declared) = self.fixed_row_effects.get(name)
+                {
+                    effects = effects.union(declared);
+                }
+                effects
             }
 
             ast::ExprKind::BinOp { op, lhs, rhs } => {
@@ -840,7 +867,17 @@ impl EffectChecker {
                         lhs_effects.random = false;
                     }
                     let rhs_effects = self.callee_effects(rhs);
-                    lhs_effects.union(&rhs_effects)
+                    let mut result = lhs_effects.union(&rhs_effects);
+                    // Mirror the `App` spine: a closed-row piped callee absorbs
+                    // the piped-in lambda, so recover its promised effects from
+                    // its declared row (its inferred effects mask the callback).
+                    if !propagate_lambda
+                        && let Some(name) = head_name(rhs)
+                        && let Some(declared) = self.fixed_row_effects.get(name)
+                    {
+                        result = result.union(declared);
+                    }
+                    result
                 } else {
                     let lhs_effects = self.infer_effects(lhs);
                     let rhs_effects = self.infer_effects(rhs);

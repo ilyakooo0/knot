@@ -212,6 +212,14 @@ pub(crate) fn handle_inlay_hint(
         if span.end < range_start {
             continue;
         }
+        // Only annotate simple identifier bindings. A punned record sub-pattern
+        // (`case p of Pt {x, y} -> …`) records its whole `{x, y}` span in the
+        // type-info table (hover uses it, but there's no per-field span); a
+        // `: Int` rendered after the `}` is misplaced, so skip spans whose
+        // source slice isn't a bare identifier.
+        if !is_bare_identifier(&doc.source, span.start, span.end) {
+            continue;
+        }
         let hint_pos = offset_to_position(&doc.source, span.end);
         let unit_tooltip = doc
             .unit_info
@@ -282,6 +290,23 @@ pub(crate) fn handle_inlay_hint(
     }
 
     Some(hints)
+}
+
+/// True when `source[start..end]` is a single bare identifier (an alphabetic
+/// or `_` first char, then identifier chars / `'`). Used to keep inlay type
+/// hints on simple variable bindings and off destructuring sub-patterns whose
+/// recorded span covers punctuation (`{x, y}`).
+fn is_bare_identifier(source: &str, start: usize, end: usize) -> bool {
+    let slice = match source.get(start..end) {
+        Some(s) if !s.is_empty() => s,
+        _ => return false,
+    };
+    let mut chars = slice.chars();
+    let first = chars.next().unwrap();
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '\'')
 }
 
 /// Emit a "♻ re-checked" hint at the start of every decl whose name appears

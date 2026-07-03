@@ -1426,12 +1426,14 @@ fn receiver_ident_before_dot(source: &str, dot_pos: usize) -> Option<String> {
     if end == ident_end {
         return None;
     }
-    let name = &source[end..ident_end];
-    // Reject leading sigils — those land us in source/derived ref territory,
-    // which is handled separately.
-    if name.starts_with('*') || name.starts_with('&') {
+    // Reject a receiver preceded by a source/derived sigil (`*src.field` /
+    // `&d.field`) — those are handled separately. The backward scan above
+    // stops at the first non-identifier byte, so a leading sigil never ends up
+    // *inside* `name`; inspect the byte immediately to its left instead.
+    if end > 0 && matches!(bytes[end - 1], b'*' | b'&') {
         return None;
     }
+    let name = &source[end..ident_end];
     Some(name.to_string())
 }
 

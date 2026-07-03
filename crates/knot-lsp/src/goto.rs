@@ -12,9 +12,30 @@ use crate::analysis::get_or_parse_file_shared;
 use crate::shared::{extract_principal_type_name, scan_knot_files_in_roots};
 use crate::state::ServerState;
 use crate::utils::{
-    ident_lookup_offset, path_to_uri, position_to_offset, span_to_range, uri_to_path,
-    word_at_position,
+    find_word_in_source, ident_lookup_offset, path_to_uri, position_to_offset, span_to_range,
+    uri_to_path, word_at_position,
 };
+
+/// Find the span of a type *declaration's* name token (`data T = …` /
+/// `type T = …`). `doc.definitions` maps a self-named data type
+/// (`data Circle = Circle {}`) to the *constructor* token (last-write-wins),
+/// which is the wrong target for goto-type-definition — resolve the type-name
+/// token directly from the AST instead.
+fn type_decl_name_span(module: &ast::Module, source: &str, type_name: &str) -> Option<ast::Span> {
+    for decl in &module.decls {
+        let is_match = match &decl.node {
+            DeclKind::Data { name, .. } | DeclKind::TypeAlias { name, .. } => name == type_name,
+            _ => false,
+        };
+        if is_match {
+            return Some(
+                find_word_in_source(source, type_name, decl.span.start, decl.span.end)
+                    .unwrap_or(decl.span),
+            );
+        }
+    }
+    None
+}
 
 // ── Go to definition ────────────────────────────────────────────────
 
@@ -157,9 +178,14 @@ pub(crate) fn handle_goto_type_definition(
     // Extract the principal named type from the type string
     let type_name = extract_principal_type_name(&type_str)?;
 
-    // Look up the definition of that type in the current document
-    if let Some(def_span) = doc.definitions.get(&type_name) {
-        let range = span_to_range(*def_span, &doc.source);
+    // Look up the definition of that type in the current document. Prefer the
+    // type *declaration's* name token (`doc.definitions` maps a self-named data
+    // type to its constructor token, the wrong target here); fall back to the
+    // generic definitions map for anything not found as a local type decl.
+    if let Some(def_span) = type_decl_name_span(&doc.module, &doc.source, &type_name)
+        .or_else(|| doc.definitions.get(&type_name).copied())
+    {
+        let range = span_to_range(def_span, &doc.source);
         return Some(GotoDefinitionResponse::Scalar(Location {
             uri: uri.clone(),
             range,

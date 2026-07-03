@@ -191,6 +191,13 @@ fn resolve_recursive(
                 }
         }
 
+        // Capture the boundary of this module's OWN declarations before the
+        // recursive resolve below prepends its transitively-imported decls.
+        // The merge only *prepends* (see the tail of `resolve_recursive`:
+        // `imported_decls.append(&mut module.decls)`), so the module's own
+        // decls remain the final `own_decl_count` entries in original order.
+        let own_decl_count = imported_module.decls.len();
+
         // Recursively resolve imports of the imported module
         let sub_result = resolve_recursive(
             &mut imported_module,
@@ -206,19 +213,28 @@ fn resolve_recursive(
             continue;
         }
 
+        // Split the merged decls back into [transitively-imported | own].
+        // Transitively-imported decls were already filtered by their own
+        // module's export rules, so they pass through unchanged; only this
+        // module's own decls are subject to its export-visibility filter.
+        let mut merged_decls = imported_module.decls;
+        let own_decls = merged_decls.split_off(merged_decls.len() - own_decl_count);
+        let transitive_decls = merged_decls;
+
         // Filter by export visibility: if the imported module has any `export`
-        // declarations, only those (plus always-visible items) pass through.
-        // If no exports exist, everything is visible (backwards compat).
-        let has_exports = imported_module.decls.iter().any(|d| d.exported);
-        let visible_decls = if has_exports {
-            let exported_names: HashSet<String> = imported_module
-                .decls
+        // declarations *of its own*, only those (plus always-visible items)
+        // pass through. If it has no own exports, everything is visible
+        // (backwards compat). Judging by own decls is essential — otherwise a
+        // transitively imported module's exports would flip a no-export module
+        // into "export-only" mode and silently drop all of its own decls.
+        let has_exports = own_decls.iter().any(|d| d.exported);
+        let visible_own: Vec<ast::Decl> = if has_exports {
+            let exported_names: HashSet<String> = own_decls
                 .iter()
                 .filter(|d| d.exported)
                 .filter_map(|d| decl_name(&d.node))
                 .collect();
-            imported_module
-                .decls
+            own_decls
                 .into_iter()
                 .filter(|d| {
                     d.exported
@@ -230,8 +246,12 @@ fn resolve_recursive(
                 })
                 .collect()
         } else {
-            imported_module.decls
+            own_decls
         };
+        // Transitively-imported decls (already export-filtered) precede this
+        // module's visible own decls, preserving the merged order.
+        let mut visible_decls = transitive_decls;
+        visible_decls.extend(visible_own);
 
         // Filter declarations based on selective import list
         let decls: Vec<ast::Decl> = if let Some(items) = &imp.items {

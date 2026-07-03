@@ -4477,7 +4477,24 @@ impl Infer {
                 let mut effects = BTreeSet::new();
                 if let ast::ExprKind::SourceRef(name) = &target.node {
                     effects.insert(IoEffect::Writes(name.clone()));
-                    effects.insert(IoEffect::Reads(name.clone()));
+
+                    // `set` is a read-modify-write only when the value actually
+                    // reads the source. Relations require that reference (it's
+                    // enforced below), so a valid relation `set` genuinely
+                    // reads. But a scalar `*counter = 5` that references nothing
+                    // reads nothing, so it must NOT carry a spurious `r *rel` —
+                    // that would force an honest `{w *rel}` signature to widen
+                    // to `{rw *rel}` (the same defect the `ReplaceSet` arm's
+                    // comment below documents fixing there).
+                    let references = value_references_source(
+                        value,
+                        name,
+                        &self.source_var_binds,
+                        &self.let_bindings,
+                    );
+                    if references {
+                        effects.insert(IoEffect::Reads(name.clone()));
+                    }
 
                     // Require `replace *rel = ...` when the value is a full
                     // replacement (doesn't reference *rel directly or via a
@@ -4488,15 +4505,7 @@ impl Infer {
                         self.source_types.get(name),
                         Some(Ty::Relation(_))
                     );
-                    if !is_view
-                        && is_relation
-                        && !value_references_source(
-                            value,
-                            name,
-                            &self.source_var_binds,
-                            &self.let_bindings,
-                        )
-                    {
+                    if !is_view && is_relation && !references {
                         self.error(
                             format!(
                                 "`*{name} = ...` must reference `*{name}` \
@@ -5592,7 +5601,14 @@ impl Infer {
                     if let Some(p) = &fp.pattern {
                         self.check_pattern(p, &ft);
                     } else {
-                        // Punned: {name} → bind variable 'name' to field type
+                        // Punned: {name} → bind variable 'name' to field type.
+                        // `FieldPat` has no span for the punned name, so the
+                        // only span available is the whole record pattern's.
+                        // Hover uses this (smallest-span-wins) to resolve a
+                        // cursor inside the pattern to a binder's type, so keep
+                        // it — but the inlay-hint loop must skip it (it would
+                        // render a misplaced `{x, y}: Int` after the `}`); that
+                        // filter lives in `inlay_hints.rs`.
                         self.bind(&fp.name, Scheme::mono(ft.clone()));
                         self.binding_types.push((pat.span, ft));
                     }

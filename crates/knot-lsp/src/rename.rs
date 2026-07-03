@@ -2309,6 +2309,45 @@ mod tests {
     }
 
     #[test]
+    fn rename_defaulted_trait_method_updates_signature() {
+        // Regression: a *defaulted* trait method is parsed as two
+        // `TraitItem::Method` entries — the signature (`greet : T`) and the
+        // default body (`greet = …`), each with its own `name_span`. defs.rs
+        // registered both via last-write-wins, so the signature token was
+        // invisible to rename; renaming from the body/usage left `greet : T`
+        // stale, corrupting the trait. Renaming must rewrite BOTH tokens.
+        let mut ws = TestWorkspace::new();
+        let src = "trait Greet a where\n  greet : a -> Text\n  greet = \\x -> \"hi\"\n";
+        let uri = ws.open("main", src);
+        let doc = ws.doc(&uri);
+        // Initiate the rename from the default-body line.
+        let off = doc.source.find("greet = ").expect("default body");
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "hello"))
+            .expect("rename produces edits");
+        let mut changes = edit.changes.expect("changes present");
+        let edits = changes.remove(&uri).expect("file has edits");
+
+        // Both the signature and the default-body tokens must be renamed.
+        let sig_off = doc.source.find("greet : ").expect("signature");
+        let sig_pos = offset_to_position(&doc.source, sig_off);
+        let body_off = doc.source.find("greet = ").expect("default body");
+        let body_pos = offset_to_position(&doc.source, body_off);
+        assert!(
+            edits
+                .iter()
+                .any(|e| e.range.start == sig_pos && e.new_text.contains("hello")),
+            "signature `greet :` must be renamed; edits: {edits:?}"
+        );
+        assert!(
+            edits
+                .iter()
+                .any(|e| e.range.start == body_pos && e.new_text.contains("hello")),
+            "default body `greet =` must be renamed; edits: {edits:?}"
+        );
+    }
+
+    #[test]
     fn rename_local_does_not_touch_impl_method_of_same_name() {
         // Regression: the trait-method impl rewrite fired for *any* symbol that
         // merely shared a trait method's name. Renaming a local binding named

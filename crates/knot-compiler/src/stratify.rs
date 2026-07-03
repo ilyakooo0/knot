@@ -78,7 +78,12 @@ fn collect_edges(
         // A variable aliasing a derived relation carries that relation's
         // dependency at the variable's current polarity.
         ast::ExprKind::Var(name) => {
-            if let Some(derived) = env.get(name) {
+            // Skip the `diff`-alias sentinel: such a variable is a function
+            // value, not a relation reference, so it contributes no edge here
+            // (its negation effect is handled at the application site).
+            if let Some(derived) = env.get(name)
+                && derived != DIFF_ALIAS
+            {
                 out.push(Edge { target: derived.clone(), polarity, span: expr.span });
             }
         }
@@ -91,7 +96,7 @@ fn collect_edges(
         // desugaring it appears as `App(App(Var("diff"), a), b)`.
         // `a` is the base set (positive), `b` is subtracted (negative).
         ast::ExprKind::App { func, arg } => {
-            if let Some(first_arg) = is_diff_applied_once(func) {
+            if let Some(first_arg) = is_diff_applied_once(func, env) {
                 // This is `(diff a) b` — `a` keeps polarity, `b` is negated.
                 collect_edges(first_arg, polarity, derived_names, env, out);
                 let neg = negate(polarity);
@@ -135,7 +140,7 @@ fn collect_edges(
             // `a |> f` is `f a`. If `f` is a partially-applied `diff` (i.e.,
             // `diff base`), then `a` becomes the subtracted (negative) arg.
             if *op == ast::BinOp::Pipe
-                && let Some(base) = is_diff_applied_once(rhs) {
+                && let Some(base) = is_diff_applied_once(rhs, env) {
                     collect_edges(base, polarity, derived_names, env, out);
                     let neg = negate(polarity);
                     collect_edges(lhs, neg, derived_names, env, out);
@@ -222,9 +227,14 @@ fn bind_derived_alias(
     env: &mut HashMap<String, String>,
 ) {
     if let ast::PatKind::Var(v) = &pat.node {
-        match &expr.node {
+        match &strip_head_wrappers(expr).node {
             ast::ExprKind::DerivedRef(name) if derived_names.contains(name) => {
                 env.insert(v.clone(), name.clone());
+            }
+            // `let d = diff` — track the alias so a later `d all self` is still
+            // recognized as set difference (negation) at its application site.
+            ast::ExprKind::Var(name) if name == "diff" => {
+                env.insert(v.clone(), DIFF_ALIAS.to_string());
             }
             // Aliasing another already-aliased variable (`let y = x`) carries
             // the alias transitively; anything else drops a stale mapping.
@@ -239,13 +249,42 @@ fn bind_derived_alias(
     }
 }
 
-/// Check if `expr` is `App(Var("diff"), arg)`, returning the first arg if so.
-fn is_diff_applied_once(expr: &ast::Expr) -> Option<&ast::Expr> {
-    if let ast::ExprKind::App { func, arg } = &expr.node
-        && let ast::ExprKind::Var(name) = &func.node
-            && name == "diff" {
-                return Some(arg);
-            }
+/// Sentinel stored in the alias `env` to mark a local variable bound to the
+/// `diff` builtin (`let d = diff`). `\0` can't appear in a real relation name,
+/// so it never collides with a derived-relation alias value.
+const DIFF_ALIAS: &str = "\0diff";
+
+/// Strip the expression wrappers that are transparent for negation analysis —
+/// a type annotation, a unit ascription, or a `refine` — mirroring
+/// `effects::head_name`, so `(diff a : T)`, `diff a <unit>`, and
+/// `refine (diff a)` are still recognized as `diff` applications.
+fn strip_head_wrappers(expr: &ast::Expr) -> &ast::Expr {
+    match &expr.node {
+        ast::ExprKind::Annot { expr: inner, .. } => strip_head_wrappers(inner),
+        ast::ExprKind::UnitLit { value, .. } => strip_head_wrappers(value),
+        ast::ExprKind::Refine(inner) => strip_head_wrappers(inner),
+        _ => expr,
+    }
+}
+
+/// Check if `expr` is a single application of `diff` (the set-difference
+/// builtin) — `App(Var("diff"), arg)` — returning the subtracted `arg` if so.
+/// Transparent wrappers around the application or its head are stripped, and a
+/// local variable aliased to `diff` (`let d = diff`, tracked in `env` via the
+/// `DIFF_ALIAS` sentinel) is recognized too.
+fn is_diff_applied_once<'a>(
+    expr: &'a ast::Expr,
+    env: &HashMap<String, String>,
+) -> Option<&'a ast::Expr> {
+    let expr = strip_head_wrappers(expr);
+    if let ast::ExprKind::App { func, arg } = &expr.node {
+        let func = strip_head_wrappers(func);
+        if let ast::ExprKind::Var(name) = &func.node
+            && (name == "diff" || env.get(name).map(String::as_str) == Some(DIFF_ALIAS))
+        {
+            return Some(arg);
+        }
+    }
     None
 }
 

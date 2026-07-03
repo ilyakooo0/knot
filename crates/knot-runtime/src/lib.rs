@@ -2730,8 +2730,37 @@ fn eq_cross_key(val: &SqlVal) -> Option<SqlValKey> {
     }
 }
 
+/// Wake every Int-variant `lt`/`le` threshold. Used when a Real row value is
+/// more negative than every i64 (`row < thr` and `row <= thr` then hold for
+/// every Int threshold), which the RealBits primary probe can't reach because
+/// all Int keys sort below all Real keys in `SqlValKey`'s total order.
+fn wake_all_int_less(idx: &RangeIndex) {
+    let lo = Bound::Included(SqlValKey::Int(i64::MIN));
+    let hi = Bound::Included(SqlValKey::Int(i64::MAX));
+    for (_, v) in idx.lt.range((lo.clone(), hi.clone())) {
+        wake_weaks(v);
+    }
+    for (_, v) in idx.le.range((lo, hi)) {
+        wake_weaks(v);
+    }
+}
+
 fn wake_range_index(idx: &RangeIndex, row_val: &SqlVal) {
     let primary = row_val.to_key();
+    // A Real row more negative than every i64 threshold: the RealBits primary
+    // probe below wakes Real-variant `lt`/`le` thresholds correctly, but Int
+    // thresholds sort below all Reals and would be skipped. `row < thr` /
+    // `row <= thr` hold for *every* Int threshold, so wake them all here.
+    // (`>`/`>=` never match such a row; the huge-positive case needs nothing
+    // extra because RealBits sorts above all Int, so the primary `gt`/`ge`
+    // probe already covers every Int threshold.)
+    if let SqlVal::Real(f) = row_val
+        && *f < i64::MIN as f64
+    {
+        wake_range_keyed(idx, &primary);
+        wake_all_int_less(idx);
+        return;
+    }
     let alt = match row_val {
         SqlVal::Int(n) => Some(SqlValKey::RealBits((*n as f64).to_bits())),
         // Integer rows arrive as TEXT (see `eq_cross_key`); probe the Real
@@ -12364,14 +12393,17 @@ fn write_child_rows(
     debug_sql(&insert_sql);
 
     // Prepare a SELECT to look up the existing _id when INSERT OR IGNORE skips a
-    // duplicate. Match on `_content_hash` (the whole-element key, last param) so a
-    // genuine full-element duplicate reuses its child row, while an element
-    // differing only in grandchild content gets a fresh child row.
+    // duplicate. Match the composite UNIQUE index `(_parent_id, _content_hash)`
+    // exactly — `_parent_id` (param 1) AND `_content_hash` (the whole-element
+    // key, last param) — so the lookup can only ever resolve to a row under the
+    // same parent, and a genuine full-element duplicate reuses its child row
+    // while an element differing only in grandchild content gets a fresh one.
     let select_id_sql = if has_children {
         let hash_idx = col_names.len();
         Some(format!(
-            "SELECT _id FROM {} WHERE {} IS ?{} LIMIT 1;",
+            "SELECT _id FROM {} WHERE {} = ?1 AND {} IS ?{} LIMIT 1;",
             table,
+            quote_ident("_parent_id"),
             quote_ident("_content_hash"),
             hash_idx
         ))

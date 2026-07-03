@@ -5,7 +5,7 @@
 //! Also lives here: `build_details`, which formats per-declaration "summary"
 //! strings used as completion details and hover headlines.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use knot::ast::{self, DeclKind, Module, Span, Type, TypeKind};
 
@@ -143,9 +143,25 @@ pub fn resolve_definitions(module: &Module, source: &str) -> Definitions {
                 // mis-resolves a method to an *earlier* method's default-body
                 // reference of the same name (e.g. `eq` calling `neq` before
                 // `neq`'s own signature appears). Mirrors document_symbol.rs.
+                // A defaulted method is parsed as TWO `TraitItem::Method`
+                // entries — the signature (`foo : T`, `default_body: None`) and
+                // the default body (`foo = …`, `default_body: Some`), each with
+                // its own `name_span`. Registering both via `define` keeps only
+                // the last (the body), leaving the signature token invisible to
+                // rename/references/highlight and corrupting the trait on
+                // rename. Define the first occurrence of each method name as
+                // canonical and cross-link any later same-name token as a
+                // self-reference (mirrors the `Fun` arm — but per-method, so we
+                // don't capture a *reference* from another method's default body
+                // of the same name, e.g. `eq` calling `neq`).
+                let mut method_defs: HashSet<&str> = HashSet::new();
                 for item in items {
                     if let ast::TraitItem::Method { name, name_span, .. } = item {
-                        resolver.define(name, *name_span);
+                        if method_defs.insert(name.as_str()) {
+                            resolver.define(name, *name_span);
+                        } else {
+                            resolver.add_ref(*name_span, name);
+                        }
                     }
                 }
             }

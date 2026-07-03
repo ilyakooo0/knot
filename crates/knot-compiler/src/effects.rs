@@ -207,6 +207,12 @@ struct EffectChecker {
     builtin_effects: HashMap<String, EffectSet>,
     /// Known source relation names.
     source_names: HashSet<String>,
+    /// Source names whose declared type is a plain scalar (not `[T]`). A `set`
+    /// on a scalar source is a pure overwrite unless its value references the
+    /// source (in which case `infer_effects(value)` already records the read),
+    /// so the `Set` arm must not add a spurious `r *rel` for these — that would
+    /// force an honest `{w *rel}` signature to widen to `{rw *rel}`.
+    scalar_source_names: HashSet<String>,
     /// Known view names. The parser produces `SourceRef` for *every* `*name`
     /// write target, so writes to views arrive looking like source writes —
     /// this set lets the `Set`/`ReplaceSet` arm recognize them and attribute
@@ -356,6 +362,7 @@ impl EffectChecker {
             decl_effects_atomic_safe: HashMap::new(),
             builtin_effects,
             source_names: HashSet::new(),
+            scalar_source_names: HashSet::new(),
             view_names: HashSet::new(),
             row_poly_decls: HashSet::new(),
             fixed_row_decls: HashSet::new(),
@@ -375,8 +382,11 @@ impl EffectChecker {
         // for the atomic-gate's opaque-callee lambda scan.
         for decl in &module.decls {
             match &decl.node {
-                ast::DeclKind::Source { name, .. } => {
+                ast::DeclKind::Source { name, ty } => {
                     self.source_names.insert(name.clone());
+                    if !matches!(&ty.node, ast::TypeKind::Relation(_)) {
+                        self.scalar_source_names.insert(name.clone());
+                    }
                 }
                 ast::DeclKind::View { name, body, .. }
                 | ast::DeclKind::Derived { name, body, .. } => {
@@ -903,7 +913,14 @@ impl EffectChecker {
                     // already references `*rel` and contributes that read via
                     // infer_effects(value) above — so adding it here is only
                     // needed (and only correct) for the non-replace form.
-                    if !is_replace {
+                    // Skip it for a *scalar* source: `*counter = 5` reads
+                    // nothing, and a read-modify-write like `*counter = *counter
+                    // + 1` already has its read from infer_effects(value). (A
+                    // relation `set` requires its value to reference the source,
+                    // but that reference isn't always surfaced as a read here —
+                    // e.g. `union xs [new]` with `xs <- *rel` — so keep the
+                    // explicit read for relations and views.)
+                    if !is_replace && !self.scalar_source_names.contains(name) {
                         effects.reads.insert(name.clone());
                     }
                     if self.view_names.contains(name) {

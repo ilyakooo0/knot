@@ -93,10 +93,22 @@ pub struct FromJsonTarget {
 pub type FromJsonTargets = HashMap<Span, FromJsonTarget>;
 
 /// Spans of `elem needle haystack` haystack arguments whose element type is a
-/// SQL-pushable scalar (Int/Text/Float/Bool, peeling aliases & refined types).
-/// Codegen consults this set to decide whether to emit
-/// `IN (SELECT value FROM json_each(?))` for dynamic haystacks.
-pub type ElemPushdownOk = HashSet<Span>;
+/// SQL-pushable scalar (peeling aliases & refined types). Codegen consults these
+/// sets to decide whether to push an `elem` down to SQL.
+///
+/// The two paths have different type constraints, so they are tracked separately:
+/// - `literal` — the `IN (?, ?, …)` form for a syntactic list literal. Each
+///   element binds as its stored representation, so `Int` (stored as TEXT) works.
+/// - `dynamic` — the `IN (SELECT value FROM json_each(?))` form for a computed
+///   haystack. `json_each` yields JSON storage classes (numbers as INTEGER), so
+///   `Int`/`Int<u>` (TEXT-stored) never match and are EXCLUDED here even though
+///   they are in `literal`. Only `Text`/`Bool`/`Uuid` are dynamic-safe.
+/// `dynamic` is always a subset of `literal`.
+#[derive(Clone, Default, Debug)]
+pub struct ElemPushdownOk {
+    pub literal: HashSet<Span>,
+    pub dynamic: HashSet<Span>,
+}
 
 // ── Units of measure ──────────────────────────────────────────────
 
@@ -715,7 +727,7 @@ impl Infer {
             refine_vars: Vec::new(),
             suppress_refine_intro: None,
             deferred_unit_binops: Vec::new(),
-            elem_pushdown_ok: HashSet::new(),
+            elem_pushdown_ok: ElemPushdownOk::default(),
         }
     }
 
@@ -750,6 +762,36 @@ impl Infer {
                 self.refined_types
                     .get(name)
                     .map(|(base, _)| self.is_sql_pushable_scalar_for_elem(base))
+                    .unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a resolved haystack type is safe for the *dynamic* `elem` path
+    /// (`IN (SELECT value FROM json_each(?))`). Stricter than
+    /// `is_elem_haystack_pushable`: `json_each` yields JSON storage classes, so
+    /// `Int`/`Int<u>` (stored as TEXT) never match and must fall back to memory.
+    fn is_elem_haystack_dynamic_pushable(&self, ty: &Ty) -> bool {
+        let peeled = ty.peel_alias();
+        let inner = match peeled {
+            Ty::Relation(t) => self.apply(t),
+            _ => return false,
+        };
+        self.is_dynamic_pushable_scalar_for_elem(&inner)
+    }
+
+    fn is_dynamic_pushable_scalar_for_elem(&self, ty: &Ty) -> bool {
+        match ty.peel_alias() {
+            // Int is stored as TEXT but JSON-encodes as a number, so
+            // `json_each` yields INTEGER values that never match the TEXT column
+            // (see the literal path, which binds Int elements as TEXT and works).
+            // Float is excluded for the same total_cmp-vs-IEEE reason as above.
+            Ty::Text | Ty::Bool | Ty::Uuid => true,
+            Ty::Con(name, args) if args.is_empty() => {
+                self.refined_types
+                    .get(name)
+                    .map(|(base, _)| self.is_dynamic_pushable_scalar_for_elem(base))
                     .unwrap_or(false)
             }
             _ => false,
@@ -4331,7 +4373,10 @@ impl Infer {
                         && name == "elem" {
                             let resolved = self.apply(&arg_ty);
                             if self.is_elem_haystack_pushable(&resolved) {
-                                self.elem_pushdown_ok.insert(arg.span);
+                                self.elem_pushdown_ok.literal.insert(arg.span);
+                                if self.is_elem_haystack_dynamic_pushable(&resolved) {
+                                    self.elem_pushdown_ok.dynamic.insert(arg.span);
+                                }
                             }
                         }
 
@@ -5602,15 +5647,12 @@ impl Infer {
                         self.check_pattern(p, &ft);
                     } else {
                         // Punned: {name} → bind variable 'name' to field type.
-                        // `FieldPat` has no span for the punned name, so the
-                        // only span available is the whole record pattern's.
-                        // Hover uses this (smallest-span-wins) to resolve a
-                        // cursor inside the pattern to a binder's type, so keep
-                        // it — but the inlay-hint loop must skip it (it would
-                        // render a misplaced `{x, y}: Int` after the `}`); that
-                        // filter lives in `inlay_hints.rs`.
+                        // Record the binder under the field-name token's own
+                        // span (not the whole record pattern's), so hover on one
+                        // punned field resolves to that field's type instead of
+                        // colliding with its siblings (smallest-span-wins).
                         self.bind(&fp.name, Scheme::mono(ft.clone()));
-                        self.binding_types.push((pat.span, ft));
+                        self.binding_types.push((fp.name_span, ft));
                     }
                 }
                 let row_var = self.fresh_var();

@@ -894,8 +894,13 @@ pub(crate) fn module_defines_name(module: &Module, name: &str) -> bool {
         | DeclKind::Source { name: n, .. }
         | DeclKind::View { name: n, .. }
         | DeclKind::Derived { name: n, .. }
-        | DeclKind::Route { name: n, .. }
         | DeclKind::RouteComposite { name: n, .. } => n == name,
+        // A route both defines its own name AND each endpoint's constructor
+        // (a first-class top-level definition — see `defs.rs`). Both are rename
+        // sites, so the origin-discipline guard must recognize either.
+        DeclKind::Route { name: n, entries } => {
+            n == name || entries.iter().any(|e| e.constructor == name)
+        }
         DeclKind::Data {
             name: n,
             constructors,
@@ -1786,11 +1791,19 @@ fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::Decl, source: &str, f: 
         }
         DeclKind::Impl { items, .. } => {
             for item in items {
-                if let ast::ImplItem::Method { params, body, .. } = item {
-                    for p in params {
-                        field_sites_in_pat(p, source, f);
+                match item {
+                    ast::ImplItem::Method { params, body, .. } => {
+                        for p in params {
+                            field_sites_in_pat(p, source, f);
+                        }
+                        field_sites_in_expr(body, source, f);
                     }
-                    field_sites_in_expr(body, source, f);
+                    // An associated type can spell out an inline record type
+                    // (`type Item = {field: T}`); its fields are rename sites too
+                    // — mirrors the symbol-rename walker `collect_name_uses_in_decl`.
+                    ast::ImplItem::AssociatedType { ty, .. } => {
+                        field_sites_in_type(ty, source, f);
+                    }
                 }
             }
         }

@@ -164,10 +164,18 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     // return fires before `route_decl_section` / the route doc comment can
     // render, leaving route names with no hover at all.
     let is_route_name = is_route_decl_name(&doc.module, word);
+    // A cursor on the bare `refine` keyword has no symbol/field/type-var/route
+    // detail, but the refine-target section below should still render, so don't
+    // early-return when the cursor sits inside a `refine expr` span.
+    let in_refine_target = doc
+        .refine_targets
+        .iter()
+        .any(|(span, _)| span.start <= lookup_offset && lookup_offset < span.end);
     if detail_opt.is_none()
         && field_at_cursor.is_none()
         && type_var_constraints.is_empty()
         && !is_route_name
+        && !in_refine_target
     {
         return None;
     }

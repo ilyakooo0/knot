@@ -264,9 +264,10 @@ pub struct Codegen {
     from_json_targets: crate::infer::FromJsonTargets,
 
     // Spans of `elem` haystack args whose element type is SQL-pushable
-    // (Text/Float/Bool). Codegen emits `IN (SELECT value FROM json_each(?))`
-    // for these instead of falling back to in-memory filter.
-    elem_pushdown_ok: HashSet<knot::ast::Span>,
+    // Spans of `elem` haystacks whose element type is SQL-pushable, split by
+    // path: `literal` (the `IN (?, …)` list form) and `dynamic` (the
+    // `IN (SELECT value FROM json_each(?))` form). See `infer::ElemPushdownOk`.
+    elem_pushdown_ok: crate::infer::ElemPushdownOk,
 }
 
 /// A top-level constant declared as a signature with no body
@@ -838,7 +839,7 @@ impl Codegen {
             refined_predicate_fns: HashMap::new(),
             source_refinements: HashMap::new(),
             from_json_targets: HashMap::new(),
-            elem_pushdown_ok: HashSet::new(),
+            elem_pushdown_ok: crate::infer::ElemPushdownOk::default(),
         }
     }
 
@@ -11582,7 +11583,7 @@ impl Codegen {
                                 // comparable, SQL doesn't), regardless of whether
                                 // the needle is a column, a computed value, or a
                                 // literal. Non-pushable → fall back to memory.
-                                if !self.elem_pushdown_ok.contains(&arg.span) {
+                                if !self.elem_pushdown_ok.literal.contains(&arg.span) {
                                     return None;
                                 }
                                 // An arithmetic needle (e.g. `x.a + x.b`)
@@ -11619,11 +11620,13 @@ impl Codegen {
                             // (b) Dynamic haystack: bind the whole list as a
                             //     single JSON-encoded param (value_to_sql_param
                             //     auto-encodes Relations) and expand via
-                            //     json_each. Gated by inference's element-type
-                            //     check (Text/Float/Bool only — Int excluded).
+                            //     json_each. Gated by inference's `dynamic` set
+                            //     (Text/Bool/Uuid only — Int and Float excluded,
+                            //     since json_each yields JSON storage classes that
+                            //     don't match the TEXT-stored Int column).
                             //     Param can't reference the bind var since the
                             //     haystack is evaluated outside the SQL row scope.
-                            if self.elem_pushdown_ok.contains(&arg.span)
+                            if self.elem_pushdown_ok.dynamic.contains(&arg.span)
                                 && !Self::expr_refs_var(arg, bind_var)
                             {
                                 let mut params = needle.params;

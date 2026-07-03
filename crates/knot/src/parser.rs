@@ -506,6 +506,9 @@ impl Parser {
             | TokenKind::Route
             | TokenKind::Serve
             | TokenKind::Migrate
+            | TokenKind::Unit
+            | TokenKind::Refine
+            | TokenKind::Forall
             | TokenKind::Export => {
                 let kw = format!("{:?}", self.peek()).to_lowercase();
                 self.error(format!(
@@ -3964,7 +3967,8 @@ impl Parser {
         if !self.at(&TokenKind::RBrace) {
             loop {
                 self.skip_newlines();
-                let (fname, _) = self.expect_lower("expected field name in record pattern").ok()?;
+                let (fname, fname_span) =
+                    self.expect_lower("expected field name in record pattern").ok()?;
                 let pattern = if self.eat(&TokenKind::Colon) {
                     self.skip_newlines();
                     Some(self.parse_pat()?)
@@ -3973,6 +3977,7 @@ impl Parser {
                 };
                 fields.push(FieldPat {
                     name: fname,
+                    name_span: fname_span,
                     pattern,
                 });
                 self.skip_newlines();

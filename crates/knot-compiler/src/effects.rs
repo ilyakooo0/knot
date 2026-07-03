@@ -989,9 +989,12 @@ impl EffectChecker {
                 // `fork` is intentionally permitted, see builtins.rs).
                 // The walk is scope-aware: a lambda param, do-bind, let, or
                 // case binder named `race` shadows the builtin, so references
-                // under that binder are local values, not the primitive.
+                // under that binder are local values, not the primitive. Seed
+                // the walk with the ENCLOSING binders (`self.shadowed`) too, so
+                // e.g. `\race -> atomic (... race ...)` treats `race` as the
+                // lambda param, not the primitive.
                 let mut disallowed: Vec<(String, Span)> = Vec::new();
-                let mut shadowed: Vec<String> = Vec::new();
+                let mut shadowed: Vec<String> = self.shadowed.clone();
                 collect_unshadowed_disallowed(inner, &mut shadowed, &mut disallowed);
                 let syntactic_race_found = !disallowed.is_empty();
                 for (name, span) in disallowed {

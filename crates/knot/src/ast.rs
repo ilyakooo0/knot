@@ -377,6 +377,11 @@ pub enum PatKind {
 #[derive(Debug, Clone)]
 pub struct FieldPat {
     pub name: Name,
+    /// Span of the field-name token. For a punned field (`pattern: None`) this
+    /// is also the binder's span — tooling (hover/inference) relies on it to
+    /// give each punned binder its own span rather than sharing the whole
+    /// record pattern's span.
+    pub name_span: Span,
     /// `None` means punned: `{name}` is shorthand for `{name: name}`.
     pub pattern: Option<Pat>,
 }

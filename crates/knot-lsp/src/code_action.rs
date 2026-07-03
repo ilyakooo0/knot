@@ -1390,6 +1390,15 @@ fn find_if_negate_at(
                     return Some(hit);
                 }
             }
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { body, .. } = item
+                        && let Some(hit) = walk(body, source, offset)
+                    {
+                        return Some(hit);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1482,15 +1491,29 @@ fn find_wrap_in_err_at(
         return None;
     }
     for decl in &module.decls {
-        if let DeclKind::Fun {
-            body: Some(body), ..
-        }
-        | DeclKind::View { body, .. }
-        | DeclKind::Derived { body, .. } = &decl.node
-            && let Some(span) = walk(body, range_start, range_end) {
-                let text = source.get(span.start..span.end)?;
-                return Some((span, format!("Err {{error: {text}}}")));
+        match &decl.node {
+            DeclKind::Fun {
+                body: Some(body), ..
             }
+            | DeclKind::View { body, .. }
+            | DeclKind::Derived { body, .. } => {
+                if let Some(span) = walk(body, range_start, range_end) {
+                    let text = source.get(span.start..span.end)?;
+                    return Some((span, format!("Err {{error: {text}}}")));
+                }
+            }
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { body, .. } = item
+                        && let Some(span) = walk(body, range_start, range_end)
+                    {
+                        let text = source.get(span.start..span.end)?;
+                        return Some((span, format!("Err {{error: {text}}}")));
+                    }
+                }
+            }
+            _ => {}
+        }
     }
     None
 }
@@ -1632,52 +1655,13 @@ fn find_case_actions(
         }
     }
 
-    // Recurse into sub-expressions
-    match &expr.node {
-        ast::ExprKind::App { func, arg } => {
-            find_case_actions(func, doc, uri, range_start, range_end, actions);
-            find_case_actions(arg, doc, uri, range_start, range_end, actions);
-        }
-        ast::ExprKind::Lambda { body, .. } => {
-            find_case_actions(body, doc, uri, range_start, range_end, actions);
-        }
-        ast::ExprKind::Do(stmts) => {
-            for stmt in stmts {
-                match &stmt.node {
-                    ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Let { expr, .. } => {
-                        find_case_actions(expr, doc, uri, range_start, range_end, actions);
-                    }
-                    ast::StmtKind::Expr(e) | ast::StmtKind::Where { cond: e } => {
-                        find_case_actions(e, doc, uri, range_start, range_end, actions);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        ast::ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            find_case_actions(cond, doc, uri, range_start, range_end, actions);
-            find_case_actions(then_branch, doc, uri, range_start, range_end, actions);
-            find_case_actions(else_branch, doc, uri, range_start, range_end, actions);
-        }
-        ast::ExprKind::Case { scrutinee, arms } => {
-            find_case_actions(scrutinee, doc, uri, range_start, range_end, actions);
-            for arm in arms {
-                find_case_actions(&arm.body, doc, uri, range_start, range_end, actions);
-            }
-        }
-        ast::ExprKind::Atomic(e) | ast::ExprKind::Refine(e) => {
-            find_case_actions(e, doc, uri, range_start, range_end, actions);
-        }
-        ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
-            find_case_actions(target, doc, uri, range_start, range_end, actions);
-            find_case_actions(value, doc, uri, range_start, range_end, actions);
-        }
-        _ => {}
-    }
+    // Recurse into every sub-expression via the canonical traversal, so a
+    // `case` nested under any expression kind (record/list/binop/field access/
+    // serve handler/groupBy key/…) is still found — a hand-written match here
+    // silently dropped those parents.
+    crate::utils::recurse_expr(expr, |e| {
+        find_case_actions(e, doc, uri, range_start, range_end, actions);
+    });
 }
 
 /// Collect every identifier name that appears in expressions, types, or
@@ -2791,34 +2775,16 @@ fn find_inline_actions(
         }
     }
 
-    // Recurse into other expression types
-    match &expr.node {
-        ast::ExprKind::App { func, arg } => {
-            find_inline_actions(func, doc, uri, cursor_offset, actions);
-            find_inline_actions(arg, doc, uri, cursor_offset, actions);
-        }
-        ast::ExprKind::Lambda { body, .. } => {
-            find_inline_actions(body, doc, uri, cursor_offset, actions);
-        }
-        ast::ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            find_inline_actions(cond, doc, uri, cursor_offset, actions);
-            find_inline_actions(then_branch, doc, uri, cursor_offset, actions);
-            find_inline_actions(else_branch, doc, uri, cursor_offset, actions);
-        }
-        ast::ExprKind::Case { scrutinee, arms } => {
-            find_inline_actions(scrutinee, doc, uri, cursor_offset, actions);
-            for arm in arms {
-                find_inline_actions(&arm.body, doc, uri, cursor_offset, actions);
-            }
-        }
-        ast::ExprKind::Atomic(e) | ast::ExprKind::Refine(e) => {
+    // Recurse into every child via the canonical traversal so a `do`-block
+    // `let` nested under any expression kind (record/list/binop/field access/
+    // set value/serve handler/…) is still offered — the old hand-written match
+    // silently dropped those parents. `Do` is fully handled above (including
+    // its own statement recursion), so skip it here to avoid visiting its
+    // statements twice.
+    if !matches!(&expr.node, ast::ExprKind::Do(_)) {
+        crate::utils::recurse_expr(expr, |e| {
             find_inline_actions(e, doc, uri, cursor_offset, actions);
-        }
-        _ => {}
+        });
     }
 }
 

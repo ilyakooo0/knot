@@ -11044,6 +11044,18 @@ fn auto_apply_child_change(
         }
     }
 
+    // A leaf child gaining its own nested children → breaking. `init_child_table`
+    // creates leaf children WITHOUT the `_id`/`_content_hash` columns that a child
+    // with grandchildren needs (see line ~10851), and SQLite cannot add a
+    // PRIMARY KEY/AUTOINCREMENT column via ALTER TABLE. Proceeding would build a
+    // unique index on the nonexistent `_content_hash` (silently dropping set
+    // dedup) and create grandchild tables whose FK references a nonexistent `_id`.
+    // Mirror the parent-level guard in `auto_apply_record_change`; force an
+    // explicit `migrate` block instead.
+    if old_nf.nested.is_empty() && !new_nf.nested.is_empty() {
+        return false;
+    }
+
     // Add new columns to the child table
     let old_col_names: HashSet<&str> = old_nf.columns.iter().map(|c| c.name.as_str()).collect();
     for c in &new_nf.columns {

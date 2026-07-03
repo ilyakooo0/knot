@@ -772,6 +772,7 @@ fn synth_ctor_field_case(ctor: &str, field: &str, pred: Expr, span: Span) -> Exp
     let rec_pat = Spanned::new(
         PatKind::Record(vec![FieldPat {
             name: field.into(),
+            name_span: span,
             pattern: Some(bound),
         }]),
         span,

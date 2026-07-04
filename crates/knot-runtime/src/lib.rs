@@ -6348,113 +6348,157 @@ pub extern "C-unwind" fn knot_relation_group_by(
 
 // ── Value equality ────────────────────────────────────────────────
 
-/// Recursively serialize a Value to bytes for hash-based set comparison.
+/// One item in the iterative-hash work stack. `Value` is a pointer to
+/// process next (write its bytes and push its children); `Bytes` is a
+/// ready-made byte sequence to extend the buffer with (used to interleave
+/// record-field name bytes with their hashed values in the correct order
+/// without recursing on the call stack).
+enum HashTask {
+    Value(*mut Value),
+    Bytes(Vec<u8>),
+}
+
+/// Serialize a Value to bytes for hash-based set comparison.
+///
+/// Iterative (uses an explicit work stack) so a deeply nested value — e.g.
+/// a 100k-element linked list encoded as `Cons 1 (Cons 2 …)` — can't blow
+/// the native call stack. Sibling functions `deep_clone_with` and
+/// `deep_drop_value` were already iterative for the same reason; this and
+/// the other hash/compare paths had been left recursive.
 fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
-    if v.is_null() {
-        buf.push(0xFF);
-        return;
-    }
-    match unsafe { as_ref(v) } {
-        Value::Int(n) => {
-            buf.push(0);
-            buf.extend_from_slice(&n.to_le_bytes());
-        }
-        Value::Float(f) => {
-            // An integral Float must hash identically to the equal Int, since
-            // `values_equal` treats `Int(2) == Float(2.0)`. `float_as_exact_i64`
-            // is the shared basis for that equality rule (and avoids the 2^63
-            // saturation trap). `-0.0` is canonicalized to `+0.0` by
-            // `alloc_float`, so it hashes as `Int(0)` correctly. NaN/±inf/out-of-
-            // range fall through to the raw-bits branch.
-            if let Some(i) = float_as_exact_i64(*f) {
-                buf.push(0);
-                buf.extend_from_slice(&i.to_le_bytes());
-            } else {
-                buf.push(1);
-                // Raw bits otherwise; canonicalize NaN so all NaN bit patterns hash the same.
-                let bits = if f.is_nan() { f64::NAN.to_bits() } else { f.to_bits() };
-                buf.extend_from_slice(&bits.to_le_bytes());
+    let mut stack: Vec<HashTask> = vec![HashTask::Value(v)];
+    while let Some(task) = stack.pop() {
+        match task {
+            HashTask::Bytes(bytes) => buf.extend_from_slice(&bytes),
+            HashTask::Value(v) => {
+                if v.is_null() {
+                    buf.push(0xFF);
+                    continue;
+                }
+                match unsafe { as_ref(v) } {
+                    Value::Int(n) => {
+                        buf.push(0);
+                        buf.extend_from_slice(&n.to_le_bytes());
+                    }
+                    Value::Float(f) => {
+                        // An integral Float must hash identically to the equal
+                        // Int, since `values_equal` treats `Int(2) == Float(2.0)`.
+                        // `float_as_exact_i64` is the shared basis for that
+                        // equality rule (and avoids the 2^63 saturation trap).
+                        // `-0.0` is canonicalized to `+0.0` by `alloc_float`,
+                        // so it hashes as `Int(0)` correctly. NaN/±inf/out-of-
+                        // range fall through to the raw-bits branch.
+                        if let Some(i) = float_as_exact_i64(*f) {
+                            buf.push(0);
+                            buf.extend_from_slice(&i.to_le_bytes());
+                        } else {
+                            buf.push(1);
+                            // Raw bits otherwise; canonicalize NaN so all NaN
+                            // bit patterns hash the same.
+                            let bits = if f.is_nan() { f64::NAN.to_bits() } else { f.to_bits() };
+                            buf.extend_from_slice(&bits.to_le_bytes());
+                        }
+                    }
+                    Value::Text(s) => {
+                        buf.push(2);
+                        buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(s.as_bytes());
+                    }
+                    Value::Bool(b) => {
+                        buf.push(3);
+                        buf.push(*b as u8);
+                    }
+                    Value::Bytes(b) => {
+                        buf.push(4);
+                        buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(b);
+                    }
+                    Value::Unit => {
+                        buf.push(5);
+                    }
+                    Value::Record(fields) => {
+                        buf.push(6);
+                        buf.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+                        // Push field tasks in reverse so they pop in forward
+                        // order: for each field, write name bytes, then hash
+                        // the value. Push value first (deeper), then the name
+                        // bytes — popping yields name-then-value per field,
+                        // fields in source order.
+                        for field in fields.iter().rev() {
+                            stack.push(HashTask::Value(field.value));
+                            let mut nb = Vec::with_capacity(4 + field.name.len());
+                            nb.extend_from_slice(&(field.name.len() as u32).to_le_bytes());
+                            nb.extend_from_slice(field.name.as_bytes());
+                            stack.push(HashTask::Bytes(nb));
+                        }
+                    }
+                    Value::Constructor(tag, payload) => {
+                        buf.push(7);
+                        buf.extend_from_slice(&(tag.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(tag.as_bytes());
+                        stack.push(HashTask::Value(*payload));
+                    }
+                    Value::Relation(rows) => {
+                        buf.push(8);
+                        // Hash as a canonical *set*: serialize each row, sort,
+                        // and dedup before writing count + rows. `values_equal`
+                        // compares relations with set semantics (duplicates
+                        // ignored), so hash equality must match — including the
+                        // row count, which is the deduped count. Rows may
+                        // themselves be relations; the iterative hash
+                        // canonicalizes them the same way before this level
+                        // sorts/dedups.
+                        //
+                        // Each row hash runs `value_to_hash_bytes` on a fresh
+                        // buffer (iterative, so no call-stack growth from
+                        // nested structures). The Relation case therefore
+                        // adds one native frame per level of relation-nesting
+                        // (typically 1–2), not per row.
+                        let mut row_bytes: Vec<Vec<u8>> = rows
+                            .iter()
+                            .map(|r| {
+                                let mut rb = Vec::new();
+                                value_to_hash_bytes(*r, &mut rb);
+                                rb
+                            })
+                            .collect();
+                        row_bytes.sort_unstable();
+                        row_bytes.dedup();
+                        buf.extend_from_slice(&(row_bytes.len() as u32).to_le_bytes());
+                        for rb in &row_bytes {
+                            buf.extend_from_slice(&(rb.len() as u32).to_le_bytes());
+                            buf.extend_from_slice(rb);
+                        }
+                    }
+                    Value::Function(f) => {
+                        buf.push(9);
+                        buf.extend_from_slice(&(f.source.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(f.source.as_bytes());
+                        buf.extend_from_slice(&(f.fn_ptr as usize).to_le_bytes());
+                        stack.push(HashTask::Value(f.env));
+                    }
+                    Value::IO(fn_ptr, env) => {
+                        // Mirror `values_equal`: two IO values are equal iff
+                        // they share the same fn pointer AND equal environments.
+                        // Hashing only the tag byte collapsed distinct IO
+                        // actions in dedup paths (union/concat/bind), silently
+                        // dropping actions.
+                        buf.push(11);
+                        buf.extend_from_slice(&(*fn_ptr as usize).to_le_bytes());
+                        stack.push(HashTask::Value(*env));
+                    }
+                    Value::Pair(a, b) => {
+                        // Pair is an internal-only variant for IO thunk envs;
+                        // it should never reach user-visible hash/compare
+                        // paths. Handle it for exhaustiveness but don't expect
+                        // it.
+                        buf.push(12);
+                        // Push b first (deeper) so a pops first.
+                        stack.push(HashTask::Value(*b));
+                        stack.push(HashTask::Value(*a));
+                    }
+                }
             }
-        }
-        Value::Text(s) => {
-            buf.push(2);
-            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
-            buf.extend_from_slice(s.as_bytes());
-        }
-        Value::Bool(b) => {
-            buf.push(3);
-            buf.push(*b as u8);
-        }
-        Value::Bytes(b) => {
-            buf.push(4);
-            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
-            buf.extend_from_slice(b);
-        }
-        Value::Unit => {
-            buf.push(5);
-        }
-        Value::Record(fields) => {
-            buf.push(6);
-            buf.extend_from_slice(&(fields.len() as u32).to_le_bytes());
-            for field in fields {
-                buf.extend_from_slice(&(field.name.len() as u32).to_le_bytes());
-                buf.extend_from_slice(field.name.as_bytes());
-                value_to_hash_bytes(field.value, buf);
-            }
-        }
-        Value::Constructor(tag, payload) => {
-            buf.push(7);
-            buf.extend_from_slice(&(tag.len() as u32).to_le_bytes());
-            buf.extend_from_slice(tag.as_bytes());
-            value_to_hash_bytes(*payload, buf);
-        }
-        Value::Relation(rows) => {
-            buf.push(8);
-            // Hash as a canonical *set*: serialize each row, sort, and dedup
-            // before writing count + rows. `values_equal` compares relations
-            // with set semantics (duplicates ignored), so hash equality must
-            // match — including the row count, which is the deduped count.
-            // Rows may themselves be relations; the recursion canonicalizes
-            // them the same way before this level sorts/dedups.
-            let mut row_bytes: Vec<Vec<u8>> = rows
-                .iter()
-                .map(|r| {
-                    let mut rb = Vec::new();
-                    value_to_hash_bytes(*r, &mut rb);
-                    rb
-                })
-                .collect();
-            row_bytes.sort_unstable();
-            row_bytes.dedup();
-            buf.extend_from_slice(&(row_bytes.len() as u32).to_le_bytes());
-            for rb in &row_bytes {
-                buf.extend_from_slice(&(rb.len() as u32).to_le_bytes());
-                buf.extend_from_slice(rb);
-            }
-        }
-        Value::Function(f) => {
-            buf.push(9);
-            buf.extend_from_slice(&(f.source.len() as u32).to_le_bytes());
-            buf.extend_from_slice(f.source.as_bytes());
-            buf.extend_from_slice(&(f.fn_ptr as usize).to_le_bytes());
-            value_to_hash_bytes(f.env, buf);
-        }
-        Value::IO(fn_ptr, env) => {
-            // Mirror `values_equal`: two IO values are equal iff they share
-            // the same fn pointer AND equal environments. Hashing only the
-            // tag byte collapsed distinct IO actions in dedup paths
-            // (union/concat/bind), silently dropping actions.
-            buf.push(11);
-            buf.extend_from_slice(&(*fn_ptr as usize).to_le_bytes());
-            value_to_hash_bytes(*env, buf);
-        }
-        Value::Pair(a, b) => {
-            // Pair is an internal-only variant for IO thunk envs; it should
-            // never reach user-visible hash/compare paths.  Handle it for
-            // exhaustiveness but don't expect it.
-            buf.push(12);
-            value_to_hash_bytes(*a, buf);
-            value_to_hash_bytes(*b, buf);
         }
     }
 }
@@ -6473,64 +6517,132 @@ fn record_content_hash_hex(row_ptr: *mut Value) -> String {
     blake3::hash(&buf).to_hex().to_string()
 }
 
+/// Iterative structural equality. Uses an explicit work stack of pending
+/// (a, b) comparisons so a deeply nested structure (long ADT spine, deeply
+/// nested record) cannot overflow the native call stack. Sibling functions
+/// `deep_clone_with` and `deep_drop_value` were already iterative for the
+/// same reason; this and the other hash/compare paths had been left
+/// recursive. The result is identical to the recursive formulation: a
+/// single mismatch returns `false`, otherwise all reachable pairs must
+/// match leaf-for-leaf.
 fn values_equal(a: *mut Value, b: *mut Value) -> bool {
-    if a == b {
-        return true;
-    }
-    // Nullable encoding: null represents the "none" variant
-    if a.is_null() || b.is_null() {
-        return false; // a == b already handled both-null
-    }
-    match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
-        (Value::Int(x), Value::Int(y)) => x == y,
-        (Value::Float(x), Value::Float(y)) => x == y,
-        // Int↔Float equality must agree with `value_to_hash_bytes`, which
-        // canonicalizes an integral Float by casting it to i64. Casting the Int
-        // to f64 instead (lossy past 2^53) makes `==` non-transitive and breaks
-        // the "equal values hash equally" contract: `Int(2^53+1)` would equal
-        // `Float(2^53.0)` yet hash differently. Use the exact-round-trip basis:
-        // equal only when the Float is integral, fits i64, and equals the Int.
-        (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => {
-            float_as_exact_i64(*y) == Some(*x)
+    let mut stack: Vec<(*mut Value, *mut Value)> = vec![(a, b)];
+    while let Some((a, b)) = stack.pop() {
+        if a == b {
+            continue;
         }
-        (Value::Text(x), Value::Text(y)) => x == y,
-        (Value::Bool(x), Value::Bool(y)) => x == y,
-        (Value::Bytes(x), Value::Bytes(y)) => x == y,
-        (Value::Unit, Value::Unit) => true,
-        (Value::Record(fa), Value::Record(fb)) => {
-            if fa.len() != fb.len() {
-                return false;
+        // Nullable encoding: null represents the "none" variant
+        if a.is_null() || b.is_null() {
+            return false; // a == b already handled above
+        }
+        match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
+            (Value::Int(x), Value::Int(y)) => {
+                if x != y {
+                    return false;
+                }
             }
-            // Fields are sorted by name — linear comparison
-            fa.iter().zip(fb.iter()).all(|(a, b)| {
-                a.name == b.name && values_equal(a.value, b.value)
-            })
+            (Value::Float(x), Value::Float(y)) => {
+                if x != y {
+                    return false;
+                }
+            }
+            // Int↔Float equality must agree with `value_to_hash_bytes`, which
+            // canonicalizes an integral Float by casting it to i64. Casting the
+            // Int to f64 instead (lossy past 2^53) makes `==` non-transitive
+            // and breaks the "equal values hash equally" contract:
+            // `Int(2^53+1)` would equal `Float(2^53.0)` yet hash differently.
+            // Use the exact-round-trip basis: equal only when the Float is
+            // integral, fits i64, and equals the Int.
+            (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => {
+                if float_as_exact_i64(*y) != Some(*x) {
+                    return false;
+                }
+            }
+            (Value::Text(x), Value::Text(y)) => {
+                if x != y {
+                    return false;
+                }
+            }
+            (Value::Bool(x), Value::Bool(y)) => {
+                if x != y {
+                    return false;
+                }
+            }
+            (Value::Bytes(x), Value::Bytes(y)) => {
+                if x != y {
+                    return false;
+                }
+            }
+            (Value::Unit, Value::Unit) => {}
+            (Value::Record(fa), Value::Record(fb)) => {
+                if fa.len() != fb.len() {
+                    return false;
+                }
+                // Fields are sorted by name — linear comparison. Any name
+                // mismatch short-circuits; matching name pairs queue their
+                // values for comparison. Push in reverse so the first
+                // mismatch encountered is the leftmost field (matches the
+                // recursive `.all` iteration order for diagnostic intent —
+                // the boolean result is order-independent).
+                let mut name_mismatch = false;
+                for (xa, xb) in fa.iter().zip(fb.iter()) {
+                    if xa.name != xb.name {
+                        name_mismatch = true;
+                        break;
+                    }
+                }
+                if name_mismatch {
+                    return false;
+                }
+                for (xa, xb) in fa.iter().zip(fb.iter()).rev() {
+                    stack.push((xa.value, xb.value));
+                }
+            }
+            (Value::Constructor(ta, pa), Value::Constructor(tb, pb)) => {
+                if ta != tb {
+                    return false;
+                }
+                stack.push((*pa, *pb));
+            }
+            (Value::Relation(ra), Value::Relation(rb)) => {
+                // Set semantics: compare unique elements (consistent with SQL
+                // paths). `value_to_hash_bytes` is iterative, so this adds no
+                // call-stack growth.
+                let set_a: HashSet<Vec<u8>> = ra.iter().map(|r| {
+                    let mut buf = Vec::new();
+                    value_to_hash_bytes(*r, &mut buf);
+                    buf
+                }).collect();
+                let set_b: HashSet<Vec<u8>> = rb.iter().map(|r| {
+                    let mut buf = Vec::new();
+                    value_to_hash_bytes(*r, &mut buf);
+                    buf
+                }).collect();
+                if set_a != set_b {
+                    return false;
+                }
+            }
+            (Value::Function(a), Value::Function(b)) => {
+                if a.fn_ptr != b.fn_ptr || a.source != b.source {
+                    return false;
+                }
+                stack.push((a.env, b.env));
+            }
+            (Value::IO(fn_a, env_a), Value::IO(fn_b, env_b)) => {
+                if fn_a != fn_b {
+                    return false;
+                }
+                stack.push((*env_a, *env_b));
+            }
+            (Value::Pair(aa, ab), Value::Pair(ba, bb)) => {
+                // Push in reverse so `a` pops first (matches recursive order).
+                stack.push((*ab, *bb));
+                stack.push((*aa, *ba));
+            }
+            _ => return false,
         }
-        (Value::Constructor(ta, pa), Value::Constructor(tb, pb)) => {
-            ta == tb && values_equal(*pa, *pb)
-        }
-        (Value::Relation(ra), Value::Relation(rb)) => {
-            // Set semantics: compare unique elements (consistent with SQL paths)
-            let set_a: HashSet<Vec<u8>> = ra.iter().map(|r| {
-                let mut buf = Vec::new();
-                value_to_hash_bytes(*r, &mut buf);
-                buf
-            }).collect();
-            let set_b: HashSet<Vec<u8>> = rb.iter().map(|r| {
-                let mut buf = Vec::new();
-                value_to_hash_bytes(*r, &mut buf);
-                buf
-            }).collect();
-            set_a == set_b
-        }
-        (Value::Function(a), Value::Function(b)) => {
-            a.fn_ptr == b.fn_ptr && a.source == b.source && values_equal(a.env, b.env)
-        }
-        (Value::IO(fn_a, env_a), Value::IO(fn_b, env_b)) => {
-            fn_a == fn_b && values_equal(*env_a, *env_b)
-        }
-        _ => false,
     }
+    true
 }
 
 // ── Binary operations ─────────────────────────────────────────────
@@ -6991,66 +7103,131 @@ fn compare_values_primitive(a: *mut Value, b: *mut Value) -> std::cmp::Ordering 
     }
 }
 
+/// One item in the iterative-compare work stack.
+enum CmpFrame {
+    /// Compare two values (leaf or compound). Compound values decompose
+    /// themselves into smaller frames and re-push.
+    Pair(*mut Value, *mut Value),
+    /// Compare two record-field names; on mismatch returns the ordering.
+    FieldName(std::sync::Arc<str>, std::sync::Arc<str>),
+    /// Final length comparison for two records with equal field names and
+    /// values up to the shorter length.
+    RecordLen(usize, usize),
+}
+
+/// Iterative structural ordering. Uses an explicit work stack so a deeply
+/// nested value (long ADT spine, deeply nested record) cannot overflow the
+/// native call stack. The result is identical to the recursive formulation
+/// — lexicographic comparison with short-circuit on the first non-Equal
+/// result, evaluated in the same pre-order, left-to-right order.
 fn compare_values(a: *mut Value, b: *mut Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    // Nullable encoding: null represents the "none" variant (Nothing).
-    // Handle nulls before calling as_ref, which panics on null pointers.
-    // Mirrors values_equal's null handling. Nothing < Just x (like Haskell).
-    if a.is_null() && b.is_null() {
-        return Ordering::Equal;
-    }
-    if a.is_null() {
-        return Ordering::Less;
-    }
-    if b.is_null() {
-        return Ordering::Greater;
-    }
-    let av = unsafe { as_ref(a) };
-    let bv = unsafe { as_ref(b) };
-    if let (Value::Text(x), Value::Text(y)) = (av, bv) {
-        return x.cmp(y);
-    }
-    match (to_num_view(av), to_num_view(bv)) {
-        (Some(NumView::Int(x)), Some(NumView::Int(y))) => return x.cmp(&y),
-        (Some(NumView::Float(x)), Some(NumView::Float(y))) => return x.total_cmp(&y),
-        (Some(NumView::Int(x)), Some(NumView::Float(y))) => return cmp_int_float(x, y),
-        (Some(NumView::Float(x)), Some(NumView::Int(y))) => return cmp_int_float(y, x).reverse(),
-        _ => {}
-    }
-    // Structural ordering for non-numeric values — backs derived `Ord` on
-    // ADTs/records and ordered comparison of `Bool`/`Bytes`. Mirrors the
-    // structural recursion of `values_equal`. ADT constructors order by tag
-    // name (lexicographic), then by payload; records order field-by-field in
-    // their canonical (name-sorted) order. The type checker only permits these
-    // comparisons between values of the same type, so cross-shape mismatches
-    // indicate a real type error and still panic.
-    match (av, bv) {
-        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
-        (Value::Unit, Value::Unit) => Ordering::Equal,
-        (Value::Record(fa), Value::Record(fb)) => {
-            for (a, b) in fa.iter().zip(fb.iter()) {
-                match a.name.cmp(&b.name) {
-                    Ordering::Equal => {}
-                    o => return o,
+    let mut stack: Vec<CmpFrame> = vec![CmpFrame::Pair(a, b)];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            CmpFrame::FieldName(a_name, b_name) => match a_name.cmp(&b_name) {
+                Ordering::Equal => {}
+                o => return o,
+            },
+            CmpFrame::RecordLen(a_len, b_len) => match a_len.cmp(&b_len) {
+                Ordering::Equal => {}
+                o => return o,
+            },
+            CmpFrame::Pair(a, b) => {
+                // Nullable encoding: null represents the "none" variant
+                // (Nothing). Handle nulls before calling as_ref, which panics
+                // on null pointers. Mirrors values_equal's null handling.
+                // Nothing < Just x (like Haskell).
+                if a.is_null() && b.is_null() {
+                    continue;
                 }
-                match compare_values(a.value, b.value) {
-                    Ordering::Equal => {}
-                    o => return o,
+                if a.is_null() {
+                    return Ordering::Less;
+                }
+                if b.is_null() {
+                    return Ordering::Greater;
+                }
+                let av = unsafe { as_ref(a) };
+                let bv = unsafe { as_ref(b) };
+                if let (Value::Text(x), Value::Text(y)) = (av, bv) {
+                    match x.cmp(y) {
+                        Ordering::Equal => {}
+                        o => return o,
+                    }
+                    continue;
+                }
+                if let Some(num_ord) = match (to_num_view(av), to_num_view(bv)) {
+                    (Some(NumView::Int(x)), Some(NumView::Int(y))) => Some(x.cmp(&y)),
+                    (Some(NumView::Float(x)), Some(NumView::Float(y))) => Some(x.total_cmp(&y)),
+                    (Some(NumView::Int(x)), Some(NumView::Float(y))) => Some(cmp_int_float(x, y)),
+                    (Some(NumView::Float(x)), Some(NumView::Int(y))) => {
+                        Some(cmp_int_float(y, x).reverse())
+                    }
+                    _ => None,
+                } {
+                    match num_ord {
+                        Ordering::Equal => {}
+                        o => return o,
+                    }
+                    continue;
+                }
+                // Structural ordering for non-numeric values — backs derived
+                // `Ord` on ADTs/records and ordered comparison of
+                // `Bool`/`Bytes`. Mirrors the structural recursion of
+                // `values_equal`. ADT constructors order by tag name
+                // (lexicographic), then by payload; records order
+                // field-by-field in their canonical (name-sorted) order. The
+                // type checker only permits these comparisons between values
+                // of the same type, so cross-shape mismatches indicate a real
+                // type error and still panic.
+                match (av, bv) {
+                    (Value::Bool(x), Value::Bool(y)) => match x.cmp(y) {
+                        Ordering::Equal => {}
+                        o => return o,
+                    },
+                    (Value::Bytes(x), Value::Bytes(y)) => match x.cmp(y) {
+                        Ordering::Equal => {}
+                        o => return o,
+                    },
+                    (Value::Unit, Value::Unit) => {}
+                    (Value::Record(fa), Value::Record(fb)) => {
+                        // Push the final length-comparison frame first (it
+                        // runs last, after all fields are compared).
+                        stack.push(CmpFrame::RecordLen(fa.len(), fb.len()));
+                        // For each field in reverse, push value-Pair then
+                        // FieldName so they pop name-first, value-second, in
+                        // forward field order. Recursive version checks
+                        // field1.name, field1.value, field2.name, … — the
+                        // stack mirrors that exactly because the next
+                        // field's frames are below the current field's.
+                        for (xa, xb) in fa.iter().zip(fb.iter()).rev() {
+                            stack.push(CmpFrame::Pair(xa.value, xb.value));
+                            stack.push(CmpFrame::FieldName(xa.name.clone(), xb.name.clone()));
+                        }
+                    }
+                    (Value::Constructor(ta, pa), Value::Constructor(tb, pb)) => {
+                        match ta.cmp(tb) {
+                            Ordering::Equal => {}
+                            o => return o,
+                        }
+                        stack.push(CmpFrame::Pair(*pa, *pb));
+                    }
+                    (Value::Pair(aa, ab), Value::Pair(ba, bb)) => {
+                        // Push tail first so head pops first (matches
+                        // recursive order).
+                        stack.push(CmpFrame::Pair(*ab, *bb));
+                        stack.push(CmpFrame::Pair(*aa, *ba));
+                    }
+                    _ => panic!(
+                        "knot runtime: cannot compare {} with {}",
+                        type_name(a),
+                        type_name(b)
+                    ),
                 }
             }
-            fa.len().cmp(&fb.len())
         }
-        (Value::Constructor(ta, pa), Value::Constructor(tb, pb)) => match ta.cmp(tb) {
-            Ordering::Equal => compare_values(*pa, *pb),
-            o => o,
-        },
-        _ => panic!(
-            "knot runtime: cannot compare {} with {}",
-            type_name(a),
-            type_name(b)
-        ),
     }
+    Ordering::Equal
 }
 
 /// Extract Ordering constructor tag as i32: 0=LT, 1=EQ, 2=GT.
@@ -16422,6 +16599,31 @@ fn http_serve_loop(
                                     return;
                                 }
                             };
+                            // Enforce the response body cap (mirrors the
+                            // inbound-request and fetch-response ceilings)
+                            // so a handler that returns a multi-GB relation
+                            // can't OOM the server. AGENTS.md documents
+                            // `--http-max-body-bytes` as applying to both
+                            // `listen` and `fetch`.
+                            let max = http_max_body_bytes();
+                            if json.len() as u64 > max {
+                                log_error!(
+                                    "[HTTP] response body exceeds {} byte limit; returning 500",
+                                    max
+                                );
+                                let body = "{\"error\":\"response too large\"}".to_string();
+                                let response = tiny_http::Response::from_string(&body)
+                                    .with_status_code(500)
+                                    .with_header(
+                                        "Content-Type: application/json"
+                                            .parse::<tiny_http::Header>()
+                                            .unwrap(),
+                                    );
+                                let _ = request.respond(response);
+                                knot_db_close(db);
+                                unsafe { deep_drop_value(handler); }
+                                return;
+                            }
                             let mut response = tiny_http::Response::from_string(&json)
                                 .with_status_code(status_code)
                                 .with_header(
@@ -16521,6 +16723,26 @@ fn http_serve_loop(
                                     return;
                                 }
                             };
+                            // Enforce the response body cap on this path too.
+                            let max = http_max_body_bytes();
+                            if json.len() as u64 > max {
+                                log_error!(
+                                    "[HTTP] response body exceeds {} byte limit; returning 500",
+                                    max
+                                );
+                                let body = "{\"error\":\"response too large\"}".to_string();
+                                let response = tiny_http::Response::from_string(&body)
+                                    .with_status_code(500)
+                                    .with_header(
+                                        "Content-Type: application/json"
+                                            .parse::<tiny_http::Header>()
+                                            .unwrap(),
+                                    );
+                                let _ = request.respond(response);
+                                knot_db_close(db);
+                                unsafe { deep_drop_value(handler); }
+                                return;
+                            }
                             log_debug!("[HTTP] --> {} {}", status_code, json);
                             let response = tiny_http::Response::from_string(&json)
                                 .with_status_code(status_code)
@@ -17688,112 +17910,16 @@ fn serialize_value_for_hash(v: *mut Value) -> Vec<u8> {
     buf
 }
 
+/// Serialize a Value to compact bytes for use as a hash key.
+///
+/// Byte-for-byte identical to `value_to_hash_bytes` (the canonical
+/// serialization used by `values_equal` and `record_content_hash_hex`), so a
+/// key produced here matches a hash bucket produced there. Delegating (rather
+/// than duplicating) keeps the two paths in lockstep and inherits the
+/// iterative work stack so deeply nested values can't overflow the call
+/// stack.
 fn serialize_value_for_hash_into(v: *mut Value, buf: &mut Vec<u8>) {
-    if v.is_null() {
-        buf.push(0xFF);
-        return;
-    }
-    // Tag bytes must match value_to_hash_bytes for cross-path consistency.
-    match unsafe { as_ref(v) } {
-        Value::Int(n) => {
-            buf.push(0);
-            buf.extend_from_slice(&n.to_le_bytes());
-        }
-        Value::Float(f) => {
-            // An integral Float must hash identically to the equal Int, since
-            // `values_equal` treats `Int(2) == Float(2.0)`. `float_as_exact_i64`
-            // is the shared basis for that equality rule (and avoids the 2^63
-            // saturation trap). `-0.0` is canonicalized to `+0.0` by
-            // `alloc_float`, so it hashes as `Int(0)` correctly. NaN/±inf/out-of-
-            // range fall through to the raw-bits branch.
-            if let Some(i) = float_as_exact_i64(*f) {
-                buf.push(0);
-                buf.extend_from_slice(&i.to_le_bytes());
-            } else {
-                buf.push(1);
-                // Raw bits otherwise; canonicalize NaN so all NaN bit patterns hash the same.
-                let bits = if f.is_nan() { f64::NAN.to_bits() } else { f.to_bits() };
-                buf.extend_from_slice(&bits.to_le_bytes());
-            }
-        }
-        Value::Text(s) => {
-            buf.push(2);
-            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
-            buf.extend_from_slice(s.as_bytes());
-        }
-        Value::Bool(b) => {
-            buf.push(3);
-            buf.push(*b as u8);
-        }
-        Value::Bytes(b) => {
-            buf.push(4);
-            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
-            buf.extend_from_slice(b);
-        }
-        Value::Unit => {
-            buf.push(5);
-        }
-        Value::Record(fields) => {
-            buf.push(6);
-            buf.extend_from_slice(&(fields.len() as u32).to_le_bytes());
-            for field in fields {
-                buf.extend_from_slice(&(field.name.len() as u32).to_le_bytes());
-                buf.extend_from_slice(field.name.as_bytes());
-                serialize_value_for_hash_into(field.value, buf);
-            }
-        }
-        Value::Constructor(tag, payload) => {
-            buf.push(7);
-            let tag_bytes = tag.as_bytes();
-            buf.extend_from_slice(&(tag_bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(tag_bytes);
-            serialize_value_for_hash_into(*payload, buf);
-        }
-        Value::Relation(rows) => {
-            buf.push(8);
-            // Canonical *set* form: sort + dedup, then write the DEDUPED
-            // count — must match `value_to_hash_bytes` exactly, otherwise a
-            // relation key containing duplicate rows hashes differently
-            // across the two paths and equal join keys miss each other.
-            let mut row_bytes: Vec<Vec<u8>> = rows
-                .iter()
-                .map(|r| {
-                    let mut rb = Vec::new();
-                    serialize_value_for_hash_into(*r, &mut rb);
-                    rb
-                })
-                .collect();
-            row_bytes.sort_unstable();
-            row_bytes.dedup();
-            buf.extend_from_slice(&(row_bytes.len() as u32).to_le_bytes());
-            for rb in &row_bytes {
-                buf.extend_from_slice(&(rb.len() as u32).to_le_bytes());
-                buf.extend_from_slice(rb);
-            }
-        }
-        Value::Function(f) => {
-            buf.push(9);
-            buf.extend_from_slice(&(f.source.len() as u32).to_le_bytes());
-            buf.extend_from_slice(f.source.as_bytes());
-            // Include the fn pointer (mirroring `value_to_hash_bytes` and
-            // `values_equal`): two functions with identical source/env but
-            // distinct compiled bodies must not collide as equal join keys.
-            buf.extend_from_slice(&(f.fn_ptr as usize).to_le_bytes());
-            serialize_value_for_hash_into(f.env, buf);
-        }
-        Value::IO(fn_ptr, env) => {
-            // Match `value_to_hash_bytes`: include the fn pointer and env so
-            // distinct IO actions don't collide (consistent with `values_equal`).
-            buf.push(11);
-            buf.extend_from_slice(&(*fn_ptr as usize).to_le_bytes());
-            serialize_value_for_hash_into(*env, buf);
-        }
-        Value::Pair(a, b) => {
-            buf.push(12);
-            serialize_value_for_hash_into(*a, buf);
-            serialize_value_for_hash_into(*b, buf);
-        }
-    }
+    value_to_hash_bytes(v, buf)
 }
 
 /// Build a hash index over a relation on a given field.
@@ -20323,6 +20449,81 @@ mod _fk_migration_listen_tests {
         // Just {value: null} < Just {value: 5} (Nothing < Just x)
         assert_eq!(compare_values(mk_just(-1), mk_just(5)), std::cmp::Ordering::Less);
         assert_eq!(compare_values(mk_just(5), mk_just(-1)), std::cmp::Ordering::Greater);
+    }
+}
+
+#[cfg(test)]
+mod _deep_nesting_iterative_tests {
+    use super::*;
+
+    /// Build a deeply right-nested Constructor spine of depth `n`:
+    ///   Cons(0, Cons(1, … Cons(n-1, Nil)))
+    /// Values like this exercise the iterative hash/eq/compare paths — the
+    /// previous recursive implementations stack-overflowed around 100k
+    /// elements on Rust's default 8MB stack.
+    fn deep_spine(n: i64) -> *mut Value {
+        let mut acc = alloc(Value::Constructor(intern_str("Nil"), alloc(Value::Unit)));
+        for i in (0..n).rev() {
+            let tail = acc;
+            let head = alloc_int(i);
+            let pair = {
+                let mut fs = vec![
+                    RecordField { name: intern_str("head"), value: head },
+                    RecordField { name: intern_str("tail"), value: tail },
+                ];
+                fs.sort_by(|a, b| a.name.cmp(&b.name));
+                alloc(Value::Record(fs))
+            };
+            acc = alloc(Value::Constructor(intern_str("Cons"), pair));
+        }
+        acc
+    }
+
+    #[test]
+    fn value_to_hash_bytes_handles_deep_ctors() {
+        // 200k-deep spine would overflow a recursive implementation's
+        // 8MB stack (each frame ~80B → ~16MB). The iterative version uses
+        // a heap work stack and completes cleanly.
+        let deep = deep_spine(200_000);
+        let mut buf = Vec::new();
+        value_to_hash_bytes(deep, &mut buf);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn values_equal_handles_deep_ctors() {
+        let a = deep_spine(200_000);
+        let b = deep_spine(200_000);
+        assert!(values_equal(a, b));
+        // A shorter spine is unequal.
+        let c = deep_spine(199_999);
+        assert!(!values_equal(a, c));
+    }
+
+    #[test]
+    fn compare_values_handles_deep_ctors() {
+        let a = deep_spine(200_000);
+        let b = deep_spine(200_000);
+        assert_eq!(compare_values(a, b), std::cmp::Ordering::Equal);
+        // A lexicographically smaller spine (smaller head at the deepest
+        // differing position) compares Less.
+        let c = deep_spine(199_999);
+        let ord = compare_values(a, c);
+        // Either Less or Greater is fine — the point is it terminates
+        // without overflowing and returns a consistent ordering.
+        assert!(ord == std::cmp::Ordering::Less || ord == std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn serialize_value_for_hash_handles_deep_ctors() {
+        let deep = deep_spine(200_000);
+        let bytes = serialize_value_for_hash(deep);
+        assert!(!bytes.is_empty());
+        // Cross-check: produces the same bytes as value_to_hash_bytes
+        // (they share the iterative implementation now).
+        let mut direct = Vec::new();
+        value_to_hash_bytes(deep, &mut direct);
+        assert_eq!(bytes, direct);
     }
 }
 

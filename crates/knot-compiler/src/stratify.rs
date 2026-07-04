@@ -26,65 +26,98 @@ struct Edge {
     span: Span,
 }
 
-/// Collect all derived relation names and their dependency edges.
+/// Collect all derived-relation and view names plus their dependency edges.
+///
+/// Views participate in the stratification graph because a derived relation
+/// may read a view (`*v`) whose body in turn reads the derived (`&d`),
+/// forming an otherwise-invisible cycle `&d → *v → &d` that would bypass
+/// the codegen self-recursion detector and stack-overflow at runtime. We
+/// therefore treat both decl kinds as graph nodes and walk both bodies.
 fn build_dependency_graph(module: &ast::Module) -> (HashSet<String>, HashMap<String, Vec<Edge>>) {
-    let mut derived_names = HashSet::new();
+    let mut node_names = HashSet::new();
     let mut edges: HashMap<String, Vec<Edge>> = HashMap::new();
 
-    // First pass: collect all derived relation names.
+    // First pass: collect all node names (derived relations and views).
     for decl in &module.decls {
-        if let ast::DeclKind::Derived { name, .. } = &decl.node {
-            derived_names.insert(name.clone());
-            edges.entry(name.clone()).or_default();
+        match &decl.node {
+            ast::DeclKind::Derived { name, .. } => {
+                node_names.insert(name.clone());
+                edges.entry(name.clone()).or_default();
+            }
+            ast::DeclKind::View { name, .. } => {
+                node_names.insert(name.clone());
+                edges.entry(name.clone()).or_default();
+            }
+            _ => {}
         }
     }
 
-    // Second pass: walk each derived relation body to find edges.
+    // Second pass: walk each node's body to find edges.
     for decl in &module.decls {
-        if let ast::DeclKind::Derived { name, body, .. } = &decl.node {
-            let mut found = Vec::new();
-            let env = HashMap::new();
-            collect_edges(body, Polarity::Positive, &derived_names, &env, &mut found);
-            edges.get_mut(name).unwrap().extend(found);
+        match &decl.node {
+            ast::DeclKind::Derived { name, body, .. } => {
+                let mut found = Vec::new();
+                let env = HashMap::new();
+                let partial_diffs = HashMap::new();
+                collect_edges(body, Polarity::Positive, &node_names, &env, &partial_diffs, &mut found);
+                edges.get_mut(name).unwrap().extend(found);
+            }
+            ast::DeclKind::View { name, body, .. } => {
+                let mut found = Vec::new();
+                let env = HashMap::new();
+                let partial_diffs = HashMap::new();
+                collect_edges(body, Polarity::Positive, &node_names, &env, &partial_diffs, &mut found);
+                edges.get_mut(name).unwrap().extend(found);
+            }
+            _ => {}
         }
     }
 
-    (derived_names, edges)
+    (node_names, edges)
 }
 
-/// Walk an expression and collect derived-ref edges with polarity.
+/// Walk an expression and collect derived-ref/view-ref edges with polarity.
 ///
 /// `diff a b` makes `b` negative (it's the subtracted set). `a` stays positive.
 /// Everything else propagates the current polarity unchanged.
 ///
-/// `env` maps local variables bound *directly* to a derived relation (`self <-
-/// &bad` / `let self = &bad`) to that relation's name. A negative use of such a
-/// variable (`diff all self`) then records a negative edge to the derived
-/// relation — without this, self-negation laundered through a bind escapes the
-/// stratification check (a bare `diff *all &bad` doesn't even type-check, since
-/// `&bad` is `IO`-typed inside a derived body; it must be bound first), so the
-/// oscillating fixpoint would only be caught at runtime after 10000 iterations.
+/// `env` maps local variables bound *directly* to a node (`self <- &bad` /
+/// `let self = &bad` / `r <- *view` / `let r = *view`) to that node's name. A
+/// negative use of such a variable (`diff all self`) then records a negative
+/// edge to the node — without this, self-negation laundered through a bind
+/// escapes the stratification check (a bare `diff *all &bad` doesn't even
+/// type-check, since `&bad` is `IO`-typed inside a derived body; it must be
+/// bound first), so the oscillating fixpoint would only be caught at runtime
+/// after 10000 iterations.
 fn collect_edges(
     expr: &ast::Expr,
     polarity: Polarity,
-    derived_names: &HashSet<String>,
+    node_names: &HashSet<String>,
     env: &HashMap<String, String>,
+    partial_diffs: &HashMap<String, ast::Expr>,
     out: &mut Vec<Edge>,
 ) {
     match &expr.node {
-        ast::ExprKind::DerivedRef(name) if derived_names.contains(name) => {
+        ast::ExprKind::DerivedRef(name) if node_names.contains(name) => {
             out.push(Edge { target: name.clone(), polarity, span: expr.span });
         }
-        // A variable aliasing a derived relation carries that relation's
-        // dependency at the variable's current polarity.
+        // A source-read from a *view* creates an edge too. Views are nodes
+        // (their bodies can in turn reference derived relations, forming
+        // cycles); ordinary user sources are not nodes, so non-view
+        // SourceRefs fall through and contribute no edge.
+        ast::ExprKind::SourceRef(name) if node_names.contains(name) => {
+            out.push(Edge { target: name.clone(), polarity, span: expr.span });
+        }
+        // A variable aliasing a node carries that node's dependency at the
+        // variable's current polarity.
         ast::ExprKind::Var(name) => {
             // Skip the `diff`-alias sentinel: such a variable is a function
             // value, not a relation reference, so it contributes no edge here
             // (its negation effect is handled at the application site).
-            if let Some(derived) = env.get(name)
-                && derived != DIFF_ALIAS
+            if let Some(node) = env.get(name)
+                && node != DIFF_ALIAS
             {
-                out.push(Edge { target: derived.clone(), polarity, span: expr.span });
+                out.push(Edge { target: node.clone(), polarity, span: expr.span });
             }
         }
         ast::ExprKind::DerivedRef(_)
@@ -96,121 +129,148 @@ fn collect_edges(
         // desugaring it appears as `App(App(Var("diff"), a), b)`.
         // `a` is the base set (positive), `b` is subtracted (negative).
         ast::ExprKind::App { func, arg } => {
+            // Direct partial application: `(diff a) b` or `(d) b` where `d`
+            // was bound to bare `diff` via `let d = diff`.
             if let Some(first_arg) = is_diff_applied_once(func, env) {
                 // This is `(diff a) b` — `a` keeps polarity, `b` is negated.
-                collect_edges(first_arg, polarity, derived_names, env, out);
+                collect_edges(first_arg, polarity, node_names, env, partial_diffs, out);
                 let neg = negate(polarity);
-                collect_edges(arg, neg, derived_names, env, out);
+                collect_edges(arg, neg, node_names, env, partial_diffs, out);
+            }
+            // Let-bound partial application: `let d = diff X` followed by
+            // `d Y`. The App head is `Var("d")`, not an `App`, so the direct
+            // check above misses it. Look up `d` in `partial_diffs` to recover
+            // the bound positive base `X`, then treat `Y` as the subtracted
+            // (negative) argument.
+            else if let ast::ExprKind::Var(name) = &strip_head_wrappers(func).node
+                && let Some(bound_base) = partial_diffs.get(name)
+            {
+                collect_edges(bound_base, polarity, node_names, env, partial_diffs, out);
+                let neg = negate(polarity);
+                collect_edges(arg, neg, node_names, env, partial_diffs, out);
             } else {
-                collect_edges(func, polarity, derived_names, env, out);
-                collect_edges(arg, polarity, derived_names, env, out);
+                collect_edges(func, polarity, node_names, env, partial_diffs, out);
+                collect_edges(arg, polarity, node_names, env, partial_diffs, out);
             }
         }
 
         ast::ExprKind::Record(fields) => {
             for f in fields {
-                collect_edges(&f.value, polarity, derived_names, env, out);
+                collect_edges(&f.value, polarity, node_names, env, partial_diffs, out);
             }
         }
         ast::ExprKind::RecordUpdate { base, fields } => {
-            collect_edges(base, polarity, derived_names, env, out);
+            collect_edges(base, polarity, node_names, env, partial_diffs, out);
             for f in fields {
-                collect_edges(&f.value, polarity, derived_names, env, out);
+                collect_edges(&f.value, polarity, node_names, env, partial_diffs, out);
             }
         }
         ast::ExprKind::FieldAccess { expr, .. } => {
-            collect_edges(expr, polarity, derived_names, env, out);
+            collect_edges(expr, polarity, node_names, env, partial_diffs, out);
         }
         ast::ExprKind::List(elems) => {
             for e in elems {
-                collect_edges(e, polarity, derived_names, env, out);
+                collect_edges(e, polarity, node_names, env, partial_diffs, out);
             }
         }
         ast::ExprKind::Lambda { params, body } => {
             // A lambda parameter shadows any outer alias of the same name.
             let mut inner = env.clone();
+            let mut inner_partial = partial_diffs.clone();
             for p in params {
                 if let ast::PatKind::Var(v) = &p.node {
                     inner.remove(v);
+                    inner_partial.remove(v);
                 }
             }
-            collect_edges(body, polarity, derived_names, &inner, out);
+            collect_edges(body, polarity, node_names, &inner, &inner_partial, out);
         }
         ast::ExprKind::BinOp { lhs, rhs, op } => {
             // `a |> f` is `f a`. If `f` is a partially-applied `diff` (i.e.,
             // `diff base`), then `a` becomes the subtracted (negative) arg.
             if *op == ast::BinOp::Pipe
                 && let Some(base) = is_diff_applied_once(rhs, env) {
-                    collect_edges(base, polarity, derived_names, env, out);
+                    collect_edges(base, polarity, node_names, env, partial_diffs, out);
                     let neg = negate(polarity);
-                    collect_edges(lhs, neg, derived_names, env, out);
+                    collect_edges(lhs, neg, node_names, env, partial_diffs, out);
                     return;
                 }
-            collect_edges(lhs, polarity, derived_names, env, out);
-            collect_edges(rhs, polarity, derived_names, env, out);
+            // Pipe into a let-bound partial diff: `a |> d` where `let d = diff X`.
+            if *op == ast::BinOp::Pipe
+                && let ast::ExprKind::Var(name) = &strip_head_wrappers(rhs).node
+                && let Some(bound_base) = partial_diffs.get(name)
+            {
+                collect_edges(bound_base, polarity, node_names, env, partial_diffs, out);
+                let neg = negate(polarity);
+                collect_edges(lhs, neg, node_names, env, partial_diffs, out);
+                return;
+            }
+            collect_edges(lhs, polarity, node_names, env, partial_diffs, out);
+            collect_edges(rhs, polarity, node_names, env, partial_diffs, out);
         }
         ast::ExprKind::UnaryOp { op: _, operand } => {
             // `not` is boolean negation (`Bool -> Bool`), not set complement —
             // it does not create negative dependencies. Only `diff` (set
             // difference) creates negative edges.
-            collect_edges(operand, polarity, derived_names, env, out);
+            collect_edges(operand, polarity, node_names, env, partial_diffs, out);
         }
         ast::ExprKind::If { cond, then_branch, else_branch } => {
-            collect_edges(cond, polarity, derived_names, env, out);
-            collect_edges(then_branch, polarity, derived_names, env, out);
-            collect_edges(else_branch, polarity, derived_names, env, out);
+            collect_edges(cond, polarity, node_names, env, partial_diffs, out);
+            collect_edges(then_branch, polarity, node_names, env, partial_diffs, out);
+            collect_edges(else_branch, polarity, node_names, env, partial_diffs, out);
         }
         ast::ExprKind::Case { scrutinee, arms } => {
-            collect_edges(scrutinee, polarity, derived_names, env, out);
+            collect_edges(scrutinee, polarity, node_names, env, partial_diffs, out);
             for arm in arms {
-                collect_edges(&arm.body, polarity, derived_names, env, out);
+                collect_edges(&arm.body, polarity, node_names, env, partial_diffs, out);
             }
         }
         ast::ExprKind::Do(stmts) => {
             // Bindings are visible to the statements that follow them, so
             // accumulate derived-relation aliases into a local env as we go.
             let mut local_env = env.clone();
+            let mut local_partial = partial_diffs.clone();
             for s in stmts {
                 match &s.node {
                     ast::StmtKind::Bind { pat, expr } => {
-                        collect_edges(expr, polarity, derived_names, &local_env, out);
-                        bind_derived_alias(pat, expr, derived_names, &mut local_env);
+                        collect_edges(expr, polarity, node_names, &local_env, &local_partial, out);
+                        bind_derived_alias(pat, expr, node_names, &mut local_env, &mut local_partial);
                     }
                     ast::StmtKind::Let { pat, expr } => {
-                        collect_edges(expr, polarity, derived_names, &local_env, out);
-                        bind_derived_alias(pat, expr, derived_names, &mut local_env);
+                        collect_edges(expr, polarity, node_names, &local_env, &local_partial, out);
+                        bind_derived_alias(pat, expr, node_names, &mut local_env, &mut local_partial);
                     }
                     ast::StmtKind::Where { cond } => {
-                        collect_edges(cond, polarity, derived_names, &local_env, out);
+                        collect_edges(cond, polarity, node_names, &local_env, &local_partial, out);
                     }
                     ast::StmtKind::GroupBy { key } => {
-                        collect_edges(key, polarity, derived_names, &local_env, out);
+                        collect_edges(key, polarity, node_names, &local_env, &local_partial, out);
                     }
                     ast::StmtKind::Expr(e) => {
-                        collect_edges(e, polarity, derived_names, &local_env, out);
+                        collect_edges(e, polarity, node_names, &local_env, &local_partial, out);
                     }
                 }
             }
         }
         ast::ExprKind::Atomic(inner) => {
-            collect_edges(inner, polarity, derived_names, env, out);
+            collect_edges(inner, polarity, node_names, env, partial_diffs, out);
         }
         ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
-            collect_edges(target, polarity, derived_names, env, out);
-            collect_edges(value, polarity, derived_names, env, out);
+            collect_edges(target, polarity, node_names, env, partial_diffs, out);
+            collect_edges(value, polarity, node_names, env, partial_diffs, out);
         }
         ast::ExprKind::UnitLit { value, .. } => {
-            collect_edges(value, polarity, derived_names, env, out);
+            collect_edges(value, polarity, node_names, env, partial_diffs, out);
         }
         ast::ExprKind::Annot { expr: inner, .. } => {
-            collect_edges(inner, polarity, derived_names, env, out);
+            collect_edges(inner, polarity, node_names, env, partial_diffs, out);
         }
         ast::ExprKind::Refine(inner) => {
-            collect_edges(inner, polarity, derived_names, env, out);
+            collect_edges(inner, polarity, node_names, env, partial_diffs, out);
         }
         ast::ExprKind::Serve { handlers, .. } => {
             for h in handlers {
-                collect_edges(&h.body, polarity, derived_names, env, out);
+                collect_edges(&h.body, polarity, node_names, env, partial_diffs, out);
             }
         }
     }
@@ -220,30 +280,56 @@ fn collect_edges(
 /// derived relation, record `var -> derived` so a later negative use of the
 /// variable is attributed to that relation. Any other binding of the same
 /// variable name clears a stale alias (shadowing).
+///
+/// `partial_diffs` tracks let-bindings of partially-applied `diff`
+/// (`let d = diff X`). The bare-`diff` alias (`let d = diff`) goes into `env`
+/// under the DIFF_ALIAS sentinel; a *partially-applied* `diff` stores the
+/// bound positive base in `partial_diffs` so the App arm of `collect_edges`
+/// can recover the `(diff X) Y` shape from a syntactic `d Y`.
 fn bind_derived_alias(
     pat: &ast::Pat,
     expr: &ast::Expr,
-    derived_names: &HashSet<String>,
+    node_names: &HashSet<String>,
     env: &mut HashMap<String, String>,
+    partial_diffs: &mut HashMap<String, ast::Expr>,
 ) {
     if let ast::PatKind::Var(v) = &pat.node {
-        match &strip_head_wrappers(expr).node {
-            ast::ExprKind::DerivedRef(name) if derived_names.contains(name) => {
+        let stripped = strip_head_wrappers(expr);
+        match &stripped.node {
+            ast::ExprKind::DerivedRef(name) if node_names.contains(name) => {
                 env.insert(v.clone(), name.clone());
+                partial_diffs.remove(v);
             }
             // `let d = diff` — track the alias so a later `d all self` is still
             // recognized as set difference (negation) at its application site.
             ast::ExprKind::Var(name) if name == "diff" => {
                 env.insert(v.clone(), DIFF_ALIAS.to_string());
+                partial_diffs.remove(v);
+            }
+            // `let d = diff X` — partially-applied diff. Store the bound
+            // positive base `X` so a later `d Y` is recognized as
+            // `(diff X) Y` (X positive, Y negative).
+            ast::ExprKind::App { func, arg: base }
+                if matches!(&strip_head_wrappers(func).node, ast::ExprKind::Var(n) if n == "diff") =>
+            {
+                partial_diffs.insert(v.clone(), (**base).clone());
+                env.remove(v);
             }
             // Aliasing another already-aliased variable (`let y = x`) carries
             // the alias transitively; anything else drops a stale mapping.
             ast::ExprKind::Var(other) if env.contains_key(other) => {
                 let target = env[other].clone();
                 env.insert(v.clone(), target);
+                partial_diffs.remove(v);
+            }
+            ast::ExprKind::Var(other) if partial_diffs.contains_key(other) => {
+                let target = partial_diffs[other].clone();
+                partial_diffs.insert(v.clone(), target);
+                env.remove(v);
             }
             _ => {
                 env.remove(v);
+                partial_diffs.remove(v);
             }
         }
     }
@@ -376,8 +462,14 @@ pub fn check(module: &ast::Module) -> Vec<Diagnostic> {
     // Collect declaration spans for error reporting.
     let mut decl_spans: HashMap<String, Span> = HashMap::new();
     for decl in &module.decls {
-        if let ast::DeclKind::Derived { name, .. } = &decl.node {
-            decl_spans.insert(name.clone(), decl.span);
+        match &decl.node {
+            ast::DeclKind::Derived { name, .. } => {
+                decl_spans.insert(name.clone(), decl.span);
+            }
+            ast::DeclKind::View { name, .. } => {
+                decl_spans.insert(name.clone(), decl.span);
+            }
+            _ => {}
         }
     }
 

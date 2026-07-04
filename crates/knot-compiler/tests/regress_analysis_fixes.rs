@@ -349,6 +349,42 @@ main = println "ok"
 }
 
 #[test]
+fn parameterized_single_variant_data_type_substitutes_args() {
+    // `data Box a = Box {value: a}` applied as `Box Int` must produce the
+    // schema "value:int" — substituting the type argument into the field.
+    // Before the fix, the resolved alias collapsed the type parameter to
+    // `Named("unknown")`, producing the meaningless "value:text".
+    let src = r#"data Box a = Box {value: a}
+*boxes : [Box Int]
+main = println "ok"
+"#;
+    let module = parse(src);
+    let env = knot_compiler::types::TypeEnv::from_module(&module);
+    assert_eq!(
+        env.source_schemas["boxes"], "value:int",
+        "Box Int must substitute Int for the type parameter (got {:?})",
+        env.source_schemas["boxes"]
+    );
+}
+
+#[test]
+fn parameterized_single_variant_data_type_substitutes_record_arg() {
+    // Substitution must recurse into structured arguments, producing the
+    // "json" column type for a record-typed parameter.
+    let src = r#"data Box a = Box {value: a}
+*boxes : [Box {name: Text}]
+main = println "ok"
+"#;
+    let module = parse(src);
+    let env = knot_compiler::types::TypeEnv::from_module(&module);
+    assert_eq!(
+        env.source_schemas["boxes"], "value:json",
+        "Box {{name: Text}} must use the json column type (got {:?})",
+        env.source_schemas["boxes"]
+    );
+}
+
+#[test]
 fn maybe_field_round_trips_just_and_nothing() {
     let (stdout, stderr, ok) = compile_and_run(
         "maybe_field_roundtrip",

@@ -9588,8 +9588,17 @@ impl Codegen {
                             }
                         }
 
-                    if matches!(&pat.node, ast::PatKind::Constructor { .. }) {
-                        // Constructor patterns need filter branches
+                    if matches!(
+                        &pat.node,
+                        ast::PatKind::Constructor { .. }
+                            | ast::PatKind::Lit(_)
+                            | ast::PatKind::List(_)
+                            | ast::PatKind::Cons { .. }
+                    ) {
+                        // All refutable patterns need filter branches so a
+                        // mismatched row is skipped (relational semantics),
+                        // not trapped. `bind_do_pattern` emits skip blocks
+                        // for Constructor/Lit/List/Cons uniformly.
                         let mut pattern_skips = Vec::new();
                         bind_do_pattern(builder, self, pat, val, env, &mut pattern_skips);
                         if let Some(loop_info) = loop_stack.last_mut() {
@@ -10800,7 +10809,11 @@ impl Codegen {
             }
         }
 
-        if let Some((func, col_sql, result_is_text)) = aggregate {
+        // The third tuple element is type-dependent on `func`:
+        //   MIN/MAX → `is_text` (text vs numeric result column)
+        //   SUM     → `is_float` (float vs int result column)
+        // Each branch below gives it a meaningful local name.
+        if let Some((func, col_sql, result_flag)) = aggregate {
             // An aggregate after take/drop would have to apply AFTER the
             // LIMIT, but aggregate SQL has no LIMIT — fall back. (The order
             // check already rejects this; keep the guard as belt-and-braces.)
@@ -10826,15 +10839,15 @@ impl Codegen {
                 _ => "knot_source_query_count",
             };
             if rt_fn == "knot_source_query_value" {
-                let is_text = builder.ins().iconst(types::I64, result_is_text as i64);
+                let is_text = builder.ins().iconst(types::I64, result_flag as i64);
                 Some(self.call_rt(
                     builder,
                     rt_fn,
                     &[db, sql_ptr, sql_len, params_rel, is_text],
                 ))
             } else if rt_fn == "knot_source_query_sum" {
-                // For SUM the tuple flag carries is_float (see PipeOp::Sum).
-                let is_float = builder.ins().iconst(types::I64, result_is_text as i64);
+                // For SUM `result_flag` carries `is_float` (see PipeOp::Sum).
+                let is_float = builder.ins().iconst(types::I64, result_flag as i64);
                 Some(self.call_rt(
                     builder,
                     rt_fn,

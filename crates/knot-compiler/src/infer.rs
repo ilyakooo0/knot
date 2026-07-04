@@ -1912,7 +1912,14 @@ impl Infer {
             (Ty::Variant(c1, r1), Ty::Variant(c2, r2)) => {
                 self.unify_variants(c1, *r1, c2, *r2, span, t1_provided);
             }
-            (Ty::Con(name, args), Ty::Variant(c2, r2)) => {
+            // Skip these arms when `name` is a refined type alias: a refined
+            // ADT base (`type Warm = Color where …`) is registered in
+            // `refined_types`, not `data_types`, so `con_to_variant` returns
+            // None and would spuriously fail. The refined-subsumption arms
+            // below handle the reduction (`Warm → Color → Variant`) instead.
+            (Ty::Con(name, args), Ty::Variant(c2, r2))
+                if !self.refined_types.contains_key(name) =>
+            {
                 if let Some(expanded) = self.con_to_variant(name, args) {
                     let (ec, er) = match expanded {
                         Ty::Variant(c, r) => (c, r),
@@ -1933,7 +1940,9 @@ impl Infer {
                     );
                 }
             }
-            (Ty::Variant(c1, r1), Ty::Con(name, args)) => {
+            (Ty::Variant(c1, r1), Ty::Con(name, args))
+                if !self.refined_types.contains_key(name) =>
+            {
                 if let Some(expanded) = self.con_to_variant(name, args) {
                     let (ec, er) = match expanded {
                         Ty::Variant(c, r) => (c, r),
@@ -3324,13 +3333,36 @@ impl Infer {
         if !is_union_result {
             return;
         }
-        self.effect_union_upper_bounds
-            .entry(end)
-            .and_modify(|(existing, sp)| {
-                *existing = existing.intersection(bound).cloned().collect();
-                *sp = span;
-            })
-            .or_insert_with(|| (bound.clone(), span));
+        // Store the bound at `end` (the canonical chain representative used by
+        // `resolve_effect_union`'s lookup) AND at every var along the chain
+        // from `rv` to `end`. The next step after a record is typically
+        // `bind_var(rv, EffectRow(...))`, which cuts the chain at `rv`:
+        // afterwards `var_chain_end(u.result)` becomes `rv` for any union
+        // result whose chain reached `end` through `rv`. Storing only at `end`
+        // would orphan the bound in that case, laundering stricter effects
+        // through the union. Storing at every link makes the bound survive
+        // any later cut.
+        let mut chain_vars = Vec::new();
+        let mut cur = rv;
+        chain_vars.push(cur);
+        let mut steps = 0usize;
+        while let Some(Ty::Var(next)) = self.subst.get(&cur) {
+            if *next == cur || *next == end || steps > 10_000 {
+                break;
+            }
+            cur = *next;
+            chain_vars.push(cur);
+            steps += 1;
+        }
+        for key in chain_vars.into_iter().chain(std::iter::once(end)) {
+            self.effect_union_upper_bounds
+                .entry(key)
+                .and_modify(|(existing, sp)| {
+                    *existing = existing.intersection(bound).cloned().collect();
+                    *sp = span;
+                })
+                .or_insert_with(|| (bound.clone(), span));
+        }
     }
 
     fn resolve_effect_union(&mut self, u: &EffectUnion) {
@@ -6820,6 +6852,12 @@ impl Infer {
             // value resolves to the underlying primitive's impl.
             Ty::IntUnit(_) => Some("Int".into()),
             Ty::FloatUnit(_) => Some("Float".into()),
+            // An unresolved associated-type projection (`Elem c`, etc.) cannot
+            // be reduced to a concrete type with trait impls. Returning None
+            // here would silently drop trait constraints on such types
+            // (e.g. `Display (Elem c)` would vanish). Surface a name so the
+            // missing-impl error path fires with a clear diagnostic instead.
+            Ty::Assoc(name, _) => Some(name.clone()),
             _ => None,
         }
     }

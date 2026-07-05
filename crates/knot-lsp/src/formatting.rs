@@ -142,7 +142,13 @@ pub(crate) fn handle_range_formatting(
 
     let mut prev_was_blank = false;
     for i in start_line..=end_line.min(lines.len().saturating_sub(1)) {
-        let line = lines[i];
+        // `split('\n')` on CRLF leaves a trailing `\r` on each line. Strip it
+        // before processing so `trim_end` doesn't treat `\r` as trailing
+        // whitespace (which would produce a spurious edit on every CRLF line,
+        // deleting the carriage return and corrupting line endings), and so
+        // `utf16_len(line)` doesn't count the `\r` (LSP positions cannot
+        // denote `\r|\n`).
+        let line = lines[i].strip_suffix('\r').unwrap_or(lines[i]);
 
         // Convert tabs to spaces
         if use_spaces && line.contains('\t') {

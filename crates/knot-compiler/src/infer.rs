@@ -4268,6 +4268,17 @@ impl Infer {
                 if fields.is_empty() {
                     return Ty::unit();
                 }
+                // Detect duplicate field names — `BTreeMap::collect` would
+                // silently keep only the last entry, masking a user error.
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for f in fields {
+                    if !seen.insert(f.name.clone()) {
+                        self.error(
+                            format!("duplicate field '{}' in record literal", f.name),
+                            f.value.span,
+                        );
+                    }
+                }
                 let field_tys: BTreeMap<String, Ty> = fields
                     .iter()
                     .map(|f| {
@@ -4284,10 +4295,36 @@ impl Infer {
                     let val_ty = self.infer_expr(&field.value);
                     update_fields.insert(field.name.clone(), val_ty);
                 }
+                // Row-polymorphic record update: the base may be any record
+                // with a fresh row tail `rv` (capturing its existing fields).
+                // The result overlays the update fields — overriding fields
+                // already in the base and adding new ones. Constraining the
+                // base to already possess the update fields (the previous
+                // approach) broke extension, the primary use case for
+                // `{base | field: val}` syntax.
+                //
+                // Override type safety: when the base's `rv` resolves to a
+                // concrete record (e.g. a literal) that has a field with the
+                // same name as an update field, the explicit unification below
+                // catches the mismatch. When the base is an unresolved variable
+                // (e.g. a lambda parameter whose type is later generalized),
+                // the override type safety relies on later use-site
+                // unification — a known limitation of row polymorphism without
+                // explicit row constraints.
                 let rv = self.fresh_var();
-                let constraint = Ty::Record(update_fields, Some(rv));
+                let constraint = Ty::Record(BTreeMap::new(), Some(rv));
                 self.unify(&base_ty, &constraint, base.span);
-                base_ty
+                // If the base's row var resolved to a concrete record, unify
+                // overlapping field types for override type safety.
+                let resolved_rv = self.apply(&Ty::Var(rv));
+                if let Ty::Record(base_fields, _) = &resolved_rv {
+                    for (name, update_ty) in &update_fields {
+                        if let Some(base_field_ty) = base_fields.get(name) {
+                            self.unify(update_ty, base_field_ty, base.span);
+                        }
+                    }
+                }
+                Ty::Record(update_fields, Some(rv))
             }
 
             ast::ExprKind::FieldAccess { expr: e, field } => {
@@ -6665,6 +6702,26 @@ impl Infer {
                 ..
             } = &decl.node
             {
+                // Detect duplicate constructor names within the same `data`
+                // declaration. Distinct ADTs may share a constructor name
+                // (row-polymorphic variants — see comment below), but a
+                // duplicate within one declaration is a user error that would
+                // otherwise be silently accepted (last-write-wins for the
+                // variant row, confusing downstream errors).
+                {
+                    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    for ctor in ctors {
+                        if !seen.insert(ctor.name.clone()) {
+                            self.error(
+                                format!(
+                                    "duplicate constructor '{}' in data declaration '{}'",
+                                    ctor.name, name
+                                ),
+                                decl.span,
+                            );
+                        }
+                    }
+                }
                 let mut ctor_list = Vec::new();
                 for ctor in ctors {
                     let fields: Vec<(String, ast::Type)> = ctor

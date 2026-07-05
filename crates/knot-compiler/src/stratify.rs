@@ -414,28 +414,77 @@ impl<'a> Tarjan<'a> {
     }
 
     fn strongconnect(&mut self, v: String) {
-        self.index.insert(v.clone(), self.index_counter);
-        self.lowlink.insert(v.clone(), self.index_counter);
-        self.index_counter += 1;
-        self.stack.push(v.clone());
-        self.on_stack.insert(v.clone());
+        // Iterative formulation of Tarjan's SCC to avoid unbounded recursion
+        // on deep derived-relation dependency graphs. The work stack holds
+        // `(node, next_edge_idx)` so we can resume iterating a node's edges
+        // after recursing into a successor.
+        let mut work: Vec<(String, usize)> = Vec::new();
+        self.start_node(&v);
+        work.push((v, 0));
 
-        if let Some(edges) = self.edges.get(&v) {
-            for edge in edges {
-                if !self.index.contains_key(&edge.target) {
-                    self.strongconnect(edge.target.clone());
-                    let ll = self.lowlink[&edge.target];
-                    let cur = self.lowlink[&v];
-                    self.lowlink.insert(v.clone(), cur.min(ll));
-                } else if self.on_stack.contains(&edge.target) {
-                    let idx = self.index[&edge.target];
-                    let cur = self.lowlink[&v];
-                    self.lowlink.insert(v.clone(), cur.min(idx));
+        loop {
+            // Peek at the top of the work stack without holding a borrow
+            // across the body (we need to mutate `self` and `work` below).
+            let (top_node, top_idx) = match work.last() {
+                Some((n, i)) => (n.clone(), *i),
+                None => break,
+            };
+            let edges = self.edges.get(&top_node).cloned();
+            let edges = match edges {
+                Some(e) => e,
+                None => {
+                    // No edges: pop and finish this node.
+                    let finished = work.pop().unwrap().0;
+                    self.finish_node(&finished);
+                    continue;
                 }
+            };
+            // Advance to the next unprocessed edge.
+            let mut idx = top_idx;
+            let mut pushed = false;
+            while idx < edges.len() {
+                let target = &edges[idx];
+                if !self.index.contains_key(&target.target) {
+                    // Unvisited successor: recurse by pushing onto the work
+                    // stack. Save the advanced index so we resume after it.
+                    if let Some((_, ei)) = work.last_mut() {
+                        *ei = idx + 1;
+                    }
+                    self.start_node(&target.target);
+                    work.push((target.target.clone(), 0));
+                    pushed = true;
+                    break;
+                } else if self.on_stack.contains(&target.target) {
+                    let t_idx = self.index[&target.target];
+                    let cur = self.lowlink[&top_node];
+                    self.lowlink.insert(top_node.clone(), cur.min(t_idx));
+                }
+                idx += 1;
             }
+            if pushed {
+                continue;
+            }
+            // All edges processed: update parent's lowlink, pop, and finish.
+            let ll = self.lowlink[&top_node];
+            work.pop();
+            if let Some((parent, _)) = work.last() {
+                let cur = self.lowlink[parent];
+                self.lowlink.insert(parent.clone(), cur.min(ll));
+            }
+            self.finish_node(&top_node);
         }
+    }
 
-        if self.lowlink[&v] == self.index[&v] {
+    fn start_node(&mut self, v: &str) {
+        self.index.insert(v.to_string(), self.index_counter);
+        self.lowlink.insert(v.to_string(), self.index_counter);
+        self.index_counter += 1;
+        self.stack.push(v.to_string());
+        self.on_stack.insert(v.to_string());
+    }
+
+    fn finish_node(&mut self, v: &str) {
+        if self.lowlink[v] == self.index[v] {
             let mut scc = Vec::new();
             loop {
                 let w = self.stack.pop().unwrap();

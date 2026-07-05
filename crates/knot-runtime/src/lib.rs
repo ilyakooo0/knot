@@ -7325,7 +7325,7 @@ fn format_value(v: *mut Value) -> String {
         Value::Record(fields) => {
             let inner: Vec<String> = fields
                 .iter()
-                .map(|f| format!("{}: {}", f.name, format_value(f.value)))
+                .map(|f| format!("{}: {}", f.name, format_value_field(f.value)))
                 .collect();
             format!("{{{}}}", inner.join(", "))
         }
@@ -7334,7 +7334,7 @@ fn format_value(v: *mut Value) -> String {
             format!("[{}]", inner.join(", "))
         }
         Value::Constructor(tag, payload) => {
-            let p = format_value(*payload);
+            let p = format_value_field(*payload);
             if p == "{}" {
                 format!("{} {{}}", tag)
             } else {
@@ -7344,6 +7344,40 @@ fn format_value(v: *mut Value) -> String {
         Value::Function(f) => f.source.to_string(),
         Value::IO(_, _) => "<<IO>>".to_string(),
         Value::Pair(_, _) => "<<Pair>>".to_string(),
+    }
+}
+
+/// Like `format_value` but escapes `"` and `\` in `Text` values so that a
+/// record/constructor field containing quotes displays unambiguously (e.g.
+/// `{name: "a\"b"}` instead of the confusing `{name: "a"b"}`). Top-level
+/// `println` of a `Text` value uses `format_value` directly (no escaping) so
+/// `println (toJson ...)` prints the raw JSON.
+fn format_value_field(v: *mut Value) -> String {
+    if v.is_null() {
+        return "null".to_string();
+    }
+    match unsafe { as_ref(v) } {
+        Value::Text(s) => format!("\"{}\"", json_escape(s)),
+        Value::Record(fields) => {
+            let inner: Vec<String> = fields
+                .iter()
+                .map(|f| format!("{}: {}", f.name, format_value_field(f.value)))
+                .collect();
+            format!("{{{}}}", inner.join(", "))
+        }
+        Value::Relation(rows) => {
+            let inner: Vec<String> = rows.iter().map(|r| format_value_field(*r)).collect();
+            format!("[{}]", inner.join(", "))
+        }
+        Value::Constructor(tag, payload) => {
+            let p = format_value_field(*payload);
+            if p == "{}" {
+                format!("{} {{}}", tag)
+            } else {
+                format!("{} {}", tag, p)
+            }
+        }
+        _ => format_value(v),
     }
 }
 
@@ -10466,6 +10500,7 @@ pub extern "C-unwind" fn knot_source_migrate(
     new_schema_len: usize,
     migrate_fn: *mut Value,
 ) {
+    let _wl = write_lock_guard();
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     let old_schema = unsafe { str_from_raw(old_schema_ptr, old_schema_len) };
@@ -10660,6 +10695,12 @@ pub extern "C-unwind" fn knot_source_migrate(
         .conn
         .execute_batch("RELEASE SAVEPOINT knot_migrate;")
         .expect("knot runtime: failed to commit migration");
+
+    if db_ref.atomic_depth.get() > 0 {
+        stm_track_write(name);
+    } else {
+        notify_relation_changed(name);
+    }
 
     eprintln!("Migrated source '{}': {} rows", name, old_rows.len());
 }

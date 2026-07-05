@@ -9640,7 +9640,7 @@ impl Codegen {
                             // restore the shadowed bindings, or a later scope /
                             // `retry` in the enclosing function is corrupted.
                             let empty = self.call_rt(builder, "knot_relation_empty", &[]);
-                            let promoted =
+                            let mut promoted =
                                 self.call_rt(builder, "knot_arena_pop_frame_promote", &[empty]);
                             self.atomic_arena_frames -= 1;
                             env.bindings = prev_env_bindings;
@@ -9648,6 +9648,32 @@ impl Codegen {
                             self.source_var_binds = prev_source_var_binds;
                             self.pending_index_frees.truncate(index_free_mark);
                             self.replay_source_bind_invalidations_since(invalidation_mark);
+                            // Seal any pre-bind `where` skip blocks so they
+                            // don't dangle as unsealed block references — the
+                            // Cranelift verifier rejects them and aborts
+                            // compilation with an internal error instead of the
+                            // clean diagnostic we just emitted. Each skip block
+                            // produces its own empty relation and passes it as
+                            // the merge block param so `promoted` dominates.
+                            if !pre_bind_where_skips.is_empty() {
+                                let do_exit = builder.create_block();
+                                let result_param = builder.append_block_param(do_exit, self.ptr_type);
+                                builder.ins().jump(do_exit, &[promoted.into()]);
+                                for skip in &pre_bind_where_skips {
+                                    builder.switch_to_block(*skip);
+                                    builder.seal_block(*skip);
+                                    let skip_empty = self.call_rt(builder, "knot_relation_empty", &[]);
+                                    let skip_promoted = self.call_rt(
+                                        builder,
+                                        "knot_arena_pop_frame_promote",
+                                        &[skip_empty],
+                                    );
+                                    builder.ins().jump(do_exit, &[skip_promoted.into()]);
+                                }
+                                builder.switch_to_block(do_exit);
+                                builder.seal_block(do_exit);
+                                promoted = result_param;
+                            }
                             return promoted;
                         }
                     };
@@ -9707,7 +9733,7 @@ impl Codegen {
                             // down the do-block scope so the leaked arena frame /
                             // shadowed bindings don't corrupt a later scope.
                             let empty = self.call_rt(builder, "knot_relation_empty", &[]);
-                            let promoted =
+                            let mut promoted =
                                 self.call_rt(builder, "knot_arena_pop_frame_promote", &[empty]);
                             self.atomic_arena_frames -= 1;
                             env.bindings = prev_env_bindings;
@@ -9715,6 +9741,30 @@ impl Codegen {
                             self.source_var_binds = prev_source_var_binds;
                             self.pending_index_frees.truncate(index_free_mark);
                             self.replay_source_bind_invalidations_since(invalidation_mark);
+                            // Seal pre-bind `where` skip blocks (defensive —
+                            // normally empty here since a primary bind opened
+                            // loops, but guard against a misordered do-block).
+                            // Each skip block passes its own empty relation as
+                            // the merge block param so `promoted` dominates.
+                            if !pre_bind_where_skips.is_empty() {
+                                let do_exit = builder.create_block();
+                                let result_param = builder.append_block_param(do_exit, self.ptr_type);
+                                builder.ins().jump(do_exit, &[promoted.into()]);
+                                for skip in &pre_bind_where_skips {
+                                    builder.switch_to_block(*skip);
+                                    builder.seal_block(*skip);
+                                    let skip_empty = self.call_rt(builder, "knot_relation_empty", &[]);
+                                    let skip_promoted = self.call_rt(
+                                        builder,
+                                        "knot_arena_pop_frame_promote",
+                                        &[skip_empty],
+                                    );
+                                    builder.ins().jump(do_exit, &[skip_promoted.into()]);
+                                }
+                                builder.switch_to_block(do_exit);
+                                builder.seal_block(do_exit);
+                                promoted = result_param;
+                            }
                             return promoted;
                         }
                     };

@@ -132,9 +132,16 @@ fn lint_expr(
             rhs,
         } => {
             lint_pipe_chain(expr, source_schemas, views, diags);
-            // Still recurse into sub-expressions for nested patterns,
-            // but avoid double-reporting the top-level pipe.
-            lint_expr(lhs, source_schemas, views, diags);
+            // `lint_pipe_chain` flattens the entire chain (walking `lhs`
+            // through every nested `BinOp::Pipe`) and emits one diagnostic
+            // per failing operation. Recursing into `lhs` via `lint_expr`
+            // would re-enter the `BinOp::Pipe` arm and re-lint the sub-chain,
+            // producing duplicate diagnostics. Only recurse into `rhs` (the
+            // last operation's argument, e.g. a lambda body) and skip `lhs`
+            // when it is itself a pipe (already covered by the flatten).
+            if !matches!(&lhs.node, ExprKind::BinOp { op: BinOp::Pipe, .. }) {
+                lint_expr(lhs, source_schemas, views, diags);
+            }
             lint_expr(rhs, source_schemas, views, diags);
         }
         // Recurse into all sub-expressions

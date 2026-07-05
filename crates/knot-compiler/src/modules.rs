@@ -149,13 +149,19 @@ fn resolve_recursive(
 
         let lexer = knot::lexer::Lexer::new(&source);
         let (tokens, lex_diags) = lexer.tokenize();
-        if !lex_diags.is_empty() {
+        // Only treat lex errors as fatal — the lexer currently only emits
+        // errors, but filtering by severity (mirroring the parse-diagnostics
+        // path below) future-proofs against lex warnings/info becoming
+        // hard failures that abort the entire compilation.
+        if lex_diags.iter().any(|d| d.severity == knot::diagnostic::Severity::Error) {
             for diag in &lex_diags {
-                errors.push(format!(
-                    "in import '{}': {}",
-                    imp.path,
-                    diag.render(&source, &canonical.display().to_string())
-                ));
+                if diag.severity == knot::diagnostic::Severity::Error {
+                    errors.push(format!(
+                        "in import '{}': {}",
+                        imp.path,
+                        diag.render(&source, &canonical.display().to_string())
+                    ));
+                }
             }
         }
 

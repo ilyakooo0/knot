@@ -139,13 +139,13 @@ fn diff_token_lists(
     if delete_count == 0 && replacement.is_empty() {
         return Vec::new();
     }
-    // Per the spec, each edit's `start` is in u5 token-tuple offset.
-    // SemanticToken fields are 5 u32s, but the LSP `start` field is the
-    // *flat token array* index expressed as a count of u32s — so the index
-    // we computed (token-tuple count) needs multiplying by 5.
+    // Per the LSP spec, `start` and `deleteCount` are indices into the
+    // token-tuple array (each tuple is 5 u32s), NOT into the flat `uinteger[]`
+    // data array. Multiplying by 5 would offset `start` to the wrong token and
+    // delete 5× too many tokens, corrupting highlighting on every delta request.
     vec![SemanticTokensEdit {
-        start: (start as u32) * 5,
-        delete_count: delete_count * 5,
+        start: start as u32,
+        delete_count: delete_count,
         data: Some(replacement),
     }]
 }

@@ -242,6 +242,12 @@ fn main() {
             folders
                 .iter()
                 .filter_map(|f| uri_to_path(&f.uri))
+                // Canonicalize so `prune_caches_outside_roots`'s
+                // `p.starts_with(root)` check works on symlinked setups where
+                // cache keys (canonicalized) would otherwise never match
+                // non-canonical roots. Fall back to the raw path if
+                // canonicalization fails (e.g. the folder doesn't exist yet).
+                .map(|p| p.canonicalize().unwrap_or(p))
                 .collect()
         })
         .unwrap_or_default();
@@ -1522,12 +1528,14 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
             .event
             .removed
             .iter()
-            .filter_map(|f| uri_to_path(&f.uri))
+            .filter_map(|f| uri_to_path(&f.uri).and_then(|p| p.canonicalize().ok().or(Some(p))))
             .collect();
         state.workspace_roots.retain(|p| !removed.contains(p));
         for added in &params.event.added {
             if let Some(path) = uri_to_path(&added.uri)
                 && !state.workspace_roots.contains(&path) {
+                    // Canonicalize added roots to match cache-key canonicalization.
+                    let path = path.canonicalize().unwrap_or(path);
                     state.workspace_roots.push(path);
                 }
         }

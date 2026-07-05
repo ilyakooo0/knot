@@ -422,13 +422,10 @@ impl<'a> Tarjan<'a> {
         self.start_node(&v);
         work.push((v, 0));
 
-        loop {
-            // Peek at the top of the work stack without holding a borrow
-            // across the body (we need to mutate `self` and `work` below).
-            let (top_node, top_idx) = match work.last() {
-                Some((n, i)) => (n.clone(), *i),
-                None => break,
-            };
+        // Peek at the top of the work stack without holding a borrow
+        // across the body (we need to mutate `self` and `work` below).
+        while let Some((n, i)) = work.last() {
+            let (top_node, top_idx) = (n.clone(), *i);
             let edges = self.edges.get(&top_node).cloned();
             let edges = match edges {
                 Some(e) => e,

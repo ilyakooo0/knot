@@ -145,7 +145,7 @@ fn diff_token_lists(
     // delete 5× too many tokens, corrupting highlighting on every delta request.
     vec![SemanticTokensEdit {
         start: start as u32,
-        delete_count: delete_count,
+        delete_count,
         data: Some(replacement),
     }]
 }

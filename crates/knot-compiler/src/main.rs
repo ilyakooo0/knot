@@ -33,6 +33,15 @@ fn main() {
                         eprintln!("Error: missing value for -o");
                         process::exit(1);
                     }
+                    // Don't swallow a flag-like token as the output path —
+                    // mirrors the `--name value` guard below. Use `-o=<value>`
+                    // for paths that start with `-`.
+                    if !args[i + 1].is_empty() && args[i + 1].starts_with('-') {
+                        eprintln!(
+                            "Error: missing value for -o (for values starting with '-', use -o=<value>)"
+                        );
+                        process::exit(1);
+                    }
                     output = Some(PathBuf::from(&args[i + 1]));
                     i += 2;
                 } else if let Some(val) = args[i].strip_prefix("-o=") {
@@ -42,6 +51,12 @@ fn main() {
                     if rest == "output" {
                         if i + 1 >= args.len() {
                             eprintln!("Error: missing value for --output");
+                            process::exit(1);
+                        }
+                        if !args[i + 1].is_empty() && args[i + 1].starts_with('-') {
+                            eprintln!(
+                                "Error: missing value for --output (for values starting with '-', use --output=<value>)"
+                            );
                             process::exit(1);
                         }
                         output = Some(PathBuf::from(&args[i + 1]));
@@ -469,10 +484,18 @@ fn is_extracted_temp_runtime(p: &std::path::Path) -> bool {
 fn find_runtime() -> PathBuf {
     // 1. Environment variable override
     if let Ok(path) = std::env::var("KNOT_RUNTIME_LIB") {
-        let p = PathBuf::from(path);
+        let p = PathBuf::from(&path);
         if p.exists() {
             return p;
         }
+        // The user explicitly set the override; a typo (or a stale path)
+        // should not silently fall through to the embedded runtime, which
+        // would produce binaries with subtly different behavior.
+        eprintln!(
+            "Error: KNOT_RUNTIME_LIB is set to '{}' but the file does not exist",
+            path
+        );
+        process::exit(1);
     }
 
     // 2. Same directory as the compiler executable

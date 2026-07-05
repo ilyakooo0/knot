@@ -103,7 +103,7 @@ pub type FromJsonTargets = HashMap<Span, FromJsonTarget>;
 ///   haystack. `json_each` yields JSON storage classes (numbers as INTEGER), so
 ///   `Int`/`Int<u>` (TEXT-stored) never match and are EXCLUDED here even though
 ///   they are in `literal`. Only `Text`/`Bool`/`Uuid` are dynamic-safe.
-/// `dynamic` is always a subset of `literal`.
+///   `dynamic` is always a subset of `literal`.
 #[derive(Clone, Default, Debug)]
 pub struct ElemPushdownOk {
     pub literal: HashSet<Span>,

@@ -93,6 +93,11 @@ use crate::workspace_diagnostics::{
 };
 use crate::workspace_symbol::handle_workspace_symbol;
 
+/// One diagnostic's primary byte range plus the byte ranges of its related
+/// information entries that live in the same file. Used by the
+/// `didChange` handler to rebase cached diagnostics across in-flight edits.
+type DiagByteRanges = Vec<(usize, usize, Vec<(usize, usize)>)>;
+
 // ── Entry point ─────────────────────────────────────────────────────
 
 fn main() {
@@ -1100,7 +1105,7 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
         // primary range and the related-info locations, so "click to navigate"
         // targets stay correct during the debounce window before the next full
         // analysis.
-        let mut diag_byte_ranges: Option<Vec<(usize, usize, Vec<(usize, usize)>)>> =
+        let mut diag_byte_ranges: Option<DiagByteRanges> =
             cached_diags
                 .as_ref()
                 .map(|ds| {
@@ -1194,26 +1199,25 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
                     // are preserved verbatim — their target file's positions
                     // are unaffected by an edit in *this* file.
                     if let Some(orig_related) = d.related_information.as_ref() {
-                        let mut ri_iter = orig_related.iter();
                         let mut shifted_related: Vec<lsp_types::DiagnosticRelatedInformation> =
                             Vec::with_capacity(orig_related.len());
                         let mut rel_iter = related.iter();
-                        while let Some(ri) = ri_iter.next() {
+                        for ri in orig_related {
                             if ri.location.uri != uri {
                                 shifted_related.push(ri.clone());
-                            } else if let Some(&(rs, re)) = rel_iter.next() {
-                                if rs != usize::MAX && re <= source.len() {
-                                    shifted_related.push(lsp_types::DiagnosticRelatedInformation {
-                                        location: lsp_types::Location {
-                                            uri: uri.clone(),
-                                            range: lsp_types::Range {
-                                                start: offset_to_position(&source, rs),
-                                                end: offset_to_position(&source, re),
-                                            },
+                            } else if let Some(&(rs, re)) = rel_iter.next()
+                                && rs != usize::MAX && re <= source.len()
+                            {
+                                shifted_related.push(lsp_types::DiagnosticRelatedInformation {
+                                    location: lsp_types::Location {
+                                        uri: uri.clone(),
+                                        range: lsp_types::Range {
+                                            start: offset_to_position(&source, rs),
+                                            end: offset_to_position(&source, re),
                                         },
-                                        message: ri.message.clone(),
-                                    });
-                                }
+                                    },
+                                    message: ri.message.clone(),
+                                });
                                 // else: overlapped an edit — drop this related entry.
                             }
                         }

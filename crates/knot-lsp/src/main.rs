@@ -703,11 +703,22 @@ fn apply_analysis_result(state: &mut ServerState, conn: &Connection, result: Ana
 
     // If a newer edit was applied while analysis was running, drop the result.
     // The newer edit will already have queued a fresh task.
+    //
+    // Version to publish with. Defaults to the task's own version, but when a
+    // pending entry carries the *same source* as this result, a no-op
+    // `didChange` may have bumped the pending version past the task's without
+    // queueing fresh work (see the `already_pending` branch in `didChange`).
+    // In that case the pending version is the one the client's buffer is at, so
+    // publish against it — otherwise version-checking clients (Helix) discard a
+    // notification carrying the stale task version and the dedup cache then
+    // suppresses every identical re-analysis, stranding the diagnostics.
+    let mut publish_version = result.version;
     match state.pending_sources.get(&result.uri) {
         Some(pending) => {
             if pending.source != result.doc.source {
                 return;
             }
+            publish_version = pending.version;
             state.pending_sources.remove(&result.uri);
         }
         None => {
@@ -796,7 +807,7 @@ fn apply_analysis_result(state: &mut ServerState, conn: &Connection, result: Ana
     // before this insert, the client would re-pull and get the stale prior
     // doc — which is exactly the bug this is meant to fix.
     let uri = result.uri.clone();
-    let version = result.version;
+    let version = publish_version;
     // Snapshot whether the cached doc diagnostics actually moved. Pull-mode
     // clients sit on whatever they last pulled until we send a refresh, so
     // any change to `state.documents.knot_diagnostics` must trigger one —
@@ -2075,6 +2086,64 @@ main = do
         assert_eq!(pubs.len(), 2, "expected two publishes; got: {:?}", pubs);
         assert_eq!(pubs[1].2, 0, "expected the fix-publish to be empty");
         assert_eq!(pubs[1].1, Some(2), "expected v2 on the fix-publish");
+    }
+
+    /// Regression (B78): a no-op `didChange` (e.g. format-on-save with no
+    /// change) bumps `pending_sources[uri].version` past the in-flight task's
+    /// version *without* queueing fresh work — that's the `already_pending`
+    /// branch in `didChange`. When the older task finishes, its result must be
+    /// published against the **pending** version (the one the client's buffer
+    /// is actually at), not the stale task version. Publishing the stale
+    /// version makes version-checking clients (Helix) discard the
+    /// notification; the dedup cache then suppresses every identical
+    /// re-analysis, so the diagnostics stay stuck until the next real edit.
+    #[test]
+    fn apply_analysis_result_publishes_pending_version_after_noop_didchange() {
+        let (server, client) = Connection::memory();
+        let mut state = make_state();
+        let uri = Uri::from_str("file:///test/repro.knot").unwrap();
+
+        // Analyze the source that the in-flight (v1) task carries.
+        let mut import_cache_local = match state.import_cache.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        };
+        let mut inf_cache_local = match state.inference_cache.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        };
+        let doc =
+            analyze_document(&uri, BAD_SOURCE, &mut import_cache_local, &mut inf_cache_local);
+
+        // A no-op didChange bumped the pending version to v2: same source text,
+        // no fresh task queued (the `already_pending` branch just refreshes
+        // `pending.version`).
+        state.pending_sources.insert(
+            uri.clone(),
+            crate::state::PendingSource {
+                source: BAD_SOURCE.to_string(),
+                version: Some(2),
+            },
+        );
+
+        // The original v1 task finishes and its result flows in.
+        let result = AnalysisResult {
+            uri: uri.clone(),
+            version: Some(1),
+            doc,
+        };
+        apply_analysis_result(&mut state, &server, result);
+
+        let pubs = drain_publishes(&client);
+        assert_eq!(pubs.len(), 1, "expected one publish; got: {:?}", pubs);
+        assert_eq!(
+            pubs[0].1,
+            Some(2),
+            "publish must carry the pending (latest) version, not the stale task version"
+        );
+        // The stored document version must also track the latest version so the
+        // pull-mode diagnostics handler reports it correctly.
+        assert_eq!(state.document_versions.get(&uri), Some(&2));
     }
 
     /// Drain every message queued on the client side, returning a count of

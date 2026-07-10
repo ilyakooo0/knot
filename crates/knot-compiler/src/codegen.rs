@@ -4544,7 +4544,17 @@ impl Codegen {
                         // handler (HTTP body fields) — locally constructed
                         // rows (e.g. `union rows [{v: -5}]`) would otherwise
                         // bypass refined-type validation entirely.
-                        let new_rows = self.compile_expr(builder, new_rows_expr, env, db);
+                        let mut new_rows = self.compile_expr(builder, new_rows_expr, env, db);
+                        // A do-block that binds from a source is classified as
+                        // IO, so compile_expr produced a deferred Value::IO
+                        // thunk rather than a Relation. knot_source_append needs
+                        // a concrete Relation, so force the thunk with
+                        // knot_io_run first (identity on non-IO values).
+                        if let ast::ExprKind::Do(stmts) = &new_rows_expr.node
+                            && self.is_io_do_block(stmts)
+                        {
+                            new_rows = self.call_rt(builder, "knot_io_run", &[db, new_rows]);
+                        }
                         self.emit_refinement_checks(builder, name, new_rows, env, db);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
                         let (schema_ptr, schema_len) =

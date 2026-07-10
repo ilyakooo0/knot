@@ -131,15 +131,19 @@ fn lint_expr(
             lhs,
             rhs,
         } => {
-            lint_pipe_chain(expr, source_schemas, views, diags);
-            // `lint_pipe_chain` flattens the entire chain (walking `lhs`
-            // through every nested `BinOp::Pipe`) and emits one diagnostic
-            // per failing operation. Recursing into `lhs` via `lint_expr`
-            // would re-enter the `BinOp::Pipe` arm and re-lint the sub-chain,
-            // producing duplicate diagnostics. Only recurse into `rhs` (the
-            // last operation's argument, e.g. a lambda body) and skip `lhs`
-            // when it is itself a pipe (already covered by the flatten).
-            if !matches!(&lhs.node, ExprKind::BinOp { op: BinOp::Pipe, .. }) {
+            let chain_covered = lint_pipe_chain(expr, source_schemas, views, diags);
+            // When `lint_pipe_chain` covers the chain it flattens the entire
+            // thing (walking `lhs` through every nested `BinOp::Pipe`) and
+            // emits one diagnostic per failing operation. In that case
+            // recursing into `lhs` via `lint_expr` would re-enter this arm and
+            // re-lint the sub-chain, producing duplicate diagnostics — so skip
+            // `lhs` when it is itself a pipe (already covered by the flatten).
+            // But when `lint_pipe_chain` bails (flatten fails, non-source head,
+            // view/ADT schema) it lints nothing; skipping `lhs` there would
+            // leave the inner sub-chain and its middle-stage lambda bodies
+            // entirely unlinted, so recurse into `lhs` to lint it generically.
+            let lhs_is_pipe = matches!(&lhs.node, ExprKind::BinOp { op: BinOp::Pipe, .. });
+            if !(chain_covered && lhs_is_pipe) {
                 lint_expr(lhs, source_schemas, views, diags);
             }
             lint_expr(rhs, source_schemas, views, diags);
@@ -403,33 +407,39 @@ fn lint_set_expr(
 
 /// Check pipe chains like `*source |> filter f |> map g` for operations
 /// that will fall back to runtime.
+/// Lint a pipe chain for SQL-pushdown fallbacks. Returns `true` when the chain
+/// was actually covered — i.e. it flattened to a plain-source head and either
+/// walked every operation or emitted the operation-order diagnostic. Returns
+/// `false` on every bail path (flatten fails, non-source head, view/ADT/nested
+/// schema): in those cases nothing was linted, so the caller must fall back to
+/// recursing into the sub-chain generically or its diagnostics are lost.
 fn lint_pipe_chain(
     expr: &Expr,
     source_schemas: &HashMap<String, String>,
     views: &HashSet<&str>,
     diags: &mut Vec<Diagnostic>,
-) {
+) -> bool {
     let (source, ops) = match flatten_pipe_chain(expr) {
         Some(v) => v,
-        None => return,
+        None => return false,
     };
     if ops.is_empty() {
-        return;
+        return false;
     }
 
     let source_name = match &source.node {
         ExprKind::SourceRef(name) => name,
-        _ => return,
+        _ => return false,
     };
     if views.contains(source_name.as_str()) {
-        return;
+        return false;
     }
     let schema = match source_schemas.get(source_name) {
         Some(s) => s,
-        None => return,
+        None => return false,
     };
     if schema.starts_with('#') || schema.contains('[') {
-        return;
+        return false;
     }
 
     // Mirror codegen's pipe operation-order check: out-of-order chains
@@ -446,7 +456,8 @@ fn lint_pipe_chain(
                  (filter, then sortBy, then map, then drop, then take)",
             ),
         );
-        return;
+        // The whole flattened chain was analyzed and flagged as one unit.
+        return true;
     }
 
     for op in &ops {
@@ -527,6 +538,8 @@ fn lint_pipe_chain(
             | LintPipeOp::Drop { .. } => {}
         }
     }
+    // Every operation in the flattened chain was linted above.
+    true
 }
 
 // ── Application form lint ──────────────────────────────────────────

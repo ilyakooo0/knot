@@ -627,9 +627,11 @@ fn scan_workspace_files(
         // newer text for `other_uri` than the last analyzed `other_doc.source`,
         // every span we'd compute here indexes into the old bytes — applying
         // those edits to the new buffer corrupts it. Skip this document and
-        // let the client retry once analysis catches up. It is still marked
-        // `scanned` below so the disk phase never recomputes its edits from
-        // on-disk bytes either.
+        // let the disk phase handle it from on-disk bytes instead. Crucially,
+        // do NOT mark it `scanned`: doing so would make the disk phase skip it
+        // too, so a stale *owner* document would never get its declaration
+        // renamed while non-stale importers were rewritten — a partial edit.
+        // Leaving it unscanned lets the disk phase still process it.
         if state
             .pending_sources
             .get(other_uri)
@@ -2609,6 +2611,65 @@ mod tests {
                 "all edits should rewrite to `parsed`; got: {edits:?}"
             );
         }
+    }
+
+    #[test]
+    fn rename_still_edits_owner_when_owner_doc_is_stale() {
+        // B70 regression: a rename initiated from a fresh importer must not
+        // produce a *partial* workspace edit when the owner's open document is
+        // mid-debounce (pending analysis differs from the analyzed source).
+        // The old code skipped the stale owner in the open-doc scan AND marked
+        // it `scanned`, so the disk phase skipped it too — importers renamed,
+        // owner declaration untouched. Now the stale owner is left unscanned so
+        // the disk phase rewrites its declaration from the on-disk bytes.
+        use crate::state::PendingSource;
+        use crate::test_support::TempWorkspace;
+        let mut tw = TempWorkspace::new();
+        let owner_uri = tw.write_and_open("owner.knot", "parse = \\x -> x\n");
+        let consumer_uri = tw.write_and_open(
+            "consumer.knot",
+            "import ./owner\n\nmain = parse 5\n",
+        );
+        // Make the owner document stale: the editor holds newer, not-yet-
+        // analyzed text (still declaring `parse`, but different bytes) so the
+        // per-doc staleness guard in `scan_workspace_files` trips for it. The
+        // on-disk file still holds the analyzable `parse` declaration.
+        tw.workspace.state.pending_sources.insert(
+            owner_uri.clone(),
+            PendingSource {
+                source: "-- mid-edit\nparse = \\x -> x\n".into(),
+                version: Some(2),
+            },
+        );
+        // Rename from the *fresh* consumer's call site.
+        let consumer_doc = tw.workspace.doc(&consumer_uri);
+        let off = consumer_doc.source.find("parse 5").expect("call site");
+        let pos = offset_to_position(&consumer_doc.source, off);
+        let edit = handle_rename(&tw.workspace.state, &rename_params(&consumer_uri, pos, "parsed"))
+            .expect("rename emits edit");
+        let changes = edit.changes.expect("changes present");
+        // The consumer (fresh) is edited via the open-doc scan.
+        assert!(
+            changes.contains_key(&consumer_uri),
+            "consumer file missed edit; got: {changes:?}"
+        );
+        // The stale owner must still be edited — via the disk phase, keyed by
+        // its canonical path. Match on canonical path rather than raw URI.
+        let owner_canon = canonical_for_uri(&owner_uri).expect("owner canonical path");
+        let owner_edits = changes
+            .iter()
+            .find(|(u, _)| canonical_for_uri(u).as_ref() == Some(&owner_canon))
+            .map(|(_, e)| e)
+            .unwrap_or_else(|| {
+                panic!("owner declaration left un-renamed (partial edit); got: {changes:?}")
+            });
+        // Disk phase reads the on-disk bytes, so apply against those.
+        let owner_disk = "parse = \\x -> x\n";
+        let renamed = apply_edits(owner_disk, owner_edits);
+        assert_eq!(
+            renamed, "parsed = \\x -> x\n",
+            "owner declaration should be renamed from on-disk bytes; got: {renamed:?}"
+        );
     }
 
     #[test]

@@ -1870,19 +1870,56 @@ impl Infer {
                     merged.extend(e2.iter().cloned());
                     let unified_inner = self.apply(&a);
                     let merged_io =
-                        Ty::IO(merged, None, Box::new(unified_inner));
-                    // Bind at the *end* of each var's substitution chain
+                        Ty::IO(merged.clone(), None, Box::new(unified_inner));
+                    // Widen at the *end* of each var's substitution chain
                     // (via bind_var, which checks skolems/occurs) so any
                     // aliases along the chain keep seeing the widened IO —
                     // a raw insert at the root var would orphan them.
-                    if let Some(v) = var1 {
-                        let root = self.var_chain_end(v);
+                    //
+                    // Only the *required*-side var is a fresh accumulator meant
+                    // to absorb the union, so overwriting it is correct. The
+                    // *provided*-side var is the actual branch value: in this
+                    // `(IO, IO)` arm a `Some` var is already bound to a concrete
+                    // closed IO (otherwise `apply` would have left it a
+                    // `Ty::Var` and this arm would not match). Overwriting that
+                    // binding would relabel a value whose type was already fixed
+                    // by an earlier, already-discharged obligation (e.g. a
+                    // lambda parameter pinned to `IO {} {}` by a prior call) —
+                    // silently laundering the widened effects past both the
+                    // effect annotation and the atomic gate, since that
+                    // obligation is never revisited. So for the provided side
+                    // keep the existing binding and merely unify the widened
+                    // effects against it (its effects are ⊆ the union by
+                    // construction, so merging a pure branch with an effectful
+                    // one is still accepted).
+                    let (provided_var, required_var, provided_effects) =
+                        if t1_provided {
+                            (var1, var2, &e1)
+                        } else {
+                            (var2, var1, &e2)
+                        };
+                    let required_root =
+                        required_var.map(|v| self.var_chain_end(v));
+                    if let Some(root) = required_root {
                         self.bind_var(root, merged_io.clone(), span);
                     }
-                    if let Some(v) = var2 {
+                    if let Some(v) = provided_var {
                         let root = self.var_chain_end(v);
-                        if Some(root) != var1.map(|v1| self.var_chain_end(v1)) {
-                            self.bind_var(root, merged_io, span);
+                        if Some(root) != required_root {
+                            if self.subst.contains_key(&root) {
+                                // Already bound to a concrete closed IO:
+                                // preserve it, only checking compatibility.
+                                self.unify_io_effects(
+                                    provided_effects,
+                                    None,
+                                    &merged,
+                                    None,
+                                    span,
+                                    true,
+                                );
+                            } else {
+                                self.bind_var(root, merged_io, span);
+                            }
                         }
                     }
                 } else {

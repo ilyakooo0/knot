@@ -8401,6 +8401,28 @@ impl Codegen {
                         {
                             self.compile_do(builder, stmts, env, db)
                         }
+                        // An `atomic` block compiles *eagerly* — the Atomic arm
+                        // of compile_expr emits the savepoint/retry loop inline
+                        // rather than producing a deferred IO thunk. Binding it
+                        // with the general `compile_expr` path below would run
+                        // the whole transaction once, right here at the `let`,
+                        // and bind the name to the transaction's *result value*.
+                        // Later uses (`let bump = atomic do {…}; bump; bump`)
+                        // would then be plain values, and each `knot_io_run` on
+                        // them a no-op — so the transaction fires once instead of
+                        // per use. Wrap the atomic in an IO thunk instead: the
+                        // bound name holds a deferred `Value::IO(fn_ptr, env)`,
+                        // and each use re-runs the whole transaction when
+                        // `knot_io_run` executes it (the thunk body compiles the
+                        // atomic eagerly via compile_io_do_eager → compile_expr,
+                        // but only when invoked).
+                        ast::ExprKind::Atomic(_) => {
+                            let do_stmts = vec![ast::Spanned::new(
+                                ast::StmtKind::Expr(expr.clone()),
+                                expr.span,
+                            )];
+                            self.compile_io_do_as_thunk(builder, &do_stmts, env, db)
+                        }
                         _ => {
                             let v = self.compile_expr(builder, expr, env, db);
                             if relation_only_io {

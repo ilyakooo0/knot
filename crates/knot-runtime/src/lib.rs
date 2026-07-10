@@ -10984,11 +10984,6 @@ fn parse_record_schema(spec: &str) -> RecordSchema {
     RecordSchema { columns, nested }
 }
 
-/// Backward-compatible: parse a flat schema (no nested fields) into Vec<ColumnSpec>.
-fn parse_schema(spec: &str) -> Vec<ColumnSpec> {
-    parse_record_schema(spec).columns
-}
-
 /// Build a COALESCE expression that maps NULL to a sentinel value for use in
 /// UNIQUE indexes (SQLite treats NULLs as distinct, so we need a non-NULL stand-in).
 ///
@@ -14842,7 +14837,13 @@ pub extern "C-unwind" fn knot_view_read(
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     let view_schema = unsafe { str_from_raw(schema_ptr, schema_len) };
     let filter_where = unsafe { str_from_raw(filter_ptr, filter_len) };
-    let cols = parse_schema(view_schema);
+    // Parse the FULL record schema, keeping `field:[...]` nested descriptors.
+    // Taking only the scalar columns would drop them, omitting the nested column
+    // from the SELECT so the field never lands in the record — first access
+    // would then panic with "field not found" (Bug B25). Nested fields live in
+    // child tables (`_knot_<name>__<field>`) exactly like a source relation, so
+    // we reassemble them below via `read_child_table`, as `read_record_table` does.
+    let schema = parse_record_schema(view_schema);
 
     // Inside `atomic`, register the view's UNDERLYING SOURCE table in the
     // STM read set (codegen passes `view.source_name` as `name` here), so a
@@ -14860,26 +14861,32 @@ pub extern "C-unwind" fn knot_view_read(
         ),
     };
 
-    let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
+    // When the view exposes nested fields, the underlying source table carries
+    // an `_id` primary key; SELECT it first so each nested field can be looked
+    // up in its child table by `_parent_id`.
+    let table_name = format!("_knot_{}", name);
+    let has_children = !schema.nested.is_empty();
+
+    let mut select_cols: Vec<String> = Vec::new();
+    if has_children {
+        select_cols.push(quote_ident("_id"));
+    }
+    for c in &schema.columns {
+        select_cols.push(quote_ident(&c.name));
+    }
+    let select_list = if select_cols.is_empty() {
+        "1".to_string()
+    } else {
+        select_cols.join(", ")
+    };
+
     let sql = if filter_where.is_empty() {
-        format!(
-            "SELECT {} FROM {}",
-            if col_names.is_empty() {
-                "1".to_string()
-            } else {
-                col_names.join(", ")
-            },
-            quote_ident(&format!("_knot_{}", name))
-        )
+        format!("SELECT {} FROM {}", select_list, quote_ident(&table_name))
     } else {
         format!(
             "SELECT {} FROM {} WHERE {}",
-            if col_names.is_empty() {
-                "1".to_string()
-            } else {
-                col_names.join(", ")
-            },
-            quote_ident(&format!("_knot_{}", name)),
+            select_list,
+            quote_ident(&table_name),
             filter_where
         )
     };
@@ -14908,12 +14915,29 @@ pub extern "C-unwind" fn knot_view_read(
         .next()
         .unwrap_or_else(|e| panic!("knot runtime: view_read fetch error: {}", e))
     {
-        let record = knot_record_empty(cols.len());
-        for (i, col) in cols.iter().enumerate() {
-            let val = read_sql_column(row, i, col.ty);
+        let total_fields = schema.columns.len() + schema.nested.len();
+        let record = knot_record_empty(total_fields);
+        let col_offset = if has_children { 1 } else { 0 }; // skip the leading _id
+
+        // Scalar columns.
+        for (i, col) in schema.columns.iter().enumerate() {
+            let val = read_sql_column(row, i + col_offset, col.ty);
             let name_bytes = col.name.as_bytes();
             knot_record_set_field(record, name_bytes.as_ptr(), name_bytes.len(), val);
         }
+
+        // Nested relation fields, reassembled from their child tables keyed on
+        // the parent `_id` (same path as `read_record_table`).
+        if has_children {
+            let parent_id: i64 = row.get(0).unwrap();
+            for nf in &schema.nested {
+                let child_table = format!("{}__{}", table_name, nf.name);
+                let val = read_child_table(&db_ref.conn, &child_table, nf, parent_id);
+                let name_bytes = nf.name.as_bytes();
+                knot_record_set_field(record, name_bytes.as_ptr(), name_bytes.len(), val);
+            }
+        }
+
         rows.push(record);
     }
 

@@ -8594,24 +8594,64 @@ impl Infer {
                             // annotation variable, so each call-site
                             // instantiation gets its own fresh composition
                             // (mirrors `generalize`).
-                            let skolem_set: std::collections::HashSet<TyVar> = fresh_skolems.iter().copied().collect();
-                            let unit_skolem_set: std::collections::HashSet<UnitVar> = fresh_unit_skolems.iter().copied().collect();
+                            //
+                            // The scheme's type was just rebuilt from the
+                            // annotation with *fresh* vars (`ann_ty`), so the
+                            // body-check skolems these binops reference no
+                            // longer occur anywhere in it. Build a
+                            // skolem→fresh-var map by walking the skolemised
+                            // body type (`inferred`) against `ann_ty` in
+                            // parallel — they share the annotation's structure
+                            // — and re-point each captured binop at the vars
+                            // that actually appear in the scheme. Without this
+                            // the binop's result floats free of the return type
+                            // at instantiation and end-of-inference resolution
+                            // degrades to a vacuous `unify`, silently
+                            // mis-typing e.g. `scale 3.0<M> 4.0<M>` as
+                            // `Float<M>` instead of the `Float<M^2>` that
+                            // contradicts the `a -> a -> a` signature. (B12)
+                            let skolem_set: HashSet<TyVar> = fresh_skolems.iter().copied().collect();
+                            let unit_skolem_set: HashSet<UnitVar> = fresh_unit_skolems.iter().copied().collect();
+                            let mut walk_ty: HashMap<TyVar, TyVar> = HashMap::new();
+                            let mut walk_unit: HashMap<UnitVar, UnitVar> = HashMap::new();
+                            correspond_vars(&inferred, &ann_ty, &mut walk_ty, &mut walk_unit);
+                            // Restrict the remaps to the body-check skolems: only
+                            // those vanish from the rebuilt type. Other vars in an
+                            // operand are outer-scope and must be left untouched.
+                            let skolem_ty_subst: HashMap<TyVar, Ty> = walk_ty
+                                .iter()
+                                .filter(|(k, _)| skolem_set.contains(k))
+                                .map(|(k, v)| (*k, Ty::Var(*v)))
+                                .collect();
+                            let skolem_unit_subst: HashMap<UnitVar, UnitVar> = walk_unit
+                                .iter()
+                                .filter(|(k, _)| unit_skolem_set.contains(k))
+                                .map(|(k, v)| (*k, *v))
+                                .collect();
+                            let remapped_unit_targets: HashSet<UnitVar> =
+                                skolem_unit_subst.values().copied().collect();
                             let pending_binops = std::mem::take(&mut self.deferred_unit_binops);
                             let mut captured_binops: Vec<DeferredUnitBinop> = Vec::new();
                             for b in pending_binops {
                                 let resolved_result = self.apply(&Ty::Var(b.result));
                                 if let Ty::Var(v) = &resolved_result
-                                    && skolem_set.contains(v) {
-                                        let lhs = self.apply(&b.lhs);
-                                        let rhs = self.apply(&b.rhs);
-                                        if !vars.contains(v) {
-                                            vars.push(*v);
+                                    && skolem_set.contains(v)
+                                    && let Some(Ty::Var(fresh_result)) =
+                                        skolem_ty_subst.get(v).cloned() {
+                                        let mut lhs = self.subst_ty(&self.apply(&b.lhs), &skolem_ty_subst);
+                                        let mut rhs = self.subst_ty(&self.apply(&b.rhs), &skolem_ty_subst);
+                                        if !skolem_unit_subst.is_empty() {
+                                            lhs = self.subst_unit_vars_in_ty(&lhs, &skolem_unit_subst);
+                                            rhs = self.subst_unit_vars_in_ty(&rhs, &skolem_unit_subst);
+                                        }
+                                        if !vars.contains(&fresh_result) {
+                                            vars.push(fresh_result);
                                         }
                                         let mut all_uv = Vec::new();
                                         collect_unit_vars_ordered(&lhs, &mut all_uv);
                                         collect_unit_vars_ordered(&rhs, &mut all_uv);
                                         for uv in &all_uv {
-                                            if unit_skolem_set.contains(uv) && !unit_vars.contains(uv) {
+                                            if remapped_unit_targets.contains(uv) && !unit_vars.contains(uv) {
                                                 unit_vars.push(*uv);
                                             }
                                         }
@@ -8619,7 +8659,7 @@ impl Infer {
                                             op: b.op,
                                             lhs,
                                             rhs,
-                                            result: *v,
+                                            result: fresh_result,
                                             span: b.span,
                                         });
                                         continue;
@@ -9190,6 +9230,115 @@ fn collect_unit_vars_ordered(ty: &Ty, out: &mut Vec<UnitVar>) {
         Ty::Forall(_, inner) => collect_unit_vars_ordered(inner, out),
         Ty::Alias(_, inner) => collect_unit_vars_ordered(inner, out),
         _ => {}
+    }
+}
+
+/// Walk two structurally-parallel types, recording how the type and unit
+/// variables in `from` correspond to those in `to`. Both must derive from the
+/// same annotation AST — they differ only in variable identities — as happens
+/// when a scheme's type is rebuilt from its annotation with fresh vars: the
+/// skolemised body-check type and the rebuilt type share their shape. Used to
+/// re-point deferred unit-binops captured against body-check skolems onto the
+/// rebuilt scheme's fresh vars (see the `has_constraints` branch of
+/// `infer_declarations`, B12).
+fn correspond_vars(
+    from: &Ty,
+    to: &Ty,
+    ty_map: &mut HashMap<TyVar, TyVar>,
+    unit_map: &mut HashMap<UnitVar, UnitVar>,
+) {
+    match (from, to) {
+        (Ty::Var(a), Ty::Var(b)) => {
+            ty_map.entry(*a).or_insert(*b);
+        }
+        (Ty::Fun(p1, r1), Ty::Fun(p2, r2)) => {
+            correspond_vars(p1, p2, ty_map, unit_map);
+            correspond_vars(r1, r2, ty_map, unit_map);
+        }
+        (Ty::Relation(a), Ty::Relation(b)) => {
+            correspond_vars(a, b, ty_map, unit_map)
+        }
+        (Ty::Con(_, a1), Ty::Con(_, a2)) => {
+            for (x, y) in a1.iter().zip(a2) {
+                correspond_vars(x, y, ty_map, unit_map);
+            }
+        }
+        (Ty::App(f1, a1), Ty::App(f2, a2)) => {
+            correspond_vars(f1, f2, ty_map, unit_map);
+            correspond_vars(a1, a2, ty_map, unit_map);
+        }
+        (Ty::Record(f1, r1), Ty::Record(f2, r2)) => {
+            for (k, v) in f1 {
+                if let Some(w) = f2.get(k) {
+                    correspond_vars(v, w, ty_map, unit_map);
+                }
+            }
+            if let (Some(a), Some(b)) = (r1, r2) {
+                ty_map.entry(*a).or_insert(*b);
+            }
+        }
+        (Ty::Variant(c1, r1), Ty::Variant(c2, r2)) => {
+            for (k, v) in c1 {
+                if let Some(w) = c2.get(k) {
+                    correspond_vars(v, w, ty_map, unit_map);
+                }
+            }
+            if let (Some(a), Some(b)) = (r1, r2) {
+                ty_map.entry(*a).or_insert(*b);
+            }
+        }
+        (Ty::IO(_, r1, i1), Ty::IO(_, r2, i2)) => {
+            if let (Some(a), Some(b)) = (r1, r2) {
+                ty_map.entry(*a).or_insert(*b);
+            }
+            correspond_vars(i1, i2, ty_map, unit_map);
+        }
+        (Ty::IntUnit(u1), Ty::IntUnit(u2))
+        | (Ty::FloatUnit(u1), Ty::FloatUnit(u2)) => {
+            correspond_unit_vars(u1, u2, unit_map);
+        }
+        (Ty::Forall(_, i1), Ty::Forall(_, i2)) => {
+            correspond_vars(i1, i2, ty_map, unit_map)
+        }
+        (Ty::Alias(_, i1), Ty::Alias(_, i2)) => {
+            correspond_vars(i1, i2, ty_map, unit_map)
+        }
+        // Look through a one-sided alias so shapes still line up.
+        (Ty::Alias(_, i1), other) => {
+            correspond_vars(i1, other, ty_map, unit_map)
+        }
+        (other, Ty::Alias(_, i2)) => {
+            correspond_vars(other, i2, ty_map, unit_map)
+        }
+        (Ty::Assoc(_, i1), Ty::Assoc(_, i2)) => {
+            correspond_vars(i1, i2, ty_map, unit_map)
+        }
+        _ => {}
+    }
+}
+
+/// Pair the unit variables of two structurally-parallel units by exponent
+/// (see `correspond_vars`). The common shape is a single variable per unit
+/// (`Float<u>`), which pairs unambiguously; ties within one exponent pair in
+/// `BTreeMap` iteration order.
+fn correspond_unit_vars(
+    from: &UnitTy,
+    to: &UnitTy,
+    unit_map: &mut HashMap<UnitVar, UnitVar>,
+) {
+    let mut targets_by_exp: BTreeMap<i32, Vec<UnitVar>> = BTreeMap::new();
+    for (&v, &e) in &to.vars {
+        targets_by_exp.entry(e).or_default().push(v);
+    }
+    let mut next: BTreeMap<i32, usize> = BTreeMap::new();
+    for (&v, &e) in &from.vars {
+        if let Some(candidates) = targets_by_exp.get(&e) {
+            let idx = next.entry(e).or_insert(0);
+            if let Some(&target) = candidates.get(*idx) {
+                unit_map.entry(v).or_insert(target);
+                *idx += 1;
+            }
+        }
     }
 }
 

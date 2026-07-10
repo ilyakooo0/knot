@@ -4770,6 +4770,10 @@ impl Infer {
                 }
             }
 
+            // `2 seconds` is inference-identical to its desugared `2 * 1000`;
+            // infer the wrapped multiplication directly.
+            ast::ExprKind::TimeUnitLit { value, .. } => self.infer_expr(value),
+
             ast::ExprKind::Annot { expr: inner, ty } => {
                 let inner_ty = self.infer_expr(inner);
                 // Treat lowercase unit names in an inline ascription as
@@ -6185,7 +6189,7 @@ impl Infer {
                 })
             }
             ast::ExprKind::Lambda { body, .. } => self.expr_is_io_prescan(body),
-            ast::ExprKind::UnitLit { value, .. } => self.expr_is_io_prescan(value),
+            ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => self.expr_is_io_prescan(value),
             ast::ExprKind::Annot { expr, .. } => self.expr_is_io_prescan(expr),
             ast::ExprKind::Refine(inner) => self.expr_is_io_prescan(inner),
             _ => false,
@@ -9673,7 +9677,7 @@ fn value_references_source_inner(
                 inner, source_name, aliases, let_bindings, visited,
             )
         }
-        ast::ExprKind::UnitLit { value, .. } => value_references_source_inner(
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => value_references_source_inner(
             value, source_name, aliases, let_bindings, visited,
         ),
         ast::ExprKind::Annot { expr, .. } => value_references_source_inner(

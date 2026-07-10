@@ -1742,6 +1742,18 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
                 render_unit_expr(unit)
             )
         }
+        ExprKind::TimeUnitLit { value, unit_name } => {
+            // Recover the original numeric literal from the desugared
+            // `n * factor` and re-render the surface `n unit` form (e.g.
+            // `2 seconds`). The `n unit` juxtaposition reads like an
+            // application, so parenthesize in argument position the same way
+            // — `sleep (2 seconds)`, not `sleep 2 seconds`.
+            let num = match &value.node {
+                ExprKind::BinOp { lhs, .. } => render_expr_inline(lhs, Prec::Atom),
+                _ => render_expr_inline(value, Prec::Atom),
+            };
+            paren_if(parent > Prec::App, format!("{} {}", num, unit_name))
+        }
         ExprKind::Annot { expr, ty } => {
             let mut inner = render_expr_inline(expr, Prec::Lowest);
             if annot_inner_needs_parens(expr, true) {
@@ -2387,6 +2399,75 @@ mod tests {
         let once = fmt(input);
         let twice = fmt(&once);
         assert_eq!(once, twice, "formatter is not idempotent:\n--- once ---\n{}\n--- twice ---\n{}\n", once, twice);
+    }
+
+    // B50: A multi-line `do`/`case` block in argument position is rendered
+    // parenthesized. A statement that begins with a prefix operator (`-2`)
+    // must stay a separate statement on reparse — the parser's layout column
+    // guard has to fire at the block-item boundary even inside parens, or the
+    // `let a = 1` line glues to the `-2` line as `let a = 1 - 2`, the reparse
+    // AST diverges, and the whole file silently reverts.
+    #[test]
+    fn b50_parenthesized_do_block_keeps_statement_boundary() {
+        // The formatter parenthesizes the do-block (last app arg) and the
+        // output must round-trip — no whole-file revert to the input.
+        assert_fmt(
+            "main = forEach xs do\n  let a = 1\n  -2\n",
+            "main = forEach xs (do\n  let a = 1\n  -2)\n",
+        );
+        assert_idempotent("main = forEach xs do\n  let a = 1\n  -2\n");
+    }
+
+    #[test]
+    fn b50_parenthesized_do_block_parses_two_statements() {
+        // Parse the parenthesized rendering directly: the do-block must hold
+        // two statements (`let a = 1` and `-2`), not one glued `let a = 1 - 2`.
+        let src = "main = forEach xs (do\n  let a = 1\n  -2)\n";
+        let lexer = Lexer::new(src);
+        let (tokens, _) = lexer.tokenize();
+        let (module, diags) = Parser::new(src.to_string(), tokens).parse_module();
+        assert!(
+            !diags.iter().any(|d| d.severity == crate::diagnostic::Severity::Error),
+            "unexpected parse errors: {:?}",
+            diags
+        );
+        fn find_do(e: &Expr) -> Option<&[Stmt]> {
+            match &e.node {
+                ExprKind::Do(stmts) => Some(stmts),
+                ExprKind::App { func, arg } => find_do(arg).or_else(|| find_do(func)),
+                _ => None,
+            }
+        }
+        let DeclKind::Fun { body: Some(body), .. } = &module.decls[0].node else {
+            panic!("expected a function declaration");
+        };
+        let stmts = find_do(body).expect("expected a do-block argument");
+        assert_eq!(stmts.len(), 2, "statements glued together: {:?}", stmts);
+        assert!(matches!(&stmts[0].node, StmtKind::Let { .. }), "{:?}", stmts[0]);
+    }
+
+    #[test]
+    fn b50_parenthesized_column0_continuation_still_works() {
+        // The block-boundary rule must NOT break a legitimate column-0 operator
+        // continuation inside parens: here no do/case block is active, so the
+        // `+ b` on the next line continues the parenthesized expression.
+        let src = "main = (a\n+ b)\n";
+        let lexer = Lexer::new(src);
+        let (tokens, _) = lexer.tokenize();
+        let (module, diags) = Parser::new(src.to_string(), tokens).parse_module();
+        assert!(
+            !diags.iter().any(|d| d.severity == crate::diagnostic::Severity::Error),
+            "unexpected parse errors: {:?}",
+            diags
+        );
+        let DeclKind::Fun { body: Some(body), .. } = &module.decls[0].node else {
+            panic!("expected a function declaration");
+        };
+        assert!(
+            matches!(&body.node, ExprKind::BinOp { op: BinOp::Add, .. }),
+            "column-0 continuation inside parens broke: {:?}",
+            body
+        );
     }
 
     #[test]

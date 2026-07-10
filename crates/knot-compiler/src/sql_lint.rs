@@ -200,7 +200,7 @@ fn lint_expr(
         ExprKind::Annot { expr: inner, .. } => {
             lint_expr(inner, source_schemas, views, diags);
         }
-        ExprKind::UnitLit { value, .. } => {
+        ExprKind::UnitLit { value, .. } | ExprKind::TimeUnitLit { value, .. } => {
             lint_expr(value, source_schemas, views, diags);
         }
         ExprKind::Refine(inner) => {
@@ -1075,7 +1075,7 @@ fn references_source(expr: &Expr, source_name: &str) -> bool {
         ExprKind::Atomic(inner) | ExprKind::Refine(inner) => {
             references_source(inner, source_name)
         }
-        ExprKind::UnitLit { value, .. } => references_source(value, source_name),
+        ExprKind::UnitLit { value, .. } | ExprKind::TimeUnitLit { value, .. } => references_source(value, source_name),
         ExprKind::Serve { handlers, .. } => {
             handlers.iter().any(|h| references_source(&h.body, source_name))
         }

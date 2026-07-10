@@ -1532,12 +1532,17 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
             .collect();
         state.workspace_roots.retain(|p| !removed.contains(p));
         for added in &params.event.added {
-            if let Some(path) = uri_to_path(&added.uri)
-                && !state.workspace_roots.contains(&path) {
-                    // Canonicalize added roots to match cache-key canonicalization.
-                    let path = path.canonicalize().unwrap_or(path);
+            if let Some(path) = uri_to_path(&added.uri) {
+                // Canonicalize added roots to match cache-key canonicalization,
+                // and do so *before* the dedup check: existing roots are stored
+                // canonicalized, so a symlinked spelling of an already-present
+                // root would slip past a raw-path comparison and get pushed
+                // again, causing duplicate workspace scans.
+                let path = path.canonicalize().unwrap_or(path);
+                if !state.workspace_roots.contains(&path) {
                     state.workspace_roots.push(path);
                 }
+            }
         }
         state.workspace_root = state.workspace_roots.first().cloned();
 

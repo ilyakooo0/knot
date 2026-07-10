@@ -705,6 +705,39 @@ main = combine (println "left") (println "right")
     );
 }
 
+#[test]
+fn user_annotated_effect_union_if_branches_accepted() {
+    // Regression (B22): an `if` in *infer* position (here as the argument of
+    // `id`, so the callee doesn't push an expected type back down) whose two
+    // branches carry *distinct* rigid effect rows (`r1`, `r2`) must satisfy
+    // the declared union `r1 \/ r2`. Previously the If arm's row merge called
+    // `unify` on the two rigid skolems directly, bypassing the effect-union
+    // escape and rejecting with "cannot unify rigid type variables".
+    let src = r#"combine : Bool -> IO {| r1} {} -> IO {| r2} {} -> IO {| r1 \/ r2} {}
+combine = \c a b -> id (if c then a else b)
+main = combine true (println "left") (println "right")
+"#;
+    let diags = check_src(src);
+    assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
+}
+
+#[test]
+fn effect_row_equality_without_union_still_rejected_in_if() {
+    // The `if` merge must NOT silently collapse two distinct rigid rows into
+    // a single-row result absent a declared `\/` union — the fix delegates to
+    // `merge_do_io_row`, which still falls back to `unify` here.
+    let src = r#"combine : Bool -> IO {| r1} {} -> IO {| r2} {} -> IO {| r1} {}
+combine = \c a b -> id (if c then a else b)
+main = combine true (println "left") (println "right")
+"#;
+    let diags = check_src(src);
+    assert!(
+        has_error(&diags, "cannot unify rigid type variables"),
+        "rigid rows must not silently merge without a `\\/` union: {:?}",
+        diags
+    );
+}
+
 // ── 12. IO-vs-Relation unification in IO do blocks ──
 
 #[test]

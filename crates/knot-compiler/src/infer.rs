@@ -3653,6 +3653,27 @@ impl Infer {
                                 .into_iter()
                                 .map(|v| (v, self.fresh()))
                                 .collect();
+                            // These freshly-minted alias-body vars must be
+                            // quantified in the enclosing annotation's scheme.
+                            // Without registering them in `annotation_vars`,
+                            // the pre-registered scheme leaves them unquantified
+                            // and shares them across every call site — the first
+                            // use pins the alias (e.g. `Box` to `{val: Int}`) and
+                            // later uses at other types are falsely rejected. The
+                            // bug surfaced only when the annotated decl was
+                            // declared after its first caller, so re-generalization
+                            // (which never happens for constrained functions)
+                            // couldn't paper over it (bug B21). Guarded on
+                            // `in_type_annotation` so only scheme-building callers
+                            // are affected, not alias-definition collection.
+                            if self.in_type_annotation {
+                                for fresh in mapping.values() {
+                                    if let Ty::Var(v) = fresh {
+                                        self.annotation_vars
+                                            .insert(format!("__alias_fv#{v}"), *v);
+                                    }
+                                }
+                            }
                             self.subst_ty(&aliased, &mapping)
                         };
                         // Wrap nullary alias references so the name flows
@@ -4545,13 +4566,18 @@ impl Infer {
                         // result. When both are still-open *distinct* row
                         // variables, `r1.or(r2)` would silently drop one, so
                         // effects later flowing into the dropped tail would
-                        // vanish from the if-expression's type. Unify the two
-                        // tails (the same merge `unify_io_effects` performs for
-                        // distinct rows) so neither is lost.
+                        // vanish from the if-expression's type. Merge the two
+                        // tails the same way a sequenced do-block does: a direct
+                        // `unify` of two *rigid* signature skolems (as in a
+                        // declared `IO {| r1 \/ r2}` union) fails with "cannot
+                        // unify rigid type variables"; `merge_do_io_row` instead
+                        // records a pending `\/` effect-union constraint (and
+                        // still falls back to `unify` for the flexible cases).
                         let row = match (*r1, *r2) {
                             (Some(a), Some(b)) if a != b => {
-                                self.unify(&Ty::Var(a), &Ty::Var(b), expr.span);
-                                Some(a)
+                                let mut merged_row = Some(a);
+                                self.merge_do_io_row(&mut merged_row, b, expr.span);
+                                merged_row
                             }
                             (a, b) => a.or(b),
                         };

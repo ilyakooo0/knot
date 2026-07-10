@@ -4313,10 +4313,21 @@ impl Codegen {
 
             ast::ExprKind::BinOp { op, lhs, rhs } => {
                 if matches!(op, ast::BinOp::Pipe) {
-                    // Check for: source |> match Constructor → SQL-level match
+                    // Check for: source |> match Constructor → SQL-level match.
+                    // Only when `match` is NOT shadowed — a locally-bound name
+                    // (lambda param, `let`, do-bind, captured free var) or a
+                    // user-declared top-level `match` must win over the builtin,
+                    // mirroring `compile_app` (env-locals first) and the non-pipe
+                    // `match` special form (guarded on `user_shadows_special`).
+                    // Without this, `\match -> xs |> match Ctor` would call the
+                    // builtin instead of the local value. When shadowed, fall
+                    // through to `try_compile_pipe_sql`/`compile_app` below, which
+                    // resolve the shadowing name correctly.
                     if let ast::ExprKind::App { func: match_fn, arg: match_arg } = &rhs.node
                         && let (ast::ExprKind::Var(fn_name), ast::ExprKind::Constructor(ctor_name)) = (&match_fn.node, &match_arg.node)
-                            && fn_name == "match" {
+                            && fn_name == "match"
+                            && !env.bindings.contains_key(fn_name)
+                            && !(self.top_fn_names.contains(fn_name) && self.user_fns.contains_key(fn_name)) {
                                 if let ast::ExprKind::SourceRef(source_name) = &lhs.node
                                     && let Some(schema) = self.source_schemas.get(source_name).cloned() {
                                         let (name_ptr, name_len) =
@@ -8334,7 +8345,20 @@ impl Codegen {
                     let rhs_iterates = (!self.expr_is_io(expr)
                         && (matches!(&expr.node, ast::ExprKind::List(_))
                             || self.expr_is_known_relation(expr)
-                            || self.expr_is_relation_var(expr)))
+                            || self.expr_is_relation_var(expr)
+                            // A pure comprehension over the relation monad is
+                            // desugared before codegen into an `App` spine of
+                            // `__bind`/`__yield` (no longer an `ExprKind::Do`),
+                            // and inference types the bind pattern as the
+                            // ELEMENT type. The Let arm recognizes this shape
+                            // (via `desugared_monad_kind`, ~line 8434) to mark
+                            // the binding relation-valued; mirror it here so
+                            // `x <- do { a <- [1,2,3]; yield a }` iterates
+                            // per-row (x : element) instead of binding the whole
+                            // relation value (which prints the list once and
+                            // panics on field access).
+                            || self.desugared_monad_kind(expr)
+                                == Some(MonadKind::Relation)))
                         || (pat_filters_rows && rhs_is_io_relation_source);
                     // Names (re)bound by this pattern are rows from here on,
                     // not the relation-valued lets they may have shadowed.

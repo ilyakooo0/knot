@@ -3312,7 +3312,6 @@ pub extern "C-unwind" fn knot_override_lookup(
         if let Some(v) = args[i].strip_prefix(&flag) {
             if let Some(v) = v.strip_prefix('=') {
                 value = Some(v.to_string());
-                break;
             } else if v.is_empty() {
                 if is_bool {
                     // Boolean flag. Consume the explicit two-arg form
@@ -3328,14 +3327,14 @@ pub extern "C-unwind" fn knot_override_lookup(
                         )
                     {
                         value = Some(args[i + 1].clone());
+                        i += 1; // skip the consumed value token
                     } else {
                         value = Some("true".to_string());
                     }
-                    break;
                 } else if i + 1 < args.len() && !args[i + 1].starts_with("--") {
                     // --name value (two-arg form)
                     value = Some(args[i + 1].clone());
-                    break;
+                    i += 1; // skip the consumed value token
                 }
             }
         }
@@ -3372,7 +3371,7 @@ pub extern "C-unwind" fn knot_override_lookup(
         1 => {
             // Float
             match val_str.parse::<f64>() {
-                Ok(n) => alloc(Value::Float(n)),
+                Ok(n) => alloc_float(n),
                 Err(_) => {
                     eprintln!(
                         "Error: invalid value '{}' for --{} (expected {})",
@@ -6436,7 +6435,21 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
                         buf.push(7);
                         buf.extend_from_slice(&(tag.len() as u32).to_le_bytes());
                         buf.extend_from_slice(tag.as_bytes());
-                        stack.push(HashTask::Value(*payload));
+                        // Nullary constructors have two runtime forms:
+                        // `Constructor(tag, Unit)` and `Constructor(tag, Record([]))`.
+                        // Canonicalize both to the same hash bytes (tag 5,
+                        // matching Unit) so set semantics agree.
+                        match unsafe { as_ref(*payload) } {
+                            Value::Unit => {
+                                buf.push(5);
+                            }
+                            Value::Record(r) if r.is_empty() => {
+                                buf.push(5);
+                            }
+                            _ => {
+                                stack.push(HashTask::Value(*payload));
+                            }
+                        }
                     }
                     Value::Relation(rows) => {
                         buf.push(8);
@@ -6525,6 +6538,16 @@ fn record_content_hash_hex(row_ptr: *mut Value) -> String {
 /// recursive. The result is identical to the recursive formulation: a
 /// single mismatch returns `false`, otherwise all reachable pairs must
 /// match leaf-for-leaf.
+/// Check if a value is a nullary constructor payload: `Unit` or an empty `Record([])`.
+/// Both forms represent the same conceptual "no payload" for nullary constructors.
+fn is_nullary_payload(v: *mut Value) -> bool {
+    match unsafe { as_ref(v) } {
+        Value::Unit => true,
+        Value::Record(r) => r.is_empty(),
+        _ => false,
+    }
+}
+
 fn values_equal(a: *mut Value, b: *mut Value) -> bool {
     let mut stack: Vec<(*mut Value, *mut Value)> = vec![(a, b)];
     while let Some((a, b)) = stack.pop() {
@@ -6542,6 +6565,11 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
                 }
             }
             (Value::Float(x), Value::Float(y)) => {
+                // NaN == NaN must be true: hash canonicalization and `compare`
+                // already treat two NaNs as equal, so scalar `==` must agree.
+                if x.is_nan() && y.is_nan() {
+                    continue;
+                }
                 if x != y {
                     return false;
                 }
@@ -6601,6 +6629,16 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
             (Value::Constructor(ta, pa), Value::Constructor(tb, pb)) => {
                 if ta != tb {
                     return false;
+                }
+                // Nullary constructors have two runtime representations:
+                // `Constructor(tag, Unit)` (bare `Nothing`) and
+                // `Constructor(tag, Record([]))` (`Nothing {}`). Treat
+                // Unit and empty Record as equal so set semantics (hash,
+                // dedup, union, elem) agree across both forms.
+                let pa_is_empty = is_nullary_payload(*pa);
+                let pb_is_empty = is_nullary_payload(*pb);
+                if pa_is_empty && pb_is_empty {
+                    continue;
                 }
                 stack.push((*pa, *pb));
             }
@@ -7210,7 +7248,17 @@ fn compare_values(a: *mut Value, b: *mut Value) -> std::cmp::Ordering {
                             Ordering::Equal => {}
                             o => return o,
                         }
-                        stack.push(CmpFrame::Pair(*pa, *pb));
+                        // Nullary constructors have two runtime forms:
+                        // `Constructor(tag, Unit)` and `Constructor(tag, Record([]))`.
+                        // Treat Unit and empty Record as equal so comparisons
+                        // don't panic on the mixed pair.
+                        let pa_is_empty = is_nullary_payload(*pa);
+                        let pb_is_empty = is_nullary_payload(*pb);
+                        if pa_is_empty && pb_is_empty {
+                            // Both nullary — equal payloads.
+                        } else {
+                            stack.push(CmpFrame::Pair(*pa, *pb));
+                        }
                     }
                     (Value::Pair(aa, ab), Value::Pair(ba, bb)) => {
                         // Push tail first so head pops first (matches

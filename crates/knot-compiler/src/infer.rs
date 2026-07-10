@@ -857,6 +857,12 @@ impl Infer {
                 // subsumption arms exclude it — so this only ever rejects a
                 // genuine base value.)
                 | Ty::Con(..)
+                // Open variants (`<Ctor {} | r>`) can serve as a refinement
+                // base. Without this, constructor-pattern scrutinees typed as
+                // open variants bypass the introduction guard and unify
+                // through `resolve_refined_base` with no `refine` and no
+                // runtime validation.
+                | Ty::Variant(..)
         )
     }
 
@@ -5745,6 +5751,12 @@ impl Infer {
             ast::PatKind::Record(field_pats) => {
                 let mut field_types = BTreeMap::new();
                 for fp in field_pats {
+                    if field_types.contains_key(&fp.name) {
+                        self.error(
+                            format!("duplicate field '{}' in record pattern", fp.name),
+                            fp.name_span,
+                        );
+                    }
                     let ft = self.fresh();
                     field_types.insert(fp.name.clone(), ft.clone());
                     if let Some(p) = &fp.pattern {
@@ -5886,7 +5898,20 @@ impl Infer {
 
         match resolved.peel_alias() {
             Ty::Con(name, _) => {
-                let data_info = match self.data_types.get(name) {
+                // A refined alias (`type Warm = Color where …`) stays
+                // nominal as `Con("Warm", [])` and is stored only in
+                // `refined_types`, not `data_types`. Without resolving the
+                // refined alias to its base ADT, the lookup below returns
+                // `None` and exhaustiveness is silently skipped.
+                let name = if !self.data_types.contains_key(name) {
+                    match self.resolve_refined_base(name, span) {
+                        Some(Ty::Con(base, _)) => base,
+                        _ => return,
+                    }
+                } else {
+                    name.clone()
+                };
+                let data_info = match self.data_types.get(&name) {
                     Some(info) => info.clone(),
                     None => return,
                 };

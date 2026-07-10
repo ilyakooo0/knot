@@ -89,7 +89,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   diagnostic.
   **Confidence: high.**
 
-- [ ] **B9. Nullary constructors exist in two runtime representations that don't compare equal** — `crates/knot-runtime/src/lib.rs:6601` (values_equal), `lib.rs:7221` (compare panic), `lib.rs:6416` (hash tags)
+- [x] **B9. Nullary constructors exist in two runtime representations that don't compare equal** — `crates/knot-runtime/src/lib.rs:6601` (values_equal), `lib.rs:7221` (compare panic), `lib.rs:6416` (hash tags)
   `Constructor(tag, Unit)` (bare `Nothing`, `knot_relation_single`, SQLite `tag`-column reads,
   temp-table round-trips through `union`/`diff`/`inter`, JSON `tag` coercion) vs
   `Constructor(tag, Record([]))` (`Nothing {}` / `Red {}` via `knot_record_empty`, `make_nothing`).
@@ -114,7 +114,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   performing console IO.
   **Confidence: high.**
 
-- [ ] **B11. Duplicate field names in a record pattern leave the earlier binder unconstrained** — `crates/knot-compiler/src/infer.rs:5745` (`check_pattern` Record arm)
+- [x] **B11. Duplicate field names in a record pattern leave the earlier binder unconstrained** — `crates/knot-compiler/src/infer.rs:5745` (`check_pattern` Record arm)
   The parser accepts duplicates; `check_pattern` inserts into a `BTreeMap`, so the second insert
   overwrites the first field's type — the first binder keeps a never-unified fresh var usable at
   any type. Record literals get a duplicate-field diagnostic (infer.rs:4273); patterns don't.
@@ -132,7 +132,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   constraint the same program is correctly rejected.
   **Confidence: high.**
 
-- [ ] **B13. Exhaustiveness checking silently skipped for refined ADT aliases** — `crates/knot-compiler/src/infer.rs:5887`
+- [x] **B13. Exhaustiveness checking silently skipped for refined ADT aliases** — `crates/knot-compiler/src/infer.rs:5887`
   A refined alias (`type Warm = Color where …`) stays nominal as `Con("Warm", [])`, stored only in
   `refined_types`; `check_exhaustiveness` does `data_types.get("Warm")` → `None => return`, no
   wildcard requirement. (`resolve_refined_base` exists but is not consulted here.)
@@ -140,7 +140,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   a runtime match failure.
   **Confidence: high.**
 
-- [ ] **B14. Open-variant values bypass the refined-type introduction guard** — `crates/knot-compiler/src/infer.rs:839` (`is_concrete_refinement_base`)
+- [x] **B14. Open-variant values bypass the refined-type introduction guard** — `crates/knot-compiler/src/infer.rs:839` (`is_concrete_refinement_base`)
   The guard's concrete-base list omits `Ty::Variant`. Constructor patterns type scrutinees as open
   variants `<Ctor {} | r>`, which unify straight through `resolve_refined_base` with no `refine`
   and no runtime validation (function args are only trusted statically).
@@ -305,7 +305,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   TypeAlias/Data. Schema changes to imported sources surface only as a runtime startup panic.
   **Confidence: high.**
 
-- [ ] **B36. Lockfile written non-atomically** — `crates/knot-compiler/src/lockfile.rs:401`
+- [x] **B36. Lockfile written non-atomically** — `crates/knot-compiler/src/lockfile.rs:401`
   Plain `fs::write`; a crash mid-write leaves a corrupt lockfile that hard-errors every compile
   until deleted. Use temp+rename.
   **Confidence: medium** (minor).
@@ -381,13 +381,13 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   ~50–100k-node `Cons` spine passes eq/hash then SIGSEGVs on `show`/`toJson`.
   **Confidence: medium** (mechanically certain; depth-dependent).
 
-- [ ] **B46. Compile-time-constant override path bypasses `-0.0` canonicalization** — `crates/knot-runtime/src/lib.rs:3375`
+- [x] **B46. Compile-time-constant override path bypasses `-0.0` canonicalization** — `crates/knot-runtime/src/lib.rs:3375`
   Allocates `Value::Float` directly instead of `alloc_float`, producing the only reachable `-0.0`;
   `compare_values` uses `total_cmp`, so `threshold < 0.0 && threshold == 0.0` both hold.
   One-line fix.
   **Confidence: medium** (narrow trigger, certain invariant break).
 
-- [ ] **B47. NaN has three disagreeing equality notions** — `crates/knot-runtime/src/lib.rs:6544` vs `lib.rs:6611`/`lib.rs:7161`
+- [x] **B47. NaN has three disagreeing equality notions** — `crates/knot-runtime/src/lib.rs:6544` vs `lib.rs:6611`/`lib.rs:7161`
   Scalar `==` says two NaNs differ; relation membership (hash canonicalization) says they're the
   same element; `compare` says EQ. Design call needed on which is canonical.
   **Confidence: medium.**
@@ -417,13 +417,13 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   the safety net, destroys surface syntax.
   **Confidence: high** (fidelity bug; semantics preserved).
 
-- [ ] **B52. Verbatim formatter fallback replaces tabs inside string literals** — `crates/knot/src/format.rs:557` (`normalize_source_slice`)
+- [x] **B52. Verbatim formatter fallback replaces tabs inside string literals** — `crates/knot/src/format.rs:557` (`normalize_source_slice`)
   `s.replace('\t', " ")` runs over the whole slice including strings; a decl with an internal
   comment (forcing verbatim) plus a raw-tab string changes the string value → reparse mismatch →
   whole-file silent revert.
   **Confidence: medium-high.**
 
-- [ ] **B53. Route paths reject dashed segments with keyword parts that import paths accept** — `crates/knot/src/parser.rs:701` vs `parser.rs:681`
+- [x] **B53. Route paths reject dashed segments with keyword parts that import paths accept** — `crates/knot/src/parser.rs:701` vs `parser.rs:681`
   `/foo-type`, `/x-do`, `/a-in` fail ("expected '='…") because the route suffix helper admits only
   `Lower`/`Upper`, unlike the import version which also takes `keyword_str()`. `/do-foo` works.
   **Confidence: high** on behavior, **medium** on intent.
@@ -448,7 +448,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   sub-chain gets zero linting, and middle-stage lambda bodies are never generically recursed.
   **Confidence: high** mechanics, info-level impact.
 
-- [ ] **B57. `length` pushdown diverges on NUL-containing text** — `crates/knot-compiler/src/sql_lint.rs:881`
+- [x] **B57. `length` pushdown diverges on NUL-containing text** — `crates/knot-compiler/src/sql_lint.rs:881`
   SQLite `LENGTH()` counts chars before the first NUL; `knot_text_length` counts all.
   `where length p.name == 5` filters differently pushed vs in-memory.
   **Confidence: medium** (exotic data).
@@ -463,16 +463,16 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
 
 ### CLI / build
 
-- [ ] **B58. A compile-time constant named `output` can't be overridden at build time** — `crates/knot-compiler/src/main.rs:50`
+- [x] **B58. A compile-time constant named `output` can't be overridden at build time** — `crates/knot-compiler/src/main.rs:50`
   `--output`/`--output=` is reserved by `build` (value repurposed as the output path, no
   diagnostic), yet at runtime `./app --output=x` does override the constant.
   **Confidence: medium.**
 
-- [ ] **B59. Duplicate `--name=value` flags: last-wins at build, first-wins at run** — `crates/knot-compiler/src/main.rs:71` vs runtime `knot_override_lookup`
+- [x] **B59. Duplicate `--name=value` flags: last-wins at build, first-wins at run** — `crates/knot-compiler/src/main.rs:71` vs runtime `knot_override_lookup`
   `--port=1 --port=2` bakes 2 at build, uses 1 at run.
   **Confidence: medium.**
 
-- [ ] **B60. `find_runtime` prefers a stale `libknot_runtime.a` next to the compiler over the newer embedded runtime** — `crates/knot-compiler/src/main.rs:502`
+- [x] **B60. `find_runtime` prefers a stale `libknot_runtime.a` next to the compiler over the newer embedded runtime** — `crates/knot-compiler/src/main.rs:502`
   No freshness/content check; after rebuilding only knot-compiler, `knot build` silently links the
   stale archive.
   **Confidence: medium.**
@@ -482,7 +482,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   (mtime-only freshness).
   **Confidence: medium** (low likelihood).
 
-- [ ] **B62. `db` explorer loads entire tables unbounded** — `crates/knot-runtime/src/tui.rs:174`, `tui.rs:636`
+- [x] **B62. `db` explorer loads entire tables unbounded** — `crates/knot-runtime/src/tui.rs:174`, `tui.rs:636`
   `load_rows` has no LIMIT; runs before `enable_raw_mode`, so a large table makes `<program> db`
   appear frozen (or OOM), and every selection change re-scans the full table. Docs claim
   pagination; none exists.
@@ -586,7 +586,7 @@ replace/measure that widened span assuming it excludes parens:
   willRenameFiles resolves `lib.v2.knot` → file moves silently skip rewriting that importer.
   **Confidence: medium.**
 
-- [ ] **B80. `parse_app` drops application args when the head is a type variable** — `crates/knot-lsp/src/parsed_type.rs:372`
+- [x] **B80. `parse_app` drops application args when the head is a type variable** — `crates/knot-lsp/src/parsed_type.rs:372`
   `map : (a -> b) -> f a -> f b` renders in hover/signature help as `(a -> b) -> f -> f`.
   **Confidence: medium.**
 
@@ -595,7 +595,7 @@ replace/measure that widened span assuming it excludes parens:
   corruption).
   **Confidence: medium** (low impact).
 
-- [ ] **B82. `rateLimit` completion gate is end-exclusive** — `crates/knot-lsp/src/completion.rs:1024`
+- [x] **B82. `rateLimit` completion gate is end-exclusive** — `crates/knot-lsp/src/completion.rs:1024`
   Cursor at the end of the rateLimit expression (the common append position) falls back to route
   method/type completions instead of expression completions. `find_enclosing_do_span` uses
   inclusive end.

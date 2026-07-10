@@ -554,8 +554,41 @@ fn render_decl_with_fallback(source: &str, d: &Decl, comments: &[Comment<'_>]) -
 /// so a tab must be replaced by exactly one space — anything wider can change
 /// the relative indentation of mixed tab/space sibling lines inside a layout
 /// block, altering block structure on reparse.
+///
+/// Tab replacement is string-aware: tabs inside `"…"` string literals are left
+/// untouched so that a raw tab in a string value survives the round-trip
+/// (replacing it would change the string's value → reparse mismatch → the
+/// whole-file fallback silently reverts all formatting). Escaped quotes (`\"`)
+/// and other backslash escapes are handled so a `\"` inside a string does not
+/// terminate the string-tracking state.
 fn normalize_source_slice(s: &str) -> String {
-    let s = s.replace('\t', " ");
+    // Replace tabs outside of string literals with a single space, preserving
+    // tabs that appear inside `"…"` string literals verbatim.
+    let mut tab_normalized = String::with_capacity(s.len());
+    let mut in_string = false;
+    let mut prev_backslash = false;
+    for ch in s.chars() {
+        if in_string {
+            tab_normalized.push(ch);
+            if prev_backslash {
+                // Any character following a backslash is consumed as part of
+                // the escape — it cannot end the string.
+                prev_backslash = false;
+            } else if ch == '\\' {
+                prev_backslash = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+        } else if ch == '"' {
+            in_string = true;
+            tab_normalized.push(ch);
+        } else if ch == '\t' {
+            tab_normalized.push(' ');
+        } else {
+            tab_normalized.push(ch);
+        }
+    }
+    let s = tab_normalized;
     let mut out = String::with_capacity(s.len());
     for (i, line) in s.split('\n').enumerate() {
         if i > 0 {

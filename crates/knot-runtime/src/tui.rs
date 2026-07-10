@@ -101,6 +101,11 @@ fn split_respecting_brackets(s: &str, sep: char) -> Vec<&str> {
 
 // ── Data loading ─────────────────────────────────────────────────
 
+/// Maximum number of rows loaded into the TUI at once. Prevents OOM when
+/// a relation contains millions of rows — the explorer is for interactive
+/// browsing, not bulk export.
+const ROW_LIMIT: usize = 1000;
+
 fn load_relations(conn: &Connection) -> Vec<RelationInfo> {
     // Check if _knot_schema exists
     let exists: bool = conn
@@ -186,7 +191,8 @@ fn load_rows(conn: &Connection, rel: &RelationInfo) -> Vec<Vec<String>> {
                     |row| row.get(0),
                 )
                 .unwrap_or(0);
-            (0..count as usize).map(|_| vec!["{}".to_string()]).collect()
+            let capped = (count as usize).min(ROW_LIMIT);
+            (0..capped).map(|_| vec!["{}".to_string()]).collect()
         }
         SchemaKind::Record(fields) => {
             let col_names: Vec<String> = fields
@@ -199,7 +205,12 @@ fn load_rows(conn: &Connection, rel: &RelationInfo) -> Vec<Vec<String>> {
                 return Vec::new();
             }
 
-            let sql = format!("SELECT {} FROM {}", col_names.join(", "), quoted_table);
+            let sql = format!(
+                "SELECT {} FROM {} LIMIT {}",
+                col_names.join(", "),
+                quoted_table,
+                ROW_LIMIT
+            );
             let mut stmt = match conn.prepare(&sql) {
                 Ok(s) => s,
                 Err(_) => return Vec::new(),
@@ -243,7 +254,12 @@ fn load_rows(conn: &Connection, rel: &RelationInfo) -> Vec<Vec<String>> {
                 select_cols.push(crate::quote_ident(fname));
             }
 
-            let sql = format!("SELECT {} FROM {}", select_cols.join(", "), quoted_table);
+            let sql = format!(
+                "SELECT {} FROM {} LIMIT {}",
+                select_cols.join(", "),
+                quoted_table,
+                ROW_LIMIT
+            );
             let mut stmt = match conn.prepare(&sql) {
                 Ok(s) => s,
                 Err(_) => return Vec::new(),
@@ -513,7 +529,14 @@ fn ui(frame: &mut Frame, app: &mut App) {
             })
             .collect();
         (
-            format!(" *{} ({} rows) ", rel.name, rel.row_count),
+            if app.data_rows.len() >= ROW_LIMIT && rel.row_count > ROW_LIMIT {
+                format!(
+                    " *{} ({} rows, showing first {}) ",
+                    rel.name, rel.row_count, ROW_LIMIT
+                )
+            } else {
+                format!(" *{} ({} rows) ", rel.name, rel.row_count)
+            },
             hdrs,
             w,
         )

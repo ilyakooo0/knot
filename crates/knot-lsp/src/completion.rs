@@ -1022,7 +1022,7 @@ fn offset_in_route_rate_limit(module: &Module, offset: usize) -> bool {
         if let DeclKind::Route { entries, .. } = &decl.node {
             for entry in entries {
                 if let Some(rl) = &entry.rate_limit
-                    && rl.span.start <= offset && offset < rl.span.end {
+                    && rl.span.start <= offset && offset <= rl.span.end {
                         return true;
                     }
             }

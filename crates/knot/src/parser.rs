@@ -699,9 +699,10 @@ impl Parser {
     /// `foo-bar`, silently parsing a different path than written. Mirrors
     /// `consume_import_dashed_suffix`.
     fn consume_route_dashed_suffix(&mut self, seg: &mut String) {
-        while self.at(&TokenKind::Minus)
-            && matches!(self.peek_ahead(1), TokenKind::Lower(_) | TokenKind::Upper(_))
-        {
+        loop {
+            if !self.at(&TokenKind::Minus) {
+                break;
+            }
             let minus_span = self.span();
             if minus_span.start != self.prev_span().end {
                 break;
@@ -712,15 +713,17 @@ impl Parser {
             if next.span.start != minus_span.end {
                 break;
             }
+            let part: Option<String> = match &next.kind {
+                TokenKind::Lower(n) | TokenKind::Upper(n) => Some(n.clone()),
+                k => k.keyword_str().map(|s| s.to_string()),
+            };
+            let Some(part) = part else {
+                break;
+            };
             self.advance(); // consume `-`
-            let next = self.advance();
-            match next.kind {
-                TokenKind::Lower(s) | TokenKind::Upper(s) => {
-                    seg.push('-');
-                    seg.push_str(&s);
-                }
-                _ => unreachable!(),
-            }
+            self.advance(); // consume the segment part
+            seg.push('-');
+            seg.push_str(&part);
         }
     }
 }

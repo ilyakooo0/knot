@@ -90,6 +90,25 @@ fn main() {
                     process::exit(1);
                 }
             }
+
+            // Warn when a compile-time constant name collides with a reserved
+            // CLI flag name.  `--output` (and `--output=value`) is consumed by
+            // the build subcommand as the output path, so a constant named
+            // `output` can never be overridden via `--output=…` at build time.
+            // However `./app --output=x` *does* override the constant at run
+            // time, which is surprising — emit a warning so users notice.
+            const RESERVED_FLAGS: &[&str] = &["output"];
+            for name in overrides.keys() {
+                if RESERVED_FLAGS.contains(&name.as_str()) {
+                    eprintln!(
+                        "Warning: compile-time constant '{}' has the same name as a reserved CLI flag; \
+                         it cannot be overridden at build time via --{}=… (the flag is used for the output path). \
+                         At run time the flag will override the constant instead.",
+                        name, name
+                    );
+                }
+            }
+
             cmd_build(&args[2], output.as_deref(), &overrides);
         }
         "fmt" => {
@@ -481,11 +500,90 @@ fn is_extracted_temp_runtime(p: &std::path::Path) -> bool {
             })
 }
 
+/// Returns true if the runtime archive `lib` is stale — i.e. the newest
+/// source file under `crates/knot-runtime/src/` (recursively) or the
+/// runtime crate's `Cargo.toml` has an mtime newer than the archive itself.
+/// Falls back to `false` (assume fresh) when the workspace root can't be
+/// located or mtimes can't be compared, so we never block builds spuriously.
+fn is_runtime_stale(lib: &std::path::Path, exe_dir: &std::path::Path) -> bool {
+    // Walk up from the compiler's directory to find the workspace root
+    // (the directory containing `crates/knot-runtime/`). In a cargo
+    // workspace the compiler binary lives in `target/<profile>/`, so the
+    // workspace root is two levels above `exe_dir`.
+    let workspace_root = exe_dir
+        .ancestors()
+        .skip(1) // skip `target/<profile>` itself
+        .find(|d| d.join("crates/knot-runtime").is_dir());
+
+    let workspace_root = match workspace_root {
+        Some(r) => r,
+        None => return false, // can't locate workspace — assume fresh
+    };
+
+    let lib_mtime = match std::fs::metadata(lib).and_then(|m| m.modified()) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+
+    // Recursively find the newest mtime among all `*.rs` files under
+    // `crates/knot-runtime/src/`, plus the runtime crate's `Cargo.toml`.
+    let mut newest_src: Option<std::time::SystemTime> = None;
+
+    fn consider(
+        p: &std::path::Path,
+        newest: &mut Option<std::time::SystemTime>,
+    ) {
+        if let Ok(m) = std::fs::metadata(p).and_then(|m| m.modified())
+            && newest.map(|n| m > n).unwrap_or(true) {
+            *newest = Some(m);
+        }
+    }
+
+    fn walk_dir(dir: &std::path::Path, newest: &mut Option<std::time::SystemTime>) {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    walk_dir(&p, newest);
+                } else if p.extension().map(|e| e == "rs").unwrap_or(false) {
+                    consider(&p, newest);
+                }
+            }
+        }
+    }
+
+    walk_dir(&workspace_root.join("crates/knot-runtime/src"), &mut newest_src);
+    consider(
+        &workspace_root.join("crates/knot-runtime/Cargo.toml"),
+        &mut newest_src,
+    );
+
+    match newest_src {
+        Some(src_mtime) => src_mtime > lib_mtime,
+        None => false, // no source files found — assume fresh
+    }
+}
+
 fn find_runtime() -> PathBuf {
     // 1. Environment variable override
     if let Ok(path) = std::env::var("KNOT_RUNTIME_LIB") {
         let p = PathBuf::from(&path);
         if p.exists() {
+            // Warn if the archive is stale relative to the runtime source,
+            // but still use it — the user set the override explicitly.
+            if let Some(exe_dir) = std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(|p| p.to_path_buf()))
+            {
+                if is_runtime_stale(&p, &exe_dir) {
+                    eprintln!(
+                        "Warning: KNOT_RUNTIME_LIB archive '{}' is older than \
+                         crates/knot-runtime/src/ — rebuild knot-runtime to \
+                         pick up source changes",
+                        path
+                    );
+                }
+            }
             return p;
         }
         // The user explicitly set the override; a typo (or a stale path)
@@ -503,7 +601,20 @@ fn find_runtime() -> PathBuf {
         && let Some(exe_dir) = exe.parent() {
             let candidate = exe_dir.join("libknot_runtime.a");
             if candidate.exists() {
-                return candidate;
+                // Freshness check: if the runtime source is newer than the
+                // archive, the archive is stale (e.g. only knot-compiler was
+                // rebuilt). Skip it and fall through to the embedded runtime
+                // rather than silently linking stale code.
+                if is_runtime_stale(&candidate, exe_dir) {
+                    eprintln!(
+                        "Warning: {} is older than crates/knot-runtime/src/ \
+                         — skipping stale archive, falling back to embedded \
+                         runtime. Run `cargo build -p knot-runtime` to refresh.",
+                        candidate.display()
+                    );
+                } else {
+                    return candidate;
+                }
             }
         }
 

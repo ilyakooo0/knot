@@ -369,6 +369,11 @@ impl<'a> Parser<'a> {
             } else {
                 Some(ParsedType::Io { effects, rest, ty })
             }
+        } else if let ParsedType::Var(name) = head {
+            // `f a -> f b` — a type variable applied to args must be
+            // promoted to Named so `render_atomic` parenthesizes
+            // correctly. Without this the args are silently dropped.
+            Some(ParsedType::Named(name, args))
         } else {
             // Atom-with-args where head isn't named — uncommon; fall back.
             Some(head)

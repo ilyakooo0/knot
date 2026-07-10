@@ -398,8 +398,13 @@ pub fn update(
 
     let lock_path = lockfile_path(source_path);
     let content = generate(module, source_text, imported_type_snippets);
-    std::fs::write(&lock_path, content)
-        .map_err(|e| format!("cannot write {}: {}", lock_path.display(), e))
+    // Atomic write: write to a temp file then rename, so a crash mid-write
+    // doesn't leave a corrupt lockfile that hard-errors every compile.
+    let tmp_path = lock_path.with_extension("lock.tmp");
+    std::fs::write(&tmp_path, &content)
+        .map_err(|e| format!("cannot write {}: {}", tmp_path.display(), e))?;
+    std::fs::rename(&tmp_path, &lock_path)
+        .map_err(|e| format!("cannot rename {} to {}: {}", tmp_path.display(), lock_path.display(), e))
 }
 
 fn find_source_span(module: &Module, name: &str) -> Span {

@@ -870,18 +870,17 @@ fn try_sql_atom(bind_var: &str, expr: &Expr) -> Option<()> {
                 _ => None,
             }
         }
-        // Built-in functions: length (toUpper/toLower are NOT pushed
+        // Built-in functions (toUpper/toLower are NOT pushed
         // down — SQLite UPPER/LOWER are ASCII-only, the runtime is
         // Unicode-aware; trim likewise: SQLite TRIM strips ASCII spaces
-        // only while the runtime trims all Unicode whitespace)
-        ExprKind::App { func, arg } => {
-            if let ExprKind::Var(name) = &func.node {
-                match name.as_str() {
-                    "length" => {
-                        try_sql_atom(bind_var, arg)
-                    }
-                    _ => None,
-                }
+        // only while the runtime trims all Unicode whitespace; length
+        // likewise: SQLite LENGTH() counts chars before the first NUL
+        // byte while knot_text_length counts all chars)
+        ExprKind::App { func, .. } => {
+            // No built-in functions are pushed down — always fall
+            // through to the non-pushable case.
+            if let ExprKind::Var(_) = &func.node {
+                None
             } else {
                 None
             }
@@ -898,16 +897,14 @@ fn try_sql_atom(bind_var: &str, expr: &Expr) -> Option<()> {
 
 /// Mirror of codegen's `cast_arithmetic_for_where` applicability: an atom
 /// would receive the KNOT_INT text-cast when it compiles to a parenthesized
-/// arithmetic expression or a LENGTH() call.
+/// arithmetic expression. (LENGTH() is no longer pushed down, so App
+/// expressions never need the cast here.)
 fn atom_would_need_cast(expr: &Expr) -> bool {
     match &expr.node {
         ExprKind::BinOp {
             op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Concat,
             ..
         } => true,
-        ExprKind::App { func, .. } => {
-            matches!(&func.node, ExprKind::Var(name) if name == "length")
-        }
         _ => false,
     }
 }
@@ -1317,15 +1314,13 @@ fn try_sql_column_expr(bind_var: &str, body: &Expr, schema: &str) -> Option<()> 
         }
         // toUpper/toLower are NOT pushed down (ASCII-only in SQLite);
         // trim likewise (SQLite TRIM strips ASCII spaces only, the
-        // runtime trims all Unicode whitespace).
-        ExprKind::App { func, arg } => {
-            if let ExprKind::Var(name) = &func.node {
-                match name.as_str() {
-                    "length" => {
-                        try_sql_column_expr(bind_var, arg, schema)
-                    }
-                    _ => None,
-                }
+        // runtime trims all Unicode whitespace); length likewise
+        // (SQLite LENGTH() counts chars before the first NUL byte,
+        // while knot_text_length counts all chars).
+        ExprKind::App { func, .. } => {
+            // No built-in functions are pushed down.
+            if let ExprKind::Var(_) = &func.node {
+                None
             } else {
                 None
             }
@@ -1484,8 +1479,11 @@ mod tests {
     }
 
     #[test]
-    fn no_lint_on_length_in_where() {
-        // length(p.name) now compiles to SQL LENGTH().
+    fn lint_on_length_in_where() {
+        // length(p.name) is NOT pushed down to SQL LENGTH() because SQLite
+        // LENGTH() counts chars before the first NUL byte while
+        // knot_text_length counts all chars. The where clause falls back
+        // to runtime evaluation.
         let diags = lint(
             "type T = {name: Text, age: Int}\n\
              *people : [T]\n\
@@ -1494,7 +1492,7 @@ mod tests {
                where length p.name > 3\n  \
                yield p\n",
         );
-        assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
+        assert!(!diags.is_empty(), "expected a diagnostic for non-pushable length, got none");
     }
 
     #[test]

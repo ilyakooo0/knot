@@ -11443,23 +11443,18 @@ impl Codegen {
                     params,
                 })
             }
-            // Built-in functions: length, toUpper, toLower, trim
-            ast::ExprKind::App { func, arg } => {
-                if let ast::ExprKind::Var(name) = &func.node {
+            // Built-in functions: toUpper, toLower, trim, length
+            ast::ExprKind::App { func, .. } => {
+                if let ast::ExprKind::Var(_) = &func.node {
                     // NOTE: toUpper/toLower are deliberately NOT pushed
                     // down — SQLite's UPPER/LOWER are ASCII-only while the
                     // runtime does full Unicode case mapping. Likewise
                     // trim: SQLite TRIM strips ASCII spaces only, while
-                    // the runtime trims all Unicode whitespace.
-                    let sql_fn = match name.as_str() {
-                        "length" => "LENGTH",
-                        _ => return None,
-                    };
-                    let inner = Self::try_compile_sql_atom(bind_aliases, arg, env, let_binds)?;
-                    Some(SqlFragment {
-                        sql: format!("{}({})", sql_fn, inner.sql),
-                        params: inner.params,
-                    })
+                    // the runtime trims all Unicode whitespace. length is
+                    // also NOT pushed down: SQLite LENGTH() counts chars
+                    // before the first NUL byte, while knot_text_length
+                    // counts all chars.
+                    None
                 } else {
                     None
                 }
@@ -11919,23 +11914,18 @@ impl Codegen {
                     params,
                 })
             }
-            // Built-in functions: length, toUpper, toLower, trim
-            ast::ExprKind::App { func, arg } => {
-                if let ast::ExprKind::Var(name) = &func.node {
+            // Built-in functions: toUpper, toLower, trim, length
+            ast::ExprKind::App { func, .. } => {
+                if let ast::ExprKind::Var(_) = &func.node {
                     // NOTE: toUpper/toLower are deliberately NOT pushed
                     // down — SQLite's UPPER/LOWER are ASCII-only while the
                     // runtime does full Unicode case mapping. Likewise
                     // trim: SQLite TRIM strips ASCII spaces only, while
-                    // the runtime trims all Unicode whitespace.
-                    let sql_fn = match name.as_str() {
-                        "length" => "LENGTH",
-                        _ => return None,
-                    };
-                    let inner = Self::try_compile_single_table_atom(bind_var, arg)?;
-                    Some(SqlFragment {
-                        sql: format!("{}({})", sql_fn, inner.sql),
-                        params: inner.params,
-                    })
+                    // the runtime trims all Unicode whitespace. length is
+                    // also NOT pushed down: SQLite LENGTH() counts chars
+                    // before the first NUL byte, while knot_text_length
+                    // counts all chars.
+                    None
                 } else {
                     None
                 }
@@ -14648,19 +14638,16 @@ fn try_sql_arithmetic_expr(
             let else_sql = try_sql_arithmetic_expr(bind_var, else_branch, alias, schema)?;
             Some(format!("CASE WHEN {} THEN {} ELSE {} END", cond_sql, then_sql, else_sql))
         }
-        // Built-in functions: length, toUpper, toLower, trim
-        ast::ExprKind::App { func, arg } => {
-            if let ast::ExprKind::Var(name) = &func.node {
+        // Built-in functions: toUpper, toLower, trim, length
+        ast::ExprKind::App { func, .. } => {
+            if let ast::ExprKind::Var(_) = &func.node {
                 // toUpper/toLower deliberately not pushed down (SQLite
                 // UPPER/LOWER are ASCII-only; the runtime is Unicode-aware).
                 // trim likewise: SQLite TRIM strips ASCII spaces only, the
-                // runtime trims all Unicode whitespace.
-                let sql_fn = match name.as_str() {
-                    "length" => "LENGTH",
-                    _ => return None,
-                };
-                let inner = try_sql_arithmetic_expr(bind_var, arg, alias, schema)?;
-                Some(format!("{}({})", sql_fn, inner))
+                // runtime trims all Unicode whitespace. length likewise:
+                // SQLite LENGTH() counts chars before the first NUL byte,
+                // while knot_text_length counts all chars.
+                None
             } else {
                 None
             }
@@ -14910,19 +14897,16 @@ fn try_multi_table_arithmetic_expr(
             let else_sql = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, else_branch)?;
             Some(format!("CASE WHEN {} THEN {} ELSE {} END", cond_sql, then_sql, else_sql))
         }
-        // Built-in functions: length, toUpper, toLower, trim
-        ast::ExprKind::App { func, arg } => {
-            if let ast::ExprKind::Var(name) = &func.node {
+        // Built-in functions: toUpper, toLower, trim, length
+        ast::ExprKind::App { func, .. } => {
+            if let ast::ExprKind::Var(_) = &func.node {
                 // toUpper/toLower deliberately not pushed down (SQLite
                 // UPPER/LOWER are ASCII-only; the runtime is Unicode-aware).
                 // trim likewise: SQLite TRIM strips ASCII spaces only, the
-                // runtime trims all Unicode whitespace.
-                let sql_fn = match name.as_str() {
-                    "length" => "LENGTH",
-                    _ => return None,
-                };
-                let inner = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, arg)?;
-                Some(format!("{}({})", sql_fn, inner))
+                // runtime trims all Unicode whitespace. length likewise:
+                // SQLite LENGTH() counts chars before the first NUL byte,
+                // while knot_text_length counts all chars.
+                None
             } else {
                 None
             }

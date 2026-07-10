@@ -449,18 +449,25 @@ impl EffectChecker {
                 _ => None,
             })
             .collect();
-        let mut method_bodies: std::collections::BTreeMap<String, Vec<&ast::Expr>> =
-            std::collections::BTreeMap::new();
+        // Store each method's params alongside its body so the effect walk
+        // can push them as shadowing binders: a param named after an IO
+        // builtin (e.g. `pretty now = show now`) must shadow the builtin, or
+        // the method's inferred effects are poisoned (here, a spurious
+        // `{clock}` from the `now` builtin). See `push_masking_binders`.
+        let mut method_bodies: std::collections::BTreeMap<
+            String,
+            Vec<(&[ast::Pat], &ast::Expr)>,
+        > = std::collections::BTreeMap::new();
         for decl in &module.decls {
             match &decl.node {
                 ast::DeclKind::Impl { items, .. } => {
                     for item in items {
-                        if let ast::ImplItem::Method { name, body, .. } = item
+                        if let ast::ImplItem::Method { name, params, body, .. } = item
                             && !fun_names.contains(name.as_str()) {
                                 method_bodies
                                     .entry(name.clone())
                                     .or_default()
-                                    .push(body);
+                                    .push((params.as_slice(), body));
                             }
                     }
                 }
@@ -468,6 +475,7 @@ impl EffectChecker {
                     for item in items {
                         if let ast::TraitItem::Method {
                             name,
+                            default_params,
                             default_body: Some(body),
                             ..
                         } = item
@@ -475,7 +483,7 @@ impl EffectChecker {
                                 method_bodies
                                     .entry(name.clone())
                                     .or_default()
-                                    .push(body);
+                                    .push((default_params.as_slice(), body));
                             }
                     }
                 }
@@ -532,8 +540,10 @@ impl EffectChecker {
             // visible.
             for (name, bodies) in &method_bodies {
                 let mut effects = EffectSet::empty();
-                for body in bodies {
+                for (params, body) in bodies {
+                    let mark = self.push_masking_binders(params.iter());
                     effects = effects.union(&self.fun_body_effects(body));
+                    self.pop_masking_binders(mark);
                 }
                 let old = self.decl_effects.get(name);
                 if old.is_none_or(|o| *o != effects) {
@@ -580,8 +590,10 @@ impl EffectChecker {
                 }
                 for (name, bodies) in &method_bodies {
                     let mut effects = EffectSet::empty();
-                    for body in bodies {
+                    for (params, body) in bodies {
+                        let mark = self.push_masking_binders(params.iter());
                         effects = effects.union(&self.fun_body_effects(body));
+                        self.pop_masking_binders(mark);
                     }
                     let old = self.decl_effects_atomic_safe.get(name);
                     if old.is_none_or(|o| *o != effects) {
@@ -615,9 +627,11 @@ impl EffectChecker {
         // lambda in the method's own scope was missed) and false positives.
         for (name, bodies) in &method_bodies {
             self.current_decl_name = Some(name.clone());
-            for body in bodies {
+            for (params, body) in bodies {
                 self.decl_bodies.insert(name.clone(), (**body).clone());
+                let mark = self.push_masking_binders(params.iter());
                 let _ = self.fun_body_effects(body);
+                self.pop_masking_binders(mark);
             }
         }
         self.current_decl_name = None;
@@ -1103,25 +1117,17 @@ impl EffectChecker {
                     // `items`); a let-bound IO action (e.g. `let x = readFile
                     // "f"`) contributes the action's own effects when later
                     // sequenced. An unused binding contributes nothing.
-                    if let ast::StmtKind::Let { pat, expr } = &stmt.node
-                        && let ast::PatKind::Var(name) = &pat.node {
-                            let latent = if is_lambda_arg(expr) {
-                                self.fun_body_effects(expr)
-                            } else if let Some(alias) = self.builtin_alias_effects(expr) {
-                                // Point-free alias of a non-nullary IO builtin
-                                // (`let f = readFile`): later applying `f`
-                                // performs the builtin's effects, so charge
-                                // them here rather than laundering IO past the
-                                // atomic gate.
-                                alias
-                            } else {
-                                self.infer_effects(expr)
-                            };
-                            self.local_fn_effects
-                                .last_mut()
-                                .unwrap()
-                                .insert(name.clone(), (latent, false));
-                        }
+                    if let ast::StmtKind::Let { pat, expr } = &stmt.node {
+                        // Record a latent-effect entry for every binder the
+                        // pattern introduces. A plain `let x = e` binds one
+                        // name, but a record destructure `let {fn} = {fn: \u ->
+                        // *items}` binds each field — and those field binders
+                        // must keep their value's latent effects too, or a
+                        // later `rows <- fn {}` silently drops the `r *items`
+                        // read (the value's effects are laundered past the
+                        // atomic gate / effect annotations).
+                        self.register_let_latent(pat, expr);
+                    }
                     let stmt_effects = self.infer_stmt_effects(stmt);
                     effects = effects.union(&stmt_effects);
                     // Binders come into scope for *later* statements.
@@ -1407,6 +1413,20 @@ impl EffectChecker {
                         if found.is_none() && contains_atomic_disallowed_ref(body) => {
                             found = Some(node.span);
                         }
+                    // A bare reference to an atomic-disallowed IO builtin
+                    // (`println`, `logInfo`, `writeFile`, …) reaches IO directly
+                    // — it need not be wrapped in a lambda. `r = {fn: println}`
+                    // then `r.fn "x"` inside atomic launders the builtin through
+                    // a record field; the opaque call ends up invoking it, so
+                    // reject conservatively, mirroring the Lambda arm above and
+                    // the shadow-unaware convention of `contains_atomic_disallowed_ref`.
+                    ast::ExprKind::Var(name)
+                        if found.is_none()
+                            && crate::builtins::ATOMIC_DISALLOWED_BUILTINS
+                                .contains(&name.as_str()) =>
+                    {
+                        found = Some(node.span);
+                    }
                     ast::ExprKind::Var(name) => referenced.push(name.clone()),
                     _ => {}
                 }
@@ -1419,6 +1439,73 @@ impl EffectChecker {
             }
         }
         found
+    }
+
+    /// Latent effects of a value bound by a `let` — the effects a later
+    /// *execution* of the bound name recovers, while the `let` itself charges
+    /// nothing (binding an IO action ≠ running it). A bound lambda contributes
+    /// its body's effects when later called (`let f = \u -> *items` → `r
+    /// *items`); a point-free alias of a non-nullary IO builtin (`let f =
+    /// readFile`) contributes the builtin's effects so applying `f` later does
+    /// not launder IO past the atomic gate; anything else contributes the
+    /// value expression's own effects.
+    fn latent_effects_of(&mut self, expr: &ast::Expr) -> EffectSet {
+        if is_lambda_arg(expr) {
+            self.fun_body_effects(expr)
+        } else if let Some(alias) = self.builtin_alias_effects(expr) {
+            alias
+        } else {
+            self.infer_effects(expr)
+        }
+    }
+
+    /// Register latent-effect entries for the binders a `let` pattern
+    /// introduces, so a later reference recovers the effects of the value each
+    /// binder was bound to. A plain `let x = e` binds one name; a record
+    /// destructure `let {fn} = {fn: \u -> *items}` binds each field to the
+    /// matching sub-expression of the record *literal* value, and must keep
+    /// those effects too — otherwise `rows <- fn {}` drops the `r *items` read.
+    /// Nested record patterns recurse. When the value is not a record literal
+    /// there is no per-field sub-expression to attribute, so nothing is
+    /// recorded for the field binders (leaving them absent is the safe,
+    /// pre-existing behavior).
+    fn register_let_latent(&mut self, pat: &ast::Pat, value: &ast::Expr) {
+        match &pat.node {
+            ast::PatKind::Var(name) => {
+                let latent = self.latent_effects_of(value);
+                self.local_fn_effects
+                    .last_mut()
+                    .unwrap()
+                    .insert(name.clone(), (latent, false));
+            }
+            ast::PatKind::Record(field_pats) => {
+                // Only a record *literal* value exposes each field's bound
+                // sub-expression; a computed record (`let {fn} = mk {}`) is
+                // opaque here.
+                let ast::ExprKind::Record(value_fields) = &value.node else {
+                    return;
+                };
+                for fp in field_pats {
+                    let Some(vf) = value_fields.iter().find(|f| f.name == fp.name) else {
+                        continue;
+                    };
+                    match &fp.pattern {
+                        // Punned `{fn}` — the binder is the field name itself.
+                        None => {
+                            let latent = self.latent_effects_of(&vf.value);
+                            self.local_fn_effects
+                                .last_mut()
+                                .unwrap()
+                                .insert(fp.name.clone(), (latent, false));
+                        }
+                        // `{fn: p}` — recurse into the sub-pattern against the
+                        // field's value (handles `{fn: g}` and nested records).
+                        Some(sub) => self.register_let_latent(sub, &vf.value),
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Infer effects of a do-block statement.

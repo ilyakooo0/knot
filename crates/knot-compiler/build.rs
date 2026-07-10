@@ -64,10 +64,20 @@ fn main() {
                 .map(PathBuf::from)
                 .filter(|p| is_valid_lib(p))
         })
-        // 2. Walk up from OUT_DIR (works in normal `cargo build` within workspace)
+        // 2. Walk up from OUT_DIR (works in normal `cargo build` within
+        //    workspace), but stop at the cargo target directory boundary. Going
+        //    past it would let a stray libknot_runtime.a in an unrelated
+        //    ancestor (e.g. $HOME) be embedded on mtime alone.
         .or_else(|| {
+            let target_dir = std::env::var("CARGO_TARGET_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| workspace_root.join("target"));
+            // Canonicalize so the `..`-laden workspace_root path compares
+            // correctly against cargo's canonical OUT_DIR ancestors.
+            let boundary = std::fs::canonicalize(&target_dir).unwrap_or(target_dir);
             out_path
                 .ancestors()
+                .take_while(|p| p.starts_with(&boundary))
                 .map(|p| p.join("libknot_runtime.a"))
                 .find(|p| is_fresh_lib(p, &workspace_root))
         })

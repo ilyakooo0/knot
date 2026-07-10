@@ -267,6 +267,16 @@ pub enum ExprKind {
         unit: UnitExpr,
     },
 
+    /// `2 seconds`, `5 ms` — time-unit sugar. `value` holds the desugared
+    /// form (a `BinOp::Mul` of the literal and its millisecond factor, so
+    /// inference/codegen treat it identically to that multiplication);
+    /// `unit_name` preserves the original unit word so the formatter can
+    /// re-render the surface syntax instead of the raw multiplication.
+    TimeUnitLit {
+        value: Box<Expr>,
+        unit_name: Name,
+    },
+
     /// `(expr : Type)` — type annotation on expression.
     Annot {
         expr: Box<Expr>,

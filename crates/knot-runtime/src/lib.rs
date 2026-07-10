@@ -10984,11 +10984,6 @@ fn parse_record_schema(spec: &str) -> RecordSchema {
     RecordSchema { columns, nested }
 }
 
-/// Backward-compatible: parse a flat schema (no nested fields) into Vec<ColumnSpec>.
-fn parse_schema(spec: &str) -> Vec<ColumnSpec> {
-    parse_record_schema(spec).columns
-}
-
 /// Build a COALESCE expression that maps NULL to a sentinel value for use in
 /// UNIQUE indexes (SQLite treats NULLs as distinct, so we need a non-NULL stand-in).
 ///
@@ -13334,16 +13329,17 @@ pub extern "C-unwind" fn knot_source_diff_write(
 
 /// Check whether a SQLite table has a column with the given name.
 fn table_has_column(conn: &rusqlite::Connection, table: &str, col: &str) -> bool {
+    table_column_names(conn, table).iter().any(|n| n == col)
+}
+
+/// List a SQLite table's column names in declaration order.
+fn table_column_names(conn: &rusqlite::Connection, table: &str) -> Vec<String> {
     let sql = format!("PRAGMA table_info({})", quote_ident(table));
     if let Ok(mut stmt) = conn.prepare(&sql)
         && let Ok(names) = stmt.query_map([], |row| row.get::<_, String>(1)) {
-            for name in names.flatten() {
-                if name == col {
-                    return true;
-                }
-            }
+            return names.flatten().collect();
         }
-    false
+    Vec::new()
 }
 
 /// DELETE rows that don't match a WHERE condition.
@@ -14469,16 +14465,51 @@ pub extern "C-unwind" fn knot_constraint_register(
                 "uniqueness constraint violated: *{} <= *{}.{}",
                 sub_rel, sup_rel, sf
             ).replace('\'', "''");
+            // A set-semantics re-append (`set *rel = union *rel [...]`)
+            // re-inserts rows that already exist verbatim. `write_record_rows`
+            // uses INSERT OR IGNORE, so such a duplicate is silently deduped by
+            // the table's `_unique` full-row index. But SQLite fires this BEFORE
+            // INSERT trigger — and its RAISE(ABORT) — *before* the OR IGNORE
+            // conflict resolution, so an unconditional key check aborts an
+            // idempotent no-op (panicking on the second run of the same binary).
+            // Skip the abort when a full-row duplicate already exists: the insert
+            // would have been ignored, not a genuine key collision. The full-row
+            // key mirrors `init_record_table`'s `_unique` index — `_content_hash`
+            // for tables with nested children, else every scalar column (matched
+            // with `IS` for the same NULL-equality the index's coalescing gives).
+            let cols = table_column_names(&db_ref.conn, &format!("_knot_{}", sub_rel));
+            let full_row_match = if cols.iter().any(|c| c == "_content_hash") {
+                let ch = quote_ident("_content_hash");
+                format!("{ch} IS NEW.{ch}")
+            } else {
+                cols.iter()
+                    .filter(|c| c.as_str() != "_id" && c.as_str() != "_parent_id")
+                    .map(|c| {
+                        let q = quote_ident(c);
+                        format!("{q} IS NEW.{q}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            };
+            // Empty only for degenerate column-less tables, which never carry a
+            // field-level uniqueness constraint; fall back to the bare key check.
+            let dup_guard = if full_row_match.is_empty() {
+                String::new()
+            } else {
+                format!(" AND NOT EXISTS (SELECT 1 FROM {table} WHERE {full_row_match})")
+            };
+
             let trigger_sql = format!(
                 "CREATE TRIGGER IF NOT EXISTS {trg} \
                  BEFORE INSERT ON {table} \
                  FOR EACH ROW \
-                 WHEN EXISTS (SELECT 1 FROM {table} WHERE {col} = NEW.{col}) \
+                 WHEN EXISTS (SELECT 1 FROM {table} WHERE {col} = NEW.{col}){dup_guard} \
                  BEGIN SELECT RAISE(ABORT, '{msg}'); END;",
                 trg = quote_ident(&format!("_knot_uniq_{}_{}_ins", sub_rel, sf)),
                 table = table,
                 col = col,
                 msg = msg,
+                dup_guard = dup_guard,
             );
             debug_sql(&trigger_sql);
             db_ref.conn.execute_batch(&trigger_sql)
@@ -14842,7 +14873,12 @@ pub extern "C-unwind" fn knot_view_read(
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     let view_schema = unsafe { str_from_raw(schema_ptr, schema_len) };
     let filter_where = unsafe { str_from_raw(filter_ptr, filter_len) };
-    let cols = parse_schema(view_schema);
+    // Parse the FULL record schema, keeping `field:[...]` nested descriptors, so
+    // views exposing nested relation columns join their child tables — mirroring
+    // the write side (`knot_view_write`) and `read_record_table` (used by
+    // `knot_source_read`). Taking only the scalar columns here would omit the
+    // nested field, and first access would panic with "field not found".
+    let rec_schema = parse_record_schema(view_schema);
 
     // Inside `atomic`, register the view's UNDERLYING SOURCE table in the
     // STM read set (codegen passes `view.source_name` as `name` here), so a
@@ -14860,26 +14896,33 @@ pub extern "C-unwind" fn knot_view_read(
         ),
     };
 
-    let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
+    // Build the SELECT column list. When the view exposes nested relation
+    // fields (stored in child tables `_knot_<name>__<field>`), also select the
+    // parent `_id` so each row can be joined to its child rows — the same shape
+    // `read_record_table` and `knot_view_write` use for nested sources.
+    let table_name = format!("_knot_{}", name);
+    let has_children = !rec_schema.nested.is_empty();
+
+    let mut select_cols: Vec<String> = Vec::new();
+    if has_children {
+        select_cols.push(quote_ident("_id"));
+    }
+    for c in &rec_schema.columns {
+        select_cols.push(quote_ident(&c.name));
+    }
+    let select_list = if select_cols.is_empty() {
+        "1".to_string()
+    } else {
+        select_cols.join(", ")
+    };
+
     let sql = if filter_where.is_empty() {
-        format!(
-            "SELECT {} FROM {}",
-            if col_names.is_empty() {
-                "1".to_string()
-            } else {
-                col_names.join(", ")
-            },
-            quote_ident(&format!("_knot_{}", name))
-        )
+        format!("SELECT {} FROM {}", select_list, quote_ident(&table_name))
     } else {
         format!(
             "SELECT {} FROM {} WHERE {}",
-            if col_names.is_empty() {
-                "1".to_string()
-            } else {
-                col_names.join(", ")
-            },
-            quote_ident(&format!("_knot_{}", name)),
+            select_list,
+            quote_ident(&table_name),
             filter_where
         )
     };
@@ -14904,16 +14947,32 @@ pub extern "C-unwind" fn knot_view_read(
         .query(param_refs.as_slice())
         .unwrap_or_else(|e| panic!("knot runtime: view_read exec error: {}", e));
 
+    // Scalar columns start after the leading `_id` when children are present.
+    let col_offset = if has_children { 1 } else { 0 };
     while let Some(row) = result_rows
         .next()
         .unwrap_or_else(|e| panic!("knot runtime: view_read fetch error: {}", e))
     {
-        let record = knot_record_empty(cols.len());
-        for (i, col) in cols.iter().enumerate() {
-            let val = read_sql_column(row, i, col.ty);
+        let total_fields = rec_schema.columns.len() + rec_schema.nested.len();
+        let record = knot_record_empty(total_fields);
+
+        for (i, col) in rec_schema.columns.iter().enumerate() {
+            let val = read_sql_column(row, i + col_offset, col.ty);
             let name_bytes = col.name.as_bytes();
             knot_record_set_field(record, name_bytes.as_ptr(), name_bytes.len(), val);
         }
+
+        // Nested relation fields, joined from their child tables by `_id`.
+        if has_children {
+            let parent_id: i64 = row.get(0).unwrap();
+            for nf in &rec_schema.nested {
+                let child_table_name = format!("{}__{}", table_name, nf.name);
+                let val = read_child_table(&db_ref.conn, &child_table_name, nf, parent_id);
+                let name_bytes = nf.name.as_bytes();
+                knot_record_set_field(record, name_bytes.as_ptr(), name_bytes.len(), val);
+            }
+        }
+
         rows.push(record);
     }
 

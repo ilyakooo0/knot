@@ -590,10 +590,17 @@ pub(crate) fn handle_code_action(
     if range_start != range_end {
         let selected_text = &doc.source[range_start..range_end.min(doc.source.len())];
         let trimmed = selected_text.trim();
-        // Only offer for non-trivial selections (not just a name or empty)
+        // Only offer for non-trivial selections (not just a name or empty) that
+        // line up exactly with a whole expression node. Replacing the selection
+        // with a variable/call only preserves meaning when the selection IS a
+        // complete sub-expression; a fragment that straddles operator-precedence
+        // boundaries — e.g. `a + b` inside `2 * a + b`, which parses as
+        // `(2 * a) + b` — matches no node, and extracting it would silently
+        // rewrite the value (`2 * (a + b)`). The exact-span check rejects those.
         if !trimmed.is_empty()
             && trimmed.len() > 1
             && !trimmed.chars().all(|c| c.is_alphanumeric() || c == '_')
+            && selection_matches_expr_node(&doc.module, &doc.source, range_start, range_end)
         {
             // Pick fresh names that don't collide with anything in scope. Stable
             // numbering keeps the result deterministic and easy to test.
@@ -1516,6 +1523,93 @@ fn find_wrap_in_err_at(
         }
     }
     None
+}
+
+/// Strip surrounding whitespace and any balanced enclosing parentheses from the
+/// byte range `[lo, hi)`, returning the trimmed "core" range. Used to compare a
+/// selection against an expression node's span up to redundant parens: the
+/// parser folds a parenthesized expression's parens into the node's span (so
+/// `(x * 2)` and `x * 2` are the same node — see `parser.rs`'s `LParen` atom
+/// arm), and the user may or may not include those parens in the selection.
+fn strip_ws_and_enclosing_parens(source: &str, mut lo: usize, mut hi: usize) -> (usize, usize) {
+    let bytes = source.as_bytes();
+    hi = hi.min(bytes.len());
+    lo = lo.min(hi);
+    loop {
+        while lo < hi && bytes[lo].is_ascii_whitespace() {
+            lo += 1;
+        }
+        while hi > lo && bytes[hi - 1].is_ascii_whitespace() {
+            hi -= 1;
+        }
+        if hi - lo < 2 || bytes[lo] != b'(' || bytes[hi - 1] != b')' {
+            break;
+        }
+        // Only strip when the leading `(` is closed by the trailing `)` — not
+        // when they belong to different groups, as in `(a) + (b)` (whose top
+        // node span also starts with `(` and ends with `)`).
+        let mut depth = 0i32;
+        let mut wraps = false;
+        for (i, &b) in bytes[lo..hi].iter().enumerate() {
+            match b {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        wraps = lo + i == hi - 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !wraps {
+            break;
+        }
+        lo += 1;
+        hi -= 1;
+    }
+    (lo, hi)
+}
+
+/// True when the selection `[lo, hi)` denotes a whole expression node (up to
+/// redundant surrounding parentheses/whitespace). Gates the extract-to-let /
+/// extract-to-function refactors: those replace the selection with a variable
+/// or call, which only preserves program meaning when the selection is a
+/// complete sub-expression. A fragment straddling operator-precedence
+/// boundaries matches no node and is rejected.
+fn selection_matches_expr_node(module: &Module, source: &str, lo: usize, hi: usize) -> bool {
+    let target = strip_ws_and_enclosing_parens(source, lo, hi);
+    // A whitespace-only or empty selection has no meaningful core.
+    if target.0 >= target.1 {
+        return false;
+    }
+    fn walk(expr: &ast::Expr, source: &str, target: (usize, usize)) -> bool {
+        // Prune: only a node whose span covers the (stripped) selection can
+        // match it or contain a descendant that does.
+        if expr.span.start > target.0 || target.1 > expr.span.end {
+            return false;
+        }
+        if strip_ws_and_enclosing_parens(source, expr.span.start, expr.span.end) == target {
+            return true;
+        }
+        let mut found = false;
+        crate::utils::recurse_expr(expr, |child| {
+            found = found || walk(child, source, target);
+        });
+        found
+    }
+    module.decls.iter().any(|decl| match &decl.node {
+        DeclKind::Fun {
+            body: Some(body), ..
+        }
+        | DeclKind::View { body, .. }
+        | DeclKind::Derived { body, .. } => walk(body, source, target),
+        DeclKind::Impl { items, .. } => items.iter().any(|item| {
+            matches!(item, ast::ImplItem::Method { body, .. } if walk(body, source, target))
+        }),
+        _ => false,
+    })
 }
 
 /// Locate the innermost `refine expr` containing the cursor, returning its full
@@ -4354,6 +4448,59 @@ mod regress_fixes_tests {
         assert!(
             out.contains("\nexport f"),
             "exported decl must keep its `export` prefix:\n{out}"
+        );
+    }
+
+    /// Bug B72: extract must not fire on a selection that straddles
+    /// operator-precedence boundaries. `2 * a + b` parses as `(2 * a) + b`, so
+    /// `a + b` is not an expression node; extracting it would rewrite the value
+    /// to `2 * (a + b)`. The action must be suppressed for such fragments.
+    #[test]
+    fn extract_not_offered_for_precedence_straddling_fragment() {
+        let mut tw = TestWorkspace::new();
+        let src = "f = \\a b -> 2 * a + b\n";
+        let uri = tw.open("main", src);
+        let range = selection(src, "a + b");
+        let actions = handle_code_action(&tw.state, &params_for(&uri, range))
+            .unwrap_or_default();
+        assert!(
+            action_titled(&actions, |t| t.starts_with("Extract to function")).is_none(),
+            "extract must not be offered for a non-node fragment `a + b`; \
+             actions: {:?}",
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    CodeActionOrCommand::CodeAction(ca) => Some(ca.title.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Companion to the B72 fragment check: a selection that DOES coincide with
+    /// a whole expression node (`2 * a` inside `2 * a + b`) must still offer the
+    /// extract, and the extracted result must round-trip through the parser.
+    #[test]
+    fn extract_offered_for_whole_expression_node() {
+        let mut tw = TestWorkspace::new();
+        let src = "f = \\a b -> 2 * a + b\n";
+        let uri = tw.open("main", src);
+        let range = selection(src, "2 * a");
+        let actions = handle_code_action(&tw.state, &params_for(&uri, range))
+            .unwrap_or_default();
+        let action = action_titled(&actions, |t| t.starts_with("Extract to function"))
+            .expect("extract-to-function offered for a whole node");
+        let edits = edits_for(action, &uri);
+        let out = apply_edits_to(src, edits);
+        let lexer = knot::lexer::Lexer::new(&out);
+        let (tokens, _) = lexer.tokenize();
+        let parser = knot::parser::Parser::new(out.clone(), tokens);
+        let (_, diags) = parser.parse_module();
+        assert!(
+            diags
+                .iter()
+                .all(|d| !matches!(d.severity, knot::diagnostic::Severity::Error)),
+            "extracted result must parse; got {diags:?}\nsource:\n{out}"
         );
     }
 

@@ -593,7 +593,14 @@ fn handle_will_rename_files(
                     None => (doc.source.as_str(), doc.module.imports.as_slice()),
                 };
             for imp in live_imports {
-                let resolved = importer_dir.join(format!("{}.knot", imp.path));
+                // Match the compiler's import resolution (see
+                // `knot-compiler/src/modules.rs`): `with_extension("knot")`
+                // *replaces* any existing suffix, so `import ./lib.v2` resolves
+                // to `lib.knot` — not `lib.v2.knot`. Using `format!("{}.knot")`
+                // here would compute a different path than the one the compiler
+                // loads, so a matching file move would be silently skipped.
+                let resolved =
+                    importer_dir.join(PathBuf::from(&imp.path).with_extension("knot"));
                 let canonical = match resolved.canonicalize() {
                     Ok(p) => p,
                     Err(_) => continue,

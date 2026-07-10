@@ -1365,10 +1365,21 @@ fn find_if_negate_at(
             } else {
                 format!("not ({cond_text})")
             };
-            return Some((
-                expr.span,
-                format!("if {new_cond} then {else_text} else {then_text}"),
-            ));
+            let rewrite = format!("if {new_cond} then {else_text} else {then_text}");
+            // When the `if` sits in operand position it's parenthesized, and
+            // the parser folds those parens into this expr's span while keeping
+            // the bare `If` node (see parse_atom's `LParen` arm). Replacing the
+            // whole `(if …)` span with an unparenthesized rewrite would let a
+            // trailing operator bind into the else branch —
+            // `(if c then a else b) * 2` → `if not c then b else a * 2`. Re-wrap
+            // to keep the operand outside the conditional.
+            let expr_text = source.get(expr.span.start..expr.span.end)?;
+            let rewrite = if is_already_parenthesized(expr_text) {
+                format!("({rewrite})")
+            } else {
+                rewrite
+            };
+            return Some((expr.span, rewrite));
         }
         let mut found = None;
         crate::utils::recurse_expr(expr, |child| {
@@ -3162,6 +3173,19 @@ fn find_if_to_case_at(
                     let replacement = format!(
                         "case {cond_text} of{indent}True {{}} -> {then_text}{indent}False {{}} -> {else_text}"
                     );
+                    // A parenthesized `if` in operand position folds its parens
+                    // into `expr.span` (parse_atom keeps the bare node), so
+                    // replacing the whole `(if …)` span with a bare `case …`
+                    // would let a trailing operator bind into the last arm —
+                    // `(if c then a else b) * 2` → `case … False {} -> b * 2`.
+                    // Re-wrap in parens; inside delimiters the `)` terminates
+                    // the arm block, so the multi-line layout still parses.
+                    let expr_text = safe_slice(source, expr.span);
+                    let replacement = if is_already_parenthesized(expr_text) {
+                        format!("({replacement})")
+                    } else {
+                        replacement
+                    };
                     *best = Some((expr.span, replacement));
                 }
             }
@@ -3218,25 +3242,39 @@ fn find_flip_binary_at(
                 _ => None,
             };
             if let Some(op_text) = op_str {
-                let size = expr.span.end - expr.span.start;
+                // Replace only the operator's own extent (`lhs … rhs`), never
+                // the enclosing parens. The parser folds surrounding `(` `)`
+                // into a binary expression's own span, so replacing
+                // `expr.span` would strip parens that hold the expression
+                // together in its context: `f (a == b)` must stay
+                // `f (b == a)`, not become `f b == a` (which reparses as
+                // `(f b) == a`).
+                let flip_span = Span::new(lhs.span.start, rhs.span.end);
+                let size = flip_span.end - flip_span.start;
                 if best.as_ref().is_none_or(|b| size < b.0.end - b.0.start) {
-                    // Keyword forms (if/case/lambda/do) greedily consume
-                    // everything to their right, so moving one to the other
-                    // operand position swallows the operator and the old
-                    // operand (`false && if … else false` flipped naively
-                    // becomes `if … else false && false`). Parenthesize a
-                    // moved keyword-form operand on either side — over-
-                    // parenthesizing is harmless.
+                    // A moved operand keeps its own source text but lands in a
+                    // new neighbor context that can re-parse it. Keyword forms
+                    // (if/case/lambda/do) greedily consume everything to their
+                    // right (`false && if … else false` flips to
+                    // `if … else false && false`). Binary/unary operands
+                    // re-associate with the flip operator when they share or
+                    // undercut its precedence: `a / b * c` is `(a / b) * c`,
+                    // and a naive flip to `c * a / b` reparses as `(c * a) / b`
+                    // — a different value under integer division. Parenthesize
+                    // both families unless the source already wraps them;
+                    // over-parenthesizing is harmless.
                     let operand_text = |e: &ast::Expr| -> String {
                         let text = safe_slice(source, e.span);
-                        let keyword_form = matches!(
+                        let needs_parens = matches!(
                             &e.node,
                             ast::ExprKind::If { .. }
                                 | ast::ExprKind::Case { .. }
                                 | ast::ExprKind::Lambda { .. }
                                 | ast::ExprKind::Do(_)
+                                | ast::ExprKind::BinOp { .. }
+                                | ast::ExprKind::UnaryOp { .. }
                         );
-                        if keyword_form && !is_already_parenthesized(text) {
+                        if needs_parens && !is_already_parenthesized(text) {
                             format!("({text})")
                         } else {
                             text.to_string()
@@ -3244,7 +3282,7 @@ fn find_flip_binary_at(
                     };
                     let replacement =
                         format!("{} {op_text} {}", operand_text(rhs), operand_text(lhs));
-                    *best = Some((expr.span, replacement));
+                    *best = Some((flip_span, replacement));
                 }
             }
         }
@@ -3441,6 +3479,33 @@ mod tests {
         assert!(
             parses_cleanly(&out),
             "if-to-case rewrite must reparse cleanly; got:\n{out}"
+        );
+    }
+
+    /// Bug B66: a parenthesized `if` in operand position folds its parens into
+    /// the expr span. Replacing the whole `(if …)` span with a bare `case …`
+    /// dropped the parens, so the trailing `* 2` bound into the last arm
+    /// (`False {} -> b * 2`). The rewrite must re-wrap in parens.
+    #[test]
+    fn if_to_case_reparenthesizes_operand_position() {
+        let src = "f = \\c a b -> (if c then a else b) * 2\n";
+        let module = parse_module(src);
+        let off = src.find("if c").expect("if expr");
+        let (span, replacement) =
+            find_if_to_case_at(&module, src, off).expect("if-to-case offered");
+        assert!(
+            replacement.starts_with('(') && replacement.ends_with(')'),
+            "parenthesized-if rewrite must stay parenthesized; got: {replacement}"
+        );
+        let mut out = src.to_string();
+        out.replace_range(span.start..span.end, &replacement);
+        assert!(
+            out.contains(") * 2"),
+            "trailing operand must stay outside the case; got:\n{out}"
+        );
+        assert!(
+            parses_cleanly(&out),
+            "reparenthesized if-to-case rewrite must reparse cleanly; got:\n{out}"
         );
     }
 
@@ -4836,6 +4901,24 @@ mod regress_fixes_batch2_tests {
         assert_eq!(replacement, "if a then 2 else 1");
     }
 
+    /// Bug B66: a parenthesized `if` in operand position folds its parens into
+    /// the expr span. Replacing the whole `(if …)` span with a bare `if …`
+    /// dropped the parens, so the trailing `* 2` bound into the else branch
+    /// (`if not c then b else a * 2`). The rewrite must re-wrap in parens.
+    #[test]
+    fn negate_condition_reparenthesizes_operand_position() {
+        let src = "f = \\c a b -> (if c then a else b) * 2\n";
+        let module = parse_module(src);
+        let off = src.find("if c").expect("if expr");
+        let (span, replacement) =
+            find_if_negate_at(&module, src, off).expect("negate action offered");
+        assert_eq!(replacement, "(if not (c) then b else a)");
+        let mut out = src.to_string();
+        out.replace_range(span.start..span.end, &replacement);
+        assert_eq!(out, "f = \\c a b -> (if not (c) then b else a) * 2\n");
+        assert!(parses_cleanly(&out), "negate rewrite must reparse: {out}");
+    }
+
     /// Bug 4: flipping a commutative operator whose operand is a keyword form
     /// must parenthesize the moved `if` — keyword forms greedily consume to
     /// their right, so the bare flip `if … else 2 == 0` would swallow `== 0`
@@ -4852,6 +4935,44 @@ mod regress_fixes_batch2_tests {
         assert_eq!(replacement, "(if x then 1 else 2) == 0");
         let mut out = src.to_string();
         out.replace_range(span.start..span.end, &replacement);
+        assert!(parses_cleanly(&out), "flip rewrite must reparse: {out}");
+    }
+
+    /// Bug B64a: `a / b * c` parses as `(a / b) * c`. Flipping the `*`'s
+    /// operands must produce `c * (a / b)`, not `c * a / b` — the latter
+    /// reparses as `(c * a) / b`, a re-association that changes the value
+    /// under integer division (a=1,b=2,c=4: 0 vs 2). The moved `a / b`
+    /// operand shares `*`'s precedence, so it must be parenthesized.
+    #[test]
+    fn flip_operands_parenthesizes_reassociating_operand() {
+        let src = "f = \\a b c -> a / b * c\n";
+        let module = parse_module(src);
+        let off = src.find("* c").expect("mul operator");
+        let (span, replacement) =
+            find_flip_binary_at(&module, src, off).expect("flip action offered");
+        assert_eq!(replacement, "c * (a / b)");
+        let mut out = src.to_string();
+        out.replace_range(span.start..span.end, &replacement);
+        assert_eq!(out, "f = \\a b c -> c * (a / b)\n");
+        assert!(parses_cleanly(&out), "flip rewrite must reparse: {out}");
+    }
+
+    /// Bug B64b: the parser folds enclosing parens into a binary expression's
+    /// own span, so `f (a == b)` has an `==` node whose span covers `(a == b)`.
+    /// Flipping must preserve the parens (`f (b == a)`); dropping them yields
+    /// `f b == a`, which reparses as `(f b) == a` — a completely different
+    /// expression.
+    #[test]
+    fn flip_operands_preserves_enclosing_parens() {
+        let src = "f = \\a b -> f (a == b)\n";
+        let module = parse_module(src);
+        let off = src.find("a ==").expect("eq operand");
+        let (span, replacement) =
+            find_flip_binary_at(&module, src, off).expect("flip action offered");
+        assert_eq!(replacement, "b == a");
+        let mut out = src.to_string();
+        out.replace_range(span.start..span.end, &replacement);
+        assert_eq!(out, "f = \\a b -> f (b == a)\n");
         assert!(parses_cleanly(&out), "flip rewrite must reparse: {out}");
     }
 

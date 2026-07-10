@@ -7087,10 +7087,14 @@ impl Infer {
                             self.fetch_response_types
                                 .insert(entry.constructor.clone(), resp_ty.clone());
                         }
-                        if !entry.response_headers.is_empty() {
-                            self.fetch_response_headers
-                                .insert(entry.constructor.clone(), entry.response_headers.clone());
-                        }
+                        // Always insert (even when empty) so a later route
+                        // entry that reuses this constructor name but declares
+                        // no response headers overwrites an earlier one that
+                        // did — otherwise the stale headers survive and fetch
+                        // infers a chimera {body, headers} response type. Empty
+                        // is treated as "no headers" at the use site.
+                        self.fetch_response_headers
+                            .insert(entry.constructor.clone(), entry.response_headers.clone());
                     }
                 }
                 ast::DeclKind::RouteComposite { name, .. } => {

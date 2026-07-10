@@ -13057,16 +13057,23 @@ pub(crate) fn sum_result_is_float(
 
 /// Whether a `sortBy` projection is safe to push to SQL `ORDER BY`: not an
 /// Int-typed CASE (collation loss, see `int_case_projection_pushable`) and not
-/// Float (SQLite orders floats differently from Knot's `total_cmp` — NaN sorts
-/// as NULL and -0.0/+0.0 are conflated). Float sort keys fall back to the
-/// faithful in-memory sort, mirroring the float comparison policy.
+/// Float/tag/bool. Float sort keys fall back to the faithful in-memory sort
+/// because SQLite orders floats differently from Knot's `total_cmp` (NaN sorts
+/// as NULL and -0.0/+0.0 are conflated). `tag` and `bool` keys likewise fall
+/// back: SQLite would order them by their TEXT/`1`/`0` storage, which does not
+/// match the declared `Ord` for those types — the same reason
+/// `minmax_pushdown_type_ok` and `try_compile_sql_comparison` treat tag/bool
+/// ordering as unsound and keep it in memory.
 pub(crate) fn sortby_projection_pushable(
     bind_var: &str,
     body: &ast::Expr,
     schema: &str,
 ) -> bool {
     int_case_projection_pushable(bind_var, body, schema)
-        && infer_sql_expr_type(bind_var, body, schema).as_deref() != Some("float")
+        && !matches!(
+            infer_sql_expr_type(bind_var, body, schema).as_deref(),
+            Some("float") | Some("tag") | Some("bool")
+        )
 }
 
 /// True when an expression tree contains an if/then/else node (which

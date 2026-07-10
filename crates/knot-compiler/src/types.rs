@@ -710,6 +710,53 @@ fn value_predicates(
                 seen_aliases,
             ));
         }
+        // Type application such as `Maybe Nat` or `Result Text Pos`. The
+        // refinement lives on a type *argument*, but the runtime value is
+        // wrapped in one of the type's constructors (`Just {value: x}`,
+        // `Ok {value: x}`, `Err {error: e}`), so applying the inner predicate
+        // to the whole value would compare a constructor against a primitive
+        // and panic. Recurse into each argument and wrap the resulting
+        // predicate in a `case` that unwraps the constructor carrying that
+        // argument and passes for the other variants (`Nothing`, the other
+        // arm of `Result`) — mirroring the `all` wrap used for relations.
+        TypeKind::App { .. } => {
+            // Flatten the left-nested application spine to (head, [args]).
+            let mut head: &Type = ty;
+            let mut args: Vec<&Type> = Vec::new();
+            while let TypeKind::App { func, arg } = &head.node {
+                args.push(arg.as_ref());
+                head = func.as_ref();
+            }
+            args.reverse();
+            if let TypeKind::Named(head_name) = &head.node {
+                for (idx, arg_ty) in args.iter().enumerate() {
+                    // (constructor, payload field) carrying this positional
+                    // argument, for the built-in generics whose shape is
+                    // fixed. Unknown heads collect nothing (safe fallback).
+                    let ctor_field = match (head_name.as_str(), idx) {
+                        ("Maybe", 0) => Some(("Just", "value")),
+                        ("Result", 0) => Some(("Err", "error")),
+                        ("Result", 1) => Some(("Ok", "value")),
+                        _ => None,
+                    };
+                    let Some((ctor, field)) = ctor_field else {
+                        continue;
+                    };
+                    for (label, pred) in value_predicates(
+                        arg_ty,
+                        refined_types,
+                        alias_ast_types,
+                        data_ctor_decls,
+                        seen_aliases,
+                    ) {
+                        out.push((
+                            label,
+                            synth_ctor_field_case(ctor, field, pred, arg_ty.span),
+                        ));
+                    }
+                }
+            }
+        }
         _ => {}
     }
     out

@@ -141,7 +141,7 @@ impl Parser {
         // Pre-scan for top-level declaration names that collide with
         // time-unit words so `maybe_time_unit` doesn't silently rewrite
         // `2 ms` as `2 * 1` when `ms` is a user-defined top-level value.
-        self.top_level_names = self.scan_top_level_names();
+        self.top_level_names = self.scan_top_level_names(&imports);
         let mut decls = Vec::new();
         while !self.at_eof() {
             self.skip_newlines();
@@ -252,23 +252,55 @@ impl Parser {
         self.bound_vars.iter().any(|v| v == name)
     }
 
-    /// Pre-scan the token stream for top-level declaration names that collide
-    /// with time-unit words (`ms`, `seconds`, `minutes`, `hours`, `days`,
-    /// `weeks`). This lets `maybe_time_unit` suppress unit sugar when such a
-    /// name is a user-defined value rather than the built-in unit.
-    fn scan_top_level_names(&self) -> HashSet<String> {
+    /// Pre-scan the token stream for names that collide with time-unit words
+    /// (`ms`, `seconds`, `minutes`, `hours`, `days`, `weeks`) and are actually
+    /// user-defined values rather than the built-in unit. This lets
+    /// `maybe_time_unit` suppress unit sugar for those names. Covers:
+    ///   * top-level declarations (column-0 `name =`/`name :`, optionally
+    ///     behind a `*`/`&`/`export` sigil),
+    ///   * selectively imported item names (`import ./time (ms)`),
+    ///   * trait/impl method names (indented `name :`/`name =` inside a
+    ///     `trait …`/`impl …` block body).
+    /// Without the latter two, `import ./time (ms)` then `g = f 2 ms` would
+    /// silently parse as `f (2 * 1)`, dropping the `ms` argument.
+    fn scan_top_level_names(&self, imports: &[Import]) -> HashSet<String> {
         const TIME_UNITS: &[&str] =
             &["ms", "seconds", "minutes", "hours", "days", "weeks"];
         let mut names = HashSet::new();
+
+        // Selectively imported item names shadow the built-in units in this
+        // module, so a time-unit-named import must suppress sugar too.
+        for imp in imports {
+            if let Some(items) = &imp.items {
+                for item in items {
+                    if TIME_UNITS.contains(&item.name.as_str()) {
+                        names.insert(item.name.clone());
+                    }
+                }
+            }
+        }
+
         let n = self.tokens.len();
+        // Track whether we are inside a `trait …`/`impl …` block body: the
+        // keyword sits at column 0 and its (indented) body — up to the next
+        // column-0 token that starts a new top-level declaration — holds method
+        // declarations, each an indented `name :`/`name =` at line start.
+        let mut in_trait_impl_body = false;
         for i in 0..n {
+            // Any column-0 token ends the previous trait/impl body and opens a
+            // new one only when it is itself a `trait`/`impl` keyword.
+            if self.token_cols[i] == 0 {
+                in_trait_impl_body =
+                    matches!(self.tokens[i].kind, TokenKind::Trait | TokenKind::Impl);
+            }
+
             let TokenKind::Lower(s) = &self.tokens[i].kind else {
                 continue;
             };
             if !TIME_UNITS.contains(&s.as_str()) {
                 continue;
             }
-            // Must be followed by `=` or `:` to be a declaration name.
+            // Must be followed by `=` or `:` to be a declaration/method name.
             if i + 1 >= n {
                 continue;
             }
@@ -285,6 +317,16 @@ impl Parser {
                 && self.token_cols[i - 1] == 0;
             if self.token_cols[i] == 0 || preceded_by_sigil_at_col0 {
                 names.insert(s.clone());
+                continue;
+            }
+            // A trait/impl method name: the first token on its line (preceded
+            // by a layout newline) inside a trait/impl block body.
+            if in_trait_impl_body {
+                let at_line_start =
+                    i == 0 || matches!(self.tokens[i - 1].kind, TokenKind::Newline);
+                if at_line_start {
+                    names.insert(s.clone());
+                }
             }
         }
         names

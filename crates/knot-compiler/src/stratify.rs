@@ -505,8 +505,14 @@ pub fn check(module: &ast::Module) -> Vec<Diagnostic> {
     let (_, edges) = build_dependency_graph(module);
     let sccs = Tarjan::run(&edges);
 
-    // Collect declaration spans for error reporting.
+    // Collect declaration spans for error reporting, and track which nodes are
+    // views. Views and derived relations share the dependency graph, but they
+    // compile very differently on a self-loop: a self-recursive *derived*
+    // relation is legal (codegen emits a `knot_relation_fixpoint` wrapper),
+    // whereas a self-recursive *view* has no fixpoint codegen — so we need to
+    // tell the two apart when a single-node cycle is found below.
     let mut decl_spans: HashMap<String, Span> = HashMap::new();
+    let mut view_names: HashSet<String> = HashSet::new();
     for decl in &module.decls {
         match &decl.node {
             ast::DeclKind::Derived { name, .. } => {
@@ -514,6 +520,7 @@ pub fn check(module: &ast::Module) -> Vec<Diagnostic> {
             }
             ast::DeclKind::View { name, .. } => {
                 decl_spans.insert(name.clone(), decl.span);
+                view_names.insert(name.clone());
             }
             _ => {}
         }
@@ -615,6 +622,37 @@ pub fn check(module: &ast::Module) -> Vec<Diagnostic> {
             );
             diagnostics.push(diag);
         }
+
+        // Single-node positive self-loop on a *view* (`*v = do { r <- *v; … }`).
+        // A self-recursive derived relation is handled by codegen's
+        // `knot_relation_fixpoint` wrapper, but a view has no such path:
+        // `analyze_view` treats the self-read as the view's own base source, so
+        // the generated query targets a `_knot_<view>` table that is never
+        // created and the program panics at runtime with "no such table". Catch
+        // it here as a compile error instead. (A *negative* self-loop is already
+        // reported as unstratifiable above; multi-node cycles fall into the
+        // mutual-recursion branch above — this handles only the direct,
+        // single-node view self-loop those two branches miss.)
+        if scc.len() == 1 && !scc_has_negative && view_names.contains(&scc[0]) {
+            let name = &scc[0];
+            let mut diag = Diagnostic::error(format!(
+                "self-recursive view is not supported: `*{}` reads from itself",
+                name
+            ));
+            if let Some(&decl_span) = decl_spans.get(name) {
+                diag = diag.label(decl_span, "this view reads from itself");
+            }
+            diag = diag.note(
+                "a view is a bidirectional query over concrete sources, not a \
+                 fixpoint-iterated relation — there is no table backing the view \
+                 itself to read from",
+            );
+            diag = diag.note(
+                "use a recursive derived relation (`&…`) for fixpoint iteration, or \
+                 rewrite the view to read only from concrete sources",
+            );
+            diagnostics.push(diag);
+        }
     }
 
     diagnostics
@@ -637,6 +675,10 @@ mod tests {
 
     fn derived(name: &str, body: Expr) -> Decl {
         Decl { node: DeclKind::Derived { name: name.to_string(), ty: None, body }, span: span(), exported: false }
+    }
+
+    fn view(name: &str, body: Expr) -> Decl {
+        Decl { node: DeclKind::View { name: name.to_string(), ty: None, body }, span: span(), exported: false }
     }
 
     fn derived_ref(name: &str) -> Expr {
@@ -950,6 +992,93 @@ mod tests {
         assert!(
             !diags.is_empty(),
             "pipe-diff mutual recursion should be detected as unstratifiable"
+        );
+    }
+
+    #[test]
+    fn self_recursive_view_is_rejected() {
+        // *v = do
+        //   r <- *v
+        //   yield r
+        //
+        // A view has no fixpoint codegen (unlike a derived relation): reading
+        // itself makes `analyze_view` treat the view as its own base source, so
+        // the generated query hits a nonexistent `_knot_v` table and panics at
+        // runtime. It must be rejected at compile time instead.
+        let body = do_expr(vec![
+            bind_stmt("r", source_ref("v")),
+            yield_stmt(var("r")),
+        ]);
+        let m = module(vec![view("v", body)]);
+        let diags = check(&m);
+        assert_eq!(diags.len(), 1, "one self-recursive-view error");
+        assert!(
+            diags[0].message.contains("self-recursive view") && diags[0].message.contains("*v"),
+            "expected self-recursive-view diagnostic, got: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn self_recursive_derived_is_still_ok() {
+        // &v = do
+        //   r <- &v
+        //   yield r
+        //
+        // The view-specific rejection must NOT fire for a derived relation — a
+        // single-node positive self-loop on a derived relation is the supported
+        // recursive-derived-relation feature (fixpoint codegen).
+        let body = do_expr(vec![
+            bind_stmt("r", derived_ref("v")),
+            yield_stmt(var("r")),
+        ]);
+        let m = module(vec![derived("v", body)]);
+        let diags = check(&m);
+        assert!(
+            diags.is_empty(),
+            "self-recursive derived relation should compile: {:?}",
+            diags.first().map(|d| &d.message)
+        );
+    }
+
+    #[test]
+    fn non_recursive_view_is_ok() {
+        // *v = do
+        //   r <- *items
+        //   yield r
+        //
+        // Reading a *different*, concrete source is a perfectly ordinary view —
+        // no self-loop, no error.
+        let body = do_expr(vec![
+            bind_stmt("r", source_ref("items")),
+            yield_stmt(var("r")),
+        ]);
+        let m = module(vec![view("v", body)]);
+        let diags = check(&m);
+        assert!(diags.is_empty(), "non-recursive view should be fine");
+    }
+
+    #[test]
+    fn view_derived_mutual_cycle_is_rejected() {
+        // *v = do { x <- &d; yield x }
+        // &d = *v
+        //
+        // A 2-node cycle spanning a view and a derived relation is caught by the
+        // mutual-recursion branch (not the single-node view self-loop branch).
+        let v_body = do_expr(vec![
+            bind_stmt("x", derived_ref("d")),
+            yield_stmt(var("x")),
+        ]);
+        let m = module(vec![
+            view("v", v_body),
+            derived("d", source_ref("v")),
+        ]);
+        let diags = check(&m);
+        assert_eq!(diags.len(), 1, "one mutual-recursion error");
+        assert!(
+            diags[0].message.contains("mutually recursive"),
+            "expected mutual-recursion diagnostic, got: {}",
+            diags[0].message
         );
     }
 }

@@ -507,8 +507,28 @@ pub fn analyze_document(
 
         let mut analysis_module = module.clone();
 
+        // Byte ranges in the inlined module that come from *imported* files.
+        // `resolve_imports` prepends copies of imported declarations whose
+        // spans index a *different* file's source. A diagnostic anchored in
+        // one of those foreign spans can, by numeric coincidence, fall inside
+        // one of this file's own decl spans and slip past `anchored_in_user`
+        // as a phantom squiggle. Recording the imported spans lets the filter
+        // reject any diagnostic whose label lands in foreign content, since a
+        // foreign label points into the same coordinate space as the imported
+        // decl it belongs to.
+        let mut imported_regions: Vec<Span> = Vec::new();
         if let Some(path) = uri_to_path(uri) {
+            // Count this file's own decls before inlining; `resolve_imports`
+            // prepends imported decls, leaving the own decls as the trailing
+            // entries (see `modules::resolve_recursive`). The prefix is
+            // therefore exactly the inlined imported content.
+            let own_decl_count = module.decls.len();
             let _ = knot_compiler::modules::resolve_imports(&mut analysis_module, &path);
+            let imported_count = analysis_module.decls.len().saturating_sub(own_decl_count);
+            imported_regions = analysis_module.decls[..imported_count]
+                .iter()
+                .map(|d| d.span)
+                .collect();
         }
 
         knot_compiler::base::inject_prelude(&mut analysis_module);
@@ -530,17 +550,23 @@ pub fn analyze_document(
         // (`module` is the pre-injection parse of this file). Mirrors
         // `workspace_diagnostics`' `anchored_in_importer` filter.
         let user_decl_spans: Vec<Span> = module.decls.iter().map(|d| d.span).collect();
-        let in_user_decl = |s: &Span| {
-            user_decl_spans
+        // A span that lands inside an imported decl's range belongs to foreign
+        // content, even when it *also* numerically falls inside a user decl
+        // span. Treat imported-region membership as the decisive signal so a
+        // foreign span never counts as "in the user's source".
+        let in_imported_region = |s: &Span| {
+            imported_regions
                 .iter()
-                .any(|d| d.start <= s.start && s.end <= d.end)
+                .any(|r| r.start <= s.start && s.end <= r.end)
+        };
+        let in_user_decl = |s: &Span| {
+            !in_imported_region(s)
+                && user_decl_spans
+                    .iter()
+                    .any(|d| d.start <= s.start && s.end <= d.end)
         };
         let anchored_in_user = |d: &Diagnostic| -> bool {
-            d.labels.iter().any(|l| {
-                user_decl_spans
-                    .iter()
-                    .any(|u| u.start <= l.span.start && l.span.end <= u.end)
-            })
+            d.labels.iter().any(|l| in_user_decl(&l.span))
         };
 
         let (

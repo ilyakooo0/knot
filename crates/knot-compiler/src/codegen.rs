@@ -4033,6 +4033,35 @@ impl Codegen {
                 if let Some(&val) = env.bindings.get(name.as_str()) {
                     return val;
                 }
+                // A user-defined top-level declaration whose name collides with
+                // one of the zero-arg builtins below (`now`, `randomFloat`,
+                // `retry`, …) shadows the builtin. None of those names are
+                // stdlib functions, so a `user_fns` hit here is always a genuine
+                // user declaration, never a stdlib registration. The applied-call
+                // path already consults `user_fns` before its builtin special
+                // cases; the bare reference must too, or the user's declaration
+                // is compiled but never referenced — e.g. `now = 5` would emit
+                // `knot_now_io` here, producing an `IO` value where the type
+                // checker inferred `Int` (a runtime panic when later used).
+                if let Some((func_id, n_params)) = self.user_fns.get(name).copied() {
+                    if n_params == 0 {
+                        // 0-param function is a constant — call it directly
+                        let func_ref =
+                            self.module.declare_func_in_func(func_id, builder.func);
+                        let call = builder.ins().call(func_ref, &[db]);
+                        return builder.inst_results(call)[0];
+                    } else {
+                        // Create a trampoline that bridges (db, env, arg) calling
+                        // convention to the user function's (db, arg1, ...) convention.
+                        let trampoline_id = self.get_or_create_trampoline(name, n_params);
+                        let func_ref =
+                            self.module.declare_func_in_func(trampoline_id, builder.func);
+                        let fn_addr = builder.ins().func_addr(self.ptr_type, func_ref);
+                        let null = builder.ins().iconst(self.ptr_type, 0);
+                        let (src_ptr, src_len) = self.string_ptr(builder, name);
+                        return self.call_rt(builder, "knot_value_function", &[fn_addr, null, src_ptr, src_len]);
+                    }
+                }
                 if name == "now" {
                     return self.call_rt(builder, "knot_now_io", &[]);
                 }
@@ -4085,31 +4114,9 @@ impl Codegen {
                     }
                     return self.call_rt(builder, "knot_stm_retry", &[]);
                 }
-                if let Some(&val) = env.bindings.get(name) {
-                    val
-                } else if let Some((func_id, n_params)) =
-                    self.user_fns.get(name).copied()
-                {
-                    if n_params == 0 {
-                        // 0-param function is a constant — call it directly
-                        let func_ref =
-                            self.module.declare_func_in_func(func_id, builder.func);
-                        let call = builder.ins().call(func_ref, &[db]);
-                        builder.inst_results(call)[0]
-                    } else {
-                        // Create a trampoline that bridges (db, env, arg) calling
-                        // convention to the user function's (db, arg1, ...) convention.
-                        let trampoline_id = self.get_or_create_trampoline(name, n_params);
-                        let func_ref =
-                            self.module.declare_func_in_func(trampoline_id, builder.func);
-                        let fn_addr = builder.ins().func_addr(self.ptr_type, func_ref);
-                        let null = builder.ins().iconst(self.ptr_type, 0);
-                        let (src_ptr, src_len) = self.string_ptr(builder, name);
-                        self.call_rt(builder, "knot_value_function", &[fn_addr, null, src_ptr, src_len])
-                    }
-                } else {
-                    panic!("codegen: undefined variable '{}'", name)
-                }
+                // `env` and `user_fns` were both consulted above; anything
+                // reaching here is a genuinely undefined variable.
+                panic!("codegen: undefined variable '{}'", name)
             }
 
             ast::ExprKind::Constructor(name) => {

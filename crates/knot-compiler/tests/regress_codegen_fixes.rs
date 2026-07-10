@@ -645,3 +645,30 @@ main = do
         "local param must shadow the stdlib `count` (expected 14), got:\n{stdout}"
     );
 }
+
+// ── BUG B4: bare refs to user decls named like zero-arg builtins ───
+// The bare-`Var` arm in `compile_expr` checked the zero-arg builtin special
+// cases (`now`, `randomFloat`, `randomUuid`, `generateKeyPair`,
+// `generateSigningKeyPair`, `readLine`, `retry`) BEFORE consulting `user_fns`.
+// Those names are not stdlib functions, so a user declaration `now = 5` was
+// compiled but never referenced: the bare `now` emitted `knot_now_io`, yielding
+// an `IO` value where the type checker had inferred `Int`. `now + 1` then called
+// `knot_value_add(Value::IO, Int)` and panicked at runtime. The applied-call
+// path always consulted `user_fns` first; only bare references diverged.
+
+#[test]
+fn bare_ref_to_user_decl_named_like_zero_arg_builtin() {
+    // `now = 5` shadows the `now` builtin; the bare reference `now` must read
+    // the user's `Int` constant (so `now + 1` is 6), not emit `knot_now_io`.
+    let (stdout, stderr, ok) = compile_and_run(
+        "shadow_zero_arg_builtin_now",
+        r#"now = 5
+main = println (show (now + 1))
+"#,
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains('6'),
+        "bare `now` must read the user constant (expected 6), got:\n{stdout}"
+    );
+}

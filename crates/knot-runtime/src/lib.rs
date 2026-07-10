@@ -7493,59 +7493,102 @@ pub extern "C-unwind" fn knot_guard_failed() {
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_value_show(v: *mut Value) -> *mut Value {
-    fn show_inner(v: *mut Value) -> String {
-        if v.is_null() {
-            return "null".to_string();
-        }
-        match unsafe { as_ref(v) } {
-            Value::Int(n) => n.to_string(),
-            Value::Float(n) => {
-                if n.is_nan() || n.is_infinite() {
-                    format!("{}", n)
-                } else if n.fract() == 0.0 {
-                    format!("{:.1}", n)
-                } else {
-                    n.to_string()
+    // Iterative rendering over an explicit work stack. A deeply right-nested
+    // ADT spine — e.g. a 100k-element list `Cons 0 (Cons 1 … Nil)`, stored as
+    // Constructor→Record→Constructor→… — previously drove one native frame per
+    // level through the recursive `show_inner` payload path and SIGSEGV'd on
+    // Rust's default 8MB stack around 100k deep. The sibling `values_equal`
+    // and `value_to_hash_bytes` paths were already converted to this same
+    // work-stack technique; the output here is byte-for-byte identical to the
+    // former recursive formulation. Note the Constructor case can only avoid
+    // the deep recursion if the intermediate `Record` (which holds the spine's
+    // `tail`) is traversed through the stack too — hence every compound kind
+    // pushes its children as tasks rather than recursing.
+    enum Task {
+        // Render this value: append leaves directly, or push child `Render`
+        // tasks (interleaved with `Lit` punctuation) for compound kinds.
+        Render(*mut Value),
+        // Emit a ready-made literal (braces, separators, field names, tags),
+        // letting us wrap structure around child renders without recursing.
+        Lit(String),
+    }
+
+    let mut out = String::new();
+    let mut stack: Vec<Task> = vec![Task::Render(v)];
+    while let Some(task) = stack.pop() {
+        match task {
+            Task::Lit(s) => out.push_str(&s),
+            Task::Render(v) => {
+                if v.is_null() {
+                    out.push_str("null");
+                    continue;
+                }
+                match unsafe { as_ref(v) } {
+                    Value::Int(n) => out.push_str(&n.to_string()),
+                    Value::Float(n) => {
+                        if n.is_nan() || n.is_infinite() {
+                            out.push_str(&format!("{}", n));
+                        } else if n.fract() == 0.0 {
+                            out.push_str(&format!("{:.1}", n));
+                        } else {
+                            out.push_str(&n.to_string());
+                        }
+                    }
+                    Value::Text(s) => out.push_str(s),
+                    Value::Bytes(b) => {
+                        use std::fmt::Write;
+                        for byte in b.iter() {
+                            let _ = write!(out, "{:02x}", byte);
+                        }
+                    }
+                    Value::Bool(b) => out.push_str(if *b { "True" } else { "False" }),
+                    Value::Unit => out.push_str("{}"),
+                    Value::Record(fields) => {
+                        // {name: v, name: v} — push in reverse so tasks pop in
+                        // forward (source) order.
+                        stack.push(Task::Lit("}".to_string()));
+                        for (i, f) in fields.iter().enumerate().rev() {
+                            stack.push(Task::Render(f.value));
+                            let sep = if i == 0 {
+                                format!("{}: ", f.name)
+                            } else {
+                                format!(", {}: ", f.name)
+                            };
+                            stack.push(Task::Lit(sep));
+                        }
+                        stack.push(Task::Lit("{".to_string()));
+                    }
+                    Value::Relation(rows) => {
+                        stack.push(Task::Lit("]".to_string()));
+                        for (i, r) in rows.iter().enumerate().rev() {
+                            stack.push(Task::Render(*r));
+                            if i != 0 {
+                                stack.push(Task::Lit(", ".to_string()));
+                            }
+                        }
+                        stack.push(Task::Lit("[".to_string()));
+                    }
+                    Value::Constructor(tag, payload) => {
+                        // Nullary payload (`Unit` or empty `Record`) renders as
+                        // `tag {}` — exactly the former `p == "{}"` check, made
+                        // structural so the payload string isn't materialized
+                        // first and the spine's tail never recurses.
+                        if !payload.is_null() && is_nullary_payload(*payload) {
+                            out.push_str(tag);
+                            out.push_str(" {}");
+                        } else {
+                            stack.push(Task::Render(*payload));
+                            stack.push(Task::Lit(format!("{} ", tag)));
+                        }
+                    }
+                    Value::Function(f) => out.push_str(&f.source),
+                    Value::IO(_, _) => out.push_str("<<IO>>"),
+                    Value::Pair(_, _) => out.push_str("<<Pair>>"),
                 }
             }
-            Value::Text(s) => (**s).to_string(),
-            Value::Bytes(b) => {
-                let mut hex = String::with_capacity(b.len() * 2);
-                for byte in b.iter() {
-                    use std::fmt::Write;
-                    let _ = write!(hex, "{:02x}", byte);
-                }
-                hex
-            }
-            Value::Bool(b) => {
-                if *b { "True".to_string() } else { "False".to_string() }
-            }
-            Value::Unit => "{}".to_string(),
-            Value::Record(fields) => {
-                let inner: Vec<String> = fields
-                    .iter()
-                    .map(|f| format!("{}: {}", f.name, show_inner(f.value)))
-                    .collect();
-                format!("{{{}}}", inner.join(", "))
-            }
-            Value::Relation(rows) => {
-                let inner: Vec<String> = rows.iter().map(|r| show_inner(*r)).collect();
-                format!("[{}]", inner.join(", "))
-            }
-            Value::Constructor(tag, payload) => {
-                let p = show_inner(*payload);
-                if p == "{}" {
-                    format!("{} {{}}", tag)
-                } else {
-                    format!("{} {}", tag, p)
-                }
-            }
-            Value::Function(f) => f.source.to_string(),
-            Value::IO(_, _) => "<<IO>>".to_string(),
-            Value::Pair(_, _) => "<<Pair>>".to_string(),
         }
     }
-    alloc(Value::Text(Arc::from(show_inner(v))))
+    alloc(Value::Text(Arc::from(out)))
 }
 
 // ── IO monad ─────────────────────────────────────────────────────
@@ -15729,78 +15772,142 @@ fn just_ctor_value(tag: &str, payload: *mut Value) -> Option<*mut Value> {
 }
 
 fn value_to_serde_json_impl(v: *mut Value, wire: bool) -> serde_json::Value {
-    if v.is_null() {
-        return serde_json::Value::Null;
+    use serde_json::Value as Json;
+
+    // Iterative post-order builder over an explicit work stack. A deeply
+    // right-nested Constructor/Record spine — e.g. a 100k-element `Cons`-list
+    // stored as Constructor→Record→Constructor→… — previously drove one native
+    // frame per level through the direct `value_to_serde_json_impl(*payload)`
+    // recursion and SIGSEGV'd on Rust's default 8MB stack. The sibling
+    // eq/hash/compare and `show` paths use this same technique. Leaves push a
+    // finished `Json` onto `results`; compound kinds push a `Finish*` marker
+    // plus child `Emit` jobs, and the marker folds the children (already on
+    // `results`) into the parent. Every `Emit` job nets exactly one `results`
+    // entry, so a `Finish*` marker always finds its children on top.
+    enum Job {
+        Emit(*mut Value),
+        FinishRecord(Vec<Arc<str>>), // field names, in source order
+        FinishRelation(usize),       // row count
+        FinishCtor(Arc<str>),        // constructor tag
     }
-    match unsafe { as_ref(v) } {
-        Value::Int(n) => serde_json::Value::Number((*n).into()),
-        Value::Float(n) => {
-            if n.is_finite() {
-                serde_json::json!(*n)
-            } else if wire {
-                // JSON has no representation for NaN/±Infinity. On the HTTP wire
-                // path encode them as `null` (matching JS `JSON.stringify`)
-                // rather than panicking: this serializer runs on the success-
-                // response path *outside* the handler's `catch_unwind`, so a
-                // panic here would crash the worker thread and drop the
-                // connection with no response.
-                serde_json::Value::Null
-            } else {
-                // Storage path (`value_to_json_db`): a non-finite Float in a
-                // JSON column would round-trip Float → null → Unit on read,
-                // silently changing the value *and* its type. Panic to protect
-                // the round-trip, matching `float_to_sqlite_real`'s guard for
-                // scalar columns.
-                panic!(
-                    "knot runtime: cannot store non-finite Float ({}) in a JSON \
-                     column — it would round-trip to Unit, breaking round-trips",
-                    n
-                );
-            }
-        }
-        Value::Text(s) => serde_json::Value::String((**s).to_string()),
-        Value::Bool(b) => serde_json::Value::Bool(*b),
-        Value::Bytes(b) => {
-            let mut map = serde_json::Map::with_capacity(1);
-            map.insert("__knot_bytes".into(), serde_json::Value::String(base64_encode(b)));
-            serde_json::Value::Object(map)
-        }
-        Value::Unit => serde_json::Value::Null,
-        Value::Record(fields) => {
-            let mut map = serde_json::Map::with_capacity(fields.len());
-            for f in fields {
-                map.insert(f.name.to_string(), value_to_serde_json_impl(f.value, wire));
-            }
-            serde_json::Value::Object(map)
-        }
-        Value::Relation(rows) => {
-            serde_json::Value::Array(rows.iter().map(|r| value_to_serde_json_impl(*r, wire)).collect())
-        }
-        Value::Constructor(tag, payload) => {
-            // Wire encoding maps the built-in Maybe to JSON's native optional:
-            // Nothing → null, Just x → x. (`Just Nothing` collapses to null —
-            // the usual lossiness of this convention.)
-            if wire {
-                if is_nothing_ctor(tag, *payload) {
-                    return serde_json::Value::Null;
+
+    let mut work: Vec<Job> = vec![Job::Emit(v)];
+    let mut results: Vec<Json> = Vec::new();
+
+    while let Some(job) = work.pop() {
+        match job {
+            Job::Emit(v) => {
+                if v.is_null() {
+                    results.push(Json::Null);
+                    continue;
                 }
-                if let Some(inner) = just_ctor_value(tag, *payload) {
-                    return value_to_serde_json_impl(inner, wire);
+                match unsafe { as_ref(v) } {
+                    Value::Int(n) => results.push(Json::Number((*n).into())),
+                    Value::Float(n) => {
+                        if n.is_finite() {
+                            results.push(serde_json::json!(*n));
+                        } else if wire {
+                            // JSON has no representation for NaN/±Infinity. On the
+                            // HTTP wire path encode them as `null` (matching JS
+                            // `JSON.stringify`) rather than panicking: this
+                            // serializer runs on the success-response path
+                            // *outside* the handler's `catch_unwind`, so a panic
+                            // here would crash the worker thread and drop the
+                            // connection with no response.
+                            results.push(Json::Null);
+                        } else {
+                            // Storage path (`value_to_json_db`): a non-finite
+                            // Float in a JSON column would round-trip Float →
+                            // null → Unit on read, silently changing the value
+                            // *and* its type. Panic to protect the round-trip,
+                            // matching `float_to_sqlite_real`'s guard for scalar
+                            // columns.
+                            panic!(
+                                "knot runtime: cannot store non-finite Float ({}) in a JSON \
+                                 column — it would round-trip to Unit, breaking round-trips",
+                                n
+                            );
+                        }
+                    }
+                    Value::Text(s) => results.push(Json::String((**s).to_string())),
+                    Value::Bool(b) => results.push(Json::Bool(*b)),
+                    Value::Bytes(b) => {
+                        let mut map = serde_json::Map::with_capacity(1);
+                        map.insert("__knot_bytes".into(), Json::String(base64_encode(b)));
+                        results.push(Json::Object(map));
+                    }
+                    Value::Unit => results.push(Json::Null),
+                    Value::Record(fields) => {
+                        // Push Finish then child Emits in reverse so children pop
+                        // in forward order and land on `results` in field order.
+                        let names: Vec<Arc<str>> = fields.iter().map(|f| f.name.clone()).collect();
+                        work.push(Job::FinishRecord(names));
+                        for f in fields.iter().rev() {
+                            work.push(Job::Emit(f.value));
+                        }
+                    }
+                    Value::Relation(rows) => {
+                        work.push(Job::FinishRelation(rows.len()));
+                        for r in rows.iter().rev() {
+                            work.push(Job::Emit(*r));
+                        }
+                    }
+                    Value::Constructor(tag, payload) => {
+                        // Wire encoding maps the built-in Maybe to JSON's native
+                        // optional: Nothing → null, Just x → x. (`Just Nothing`
+                        // collapses to null — the usual lossiness of this
+                        // convention.)
+                        if wire {
+                            if is_nothing_ctor(tag, *payload) {
+                                results.push(Json::Null);
+                                continue;
+                            }
+                            if let Some(inner) = just_ctor_value(tag, *payload) {
+                                work.push(Job::Emit(inner));
+                                continue;
+                            }
+                        }
+                        // Wrap in `__knot_ctor` so parseJson can reconstruct
+                        // without colliding with user records that happen to use
+                        // `tag`/`value` keys.
+                        work.push(Job::FinishCtor(tag.clone()));
+                        work.push(Job::Emit(*payload));
+                    }
+                    Value::Function(f) => {
+                        results.push(Json::String(format!("<function: {}>", &*f.source)))
+                    }
+                    Value::IO(_, _) => results.push(Json::String("<<IO>>".into())),
+                    Value::Pair(_, _) => results.push(Json::String("<<Pair>>".into())),
                 }
             }
-            // Wrap in `__knot_ctor` so parseJson can reconstruct without
-            // colliding with user records that happen to use `tag`/`value` keys.
-            let mut inner = serde_json::Map::with_capacity(2);
-            inner.insert("tag".into(), serde_json::Value::String(tag.to_string()));
-            inner.insert("value".into(), value_to_serde_json_impl(*payload, wire));
-            let mut map = serde_json::Map::with_capacity(1);
-            map.insert("__knot_ctor".into(), serde_json::Value::Object(inner));
-            serde_json::Value::Object(map)
+            Job::FinishRecord(names) => {
+                let start = results.len() - names.len();
+                let children = results.split_off(start); // forward (field) order
+                let mut map = serde_json::Map::with_capacity(names.len());
+                for (name, child) in names.iter().zip(children) {
+                    map.insert(name.to_string(), child);
+                }
+                results.push(Json::Object(map));
+            }
+            Job::FinishRelation(n) => {
+                let start = results.len() - n;
+                let children = results.split_off(start); // forward (row) order
+                results.push(Json::Array(children));
+            }
+            Job::FinishCtor(tag) => {
+                let payload_json = results.pop().expect("ctor payload result");
+                let mut inner = serde_json::Map::with_capacity(2);
+                inner.insert("tag".into(), Json::String(tag.to_string()));
+                inner.insert("value".into(), payload_json);
+                let mut map = serde_json::Map::with_capacity(1);
+                map.insert("__knot_ctor".into(), Json::Object(inner));
+                results.push(Json::Object(map));
+            }
         }
-        Value::Function(f) => serde_json::Value::String(format!("<function: {}>", &*f.source)),
-        Value::IO(_, _) => serde_json::Value::String("<<IO>>".into()),
-        Value::Pair(_, _) => serde_json::Value::String("<<Pair>>".into()),
     }
+
+    debug_assert_eq!(results.len(), 1, "value_to_serde_json_impl must produce one root value");
+    results.pop().unwrap_or(Json::Null)
 }
 
 /// Call the compiled toJson dispatcher for a sub-value, returning the JSON string.
@@ -20613,6 +20720,65 @@ mod _deep_nesting_iterative_tests {
         let mut direct = Vec::new();
         value_to_hash_bytes(deep, &mut direct);
         assert_eq!(bytes, direct);
+    }
+
+    /// Read the `Value::Text` a `knot_value_show` call produced.
+    fn show_text(v: *mut Value) -> String {
+        match unsafe { as_ref(knot_value_show(v)) } {
+            Value::Text(s) => (**s).to_string(),
+            other => panic!("expected Text, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn value_show_handles_deep_ctors() {
+        // A 200k-deep spine would overflow the previous recursive `show_inner`
+        // (Constructor→Record→Constructor per level). The work-stack version
+        // completes and starts with the outermost `Cons`.
+        let deep = deep_spine(200_000);
+        assert!(show_text(deep).starts_with("Cons {head: 0, tail: "));
+    }
+
+    #[test]
+    fn value_show_small_spine_matches_recursive_format() {
+        // Byte-for-byte equal to the former recursive formulation: constructor
+        // tag + space + payload; nullary payload renders as `tag {}`; record
+        // fields render in sorted (head < tail) order.
+        assert_eq!(show_text(deep_spine(0)), "Nil {}");
+        assert_eq!(
+            show_text(deep_spine(2)),
+            "Cons {head: 0, tail: Cons {head: 1, tail: Nil {}}}"
+        );
+    }
+
+    #[test]
+    fn value_to_json_handles_deep_ctors() {
+        // Same deep-spine SIGSEGV in the JSON encoder (`value_to_serde_json_impl`
+        // recursed directly on the Constructor payload); the iterative builder
+        // completes.
+        let deep = deep_spine(200_000);
+        let json = value_to_json(deep);
+        assert!(json.starts_with("{\"__knot_ctor\""));
+    }
+
+    #[test]
+    fn value_to_json_small_spine_matches_recursive_shape() {
+        // Compare as parsed JSON so object-key ordering (BTreeMap vs
+        // preserve_order) doesn't matter — only the structure must match the
+        // former recursive output: `__knot_ctor` wrapping, nested payload, and
+        // the nullary `Nil` payload encoded as null.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&value_to_json(deep_spine(1))).unwrap();
+        let expected = serde_json::json!({
+            "__knot_ctor": {
+                "tag": "Cons",
+                "value": {
+                    "head": 0,
+                    "tail": { "__knot_ctor": { "tag": "Nil", "value": serde_json::Value::Null } }
+                }
+            }
+        });
+        assert_eq!(parsed, expected);
     }
 }
 

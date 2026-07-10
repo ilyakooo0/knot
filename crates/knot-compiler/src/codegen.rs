@@ -13895,7 +13895,7 @@ fn extract_filter_on_source(
 // substituted value, we abandon that branch of substitution and leave the
 // expression unchanged, which is sound (just less optimized).
 
-fn beta_reduce(
+pub(crate) fn beta_reduce(
     expr: &ast::Expr,
     fun_bodies: &HashMap<String, ast::Expr>,
     let_bindings: &HashMap<String, ast::Expr>,

@@ -942,9 +942,10 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
     }
 
     // Non-final statements must be Bind/Where/Let or a bare Expr (sequenced
-    // monadically as `_ <- e`). Final statement must be a bare Expr — yield
-    // is one option, but any expression of monad type is valid (its value
-    // becomes the do-block's result).
+    // monadically as `_ <- e`). Final statement must be a bare Expr — either
+    // an explicit `yield e` or any other expression. `desugar_stmts` wraps the
+    // final in `__yield` (Applicative.pure) either way, so a plain value `a`
+    // becomes the monadic result `m a`.
     for stmt in &stmts[..stmts.len() - 1] {
         match &stmt.node {
             StmtKind::Bind { .. } | StmtKind::Where { .. } | StmtKind::Let { .. } | StmtKind::Expr(_) => {}
@@ -1158,18 +1159,24 @@ fn spanned<T>(node: T, span: Span) -> Spanned<T> {
 fn desugar_stmts(stmts: &[Stmt], span: Span) -> Expr {
     assert!(!stmts.is_empty());
 
-    // Base case: single statement
+    // Base case: single statement — the do-block's final result.
     if stmts.len() == 1 {
         return match &stmts[0].node {
             StmtKind::Expr(e) => {
-                // Transform yield e -> __yield(e) for generic monad support
-                if let Some(inner) = e.node.as_yield_arg() {
-                    mk_yield(inner.clone(), span)
-                } else {
-                    e.clone()
+                // The final bare expression is the yielded result and must be
+                // wrapped in `__yield` (Applicative.pure) so the do-block has
+                // monad type `m a`, not the bare `a`. An explicit `yield e`
+                // wraps its inner argument; a bare `e` (e.g. `show x` in
+                // `do { x <- ioAction; show x }`) is wrapped as-is. Without
+                // this, a trait-only-IO chain returns `Text` instead of the
+                // expected `IO Text` and fails to type-check against the gate
+                // (see `is_pure_comprehension`).
+                match e.node.as_yield_arg() {
+                    Some(inner) => mk_yield(inner.clone(), span),
+                    None => mk_yield(e.clone(), span),
                 }
             }
-            // Shouldn't happen for valid pure comprehensions (last must be yield)
+            // Shouldn't happen for valid pure comprehensions (last must be Expr)
             _ => mk_empty(span),
         };
     }

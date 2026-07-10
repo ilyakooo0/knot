@@ -1870,18 +1870,43 @@ impl Infer {
                     merged.extend(e2.iter().cloned());
                     let unified_inner = self.apply(&a);
                     let merged_io =
-                        Ty::IO(merged, None, Box::new(unified_inner));
+                        Ty::IO(merged.clone(), None, Box::new(unified_inner));
+                    // The REQUIRED-side var is a fresh result accumulator
+                    // (an if/case result var, or a do-block's sequencing
+                    // var): it legitimately absorbs the union of the
+                    // branches' effects, so it takes the widened IO.
+                    //
+                    // The PROVIDED-side var is an actual branch *value*.
+                    // Widening fires whenever a side was *syntactically* a
+                    // `Ty::Var` — but that var may already be bound (through
+                    // the substitution) to a concrete closed IO by an
+                    // earlier, already-discharged obligation (e.g. `g act`
+                    // pinning `act : IO {} {}`). Overwriting that chain-end
+                    // binding with the widened effect set would launder the
+                    // extra effects past the original check and past the
+                    // atomic gate. So resolve the provided-side var through
+                    // `self.subst`: if it is already a concrete `Ty::IO`,
+                    // preserve the binding and only validate compatibility
+                    // via `unify_io_effects` (which does not rebind in the
+                    // closed/closed case, mirroring `merge_do_io_row`'s
+                    // unify-don't-clobber merge); only a genuinely unbound
+                    // provided-side var is bound to the widened IO.
+                    //
                     // Bind at the *end* of each var's substitution chain
                     // (via bind_var, which checks skolems/occurs) so any
                     // aliases along the chain keep seeing the widened IO —
                     // a raw insert at the root var would orphan them.
-                    if let Some(v) = var1 {
-                        let root = self.var_chain_end(v);
+                    let provided_var = if t1_provided { var1 } else { var2 };
+                    let required_var = if t1_provided { var2 } else { var1 };
+
+                    let required_root =
+                        required_var.map(|v| self.var_chain_end(v));
+                    if let Some(root) = required_root {
                         self.bind_var(root, merged_io.clone(), span);
                     }
-                    if let Some(v) = var2 {
+                    if let Some(v) = provided_var {
                         let root = self.var_chain_end(v);
-                        if Some(root) != var1.map(|v1| self.var_chain_end(v1)) {
+                        if Some(root) != required_root {
                             self.bind_var(root, merged_io, span);
                         }
                     }

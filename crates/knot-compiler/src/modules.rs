@@ -8,18 +8,31 @@ use knot::ast;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+/// Source-text snippets sliced from imported modules for the schema lockfile.
+///
+/// The lockfile is re-parsed on its own, so it must carry both the types a
+/// source relation references and the source declarations themselves — for
+/// declarations that live in imported modules, not just the entry module.
+#[derive(Default)]
+pub struct ImportedSnippets {
+    /// Non-parameterized type alias / data declarations from imported modules.
+    pub types: Vec<String>,
+    /// Source declarations (`*name : [T]`) from imported modules.
+    pub sources: Vec<String>,
+}
+
 /// Resolve all imports in the module, recursively loading imported files
 /// and merging their declarations. Detects import cycles.
 ///
-/// On success, returns the source text of every non-parameterized type alias
-/// and data declaration found in imported files. The schema lockfile embeds
-/// these snippets so that source relation types defined in imported modules
-/// (e.g. `*people : [Person]` with `Person` from another file) still resolve
-/// when the lockfile is re-parsed on its own.
+/// On success, returns the source text of every non-parameterized type alias,
+/// data declaration, and source declaration found in imported files. The schema
+/// lockfile embeds these snippets so that source relations defined in imported
+/// modules (e.g. `*people : [Person]` with `Person` from another file) are
+/// tracked and still resolve when the lockfile is re-parsed on its own.
 pub fn resolve_imports(
     module: &mut ast::Module,
     source_path: &Path,
-) -> Result<Vec<String>, Vec<String>> {
+) -> Result<ImportedSnippets, Vec<String>> {
     let canonical = source_path
         .canonicalize()
         .unwrap_or_else(|_| source_path.to_path_buf());
@@ -27,11 +40,13 @@ pub fn resolve_imports(
     in_flight.insert(canonical.clone());
     let mut imported = HashSet::new();
     imported.insert(canonical);
-    let mut type_snippets = Vec::new();
-    resolve_recursive(module, source_path, &mut in_flight, &mut imported, &mut type_snippets)?;
-    type_snippets.sort();
-    type_snippets.dedup();
-    Ok(type_snippets)
+    let mut snippets = ImportedSnippets::default();
+    resolve_recursive(module, source_path, &mut in_flight, &mut imported, &mut snippets)?;
+    snippets.types.sort();
+    snippets.types.dedup();
+    snippets.sources.sort();
+    snippets.sources.dedup();
+    Ok(snippets)
 }
 
 fn resolve_recursive(
@@ -39,7 +54,7 @@ fn resolve_recursive(
     source_path: &Path,
     in_flight: &mut HashSet<PathBuf>,
     imported: &mut HashSet<PathBuf>,
-    type_snippets: &mut Vec<String>,
+    snippets: &mut ImportedSnippets,
 ) -> Result<(), Vec<String>> {
     if module.imports.is_empty() {
         return Ok(());
@@ -183,17 +198,22 @@ fn resolve_recursive(
             continue;
         }
 
-        // Collect type declaration snippets for the schema lockfile while this
-        // file's own decls still pair with its own source text (after the
-        // recursive merge below, decl spans may reference other files).
+        // Collect type and source declaration snippets for the schema lockfile
+        // while this file's own decls still pair with its own source text (after
+        // the recursive merge below, decl spans may reference other files).
         for d in &imported_module.decls {
             let is_type_decl = matches!(
                 &d.node,
                 ast::DeclKind::TypeAlias { params, .. } if params.is_empty()
             ) || matches!(&d.node, ast::DeclKind::Data { .. });
+            let is_source_decl = matches!(&d.node, ast::DeclKind::Source { .. });
             if is_type_decl
                 && let Some(text) = source.get(d.span.start..d.span.end) {
-                    type_snippets.push(text.to_string());
+                    snippets.types.push(text.to_string());
+                }
+            if is_source_decl
+                && let Some(text) = source.get(d.span.start..d.span.end) {
+                    snippets.sources.push(text.to_string());
                 }
         }
 
@@ -210,7 +230,7 @@ fn resolve_recursive(
             &canonical,
             in_flight,
             imported,
-            type_snippets,
+            snippets,
         );
         in_flight.remove(&canonical);
         if let Err(sub_errors) = sub_result {

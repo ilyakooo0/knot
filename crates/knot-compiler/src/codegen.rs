@@ -67,6 +67,12 @@ pub struct Codegen {
     // Names registered as stdlib builtins (skip user redefinitions)
     stdlib_fns: HashSet<String>,
 
+    // Stdlib names the user re-defines at top level. A user-defined function
+    // OVERRIDES a same-named builtin (see compile_app's shadowing rule), so the
+    // stdlib version is neither registered nor defined for these names — the
+    // user's declaration flows through the normal function path instead.
+    user_shadowed_stdlib: HashSet<String>,
+
     // Source relation schemas: name -> schema descriptor
     source_schemas: HashMap<String, String>,
     /// Variables bound from source reads: var_name → source_name.
@@ -805,6 +811,7 @@ impl Codegen {
             runtime_fns: HashMap::new(),
             user_fns: HashMap::new(),
             stdlib_fns: HashSet::new(),
+            user_shadowed_stdlib: HashSet::new(),
             source_schemas: HashMap::new(),
             source_var_binds: HashMap::new(),
             source_bind_invalidations: Vec::new(),
@@ -1230,6 +1237,11 @@ impl Codegen {
     /// Register a standard library function as a user_fn.
     /// All stdlib functions are registered as 1-param so they curry properly.
     fn register_stdlib_fn(&mut self, name: &str) {
+        // A user redefinition of this name wins — skip the stdlib registration
+        // so `user_fns[name]` is free for the user's own declaration.
+        if self.user_shadowed_stdlib.contains(name) {
+            return;
+        }
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(self.ptr_type)); // db
         sig.params.push(AbiParam::new(self.ptr_type)); // arg1
@@ -1257,6 +1269,10 @@ impl Codegen {
 
     /// Define a 1-param stdlib function that directly delegates to a runtime function.
     fn define_stdlib_fn_1(&mut self, name: &str, rt_name: &str) {
+        // User redefinition overrides the stdlib version (never registered).
+        if self.user_shadowed_stdlib.contains(name) {
+            return;
+        }
         let (func_id, _) = self.user_fns[name];
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(self.ptr_type)); // db
@@ -1441,6 +1457,23 @@ impl Codegen {
         // through Monad/Applicative/Alternative trait impls (see compile_app,
         // compile_monadic_yield, compile_monadic_empty). No standalone user
         // function is registered — dispatch is compile-time via monad_info.
+
+        // A user-defined top-level function shadows any same-named stdlib
+        // builtin (compile_app documents this rule). Collect those names up
+        // front so we neither register nor define the stdlib version for them —
+        // the user's declaration then flows through the normal function path
+        // and `user_fns[name]` ends up pointing at the user's code. Without
+        // this, the program type-checks against the user's semantics (inference
+        // binds the user decl after `register_builtins`) but silently runs the
+        // stdlib's.
+        self.user_shadowed_stdlib = module
+            .decls
+            .iter()
+            .filter_map(|decl| match &decl.node {
+                ast::DeclKind::Fun { name, body: Some(_), .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
 
         // Register standard library functions (all as 1-param for proper currying)
         // map and fold are now trait methods (Functor.map, Foldable.fold)
@@ -9676,6 +9709,21 @@ impl Codegen {
                             }
                             return promoted;
                         }
+                    };
+                    // Arena GC: promote the row before pushing it into the
+                    // temp relation. When the primary bind was materialized
+                    // inside enclosing loops (cross join, non-equi where, or a
+                    // compound condition not matched by `match_equi_join`),
+                    // closing those loops below runs `knot_arena_reset_to` per
+                    // iteration, which would free this row before
+                    // `knot_relation_group_by` reads it. Promotion pins it,
+                    // exactly as the yield path does. (A row read from a
+                    // relation is never a promote-safe singleton, so no
+                    // escape-analysis check is needed here.)
+                    let var_val = if !loop_stack.is_empty() {
+                        self.call_rt(builder, "knot_arena_promote", &[var_val])
+                    } else {
+                        var_val
                     };
                     self.call_rt_void(
                         builder,

@@ -1213,6 +1213,28 @@ pub(crate) fn find_field_access_at_offset(
                     }
                 }
             }
+            // Trait default method bodies also contain field accesses
+            // (`r.count`); without this arm a hover there falls back to a
+            // same-named global's signature.
+            DeclKind::Trait { items, .. } => {
+                for item in items {
+                    if let ast::TraitItem::Method { default_body: Some(body), .. } = item {
+                        walk(body, source, offset, &mut best, 0);
+                    }
+                }
+            }
+            // `migrate *rel from … to … using <expr>` — the `using` function is
+            // real user code that can dereference record fields.
+            DeclKind::Migrate { using_fn, .. } => walk(using_fn, source, offset, &mut best, 0),
+            // The `rateLimit <expr>` clause on a route entry is user-edited
+            // code (`{key: \input ctx -> …}`) that dereferences fields.
+            DeclKind::Route { entries, .. } => {
+                for entry in entries {
+                    if let Some(rl) = &entry.rate_limit {
+                        walk(rl, source, offset, &mut best, 0);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1226,10 +1248,17 @@ pub(crate) fn find_field_access_at_offset(
 /// and pipe operators so `p <- filter f *people` and `p <- *src |> filter f`
 /// resolve to `people` / `src`.
 ///
-/// First match wins. In typical knot code, top-level decls bind a given name
-/// at most once, so this is correct in practice; shadowed bindings won't be
-/// distinguished.
-pub(crate) fn resolve_var_to_source(module: &Module, var_name: &str) -> Option<String> {
+/// Only the declaration that encloses `cursor_offset` is searched. The same
+/// variable name (e.g. `p`) is routinely bound in unrelated do-blocks across
+/// different decls; without this scoping the first module-wide binding would
+/// win and callers would attribute the field to the wrong source relation
+/// (bug B74). Within the enclosing decl, first match wins — shadowed bindings
+/// inside a single decl are not distinguished.
+pub(crate) fn resolve_var_to_source(
+    module: &Module,
+    var_name: &str,
+    cursor_offset: usize,
+) -> Option<String> {
     fn pat_binds_var(pat: &ast::Pat, name: &str) -> bool {
         match &pat.node {
             ast::PatKind::Var(n) => n == name,
@@ -1296,6 +1325,12 @@ pub(crate) fn resolve_var_to_source(module: &Module, var_name: &str) -> Option<S
 
     let mut found = None;
     for decl in &module.decls {
+        // Scope resolution to the decl under the cursor. Top-level decls don't
+        // nest, so at most one span contains the offset; any others may bind
+        // the same name from a different source and must be ignored (bug B74).
+        if !(decl.span.start <= cursor_offset && cursor_offset < decl.span.end) {
+            continue;
+        }
         match &decl.node {
             DeclKind::Fun { body: Some(body), .. }
             | DeclKind::View { body, .. }

@@ -222,6 +222,19 @@ impl TypeEnv {
         // run-until-stable loop grows it without bound until the stack
         // overflows. Cyclic aliases are reported as diagnostics by
         // `check_alias_cycles` / type inference before codegen runs.
+        //
+        // `re_resolve_type` only substitutes `Named` *leaves*, so it cannot
+        // repair an alias that *applied* a not-yet-declared parameterized
+        // data type: `type Wrapped = [Box Int]` declared before
+        // `data Box a = ...` resolves the `Box Int` application to
+        // `Named("unknown")` in the first pass, permanently losing the
+        // application structure (head + arguments). To recover it, re-run
+        // `resolve_type` from the alias's original AST (`alias_ast_types`) —
+        // now that every data declaration is registered in `aliases` /
+        // `single_variant_params`, the application resolves to the correct
+        // record/ADT shape (e.g. `value:int` instead of `_value:text`).
+        // Aliases without a stored AST (e.g. multi-variant data types
+        // registered directly as `Adt`) keep the leaf-substitution path.
         let alias_keys: Vec<String> = aliases.keys().cloned().collect();
         for name in &alias_keys {
             let resolved = aliases[name].clone();
@@ -709,6 +722,53 @@ fn value_predicates(
                 data_ctor_decls,
                 seen_aliases,
             ));
+        }
+        // Type application such as `Maybe Nat` or `Result Text Pos`. The
+        // refinement lives on a type *argument*, but the runtime value is
+        // wrapped in one of the type's constructors (`Just {value: x}`,
+        // `Ok {value: x}`, `Err {error: e}`), so applying the inner predicate
+        // to the whole value would compare a constructor against a primitive
+        // and panic. Recurse into each argument and wrap the resulting
+        // predicate in a `case` that unwraps the constructor carrying that
+        // argument and passes for the other variants (`Nothing`, the other
+        // arm of `Result`) — mirroring the `all` wrap used for relations.
+        TypeKind::App { .. } => {
+            // Flatten the left-nested application spine to (head, [args]).
+            let mut head: &Type = ty;
+            let mut args: Vec<&Type> = Vec::new();
+            while let TypeKind::App { func, arg } = &head.node {
+                args.push(arg.as_ref());
+                head = func.as_ref();
+            }
+            args.reverse();
+            if let TypeKind::Named(head_name) = &head.node {
+                for (idx, arg_ty) in args.iter().enumerate() {
+                    // (constructor, payload field) carrying this positional
+                    // argument, for the built-in generics whose shape is
+                    // fixed. Unknown heads collect nothing (safe fallback).
+                    let ctor_field = match (head_name.as_str(), idx) {
+                        ("Maybe", 0) => Some(("Just", "value")),
+                        ("Result", 0) => Some(("Err", "error")),
+                        ("Result", 1) => Some(("Ok", "value")),
+                        _ => None,
+                    };
+                    let Some((ctor, field)) = ctor_field else {
+                        continue;
+                    };
+                    for (label, pred) in value_predicates(
+                        arg_ty,
+                        refined_types,
+                        alias_ast_types,
+                        data_ctor_decls,
+                        seen_aliases,
+                    ) {
+                        out.push((
+                            label,
+                            synth_ctor_field_case(ctor, field, pred, arg_ty.span),
+                        ));
+                    }
+                }
+            }
         }
         _ => {}
     }

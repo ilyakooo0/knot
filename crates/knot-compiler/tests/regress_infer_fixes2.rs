@@ -451,6 +451,44 @@ main = do
     );
 }
 
+#[test]
+fn fetch_bare_nullary_route_constructor_accepted() {
+    // B37: `fetch url Ctor` with a bare nullary route constructor was
+    // spuriously rejected in inference — `record_arg` fell back to the
+    // Constructor node itself, whose inferred type is the ADT (`Api`),
+    // then unified against the empty expected record ("expected {}, found
+    // Api"). fetch_ctor_name and compile_fetch both already support the
+    // form; only inference rejected it, and only for multi-endpoint routes.
+    let diags = check_src(
+        r#"route Api where
+  GET /health -> {status: Text} = Health
+  GET /users/{id: Int} -> {name: Text} = GetUser
+
+main = do
+  r <- fetch "http://localhost:1" Health
+  yield {}
+"#,
+    );
+    assert_clean(&diags);
+}
+
+#[test]
+fn fetchwith_bare_nullary_route_constructor_accepted() {
+    // Same bare-constructor form, through fetchWith (which adds an
+    // options argument before the constructor).
+    let diags = check_src(
+        r#"route Api where
+  GET /health -> {status: Text} = Health
+  GET /users/{id: Int} -> {name: Text} = GetUser
+
+main = do
+  r <- fetchWith "http://localhost:1" {headers: [{name: "X-A", value: "b"}]} Health
+  yield {}
+"#,
+    );
+    assert_clean(&diags);
+}
+
 // A `race`/`fork` result's effect-union row must not be laundered through a
 // value annotated with fewer effects. Passing `race (console) (console)` to a
 // parameter typed `IO {}` is an effect-soundness violation: the union resolves

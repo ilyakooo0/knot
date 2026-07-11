@@ -13023,6 +13023,132 @@ fn with_savepoint_rollback<T>(db_ref: &KnotDb, sp: &str, f: impl FnOnce() -> T) 
     }
 }
 
+/// A referential `BEFORE DELETE` trigger suspended for the duration of a full
+/// relation replace (bug B24). `create_sql` re-creates it verbatim;
+/// `sub_table`/`sub_col`/`sup_col` drive the post-replace whole-relation orphan
+/// scan that stands in for the per-row check we suspended.
+struct SuspendedDelTrigger {
+    create_sql: String,
+    sub_table: String,
+    sub_col: String,
+    sup_col: String,
+}
+
+/// Extract `(sub_table, sub_col, sup_col)` from a generated referential
+/// `BEFORE DELETE` trigger body. Every such trigger `knot_constraint_register`
+/// emits has the fixed shape
+/// `... WHEN EXISTS (SELECT 1 FROM <sub_table> WHERE <sub_col> = OLD.<sup_col>) BEGIN ...`
+/// with each identifier double-quoted. Returns `None` for any unrecognized shape
+/// (e.g. a hand-written trigger) so the caller leaves that trigger in place
+/// rather than dropping a guard it can't reconstruct a check for.
+fn parse_del_trigger(sql: &str) -> Option<(String, String, String)> {
+    // Only look at the WHEN clause (before BEGIN) so a RAISE message that
+    // happened to contain our markers can't confuse the parse.
+    let head = sql.split(" BEGIN ").next().unwrap_or(sql);
+    let after_from = head.split_once("SELECT 1 FROM ")?.1;
+    let (sub_table, rest) = after_from.split_once(" WHERE ")?;
+    let (sub_col, rest) = rest.split_once(" = OLD.")?;
+    let sup_col = rest.split_once(')')?.0;
+    let sub_table = sub_table.trim();
+    let sub_col = sub_col.trim();
+    let sup_col = sup_col.trim();
+    if sub_table.is_empty() || sub_col.is_empty() || sup_col.is_empty() {
+        return None;
+    }
+    Some((sub_table.to_string(), sub_col.to_string(), sup_col.to_string()))
+}
+
+/// Suspend (drop) every referential `BEFORE DELETE` trigger guarding `table` and
+/// return them so the caller can restore + revalidate after re-inserting.
+///
+/// A full replace is DELETE-all + INSERT-all: the per-row `BEFORE DELETE` guard
+/// would abort on the transient missing-key state even when the replacement
+/// re-inserts the referenced key (bug B24). We emulate a deferred constraint —
+/// drop the triggers here, let the caller DELETE+INSERT, then re-create them and
+/// run one whole-relation orphan scan per trigger (`restore_del_triggers`).
+/// Triggers on the subset side (`BEFORE INSERT`/uniqueness) are untouched, so a
+/// replacement that reintroduces a genuine violation is still rejected.
+fn suspend_del_triggers(conn: &Connection, table: &str) -> Vec<SuspendedDelTrigger> {
+    let pairs: Vec<(String, String)> = {
+        let mut stmt = match conn.prepare(
+            "SELECT name, sql FROM sqlite_master \
+             WHERE type = 'trigger' AND tbl_name = ?1 AND sql LIKE '%BEFORE DELETE%'",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let iter = match stmt.query_map([table], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        }) {
+            Ok(it) => it,
+            Err(_) => return Vec::new(),
+        };
+        iter.flatten().collect()
+    };
+
+    let mut suspended = Vec::new();
+    for (name, sql) in pairs {
+        let Some((sub_table, sub_col, sup_col)) = parse_del_trigger(&sql) else {
+            continue;
+        };
+        let drop_sql = format!("DROP TRIGGER IF EXISTS {};", quote_ident(&name));
+        debug_sql(&drop_sql);
+        if conn.execute_batch(&drop_sql).is_ok() {
+            suspended.push(SuspendedDelTrigger { create_sql: sql, sub_table, sub_col, sup_col });
+        }
+    }
+    suspended
+}
+
+/// Re-create the suspended `BEFORE DELETE` triggers, then run the deferred
+/// whole-relation orphan scan for each. Panics — rolling back the enclosing
+/// `knot_replace` savepoint via `with_savepoint_rollback` — if the replacement
+/// left any subset row pointing at a superset key that no longer exists, the
+/// same violation the per-row trigger would have caught. `sup_table` is the
+/// (unquoted) superset table being replaced.
+fn restore_del_triggers(conn: &Connection, sup_table: &str, suspended: &[SuspendedDelTrigger]) {
+    // Re-create first so the table is fully guarded again regardless of the
+    // scan outcome below (and so a rollback on scan failure restores the same
+    // trigger set the DROPs removed).
+    for t in suspended {
+        debug_sql(&t.create_sql);
+        conn.execute_batch(&t.create_sql)
+            .expect("knot runtime: failed to restore delete trigger after replace");
+    }
+    let sup_q = quote_ident(sup_table);
+    for t in suspended {
+        // Orphan iff some non-NULL subset key has no matching superset row —
+        // the whole-relation form of the per-row `EXISTS (... = OLD.key)` guard.
+        let scan = format!(
+            "SELECT EXISTS(SELECT 1 FROM {sub} AS sub \
+             WHERE sub.{sub_col} IS NOT NULL \
+             AND NOT EXISTS (SELECT 1 FROM {sup} AS sup WHERE sup.{sup_col} = sub.{sub_col}));",
+            sub = t.sub_table,
+            sub_col = t.sub_col,
+            sup = sup_q,
+            sup_col = t.sup_col,
+        );
+        debug_sql(&scan);
+        let orphaned: i64 = conn
+            .query_row(&scan, [], |r| r.get(0))
+            .expect("knot runtime: orphan scan failed after replace");
+        if orphaned != 0 {
+            let rel = |s: &str| {
+                let s = s.trim_matches('"');
+                s.strip_prefix("_knot_").unwrap_or(s).to_string()
+            };
+            let field = |s: &str| s.trim_matches('"').to_string();
+            panic!(
+                "knot runtime: subset constraint violated: cannot replace *{sup} while *{sub}.{sf} references a removed *{sup}.{spf} value",
+                sup = rel(sup_table),
+                sub = rel(&t.sub_table),
+                sf = field(&t.sub_col),
+                spf = field(&t.sup_col),
+            );
+        }
+    }
+}
+
 /// Write a relation to a source (replaces all rows).
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_source_write(
@@ -13052,6 +13178,15 @@ pub extern "C-unwind" fn knot_source_write(
     let table_name = format!("_knot_{}", name);
 
     with_savepoint_rollback(db_ref, "knot_replace", || {
+        // A full replace is DELETE-all + INSERT-all. Suspend the per-row
+        // referential BEFORE DELETE triggers guarding this (superset) table so
+        // they don't abort on the transient missing-key state when the
+        // replacement re-inserts the referenced key; `restore_del_triggers`
+        // re-creates them and runs a whole-relation orphan scan afterwards to
+        // preserve the guarantee for replacements that genuinely drop a
+        // referenced key (bug B24).
+        let suspended = suspend_del_triggers(&db_ref.conn, &table_name);
+
         if is_adt_schema(schema) {
             let table = quote_ident(&table_name);
             let delete_sql = format!("DELETE FROM {};", table);
@@ -13097,6 +13232,11 @@ pub extern "C-unwind" fn knot_source_write(
             // Insert all rows
             write_record_rows(&db_ref.conn, &table_name, &rec, rows);
         }
+
+        // Re-enable the referential BEFORE DELETE triggers and verify the
+        // replacement didn't orphan any referencing rows (panics -> savepoint
+        // rollback if it did).
+        restore_del_triggers(&db_ref.conn, &table_name, &suspended);
     });
 
     db_ref
@@ -21004,6 +21144,145 @@ mod _fk_migration_listen_tests {
         // Just {value: null} < Just {value: 5} (Nothing < Just x)
         assert_eq!(compare_values(mk_just(-1), mk_just(5)), std::cmp::Ordering::Less);
         assert_eq!(compare_values(mk_just(5), mk_just(-1)), std::cmp::Ordering::Greater);
+    }
+
+    // ── Fix B24: a full replace (`set`/`replace`) is DELETE-all + INSERT-all. ──
+    // The per-row BEFORE DELETE referential trigger must not abort on the ──
+    // transient missing-key state when the replacement re-inserts the key. ──
+
+    /// Build a `*people` relation value (`name: Text`) from a list of names.
+    fn people_relation(names: &[&str]) -> *mut Value {
+        let rows: Vec<*mut Value> = names
+            .iter()
+            .map(|n| {
+                alloc(Value::Record(vec![RecordField {
+                    name: "name".into(),
+                    value: knot_value_text(n.as_ptr(), n.len()),
+                }]))
+            })
+            .collect();
+        alloc(Value::Relation(rows))
+    }
+
+    /// Full-replace `*people` with `names` via the runtime write path.
+    fn replace_people(db: *mut c_void, names: &[&str]) {
+        let rel = people_relation(names);
+        let name = "people";
+        let schema = "name:text";
+        knot_source_write(db, name.as_ptr(), name.len(), schema.as_ptr(), schema.len(), rel);
+    }
+
+    fn people_orders_db() -> *mut c_void {
+        let db = test_db();
+        let conn = conn_of(db);
+        conn.execute_batch(
+            r#"CREATE TABLE "_knot_people" ("name" TEXT);
+               CREATE TABLE "_knot_orders" ("customer" TEXT);"#,
+        )
+        .unwrap();
+        // *orders.customer <= *people.name
+        register(db, "orders", "customer", "people", "name");
+        conn.execute_batch(
+            r#"INSERT INTO "_knot_people" VALUES ('alice'), ('bob');
+               INSERT INTO "_knot_orders" VALUES ('alice');"#,
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn replace_reinserting_referenced_key_succeeds() {
+        // `alice` is referenced by an order. Replacing *people with a set that
+        // still contains `alice` must succeed — the old build aborted on the
+        // DELETE-all phase even though the INSERT re-added `alice` (bug B24).
+        let db = people_orders_db();
+        let conn = conn_of(db);
+
+        replace_people(db, &["alice", "bob", "carol"]);
+
+        let names: Vec<String> = conn
+            .prepare(r#"SELECT "name" FROM "_knot_people" ORDER BY "name""#)
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(names, vec!["alice", "bob", "carol"]);
+
+        // The suspended delete trigger is restored and still enforced:
+        // deleting the still-referenced `alice` directly is rejected.
+        let del = conn.execute(r#"DELETE FROM "_knot_people" WHERE "name" = 'alice'"#, []);
+        assert!(del.is_err(), "referential delete trigger must be restored after replace");
+    }
+
+    #[test]
+    fn replace_dropping_referenced_key_still_rejected() {
+        // The deferred whole-relation orphan scan must still reject a
+        // replacement that genuinely removes a referenced key — no silent
+        // orphaning once the per-row trigger is suspended.
+        let db = people_orders_db();
+        let conn = conn_of(db);
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            replace_people(db, &["bob", "carol"]); // drops referenced `alice`
+        }));
+        assert!(res.is_err(), "replace that orphans a referenced key must be rejected");
+
+        // The savepoint rolled back: `alice` is still present, order intact.
+        let alice: i64 = conn
+            .query_row(
+                r#"SELECT COUNT(*) FROM "_knot_people" WHERE "name" = 'alice'"#,
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(alice, 1, "rejected replace must roll back, leaving alice present");
+
+        // Triggers restored after rollback: a valid replace still works.
+        replace_people(db, &["alice", "bob", "carol"]);
+        let count: i64 = conn
+            .query_row(r#"SELECT COUNT(*) FROM "_knot_people""#, [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn replace_reinserting_key_shared_by_two_subsets_succeeds() {
+        // A superset referenced by two subsets has two BEFORE DELETE triggers;
+        // both must be suspended and restored across the replace.
+        let db = test_db();
+        let conn = conn_of(db);
+        conn.execute_batch(
+            r#"CREATE TABLE "_knot_people" ("name" TEXT);
+               CREATE TABLE "_knot_orders" ("customer" TEXT);
+               CREATE TABLE "_knot_comments" ("author" TEXT);"#,
+        )
+        .unwrap();
+        register(db, "orders", "customer", "people", "name");
+        register(db, "comments", "author", "people", "name");
+        conn.execute_batch(
+            r#"INSERT INTO "_knot_people" VALUES ('alice'), ('bob');
+               INSERT INTO "_knot_orders" VALUES ('alice');
+               INSERT INTO "_knot_comments" VALUES ('bob');"#,
+        )
+        .unwrap();
+
+        // Both `alice` and `bob` are referenced; the replacement keeps both.
+        replace_people(db, &["alice", "bob", "carol"]);
+        let count: i64 = conn
+            .query_row(r#"SELECT COUNT(*) FROM "_knot_people""#, [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+
+        // Both triggers restored: each still guards its own reference.
+        assert!(
+            conn.execute(r#"DELETE FROM "_knot_people" WHERE "name" = 'alice'"#, []).is_err(),
+            "orders delete trigger must be restored"
+        );
+        assert!(
+            conn.execute(r#"DELETE FROM "_knot_people" WHERE "name" = 'bob'"#, []).is_err(),
+            "comments delete trigger must be restored"
+        );
     }
 }
 

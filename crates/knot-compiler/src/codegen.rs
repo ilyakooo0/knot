@@ -5625,7 +5625,7 @@ impl Codegen {
             && env.bindings.contains_key(name) {
                 let compiled_args: Vec<Value> = args
                     .iter()
-                    .map(|a| self.compile_expr(builder, a, env, db))
+                    .map(|a| self.compile_arg_expr(builder, a, env, db))
                     .collect();
                 let func_val = self.compile_expr(builder, func_expr, env, db);
                 let mut result = func_val;
@@ -6467,7 +6467,7 @@ impl Codegen {
 
         let compiled_args: Vec<Value> = args
             .iter()
-            .map(|a| self.compile_expr(builder, a, env, db))
+            .map(|a| self.compile_arg_expr(builder, a, env, db))
             .collect();
 
         match &func_expr.node {
@@ -8448,6 +8448,42 @@ impl Codegen {
 
         // Create IO value: IO(fn_ptr, env)
         self.call_rt(builder, "knot_io_new", &[fn_addr, env_val])
+    }
+
+    /// Compile an expression in *argument* position, where the value is handed
+    /// to a callee instead of being executed here.
+    ///
+    /// `Set`/`ReplaceSet` are typed `IO {} {}`, but their `compile_expr` arms
+    /// emit the write inline. That is correct for a do-block *statement* (the
+    /// write is meant to run at that point) and wrong for an argument: in
+    /// `when False (*rel = …)` the argument is compiled while building the call,
+    /// so the write fired no matter what the guard said — the callee only ever
+    /// received the already-performed write's unit result. Wrap the write in a
+    /// single-statement IO thunk instead, which is exactly what a `do`-block
+    /// argument (`when False do *rel = …`) already compiles to, and why that
+    /// form was unaffected. The callee now decides: `when False` drops the
+    /// thunk, `when True` returns it and the caller's `knot_io_run` executes it.
+    ///
+    /// Mirrors the `Atomic`-in-`let` case above, which defers for the same
+    /// reason.
+    fn compile_arg_expr(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        expr: &ast::Expr,
+        env: &mut Env,
+        db: Value,
+    ) -> Value {
+        if matches!(
+            &expr.node,
+            ast::ExprKind::Set { .. } | ast::ExprKind::ReplaceSet { .. }
+        ) {
+            let do_stmts = vec![ast::Spanned::new(
+                ast::StmtKind::Expr(expr.clone()),
+                expr.span,
+            )];
+            return self.compile_io_do_as_thunk(builder, &do_stmts, env, db);
+        }
+        self.compile_expr(builder, expr, env, db)
     }
 
     /// Compile IO do-block body eagerly (runs IO actions inline).

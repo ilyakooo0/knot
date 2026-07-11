@@ -741,9 +741,15 @@ fn is_sql_compilable(stmts: &[Stmt], source_vars: &HashSet<String>) -> bool {
                     return false;
                 }
             }
-            StmtKind::Let { .. } => {
+            StmtKind::Let { pat, .. } => {
                 // Let statements are handled by codegen's `analyze_sql_plan`
                 // (which substitutes let-bound values as SQL parameters).
+                // Add the let-bound variable name to bind_vars so that
+                // subsequent Where clauses can reference it and stay
+                // SQL-compilable.
+                if let PatKind::Var(name) = &pat.node {
+                    bind_vars.insert(name.as_str());
+                }
             }
             _ => return false,
         }

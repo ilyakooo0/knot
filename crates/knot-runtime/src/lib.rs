@@ -11980,13 +11980,20 @@ pub extern "C-unwind" fn knot_source_query_value(
                     } else {
                         // Int columns are stored as TEXT COLLATE KNOT_INT, so a
                         // MIN/MAX over an Int column comes back as Text. Parse
-                        // it back to a numeric value (same logic as query_sum).
+                        // it back to an Int. A value that doesn't fit i64 is a
+                        // legacy BigInt-era value the runtime's i64 ints cannot
+                        // represent — panic with the same clear migration
+                        // message as `read_sql_column` rather than silently
+                        // degrading to a lossy Float.
                         if let Ok(n) = s.parse::<i64>() {
                             Ok(alloc_int(n))
-                        } else if let Ok(f) = s.parse::<f64>() {
-                            Ok(alloc_float(f))
                         } else {
-                            Ok(alloc(Value::Text(Arc::from(s))))
+                            panic!(
+                                "knot runtime: integer value '{}' does not fit in a 64-bit Int. \
+                                 This database was likely written by an older Knot build with unbounded \
+                                 integers; values beyond ±9223372036854775807 cannot be read.",
+                                s
+                            );
                         }
                     }
                 }

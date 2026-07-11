@@ -672,3 +672,70 @@ main = println (show (now + 1))
         "bare `now` must read the user constant (expected 6), got:\n{stdout}"
     );
 }
+
+// ── when/unless guards not gating relation writes ─────────────────
+//
+// `Set`/`ReplaceSet` are typed `IO {} {}`, but their `compile_expr` arms emit
+// the write inline. In *statement* position that is right (the write is meant
+// to run); in *argument* position it fired while the call's arguments were
+// being built, so `when False (*rel = …)` performed the write and handed `when`
+// only the unit result — the guard had nothing left to suppress. The `do`-block
+// form (`when False do *rel = …`) was unaffected, because a do-block argument
+// already compiles to a deferred IO thunk. Arguments now defer writes the same
+// way, so the callee decides whether to run them.
+
+#[test]
+fn when_false_does_not_run_relation_write() {
+    // `when false` / `unless true` must leave the relation untouched, whether
+    // the write is a bare argument or a `do`-block, and whether the guard is a
+    // literal or a runtime value.
+    let (stdout, stderr, ok) = compile_and_run(
+        "when_guard_gates_write",
+        r#"*items : [{a: Int}]
+
+flag = false
+
+main = do
+  replace *items = [{a: 1}, {a: 2}]
+  when false (replace *items = [{a: 99}])
+  unless true (replace *items = [])
+  when flag (*items = union *items [{a: 99}])
+  when false do
+    replace *items = [{a: 99}]
+  rows <- *items
+  println ("count: " ++ show (count rows))
+"#,
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("count: 2"),
+        "a falsy when/unless guard must suppress the write (expected 2 rows), got:\n{stdout}"
+    );
+}
+
+#[test]
+fn when_true_still_runs_relation_write_exactly_once() {
+    // The other half of the fix: deferring the write must not drop it, or run
+    // it twice. The append form makes a double-run observable — running the
+    // thunk twice would add two rows instead of one.
+    let (stdout, stderr, ok) = compile_and_run(
+        "when_guard_runs_write_once",
+        r#"*items : [{a: Int}]
+
+flag = true
+
+main = do
+  replace *items = [{a: 1}]
+  when true (*items = union *items [{a: 2}])
+  unless false (*items = union *items [{a: 3}])
+  when flag (*items = union *items [{a: 4}])
+  rows <- *items
+  println ("count: " ++ show (count rows))
+"#,
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("count: 4"),
+        "a truthy when/unless guard must run the write exactly once (expected 4 rows), got:\n{stdout}"
+    );
+}

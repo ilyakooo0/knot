@@ -12792,12 +12792,21 @@ fn adt_row_to_params(
                     "knot runtime: unknown constructor tag '{}' in ADT source write (known: {})",
                     tag, adt.constructors.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
                 ));
-            let ctor_field_names: HashSet<&str> = ctor
-                .fields.iter().map(|f| f.name.as_str()).collect();
+            // Field name → the column type *this* constructor declares for it.
+            // A name reused across constructors can carry a different type in
+            // each (`#Boxed:v=json|Labeled:v=tag`), and `all_fields` keeps only
+            // the first-declared one. Encoding with that type rewrites the
+            // value — `value_to_sqlite` picks tag-text vs JSON off the ColType,
+            // so a `tag` pushed through the JSON encoder reads back as a
+            // Constructor whose tag is the whole JSON blob, and a record pushed
+            // through a scalar encoder panics. The read path already decodes
+            // with the declaring constructor's type, so write must match it.
+            let ctor_field_tys: HashMap<&str, ColType> =
+                ctor.fields.iter().map(|f| (f.name.as_str(), f.ty)).collect();
 
             // For each field in the wide table
             for field in &adt.all_fields {
-                if ctor_field_names.contains(field.name.as_str()) {
+                if let Some(&ty) = ctor_field_tys.get(field.name.as_str()) {
                     // This field belongs to this constructor — extract from payload
                     let payload_ref = unsafe { as_ref(*payload) };
                     match payload_ref {
@@ -12805,7 +12814,7 @@ fn adt_row_to_params(
                             let val = fields
                                 .iter()
                                 .find(|f| &*f.name == field.name.as_str())
-                                .map(|f| value_to_sqlite(f.value, field.ty))
+                                .map(|f| value_to_sqlite(f.value, ty))
                                 .unwrap_or(rusqlite::types::Value::Null);
                             params.push(val);
                         }
@@ -21954,6 +21963,168 @@ mod _fk_migration_listen_tests {
             conn.execute(r#"DELETE FROM "_knot_people" WHERE "name" = 'bob'"#, []).is_err(),
             "comments delete trigger must be restored"
         );
+    }
+}
+
+/// A field name reused across constructors with *different* column types must
+/// be written with the type its own constructor declares.
+///
+/// `data Item = Labeled {v: Color} | Boxed {v: {x: Int}}` compiles to the
+/// descriptor `#Labeled:v=tag|Boxed:v=json` — the shared column `v` is a `tag`
+/// for `Labeled` and `json` for `Boxed`. The write path used to encode every
+/// row with the *first-declared* type (`all_fields` keeps only that one), while
+/// the read path decodes with the declaring constructor's type. The mismatch
+/// corrupts in both declaration orders.
+#[cfg(test)]
+mod _adt_ctor_field_type_tests {
+    use super::*;
+
+    fn test_db() -> *mut c_void {
+        let conn = Connection::open_in_memory().unwrap();
+        // Same collation knot_db_open registers — Int columns are TEXT
+        // with COLLATE KNOT_INT.
+        conn.create_collation("KNOT_INT", |a: &str, b: &str| {
+            match (a.parse::<i64>(), b.parse::<i64>()) {
+                (Ok(pa), Ok(pb)) => pa.cmp(&pb),
+                (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+                (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+                (Err(_), Err(_)) => a.cmp(b),
+            }
+        })
+        .unwrap();
+        // `knot_source_init` consults the migration ledger that `knot_db_open`
+        // creates; a bare in-memory connection needs it too.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _knot_schema (name TEXT PRIMARY KEY, schema TEXT NOT NULL);",
+        )
+        .unwrap();
+        Box::into_raw(Box::new(KnotDb {
+            conn,
+            atomic_depth: std::cell::Cell::new(0),
+            indexed: RefCell::new(HashSet::new()),
+        })) as *mut c_void
+    }
+
+    /// `Labeled {v: <Color>}` — `v` holds a nullary constructor (`tag` column).
+    fn labeled_row(color: &str) -> *mut Value {
+        alloc(Value::Constructor(
+            intern_str("Labeled"),
+            alloc(Value::Record(vec![RecordField {
+                name: intern_str("v"),
+                value: alloc(Value::Constructor(intern_str(color), alloc(Value::Unit))),
+            }])),
+        ))
+    }
+
+    /// `Boxed {v: {x: Int}}` — `v` holds a record (`json` column).
+    fn boxed_row(x: i64) -> *mut Value {
+        alloc(Value::Constructor(
+            intern_str("Boxed"),
+            alloc(Value::Record(vec![RecordField {
+                name: intern_str("v"),
+                value: alloc(Value::Record(vec![RecordField {
+                    name: intern_str("x"),
+                    value: alloc_int(x),
+                }])),
+            }])),
+        ))
+    }
+
+    /// Write `rows` to an ADT source under `schema`, then read them back.
+    fn adt_roundtrip(schema: &str, rows: Vec<*mut Value>) -> Vec<*mut Value> {
+        let db = test_db();
+        let name = "items";
+        knot_source_init(db, name.as_ptr(), name.len(), schema.as_ptr(), schema.len());
+        let rel = alloc(Value::Relation(rows));
+        knot_source_write(db, name.as_ptr(), name.len(), schema.as_ptr(), schema.len(), rel);
+        let back = knot_source_read(db, name.as_ptr(), name.len(), schema.as_ptr(), schema.len());
+        match unsafe { as_ref(back) } {
+            Value::Relation(rows) => rows.clone(),
+            other => panic!("expected a relation, got {}", type_name_of(other)),
+        }
+    }
+
+    fn type_name_of(v: &Value) -> &'static str {
+        match v {
+            Value::Relation(_) => "relation",
+            Value::Record(_) => "record",
+            Value::Constructor(_, _) => "constructor",
+            _ => "other",
+        }
+    }
+
+    /// The `v` field of the row tagged `tag`.
+    fn field_v(rows: &[*mut Value], tag: &str) -> *mut Value {
+        let row = *rows
+            .iter()
+            .find(|r| matches!(unsafe { as_ref(**r) }, Value::Constructor(t, _) if &**t == tag))
+            .unwrap_or_else(|| panic!("no row tagged `{}` came back", tag));
+        match unsafe { as_ref(row) } {
+            Value::Constructor(_, payload) => match unsafe { as_ref(*payload) } {
+                Value::Record(fields) => {
+                    fields.iter().find(|f| &*f.name == "v").expect("field `v` missing").value
+                }
+                _ => panic!("`{}` payload is not a record", tag),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    /// `Labeled`'s `v` must come back as the bare constructor `Red`.
+    fn assert_labeled_intact(rows: &[*mut Value]) {
+        match unsafe { as_ref(field_v(rows, "Labeled")) } {
+            Value::Constructor(tag, payload) => {
+                assert_eq!(
+                    &**tag, "Red",
+                    "`Labeled.v` must round-trip as the tag `Red`, not as a re-encoded blob"
+                );
+                assert!(matches!(unsafe { as_ref(*payload) }, Value::Unit));
+            }
+            other => panic!("`Labeled.v` must be a Constructor, got {}", type_name_of(other)),
+        }
+    }
+
+    /// `Boxed`'s `v` must come back as the record `{x: 1}`.
+    fn assert_boxed_intact(rows: &[*mut Value]) {
+        match unsafe { as_ref(field_v(rows, "Boxed")) } {
+            Value::Record(fields) => {
+                let x = fields.iter().find(|f| &*f.name == "x").expect("`x` missing");
+                assert!(
+                    matches!(unsafe { as_ref(x.value) }, Value::Int(1)),
+                    "`Boxed.v.x` must round-trip as the Int 1"
+                );
+            }
+            other => panic!("`Boxed.v` must be a Record, got {}", type_name_of(other)),
+        }
+    }
+
+    #[test]
+    fn conflicting_field_roundtrips_with_tag_declared_first() {
+        // `tag` is the first-declared type for `v`. Writing `Boxed`'s record
+        // through the `tag` encoder hit `value_to_sqlite`'s catch-all and
+        // panicked ("cannot convert to SQL").
+        let rows = adt_roundtrip(
+            "#Labeled:v=tag|Boxed:v=json",
+            vec![labeled_row("Red"), boxed_row(1)],
+        );
+        assert_eq!(rows.len(), 2);
+        assert_labeled_intact(&rows);
+        assert_boxed_intact(&rows);
+    }
+
+    #[test]
+    fn conflicting_field_roundtrips_with_json_declared_first() {
+        // Reverse order: `json` is first-declared, so `Labeled`'s `Red` tag was
+        // written through the JSON encoder and read back — with `Labeled`'s
+        // real `tag` type — as Constructor("{\"__knot_ctor\":…}"). Silent
+        // corruption: no panic, just a mangled tag.
+        let rows = adt_roundtrip(
+            "#Boxed:v=json|Labeled:v=tag",
+            vec![boxed_row(1), labeled_row("Red")],
+        );
+        assert_eq!(rows.len(), 2);
+        assert_labeled_intact(&rows);
+        assert_boxed_intact(&rows);
     }
 }
 

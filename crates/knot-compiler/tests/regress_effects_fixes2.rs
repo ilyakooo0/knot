@@ -167,6 +167,62 @@ main = do
     assert_has_error(&diags, "IO effects are not allowed inside atomic blocks");
 }
 
+#[test]
+fn impl_method_param_shadows_io_builtin() {
+    // `pretty now = show now` — the method param `now` must shadow the
+    // nullary `now` clock builtin. Pre-fix the param was not pushed as a
+    // shadowing binder, so `now` in the body resolved to the builtin and
+    // poisoned `pretty` with a spurious `{clock}` effect; calling it inside
+    // `atomic` then tripped the IO-in-atomic gate.
+    let diags = effect_diags(
+        r#"*items : [{n: Int}]
+
+trait Pretty a where
+  pretty : a -> Text
+
+impl Pretty Int where
+  pretty now = show now
+
+main = do
+  r <- atomic (do
+    rows <- *items
+    let s = pretty 1
+    yield {})
+  yield {}
+"#,
+    );
+    assert_no_error(&diags, "IO effects are not allowed inside atomic blocks");
+    assert_no_diags(&diags);
+}
+
+#[test]
+fn trait_default_param_shadows_io_builtin() {
+    // Same shadowing rule for a trait *default* body's params: the default
+    // `pretty now = show now` (param `now`) is walked as part of the method
+    // union and must not contribute a spurious `{clock}` effect. The impl
+    // uses a benign param so only the default exercises the shadowing path.
+    let diags = effect_diags(
+        r#"*items : [{n: Int}]
+
+trait Pretty a where
+  pretty : a -> Text
+  pretty now = show now
+
+impl Pretty Int where
+  pretty x = show x
+
+main = do
+  r <- atomic (do
+    rows <- *items
+    let s = pretty 1
+    yield {})
+  yield {}
+"#,
+    );
+    assert_no_error(&diags, "IO effects are not allowed inside atomic blocks");
+    assert_no_diags(&diags);
+}
+
 // ── 6. Let-bound lambda referenced by name carries effects ──────────
 
 #[test]

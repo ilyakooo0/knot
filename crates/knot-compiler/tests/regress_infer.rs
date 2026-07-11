@@ -500,6 +500,32 @@ main = f
     );
 }
 
+#[test]
+fn if_widening_does_not_launder_bound_provided_var() {
+    // B10: `act` is a fresh param that `g act` pins to `IO {} {}`. Using it as
+    // one branch of an `if` whose other branch has `console` must NOT overwrite
+    // `act`'s binding with the widened `IO {console} {}`. Before the fix, the
+    // widening arm relabelled `act` to `IO {console} {}`, so the later
+    // `check act` (which also requires `IO {} {}`) spuriously failed — the
+    // earlier `g act` obligation was discharged against the narrower binding
+    // and never revisited. `act` must stay `IO {} {}`, so this type-checks.
+    let src = r#"g : IO {} {} -> IO {} {}
+g = \a -> a
+check : IO {} {} -> IO {} {}
+check = \a -> a
+runIt = \act -> do
+  first <- g act
+  logIt <- if true then println "hi" else act
+  check act
+"#;
+    let diags = check_src(src);
+    assert!(
+        diags.is_empty(),
+        "widening must not launder the bound provided var: {:?}",
+        diags
+    );
+}
+
 // ── 10. Unit-composition guard must cover polymorphic unit variables ──
 
 #[test]

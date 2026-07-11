@@ -10017,6 +10017,54 @@ fn json_encode_value(db: *mut c_void, v: *mut Value) -> String {
     }
 }
 
+/// Estimate the JSON-serialized byte length of a `Relation` response
+/// *without* materializing the full string, so an oversized response can
+/// be rejected before `json_encode_value` allocates it in full.
+///
+/// The listen response path historically checked `json.len() > max` only
+/// *after* `json_encode_value` had already built the entire string — a
+/// post-hoc guard, not a memory bound: a handler returning a multi-GB
+/// relation OOMs the server before the length check ever runs. The
+/// inbound request path, by contrast, caps while streaming the body. This
+/// closes that asymmetry for the common OOM case — a handler returning a
+/// large source relation.
+///
+/// Estimation samples up to `SAMPLE_ROWS` rows, encodes each to measure
+/// its real serialized length (so any custom `ToJSON` impl is respected
+/// via `json_encode_value`), and extrapolates `avg_row_len * row_count`
+/// plus the enclosing `[`/`]` brackets and inter-row `,` framing.
+/// Encoding a bounded sample is itself bounded, so the estimate can't OOM.
+///
+/// Returns `None` for non-`Relation` values — ordinary handler output
+/// (records, scalars) is bounded and still covered by the precise
+/// post-encode cap that follows the call sites.
+fn estimate_relation_json_size(db: *mut c_void, v: *mut Value) -> Option<u64> {
+    const SAMPLE_ROWS: usize = 16;
+    let rows = match unsafe { as_ref(v) } {
+        Value::Relation(rows) => rows,
+        _ => return None,
+    };
+    let row_count = rows.len() as u64;
+    if row_count == 0 {
+        return Some(2); // "[]"
+    }
+    let sample_n = rows.len().min(SAMPLE_ROWS);
+    let mut sample_bytes: u64 = 0;
+    for row in rows.iter().take(sample_n) {
+        sample_bytes =
+            sample_bytes.saturating_add(json_encode_value(db, *row).len() as u64);
+    }
+    // Round the per-row average up so the estimate never undershoots the
+    // true size purely from integer truncation (ceil division; sample_n ≥ 1).
+    let avg_row = sample_bytes.saturating_add(sample_n as u64 - 1) / sample_n as u64;
+    // row_count rows, (row_count - 1) commas between them, 2 brackets.
+    let estimate = avg_row
+        .saturating_mul(row_count)
+        .saturating_add(row_count.saturating_sub(1))
+        .saturating_add(2);
+    Some(estimate)
+}
+
 /// toJson(value) — convert any Knot value to its JSON text representation
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_json_encode(v: *mut Value) -> *mut Value {
@@ -16798,6 +16846,41 @@ fn http_serve_loop(
                                     return;
                                 }
                             };
+                            // Pre-encoding size guard for Relation responses.
+                            // The cap below (`json.len() > max`) only fires
+                            // *after* `json_encode_value` materializes the
+                            // whole string — a post-hoc guard, not a memory
+                            // bound — so a handler returning a multi-GB
+                            // relation OOMs the server before that check runs.
+                            // Estimate the serialized size from a row sample
+                            // and reject with 413 *before* encoding when the
+                            // estimate exceeds the cap. Non-Relation values
+                            // fall through to the precise post-encode cap.
+                            let max = http_max_body_bytes();
+                            let est = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                estimate_relation_json_size(db, body_field)
+                            }))
+                            .unwrap_or(None);
+                            if let Some(est) = est
+                                && est > max
+                            {
+                                    log_error!(
+                                        "[HTTP] estimated response body ~{} bytes exceeds {} byte limit; returning 413",
+                                        est, max
+                                    );
+                                    let body = "{\"error\":\"response too large\"}".to_string();
+                                    let response = tiny_http::Response::from_string(&body)
+                                        .with_status_code(413)
+                                        .with_header(
+                                            "Content-Type: application/json"
+                                                .parse::<tiny_http::Header>()
+                                                .unwrap(),
+                                        );
+                                    let _ = request.respond(response);
+                                    knot_db_close(db);
+                                    unsafe { deep_drop_value(handler); }
+                                    return;
+                            }
                             let json = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 json_encode_value(db, body_field)
                             })) {
@@ -16922,6 +17005,37 @@ fn http_serve_loop(
                             log_debug!("[HTTP] --> {} {}", status_code, json);
                             let _ = request.respond(response);
                         } else {
+                            // Pre-encoding size guard for Relation responses
+                            // (see the headers path above): estimate the
+                            // serialized size from a row sample and reject
+                            // with 413 *before* `json_encode_value` allocates
+                            // the whole string, so a handler returning a
+                            // multi-GB relation can't OOM the server.
+                            let max = http_max_body_bytes();
+                            let est = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                estimate_relation_json_size(db, body_val)
+                            }))
+                            .unwrap_or(None);
+                            if let Some(est) = est
+                                && est > max
+                            {
+                                    log_error!(
+                                        "[HTTP] estimated response body ~{} bytes exceeds {} byte limit; returning 413",
+                                        est, max
+                                    );
+                                    let body = "{\"error\":\"response too large\"}".to_string();
+                                    let response = tiny_http::Response::from_string(&body)
+                                        .with_status_code(413)
+                                        .with_header(
+                                            "Content-Type: application/json"
+                                                .parse::<tiny_http::Header>()
+                                                .unwrap(),
+                                        );
+                                    let _ = request.respond(response);
+                                    knot_db_close(db);
+                                    unsafe { deep_drop_value(handler); }
+                                    return;
+                            }
                             let json = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 json_encode_value(db, body_val)
                             })) {
@@ -20263,6 +20377,48 @@ mod _bugfix_batch_tests {
             .unwrap();
         assert_eq!(out, data);
         knot_set_http_max_body_bytes(0); // restore env-or-default resolution
+    }
+
+    // ── Fix B42: listen response-body cap estimated before encoding ──
+
+    #[test]
+    fn estimate_relation_json_size_extrapolates_from_sample() {
+        // Non-Relation values are out of scope for the pre-encode guard:
+        // ordinary handler output is bounded and covered by the precise
+        // post-encode cap. estimate_relation_json_size returns None so the
+        // caller falls through to that path.
+        let scalar = alloc(Value::Int(42));
+        assert_eq!(
+            estimate_relation_json_size(std::ptr::null_mut(), scalar),
+            None
+        );
+
+        // An empty relation encodes to "[]" (2 bytes).
+        let empty = alloc(Value::Relation(vec![]));
+        assert_eq!(
+            estimate_relation_json_size(std::ptr::null_mut(), empty),
+            Some(2)
+        );
+
+        // A relation of many identical rows should estimate ~N * per-row
+        // size — far above a tiny cap — so the listen path can reject it
+        // with 413 *before* json_encode_value materializes the full string.
+        let mk_row = || {
+            alloc(Value::Record(vec![RecordField {
+                name: Arc::from("name"),
+                value: alloc(Value::Text(Arc::from("abcdefghijklmnopqrstuvwxyz"))),
+            }]))
+        };
+        let rows: Vec<*mut Value> = (0..1000).map(|_| mk_row()).collect();
+        let rel = alloc(Value::Relation(rows));
+        let est = estimate_relation_json_size(std::ptr::null_mut(), rel)
+            .expect("relation should produce an estimate");
+        // One row: {"name":"abcdefghijklmnopqrstuvwxyz"} is ~35 bytes, so
+        // 1000 rows must clear a 1 KiB cap by a wide margin.
+        assert!(est > 1024, "estimate {} should exceed 1 KiB", est);
+        // Estimation extrapolates from a bounded 16-row sample, so it must
+        // hold even though only a fraction of the rows were encoded.
+        assert!(est >= 1000, "estimate {} too small for 1000 rows", est);
     }
 }
 

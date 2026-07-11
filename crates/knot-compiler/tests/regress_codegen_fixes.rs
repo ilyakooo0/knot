@@ -739,3 +739,63 @@ main = do
         "a truthy when/unless guard must run the write exactly once (expected 4 rows), got:\n{stdout}"
     );
 }
+
+// ── Finding 6: `<-`-bound source comprehension silently yielding {} ─
+
+#[test]
+fn bind_bound_source_comprehension_yields_all_rows() {
+    // `xs <- do { r <- *items; where …; yield … }` is a comprehension whose
+    // only IO is the relation read. It used to go through `compile_expr` →
+    // `compile_io_do` (is_io_do_block sees the SourceRef bind), where `where`
+    // is a GUARD over the whole relation value rather than a per-row filter:
+    // `r.v` silently meant "the FIRST row's v", and a false guard skipped the
+    // rest of the block and bound `{}` — total data loss. The `let`-bound form
+    // has always compiled through the relational loop path, so the two forms
+    // disagreed on identical source. They must now agree.
+    let (stdout, stderr, ok) = compile_and_run(
+        "bind_source_comprehension",
+        r#"*items : [{k: Text, v: Int}]
+
+main = do
+  replace *items = [{k: "a", v: 1}, {k: "b", v: 5}, {k: "c", v: 9}]
+
+  -- first row (v = 1) fails the filter: the guard reading used to bail out
+  -- of the whole block and yield {}
+  bound <- do
+    r <- *items
+    where r.v > 3
+    yield r.k
+  let letted = do
+    r <- *items
+    where r.v > 3
+    yield r.k
+
+  -- first row passes: the guard reading yielded just that one row's value
+  -- ("a") instead of accumulating every match
+  boundAll <- do
+    r <- *items
+    where r.v > 0
+    yield r.k
+
+  println ("bound: " ++ show bound)
+  println ("letted: " ++ show letted)
+  println ("boundAll: " ++ show boundAll)
+"#,
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    // The filter drops the first row — the regression yielded `{}` here.
+    assert!(
+        stdout.contains("bound: [b, c]"),
+        "a `<-`-bound source comprehension must accumulate every matching row, got:\n{stdout}"
+    );
+    // The `<-` and `let` forms must not disagree on identical source.
+    assert!(
+        stdout.contains("letted: [b, c]"),
+        "the let-bound form must keep working, got:\n{stdout}"
+    );
+    // The filter keeps every row — the regression yielded just `a`.
+    assert!(
+        stdout.contains("boundAll: [a, b, c]"),
+        "`where` must be a per-row filter, not a guard on the first row, got:\n{stdout}"
+    );
+}

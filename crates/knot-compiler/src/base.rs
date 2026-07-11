@@ -247,6 +247,14 @@ fn impl_arg_type_name(ty: &ast::Type) -> Option<String> {
 // `monad_info` (and the other span-keyed inference maps). Type spans are left
 // alone — they never key `monad_info`. Mirrors the AST shape walked by
 // `unused::walk_decl`; keep the two in sync when the AST grows a node.
+//
+// "Every span" includes the standalone `name_span`/`api_span` fields, not just
+// the `Spanned` wrappers: inference keys a punned record field's binder on
+// `FieldPat::name_span` (`Just {value}` in the prelude's Maybe impls), so
+// leaving it unshifted leaks a raw PRELUDE_SOURCE offset into `local_type_info`
+// — a span the LSP cannot tell apart from a user span, since its provenance
+// filter can only compare byte ranges. It then anchors an inlay hint at that
+// offset in the user's file, landing mid-token (`prior|ity`, `main = listen|`).
 
 fn shift_decl_spans(decl: &mut ast::Decl, offset: usize) {
     use ast::DeclKind::*;
@@ -261,7 +269,12 @@ fn shift_decl_spans(decl: &mut ast::Decl, offset: usize) {
         View { body, .. } | Derived { body, .. } => shift_expr_spans(body, offset),
         Trait { items, .. } => {
             for item in items {
-                if let ast::TraitItem::Method { default_params, default_body, .. } = item {
+                if let ast::TraitItem::Method {
+                    name_span, default_params, default_body, ..
+                } = item
+                {
+                    name_span.start += offset;
+                    name_span.end += offset;
                     for p in default_params {
                         shift_pat_spans(p, offset);
                     }
@@ -273,7 +286,9 @@ fn shift_decl_spans(decl: &mut ast::Decl, offset: usize) {
         }
         Impl { items, .. } => {
             for item in items {
-                if let ast::ImplItem::Method { params, body, .. } = item {
+                if let ast::ImplItem::Method { name_span, params, body, .. } = item {
+                    name_span.start += offset;
+                    name_span.end += offset;
                     for p in params {
                         shift_pat_spans(p, offset);
                     }
@@ -357,7 +372,9 @@ fn shift_expr_spans(e: &mut ast::Expr, offset: usize) {
         Atomic(inner) | Refine(inner) => shift_expr_spans(inner, offset),
         UnitLit { value, .. } | TimeUnitLit { value, .. } => shift_expr_spans(value, offset),
         Annot { expr, .. } => shift_expr_spans(expr, offset),
-        Serve { handlers, .. } => {
+        Serve { api_span, handlers, .. } => {
+            api_span.start += offset;
+            api_span.end += offset;
             for h in handlers {
                 h.endpoint_span.start += offset;
                 h.endpoint_span.end += offset;
@@ -391,6 +408,12 @@ fn shift_pat_spans(p: &mut ast::Pat, offset: usize) {
         Constructor { payload, .. } => shift_pat_spans(payload, offset),
         Record(fields) => {
             for fp in fields {
+                // The field-name token's own span. For a punned field
+                // (`{value}`) this IS the binder's span, and inference records
+                // it in `binding_types` — so it must be shifted like any other
+                // binder span, or it escapes as a raw prelude offset.
+                fp.name_span.start += offset;
+                fp.name_span.end += offset;
                 if let Some(inner) = &mut fp.pattern {
                     shift_pat_spans(inner, offset);
                 }
@@ -411,6 +434,7 @@ fn shift_pat_spans(p: &mut ast::Pat, offset: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use knot::ast::Span;
 
     /// Smallest `span.start` anywhere in an expression subtree.
     fn min_expr_span(e: &ast::Expr) -> usize {
@@ -472,5 +496,195 @@ mod tests {
         const _: () = {
             assert!(PRELUDE_SPAN_OFFSET > (1usize << 31));
         };
+    }
+
+    /// Collect EVERY value-level span in a decl — including the standalone
+    /// `name_span`/`api_span`/`endpoint_span` fields, which are easy to forget
+    /// because they aren't `Spanned` wrappers. Type spans are excluded: the
+    /// shifter deliberately leaves them alone (they never key a span map).
+    ///
+    /// Deliberately written as an independent walk rather than reusing the
+    /// shifter's traversal, so a field the shifter forgets is still visited
+    /// here and the assertion below catches it.
+    fn collect_value_spans(decl: &ast::Decl, out: &mut Vec<(&'static str, Span)>) {
+        fn pat(p: &ast::Pat, out: &mut Vec<(&'static str, Span)>) {
+            out.push(("pat", p.span));
+            match &p.node {
+                ast::PatKind::Var(_) | ast::PatKind::Wildcard | ast::PatKind::Lit(_) => {}
+                ast::PatKind::Constructor { payload, .. } => pat(payload, out),
+                ast::PatKind::Record(fields) => {
+                    for fp in fields {
+                        out.push(("FieldPat::name_span", fp.name_span));
+                        if let Some(inner) = &fp.pattern {
+                            pat(inner, out);
+                        }
+                    }
+                }
+                ast::PatKind::List(items) => items.iter().for_each(|i| pat(i, out)),
+                ast::PatKind::Cons { head, tail } => {
+                    pat(head, out);
+                    pat(tail, out);
+                }
+            }
+        }
+        fn expr(e: &ast::Expr, out: &mut Vec<(&'static str, Span)>) {
+            out.push(("expr", e.span));
+            if let ast::ExprKind::Serve { api_span, handlers, .. } = &e.node {
+                out.push(("Serve::api_span", *api_span));
+                for h in handlers {
+                    out.push(("ServeHandler::endpoint_span", h.endpoint_span));
+                }
+            }
+            if let ast::ExprKind::Lambda { params, .. } = &e.node {
+                params.iter().for_each(|p| pat(p, out));
+            }
+            if let ast::ExprKind::Case { arms, .. } = &e.node {
+                arms.iter().for_each(|a| pat(&a.pat, out));
+            }
+            if let ast::ExprKind::Do(stmts) = &e.node {
+                for s in stmts {
+                    out.push(("stmt", s.span));
+                    if let ast::StmtKind::Bind { pat: p, .. } | ast::StmtKind::Let { pat: p, .. } =
+                        &s.node
+                    {
+                        pat(p, out);
+                    }
+                }
+            }
+            crate::base::tests::recurse(e, |c| expr(c, out));
+        }
+
+        out.push(("decl", decl.span));
+        match &decl.node {
+            ast::DeclKind::Fun { body: Some(b), .. } => expr(b, out),
+            ast::DeclKind::View { body, .. } | ast::DeclKind::Derived { body, .. } => {
+                expr(body, out)
+            }
+            ast::DeclKind::Trait { items, .. } => {
+                for item in items {
+                    if let ast::TraitItem::Method {
+                        name_span, default_params, default_body, ..
+                    } = item
+                    {
+                        out.push(("TraitItem::Method::name_span", *name_span));
+                        default_params.iter().for_each(|p| pat(p, out));
+                        if let Some(b) = default_body {
+                            expr(b, out);
+                        }
+                    }
+                }
+            }
+            ast::DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { name_span, params, body, .. } = item {
+                        out.push(("ImplItem::Method::name_span", *name_span));
+                        params.iter().for_each(|p| pat(p, out));
+                        expr(body, out);
+                    }
+                }
+            }
+            ast::DeclKind::Migrate { using_fn, .. } => expr(using_fn, out),
+            ast::DeclKind::Route { entries, .. } => {
+                for e in entries {
+                    if let Some(rl) = &e.rate_limit {
+                        expr(rl, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Re-export the shared sub-expression walk for `collect_value_spans`.
+    fn recurse<F: FnMut(&ast::Expr)>(e: &ast::Expr, mut f: F) {
+        use ast::ExprKind::*;
+        match &e.node {
+            App { func, arg } => {
+                f(func);
+                f(arg);
+            }
+            Lambda { body, .. } => f(body),
+            BinOp { lhs, rhs, .. } => {
+                f(lhs);
+                f(rhs);
+            }
+            UnaryOp { operand, .. } => f(operand),
+            If { cond, then_branch, else_branch } => {
+                f(cond);
+                f(then_branch);
+                f(else_branch);
+            }
+            Case { scrutinee, arms } => {
+                f(scrutinee);
+                arms.iter().for_each(|a| f(&a.body));
+            }
+            Do(stmts) => {
+                for s in stmts {
+                    match &s.node {
+                        ast::StmtKind::Bind { expr, .. }
+                        | ast::StmtKind::Let { expr, .. }
+                        | ast::StmtKind::Expr(expr)
+                        | ast::StmtKind::Where { cond: expr } => f(expr),
+                        ast::StmtKind::GroupBy { key } => f(key),
+                    }
+                }
+            }
+            Set { target, value } | ReplaceSet { target, value } => {
+                f(target);
+                f(value);
+            }
+            Atomic(i) | Refine(i) => f(i),
+            Record(fields) => fields.iter().for_each(|fl| f(&fl.value)),
+            RecordUpdate { base, fields } => {
+                f(base);
+                fields.iter().for_each(|fl| f(&fl.value));
+            }
+            List(items) => items.iter().for_each(f),
+            FieldAccess { expr, .. } | Annot { expr, .. } => f(expr),
+            UnitLit { value, .. } | TimeUnitLit { value, .. } => f(value),
+            Serve { handlers, .. } => handlers.iter().for_each(|h| f(&h.body)),
+            Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) => {}
+        }
+    }
+
+    /// GitHub issue #4 — "wrong inlay hint position sometimes".
+    ///
+    /// `prelude_spans_shifted_out_of_user_range` (above) only spot-checks decl
+    /// spans and `when`'s body, so it missed `FieldPat::name_span`: the prelude's
+    /// Maybe impls destructure `Just {value}`, and for a PUNNED field that span
+    /// is the binder's span, which inference records in `binding_types`. Left
+    /// unshifted it escaped as a raw PRELUDE_SOURCE offset (1303/1640/1850) and
+    /// the LSP — whose provenance filter can only compare byte ranges — anchored
+    /// an inlay hint there, mid-token, in whatever user file straddled it.
+    ///
+    /// Assert exhaustively instead of by spot-check: NO value-level span in any
+    /// prelude decl may remain in user-file range.
+    #[test]
+    fn every_prelude_value_span_is_shifted() {
+        let mut module = ast::Module { imports: vec![], decls: vec![] };
+        inject_prelude(&mut module);
+        assert!(!module.decls.is_empty(), "prelude should inject decls");
+
+        let mut spans = Vec::new();
+        for decl in &module.decls {
+            collect_value_spans(decl, &mut spans);
+        }
+
+        let leaked: Vec<_> = spans
+            .iter()
+            .filter(|(_, s)| s.start < PRELUDE_SPAN_OFFSET || s.end < PRELUDE_SPAN_OFFSET)
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "prelude spans left in user-file range (they will alias user offsets \
+             and misplace inlay hints): {leaked:?}",
+        );
+
+        // The punned `Just {value}` binder is the exact span that regressed —
+        // make sure the walk actually reached one, so this can't pass vacuously.
+        assert!(
+            spans.iter().any(|(k, _)| *k == "FieldPat::name_span"),
+            "expected the prelude's punned `Just {{value}}` patterns to be visited",
+        );
     }
 }

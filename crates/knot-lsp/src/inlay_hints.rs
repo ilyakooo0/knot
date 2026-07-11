@@ -1860,4 +1860,201 @@ checkGlobalRate = \t -> atomic do
             ws.doc(&uri).effect_info
         );
     }
+
+    /// True when `offset` sits strictly INSIDE an identifier token — i.e. a
+    /// hint anchored there visually splits the token (`prior|ity` renders as
+    /// `prior: aity`). No legitimate hint anchor ever does this: every hint
+    /// category anchors at a token boundary.
+    fn splits_identifier(source: &str, offset: usize) -> bool {
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'';
+        let bytes = source.as_bytes();
+        offset > 0
+            && offset < bytes.len()
+            && is_ident(bytes[offset - 1])
+            && is_ident(bytes[offset])
+    }
+
+    fn assert_no_split_hints(ws: &ServerState, uri: &Uri, range: Range, ctx: &str) -> usize {
+        let hints = handle_inlay_hint(ws, &hint_params(uri, range)).unwrap_or_default();
+        let doc = ws.documents.get(uri).expect("doc");
+        for h in &hints {
+            let off = position_to_offset(&doc.source, h.position);
+            if splits_identifier(&doc.source, off) {
+                let lo = off.saturating_sub(24);
+                panic!(
+                    "{ctx}: inlay hint {:?} is anchored INSIDE an identifier at byte {off} \
+                     (line {}, col {}) — it renders mid-token: ⟪{}|{}⟫",
+                    h.label,
+                    h.position.line + 1,
+                    h.position.character,
+                    safe_slice(&doc.source, Span::new(lo, off)).replace('\n', "⏎"),
+                    safe_slice(&doc.source, Span::new(off, (off + 24).min(doc.source.len())))
+                        .replace('\n', "⏎"),
+                );
+            }
+        }
+        hints.len()
+    }
+
+    /// GitHub issue #4 — "wrong inlay hint position sometimes".
+    ///
+    /// Root cause: `inject_prelude` shifts prelude spans past `PRELUDE_SPAN_OFFSET`
+    /// so they can't alias user-file byte offsets, but it skipped
+    /// `FieldPat::name_span`. For a PUNNED record field that span IS the binder's
+    /// span, and the prelude's Maybe impls destructure `Just {value}` — so
+    /// inference recorded three raw PRELUDE_SOURCE offsets (1303/1640/1850) in
+    /// `local_type_info`. The LSP's provenance filter can only compare byte
+    /// ranges, so it could not tell those apart from real user spans: any user
+    /// decl that happened to STRADDLE one let the ghost through, and the hint got
+    /// anchored at that offset in the user's file — landing mid-token. Whether a
+    /// decl straddled a leaked offset depends purely on file layout, which is what
+    /// made it happen only "sometimes".
+    ///
+    /// `examples/query_opt.knot` reproduces it with no edits at all: a `: a` ghost
+    /// used to split `employees` into `employe|es`.
+    #[test]
+    fn no_inlay_hint_anchors_inside_an_identifier_token() {
+        let mut files: Vec<_> = std::fs::read_dir("../../examples")
+            .expect("examples dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "knot"))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "expected example programs to scan");
+
+        let mut total_hints = 0usize;
+        for path in &files {
+            let Ok(src) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let mut ws = TestWorkspace::new();
+            let uri = ws.open("main", &src);
+            let range = ws.whole_file_range(&uri);
+            total_hints += assert_no_split_hints(
+                &ws.state,
+                &uri,
+                range,
+                &path.file_name().unwrap().to_string_lossy(),
+            );
+        }
+        // Guard against a vacuous pass (e.g. analysis silently producing nothing).
+        assert!(
+            total_hints > 50,
+            "expected the example corpus to produce hints to check; got {total_hints}"
+        );
+    }
+
+    /// Every binder span in the user's OWN parsed AST. `local_type_info` is keyed
+    /// by binder span, so a key that isn't in this set can only have come from a
+    /// foreign source (the prelude, or an inlined import) whose byte offsets are
+    /// meaningless in this document.
+    fn user_binder_spans(module: &ast::Module) -> std::collections::HashSet<Span> {
+        fn pat(p: &ast::Pat, out: &mut std::collections::HashSet<Span>) {
+            out.insert(p.span);
+            match &p.node {
+                ast::PatKind::Record(fields) => {
+                    for f in fields {
+                        // Punned `{value}`: the field-name token IS the binder.
+                        out.insert(f.name_span);
+                        if let Some(inner) = &f.pattern {
+                            pat(inner, out);
+                        }
+                    }
+                }
+                ast::PatKind::Constructor { payload, .. } => pat(payload, out),
+                ast::PatKind::List(items) => items.iter().for_each(|i| pat(i, out)),
+                ast::PatKind::Cons { head, tail } => {
+                    pat(head, out);
+                    pat(tail, out);
+                }
+                _ => {}
+            }
+        }
+        fn expr(e: &ast::Expr, out: &mut std::collections::HashSet<Span>) {
+            match &e.node {
+                ast::ExprKind::Lambda { params, .. } => params.iter().for_each(|p| pat(p, out)),
+                ast::ExprKind::Case { arms, .. } => arms.iter().for_each(|a| pat(&a.pat, out)),
+                ast::ExprKind::Do(stmts) => {
+                    for s in stmts {
+                        if let ast::StmtKind::Bind { pat: p, .. }
+                        | ast::StmtKind::Let { pat: p, .. } = &s.node
+                        {
+                            pat(p, out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            recurse_expr(e, |c| expr(c, out));
+        }
+
+        let mut out = std::collections::HashSet::new();
+        for d in &module.decls {
+            match &d.node {
+                DeclKind::Fun { body: Some(b), .. } => expr(b, &mut out),
+                DeclKind::View { body, .. } | DeclKind::Derived { body, .. } => expr(body, &mut out),
+                DeclKind::Impl { items, .. } => {
+                    for item in items {
+                        if let ast::ImplItem::Method { params, body, .. } = item {
+                            params.iter().for_each(|p| pat(p, &mut out));
+                            expr(body, &mut out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Issue #4 names `examples/routes.knot`. At its committed length the leaked
+    /// prelude offsets land just past the last decl, so the ghost is filtered by
+    /// luck — but any edit that shifts the decls surfaces it. Sweeping the leading
+    /// padding reproduces what a user sees while typing: with the ghost present, a
+    /// `: a` hint appears inside `main = listen| 8080 api`.
+    ///
+    /// Asserted as a set-membership property rather than "does it split a token":
+    /// a leaked span is wrong wherever it lands, and it only *sometimes* happens to
+    /// land mid-identifier. Every `local_type_info` key must be a binder that really
+    /// exists in this document's AST.
+    #[test]
+    fn routes_knot_local_types_contain_no_foreign_spans_as_the_file_shifts() {
+        let base = std::fs::read_to_string("../../examples/routes.knot").expect("routes.knot");
+        // The offsets the prelude's punned `Just {value}` binders used to leak at.
+        const LEAKED: [usize; 3] = [1303, 1640, 1850];
+        let mut straddled = false;
+
+        for pad in 0..24usize {
+            let src = format!("{}{}", "-- pad\n".repeat(pad), base);
+            let mut ws = TestWorkspace::new();
+            let uri = ws.open("main", &src);
+            let range = ws.whole_file_range(&uri);
+            assert_no_split_hints(&ws.state, &uri, range, &format!("routes.knot +{pad} lines"));
+
+            let doc = ws.doc(&uri);
+            // A foreign span only survives the LSP's byte-range provenance filter
+            // when a user decl fully contains it — record that we exercised that.
+            straddled |= doc.module.decls.iter().any(|d| {
+                LEAKED.iter().any(|o| d.span.start <= *o && o + 5 <= d.span.end)
+            });
+
+            let binders = user_binder_spans(&doc.module);
+            for span in doc.local_type_info.keys() {
+                assert!(
+                    binders.contains(span),
+                    "routes.knot +{pad} lines: local_type_info has span {span:?} \
+                     (source text {:?}) that is not a binder in this file — a foreign \
+                     (prelude/import) offset leaked in and will anchor a hint at a \
+                     meaningless position",
+                    safe_slice(&doc.source, *span),
+                );
+            }
+        }
+
+        assert!(
+            straddled,
+            "setup: no padding made a decl straddle a formerly-leaked prelude offset, \
+             so this test would pass vacuously — retune the sweep"
+        );
+    }
 }

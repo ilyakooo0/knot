@@ -650,6 +650,12 @@ pub fn analyze_document(
         // diagnostics.
         all_diags.extend(knot_compiler::unused::check(&module.decls));
 
+        all_diags.extend(
+            knot_compiler::types::check_reserved_field_names(&analysis_module)
+                .into_iter()
+                .filter(anchored_in_user),
+        );
+
         let type_env = knot_compiler::types::TypeEnv::from_module(&analysis_module);
         source_refinements = type_env.source_refinements.clone();
 

@@ -444,6 +444,165 @@ fn collect_named_alias_refs(
     }
 }
 
+/// Column names the persistence layer owns. A persisted field carrying one of
+/// these names maps straight onto the internal column of the same name:
+/// `_id` (parent tables with nested children), `_parent_id` / `_content_hash`
+/// (child tables), and `_tag` (ADT tables) each make `CREATE TABLE` fail with
+/// "duplicate column name", while `_value` is the column synthesized for
+/// scalar sources — a record whose only field is `_value` is indistinguishable
+/// from one (`schema.starts_with("_value:")` is how codegen recognizes a
+/// scalar source).
+pub const RESERVED_COLUMNS: [&str; 5] =
+    ["_id", "_tag", "_parent_id", "_content_hash", "_value"];
+
+/// Reject `_`-prefixed field names in the types that become SQLite tables.
+///
+/// Field names are used verbatim as column names, and the runtime reserves the
+/// `_` prefix for its own bookkeeping columns (see `RESERVED_COLUMNS`). Such a
+/// field used to compile cleanly and abort on the first run at table init, so
+/// it is rejected here instead. Checked on the element type of every source and
+/// on both sides of every `migrate` — the types that get a table — following
+/// aliases, data declarations, and nested relations (whose child tables reserve
+/// their own columns). Types that are never persisted are not restricted.
+///
+/// Runs before `TypeEnv::from_module`, which would otherwise bake the colliding
+/// name into a schema descriptor.
+pub fn check_reserved_field_names(module: &Module) -> Vec<knot::diagnostic::Diagnostic> {
+    let mut walker = ReservedFieldWalker {
+        aliases: HashMap::new(),
+        data_decls: HashMap::new(),
+        relation: String::new(),
+        reported: HashSet::new(),
+        diags: Vec::new(),
+    };
+    for decl in &module.decls {
+        match &decl.node {
+            DeclKind::TypeAlias { name, ty, .. } => {
+                walker.aliases.insert(name.as_str(), ty);
+            }
+            DeclKind::Data {
+                name, constructors, ..
+            } => {
+                walker.data_decls.insert(name.as_str(), constructors);
+            }
+            _ => {}
+        }
+    }
+    for decl in &module.decls {
+        match &decl.node {
+            DeclKind::Source { name, ty } => {
+                walker.relation = name.clone();
+                walker.walk(ty, &mut HashSet::new());
+            }
+            DeclKind::Migrate {
+                relation,
+                from_ty,
+                to_ty,
+                ..
+            } => {
+                walker.relation = relation.clone();
+                walker.walk(from_ty, &mut HashSet::new());
+                walker.walk(to_ty, &mut HashSet::new());
+            }
+            _ => {}
+        }
+    }
+    walker.diags
+}
+
+struct ReservedFieldWalker<'a> {
+    aliases: HashMap<&'a str, &'a Type>,
+    data_decls: HashMap<&'a str, &'a Vec<ConstructorDef>>,
+    /// Source (or migrated relation) currently being walked — named in the
+    /// diagnostic, since the offending field may sit in an alias declared far
+    /// from the source that persists it.
+    relation: String,
+    /// (field name, span) pairs already reported: one alias can be reached from
+    /// several sources, and the field is only wrong once.
+    reported: HashSet<(String, Span)>,
+    diags: Vec<knot::diagnostic::Diagnostic>,
+}
+
+impl<'a> ReservedFieldWalker<'a> {
+    fn walk(&mut self, ty: &'a Type, seen: &mut HashSet<&'a str>) {
+        match &ty.node {
+            TypeKind::Record { fields, .. } => {
+                for f in fields {
+                    self.check_field(&f.name, &f.value);
+                    self.walk(&f.value, seen);
+                }
+            }
+            TypeKind::Variant { constructors, .. } => {
+                self.walk_constructors(constructors, seen);
+            }
+            TypeKind::Relation(inner) => self.walk(inner, seen),
+            TypeKind::Named(name) => self.walk_named(name, seen),
+            TypeKind::App { func, arg } => {
+                self.walk(func, seen);
+                self.walk(arg, seen);
+            }
+            TypeKind::UnitAnnotated { base, .. } | TypeKind::Refined { base, .. } => {
+                self.walk(base, seen)
+            }
+            TypeKind::Effectful { ty, .. } | TypeKind::IO { ty, .. } | TypeKind::Forall { ty, .. } => {
+                self.walk(ty, seen)
+            }
+            // A function can never be stored in a column, so nothing below one
+            // reaches a table.
+            TypeKind::Function { .. } | TypeKind::Var(_) | TypeKind::Hole => {}
+        }
+    }
+
+    fn walk_named(&mut self, name: &'a str, seen: &mut HashSet<&'a str>) {
+        // A name reached twice is either a cycle (reported by
+        // `check_alias_cycles`) or a repeat, whose fields are already checked.
+        if !seen.insert(name) {
+            return;
+        }
+        if let Some(ty) = self.aliases.get(name).copied() {
+            self.walk(ty, seen);
+        }
+        if let Some(ctors) = self.data_decls.get(name).copied() {
+            self.walk_constructors(ctors, seen);
+        }
+    }
+
+    fn walk_constructors(&mut self, ctors: &'a [ConstructorDef], seen: &mut HashSet<&'a str>) {
+        for ctor in ctors {
+            for f in &ctor.fields {
+                self.check_field(&f.name, &f.value);
+                self.walk(&f.value, seen);
+            }
+        }
+    }
+
+    fn check_field(&mut self, name: &str, value: &Type) {
+        if !name.starts_with('_') {
+            return;
+        }
+        if !self.reported.insert((name.to_string(), value.span)) {
+            return;
+        }
+        let detail = if RESERVED_COLUMNS.contains(&name) {
+            format!("'{}' is an internal column of that table", name)
+        } else {
+            "the '_' prefix is reserved for internal columns".to_string()
+        };
+        self.diags.push(
+            knot::diagnostic::Diagnostic::error(format!(
+                "field '{}' of relation '*{}' uses a reserved name — {}",
+                name, self.relation, detail
+            ))
+            .label(value.span, format!("rename the '{}' field", name))
+            .note(format!(
+                "a persisted relation stores each field in a SQLite column of \
+                 the same name, and the runtime keeps its own {} columns there",
+                RESERVED_COLUMNS.join(", ")
+            )),
+        );
+    }
+}
+
 /// Walk a source's type (e.g., `[{name: NonEmptyText, age: Nat}]`) and collect
 /// refinement info: (field_name_or_none, refined_type_name, predicate_expr).
 ///

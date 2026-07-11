@@ -362,6 +362,17 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
         process::exit(1);
     }
 
+    // Reject persisted fields whose names collide with the runtime's internal
+    // SQLite columns (`_id`, `_tag`, ...) — they used to compile clean and
+    // abort at table init with "duplicate column name".
+    let reserved_diags = types::check_reserved_field_names(&module);
+    if !reserved_diags.is_empty() {
+        for diag in &reserved_diags {
+            eprintln!("{}", diag.render(&source, &filename));
+        }
+        process::exit(1);
+    }
+
     // Resolve types
     let type_env = types::TypeEnv::from_module(&module);
 

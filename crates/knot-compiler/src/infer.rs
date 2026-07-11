@@ -11529,13 +11529,13 @@ main = applyPred (\\r -> r.x == r.y)\
     }
 
     #[test]
-    fn lt_on_polymorphic_param_requires_ord_constraint() {
-        let diags = check_src(
-            "myMin : a -> a -> a\n\
-             myMin = \\a b -> if a < b then a else b\n\
+    fn lt_on_polymorphic_param_is_structural() {
+        // Eq/Ord traits removed from comparison operators — < is structural, no constraint needed.
+        assert!(check_src(
+            "myMin : a -> a -> a\\n\
+             myMin = \\a b -> if a < b then a else b\\n\
              main = println (show (myMin 1 2))"
-        );
-        assert!(has_error(&diags, "constraint 'Ord a'"));
+        ).is_empty());
     }
 
     #[test]
@@ -11548,13 +11548,13 @@ main = applyPred (\\r -> r.x == r.y)\
     }
 
     #[test]
-    fn eq_on_polymorphic_param_requires_eq_constraint() {
-        let diags = check_src(
-            "same : a -> a -> Bool\n\
-             same = \\a b -> a == b\n\
+    fn eq_on_polymorphic_param_is_structural() {
+        // Eq/Ord traits removed from comparison operators — == is structural, no constraint needed.
+        assert!(check_src(
+            "same : a -> a -> Bool\\n\
+             same = \\a b -> a == b\\n\
              main = println (show (same 1 1))"
-        );
-        assert!(has_error(&diags, "constraint 'Eq a'"));
+        ).is_empty());
     }
 
     #[test]

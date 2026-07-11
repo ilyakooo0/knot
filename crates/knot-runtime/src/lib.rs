@@ -7140,6 +7140,102 @@ fn compare_values_primitive(a: *mut Value, b: *mut Value) -> std::cmp::Ordering 
     }
 }
 
+// ── Constructor declaration order ─────────────────────────────────
+
+/// Declaration order of every constructor the program declares, keyed by tag.
+///
+/// Structural `Ord` on an ADT must follow the order the constructors were
+/// written in: `data Priority = Low | Medium | High | Critical` means
+/// `Low < Medium < High < Critical`, not the alphabetical `Critical < High <
+/// Low < Medium` that comparing tag strings would give. A `Value::Constructor`
+/// carries only its tag — and a tag round-trips through SQLite as bare TEXT —
+/// so the index cannot live on the value. Instead the compiler emits one
+/// `knot_register_ctor_order` call per `data` declaration at program init and
+/// comparisons resolve the tag here.
+///
+/// Distinct ADTs may legally share a constructor name (row-polymorphic
+/// variants — see the note in infer.rs), so a tag maps to *every* `(type,
+/// index)` pair that declares it and a comparison picks the type that declares
+/// both tags.
+static CTOR_ORDER: std::sync::LazyLock<RwLock<HashMap<Arc<str>, Vec<(Arc<str>, u32)>>>> =
+    std::sync::LazyLock::new(|| {
+        let mut map: HashMap<Arc<str>, Vec<(Arc<str>, u32)>> = HashMap::new();
+        // ADTs the runtime constructs itself (`race`/`fetch` results, `compare`
+        // results, nullable decoding). Compiled programs never declare these,
+        // so nothing else would register them.
+        for (ty, ctors) in [
+            ("Maybe", &["Nothing", "Just"][..]),
+            ("Result", &["Err", "Ok"][..]),
+            ("Ordering", &["LT", "EQ", "GT"][..]),
+        ] {
+            let ty = intern_str(ty);
+            for (i, ctor) in ctors.iter().enumerate() {
+                map.entry(intern_str(ctor))
+                    .or_default()
+                    .push((ty.clone(), i as u32));
+            }
+        }
+        RwLock::new(map)
+    });
+
+/// Record the constructors of one `data` declaration, in declaration order.
+/// Re-registering a type replaces its previous entries, so a program that
+/// shadows a built-in ADT (or a test that registers twice) can't leave two
+/// conflicting indices behind for the same tag.
+fn register_ctor_order(type_name: &str, ctors: &[&str]) {
+    let mut reg = CTOR_ORDER.write().unwrap_or_else(|e| e.into_inner());
+    for entries in reg.values_mut() {
+        entries.retain(|(t, _)| &**t != type_name);
+    }
+    reg.retain(|_, entries| !entries.is_empty());
+    let ty = intern_str(type_name);
+    for (i, ctor) in ctors.iter().enumerate() {
+        reg.entry(intern_str(ctor))
+            .or_default()
+            .push((ty.clone(), i as u32));
+    }
+}
+
+/// Register a `data` declaration's constructor order. `ctors` is the
+/// comma-separated constructor list in declaration order, e.g.
+/// `"Low,Medium,High,Critical"`.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_register_ctor_order(
+    type_ptr: *const u8,
+    type_len: usize,
+    ctors_ptr: *const u8,
+    ctors_len: usize,
+) {
+    let type_name = unsafe { str_from_raw(type_ptr, type_len) };
+    let ctors: Vec<&str> = unsafe { str_from_raw(ctors_ptr, ctors_len) }
+        .split(',')
+        .filter(|c| !c.is_empty())
+        .collect();
+    if type_name.is_empty() || ctors.is_empty() {
+        return;
+    }
+    register_ctor_order(type_name, &ctors);
+}
+
+/// Order two constructor tags by the declaration order of the ADT that
+/// declares both. Tags of an ADT that never registered (a runtime-internal
+/// constructor, or a value built before init) fall back to comparing the tag
+/// names, which at least keeps the ordering total and deterministic.
+fn compare_ctor_tags(a: &str, b: &str) -> std::cmp::Ordering {
+    if a == b {
+        return std::cmp::Ordering::Equal;
+    }
+    let reg = CTOR_ORDER.read().unwrap_or_else(|e| e.into_inner());
+    if let (Some(a_decls), Some(b_decls)) = (reg.get(a), reg.get(b)) {
+        for (a_ty, a_idx) in a_decls {
+            if let Some((_, b_idx)) = b_decls.iter().find(|(b_ty, _)| b_ty == a_ty) {
+                return a_idx.cmp(b_idx);
+            }
+        }
+    }
+    a.cmp(b)
+}
+
 /// One item in the iterative-compare work stack.
 enum CmpFrame {
     /// Compare two values (leaf or compound). Compound values decompose
@@ -7211,8 +7307,9 @@ fn compare_values(a: *mut Value, b: *mut Value) -> std::cmp::Ordering {
                 // Structural ordering for non-numeric values — backs derived
                 // `Ord` on ADTs/records and ordered comparison of
                 // `Bool`/`Bytes`. Mirrors the structural recursion of
-                // `values_equal`. ADT constructors order by tag name
-                // (lexicographic), then by payload; records order
+                // `values_equal`. ADT constructors order by the declaration
+                // order of their tags (see `compare_ctor_tags`), then by
+                // payload; records order
                 // field-by-field in their canonical (name-sorted) order. The
                 // type checker only permits these comparisons between values
                 // of the same type, so cross-shape mismatches indicate a real
@@ -7243,7 +7340,7 @@ fn compare_values(a: *mut Value, b: *mut Value) -> std::cmp::Ordering {
                         }
                     }
                     (Value::Constructor(ta, pa), Value::Constructor(tb, pb)) => {
-                        match ta.cmp(tb) {
+                        match compare_ctor_tags(ta, tb) {
                             Ordering::Equal => {}
                             o => return o,
                         }
@@ -21270,6 +21367,208 @@ mod _fk_migration_listen_tests {
         // Just {value: null} < Just {value: 5} (Nothing < Just x)
         assert_eq!(compare_values(mk_just(-1), mk_just(5)), std::cmp::Ordering::Less);
         assert_eq!(compare_values(mk_just(5), mk_just(-1)), std::cmp::Ordering::Greater);
+    }
+
+    // ── Constructor Ord follows declaration order, not tag spelling ──
+    //
+    // `data Priority = Low | Medium | High | Critical` must order
+    // Low < Medium < High < Critical. Comparing tag strings gave the
+    // alphabetical Critical < High < Low < Medium, which is nobody's
+    // intent. The compiler registers each `data` decl's constructor order
+    // at program init; `compare_ctor_tags` resolves the tag through it.
+
+    /// A nullary constructor value, e.g. `Low`.
+    fn nullary_ctor(tag: &str) -> *mut Value {
+        alloc(Value::Constructor(intern_str(tag), alloc(Value::Unit)))
+    }
+
+    /// A single-field constructor value, e.g. `Just {value: n}`.
+    fn ctor_with_int(tag: &str, field: &str, n: i64) -> *mut Value {
+        let payload = alloc(Value::Record(vec![RecordField {
+            name: intern_str(field),
+            value: alloc_int(n),
+        }]));
+        alloc(Value::Constructor(intern_str(tag), payload))
+    }
+
+    #[test]
+    fn ctor_ord_follows_declaration_order() {
+        register_ctor_order("Priority", &["Low", "Medium", "High", "Critical"]);
+
+        let low = nullary_ctor("Low");
+        let medium = nullary_ctor("Medium");
+        let high = nullary_ctor("High");
+        let critical = nullary_ctor("Critical");
+
+        assert_eq!(compare_values(low, medium), std::cmp::Ordering::Less);
+        assert_eq!(compare_values(medium, high), std::cmp::Ordering::Less);
+        assert_eq!(compare_values(high, critical), std::cmp::Ordering::Less);
+        // Transitively, across the whole declaration.
+        assert_eq!(compare_values(low, critical), std::cmp::Ordering::Less);
+        assert_eq!(compare_values(critical, low), std::cmp::Ordering::Greater);
+        assert_eq!(compare_values(high, high), std::cmp::Ordering::Equal);
+
+        // Alphabetical order would have produced Critical < High < Low < Medium.
+        let mut sorted = vec![critical, low, high, medium];
+        sorted.sort_by(|a, b| compare_values(*a, *b));
+        let tags: Vec<&str> = sorted
+            .iter()
+            .map(|v| match unsafe { as_ref(*v) } {
+                Value::Constructor(t, _) => &**t,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(tags, ["Low", "Medium", "High", "Critical"]);
+    }
+
+    #[test]
+    fn ctor_ord_drives_the_comparison_builtins() {
+        register_ctor_order("Level", &["Debug", "Info", "Warn", "Fatal"]);
+
+        let debug = nullary_ctor("Debug");
+        let fatal = nullary_ctor("Fatal");
+
+        // `<` / `>` (Ord operators) and `compare` (Ord.compare) all route
+        // through compare_values, so each must see declaration order.
+        assert!(compare_lt(debug, fatal));
+        assert!(!compare_gt(debug, fatal));
+        let lt = knot_value_compare(debug, fatal);
+        match unsafe { as_ref(lt) } {
+            Value::Constructor(t, _) => assert_eq!(&**t, "LT"),
+            _ => panic!("expected Ordering constructor, got {}", type_name(lt)),
+        }
+        let gt = knot_value_compare(fatal, debug);
+        match unsafe { as_ref(gt) } {
+            Value::Constructor(t, _) => assert_eq!(&**t, "GT"),
+            _ => panic!("expected Ordering constructor, got {}", type_name(gt)),
+        }
+    }
+
+    #[test]
+    fn ctor_ord_compares_payload_only_when_tags_match() {
+        register_ctor_order("Shape", &["Rect", "Circle"]);
+
+        // Same tag → the payload breaks the tie.
+        assert_eq!(
+            compare_values(
+                ctor_with_int("Circle", "radius", 1),
+                ctor_with_int("Circle", "radius", 2)
+            ),
+            std::cmp::Ordering::Less
+        );
+        // Different tags → declaration order wins regardless of payload,
+        // even though "Circle" < "Rect" alphabetically.
+        assert_eq!(
+            compare_values(
+                ctor_with_int("Rect", "width", 99),
+                ctor_with_int("Circle", "radius", 1)
+            ),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn ctor_ord_seeds_builtin_adts() {
+        // The runtime builds these itself, so nothing registers them at init.
+        // Maybe: Nothing < Just (matches the null-encoding order elsewhere in
+        // compare_values, which alphabetical tag order would contradict).
+        assert_eq!(
+            compare_values(nullary_ctor("Nothing"), ctor_with_int("Just", "value", 0)),
+            std::cmp::Ordering::Less
+        );
+        // Result: Err < Ok.
+        assert_eq!(
+            compare_values(
+                ctor_with_int("Err", "error", 1),
+                ctor_with_int("Ok", "value", 0)
+            ),
+            std::cmp::Ordering::Less
+        );
+        // Ordering: LT < EQ < GT (alphabetical would give EQ < GT < LT).
+        assert_eq!(
+            compare_values(nullary_ctor("LT"), nullary_ctor("EQ")),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_values(nullary_ctor("EQ"), nullary_ctor("GT")),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn ctor_ord_resolves_shared_names_via_declaring_type() {
+        // Distinct ADTs may share a constructor name (row-polymorphic
+        // variants). Each comparison must use the type that declares *both*
+        // tags, not whichever registered last.
+        register_ctor_order("TrafficLight", &["Red", "Amber", "Green"]);
+        register_ctor_order("Ripeness", &["Green", "Ripe", "Red"]);
+
+        // Within TrafficLight: Red (0) < Green (2).
+        assert_eq!(
+            compare_values(nullary_ctor("Red"), nullary_ctor("Amber")),
+            std::cmp::Ordering::Less
+        );
+        // Within Ripeness: Ripe (1) < Red (2) — and Green (0) < Ripe (1).
+        assert_eq!(
+            compare_values(nullary_ctor("Green"), nullary_ctor("Ripe")),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_values(nullary_ctor("Ripe"), nullary_ctor("Red")),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn ctor_ord_reregistration_replaces_previous_order() {
+        register_ctor_order("Reordered", &["Alpha", "Beta"]);
+        assert_eq!(
+            compare_values(nullary_ctor("Alpha"), nullary_ctor("Beta")),
+            std::cmp::Ordering::Less
+        );
+        // Recompiling the same type with a new order must not leave the old
+        // indices behind for the same tags.
+        register_ctor_order("Reordered", &["Beta", "Alpha"]);
+        assert_eq!(
+            compare_values(nullary_ctor("Alpha"), nullary_ctor("Beta")),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn ctor_ord_unregistered_tags_fall_back_to_tag_name() {
+        // Nothing registers these — comparison must stay total and
+        // deterministic rather than panicking or reporting Equal.
+        assert_eq!(
+            compare_values(nullary_ctor("ZZUnknownA"), nullary_ctor("ZZUnknownB")),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_values(nullary_ctor("ZZUnknownB"), nullary_ctor("ZZUnknownA")),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn knot_register_ctor_order_parses_the_ctor_list() {
+        // The FFI entry point the compiler emits at program init.
+        let ty = "Size";
+        let ctors = "Small,Medium2,Large";
+        knot_register_ctor_order(ty.as_ptr(), ty.len(), ctors.as_ptr(), ctors.len());
+
+        assert_eq!(
+            compare_values(nullary_ctor("Small"), nullary_ctor("Medium2")),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_values(nullary_ctor("Medium2"), nullary_ctor("Large")),
+            std::cmp::Ordering::Less
+        );
+        // "Large" < "Small" alphabetically; declaration order says otherwise.
+        assert_eq!(
+            compare_values(nullary_ctor("Large"), nullary_ctor("Small")),
+            std::cmp::Ordering::Greater
+        );
     }
 
     // ── Fix B24: a full replace (`set`/`replace`) is DELETE-all + INSERT-all. ──

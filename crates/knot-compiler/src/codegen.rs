@@ -978,6 +978,9 @@ impl Codegen {
         self.declare_rt("knot_value_show", &[p], &[p]);
         self.declare_rt("knot_guard_failed", &[], &[]);
 
+        // Constructor declaration order (backs structural `Ord` on ADTs)
+        self.declare_rt("knot_register_ctor_order", &[p, p, p, p], &[]);
+
         // Database
         self.declare_rt("knot_db_open", &[p, p], &[p]);
         self.declare_rt("knot_db_close", &[p], &[]);
@@ -3894,6 +3897,27 @@ impl Codegen {
                 let func_ref = cg.module.declare_func_in_func(dispatcher_id, builder.func);
                 let func_addr = builder.ins().func_addr(cg.ptr_type, func_ref);
                 cg.call_rt_void(builder, "knot_register_to_json", &[func_addr]);
+            }
+
+            // Register constructor declaration order for every `data`
+            // declaration. Structural `Ord` on an ADT follows the order the
+            // constructors were written in, and a `Value::Constructor` carries
+            // only its tag, so the runtime needs the order handed to it.
+            for decl in &decls {
+                if let ast::DeclKind::Data { name, constructors, .. } = &decl.node {
+                    let ctor_list = constructors
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let (name_ptr, name_len) = cg.string_ptr(builder, name);
+                    let (ctors_ptr, ctors_len) = cg.string_ptr(builder, &ctor_list);
+                    cg.call_rt_void(
+                        builder,
+                        "knot_register_ctor_order",
+                        &[name_ptr, name_len, ctors_ptr, ctors_len],
+                    );
+                }
             }
 
             // Apply pending migrations (before source init)

@@ -10336,7 +10336,14 @@ fn value_references_source_inner(
 /// and only the type checker can tell whether each one means `pure e` or `e`
 /// (see `resolve_result_markers`). Every marker is rewritten away here, so
 /// later passes never see one.
+///
+/// Runs on a grown stack: a desugared `do` block nests one `__bind` per
+/// statement, and `infer_expr` recurses through every level.
 pub fn check(module: &mut ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, LocalTypeInfo, RefineTargets, RefinedTypeInfoMap, FromJsonTargets, ElemPushdownOk) {
+    crate::stack::grow(|| check_inner(module))
+}
+
+fn check_inner(module: &mut ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, LocalTypeInfo, RefineTargets, RefinedTypeInfoMap, FromJsonTargets, ElemPushdownOk) {
     let mut infer = Infer::new();
 
     // Phase 1: Collect type aliases, data types, constructors

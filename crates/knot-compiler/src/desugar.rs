@@ -26,7 +26,14 @@ use std::collections::HashSet;
 
 /// Desugar a module in place. Transforms pure-comprehension do blocks
 /// into nested bind/yield/empty expressions, and routes into data declarations.
+///
+/// Runs on a grown stack: `desugar_stmts` recurses once per do-block
+/// statement to build the bind chain, and the walkers then descend it.
 pub fn desugar(module: &mut Module) {
+    crate::stack::grow(|| desugar_inner(module))
+}
+
+fn desugar_inner(module: &mut Module) {
     desugar_routes(module);
     let io_fns = detect_io_functions(&module.decls);
     let no_source_vars = HashSet::new();

@@ -559,7 +559,14 @@ impl<'a> Tarjan<'a> {
 /// Check that all recursive derived relations are stratifiable.
 ///
 /// Returns diagnostics for any cycle that contains a negative (diff) edge.
+///
+/// Runs on a grown stack — building the dependency graph walks expression
+/// bodies recursively, including desugared `do` chains.
 pub fn check(module: &ast::Module) -> Vec<Diagnostic> {
+    crate::stack::grow(|| check_inner(module))
+}
+
+fn check_inner(module: &ast::Module) -> Vec<Diagnostic> {
     let (_, edges) = build_dependency_graph(module);
     let sccs = Tarjan::run(&edges);
 

@@ -579,8 +579,40 @@ fn format_literal_display(lit: &ast::Literal) -> Option<String> {
 
 // Entry point threads every inference artifact into codegen; grouping them
 // into a struct would obscure more than it helps.
+///
+/// Runs on a grown stack — `compile_expr` recurses through the `__bind` chain
+/// a desugared `do` block expands into, one level per statement.
 #[allow(clippy::too_many_arguments)]
 pub fn compile(
+    module: &ast::Module,
+    type_env: &TypeEnv,
+    source_file: &str,
+    monad_info: &MonadInfo,
+    refine_targets: &crate::infer::RefineTargets,
+    refined_types: &crate::infer::RefinedTypeInfoMap,
+    from_json_targets: &crate::infer::FromJsonTargets,
+    type_info: &crate::infer::TypeInfo,
+    elem_pushdown_ok: &crate::infer::ElemPushdownOk,
+    compile_time_overrides: &HashMap<String, String>,
+) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
+    crate::stack::grow(|| {
+        compile_inner(
+            module,
+            type_env,
+            source_file,
+            monad_info,
+            refine_targets,
+            refined_types,
+            from_json_targets,
+            type_info,
+            elem_pushdown_ok,
+            compile_time_overrides,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_inner(
     module: &ast::Module,
     type_env: &TypeEnv,
     source_file: &str,

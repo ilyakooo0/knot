@@ -8,6 +8,7 @@ pub mod linker;
 pub mod lockfile;
 pub mod modules;
 pub mod sql_lint;
+pub mod stack;
 pub mod stratify;
 pub mod types;
 pub(crate) mod unwind;

@@ -14471,10 +14471,95 @@ pub extern "C-unwind" fn knot_route_set_field_refinement(
     let table = unsafe { &mut *(table as *mut RouteTable) };
     table.field_refinements.push(FieldRefinement {
         constructor: ctor.to_string(),
-        field_name: field.to_string(),
+        path: field.to_string(),
         predicate,
         type_name: type_name.to_string(),
     });
+}
+
+/// One step of a refinement path (see `knot_route_set_field_refinement`).
+enum RefStep {
+    /// A record field.
+    Field(String),
+    /// `[]` — every element of a relation.
+    Each,
+    /// `?` — the payload of a `Maybe`; a `Nothing` has nothing to check.
+    Unwrap,
+}
+
+/// Parse a refinement path such as `events[].pubkey?`. Knot field names are
+/// alphanumeric identifiers, so `.`, `[]` and `?` never appear inside one and
+/// the grammar needs no escaping.
+fn parse_ref_path(path: &str) -> Vec<RefStep> {
+    let mut steps = Vec::new();
+    let mut name = String::new();
+    let mut chars = path.chars().peekable();
+    let flush = |name: &mut String, steps: &mut Vec<RefStep>| {
+        if !name.is_empty() {
+            steps.push(RefStep::Field(std::mem::take(name)));
+        }
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '.' => flush(&mut name, &mut steps),
+            '[' => {
+                flush(&mut name, &mut steps);
+                if chars.peek() == Some(&']') {
+                    chars.next();
+                }
+                steps.push(RefStep::Each);
+            }
+            '?' => {
+                flush(&mut name, &mut steps);
+                steps.push(RefStep::Unwrap);
+            }
+            other => name.push(other),
+        }
+    }
+    flush(&mut name, &mut steps);
+    steps
+}
+
+/// Walk `value` along `steps` and run `predicate` everywhere the path lands —
+/// once for a plain field, once per element under a `[]`.
+///
+/// A step that finds nothing (an absent field, a `Nothing`) is vacuously
+/// valid: there is no value to check. That matches how the flat top-level
+/// check this generalizes treated a missing field.
+fn refinement_holds_at(
+    db: *mut c_void,
+    value: *mut Value,
+    steps: &[RefStep],
+    predicate: *mut Value,
+) -> bool {
+    let Some((step, rest)) = steps.split_first() else {
+        return knot_refinement_check_value(db, value, predicate) != 0;
+    };
+    match step {
+        RefStep::Field(name) => match unsafe { as_ref(value) } {
+            Value::Record(fields) => match fields.iter().find(|f| &*f.name == name.as_str()) {
+                Some(f) => refinement_holds_at(db, f.value, rest, predicate),
+                None => true,
+            },
+            _ => true,
+        },
+        RefStep::Each => match unsafe { as_ref(value) } {
+            Value::Relation(items) => items
+                .iter()
+                .all(|it| refinement_holds_at(db, *it, rest, predicate)),
+            _ => true,
+        },
+        RefStep::Unwrap => match unsafe { as_ref(value) } {
+            Value::Constructor(tag, payload) if &**tag == "Just" => {
+                let inner = knot_record_field(*payload, b"value".as_ptr(), 5);
+                refinement_holds_at(db, inner, rest, predicate)
+            }
+            Value::Constructor(tag, _) if &**tag == "Nothing" => true,
+            // Not a `Maybe` after all — the decoder handed back a bare value.
+            // Check it rather than silently skipping it.
+            _ => refinement_holds_at(db, value, rest, predicate),
+        },
+    }
 }
 
 /// Register a rate-limit configuration for a route endpoint.
@@ -15707,7 +15792,10 @@ struct RouteTableEntry {
 
 struct FieldRefinement {
     constructor: String,
-    field_name: String,
+    /// Where in the decoded body the predicate applies. See `parse_ref_path`:
+    /// a plain field name for a top-level refinement, or a walk such as
+    /// `events[].pubkey?` for one nested inside a list and a `Maybe`.
+    path: String,
     predicate: *mut Value,
     type_name: String,
 }
@@ -15720,7 +15808,7 @@ impl Clone for FieldRefinement {
     fn clone(&self) -> Self {
         Self {
             constructor: self.constructor.clone(),
-            field_name: self.field_name.clone(),
+            path: self.path.clone(),
             predicate: self.predicate,
             type_name: self.type_name.clone(),
         }
@@ -17059,16 +17147,14 @@ fn http_serve_loop(
 
                     // Validate refined body fields (after the rate-limit
                     // check — see above).
-                    if let Value::Record(rec_fields) = unsafe { as_ref(record) } {
+                    if matches!(unsafe { as_ref(record) }, Value::Record(_)) {
                         for refinement in &entry_refinements {
-                            if let Some(field) = rec_fields.iter().find(|f| &*f.name == refinement.field_name.as_str()) {
-                                let check = knot_refinement_check_value(db, field.value, refinement.predicate);
-                                if check == 0 {
-                                    return Err((400, format!(
-                                        "validation error: field '{}' does not satisfy '{}' constraint",
-                                        refinement.field_name, refinement.type_name
-                                    ), None));
-                                }
+                            let steps = parse_ref_path(&refinement.path);
+                            if !refinement_holds_at(db, record, &steps, refinement.predicate) {
+                                return Err((400, format!(
+                                    "validation error: field '{}' does not satisfy '{}' constraint",
+                                    refinement.path, refinement.type_name
+                                ), None));
                             }
                         }
                     }

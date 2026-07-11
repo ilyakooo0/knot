@@ -276,6 +276,11 @@ pub struct Codegen {
 
     // Refined type predicates: type_name -> predicate AST expression
     refined_types: HashMap<String, knot::ast::Expr>,
+    // Declared (unresolved) alias bodies: alias_name -> AST type. Unlike
+    // `type_aliases`, these keep their `where` refinements, so
+    // `collect_type_refinements` can follow `events: [GossipEvent]` into
+    // `GossipEvent`'s own refined fields.
+    alias_ast: HashMap<String, knot::ast::Type>,
     // Source refinements: source_name -> [(field_name_or_none, type_name, predicate_expr)]
     source_refinements: HashMap<String, Vec<(Option<String>, String, knot::ast::Expr)>>,
     // Refine expression targets: expr_span -> refined type name
@@ -606,6 +611,16 @@ pub fn compile(
     cg.monad_info = monad_info.clone();
     cg.refine_targets = refine_targets.clone();
     cg.refined_types = refined_types.clone();
+    cg.alias_ast = module
+        .decls
+        .iter()
+        .filter_map(|d| match &d.node {
+            ast::DeclKind::TypeAlias { name, params, ty } if params.is_empty() => {
+                Some((name.clone(), ty.clone()))
+            }
+            _ => None,
+        })
+        .collect();
     cg.from_json_targets = from_json_targets.clone();
     cg.elem_pushdown_ok = elem_pushdown_ok.clone();
     cg.source_refinements = type_env.source_refinements.clone();
@@ -868,6 +883,7 @@ impl Codegen {
             atomic_arena_frames: 0,
             pending_index_frees: Vec::new(),
             refined_types: HashMap::new(),
+            alias_ast: HashMap::new(),
             refine_targets: HashMap::new(),
             refined_predicate_fns: HashMap::new(),
             source_refinements: HashMap::new(),
@@ -3730,6 +3746,7 @@ impl Codegen {
         let all_routes: Vec<(String, Vec<ast::RouteEntry>)> =
             self.route_entries.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         let to_json_dispatcher_id = self.trait_dispatcher_fns.get("toJson").copied();
+        let alias_ast = self.alias_ast.clone();
 
         self.build_function(main_id, sig, |cg, builder, entry| {
             let argc = builder.block_params(entry)[0];
@@ -3950,25 +3967,25 @@ impl Codegen {
                 );
             }
 
-            // Register refinement predicates for route body fields
+            // Register refinement predicates for route body fields, including
+            // the ones nested inside lists and records (see
+            // `collect_type_refinements`).
             for (table, entries) in &route_tables {
                 for route_entry in entries {
                     let (ctor_ptr, ctor_len) = cg.string_ptr(builder, &route_entry.constructor);
                     for field in &route_entry.body_fields {
-                        let refined_type_name = match &field.value.node {
-                            ast::TypeKind::Refined { predicate, .. } => {
-                                // Inline refinement — use field name as type name
-                                Some((field.name.clone(), (**predicate).clone()))
-                            }
-                            ast::TypeKind::Named(name) => {
-                                cg.refined_types.get(name).map(|pred| (name.clone(), pred.clone()))
-                            }
-                            _ => None,
-                        };
-                        if let Some((type_name, pred_expr)) = refined_type_name {
+                        let mut found = Vec::new();
+                        collect_type_refinements(
+                            &field.value,
+                            &field.name,
+                            &alias_ast,
+                            &mut Vec::new(),
+                            &mut found,
+                        );
+                        for (path, type_name, pred_expr) in found {
                             let mut pred_env = Env::new();
                             let pred_fn = cg.compile_expr(builder, &pred_expr, &mut pred_env, db);
-                            let (fn_ptr, fn_len) = cg.string_ptr(builder, &field.name);
+                            let (fn_ptr, fn_len) = cg.string_ptr(builder, &path);
                             let (tn_ptr, tn_len) = cg.string_ptr(builder, &type_name);
                             cg.call_rt_void(
                                 builder,
@@ -6703,21 +6720,19 @@ impl Codegen {
                         let (ctor_ptr, ctor_len) =
                             self.string_ptr(builder, &entry.constructor);
                         for field in &entry.body_fields {
-                            let refined_type_name = match &field.value.node {
-                                ast::TypeKind::Refined { predicate, .. } => {
-                                    // Inline refinement — use field name as type name
-                                    Some((field.name.clone(), (**predicate).clone()))
-                                }
-                                ast::TypeKind::Named(name) => {
-                                    self.refined_types.get(name).map(|pred| (name.clone(), pred.clone()))
-                                }
-                                _ => None,
-                            };
-                            if let Some((type_name, pred_expr)) = refined_type_name {
+                            let mut found = Vec::new();
+                            collect_type_refinements(
+                                &field.value,
+                                &field.name,
+                                &self.alias_ast,
+                                &mut Vec::new(),
+                                &mut found,
+                            );
+                            for (path, type_name, pred_expr) in found {
                                 let mut pred_env = Env::new();
                                 let pred_fn =
                                     self.compile_expr(builder, &pred_expr, &mut pred_env, db);
-                                let (fn_ptr, fn_len) = self.string_ptr(builder, &field.name);
+                                let (fn_ptr, fn_len) = self.string_ptr(builder, &path);
                                 let (tn_ptr, tn_len) = self.string_ptr(builder, &type_name);
                                 self.call_rt_void(
                                     builder,
@@ -16333,6 +16348,73 @@ fn method_params_body<'a>(
 }
 
 /// Map a type name to its runtime Value tag (as used by knot_value_get_tag).
+/// Every refinement predicate reachable from a route body field's declared
+/// type, as `(path, type_name, predicate)`.
+///
+/// Only the field's own top-level type used to be checked, so a refinement
+/// nested inside a list or a record — `events: [GossipEvent]` where
+/// `GossipEvent` has `pubkey: Maybe PubkeyHex` — was decoded straight into the
+/// handler with its predicate never run. The path tells the runtime how to
+/// walk in: `events[].pubkey?` descends the list, then the field, then unwraps
+/// the `Maybe` (a `Nothing` is vacuously valid). See `parse_ref_path` in the
+/// runtime for the grammar.
+fn collect_type_refinements(
+    ty: &ast::Type,
+    path: &str,
+    alias_ast: &HashMap<String, ast::Type>,
+    visiting: &mut Vec<String>,
+    out: &mut Vec<(String, String, ast::Expr)>,
+) {
+    match &ty.node {
+        ast::TypeKind::Refined { base, predicate } => {
+            // An inline refinement has no name of its own; the path reads well
+            // enough in the diagnostic ("field 'events[].score' does not
+            // satisfy …"). A named one is handled by the `Named` arm below,
+            // which passes the alias name through as the type name.
+            out.push((path.to_string(), path.to_string(), (**predicate).clone()));
+            collect_type_refinements(base, path, alias_ast, visiting, out);
+        }
+        ast::TypeKind::Named(name) => {
+            // Guard against `type A = B; type B = A`, which `check_alias_cycles`
+            // reports separately — don't recurse forever before it does.
+            if visiting.iter().any(|n| n == name) {
+                return;
+            }
+            let Some(aliased) = alias_ast.get(name) else {
+                return; // primitive, data type, or unknown — nothing nested
+            };
+            visiting.push(name.clone());
+            if let ast::TypeKind::Refined { base, predicate } = &aliased.node {
+                out.push((path.to_string(), name.clone(), (**predicate).clone()));
+                collect_type_refinements(base, path, alias_ast, visiting, out);
+            } else {
+                collect_type_refinements(aliased, path, alias_ast, visiting, out);
+            }
+            visiting.pop();
+        }
+        ast::TypeKind::Record { fields, .. } => {
+            for f in fields {
+                let sub = format!("{}.{}", path, f.name);
+                collect_type_refinements(&f.value, &sub, alias_ast, visiting, out);
+            }
+        }
+        ast::TypeKind::Relation(inner) => {
+            let sub = format!("{}[]", path);
+            collect_type_refinements(inner, &sub, alias_ast, visiting, out);
+        }
+        // `Maybe T` — the only type application whose payload the JSON decoder
+        // unwraps positionally. Everything else (`Result e a`, user ADTs) is
+        // tagged and has no single "the value" to refine.
+        ast::TypeKind::App { func, arg }
+            if matches!(&func.node, ast::TypeKind::Named(n) if n == "Maybe") =>
+        {
+            let sub = format!("{}?", path);
+            collect_type_refinements(arg, &sub, alias_ast, visiting, out);
+        }
+        _ => {}
+    }
+}
+
 pub fn type_name_to_tag(name: &str) -> Option<i64> {
     match name {
         "Int" => Some(0),

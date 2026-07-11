@@ -460,13 +460,14 @@ fn desugar_expr(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<String>) 
 
     // Now check if this expression is a desugaring-eligible Do block.
     // Check eligibility with immutable borrows first to avoid borrow conflicts.
-    let (sql_compilable, pure_comp) = if let ExprKind::Do(stmts) = &expr.node {
+    let (sql_compilable, pure_comp, let_block) = if let ExprKind::Do(stmts) = &expr.node {
         (
             is_sql_compilable(stmts, source_vars),
             is_pure_comprehension(stmts, io_fns),
+            is_let_block(stmts),
         )
     } else {
-        (false, false)
+        (false, false, false)
     };
 
     if sql_compilable {
@@ -475,12 +476,79 @@ fn desugar_expr(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<String>) 
         // recurse_into_children above.
         return;
     }
+    if let_block
+        && let ExprKind::Do(stmts) = &expr.node
+    {
+        let span = expr.span;
+        let desugared = desugar_let_block(stmts, span);
+        *expr = desugared;
+        return;
+    }
     if pure_comp
         && let ExprKind::Do(stmts) = &expr.node {
             let span = expr.span;
             let desugared = desugar_stmts(stmts, span);
             *expr = desugared;
         }
+}
+
+/// A `do` block that binds nothing monadic — only `let`s followed by a bare
+/// final expression, as in
+///
+/// ```knot
+/// isValidHex = \s -> do
+///   let n = length s
+///   n > 0 && n % 2 == 0
+/// ```
+///
+/// There is no `<-`, no `where`, and no `yield`, so no monad is involved: the
+/// block is plain `let … in expr` and its type is the final expression's type.
+/// Treating it as a comprehension instead invents a monad variable for the
+/// result and reports the final `Bool` as `(t384 Bool)`.
+fn is_let_block(stmts: &[Stmt]) -> bool {
+    let Some((last, init)) = stmts.split_last() else {
+        return false;
+    };
+    if init.is_empty() {
+        return false; // a lone expression is not a `let` block
+    }
+    if !init.iter().all(|s| matches!(&s.node, StmtKind::Let { .. })) {
+        return false;
+    }
+    // An explicit `yield` asks for the monadic reading even here
+    // (`do { let x = 1; yield x }` is `pure 1`), so leave it to the
+    // comprehension path.
+    matches!(&last.node, StmtKind::Expr(e) if e.node.as_yield_arg().is_none())
+}
+
+/// Lower a `let` block (see `is_let_block`) to nested immediately-applied
+/// lambdas — the same shape `desugar_stmts` gives a `Let` statement, but with
+/// no `__yield`/`__bind` around the result.
+fn desugar_let_block(stmts: &[Stmt], span: Span) -> Expr {
+    let (last, init) = stmts.split_last().expect("is_let_block checked non-empty");
+    let StmtKind::Expr(body) = &last.node else {
+        unreachable!("is_let_block requires a bare final expression")
+    };
+    let mut out = body.clone();
+    for stmt in init.iter().rev() {
+        let StmtKind::Let { pat, expr } = &stmt.node else {
+            unreachable!("is_let_block requires every preceding statement to be a let")
+        };
+        out = spanned(
+            ExprKind::App {
+                func: Box::new(spanned(
+                    ExprKind::Lambda {
+                        params: vec![pat.clone()],
+                        body: Box::new(out),
+                    },
+                    span,
+                )),
+                arg: Box::new(expr.clone()),
+            },
+            span,
+        );
+    }
+    out
 }
 
 /// Recurse into all child expressions of a node (except Do blocks handled
@@ -1188,17 +1256,21 @@ fn desugar_stmts(stmts: &[Stmt], span: Span) -> Expr {
     if stmts.len() == 1 {
         return match &stmts[0].node {
             StmtKind::Expr(e) => {
-                // The final bare expression is the yielded result and must be
-                // wrapped in `__yield` (Applicative.pure) so the do-block has
-                // monad type `m a`, not the bare `a`. An explicit `yield e`
-                // wraps its inner argument; a bare `e` (e.g. `show x` in
-                // `do { x <- ioAction; show x }`) is wrapped as-is. Without
-                // this, a trait-only-IO chain returns `Text` instead of the
-                // expected `IO Text` and fails to type-check against the gate
-                // (see `is_pure_comprehension`).
+                // An explicit `yield e` is always `Applicative.pure e`.
+                //
+                // A final *bare* expression is ambiguous and only the type
+                // checker can settle it: `do { x <- act; show x }` wants
+                // `pure (show x)` (a plain `Text` value), while
+                // `do { action x; loop rest }` wants `loop rest` itself — it
+                // is already an action in the block's monad. Wrapping both in
+                // `__yield` types the second as `m (m a)`, which is what broke
+                // every IO do-block (the prelude's own `forEach` included).
+                // Emit a `__result` marker instead: `infer` rewrites it to
+                // `__yield e` or to a bare `e` once it knows both the block's
+                // monad and `e`'s type (see `resolve_result_markers`).
                 match e.node.as_yield_arg() {
                     Some(inner) => mk_yield(inner.clone(), span),
-                    None => mk_yield(e.clone(), span),
+                    None => mk_result(e.clone(), span),
                 }
             }
             // Shouldn't happen for valid pure comprehensions (last must be Expr)
@@ -1355,6 +1427,31 @@ fn mk_yield(inner: Expr, span: Span) -> Expr {
         span,
     )
 }
+
+/// Build `App(Var("__result"), inner)` — the *unresolved* result of a
+/// do-block whose final statement is a bare expression. Type inference
+/// replaces every one of these with either `App(Var("__yield"), inner)` (when
+/// `inner` is a plain value, so the block's result is `pure inner`) or with
+/// `inner` alone (when `inner` is already an action in the block's monad).
+/// The helper Var gets a unique synthesized span (see `fresh_monad_span`) so
+/// the `__yield` rewrite lands on a span `monad_info` already carries.
+fn mk_result(inner: Expr, span: Span) -> Expr {
+    spanned(
+        ExprKind::App {
+            func: Box::new(spanned(
+                ExprKind::Var(RESULT_MARKER.into()),
+                fresh_monad_span(span),
+            )),
+            arg: Box::new(inner),
+        },
+        span,
+    )
+}
+
+/// Name of the synthesized marker `mk_result` emits. Never written by users
+/// (leading underscores are not valid in Knot identifiers) and never survives
+/// inference — `infer::check` rewrites every occurrence away.
+pub(crate) const RESULT_MARKER: &str = "__result";
 
 /// Build `Var("__empty")` with a unique synthesized span (see
 /// `fresh_monad_span`).

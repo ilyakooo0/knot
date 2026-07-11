@@ -606,7 +606,7 @@ pub fn analyze_document(
             refined_type_info,
             _from_json,
             _elem_pushdown,
-        ) = knot_compiler::infer::check(&analysis_module);
+        ) = knot_compiler::infer::check(&mut analysis_module);
         all_diags.extend(infer_diags.into_iter().filter(anchored_in_user));
         type_info = inferred_types;
         local_type_info = local_types;

@@ -67,6 +67,25 @@ pub enum IoEffect {
 /// Maps desugared do-block spans to their resolved monad type.
 pub type MonadInfo = HashMap<Span, MonadKind>;
 
+/// A synthesized `__result e` node: the final bare expression of a desugared
+/// do-block, whose meaning is type-directed. If `e`'s type is an action in the
+/// block's monad `m` the block's result IS `e`; otherwise `e` is a plain value
+/// and the result is `pure e`. `resolve_result_markers` decides, unifies
+/// accordingly, and rewrites the node.
+struct ResultMarker {
+    /// Span of the `__result` Var itself — the `monad_vars` key, and the node
+    /// the AST rewrite looks for.
+    span: Span,
+    /// The do-block's monad type constructor.
+    monad: TyVar,
+    /// The do-block's result element type (`a` in `m a`).
+    elem: TyVar,
+    /// Inferred type of the final expression.
+    arg: Ty,
+    /// Span of the final expression, for the mismatch diagnostic.
+    arg_span: Span,
+}
+
 /// Maps `refine` expression spans to their resolved refined type name.
 pub type RefineTargets = HashMap<Span, String>;
 
@@ -514,6 +533,14 @@ struct Infer {
     /// user-defined monad lacking one gets a clean diagnostic instead of a
     /// missing-impl panic in codegen.
     empty_spans: std::collections::HashSet<Span>,
+    /// Synthesized `__result e` nodes — a desugared do-block's final bare
+    /// expression, whose meaning (`pure e` vs. `e`) depends on types.
+    /// Resolved and rewritten away by `resolve_result_markers`.
+    result_markers: Vec<ResultMarker>,
+    /// Recursion depth of `unify_dir`. Refinement widening looks for
+    /// unification *variables*, which only the outermost call still sees —
+    /// recursive calls get sub-terms that `apply` has already substituted.
+    unify_depth: usize,
     /// Full `traverse f rel` applications: (call span, result type var,
     /// container type var). Post-inference, relation-container calls get a
     /// `monad_info` entry keyed by the call span so codegen can tell the
@@ -695,6 +722,8 @@ impl Infer {
             errors: Vec::new(),
             monad_vars: Vec::new(),
             empty_spans: std::collections::HashSet::new(),
+            result_markers: Vec::new(),
+            unify_depth: 0,
             traverse_calls: Vec::new(),
             from_json_calls: Vec::new(),
             trait_method_traits: HashMap::new(),
@@ -1583,10 +1612,163 @@ impl Infer {
     /// type that is *required* must be skolemised so the requirement can't
     /// be silently narrowed to a single instantiation (rank-2 soundness).
     fn unify_dir(&mut self, t1: &Ty, t2: &Ty, span: Span, t1_provided: bool) {
+        // Before `apply` erases which parts of these types are still
+        // *variables*, re-point any variable pinned to a refined type that is
+        // required to hold the refinement's base type. Only the outermost call
+        // can find anything: the recursive ones receive fully-applied
+        // sub-terms, whose variables `apply` has already substituted away.
+        if self.unify_depth == 0 {
+            self.widen_refined_vars(t1, t2, 0);
+        }
+        self.unify_depth += 1;
+        self.unify_inner(t1, t2, span, t1_provided);
+        self.unify_depth -= 1;
+    }
+
+    /// Re-point unification variables that were pinned to a refined type but
+    /// are required to hold values of the refinement's *base* type.
+    ///
+    /// `elem : a -> [a] -> Bool` called as `elem (n : ServerName) (xs : [Text])`
+    /// binds `a := ServerName` from the needle, then rejects `xs` — a plain
+    /// `Text` cannot implicitly become a `ServerName`. But nothing is being
+    /// laundered *into* the refinement here: the call simply wants `a` to be
+    /// the wider `Text`, which every `ServerName` already is. Forgetting a
+    /// refinement is the same subsumption `unify` already permits between
+    /// concrete types, so widen the variable and let the call through.
+    ///
+    /// Strictly one-way. Re-pointing a variable pinned to `Text` at
+    /// `ServerName` would let `\t -> filter (\_ -> True) [t] : [ServerName]`
+    /// launder an arbitrary `Text` into a refined list, so that never happens.
+    /// It is also why this walks *variables* and not concrete types:
+    /// `asNat : Int -> Nat; asNat = \x -> x` offers no variable to widen and
+    /// stays rejected.
+    fn widen_refined_vars(&mut self, t1: &Ty, t2: &Ty, depth: usize) {
+        // Types are finite (the occurs check rules out cyclic substitutions),
+        // but bound the walk anyway — this runs on every unification.
+        if depth > 12 {
+            return;
+        }
+        let (v1, a) = self.shallow_resolve(t1);
+        let (v2, b) = self.shallow_resolve(t2);
+
+        if let Some(v) = v1
+            && let Some(base) = self.widened_base(&a, &b)
+        {
+            self.subst.insert(v, base);
+            return;
+        }
+        if let Some(v) = v2
+            && let Some(base) = self.widened_base(&b, &a)
+        {
+            self.subst.insert(v, base);
+            return;
+        }
+
+        match (&a, &b) {
+            (Ty::Relation(x), Ty::Relation(y)) => self.widen_refined_vars(x, y, depth + 1),
+            (Ty::Fun(p1, r1), Ty::Fun(p2, r2)) => {
+                self.widen_refined_vars(p1, p2, depth + 1);
+                self.widen_refined_vars(r1, r2, depth + 1);
+            }
+            (Ty::App(f1, x1), Ty::App(f2, x2)) => {
+                self.widen_refined_vars(f1, f2, depth + 1);
+                self.widen_refined_vars(x1, x2, depth + 1);
+            }
+            (Ty::IO(_, _, x), Ty::IO(_, _, y)) => self.widen_refined_vars(x, y, depth + 1),
+            (Ty::Con(n1, a1), Ty::Con(n2, a2)) if n1 == n2 && a1.len() == a2.len() => {
+                for (x, y) in a1.clone().iter().zip(a2.clone().iter()) {
+                    self.widen_refined_vars(x, y, depth + 1);
+                }
+            }
+            (Ty::Record(f1, _), Ty::Record(f2, _)) => {
+                let common: Vec<(Ty, Ty)> = f1
+                    .iter()
+                    .filter_map(|(k, x)| f2.get(k).map(|y| (x.clone(), y.clone())))
+                    .collect();
+                for (x, y) in common {
+                    self.widen_refined_vars(&x, &y, depth + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// When `refined` is a refined type and `required` is exactly its base,
+    /// return that base — the type a variable pinned to `refined` should widen
+    /// to. `None` otherwise, including refined-vs-refined: two refinements over
+    /// one base must not interchange without a `refine`.
+    fn widened_base(&mut self, refined: &Ty, required: &Ty) -> Option<Ty> {
+        let Ty::Con(name, args) = refined else {
+            return None;
+        };
+        if !args.is_empty() || !self.refined_types.contains_key(name) {
+            return None;
+        }
+        if matches!(required, Ty::Con(n, a)
+            if a.is_empty() && self.refined_types.contains_key(n))
+        {
+            return None;
+        }
+        let base = self.refined_base_ty(name)?;
+        (base == *required).then_some(base)
+    }
+
+    /// The ultimate base type of a refined alias, following chains of
+    /// refinements over refinements. `None` on a cycle — `resolve_refined_base`
+    /// is the reporting variant; this one stays quiet because it runs
+    /// speculatively on every unification.
+    fn refined_base_ty(&self, name: &str) -> Option<Ty> {
+        let mut visited: Vec<&str> = vec![name];
+        let mut current = &self.refined_types.get(name)?.0;
+        loop {
+            match current {
+                Ty::Con(n, args) if args.is_empty() && self.refined_types.contains_key(n) => {
+                    if visited.contains(&n.as_str()) {
+                        return None;
+                    }
+                    visited.push(n.as_str());
+                    current = &self.refined_types[n].0;
+                }
+                _ => return Some(current.clone()),
+            }
+        }
+    }
+
+    /// Follow a variable's substitution chain to the type it points at
+    /// *without* substituting inside that type, so the variable's identity
+    /// survives. Returns the last variable in the chain — the one to rebind —
+    /// alongside the resolved type. A deep `apply` would have replaced the
+    /// variable with its binding, which is precisely what
+    /// `widen_refined_vars` needs to see.
+    fn shallow_resolve(&self, ty: &Ty) -> (Option<TyVar>, Ty) {
+        let mut last_var = None;
+        let mut current = ty.clone();
+        loop {
+            let Ty::Var(v) = current else {
+                return (last_var, current);
+            };
+            match self.subst.get(&v) {
+                Some(next) => {
+                    last_var = Some(v);
+                    current = next.clone();
+                }
+                None => return (None, Ty::Var(v)),
+            }
+        }
+    }
+
+    fn unify_inner(&mut self, t1: &Ty, t2: &Ty, span: Span, t1_provided: bool) {
         // Capture root vars before apply shadows them — needed to propagate
         // merged IO effects back into the substitution.
         let var1 = if let Ty::Var(v) = t1 { Some(*v) } else { None };
         let var2 = if let Ty::Var(v) = t2 { Some(*v) } else { None };
+        // Bind variables to the *unsubstituted* type (see the `Var` arms
+        // below): `apply` is recursive, so a binding that still mentions
+        // variables resolves identically — but it keeps those variables
+        // reachable, which is what lets `widen_refined_vars` find and re-point
+        // them later. Binding the applied copy instead freezes whatever they
+        // happened to point at when the binding was made.
+        let (raw1, raw2) = (t1, t2);
         let t1 = self.apply(t1);
         let t2 = self.apply(t2);
 
@@ -1693,11 +1875,11 @@ impl Infer {
             }
             (Ty::Var(v), _) => {
                 let v = *v;
-                self.bind_var(v, t2.clone(), span);
+                self.bind_var(v, raw2.clone(), span);
             }
             (_, Ty::Var(v)) => {
                 let v = *v;
-                self.bind_var(v, t1.clone(), span);
+                self.bind_var(v, raw1.clone(), span);
             }
             (Ty::Int, Ty::Int)
             | (Ty::Float, Ty::Float)
@@ -4456,6 +4638,33 @@ impl Infer {
                     return ty;
                 }
 
+                // `__result e` — a desugared do-block's final bare expression,
+                // which is either `pure e` or `e` itself depending on whether
+                // `e` is already an action in the block's monad. Neither the
+                // desugarer nor a single HM type can decide that, so type it as
+                // the block's `App(m, a)` and defer the choice to
+                // `resolve_result_markers`, which reruns once `m` and `e`'s
+                // type are known and then rewrites the AST accordingly.
+                if let ast::ExprKind::Var(name) = &func.node
+                    && name == crate::desugar::RESULT_MARKER
+                {
+                    let arg_ty = self.infer_expr(arg);
+                    let m = self.fresh_var();
+                    let a = self.fresh_var();
+                    self.monad_vars.push((func.span, m));
+                    self.result_markers.push(ResultMarker {
+                        span: func.span,
+                        monad: m,
+                        elem: a,
+                        arg: arg_ty,
+                        arg_span: arg.span,
+                    });
+                    return Ty::App(
+                        Box::new(Ty::Var(m)),
+                        Box::new(Ty::Var(a)),
+                    );
+                }
+
                 // Constructor application `Ctor {fields}`: type the argument
                 // against the constructor's field record and return the data
                 // type directly. This is required now that bare nullary
@@ -4495,34 +4704,77 @@ impl Infer {
                             return body_ty;
                         }
 
-                let func_ty = self.infer_expr(func);
+                // Check lambda arguments LAST.
+                //
+                // `filter (\s -> isLocal s) names` is
+                // `App(App(filter, lam), names)`. Inferring left to right lets
+                // the lambda's body pin `filter`'s `a` to `isLocal`'s `Text`
+                // before `names : [ServerName]` is ever looked at — the
+                // refinement is thrown away, and the declared `[ServerName]`
+                // result is then rejected. The *data* argument is the one that
+                // knows the type, so pin the shared variables from it and
+                // *check* the lambda against the parameter type it settled.
+                //
+                // Restricted to a named head with a two-argument signature, so
+                // the shape is known before anything is inferred and there is
+                // no half-inferred state to unwind.
+                let lambda_last = if let ast::ExprKind::App { func: head, arg: lam } = &func.node
+                    && matches!(&lam.node, ast::ExprKind::Lambda { .. })
+                    && let ast::ExprKind::Var(head_name) = &head.node
+                {
+                    self.lookup(head_name)
+                        .is_some_and(|s| takes_two_args(&s.ty))
+                        .then(|| ((**head).clone(), (**lam).clone()))
+                } else {
+                    None
+                };
 
-                // Higher-rank arg slot: when the function's parameter is
-                // a `Ty::Forall`, check the argument against the Forall's
-                // body so the arg can be used polymorphically inside the
-                // callee. Predicative — relies on later escape checks.
-                let func_applied = self.apply(&func_ty);
-                if let Ty::Fun(arg_slot, ret_ty) = &func_applied {
-                    let arg_slot_resolved = self.apply(arg_slot);
-                    if matches!(arg_slot_resolved, Ty::Forall(..)) {
-                        self.check_expr(arg, &arg_slot_resolved);
-                        let result_ty = (**ret_ty).clone();
-                        if let ast::ExprKind::Var(name) = &func.node
-                            && name == "parseJson"
-                                && let Ty::Var(v) = &result_ty {
-                                    self.from_json_calls.push((expr.span, *v));
-                                }
-                        return result_ty;
+                let (arg_ty, result_ty) = if let Some((head, lam)) = lambda_last {
+                    let head_ty = self.infer_expr(&head);
+                    let head_applied = self.apply(&head_ty);
+                    let (p1, p2, ret) = match head_applied {
+                        Ty::Fun(p1, rest) => match self.apply(&rest) {
+                            Ty::Fun(p2, ret) => (*p1, *p2, *ret),
+                            _ => unreachable!("takes_two_args checked the arity"),
+                        },
+                        _ => unreachable!("takes_two_args checked the arity"),
+                    };
+                    self.check_expr(arg, &p2);
+                    self.check_expr(&lam, &p1);
+                    let result_ty = self.fresh();
+                    self.unify(&ret, &result_ty, expr.span);
+                    (self.apply(&p2), result_ty)
+                } else {
+                    let func_ty = self.infer_expr(func);
+
+                    // Higher-rank arg slot: when the function's parameter is
+                    // a `Ty::Forall`, check the argument against the Forall's
+                    // body so the arg can be used polymorphically inside the
+                    // callee. Predicative — relies on later escape checks.
+                    let func_applied = self.apply(&func_ty);
+                    if let Ty::Fun(arg_slot, ret_ty) = &func_applied {
+                        let arg_slot_resolved = self.apply(arg_slot);
+                        if matches!(arg_slot_resolved, Ty::Forall(..)) {
+                            self.check_expr(arg, &arg_slot_resolved);
+                            let result_ty = (**ret_ty).clone();
+                            if let ast::ExprKind::Var(name) = &func.node
+                                && name == "parseJson"
+                                    && let Ty::Var(v) = &result_ty {
+                                        self.from_json_calls.push((expr.span, *v));
+                                    }
+                            return result_ty;
+                        }
                     }
-                }
 
-                let arg_ty = self.infer_expr(arg);
-                let result_ty = self.fresh();
-                let expected = Ty::Fun(
-                    Box::new(arg_ty.clone()),
-                    Box::new(result_ty.clone()),
-                );
-                self.unify(&func_ty, &expected, arg.span);
+                    let arg_ty = self.infer_expr(arg);
+                    let result_ty = self.fresh();
+                    let expected = Ty::Fun(
+                        Box::new(arg_ty.clone()),
+                        Box::new(result_ty.clone()),
+                    );
+                    self.unify(&func_ty, &expected, arg.span);
+                    (arg_ty, result_ty)
+                };
 
                 // Track parseJson calls for compile-time FromJSON dispatch
                 if let ast::ExprKind::Var(name) = &func.node
@@ -9928,7 +10180,13 @@ fn value_references_source_inner(
 /// Run type inference on a parsed module. Returns diagnostics,
 /// resolved monad info for desugared do-blocks, and inferred type info
 /// mapping declaration names to their display type strings.
-pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, LocalTypeInfo, RefineTargets, RefinedTypeInfoMap, FromJsonTargets, ElemPushdownOk) {
+///
+/// The module is taken by `&mut` because inference also *elaborates* it: the
+/// desugarer emits `__result` markers for do-block final bare expressions,
+/// and only the type checker can tell whether each one means `pure e` or `e`
+/// (see `resolve_result_markers`). Every marker is rewritten away here, so
+/// later passes never see one.
+pub fn check(module: &mut ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, LocalTypeInfo, RefineTargets, RefinedTypeInfoMap, FromJsonTargets, ElemPushdownOk) {
     let mut infer = Infer::new();
 
     // Phase 1: Collect type aliases, data types, constructors
@@ -10080,6 +10338,12 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
     // still checked.
     infer.resolve_deferred_unit_binops();
 
+    // Phase 4b3: Settle desugared do-blocks' final bare expressions — `pure e`
+    // or `e` itself — and rewrite the markers out of the AST. Runs before
+    // check_constraints so the unifications it performs are visible to the
+    // deferred trait checks.
+    resolve_result_markers(&mut infer, module);
+
     // Phase 4c: Check deferred trait constraints
     infer.check_constraints();
 
@@ -10215,6 +10479,228 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
     (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok)
 }
 
+
+/// Whether a scheme's type is a two-argument function — the shape the
+/// check-lambda-arguments-last path in `infer_expr`'s `App` arm relies on.
+/// Peels `Forall` binders; nothing else, since the head's type comes straight
+/// from its scheme and has not been substituted into yet.
+fn takes_two_args(ty: &Ty) -> bool {
+    match ty {
+        Ty::Forall(_, body) => takes_two_args(body),
+        Ty::Fun(_, rest) => matches!(rest.as_ref(), Ty::Fun(..)),
+        _ => false,
+    }
+}
+
+// ── Do-block final-expression resolution (`__result`) ─────────────
+
+/// The monad a type is an action in, if it is one at all — the counterpart of
+/// `monad_kind_of`, which classifies the *monad constructor*. Unlike that
+/// function this one never guesses: anything that is not recognisably `m a`
+/// (a plain `Int`, an unresolved var, a record) yields `None`.
+fn action_monad_of(ty: &Ty) -> Option<MonadKind> {
+    match ty.peel_alias() {
+        Ty::IO(..) => Some(MonadKind::IO),
+        Ty::Relation(_) => Some(MonadKind::Relation),
+        // Saturated (`Maybe Int`) or partially applied (`Result e`) ADTs. A
+        // nullary `Con(name, [])` is a plain data type, not an action.
+        Ty::Con(name, args) if !args.is_empty() => Some(MonadKind::Adt(name.clone())),
+        Ty::App(f, _) => action_monad_of(f).or_else(|| match f.peel_alias() {
+            Ty::TyCon(name) if name == "[]" => Some(MonadKind::Relation),
+            Ty::TyCon(name) if name == "IO" => Some(MonadKind::IO),
+            Ty::TyCon(name) => Some(MonadKind::Adt(name.clone())),
+            _ => None,
+        }),
+        // A constructor expression (`Just {value: x}`, `Ok {value: x}`) types
+        // as an open variant rather than the ADT itself — recognise the
+        // built-in monadic shapes, as `traverse` resolution already does.
+        Ty::Variant(ctors, _) if !ctors.is_empty() => {
+            if ctors.keys().all(|k| k == "Just" || k == "Nothing") {
+                Some(MonadKind::Adt("Maybe".into()))
+            } else if ctors.keys().all(|k| k == "Ok" || k == "Err") {
+                Some(MonadKind::Adt("Result".into()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Settle every `__result e` marker the desugarer left behind, then rewrite it
+/// out of the AST.
+///
+/// `do { …; e }` with a bare final `e` means one of two things, and only the
+/// types tell them apart:
+///
+///   * `e` is already an action in the block's monad — `do { act x; loop rest }`
+///     — and the block's result IS `e`. Wrapping it in `pure` would type the
+///     block as `m (m a)`.
+///   * `e` is a plain value — `do { x <- act; show x }` — and the block's
+///     result is `pure e`.
+///
+/// So compare the block's monad `m` (fixed by the enclosing `__bind`, and by
+/// the declaration's annotation) against the head of `e`'s type, and unify the
+/// marker's `App(m, a)` accordingly. When `e`'s type is too unresolved to
+/// classify, fall back to `pure` — the reading that makes an un-annotated
+/// `do { x <- act; someValue }` work.
+fn resolve_result_markers(infer: &mut Infer, module: &mut ast::Module) {
+    let markers = std::mem::take(&mut infer.result_markers);
+    // Spans of the markers that turned out to mean `pure e`; the rest are the
+    // identity and get replaced by their argument.
+    let mut pure_spans: HashSet<Span> = HashSet::new();
+
+    for m in &markers {
+        let monad = infer.apply(&Ty::Var(m.monad));
+        let arg = infer.apply(&m.arg);
+        let block_kind = monad_kind_of(&monad);
+        let is_action = action_monad_of(&arg) == Some(block_kind)
+            // An unresolved monad var defaults to `Relation` in
+            // `monad_kind_of`, which would misread `do { …; someList }` in an
+            // otherwise-unconstrained block. Only trust the comparison when
+            // the monad actually resolved to something.
+            && !matches!(monad, Ty::Var(_));
+        if is_action {
+            let action_ty = Ty::App(
+                Box::new(Ty::Var(m.monad)),
+                Box::new(Ty::Var(m.elem)),
+            );
+            infer.unify(&action_ty, &arg, m.arg_span);
+        } else {
+            pure_spans.insert(m.span);
+            infer.unify(&Ty::Var(m.elem), &arg, m.arg_span);
+        }
+    }
+
+    for decl in &mut module.decls {
+        rewrite_decl_results(decl, &pure_spans);
+    }
+}
+
+/// Replace each `__result` node: `pure`-classified markers become `__yield`
+/// (keeping the Var's span, which `monad_info` is already keyed by), and the
+/// rest collapse to their argument.
+fn rewrite_result_markers(expr: &mut ast::Expr, pure_spans: &HashSet<Span>) {
+    if let ast::ExprKind::App { func, arg } = &mut expr.node
+        && matches!(&func.node, ast::ExprKind::Var(n) if n == crate::desugar::RESULT_MARKER)
+    {
+        if pure_spans.contains(&func.span) {
+            func.node = ast::ExprKind::Var("__yield".into());
+            rewrite_result_markers(arg, pure_spans);
+        } else {
+            let mut inner = (**arg).clone();
+            rewrite_result_markers(&mut inner, pure_spans);
+            *expr = inner;
+        }
+        return;
+    }
+    walk_expr_children_mut(expr, &mut |e| rewrite_result_markers(e, pure_spans));
+}
+
+fn rewrite_decl_results(decl: &mut ast::Decl, pure_spans: &HashSet<Span>) {
+    use ast::DeclKind::*;
+    match &mut decl.node {
+        Fun { body, .. } => {
+            if let Some(b) = body {
+                rewrite_result_markers(b, pure_spans);
+            }
+        }
+        View { body, .. } | Derived { body, .. } => rewrite_result_markers(body, pure_spans),
+        Trait { items, .. } => {
+            for item in items {
+                if let ast::TraitItem::Method { default_body: Some(b), .. } = item {
+                    rewrite_result_markers(b, pure_spans);
+                }
+            }
+        }
+        Impl { items, .. } => {
+            for item in items {
+                if let ast::ImplItem::Method { body, .. } = item {
+                    rewrite_result_markers(body, pure_spans);
+                }
+            }
+        }
+        Route { entries, .. } => {
+            for e in entries {
+                if let Some(expr) = &mut e.rate_limit {
+                    rewrite_result_markers(expr, pure_spans);
+                }
+            }
+        }
+        Migrate { using_fn, .. } => rewrite_result_markers(using_fn, pure_spans),
+        Data { .. } | TypeAlias { .. } | Source { .. } | RouteComposite { .. }
+        | SubsetConstraint { .. } | UnitDecl { .. } => {}
+    }
+}
+
+/// Apply `f` to each direct sub-expression. Mirrors the AST shape walked by
+/// `base::shift_expr_spans`; keep the two in sync when the AST grows a node.
+fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Expr)) {
+    use ast::ExprKind::*;
+    match &mut expr.node {
+        Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) => {}
+        Record(fields) => {
+            for fl in fields {
+                f(&mut fl.value);
+            }
+        }
+        RecordUpdate { base, fields } => {
+            f(base);
+            for fl in fields {
+                f(&mut fl.value);
+            }
+        }
+        FieldAccess { expr, .. } => f(expr),
+        List(items) => {
+            for it in items {
+                f(it);
+            }
+        }
+        Lambda { body, .. } => f(body),
+        App { func, arg } => {
+            f(func);
+            f(arg);
+        }
+        BinOp { lhs, rhs, .. } => {
+            f(lhs);
+            f(rhs);
+        }
+        UnaryOp { operand, .. } => f(operand),
+        If { cond, then_branch, else_branch } => {
+            f(cond);
+            f(then_branch);
+            f(else_branch);
+        }
+        Case { scrutinee, arms } => {
+            f(scrutinee);
+            for arm in arms {
+                f(&mut arm.body);
+            }
+        }
+        Do(stmts) => {
+            for s in stmts {
+                match &mut s.node {
+                    ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Let { expr, .. } => f(expr),
+                    ast::StmtKind::Where { cond } => f(cond),
+                    ast::StmtKind::GroupBy { key } => f(key),
+                    ast::StmtKind::Expr(e) => f(e),
+                }
+            }
+        }
+        Set { target, value } | ReplaceSet { target, value } => {
+            f(target);
+            f(value);
+        }
+        Atomic(inner) | Refine(inner) => f(inner),
+        UnitLit { value, .. } | TimeUnitLit { value, .. } => f(value),
+        Annot { expr, .. } => f(expr),
+        Serve { handlers, .. } => {
+            for h in handlers {
+                f(&mut h.body);
+            }
+        }
+    }
+}
 
 /// Classify a resolved monad/applicative type into a `MonadKind` for
 /// codegen dispatch. Defaults unresolved types to Relation.
@@ -10411,14 +10897,14 @@ mod tests {
     fn check_src(src: &str) -> Vec<Diagnostic> {
         let mut module = parse(src);
         crate::desugar::desugar(&mut module);
-        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown) = check(&module);
+        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown) = check(&mut module);
         diags
     }
 
     fn type_info_for(src: &str) -> TypeInfo {
         let mut module = parse(src);
         crate::desugar::desugar(&mut module);
-        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown) = check(&module);
+        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown) = check(&mut module);
         type_info
     }
 

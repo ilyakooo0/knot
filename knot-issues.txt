@@ -1,0 +1,164 @@
+# Knot Language — Bugs, Rough Parts, and Corner Cases
+
+Discovered while fixing skrepka's server.knot compilation issues (July 2026).
+
+## CRITICAL — Compiler Regression (2026.7.11.* releases)
+
+### 1. IO do-blocks completely broken — every expression inferred as `IO _ {}`
+
+**Affected releases:** all `2026.7.11.*` (at least .413 through .510)
+**Working release:** `2026.6.26.1947`
+
+Every IO do-block fails with `type mismatch: expected {}, found IO _ {}` on the last expression, regardless of what it is — `yield {}`, a bare `42`, a recursive call, `{}`, even `let done : {} = {}; done`. The compiler treats every expression in an IO do-block as `IO _ {}` and then rejects it because the inner type is `{}`, not `IO _ {}`.
+
+This is not specific to skrepka — even the Knot repo's own example programs (`examples/for_each.knot`) fail to compile:
+
+```knot
+main = do
+  forEach [1, 2, 3] (\x -> println (show x))
+  println "done"
+  yield {}    -- Error: expected {}, found IO _ {}
+```
+
+**Impact:** Any program using IO do-blocks (i.e., essentially all programs) fails to compile. Had to pin CI to `2026.6.26.1947`.
+
+---
+
+## HIGH — Refined Type Subtyping Gaps
+
+### 2. `==` doesn't upcast refined subtypes to their base type
+
+```knot
+type PubkeyHex = Text where isValidExactHex 64
+type ServerName = Text where isValidServerName
+
+-- p.pubkey is PubkeyHex, pk is Text
+p.pubkey == pk   -- Error: cannot implicitly use Text where refined type PubkeyHex is required
+```
+
+The `Eq` trait is `eq : a -> a -> Bool` — both sides must unify to the same type. When one side is `PubkeyHex` and the other is `Text`, the compiler tries to unify them and fails. It never attempts to upcast `PubkeyHex` to `Text` (even though `PubkeyHex <: Text`).
+
+**Workaround:** Helper functions `textEq : Text -> Text -> Bool` and `textElem : Text -> [Text] -> Bool` that force both sides to `Text` before comparing.
+
+**Proposed fix:** When type-checking `x == y` where `x : A` and `y : B`, if `A <: B`, upcast `x` to `B` and call `eq : B -> B -> Bool`. ~20-line change in the type checker.
+
+### 3. `filter` with a predicate that takes a base type downgrades the list element type
+
+```knot
+collectPeers : [a] -> (a -> ServerName) -> [ServerName]
+collectPeers = \items getServer -> filter (\s -> not isLocalServer s) (map getServer items)
+-- Error: cannot implicitly use Text where ServerName is required
+```
+
+`isLocalServer : Text -> Bool` — when `filter`'s predicate receives `ServerName` and passes it to `isLocalServer : Text -> Bool`, the compiler unifies the predicate parameter as `Text`, which makes `filter` return `[Text]` instead of `[ServerName]`.
+
+**Impact:** Cannot thread refined types through `filter` when the predicate takes a base type. Forces everything back to `Text`.
+
+### 4. `elem` doesn't work across subtype boundaries
+
+```knot
+elem p.pubkey collected.touched
+-- p.pubkey is PubkeyHex, collected.touched is [Text]
+-- Error: cannot implicitly use Text where PubkeyHex is required
+```
+
+Same root cause as #2 — `elem : a -> [a] -> Bool` requires both the needle and list elements to share a type.
+
+### 5. `fold` accumulator loses refined type information
+
+```knot
+fold (\acc e -> ... {touched: union acc.touched [pubkey], ...}) {touched: [], added: []} events
+-- pubkey is PubkeyHex, but touched infers as [PubkeyHex] not [Text],
+-- then later comparing with Text values fails
+```
+
+The fold's initial value `{touched: [], added: []}` has `touched: [a]`. The first `union acc.touched [pubkey]` pins `a = PubkeyHex`. But later uses of `collected.touched` with `Text` values fail because `PubkeyHex != Text`.
+
+**Workaround:** Explicit type annotation on the initial value: `{touched: ([] : [Text]), added: ([] : [PresenceEntry])}`.
+
+### 6. Cannot assign a literal to a refined type constant
+
+```knot
+serverHost : ServerName
+serverHost = "localhost"
+-- Error: cannot implicitly use Text where refined type ServerName is required
+```
+
+A string literal is `Text`, and assigning it to a `ServerName` variable requires `refine`. But for overridable constants (CLI `--name=value`), `refine` is awkward — the value comes from the command line at runtime, not from source.
+
+**Workaround:** Change the type to `Text` and do a separate `localServerName : Maybe ServerName = case refine serverHost of ...`.
+
+---
+
+## MEDIUM — Do-Block Type Inference
+
+### 7. Bare `do` blocks with `let` and pure expressions get fresh type variables
+
+```knot
+isValidHex = \s -> do
+  let n = length s
+  n > 0 && n / 2 * 2 == n && all (\c -> contains c "0123456789abcdef") (chars s)
+-- Error: type mismatch: expected Bool, found (t384 Bool)
+```
+
+A `do` block with only `let` and a final expression (no `<-` binds) introduces a fresh type variable `tNNN` instead of inferring `Bool`. The `do` keyword is unnecessary for pure expressions but the compiler accepts it and then gets confused about the return type.
+
+**Workaround:** Remove the `do` keyword and use `let ... in`:
+```knot
+isValidHex = \s -> let n = length s in n > 0 && ...
+```
+
+**Proposed fix:** Either reject `do` blocks with no `<-` binds (they're always unnecessary), or infer the correct type from the final expression.
+
+### 8. `main` type inference — no working pattern for IO do-blocks with a non-recursive final expression
+
+`backgroundPrune` works because its last expression is a recursive call with type `IO ... a` matching the annotation `IO ... a`. But `main` (which ends with `listenOn`) fails in the newer compiler because the last expression's `IO ... {}` doesn't match the inner type `{}`.
+
+No combination worked in the `2026.7.11.*` releases:
+- `main : IO _ {}` — `_` not accepted in effect row
+- `main : IO {| r} {}` — rigid type variable escapes
+- `main : IO {concrete effects} {}` — same "expected {}, found IO _ {}"
+- `_ <- listenOn ...; yield {}` — `yield {}` also fails
+- `_ <- listenOn ...; {}` — `{}` also inferred as `IO _ {}`
+- `let done : {} = {}; done` — `done` also inferred as `IO _ {}`
+
+This is part of the critical regression (#1), but even in the working compiler, the type annotation for `main` had to be removed entirely — inference works but explicit annotations don't.
+
+---
+
+## LOW — Ergonomics and Rough Edges
+
+### 9. No list covariance — `[PubkeyHex]` is not a `[Text]`
+
+Even though `PubkeyHex <: Text`, a `[PubkeyHex]` cannot be passed where `[Text]` is expected. The type system doesn't support covariance on list element types. This forces `collectPeers` to return `[Text]` and lose the refinement.
+
+### 10. `{}` is ambiguous between unit value and empty record
+
+In an IO do-block, `{}` is interpreted as `yield {}` (the `Applicative.yield` for IO), which produces `IO ... {}`. There's no way to write a pure `{}` (unit value) as the last expression in an IO do-block — it always gets wrapped in IO.
+
+### 11. Refined type predicates can't reference other top-level constants
+
+`type ServerName = Text where isValidServerName` where `isValidServerName` checks `length s <= maxServerNameLen`. This works, but if `maxServerNameLen` is a CLI-overridable constant, the predicate uses the compile-time value, not the runtime override. The refined type check happens at the type level, not at runtime.
+
+### 12. Nested list refinement gap — route body fields in lists aren't validated
+
+Route body fields like `pubkey: Maybe PubkeyHex` inside a list (`events: [GossipEvent]`) bypass the runtime refinement check. The server.knot code has to manually re-validate with `isValidExactHex 64 pubkey` inside the handler. This is documented in the code comments but is a rough edge — the type system promises safety that isn't delivered for nested types.
+
+---
+
+## Summary
+
+| # | Severity | Issue | Status |
+|---|----------|-------|--------|
+| 1 | CRITICAL | IO do-blocks broken in 2026.7.11.* releases | Pinned CI to 2026.6.26.1947 |
+| 2 | HIGH | `==` doesn't upcast refined subtypes | Workaround: `textEq` helper |
+| 3 | HIGH | `filter` downgrades refined list element type | Workaround: use `Text` everywhere internally |
+| 4 | HIGH | `elem` doesn't work across subtypes | Workaround: `textElem` helper |
+| 5 | HIGH | `fold` loses refined type on accumulator | Workaround: explicit type annotations |
+| 6 | HIGH | Can't assign literal to refined type constant | Workaround: use `Text` + separate `refine` |
+| 7 | MEDIUM | Pure `do` blocks get fresh type variables | Workaround: remove `do`, use `let ... in` |
+| 8 | MEDIUM | No working `main` type annotation pattern | Workaround: omit annotation, let inference work |
+| 9 | LOW | No list covariance | Workaround: use base types |
+| 10 | LOW | `{}` ambiguous in IO do-blocks | No workaround (compiler bug) |
+| 11 | LOW | Refined predicates use compile-time constants | Design limitation |
+| 12 | LOW | Nested list refinement gap | Manual re-validation in handlers |

@@ -1393,6 +1393,18 @@ fn render_unit_expr(u: &UnitExpr) -> String {
     render_unit_expr_prec(u, 0)
 }
 
+/// Returns true if the unit expression is a single bare lowercase identifier
+/// (e.g. `usd`, `m`), which in argument position creates a syntactic ambiguity
+/// with chained comparison (`f 999<usd> 6` reparses as `(f 999 < usd) > 6`).
+/// Uppercase (`M`), compound (`m/s`), and power (`m^2`) units have no
+/// comparison reading, so only the bare-lowercase-ident case needs protecting.
+fn unit_is_bare_lower_ident(u: &UnitExpr) -> bool {
+    match u {
+        UnitExpr::Named(n) => n.chars().all(|c| c.is_ascii_lowercase()) && !n.is_empty(),
+        _ => false,
+    }
+}
+
 /// Contexts (`ctx`): 0 = top level, 1 = left operand of `*`/`/` (left-assoc,
 /// so same-precedence children need no parens), 2 = right operand of `*`/`/`
 /// (a nested `*`/`/` must keep its parens to preserve associativity), 3 =
@@ -1736,11 +1748,26 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             paren_if(parent > Prec::Lowest, s)
         }
         ExprKind::UnitLit { value, unit } => {
-            format!(
+            let s = format!(
                 "{}<{}>",
                 render_expr_inline(value, Prec::Atom),
                 render_unit_expr(unit)
-            )
+            );
+            // A unit literal whose unit is a single bare lowercase identifier
+            // (`999<usd>`) is syntactically ambiguous with a chained
+            // comparison: in argument position `f 999<usd> 6` reparses as
+            // `(f 999 < usd) > 6`. The parser resolves this toward comparison
+            // whenever another atom follows the `>`, even across whitespace.
+            // Uppercase (`<M>`), compound (`<m/s>`), and power (`<m^2>`) units
+            // have no comparison reading once space-separated, so only the
+            // bare-lowercase case needs protecting. Parenthesize it in tight
+            // (atom) positions — i.e. as a function argument — so the `<…>`
+            // can never be mistaken for comparison operators.
+            if parent == Prec::Atom && unit_is_bare_lower_ident(unit) {
+                format!("({})", s)
+            } else {
+                s
+            }
         }
         ExprKind::Annot { expr, ty } => {
             let mut inner = render_expr_inline(expr, Prec::Lowest);

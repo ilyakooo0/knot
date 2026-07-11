@@ -684,10 +684,16 @@ pub(crate) fn handle_code_action(
             } else {
                 format!("{fn_name} = \\{} -> {trimmed}\n\n", free_vars.join(" "))
             };
-            let call_args = if free_vars.is_empty() {
-                String::new()
+            // Build the call-site replacement. When the helper takes
+            // arguments, the call must be parenthesized: without parens,
+            // replacing `x + 2` inside `show (x + 2)` yields
+            // `show extracted_fn x`, which parses as `(show extracted_fn) x`
+            // — the wrong application order. A bare zero-arg call needs no
+            // parens (it's a single atom already).
+            let call_site = if free_vars.is_empty() {
+                fn_name.clone()
             } else {
-                format!(" {}", free_vars.join(" "))
+                format!("({fn_name} {})", free_vars.join(" "))
             };
 
             // Find the enclosing top-level declaration to place the function
@@ -718,7 +724,7 @@ pub(crate) fn handle_code_action(
                     // Replace the selected expression with a call
                     TextEdit {
                         range: sel_range,
-                        new_text: format!("{fn_name}{call_args}"),
+                        new_text: call_site,
                     },
                 ],
             );
@@ -4354,6 +4360,73 @@ mod regress_fixes_tests {
         assert!(
             out.contains("\nexport f"),
             "exported decl must keep its `export` prefix:\n{out}"
+        );
+    }
+
+    /// B67: "Extract to function" must parenthesize the call site when the
+    /// helper takes arguments. Extracting the argument `(n + 2)` from
+    /// `show (n + 2)` must yield `show (extracted_fn n)`, not
+    /// `show extracted_fn n` — the latter parses as `(show extracted_fn) n`,
+    /// the wrong application order.
+    #[test]
+    fn extract_function_parenthesizes_call_site_with_args() {
+        let mut tw = TestWorkspace::new();
+        let src = "f = \\n -> show (n + 2)\n";
+        let uri = tw.open("main", src);
+        // Select the parenthesized argument, parens included — this is the
+        // shape that used to drop the wrapping and misapply the call.
+        let range = selection(src, "(n + 2)");
+        let actions = handle_code_action(&tw.state, &params_for(&uri, range))
+            .unwrap_or_default();
+        let action = action_titled(&actions, |t| t.starts_with("Extract to function"))
+            .expect("extract-to-function offered");
+        let edits = edits_for(action, &uri);
+        let out = apply_edits_to(src, edits);
+        assert!(
+            out.contains("show (extracted_fn n)"),
+            "call site must be parenthesized as `(extracted_fn n)`; got:\n{out}"
+        );
+        assert!(
+            !out.contains("show extracted_fn n"),
+            "call site must not be a bare `show extracted_fn n`; got:\n{out}"
+        );
+        // The result must round-trip through the parser cleanly.
+        let lexer = knot::lexer::Lexer::new(&out);
+        let (tokens, _) = lexer.tokenize();
+        let parser = knot::parser::Parser::new(out.clone(), tokens);
+        let (_, diags) = parser.parse_module();
+        assert!(
+            diags.iter().all(|d| !matches!(d.severity, knot::diagnostic::Severity::Error)),
+            "extracted result must parse; got {diags:?}\nsource:\n{out}"
+        );
+    }
+
+    /// A zero-arg extraction needs NO wrapping parens — the call is a single
+    /// atom already, so `show (1 + 2)` → `show extracted_fn` is correct.
+    #[test]
+    fn extract_function_no_parens_for_zero_arg_call() {
+        let mut tw = TestWorkspace::new();
+        let src = "f = show (1 + 2)\n";
+        let uri = tw.open("main", src);
+        let range = selection(src, "(1 + 2)");
+        let actions = handle_code_action(&tw.state, &params_for(&uri, range))
+            .unwrap_or_default();
+        let action = action_titled(&actions, |t| t.starts_with("Extract to function"))
+            .expect("extract-to-function offered");
+        let edits = edits_for(action, &uri);
+        let out = apply_edits_to(src, edits);
+        assert!(
+            out.contains("show extracted_fn\n"),
+            "zero-arg call needs no wrapping parens; got:\n{out}"
+        );
+        // Still must parse cleanly.
+        let lexer = knot::lexer::Lexer::new(&out);
+        let (tokens, _) = lexer.tokenize();
+        let parser = knot::parser::Parser::new(out.clone(), tokens);
+        let (_, diags) = parser.parse_module();
+        assert!(
+            diags.iter().all(|d| !matches!(d.severity, knot::diagnostic::Severity::Error)),
+            "extracted result must parse; got {diags:?}\nsource:\n{out}"
         );
     }
 

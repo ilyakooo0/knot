@@ -222,6 +222,19 @@ impl TypeEnv {
         // run-until-stable loop grows it without bound until the stack
         // overflows. Cyclic aliases are reported as diagnostics by
         // `check_alias_cycles` / type inference before codegen runs.
+        //
+        // `re_resolve_type` only substitutes `Named` *leaves*, so it cannot
+        // repair an alias that *applied* a not-yet-declared parameterized
+        // data type: `type Wrapped = [Box Int]` declared before
+        // `data Box a = ...` resolves the `Box Int` application to
+        // `Named("unknown")` in the first pass, permanently losing the
+        // application structure (head + arguments). To recover it, re-run
+        // `resolve_type` from the alias's original AST (`alias_ast_types`) —
+        // now that every data declaration is registered in `aliases` /
+        // `single_variant_params`, the application resolves to the correct
+        // record/ADT shape (e.g. `value:int` instead of `_value:text`).
+        // Aliases without a stored AST (e.g. multi-variant data types
+        // registered directly as `Adt`) keep the leaf-substitution path.
         let alias_keys: Vec<String> = aliases.keys().cloned().collect();
         for name in &alias_keys {
             let resolved = aliases[name].clone();

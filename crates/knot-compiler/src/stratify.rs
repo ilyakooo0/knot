@@ -1,10 +1,17 @@
 //! Stratification checking for recursive derived relations.
 //!
-//! A recursive derived relation that uses negation (e.g. `diff`) on itself
+//! A recursive derived relation that uses a non-monotone operation on itself
 //! or on a mutually-recursive peer cannot converge to a unique minimal
 //! fixpoint.  This pass builds a dependency graph between derived relations,
 //! finds strongly-connected components, and rejects any cycle that contains
-//! a negative (diff) edge.
+//! a negative edge.
+//!
+//! Two operations create negative edges: set difference (`diff a b`, which
+//! negates `b`) and aggregates (`count`/`sum`/`avg`/`minOn`/`maxOn`) applied
+//! to the recursive relation. An aggregate collapses the whole relation to a
+//! scalar whose value shifts as the relation grows, so a body gated on it
+//! (e.g. `where count self == 0`) oscillates instead of converging — caught
+//! here rather than panicking after 10000 fixpoint iterations at runtime.
 
 use knot::ast;
 use knot::ast::Span;
@@ -13,10 +20,22 @@ use std::collections::{HashMap, HashSet};
 
 // ── Dependency graph ────────────────────────────────────────────
 
+/// Why a dependency is negative (non-monotone). Carried on `Polarity::Negative`
+/// so the diagnostic can name the concrete cause instead of always blaming
+/// `diff`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NegCause {
+    /// Set difference (`diff a b`) — the subtracted set `b`.
+    Diff,
+    /// A non-monotone aggregate (`count`/`sum`/`avg`/`minOn`/`maxOn`/`countWhere`)
+    /// collapsing the relation to a scalar.
+    Aggregate,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Polarity {
     Positive,
-    Negative,
+    Negative(NegCause),
 }
 
 #[derive(Debug, Clone)]
@@ -134,7 +153,7 @@ fn collect_edges(
             if let Some(first_arg) = is_diff_applied_once(func, env) {
                 // This is `(diff a) b` — `a` keeps polarity, `b` is negated.
                 collect_edges(first_arg, polarity, node_names, env, partial_diffs, out);
-                let neg = negate(polarity);
+                let neg = negate(polarity, NegCause::Diff);
                 collect_edges(arg, neg, node_names, env, partial_diffs, out);
             }
             // Let-bound partial application: `let d = diff X` followed by
@@ -146,7 +165,19 @@ fn collect_edges(
                 && let Some(bound_base) = partial_diffs.get(name)
             {
                 collect_edges(bound_base, polarity, node_names, env, partial_diffs, out);
-                let neg = negate(polarity);
+                let neg = negate(polarity, NegCause::Diff);
+                collect_edges(arg, neg, node_names, env, partial_diffs, out);
+            }
+            // A non-monotone aggregate over the relation: `count self`,
+            // `sum f self`, `minOn f self`, ... `arg` here is the aggregate's
+            // relation argument (always the last one). Aggregates collapse the
+            // relation to a scalar whose value changes as the relation grows,
+            // so a recursive body gated on one never converges — record the
+            // relation arg as a negative edge so the cycle is rejected.
+            else if completes_aggregate_over_relation(func) {
+                // The selector/predicate arg (in `func`) stays positive.
+                collect_edges(func, polarity, node_names, env, partial_diffs, out);
+                let neg = negate(polarity, NegCause::Aggregate);
                 collect_edges(arg, neg, node_names, env, partial_diffs, out);
             } else {
                 collect_edges(func, polarity, node_names, env, partial_diffs, out);
@@ -191,7 +222,7 @@ fn collect_edges(
             if *op == ast::BinOp::Pipe
                 && let Some(base) = is_diff_applied_once(rhs, env) {
                     collect_edges(base, polarity, node_names, env, partial_diffs, out);
-                    let neg = negate(polarity);
+                    let neg = negate(polarity, NegCause::Diff);
                     collect_edges(lhs, neg, node_names, env, partial_diffs, out);
                     return;
                 }
@@ -201,7 +232,17 @@ fn collect_edges(
                 && let Some(bound_base) = partial_diffs.get(name)
             {
                 collect_edges(bound_base, polarity, node_names, env, partial_diffs, out);
-                let neg = negate(polarity);
+                let neg = negate(polarity, NegCause::Diff);
+                collect_edges(lhs, neg, node_names, env, partial_diffs, out);
+                return;
+            }
+            // Pipe into a non-monotone aggregate: `self |> count`,
+            // `rel |> minOn f`. Since `a |> f` is `f a`, if `rhs` needs exactly
+            // one more argument to complete an aggregate, `lhs` is that
+            // aggregate's relation argument — negative.
+            if *op == ast::BinOp::Pipe && completes_aggregate_over_relation(rhs) {
+                collect_edges(rhs, polarity, node_names, env, partial_diffs, out);
+                let neg = negate(polarity, NegCause::Aggregate);
                 collect_edges(lhs, neg, node_names, env, partial_diffs, out);
                 return;
             }
@@ -374,10 +415,26 @@ fn is_diff_applied_once<'a>(
     None
 }
 
-fn negate(p: Polarity) -> Polarity {
+/// Flip polarity. Producing a *negative* edge needs a `cause` describing the
+/// non-monotone operation responsible (used only when the result is
+/// `Negative`); double negation back to `Positive` ignores it.
+fn negate(p: Polarity, cause: NegCause) -> Polarity {
     match p {
-        Polarity::Positive => Polarity::Negative,
-        Polarity::Negative => Polarity::Positive,
+        Polarity::Positive => Polarity::Negative(cause),
+        Polarity::Negative(_) => Polarity::Positive,
+    }
+}
+
+/// Check if an expression is a call to an aggregate builtin (count, sum,
+/// avg, minOn, maxOn, countWhere) — these are non-monotone when applied
+/// to a self-referential relation, so they must create negative edges.
+fn completes_aggregate_over_relation(expr: &ast::Expr) -> bool {
+    match &expr.node {
+        ast::ExprKind::Var(name) => {
+            matches!(name.as_str(), "count" | "sum" | "avg" | "minOn" | "maxOn" | "countWhere")
+        }
+        ast::ExprKind::App { func, .. } => completes_aggregate_over_relation(func),
+        _ => false,
     }
 }
 
@@ -547,7 +604,7 @@ pub fn check(module: &ast::Module) -> Vec<Diagnostic> {
         for name in scc {
             if let Some(es) = edges.get(name) {
                 for edge in es {
-                    if edge.polarity == Polarity::Negative && scc_set.contains(&edge.target) {
+                    if matches!(edge.polarity, Polarity::Negative(_)) && scc_set.contains(&edge.target) {
                         scc_has_negative = true;
                         let mut diag = Diagnostic::error(format!(
                             "unstratifiable recursion: `&{}` negates `&{}` through `diff`",

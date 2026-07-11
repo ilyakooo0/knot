@@ -10870,6 +10870,77 @@ pub extern "C-unwind" fn knot_source_migrate(
     eprintln!("Migrated source '{}': {} rows", name, old_rows.len());
 }
 
+/// Compute a source's migrated rows *without* persisting them, so the compiler
+/// can run refinement validation on the transformed data before the
+/// destructive `knot_source_migrate` write (mirroring the set/replace/view
+/// paths, which validate refined rows before every write). Applies the same
+/// schema gate and per-row transform as `knot_source_migrate`, but performs no
+/// DDL or inserts.
+///
+/// Returns the transformed rows as a relation of bare element values (scalar
+/// sources are unwrapped from their `{_value: x}` storage rows, matching what
+/// set/replace hand to `knot_refinement_validate_relation`). Any case with
+/// nothing to migrate — stored schema already the new schema, absent, or a
+/// mismatch that `knot_source_migrate` will itself report — yields an empty
+/// relation so the refinement checks are a safe no-op.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_source_migrate_preview(
+    db: *mut c_void,
+    name_ptr: *const u8,
+    name_len: usize,
+    old_schema_ptr: *const u8,
+    old_schema_len: usize,
+    // Present to keep the ABI identical to knot_source_migrate; the target
+    // schema isn't needed to compute the pre-write rows.
+    _new_schema_ptr: *const u8,
+    _new_schema_len: usize,
+    migrate_fn: *mut Value,
+) -> *mut Value {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let name = unsafe { str_from_raw(name_ptr, name_len) };
+    let old_schema = unsafe { str_from_raw(old_schema_ptr, old_schema_len) };
+
+    let stored: Option<String> = db_ref
+        .conn
+        .query_row(
+            "SELECT schema FROM _knot_schema WHERE name = ?1;",
+            rusqlite::params![name],
+            |row| row.get(0),
+        )
+        .ok();
+
+    // Only a pending old→new migration has rows to transform and validate.
+    // Every other case (already migrated, missing, or a schema mismatch that
+    // knot_source_migrate will panic on) leaves nothing to check.
+    match &stored {
+        Some(s) if s == old_schema => {}
+        _ => return alloc(Value::Relation(Vec::new())),
+    }
+
+    // Read all rows using the old schema (unchanged: preview never writes).
+    let old_data = knot_source_read(db, name_ptr, name_len, old_schema_ptr, old_schema_len);
+    let old_rows = match unsafe { as_ref(old_data) } {
+        Value::Relation(rows) => rows.clone(),
+        _ => return alloc(Value::Relation(Vec::new())),
+    };
+
+    // Transform each row exactly as knot_source_migrate does, but return the
+    // bare transformed element (no `{_value: x}` re-wrap): refinement checks
+    // run on the same value shape set/replace validate.
+    let old_is_scalar = is_scalar_value_schema(old_schema);
+    let mut new_rows: Vec<*mut Value> = Vec::with_capacity(old_rows.len());
+    for row in &old_rows {
+        let input = if old_is_scalar {
+            knot_record_field(*row, "_value".as_ptr(), 6)
+        } else {
+            *row
+        };
+        let out = knot_value_call(db, migrate_fn, input);
+        new_rows.push(out);
+    }
+    alloc(Value::Relation(new_rows))
+}
+
 // ── Source operations ─────────────────────────────────────────────
 
 /// Schema descriptor format: "col1:type1,col2:type2,..."

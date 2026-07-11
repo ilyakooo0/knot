@@ -88,19 +88,124 @@ fn parse_adt_constructors(spec: &str) -> Vec<(String, Vec<(String, String)>)> {
     ctors
 }
 
-/// Compare two field lists by name, ignoring declaration order: same set of
-/// names, each with the same type. Adding or removing a field counts as a
-/// mismatch. Uses sorted comparison to correctly handle duplicate field names
-/// (a first-match `find` would match the wrong duplicate).
+/// Two field lists denote the same fields (order-independent) with identical
+/// types — i.e. their change classifies as `Identical`.
 fn fields_match(old: &[(String, String)], new: &[(String, String)]) -> bool {
-    if old.len() != new.len() {
-        return false;
+    classify_field_set(old, new) == SchemaChange::Identical
+}
+
+/// Classify the change between two field lists (order-independent), recursing
+/// into nested child-table schemas via [`classify_field_type`] rather than
+/// comparing bracketed descriptors as opaque strings. Returns `Identical` when
+/// the lists denote the same fields with identical types, `Safe` when every old
+/// field survives (identically or via a safe nested change) and the only
+/// differences are additions, and `Breaking` when a field is removed or a type
+/// change is breaking. Duplicate field names are handled by binding exact
+/// `(name, type)` pairs first, so a first-match by name cannot mask a breaking
+/// change on a duplicate.
+fn classify_field_set(old: &[(String, String)], new: &[(String, String)]) -> SchemaChange {
+    let mut used = vec![false; new.len()];
+    let mut leftover_old: Vec<&(String, String)> = Vec::new();
+
+    // Pass 1: bind exact (name + identical type string) matches. This consumes
+    // duplicate field names against their true counterpart before the name-only
+    // fallback below.
+    for of in old {
+        match new
+            .iter()
+            .enumerate()
+            .position(|(i, nf)| !used[i] && nf.0 == of.0 && nf.1 == of.1)
+        {
+            Some(i) => used[i] = true,
+            None => leftover_old.push(of),
+        }
     }
-    let mut old_sorted: Vec<&(String, String)> = old.iter().collect();
-    let mut new_sorted: Vec<&(String, String)> = new.iter().collect();
-    old_sorted.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    new_sorted.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    old_sorted == new_sorted
+
+    let mut any_safe = false;
+
+    // Pass 2: bind each remaining old field by name and classify the type
+    // change, recursing into nested child-table schemas.
+    for of in leftover_old {
+        match new
+            .iter()
+            .enumerate()
+            .position(|(i, nf)| !used[i] && nf.0 == of.0)
+        {
+            Some(i) => {
+                used[i] = true;
+                match classify_field_type(&of.1, &new[i].1) {
+                    SchemaChange::Identical => {}
+                    SchemaChange::Safe => any_safe = true,
+                    SchemaChange::Breaking => return SchemaChange::Breaking,
+                }
+            }
+            None => return SchemaChange::Breaking, // field removed
+        }
+    }
+
+    // Any unmatched new fields are nullable-column additions — safe.
+    if used.iter().any(|u| !u) {
+        any_safe = true;
+    }
+
+    if any_safe {
+        SchemaChange::Safe
+    } else {
+        SchemaChange::Identical
+    }
+}
+
+/// Classify a single field's type change. When both the old and new type are
+/// nested child-table schemas (`[...]`), recurse into the bracketed schema and
+/// compare it field-by-field instead of treating the descriptor as an opaque
+/// string — a reorder or safe column addition inside a nested relation is
+/// applied by the runtime's `auto_apply_child_change` and must not force a
+/// migrate block. Any other differing type is a breaking type change.
+fn classify_field_type(old_ty: &str, new_ty: &str) -> SchemaChange {
+    if old_ty == new_ty {
+        return SchemaChange::Identical;
+    }
+    match (unbracket(old_ty), unbracket(new_ty)) {
+        (Some(old_inner), Some(new_inner)) => classify_child_schema_change(old_inner, new_inner),
+        // A scalar type change, or a change between a nested relation and a
+        // scalar column, is breaking.
+        _ => SchemaChange::Breaking,
+    }
+}
+
+/// If `ty` is a nested child-table schema (`[...]`), return the inner child
+/// schema descriptor without the surrounding brackets; otherwise `None`.
+fn unbracket(ty: &str) -> Option<&str> {
+    ty.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+}
+
+/// Classify the change of a nested child-table schema (the inner content of a
+/// `field:[...]` descriptor), mirroring the runtime's `auto_apply_child_change`:
+/// removing a column/sub-field or changing a type is breaking; adding a scalar
+/// column or reordering is safe. A leaf child (one with no sub-relations of its
+/// own) gaining a nested sub-relation is breaking — a leaf table is created
+/// without the `_id`/`_content_hash` columns a parent needs and SQLite cannot
+/// add them via `ALTER TABLE`, so the runtime forces an explicit migrate block.
+fn classify_child_schema_change(old: &str, new: &str) -> SchemaChange {
+    if old == new {
+        return SchemaChange::Identical;
+    }
+    // An ADT element type reuses the ADT-aware classification.
+    if old.starts_with('#') || new.starts_with('#') {
+        return classify_schema_change(old, new);
+    }
+
+    let old_fields = parse_record_fields(old);
+    let new_fields = parse_record_fields(new);
+
+    // Leaf child gaining its own nested sub-relation — breaking (see doc above).
+    let old_has_nested = old_fields.iter().any(|(_, t)| unbracket(t).is_some());
+    let new_has_nested = new_fields.iter().any(|(_, t)| unbracket(t).is_some());
+    if !old_has_nested && new_has_nested {
+        return SchemaChange::Breaking;
+    }
+
+    classify_field_set(&old_fields, &new_fields)
 }
 
 fn classify_adt_change(old: &str, new: &str) -> SchemaChange {
@@ -186,33 +291,6 @@ fn classify_record_change(old: &str, new: &str) -> SchemaChange {
     let old_fields = parse_record_fields(old);
     let new_fields = parse_record_fields(new);
 
-    // Use fields_match for a correct multiset comparison that handles
-    // duplicate field names (a first-match `find` would match the wrong
-    // duplicate, masking a breaking change).
-    if fields_match(&old_fields, &new_fields) {
-        return SchemaChange::Identical;
-    }
-
-    // Check if this is a safe addition: all old fields must be present
-    // in new with identical types. New fields are added as nullable
-    // columns, so existing data is not lost.
-    let old_map: HashMap<&str, &str> = old_fields
-        .iter()
-        .map(|(n, t)| (n.as_str(), t.as_str()))
-        .collect();
-    let new_map: HashMap<&str, &str> = new_fields
-        .iter()
-        .map(|(n, t)| (n.as_str(), t.as_str()))
-        .collect();
-
-    // Every old field must exist in new with the same type
-    for (name, ty) in &old_map {
-        match new_map.get(*name) {
-            Some(new_ty) if *new_ty == *ty => {}
-            _ => return SchemaChange::Breaking,
-        }
-    }
-
     // Adding the *first* nested-relation field to a source is breaking, even
     // though every old field is preserved. Nested `[T]` fields live in child
     // tables keyed by a `_parent_id` FK, which requires the parent table to
@@ -221,16 +299,22 @@ fn classify_record_change(old: &str, new: &str) -> SchemaChange {
     // apply this in place — it must go through a migrate block (table rebuild).
     // Once the parent already has at least one nested field (and thus an
     // `_id`), further nested fields only add new child tables (a CREATE TABLE),
-    // which is a safe addition.
+    // which is a safe addition. `classify_child_schema_change` enforces the
+    // same rule one level down, for a leaf child gaining a sub-relation.
     let old_has_nested = old_fields.iter().any(|(_, ty)| is_nested_field(ty));
     let new_has_nested = new_fields.iter().any(|(_, ty)| is_nested_field(ty));
     if new_has_nested && !old_has_nested {
         return SchemaChange::Breaking;
     }
 
-    // If we get here, all old fields are preserved. New fields are
-    // nullable additions — safe.
-    SchemaChange::Safe
+    // Compare field-by-field, recursing into nested child-table schemas
+    // (`field:[...]`) rather than treating their bracketed descriptors as opaque
+    // strings: a reorder or a safe column addition inside a nested relation is
+    // Safe (the runtime's `auto_apply_child_change` applies it), only a column
+    // removal or a type change is Breaking. The field-set comparison binds exact
+    // `(name, type)` pairs before falling back to name-only matching, so
+    // duplicate field names cannot mask a breaking change on a duplicate.
+    classify_field_set(&old_fields, &new_fields)
 }
 
 /// A nested-relation field's type descriptor is bracketed (`[child_schema]`),
@@ -401,26 +485,32 @@ pub fn check(source_path: &Path, module: &Module, type_env: &TypeEnv) -> Vec<Dia
 }
 
 /// Write the lockfile after a successful compile.
-/// Only writes if the module has source declarations.
+/// Only writes if there are source declarations to track (in the entry module
+/// or any imported module).
 /// `imported_type_snippets` carries type alias / data declarations from
 /// imported modules (sliced from their own source files), so types referenced
 /// by source declarations still resolve when the lockfile is parsed alone.
+/// `imported_source_snippets` carries the source declarations from imported
+/// modules, so schema changes to them are tracked by the lockfile just like
+/// entry-module sources (rather than only surfacing as a runtime startup panic).
 pub fn update(
     source_path: &Path,
     source_text: &str,
     module: &Module,
     imported_type_snippets: &[String],
+    imported_source_snippets: &[String],
 ) -> Result<(), String> {
     let has_sources = module
         .decls
         .iter()
-        .any(|d| matches!(&d.node, DeclKind::Source { .. }));
+        .any(|d| matches!(&d.node, DeclKind::Source { .. }))
+        || !imported_source_snippets.is_empty();
     if !has_sources {
         return Ok(());
     }
 
     let lock_path = lockfile_path(source_path);
-    let content = generate(module, source_text, imported_type_snippets);
+    let content = generate(module, source_text, imported_type_snippets, imported_source_snippets);
     // Atomic write: write to a temp file then rename, so a crash mid-write
     // doesn't leave a corrupt lockfile that hard-errors every compile.
     let tmp_path = lock_path.with_extension("lock.tmp");
@@ -453,13 +543,20 @@ fn find_migrate_span(module: &Module, name: &str) -> Span {
 }
 
 /// Generate lockfile content by extracting declarations from source text.
-fn generate(module: &Module, source_text: &str, imported_type_snippets: &[String]) -> String {
+fn generate(module: &Module, source_text: &str, imported_type_snippets: &[String], imported_source_snippets: &[String]) -> String {
     let mut out = String::new();
     out.push_str("-- schema.lock (auto-generated, do not edit)\n");
     out.push_str("-- Commit to source control.\n");
 
     // Type declarations from imported modules (sliced from their own sources)
     for snippet in imported_type_snippets {
+        out.push('\n');
+        out.push_str(snippet);
+        out.push('\n');
+    }
+
+    // Source declarations from imported modules
+    for snippet in imported_source_snippets {
         out.push('\n');
         out.push_str(snippet);
         out.push('\n');
@@ -620,6 +717,126 @@ mod tests {
             SchemaChange::Identical
         );
     }
+
+    // --- Nested child-table schemas (`field:[...]`) --------------------------
+    // These previously compared the bracketed descriptor as an opaque string,
+    // so a reorder or safe column addition inside the nested relation was
+    // spuriously classified as Breaking (bug B34).
+
+    #[test]
+    fn nested_field_reorder_is_identical() {
+        // Reordering columns inside `items:[...]` is name-based on the child
+        // table — semantically identical, no migrate block required.
+        assert_eq!(
+            classify_schema_change(
+                "id:int,items:[name:text,price:float]",
+                "id:int,items:[price:float,name:text]"
+            ),
+            SchemaChange::Identical
+        );
+    }
+
+    #[test]
+    fn nested_field_column_added_is_safe() {
+        // Adding a scalar column inside the nested relation is a nullable-column
+        // addition the runtime auto-applies — Safe, not Breaking.
+        assert_eq!(
+            classify_schema_change("items:[name:text]", "items:[name:text,price:float]"),
+            SchemaChange::Safe
+        );
+    }
+
+    #[test]
+    fn nested_field_column_removed_is_breaking() {
+        assert_eq!(
+            classify_schema_change("items:[name:text,price:float]", "items:[name:text]"),
+            SchemaChange::Breaking
+        );
+    }
+
+    #[test]
+    fn nested_field_column_type_changed_is_breaking() {
+        assert_eq!(
+            classify_schema_change("items:[qty:int]", "items:[qty:float]"),
+            SchemaChange::Breaking
+        );
+    }
+
+    #[test]
+    fn nested_field_to_scalar_is_breaking() {
+        assert_eq!(
+            classify_schema_change("items:[name:text]", "items:text"),
+            SchemaChange::Breaking
+        );
+    }
+
+    #[test]
+    fn nested_reorder_with_sibling_scalar_addition_is_safe() {
+        // A nested reorder combined with a top-level scalar addition: the
+        // strongest classification wins (Safe), never Breaking.
+        assert_eq!(
+            classify_schema_change(
+                "items:[name:text,price:float]",
+                "items:[price:float,name:text],note:text"
+            ),
+            SchemaChange::Safe
+        );
+    }
+
+    #[test]
+    fn leaf_child_gaining_nested_subrelation_is_breaking() {
+        // A leaf child table is created without the `_id`/`_content_hash`
+        // columns a parent needs, and SQLite cannot add them via ALTER TABLE —
+        // the runtime's `auto_apply_child_change` refuses this, so the compiler
+        // must classify it Breaking rather than Safe (avoids the inverse bug).
+        assert_eq!(
+            classify_schema_change(
+                "items:[name:text]",
+                "items:[name:text,tags:[label:text]]"
+            ),
+            SchemaChange::Breaking
+        );
+    }
+
+    #[test]
+    fn nested_within_nested_reorder_is_identical() {
+        // Reordering columns two levels deep, where every child already has its
+        // own nested sub-relation, is still just a reorder — Identical.
+        assert_eq!(
+            classify_schema_change(
+                "items:[name:text,tags:[a:int,b:int]]",
+                "items:[name:text,tags:[b:int,a:int]]"
+            ),
+            SchemaChange::Identical
+        );
+    }
+
+    #[test]
+    fn nested_within_nested_column_added_is_safe() {
+        assert_eq!(
+            classify_schema_change(
+                "items:[name:text,tags:[a:int]]",
+                "items:[name:text,tags:[a:int,b:int]]"
+            ),
+            SchemaChange::Safe
+        );
+    }
+
+    #[test]
+    fn nonleaf_child_gaining_additional_subrelation_is_safe() {
+        // The child already has a sub-relation (`tags`), so it has the `_id`/
+        // `_content_hash` scaffolding; adding a second sub-relation is a safe
+        // brand-new child table, matching `auto_apply_child_change`.
+        assert_eq!(
+            classify_schema_change(
+                "items:[name:text,tags:[label:text]]",
+                "items:[name:text,tags:[label:text],notes:[body:text]]"
+            ),
+            SchemaChange::Safe
+        );
+    }
+
+    // --- Parent `_id` requirement for a source's first nested field ----------
 
     #[test]
     fn first_nested_field_added_is_breaking() {

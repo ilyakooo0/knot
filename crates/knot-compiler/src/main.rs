@@ -335,7 +335,7 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     let original_decls = module.decls.clone();
 
     // Resolve imports — load, parse, and merge imported modules
-    let imported_type_snippets = match modules::resolve_imports(&mut module, &source_path) {
+    let imported_snippets = match modules::resolve_imports(&mut module, &source_path) {
         Ok(snippets) => snippets,
         Err(diags) => {
             for diag in &diags {
@@ -471,7 +471,7 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
         imports: vec![],
         decls: original_decls,
     };
-    if let Err(e) = lockfile::update(&source_path, &source, &lockfile_module, &imported_type_snippets) {
+    if let Err(e) = lockfile::update(&source_path, &source, &lockfile_module, &imported_snippets.types, &imported_snippets.sources) {
         eprintln!("Warning: {}", e);
     }
 

@@ -85,6 +85,29 @@ fn enforce_import_cache_cap(cache: &mut ImportCache) {
     }
 }
 
+/// LRU eviction for `InferenceCache`. Drops the least-recently-accessed
+/// entries until the cache is back under `MAX_INFERENCE_CACHE_ENTRIES`.
+/// The in-place insertion path (`analyze_document`) evicts before it inserts,
+/// but merge-back in `analysis_worker` only inserts into the shared cache and
+/// never evicts, so the shared map grew unbounded across a long session (each
+/// task then clones the whole map, driving RSS and per-keystroke latency up).
+/// Mirrors `enforce_import_cache_cap` so growth stays bounded regardless of
+/// which path inserts.
+fn enforce_inference_cache_cap(cache: &mut InferenceCache) {
+    while cache.len() > MAX_INFERENCE_CACHE_ENTRIES {
+        let victim = cache
+            .iter()
+            .min_by_key(|(_, s)| s.access_clock)
+            .map(|(k, _)| k.clone());
+        match victim {
+            Some(k) => {
+                cache.remove(&k);
+            }
+            None => break,
+        }
+    }
+}
+
 /// Extract a `<unit>` annotation from a formatted local type string. Returns
 /// `None` for dimensionless types or types without unit info.
 fn extract_unit_from_local_type(ty: &str) -> Option<String> {
@@ -239,6 +262,11 @@ pub fn analysis_worker(
                             shared.entry(k).or_insert(v);
                         }
                     }
+                    // Merge-back only inserts, so the shared inference cache
+                    // could drift over the cap the same way the import cache
+                    // did. Re-enforce the LRU cap here so growth stays bounded
+                    // across sessions regardless of which path inserts.
+                    enforce_inference_cache_cap(&mut shared);
                 }
             }
 
@@ -1150,6 +1178,54 @@ mod tests {
         let min_surviving = cache
             .values()
             .map(|e| e.access_clock)
+            .min()
+            .unwrap_or_default();
+        assert!(
+            min_surviving >= 10,
+            "expected the 10 oldest entries to be evicted; min surviving clock is {min_surviving}"
+        );
+    }
+
+    #[test]
+    fn inference_cache_cap_evicts_least_recently_used() {
+        // Regression for B76: merge-back only inserted into the shared
+        // inference cache and never evicted, so it grew unbounded. Insert
+        // beyond the cap, then verify `enforce_inference_cache_cap` keeps only
+        // the freshest `MAX_INFERENCE_CACHE_ENTRIES` entries.
+        use crate::state::InferenceSnapshot;
+
+        let mut cache: InferenceCache = HashMap::new();
+        for i in 0..MAX_INFERENCE_CACHE_ENTRIES + 10 {
+            let key = (PathBuf::from(format!("/tmp/inf{i}.knot")), i as u64);
+            cache.insert(
+                key,
+                InferenceSnapshot {
+                    diagnostics: Vec::new(),
+                    type_info: HashMap::new(),
+                    local_type_info: HashMap::new(),
+                    effect_info: HashMap::new(),
+                    effect_sets: HashMap::new(),
+                    refined_types: HashMap::new(),
+                    refine_targets: HashMap::new(),
+                    source_refinements: HashMap::new(),
+                    monad_info: HashMap::new(),
+                    unit_info: HashMap::new(),
+                    fingerprint: ModuleFingerprint {
+                        decl_hashes: HashMap::new(),
+                        decl_signature_hashes: HashMap::new(),
+                        decl_deps: HashMap::new(),
+                        structure_hash: 0,
+                    },
+                    access_clock: i as u64,
+                },
+            );
+        }
+        enforce_inference_cache_cap(&mut cache);
+        assert_eq!(cache.len(), MAX_INFERENCE_CACHE_ENTRIES);
+        // The oldest 10 entries (clocks 0..9) should be the ones evicted.
+        let min_surviving = cache
+            .values()
+            .map(|s| s.access_clock)
             .min()
             .unwrap_or_default();
         assert!(

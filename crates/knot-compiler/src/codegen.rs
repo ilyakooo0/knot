@@ -8553,6 +8553,47 @@ impl Codegen {
                         &expr.node,
                         ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_)
                     );
+                    // A comprehension TAIL inside a sequential IO block:
+                    //
+                    //   replace *people = [...]      -- IO statement
+                    //   p <- *people                 -- ← this bind
+                    //   where p.age > 27
+                    //   yield p.name
+                    //
+                    // The bind and every statement after it form a relation
+                    // comprehension, so the bind must iterate ROWS — `where`
+                    // filters each row and `yield` accumulates the matches.
+                    // Taking the whole relation instead gives `where` GUARD
+                    // semantics, under which `p.age` silently means "the FIRST
+                    // row's age": examples/hello.knot printed only "Alice"
+                    // (row 1 passed the guard, so its single yield became the
+                    // whole result) and never "Carol". PR #63 fixed this same
+                    // root cause for the `<-`-bound form (`xs <- do { r <- *rel;
+                    // where …; yield … }`); this is the same comprehension
+                    // written directly as the block's trailing statements.
+                    //
+                    // Both readings of `x <- *rel` are legal, so the bound
+                    // name's USES pick between them: DESIGN.md's
+                    // `&seniors = do { people <- *people;
+                    //                  yield (filter (\p -> p.age > 65) people) }`
+                    // passes the name on as the whole relation, while the
+                    // comprehension above only ever reads fields off it. Iterate
+                    // exactly when every use is a field access on the name —
+                    // referenced, but never as a value — which is meaningless
+                    // under whole-relation semantics anyway ("first row's age").
+                    let comprehension_tail = rhs_is_io_relation_source
+                        && Self::do_block_is_comprehension(&stmts[stmt_idx..])
+                        && match &pat.node {
+                            ast::PatKind::Var(name) => {
+                                let tail = ast::Spanned::new(
+                                    ast::ExprKind::Do(stmts[stmt_idx + 1..].to_vec()),
+                                    stmt.span,
+                                );
+                                expr_refs_var(&tail, name)
+                                    && !expr_uses_var_as_value(&tail, name)
+                            }
+                            _ => false,
+                        };
                     let rhs_iterates = (!self.expr_is_io(expr)
                         && (matches!(&expr.node, ast::ExprKind::List(_))
                             || self.expr_is_known_relation(expr)
@@ -8570,7 +8611,8 @@ impl Codegen {
                             // panics on field access).
                             || self.desugared_monad_kind(expr)
                                 == Some(MonadKind::Relation)))
-                        || (pat_filters_rows && rhs_is_io_relation_source);
+                        || (pat_filters_rows && rhs_is_io_relation_source)
+                        || comprehension_tail;
                     // Names (re)bound by this pattern are rows from here on,
                     // not the relation-valued lets they may have shadowed.
                     self.io_relation_vars.retain(|n| !pat_binds(pat, n));
@@ -15872,6 +15914,121 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
         ast::ExprKind::Annot { expr: e, .. } => expr_refs_var(e, var),
         ast::ExprKind::Serve { handlers, .. } => {
             handlers.iter().any(|h| expr_refs_var(&h.body, var))
+        }
+    }
+}
+
+/// Like `expr_refs_var`, but a bare field access on `var` (`p.age`) does NOT
+/// count as a reference: it reports only uses of `var` as a *whole value* —
+/// passed to a function (`filter pred people`), yielded, compared, and so on.
+///
+/// A do-block bind from a relation source is ambiguous on its own: DESIGN.md's
+/// `&seniors = do { people <- *people; yield (filter … people) }` binds the
+/// WHOLE relation, while `do { p <- *people; where p.age > 27; yield p.name }`
+/// binds each ROW. The bound name's use sites are what tell them apart, so
+/// `compile_io_do_eager` pairs this with `expr_refs_var`: referenced, but never
+/// as a value, means every use is a field access — a row.
+///
+/// Mirrors `expr_refs_var`'s shadowing rules (and its exhaustive match, so a
+/// new `ExprKind` cannot be silently forgotten here).
+fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
+    let pat_binds_var = |pat: &ast::Pat| pat_bound_names(pat).iter().any(|n| n == var);
+    match &expr.node {
+        ast::ExprKind::Var(name) => name == var,
+        ast::ExprKind::Lit(_)
+        | ast::ExprKind::Constructor(_)
+        | ast::ExprKind::SourceRef(_)
+        | ast::ExprKind::DerivedRef(_) => false,
+        // `var.field` is a ROW use, not a value use — the whole point of this
+        // walker. A field access on anything else still recurses (`f x . name`
+        // may well pass `var` to `f`), as does a nested base (`var.a.b` has
+        // `var.a` as its base, which is itself a row use of `var`).
+        ast::ExprKind::FieldAccess { expr: e, .. } => {
+            if matches!(&e.node, ast::ExprKind::Var(name) if name == var) {
+                false
+            } else {
+                expr_uses_var_as_value(e, var)
+            }
+        }
+        ast::ExprKind::App { func, arg } => {
+            expr_uses_var_as_value(func, var) || expr_uses_var_as_value(arg, var)
+        }
+        ast::ExprKind::BinOp { lhs, rhs, .. } => {
+            expr_uses_var_as_value(lhs, var) || expr_uses_var_as_value(rhs, var)
+        }
+        ast::ExprKind::UnaryOp { operand, .. } => expr_uses_var_as_value(operand, var),
+        ast::ExprKind::If { cond, then_branch, else_branch } => {
+            expr_uses_var_as_value(cond, var)
+                || expr_uses_var_as_value(then_branch, var)
+                || expr_uses_var_as_value(else_branch, var)
+        }
+        ast::ExprKind::Lambda { params, body } => {
+            if params.iter().any(pat_binds_var) {
+                false // shadowed
+            } else {
+                expr_uses_var_as_value(body, var)
+            }
+        }
+        ast::ExprKind::Case { scrutinee, arms } => {
+            expr_uses_var_as_value(scrutinee, var)
+                || arms.iter().any(|arm| {
+                    !pat_binds_var(&arm.pat) && expr_uses_var_as_value(&arm.body, var)
+                })
+        }
+        ast::ExprKind::Record(fields) => {
+            fields.iter().any(|f| expr_uses_var_as_value(&f.value, var))
+        }
+        // `{p | age: 1}` rebuilds the whole record `p`, so the base is a value
+        // use even though field names appear next to it.
+        ast::ExprKind::RecordUpdate { base, fields } => {
+            expr_uses_var_as_value(base, var)
+                || fields.iter().any(|f| expr_uses_var_as_value(&f.value, var))
+        }
+        ast::ExprKind::List(elems) => {
+            elems.iter().any(|e| expr_uses_var_as_value(e, var))
+        }
+        ast::ExprKind::Do(stmts) => {
+            for stmt in stmts {
+                match &stmt.node {
+                    ast::StmtKind::Bind { pat, expr: e } | ast::StmtKind::Let { pat, expr: e } => {
+                        if expr_uses_var_as_value(e, var) {
+                            return true;
+                        }
+                        if pat_binds_var(pat) {
+                            return false; // shadowed for remaining stmts
+                        }
+                    }
+                    ast::StmtKind::Where { cond } => {
+                        if expr_uses_var_as_value(cond, var) {
+                            return true;
+                        }
+                    }
+                    ast::StmtKind::GroupBy { key } => {
+                        if expr_uses_var_as_value(key, var) {
+                            return true;
+                        }
+                    }
+                    ast::StmtKind::Expr(e) => {
+                        if expr_uses_var_as_value(e, var) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+        ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
+            expr_uses_var_as_value(target, var) || expr_uses_var_as_value(value, var)
+        }
+        ast::ExprKind::Atomic(inner) | ast::ExprKind::Refine(inner) => {
+            expr_uses_var_as_value(inner, var)
+        }
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => {
+            expr_uses_var_as_value(value, var)
+        }
+        ast::ExprKind::Annot { expr: e, .. } => expr_uses_var_as_value(e, var),
+        ast::ExprKind::Serve { handlers, .. } => {
+            handlers.iter().any(|h| expr_uses_var_as_value(&h.body, var))
         }
     }
 }

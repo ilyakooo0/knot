@@ -799,3 +799,66 @@ main = do
         "`where` must be a per-row filter, not a guard on the first row, got:\n{stdout}"
     );
 }
+
+// ── Finding 7: comprehension tail in a sequential IO block ────────
+
+#[test]
+fn comprehension_tail_after_io_statement_yields_all_rows() {
+    // examples/hello.knot's shape: a sequential IO statement (`replace`)
+    // followed by a comprehension written directly as the block's trailing
+    // statements (`p <- *people; where …; yield …`). The bind used to take the
+    // WHOLE relation, which gives `where` guard semantics — `p.age` silently
+    // meant "the FIRST row's age", so the block yielded that one row's name and
+    // dropped every later match: hello.knot printed "Alice" but never "Carol".
+    // PR #63 fixed the same root cause for the `<-`-bound form (`xs <- do { … }`);
+    // the comprehension must accumulate all matching rows in this form too.
+    let (stdout, stderr, ok) = compile_and_run(
+        "comprehension_tail_after_io",
+        r#"type Person = {name: Text, age: Int}
+
+*people : [Person]
+
+adults = do
+  p <- *people
+  where p.age > 27
+  yield p.name
+
+main = do
+  replace *people = [{name: "Alice", age: 30}, {name: "Bob", age: 25}, {name: "Carol", age: 35}]
+
+  -- the comprehension tail: `where` is a per-row filter, not a guard on row 1
+  names <- adults
+  println ("names: " ++ show names)
+
+  -- a first row that FAILS the guard used to skip the rest of the block
+  -- entirely and yield {} — every row lost, not just the first
+  young <- do
+    p <- *people
+    where p.age < 27
+    yield p.name
+  println ("young: " ++ show young)
+
+  -- the bound name used as a whole relation keeps IO-bind semantics
+  -- (DESIGN.md: `&seniors = do { people <- *people; yield (filter … people) }`)
+  rows <- *people
+  println ("count: " ++ show (count rows))
+"#,
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    // The regression printed just `Alice` — row 1 passed the guard, and its
+    // single yield became the whole result.
+    assert!(
+        stdout.contains("names: [Alice, Carol]"),
+        "a comprehension tail must accumulate every matching row, got:\n{stdout}"
+    );
+    // Row 1 (age 30) fails `< 27`, so the guard reading bailed out with `{}`.
+    assert!(
+        stdout.contains("young: [Bob]"),
+        "a first row failing the filter must not drop the rest, got:\n{stdout}"
+    );
+    // A name passed on as a value is still the whole relation, not a row.
+    assert!(
+        stdout.contains("count: 3"),
+        "a whole-relation bind must keep binding the relation, got:\n{stdout}"
+    );
+}

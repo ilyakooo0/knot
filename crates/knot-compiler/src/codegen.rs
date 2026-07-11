@@ -7781,6 +7781,15 @@ impl Codegen {
         let mut fun_bodies: Vec<(String, &ast::Expr)> = Vec::new();
         for decl in decls {
             match &decl.node {
+                ast::DeclKind::Fun { name, body: Some(body), ty: Some(ts), .. } => {
+                    // Seed IO functions from type annotations (same as desugar's fun_sig_io).
+                    // Functions like `forEach` whose IO comes from trait-method calls
+                    // (yield) are not detected by body scan alone.
+                    if Self::type_returns_io_codegen(&ts.ty) {
+                        self.io_functions.insert(name.clone());
+                    }
+                    fun_bodies.push((name.clone(), body));
+                }
                 ast::DeclKind::Fun { name, body: Some(body), .. } => {
                     fun_bodies.push((name.clone(), body));
                 }
@@ -7827,6 +7836,16 @@ impl Codegen {
             if !changed {
                 break;
             }
+        }
+    }
+
+    /// Whether a declared type's final return type is `IO ...` (walking through
+    /// curried function arrows). Mirrors desugar's `type_returns_io`.
+    fn type_returns_io_codegen(ty: &ast::Type) -> bool {
+        match &ty.node {
+            ast::TypeKind::Function { result, .. } => Self::type_returns_io_codegen(result),
+            ast::TypeKind::IO { .. } => true,
+            _ => false,
         }
     }
 

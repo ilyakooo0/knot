@@ -6762,22 +6762,21 @@ pub extern "C-unwind" fn knot_value_div(a: *mut Value, b: *mut Value) -> *mut Va
             }
         }
         (Some(NumView::Float(x)), Some(NumView::Float(y))) => {
-            if y == 0.0 {
-                panic!("knot runtime: division by zero");
-            }
+            // IEEE 754: float division by zero produces infinity/NaN,
+            // not a panic. Only integer division by zero panics.
             alloc_float(x / y)
         }
         (Some(NumView::Int(x)), Some(NumView::Float(y))) => {
-            if y == 0.0 {
-                panic!("knot runtime: division by zero");
-            }
             alloc_float(x as f64 / y)
         }
         (Some(NumView::Float(x)), Some(NumView::Int(y))) => {
             if y == 0 {
-                panic!("knot runtime: division by zero");
+                // Int divisor is zero — produce IEEE 754 result
+                if x == 0.0 { alloc_float(f64::NAN) }
+                else { alloc_float(if x > 0.0 { f64::INFINITY } else { f64::NEG_INFINITY }) }
+            } else {
+                alloc_float(x / y as f64)
             }
-            alloc_float(x / y as f64)
         }
         _ => panic!("knot runtime: cannot divide {} / {}", type_name(a), type_name(b)),
     }

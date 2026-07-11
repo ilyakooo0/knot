@@ -705,9 +705,6 @@ fn scan_workspace_files(
             .get(other_uri)
             .is_some_and(|p| p.source != other_doc.source)
         {
-            if let Some(p) = canonical_for_uri(other_uri) {
-                scanned.insert(p);
-            }
             continue;
         }
         let other_path = canonical_for_uri(other_uri);

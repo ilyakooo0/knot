@@ -1871,33 +1871,43 @@ impl Infer {
                     let unified_inner = self.apply(&a);
                     let merged_io =
                         Ty::IO(merged.clone(), None, Box::new(unified_inner));
-                    // Widen at the *end* of each var's substitution chain
+                    // Bind at the *end* of each var's substitution chain
                     // (via bind_var, which checks skolems/occurs) so any
                     // aliases along the chain keep seeing the widened IO —
                     // a raw insert at the root var would orphan them.
                     //
-                    // Only the *required*-side var is a fresh accumulator meant
-                    // to absorb the union, so overwriting it is correct. The
-                    // *provided*-side var is the actual branch value: in this
-                    // `(IO, IO)` arm a `Some` var is already bound to a concrete
-                    // closed IO (otherwise `apply` would have left it a
-                    // `Ty::Var` and this arm would not match). Overwriting that
-                    // binding would relabel a value whose type was already fixed
-                    // by an earlier, already-discharged obligation (e.g. a
-                    // lambda parameter pinned to `IO {} {}` by a prior call) —
-                    // silently laundering the widened effects past both the
-                    // effect annotation and the atomic gate, since that
-                    // obligation is never revisited. So for the provided side
-                    // keep the existing binding and merely unify the widened
-                    // effects against it (its effects are ⊆ the union by
-                    // construction, so merging a pure branch with an effectful
-                    // one is still accepted).
+                    // The REQUIRED-side var is a fresh result accumulator
+                    // (an if/case result var, or a do-block's sequencing
+                    // var): it legitimately absorbs the union of the
+                    // branches' effects, so overwriting it is correct.
+                    //
+                    // The PROVIDED-side var is an actual branch *value*.
+                    // Widening fires whenever a side was *syntactically* a
+                    // `Ty::Var` — but that var may already be bound (through
+                    // the substitution) to a concrete closed IO by an
+                    // earlier, already-discharged obligation (e.g. `g act`
+                    // pinning `act : IO {} {}`, or a lambda parameter fixed
+                    // by a prior call). Overwriting that chain-end binding
+                    // with the widened effect set would relabel a value whose
+                    // type was already fixed, laundering the extra effects
+                    // past both the effect annotation and the atomic gate,
+                    // since that obligation is never revisited. So resolve
+                    // the provided-side var through `self.subst`: if it is
+                    // already bound, preserve the binding and only validate
+                    // compatibility via `unify_io_effects` (which does not
+                    // rebind in the closed/closed case, mirroring
+                    // `merge_do_io_row`'s unify-don't-clobber merge — its
+                    // effects are ⊆ the union by construction, so merging a
+                    // pure branch with an effectful one is still accepted);
+                    // only a genuinely unbound provided-side var is bound to
+                    // the widened IO.
                     let (provided_var, required_var, provided_effects) =
                         if t1_provided {
                             (var1, var2, &e1)
                         } else {
                             (var2, var1, &e2)
                         };
+
                     let required_root =
                         required_var.map(|v| self.var_chain_end(v));
                     if let Some(root) = required_root {

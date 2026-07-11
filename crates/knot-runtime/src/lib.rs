@@ -15173,13 +15173,15 @@ pub extern "C-unwind" fn knot_view_read(
         let total_fields = rec_schema.columns.len() + rec_schema.nested.len();
         let record = knot_record_empty(total_fields);
 
+        // Scalar columns.
         for (i, col) in rec_schema.columns.iter().enumerate() {
             let val = read_sql_column(row, i + col_offset, col.ty);
             let name_bytes = col.name.as_bytes();
             knot_record_set_field(record, name_bytes.as_ptr(), name_bytes.len(), val);
         }
 
-        // Nested relation fields, joined from their child tables by `_id`.
+        // Nested relation fields, reassembled from their child tables keyed on
+        // the parent `_id` (same path as `read_record_table`).
         if has_children {
             let parent_id: i64 = row.get(0).unwrap();
             for nf in &rec_schema.nested {

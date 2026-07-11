@@ -840,6 +840,17 @@ impl EffectChecker {
                 {
                     effects = effects.union(declared);
                 }
+                // The declared row above covers the callee's IO effects but not
+                // relation reads/writes performed by its callback arguments —
+                // those are `IO {}` at the type level, so no closed declared row
+                // can express them. Charge them explicitly, or a callback like
+                // `\n -> *secrets` laundered through a closed-row callee reports
+                // no reads (bug B17). No-op for `propagate_lambda`, where the
+                // lambda's full effects already flowed in via `arg_effects`.
+                if !propagate_lambda {
+                    let db = self.lambda_arg_db_effects(&args);
+                    effects = effects.union(&db);
+                }
                 effects
             }
 
@@ -900,6 +911,13 @@ impl EffectChecker {
                         && let Some(declared) = self.fixed_row_effects.get(name)
                     {
                         result = result.union(declared);
+                    }
+                    // Mirror the App spine: recover relation reads/writes the
+                    // piped-in lambda performs, which the closed declared row
+                    // cannot express (bug B17). `lhs` is the sole argument.
+                    if !propagate_lambda {
+                        let db = self.lambda_arg_db_effects(&[&**lhs]);
+                        result = result.union(&db);
                     }
                     result
                 } else {
@@ -1725,6 +1743,29 @@ impl EffectChecker {
                 .builtin_alias_effects(body)
                 .unwrap_or_else(|| self.infer_effects(body)),
         }
+    }
+
+    /// Relation reads/writes performed by a closed-row (`fixed_row`) callee's
+    /// *lambda* arguments. When `propagate_lambda` is false the callee "absorbs"
+    /// its callbacks and we recover its *declared* row instead of the callbacks'
+    /// effects — correct for the five IO effects (console/fs/clock/network/
+    /// random), which are tracked in the type-level effect row and so are
+    /// genuinely covered by the declared set. But relation reads/writes are
+    /// invisible at the type level (`*rel` reads as `IO {}`), so no closed
+    /// declared row can ever express them — a callback like `\n -> *secrets`
+    /// laundered through such a callee would otherwise report no reads at all
+    /// (bug B17). Recover only those db effects here; IO effects stay absorbed
+    /// (see `non_row_poly_callee_does_not_propagate_lambda_effects`).
+    fn lambda_arg_db_effects(&mut self, args: &[&ast::Expr]) -> EffectSet {
+        let mut db = EffectSet::empty();
+        for arg in args {
+            if is_lambda_arg(arg) {
+                let body = self.fun_body_effects(arg);
+                db.reads.extend(body.reads);
+                db.writes.extend(body.writes);
+            }
+        }
+        db
     }
 
     /// If `expr` is a point-free reference to a *non-nullary* IO builtin — an
@@ -3217,6 +3258,68 @@ mod tests {
         assert!(
             !effects["g"].console,
             "non-row-poly callee should absorb lambda effects, not propagate"
+        );
+    }
+
+    /// Regression (bug B17): a closed-row (`fixed_row`) callee absorbs its
+    /// callback's *IO* effects into its declared row, but relation reads/writes
+    /// are invisible at the type level (`*rel` is `IO {}`) — no declared row can
+    /// express them. So a callback that reads a relation, laundered through a
+    /// closed-row callee, must still report that read at the call site;
+    /// otherwise a dishonest `leak : IO {} [Item]` passes and the honest
+    /// `leak : IO {r *secrets} [Item]` wrongly warns "declared effects unused".
+    #[test]
+    fn fixed_row_callee_propagates_lambda_db_reads() {
+        // runCb : (Int -> IO {} [Item]) -> IO {} [Item]
+        // runCb = \cb -> cb 0
+        let run_cb_body = spanned(ExprKind::Lambda {
+            params: vec![spanned(PatKind::Var("cb".into()))],
+            body: Box::new(spanned(ExprKind::App {
+                func: Box::new(spanned(ExprKind::Var("cb".into()))),
+                arg: Box::new(spanned(ExprKind::Lit(Literal::Int("0".into())))),
+            })),
+        });
+        let items_ty = || {
+            spanned(TypeKind::Relation(Box::new(spanned(TypeKind::Named(
+                "Item".into(),
+            )))))
+        };
+        let run_cb_ty = TypeScheme {
+            constraints: vec![],
+            ty: spanned(TypeKind::Function {
+                param: Box::new(spanned(TypeKind::Function {
+                    param: Box::new(spanned(TypeKind::Named("Int".into()))),
+                    result: Box::new(spanned(TypeKind::IO {
+                        effects: vec![],
+                        rest: vec![],
+                        ty: Box::new(items_ty()),
+                    })),
+                })),
+                result: Box::new(spanned(TypeKind::IO {
+                    effects: vec![],
+                    rest: vec![],
+                    ty: Box::new(items_ty()),
+                })),
+            }),
+        };
+
+        // leak = runCb (\n -> *secrets)
+        let leak_body = spanned(ExprKind::App {
+            func: Box::new(spanned(ExprKind::Var("runCb".into()))),
+            arg: Box::new(spanned(ExprKind::Lambda {
+                params: vec![spanned(PatKind::Var("n".into()))],
+                body: Box::new(spanned(ExprKind::SourceRef("secrets".into()))),
+            })),
+        });
+
+        let (_diags, effects) = check_module(vec![
+            make_source("secrets"),
+            make_fun_with_type("runCb", run_cb_body, run_cb_ty),
+            make_fun("leak", leak_body),
+        ]);
+        assert!(
+            effects["leak"].reads.contains("secrets"),
+            "callback's relation read must propagate through a closed-row callee"
         );
     }
 

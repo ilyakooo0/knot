@@ -1816,7 +1816,27 @@ fn collect_referenced_names(module: &Module) -> HashSet<String> {
                     for f in &e.response_headers {
                         collect_names_in_type(&f.value, &mut names);
                     }
+                    // `rateLimit <expr>` can reference imported helpers (e.g. a
+                    // shared key function). If we skip it, organize/remove-unused
+                    // imports would delete the import and break compilation.
+                    if let Some(rl) = &e.rate_limit {
+                        collect_names_in_expr(rl, &mut names);
+                    }
                 }
+            }
+            // `route Api = TodoApi | AdminApi` composes other route
+            // declarations by name — each component may be imported, so it must
+            // count as used or the composition would reference an undefined route.
+            DeclKind::RouteComposite { components, .. } => {
+                for component in components {
+                    names.insert(component.clone());
+                }
+            }
+            // `*orders.customer <= *people.name` references source relations by
+            // name on both sides; imported relations used only here must count.
+            DeclKind::SubsetConstraint { sub, sup } => {
+                names.insert(sub.relation.clone());
+                names.insert(sup.relation.clone());
             }
             _ => {}
         }

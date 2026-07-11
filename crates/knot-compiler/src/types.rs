@@ -238,7 +238,20 @@ impl TypeEnv {
         let alias_keys: Vec<String> = aliases.keys().cloned().collect();
         for name in &alias_keys {
             let resolved = aliases[name].clone();
-            let fixed = re_resolve_type(&resolved, &aliases);
+            // `Named("unknown")` is the placeholder left behind whenever the
+            // first pass could not make sense of a type — including an
+            // application of a data type declared later. Only then is the
+            // AST re-resolution worth doing; otherwise the cheaper leaf
+            // substitution is enough (and avoids re-expanding aliases whose
+            // resolved form is already correct).
+            let from_ast = if contains_unknown(&resolved) {
+                alias_ast_types.get(name).map(|ast| {
+                    resolve_type(ast, &aliases, &associated_types, &single_variant_params)
+                })
+            } else {
+                None
+            };
+            let fixed = from_ast.unwrap_or_else(|| re_resolve_type(&resolved, &aliases));
             if fixed != resolved {
                 aliases.insert(name.clone(), fixed);
             }
@@ -1082,6 +1095,26 @@ fn resolve_type(
             // Quantifiers are phantom for schema resolution.
             resolve_type(ty, aliases, assoc_types, single_variant_params)
         }
+    }
+}
+
+/// Whether a resolved type still carries the `Named("unknown")` placeholder
+/// `resolve_type` leaves behind for a type it could not make sense of — a bare
+/// type parameter, a hole, or an application whose head constructor was not yet
+/// declared. The last case is the recoverable one: re-resolving from the
+/// original AST rebuilds the application once every data declaration is known.
+fn contains_unknown(ty: &ResolvedType) -> bool {
+    match ty {
+        ResolvedType::Named(n) => n == "unknown",
+        ResolvedType::Record(fields) => fields.iter().any(|(_, t)| contains_unknown(t)),
+        ResolvedType::Relation(inner) => contains_unknown(inner),
+        ResolvedType::Function(param, result) => {
+            contains_unknown(param) || contains_unknown(result)
+        }
+        ResolvedType::Adt(ctors) => ctors
+            .iter()
+            .any(|(_, fields)| fields.iter().any(|(_, t)| contains_unknown(t))),
+        _ => false,
     }
 }
 

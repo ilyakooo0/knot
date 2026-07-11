@@ -10748,7 +10748,7 @@ pub extern "C-unwind" fn knot_source_migrate(
     // Recurse to handle grandchild+ tables (deepest first).
     fn drop_nested_tables(conn: &rusqlite::Connection, parent_table: &str, nested: &[NestedField]) {
         for nf in nested {
-            let child = format!("{}__{}", parent_table, nf.name);
+            let child = child_table_name(parent_table, &nf.name);
             // Drop grandchildren first (depth-first)
             drop_nested_tables(conn, &child, &nf.nested);
             let drop_child = format!("DROP TABLE IF EXISTS {};", quote_ident(&child));
@@ -11538,7 +11538,7 @@ fn auto_apply_child_change(
     old_nf: &NestedField,
     new_nf: &NestedField,
 ) -> bool {
-    let child_table = format!("{}__{}", parent_table, new_nf.name);
+    let child_table = child_table_name(parent_table, &new_nf.name);
 
     // Check that all old columns still exist with same type
     for old_col in &old_nf.columns {
@@ -12357,7 +12357,7 @@ pub extern "C-unwind" fn knot_source_read_where(
             if has_children {
                 let parent_id: i64 = row.get(0).unwrap();
                 for nf in &rec.nested {
-                    let child_table_name = format!("{}__{}", table_name, nf.name);
+                    let child_table_name = child_table_name(&table_name, &nf.name);
                     let val = read_child_table(&db_ref.conn, &child_table_name, nf, parent_id);
                     let fname = nf.name.as_bytes();
                     knot_record_set_field(record, fname.as_ptr(), fname.len(), val);
@@ -12569,7 +12569,7 @@ fn read_record_table(
         if has_children {
             let parent_id: i64 = row.get(0).unwrap();
             for nf in &schema.nested {
-                let child_table_name = format!("{}__{}", table_name, nf.name);
+                let child_table_name = child_table_name(table_name, &nf.name);
                 let val = read_child_table(conn, &child_table_name, nf, parent_id);
                 let name = nf.name.as_bytes();
                 knot_record_set_field(record, name.as_ptr(), name.len(), val);
@@ -12632,7 +12632,7 @@ fn read_child_table(
         if has_children {
             let child_id: i64 = row.get(0).unwrap();
             for grandchild in &nf.nested {
-                let gc_table = format!("{}__{}", table_name, grandchild.name);
+                let gc_table = child_table_name(table_name, &grandchild.name);
                 let val = read_child_table(conn, &gc_table, grandchild, child_id);
                 let name = grandchild.name.as_bytes();
                 knot_record_set_field(record, name.as_ptr(), name.len(), val);
@@ -12709,7 +12709,7 @@ fn delete_record_table(conn: &rusqlite::Connection, table_name: &str, schema: &R
 }
 
 fn delete_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &NestedField) {
-    let child_table = format!("{}__{}", parent_table, nf.name);
+    let child_table = child_table_name(parent_table, &nf.name);
     // Recurse to delete grandchildren first
     for grandchild in &nf.nested {
         delete_child_table(conn, &child_table, grandchild);
@@ -12732,7 +12732,7 @@ fn delete_child_rows_for_parent(conn: &rusqlite::Connection, child_table: &str, 
                 .filter_map(|r| r.ok())
                 .collect();
             for grandchild in &nf.nested {
-                let gc_table = format!("{}__{}", child_table, grandchild.name);
+                let gc_table = child_table_name(child_table, &grandchild.name);
                 for &child_id in &ids {
                     delete_child_rows_for_parent(conn, &gc_table, child_id, grandchild);
                 }
@@ -12863,7 +12863,7 @@ fn write_record_rows(
                 conn.last_insert_rowid()
             };
             for nf in &schema.nested {
-                let child_table = format!("{}__{}", table_name, nf.name);
+                let child_table = child_table_name(table_name, &nf.name);
                 let child_val = field_map.get(nf.name.as_str())
                     .copied()
                     .unwrap_or(std::ptr::null_mut());
@@ -12990,7 +12990,7 @@ fn write_child_rows(
                 conn.last_insert_rowid()
             };
             for grandchild in &nf.nested {
-                let gc_table = format!("{}__{}", table_name, grandchild.name);
+                let gc_table = child_table_name(table_name, &grandchild.name);
                 let gc_val = field_map.get(grandchild.name.as_str())
                     .copied()
                     .unwrap_or(std::ptr::null_mut());
@@ -15325,7 +15325,7 @@ pub extern "C-unwind" fn knot_view_read(
         if has_children {
             let parent_id: i64 = row.get(0).unwrap();
             for nf in &rec_schema.nested {
-                let child_table_name = format!("{}__{}", table_name, nf.name);
+                let child_table_name = child_table_name(&table_name, &nf.name);
                 let val = read_child_table(&db_ref.conn, &child_table_name, nf, parent_id);
                 let name_bytes = nf.name.as_bytes();
                 knot_record_set_field(record, name_bytes.as_ptr(), name_bytes.len(), val);
@@ -15515,7 +15515,7 @@ pub extern "C-unwind" fn knot_view_write(
 
             // Delete child rows for each parent _id
             for nf in &rec_schema.nested {
-                let child_table = format!("{}__{}", table_name, nf.name);
+                let child_table = child_table_name(&table_name, &nf.name);
                 for &parent_id in &ids {
                     delete_child_rows_for_parent(&db_ref.conn, &child_table, parent_id, nf);
                 }

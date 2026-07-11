@@ -429,6 +429,7 @@ fn negate(p: Polarity, cause: NegCause) -> Polarity {
 /// avg, minOn, maxOn, countWhere) — these are non-monotone when applied
 /// to a self-referential relation, so they must create negative edges.
 fn completes_aggregate_over_relation(expr: &ast::Expr) -> bool {
+    let expr = strip_head_wrappers(expr);
     match &expr.node {
         ast::ExprKind::Var(name) => {
             matches!(name.as_str(), "count" | "sum" | "avg" | "minOn" | "maxOn" | "countWhere")

@@ -5515,12 +5515,10 @@ impl Infer {
             // Comparison: both same type, result Bool
             ast::BinOp::Eq | ast::BinOp::Neq => {
                 self.unify_symmetric(&lhs_ty, &rhs_ty, span);
-                self.require_trait("Eq", &lhs_ty, span);
                 Ty::Bool
             }
             ast::BinOp::Lt | ast::BinOp::Gt | ast::BinOp::Le | ast::BinOp::Ge => {
                 self.unify_symmetric(&lhs_ty, &rhs_ty, span);
-                self.require_trait("Ord", &lhs_ty, span);
                 Ty::Bool
             }
             // Boolean: both Bool, result Bool
@@ -5533,7 +5531,7 @@ impl Infer {
             ast::BinOp::Concat => {
                 self.unify_symmetric(&lhs_ty, &rhs_ty, span);
                 self.require_trait("Semigroup", &lhs_ty, span);
-                self.degrade_refinement(lhs_ty, span)
+                lhs_ty
             }
             // Pipe: a |> f  =  f a
             ast::BinOp::Pipe => {

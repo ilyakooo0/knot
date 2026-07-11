@@ -355,7 +355,7 @@ fn shift_expr_spans(e: &mut ast::Expr, offset: usize) {
             shift_expr_spans(value, offset);
         }
         Atomic(inner) | Refine(inner) => shift_expr_spans(inner, offset),
-        UnitLit { value, .. } => shift_expr_spans(value, offset),
+        UnitLit { value, .. } | TimeUnitLit { value, .. } => shift_expr_spans(value, offset),
         Annot { expr, .. } => shift_expr_spans(expr, offset),
         Serve { handlers, .. } => {
             for h in handlers {

@@ -1870,19 +1870,56 @@ impl Infer {
                     merged.extend(e2.iter().cloned());
                     let unified_inner = self.apply(&a);
                     let merged_io =
-                        Ty::IO(merged, None, Box::new(unified_inner));
-                    // Bind at the *end* of each var's substitution chain
+                        Ty::IO(merged.clone(), None, Box::new(unified_inner));
+                    // Widen at the *end* of each var's substitution chain
                     // (via bind_var, which checks skolems/occurs) so any
                     // aliases along the chain keep seeing the widened IO —
                     // a raw insert at the root var would orphan them.
-                    if let Some(v) = var1 {
-                        let root = self.var_chain_end(v);
+                    //
+                    // Only the *required*-side var is a fresh accumulator meant
+                    // to absorb the union, so overwriting it is correct. The
+                    // *provided*-side var is the actual branch value: in this
+                    // `(IO, IO)` arm a `Some` var is already bound to a concrete
+                    // closed IO (otherwise `apply` would have left it a
+                    // `Ty::Var` and this arm would not match). Overwriting that
+                    // binding would relabel a value whose type was already fixed
+                    // by an earlier, already-discharged obligation (e.g. a
+                    // lambda parameter pinned to `IO {} {}` by a prior call) —
+                    // silently laundering the widened effects past both the
+                    // effect annotation and the atomic gate, since that
+                    // obligation is never revisited. So for the provided side
+                    // keep the existing binding and merely unify the widened
+                    // effects against it (its effects are ⊆ the union by
+                    // construction, so merging a pure branch with an effectful
+                    // one is still accepted).
+                    let (provided_var, required_var, provided_effects) =
+                        if t1_provided {
+                            (var1, var2, &e1)
+                        } else {
+                            (var2, var1, &e2)
+                        };
+                    let required_root =
+                        required_var.map(|v| self.var_chain_end(v));
+                    if let Some(root) = required_root {
                         self.bind_var(root, merged_io.clone(), span);
                     }
-                    if let Some(v) = var2 {
+                    if let Some(v) = provided_var {
                         let root = self.var_chain_end(v);
-                        if Some(root) != var1.map(|v1| self.var_chain_end(v1)) {
-                            self.bind_var(root, merged_io, span);
+                        if Some(root) != required_root {
+                            if self.subst.contains_key(&root) {
+                                // Already bound to a concrete closed IO:
+                                // preserve it, only checking compatibility.
+                                self.unify_io_effects(
+                                    provided_effects,
+                                    None,
+                                    &merged,
+                                    None,
+                                    span,
+                                    true,
+                                );
+                            } else {
+                                self.bind_var(root, merged_io, span);
+                            }
                         }
                     }
                 } else {
@@ -3653,6 +3690,27 @@ impl Infer {
                                 .into_iter()
                                 .map(|v| (v, self.fresh()))
                                 .collect();
+                            // These freshly-minted alias-body vars must be
+                            // quantified in the enclosing annotation's scheme.
+                            // Without registering them in `annotation_vars`,
+                            // the pre-registered scheme leaves them unquantified
+                            // and shares them across every call site — the first
+                            // use pins the alias (e.g. `Box` to `{val: Int}`) and
+                            // later uses at other types are falsely rejected. The
+                            // bug surfaced only when the annotated decl was
+                            // declared after its first caller, so re-generalization
+                            // (which never happens for constrained functions)
+                            // couldn't paper over it (bug B21). Guarded on
+                            // `in_type_annotation` so only scheme-building callers
+                            // are affected, not alias-definition collection.
+                            if self.in_type_annotation {
+                                for fresh in mapping.values() {
+                                    if let Ty::Var(v) = fresh {
+                                        self.annotation_vars
+                                            .insert(format!("__alias_fv#{v}"), *v);
+                                    }
+                                }
+                            }
                             self.subst_ty(&aliased, &mapping)
                         };
                         // Wrap nullary alias references so the name flows
@@ -4545,13 +4603,18 @@ impl Infer {
                         // result. When both are still-open *distinct* row
                         // variables, `r1.or(r2)` would silently drop one, so
                         // effects later flowing into the dropped tail would
-                        // vanish from the if-expression's type. Unify the two
-                        // tails (the same merge `unify_io_effects` performs for
-                        // distinct rows) so neither is lost.
+                        // vanish from the if-expression's type. Merge the two
+                        // tails the same way a sequenced do-block does: a direct
+                        // `unify` of two *rigid* signature skolems (as in a
+                        // declared `IO {| r1 \/ r2}` union) fails with "cannot
+                        // unify rigid type variables"; `merge_do_io_row` instead
+                        // records a pending `\/` effect-union constraint (and
+                        // still falls back to `unify` for the flexible cases).
                         let row = match (*r1, *r2) {
                             (Some(a), Some(b)) if a != b => {
-                                self.unify(&Ty::Var(a), &Ty::Var(b), expr.span);
-                                Some(a)
+                                let mut merged_row = Some(a);
+                                self.merge_do_io_row(&mut merged_row, b, expr.span);
+                                merged_row
                             }
                             (a, b) => a.or(b),
                         };
@@ -4769,6 +4832,10 @@ impl Infer {
                     }
                 }
             }
+
+            // `2 seconds` is inference-identical to its desugared `2 * 1000`;
+            // infer the wrapped multiplication directly.
+            ast::ExprKind::TimeUnitLit { value, .. } => self.infer_expr(value),
 
             ast::ExprKind::Annot { expr: inner, ty } => {
                 let inner_ty = self.infer_expr(inner);
@@ -5275,12 +5342,18 @@ impl Infer {
         }
 
         // Infer the constructor's record payload (request fields only).
+        // A bare nullary route constructor (`fetch url Ctor`) carries no
+        // record argument — inferring the Constructor node as an expression
+        // yields the ADT type, which would spuriously fail to unify against
+        // the (empty) expected record. Skip payload unification for it; the
+        // response type below is resolved from route metadata regardless.
         let ctor_arg = args.last().unwrap();
         let record_arg = match &ctor_arg.node {
-            ast::ExprKind::App { arg, .. } => arg.as_ref(),
-            _ => ctor_arg,
+            ast::ExprKind::App { arg, .. } => Some(arg.as_ref()),
+            ast::ExprKind::Constructor(_) => None,
+            _ => Some(*ctor_arg),
         };
-        let record_ty = self.infer_expr(record_arg);
+        let record_ty = record_arg.map(|r| self.infer_expr(r));
 
         // Build the expected request fields from the route entry. Save and
         // restore annotation_vars so fetch inference doesn't corrupt the
@@ -5292,13 +5365,15 @@ impl Infer {
                 let v = self.fresh_var();
                 self.annotation_vars.insert(p.clone(), v);
             }
-            let field_tys: BTreeMap<String, Ty> = info
-                .fields
-                .iter()
-                .map(|(name, ty)| (name.clone(), self.ast_type_to_ty(ty)))
-                .collect();
-            let expected_record = Ty::Record(field_tys, None);
-            self.unify(&record_ty, &expected_record, ctor_arg.span);
+            if let Some(record_ty) = &record_ty {
+                let field_tys: BTreeMap<String, Ty> = info
+                    .fields
+                    .iter()
+                    .map(|(name, ty)| (name.clone(), self.ast_type_to_ty(ty)))
+                    .collect();
+                let expected_record = Ty::Record(field_tys, None);
+                self.unify(record_ty, &expected_record, ctor_arg.span);
+            }
         }
 
         // Build the return type: IO {network} (Result {status, message} ResponseTy)
@@ -6185,7 +6260,7 @@ impl Infer {
                 })
             }
             ast::ExprKind::Lambda { body, .. } => self.expr_is_io_prescan(body),
-            ast::ExprKind::UnitLit { value, .. } => self.expr_is_io_prescan(value),
+            ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => self.expr_is_io_prescan(value),
             ast::ExprKind::Annot { expr, .. } => self.expr_is_io_prescan(expr),
             ast::ExprKind::Refine(inner) => self.expr_is_io_prescan(inner),
             _ => false,
@@ -7087,10 +7162,14 @@ impl Infer {
                             self.fetch_response_types
                                 .insert(entry.constructor.clone(), resp_ty.clone());
                         }
-                        if !entry.response_headers.is_empty() {
-                            self.fetch_response_headers
-                                .insert(entry.constructor.clone(), entry.response_headers.clone());
-                        }
+                        // Always insert (even when empty) so a later route
+                        // entry that reuses this constructor name but declares
+                        // no response headers overwrites an earlier one that
+                        // did — otherwise the stale headers survive and fetch
+                        // infers a chimera {body, headers} response type. Empty
+                        // is treated as "no headers" at the use site.
+                        self.fetch_response_headers
+                            .insert(entry.constructor.clone(), entry.response_headers.clone());
                     }
                 }
                 ast::DeclKind::RouteComposite { name, .. } => {
@@ -9673,7 +9752,7 @@ fn value_references_source_inner(
                 inner, source_name, aliases, let_bindings, visited,
             )
         }
-        ast::ExprKind::UnitLit { value, .. } => value_references_source_inner(
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => value_references_source_inner(
             value, source_name, aliases, let_bindings, visited,
         ),
         ast::ExprKind::Annot { expr, .. } => value_references_source_inner(

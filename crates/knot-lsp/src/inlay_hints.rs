@@ -1121,6 +1121,35 @@ fn function_param_tooltip(
     )))
 }
 
+/// Find the byte offset of the `do` keyword within `[start, end)` of `source`.
+///
+/// A `Do` expression's span does not always begin at `do`: a parenthesized do
+/// used as an argument (`f (do ...)`) keeps the inner `Do` node but widens its
+/// span to include the surrounding parens, so `span.start` points at `(`.
+/// Anchoring a hint at a fixed `span.start + 2` would therefore land
+/// mid-keyword. This scans forward from `start` for the first standalone `do`
+/// token — bounded by non-identifier characters so it never matches the tail of
+/// an identifier like `weirdo` or a longer keyword-like word — and returns its
+/// offset, or `None` if there is no such token before `end`.
+fn find_do_keyword(source: &str, start: usize, end: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let end = end.min(bytes.len());
+    // Identifier-continue chars per the lexer: ASCII alphanumerics, `_`, `'`.
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'';
+    let mut i = start;
+    while i + 2 <= end {
+        if bytes[i] == b'd' && bytes[i + 1] == b'o' {
+            let prev_ok = i == 0 || !is_ident(bytes[i - 1]);
+            let next_ok = i + 2 >= bytes.len() || !is_ident(bytes[i + 2]);
+            if prev_ok && next_ok {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Walk the AST collecting `do` block spans whose monad has been resolved.
 /// Emit a leading hint at the block's `do` keyword describing the kind.
 fn add_monad_context_hints(
@@ -1145,14 +1174,18 @@ fn add_monad_context_hints(
                         MonadKind::Adt(name) => format!("[{name}]"),
                     };
                     let pos = offset_to_position(&doc.source, expr.span.start);
-                    // Anchor the hint just past the `do` keyword. We trust the
-                    // span starts at `do` — emit at start, then let the editor
-                    // render with padding_right.
-                    let do_end = expr.span.start + 2; // length of "do"
-                    let do_pos = if do_end <= doc.source.len() {
-                        offset_to_position(&doc.source, do_end)
-                    } else {
-                        pos
+                    // Anchor the hint just past the `do` keyword. The span does
+                    // NOT always begin at `do`: a parenthesized do used as an
+                    // argument (`f (do ...)`) keeps the inner `Do` node but
+                    // widens its span to include the surrounding parens, so
+                    // `span.start` points at `(`. A blind `+ 2` would then land
+                    // mid-keyword (between `d` and `o`). Scan forward from the
+                    // span start for the actual `do` token and anchor after it;
+                    // fall back to the span start if none is found.
+                    let do_pos = match find_do_keyword(&doc.source, expr.span.start, expr.span.end)
+                    {
+                        Some(do_start) => offset_to_position(&doc.source, do_start + 2),
+                        None => pos,
                     };
                     hints.push(InlayHint {
                         position: do_pos,
@@ -1540,6 +1573,46 @@ checkGlobalRate = \t -> atomic do
         assert!(
             has_monad_hint,
             "expected `[Monad]` hint; got: {labels:?}"
+        );
+    }
+
+    /// Regression for B68: a parenthesized do block used as an argument
+    /// (`f (do ...)`) keeps the inner `Do` node but widens its span to include
+    /// the surrounding parens, so `span.start` points at `(`, not `do`. A blind
+    /// `span.start + 2` anchor lands mid-keyword (between `d` and `o`); the hint
+    /// must anchor just after the actual `do` token instead.
+    #[test]
+    fn monad_context_hint_anchors_at_do_keyword_for_parenthesized_do() {
+        let mut ws = TestWorkspace::new();
+        let src = "apply = \\m -> m\nsafe = \\x -> apply (do\n  v <- Just {value: x}\n  yield v.value)\n";
+        let uri = ws.open("main", src);
+        let doc = ws.doc(&uri);
+        let range = ws.whole_file_range(&uri);
+        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
+
+        // The one `do` in the source is the keyword we care about.
+        let do_off = doc.source.find("do").expect("do keyword");
+        // The hint should anchor immediately after `do`, not between `d`/`o`.
+        let expected = offset_to_position(&doc.source, do_off + 2);
+        let wrong_mid_keyword = offset_to_position(&doc.source, do_off + 1);
+
+        let monad_hint = hints
+            .iter()
+            .find(|h| match &h.label {
+                InlayHintLabel::String(s) => {
+                    s.starts_with('[') && s.ends_with(']') && !s.contains(':')
+                }
+                _ => false,
+            })
+            .expect("expected a `[Monad]` context hint");
+
+        assert_ne!(
+            monad_hint.position, wrong_mid_keyword,
+            "monad hint anchored mid-keyword (between `d` and `o`)"
+        );
+        assert_eq!(
+            monad_hint.position, expected,
+            "monad hint should anchor just after the `do` keyword"
         );
     }
 

@@ -684,10 +684,16 @@ pub(crate) fn handle_code_action(
             } else {
                 format!("{fn_name} = \\{} -> {trimmed}\n\n", free_vars.join(" "))
             };
-            let call_args = if free_vars.is_empty() {
-                String::new()
+            // Build the call-site replacement. When the helper takes
+            // arguments, the call must be parenthesized: without parens,
+            // replacing `x + 2` inside `show (x + 2)` yields
+            // `show extracted_fn x`, which parses as `(show extracted_fn) x`
+            // — the wrong application order. A bare zero-arg call needs no
+            // parens (it's a single atom already).
+            let call_site = if free_vars.is_empty() {
+                fn_name.clone()
             } else {
-                format!(" {}", free_vars.join(" "))
+                format!("({fn_name} {})", free_vars.join(" "))
             };
 
             // Find the enclosing top-level declaration to place the function
@@ -718,7 +724,7 @@ pub(crate) fn handle_code_action(
                     // Replace the selected expression with a call
                     TextEdit {
                         range: sel_range,
-                        new_text: format!("{fn_name}{call_args}"),
+                        new_text: call_site,
                     },
                 ],
             );
@@ -1239,13 +1245,21 @@ fn find_add_wildcard_arm_at(
             // indent that would terminate the layout-sensitive case block.
             let indent = arm_indentation(expr, arms, source);
 
-            let case_text = source.get(expr.span.start..expr.span.end)?;
-            let mut rewritten = case_text.to_string();
-            // Append the new arm. `todo` is intentionally an undefined name so
-            // the user gets a clear "fill me in" diagnostic.
+            // Insert the new arm right after the last arm's body, NOT at
+            // `expr.span.end`. When the case is wrapped in parens
+            // (`show (case c of Red {} -> 1)`), the parser folds the enclosing
+            // parens into the case node's span, so `expr.span.end` points past
+            // the closing `)`; inserting there would land the arm outside the
+            // parens and break the parse. The last arm's body always ends
+            // inside the parens. `arms` is guaranteed non-empty here (the
+            // empty-arms case returned above).
+            let insert_at = arms.last()?.body.span.end;
+            // The new arm. `todo` is intentionally an undefined name so the
+            // user gets a clear "fill me in" diagnostic.
+            let mut rewritten = String::new();
             rewritten.push_str(&indent);
             rewritten.push_str("_ -> todo");
-            return Some((expr.span, rewritten));
+            return Some((Span::new(insert_at, insert_at), rewritten));
         }
         let mut found = None;
         crate::utils::recurse_expr(expr, |child| {
@@ -1365,10 +1379,21 @@ fn find_if_negate_at(
             } else {
                 format!("not ({cond_text})")
             };
-            return Some((
-                expr.span,
-                format!("if {new_cond} then {else_text} else {then_text}"),
-            ));
+            let rewrite = format!("if {new_cond} then {else_text} else {then_text}");
+            // When the `if` sits in operand position it's parenthesized, and
+            // the parser folds those parens into this expr's span while keeping
+            // the bare `If` node (see parse_atom's `LParen` arm). Replacing the
+            // whole `(if …)` span with an unparenthesized rewrite would let a
+            // trailing operator bind into the else branch —
+            // `(if c then a else b) * 2` → `if not c then b else a * 2`. Re-wrap
+            // to keep the operand outside the conditional.
+            let expr_text = source.get(expr.span.start..expr.span.end)?;
+            let rewrite = if is_already_parenthesized(expr_text) {
+                format!("({rewrite})")
+            } else {
+                rewrite
+            };
+            return Some((expr.span, rewrite));
         }
         let mut found = None;
         crate::utils::recurse_expr(expr, |child| {
@@ -1624,7 +1649,19 @@ fn find_case_actions(
                             .map(|c| build_case_arm(c, &arm_indent))
                             .collect();
 
-                        let insert_pos = offset_to_position(&doc.source, expr.span.end);
+                        // Insert after the last arm's body rather than at
+                        // `expr.span.end`. A parenthesized case
+                        // (`show (case c of Red {} -> 1)`) has its enclosing
+                        // parens folded into the case node's span by the
+                        // parser, so `expr.span.end` points past the closing
+                        // `)`; the last arm's body always ends inside the
+                        // parens. Falls back to `expr.span.end` only for the
+                        // (parser-impossible) empty-arms case.
+                        let insert_offset = arms
+                            .last()
+                            .map(|a| a.body.span.end)
+                            .unwrap_or(expr.span.end);
+                        let insert_pos = offset_to_position(&doc.source, insert_offset);
                         let mut changes = HashMap::new();
                         changes.insert(
                             uri.clone(),
@@ -1779,7 +1816,27 @@ fn collect_referenced_names(module: &Module) -> HashSet<String> {
                     for f in &e.response_headers {
                         collect_names_in_type(&f.value, &mut names);
                     }
+                    // `rateLimit <expr>` can reference imported helpers (e.g. a
+                    // shared key function). If we skip it, organize/remove-unused
+                    // imports would delete the import and break compilation.
+                    if let Some(rl) = &e.rate_limit {
+                        collect_names_in_expr(rl, &mut names);
+                    }
                 }
+            }
+            // `route Api = TodoApi | AdminApi` composes other route
+            // declarations by name — each component may be imported, so it must
+            // count as used or the composition would reference an undefined route.
+            DeclKind::RouteComposite { components, .. } => {
+                for component in components {
+                    names.insert(component.clone());
+                }
+            }
+            // `*orders.customer <= *people.name` references source relations by
+            // name on both sides; imported relations used only here must count.
+            DeclKind::SubsetConstraint { sub, sup } => {
+                names.insert(sub.relation.clone());
+                names.insert(sup.relation.clone());
             }
             _ => {}
         }
@@ -1856,7 +1913,7 @@ fn collect_names_in_expr(expr: &ast::Expr, out: &mut HashSet<String>) {
             }
         }
         ast::ExprKind::FieldAccess { expr, .. } => collect_names_in_expr(expr, out),
-        ast::ExprKind::UnitLit { value, .. } => collect_names_in_expr(value, out),
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => collect_names_in_expr(value, out),
         ast::ExprKind::Annot { expr, ty } => {
             collect_names_in_expr(expr, out);
             collect_names_in_type(ty, out);
@@ -3162,6 +3219,19 @@ fn find_if_to_case_at(
                     let replacement = format!(
                         "case {cond_text} of{indent}True {{}} -> {then_text}{indent}False {{}} -> {else_text}"
                     );
+                    // A parenthesized `if` in operand position folds its parens
+                    // into `expr.span` (parse_atom keeps the bare node), so
+                    // replacing the whole `(if …)` span with a bare `case …`
+                    // would let a trailing operator bind into the last arm —
+                    // `(if c then a else b) * 2` → `case … False {} -> b * 2`.
+                    // Re-wrap in parens; inside delimiters the `)` terminates
+                    // the arm block, so the multi-line layout still parses.
+                    let expr_text = safe_slice(source, expr.span);
+                    let replacement = if is_already_parenthesized(expr_text) {
+                        format!("({replacement})")
+                    } else {
+                        replacement
+                    };
                     *best = Some((expr.span, replacement));
                 }
             }
@@ -3218,25 +3288,39 @@ fn find_flip_binary_at(
                 _ => None,
             };
             if let Some(op_text) = op_str {
-                let size = expr.span.end - expr.span.start;
+                // Replace only the operator's own extent (`lhs … rhs`), never
+                // the enclosing parens. The parser folds surrounding `(` `)`
+                // into a binary expression's own span, so replacing
+                // `expr.span` would strip parens that hold the expression
+                // together in its context: `f (a == b)` must stay
+                // `f (b == a)`, not become `f b == a` (which reparses as
+                // `(f b) == a`).
+                let flip_span = Span::new(lhs.span.start, rhs.span.end);
+                let size = flip_span.end - flip_span.start;
                 if best.as_ref().is_none_or(|b| size < b.0.end - b.0.start) {
-                    // Keyword forms (if/case/lambda/do) greedily consume
-                    // everything to their right, so moving one to the other
-                    // operand position swallows the operator and the old
-                    // operand (`false && if … else false` flipped naively
-                    // becomes `if … else false && false`). Parenthesize a
-                    // moved keyword-form operand on either side — over-
-                    // parenthesizing is harmless.
+                    // A moved operand keeps its own source text but lands in a
+                    // new neighbor context that can re-parse it. Keyword forms
+                    // (if/case/lambda/do) greedily consume everything to their
+                    // right (`false && if … else false` flips to
+                    // `if … else false && false`). Binary/unary operands
+                    // re-associate with the flip operator when they share or
+                    // undercut its precedence: `a / b * c` is `(a / b) * c`,
+                    // and a naive flip to `c * a / b` reparses as `(c * a) / b`
+                    // — a different value under integer division. Parenthesize
+                    // both families unless the source already wraps them;
+                    // over-parenthesizing is harmless.
                     let operand_text = |e: &ast::Expr| -> String {
                         let text = safe_slice(source, e.span);
-                        let keyword_form = matches!(
+                        let needs_parens = matches!(
                             &e.node,
                             ast::ExprKind::If { .. }
                                 | ast::ExprKind::Case { .. }
                                 | ast::ExprKind::Lambda { .. }
                                 | ast::ExprKind::Do(_)
+                                | ast::ExprKind::BinOp { .. }
+                                | ast::ExprKind::UnaryOp { .. }
                         );
-                        if keyword_form && !is_already_parenthesized(text) {
+                        if needs_parens && !is_already_parenthesized(text) {
                             format!("({text})")
                         } else {
                             text.to_string()
@@ -3244,7 +3328,7 @@ fn find_flip_binary_at(
                     };
                     let replacement =
                         format!("{} {op_text} {}", operand_text(rhs), operand_text(lhs));
-                    *best = Some((expr.span, replacement));
+                    *best = Some((flip_span, replacement));
                 }
             }
         }
@@ -3284,7 +3368,7 @@ fn find_pipe_conversion_at(
         offset: usize,
         best: &mut Option<(Span, String)>,
         is_app_head: bool,
-        under_operator: bool,
+        needs_parens: bool,
     ) {
         if expr.span.start > offset || offset > expr.span.end {
             return;
@@ -3317,12 +3401,18 @@ fn find_pipe_conversion_at(
                     } else {
                         arg_text.to_string()
                     };
-                    // `|>` has the lowest precedence, so splicing a bare pipe
-                    // into an operator operand re-associates the expression:
-                    // `1 + double x` → `1 + x |> double` parses as
-                    // `(1 + x) |> double`. Parenthesize the pipe whenever the
-                    // application is an operand of a Bin/UnaryOp.
-                    let replacement = if under_operator {
+                    // `|>` has the lowest precedence, so a bare pipe
+                    // re-associates whenever it lands in a position that binds
+                    // tighter than it. Two such positions need parens:
+                    //   - an operand of a Bin/UnaryOp: `1 + double x` →
+                    //     `1 + x |> double` parses as `(1 + x) |> double`.
+                    //   - the argument of an enclosing application: the source
+                    //     `g (f x)` gives the inner `App` a span that swallows
+                    //     the parens, so replacing it with `x |> f` yields
+                    //     `g x |> f`, i.e. `f (g x)` — application order
+                    //     silently reversed.
+                    // Parenthesize the pipe in either case.
+                    let replacement = if needs_parens {
                         format!("({arg_part} |> {func_text})")
                     } else {
                         format!("{arg_part} |> {func_text}")
@@ -3331,16 +3421,18 @@ fn find_pipe_conversion_at(
                 }
             }
             // Recurse manually so the function side knows it is an
-            // application head. An application's argument slot is atomic
-            // (complex args are parenthesized in the source), so neither
-            // child inherits the operator context.
+            // application head. The argument slot binds tighter than `|>`:
+            // a complex arg is parenthesized in the source and the `App`
+            // span covers those parens, so a pipe spliced there must be
+            // re-parenthesized to preserve application order.
             walk(func, source, offset, best, true, false);
-            walk(arg, source, offset, best, false, false);
+            walk(arg, source, offset, best, false, true);
             return;
         }
         // Operator operands need the flag so a converted App inside them is
         // parenthesized; everything else resets it (their children sit in
-        // delimited or otherwise pipe-safe positions).
+        // delimited or otherwise pipe-safe positions where a bare pipe does
+        // not re-associate).
         match &expr.node {
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
                 walk(lhs, source, offset, best, false, true);
@@ -3441,6 +3533,33 @@ mod tests {
         assert!(
             parses_cleanly(&out),
             "if-to-case rewrite must reparse cleanly; got:\n{out}"
+        );
+    }
+
+    /// Bug B66: a parenthesized `if` in operand position folds its parens into
+    /// the expr span. Replacing the whole `(if …)` span with a bare `case …`
+    /// dropped the parens, so the trailing `* 2` bound into the last arm
+    /// (`False {} -> b * 2`). The rewrite must re-wrap in parens.
+    #[test]
+    fn if_to_case_reparenthesizes_operand_position() {
+        let src = "f = \\c a b -> (if c then a else b) * 2\n";
+        let module = parse_module(src);
+        let off = src.find("if c").expect("if expr");
+        let (span, replacement) =
+            find_if_to_case_at(&module, src, off).expect("if-to-case offered");
+        assert!(
+            replacement.starts_with('(') && replacement.ends_with(')'),
+            "parenthesized-if rewrite must stay parenthesized; got: {replacement}"
+        );
+        let mut out = src.to_string();
+        out.replace_range(span.start..span.end, &replacement);
+        assert!(
+            out.contains(") * 2"),
+            "trailing operand must stay outside the case; got:\n{out}"
+        );
+        assert!(
+            parses_cleanly(&out),
+            "reparenthesized if-to-case rewrite must reparse cleanly; got:\n{out}"
         );
     }
 
@@ -4357,6 +4476,73 @@ mod regress_fixes_tests {
         );
     }
 
+    /// B67: "Extract to function" must parenthesize the call site when the
+    /// helper takes arguments. Extracting the argument `(n + 2)` from
+    /// `show (n + 2)` must yield `show (extracted_fn n)`, not
+    /// `show extracted_fn n` — the latter parses as `(show extracted_fn) n`,
+    /// the wrong application order.
+    #[test]
+    fn extract_function_parenthesizes_call_site_with_args() {
+        let mut tw = TestWorkspace::new();
+        let src = "f = \\n -> show (n + 2)\n";
+        let uri = tw.open("main", src);
+        // Select the parenthesized argument, parens included — this is the
+        // shape that used to drop the wrapping and misapply the call.
+        let range = selection(src, "(n + 2)");
+        let actions = handle_code_action(&tw.state, &params_for(&uri, range))
+            .unwrap_or_default();
+        let action = action_titled(&actions, |t| t.starts_with("Extract to function"))
+            .expect("extract-to-function offered");
+        let edits = edits_for(action, &uri);
+        let out = apply_edits_to(src, edits);
+        assert!(
+            out.contains("show (extracted_fn n)"),
+            "call site must be parenthesized as `(extracted_fn n)`; got:\n{out}"
+        );
+        assert!(
+            !out.contains("show extracted_fn n"),
+            "call site must not be a bare `show extracted_fn n`; got:\n{out}"
+        );
+        // The result must round-trip through the parser cleanly.
+        let lexer = knot::lexer::Lexer::new(&out);
+        let (tokens, _) = lexer.tokenize();
+        let parser = knot::parser::Parser::new(out.clone(), tokens);
+        let (_, diags) = parser.parse_module();
+        assert!(
+            diags.iter().all(|d| !matches!(d.severity, knot::diagnostic::Severity::Error)),
+            "extracted result must parse; got {diags:?}\nsource:\n{out}"
+        );
+    }
+
+    /// A zero-arg extraction needs NO wrapping parens — the call is a single
+    /// atom already, so `show (1 + 2)` → `show extracted_fn` is correct.
+    #[test]
+    fn extract_function_no_parens_for_zero_arg_call() {
+        let mut tw = TestWorkspace::new();
+        let src = "f = show (1 + 2)\n";
+        let uri = tw.open("main", src);
+        let range = selection(src, "(1 + 2)");
+        let actions = handle_code_action(&tw.state, &params_for(&uri, range))
+            .unwrap_or_default();
+        let action = action_titled(&actions, |t| t.starts_with("Extract to function"))
+            .expect("extract-to-function offered");
+        let edits = edits_for(action, &uri);
+        let out = apply_edits_to(src, edits);
+        assert!(
+            out.contains("show extracted_fn\n"),
+            "zero-arg call needs no wrapping parens; got:\n{out}"
+        );
+        // Still must parse cleanly.
+        let lexer = knot::lexer::Lexer::new(&out);
+        let (tokens, _) = lexer.tokenize();
+        let parser = knot::parser::Parser::new(out.clone(), tokens);
+        let (_, diags) = parser.parse_module();
+        assert!(
+            diags.iter().all(|d| !matches!(d.severity, knot::diagnostic::Severity::Error)),
+            "extracted result must parse; got {diags:?}\nsource:\n{out}"
+        );
+    }
+
     /// "Add deriving" must attach to the data decl itself — decl spans
     /// include the trailing newline run, so inserting at span.end used to
     /// glue the clause onto the NEXT declaration.
@@ -4781,6 +4967,28 @@ mod regress_fixes_batch2_tests {
         assert_eq!(replacement, "x |> show");
     }
 
+    /// B63: converting the inner application of `g (f x)` to pipe form must
+    /// parenthesize the pipe. The parser gives the inner `App` a span that
+    /// covers the source parens, so an unparenthesized `x |> f` would replace
+    /// `(f x)` with `x |> f`, producing `g x |> f` — which parses as
+    /// `f (g x)`, silently reversing the application order.
+    #[test]
+    fn pipe_conversion_parenthesizes_in_argument_position() {
+        let src = "k = \\x -> g (f x)\n";
+        let module = parse_module(src);
+        let off = src.find("f x").expect("inner application"); // on `f`
+        let (span, replacement) =
+            find_pipe_conversion_at(&module, src, off).expect("pipe action offered");
+        assert_eq!(replacement, "(x |> f)");
+        let mut out = src.to_string();
+        out.replace_range(span.start..span.end, &replacement);
+        assert!(parses_cleanly(&out), "pipe rewrite must reparse: {out}");
+        assert!(
+            out.contains("g (x |> f)"),
+            "application order must be preserved: {out}"
+        );
+    }
+
     /// Bug 2: adding a wildcard arm to a case whose first arm sits inline on
     /// the `of` line must indent the new arm at the FIRST ARM's column (the
     /// layout block indent), not case-column+2 — the latter is shallower than
@@ -4836,6 +5044,24 @@ mod regress_fixes_batch2_tests {
         assert_eq!(replacement, "if a then 2 else 1");
     }
 
+    /// Bug B66: a parenthesized `if` in operand position folds its parens into
+    /// the expr span. Replacing the whole `(if …)` span with a bare `if …`
+    /// dropped the parens, so the trailing `* 2` bound into the else branch
+    /// (`if not c then b else a * 2`). The rewrite must re-wrap in parens.
+    #[test]
+    fn negate_condition_reparenthesizes_operand_position() {
+        let src = "f = \\c a b -> (if c then a else b) * 2\n";
+        let module = parse_module(src);
+        let off = src.find("if c").expect("if expr");
+        let (span, replacement) =
+            find_if_negate_at(&module, src, off).expect("negate action offered");
+        assert_eq!(replacement, "(if not (c) then b else a)");
+        let mut out = src.to_string();
+        out.replace_range(span.start..span.end, &replacement);
+        assert_eq!(out, "f = \\c a b -> (if not (c) then b else a) * 2\n");
+        assert!(parses_cleanly(&out), "negate rewrite must reparse: {out}");
+    }
+
     /// Bug 4: flipping a commutative operator whose operand is a keyword form
     /// must parenthesize the moved `if` — keyword forms greedily consume to
     /// their right, so the bare flip `if … else 2 == 0` would swallow `== 0`
@@ -4852,6 +5078,44 @@ mod regress_fixes_batch2_tests {
         assert_eq!(replacement, "(if x then 1 else 2) == 0");
         let mut out = src.to_string();
         out.replace_range(span.start..span.end, &replacement);
+        assert!(parses_cleanly(&out), "flip rewrite must reparse: {out}");
+    }
+
+    /// Bug B64a: `a / b * c` parses as `(a / b) * c`. Flipping the `*`'s
+    /// operands must produce `c * (a / b)`, not `c * a / b` — the latter
+    /// reparses as `(c * a) / b`, a re-association that changes the value
+    /// under integer division (a=1,b=2,c=4: 0 vs 2). The moved `a / b`
+    /// operand shares `*`'s precedence, so it must be parenthesized.
+    #[test]
+    fn flip_operands_parenthesizes_reassociating_operand() {
+        let src = "f = \\a b c -> a / b * c\n";
+        let module = parse_module(src);
+        let off = src.find("* c").expect("mul operator");
+        let (span, replacement) =
+            find_flip_binary_at(&module, src, off).expect("flip action offered");
+        assert_eq!(replacement, "c * (a / b)");
+        let mut out = src.to_string();
+        out.replace_range(span.start..span.end, &replacement);
+        assert_eq!(out, "f = \\a b c -> c * (a / b)\n");
+        assert!(parses_cleanly(&out), "flip rewrite must reparse: {out}");
+    }
+
+    /// Bug B64b: the parser folds enclosing parens into a binary expression's
+    /// own span, so `f (a == b)` has an `==` node whose span covers `(a == b)`.
+    /// Flipping must preserve the parens (`f (b == a)`); dropping them yields
+    /// `f b == a`, which reparses as `(f b) == a` — a completely different
+    /// expression.
+    #[test]
+    fn flip_operands_preserves_enclosing_parens() {
+        let src = "f = \\a b -> f (a == b)\n";
+        let module = parse_module(src);
+        let off = src.find("a ==").expect("eq operand");
+        let (span, replacement) =
+            find_flip_binary_at(&module, src, off).expect("flip action offered");
+        assert_eq!(replacement, "b == a");
+        let mut out = src.to_string();
+        out.replace_range(span.start..span.end, &replacement);
+        assert_eq!(out, "f = \\a b -> f (b == a)\n");
         assert!(parses_cleanly(&out), "flip rewrite must reparse: {out}");
     }
 
